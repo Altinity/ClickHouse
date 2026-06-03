@@ -314,6 +314,20 @@ private:
     void republishDetachedStagingIntoActive(
         const ContentAddressed::PartFilePath & src_staging, const ContentAddressed::PartFilePath & dst_active);
 
+    // Projection MATERIALIZE / merge: rename a STAGED projection directory within the part this
+    // transaction is assembling, <part>/<X>.tmp_proj -> <part>/<proj>.proj. MergeTree builds the
+    // projection part under a temporary <proj>_<n>.tmp_proj subdirectory of the (not-yet-committed)
+    // parent part and renames it to the final <proj>.proj before the parent part commits
+    // (MergeProjectionPartsTask). Content addressing keys the staged projection files by their in-part
+    // logical name (<X>.tmp_proj/<inner>), so this re-keys every recorded blob and inline mutable file
+    // under the old projection-dir prefix to the new <proj>.proj/ prefix in this transaction's staged
+    // maps. No object is moved in storage (content-addressed), and no ref is published yet — the parent
+    // part's ref/manifest is published at commit with the re-keyed <proj>.proj/ keys. Returns true if
+    // the move was a staged same-part projection-dir rename and was handled here. Reached only from
+    // moveDirectory.
+    bool rekeyStagedProjectionDir(
+        const ContentAddressed::PartFilePath & src, const ContentAddressed::PartFilePath & dst);
+
     // RENAME TABLE / cross-engine table move: re-key every ref + per-ref sidecar (and verbatim
     // table-level file) from the source table identifier to the destination table identifier, then
     // unlink the source pointer objects. The table identifier is part of the ref/store object key, so

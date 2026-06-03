@@ -673,6 +673,48 @@ void ContentAddressedTransaction::republishTableRefs(const std::string & src_tab
         ContentAddressed::tableFilesPrefix(key_prefix, metadata_storage.server_id, dst_table_id));
 }
 
+bool ContentAddressedTransaction::rekeyStagedProjectionDir(
+    const ContentAddressed::PartFilePath & src, const ContentAddressed::PartFilePath & dst)
+{
+    /// Only meaningful for the part this transaction is currently assembling: the projection rename
+    /// happens after the projection files have been written into this transaction's staged maps, so the
+    /// target must already be pinned and must match. If nothing is staged or it is a different part, this
+    /// is not the staged-projection-rename case — let moveDirectory fall through to its other branches.
+    if (table_uuid.empty() || part_name.empty()
+        || src.table_uuid != table_uuid || src.part_name != part_name)
+        return false;
+
+    /// Re-key every staged blob and inline mutable file whose in-part name lives under the old projection
+    /// directory (<src.file>/...) to the new one (<dst.file>/...). The blob/byte payloads are unchanged —
+    /// only the logical key changes — so the manifest published at commit carries the final <proj>.proj/
+    /// names. A whole-directory rename has nothing keyed at the bare <src.file> (projection files are
+    /// always <proj>.proj/<inner>), so we match strictly on the "<src.file>/" prefix.
+    const std::string src_prefix = src.file + "/";
+    const std::string dst_prefix = dst.file + "/";
+
+    auto rekey_map = [&](auto & m)
+    {
+        using MapT = std::decay_t<decltype(m)>;
+        MapT moved;
+        for (auto it = m.begin(); it != m.end();)
+        {
+            if (it->first.rfind(src_prefix, 0) == 0)
+            {
+                moved[dst_prefix + it->first.substr(src_prefix.size())] = std::move(it->second);
+                it = m.erase(it);
+            }
+            else
+                ++it;
+        }
+        for (auto & [k, v] : moved)
+            m[k] = std::move(v);
+    };
+
+    rekey_map(recorded);
+    rekey_map(recorded_mutable);
+    return true;
+}
+
 void ContentAddressedTransaction::moveDirectory(const std::string & from, const std::string & to)
 {
     /// DETACH PARTITION moves a COMMITTED part directory <uuid[:3]>/<uuid>/<part> into the detached
@@ -750,6 +792,24 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
         }
     }
 
+    /// Projection MATERIALIZE / merge stages the projection part under a temporary subdirectory of the
+    /// part being assembled, <part>/<proj>_<n>.tmp_proj, and renames it to the final <part>/<proj>.proj
+    /// before the parent part commits (MergeProjectionPartsTask). Both endpoints are files (a projection
+    /// subdir) WITHIN the same staged part: `from` ends in ".tmp_proj", `to` ends in ".proj", and the
+    /// part component matches the (table_uuid, part_name) this transaction is assembling. Re-key the
+    /// staged projection files in place so the parent part's manifest, published at commit, carries the
+    /// final <proj>.proj/<inner> keys. (Without this the recorded keys stay <proj>_<n>.tmp_proj/<inner>
+    /// and the read path, which resolves <proj>.proj/<inner>, finds them absent — FILE_DOESNT_EXIST.)
+    if (auto src_proj = ContentAddressed::parsePartFilePath(from); src_proj && !src_proj->file.empty())
+    {
+        if (auto dst_proj = ContentAddressed::parsePartFilePath(to);
+            dst_proj && !dst_proj->file.empty()
+            && src_proj->table_uuid == dst_proj->table_uuid && src_proj->part_name == dst_proj->part_name
+            && src_proj->file.ends_with(".tmp_proj") && dst_proj->file.ends_with(".proj")
+            && rekeyStagedProjectionDir(*src_proj, *dst_proj))
+            return;
+    }
+
     /// MergeTree assembles a part under a temporary directory (e.g. tmp_insert_<part>) and renames
     /// it to the final <part> at commit. Re-pin the (table_uuid, part_name) target to the
     /// destination so the ref is published under the final part name. The recorded blobs are keyed
@@ -788,6 +848,18 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
     if (src_part && src_part->file.empty()
         && src_part->table_uuid == table_uuid && src_part->part_name == part_name)
     {
+        /// A projection MATERIALIZE / merge writes the projection part into a SEPARATE child storage of
+        /// the staged part and COMMITS that child's own transaction early (MutateTask /
+        /// MergeProjectionPartsTask). On a content-addressed pool that early commit publishes a standalone
+        /// ref under the staged part name (e.g. tmp_mut_<part>), carrying the projection's files. After the
+        /// projection dir is renamed into the parent manifest (rekeyStagedProjectionDir above) the parent
+        /// part is renamed away from tmp_mut_<part>, leaving that standalone ref orphaned — and
+        /// clearOldTemporaryDirectories then trips over it on the next startup/ATTACH (it lists
+        /// tmp_mut_<part> as a live directory). Unlink the source part's ref + sidecars here so the
+        /// rename leaves nothing behind. For a plain INSERT (tmp_insert_<part> with no early sub-commit)
+        /// there is no such ref, so this is a no-op.
+        unlinkPartDirRefs(from);
+
         table_uuid = dst_part->table_uuid;
         part_name = dst_part->part_name;
     }

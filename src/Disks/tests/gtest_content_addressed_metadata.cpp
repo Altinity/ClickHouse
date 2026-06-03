@@ -3039,6 +3039,61 @@ TEST_F(ContentAddressedMetaTest, ProjectionSubdirIsDiscoverable)
     EXPECT_TRUE(ms->existsDirectory("uui/" + uuid + "/" + part));
 }
 
+// Projection MATERIALIZE / merge stages the projection part under a temporary subdirectory of the
+// (not-yet-committed) parent part, <part>/<proj>_<n>.tmp_proj, and renames it to <part>/<proj>.proj
+// before the parent part commits (MergeProjectionPartsTask). Content addressing keys the staged
+// projection files by their in-part name (<proj>_<n>.tmp_proj/<inner>), so moveDirectory of that staged
+// projection dir must re-key them to <proj>.proj/<inner> in the transaction's staged maps; otherwise the
+// parent manifest is published with .tmp_proj/ keys and the read path (resolving <proj>.proj/<inner>)
+// throws FILE_DOESNT_EXIST. This drives that staged same-part projection-dir rename and asserts the
+// committed manifest carries the final <proj>.proj/ keys (and none of the .tmp_proj/ ones).
+TEST_F(ContentAddressedMetaTest, StagedProjectionTmpDirRenameRekeysManifest)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_proj_tmp_rename");
+    const std::string uuid = "uuid-proj-tmp";
+    const std::string tmp_part = "tmp_mut_all_1_2_1_3";
+    const std::string final_part = "all_1_2_1_3";
+    const std::string tmp_base = "uui/" + uuid + "/" + tmp_part + "/";
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+
+    // Write the parent part's top-level files and the projection files under the temporary
+    // <proj>_<n>.tmp_proj subdirectory (mirrors MergeProjectionPartsTask's staging name).
+    for (const auto & f : {std::string("columns.txt"), std::string("data.bin"), std::string("checksums.txt"),
+                           std::string("p_sum_1.tmp_proj/columns.txt"), std::string("p_sum_1.tmp_proj/data.bin"),
+                           std::string("p_sum_1.tmp_proj/checksums.txt")})
+    {
+        auto buf = tx.writeFile(tmp_base + f, 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = "bytes-of-" + f;
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+
+    // Rename the staged projection directory <proj>_<n>.tmp_proj -> <proj>.proj (the materialize merge's
+    // final rename), then rename the parent part dir tmp_mut_<part> -> <part> (the part commit rename).
+    tx.moveDirectory(tmp_base + "p_sum_1.tmp_proj", tmp_base + "p_sum.proj");
+    tx.moveDirectory("uui/" + uuid + "/" + tmp_part, "uui/" + uuid + "/" + final_part);
+    tx.commit(DB::NoCommitOptions{});
+
+    const std::string base = "uui/" + uuid + "/" + final_part + "/";
+
+    // The projection is discoverable under its final .proj name; the .tmp_proj name is gone.
+    EXPECT_TRUE(ms->existsDirectory(base + "p_sum.proj"));
+    EXPECT_FALSE(ms->existsDirectory(base + "p_sum_1.tmp_proj"));
+
+    // Every projection inner file resolves under .proj/, and none remains under .tmp_proj/.
+    EXPECT_NO_THROW(ms->getFileSize(base + "p_sum.proj/data.bin"));
+    EXPECT_NO_THROW(ms->getFileSize(base + "p_sum.proj/columns.txt"));
+    EXPECT_NO_THROW(ms->getFileSize(base + "p_sum.proj/checksums.txt"));
+    EXPECT_FALSE(ms->existsFile(base + "p_sum_1.tmp_proj/data.bin"));
+
+    // The inner listing of the projection dir is exactly its files (the .proj/ prefix stripped).
+    auto inner = ms->listDirectory(base + "p_sum.proj");
+    std::set<std::string> got(inner.begin(), inner.end());
+    EXPECT_EQ(got, (std::set<std::string>{"columns.txt", "data.bin", "checksums.txt"}));
+}
+
 // listDirectory("<part>/<proj>.proj") returns the projection's INNER file names (the <proj>.proj/
 // prefix stripped), so the projection's child DataPartStorage enumerates exactly its own files.
 TEST_F(ContentAddressedMetaTest, ProjectionSubdirListsInnerFiles)
