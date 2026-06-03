@@ -104,6 +104,16 @@ std::string poolMounterKey(const std::string & key_prefix, const std::string & s
     return poolMountersPrefix(key_prefix) + server_id;
 }
 
+std::string sessionsPrefix(const std::string & key_prefix)
+{
+    return withPrefix(key_prefix, "sessions/");
+}
+
+std::string sessionKey(const std::string & key_prefix, const std::string & session_id)
+{
+    return sessionsPrefix(key_prefix) + session_id;
+}
+
 std::string diskFileKey(const std::string & key_prefix, const std::string & path)
 {
     /// Verbatim: the raw disk-relative path joined under the object-storage common key prefix with

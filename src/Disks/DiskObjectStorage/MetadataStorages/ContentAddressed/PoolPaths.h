@@ -85,6 +85,19 @@ std::string poolMetaKey(const std::string & key_prefix);
 std::string poolMountersPrefix(const std::string & key_prefix);
 std::string poolMounterKey(const std::string & key_prefix, const std::string & server_id);
 
+// Cross-mounter write-session pins. While a part is being written, each in-flight transaction owns a
+// uniquely-keyed WriteSession object under the sessions prefix that records the part's blob hashes
+// BEFORE they are referenced by any published ref, so a GC sweep on ANOTHER mounter treats those
+// hashes as reachable for the lifetime of the write (the cross-process generalization of the
+// in-process pin). The owner rewrites only its OWN uniquely-keyed object (no CAS / no contention) and
+// removes it once the ref is published (commit) or the transaction aborts. Sessions live under the
+// `pool/sessions/` prefix, a distinct keyspace from blobs/parts/refs, so the reachability sweep
+// enumerates them on their own and never confuses one with a blob/part/ref.
+//   - sessionsPrefix: <key_prefix>/sessions/        (list this to enumerate live write sessions)
+//   - sessionKey:      <key_prefix>/sessions/<session_id>  (one per in-flight transaction)
+std::string sessionsPrefix(const std::string & key_prefix);
+std::string sessionKey(const std::string & key_prefix, const std::string & session_id);
+
 // Verbatim object key for a generic disk-level file: a path that is neither a part file nor a
 // table-level file (e.g. the server's startup access-check probe clickhouse_access_check_<uuid>
 // written at the disk root). Such files are stored verbatim at <key_prefix>/<path> (no content

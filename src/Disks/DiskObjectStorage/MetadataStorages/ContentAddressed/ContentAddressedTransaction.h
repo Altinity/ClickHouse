@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/WriteSession.h>
 #include <Disks/WriteMode.h>
 #include <IO/HashingWriteBuffer.h>
 #include <IO/WriteBufferFromFile.h>
@@ -43,6 +44,13 @@ public:
     /// hash is handed over as a typed BlobHash so the transaction cannot confuse it with an object key.
     using OnFinalized = std::function<void(const BlobHash & blob_hash, size_t size)>;
 
+    /// Invoked from finalizeImpl at the SAME point the in-process pin (B52) is taken — under the GC
+    /// lock, BEFORE the dedup existence-check / upload. Lets the owning transaction record the blob in
+    /// its cross-mounter WriteSession and persist that session object, so a GC sweep on another mounter
+    /// treats the hash as reachable before it is ever uploaded (M8 cross-mounter pin). The hash is typed
+    /// so it cannot be confused with an object key. May be empty (no session wiring).
+    using OnPinBlob = std::function<void(const BlobHash & blob_hash)>;
+
     /// key_prefix_ is the object-storage common key prefix to prepend to the blob key; an empty
     /// prefix yields the bare blobs/<hash> key. It is threaded from the owning transaction so the
     /// blob is uploaded exactly where the read side resolves it.
@@ -57,7 +65,8 @@ public:
         std::string temp_dir_,
         std::shared_ptr<std::mutex> gc_lock_ = nullptr,
         std::shared_ptr<std::set<std::string>> in_flight_pinned_blobs_ = nullptr,
-        OnFinalized on_finalized_ = {});
+        OnFinalized on_finalized_ = {},
+        OnPinBlob on_pin_blob_ = {});
     ~ContentAddressedWriteBuffer() override;
 
     void sync() override;
@@ -86,6 +95,9 @@ private:
     std::shared_ptr<std::mutex> gc_lock;
     std::shared_ptr<std::set<std::string>> in_flight_pinned_blobs;
     OnFinalized on_finalized;
+    /// Invoked under gc_lock, before the dedup-skip/upload decision, to record the blob in the owning
+    /// transaction's cross-mounter WriteSession (M8). May be empty.
+    OnPinBlob on_pin_blob{};
 
     std::unique_ptr<WriteBufferFromFile> temp_file;
     std::unique_ptr<HashingWriteBuffer> hashing;
@@ -256,6 +268,19 @@ private:
     // destruction of an uncommitted transaction). Idempotent.
     void releasePinnedBlobs() noexcept;
 
+    // M8 (cross-mounter pin): record blob_hash in this transaction's WriteSession and (re)persist the
+    // session object so a GC sweep on ANOTHER mounter treats the hash as reachable. Called under the GC
+    // lock, BEFORE the blob is uploaded (the same point the in-process pin is taken), so the pin is
+    // durable before the upload. The session is opened lazily on the first recorded blob: it is owned
+    // by this transaction at a unique key, so the owner rewrites its OWN object (no CAS needed).
+    void recordBlobInSession(const ContentAddressed::BlobHash & blob_hash);
+
+    // M8: best-effort remove this transaction's WriteSession object (after the ref is published, or on
+    // destruction of an uncommitted transaction). The ref now keeps the blobs reachable, so the pin is
+    // no longer needed; an aborted session would expire by its lease anyway, but clean it up eagerly.
+    // Idempotent and never throws (mirrors releasePinnedBlobs).
+    void releaseSession() noexcept;
+
     // DETACH PARTITION: re-publish a committed part directory as a detached ref. The detached ref is
     // named "detached" and carries the source part's manifest blob entries and mutable sidecar files
     // re-keyed under the detached part directory component, then the source ref is unlinked. Content
@@ -311,6 +336,14 @@ private:
     /// B52: full blob object keys this transaction pinned in the pool's in-flight set (via the write
     /// buffer, under the GC lock). Released once the ref is published or the transaction is destroyed.
     std::set<std::string> pinned_blob_keys;
+
+    /// M8 (cross-mounter pin): this transaction's WriteSession, opened lazily on the first recorded
+    /// blob. While open it is persisted at sessionKey(key_prefix, session_id) (a unique key owned by
+    /// this transaction) and lists every pending blob hash. Removed once the ref is published (commit)
+    /// or the transaction is destroyed uncommitted. session_open is false until the first blob.
+    bool session_open = false;
+    std::string session_id;
+    ContentAddressed::WriteSession session;
 };
 
 }

@@ -15,6 +15,7 @@
 
 #include <base/hex.h>
 
+#include <chrono>
 #include <filesystem>
 #include <mutex>
 
@@ -44,6 +45,11 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
     /// GC forever. A committed transaction already cleared pinned_blob_keys under gc_lock, so this is a
     /// no-op for it.
     releasePinnedBlobs();
+
+    /// M8: an uncommitted transaction also leaves its cross-mounter WriteSession object behind. Its
+    /// lease would expire anyway, but remove it eagerly (best-effort) so an aborted insert leaves no
+    /// lingering session. A committed transaction already cleared it in commit(), so this is a no-op.
+    releaseSession();
 }
 
 void ContentAddressedTransaction::releasePinnedBlobs() noexcept
@@ -61,6 +67,64 @@ void ContentAddressedTransaction::releasePinnedBlobs() noexcept
         /// loss). Never let it escape a destructor.
     }
     pinned_blob_keys.clear();
+}
+
+void ContentAddressedTransaction::recordBlobInSession(const ContentAddressed::BlobHash & blob_hash)
+{
+    /// Called from the write buffer's finalizeImpl under the GC lock, BEFORE the blob is uploaded.
+    /// Lazily open the session on the first recorded blob: generate a unique key (the server id plus a
+    /// random suffix, so two concurrent transactions on the same mounter never collide), stamp the
+    /// owning identity and an advisory lease, and leave the fence token 0 (Phase C wires real fencing).
+    if (!session_open)
+    {
+        session_id = metadata_storage.server_id + "-" + getRandomASCIIString(24);
+
+        /// A fixed advisory lease for now: a liveness HINT only. A remote GC treats an EXPIRED session
+        /// as reclaimable so a crashed writer cannot pin blobs forever; the deadline is NEVER the basis
+        /// of a positive "still live" decision (see WriteSession.h).
+        constexpr UInt64 lease_seconds = 300;
+        const UInt64 now_unix = static_cast<UInt64>(
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+
+        session = ContentAddressed::WriteSession{};
+        session.server_id = metadata_storage.server_id;
+        session.lease_deadline_unix = now_unix + lease_seconds;
+        session.fence_token = 0;
+        /// The committed content PartId is only known at commit (it is derived from the full blob set),
+        /// so the session identifies the part by the writer's part name — enough for a remote GC to
+        /// attribute the pin and for diagnostics.
+        session.part_id = ContentAddressed::PartId(part_name);
+        session_open = true;
+    }
+
+    session.pending.push_back(blob_hash);
+
+    /// Per-blob rewrite of the OWNER's uniquely-keyed session object: no CAS needed (no other writer
+    /// touches this key). Rewriting per blob is the simple correct approach; batching the rewrites is a
+    /// future optimization. Persisting BEFORE the blob is uploaded is the whole point — the cross-mounter
+    /// pin must be durable before the blob can be observed by a remote sweep.
+    const std::string key = ContentAddressed::sessionKey(key_prefix, session_id);
+    const std::string bytes = session.serialize();
+    auto out = metadata_storage.object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
+    out->write(bytes.data(), bytes.size());
+    out->finalize();
+}
+
+void ContentAddressedTransaction::releaseSession() noexcept
+{
+    if (!session_open)
+        return;
+    try
+    {
+        metadata_storage.object_storage->removeObjectIfExists(
+            StoredObject(ContentAddressed::sessionKey(key_prefix, session_id)));
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+        /// Best-effort: a failure to remove the session object only over-retains the pin (conservative
+        /// — never data loss; the lease expires anyway). Never let it escape a destructor.
+    }
+    session_open = false;
 }
 
 void ContentAddressedTransaction::rememberTarget(const std::string & path)
@@ -148,7 +212,11 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// B52: track the pinned blob key so it is released when the ref is published (commit) or
             /// when an uncommitted transaction is destroyed. The write buffer pinned it under the GC lock.
             pinned_blob_keys.insert(ContentAddressed::blobKey(key_prefix, blob_hash).string());
-        });
+        },
+        /// M8: the cross-mounter pin. Invoked from finalizeImpl under the GC lock, BEFORE the blob is
+        /// uploaded — record the hash in this transaction's WriteSession and (re)persist it so a sweep
+        /// on another mounter treats the hash as reachable before it ever exists in the bucket.
+        [this](const ContentAddressed::BlobHash & blob_hash) { recordBlobInSession(blob_hash); });
 }
 
 void ContentAddressedTransaction::createHardLink(const std::string & from, const std::string & to)
@@ -763,6 +831,13 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     for (const auto & key : pinned_blob_keys)
         metadata_storage.inFlightPinnedBlobs()->erase(key);
     pinned_blob_keys.clear();
+
+    /// M8: the ref is published, so the cross-mounter pin (the WriteSession object) is no longer needed
+    /// — the ref now keeps every referenced blob reachable for a sweep on ANY mounter. Remove it. This
+    /// is done OUTSIDE the gc_lock window above on purpose: it is a plain object delete on this
+    /// transaction's OWN uniquely-keyed session object (no in-process state, so the local lock is
+    /// irrelevant), and the ref publish above already closed the local race.
+    releaseSession();
 }
 
 TransactionCommitOutcomeVariant ContentAddressedTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
@@ -1059,13 +1134,15 @@ ContentAddressedWriteBuffer::ContentAddressedWriteBuffer(
     std::string temp_dir_,
     std::shared_ptr<std::mutex> gc_lock_,
     std::shared_ptr<std::set<std::string>> in_flight_pinned_blobs_,
-    OnFinalized on_finalized_)
+    OnFinalized on_finalized_,
+    OnPinBlob on_pin_blob_)
     : WriteBufferFromFileBase(DBMS_DEFAULT_BUFFER_SIZE, nullptr, 0)
     , object_storage(std::move(object_storage_))
     , key_prefix(std::move(key_prefix_))
     , gc_lock(std::move(gc_lock_))
     , in_flight_pinned_blobs(std::move(in_flight_pinned_blobs_))
     , on_finalized(std::move(on_finalized_))
+    , on_pin_blob(std::move(on_pin_blob_))
 {
     fs::create_directories(temp_dir_);
     temp_path = temp_dir_ + "/" + getRandomASCIIString(32) + ".tmp";
@@ -1162,6 +1239,14 @@ void ContentAddressedWriteBuffer::finalizeImpl()
     {
         if (in_flight_pinned_blobs)
             in_flight_pinned_blobs->insert(key);
+        /// M8: also publish the CROSS-mounter pin (the WriteSession object) BEFORE the upload, while
+        /// the GC lock is held. The in-process pin above only protects this server's own sweep; the
+        /// session object protects a sweep running on ANOTHER mounter that lists the bucket and would
+        /// otherwise see this just-uploaded-but-not-yet-referenced blob as unreachable (data loss). It
+        /// must be durable before the blob exists, so it is taken here (pin-before-upload), not in the
+        /// post-upload on_finalized callback.
+        if (on_pin_blob)
+            on_pin_blob(BlobHash(blob_hash));
         return object_storage->tryGetObjectMetadata(key, /*with_tags=*/false);
     };
 

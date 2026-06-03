@@ -212,6 +212,7 @@ public:
         fs::remove_all("blobs", ec);
         fs::remove_all("parts", ec);
         fs::remove_all("store", ec);
+        fs::remove_all("sessions", ec);
         fs::remove_all("cas_wbuf_tmp", ec);
         fs::remove_all(kCasTestScratch, ec);
     }
@@ -1923,6 +1924,87 @@ TEST_F(ContentAddressedMetaTest, WriteSessionRoundTripsAndRejectsBadVersion)
     std::string future = session.serialize();
     future[4] = static_cast<char>(WriteSession::ENCODING_VERSION + 1); // bump the ENCODING version byte
     EXPECT_THROW(WriteSession::deserialize(future), DB::Exception);
+}
+
+// CAS M8 Phase B (cross-mounter pin, end-to-end): while a part is being written but BEFORE its ref is
+// published, the transaction must have published exactly one WriteSession object that lists the part's
+// blob hashes — so a GC sweep on ANOTHER mounter treats those just-uploaded-but-not-yet-referenced
+// blobs as reachable. Once the ref is published (commit) the session object is removed (the ref now
+// keeps the blobs reachable). This is the cross-process generalization of the in-process pin (B52).
+TEST_F(ContentAddressedMetaTest, SessionPinListsPendingBlobsBeforeRefPublish)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_session_pin");
+    auto os = getObjectStorage("cas_session_pin");
+    const std::string uuid = "uuid-session-pin";
+    const std::string part = "all_1_1_0";
+    const std::map<std::string, std::string> files{{"a.bin", "AAA"}, {"b.bin", "BBBB"}, {"columns.txt", "x y"}};
+
+    // Build the part (finalize each content file) but do NOT commit yet: each write-buffer finalize
+    // pins its blob in the session BEFORE the upload, rewriting the one session object per blob.
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    for (const auto & [name, bytes] : files)
+    {
+        auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+
+    // Exactly one session object exists under the sessions prefix (one per in-flight transaction).
+    auto session_keys = listKeysUnder(os, sessionsPrefix(""));
+    ASSERT_EQ(session_keys.size(), 1u) << "expected exactly one in-flight WriteSession object";
+
+    // It deserializes to a session that names this part and lists this part's blob hashes. The hashes
+    // are the same the part's content files resolve to: project them to full blob object keys and
+    // compare against the blob keys the committed part will read back from.
+    auto session = WriteSession::deserialize(readObject(os, session_keys[0]));
+    EXPECT_EQ(session.part_id, PartId(part));
+    EXPECT_EQ(session.pending.size(), files.size());
+
+    std::set<std::string> pinned_blob_keys;
+    for (const auto & h : session.pending)
+        pinned_blob_keys.insert(blobKey("", h).string());
+
+    // Now publish the ref: the session object must be GONE (the ref keeps the blobs reachable).
+    tx.commit(DB::NoCommitOptions{});
+    EXPECT_TRUE(listKeysUnder(os, sessionsPrefix("")).empty()) << "session object must be cleared on commit";
+
+    // The part still reads back correctly, and the blobs the session pinned are exactly the part's blobs.
+    std::set<std::string> committed_blob_keys;
+    for (const auto & [name, bytes] : files)
+    {
+        auto objs = ms->getStorageObjects("uui/" + uuid + "/" + part + "/" + name);
+        ASSERT_EQ(objs.size(), 1u);
+        EXPECT_EQ(readObject(os, objs[0].remote_path), bytes);
+        committed_blob_keys.insert(objs[0].remote_path);
+    }
+    EXPECT_EQ(pinned_blob_keys, committed_blob_keys);
+}
+
+// CAS M8 Phase B: an ABORTED transaction (one that goes out of scope without commit) must not leave a
+// lingering session object. Its lease would expire anyway, but the destructor removes it eagerly,
+// mirroring the in-process pin release.
+TEST_F(ContentAddressedMetaTest, AbortedTransactionLeavesNoSession)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_session_abort");
+    auto os = getObjectStorage("cas_session_abort");
+    const std::string uuid = "uuid-session-abort";
+    const std::string part = "all_1_1_0";
+
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{{"a.bin", "AAA"}, {"b.bin", "BBBB"}})
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        // While live, the session object exists (the cross-mounter pin is active).
+        ASSERT_EQ(listKeysUnder(os, sessionsPrefix("")).size(), 1u);
+        // tx goes out of scope WITHOUT commit -> destructor must remove the session object.
+    }
+    EXPECT_TRUE(listKeysUnder(os, sessionsPrefix("")).empty()) << "aborted transaction must leave no session";
 }
 
 // Task 4: `_pool_meta` is on the shared codec now. Pin the on-object bytes (cross-arch determinism)
