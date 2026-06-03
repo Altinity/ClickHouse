@@ -1,0 +1,35 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <disk_content_addressed_shared>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>content_addressed</metadata_type>
+                <!-- A single shared bucket path. BOTH servers load this same config, so they mount
+                     the SAME pool (the bucket is the single source of truth; no Keeper). -->
+                <endpoint>http://minio1:9001/root/shared_pool/</endpoint>
+                <access_key_id>minio</access_key_id>
+                <secret_access_key>ClickHouse_Minio_P@ssw0rd</secret_access_key>
+                <!-- Two servers mounting one pool: this acknowledgement is mandatory; without it the
+                     second mounter refuses to attach (see PoolMeta ownership check). -->
+                <content_addressed_allow_shared_pool>1</content_addressed_allow_shared_pool>
+                <!-- Background reachability GC enabled on BOTH servers, running aggressively so a
+                     sweep happens during the test. The grace window must be short enough to reclaim
+                     within the test, but the sweep must NOT reclaim a blob the OTHER server's live
+                     part still references. -->
+                <content_addressed_gc_enabled>1</content_addressed_gc_enabled>
+                <content_addressed_gc_grace_sec>3</content_addressed_gc_grace_sec>
+                <content_addressed_gc_interval_sec>1</content_addressed_gc_interval_sec>
+            </disk_content_addressed_shared>
+        </disks>
+        <policies>
+            <content_addressed_shared>
+                <volumes>
+                    <main>
+                        <disk>disk_content_addressed_shared</disk>
+                    </main>
+                </volumes>
+            </content_addressed_shared>
+        </policies>
+    </storage_configuration>
+</clickhouse>
