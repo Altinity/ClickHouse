@@ -310,7 +310,6 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsSeconds refresh_statistics_interval;
     extern const MergeTreeSettingsBool remove_unused_patch_parts;
     extern const MergeTreeSettingsSearchOrphanedPartsDisks search_orphaned_parts_disks;
-    extern const MergeTreeSettingsUInt64 non_replicated_deduplication_window;
     extern const MergeTreeSettingsBool allow_part_offset_column_in_projections;
     extern const MergeTreeSettingsUInt64 max_uncompressed_bytes_in_patches;
     extern const MergeTreeSettingsString auto_statistics_types;
@@ -1255,32 +1254,20 @@ void MergeTreeData::checkContentAddressedDiskRestrictions(const StorageInMemoryM
     /// mutation/clone-class features are gated at their own operation sites (supportsHardLinks for
     /// mutations and lightweight delete; checkAlterPartitionIsPossible for the partition-clone
     /// ALTERs — B21). This method covers only what is decidable from the table metadata at create
-    /// time: right now that is projections and the on-disk deduplication log.
+    /// time: right now that is projections.
+    ///
+    /// The non-replicated deduplication window (deduplication_logs/) IS supported on a content-addressed
+    /// disk: the log auto-detects that the disk does not support append writes (the same as a plain s3
+    /// disk) and rewrites a fresh rotated log object per record, and CA's table-level file mechanism
+    /// stores those log objects in the table's files/ namespace subdirectory. No gate needed.
     const bool has_projections = metadata.hasProjections();
 
-    /// A non-replicated deduplication window makes a plain MergeTree write an APPEND-mode
-    /// deduplication log (deduplication_logs/) at the table root. The immutable content-addressed
-    /// disk cannot host append writes, so the log's writer would never be created and the first
-    /// INSERT would dereference a null writer (B37). Reject it at CREATE/ATTACH instead.
-    const bool has_dedup_log = (*getSettings())[MergeTreeSetting::non_replicated_deduplication_window] != 0;
-
-    if (!has_projections && !has_dedup_log)
+    if (!has_projections)
         return;
 
     for (const auto & disk : getStoragePolicy()->getDisks())
     {
         if (!disk->isContentAddressed())
-            continue;
-
-        if (has_dedup_log)
-            throw Exception(
-                ErrorCodes::SUPPORT_IS_DISABLED,
-                "Setting non_replicated_deduplication_window is not supported on a content_addressed "
-                "disk (it requires an append-mode on-disk deduplication log that the immutable "
-                "content-addressed disk cannot host - see backlog B37); disk '{}'",
-                disk->getName());
-
-        if (!has_projections)
             continue;
 
         throw Exception(

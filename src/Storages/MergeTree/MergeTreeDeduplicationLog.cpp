@@ -104,8 +104,14 @@ void MergeTreeDeduplicationLog::load()
     {
         if (auto * object_storage = dynamic_cast<DiskObjectStorage *>(disk.get()))
         {
-            // MetadataStorageType::Plain does not have directory concept. When checking `logs_dir` existence, it might return false.
-            if (object_storage->getMetadataStorage()->getType() != MetadataStorageType::Plain)
+            // Plain and ContentAddressed object storages do not materialize empty directories, so a
+            // missing logs_dir is normal for a fresh table: fall through so the current_writer is still
+            // created (an INSERT must have a writer, else addPart fails closed). For these types a
+            // missing dir is NOT evidence of nothing to do; iterateDirectory below finds any logs that
+            // already exist, and rotate() creates the writer when there are none. Any other object
+            // storage returns here: a missing dir means there is genuinely nothing and nowhere to write.
+            const auto type = object_storage->getMetadataStorage()->getType();
+            if (type != MetadataStorageType::Plain && type != MetadataStorageType::ContentAddressed)
                 return;
         }
     }

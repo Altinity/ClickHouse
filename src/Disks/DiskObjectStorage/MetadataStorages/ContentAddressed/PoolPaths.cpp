@@ -245,7 +245,14 @@ static std::optional<PartDirAnchor> findPartDirComponent(const std::vector<std::
     {
         const size_t part_idx = *uuid_idx + 1;
         if (part_idx < p.size())
+        {
+            // The reserved deduplication-log directory is a table-level subdir, not a part dir, so a
+            // path <uuid>/deduplication_logs/<file> resolves as a table-level file (see
+            // kDeduplicationLogsDirName) rather than being content-addressed as a part.
+            if (p[part_idx] == kDeduplicationLogsDirName)
+                return std::nullopt;
             return PartDirAnchor{*uuid_idx, part_idx}; // table id = the single <uuid> component
+        }
         return std::nullopt; // table dir, no part component after the uuid
     }
 
@@ -324,15 +331,18 @@ std::optional<TableFilePath> parseTableFilePath(const std::string & path)
 {
     auto p = splitNonEmpty(path);
 
-    // Atomic layout: a table-level file lives directly under the table dir, i.e. exactly one component
-    // after the uuid (e.g. format_version.txt). Deeper paths are part files (see isPartFilePath).
+    // Atomic layout: a table-level file lives under the table dir, i.e. at least one component after
+    // the uuid. The tail is EVERYTHING after the uuid joined by '/', so a table-level file in a
+    // subdirectory (e.g. deduplication_logs/deduplication_log_1.txt) keeps its full sub-path. A part
+    // file is excluded earlier by isPartFilePath (it has a part-dir component); this function is only
+    // reached for non-part paths, so a deeper tail here is always a genuine table-level sub-path.
     if (auto uuid_idx = findTableUuidComponent(p))
     {
-        if (*uuid_idx + 2 != p.size())
-            return std::nullopt;
+        if (*uuid_idx + 1 >= p.size())
+            return std::nullopt; // the bare table dir, no file tail
         TableFilePath r;
         r.table_uuid = p[*uuid_idx];
-        r.tail = p[*uuid_idx + 1];
+        r.tail = joinTableId(p, *uuid_idx + 1, p.size());
         return r;
     }
 
@@ -342,6 +352,21 @@ std::optional<TableFilePath> parseTableFilePath(const std::string & path)
     // dir (else it is a part file). Consistent with parsePartFilePath's table identifier.
     if (p.size() < 2 || findPartDirComponent(p))
         return std::nullopt;
+
+    // A reserved table-level subdirectory (deduplication_logs/) splits the path explicitly: the table id
+    // is everything before it, the tail is the reserved dir and everything under it. Without this the
+    // generic "last component is the file" rule would fold the subdir into the table id and mis-scope the
+    // log objects. The reserved component must be at index >= 1 so the table id is never the bare root.
+    for (size_t i = 1; i + 1 < p.size(); ++i)
+    {
+        if (p[i] == kDeduplicationLogsDirName)
+        {
+            TableFilePath r;
+            r.table_uuid = joinTableId(p, 0, i);
+            r.tail = joinTableId(p, i, p.size());
+            return r;
+        }
+    }
 
     TableFilePath r;
     r.table_uuid = joinTableId(p, 0, p.size() - 1);

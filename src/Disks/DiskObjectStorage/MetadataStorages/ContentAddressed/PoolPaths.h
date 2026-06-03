@@ -59,6 +59,15 @@ inline constexpr std::string_view kRefMetaSuffix = ".meta";
 // MergeTreeData::DETACHED_DIR_NAME (kept here to avoid a Storages dependency from the disk layer).
 inline constexpr std::string_view kDetachedDirName = "detached";
 
+// The non-replicated deduplication-log namespace. A MergeTree with non_replicated_deduplication_window
+// writes an on-disk log at <table>/deduplication_logs/deduplication_log_N.txt. In the Atomic layout the
+// path <uuid>/deduplication_logs/<file> is structurally indistinguishable from a part file
+// <uuid>/<part>/<file>, so this directory name is RESERVED: a component equal to it (directly under the
+// table dir) is never a part dir — its contents are table-level verbatim files under the files/
+// namespace. ClickHouse part names never take this form (they end in numeric min_max_level groups), so
+// reserving the name cannot shadow a real part. Mirrors how kDetachedDirName reserves "detached".
+inline constexpr std::string_view kDeduplicationLogsDirName = "deduplication_logs";
+
 // True iff key (a key under some refsPrefix) is a per-ref sidecar rather than a ref object.
 bool isRefMetaKey(const std::string & key);
 

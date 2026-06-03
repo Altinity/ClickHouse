@@ -234,6 +234,18 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
                     return true;
         return false;
     }
+    // A table-level SUBDIRECTORY <uuid[:3]>/<uuid>/<subdir>[/...] (e.g. deduplication_logs/): table-level
+    // files may live in subdirectories under the table's files/ namespace. The directory exists iff at
+    // least one verbatim table file is keyed under tableFileKey(<subdir>/...). This is what lets the
+    // non-replicated deduplication log (deduplication_logs/deduplication_log_N.txt) discover its dir on
+    // load just as it would on a plain disk.
+    if (auto tf = ContentAddressed::parseTableFilePath(path))
+    {
+        const std::string dir_prefix = ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail + "/");
+        RelativePathsWithMetadata files;
+        object_storage->listObjects(dir_prefix, files, 1);
+        return !files.empty();
+    }
     return false;
 }
 
@@ -428,6 +440,29 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             for (const auto & [file, _] : sidecar->files)
                 if (file.starts_with(prefix))
                     result.emplace(file.substr(prefix.size()));
+        return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
+    }
+
+    // A table-level SUBDIRECTORY <uuid[:3]>/<uuid>/<subdir>[/...] (e.g. deduplication_logs/): list the
+    // verbatim table files keyed under tableFileKey(<subdir>/...), collapsing each to its first path
+    // component after the subdir prefix (so a nested file appears as its child entry, a deeper subdir as
+    // a single dir entry). Mirrors the table-dir branch's first-component collapse. This lets the
+    // non-replicated deduplication log enumerate deduplication_log_N.txt files on load.
+    if (auto tf = ContentAddressed::parseTableFilePath(path))
+    {
+        const std::string dir_prefix = ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail + "/");
+        RelativePathsWithMetadata files;
+        object_storage->listObjects(dir_prefix, files, 0);
+        std::unordered_set<std::string> result;
+        for (const auto & elem : files)
+        {
+            const auto & rp = elem->relative_path;
+            if (rp.find(dir_prefix) != 0)
+                continue;
+            const auto rest = rp.substr(dir_prefix.size());
+            const auto slash_pos = rest.find('/');
+            result.emplace(rest.substr(0, slash_pos));
+        }
         return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
     }
 

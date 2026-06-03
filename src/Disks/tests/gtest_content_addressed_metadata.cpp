@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <optional>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
@@ -138,6 +139,30 @@ TEST(ContentAddressedPoolPaths, ParseTableUuid)
     EXPECT_EQ(parseTableUuid("uui/uuid-1/"), std::optional<std::string>("uuid-1"));
     EXPECT_EQ(parseTableUuid("uui/uuid-1"), std::optional<std::string>("uuid-1"));
     EXPECT_FALSE(parseTableUuid("uui/uuid-1/all_1_1_0").has_value()); // part dir, not table dir
+}
+
+// A table-level file may live in a SUBDIRECTORY under the table dir (e.g. the non-replicated
+// deduplication log deduplication_logs/deduplication_log_N.txt). The Atomic-layout parse keeps the
+// full sub-path as the tail; a single-component tail is unchanged; the bare table dir is not a file.
+TEST(ContentAddressedPoolPaths, ParseTableFilePathNested)
+{
+    using namespace DB::ContentAddressed;
+    EXPECT_FALSE(isPartFilePath("uui/uuid-1/deduplication_logs/deduplication_log_1.txt"));
+    auto tf = parseTableFilePath("uui/uuid-1/deduplication_logs/deduplication_log_1.txt");
+    ASSERT_TRUE(tf.has_value());
+    EXPECT_EQ(tf->table_uuid, "uuid-1");
+    EXPECT_EQ(tf->tail, "deduplication_logs/deduplication_log_1.txt");
+
+    auto flat = parseTableFilePath("uui/uuid-1/format_version.txt");
+    ASSERT_TRUE(flat.has_value());
+    EXPECT_EQ(flat->table_uuid, "uuid-1");
+    EXPECT_EQ(flat->tail, "format_version.txt");
+
+    EXPECT_FALSE(parseTableFilePath("uui/uuid-1").has_value());
+    EXPECT_FALSE(parseTableFilePath("uui/uuid-1/").has_value());
+
+    // A part file is still a part file, never mistaken for a (nested) table-level file.
+    EXPECT_TRUE(isPartFilePath("uui/uuid-1/all_1_1_0/data.bin"));
 }
 
 namespace fs = std::filesystem;
@@ -1261,6 +1286,97 @@ TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
 
     // The table-level file is unaffected by the part commit.
     EXPECT_EQ(readObject(os, ms->getStorageObjects(format_version)[0].remote_path), "1");
+}
+
+// A table-level file in a SUBDIRECTORY (the non-replicated deduplication log lives at
+// deduplication_logs/deduplication_log_N.txt) round-trips through the table-level files/ namespace:
+// it writes/reads back verbatim, the subdirectory is discoverable via existsDirectory, the log files
+// enumerate via listDirectory (and iterateDirectory), the subdir shows up as one child of the table
+// dir, and removal unlinks just that object. This is exactly what MergeTreeDeduplicationLog needs to
+// load and rotate its logs on a content-addressed disk (the same rewrite-per-record path as plain s3).
+TEST_F(ContentAddressedMetaTest, TableLevelSubdirectoryRoundTripsLikeDedupLog)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_subdir");
+    auto os = getObjectStorage("cas_subdir");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-subdir";
+    const std::string dir = "uui/" + uuid + "/deduplication_logs";
+    const std::string log1 = dir + "/deduplication_log_1.txt";
+    const std::string log2 = dir + "/deduplication_log_2.txt";
+
+    auto writeTableFile = [&](const std::string & path, const std::string & bytes)
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(path, 4096, DB::WriteMode::Rewrite, {});
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    // Before any write the subdirectory does not exist (mirrors a fresh table on load()).
+    EXPECT_FALSE(ms->existsDirectory(dir));
+
+    writeTableFile(log1, "1\tall_1_1_0\tblock-a\n");
+
+    // The log file resolves verbatim under the table's files/ namespace, keeping its sub-path.
+    EXPECT_TRUE(ms->existsFile(log1));
+    auto objs = ms->getStorageObjects(log1);
+    ASSERT_EQ(objs.size(), 1u);
+    EXPECT_EQ(objs[0].remote_path, tableFileKey("", sid, uuid, "deduplication_logs/deduplication_log_1.txt"));
+    EXPECT_EQ(readObject(os, objs[0].remote_path), "1\tall_1_1_0\tblock-a\n");
+
+    // The subdirectory is now discoverable and lists its single log file.
+    EXPECT_TRUE(ms->existsDirectory(dir));
+    {
+        auto names = ms->listDirectory(dir);
+        ASSERT_EQ(names.size(), 1u);
+        EXPECT_EQ(names[0], "deduplication_log_1.txt");
+    }
+
+    // iterateDirectory prepends the queried path to each child (as MergeTreeDeduplicationLog::load relies on).
+    {
+        std::vector<std::string> it_paths;
+        for (auto it = ms->iterateDirectory(dir); it->isValid(); it->next())
+            it_paths.push_back(it->path());
+        ASSERT_EQ(it_paths.size(), 1u);
+        EXPECT_EQ(it_paths[0], dir + "/deduplication_log_1.txt");
+    }
+
+    // The table dir lists the subdirectory as a single child entry (first-component collapse).
+    {
+        auto table_children = ms->listDirectory("uui/" + uuid);
+        EXPECT_NE(std::find(table_children.begin(), table_children.end(), "deduplication_logs"), table_children.end());
+    }
+
+    // A second rotated log file is independently enumerated.
+    writeTableFile(log2, "2\tall_1_1_0\tblock-a\n");
+    {
+        auto names = ms->listDirectory(dir);
+        ASSERT_EQ(names.size(), 2u);
+    }
+
+    // Dropping an outdated log unlinks just that object; the other remains.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.unlinkFile(log1, /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(ms->existsFile(log1));
+    EXPECT_TRUE(ms->existsFile(log2));
+    {
+        auto names = ms->listDirectory(dir);
+        ASSERT_EQ(names.size(), 1u);
+        EXPECT_EQ(names[0], "deduplication_log_2.txt");
+    }
+
+    // Removing the last log empties the subdirectory.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.unlinkFile(log2, /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(ms->existsDirectory(dir));
 }
 
 // P3.5 (B27): a generic disk-level file — one that is neither a part file nor a table-level file,
