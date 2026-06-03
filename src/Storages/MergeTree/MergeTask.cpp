@@ -558,7 +558,14 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     std::optional<MergeTreeDataPartBuilder> builder;
     if (global_ctx->parent_part)
     {
-        auto data_part_storage = global_ctx->parent_part->getDataPartStorage().getProjection(local_tmp_part_basename,  /* use parent transaction */ false);
+        /// On a content-addressed disk a part is one atomic unit (one manifest + one ref). The projection
+        /// sub-part must therefore be written through the PARENT part's whole-part transaction (mirroring
+        /// the INSERT path, `MergeTreeDataWriter::writeProjectionPartImpl` with `use_parent_transaction =
+        /// true`) so its files land in the parent manifest and survive a reload (B58). On a non-CA disk we
+        /// keep the historical behavior: the projection sub-part opens and commits its own sub-transaction.
+        global_ctx->projection_uses_parent_transaction = global_ctx->parent_part->getDataPartStorage().isContentAddressed();
+        auto data_part_storage = global_ctx->parent_part->getDataPartStorage().getProjection(
+            local_tmp_part_basename, /* use_parent_transaction */ global_ctx->projection_uses_parent_transaction);
         builder.emplace(*global_ctx->data, global_ctx->future_part->name, data_part_storage, getReadSettings());
         builder->withParentPart(global_ctx->parent_part);
     }
@@ -578,7 +585,10 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     if (data_part_storage->exists())
         throw Exception(ErrorCodes::DIRECTORY_ALREADY_EXISTS, "Directory {} already exists", data_part_storage->getFullPath());
 
-    data_part_storage->beginTransaction();
+    /// Skip begin only for a CA projection sub-part: its storage shares the parent's already-open
+    /// transaction, so opening another would throw ("Uncommitted shared transaction already exists").
+    if (!global_ctx->projection_uses_parent_transaction)
+        data_part_storage->beginTransaction();
 
     /// Background temp dirs cleaner will not touch tmp projection directory because
     /// it's located inside part's directory
@@ -1244,7 +1254,11 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::calculateProjections(const Blo
                 *global_ctx->data, ctx->log, result, projection, global_ctx->new_data_part.get(), ++ctx->projection_block_num, global_ctx->context);
 
             tmp_part->finalize();
-            tmp_part->part->getDataPartStorage().commitTransaction();
+            /// On a CA disk the temp projection sub-part shares the parent part's whole-part transaction
+            /// and is committed by the parent's single commit; committing here would throw on the shared
+            /// transaction. On a non-CA disk it owns its sub-transaction and must commit it (B58).
+            if (!tmp_part->part->getDataPartStorage().isContentAddressed())
+                tmp_part->part->getDataPartStorage().commitTransaction();
             ctx->projection_parts[projection.name].emplace_back(std::move(tmp_part->part));
         }
         ctx->projections_rebuild_elapsed_ns[projection.name] += projection_watch.elapsedNanoseconds();
@@ -1269,7 +1283,9 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::finalizeProjections() const
                 *global_ctx->data, ctx->log, result, projection, global_ctx->new_data_part.get(), ++ctx->projection_block_num, global_ctx->context);
 
             temp_part->finalize();
-            temp_part->part->getDataPartStorage().commitTransaction();
+            /// See the matching note above: CA temp projection sub-parts ride the parent transaction.
+            if (!temp_part->part->getDataPartStorage().isContentAddressed())
+                temp_part->part->getDataPartStorage().commitTransaction();
             ctx->projection_parts[projection.name].emplace_back(std::move(temp_part->part));
         }
     }

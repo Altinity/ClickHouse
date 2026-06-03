@@ -23,11 +23,20 @@ after_merge_by_b	8	200
 after_merge_by_b	9	200
 has_projection	1
 uses_projection	1
+after_merge_reload_projection	1
+after_merge_reload_uses_projection	1
 after_add_projection_count	2000
+projections_after_add	p_by_b	1
 projections_after_add	p_sum	1
 uses_p_sum	1
+projections_after_materialize_reload	p_by_b	1
+projections_after_materialize_reload	p_sum	1
+after_materialize_reload_uses_p_sum	1
+projections_after_update_reload	p_by_b	1
+projections_after_update_reload	p_sum	1
+after_update_reload_uses_p_sum	1
 after_drop_projection_count	2000
-projections_after_drop	0
+projections_after_drop	p_sum	1
 after_reload_by_b	0	200
 after_reload_by_b	1	200
 after_reload_by_b	2	200

@@ -1028,7 +1028,11 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeProjectionPartImpl(
     auto projection_part_storage = new_data_part->getDataPartStoragePtr();
     auto data_settings = data.getSettings(&projection.settings_changes);
 
-    if (is_temp)
+    /// On a content-addressed disk the temp projection sub-part shares the parent part's whole-part
+    /// transaction (see `getProjectionPartBuilder`), so it must NOT open its own — that would throw
+    /// ("Uncommitted shared transaction already exists"). On a non-CA disk the temp projection keeps its
+    /// own sub-transaction (the historical behavior). Mirrors the commit-side gating in the callers.
+    if (is_temp && !projection_part_storage->isContentAddressed())
         projection_part_storage->beginTransaction();
 
     new_data_part->is_temp = is_temp;

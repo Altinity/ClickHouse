@@ -256,6 +256,11 @@ bool DataPartStorageOnDiskBase::isStoredOnRemoteDisk() const
     return volume->getDisk()->isRemote();
 }
 
+bool DataPartStorageOnDiskBase::isContentAddressed() const
+{
+    return volume->getDisk()->isContentAddressed();
+}
+
 std::optional<String> DataPartStorageOnDiskBase::getCacheName() const
 {
     if (volume->getDisk()->supportsCache())
