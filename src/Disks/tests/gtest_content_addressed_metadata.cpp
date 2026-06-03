@@ -76,6 +76,57 @@ TEST(ContentAddressedPoolPaths, ParsePartFilePath)
     EXPECT_FALSE(parsePartFilePath("123").has_value());          // shallower
 }
 
+// B40: a NON-Atomic database (Ordinary/Memory/Lazy) stores a table under data/<db>/<table>/, which is
+// NOT the uuid-anchored store/ layout, so the parser must fall back to the MergeTree part-dir grammar
+// to find the table/part boundary. Without this, every part file was misclassified as a verbatim
+// non-part file (written under tmp_insert_<part>/, the tmp->final rename moved nothing, and the read
+// of the final part dir found no object → read-miss data loss). The table identifier becomes the full
+// data/<db>/<table> path, used identically on write and read so the ref/manifest/blob keys match.
+TEST(ContentAddressedPoolPaths, ParseNonAtomicPartFilePath)
+{
+    // A plain part file: table id is the whole data/<db>/<table> path, the part dir is recognized by
+    // its _<min>_<max>_<level> block-range suffix.
+    auto file = parsePartFilePath("data/memory_01069/mt/all_1_1_0/data.cmrk4");
+    ASSERT_TRUE(file.has_value());
+    EXPECT_EQ(file->table_uuid, "data/memory_01069/mt");
+    EXPECT_EQ(file->part_name, "all_1_1_0");
+    EXPECT_EQ(file->file, "data.cmrk4");
+
+    // A temporary insert part keeps the block-range suffix, so the SAME part is recognized before and
+    // after the tmp->final rename (the rename must re-pin to the same table id, not drop the file).
+    auto tmp = parsePartFilePath("data/memory_01069/mt/tmp_insert_all_1_1_0/data.cmrk4");
+    ASSERT_TRUE(tmp.has_value());
+    EXPECT_EQ(tmp->table_uuid, "data/memory_01069/mt");
+    EXPECT_EQ(tmp->part_name, "tmp_insert_all_1_1_0");
+
+    // A mutation-level part (4 numeric tail groups) is still a part dir.
+    auto mut = parsePartFilePath("data/db/tbl/20200101_1_1_0_5/data.bin");
+    ASSERT_TRUE(mut.has_value());
+    EXPECT_EQ(mut->part_name, "20200101_1_1_0_5");
+
+    // A table-level file (format_version.txt) has no part-dir component: it is NOT a part file.
+    EXPECT_FALSE(isPartFilePath("data/memory_01069/mt/format_version.txt"));
+    auto tf = parseTableFilePath("data/memory_01069/mt/format_version.txt");
+    ASSERT_TRUE(tf.has_value());
+    EXPECT_EQ(tf->table_uuid, "data/memory_01069/mt");
+    EXPECT_EQ(tf->tail, "format_version.txt");
+
+    // The table dir itself (no part) resolves to the full table id, so DROP/listing scope the refs.
+    EXPECT_EQ(parseTableUuid("data/memory_01069/mt"), std::optional<std::string>("data/memory_01069/mt"));
+
+    // A bare single-component disk-level path (e.g. the startup access-check probe) is neither a part
+    // file, a table-level file, nor a table dir — it stays a verbatim disk file.
+    EXPECT_FALSE(isPartFilePath("clickhouse_access_check_xyz"));
+    EXPECT_FALSE(parseTableFilePath("clickhouse_access_check_xyz").has_value());
+    EXPECT_FALSE(parseTableUuid("clickhouse_access_check_xyz").has_value());
+
+    // The Atomic layout is unchanged: the table id stays the single <uuid> component (dedup/golden).
+    auto atomic = parsePartFilePath("store/uui/uuid-1/all_1_1_0/data.bin");
+    ASSERT_TRUE(atomic.has_value());
+    EXPECT_EQ(atomic->table_uuid, "uuid-1");
+    EXPECT_EQ(atomic->part_name, "all_1_1_0");
+}
+
 TEST(ContentAddressedPoolPaths, ParseTableUuid)
 {
     EXPECT_EQ(parseTableUuid("uui/uuid-1/"), std::optional<std::string>("uuid-1"));
@@ -426,6 +477,110 @@ TEST_F(ContentAddressedMetaTest, WritePartThenReadBackAndDedup)
     // dedup: the shared "SHARED" column is one blob object
     EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path,
               ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path);
+}
+
+// B40 (data-integrity, end-to-end): a part written and committed under a NON-Atomic database path
+// (data/<db>/<table>/<part>/<file>), including the MergeTree tmp_insert_<part> -> final <part> rename,
+// must be readable from the final part dir. Before the part-dir-grammar fallback the part files were
+// written verbatim under tmp_insert_<part>/, moveDirectory moved nothing (it only handled the uuid
+// layout), and the read of the final part found no object — the read-miss this test guards against.
+TEST_F(ContentAddressedMetaTest, WriteNonAtomicPartViaTmpRenameThenReadBack)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_nonatomic");
+    auto os = getObjectStorage("cas_nonatomic");
+
+    // The non-Atomic relative_data_path of a Memory/Ordinary-DB table: data/<db>/<table>.
+    const std::string table = "data/memory_db/mt";
+    const std::string tmp_part = "tmp_insert_all_1_1_0";
+    const std::string final_part = "all_1_1_0";
+
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        // MergeTree assembles the part under a tmp dir, including a mutable per-part file.
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"data.bin", "PAYLOAD"}, {"primary.idx", "IDX"}, {"metadata_version.txt", "0"}})
+        {
+            auto buf = tx.writeFile(table + "/" + tmp_part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        // ... then renames the tmp dir to the final part name. The ref must publish under final_part.
+        tx.moveDirectory(table + "/" + tmp_part, table + "/" + final_part);
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // The final part dir resolves and reads back the exact bytes (content + mutable file).
+    const std::string base = table + "/" + final_part + "/";
+    EXPECT_TRUE(ms->existsFile(base + "data.bin"));
+    EXPECT_TRUE(ms->existsFile(base + "primary.idx"));
+    EXPECT_TRUE(ms->existsFile(base + "metadata_version.txt"));
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base + "data.bin")[0].remote_path), "PAYLOAD");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base + "primary.idx")[0].remote_path), "IDX");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base + "metadata_version.txt")[0].remote_path), "0");
+
+    // The tmp part dir is gone (the ref was re-pinned to the final name, not left dangling).
+    EXPECT_FALSE(ms->existsDirectory(table + "/" + tmp_part));
+    EXPECT_TRUE(ms->existsDirectory(table + "/" + final_part));
+
+    // The table dir lists exactly the final part, and DROP (removeRecursive on the table dir) unlinks it.
+    auto parts = ms->listDirectory(table);
+    ASSERT_EQ(parts.size(), 1u);
+    EXPECT_EQ(parts[0], final_part);
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeRecursive(table, /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(ms->existsDirectory(table));
+}
+
+// B40 (table rename): RENAME TABLE / a cross-engine table move renames the whole table data dir via
+// disk->moveDirectory(old_table_path, new_table_path). The refs are keyed by the table identifier, so
+// the read at the NEW identity would find no ref unless moveDirectory re-keys every ref/sidecar from
+// the source table id to the destination table id. This covers the Ordinary(data/db/mt)->Atomic(uuid)
+// move shape that 01114_database_atomic exercises.
+TEST_F(ContentAddressedMetaTest, RenameTableDirRekeysRefs)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_renametable");
+    auto os = getObjectStorage("cas_renametable");
+
+    const std::string src_table = "data/db3/mt";              // Ordinary-DB layout
+    const std::string dst_table = "sto/uuid-renamed";         // Atomic-DB layout (uuid anchor)
+    const std::string part = "0_1_1_0";
+
+    // Write a committed part under the Ordinary-DB table path.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"data.bin", "ROWS"}, {"metadata_version.txt", "0"}})
+        {
+            auto buf = tx.writeFile(src_table + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(ms->existsFile(src_table + "/" + part + "/data.bin"));
+
+    // Rename the whole table dir (Ordinary -> Atomic).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveDirectory(src_table, dst_table);
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // The part reads back at the NEW table identity, and the source identity is gone.
+    EXPECT_TRUE(ms->existsFile(dst_table + "/" + part + "/data.bin"));
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(dst_table + "/" + part + "/data.bin")[0].remote_path), "ROWS");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(dst_table + "/" + part + "/metadata_version.txt")[0].remote_path), "0");
+    EXPECT_FALSE(ms->existsFile(src_table + "/" + part + "/data.bin"));
+    EXPECT_FALSE(ms->existsDirectory(src_table));
+
+    auto parts = ms->listDirectory(dst_table);
+    ASSERT_EQ(parts.size(), 1u);
+    EXPECT_EQ(parts[0], part);
 }
 
 // B36: moveDirectory of a COMMITTED part into the detached namespace must re-publish a "detached"

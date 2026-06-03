@@ -268,6 +268,53 @@ void ContentAddressedTransaction::republishCommittedPartIntoDetached(
     }
 }
 
+void ContentAddressedTransaction::republishTableRefs(const std::string & src_table_id, const std::string & dst_table_id)
+{
+    if (src_table_id == dst_table_id)
+        return;
+
+    /// Re-key every object under a source per-(server,table) prefix to the destination prefix by
+    /// copying the small pointer object verbatim and unlinking the source. Refs, per-ref sidecars and
+    /// verbatim table-level files are all tiny pointer objects, so a read+write+delete is correct (the
+    /// content blobs/manifests they point at are content-addressed and shared — never copied/moved).
+    auto rekey_prefix = [this](const std::string & src_prefix, const std::string & dst_prefix)
+    {
+        RelativePathsWithMetadata children;
+        metadata_storage.object_storage->listObjects(src_prefix, children, /*max_keys=*/0);
+
+        StoredObjects to_remove;
+        for (const auto & child : children)
+        {
+            const std::string & src_key = child->relative_path;
+            const auto pos = src_key.rfind(src_prefix);
+            if (pos == std::string::npos)
+                continue;
+            const std::string tail = src_key.substr(pos + src_prefix.size());
+            const std::string dst_key = dst_prefix + tail;
+
+            auto bytes = metadata_storage.readSmallObjectIfExists(src_key);
+            if (!bytes)
+                continue; /// raced away; nothing to move
+
+            auto out = metadata_storage.object_storage->writeObject(StoredObject(dst_key), WriteMode::Rewrite);
+            out->write(bytes->data(), bytes->size());
+            out->finalize();
+
+            to_remove.emplace_back(src_key);
+        }
+
+        if (!to_remove.empty())
+            metadata_storage.object_storage->removeObjectsIfExist(to_remove);
+    };
+
+    rekey_prefix(
+        ContentAddressed::refsPrefix(key_prefix, metadata_storage.server_id, src_table_id),
+        ContentAddressed::refsPrefix(key_prefix, metadata_storage.server_id, dst_table_id));
+    rekey_prefix(
+        ContentAddressed::tableFilesPrefix(key_prefix, metadata_storage.server_id, src_table_id),
+        ContentAddressed::tableFilesPrefix(key_prefix, metadata_storage.server_id, dst_table_id));
+}
+
 void ContentAddressedTransaction::moveDirectory(const std::string & from, const std::string & to)
 {
     /// DETACH PARTITION moves a COMMITTED part directory <uuid[:3]>/<uuid>/<part> into the detached
@@ -284,6 +331,23 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
             dst_detached && dst_detached->part_name == ContentAddressed::kDetachedDirName && !dst_detached->file.empty())
         {
             republishCommittedPartIntoDetached(*src_committed, *dst_detached);
+            return;
+        }
+    }
+
+    /// RENAME TABLE / cross-engine table move (MergeTreeData::rename) renames the whole table data
+    /// directory: disk->moveDirectory(relative_data_path, new_table_path). Both endpoints are TABLE
+    /// dirs (no part component). The refs/sidecars are keyed by the table identifier (the <uuid> for
+    /// Atomic, the data/<db>/<table> path for non-Atomic), so the table identifier changes across the
+    /// rename (e.g. Ordinary data/db/mt -> Atomic <uuid>) and the read at the new identity would find
+    /// no ref (B40). Re-key every ref + sidecar under the source table id to the destination table id.
+    /// The shared blobs/manifests are content-addressed and untouched; only the small ref/sidecar
+    /// pointer objects are rewritten. This is a no-op when the source has no refs (an empty table).
+    if (auto src_table = ContentAddressed::parseTableUuid(from))
+    {
+        if (auto dst_table = ContentAddressed::parseTableUuid(to))
+        {
+            republishTableRefs(*src_table, *dst_table);
             return;
         }
     }

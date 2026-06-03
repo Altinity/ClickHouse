@@ -233,6 +233,14 @@ private:
     void republishCommittedPartIntoDetached(
         const ContentAddressed::PartFilePath & src_committed, const ContentAddressed::PartFilePath & dst_detached);
 
+    // RENAME TABLE / cross-engine table move: re-key every ref + per-ref sidecar (and verbatim
+    // table-level file) from the source table identifier to the destination table identifier, then
+    // unlink the source pointer objects. The table identifier is part of the ref/store object key, so
+    // a rename changes it (e.g. Ordinary data/db/mt -> Atomic <uuid>) and the read at the new identity
+    // would otherwise find no ref (B40). The shared blobs/manifests are content-addressed and
+    // untouched; only the small pointer objects move. Reached only from moveDirectory.
+    void republishTableRefs(const std::string & src_table_id, const std::string & dst_table_id);
+
     /// Object-storage common key prefix; authoritative copy from the metadata storage (see ctor).
     const std::string key_prefix;
     /// Server-local scratch dir for the write-buffer spill (see ctor).

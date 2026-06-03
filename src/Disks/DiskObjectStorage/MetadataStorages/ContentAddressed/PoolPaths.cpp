@@ -123,11 +123,11 @@ static std::vector<std::string> splitNonEmpty(const std::string & path)
     return parts;
 }
 
-// Locate the <uuid[:3]>/<uuid> anchor inside a split path. ClickHouse table data paths look like
-// <prefix...>/<uuid[:3]>/<uuid>/<rest...>, where <uuid[:3]> is exactly the first 3 characters of
-// the following <uuid> component. The leading <prefix...> is "store" on a real server but is
-// absent in the unit tests, so anchoring on the uuid pair makes parsing robust to either shape.
-// Returns the index of the <uuid> component (so components after it are the part/file/tail).
+// Locate the <uuid[:3]>/<uuid> anchor inside a split path. ClickHouse table data paths on an Atomic
+// database look like <prefix...>/<uuid[:3]>/<uuid>/<rest...>, where <uuid[:3]> is exactly the first 3
+// characters of the following <uuid> component. The leading <prefix...> is "store" on a real server
+// but is absent in the unit tests, so anchoring on the uuid pair makes parsing robust to either
+// shape. Returns the index of the <uuid> component (so the component after it is the part dir).
 static std::optional<size_t> findTableUuidComponent(const std::vector<std::string> & p)
 {
     for (size_t i = 1; i < p.size(); ++i)
@@ -140,22 +140,118 @@ static std::optional<size_t> findTableUuidComponent(const std::vector<std::strin
     return std::nullopt;
 }
 
+// True iff a path component looks like a MergeTree part directory. A non-Atomic database (Ordinary,
+// Memory, Lazy, …) stores a table under data/<db>/<table>/ — NOT the UUID-anchored store/ layout — so
+// the uuid anchor cannot find the table/part boundary there, and a uuid-only parser misclassified
+// every part file as a verbatim non-part file (write went to a verbatim key under tmp_insert_<part>/,
+// the tmp->final rename moved nothing, the read of the final part dir found no object → data loss,
+// B40). A part directory carries the MergeTree block-range suffix _<min>_<max>_<level>[_<mutation>]
+// (e.g. all_1_1_0, 20200101_1_1_0_5) and keeps it through every temporary/operation prefix the part
+// passes through (tmp_insert_all_1_1_0, tmp_merge_all_1_2_1, delete_tmp_all_1_1_0). So a component is
+// a part dir iff its last 3 underscore-separated groups are all non-empty decimal numbers (with an
+// optional 4th numeric group for the mutation level). This is grammar-only — no dependency on the
+// Storages layer — and is used only as a FALLBACK when the uuid anchor is absent, so the Atomic
+// layout and the unit tests (which use the uui/uuid-N shape) are unchanged.
+static bool looksLikePartDir(const std::string & name)
+{
+    std::vector<std::string> groups;
+    std::string cur;
+    for (char c : name)
+    {
+        if (c == '_')
+        {
+            groups.push_back(cur);
+            cur.clear();
+        }
+        else
+            cur.push_back(c);
+    }
+    groups.push_back(cur);
+
+    // Need at least <partition>_<min>_<max>_<level>: a partition group plus 3 trailing numeric groups.
+    if (groups.size() < 4)
+        return false;
+
+    auto is_number = [](const std::string & s)
+    {
+        if (s.empty())
+            return false;
+        for (char c : s)
+            if (c < '0' || c > '9')
+                return false;
+        return true;
+    };
+
+    // The trailing groups are <min>_<max>_<level>[_<mutation>]: require 3 numeric tail groups, and if
+    // a 4th-from-last group is also numeric treat it as the mutation-level form. We only need the last
+    // three to be numeric to recognize a part dir (the partition id is arbitrary text before them).
+    const size_t n = groups.size();
+    return is_number(groups[n - 1]) && is_number(groups[n - 2]) && is_number(groups[n - 3]);
+}
+
+// The table/part split of a path. table_start..part_idx are the table-identifier components; part_idx
+// is the part directory; components after it are the in-part file path. For the Atomic layout the
+// table identifier is the single <uuid> component (table_start == part_idx - 1, preserving the
+// historical "table_uuid is just the uuid" identity and dedup/golden tests); for the non-Atomic
+// layout it is the full data/<db>/<table> path (table_start == 0).
+struct PartDirAnchor
+{
+    size_t table_start;
+    size_t part_idx;
+};
+
+// Locate the part-directory component. Anchor on the uuid pair first (Atomic + the unit tests); if
+// that is absent (non-Atomic data/<db>/<table>/<part>/…), fall back to the RIGHTMOST component that
+// looks like a part dir, with the whole preceding path as the table identifier. Returns nullopt when
+// the path has no part component at all (a table dir or a shallower/non-part path).
+static std::optional<PartDirAnchor> findPartDirComponent(const std::vector<std::string> & p)
+{
+    if (auto uuid_idx = findTableUuidComponent(p))
+    {
+        const size_t part_idx = *uuid_idx + 1;
+        if (part_idx < p.size())
+            return PartDirAnchor{*uuid_idx, part_idx}; // table id = the single <uuid> component
+        return std::nullopt; // table dir, no part component after the uuid
+    }
+
+    // No uuid anchor: a non-Atomic table path. The table identifier must be at least one component
+    // (a real table dir, never the bare disk root), so the part dir is at index >= 1. Scan right to
+    // left so a part-dir-shaped table/partition name earlier in the path cannot steal the anchor.
+    for (size_t i = p.size(); i-- > 1;)
+        if (looksLikePartDir(p[i]))
+            return PartDirAnchor{0, i}; // table id = the whole path before the part dir
+    return std::nullopt;
+}
+
+// Join components [start, end) with '/' into a single table identifier (one component for Atomic, the
+// data/<db>/<table> path for non-Atomic), used opaquely as a stable per-table segment of the ref/store
+// object key (store/<server>/<table_id>/refs/…).
+static std::string joinTableId(const std::vector<std::string> & p, size_t start, size_t end)
+{
+    std::string id;
+    for (size_t i = start; i < end; ++i)
+    {
+        if (!id.empty())
+            id += "/";
+        id += p[i];
+    }
+    return id;
+}
+
 std::optional<PartFilePath> parsePartFilePath(const std::string & path)
 {
     auto p = splitNonEmpty(path);
-    auto uuid_idx = findTableUuidComponent(p);
-    // Need at least the part component after the uuid: <uuid[:3]>/<uuid>/<part>.
-    if (!uuid_idx || *uuid_idx + 1 >= p.size())
+    auto anchor = findPartDirComponent(p);
+    if (!anchor)
         return std::nullopt;
 
-    const size_t part_idx = *uuid_idx + 1;
     PartFilePath r;
-    r.table_uuid = p[*uuid_idx];
-    r.part_name = p[part_idx];
-    if (part_idx + 1 < p.size())
+    r.table_uuid = joinTableId(p, anchor->table_start, anchor->part_idx);
+    r.part_name = p[anchor->part_idx];
+    if (anchor->part_idx + 1 < p.size())
     {
-        std::string file = p[part_idx + 1];
-        for (size_t i = part_idx + 2; i < p.size(); ++i)
+        std::string file = p[anchor->part_idx + 1];
+        for (size_t i = anchor->part_idx + 2; i < p.size(); ++i)
             file += "/" + p[i];
         r.file = file;
     }
@@ -165,34 +261,56 @@ std::optional<PartFilePath> parsePartFilePath(const std::string & path)
 std::optional<std::string> parseTableUuid(const std::string & path)
 {
     auto p = splitNonEmpty(path);
-    auto uuid_idx = findTableUuidComponent(p);
-    // Exactly the table dir <prefix...>/<uuid[:3]>/<uuid>[/]: nothing after the uuid.
-    if (uuid_idx && *uuid_idx + 1 == p.size())
+
+    // Atomic layout: exactly the table dir <prefix...>/<uuid[:3]>/<uuid>[/] — nothing after the uuid.
+    if (auto uuid_idx = findTableUuidComponent(p); uuid_idx && *uuid_idx + 1 == p.size())
         return p[*uuid_idx];
+
+    // Non-Atomic layout: a directory path with no part-dir component is the table dir data/<db>/<table>.
+    // Require at least two components so the bare disk root (or a single generic dir) is never taken as
+    // a table dir; the table identifier is the full joined path (consistent with parsePartFilePath).
+    if (findTableUuidComponent(p))
+        return std::nullopt; // had a uuid anchor but something followed it: not a table dir
+    if (p.size() >= 2 && !findPartDirComponent(p))
+        return joinTableId(p, 0, p.size());
     return std::nullopt;
 }
 
 bool isPartFilePath(const std::string & path)
 {
-    // A file inside a part dir: <uuid[:3]>/<uuid>/<part>/<file> => at least 2 components after
-    // the uuid (the part dir and the file within it).
+    // A file inside a part dir: <table_path...>/<part>/<file> => at least one component after the
+    // part dir. findPartDirComponent locates the part dir for both the Atomic and non-Atomic layouts.
     auto p = splitNonEmpty(path);
-    auto uuid_idx = findTableUuidComponent(p);
-    return uuid_idx && *uuid_idx + 2 < p.size();
+    auto anchor = findPartDirComponent(p);
+    return anchor && anchor->part_idx + 1 < p.size();
 }
 
 std::optional<TableFilePath> parseTableFilePath(const std::string & path)
 {
     auto p = splitNonEmpty(path);
-    auto uuid_idx = findTableUuidComponent(p);
-    // Table-level files live directly under the table dir, i.e. exactly one component after the
-    // uuid (e.g. format_version.txt). Deeper paths are part files (see isPartFilePath).
-    if (!uuid_idx || *uuid_idx + 2 != p.size())
+
+    // Atomic layout: a table-level file lives directly under the table dir, i.e. exactly one component
+    // after the uuid (e.g. format_version.txt). Deeper paths are part files (see isPartFilePath).
+    if (auto uuid_idx = findTableUuidComponent(p))
+    {
+        if (*uuid_idx + 2 != p.size())
+            return std::nullopt;
+        TableFilePath r;
+        r.table_uuid = p[*uuid_idx];
+        r.tail = p[*uuid_idx + 1];
+        return r;
+    }
+
+    // Non-Atomic layout: a path with no part-dir component whose last component is the table-level
+    // file, and the components before it are the table dir data/<db>/<table>. Require the table id to
+    // be at least one component (a real table, never the bare disk root) and the path to have no part
+    // dir (else it is a part file). Consistent with parsePartFilePath's table identifier.
+    if (p.size() < 2 || findPartDirComponent(p))
         return std::nullopt;
 
     TableFilePath r;
-    r.table_uuid = p[*uuid_idx];
-    r.tail = p[*uuid_idx + 1];
+    r.table_uuid = joinTableId(p, 0, p.size() - 1);
+    r.tail = p.back();
     return r;
 }
 
