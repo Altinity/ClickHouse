@@ -1585,6 +1585,120 @@ TEST_F(ContentAddressedMetaTest, SweepThrowsAndDeletesNothingOnMissingManifest)
     EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b1)).string()));
 }
 
+// CAS M8: a blob with NO ref but pinned by a LIVE write session is a root — a sweep past grace must
+// NOT reclaim it (cross-mounter generalization of the in-process B52 pin). The session object lives in
+// the bucket under sessionsPrefix and lists the blob's bare hash in `pending`; the sweep projects that
+// to the FULL blob object key (same blobKey fan-out as the reachable set) so it is kept. Once the
+// session is gone (or its lease expired), the blob is reclaimable again.
+TEST_F(ContentAddressedMetaTest, SweepTreatsLiveWriteSessionPinAsRoot)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_gc_session_root");
+    auto os = getObjectStorage("cas_gc_session_root");
+
+    // A single blob with NO ref or manifest pointing at it — normally collectable past grace.
+    const std::string hash = "5555555555";
+    ContentAddressedMetaTest::writeObject(os, blobKey("", BlobHash(hash)).string(), hash);
+
+    // A LIVE write session (lease in the future) pins it via `pending`.
+    WriteSession session;
+    session.server_id = "server-pin";
+    session.lease_deadline_unix = 10000; // >= the sweep's `now` below
+    session.part_id = PartId("aaaa000000000000000000000000aaaa");
+    session.pending = {BlobHash(hash)};
+    ContentAddressedMetaTest::writeObject(os, sessionKey("", "sess-1"), session.serialize());
+
+    DB::ContentAddressed::ContentAddressedGC gc(os, "");
+
+    // First sweep records the (would-be) timer; the second is past grace. The live session keeps the
+    // blob reachable across both, so it is NEVER deleted.
+    gc.runSweepOnce(/*now=*/100, /*grace=*/100);
+    gc.runSweepOnce(/*now=*/300, /*grace=*/100);
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(hash)).string())) << "live-session-pinned blob must survive";
+
+    // Remove the session pin: the blob is now a true orphan. A sweep past grace reclaims it.
+    os->removeObjectsIfExist({DB::StoredObject(sessionKey("", "sess-1"))});
+    gc.runSweepOnce(/*now=*/500, /*grace=*/100); // first sweep without the pin: starts the timer
+    gc.runSweepOnce(/*now=*/700, /*grace=*/100); // past grace -> reclaimed
+    EXPECT_FALSE(objectExists(os, blobKey("", BlobHash(hash)).string())) << "unpinned orphan blob must be reclaimed";
+}
+
+// CAS M8: re-validate-under-lock. The sweep re-reads the live roots (refs + live sessions) immediately
+// before deletion, so a ref that became present is honored even if a stale snapshot would have marked
+// the blob unreferenced. Here we add a ref to the otherwise-orphan part BETWEEN the timer-starting sweep
+// and the past-grace sweep: the re-validation re-reads the ref set and finds the new ref, so neither the
+// part manifest nor its blob is deleted. This pins the invariant that a blob/part with a live ref is
+// never deleted, which is exactly what the re-validate pass re-checks.
+TEST_F(ContentAddressedMetaTest, SweepRevalidatesBeforeDelete)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_gc_revalidate");
+    auto os = getObjectStorage("cas_gc_revalidate");
+    const std::string sid = ms->serverIdForTest();
+    auto s = seedGcPool(os, sid);
+
+    DB::ContentAddressed::ContentAddressedGC gc(os, "");
+
+    // Unlink pidA's ref so pidA's manifest + its exclusive blob b1 become unreferenced at the snapshot.
+    os->removeObjectsIfExist({DB::StoredObject(refKey("", sid, s.uuid, "all_1_1_0").string())});
+    gc.runSweepOnce(/*now=*/0, /*grace=*/100); // starts the timer for pidA manifest + b1 + the orphan
+
+    // Re-add a ref pointing at pidA BEFORE the past-grace sweep. The candidate set (computed from the
+    // snapshot timers) still lists pidA's manifest + b1, but the re-validate pass re-reads the refs and
+    // finds pidA live again -> it must NOT delete pidA's manifest or b1.
+    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0_redo").string(), serializeRefPayload(PartId(s.pid_a)));
+
+    auto r = gc.runSweepOnce(/*now=*/200, /*grace=*/100);
+
+    // pidA's manifest + b1 SURVIVE (re-validated reachable); only the never-referenced orphan is reclaimed.
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_a)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b1)).string()));
+    EXPECT_FALSE(objectExists(os, partKey("", PartId(s.pid_orphan)).string()));
+    EXPECT_FALSE(objectExists(os, blobKey("", BlobHash(s.b_orphan)).string()));
+    EXPECT_EQ(r.deleted_parts, 1u); // orphan manifest only
+    EXPECT_EQ(r.deleted_blobs, 1u); // orphan blob only
+}
+
+// CAS M8: the fence-ownership guard (the safety backstop). A holder takes the GC-leader lock (fence f1).
+// A peer then steals it after the lease expires (fence f2 > f1). When the stale-f1 holder runs a sweep
+// passing its now-superseded lock, the guard re-reads gc.lock, sees the higher fence, and deletes
+// NOTHING — a paused holder must never delete after a successor took a higher fence. With the CURRENT
+// holder's lock the same sweep deletes normally.
+TEST_F(ContentAddressedMetaTest, SweepStopsWhenLeadershipLost)
+{
+    using namespace DB::ContentAddressed;
+    // A non-empty key_prefix so the lock/fence objects (gc.lock, fence/<n>) have a parent dir — the
+    // LocalObjectStorage CAS create cannot materialize a file at the bucket root (empty parent path).
+    // The GC and the seeded orphan use the SAME prefix so the reachable set and lock key are consistent.
+    const std::string p = "cas_gc_fence";
+    auto ms = getMetadataStorage(p);
+    auto os = getObjectStorage(p);
+
+    // A single reclaimable orphan blob: no ref, no manifest points at it.
+    const std::string hash = "7777777777";
+    ContentAddressedMetaTest::writeObject(os, blobKey(p, BlobHash(hash)).string(), hash);
+
+    // Holder A takes leadership at now=1000 (lease 100 -> deadline 1100), fence f1.
+    auto a = tryAcquireGcLock(*os, p, "serverA", /*lease_seconds=*/100, /*now_unix=*/1000);
+    ASSERT_TRUE(a.has_value());
+
+    // Peer B steals after A's lease expired (now=1200), getting a strictly higher fence f2.
+    auto b = tryAcquireGcLock(*os, p, "serverB", /*lease_seconds=*/100, /*now_unix=*/1200);
+    ASSERT_TRUE(b.has_value());
+    ASSERT_GT(b->fence_token, a->fence_token);
+
+    // A's sweep with its STALE lock must delete NOTHING (the on-disk fence is now f2 != f1).
+    DB::ContentAddressed::ContentAddressedGC gc_stale(os, p);
+    gc_stale.runSweepOnce(/*now=*/1300, /*grace=*/0, /*held=*/a);
+    EXPECT_TRUE(objectExists(os, blobKey(p, BlobHash(hash)).string())) << "stale holder must not delete";
+
+    // The CURRENT holder B's sweep deletes the orphan normally (its fence matches the on-disk lock).
+    DB::ContentAddressed::ContentAddressedGC gc_live(os, p);
+    auto r = gc_live.runSweepOnce(/*now=*/1300, /*grace=*/0, /*held=*/b);
+    EXPECT_FALSE(objectExists(os, blobKey(p, BlobHash(hash)).string()));
+    EXPECT_EQ(r.deleted_blobs, 1u);
+}
+
 // Background-thread driver (Task 3a): the ContentAddressedGCThread runs runSweepOnce on the schedule
 // pool. With a tiny grace, one triggerAndWait() round must reclaim the orphan manifest + orphan blob
 // while the live manifests and referenced blobs survive — proving the thread starts, runs the sweep,

@@ -1,12 +1,14 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage_fwd.h>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -67,6 +69,18 @@ using PartManifestResolver = std::function<PartManifest(const PartId & part_id)>
 /// after wrapping those into `BlobObjectKey` too, so a bare-hash-vs-object-key mismatch cannot compile.
 std::set<BlobObjectKey> markReachableBlobs(
     const std::string & key_prefix, const std::set<PartId> & live_part_ids, const PartManifestResolver & resolve);
+
+/// Blob object keys pinned by LIVE cross-mounter write sessions (the cross-process generalization of
+/// the in-process B52 pin). Lists `sessionsPrefix`, deserializes each `WriteSession`, and for every
+/// session whose `lease_deadline_unix >= now` (an EXPIRED session is itself reclaimable — a crashed
+/// writer must not pin blobs forever) projects its `pending` bare hashes to FULL blob object keys with
+/// the SAME `blobKey` fan-out `markReachableBlobs` uses, so the result is directly comparable to the
+/// reachable set (no bare-hash-vs-object-key mismatch — the historical data-loss bug class). A live
+/// session's pinned keys are roots: a blob just uploaded but not yet referenced by a published ref must
+/// not be reclaimed out from under the writer. Any list/read error PROPAGATES (fail-close): a partial
+/// session scan must never drive deletion.
+std::set<BlobObjectKey> sessionPinnedBlobs(
+    const ObjectStoragePtr & object_storage, const std::string & key_prefix, int64_t now);
 
 struct SweepResult
 {
@@ -151,7 +165,18 @@ public:
     /// manifest for a live ref (B18), or any list/read error, aborts the sweep with the pool intact.
     /// The whole sweep is run under the per-pool GC lock (B49); holding it for the entire sweep rather
     /// than only mark+delete is acceptable for the PoC — the contention is a B9/B32 optimization.
-    SweepStats runSweepOnce(int64_t now, int64_t grace);
+    ///
+    /// Roots = live refs UNION every LIVE write-session's `pending` blobs (M8): a blob uploaded but not
+    /// yet referenced by a published ref is pinned by its writer's session object in the bucket, so a
+    /// remote sweep keeps it. A candidate is also RE-VALIDATED immediately before deletion (refs + live
+    /// sessions re-read) to close the read-refs-then-list-objects enumeration race.
+    ///
+    /// `held` is the GC-leader lock this caller holds (when run by the coordinated background thread).
+    /// When set, the fence-ownership guard re-confirms before each removal that `pool/gc.lock` STILL
+    /// carries `held->fence_token`; if a successor stole leadership (a higher fence on disk), the sweep
+    /// STOPS deleting (a paused holder must never delete after a higher fence took over). When nullopt
+    /// (single-owner / unit tests) the guard is skipped.
+    SweepStats runSweepOnce(int64_t now, int64_t grace, std::optional<GcLock> held = std::nullopt);
 
 private:
     const ObjectStoragePtr object_storage;

@@ -1,7 +1,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/WriteSession.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 
@@ -118,6 +120,27 @@ std::set<BlobObjectKey> markReachableBlobs(
     return reachable;
 }
 
+std::set<BlobObjectKey> sessionPinnedBlobs(
+    const ObjectStoragePtr & object_storage, const std::string & key_prefix, int64_t now)
+{
+    std::set<BlobObjectKey> pinned;
+    for (const auto & key : listKeysUnder(object_storage, sessionsPrefix(key_prefix)))
+    {
+        const WriteSession session = WriteSession::deserialize(readSmallObject(object_storage, key));
+        /// An EXPIRED session is itself reclaimable (a crashed writer must not pin blobs forever): the
+        /// lease is a liveness HINT only, never the basis of a positive "still pinned" decision. `now`
+        /// is the sweep clock; the lease is unsigned, so compare in a common signed domain (a negative
+        /// `now` — never produced in practice — would simply treat every session as expired).
+        if (static_cast<int64_t>(session.lease_deadline_unix) < now)
+            continue;
+        for (const auto & hash : session.pending)
+            /// Project the BARE content hash to the FULL blob object key with the SAME `blobKey` fan-out
+            /// `markReachableBlobs` uses, so the pinned set is directly comparable to the reachable set.
+            pinned.insert(blobKey(key_prefix, hash));
+    }
+    return pinned;
+}
+
 SweepResult selectForSweep(const std::set<std::string> & unreferenced,
                            const std::unordered_map<std::string, int64_t> & first_unreachable,
                            int64_t now, int64_t grace)
@@ -190,7 +213,7 @@ ContentAddressedGC::ContentAddressedGC(
 {
 }
 
-SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace)
+SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::optional<GcLock> held)
 {
     /// Hold the per-pool GC lock for the whole sweep (B49): the live-set computation, the
     /// reachable-blob mark and the delete must not interleave with a transaction commit's
@@ -201,12 +224,10 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace)
     /// (commit published its ref first) or the commit retries (sweep reclaimed it first).
     std::lock_guard<std::mutex> gc_guard(*gc_lock);
 
-    /// 1. The live roots: every part id named by a published ref.
-    std::set<PartId> live = listLivePartIds(object_storage, key_prefix);
-
-    /// 2. The reachable blob set, computed from the live parts' manifests. B18 fail-close: a live ref
-    /// whose manifest is missing throws CORRUPTED_DATA so the sweep aborts WITHOUT deleting anything
-    /// (a partial reachable set must never drive deletion — it would drop a live part's blobs).
+    /// The reachable-blob computation, factored so it can be re-run at the snapshot AND again
+    /// immediately before deletion (the re-validate-under-lock step). B18 fail-close: a live ref whose
+    /// manifest is missing throws CORRUPTED_DATA so the sweep aborts WITHOUT deleting anything (a
+    /// partial reachable set must never drive deletion — it would drop a live part's blobs).
     PartManifestResolver resolve = [this](const PartId & part_id) -> PartManifest
     {
         const PartObjectKey manifest_key = partKey(key_prefix, part_id);
@@ -218,26 +239,46 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace)
         readStringUntilEOF(bytes, *buf);
         return PartManifest::deserialize(bytes);
     };
-    /// Reachable is a std::set<BlobObjectKey>: it can only be tested against listed blobs after those
-    /// are wrapped into BlobObjectKey too, so a bare-hash-vs-object-key mismatch cannot compile.
-    std::set<BlobObjectKey> reachable_blobs = markReachableBlobs(key_prefix, live, resolve);
 
-    /// 3. The full unreferenced object-key set: every manifest not backing a live part, plus every
-    /// blob not reachable from a live manifest. Sweep scope is strictly parts/ and blobs/. This is the
-    /// ONE well-marked boundary where the raw listed strings are wrapped into their typed object keys.
-    std::set<PartObjectKey> live_part_keys;
-    for (const auto & part_id : live)
-        live_part_keys.insert(partKey(key_prefix, part_id));
+    /// One reachability snapshot: the live part ids (every part named by a published ref), the live
+    /// part manifest keys, and the reachable blob set = (refs -> manifests -> blob keys) UNION every
+    /// LIVE write-session's pending blobs (M8 session-pin roots). All blob keys are FULL object keys
+    /// (BlobObjectKey) so they are directly comparable to the listed blobs/ keys — a bare-hash mismatch
+    /// (the historical data-loss bug class) cannot compile.
+    struct Reachability
+    {
+        std::set<PartObjectKey> live_part_keys;
+        std::set<BlobObjectKey> reachable_blobs;
+    };
+    auto compute_reachability = [&]() -> Reachability
+    {
+        std::set<PartId> live = listLivePartIds(object_storage, key_prefix);
+        Reachability r;
+        for (const auto & part_id : live)
+            r.live_part_keys.insert(partKey(key_prefix, part_id));
+        r.reachable_blobs = markReachableBlobs(key_prefix, live, resolve);
+        /// Session-pin roots: a blob uploaded but not yet referenced by a published ref is pinned by a
+        /// live write session in the bucket. Treat it as reachable so a remote sweep cannot reclaim it
+        /// out from under the writer. An expired session is not a root (it is itself reclaimable).
+        for (const auto & pinned : sessionPinnedBlobs(object_storage, key_prefix, now))
+            r.reachable_blobs.insert(pinned);
+        return r;
+    };
 
+    const Reachability snapshot = compute_reachability();
+
+    /// The full unreferenced object-key set: every manifest not backing a live part, plus every blob
+    /// not reachable from a live manifest or a live session. Sweep scope is strictly parts/ and blobs/.
+    /// This is the ONE well-marked boundary where the raw listed strings are wrapped into typed keys.
     std::set<std::string> unreferenced;
     for (const auto & key : listKeysUnder(object_storage, partsPrefix(key_prefix)))
     {
-        if (!live_part_keys.contains(PartObjectKey(key)))
+        if (!snapshot.live_part_keys.contains(PartObjectKey(key)))
             unreferenced.insert(key);
     }
     for (const auto & key : listKeysUnder(object_storage, blobsPrefix(key_prefix)))
     {
-        if (reachable_blobs.contains(BlobObjectKey(key)))
+        if (snapshot.reachable_blobs.contains(BlobObjectKey(key)))
             continue;
         /// B52: a blob staged by an in-flight (uncommitted) transaction is not yet named by any
         /// published ref, so it would look unreferenced — but a dedup-skipping insert decided to reuse
@@ -250,24 +291,78 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace)
         unreferenced.insert(key);
     }
 
-    /// 4. Apply the grace-from-unreachability policy and carry the updated timer state forward.
+    /// Apply the grace-from-unreachability policy and carry the updated timer state forward.
     SweepResult res = selectForSweep(unreferenced, first_unreachable, now, grace);
     first_unreachable = std::move(res.first_unreachable);
 
-    /// 5. Delete only the objects past grace. NOTHING above can have deleted anything: a throw in
-    /// steps 1-2 (scan / missing manifest) aborts before this point with the pool intact.
+    if (res.to_delete.empty())
+        return {};
+
+    /// Re-validate-under-lock: re-read the live roots (refs + live sessions) immediately before
+    /// deletion. The snapshot above listed objects AFTER reading refs, so a ref published in that
+    /// enumeration window would have been missed; recomputing reachability here and dropping any
+    /// candidate now reachable closes that read-refs-then-list-objects race. Keep it correct over
+    /// clever: a fresh full reachability pass, then filter the candidates. B18 fail-close still holds.
+    const Reachability revalidated = compute_reachability();
+
+    /// Fence-ownership guard (the safety backstop): if this caller holds the GC-leader lock, re-confirm
+    /// before deleting that `gc.lock` STILL carries our fence token. A peer may have stolen leadership
+    /// (a higher fence on disk) while we were paused; a paused holder must NOT delete after a successor
+    /// took a higher fence. Mirror `renewGcLock`'s ownership read-check. When no lock was supplied
+    /// (single-owner / unit tests) the guard is skipped.
+    auto leadership_lost = [&]() -> bool
+    {
+        if (!held)
+            return false;
+        const StoredObject lock_object(gcLockKey(key_prefix));
+        if (!object_storage->exists(lock_object))
+            return true; /// the lock is gone -> we no longer hold leadership.
+        auto buf = object_storage->readObject(lock_object, getReadSettings(), /*read_hint=*/std::nullopt);
+        String bytes;
+        readStringUntilEOF(bytes, *buf);
+        return GcLock::deserialize(bytes).fence_token != held->fence_token;
+    };
+
+    if (leadership_lost())
+        return {}; /// a successor took a higher fence; delete NOTHING further.
+
+    /// Delete only the candidates that are STILL unreferenced after re-validation. NOTHING above can
+    /// have deleted anything: a throw in any list/read step aborts before this point with the pool
+    /// intact. The fence guard is also re-checked within the loop so a leadership loss observed
+    /// mid-delete stops further deletions (a paused holder must not keep deleting).
     const std::string parts_root = partsPrefix(key_prefix);
     SweepStats stats;
     StoredObjects to_remove;
     to_remove.reserve(res.to_delete.size());
     for (const auto & key : res.to_delete)
     {
-        if (key.rfind(parts_root, 0) == 0)
+        const bool is_part = key.rfind(parts_root, 0) == 0;
+        /// Re-validate this specific candidate against the freshly recomputed reachability.
+        if (is_part)
+        {
+            if (revalidated.live_part_keys.contains(PartObjectKey(key)))
+                continue; /// a ref to this part appeared after the snapshot -> keep it.
+        }
+        else
+        {
+            if (revalidated.reachable_blobs.contains(BlobObjectKey(key)))
+                continue; /// reachable again (new ref or live session) -> keep it.
+            if (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(key))
+                continue;
+        }
+
+        if (is_part)
             ++stats.deleted_parts;
         else
             ++stats.deleted_blobs;
         to_remove.emplace_back(key);
     }
+
+    /// Final fence re-check immediately before issuing the removal, in case leadership was lost while
+    /// re-validating (which itself does object-store reads).
+    if (leadership_lost())
+        return {};
+
     object_storage->removeObjectsIfExist(to_remove);
     return stats;
 }
