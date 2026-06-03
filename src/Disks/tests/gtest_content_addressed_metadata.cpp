@@ -3008,3 +3008,33 @@ TEST_F(ContentAddressedMetaTest, MoveDetachedStagingToActivePublishesActiveRef)
     std::set<std::string> container_got(container.begin(), container.end());
     EXPECT_TRUE(container_got.empty()) << "detached still lists staging entries";
 }
+
+// Approach A: a projection's files are stored as nested keys <proj>.proj/<file> in the parent part's
+// manifest. The CA metadata storage must recognize the projection subdirectory so loadProjections finds
+// it. This seeds a part (top-level files + one projection's nested files) through a transaction and
+// asserts the projection dir is discoverable.
+TEST_F(ContentAddressedMetaTest, ProjectionSubdirIsDiscoverable)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_proj_exists");
+    const std::string uuid = "uuid-proj";
+    const std::string part = "all_1_1_0";
+    const std::string base = "uui/" + uuid + "/" + part + "/";
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    for (const auto & f : {std::string("columns.txt"), std::string("data.bin"), std::string("checksums.txt"),
+                           std::string("p_sum.proj/columns.txt"), std::string("p_sum.proj/data.bin"),
+                           std::string("p_sum.proj/checksums.txt")})
+    {
+        auto buf = tx.writeFile(base + f, 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = "bytes-of-" + f;
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    tx.commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(ms->existsDirectory(base + "p_sum.proj"));
+    EXPECT_FALSE(ms->existsDirectory(base + "p_absent.proj"));
+    EXPECT_FALSE(ms->existsFile(base + "p_sum.proj"));
+    EXPECT_TRUE(ms->existsDirectory("uui/" + uuid + "/" + part));
+}

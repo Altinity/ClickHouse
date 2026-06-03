@@ -234,6 +234,30 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
                     return true;
         return false;
     }
+    // A projection DIRECTORY <uuid[:3]>/<uuid>/<part>/<proj>.proj: a projection's files live nested in
+    // the PARENT part's manifest under the key prefix <proj>.proj/ (Approach A — no separate part/ref).
+    // The directory exists iff the part's manifest (or per-ref sidecar) carries at least one key with
+    // that prefix. This is what makes IMergeTreeDataPart::loadProjections (which calls
+    // existsDirectory("<proj>.proj")) discover a projection on a content-addressed part. Mirrors the
+    // single-detached-part-dir branch above; keyed on the .proj/.tmp_proj suffix instead of "detached".
+    if (auto p = ContentAddressed::parsePartFilePath(path);
+        p && !p->file.empty() && p->file.find('/') == std::string::npos
+        && (p->file.ends_with(".proj") || p->file.ends_with(".tmp_proj")))
+    {
+        const std::string prefix = p->file + "/";
+        if (auto pid = readRefPartId(p->table_uuid, p->part_name))
+        {
+            auto manifest = loadPartManifestOrThrow(*pid);
+            for (const auto & [file, _] : manifest.blobs)
+                if (file.starts_with(prefix))
+                    return true;
+        }
+        if (auto sidecar = readRefSidecarIfExists(p->table_uuid, p->part_name))
+            for (const auto & [file, _] : sidecar->files)
+                if (file.starts_with(prefix))
+                    return true;
+        return false;
+    }
     // A table-level SUBDIRECTORY <uuid[:3]>/<uuid>/<subdir>[/...] (e.g. deduplication_logs/): table-level
     // files may live in subdirectories under the table's files/ namespace. The directory exists iff at
     // least one verbatim table file is keyed under tableFileKey(<subdir>/...). This is what lets the
