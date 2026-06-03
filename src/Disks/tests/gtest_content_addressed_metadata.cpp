@@ -2060,3 +2060,72 @@ TEST_F(ContentAddressedMetaTest, MoveTableLevelFileRenamesVerbatimObject)
     ASSERT_EQ(objs.size(), 1u);
     EXPECT_EQ(readObject(os, objs[0].remote_path), bytes);
 }
+
+// B5 (patch-part lifecycle): a lightweight-DELETE patch part is a normal CA part whose directory name
+// carries the `patch-<32hex>-<base_part_name>` prefix (MergeTreePartInfo::PATCH_PART_PREFIX). Its
+// blobs must be published under a ref in the table's `refs/` namespace, treated as a reachability root
+// by the GC sweep while the ref lives, and reclaimed once the ref is removed — exactly like any other
+// part. This test drives the real write/commit path end-to-end.
+TEST_F(ContentAddressedMetaTest, PatchPartIsReachableThenReclaimedLikeAnyPart)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_patch_lifecycle");
+    auto os = getObjectStorage("cas_patch_lifecycle");
+    const std::string uuid = "uuid-patch";
+    // Canonical patch-part directory name: patch-<32 hex chars>-<base_part_name>.
+    const std::string patch_part = "patch-00000000000000000000000000000000-all_1_1_0";
+
+    // Step 1: write two files through the real transaction and commit.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"data.bin", "PATCHDATA"}, {"_row_exists.bin", "X"}})
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + patch_part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // Step 2: the part must be REACHABLE — its PartId appears in the live-parts set, and
+    // getStorageObjects resolves to the backing blob.
+    // Read the ref payload directly (refKey + readObject) to get the PartId without relying on the
+    // private readRefPartId API; partIdFromRefPayload is the SAME parser the GC live-set scan uses.
+    const std::string sid = ms->serverIdForTest();
+    const std::string ref_key = refKey("", sid, uuid, patch_part).string();
+    ASSERT_TRUE(objectExists(os, ref_key)) << "patch part ref was not written by the transaction";
+    PartId pid = partIdFromRefPayload(readObject(os, ref_key));
+    EXPECT_TRUE(listLivePartIds(os, "").count(pid)) << "patch part PartId not in live set";
+
+    const std::string data_blob = ms->getStorageObjects("uui/" + uuid + "/" + patch_part + "/data.bin")[0].remote_path;
+    ASSERT_TRUE(objectExists(os, data_blob));
+    EXPECT_EQ(readObject(os, data_blob), "PATCHDATA");
+
+    // Step 3: a sweep must NOT reclaim blobs while the ref is live.
+    {
+        DB::ContentAddressed::ContentAddressedGC gc(os, "");
+        gc.runSweepOnce(/*now=*/0, /*grace=*/100);
+        gc.runSweepOnce(/*now=*/200, /*grace=*/100);
+    }
+    EXPECT_TRUE(objectExists(os, data_blob))
+        << "patch-part data blob was wrongly reclaimed while the ref is live";
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/" + patch_part + "/data.bin")[0].remote_path), "PATCHDATA");
+
+    // Step 4: remove the patch-part ref, then a sweep past grace must reclaim its blobs.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeRecursive("uui/" + uuid + "/" + patch_part, /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(listLivePartIds(os, "").count(pid))
+        << "patch part PartId still in live set after ref removal";
+
+    {
+        DB::ContentAddressed::ContentAddressedGC gc2(os, "");
+        gc2.runSweepOnce(/*now=*/0, /*grace=*/100);
+        gc2.runSweepOnce(/*now=*/200, /*grace=*/100);
+    }
+    EXPECT_FALSE(objectExists(os, data_blob))
+        << "patch-part data blob was NOT reclaimed after ref removal and sweep past grace";
+}
