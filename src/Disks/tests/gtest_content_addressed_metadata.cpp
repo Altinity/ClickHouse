@@ -538,6 +538,49 @@ TEST_F(ContentAddressedMetaTest, WriteNonAtomicPartViaTmpRenameThenReadBack)
     EXPECT_FALSE(ms->existsDirectory(table));
 }
 
+// B42 (part-lifecycle idempotency): the "part to remove doesn't exist" failure on a non-Atomic-DB
+// (Memory-engine) MergeTree table was a downstream symptom of B40 — the part's ref resolved under the
+// wrong (verbatim) path, so the engine's outdated-part cleanup could not find it. With B40 fixed the
+// part resolves; this test pins that the CA part-removal path is itself idempotent (a double-remove,
+// or a remove after the ref is already unlinked, must NOT throw — it is a no-op), so a re-attempted
+// outdated-part removal in the part lifecycle never escalates to an error.
+TEST_F(ContentAddressedMetaTest, PartRemovalIsIdempotent)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_idempotent");
+
+    const std::string table = "data/db_memory/mt"; // non-Atomic (Memory-DB) layout, as in 01625
+    const std::string part = "all_1_1_0";
+
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(table + "/" + part + "/data.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = "ROWS";
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(ms->existsDirectory(table + "/" + part));
+
+    auto remove_part = [&]
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeRecursive(table + "/" + part, /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    EXPECT_NO_THROW(remove_part());                       // first removal unlinks the ref
+    EXPECT_FALSE(ms->existsDirectory(table + "/" + part));
+    EXPECT_NO_THROW(remove_part());                       // double-remove is a no-op, must not throw
+
+    // Removing a part that never existed is likewise a no-op.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        EXPECT_NO_THROW(tx.removeRecursive(table + "/all_9_9_0", /*should_remove_objects=*/nullptr));
+        tx.commit(DB::NoCommitOptions{});
+    }
+}
+
 // B41 (concurrent-blob race): two writers racing the SAME content hash must BOTH succeed — neither
 // may observe a partially-written (size-0 / short) blob at the final key and fail closed with
 // CORRUPTED_DATA. LocalObjectStorage writes objects in place, so before the temp+atomic-rename fix a
