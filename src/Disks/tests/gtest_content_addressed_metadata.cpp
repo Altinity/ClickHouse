@@ -3038,3 +3038,30 @@ TEST_F(ContentAddressedMetaTest, ProjectionSubdirIsDiscoverable)
     EXPECT_FALSE(ms->existsFile(base + "p_sum.proj"));
     EXPECT_TRUE(ms->existsDirectory("uui/" + uuid + "/" + part));
 }
+
+// listDirectory("<part>/<proj>.proj") returns the projection's INNER file names (the <proj>.proj/
+// prefix stripped), so the projection's child DataPartStorage enumerates exactly its own files.
+TEST_F(ContentAddressedMetaTest, ProjectionSubdirListsInnerFiles)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_proj_list");
+    const std::string uuid = "uuid-proj-list";
+    const std::string part = "all_1_1_0";
+    const std::string base = "uui/" + uuid + "/" + part + "/";
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    for (const auto & f : {std::string("columns.txt"), std::string("data.bin"),
+                           std::string("p_sum.proj/columns.txt"), std::string("p_sum.proj/data.bin"),
+                           std::string("p_sum.proj/checksums.txt")})
+    {
+        auto buf = tx.writeFile(base + f, 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = "x";
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    tx.commit(DB::NoCommitOptions{});
+
+    auto inner = ms->listDirectory(base + "p_sum.proj");
+    std::set<std::string> got(inner.begin(), inner.end());
+    EXPECT_EQ(got, (std::set<std::string>{"columns.txt", "data.bin", "checksums.txt"}));
+}

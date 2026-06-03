@@ -467,6 +467,30 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
     }
 
+    // A projection DIRECTORY <uuid[:3]>/<uuid>/<part>/<proj>.proj: list the projection's inner file
+    // names by stripping the <proj>.proj/ prefix from the PARENT part's manifest (and per-ref sidecar)
+    // keys, so the projection's child DataPartStorage enumerates and reads exactly its own files.
+    // Mirrors the single-detached-part-dir listing branch; keyed on the .proj/.tmp_proj suffix.
+    if (auto p = ContentAddressed::parsePartFilePath(path);
+        p && !p->file.empty() && p->file.find('/') == std::string::npos
+        && (p->file.ends_with(".proj") || p->file.ends_with(".tmp_proj")))
+    {
+        const std::string prefix = p->file + "/";
+        std::unordered_set<std::string> result;
+        if (auto pid = readRefPartId(p->table_uuid, p->part_name))
+        {
+            auto manifest = loadPartManifestOrThrow(*pid);
+            for (const auto & [file, _] : manifest.blobs)
+                if (file.starts_with(prefix))
+                    result.emplace(file.substr(prefix.size()));
+        }
+        if (auto sidecar = readRefSidecarIfExists(p->table_uuid, p->part_name))
+            for (const auto & [file, _] : sidecar->files)
+                if (file.starts_with(prefix))
+                    result.emplace(file.substr(prefix.size()));
+        return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
+    }
+
     // A table-level SUBDIRECTORY <uuid[:3]>/<uuid>/<subdir>[/...] (e.g. deduplication_logs/): list the
     // verbatim table files keyed under tableFileKey(<subdir>/...), collapsing each to its first path
     // component after the subdir prefix (so a nested file appears as its child entry, a deeper subdir as
