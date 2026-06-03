@@ -1,4 +1,4 @@
--- Tags: no-ordinary-database
+-- Tags: no-ordinary-database, no-content-addressed-storage
 
 drop table if exists txn_counters;
 
