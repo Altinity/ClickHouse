@@ -1,39 +1,44 @@
 -- Tags: no-fasttest
 -- ^ content_addressed is an object-storage metadata type; keep it off the minimal fasttest image.
 
--- B37: a non_replicated_deduplication_window > 0 on a plain MergeTree makes it write an APPEND-mode
--- on-disk deduplication log (deduplication_logs/) at the table root. The immutable content_addressed
--- disk cannot host append writes, so the log's writer would never be created and the first INSERT
--- used to dereference a null writer and crash the server. So the setting must be rejected at CREATE
--- with a clear SUPPORT_IS_DISABLED error. A plain MergeTree WITHOUT the setting on the same kind of
--- disk must still create / insert / select / drop normally.
+-- A non_replicated_deduplication_window > 0 on a plain MergeTree keeps an on-disk deduplication log
+-- (deduplication_logs/deduplication_log_N.txt) at the table root. On a content_addressed disk that log
+-- works the same way it does on a plain s3 disk: the disk cannot host append writes, so the log
+-- rewrites a fresh rotated log object per record, stored verbatim in the table's files/ namespace. This
+-- test uses an INLINE content_addressed disk, so it exercises the CA path on any test config.
 
 DROP TABLE IF EXISTS t_cas_dedup;
-DROP TABLE IF EXISTS t_cas_plain;
 
--- (1) A table with non_replicated_deduplication_window on a content_addressed disk is rejected at CREATE.
-CREATE TABLE t_cas_dedup (a UInt64, b UInt64)
+CREATE TABLE t_cas_dedup (a UInt64)
 ENGINE = MergeTree ORDER BY a
 SETTINGS non_replicated_deduplication_window = 100, disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
     name = '04285_content_addressed_dedup',
-    path = '04285_content_addressed_dedup_pool/'); -- { serverError SUPPORT_IS_DISABLED }
+    path = '04285_content_addressed_dedup_pool/');
 
--- (2) A plain table (no dedup window) on a content_addressed disk still works end-to-end.
-CREATE TABLE t_cas_plain (a UInt64, b UInt64)
-ENGINE = MergeTree ORDER BY a
-SETTINGS disk = disk(
-    type = object_storage,
-    object_storage_type = local,
-    metadata_type = content_addressed,
-    name = '04285_content_addressed_plain',
-    path = '04285_content_addressed_plain_pool/');
+-- Identical inserts are deduplicated; each insert also writes a record to the on-disk log (the write
+-- that used to fail closed with a null writer on a content_addressed disk).
+INSERT INTO t_cas_dedup VALUES (1);
+INSERT INTO t_cas_dedup VALUES (1);
+SELECT 'after-two-identical', count() FROM t_cas_dedup;
 
-INSERT INTO t_cas_plain SELECT number, number * 2 FROM numbers(100);
-SELECT 'plain_count', count() FROM t_cas_plain;
-SELECT 'plain_sum', sum(b) FROM t_cas_plain;
+-- A distinct block is accepted.
+INSERT INTO t_cas_dedup VALUES (2);
+SELECT 'after-new-block', count() FROM t_cas_dedup;
 
-DROP TABLE t_cas_plain;
+-- Reload the table: the dedup log is re-read from the content_addressed disk.
+DETACH TABLE t_cas_dedup;
+ATTACH TABLE t_cas_dedup;
+
+-- The first block is still deduplicated — its record was reloaded from the on-disk log, not memory.
+INSERT INTO t_cas_dedup VALUES (1);
+SELECT 'after-reload-same-block', count() FROM t_cas_dedup;
+
+-- A new distinct block is still accepted after the reload.
+INSERT INTO t_cas_dedup VALUES (3);
+SELECT 'after-reload-new-block', count() FROM t_cas_dedup;
+
+DROP TABLE t_cas_dedup;
 SELECT 'dropped_ok';
