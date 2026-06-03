@@ -1,4 +1,5 @@
 
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS log;
 
 CREATE TABLE log(

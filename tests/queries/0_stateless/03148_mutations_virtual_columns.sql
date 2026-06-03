@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_mut_virtuals;
 
 CREATE TABLE t_mut_virtuals (id UInt64, s String) ENGINE = MergeTree ORDER BY id;

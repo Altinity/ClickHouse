@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 CREATE TABLE IF NOT EXISTS test (a UInt64) ENGINE=MergeTree() ORDER BY a;
 
 INSERT INTO test (a) SELECT 1 FROM numbers(1000);

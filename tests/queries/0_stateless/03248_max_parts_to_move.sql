@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t;
 DROP TABLE IF EXISTS t2;
 

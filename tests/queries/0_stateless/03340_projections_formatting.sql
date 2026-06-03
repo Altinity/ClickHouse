@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 CREATE TEMPORARY TABLE test
 (
     `user_id` UInt64,

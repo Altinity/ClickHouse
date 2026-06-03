@@ -1,4 +1,4 @@
--- Tags: no-shared-catalog, no-parallel-replicas
+-- Tags: no-shared-catalog, no-parallel-replicas, no-content-addressed-storage
 -- no-shared-catalog: STOP MERGES will only stop them on the current replica, the second one will continue to merge
 -- no-parallel-replicas: the result of EXPLAIN differs with parallel replicas
 

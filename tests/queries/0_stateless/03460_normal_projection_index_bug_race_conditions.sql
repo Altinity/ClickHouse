@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- { echo ON }
 
 SET max_threads=8;

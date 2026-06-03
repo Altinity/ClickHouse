@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- https://github.com/ClickHouse/ClickHouse/issues/39453
 
 DROP TABLE IF EXISTS test_03096;

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- https://github.com/ClickHouse/ClickHouse/issues/47432
 SET enable_analyzer=1;
 create table t1

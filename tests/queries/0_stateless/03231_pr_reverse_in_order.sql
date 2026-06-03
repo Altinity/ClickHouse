@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS checks SYNC;
 
 CREATE TABLE checks

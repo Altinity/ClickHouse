@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists tab;
 create table tab (x UInt32) engine = MergeTree order by tuple();
 

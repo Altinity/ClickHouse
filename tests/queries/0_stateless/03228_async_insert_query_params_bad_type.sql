@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_async_insert_params;
 
 CREATE TABLE t_async_insert_params (id UInt64) ENGINE = MergeTree ORDER BY tuple();

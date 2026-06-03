@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 SET optimize_trivial_insert_select = 1;
 
 DROP TABLE IF EXISTS move_partition_to_oneself;

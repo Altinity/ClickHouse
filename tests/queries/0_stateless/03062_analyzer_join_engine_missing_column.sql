@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- https://github.com/ClickHouse/ClickHouse/issues/23416
 SET enable_analyzer=1;
 create table test (TOPIC String, PARTITION UInt64, OFFSET UInt64, ID UInt64) ENGINE ReplicatedMergeTree('/clickhouse/tables/{database}/test_03062', 'r2') ORDER BY (TOPIC, PARTITION, OFFSET);

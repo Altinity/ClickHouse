@@ -1,4 +1,4 @@
--- Tags: no-replicated-database
+-- Tags: no-replicated-database, no-content-addressed-storage
 -- no-replicated-database: It messes up the output and this test explicitly checks the replicated database
 
 CREATE TABLE test

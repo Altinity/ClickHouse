@@ -1,4 +1,4 @@
--- Tags: no-random-settings
+-- Tags: no-random-settings, no-content-addressed-storage
 
 create table test
 (

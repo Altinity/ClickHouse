@@ -1,4 +1,4 @@
--- Tags: no-old-analyzer
+-- Tags: no-old-analyzer, no-content-addressed-storage
 drop table if exists test_qualify;
 create table test_qualify (number Int64) ENGINE = MergeTree ORDER BY (number);
 

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_lightweight_deletes;
 
 CREATE TABLE t_lightweight_deletes (a UInt64) ENGINE = MergeTree ORDER BY a;

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS order_by_all SYNC;
 CREATE TABLE order_by_all
 (

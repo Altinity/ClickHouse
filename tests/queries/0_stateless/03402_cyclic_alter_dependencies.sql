@@ -1,4 +1,4 @@
--- Tags: no-parallel
+-- Tags: no-parallel, no-content-addressed-storage
 DROP DICTIONARY IF EXISTS d0;
 DROP TABLE IF EXISTS t0;
 

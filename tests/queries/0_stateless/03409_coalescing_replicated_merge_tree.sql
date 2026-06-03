@@ -1,4 +1,4 @@
--- Tags: replica, no-shared-merge-tree, no-distributed-cache
+-- Tags: replica, no-shared-merge-tree, no-distributed-cache, no-content-addressed-storage
 -- Tag no-shared-merge-tree: Requires update in private (@jkartseva)
 -- Tag no-distributed-cache: Requires update in private (@jkartseva)
 

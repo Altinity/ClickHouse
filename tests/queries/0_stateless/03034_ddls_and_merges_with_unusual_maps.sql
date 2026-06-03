@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Tests maps with "unusual" key types (Float32, Nothing, LowCardinality(String))
 
 SET mutations_sync = 2;

@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-random-merge-tree-settings, no-replicated-database
+-- Tags: zookeeper, no-random-merge-tree-settings, no-replicated-database, no-content-addressed-storage
 
 drop table if exists x1;
 drop table if exists x2;

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 SET enable_analyzer = 1;
 
 DROP TABLE IF EXISTS t;

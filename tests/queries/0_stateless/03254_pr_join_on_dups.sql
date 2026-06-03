@@ -1,4 +1,4 @@
--- Tags: long
+-- Tags: long, no-content-addressed-storage
 
 drop table if exists X sync;
 drop table if exists Y sync;

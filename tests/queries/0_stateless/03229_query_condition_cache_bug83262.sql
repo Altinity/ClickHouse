@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS tab;
 
 CREATE TABLE tab (id UInt64, c UInt64) ENGINE = MergeTree ORDER BY id;

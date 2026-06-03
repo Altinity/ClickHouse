@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP DICTIONARY IF EXISTS uk_mortgage_rates_dict;
 DROP TABLE IF EXISTS uk_mortgage_rates;
 DROP VIEW IF EXISTS uk_prices_aggs_view;

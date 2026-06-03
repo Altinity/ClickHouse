@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists test;
 create table test (x UInt16, y UInt16, projection proj (select * order by x)) engine=MergeTree order by tuple() settings min_rows_for_wide_part=1, min_bytes_for_wide_part=1;
 insert into test select number, number from numbers(100000);

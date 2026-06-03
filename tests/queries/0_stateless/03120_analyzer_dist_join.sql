@@ -1,4 +1,4 @@
--- Tags: no-replicated-database
+-- Tags: no-replicated-database, no-content-addressed-storage
 -- https://github.com/ClickHouse/ClickHouse/issues/8547
 SET enable_analyzer=1;
 SET distributed_foreground_insert=1;

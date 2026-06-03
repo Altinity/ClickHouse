@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-replicated-database, no-shared-mergetree
+# Tags: no-replicated-database, no-shared-mergetree, no-content-addressed-storage
 # no-replicated-database: test relies on system.part_log but mutation can be executed on the second replica
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

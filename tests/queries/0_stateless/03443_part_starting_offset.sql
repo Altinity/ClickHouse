@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- { echo ON }
 
 drop table if exists test;

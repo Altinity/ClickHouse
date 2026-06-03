@@ -1,4 +1,4 @@
--- Tags: no-async-insert
+-- Tags: no-async-insert, no-content-addressed-storage
 
 SET wait_for_async_insert = 0;
 SET async_insert_busy_timeout_max_ms = 300000;

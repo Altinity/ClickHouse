@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS mv_table SYNC;
 DROP TABLE IF EXISTS null_table;
 

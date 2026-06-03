@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 CREATE TABLE test_table
 (
     dt DateTime,

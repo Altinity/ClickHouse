@@ -1,4 +1,4 @@
--- Tags: no-shared-catalog
+-- Tags: no-shared-catalog, no-content-addressed-storage
 -- FIXME no-shared-catalog: STOP MERGES will only stop them on the current replica, the second one will continue to merge
 
 DROP TABLE IF EXISTS t_update_materialized;

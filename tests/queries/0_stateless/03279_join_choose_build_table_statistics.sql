@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-parallel-replicas
+-- Tags: no-fasttest, no-parallel-replicas, no-content-addressed-storage
 
 SET query_plan_join_swap_table = 'auto';
 SET query_plan_optimize_join_order_algorithm = 'greedy';

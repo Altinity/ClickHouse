@@ -1,4 +1,4 @@
--- Tags: long
+-- Tags: long, no-content-addressed-storage
 
 set enable_analyzer=1;
 set mutations_sync=1;

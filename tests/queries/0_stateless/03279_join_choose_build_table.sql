@@ -1,4 +1,4 @@
--- Tags: no-parallel-replicas
+-- Tags: no-parallel-replicas, no-content-addressed-storage
 
 SET use_statistics = 0;
 SET query_plan_join_swap_table = 'auto';

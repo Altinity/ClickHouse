@@ -1,4 +1,5 @@
 
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_update_projections;
 
 SET apply_mutations_on_fly = 1;

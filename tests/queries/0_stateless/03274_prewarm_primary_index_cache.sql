@@ -1,4 +1,4 @@
--- Tags: no-parallel, no-shared-merge-tree
+-- Tags: no-parallel, no-shared-merge-tree, no-content-addressed-storage
 
 SET parallel_replicas_local_plan = 1;
 

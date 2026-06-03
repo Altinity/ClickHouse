@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper
+# Tags: zookeeper, no-content-addressed-storage
 
 # Suppress server Error logs forwarded to client stderr (the DDL worker for replica2
 # may transiently log KEEPER_EXCEPTION during initialization when databases are

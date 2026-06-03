@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Random settings limits: index_granularity=(100, 60000); index_granularity_bytes=(10000, None)
 -- Tags: long
 

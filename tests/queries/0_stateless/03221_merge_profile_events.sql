@@ -1,4 +1,4 @@
--- Tags: no-random-settings, no-random-merge-tree-settings
+-- Tags: no-random-settings, no-random-merge-tree-settings, no-content-addressed-storage
 
 DROP TABLE IF EXISTS t_merge_profile_events_1;
 

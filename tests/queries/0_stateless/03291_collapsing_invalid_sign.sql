@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 SET send_logs_level = 'fatal';
 SET optimize_on_insert = 1;
 

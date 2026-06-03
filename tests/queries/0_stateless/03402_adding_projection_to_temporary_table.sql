@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t0;
 
 CREATE TEMPORARY TABLE t0 (c0 Int, c1 Int, PROJECTION p0 (SELECT c0 GROUP BY c0)) ENGINE = MergeTree() ORDER BY tuple();

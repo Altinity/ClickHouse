@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t1 SYNC;
 DROP TABLE IF EXISTS t2 SYNC;
 
