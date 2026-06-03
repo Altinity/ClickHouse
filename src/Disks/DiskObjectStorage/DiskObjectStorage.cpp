@@ -718,15 +718,19 @@ bool DiskObjectStorage::isSharedCompatible() const
 
 bool DiskObjectStorage::supportsHardLinks() const
 {
-    /// A content-addressed pool exposes `createHardLink` only as an in-transaction carry-forward of
-    /// unchanged files into a freshly built part. There is no correct whole-part hardlink/clone
-    /// contract yet (B30); the per-file clone path corrupts parts (B21, gated separately). MergeTree
-    /// consumes `supportsHardLinks` to decide whether mutations / data-`ALTER`s (and lightweight
-    /// delete, which is a mutation) are possible — none of which M1 supports — so advertise false.
-    /// This fails those closed with a clear "immutable disk" message while leaving INSERT / SELECT /
-    /// merge / DROP / DETACH / settings-and-comment `ALTER` working (they do not consult this flag).
+    /// MergeTree consults `supportsHardLinks` at exactly two pure capability gates
+    /// (`MergeTreeData::checkAlterIsPossible` and `checkMutationIsPossible`) to decide whether
+    /// mutations / lightweight `DELETE` / data-`ALTER`s are possible. On a content-addressed pool
+    /// these are supported: `MutateTask` builds the new part through ONE whole-part transaction in
+    /// which `createHardLink` carries unchanged columns forward BY REFERENCE (the new manifest entry
+    /// points at the same blob hash — no re-upload) and changed columns are written as fresh blobs,
+    /// committed atomically. No code branches on this flag to choose a per-file-autocommit path, so
+    /// advertising true does NOT open the per-file clone hazard: the corrupting whole-part clone
+    /// paths (partition clone, BACKUP hard-link, replication) are gated by their own independent
+    /// checks (`checkAlterPartitionIsPossible`, the BACKUP CA rejection, the `Replicated*MergeTree`
+    /// CA rejection), which remain in force.
     if (metadata_storage->isContentAddressed())
-        return false;
+        return true;
 
     return !metadata_storage->isWriteOnce() && !metadata_storage->isPlain();
 }

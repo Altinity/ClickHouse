@@ -1,0 +1,4 @@
+rows	4
+move_partition_gated OK
+replace_partition_gated OK
+attach_partition_from_gated OK
