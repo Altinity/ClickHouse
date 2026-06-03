@@ -1,4 +1,4 @@
--- Tags: no-replicated-database, no-content-addressed-storage
+-- Tags: no-replicated-database
 
 DROP TABLE IF EXISTS index_test;
 

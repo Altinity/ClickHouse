@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_index_non_materialized;
 
 CREATE TABLE t_index_non_materialized (a UInt32) ENGINE = MergeTree ORDER BY tuple();

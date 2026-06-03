@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 SET automatic_parallel_replicas_mode = 0;
 SET parallel_replicas_for_non_replicated_merge_tree = 1;
 SET allow_experimental_parallel_reading_from_replicas = 1;

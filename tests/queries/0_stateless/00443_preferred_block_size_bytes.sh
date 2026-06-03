@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-random-merge-tree-settings, no-azure-blob-storage, no-content-addressed-storage
+# Tags: no-random-merge-tree-settings, no-azure-blob-storage
 
 set -e
 

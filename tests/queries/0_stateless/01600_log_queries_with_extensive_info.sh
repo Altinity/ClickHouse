@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-parallel, no-random-merge-tree-settings, no-flaky-check, no-content-addressed-storage
+# Tags: no-parallel, no-random-merge-tree-settings, no-flaky-check
 
 set -ue
 

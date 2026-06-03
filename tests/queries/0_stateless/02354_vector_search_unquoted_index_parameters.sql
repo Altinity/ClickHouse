@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-ordinary-database, no-content-addressed-storage
+-- Tags: no-fasttest, no-ordinary-database
 
 -- Tests that quoted and unquoted parameters can be passed to vector search indexes.
 

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 --- Verifies that text index preprocessor is properly applied to supported functions when the index is partially materialized.
 
 SET use_skip_indexes = 1;

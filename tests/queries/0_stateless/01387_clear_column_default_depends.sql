@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- It's Ok to CLEAR column when there are columns with default expression depending on it.
 -- But it's not Ok to DROP such column.
 

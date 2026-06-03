@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS src_table;
 DROP TABLE IF EXISTS copied_table;
 

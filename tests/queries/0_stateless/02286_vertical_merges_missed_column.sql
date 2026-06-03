@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_vertical_merges;
 
 CREATE TABLE t_vertical_merges

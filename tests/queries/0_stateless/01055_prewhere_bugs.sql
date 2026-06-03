@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_prewhere_default_column;
 DROP TABLE IF EXISTS test_prewhere_column_type;
 

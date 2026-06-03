@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Check CREATE TABLE
 
 DROP TABLE IF EXISTS tbl;

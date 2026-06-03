@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists merge;
 drop table if exists merge1;
 drop table if exists merge2;

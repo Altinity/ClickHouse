@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_index_3146;
 
 CREATE TABLE t_index_3146 (a UInt64, b UInt64) ENGINE = MergeTree ORDER BY tuple();

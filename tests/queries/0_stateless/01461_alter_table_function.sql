@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS table_from_remote;
 DROP TABLE IF EXISTS table_from_select;
 DROP TABLE IF EXISTS table_from_numbers;

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS src_01019;
 DROP TABLE IF EXISTS dest_01019;
 DROP TABLE IF EXISTS pipe_01019;

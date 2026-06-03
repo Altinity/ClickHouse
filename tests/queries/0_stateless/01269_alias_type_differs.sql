@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS data_01269;
 CREATE TABLE data_01269
 (

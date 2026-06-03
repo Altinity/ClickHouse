@@ -1,4 +1,4 @@
--- Tags: distributed, no-content-addressed-storage
+-- Tags: distributed
 
 set distributed_foreground_insert = 1;
 

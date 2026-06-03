@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_index_agg_func;
 
 CREATE TABLE t_index_agg_func

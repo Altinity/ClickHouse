@@ -1,4 +1,4 @@
--- Tags: no-parallel, no-content-addressed-storage
+-- Tags: no-parallel
 -- no-parallel: SYSTEM CLEAR MARK CACHE is used.
 
 DROP TABLE IF EXISTS t_prewarm_add_column;

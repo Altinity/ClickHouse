@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists tab;
 create table tab (d DateTime64(3), p LowCardinality(String)) engine = MergeTree order by toDate(d);
 insert into tab select toDateTime(toDate('2000-01-01')) + number, if(bitAnd(number, 1) = 0, 'a', 'b') from numbers(100);

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 set allow_suspicious_low_cardinality_types = 1;
 SELECT CAST(NULL, 'LowCardinality(Nullable(Int8))');
 

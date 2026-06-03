@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Verify that DROP COLUMN + ADD COLUMN with the same name does not resurrect old data.
 -- When a DROP COLUMN mutation has not yet been applied to a part,
 -- re-adding the column must return defaults, not stale data from before the drop.

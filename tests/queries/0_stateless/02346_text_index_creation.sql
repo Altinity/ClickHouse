@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS tab;
 
 SELECT 'Must not have no arguments.';

@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-ordinary-database, no-content-addressed-storage
+-- Tags: no-fasttest, no-ordinary-database
 
 -- Tests that text search indexes use a (non-standard) index granularity of 100 million by default.
 

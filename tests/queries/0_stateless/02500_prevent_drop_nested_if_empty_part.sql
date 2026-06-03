@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS 02500_nested;
 
 SET flatten_nested = 1;

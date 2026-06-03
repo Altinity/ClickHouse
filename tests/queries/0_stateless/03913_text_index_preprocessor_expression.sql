@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Tests text index with preprocessor on top of an index built with an expression.
 
 SET enable_full_text_index = 1;

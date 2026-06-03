@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_02559;
 CREATE TABLE test_02559 (x UInt8, s String) ENGINE = MergeTree ORDER BY tuple();
 

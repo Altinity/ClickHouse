@@ -1,4 +1,4 @@
--- Tags: no-parallel, no-content-addressed-storage
+-- Tags: no-parallel
 -- Tag no-parallel: Messes with internal cache
 
 SET enable_analyzer = 1;

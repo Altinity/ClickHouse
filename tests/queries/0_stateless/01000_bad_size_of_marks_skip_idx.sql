@@ -1,5 +1,4 @@
 
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS bad_skip_idx;
 
 CREATE TABLE bad_skip_idx

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Vertical merge should not fail when a dropped column is still physically present in parts.
 -- `injectRequiredColumns` must not pick a dropped column as the minimum-size column to inject.
 --

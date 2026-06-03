@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_fill_arrays;
 
 CREATE TABLE t_fill_arrays

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists `table_00609`;
 create table `table_00609` (key UInt64, val UInt64) engine = MergeTree order by key settings index_granularity=8192;
 insert into `table_00609` select number, number / 8192 from system.numbers limit 100000; 

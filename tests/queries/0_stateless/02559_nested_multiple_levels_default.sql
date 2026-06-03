@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS data_compact;
 DROP TABLE IF EXISTS data_memory;
 DROP TABLE IF EXISTS data_wide;

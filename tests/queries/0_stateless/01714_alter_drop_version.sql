@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS alter_drop_version;
 
 CREATE TABLE alter_drop_version
