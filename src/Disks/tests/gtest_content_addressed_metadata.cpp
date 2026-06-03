@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -241,6 +242,23 @@ TEST_F(ContentAddressedMetaTest, ConstructAndType)
     EXPECT_FALSE(ms->isReadOnly());
     EXPECT_FALSE(ms->areBlobPathsRandom());
     EXPECT_EQ(ms->getHardlinkCount("anything"), 0u);
+}
+
+// The foundational create-if-absent compare-and-set primitive: the first writer creates the object and
+// wins (true); a second create on the same key loses the CAS (false) and the first writer's bytes are
+// preserved (first-writer-wins). On the gtest's LocalObjectStorage this exercises the atomic O_EXCL
+// seam (the S3 If-None-Match path is exercised later on MinIO).
+TEST_F(ContentAddressedMetaTest, CondCreateIfAbsentIsAtomic)
+{
+    using namespace DB::ContentAddressed;
+    auto os = getObjectStorage("cas_cas");
+    // For LocalObjectStorage the key is the local path verbatim; keep it under the storage root so the
+    // fixture's getCommonKeyPrefix() cleanup removes it.
+    const std::string key = "cas_cas/cas_lock";
+
+    EXPECT_TRUE(condCreateIfAbsent(*os, key, "A"));  // first writer creates and wins
+    EXPECT_FALSE(condCreateIfAbsent(*os, key, "B")); // second writer loses the CAS
+    EXPECT_EQ(readObject(os, key), "A");             // first writer's bytes are preserved
 }
 
 TEST_F(ContentAddressedMetaTest, ResolvesAndReadsSeededPart)
