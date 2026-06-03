@@ -366,6 +366,24 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
     return {};
 }
 
+bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path) const
+{
+    // A PART directory <uuid[:3]>/<uuid>/<part> has no real sub-objects: its files are virtual, derived
+    // from the manifest. A content-addressed part is removed authoritatively by unlinking its ref (see
+    // ContentAddressedTransaction::removeDirectory), so the MergeTree fast-removal path's per-file
+    // unlinks are no-ops and the manifest-derived listing never empties. DiskObjectStorage::removeDirectory
+    // checks isDirectoryEmpty BEFORE removing and would throw CANNOT_RMDIR on every part removal, forcing
+    // a noisy recursive fallback (logged as <Error>) even though the result is correct (B45). Report a
+    // part directory as empty so removeDirectory proceeds straight to the ref-unlink. The detached
+    // namespace and TABLE dirs are NOT part dirs and keep the default iterateDirectory-based emptiness
+    // (so e.g. the DROP TABLE non-empty-data-dir guard still sees a table dir with live refs as non-empty).
+    if (auto p = ContentAddressed::parsePartFilePath(path);
+        p && p->file.empty() && p->part_name != ContentAddressed::kDetachedDirName)
+        return true;
+
+    return !iterateDirectory(path)->isValid();
+}
+
 DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std::string & path) const
 {
     // Mirror MetadataStorageFromPlainObjectStorage::iterateDirectory: prepend the path to each

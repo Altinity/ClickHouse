@@ -466,9 +466,21 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
     if (!dst_part || !dst_part->file.empty())
         return;
 
-    /// Nothing staged yet (directory-only move before any file write): adopt the destination.
+    /// Nothing staged yet. Two distinct cases share this shape:
+    ///   (a) a rename of a COMMITTED part (MergeTree renames a part to delete_tmp_<part> before
+    ///       removing it, and renames merged/mutated parts) — the source has a live ref that must be
+    ///       re-keyed to the destination, or the source ref survives and the part is rediscovered on
+    ///       the next ATTACH (B45);
+    ///   (b) a directory-only move before any file write (an INSERT's tmp_insert_<part> whose files are
+    ///       written into this transaction AFTER the rename) — the source has no committed ref, so just
+    ///       adopt the destination as the staged target.
+    /// renameCommittedPartRef distinguishes them: it returns true iff a committed source ref existed.
     if (table_uuid.empty() && part_name.empty())
     {
+        if (auto src_part = ContentAddressed::parsePartFilePath(from);
+            src_part && src_part->file.empty() && renameCommittedPartRef(*src_part, *dst_part))
+            return;
+
         table_uuid = dst_part->table_uuid;
         part_name = dst_part->part_name;
         return;
@@ -688,9 +700,120 @@ void ContentAddressedTransaction::createDirectoryRecursive(const std::string &)
     /// No-op (see createDirectory).
 }
 
-void ContentAddressedTransaction::removeDirectory(const std::string &)
+bool ContentAddressedTransaction::renameCommittedPartRef(
+    const ContentAddressed::PartFilePath & src, const ContentAddressed::PartFilePath & dst)
 {
-    /// No-op (see createDirectory).
+    /// Only a committed source ref can be renamed. An absent source ref means there is nothing
+    /// committed to move (e.g. an INSERT's tmp_insert_<part> that was only staged in this transaction);
+    /// the caller handles that case by adopting the destination as the staged target.
+    auto src_pid = metadata_storage.readRefPartId(src.table_uuid, src.part_name);
+    if (!src_pid)
+        return false;
+
+    /// Re-key the per-ref sidecar bundle and its per-file objects under the destination part name. The
+    /// sidecar's logical keys are in-part file names and do not change; only the OBJECT keys, which are
+    /// keyed by part name, move. Write the destination objects first, then publish the destination ref,
+    /// then unlink every source ref object — so a crash never loses the only pointer to the manifest.
+    if (auto src_sidecar = metadata_storage.readRefSidecarIfExists(src.table_uuid, src.part_name))
+    {
+        for (const auto & [file, bytes] : src_sidecar->files)
+        {
+            const std::string dst_file_key = ContentAddressed::refMutableFileKey(
+                key_prefix, metadata_storage.server_id, dst.table_uuid, dst.part_name, file).string();
+            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(dst_file_key), WriteMode::Rewrite);
+            file_out->write(bytes.data(), bytes.size());
+            file_out->finalize();
+        }
+
+        const std::string dst_meta_key
+            = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, dst.table_uuid, dst.part_name).string();
+        const std::string meta_bytes = src_sidecar->serialize();
+        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(dst_meta_key), WriteMode::Rewrite);
+        meta_out->write(meta_bytes.data(), meta_bytes.size());
+        meta_out->finalize();
+    }
+
+    /// Publish the destination ref (the commit point of the rename).
+    const std::string dst_ref_key
+        = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, dst.table_uuid, dst.part_name).string();
+    const std::string ref_payload = ContentAddressed::serializeRefPayload(*src_pid);
+    auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(dst_ref_key), WriteMode::Rewrite);
+    ref_out->write(ref_payload.data(), ref_payload.size());
+    ref_out->finalize();
+
+    /// Unlink the source ref and its per-ref sidecar objects (ref + <part>.* sidecars), keeping the
+    /// shared blobs/manifest. Match the basename exactly src.part_name or beginning with
+    /// "src.part_name." so a different part sharing a name prefix is never touched.
+    const std::string src_refs_prefix
+        = ContentAddressed::refsPrefix(key_prefix, metadata_storage.server_id, src.table_uuid);
+    RelativePathsWithMetadata children;
+    metadata_storage.object_storage->listObjects(src_refs_prefix, children, /*max_keys=*/0);
+    StoredObjects to_remove;
+    for (const auto & child : children)
+    {
+        const std::string & key = child->relative_path;
+        const auto pos = key.rfind(src_refs_prefix);
+        if (pos == std::string::npos)
+            continue;
+        const std::string name = key.substr(pos + src_refs_prefix.size());
+        if (name == src.part_name || name.rfind(src.part_name + ".", 0) == 0)
+            to_remove.emplace_back(key);
+    }
+    if (!to_remove.empty())
+        metadata_storage.object_storage->removeObjectsIfExist(to_remove);
+    return true;
+}
+
+bool ContentAddressedTransaction::unlinkPartDirRefs(const std::string & path)
+{
+    /// A regular part directory <uuid[:3]>/<uuid>/<part> (a part path with no file component): delete
+    /// this part's ref plus its per-ref sidecars. The objects for part P are: <refsPrefix>P (the ref),
+    /// <refsPrefix>P.meta (the bundle), and <refsPrefix>P.<file>.meta (per-file). Match the basename
+    /// exactly P or beginning with "P." — never a different part that merely shares a name prefix (e.g.
+    /// all_1_1_0 must not reach all_1_1_0_1, whose next char is '_', not '.'). The sidecars are
+    /// ref-scoped and NOT content-addressed, so they MUST be removed synchronously here or they leak
+    /// (the reachability sweep scans only blobs/+parts/). Absent ref (e.g. an uncommitted tmp part) is
+    /// a no-op. PartManifest + blobs are kept (deferred GC). The detached namespace and table dirs are
+    /// NOT regular part dirs and are not handled here.
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (!p || !p->file.empty() || p->part_name == ContentAddressed::kDetachedDirName)
+        return false;
+
+    const std::string refs_prefix
+        = ContentAddressed::refsPrefix(key_prefix, metadata_storage.server_id, p->table_uuid);
+    RelativePathsWithMetadata children;
+    metadata_storage.object_storage->listObjects(refs_prefix, children, /*max_keys=*/0);
+    StoredObjects to_remove;
+    for (const auto & child : children)
+    {
+        const std::string & key = child->relative_path;
+        const auto pos = key.rfind(refs_prefix);
+        if (pos == std::string::npos)
+            continue;
+        const std::string name = key.substr(pos + refs_prefix.size());
+        if (name == p->part_name || name.rfind(p->part_name + ".", 0) == 0)
+            to_remove.emplace_back(key);
+    }
+    if (!to_remove.empty())
+        metadata_storage.object_storage->removeObjectsIfExist(to_remove);
+    return true;
+}
+
+void ContentAddressedTransaction::removeDirectory(const std::string & path)
+{
+    /// MergeTree removes a COMPLETE part via the fast path (DataPartStorageOnDiskBase::clearDirectory):
+    /// it unlinks the part's files one by one and then calls removeDirectory(<part>) — it never calls
+    /// removeRecursive on the part directory. For a content-addressed disk the per-file unlinks are
+    /// no-ops on committed refs (the ref/manifest must survive until the directory is dropped), so this
+    /// removeDirectory(<part>) is the SINGLE authoritative point at which the part's ref must be
+    /// unlinked. If it stays a no-op the ref lingers and the part is rediscovered on the next
+    /// DETACH/ATTACH (B45). Route a part-directory removal through the same ref-unlink as removeRecursive.
+    if (unlinkPartDirRefs(path))
+        return;
+
+    /// Otherwise (table dir, detached namespace, generic dir): no-op (see createDirectory). object
+    /// storage has no real directories; existsDirectory derives from the refs/objects prefix. The
+    /// detached namespace and table dirs are removed via removeRecursive, never plain removeDirectory.
 }
 
 void ContentAddressedTransaction::removeRecursive(const std::string & path, const ShouldRemoveObjectsPredicate &)
@@ -803,34 +926,11 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         return;
     }
 
-    if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
-    {
-        /// List the whole refs/ directory (a real prefix on object storage and a real dir on the
-        /// local backend) and delete this part's ref plus its per-ref sidecars. The objects for part
-        /// P are: <refsPrefix>P (the ref), <refsPrefix>P.meta (the bundle), and <refsPrefix>P.<file>.meta
-        /// (per-file). Match the basename exactly P or beginning with "P." — never a different part
-        /// that merely shares a name prefix (e.g. all_1_1_0 must not reach all_1_1_0_1, whose next char
-        /// is '_', not '.'). The sidecars are ref-scoped and NOT content-addressed, so they MUST be
-        /// removed synchronously here or they leak (the reachability sweep scans only blobs/+parts/).
-        const std::string refs_prefix
-            = ContentAddressed::refsPrefix(key_prefix, metadata_storage.server_id, p->table_uuid);
-        RelativePathsWithMetadata children;
-        metadata_storage.object_storage->listObjects(refs_prefix, children, /*max_keys=*/0);
-        StoredObjects to_remove;
-        for (const auto & child : children)
-        {
-            const std::string & key = child->relative_path;
-            const auto pos = key.rfind(refs_prefix);
-            if (pos == std::string::npos)
-                continue;
-            const std::string name = key.substr(pos + refs_prefix.size());
-            if (name == p->part_name || name.rfind(p->part_name + ".", 0) == 0)
-                to_remove.emplace_back(key);
-        }
-        if (!to_remove.empty())
-            metadata_storage.object_storage->removeObjectsIfExist(to_remove);
+    /// A regular part directory <uuid[:3]>/<uuid>/<part> (no file component): unlink this part's ref
+    /// plus its per-ref sidecars (shared with the fast-removal removeDirectory path — B45). Blobs and
+    /// the manifest are kept (deferred GC).
+    if (unlinkPartDirRefs(path))
         return;
-    }
 
     /// Table directory <uuid[:3]>/<uuid> (parses to a table uuid, no part): delete ALL refs and ALL
     /// verbatim table-level files for this (server, table). Scoped by table_uuid so a DROP of one

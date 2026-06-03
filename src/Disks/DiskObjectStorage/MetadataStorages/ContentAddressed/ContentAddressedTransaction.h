@@ -255,6 +255,25 @@ private:
     // untouched; only the small pointer objects move. Reached only from moveDirectory.
     void republishTableRefs(const std::string & src_table_id, const std::string & dst_table_id);
 
+    // Rename the ref (+ per-ref sidecar objects) of a COMMITTED part directory within one table:
+    // <uuid>/<src_part> -> <uuid>/<dst_part>. MergeTree renames a committed part to delete_tmp_<part>
+    // before removing it (DataPartStorageOnDiskBase::remove), and renames merged/mutated parts, via
+    // disk->moveDirectory with NOTHING staged in this transaction. Content addressing has no rename, so
+    // re-key the small pointer objects (ref, bundle <part>.meta, per-file <part>.<file>.meta) from the
+    // source name to the destination name; the shared blobs/manifest are content-addressed and
+    // untouched. Returns true if a committed source ref was found and re-keyed. Without this the source
+    // ref survives the "remove", so the part is rediscovered on the next ATTACH (B45).
+    bool renameCommittedPartRef(
+        const ContentAddressed::PartFilePath & src, const ContentAddressed::PartFilePath & dst);
+
+    // Authoritative removal of a single part directory <uuid[:3]>/<uuid>/<part>: unlink the part's
+    // ref and its per-ref sidecar objects (the bundle <part>.meta and each per-file <part>.<file>.meta),
+    // keeping the shared blobs/manifest for deferred GC. Returns true if the path was a regular part
+    // directory and was handled here. Shared by removeRecursive (slow path) and removeDirectory (the
+    // MergeTree fast removal path ends with removeDirectory(<part>), so this is where a complete part's
+    // ref MUST be unlinked or it is rediscovered on the next ATTACH — B45).
+    bool unlinkPartDirRefs(const std::string & path);
+
     /// Object-storage common key prefix; authoritative copy from the metadata storage (see ctor).
     const std::string key_prefix;
     /// Server-local scratch dir for the write-buffer spill (see ctor).

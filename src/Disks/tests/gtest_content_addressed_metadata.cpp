@@ -918,6 +918,146 @@ TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
     EXPECT_EQ(readObject(os, blob_shared), "SHARED"); // blob content intact, reclaimable by GC
 }
 
+// B45: the MergeTree FAST removal path (DataPartStorageOnDiskBase::clearDirectory, used for a
+// complete part) unlinks the part's files one by one and then calls disk->removeDirectory(<part>) —
+// it never calls removeRecursive on the part directory. For a content-addressed disk the per-file
+// unlinks are no-ops on a committed ref, so removeDirectory(<part>) is the ONLY point at which the
+// ref can be unlinked. If it stays a no-op the ref lingers and the part is rediscovered by the
+// re-attach part-load scan (which enumerates strictly from refs). This pins that removeDirectory on a
+// complete part directory unlinks the ref so a re-list of the table dir no longer returns it.
+TEST_F(ContentAddressedMetaTest, RemoveDirectoryUnlinksPartRef)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_rmdir");
+    auto os = getObjectStorage("cas_rmdir");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-rmdir";
+
+    auto write_part = [&](const std::string & part, const std::map<std::string, std::string> & files)
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    // Two complete parts. One shared column blob proves a single-part removal leaves the other intact.
+    write_part("all_1_1_0", {{"a.bin", "AAA"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
+    write_part("all_2_2_0", {{"a.bin", "ZZZ"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
+
+    const std::string blob_shared = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path;
+    const std::string ref_1 = refKey("", sid, uuid, "all_1_1_0").string();
+
+    // Before removal the table dir lists both parts.
+    {
+        auto parts = ms->listDirectory("uui/" + uuid + "/");
+        std::set<std::string> got(parts.begin(), parts.end());
+        EXPECT_EQ(got, (std::set<std::string>{"all_1_1_0", "all_2_2_0"}));
+    }
+
+    // Remove one part via removeDirectory (the fast-removal entry point) — NOT removeRecursive.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeDirectory("uui/" + uuid + "/all_1_1_0");
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // The ref is gone, so a re-list (the re-attach part-load scan) NO LONGER returns the removed part.
+    EXPECT_FALSE(os->tryGetObjectMetadata(ref_1, /*with_tags=*/false).has_value());
+    {
+        auto parts = ms->listDirectory("uui/" + uuid + "/");
+        std::set<std::string> got(parts.begin(), parts.end());
+        EXPECT_EQ(got, (std::set<std::string>{"all_2_2_0"}));
+    }
+    EXPECT_FALSE(ms->existsDirectory("uui/" + uuid + "/all_1_1_0/"));
+
+    // The surviving part still resolves and the shared blob is intact (deferred GC keeps blobs).
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path), "ZZZ");
+    EXPECT_EQ(readObject(os, blob_shared), "SHARED");
+
+    // removeDirectory on the TABLE dir is still a no-op (table drop goes through removeRecursive), so
+    // it must not unlink the surviving ref.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeDirectory("uui/" + uuid);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(os->tryGetObjectMetadata(refKey("", sid, uuid, "all_2_2_0").string(), /*with_tags=*/false).has_value());
+}
+
+// B45: MergeTree renames a COMMITTED part to delete_tmp_<part> (via disk->moveDirectory, with nothing
+// staged in the transaction) BEFORE removing it. Content addressing has no rename, so moveDirectory
+// must re-key the committed source ref to the destination; the subsequent removeDirectory then unlinks
+// it. If moveDirectory only adopts the destination as a staged target (the INSERT tmp->final case) the
+// committed source ref survives the whole remove and the part is rediscovered on the next ATTACH. This
+// pins the full rename->remove sequence: after it the source part is no longer listed.
+TEST_F(ContentAddressedMetaTest, RenameCommittedPartThenRemoveUnlinksRef)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_renamerm");
+    auto os = getObjectStorage("cas_renamerm");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-renamerm";
+
+    auto write_part = [&](const std::string & part, const std::map<std::string, std::string> & files)
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    // Two committed parts; all_1_1_0 also carries a MUTABLE per-part file (metadata_version.txt) so the
+    // rename must move the per-ref sidecar objects too, not just the bare ref.
+    write_part("all_1_1_0", {{"a.bin", "AAA"}, {"columns.txt", "a"}, {"metadata_version.txt", "7"}});
+    write_part("all_2_2_0", {{"a.bin", "ZZZ"}, {"columns.txt", "a"}});
+
+    const std::string ref_src = refKey("", sid, uuid, "all_1_1_0").string();
+    const std::string ref_dst = refKey("", sid, uuid, "delete_tmp_all_1_1_0").string();
+
+    // (1) Rename the committed part to delete_tmp_<part> with NOTHING staged (a fresh transaction),
+    // exactly as DataPartStorageOnDiskBase::remove does before deleting.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveDirectory("uui/" + uuid + "/all_1_1_0", "uui/" + uuid + "/delete_tmp_all_1_1_0");
+        tx.commit(DB::NoCommitOptions{});
+    }
+    // The ref moved: source gone, destination present, and the renamed part resolves + reads.
+    EXPECT_FALSE(os->tryGetObjectMetadata(ref_src, /*with_tags=*/false).has_value());
+    EXPECT_TRUE(os->tryGetObjectMetadata(ref_dst, /*with_tags=*/false).has_value());
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/delete_tmp_all_1_1_0/a.bin")[0].remote_path), "AAA");
+    // The mutable sidecar file followed the rename (resolves from the destination ref's sidecar).
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/delete_tmp_all_1_1_0/metadata_version.txt")[0].remote_path), "7");
+    // The table dir lists the renamed name, not the original.
+    {
+        auto parts = ms->listDirectory("uui/" + uuid + "/");
+        std::set<std::string> got(parts.begin(), parts.end());
+        EXPECT_EQ(got, (std::set<std::string>{"delete_tmp_all_1_1_0", "all_2_2_0"}));
+    }
+
+    // (2) Remove the renamed directory (the fast-removal entry point). Now nothing remains of the part.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeDirectory("uui/" + uuid + "/delete_tmp_all_1_1_0");
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(os->tryGetObjectMetadata(ref_dst, /*with_tags=*/false).has_value());
+    {
+        auto parts = ms->listDirectory("uui/" + uuid + "/");
+        std::set<std::string> got(parts.begin(), parts.end());
+        EXPECT_EQ(got, (std::set<std::string>{"all_2_2_0"})); // the dropped part is NOT rediscovered
+    }
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path), "ZZZ");
+}
+
 // P3.5: non-part / table-level files (e.g. format_version.txt) are written verbatim to a direct
 // object key (no content addressing, no ref, no manifest) and resolve straight back. A part file in
 // the same table still resolves via the ref/manifest/blob path, so the two schemes coexist.

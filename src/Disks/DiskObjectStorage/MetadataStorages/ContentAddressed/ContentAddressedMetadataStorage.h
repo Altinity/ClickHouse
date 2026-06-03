@@ -52,6 +52,7 @@ public:
     Poco::Timestamp getLastModified(const std::string & path) const override;
     std::vector<std::string> listDirectory(const std::string & path) const override;
     DirectoryIteratorPtr iterateDirectory(const std::string & path) const override;
+    bool isDirectoryEmpty(const std::string & path) const override;
     StoredObjects getStorageObjects(const std::string & path) const override;
 
     const std::string & serverIdForTest() const { return server_id; }
