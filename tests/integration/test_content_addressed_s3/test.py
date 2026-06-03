@@ -81,3 +81,65 @@ def test_content_addressed_s3():
         ).strip()
         == "0"
     )
+
+
+def test_mutations_and_patch_parts_survive_restart():
+    # A mutated part and a patch part are ordinary content-addressed parts published as refs. After a
+    # restart the active set must be rediscovered from the refs in S3, so the post-mutation /
+    # post-lightweight-delete state must survive (CAS M7).
+    node = cluster.instances["node"]
+
+    node.query("DROP TABLE IF EXISTS cas_mut SYNC")
+    node.query(
+        """
+        CREATE TABLE cas_mut (
+            id Int64,
+            v UInt64,
+            s String
+        ) ENGINE = MergeTree()
+        ORDER BY id
+        SETTINGS storage_policy = '{}', enable_block_number_column = 1, enable_block_offset_column = 1
+        """.format(
+            STORAGE_POLICY
+        )
+    )
+
+    node.query(
+        "INSERT INTO cas_mut SELECT number, number * 10, toString(number) FROM numbers({})".format(
+            NUM_ROWS
+        )
+    )
+
+    # Heavy mutation: UPDATE one column (id/s carry forward by reference on the content-addressed disk).
+    node.query(
+        "ALTER TABLE cas_mut UPDATE v = v + 1 WHERE id % 2 = 0 SETTINGS mutations_sync = 2"
+    )
+    # Heavy mutation: DELETE.
+    node.query("ALTER TABLE cas_mut DELETE WHERE id % 100 = 0 SETTINGS mutations_sync = 2")
+    # Data-ALTER (column type change). Via a storage policy there is no inline-disk CustomType in
+    # settings_changes, so this works on the content-addressed disk (see backlog B53).
+    node.query("ALTER TABLE cas_mut MODIFY COLUMN v Int64 SETTINGS mutations_sync = 2")
+    # Patch part: a forced lightweight-update DELETE (throws if unsupported, so success == patch path).
+    node.query(
+        "DELETE FROM cas_mut WHERE id % 7 = 0 "
+        "SETTINGS enable_lightweight_update = 1, lightweight_delete_mode = 'lightweight_update_force', lightweight_deletes_sync = 2"
+    )
+
+    count_before = int(node.query("SELECT count() FROM cas_mut"))
+    sum_before = int(node.query("SELECT sum(v) FROM cas_mut"))
+    digest_before = node.query("SELECT sum(cityHash64(id, v, s)) FROM cas_mut").strip()
+
+    # Persistence: rediscover the active set (incl. the mutated and patch parts) from S3 refs.
+    node.restart_clickhouse()
+
+    assert int(node.query("SELECT count() FROM cas_mut")) == count_before
+    assert int(node.query("SELECT sum(v) FROM cas_mut")) == sum_before
+    assert node.query("SELECT sum(cityHash64(id, v, s)) FROM cas_mut").strip() == digest_before
+
+    node.query("DROP TABLE cas_mut SYNC")
+    assert (
+        node.query(
+            "SELECT count() FROM system.tables WHERE database = currentDatabase() AND name = 'cas_mut'"
+        ).strip()
+        == "0"
+    )
