@@ -2061,6 +2061,35 @@ TEST_F(ContentAddressedMetaTest, MoveTableLevelFileRenamesVerbatimObject)
     EXPECT_EQ(readObject(os, objs[0].remote_path), bytes);
 }
 
+// B50: unlinking a table-level file (e.g. a pruned/finished `mutation_N.txt` entry or a stale
+// `tmp_mutation_*.txt`) must reclaim its verbatim object immediately. The reachability sweep scans
+// only blobs/+parts/, so before the fix unlinkFile's table-level branch was a no-op and the object
+// leaked until DROP. After the fix the verbatim object is removed and the file no longer resolves.
+TEST_F(ContentAddressedMetaTest, UnlinkTableLevelFileReclaimsVerbatimObject)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_unlink_tf");
+    auto os = getObjectStorage("cas_unlink_tf");
+    const std::string uuid = "uuid-unlink";
+    const std::string path = "uui/" + uuid + "/mutation_9.txt";
+    const std::string bytes = "format version: 1\n9\n";
+
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(path, 4096, DB::WriteMode::Rewrite, {});
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    EXPECT_TRUE(ms->existsFile(path));
+
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.unlinkFile(path, /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(ms->existsFile(path));
+}
+
 // B5 (patch-part lifecycle): a lightweight-DELETE patch part is a normal CA part whose directory name
 // carries the `patch-<32hex>-<base_part_name>` prefix (MergeTreePartInfo::PATCH_PART_PREFIX). Its
 // blobs must be published under a ref in the table's `refs/` namespace, treated as a reachability root

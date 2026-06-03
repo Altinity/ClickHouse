@@ -603,10 +603,17 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool, boo
         return;
     }
 
-    /// Table-level file (e.g. format_version.txt): no CA-resolution-relevant state and no verbatim
-    /// removal in M1 — left to GC, matching the existing read/write treatment of such files.
-    if (ContentAddressed::parseTableFilePath(path))
+    /// Table-level file (e.g. format_version.txt, a `mutation_N.txt` entry): remove its verbatim
+    /// object. These are stored verbatim under tableFileKey and are not content-addressed, so a
+    /// mid-life delete (e.g. cleanup of a stale `tmp_mutation_*.txt`, or a pruned finished mutation
+    /// entry) must reclaim the object now — the reachability sweep only scans blobs/+parts/, so a
+    /// no-op here would leak the object until DROP (B50). removeObjectIfExists is a no-op when absent.
+    if (auto tf = ContentAddressed::parseTableFilePath(path))
+    {
+        metadata_storage.object_storage->removeObjectIfExists(StoredObject(
+            ContentAddressed::tableFileKey(key_prefix, metadata_storage.server_id, tf->table_uuid, tf->tail), path));
         return;
+    }
 
     /// Generic disk-level file (e.g. the server's startup access-check probe): delete its verbatim
     /// object so a write -> read -> unlink round-trip leaves nothing behind. removeObjectIfExists is
