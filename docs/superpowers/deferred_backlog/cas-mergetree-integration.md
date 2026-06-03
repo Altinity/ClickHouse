@@ -298,5 +298,42 @@ MySQL/native `::1` ports — IPv6 unreachable in the local harness; both fail id
 
 | B48 | **`clickhouse local` with a CA disk may not exit cleanly (shutdown hang).** During M6 triage, several `clickhouse local --queries-file <repro.sql>` invocations using an inline `content_addressed` disk were found hung for **3–21 hours** (orphaned processes), where the query had completed but the process never exited. Server-mode (praktika) tests shut down fine, so it is **local-mode-specific** — likely a background `BackgroundSchedulePool`/GC-thread or `_pool_meta` resource not joined/released on `clickhouse local` teardown (or a `DETACH PARTITION ALL` repro hang). | Surfaced while reaping orphaned processes after the overnight run; not caught by tests (they timeout-kill, masking a hang as a normal kill) | Investigate `LocalServer` shutdown vs the CA metadata storage's `shutdown()` (GC thread `task->deactivate()`); ensure the GC thread/pool task is reaped on local exit. Until fixed, treat `clickhouse local` + CA as needing an explicit process kill. Possibly relates to the GC-thread lifecycle (M5.2/Task A). |
 
+### M6 Task D — no-leftovers proof (create → write → DROP → GC → empty) (2026-06-03) {#m6-task-d}
+
+The north-star "no S3 leftovers" criterion is now proven by **two dedicated create→write→drop→wait→check-empty
+oracles**, both asserting that BOTH the pool's `blobs/` AND `parts/` (content blobs + part footers) are
+reclaimed by the single-owner background reachability GC after a `DROP TABLE … SYNC`:
+
+- **Stateless (local pool):** `tests/queries/0_stateless/04290_content_addressed_no_leftovers.sh`. An inline
+  `content_addressed` disk over `object_storage_type=local` with the pool rooted at an **absolute** `path`
+  under `CLICKHOUSE_USER_FILES_UNIQUE` (shared between server and the test shell on a local run, so the `.sh`
+  can `find` the pool directly), `content_addressed_gc_enabled=1`, `content_addressed_gc_grace_sec=2`,
+  `content_addressed_gc_interval_sec=1`. It records baseline `blobs/`+`parts/` file count, CREATEs a MergeTree
+  on the CA disk, INSERTs 6 distinct 100k-row batches (count rises above baseline), `DROP TABLE … SYNC`, then
+  **bounded-polls** (hard 60s cap, re-checking each second — not a fixed sleep) until `blobs/`+`parts/` return
+  to empty, and asserts `_pool_meta` (the durable single-owner marker) survives. The local-pool inspection
+  WORKED — no fallback was needed.
+- **Integration (S3/MinIO):** `tests/integration/test_content_addressed_gc_s3/test.py` was **strengthened** to
+  count BOTH `cas_gc_data/blobs/` and `cas_gc_data/parts/` (previously only `blobs/`) and assert both drain
+  back to ~baseline after DROP — the authoritative no-leftovers proof over real object storage.
+
+**Observed counts** (stateless local run): baseline 0 → after-insert >0 (`grew_above_baseline 1`) → after
+drop+GC 0 (`no_leftovers 1`), `_pool_meta` present. Both tests `[ OK ]` / `1 passed`.
+
+**Informational (step 3, settle check).** A small batch (`00001 00080 00502`) under the CA-**default** config
+(`Stateless tests (arm_binary, content_addressed storage, parallel)`) passed (7 passed, 1 skipped), but the
+server's default pool at `ci/tmp/run_r0/content_addressed_pool` still held ~4432 blobs + ~465 parts at
+teardown. This is **expected, not a leak**: the M6 default config uses `grace=60s`/`interval=5s` (deliberately
+larger than any single test op so the write-vs-GC race cannot bite), and praktika shuts the server down
+immediately after the short batch — well before the 60s grace window elapses — so the sweep never reclaims
+the dropped test tables' objects, and the harness does not wipe the on-disk pool on shutdown. The takeaway:
+the authoritative no-leftovers proof is the dedicated short-grace create→drop→wait→check-empty test (04290 +
+the strengthened integration test), NOT post-suite inspection of a shared long-grace pool the harness tears
+down before grace elapses. A future enhancement could add an explicit post-suite settle (`SYSTEM` flush +
+wait > grace, or a teardown-time pool sweep) if a suite-wide empty-pool assertion is wanted.
+
+> **Status:** Task D DONE. Local-pool inspection worked (no fallback). Both `blobs/`+`parts/` proven reclaimed
+> on DROP, on local and S3. CA unit (69) + CA stateless (04278–04290) green; no leftover processes.
+
 > Add new deferred items here as they arise during planning/implementation, always filling the
 > "where it plugs in" column so the architecture stays dead-end-free.

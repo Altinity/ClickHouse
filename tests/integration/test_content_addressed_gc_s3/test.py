@@ -8,9 +8,11 @@ cluster = ClickHouseCluster(__file__)
 
 STORAGE_POLICY = "content_addressed_gc_s3"
 
-# Endpoint is http://minio1:9001/root/cas_gc_data/, so the pool's blobs live under this key prefix
-# inside the `root` MinIO bucket.
+# Endpoint is http://minio1:9001/root/cas_gc_data/, so the pool's blobs and part footers live under
+# these key prefixes inside the `root` MinIO bucket. The authoritative "no S3 leftovers" proof checks
+# BOTH: a dropped table must leave neither content blobs nor part footers behind.
 BLOBS_PREFIX = "cas_gc_data/blobs/"
+PARTS_PREFIX = "cas_gc_data/parts/"
 
 # Enough rows / inserts to materialise several distinct blobs in the pool.
 NUM_ROWS = 100000
@@ -39,11 +41,16 @@ def start_cluster():
         cluster.shutdown()
 
 
-def count_blobs():
+def count_prefix(prefix):
     objects = cluster.minio_client.list_objects(
-        cluster.minio_bucket, BLOBS_PREFIX, recursive=True
+        cluster.minio_bucket, prefix, recursive=True
     )
     return len(list(objects))
+
+
+def count_pool_objects():
+    # Both content blobs and part footers must be reclaimed for the pool to be truly empty.
+    return count_prefix(BLOBS_PREFIX) + count_prefix(PARTS_PREFIX)
 
 
 def test_gc_reclaims_dropped_blobs():
@@ -51,8 +58,8 @@ def test_gc_reclaims_dropped_blobs():
 
     node.query("DROP TABLE IF EXISTS cas_gc_test SYNC")
 
-    # (1) Baseline: how many blobs exist in the pool before we create our table.
-    baseline = count_blobs()
+    # (1) Baseline: how many objects (blobs + part footers) exist in the pool before our table.
+    baseline = count_pool_objects()
 
     node.query(
         """
@@ -77,28 +84,35 @@ def test_gc_reclaims_dropped_blobs():
 
     assert int(node.query("SELECT count() FROM cas_gc_test")) == NUM_INSERTS * NUM_ROWS
 
-    after_insert = count_blobs()
+    after_insert = count_pool_objects()
     assert (
         after_insert > baseline
-    ), "expected blob count to rise above baseline {} after inserts, got {}".format(
+    ), "expected pool object count (blobs+parts) to rise above baseline {} after inserts, got {}".format(
         baseline, after_insert
     )
 
-    # (3) Drop the table: refs are unlinked synchronously; the blobs become unreferenced GC fodder.
+    # (3) Drop the table: refs are unlinked synchronously; the blobs and part footers become
+    #     unreferenced GC fodder.
     node.query("DROP TABLE cas_gc_test SYNC")
 
-    # (4) Poll until the background GC reclaims the orphaned blobs and the count returns to baseline.
-    #     Bounded wait on a background process (grace=1s, interval=1s) — not a race hack.
+    # (4) Poll until the background GC reclaims the orphaned objects and the count returns to
+    #     baseline. Bounded wait on a background process (grace=1s, interval=1s) — not a race hack.
+    #     This is the authoritative "no S3 leftovers" proof: BOTH blobs/ and parts/ must drain.
     final = after_insert
     for _ in range(RECLAIM_RETRIES):
-        final = count_blobs()
+        final = count_pool_objects()
         if final <= baseline:
             break
         time.sleep(RECLAIM_SLEEP)
 
     assert final <= baseline, (
-        "background GC did not reclaim dropped blobs within {}s: "
-        "baseline={}, after_insert={}, final={}".format(
-            int(RECLAIM_RETRIES * RECLAIM_SLEEP), baseline, after_insert, final
+        "background GC did not reclaim dropped objects (blobs+parts) within {}s: "
+        "baseline={}, after_insert={}, final={} (blobs={}, parts={})".format(
+            int(RECLAIM_RETRIES * RECLAIM_SLEEP),
+            baseline,
+            after_insert,
+            final,
+            count_prefix(BLOBS_PREFIX),
+            count_prefix(PARTS_PREFIX),
         )
     )

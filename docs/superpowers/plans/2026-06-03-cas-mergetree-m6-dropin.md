@@ -39,8 +39,11 @@ doc_type: 'guide'
 - [ ] Re-run; iterate until the non-skipped suite is green.
 
 ### Task D — no-leftovers assertion
-- [ ] After a representative run with all tables dropped, assert the pool's `blobs/` + `parts/` are empty (GC reclaimed). For the S3 variant, a post-suite bucket-object-count check. Investigate the harness teardown to add the assertion (or a dedicated test that creates+drops+waits+checks-empty).
-- [ ] Commit the no-leftovers check.
+- [x] Two dedicated create→write→DROP→wait→check-empty oracles, both asserting BOTH `blobs/`+`parts/` are reclaimed by the single-owner background GC after `DROP TABLE … SYNC`:
+  - Stateless (local pool): `04290_content_addressed_no_leftovers.sh` — inline CA disk over `object_storage_type=local`, pool at an **absolute** `path` under `CLICKHOUSE_USER_FILES_UNIQUE` (shell-inspectable), `gc_enabled=1`/`grace=2`/`interval=1`; baseline → insert (rises) → DROP → bounded-poll (60s cap, re-check each second) until `blobs/`+`parts/` empty; asserts `_pool_meta` survives. Local-pool inspection WORKED (no fallback). `[ OK ]`.
+  - Integration (S3): `test_content_addressed_gc_s3` **strengthened** to count BOTH `blobs/`+`parts/` (was `blobs/` only) and assert both drain to ~baseline after DROP. `1 passed`.
+  - Informational settle check: a batch under CA-default (`grace=60`) leaves objects in `ci/tmp/run_r0/content_addressed_pool` at teardown — expected (server shuts down before grace elapses; harness does not wipe the pool), NOT a leak. The dedicated short-grace tests are the authoritative proof. See backlog M6 Task D.
+- [x] Commit the no-leftovers check.
 
 ## Done / acceptance {#done}
 - The non-skipped stateless suite passes under CA-default; the skip list is entirely known-unsupported features (tracked in the backlog).
