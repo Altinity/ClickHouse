@@ -1,4 +1,4 @@
--- Tags: stateful, no-replicated-database, no-content-addressed-storage
+-- Tags: stateful, no-replicated-database
 -- Tag no-replicated-database: Fails due to additional replicas or shards
 
 DROP TABLE IF EXISTS fixed_granularity_table;

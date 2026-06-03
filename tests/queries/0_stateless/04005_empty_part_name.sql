@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 SET allow_drop_detached = 1;
 
 DROP TABLE IF EXISTS t;

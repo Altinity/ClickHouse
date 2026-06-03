@@ -1,4 +1,4 @@
--- Tags: no-random-merge-tree-settings, no-content-addressed-storage
+-- Tags: no-random-merge-tree-settings
 
 SET send_logs_level = 'fatal';
 

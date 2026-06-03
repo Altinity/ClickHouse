@@ -1,4 +1,4 @@
--- Tags: no-replicated-database, no-content-addressed-storage
+-- Tags: no-replicated-database
 -- Reproducer for LOGICAL_ERROR in REPLACE TABLE ... CLONE AS
 -- when alter_partition_verbose_result = true.
 

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_move_partition_src;
 DROP TABLE IF EXISTS test_move_partition_dest;
 

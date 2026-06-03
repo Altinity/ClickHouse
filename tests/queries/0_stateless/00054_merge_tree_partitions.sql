@@ -1,4 +1,4 @@
--- Tags: stateful, no-content-addressed-storage
+-- Tags: stateful
 DROP TABLE IF EXISTS partitions;
 set allow_deprecated_syntax_for_merge_tree=1;
 CREATE TABLE partitions (EventDate Date, CounterID UInt32) ENGINE = MergeTree(EventDate, CounterID, 8192);

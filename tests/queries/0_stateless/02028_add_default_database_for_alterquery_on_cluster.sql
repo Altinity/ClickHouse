@@ -1,4 +1,4 @@
--- Tags: distributed, no-parallel, no-replicated-database, no-content-addressed-storage
+-- Tags: distributed, no-parallel, no-replicated-database
 -- Tag no-replicated-database: ON CLUSTER is not allowed
 
 DROP DATABASE IF EXISTS {CLICKHOUSE_DATABASE_1:Identifier} ON CLUSTER test_shard_localhost;

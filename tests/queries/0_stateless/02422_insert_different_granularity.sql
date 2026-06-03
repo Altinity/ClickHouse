@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 SELECT '=== ataptive granularity: table one -; table two + ===';
 
 DROP TABLE IF EXISTS table_one;

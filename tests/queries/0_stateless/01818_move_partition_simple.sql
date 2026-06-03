@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS main_table_01818;
 DROP TABLE IF EXISTS tmp_table_01818;
 
