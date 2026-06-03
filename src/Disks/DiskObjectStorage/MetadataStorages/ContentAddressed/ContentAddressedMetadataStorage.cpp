@@ -267,6 +267,23 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         return metadata.last_modified;
     }
 
+    // A detached part DIRECTORY (<uuid[:3]>/<uuid>/detached/<detached_part>) is not a part file: the
+    // detached part is stored under a ref named "detached" whose manifest keys are shaped
+    // <detached_part>/<file> (B36), so parsePartFilePath reports part_name="detached" and a NON-empty
+    // file equal to the <detached_part> directory name (no further '/'). system.detached_parts reads
+    // modification_time by calling getLastModified on exactly this directory (StorageSystemDetachedParts
+    // -> disk->getLastModified(data_path/detached/<dir_name>)). It has no single blob; report the
+    // "detached" ref manifest object's mtime, mirroring the regular part-dir branch above.
+    if (auto p = ContentAddressed::parsePartFilePath(path);
+        p && p->part_name == ContentAddressed::kDetachedDirName && !p->file.empty() && p->file.find('/') == std::string::npos)
+    {
+        auto pid = readRefPartId(p->table_uuid, p->part_name);
+        if (!pid)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
+        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(storage_path_prefix, *pid).string(), /*with_tags=*/false);
+        return metadata.last_modified;
+    }
+
     // Mirror MetadataStorageFromPlainObjectStorage: report the resolved blob object's mtime.
     auto objects = getStorageObjects(path);
     chassert(!objects.empty());
