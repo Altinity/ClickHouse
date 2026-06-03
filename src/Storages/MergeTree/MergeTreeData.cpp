@@ -1246,37 +1246,12 @@ void MergeTreeData::setProperties(
 
 void MergeTreeData::checkContentAddressedDiskRestrictions(const StorageInMemoryMetadata & metadata) const
 {
-    /// The M1 content-addressed pool models a part as a flat set of top-level files (one manifest,
-    /// one ref). Features that need nested part metadata, a second active-set namespace, or a
-    /// whole-part clone contract (B30) are NOT representable yet, so fail closed at CREATE/ATTACH
-    /// with a clear message instead of letting them silently misbehave (B31, the Phase-5 gate).
-    /// Operations that DO work (INSERT / SELECT / merge / DROP / DETACH) are not touched here, and
-    /// mutation/clone-class features are gated at their own operation sites (supportsHardLinks for
-    /// mutations and lightweight delete; checkAlterPartitionIsPossible for the partition-clone
-    /// ALTERs — B21). This method covers only what is decidable from the table metadata at create
-    /// time: right now that is projections.
-    ///
-    /// The non-replicated deduplication window (deduplication_logs/) IS supported on a content-addressed
-    /// disk: the log auto-detects that the disk does not support append writes (the same as a plain s3
-    /// disk) and rewrites a fresh rotated log object per record, and CA's table-level file mechanism
-    /// stores those log objects in the table's files/ namespace subdirectory. No gate needed.
-    const bool has_projections = metadata.hasProjections();
-
-    if (!has_projections)
-        return;
-
-    for (const auto & disk : getStoragePolicy()->getDisks())
-    {
-        if (!disk->isContentAddressed())
-            continue;
-
-        throw Exception(
-            ErrorCodes::SUPPORT_IS_DISABLED,
-            "Table projections are not supported on a content_addressed disk yet "
-            "(the M1 manifest models a part as a flat file set and cannot represent nested "
-            "projection parts — see backlog B5/B31); disk '{}'",
-            disk->getName());
-    }
+    /// Projections are now supported on a content_addressed disk (stored as nested keys
+    /// <proj>.proj/<file> in the parent part's manifest — see the projections design spec). The
+    /// non-replicated deduplication window is also supported. Nothing else is decidable from table
+    /// metadata at CREATE/ATTACH time, so this is intentionally a no-op kept as the plug-in point for
+    /// any future create-time content-addressed restriction.
+    (void)metadata;
 }
 
 namespace
