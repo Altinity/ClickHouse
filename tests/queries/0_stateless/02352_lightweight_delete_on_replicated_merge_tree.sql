@@ -1,4 +1,4 @@
--- Tags: long
+-- Tags: long, no-content-addressed-storage
 
 DROP TABLE IF EXISTS replicated_table_r1 SYNC;
 DROP TABLE IF EXISTS replicated_table_r2 SYNC;

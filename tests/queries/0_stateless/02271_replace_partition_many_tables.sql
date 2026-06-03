@@ -1,4 +1,4 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-content-addressed-storage
 
 DROP TABLE IF EXISTS replace_partition_source;
 DROP TABLE IF EXISTS replace_partition_dest1;

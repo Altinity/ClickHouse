@@ -1,4 +1,4 @@
--- Tags: no-shared-merge-tree
+-- Tags: no-shared-merge-tree, no-content-addressed-storage
 -- Predicate works in a different way
 drop table if exists rmt;
 

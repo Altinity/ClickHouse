@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- add_minmax_index_for_numeric_columns=0: Changes data_skipping_indices
 DROP TABLE IF EXISTS test_table;
 

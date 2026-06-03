@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-parallel-replicas
+-- Tags: no-fasttest, no-parallel-replicas, no-content-addressed-storage
 
 -- Verify that vector search queries on multiple parts use lazy materialization
 

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists ttl_test_02129;
 
 create table ttl_test_02129(a Int64, b String, d Date)

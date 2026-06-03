@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-ordinary-database
+-- Tags: no-fasttest, no-ordinary-database, no-content-addressed-storage
 
 -- Tests that vector search indexes use a (non-standard) index granularity of 100 mio by default.
 

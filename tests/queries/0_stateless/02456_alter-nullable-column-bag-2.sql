@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t1 SYNC;
 CREATE TABLE t1  (v UInt64) ENGINE=ReplicatedMergeTree('/test/tables/{database}/test/t1', 'r1') ORDER BY v PARTITION BY v;
 INSERT INTO t1 values(1);

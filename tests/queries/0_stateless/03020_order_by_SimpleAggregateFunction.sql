@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 set allow_suspicious_primary_key = 0;
 
 drop table if exists data;

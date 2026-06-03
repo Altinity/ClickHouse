@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 {# force compact parts and wide #}
 {% for min_bytes_for_wide_part in [100000, 0] %}
 DROP TABLE IF EXISTS compact_alter_{{ min_bytes_for_wide_part }};

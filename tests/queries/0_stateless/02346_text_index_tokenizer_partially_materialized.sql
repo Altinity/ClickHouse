@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 --- Verifies that tokenizer is properly passed to supported functions when a text index is partially materialized.
 
 SET use_skip_indexes = 1;

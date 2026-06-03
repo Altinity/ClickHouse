@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS dep;
 DROP TABLE IF EXISTS dep2;
 DROP TABLE IF EXISTS id_join;

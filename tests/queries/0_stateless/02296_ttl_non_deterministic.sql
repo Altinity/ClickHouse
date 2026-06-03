@@ -1,4 +1,4 @@
--- Tags: replica
+-- Tags: replica, no-content-addressed-storage
 
 DROP TABLE IF EXISTS t_ttl_non_deterministic;
 

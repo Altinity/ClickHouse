@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS table;
 DROP DICTIONARY IF EXISTS dict;
 DROP TABLE IF EXISTS view;

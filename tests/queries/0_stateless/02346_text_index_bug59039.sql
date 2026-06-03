@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Test that DROP INDEX removes all index related files.
 -- This can't be tested directly but we can at least check that no bad things happen.
 

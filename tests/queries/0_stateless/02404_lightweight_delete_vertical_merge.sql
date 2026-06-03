@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS lwd_test;
 
 CREATE TABLE lwd_test

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-shared-merge-tree, long
+# Tags: zookeeper, no-shared-merge-tree, long, no-content-addressed-storage
 # no-shared-merge-tree: depend on local fs
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

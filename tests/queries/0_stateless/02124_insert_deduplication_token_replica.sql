@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- insert data duplicates by providing deduplication token on insert
 
 DROP TABLE IF EXISTS insert_dedup_token1 SYNC;

@@ -1,4 +1,4 @@
--- Tags: no-parallel-replicas
+-- Tags: no-parallel-replicas, no-content-addressed-storage
 
 --- Verifies that direct read on partially materialized text indexes
 

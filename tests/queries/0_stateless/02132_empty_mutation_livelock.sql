@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists a8x;
 
 set empty_result_for_aggregation_by_empty_set=1;

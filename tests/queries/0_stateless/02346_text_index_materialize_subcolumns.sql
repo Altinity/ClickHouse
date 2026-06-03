@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Tests that text indexes can be created and used on subcolumns
 
 DROP TABLE IF EXISTS tab;

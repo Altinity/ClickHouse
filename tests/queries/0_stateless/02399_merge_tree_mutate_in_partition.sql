@@ -1,4 +1,5 @@
 
+-- Tags: no-content-addressed-storage
 drop table if exists mt;
 drop table if exists m;
 

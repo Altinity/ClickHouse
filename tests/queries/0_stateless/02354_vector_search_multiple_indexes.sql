@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-ordinary-database
+-- Tags: no-fasttest, no-ordinary-database, no-content-addressed-storage
 
 -- Tests that multiple vector similarity indexes can be created on the same column (even if that makes no sense)
 

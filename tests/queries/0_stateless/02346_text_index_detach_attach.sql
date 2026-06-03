@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Test that detaching and attaching parts with a text index works
 
 CREATE TABLE tab

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_materialize_column;
 
 CREATE TABLE t_materialize_column (i Int32)

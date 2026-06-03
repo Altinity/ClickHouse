@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Test that we cannot drop a column that an ALIAS column's expression depends on.
 -- Dropping the ALIAS column itself is allowed; then the base column can be dropped.
 

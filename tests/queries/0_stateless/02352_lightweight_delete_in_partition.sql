@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_merge_tree SYNC;
 DROP TABLE IF EXISTS t_replicated_merge_tree SYNC;
 
