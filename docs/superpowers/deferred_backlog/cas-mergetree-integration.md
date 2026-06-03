@@ -296,5 +296,7 @@ MySQL/native `::1` ports — IPv6 unreachable in the local harness; both fail id
 > `00 01` slice. Remaining for a final full run: the `02*`/`03*`/`04*` numeric ranges not in this slice,
 > and re-running the tagged batch to confirm green (tagged→skip, rest→pass).
 
+| B48 | **`clickhouse local` with a CA disk may not exit cleanly (shutdown hang).** During M6 triage, several `clickhouse local --queries-file <repro.sql>` invocations using an inline `content_addressed` disk were found hung for **3–21 hours** (orphaned processes), where the query had completed but the process never exited. Server-mode (praktika) tests shut down fine, so it is **local-mode-specific** — likely a background `BackgroundSchedulePool`/GC-thread or `_pool_meta` resource not joined/released on `clickhouse local` teardown (or a `DETACH PARTITION ALL` repro hang). | Surfaced while reaping orphaned processes after the overnight run; not caught by tests (they timeout-kill, masking a hang as a normal kill) | Investigate `LocalServer` shutdown vs the CA metadata storage's `shutdown()` (GC thread `task->deactivate()`); ensure the GC thread/pool task is reaped on local exit. Until fixed, treat `clickhouse local` + CA as needing an explicit process kill. Possibly relates to the GC-thread lifecycle (M5.2/Task A). |
+
 > Add new deferred items here as they arise during planning/implementation, always filling the
 > "where it plugs in" column so the architecture stays dead-end-free.
