@@ -3093,3 +3093,22 @@ TEST_F(ContentAddressedMetaTest, PartDirListingCollapsesProjectionToDirEntry)
     std::set<std::string> got(names.begin(), names.end());
     EXPECT_EQ(got, (std::set<std::string>{"columns.txt", "data.bin", "p_sum.proj", "p_max.proj"}));
 }
+
+// The content-addressed part_id hashes the part's full file set, INCLUDING nested projection keys, so a
+// part with a projection and the same part WITHOUT it get distinct part_ids (no false dedup), and
+// ADD/DROP/MATERIALIZE PROJECTION yields a new part version. (Spec §2.)
+TEST(ContentAddressedPartId, IncludesProjectionFiles)
+{
+    using namespace DB::ContentAddressed;
+    auto blob = [](const std::string & s) { return BlobEntry{BlobHash(s), s.size(), BlobHash(s).string()}; };
+
+    std::map<std::string, BlobEntry> base{
+        {"columns.txt", blob("c")}, {"data.bin", blob("d")}, {"checksums.txt", blob("k")}};
+
+    std::map<std::string, BlobEntry> with_proj = base;
+    with_proj["p_sum.proj/data.bin"] = blob("pd");
+    with_proj["p_sum.proj/columns.txt"] = blob("pc");
+
+    EXPECT_NE(computePartId(base), computePartId(with_proj));
+    EXPECT_EQ(computePartId(with_proj), computePartId(with_proj));
+}
