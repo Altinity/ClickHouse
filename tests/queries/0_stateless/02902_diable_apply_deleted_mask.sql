@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_apply_deleted_mask;
 
 CREATE TABLE test_apply_deleted_mask(id Int64, value String) ENGINE = MergeTree ORDER BY id;

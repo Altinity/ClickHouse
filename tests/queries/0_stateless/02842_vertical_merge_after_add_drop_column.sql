@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- In some versions vertical merges after DROP COLUMN was broken in some cases
 
 drop table if exists data;

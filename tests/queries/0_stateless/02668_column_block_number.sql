@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test;
 
 CREATE TABLE test (id UInt32, a UInt32) ENGINE = MergeTree ORDER BY id

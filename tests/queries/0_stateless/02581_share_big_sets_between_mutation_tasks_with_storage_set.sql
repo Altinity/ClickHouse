@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS 02581_trips;
 
 CREATE TABLE 02581_trips(id UInt32, description String, id2 UInt32, PRIMARY KEY id) ENGINE=MergeTree ORDER BY id;

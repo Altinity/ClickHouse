@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS lwd_test_02521;
 
 CREATE TABLE lwd_test_02521 (id UInt64, value String, event_time DateTime)

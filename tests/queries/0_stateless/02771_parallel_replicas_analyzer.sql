@@ -1,4 +1,4 @@
--- Tags: zookeeper
+-- Tags: zookeeper, no-content-addressed-storage
 DROP TABLE IF EXISTS join_inner_table__fuzz_146_replicated SYNC;
 CREATE TABLE join_inner_table__fuzz_146_replicated
 (

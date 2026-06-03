@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 CREATE TABLE test (
     `c_id` String,
     `p_id` String,

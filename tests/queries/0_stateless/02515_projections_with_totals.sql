@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t;
 CREATE TABLE t (x UInt8, PROJECTION p (SELECT x GROUP BY x)) ENGINE = MergeTree ORDER BY ();
 INSERT INTO t VALUES (0);

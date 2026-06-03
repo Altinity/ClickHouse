@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 CREATE TABLE attach_partition_t7 (
                                      a UInt32,
                                      b UInt32

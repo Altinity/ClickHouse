@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-random-merge-tree-settings, no-random-settings
+# Tags: no-random-merge-tree-settings, no-random-settings, no-content-addressed-storage
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: replica, no-fasttest, no-shared-merge-tree
+# Tags: replica, no-fasttest, no-shared-merge-tree, no-content-addressed-storage
 # no-fasttest: Mutation load can be slow
 # no-shared-merge-tree -- have separate test for it
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

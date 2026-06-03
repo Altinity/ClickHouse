@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS 02691_drop_column_replicated;
 
 CREATE TABLE 02691_drop_column_replicated (col1 Int64, col2 Int64, PROJECTION 02691_drop_column_replicated (SELECT * ORDER BY col1 ))

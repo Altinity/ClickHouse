@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- test different index type
 CREATE TABLE attach_partition_t1 (
 	a UInt32,

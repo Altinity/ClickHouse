@@ -1,4 +1,4 @@
--- Tags: no-tsan, no-asan, no-ubsan, no-msan, no-fasttest
+-- Tags: no-tsan, no-asan, no-ubsan, no-msan, no-fasttest, no-content-addressed-storage
 -- no-fasttest: Slow test
 -- no sanitizers: too slow sometimes
 

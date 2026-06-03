@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 set mutations_sync = 2;
 
 drop table if exists t_delete_skip_index;

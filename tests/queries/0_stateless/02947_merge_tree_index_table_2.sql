@@ -1,4 +1,4 @@
--- Tags: no-random-settings
+-- Tags: no-random-settings, no-content-addressed-storage
 
 DROP TABLE IF EXISTS t_merge_tree_index;
 

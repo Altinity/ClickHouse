@@ -1,4 +1,4 @@
--- Tags: no-shared-merge-tree
+-- Tags: no-shared-merge-tree, no-content-addressed-storage
 -- With shared merge tree non deterministic mutations are allowed
 DROP TABLE IF EXISTS t_mutations_nondeterministic SYNC;
 

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Test that the optimizer picks up column statistics
 -- (The concrete statistics type, column data type and predicate type don't matter)
 

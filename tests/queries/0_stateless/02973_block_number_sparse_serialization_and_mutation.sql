@@ -1,4 +1,4 @@
--- Tags: zookeeper
+-- Tags: zookeeper, no-content-addressed-storage
 
 -- we need exact block-numbers
 SET insert_keeper_fault_injection_probability=0;

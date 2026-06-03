@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS cool_table;
 
 CREATE TABLE IF NOT EXISTS cool_table

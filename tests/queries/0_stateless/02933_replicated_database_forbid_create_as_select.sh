@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: replica
+# Tags: replica, no-content-addressed-storage
 
 # CREATE AS SELECT for Replicated database is broken (https://github.com/ClickHouse/ClickHouse/issues/35408).
 # This should be fixed and this test should eventually be deleted.

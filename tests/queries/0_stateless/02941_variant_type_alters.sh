@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, memory-engine
+# Tags: long, memory-engine, no-content-addressed-storage
 # memory-engine: minor data inconsistency after alter
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

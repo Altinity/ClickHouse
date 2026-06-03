@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 SET optimize_use_projections = 1;
 
 -- { echoOn }

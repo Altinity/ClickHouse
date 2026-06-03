@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Regression test for https://github.com/ClickHouse/ClickHouse/issues/102926
 -- `decrefColumnsDescriptionForColumns` must evict cache entries for schemas with
 -- `Nested` columns where `Nested::collect` produces a distinct `with_collected_nested`.

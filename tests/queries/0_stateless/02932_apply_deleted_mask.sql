@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_materialize_delete;
 
 CREATE TABLE t_materialize_delete (id UInt64, v UInt64)

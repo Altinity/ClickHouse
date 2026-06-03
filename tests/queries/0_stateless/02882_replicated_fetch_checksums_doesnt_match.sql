@@ -1,4 +1,4 @@
--- Tags: no-shared-merge-tree
+-- Tags: no-shared-merge-tree, no-content-addressed-storage
 
 DROP TABLE IF EXISTS checksums_r3;
 DROP TABLE IF EXISTS checksums_r2;

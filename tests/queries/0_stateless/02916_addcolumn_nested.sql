@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 SET flatten_nested = 0;
 
 DROP TABLE IF EXISTS nested_table;

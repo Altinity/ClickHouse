@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-fasttest
+# Tags: zookeeper, no-replicated-database, no-fasttest, no-content-addressed-storage
 # no-fasttest: Slow wait
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

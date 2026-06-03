@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_async_insert_skip_settings SYNC;
 
 CREATE TABLE t_async_insert_skip_settings (id UInt64)

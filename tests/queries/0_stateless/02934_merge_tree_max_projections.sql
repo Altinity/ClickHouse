@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_max_mt_projections_alter;
 CREATE TABLE test_max_mt_projections_alter (c1 UInt32, c2 UInt32, c3 UInt32)
         ENGINE = MergeTree ORDER BY c1

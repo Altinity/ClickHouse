@@ -1,4 +1,4 @@
--- Tags: no-random-merge-tree-settings, no-random-settings
+-- Tags: no-random-merge-tree-settings, no-random-settings, no-content-addressed-storage
 -- Because we compare part sizes, and they could be affected by index granularity and index compression settings.
 
 CREATE TABLE part_log_bytes_uncompressed (

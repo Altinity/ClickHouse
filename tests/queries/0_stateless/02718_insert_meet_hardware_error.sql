@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-parallel
+-- Tags: zookeeper, no-parallel, no-content-addressed-storage
 
 DROP TABLE IF EXISTS t_hardware_error NO DELAY;
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-ordinary-database, no-shared-merge-tree
+# Tags: no-ordinary-database, no-shared-merge-tree, no-content-addressed-storage
 # Tag no-ordinary-database: requires UUID
 # Tag no-shared-merge-tree -- unrelated test
 

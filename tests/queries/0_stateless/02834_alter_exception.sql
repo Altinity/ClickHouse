@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS alter_02834;
 CREATE TABLE alter_02834 (a UInt64) ENGINE=MergeTree() ORDER BY a;
 ALTER TABLE alter_02834 MODIFY QUERY SELECT a FROM alter_02834; -- { serverError NOT_IMPLEMENTED }

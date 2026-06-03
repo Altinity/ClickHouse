@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-replicated-database, no-shared-merge-tree
+-- Tags: zookeeper, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
 
 CREATE TABLE t
 (
