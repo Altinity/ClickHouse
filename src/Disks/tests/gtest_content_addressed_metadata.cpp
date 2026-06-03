@@ -1970,3 +1970,53 @@ TEST_F(ContentAddressedMetaTest, PoolMetaUnknownVersionFailsClosed)
         DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-one", /*allow_shared=*/false, getLogger("test")),
         DB::Exception);
 }
+
+// M7 T1: a mutation rewrites ONE column and carries the rest forward by reference — the new part's
+// unchanged-column blobs MUST be the SAME blob objects as the source (no re-upload); only the
+// changed column is a fresh blob. This is the content-addressing sweet spot the mutation path relies
+// on (MutateTask: createHardLinkFrom unchanged + writeFile changed, one commit).
+TEST_F(ContentAddressedMetaTest, MutationCarryForwardReusesUnchangedBlobs)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_mut_cf");
+    auto os = getObjectStorage("cas_mut_cf");
+    const std::string uuid = "uuid-mut";
+    const std::string src = "all_1_1_0";
+    const std::string dst = "all_1_1_0_2"; // mutation version 2
+
+    {
+        DB::ContentAddressedTransaction tx(*ms, "", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"a.bin", "AAA"}, {"b.bin", "BBB"}, {"columns.txt", "a b"}})
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + src + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    auto src_a = ms->getStorageObjects("uui/" + uuid + "/" + src + "/a.bin")[0].remote_path;
+    auto src_b = ms->getStorageObjects("uui/" + uuid + "/" + src + "/b.bin")[0].remote_path;
+
+    {
+        DB::ContentAddressedTransaction tx(*ms, "", kCasTestScratch);
+        tx.createHardLinkFrom("uui/" + uuid + "/" + src + "/a.bin",       "uui/" + uuid + "/" + dst + "/a.bin");
+        tx.createHardLinkFrom("uui/" + uuid + "/" + src + "/columns.txt", "uui/" + uuid + "/" + dst + "/columns.txt");
+        auto buf = tx.writeFile("uui/" + uuid + "/" + dst + "/b.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string nb = "NEWB";
+        buf->write(nb.data(), nb.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // (a) unchanged columns carried forward -> SAME blob objects (no re-upload)
+    EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/" + dst + "/a.bin")[0].remote_path, src_a);
+    // (b) changed column -> a DIFFERENT, fresh blob; content is the new bytes
+    auto dst_b = ms->getStorageObjects("uui/" + uuid + "/" + dst + "/b.bin")[0].remote_path;
+    EXPECT_NE(dst_b, src_b);
+    EXPECT_EQ(readObject(os, dst_b), "NEWB");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/" + dst + "/a.bin")[0].remote_path), "AAA");
+    // (c) the source part is untouched (its b.bin still resolves to BBB)
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/" + src + "/b.bin")[0].remote_path), "BBB");
+}
