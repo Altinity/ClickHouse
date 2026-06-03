@@ -1,4 +1,4 @@
--- Tags: distributed, no-content-addressed-storage
+-- Tags: distributed
 
 SET optimize_trivial_insert_select = 0;
 

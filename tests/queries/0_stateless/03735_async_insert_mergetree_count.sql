@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 set async_insert = 1;
 set wait_for_async_insert = 0;
 set async_insert_deduplicate = 1;

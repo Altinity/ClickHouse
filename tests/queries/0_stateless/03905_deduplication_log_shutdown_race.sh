@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: race, no-content-addressed-storage
+# Tags: race
 # Test for a race condition between ALTER TABLE MODIFY SETTING of
 # non_replicated_deduplication_window and DROP TABLE / table shutdown.
 # The bug: setDeduplicationWindowSize did not check the `stopped` flag,
