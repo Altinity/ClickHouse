@@ -1,4 +1,5 @@
 -- Tags: no-msan, no-content-addressed-storage
+-- no-content-addressed-storage: uses BACKUP/RESTORE (B16/B34/B35)
 
 CREATE TABLE 03593_backup_with_broken_projection
 (

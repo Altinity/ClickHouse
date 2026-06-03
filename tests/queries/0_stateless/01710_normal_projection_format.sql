@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE if exists test;
 
 CREATE TABLE test

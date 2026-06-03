@@ -1,4 +1,5 @@
 -- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: uses distributed/remote table functions
 DROP TABLE IF EXISTS r;
 
 select finalizeAggregation(cast(quantileState(0)(arrayJoin([1,2,3])) as AggregateFunction(quantile(1), UInt8)));

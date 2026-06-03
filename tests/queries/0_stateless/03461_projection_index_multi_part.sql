@@ -1,4 +1,4 @@
--- Tags: no-random-settings, no-random-merge-tree-settings, no-content-addressed-storage
+-- Tags: no-random-settings, no-random-merge-tree-settings
 
 -- Test for projection as secondary index with multiple parts
 -- This is a regression test for https://github.com/ClickHouse/ClickHouse/issues/90953

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 set optimize_use_projections = 1, force_optimize_projection = 1;
 
 drop table if exists tp;

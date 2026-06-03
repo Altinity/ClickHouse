@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- add_minmax_index_for_numeric_columns=0: Would use the index and not the projection that we want to test
 drop table if exists t;
 

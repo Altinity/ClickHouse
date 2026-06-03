@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists test;
 
 create table test(dim1 String, dim2 String, projection p1 (select dim1, dim2, count() group by dim1, dim2)) engine MergeTree order by dim1;

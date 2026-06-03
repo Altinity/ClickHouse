@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- This test would hit a LOGICAL_ERROR during merge
 CREATE TABLE post_state
 (

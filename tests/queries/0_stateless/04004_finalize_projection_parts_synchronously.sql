@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Test that finalize_projection_parts_synchronously works correctly:
 -- data is written and readable via both the primary key and projections.
 

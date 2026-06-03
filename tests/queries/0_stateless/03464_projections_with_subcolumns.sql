@@ -1,4 +1,5 @@
 -- Tags: long, no-content-addressed-storage
+-- no-content-addressed-storage: CA mutation/MATERIALIZE-PROJECTION path incomplete (B59)
 
 set enable_analyzer=1;
 set mutations_sync=1;

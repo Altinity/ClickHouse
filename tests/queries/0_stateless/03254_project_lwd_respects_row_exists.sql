@@ -1,5 +1,4 @@
 
--- Tags: no-content-addressed-storage
 -- compact test
 DROP TABLE IF EXISTS users_compact;
 

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS video_log;
 DROP TABLE IF EXISTS video_log_result__fuzz_0;
 DROP TABLE IF EXISTS rng;

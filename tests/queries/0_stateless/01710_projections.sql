@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- add_minmax_index_for_numeric_columns=0: Implicit indices will filter before projections
 drop table if exists projection_test;
 

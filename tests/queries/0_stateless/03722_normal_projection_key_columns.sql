@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 SET enable_analyzer = 1;
 -- enable projection for parallel replicas
 SET parallel_replicas_local_plan = 1;

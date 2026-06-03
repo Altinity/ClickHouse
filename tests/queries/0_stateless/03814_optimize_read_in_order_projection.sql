@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Projections should use ReadType: InOrder when ORDER BY matches projection's sorting key.
 -- Previously, ReadType would be Default (https://github.com/ClickHouse/ClickHouse/issues/89453)
 -- Tags: no-random-settings

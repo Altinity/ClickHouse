@@ -1,4 +1,4 @@
--- Tags: no-random-merge-tree-settings, no-content-addressed-storage
+-- Tags: no-random-merge-tree-settings
 
 DROP TABLE IF EXISTS data;
 DROP TABLE IF EXISTS mv_indexes;

@@ -1,4 +1,5 @@
 -- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: CA mutation/MATERIALIZE-PROJECTION path incomplete (B59)
 DROP TABLE IF EXISTS video_log;
 
 CREATE TABLE video_log

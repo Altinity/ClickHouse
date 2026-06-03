@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Tags: no-content-addressed-storage
 
 # Tests profile event "SelectedMarksByPrimaryKeyUsage"
 

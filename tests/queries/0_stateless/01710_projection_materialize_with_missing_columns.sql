@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists x;
 
 create table x (i int) engine MergeTree order by tuple();

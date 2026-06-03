@@ -1,4 +1,5 @@
 -- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: uses ATTACH/MOVE PARTITION (B21 whole-part clone)
 drop table if exists d;
 
 create table d (i int, j int) engine MergeTree partition by i % 2 order by tuple() settings index_granularity = 1;

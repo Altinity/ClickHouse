@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, no-content-addressed-storage
+# Tags: long
 
 set -e
 

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 SET use_skip_indexes_for_top_k = 0;
 SET use_top_k_dynamic_filtering = 0;
 

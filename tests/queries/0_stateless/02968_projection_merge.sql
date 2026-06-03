@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 SELECT 'ReplacingMergeTree';
 DROP TABLE IF EXISTS tp;
 CREATE TABLE tp

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- For cloud version, should also consider min_bytes_for_full_part_storage since packed storage exists,
 -- but for less redundancy, just let CI test the parameter.
 

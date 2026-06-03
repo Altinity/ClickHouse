@@ -1,4 +1,5 @@
 -- Tags: no-random-settings, no-random-merge-tree-settings, no-content-addressed-storage
+-- no-content-addressed-storage: CA mutation/MATERIALIZE-PROJECTION path incomplete (B59)
 
 DROP TABLE IF EXISTS t_proj_external;
 

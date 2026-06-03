@@ -1,4 +1,5 @@
 -- Tags: no-replicated-database, no-content-addressed-storage
+-- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 
 DROP TABLE IF EXISTS t_proj_merge;
 DROP TABLE IF EXISTS t_proj_rebuild;

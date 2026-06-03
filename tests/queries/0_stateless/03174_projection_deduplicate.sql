@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- https://github.com/ClickHouse/ClickHouse/issues/65548
 DROP TABLE IF EXISTS test_projection_deduplicate;
 

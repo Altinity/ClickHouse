@@ -1,4 +1,4 @@
--- Tags: no-async-insert, no-content-addressed-storage
+-- Tags: no-async-insert
 -- no-async-insert: initializeAggregation in VALUES is evaluated server-side via the expression template
 -- system in the async insert path, which sporadically fails with type mismatch in template evaluation.
 

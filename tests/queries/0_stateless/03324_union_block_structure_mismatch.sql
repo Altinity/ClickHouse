@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 SET optimize_use_projections = 1;
 
 -- Test for "Block structure mismatch in UnionStep" bug

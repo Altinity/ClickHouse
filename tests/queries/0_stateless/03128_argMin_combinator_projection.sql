@@ -1,4 +1,5 @@
 -- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 DROP TABLE IF EXISTS combinator_argMin_table_r1 SYNC;
 DROP TABLE IF EXISTS combinator_argMin_table_r2 SYNC;
 

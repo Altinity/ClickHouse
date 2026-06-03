@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS fx_1m;
 DROP TABLE IF EXISTS fx_5m;
 

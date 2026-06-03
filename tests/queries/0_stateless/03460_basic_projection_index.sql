@@ -1,4 +1,5 @@
 -- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 -- { echo ON }
 
 SET enable_analyzer = 1;

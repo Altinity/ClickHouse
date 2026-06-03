@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists projection_test__fuzz_0;
 set allow_suspicious_low_cardinality_types=1;
 

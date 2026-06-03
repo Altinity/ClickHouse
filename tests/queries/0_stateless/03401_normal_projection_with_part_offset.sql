@@ -1,4 +1,5 @@
 -- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: CA mutation/MATERIALIZE-PROJECTION path incomplete (B59)
 -- { echo ON }
 
 DROP TABLE IF EXISTS test;

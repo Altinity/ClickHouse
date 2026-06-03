@@ -1,4 +1,5 @@
 -- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: uses ATTACH/MOVE PARTITION (B21 whole-part clone)
 -- test different index type
 CREATE TABLE attach_partition_t1 (
 	a UInt32,

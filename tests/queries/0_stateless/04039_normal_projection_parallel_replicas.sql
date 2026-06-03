@@ -1,4 +1,4 @@
--- Tags: no-random-settings, no-content-addressed-storage
+-- Tags: no-random-settings
 
 -- Regression test for normal projections with parallel replicas.
 -- Verifies that the projection optimization is applied and produces
