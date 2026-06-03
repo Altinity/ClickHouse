@@ -6583,41 +6583,30 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                 }
                 case MetadataStorageType::ContentAddressed:
                 {
-                    /// On a content_addressed disk a whole-part clone is free: identical content yields
-                    /// identical blob hashes, hence the same manifest and the same `part_id`, so a clone
-                    /// is just publishing ONE ref to the existing `part_id`. The whole-part clone now
-                    /// runs through ONE content-addressed transaction: `DataPartStorageOnDiskBase::freeze`
-                    /// wraps the per-file `createHardLink` (each file carried forward by reference) in a
-                    /// single self-created disk transaction and commits once when `disk->isContentAddressed`,
-                    /// so the commit publishes one ref to the source `part_id` — no per-file autocommit,
-                    /// no last-file-wins corruption. This is the path the clone-class partition commands
-                    /// take, so they are now supported: `ATTACH PARTITION` of the table's own detached
-                    /// parts, `ATTACH PART`, `REPLACE PARTITION` (also `ATTACH PARTITION ... FROM`, which
-                    /// parses to `REPLACE_PARTITION` with `replace=false`), `MOVE PARTITION`, and the
-                    /// `FREEZE`/`UNFREEZE` family. The pointer-unlink commands `DROP PARTITION` /
-                    /// `DETACH PARTITION` (both `DROP_PARTITION`) and `DROP DETACHED PARTITION` stay
-                    /// allowed.
-                    ///
-                    /// Caveats handled / gated elsewhere: cross-disk `MOVE … TO DISK/VOLUME` is a
-                    /// byte-copy `clonePart` (a different path, not the in-pool `freeze` clone) and may
-                    /// still fail closed; `BACKUP` (B34) is gated separately; `FETCH PARTITION`
-                    /// (`FETCH_PARTITION`) stays rejected because it is replication (B1).
+                    /// A content_addressed disk shares one pool across parts; the part-cloning
+                    /// partition commands clone parts via `cloneAndLoadDataPart` / Backup, which calls
+                    /// `DiskObjectStorage::createHardLink` once per file with NO enclosing transaction.
+                    /// Each call autocommits a one-file manifest/ref and overwrites the destination
+                    /// ref, leaving the clone with only its last file (the corruption is silent — the
+                    /// part reads back almost empty). This affects every command that materialises a
+                    /// new part by cloning: `MOVE PARTITION` (TO TABLE / DISK / VOLUME),
+                    /// `REPLACE PARTITION`, `ATTACH PARTITION ... FROM`, AND plain `ATTACH PARTITION`
+                    /// of the table's own detached parts (ATTACH re-clones the detached part into the
+                    /// active set). Until that clone path is made transactional, fail closed and reject
+                    /// all of them. Only the pointer-unlink commands are safe: `DROP PARTITION`,
+                    /// `DETACH PARTITION` (both `DROP_PARTITION`, with `detach` distinguishing them),
+                    /// and `DROP DETACHED PARTITION` — none of these clone a part. Note `ATTACH
+                    /// PARTITION ... FROM` parses to `REPLACE_PARTITION` (with `replace=false`).
                     const static auto supported_commands = {
                         PartitionCommand::DROP_PARTITION,
                         PartitionCommand::DROP_DETACHED_PARTITION,
-                        PartitionCommand::ATTACH_PARTITION,
-                        PartitionCommand::REPLACE_PARTITION,
-                        PartitionCommand::MOVE_PARTITION,
-                        PartitionCommand::FREEZE_PARTITION,
-                        PartitionCommand::FREEZE_ALL_PARTITIONS,
-                        PartitionCommand::UNFREEZE_PARTITION,
-                        PartitionCommand::UNFREEZE_ALL_PARTITIONS,
                     };
 
                     if (!std::ranges::contains(supported_commands, command.type))
                         throw Exception(
                             ErrorCodes::SUPPORT_IS_DISABLED,
-                            "Partition operation ALTER TABLE {} is not supported on a content_addressed disk yet; disk '{}'",
+                            "Partition operation ALTER TABLE {} is not supported on a content_addressed disk yet "
+                            "(it clones parts file-by-file with no transaction, which would corrupt the clone); disk '{}'",
                             command.typeToString(), disk->getName());
                     break;
                 }
