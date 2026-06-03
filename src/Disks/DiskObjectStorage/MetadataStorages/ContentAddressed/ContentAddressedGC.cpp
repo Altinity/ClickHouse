@@ -26,6 +26,8 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int CANNOT_OPEN_FILE;
+    extern const int FILE_DOESNT_EXIST;
 }
 
 namespace ContentAddressed
@@ -126,7 +128,23 @@ std::set<BlobObjectKey> sessionPinnedBlobs(
     std::set<BlobObjectKey> pinned;
     for (const auto & key : listKeysUnder(object_storage, sessionsPrefix(key_prefix)))
     {
-        const WriteSession session = WriteSession::deserialize(readSmallObject(object_storage, key));
+        /// A session listed here can be removed by its owner (commit/abort -> releaseSession) between
+        /// this LIST and the READ. A vanished session is simply gone: on commit its blobs are now
+        /// reachable via the published ref; on abort they were never referenced — so skip it instead of
+        /// throwing. Only the missing-object errors are swallowed; a malformed/truncated session still
+        /// fails closed via deserialize (never best-effort on corruption).
+        std::string raw;
+        try
+        {
+            raw = readSmallObject(object_storage, key);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::CANNOT_OPEN_FILE || e.code() == ErrorCodes::FILE_DOESNT_EXIST)
+                continue;
+            throw;
+        }
+        const WriteSession session = WriteSession::deserialize(raw);
         /// An EXPIRED session is itself reclaimable (a crashed writer must not pin blobs forever): the
         /// lease is a liveness HINT only, never the basis of a positive "still pinned" decision. `now`
         /// is the sweep clock; the lease is unsigned, so compare in a common signed domain (a negative

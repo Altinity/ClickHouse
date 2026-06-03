@@ -2456,6 +2456,51 @@ TEST_F(ContentAddressedMetaTest, SessionPinListsPendingBlobsBeforeRefPublish)
     EXPECT_EQ(pinned_blob_keys, committed_blob_keys);
 }
 
+// B57: LocalObjectStorage::removeObject prunes empty parent dirs, so a sibling transaction's
+// releaseSession can rmdir the shared sessions/ dir while another transaction is still writing its pin.
+// persistSession must survive a pruned sessions/ dir: the next write re-creates it. (This reproduces the
+// pruned-directory state deterministically; the tight create_directories->open race itself is intrinsic
+// to LocalObjectStorage and is covered end-to-end by 02434_cancel_insert_when_client_dies.)
+TEST_F(ContentAddressedMetaTest, SessionPersistSurvivesSessionsDirPrune)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_session_prune");
+    auto os = getObjectStorage("cas_session_prune");
+    const std::string uuid = "uuid-session-prune";
+    const std::string part = "all_1_1_0";
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+
+    // First blob opens the session, creating the sessions/ directory.
+    {
+        auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/a.bin", 4096, DB::WriteMode::Rewrite, {});
+        buf->write("AAA", 3);
+        buf->finalize();
+    }
+    auto keys = listKeysUnder(os, sessionsPrefix(""));
+    ASSERT_EQ(keys.size(), 1u);
+
+    // Simulate a concurrent sibling's releaseSession: removeObjectIfExists -> LocalObjectStorage's
+    // removeObject unlinks the only session object AND prunes the now-empty sessions/ directory.
+    os->removeObjectIfExists(DB::StoredObject(keys[0]));
+    EXPECT_TRUE(listKeysUnder(os, sessionsPrefix("")).empty());
+
+    // Second blob: persistSession must re-create the pruned directory and succeed (no CANNOT_OPEN_FILE).
+    {
+        auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/b.bin", 4096, DB::WriteMode::Rewrite, {});
+        buf->write("BBBB", 4);
+        buf->finalize();
+    }
+
+    // The session is durable again and pins BOTH blobs.
+    auto keys2 = listKeysUnder(os, sessionsPrefix(""));
+    ASSERT_EQ(keys2.size(), 1u);
+    auto session = WriteSession::deserialize(readObject(os, keys2[0]));
+    EXPECT_EQ(session.pending.size(), 2u);
+
+    tx.commit(DB::NoCommitOptions{});
+}
+
 // CAS M8 Phase B: an ABORTED transaction (one that goes out of scope without commit) must not leave a
 // lingering session object. Its lease would expire anyway, but the destructor removes it eagerly,
 // mirroring the in-process pin release.

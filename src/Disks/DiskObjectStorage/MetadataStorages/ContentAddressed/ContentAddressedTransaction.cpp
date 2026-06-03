@@ -29,6 +29,8 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
     extern const int CORRUPTED_DATA;
+    extern const int CANNOT_OPEN_FILE;
+    extern const int FILE_DOESNT_EXIST;
 }
 
 ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_, std::string key_prefix_, std::string local_scratch_path_)
@@ -113,9 +115,32 @@ void ContentAddressedTransaction::persistSession()
     /// durable before the blob can be observed by a remote sweep.
     const std::string key = ContentAddressed::sessionKey(key_prefix, session_id);
     const std::string bytes = session.serialize();
-    auto out = metadata_storage.object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
-    out->write(bytes.data(), bytes.size());
-    out->finalize();
+
+    /// writeObject (LocalObjectStorage) runs fs::create_directories(parent) then opens the file, while
+    /// removeObject (a SIBLING transaction's releaseSession) unlinks the object AND prunes empty parent
+    /// dirs. Under concurrent inserts on the same mounter the shared sessions/ dir can be rmdir'd in the
+    /// window between this create_directories and the open, surfacing CANNOT_OPEN_FILE/ENOENT on the
+    /// INSERT. Retry: each attempt re-runs create_directories and almost always wins the next time. Fail
+    /// closed (rethrow) after a bounded number of attempts so the cross-mounter pin is never silently
+    /// dropped. A real object store has no directories, so this races only on a local-backed pool.
+    constexpr size_t max_attempts = 5;
+    for (size_t attempt = 1; ; ++attempt)
+    {
+        try
+        {
+            auto out = metadata_storage.object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
+            out->write(bytes.data(), bytes.size());
+            out->finalize();
+            return;
+        }
+        catch (const Exception & e)
+        {
+            if (attempt < max_attempts
+                && (e.code() == ErrorCodes::CANNOT_OPEN_FILE || e.code() == ErrorCodes::FILE_DOESNT_EXIST))
+                continue;
+            throw;
+        }
+    }
 }
 
 void ContentAddressedTransaction::releaseSession() noexcept
