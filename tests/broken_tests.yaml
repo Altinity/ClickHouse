@@ -148,6 +148,12 @@
   check_types:
   - tsan
   - asan
+- name: test_scheduler_cpu_preemptive/test.py::test_cpu_time_fairness[fixed_longer_prd]
+  reason: INVESTIGATE - Unstable on tsan, msan
+  message: 'Failed: Timeout (>900.0s)'
+  check_types:
+  - tsan
+  - msan
 - name: test_grpc_protocol/test.py::test_ipv6_select_one
   reason: INVESTIGATE - Internal test timeout
   message: FutureTimeoutError
@@ -308,7 +314,7 @@
   - ubsan
 
 # match all coverage suite fails
-- name: \d{5}_.*
+- name: \d{5}_.+
   reason: 'KNOWN: Ignoring test fails on coverage build'
   regex: true
   check_types:
