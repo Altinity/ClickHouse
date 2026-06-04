@@ -353,6 +353,44 @@ std::optional<ContentAddressed::RefSidecar> ContentAddressedMetadataStorage::rea
     return ContentAddressed::RefSidecar::deserialize(*bytes);
 }
 
+std::unordered_set<std::string> ContentAddressedMetadataStorage::collectDirectoryChildren(const std::string & prefix, bool skip_ref_meta) const
+{
+    std::unordered_set<std::string> result;
+    RelativePathsWithMetadata objects;
+    object_storage->listObjects(prefix, objects, 0);
+    for (const auto & elem : objects)
+    {
+        const auto & p = elem->relative_path;
+        // Per-ref sidecars (.meta) live under the refs/ prefix but are not parts; skip them so a part
+        // dir never appears twice (once as <part>, once as <part>.meta).
+        if (skip_ref_meta && ContentAddressed::isRefMetaKey(p))
+            continue;
+        if (p.find(prefix) != 0)
+            continue;
+        const auto rest = p.substr(prefix.size());
+        const auto slash_pos = rest.find('/');
+        // string::npos is ok: take the whole remainder.
+        result.emplace(rest.substr(0, slash_pos));
+    }
+    return result;
+}
+
+std::optional<ContentAddressed::PartId> ContentAddressedMetadataStorage::readShadowRefPartId(const std::string & shadow_table_dir, const std::string & part_name) const
+{
+    auto payload = readSmallObjectIfExists(ContentAddressed::shadowRefKey(storage_path_prefix, shadow_table_dir, part_name).string());
+    if (!payload)
+        return std::nullopt;
+    return ContentAddressed::partIdFromRefPayload(*payload);
+}
+
+std::optional<ContentAddressed::RefSidecar> ContentAddressedMetadataStorage::readShadowRefSidecarIfExists(const std::string & shadow_table_dir, const std::string & part_name) const
+{
+    auto bytes = readSmallObjectIfExists(ContentAddressed::shadowRefMetaKey(storage_path_prefix, shadow_table_dir, part_name).string());
+    if (!bytes)
+        return std::nullopt;
+    return ContentAddressed::RefSidecar::deserialize(*bytes);
+}
+
 std::string ContentAddressedMetadataStorage::resolveMutableFileBytes(const std::string & path) const
 {
     auto p = ContentAddressed::parsePartFilePath(path);
@@ -385,6 +423,20 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     if (!p || p->file.empty())
         return false;
 
+    /// FREEZE shadow part FILE: resolve via the shadow ref/sidecar (mirrors the live branch below).
+    if (!p->backup_name.empty())
+    {
+        if (ContentAddressed::isMutablePerPartFile(p->file))
+            return object_storage->tryGetObjectMetadata(
+                ContentAddressed::shadowRefMutableFileKey(storage_path_prefix, p->shadow_table_dir, p->part_name, p->file).string(),
+                /*with_tags=*/false).has_value();
+        auto pid = readShadowRefPartId(p->shadow_table_dir, p->part_name);
+        if (!pid)
+            return false;
+        auto manifest = loadPartManifestOrThrow(*pid);
+        return manifest.blobs.contains(p->file);
+    }
+
     /// A mutable per-part file is overlaid from the per-ref sidecar, never the manifest. A missing
     /// sidecar entry is a missing file (fail-close): the manifest never carries these files.
     if (ContentAddressed::isMutablePerPartFile(p->file))
@@ -401,6 +453,23 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 
 bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
 {
+    // FREEZE shadow namespace — routed BEFORE the live table-dir branch (a shadow table dir also
+    // satisfies parseTableUuid). See listDirectory for the classification.
+    if (ContentAddressed::isShadowPath(path))
+    {
+        // Shadow PART dir: exists iff its shadow ref is present.
+        if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
+            return readShadowRefPartId(p->shadow_table_dir, p->part_name).has_value();
+
+        // Shadow TABLE dir: exists iff it has at least one shadow ref (skip sidecars). STRICT uuid-pair
+        // anchor (see listDirectory) so an INTERMEDIATE dir is not mis-routed here.
+        if (ContentAddressed::endsWithTableUuidPair(path))
+            return !collectDirectoryChildren(ContentAddressed::shadowRefsPrefix(storage_path_prefix, path), /*skip_ref_meta=*/true).empty();
+
+        // Shadow INTERMEDIATE dir / backup root: exists iff any object lives under its prefix.
+        return !collectDirectoryChildren(ContentAddressed::diskFileKey(storage_path_prefix, path + "/"), /*skip_ref_meta=*/false).empty();
+    }
+
     if (auto uuid = ContentAddressed::parseTableUuid(path))
     {
         // Table dir exists iff it has at least one ref (part). Skip per-ref sidecars (.meta): they are
@@ -503,6 +572,28 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     if (!p || p->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
 
+    /// FREEZE shadow part FILE: size via the shadow ref/sidecar (mirrors the live branch below).
+    if (!p->backup_name.empty())
+    {
+        if (ContentAddressed::isMutablePerPartFile(p->file))
+        {
+            auto meta = object_storage->tryGetObjectMetadata(
+                ContentAddressed::shadowRefMutableFileKey(storage_path_prefix, p->shadow_table_dir, p->part_name, p->file).string(),
+                /*with_tags=*/false);
+            if (!meta)
+                throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no shadow sidecar object for {}", path);
+            return meta->size_bytes;
+        }
+        auto pid = readShadowRefPartId(p->shadow_table_dir, p->part_name);
+        if (!pid)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no shadow ref for {}", path);
+        auto manifest = loadPartManifestOrThrow(*pid);
+        auto it = manifest.blobs.find(p->file);
+        if (it == manifest.blobs.end())
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in shadow manifest of {}", p->file, path);
+        return it->second.size;
+    }
+
     /// Mutable per-part file: size of the per-file sidecar object (fail-close if absent).
     if (ContentAddressed::isMutablePerPartFile(p->file))
     {
@@ -526,6 +617,18 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
 
 Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::string & path) const
 {
+    // A FREEZE shadow part directory (shadow/<backup>/store/<uuid[:3]>/<uuid>/<part>): resolve via the
+    // SHADOW ref's manifest, mirroring the live part-dir branch below. Routed first so a shadow part
+    // dir is never mis-resolved through the live readRefPartId.
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
+    {
+        auto pid = readShadowRefPartId(p->shadow_table_dir, p->part_name);
+        if (!pid)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no shadow ref for {}", path);
+        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(storage_path_prefix, *pid).string(), /*with_tags=*/false);
+        return metadata.last_modified;
+    }
+
     // A part directory (<uuid[:3]>/<uuid>/<part>) has no single blob; report the manifest object's
     // mtime. MergeTree calls this on the part directory while loading parts (modification_time).
     // Timestamps are derived for content addressing, so the manifest's mtime is a reasonable proxy.
@@ -582,6 +685,53 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
 
 std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const std::string & path) const
 {
+    // FREEZE shadow namespace (shadow/<backup>/store/<uuid[:3]>/<uuid>/…). Routed BEFORE the live
+    // table-dir branch: a shadow TABLE dir also satisfies parseTableUuid (it ends in a uuid pair) and
+    // would otherwise be mis-routed to the LIVE refs prefix. The shadow refs physically mirror the
+    // store tree, so the intermediate levels (shadow/<backup>, shadow/<backup>/store, …) resolve via
+    // the same generic child-derivation as a live table dir.
+    if (ContentAddressed::isShadowPath(path))
+    {
+        // Shadow PART dir shadow/<backup>/store/<uuid[:3]>/<uuid>/<part>: list the part's files from the
+        // shadow ref's manifest (mirrors the live part-dir branch below, but via the shadow ref/sidecar).
+        if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
+        {
+            auto pid = readShadowRefPartId(p->shadow_table_dir, p->part_name);
+            if (!pid)
+                return {}; // absent shadow ref => empty listing
+            auto manifest = loadPartManifestOrThrow(*pid);
+            std::unordered_set<std::string> result;
+            auto add_first_component = [&result](const std::string & file)
+            {
+                const auto slash = file.find('/');
+                result.emplace(slash == std::string::npos ? file : file.substr(0, slash));
+            };
+            for (const auto & [file, _] : manifest.blobs)
+                add_first_component(file);
+            if (auto sidecar = readShadowRefSidecarIfExists(p->shadow_table_dir, p->part_name))
+                for (const auto & [file, _] : sidecar->files)
+                    add_first_component(file);
+            return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
+        }
+
+        // Shadow TABLE dir shadow/<backup>/store/<uuid[:3]>/<uuid>: the frozen part names live under the
+        // shadow refs/ prefix keyed by THIS dir. (shadow_table_dir here IS the path itself.) Detected via
+        // the STRICT uuid-pair anchor — NOT parseTableUuid, whose non-Atomic fallback would wrongly accept
+        // an INTERMEDIATE dir (shadow/<backup>, shadow/<backup>/store) and list an empty refs/ prefix.
+        if (ContentAddressed::endsWithTableUuidPair(path))
+        {
+            auto result = collectDirectoryChildren(ContentAddressed::shadowRefsPrefix(storage_path_prefix, path), /*skip_ref_meta=*/true);
+            return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
+        }
+
+        // Shadow INTERMEDIATE dir (shadow/<backup>, shadow/<backup>/store, shadow/<backup>/store/<uuid[:3]>):
+        // derive children generically from the object keys under it (the shadow refs physically live under
+        // these prefixes). diskFileKey is the verbatim key-prefix join (the same empty-prefix-safe rule as
+        // every other key builder), used here only to project the disk-relative dir prefix into a key prefix.
+        auto result = collectDirectoryChildren(ContentAddressed::diskFileKey(storage_path_prefix, path + "/"), /*skip_ref_meta=*/false);
+        return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
+    }
+
     // Table dir <uuid[:3]>/<uuid>[/]: list the part names from refs/ AND the table-level file names
     // from files/ (e.g. format_version.txt, mutation_N.txt). A real disk's table data dir lists both
     // its part directories and its table-level files, and consumers depend on it: in particular
@@ -591,32 +741,10 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
     if (auto uuid = ContentAddressed::parseTableUuid(path))
     {
         std::unordered_set<std::string> result;
-
-        // Mirror MetadataStorageFromPlainObjectStorage::listDirectory child-derivation: list under the
-        // prefix, strip it, and take the immediate child component.
-        auto collect_children = [&](const std::string & prefix, bool skip_ref_meta)
-        {
-            RelativePathsWithMetadata objects;
-            object_storage->listObjects(prefix, objects, 0);
-            for (const auto & elem : objects)
-            {
-                const auto & p = elem->relative_path;
-                // Per-ref sidecars (.meta) live under the refs/ prefix but are not parts; skip them so a
-                // part dir never appears twice (once as <part>, once as <part>.meta).
-                if (skip_ref_meta && ContentAddressed::isRefMetaKey(p))
-                    continue;
-                if (p.find(prefix) != 0)
-                    continue;
-                const auto rest = p.substr(prefix.size());
-                const auto slash_pos = rest.find('/');
-                // string::npos is ok: take the whole remainder.
-                result.emplace(rest.substr(0, slash_pos));
-            }
-        };
-
-        collect_children(ContentAddressed::refsPrefix(storage_path_prefix, server_id, *uuid), /*skip_ref_meta=*/true);
-        collect_children(ContentAddressed::tableFilesPrefix(storage_path_prefix, server_id, *uuid), /*skip_ref_meta=*/false);
-
+        auto refs = collectDirectoryChildren(ContentAddressed::refsPrefix(storage_path_prefix, server_id, *uuid), /*skip_ref_meta=*/true);
+        auto files = collectDirectoryChildren(ContentAddressed::tableFilesPrefix(storage_path_prefix, server_id, *uuid), /*skip_ref_meta=*/false);
+        result.merge(refs);
+        result.merge(files);
         return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
     }
 
@@ -810,6 +938,32 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
+
+    /// FREEZE shadow part FILE shadow/<backup>/store/<uuid[:3]>/<uuid>/<part>/<file>: resolve via the
+    /// SHADOW ref's manifest (so reading/ATTACHing a frozen part works), mirroring the live resolution
+    /// below but keyed by the shadow table dir. A mutable per-part file resolves to its shadow per-file
+    /// sidecar object; a content file resolves through the shadow ref -> manifest -> blob.
+    if (!p->backup_name.empty())
+    {
+        if (ContentAddressed::isMutablePerPartFile(p->file))
+        {
+            const std::string file_key
+                = ContentAddressed::shadowRefMutableFileKey(storage_path_prefix, p->shadow_table_dir, p->part_name, p->file).string();
+            auto meta = object_storage->tryGetObjectMetadata(file_key, /*with_tags=*/false);
+            if (!meta)
+                throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no shadow sidecar object for {}", path);
+            return {StoredObject(file_key, path, meta->size_bytes)};
+        }
+        auto pid = readShadowRefPartId(p->shadow_table_dir, p->part_name);
+        if (!pid)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no shadow ref for {}", path);
+        auto manifest = loadPartManifestOrThrow(*pid);
+        auto it = manifest.blobs.find(p->file);
+        if (it == manifest.blobs.end())
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in shadow manifest of {}", p->file, path);
+        const auto & e = it->second;
+        return {StoredObject(ContentAddressed::blobKey(storage_path_prefix, e.key).string(), path, e.size)};
+    }
 
     /// Mutable per-part file: resolve to its OWN per-file sidecar object, whose bytes are EXACTLY this
     /// file's content (not the manifest -> blob path). Fail-close if the part never wrote this file.

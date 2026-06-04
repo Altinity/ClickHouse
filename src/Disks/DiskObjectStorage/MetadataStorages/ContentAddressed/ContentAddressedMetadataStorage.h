@@ -12,6 +12,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_set>
 
 namespace DB
 {
@@ -177,6 +178,17 @@ private:
     // Returns nullopt if the ref object is absent, else the part id it names.
     std::optional<ContentAddressed::PartId> readRefPartId(const std::string & table_uuid, const std::string & part_name) const;
 
+    // FREEZE read side: resolve a frozen part to its part id via the SHADOW ref object at
+    // shadowRefKey(shadow_table_dir, part_name). Mirrors readRefPartId but keys off the literal shadow
+    // table dir (shadow/<backup>/store/<uuid[:3]>/<uuid>) instead of the live store/.../refs/ location.
+    // Returns nullopt if the shadow ref is absent.
+    std::optional<ContentAddressed::PartId> readShadowRefPartId(const std::string & shadow_table_dir, const std::string & part_name) const;
+
+    // FREEZE read side: read and deserialize the SHADOW per-ref sidecar at
+    // shadowRefMetaKey(shadow_table_dir, part_name) if present (else nullopt). Mirrors
+    // readRefSidecarIfExists for the shadow namespace (overlays a frozen part's mutable per-part files).
+    std::optional<ContentAddressed::RefSidecar> readShadowRefSidecarIfExists(const std::string & shadow_table_dir, const std::string & part_name) const;
+
     // Load and deserialize the manifest at partKey(part_id).
     // B18 fail-close: if the manifest object is absent, throw CORRUPTED_DATA (a live ref must
     // never point at a missing manifest); never treat it as "file doesn't exist".
@@ -184,6 +196,13 @@ private:
 
     // Read a small object (ref/manifest) into a string. Returns nullopt if the object is absent.
     std::optional<std::string> readSmallObjectIfExists(const std::string & key) const;
+
+    // Generic directory-child derivation (shared by the live table-dir listing and the shadow
+    // intermediate/table-dir listing): list every object under `prefix`, strip `prefix`, and collect
+    // the immediate child component of each. When `skip_ref_meta` is set, per-ref sidecars (.meta keys
+    // under a refs/ prefix) are skipped so a part dir never appears twice (once as <part>, once as
+    // <part>.meta). Mirrors MetadataStorageFromPlainObjectStorage::listDirectory child-derivation.
+    std::unordered_set<std::string> collectDirectoryChildren(const std::string & prefix, bool skip_ref_meta) const;
 
     const ObjectStoragePtr object_storage;
     const std::string storage_path_prefix;
