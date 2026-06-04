@@ -1,4 +1,5 @@
--- Tags: no-fasttest, no-replicated-database, no-shared-merge-tree
+-- Tags: no-fasttest, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
+-- no-content-addressed-storage: needs an auxiliary ZooKeeper ensemble (auxiliary_zookeeper2 root absent); orthogonal topology, not CA
 -- no-shared-merge-tree -- smt doesn't support aux zookeepers
 
 DROP TABLE IF EXISTS test_zk_connection_table;

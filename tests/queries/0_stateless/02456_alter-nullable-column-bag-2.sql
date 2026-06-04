@@ -1,3 +1,5 @@
+-- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
 DROP TABLE IF EXISTS t1 SYNC;
 CREATE TABLE t1  (v UInt64) ENGINE=ReplicatedMergeTree('/test/tables/{database}/test/t1', 'r1') ORDER BY v PARTITION BY v;
 INSERT INTO t1 values(1);
