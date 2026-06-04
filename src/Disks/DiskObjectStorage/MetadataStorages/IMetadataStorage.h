@@ -141,6 +141,15 @@ public:
         throwNotImplemented();
     }
 
+    /// In-flight read-your-writes for a part being assembled by THIS transaction (B59). A CA part-build
+    /// transaction stages blobs (uploaded) + mutable bytes before the single commit; these let a reader
+    /// that holds the transaction resolve those staged files before they are committed. Default: no
+    /// in-flight visibility (the committed metadata path is authoritative).
+    virtual std::optional<StoredObjects> tryGetInFlightStorageObjects(const std::string & /*path*/) const { return {}; }
+    virtual std::unique_ptr<ReadBufferFromFileBase> tryReadFileInFlight(
+        const std::string & /*path*/, const ReadSettings & /*settings*/, std::optional<size_t> /*read_hint*/) const { return nullptr; }
+    virtual std::optional<uint64_t> tryGetInFlightFileSize(const std::string & /*path*/) const { return {}; }
+
     virtual ~IMetadataTransaction() = default;
 
 protected:
