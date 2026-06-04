@@ -5735,6 +5735,20 @@ MergeTreeData::PartsToRemoveFromZooKeeper MergeTreeData::removePartsInRangeFromW
         MergeTreeData::Transaction transaction(*this, NO_TRANSACTION_RAW);
         renameTempPartAndAdd(new_data_part, transaction, lock, /*rename_in_transaction=*/ false);     /// All covered parts must be already removed
 
+        /// On a content-addressed disk a part directory becomes durable only when its disk-storage
+        /// transaction is committed (the ref to its manifest is published at commit, not at rename).
+        /// The flow below rolls back the in-memory MergeTreeData transaction (to keep the empty part
+        /// Outdated, not Active), which never calls commitTransaction on the disk storage — so on a CA
+        /// disk the empty covering part would leave NO on-disk ref and vanish on restart/reattach,
+        /// defeating its sole purpose (it exists only to cover the dropped parts on disk so a restart
+        /// does not treat them as uncovered unexpected parts and trip TOO_MANY_UNEXPECTED_DATA_PARTS).
+        /// On a plain disk the rename in renameTempPartAndAdd is already durable, so this is a no-op
+        /// there. Commit the disk storage transaction here (CA only) so the ref is published before the
+        /// in-memory rollback; the part still ends up Outdated, exactly as on a plain disk.
+        if (new_data_part->getDataPartStorage().isContentAddressed()
+            && new_data_part->getDataPartStorage().hasActiveTransaction())
+            new_data_part->getDataPartStorage().commitTransaction();
+
         /// It will add the empty part to the set of Outdated parts without making it Active (exactly what we need)
         transaction.rollback(&lock);
         new_data_part->remove_time.store(0, std::memory_order_relaxed);
