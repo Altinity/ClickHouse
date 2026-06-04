@@ -161,3 +161,30 @@ Write the implementation plan to `docs/superpowers/plans/2026-06-04-cas-mergetre
 - Stage D plan DONE: `2026-06-04-cas-mergetree-replication.md` (`caad12e850d`), 5 phases. Implementation
   (builds) BLOCKED on the minio subagent finishing (no concurrent ninja). → Awaiting minio, then: triage
   minio S3-delta + fix → implement replication Phase 1+ → Stage E (un-gate replicated tests on minio+CA).
+- Stage D implementation — fetch-by-relink WORKS END-TO-END:
+  - **Phase 1** (`3e07ab9f357`): `pool_uuid` added to `PoolMeta` (minted once at first claim, stable across
+    re-mount; `CURRENT_VERSION` bump fails closed on pre-change pools — fine for fresh test pools); N-mounter
+    mount wired (disk setting `content_addressed_allow_shared_pool` → `claimPoolOwnership`). 106 gtests.
+  - **Phase 2a** (`c28411372fa`): the metadata-layer relink primitive `relinkExistingPart`
+    (pin→re-validate→publish-ref→release) on `ContentAddressedMetadataStorage`. The mandatory PIN closes the
+    adversarial-review data-loss hole; the race test (drop source ref + sweep between pin and publish) passes
+    WITH the pin and FAILS without it (verified both ways). Load-bearing GC fix: a live session now also pins
+    the `parts/<part_id>` MANIFEST object (`sessionPinnedPartKeys`), not just blobs. 110 gtests.
+  - **Phase 2b + minimal B33 lift** (`fa27021e03b`): protocol `…WITH_CA_RELINK=10`; receiver advertises its
+    `pool_uuid`; sender relinks IFF same `pool_uuid` (sends part_id + header, NO data); receiver calls
+    `relinkExistingPart`, byte-fetch fallback otherwise; non-CA path byte-for-byte unchanged. B33 gate lifted;
+    queue-clone ops (REPLACE/MOVE/ATTACH PARTITION on Replicated CA) FAIL-CLOSED pending the Phase-3.2 audit;
+    `lockSharedData`/`unlockSharedData` confirmed CA no-ops. Key simplification: relink uses the SENDER's
+    part_id + reads the shared-pool manifest, so B6 determinism is NOT a blocker.
+  - **Integration test** (`6f244d9cbce`): `tests/integration/test_cas_replicated_relink/` — 2 ReplicatedMergeTree
+    replicas, one shared CA pool over MinIO. PASSED: INSERT on node1 → node2 fetches → identical rows; the
+    `blobs/` object count is UNCHANGED by the fetch (relink, not download); a merge relinked too; logs confirm
+    the relink path fired with ZERO byte-fetch fallbacks. Non-CA regression: 3 replicated stateless tests pass.
+  - Pushed through `6f244d9cbce`.
+- Stage E (un-gate ~354 ReplicatedMergeTree stateless tests, triage on CA) RUNNING in a background subagent
+  (bounded batches, commits per batch). Single-replica Replicated-CA INSERT/SELECT/merge/mutation should pass;
+  the fail-closed queue-clone ops + orthogonal/real-bug failures get re-gated with reasons. Awaiting it.
+- DEFERRED for follow-up (documented, not blocking the night): B59 (projection mutation read-your-staged-writes,
+  7 tests); Phase 3.2 (audit/un-gate the Replicated-CA queue-clone REPLACE/MOVE/ATTACH paths); dead-replica
+  stale-ref cleanup; cross-pool relink optimization; Keeper-accelerated refs (B11). A full multi-hour s3-CA
+  stateless run (Stage B) — config + gating proven, no correctness delta found; lower-value than the above.
