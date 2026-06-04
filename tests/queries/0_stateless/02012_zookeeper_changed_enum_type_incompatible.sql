@@ -1,5 +1,4 @@
--- Tags: zookeeper, no-replicated-database, no-content-addressed-storage
--- no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
+-- Tags: zookeeper, no-replicated-database
 -- Tag no-replicated-database: Fails due to additional replicas or shards
 
 drop table if exists enum_alter_issue;

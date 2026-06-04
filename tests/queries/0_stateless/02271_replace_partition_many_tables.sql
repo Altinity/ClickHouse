@@ -1,5 +1,4 @@
--- Tags: no-fasttest, no-content-addressed-storage
--- no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
+-- Tags: no-fasttest
 
 DROP TABLE IF EXISTS replace_partition_source;
 DROP TABLE IF EXISTS replace_partition_dest1;

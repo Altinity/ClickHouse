@@ -1,5 +1,4 @@
--- Tags: no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
--- no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
+-- Tags: no-replicated-database, no-shared-merge-tree
 -- SharedMergeTree doesn't support replace partition from MergeTree engine
 
 DROP TEMPORARY TABLE IF EXISTS src;

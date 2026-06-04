@@ -452,15 +452,15 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
         if (disk->getDataSourceDescription().metadata_type == MetadataStorageType::Keeper)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "ReplicatedMergeTree doesn't work with 's3_with_keeper' disk type");
 
-        /// B33 (lifted, CAS replication 2b): ReplicatedMergeTree on a content-addressed disk is now
-        /// allowed. INSERT/SELECT/merge/mutation and fetch-by-relink (the CA analogue of zero-copy
+        /// B33 (lifted, CAS replication 2b + Phase 3.2): ReplicatedMergeTree on a content-addressed disk
+        /// is allowed. INSERT/SELECT/merge/mutation and fetch-by-relink (the CA analogue of zero-copy
         /// replication) route through the working whole-part CA transaction / the relink path. The
-        /// replication-queue CLONE paths (queue-driven REPLACE/MOVE/ATTACH PARTITION FROM and any
-        /// cloneAndLoadDataPart-on-the-queue path) have NOT yet been audited for CA (the original B33
-        /// concern — they reach the per-file-autocommit B21 mode and could corrupt a CA part), so they
-        /// fail closed in checkAlterPartitionIsPossible below until Phase 3.2 audits them. The zero-copy
-        /// lockSharedData/unlockSharedData calls lifting this reaches are safe no-ops on CA (they
-        /// early-return on !supportZeroCopyReplication, which CA is).
+        /// replication-queue CLONE paths (queue-driven REPLACE/MOVE/ATTACH PARTITION FROM, the
+        /// cloneAndLoadDataPart-on-the-queue path) were audited in Phase 3.2: they reach the SAME
+        /// whole-part ContentAddressedTransaction the non-replicated stack uses (see
+        /// checkAlterPartitionIsPossible below), NOT the per-file-autocommit B21 mode, so they are now
+        /// permitted. The zero-copy lockSharedData/unlockSharedData calls these reach are safe no-ops on
+        /// CA (they early-return on !supportZeroCopyReplication, which CA is).
     }
 
     initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
@@ -7413,37 +7413,24 @@ void StorageReplicatedMergeTree::checkAlterPartitionIsPossible(
     const Settings & settings,
     ContextPtr local_context) const
 {
-    /// CAS replication 2b (B33 partial lift). The cross-table partition-clone commands are driven through
-    /// the replication QUEUE on a Replicated table (replacePartitionFrom / movePartitionToTable enqueue a
-    /// REPLACE_RANGE that executeReplaceRange clones via cloneAndLoadDataPart on the queue). That call
-    /// stack has NOT been audited for content addressing — it is the original B33 concern (it can reach
-    /// the per-file-autocommit clone, the B21 corruption mode). Fail it closed on a CA disk until Phase
-    /// 3.2 audits it, instead of silently corrupting the clone. INSERT/SELECT/merge/mutation/DROP and
-    /// fetch-by-relink are unaffected. Plain DROP/DETACH (pointer-unlink) is allowed.
-    bool any_ca_disk = false;
-    for (const auto & disk : getDisks())
-        if (disk->isContentAddressed())
-        {
-            any_ca_disk = true;
-            break;
-        }
-
-    if (any_ca_disk)
-    {
-        for (const auto & command : commands)
-        {
-            if (command.type == PartitionCommand::REPLACE_PARTITION
-                || command.type == PartitionCommand::MOVE_PARTITION
-                || command.type == PartitionCommand::ATTACH_PARTITION)
-                throw Exception(
-                    ErrorCodes::SUPPORT_IS_DISABLED,
-                    "Partition operation ALTER TABLE {} on a ReplicatedMergeTree content-addressed table is not "
-                    "supported yet: the replication-queue clone path is not audited on CA (B33/B21 — see backlog). "
-                    "INSERT/SELECT/merge/fetch work; this clone op is disabled to avoid silent corruption.",
-                    command.typeToString());
-        }
-    }
-
+    /// CAS replication Phase 3.2 (B33 lift complete). The cross-table partition-clone commands on a
+    /// Replicated table are driven through the replication QUEUE (`replacePartitionFrom` /
+    /// `movePartitionToTable` enqueue a `REPLACE_RANGE` that `executeReplaceRange` clones via
+    /// `cloneAndLoadDataPart` on the queue). The Phase 3.2 audit traced that call stack on a CA disk:
+    /// `executeReplaceRange` / `replacePartitionFrom` / `movePartitionToTable` all reach
+    /// `MergeTreeData::cloneAndLoadDataPart` with `must_on_same_disk=true` (REPLACE/MOVE) or with a
+    /// same-pool source (ATTACH), no `external_transaction`, and `copy_instead_of_hardlink=false` on CA
+    /// (CA disks return `supportZeroCopyReplication()==false`, so `isStoredOnRemoteDiskWithZeroCopySupport`
+    /// is false). That routes the same-disk clone through `DataPartStorageOnDiskBase::freeze`, which —
+    /// since no caller transaction is supplied and the disk is content-addressed — self-creates ONE
+    /// whole-part `ContentAddressedTransaction` (see `DataPartStorageOnDiskBase::freeze` ~L519) so all
+    /// files land in a single content-addressed part. This is the SAME audited+verified whole-part clone
+    /// the non-replicated ALTER PARTITION stack uses (M9 W2, B21 resolved) — NOT the per-file-autocommit
+    /// B21 corruption mode. So we no longer fail these closed here: delegate to the base check, which
+    /// already permits `REPLACE`/`MOVE`/`ATTACH PARTITION` on CA and keeps `FREEZE`/`FETCH PARTITION`
+    /// gated. The only residual caveat (identical for the non-replicated path) is cross-disk
+    /// `MOVE ... TO DISK/VOLUME`, which byte-copies via `clonePart`/`freezeRemote` (safe re-content-address,
+    /// not the corrupting path); the base check cannot distinguish the destination and lets it through.
     MergeTreeData::checkAlterPartitionIsPossible(commands, metadata_snapshot, settings, local_context);
 }
 

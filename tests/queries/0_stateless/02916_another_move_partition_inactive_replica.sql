@@ -1,5 +1,4 @@
--- Tags: no-parallel, no-flaky-check, no-content-addressed-storage
--- no-content-addressed-storage: Replicated-CA queue-clone MOVE PARTITION not yet audited (B33/Phase-3.2); DDL error swallowed by never_throw -> data diff
+-- Tags: no-parallel, no-flaky-check
 
 create database if not exists shard_0;
 create database if not exists shard_1;

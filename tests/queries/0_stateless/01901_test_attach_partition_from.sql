@@ -1,5 +1,4 @@
--- Tags: no-parallel, no-content-addressed-storage
--- no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
+-- Tags: no-parallel
 
 DROP TABLE IF EXISTS test_alter_attach_01901S;
 DROP TABLE IF EXISTS test_alter_attach_01901D;

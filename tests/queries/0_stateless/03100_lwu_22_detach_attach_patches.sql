@@ -1,5 +1,4 @@
--- Tags: no-replicated-database, no-content-addressed-storage
--- no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
+-- Tags: no-replicated-database
 -- no-replicated-database: fails due to additional shard.
 
 DROP TABLE IF EXISTS t_detach_attach_patches SYNC;

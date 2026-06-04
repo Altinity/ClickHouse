@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, zookeeper, no-content-addressed-storage
-# no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
+# Tags: long, zookeeper
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

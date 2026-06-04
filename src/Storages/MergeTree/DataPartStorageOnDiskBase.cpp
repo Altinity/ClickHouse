@@ -10,6 +10,7 @@
 #include <IO/ReadPipeline.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromFileBase.h>
+#include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/MergeTreeTransaction/VersionMetadataOnDisk.h>
 #include <Storages/MergeTree/Backup.h>
@@ -548,6 +549,25 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
         clone_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
         if (!params.keep_metadata_version)
             clone_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
+
+        /// When the caller wants a fresh metadata version written into the clone (the Replicated queue
+        /// clone path — `executeReplaceRange`/`replacePartitionFrom`/`movePartitionToTable` set
+        /// `metadata_version_to_write`), write `metadata_version.txt` INSIDE the clone transaction so it
+        /// is part of the single whole-part commit. On a content-addressed disk the part is published
+        /// atomically at `commit`; a separate post-clone autocommit `writeFile` of this part file (what
+        /// `cloneAndLoadDataPart` does for non-CA disks) would hit the per-file-autocommit guard (B21).
+        /// `cloneAndLoadDataPart` skips its own write when `freeze` already wrote it here.
+        if (params.metadata_version_to_write.has_value())
+        {
+            chassert(!params.keep_metadata_version);
+            auto out_metadata = clone_transaction->writeFile(
+                fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME,
+                4096,
+                WriteMode::Rewrite,
+                write_settings);
+            writeText(*params.metadata_version_to_write, *out_metadata);
+            out_metadata->finalize();
+        }
     }
     else
     {

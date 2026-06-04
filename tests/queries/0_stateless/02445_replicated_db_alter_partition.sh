@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
-# Tags: no-fasttest, no-content-addressed-storage
-# no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
+# Tags: no-fasttest
 # no-fasttest: Slow timeouts
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
