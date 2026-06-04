@@ -60,6 +60,7 @@ extern const SettingsInt64 iceberg_expire_default_max_ref_age_ms;
 namespace DB::FailPoints
 {
 extern const char iceberg_writes_cleanup[];
+extern const char iceberg_alter_orphan_metadata_cleanup_fail[];
 }
 
 namespace DB::Iceberg
@@ -786,19 +787,31 @@ void alter(
             const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
             if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, metadata))
             {
+                auto storage_metadata_name = persistent_table_components.path_resolver.resolve(metadata_info.path);
+                String orphan_cleanup_error;
                 try
                 {
-                    auto storage_metadata_name = persistent_table_components.path_resolver.resolve(metadata_info.path);
+                    fiu_do_on(FailPoints::iceberg_alter_orphan_metadata_cleanup_fail, { throw Exception(ErrorCodes::DATALAKE_DATABASE_ERROR, "Failpoint: orphan metadata cleanup failed"); });
                     object_storage->removeObjectIfExists(StoredObject(storage_metadata_name));
                 }
                 catch (...)
                 {
+                    orphan_cleanup_error = getCurrentExceptionMessage(false);
                     tryLogCurrentException(log, "Iceberg alter: failed to remove orphan metadata file after catalog commit failure");
+                }
+                if (orphan_cleanup_error.empty())
+                {
+                    throw Exception(
+                        ErrorCodes::DATALAKE_DATABASE_ERROR,
+                        "Iceberg alter: catalog commit failed for '{}' after metadata file was written successfully",
+                        catalog_filename);
                 }
                 throw Exception(
                     ErrorCodes::DATALAKE_DATABASE_ERROR,
-                    "Iceberg alter: catalog commit failed for '{}' after metadata file was written successfully",
-                    catalog_filename);
+                    "Iceberg alter: catalog commit failed for '{}' after metadata file was written successfully. Failed to remove orphan metadata file '{}': {}",
+                    catalog_filename,
+                    storage_metadata_name,
+                    orphan_cleanup_error);
             }
         }
 

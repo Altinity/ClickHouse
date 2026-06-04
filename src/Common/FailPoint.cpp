@@ -131,6 +131,8 @@ static struct InitFiu
     ONCE(iceberg_writes_non_retry_cleanup) \
     ONCE(iceberg_writes_post_publish_throw) \
     ONCE(iceberg_alter_catalog_update_metadata_fail) \
+    REGULAR(iceberg_alter_orphan_metadata_cleanup_fail) \
+    REGULAR(datalake_iceberg_metadata_create_fail) \
     ONCE(iceberg_export_after_commit_before_zk_completed) \
     REGULAR(export_partition_commit_always_throw) \
     ONCE(export_partition_status_change_throw) \

@@ -276,7 +276,7 @@ Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
         {
             Poco::JSON::Object::Ptr set_current_schema = new Poco::JSON::Object;
             set_current_schema->set("action", "set-current-schema");
-            set_current_schema->set("schema-id", -1);
+            set_current_schema->set("schema-id", new_schema_id);
             updates->add(set_current_schema);
         }
         if (sortOrderIncompatibleWithSchema(new_snapshot, new_schema_obj))

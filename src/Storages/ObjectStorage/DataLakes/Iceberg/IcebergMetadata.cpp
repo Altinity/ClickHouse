@@ -135,6 +135,11 @@ extern const SettingsBool iceberg_delete_data_on_drop;
 
 static constexpr size_t MAX_TRANSACTION_RETRIES = 100;
 
+namespace FailPoints
+{
+    extern const char datalake_iceberg_metadata_create_fail[];
+}
+
 namespace
 {
 String dumpMetadataObjectToString(const Poco::JSON::Object::Ptr & metadata_object)
@@ -952,6 +957,8 @@ DataLakeMetadataPtr IcebergMetadata::create(
     const StorageObjectStorageConfigurationWeakPtr & configuration,
     const ContextPtr & local_context)
 {
+    fiu_do_on(FailPoints::datalake_iceberg_metadata_create_fail, { throw Exception(ErrorCodes::LOGICAL_ERROR, "Failpoint: datalake iceberg metadata create failed"); });
+
     auto configuration_ptr = configuration.lock();
     if (!configuration_ptr)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to create Iceberg table, but storage configuration is expired");

@@ -176,8 +176,8 @@ public:
 
     void checkAlterIsPossible(const AlterCommands & commands) override
     {
-        if(current_metadata)
-            current_metadata->checkAlterIsPossible(commands);
+        assertInitializedDL();
+        current_metadata->checkAlterIsPossible(commands);
     }
 
     void alter(const AlterCommands & params, ContextPtr context,

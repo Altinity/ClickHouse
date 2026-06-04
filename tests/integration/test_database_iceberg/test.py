@@ -1204,6 +1204,78 @@ def test_alter_orphan_metadata_cleanup_on_catalog_failure(started_cluster):
     )
 
 
+def test_alter_fails_when_metadata_not_initialized(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_alter_uninit_metadata_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    schema = Schema(
+        NestedField(field_id=1, name="x", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="y", field_type=StringType(), required=False),
+    )
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    node.query("SYSTEM ENABLE FAILPOINT datalake_iceberg_metadata_create_fail")
+    try:
+        node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
+        create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+        with pytest.raises(QueryRuntimeException, match="Metadata is not initialized"):
+            node.query(
+                f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}` DROP COLUMN y;",
+                settings={"allow_insert_into_iceberg": 1},
+            )
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT datalake_iceberg_metadata_create_fail")
+        node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
+        create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+
+def test_alter_orphan_cleanup_failure_reported(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_alter_orphan_cleanup_fail_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    schema = Schema(
+        NestedField(field_id=1, name="x", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="y", field_type=StringType(), required=False),
+    )
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_name}` VALUES ('a', 'b');",
+        settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+    )
+
+    node.query("SYSTEM ENABLE FAILPOINT iceberg_alter_catalog_update_metadata_fail")
+    node.query("SYSTEM ENABLE FAILPOINT iceberg_alter_orphan_metadata_cleanup_fail")
+    try:
+        with pytest.raises(QueryRuntimeException) as exc_info:
+            node.query(
+                f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}` DROP COLUMN y;",
+                settings={"allow_insert_into_iceberg": 1},
+            )
+        error = exc_info.value.args[0].lower()
+        assert "catalog commit failed" in error
+        assert "failed to remove orphan metadata file" in error
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT iceberg_alter_orphan_metadata_cleanup_fail")
+        node.query("SYSTEM DISABLE FAILPOINT iceberg_alter_catalog_update_metadata_fail")
+
+
 def test_partitioning_by_time(started_cluster):
     node = started_cluster.instances["node1"]
 
