@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, no-replicated-database, no-ordinary-database, no-azure-blob-storage, no-s3-storage, no-content-addressed-storage
-# no-content-addressed-storage: uses experimental transactions; MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED, append-based txn log; object-storage-wide, B39)
+# Tags: long, no-replicated-database, no-ordinary-database, no-azure-blob-storage, no-s3-storage
 
 # shellcheck disable=SC2015
 # shellcheck disable=SC2119
