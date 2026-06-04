@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-replicated-database, no-ordinary-database, no-content-addressed-storage
-# no-content-addressed-storage: a background MERGE runs ONE disk transaction that writes the merge-output part AND rewrites source-part removal-TID files (txn_version.txt). The content-addressed transaction is single-part (one (table_uuid, part_name) + one manifest/sidecar), so ContentAddressedTransaction::rememberTarget hits a LOGICAL_ERROR on tmp_merge_<out> vs the source part and the server aborts. This is NOT the mutation-entry CSN append (that is fixed by B67 — mutation_<n>.txt append now works); it is the distinct multi-part MERGE disk transaction, which needs a multi-part CA disk transaction. Verified on a clean binary: the abort fires for tmp_merge_0_4_106_8 -> 0_4_106_8, not for the append.
+# Tags: no-fasttest, no-replicated-database, no-ordinary-database
 # Looks like server does not listen https port in fasttest
 # FIXME Replicated database executes ALTERs in separate context, so transaction info is lost
 

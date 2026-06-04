@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, no-ordinary-database, no-content-addressed-storage
-# no-content-addressed-storage: concurrent transactional inserts with old_parts_lifetime=0 trigger background MERGEs whose ONE disk transaction writes the merge-output part AND rewrites source-part removal-TID files (txn_version.txt). The content-addressed transaction is single-part (one (table_uuid, part_name) + one manifest/sidecar), so ContentAddressedTransaction::rememberTarget hits a LOGICAL_ERROR on tmp_merge_<out> vs the source part and the server aborts. This is NOT the mutation-entry CSN append (that is fixed by B67 — mutation_<n>.txt append now works); it is the distinct multi-part MERGE disk transaction, which needs a multi-part CA disk transaction. Verified on a clean binary.
+# Tags: long, no-ordinary-database
 
 # shellcheck disable=SC2015
 # shellcheck disable=SC2119

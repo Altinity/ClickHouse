@@ -402,8 +402,19 @@ std::optional<ObjectMetadata> LocalObjectStorage::tryGetObjectMetadata(const std
     if (fs::is_directory(path, error))
         return {};
 
-    /// no_such_file_or_directory is ignored only for last_write_time for consistency
-    object_metadata.size_bytes = fs::file_size(path);
+    /// The file may be removed by a concurrent operation between the last_write_time above and this
+    /// stat (TOCTOU). A real object store snapshots its metadata, so a concurrently-deleted object is
+    /// simply absent rather than surfacing a raw filesystem error — treat a vanished file as a missing
+    /// object (nullopt), exactly like the last_write_time branch above. (On a content-addressed pool
+    /// this is hit by a background MERGE's listObjects-driven ref unlink racing a sibling part's
+    /// mutable per-ref sidecar removal, e.g. refs/<part>.txn_version.txt.tmp.meta or refs/delete_tmp_<part>.meta.)
+    object_metadata.size_bytes = fs::file_size(path, error);
+    if (error)
+    {
+        if (error == std::errc::no_such_file_or_directory)
+            return {};
+        throw fs::filesystem_error("Got unexpected error while getting file size", path, error);
+    }
 
     object_metadata.etag = std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count());
     object_metadata.last_modified = Poco::Timestamp::fromEpochTime(
@@ -421,7 +432,18 @@ void LocalObjectStorage::listObjects(const std::string & path, RelativePathsWith
         if (entry.is_directory())
             continue;
 
-        children.emplace_back(std::make_shared<RelativePathWithMetadata>(entry.path(), getObjectMetadata(entry.path(), false)));
+        /// An entry yielded by the directory iterator may be removed by a concurrent operation before we
+        /// stat it (TOCTOU). A real object store snapshots its listing, so an object deleted after the
+        /// listing simply does not appear — it never surfaces a stat error to the caller. Emulate that:
+        /// `tryGetObjectMetadata` returns nullopt when the file vanished (no_such_file_or_directory), so
+        /// skip such entries instead of throwing. On a content-addressed pool this race is hit by a
+        /// background MERGE's `unlinkPartDirRefs` listing the `refs/` prefix while another transaction
+        /// removes a sibling part's mutable per-ref sidecar (e.g. `txn_version.txt.tmp.meta`).
+        auto object_metadata = tryGetObjectMetadata(entry.path(), false);
+        if (!object_metadata)
+            continue;
+
+        children.emplace_back(std::make_shared<RelativePathWithMetadata>(entry.path(), std::move(*object_metadata)));
     }
 }
 
