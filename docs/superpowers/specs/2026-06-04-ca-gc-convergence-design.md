@@ -15,7 +15,13 @@ bounds §9. Rev. 3 folds in round-2 review: generationed manifests (`parts/<part
 relink ABA hole), I7 relaxed to *single-attachable*-generation (I7a–d) with byte-identical multi-generation
 reads, tombstone gates attachment not reads, the GC RECOVER/drain branches, the session (not the `+`) as the
 handshake flag with the `+` logged after the tomb re-check, dropped CAS in favour of fenced PUT (G4-honest),
-and `event_id` dedup-on-fold. **Date:** 2026-06-04. **Branch:** `cas-mergetree-poc`.
+and `event_id` dedup-on-fold. Rev. 4 adds the **hot-path cost model + Keeper acceleration** (§12): the
+S3-only commit floor (parallel per-blob ops, one prefix-`LIST` per reused `H`, batched/async `+` →
+2 sequential control PUTs), Keeper as a bounded pure-cache accelerator (ephemeral sessions, per-shard epoch
+mirror, valid-negative tombstone cache with the *seal-to-Keeper-before-recheck* coherence rule, log-tail
+mirror) reaching a 1-PUT normal-mode floor, explicit op budgets + a "MUST NOT" list, and op-count test
+counters. Keeper stays optional for correctness, recommended for latency. **Date:** 2026-06-04. **Branch:**
+`cas-mergetree-poc`.
 North-star reference: `docs/superpowers/specs/content_addressed_shared_mergetree_design.md` (the original
 distributed CAS+GC design; section numbers below, e.g. *(doc §7)*, refer to it).
 
@@ -41,7 +47,7 @@ Converge the content-addressed (CA) GC subsystem onto the north-star design. Fou
 **Non-goals (explicit):**
 
 - **Packing / small-file bundling** (doc §9/§17) — deferred to its own spec; referenced as future work
-  (§13). With the chosen model the refcount is never materialized, so packing is not on the critical path.
+  (§14). With the chosen model the refcount is never materialized, so packing is not on the critical path.
 - **Changing the content-addressing & dedup core**, `part_id` semantics, or the freeze / fetch /
   replication-by-relink features already built — they are *preserved*; this spec shows how generations and
   the log-structured GC interact with them.
@@ -112,7 +118,7 @@ parts/<part_id>/active              optional, lazily-created pointer to current 
 store/<srv>/<uuid>/refs/<part>      live ref = commit point (per server)
 shadow/<backup>/.../refs/<part>     frozen ref — GC root (unchanged from FREEZE spec)
 sessions/<id>                       in-flight / dedup-skip / relink pin — GC root
-gc/current_epoch                    the epoch writers currently append deltas to
+gc/current_epoch/<shard>            per-shard epoch writers currently append deltas to (per-shard, not global)
 gc/log/<epoch>.<shard>/...          prefix of small +/- delta objects (one per commit or coalesced batch)
 gc/snap/<padded-epoch>.<shard>      sorted (H,g)->count run, per shard
 _pool_meta                          PoolMeta v3 (pool_uuid, no back-compat)
@@ -127,10 +133,10 @@ separate objects on purpose (§7.3).
 **Keeper holds no durable state.** With tombstones, `active`, the epoch counter, the log, and the snapshot
 all in S3 — and GC leadership already on the object-store fence lease (`PoolCoordination`) — **nothing
 durable requires Keeper**. This is stronger than the doc's "Keeper accelerator" mode (B): the end-state is
-Keeper-*optional*. The door is left open for Keeper to **accelerate** later, purely as a cache (§13): it can
-hold hot `active`/tombstone/epoch lookups to save S3 `HEAD`s, and mirror the log tail so the compaction
-skips the small-object `LIST`. None of that is built here, and losing the cache is never a correctness
-event — only a slowdown.
+Keeper-*optional* for correctness. As a pure cache it also **accelerates** the hot path (§12): hot
+`active`/tombstone/epoch lookups and ephemeral session pins collapse the writer's synchronous S3 op count,
+and a log-tail mirror saves the compaction's `LIST`. Losing the cache is never a correctness event — only a
+slowdown back to the §12.1 floor.
 
 ## 5. The log-structured, streaming GC {#log-structured-gc}
 
@@ -177,17 +183,18 @@ lost → undercount → a referenced blob is later swept. The writer already com
 cannot save it. **So S4's true prerequisite is not just "the tomb barrier exists" — it is "log completeness
 holds under concurrent appends."** This is provided by three rules together:
 
-1. **Epoch close by the fenced leader (no CAS).** A compaction first closes its epoch by writing
-   `gc/current_epoch = E+1`. This is a **plain fenced PUT**, not a compare-and-set: `gc/current_epoch` has a
-   *single writer* — the GC leader — so the existing fence lease (gated by `leadership_lost`) already
-   serializes it, and no `If-Match` primitive is needed (keeping G4's "only conditional-create" honest).
-   Only after the close does the leader `LIST` and fold `E`. "Closed" means *intended* to receive no new
-   deltas.
-2. **Writer re-append on advance.** A writer appends its `+` under the epoch it read, then **re-reads
-   `gc/current_epoch`**; if the epoch advanced past the one it wrote, it re-appends the *same logical delta*
-   into the now-current open epoch (bounded retry until the epoch is stable across its append). The orphaned
-   append in the closed epoch is a harmless leaked object (reclaimed by reconciliation). This converts the
-   straggler from *lost* to *re-logged*.
+1. **Epoch close by the fenced leader (no CAS), per shard.** A shard's compaction first closes that shard's
+   epoch by writing `gc/current_epoch/<shard> = E+1`. This is a **plain fenced PUT**, not a compare-and-set:
+   the per-shard epoch has a *single writer* — the shard's GC leader — so the existing fence lease (gated by
+   `leadership_lost`) already serializes it, and no `If-Match` primitive is needed (keeping G4's "only
+   conditional-create" honest). Only after the close does the leader `LIST` and fold `E`. Epochs are
+   **per-shard** so an unrelated shard's compaction never forces a writer to re-append for blobs in other
+   shards.
+2. **Writer re-append on advance.** A writer appends its `+` under the (per-shard) epoch it read, then
+   **re-reads `gc/current_epoch/<shard>`**; if that shard's epoch advanced past the one it wrote, it
+   re-appends the *same logical delta* (same `event_id`) into the now-current open epoch (bounded retry
+   until stable). The orphaned append in the closed epoch is a harmless leaked object (reclaimed by
+   reconciliation, deduped by `event_id`). This converts the straggler from *lost* to *re-logged*.
 3. **Session held until folded (safety net).** The in-flight session pin (§7.3) is retained until the
    writer's `+` is observed **folded into a durable snapshot**, not merely until commit. So at every
    instant, *(live sessions) ∪ (folded snapshot)* covers every live reference. Any residual straggler that
@@ -319,14 +326,16 @@ needless RECOVER/leak). The live ref stays the true reader-facing commit point, 
 3. upload missing blobs (`blobs/H/g`) and the manifest (`parts/<part_id>/<mg>`) via conditional-create;
 4. **re-check** the `.tombstone` for every pinned `(H,g)` **and** for `(part_id, mg)`;
 5. if any tomb is present → abandon that generation, resurrect to `g+1` / `mg+1`, retry from (2);
-6. else settle the final pinset and append the `gc/log +` **once** (with its `event_id`; then the epoch
-   re-append check, §5.1 rule 2);
+6. else settle the final pinset and enqueue the `gc/log +` (with its `event_id`) — **batched/async, not a
+   synchronous pre-ref PUT** (§12.1); the durable reference for the gap is the session (§5.1 rule 3);
 7. write the **live ref** (`store/.../refs/<part>`) — the commit point;
-8. keep the session until the `+` is folded (§5.1 rule 3), then delete it.
+8. keep the session until the `+` is **durably written to S3 and folded** (§5.1 rule 3, §12.1), then delete
+   it.
 
-The `+` thus lands only on the success path, after the tomb re-check, before the live ref (preserving I8).
 The §7 proof is unaffected: its "publish" flag `A` is the **session pin** (step 2), which precedes both the
-re-check (step 4) and GC's authoritative check (§6.2 reads the live session set).
+re-check (step 4) and GC's authoritative check (§6.2 reads the live session set). The `+` being async does
+*not* weaken safety because the session covers the reference until the `+` is durable *and* folded — see the
+ordering note in §8 (I8) and the cost model (§12.1).
 
 **GC (explicit order):** seal `<g>.tombstone` → **then** the fresh authoritative reference check (§6.2:
 sessions + current compaction) → delete iff none and tomb intact.
@@ -407,9 +416,12 @@ Carried from doc §13, restated against this layout:
   *I7c:* a reader may read any present generation (byte-identical); the pin generation is GC accounting,
   not read identity.
   *I7d:* `active` is a best-effort preferred-generation hint, repaired by reader fallback.
-- **I8 (ordering biases to over-count).** Commit: session before reuse; `+` (after the tomb re-check)
-  before live ref; live ref before session removal. Drop: live ref removal before `-`. A crash thus
-  over-counts (safe), never under-counts.
+- **I8 (ordering biases to over-count).** Commit: **session before reuse** (the session, not the `+`, is the
+  synchronous durable reference flag); the `+` is logged after the tomb re-check but may be **batched/async**
+  (§12.1) — the session covers the reference until the `+` is durably written *and* folded; live ref before
+  session removal. Drop: live ref removal before `-`. A crash thus over-counts (safe), never under-counts.
+  (The committed live ref is itself reconstructable into a `+` by root-marker reconciliation, so even a lost
+  async `+` cannot cause an under-count.)
 - **Theorem.** No committed ref to content `H` becomes unreadable, because the physical generations of `H`
   are never all deleted while a ref or session names `H` (proof §7, given I1–I8). (Refs name bare `H`, not a
   specific `g`, so the guarantee is content-availability, not "names a live `g`.")
@@ -490,14 +502,108 @@ an in-memory refcount.
   dedup-on-fold, or that reconciliation bounds the over-count).
 - **Stateless regression.** The `no-content-addressed-storage`-gated suite (per the `cas-test-triage`
   procedure) must stay green across every stage — the behavioral safety net.
+- **Op-count budgets (assert, don't hope).** Instrument deterministic counters and assert the §12.3 budgets
+  in tests/stress: `cas_s3_ops_per_commit{PUT,GET,HEAD,LIST,DELETE}`, `cas_s3_control_ops_per_commit`, the
+  key one **`cas_s3_sequential_control_depth_per_commit`** (target 1 normal / ≤2 degraded), plus
+  `cas_writer_tombstone_s3_fallbacks`, `cas_keeper_generation_cache_miss`,
+  `cas_keeper_tombstone_negative_invalid`, `cas_log_batch_size`, and `cas_s3_session_fallbacks`. A
+  regression that quietly reintroduces a per-blob `HEAD` then fails a test, not a benchmark months later.
 
-## 12. Open questions and assumptions {#open}
+## 12. Hot-path cost model and Keeper acceleration {#cost-model}
+
+Correctness (§5–§8) is S3-only and Keeper-optional. But at ~300 ms per S3 op, a *literal* reading of §7.1 is
+4–6 serialized round-trips per small commit (~1.2–1.8 s) — unusable for high-churn ingest and background
+merges. This section makes the op count first-class. **Keeper stays optional for correctness but is strongly
+recommended for write latency** (ClickHouse already runs it for `ReplicatedMergeTree`); the S3-only floor is
+correct but slower. These are *budgets the implementation must hit*, not afterthoughts.
+
+### 12.1 The S3-only commit-path floor {#s3-floor}
+
+Three levers collapse the naive per-blob sequential path to a small constant of *sequential* round-trips,
+with no Keeper:
+
+- **Parallelize every per-blob op.** Existence checks and uploads for the N files of a part are independent —
+  issue them with bounded fan-out, so N×300 ms becomes ≈1×300 ms. The spec mandates a **writer concurrency
+  model** for §7.1 steps 3–4, just as it mandates one for GC sharding.
+- **One prefix `LIST blobs/<H0>/<H1>/<H>/` per distinct `H`, not 2–3 `HEAD`s.** The locality-by-author
+  layout (§4) makes a single `LIST` return *existence + `.tombstone` + `active`* together — serving dedup,
+  generation resolution, **and** the handshake re-check in one op (it is `list-after-write` authoritative, so
+  it is a valid handshake `K`). And the tomb re-check is only needed for **reused** blobs: a freshly created
+  `(H,g)` has no prior `+`, so the compaction can never have produced it as a candidate, so it cannot be
+  sealed. Per-`H` cost is thus **1 LIST**, parallel across files.
+- **The `+` is batched/async, not a synchronous pre-ref PUT.** The synchronous durable flag is the
+  **session** (§5.1 rule 3); the `+` is coalesced (§5 batching) and written after the ref, the session
+  covering the reference until the `+` is durable *and* folded. A crash in the gap over-counts, never
+  under-counts (I8).
+
+**S3-only floor: one durable session PUT + one live-ref PUT (two sequential control writes) + parallel data
+uploads** — not 2N+3 sequential ops.
+
+### 12.2 Keeper acceleration (the "extra pass") {#keeper-accel}
+
+Keeper is a pure accelerator holding only a **small, bounded, hot derived set** — never durable truth. Its
+loss degrades to §12.1, never to incorrectness.
+
+- **Ephemeral session pins.** The in-flight pin is a Keeper *ephemeral* znode (pinset inline for small
+  parts; descriptor + an S3 session object for large parts), removing the S3 session PUT/DELETE; a crash
+  drops it by session timeout. **Safety rule:** if the Keeper session is lost before the live ref is
+  committed, the writer aborts (uncommitted ≠ durable truth); if Keeper drops mid-flight, the writer
+  re-establishes a durable **S3** session before committing, or aborts. GC's authoritative re-check (§6.2)
+  reads the Keeper session set in normal mode; when Keeper is down GC pauses (it is background) and writers
+  use S3 sessions, so the two never disagree (the recovery pass folds any S3 sessions back in).
+- **Per-shard epoch mirror.** `gc/current_epoch/<shard>` (S3, truth) is mirrored to Keeper with a watch;
+  writers read/watch Keeper instead of `GET`-ing S3 per commit. GC order: PUT S3 epoch → publish Keeper
+  epoch → only then fold. Writer falls back to the S3 epoch read on a Keeper miss.
+- **Valid-negative tombstone/generation cache — the safety-critical one.** To skip the per-blob tomb
+  `HEAD`/`LIST`, the writer needs a *trusted negative* ("no seal for `(H,g)` up to fence F"). Safe under one
+  coherence rule: **GC publishes each seal to Keeper *before* its S3 authoritative re-check (§6.2).** Then
+  the §7 proof holds with the Keeper seal as the flag `M`: writer commits ⇒ its Keeper read `K` missed the
+  seal ⇒ `start(K) < end(M_keeper) ≤ start(L) < end(A) ≤ start(K)`, a contradiction. A stale-**positive**
+  ("sealed" when it isn't) → a needless resurrection (wasteful, never unsafe). A stale-**negative** is
+  prevented by a freshness fence; if the cache cannot *prove* the negative at a fresh-enough fence (or
+  Keeper is unavailable), the writer **falls back to the S3 prefix `LIST`** (§12.1) — measured, never hidden.
+- **Log-tail mirror.** Keeper holds small per-delta metadata (`{s3_log_key, event_id, hash range}`), not
+  full pinsets, so the compaction skips the S3 `LIST gc/log/...` in the common case; on Keeper loss it lists
+  S3 and rebuilds. GC also **batches seals and deletes** (multi-object delete) per epoch so reclamation
+  throughput is not itself a sequential-op problem.
+- **Bounded memory.** Keeper stores only: *recent* seals (TTL'd — a writer attaching to the active
+  generation needs only to know it was not *just* sealed, not the permanent gravestone history), *non-zero*
+  `active` entries (rare; `g=0` needs none), an optional existence bloom, the epoch mirror, ephemeral
+  sessions, and the log-tail index. The reverse index, snapshot, full log, gravestones, and large pinsets
+  stay in S3. A fresh Keeper repopulates from `gc/snap` + un-folded `gc/log` — no bucket scan.
+
+### 12.3 Operation budgets and the "MUST NOT" list {#budgets}
+
+**Normal (Keeper) mode MUST NOT:** issue per-blob S3 `HEAD` tomb checks; issue per-blob S3 `GET active`;
+read S3 `gc/current_epoch` per commit; write an S3 session per short commit; write one S3 `gc/log` object
+per small commit without batching.
+
+| Scenario (normal Keeper mode) | Target synchronous S3 | Async / amortized | Forbidden on success path |
+|---|---|---|---|
+| New small part (N files) | data PUTs + manifest PUT + **1 live-ref PUT** | `+` log/index | per-blob S3 metadata reads |
+| Dedup / relink / clone | **1 live-ref PUT** | `+` log/index | S3 `HEAD`/`LIST` |
+| Drop / unlink | delete/tombstone the live ref | `-` delta | — |
+| **S3-only degraded mode** | session PUT + ref PUT (+ parallel uploads, 1 prefix-`LIST`/H) | `+` log | — (correctness over latency) |
+
+The metric that matters is **serialized S3 control round-trips before the commit is visible**: target **1**
+in normal mode, **≤2** in degraded mode — not 4–6.
+
+### 12.4 Read-path cost {#read-cost}
+
+A steady `g=0` read is exactly **one `GET blobs/H/0`** — no `active` read, no `LIST`. The on-node cache holds
+the resolved generation, so a `g>0` (resurrected) content amortizes its `active` lookup; the Keeper `active`
+hint lets the *first* read of resurrected content skip the `404`-then-`LIST`. The `LIST blobs/H/` fallback
+fires only on a genuine miss, so G3 holds and there is no hot-path listing storm.
+
+## 13. Open questions and assumptions {#open}
 
 - **No back-compat assumption** (§1) — confirmed for the PoC branch; revisit before any non-PoC use.
 - **`gc/log` truth level — classified.** The log is a **rebuildable accelerator, not durable commit
-  truth.** Because at most one generation of `H` is live (I7), `(H,g)` reachability is reconstructable from
-  the live refs + manifests + the blob store's own tombstone state (the heavy fallback, doc §12) without the
-  log. The log only makes GC *fast*; losing it forces a slower rebuild, never a wrong answer.
+  truth.** Refs name *content* `H` (not a specific `g`), so after log loss the live refs + manifests
+  reconstruct **content reachability** (the heavy fallback, doc §12); rebuild may **rebind** each live `H`
+  to any present byte-identical generation, then sweep unbound sealed generations via the normal
+  seal/recheck protocol. Exact historical per-generation attribution may be lost, but no data is. The log
+  only makes GC *fast*; losing it forces a slower rebuild, never a wrong answer.
 - **Grace duration** is a liveness knob only and never affects safety (doc §6.3); its value trades
   reclamation latency against the resurrect/recover rate.
 - **Observability (build alongside S1–S4).** Export `cas_generation_resurrections_total`,
@@ -506,17 +612,18 @@ an in-memory refcount.
   zero-refs→resurrection grows tombstones/duplicate-bytes; permanent gravestones are safe but not free, so
   these are guardrails, not just dashboards.
 
-## 13. Future work {#future}
+## 14. Future work {#future}
 
 - **Packing** (deferred, §1): bundle truly-tiny part files into larger content-addressed blobs to attack
   raw S3 object count and per-request cost. It slots in beneath the manifest (the manifest would pin bundle
   slices); the GC/handshake model here is unchanged because it operates on `(H,g)` regardless of whether
   `H` is a single file or a bundle.
-- **Keeper acceleration** (§4): mirror hot `active`/tombstone/epoch lookups and the log tail into Keeper as
-  a pure cache. No durable state moves to Keeper; losing it is only a slowdown.
 - **Parallel GC** (§5): run N per-shard compaction workers concurrently once a single-worker shard
   compaction is proven.
 - **Self-describing refs (optional optimization).** Inlining the resolved `(H,g)` pinset (or a
   `pinsets/<hash>` pointer) into the live ref would let a rebuild resolve generations without reading the
-  blob store at all. It is *not* required for correctness — I7 already makes `(H,g)` reconstructable — so it
-  is deferred as a rebuild-speed optimization, weighed against the extra commit-path write.
+  blob store. It is *not* required for correctness (I7 makes `(H,g)` reconstructable) nor for write latency
+  (Keeper ephemeral sessions + async `+` already reach the §12.3 one-PUT floor without it). Its value is
+  (a) shrinking the degraded S3-only path toward one PUT (inline pins → no separate session/log write), and
+  (b) faster rebuild. Deferred, weighed against larger refs and pinset chunking for very large parts; a
+  hybrid (inline for small pinsets, separate session/log for large) is the natural shape if adopted.
