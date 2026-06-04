@@ -317,6 +317,9 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         metadata_storage.object_storage,
         key_prefix,
         local_scratch_path,
+        buf_size,
+        settings.use_adaptive_write_buffer,
+        settings.adaptive_write_buffer_initial_size,
         metadata_storage.gcLock(),
         metadata_storage.inFlightPinnedBlobs(),
         [this, part_table_uuid, part_part_name, file](const ContentAddressed::BlobHash & blob_hash, size_t size)
@@ -1781,11 +1784,22 @@ ContentAddressedWriteBuffer::ContentAddressedWriteBuffer(
     ObjectStoragePtr object_storage_,
     std::string key_prefix_,
     std::string temp_dir_,
+    size_t buf_size_,
+    bool use_adaptive_buffer_size_,
+    size_t adaptive_buffer_initial_size_,
     std::shared_ptr<std::mutex> gc_lock_,
     std::shared_ptr<std::set<std::string>> in_flight_pinned_blobs_,
     OnFinalized on_finalized_,
     OnPinBlob on_pin_blob_)
-    : WriteBufferFromFileBase(DBMS_DEFAULT_BUFFER_SIZE, nullptr, 0)
+    /// Honour the caller's requested working-buffer size, and the adaptive-sizing flag the plain
+    /// object-storage backends (S3/Azure) honour: when adaptive sizing is on we pre-allocate only the
+    /// small adaptive-initial buffer instead of the full `buf_size_`. Hard-coding DBMS_DEFAULT_BUFFER_SIZE
+    /// here made every content-addressed column stream allocate a full 1 MiB working buffer regardless of
+    /// `min_columns_to_activate_adaptive_write_buffer`, so a wide part with hundreds of columns blew the
+    /// per-INSERT memory budget. Our own base buffer is fixed (it just stages caller bytes before they
+    /// are hashed and spilled), so a small fixed buffer is correct — the costly IO is the temp-file
+    /// spill below, which grows adaptively.
+    : WriteBufferFromFileBase(use_adaptive_buffer_size_ ? adaptive_buffer_initial_size_ : buf_size_, nullptr, 0)
     , object_storage(std::move(object_storage_))
     , key_prefix(std::move(key_prefix_))
     , gc_lock(std::move(gc_lock_))
@@ -1796,7 +1810,20 @@ ContentAddressedWriteBuffer::ContentAddressedWriteBuffer(
     fs::create_directories(temp_dir_);
     temp_path = temp_dir_ + "/" + getRandomASCIIString(32) + ".tmp";
 
-    temp_file = std::make_unique<WriteBufferFromFile>(temp_path);
+    /// The local-scratch spill buffer is a SECOND per-stream buffer (the bytes hashed out of our own
+    /// working buffer land here before being uploaded). Thread the adaptive-sizing flag into it too so
+    /// it STARTS small and grows on demand (its native support), keeping the per-stream footprint small
+    /// for wide parts. It writes to a local temp file, not the remote stream.
+    temp_file = std::make_unique<WriteBufferFromFile>(
+        temp_path,
+        /*buf_size=*/buf_size_,
+        /*flags=*/-1,
+        /*throttler=*/nullptr,
+        /*mode=*/0666,
+        /*existing_memory=*/nullptr,
+        /*alignment=*/0,
+        use_adaptive_buffer_size_,
+        adaptive_buffer_initial_size_);
     hashing = std::make_unique<HashingWriteBuffer>(*temp_file);
 }
 

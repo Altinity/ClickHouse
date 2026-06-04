@@ -59,10 +59,23 @@ public:
     /// decision under that lock so the pin is visible to a concurrent sweep before the skip — closing
     /// the window where a reused (skip-uploaded) blob could be reclaimed before the ref is published.
     /// Both may be null (legacy / unit construction with no background GC): then no pin is taken.
+    /// `buf_size_` is the working-buffer size requested by the caller (the MergeTree writer threads it
+    /// down). `use_adaptive_buffer_size_` / `adaptive_buffer_initial_size_` mirror the same flags the
+    /// plain object-storage backends honour (`S3ObjectStorage`, `AzureObjectStorage`): when adaptive
+    /// sizing is on the per-stream buffer STARTS at `adaptive_buffer_initial_size_` (a few KiB) and
+    /// grows on demand, instead of pre-allocating the full `buf_size_`. This is what
+    /// `min_columns_to_activate_adaptive_write_buffer` toggles, so a wide part with hundreds of columns
+    /// keeps its per-INSERT write-buffer footprint small. These size ONLY this buffer's own working
+    /// buffer — the caller writes into it before the bytes are hashed and spilled — so the footprint
+    /// tracks the plain path. The local-scratch spill file keeps a small fixed buffer of its own (its
+    /// IO is to a local temp file, not the costly remote stream).
     ContentAddressedWriteBuffer(
         ObjectStoragePtr object_storage_,
         std::string key_prefix_,
         std::string temp_dir_,
+        size_t buf_size_ = DBMS_DEFAULT_BUFFER_SIZE,
+        bool use_adaptive_buffer_size_ = false,
+        size_t adaptive_buffer_initial_size_ = DBMS_DEFAULT_INITIAL_ADAPTIVE_BUFFER_SIZE,
         std::shared_ptr<std::mutex> gc_lock_ = nullptr,
         std::shared_ptr<std::set<std::string>> in_flight_pinned_blobs_ = nullptr,
         OnFinalized on_finalized_ = {},
