@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-ordinary-database, no-shared-merge-tree, no-content-addressed-storage
-# no-content-addressed-storage: uses experimental transactions; MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED; object-storage-wide, B39)
+# Tags: zookeeper, no-replicated-database, no-ordinary-database, no-shared-merge-tree
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
