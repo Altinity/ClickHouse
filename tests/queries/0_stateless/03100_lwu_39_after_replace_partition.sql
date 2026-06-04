@@ -1,3 +1,5 @@
+-- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
 DROP TABLE IF EXISTS t_lwu_replace;
 
 SET enable_lightweight_update = 1;
