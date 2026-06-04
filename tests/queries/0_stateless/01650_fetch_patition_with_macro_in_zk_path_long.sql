@@ -1,4 +1,5 @@
--- Tags: long, no-shared-merge-tree
+-- Tags: long, no-shared-merge-tree, no-content-addressed-storage
+-- no-content-addressed-storage: FETCH PARTITION partition-clone not supported on CA (B21 partition-clone)
 
 DROP TABLE IF EXISTS test_01640;
 DROP TABLE IF EXISTS restore_01640;
