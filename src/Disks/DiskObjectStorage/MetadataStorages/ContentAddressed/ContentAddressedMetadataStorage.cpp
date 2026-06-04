@@ -70,7 +70,7 @@ void ContentAddressedMetadataStorage::startup()
     /// own pool, and fail closed on an unknown format version or a second/concurrent mounter (B11).
     /// This is the guard that makes it safe to run background GC without the full coordination
     /// protocol (B32): a pool another live server could be writing to is never swept here.
-    ContentAddressed::claimPoolOwnership(
+    pool_uuid = ContentAddressed::claimPoolOwnership(
         object_storage,
         storage_path_prefix,
         server_id,

@@ -60,6 +60,12 @@ public:
 
     const std::string & serverIdForTest() const { return server_id; }
 
+    /// The pool's stable identity (`PoolMeta::pool_uuid`), resolved during `startup` (minted on a fresh
+    /// claim, or read from the existing marker on re-mount / shared-accept). Empty before `startup`.
+    /// Used by the fetch-by-relink path to confirm two replicas share a pool — endpoint+prefix
+    /// string-matching is unsafe (false positives → mis-relink).
+    const std::string & getPoolUUID() const { return pool_uuid; }
+
     /// Test hook: run one synchronous GC sweep round and wait for it (no-op if no GC thread).
     const ContentAddressedGCThreadPtr & gcThreadForTest() const { return gc_thread; }
 
@@ -123,6 +129,10 @@ private:
     /// Operator opt-in to mount a pool already owned by a different server (B11). Default false:
     /// fail closed on a second/concurrent mounter so background GC can never run un-coordinated.
     const bool allow_shared_pool;
+
+    /// The pool's stable identity, resolved by `claimPoolOwnership` during `startup` (minted once by
+    /// the first claimant, read back on every later mount). Empty until `startup` runs.
+    std::string pool_uuid;
 
     /// Per-pool in-process GC lock (B49), shared with the background sweep and the commit path so a
     /// dedup-skipped blob cannot be reclaimed in the finalize -> commit window. Created eagerly so the

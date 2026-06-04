@@ -2358,11 +2358,13 @@ TEST_F(ContentAddressedMetaTest, PoolMetaSerializeRoundTrips)
     meta.version = PoolMeta::CURRENT_VERSION;
     meta.owner_server_id = "server-abc";
     meta.claimed_at_unix = 1234567;
+    meta.pool_uuid = "01234567-89ab-cdef-0123-456789abcdef";
 
     auto parsed = PoolMeta::deserialize(meta.serialize());
     EXPECT_EQ(parsed.version, PoolMeta::CURRENT_VERSION);
     EXPECT_EQ(parsed.owner_server_id, "server-abc");
     EXPECT_EQ(parsed.claimed_at_unix, 1234567);
+    EXPECT_EQ(parsed.pool_uuid, "01234567-89ab-cdef-0123-456789abcdef");
 }
 
 TEST_F(ContentAddressedMetaTest, PoolMetaRejectsBadMagic)
@@ -2533,14 +2535,20 @@ TEST_F(ContentAddressedMetaTest, AbortedTransactionLeavesNoSession)
 TEST_F(ContentAddressedMetaTest, PoolMetaGoldenBytesAndRejectsUnknownEncoding)
 {
     PoolMeta meta;
-    meta.version = 1;
+    // CAS replication Phase 1.1 bumped the POOL-content version to 2 and appended `pool_uuid` LAST in
+    // the body. The golden bytes are updated for the version-2 layout: the version u32 is now 2 and a
+    // length-prefixed pool_uuid trails the (unchanged) version-1 fields. The encoding version byte is
+    // unchanged (only the body grew), so an unknown ENCODING version still fails closed (below).
+    meta.version = 2;
     meta.owner_server_id = "srv";
     meta.claimed_at_unix = 1;
+    meta.pool_uuid = "pu";
     const std::string expected =
         std::string("CAPM\x01", 5)                              // magic(4) + encoding version(1)
-        + std::string("\x01\x00\x00\x00", 4)                    // pool content version u32 LE = 1
+        + std::string("\x02\x00\x00\x00", 4)                    // pool content version u32 LE = 2
         + std::string("\x03", 1) + "srv"                        // owner server id (length-prefixed)
-        + std::string("\x01\x00\x00\x00\x00\x00\x00\x00", 8);   // claimed_at_unix i64 LE = 1
+        + std::string("\x01\x00\x00\x00\x00\x00\x00\x00", 8)    // claimed_at_unix i64 LE = 1
+        + std::string("\x02", 1) + "pu";                        // pool_uuid (length-prefixed, version 2+)
     EXPECT_EQ(meta.serialize(), expected);
     EXPECT_EQ(PoolMeta::deserialize(meta.serialize()).owner_server_id, "srv");
 
@@ -2663,6 +2671,202 @@ TEST_F(ContentAddressedMetaTest, PoolMounterRegistryListsAllMounters)
 
     EXPECT_TRUE(ids.contains("server-a")) << "server-a not registered";
     EXPECT_TRUE(ids.contains("server-b")) << "server-b not registered";
+}
+
+// CAS replication Phase 1.1: the first claim MINTS a stable, non-empty `pool_uuid`. It is written into
+// `_pool_meta`, returned by `claimPoolOwnership`, and round-trips through (de)serialize unchanged.
+TEST_F(ContentAddressedMetaTest, PoolUUIDMintedOnFirstClaim)
+{
+    const std::string prefix = "cas_pool_uuid_mint";
+    auto os = getObjectStorage(prefix);
+
+    const std::string returned =
+        DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-one", /*allow_shared=*/false, getLogger("test"));
+    EXPECT_FALSE(returned.empty()) << "first claim must mint a non-empty pool_uuid";
+
+    // The minted value is persisted in the marker and reads back identically (version is the new
+    // CURRENT_VERSION = 2, the version that carries pool_uuid in the body).
+    auto parsed = PoolMeta::deserialize(readObject(os, poolMetaKey(prefix)));
+    EXPECT_EQ(parsed.version, PoolMeta::CURRENT_VERSION);
+    EXPECT_EQ(parsed.pool_uuid, returned);
+    EXPECT_FALSE(parsed.pool_uuid.empty());
+}
+
+// CAS replication Phase 1.1: the `pool_uuid` is STABLE — re-opening the SAME pool (same prefix, same
+// server re-mounting, AND a shared mounter with a different server id) reads back the creator's
+// pool_uuid and never re-mints it. Two DIFFERENT pool prefixes mint DIFFERENT pool_uuids (so two
+// distinct pools can never be mistaken for one — the safety property fetch-by-relink relies on).
+TEST_F(ContentAddressedMetaTest, PoolUUIDIsStableAcrossReopenAndDiffersPerPool)
+{
+    const std::string prefix_a = "cas_pool_uuid_a";
+    const std::string prefix_b = "cas_pool_uuid_b";
+    auto os_a = getObjectStorage(prefix_a);
+    auto os_b = getObjectStorage(prefix_b);
+
+    // First claim mints; the SAME server re-mounting the SAME pool reads back the SAME uuid (never re-mint).
+    const std::string uuid_a1 =
+        DB::ContentAddressed::claimPoolOwnership(os_a, prefix_a, "server-one", /*allow_shared=*/false, getLogger("test"));
+    const std::string uuid_a2 =
+        DB::ContentAddressed::claimPoolOwnership(os_a, prefix_a, "server-one", /*allow_shared=*/false, getLogger("test"));
+    EXPECT_FALSE(uuid_a1.empty());
+    EXPECT_EQ(uuid_a1, uuid_a2) << "re-mount must keep the creator's pool_uuid";
+
+    // A DIFFERENT server mounting the SAME pool as a shared mounter also reads back the creator's uuid
+    // (it must not re-mint — that would defeat the shared-pool identity match).
+    const std::string uuid_a_shared =
+        DB::ContentAddressed::claimPoolOwnership(os_a, prefix_a, "server-two", /*allow_shared=*/true, getLogger("test"));
+    EXPECT_EQ(uuid_a1, uuid_a_shared) << "a shared mounter must observe the creator's pool_uuid";
+
+    // The marker on disk still carries the creator's uuid (never rewritten by the shared mounter).
+    EXPECT_EQ(PoolMeta::deserialize(readObject(os_a, poolMetaKey(prefix_a))).pool_uuid, uuid_a1);
+
+    // A DIFFERENT pool (distinct prefix) mints a DIFFERENT uuid.
+    const std::string uuid_b =
+        DB::ContentAddressed::claimPoolOwnership(os_b, prefix_b, "server-one", /*allow_shared=*/false, getLogger("test"));
+    EXPECT_FALSE(uuid_b.empty());
+    EXPECT_NE(uuid_a1, uuid_b) << "two distinct pools must have distinct pool_uuids";
+}
+
+// CAS replication Phase 1.1 (storage getter): the metadata storage exposes the pool's stable identity
+// via getPoolUUID after startup (minted on the fresh claim here). The value matches the marker on disk.
+TEST_F(ContentAddressedMetaTest, MetadataStorageExposesPoolUUIDAfterStartup)
+{
+    const std::string prefix = "cas_pool_uuid_storage";
+    fs::remove_all("./" + prefix);
+
+    DB::LocalObjectStorageSettings settings("test", "./" + prefix, /*read_only_=*/false);
+    auto os = std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+    auto ms = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        os, /*storage_path_prefix=*/prefix, "server-one", kCasTestScratch, /*context=*/nullptr, /*allow_shared_pool=*/false);
+
+    // Before startup the identity is unresolved.
+    EXPECT_TRUE(ms->getPoolUUID().empty());
+
+    ms->startup();
+    EXPECT_FALSE(ms->getPoolUUID().empty()) << "startup must resolve the pool_uuid";
+    EXPECT_EQ(ms->getPoolUUID(), PoolMeta::deserialize(readObject(os, poolMetaKey(prefix))).pool_uuid);
+
+    ms->shutdown();
+    os->shutdown();
+    fs::remove_all("./" + prefix);
+}
+
+// CAS replication Phase 1.1 (migration / fail-closed): a pool written by the PRE-change code (POOL-content
+// version 1, no pool_uuid in the body) must fail closed on this build rather than be silently
+// reinterpreted. We synthesize a version-1 marker by serializing the legacy body shape directly. The
+// claim path then refuses to mount (unknown POOL-content version), which is the accepted migration story:
+// fresh test pools are created each run, so they get version 2; a real pre-existing version-1 pool fails
+// closed (no in-place migration in Phase 1).
+TEST_F(ContentAddressedMetaTest, PoolMetaLegacyVersionOneFailsClosed)
+{
+    using namespace DB::ContentAddressed;
+    const std::string prefix = "cas_pool_uuid_legacy";
+    auto os = getObjectStorage(prefix);
+
+    // Hand-build the legacy version-1 body: magic(4)+enc(1) + version u32 LE = 1 + owner + claimed_at i64,
+    // with NO trailing pool_uuid (exactly what the pre-change serializer wrote).
+    const std::string legacy =
+        std::string("CAPM\x01", 5)
+        + std::string("\x01\x00\x00\x00", 4)                    // pool content version u32 LE = 1
+        + std::string("\x03", 1) + "old"                        // owner server id (length-prefixed)
+        + std::string("\x01\x00\x00\x00\x00\x00\x00\x00", 8);   // claimed_at_unix i64 LE = 1
+    writeObject(os, poolMetaKey(prefix), legacy);
+
+    // It parses (the deserializer reads pool_uuid only for version >= 2, so a version-1 body is valid),
+    // but the claim path gates the POOL-content version and fails closed on the unknown (old) version.
+    EXPECT_EQ(PoolMeta::deserialize(legacy).version, 1u);
+    EXPECT_EQ(PoolMeta::deserialize(legacy).pool_uuid, "");
+    EXPECT_THROW(
+        DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-one", /*allow_shared=*/false, getLogger("test")),
+        DB::Exception);
+}
+
+// CAS replication Phase 1.2 (N concurrent mounters + union-of-refs): two ContentAddressedMetadataStorage
+// instances with DISTINCT server ids share ONE pool (same object storage + prefix), both allow_shared.
+// Both claim succeed (no throw); both register in the mounter registry; they observe the SAME pool_uuid;
+// each publishes its OWN ref under a disjoint store/<server>/ subtree; and listLivePartIds — the GC live
+// set — sees BOTH servers' refs as roots (the cross-replica reference tracking the design gets for free).
+// Each also writes the SAME blob idempotently (the second condCreateIfAbsent is a no-op).
+TEST_F(ContentAddressedMetaTest, TwoMountersShareOnePoolUnionOfRefsAndSamePoolUUID)
+{
+    using namespace DB::ContentAddressed;
+    const std::string p = "cas_two_mounters_union";
+    fs::remove_all("./" + p);
+
+    DB::LocalObjectStorageSettings settings("test", "./" + p, /*read_only_=*/false);
+    auto os = std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+
+    auto make_storage = [&](const std::string & sid)
+    {
+        return std::make_shared<DB::ContentAddressedMetadataStorage>(
+            os, /*storage_path_prefix=*/p, sid, kCasTestScratch, /*context=*/nullptr, /*allow_shared_pool=*/true);
+    };
+    auto a = make_storage("serverA");
+    auto b = make_storage("serverB");
+
+    // Both mount succeed (B is NOT rejected — allow_shared is set), and both register in the registry.
+    EXPECT_NO_THROW(a->startup());
+    EXPECT_NO_THROW(b->startup());
+    EXPECT_TRUE(objectExists(os, poolMounterKey(p, "serverA")));
+    EXPECT_TRUE(objectExists(os, poolMounterKey(p, "serverB")));
+
+    // Both observe the SAME stable pool_uuid (the creator's; the shared mounter never re-mints).
+    EXPECT_FALSE(a->getPoolUUID().empty());
+    EXPECT_EQ(a->getPoolUUID(), b->getPoolUUID()) << "two mounters of one pool must share one pool_uuid";
+
+    // Each mounter COMMITS its own part: A writes blob "SHARED" + a private "A-ONLY"; B writes the SAME
+    // "SHARED" blob (idempotent dedup) + a private "B-ONLY".
+    const std::string uuid_a = "uuid-mount-a";
+    const std::string uuid_b = "uuid-mount-b";
+    auto commit_part = [&](DB::ContentAddressedMetadataStorage & ms, const std::string & uuid,
+                           const std::map<std::string, std::string> & files)
+    {
+        DB::ContentAddressedTransaction tx(ms, /*key_prefix=*/p, kCasTestScratch);
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    };
+    commit_part(*a, uuid_a, {{"a.bin", "A-ONLY"}, {"s.bin", "SHARED"}});
+    commit_part(*b, uuid_b, {{"b.bin", "B-ONLY"}, {"s.bin", "SHARED"}});
+
+    // Each ref lives under a DISJOINT store/<server>/ subtree (the per-server ref namespace).
+    auto a_refs = listKeysUnder(os, refsPrefix(p, "serverA", uuid_a));
+    auto b_refs = listKeysUnder(os, refsPrefix(p, "serverB", uuid_b));
+    ASSERT_FALSE(a_refs.empty());
+    ASSERT_FALSE(b_refs.empty());
+    for (const auto & k : a_refs)
+        EXPECT_NE(k.find("store/serverA/"), std::string::npos) << k;
+    for (const auto & k : b_refs)
+        EXPECT_NE(k.find("store/serverB/"), std::string::npos) << k;
+
+    // The shared "SHARED" column deduplicates to ONE blob object across the two mounters.
+    EXPECT_EQ(a->getStorageObjects("uui/" + uuid_a + "/all_1_1_0/s.bin")[0].remote_path,
+              b->getStorageObjects("uui/" + uuid_b + "/all_1_1_0/s.bin")[0].remote_path);
+
+    // The GC live set (listLivePartIds) scans the union of ALL servers' refs as roots: it must contain
+    // BOTH parts' ids. This is the cross-replica reference tracking the replication design gets for free.
+    auto a_pid = a->getStorageObjects("uui/" + uuid_a + "/all_1_1_0/a.bin"); // resolve to ensure part exists
+    ASSERT_EQ(a_pid.size(), 1u);
+    std::set<PartId> live = listLivePartIds(os, p);
+    EXPECT_EQ(live.size(), 2u) << "the union of both mounters' refs must be the live set";
+
+    // A sweep from ONE mounter's perspective (grace huge so nothing is reclaimed) keeps BOTH parts'
+    // blobs reachable — neither mounter's data is seen as orphaned by the other's GC.
+    auto a_blob = a->getStorageObjects("uui/" + uuid_a + "/all_1_1_0/a.bin")[0].remote_path;
+    auto b_blob = b->getStorageObjects("uui/" + uuid_b + "/all_1_1_0/b.bin")[0].remote_path;
+    DB::ContentAddressed::ContentAddressedGC gc(os, p);
+    gc.runSweepOnce(/*now=*/0, /*grace=*/1000000);
+    EXPECT_TRUE(objectExists(os, a_blob)) << "A's blob must be reachable from the union-of-refs scan";
+    EXPECT_TRUE(objectExists(os, b_blob)) << "B's blob must be reachable from the union-of-refs scan";
+
+    a->shutdown();
+    b->shutdown();
+    os->shutdown();
+    fs::remove_all("./" + p);
 }
 
 // M7 T1: a mutation rewrites ONE column and carries the rest forward by reference — the new part's

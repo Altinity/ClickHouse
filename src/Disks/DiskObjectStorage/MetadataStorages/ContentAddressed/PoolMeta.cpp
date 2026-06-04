@@ -12,6 +12,7 @@
 
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <Core/UUID.h>
 
 #include <ctime>
 
@@ -38,6 +39,9 @@ std::string PoolMeta::serialize() const
     DB::writeBinaryLittleEndian(version, buf);
     DB::writeStringBinary(owner_server_id, buf);
     DB::writeBinaryLittleEndian(claimed_at_unix, buf);
+    /// `pool_uuid` is appended LAST (version 2+). It comes after the body fields the version-1 layout
+    /// already carried, so the body's leading `version` u32 still gates compatibility for old readers.
+    DB::writeStringBinary(pool_uuid, buf);
     buf.finalize();
     return out;
 }
@@ -54,6 +58,12 @@ PoolMeta PoolMeta::deserialize(const std::string & bytes)
     DB::readBinaryLittleEndian(meta.version, buf);
     DB::readStringBinary(meta.owner_server_id, buf);
     DB::readBinaryLittleEndian(meta.claimed_at_unix, buf);
+    /// `pool_uuid` is present in the body only for version 2+. Read it only when the body declares a
+    /// version that carries it; a version-1 body has no such trailing field. The caller still gates the
+    /// POOL-content `version` (an unknown/newer version fails closed there), so this only needs to parse
+    /// far enough to read the version-2 layout this build understands.
+    if (meta.version >= 2)
+        DB::readStringBinary(meta.pool_uuid, buf);
 
     if (meta.owner_server_id.empty())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed: _pool_meta is missing required fields");
@@ -61,7 +71,7 @@ PoolMeta PoolMeta::deserialize(const std::string & bytes)
     return meta;
 }
 
-void claimPoolOwnership(
+std::string claimPoolOwnership(
     const ObjectStoragePtr & object_storage,
     const std::string & key_prefix,
     const std::string & server_id,
@@ -87,15 +97,23 @@ void claimPoolOwnership(
     meta.version = PoolMeta::CURRENT_VERSION;
     meta.owner_server_id = server_id;
     meta.claimed_at_unix = static_cast<int64_t>(std::time(nullptr));
+    /// Mint the stable `pool_uuid` HERE — only the first claimant (the one that wins the CAS below)
+    /// ever writes a freshly-minted value. `UUIDHelpers::generateV4` is the same server-context random
+    /// UUID generator used for the `ServerUUID` (a server-side, non-deterministic identity is correct
+    /// for a pool created once and read back by every later mount). On the lost-CAS paths below we
+    /// instead READ and keep the existing `pool_uuid`, so it is never re-minted.
+    meta.pool_uuid = toString(UUIDHelpers::generateV4());
 
     /// Absent -> claim, ATOMICALLY. `condCreateIfAbsent` is the compare-and-set: exactly one of two
     /// truly-concurrent first-mounters can create the marker (B51 — the old read-then-write let both
     /// see "absent" and both claim). If we created it we are the first owner — done.
     if (condCreateIfAbsent(*object_storage, key, meta.serialize()))
     {
-        LOG_INFO(log, "ContentAddressed: claimed pool ownership at '{}' for server '{}'", key, server_id);
+        LOG_INFO(
+            log, "ContentAddressed: claimed pool ownership at '{}' for server '{}' (pool_uuid '{}')",
+            key, server_id, meta.pool_uuid);
         register_mounter();
-        return;
+        return meta.pool_uuid;
     }
 
     /// The CAS was lost: the marker already existed (a prior mount of ours, or another mounter that won
@@ -117,10 +135,13 @@ void claimPoolOwnership(
     if (existing.owner_server_id == server_id)
     {
         /// The same server re-mounting its own pool — the normal case (incl. each M6 test run, which
-        /// uses a stable server id and a fresh pool). Nothing to do; keep the existing marker.
-        LOG_TRACE(log, "ContentAddressed: pool at '{}' already owned by this server '{}'", key, server_id);
+        /// uses a stable server id and a fresh pool). Nothing to do; keep the existing marker and its
+        /// already-minted `pool_uuid` (never re-mint).
+        LOG_TRACE(
+            log, "ContentAddressed: pool at '{}' already owned by this server '{}' (pool_uuid '{}')",
+            key, server_id, existing.pool_uuid);
         register_mounter();
-        return;
+        return existing.pool_uuid;
     }
 
     if (!allow_shared)
@@ -132,16 +153,19 @@ void claimPoolOwnership(
             key, existing.owner_server_id);
 
     /// Operator explicitly acknowledged shared use. Do NOT rewrite the marker (that would hide the
-    /// first owner); register THIS mounter in the registry and proceed. Shared use is coordinated (M8):
-    /// the background sweep deletes only while it holds the fenced per-pool GC-leader lock, and live
-    /// write-session pins keep just-uploaded blobs reachable across mounters, so concurrent mounters are
-    /// safe. Log at INFO so the shared configuration stays visible without implying it is unsafe.
+    /// first owner OR re-mint the pool_uuid); register THIS mounter in the registry and proceed. Shared
+    /// use is coordinated (M8): the background sweep deletes only while it holds the fenced per-pool
+    /// GC-leader lock, and live write-session pins keep just-uploaded blobs reachable across mounters,
+    /// so concurrent mounters are safe. Keep the existing (creator's) `pool_uuid`. Log at INFO so the
+    /// shared configuration stays visible without implying it is unsafe.
     LOG_INFO(
         log,
-        "ContentAddressed: pool at '{}' is owned by another server '{}' and 'content_addressed_allow_shared_pool' "
-        "is set; registering as a shared mounter (coordinated GC-leader lock + write-session pins). Server '{}'.",
-        key, existing.owner_server_id, server_id);
+        "ContentAddressed: pool at '{}' is owned by another server '{}' (pool_uuid '{}') and "
+        "'content_addressed_allow_shared_pool' is set; registering as a shared mounter (coordinated "
+        "GC-leader lock + write-session pins). Server '{}'.",
+        key, existing.owner_server_id, existing.pool_uuid, server_id);
     register_mounter();
+    return existing.pool_uuid;
 }
 
 }
