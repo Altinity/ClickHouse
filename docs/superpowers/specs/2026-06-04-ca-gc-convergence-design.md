@@ -9,7 +9,10 @@ doc_type: 'guide'
 
 # Content-Addressed MergeTree — GC Convergence Design {#cas-gc-convergence}
 
-**Status:** umbrella design spec, awaiting review. **Date:** 2026-06-04. **Branch:** `cas-mergetree-poc`.
+**Status:** umbrella design spec, awaiting review (rev. 2 — incorporates external review: epoch-close /
+log-completeness protocol §5.1, read-safety invariants §6.1–§6.2, explicit writer/unlink ordering §7.1,
+sessions-until-folded §7.3, manifest reclamation + orphan bounds §9). **Date:** 2026-06-04. **Branch:**
+`cas-mergetree-poc`.
 North-star reference: `docs/superpowers/specs/content_addressed_shared_mergetree_design.md` (the original
 distributed CAS+GC design; section numbers below, e.g. *(doc §7)*, refer to it).
 
@@ -131,9 +134,13 @@ The reverse index is log-structured, like an LSM tree:
 - **Snapshot = a sorted run.** `gc/snap/<padded-epoch>.<shard>` holds `(H,g) → count`, **sorted by
   `(H,g)`**. This is the durable folded state.
 - **Delta log = the tail.** Commit and drop append `{op:+/-, part_id, pins:[(H,g)…]}` objects under
-  `gc/log/<epoch>.<shard>/` (pins inlined and `(H,g)`-resolved, doc §10). S3 has no append, so each
-  commit (or coalesced batch) writes its own small object under the prefix. **One write per commit — to
-  S3 only.** Keeper is not on this path.
+  `gc/log/<epoch>.<shard>/` (pins inlined and `(H,g)`-resolved, doc §10). S3 has no append, so each batch
+  writes its own small object under the prefix, **to S3 only** (Keeper is not on this path).
+- **Batching is a requirement, not a tuning lever.** S3 throttles a prefix at ~3,500 `PUT`/s, and
+  high-churn MergeTree ingest (small-block inserts + background merges/mutations) can burst commits. So a
+  writer **coalesces deltas** — in-memory group-commit over a short window, one object per `(shard,
+  window)` — rather than one object per commit, and the hash-prefix sharding (below) spreads `PUT` load
+  across prefixes. This is built into the write path from S2, not deferred.
 - **A GC epoch is a compaction.** The fenced leader, for each shard: `LIST`s the epoch's `gc/log` objects,
   **sorts** the deltas by `(H,g)`, then **streaming merge-joins** them against the sorted snapshot — an
   external merge-sort. It walks both sorted inputs in lockstep, sums counts per key, **writes the new
@@ -144,7 +151,7 @@ The reverse index is log-structured, like an LSM tree:
 - **Ordering invariant (I1/I6).** The `gc/log +` delta is written **before** the ref (commit point). So
   *ref exists ⇒ delta exists* ⇒ the log is complete for every live reference ⇒ a rebuild can only
   over-count (corrected by reconcile, §9), never under-count a live reference. This is what makes deletion
-  at `count == 0` safe.
+  at `count == 0` safe — **but only if every delta lands in a foldable position; see §5.1.**
 
 **Sharding by prefix → parallel GC (designed-in, implemented later).** The snapshot, the log, and the
 leadership lease are all keyed by **hash-prefix shard** from day one. A shard is the unit of
@@ -153,6 +160,38 @@ workers, one per shard, in parallel** is then a configuration change, not a rede
 
 This satisfies G3: the compaction reads only `gc/snap` + `gc/log`, never `LIST blobs/`. The full bucket scan
 survives **only** as the rare reconciliation / abandoned-upload fallback (doc §12 heavy fallback).
+
+### 5.1 Epoch protocol and log completeness {#epoch-protocol}
+
+Under the `gc_lock` (S2/S3) the lock does a second, easily-missed job: while a compaction holds it, no
+commit is appending, so the compaction's `LIST gc/log/E.shard/` sees a **stable** set. Once the lock is
+gone (S4), that consistency is not free, and naïvely folding an epoch reintroduces a data-loss race: a
+writer reads `current_epoch = E`, the compaction `LIST`s `E`, folds, advances to `E+1`, and reclaims `E`'s
+log; *then* the writer's `+` for `E` lands. That delta is never folded and never re-read → the reference is
+lost → undercount → a referenced blob is later swept. The writer already committed, so the §7 handshake
+cannot save it. **So S4's true prerequisite is not just "the tomb barrier exists" — it is "log completeness
+holds under concurrent appends."** This is provided by three rules together:
+
+1. **Epoch close by CAS.** A compaction first closes its epoch: conditional-update `gc/current_epoch`
+   `E → E+1` (the object store's compare-and-set / `If-Match`-equivalent). Only after the close does it
+   `LIST` and fold `E`. "Closed" means *intended* to receive no new deltas.
+2. **Writer re-append on advance.** A writer appends its `+` under the epoch it read, then **re-reads
+   `gc/current_epoch`**; if the epoch advanced past the one it wrote, it re-appends the same `+` into the
+   now-current open epoch (bounded retry until the epoch is stable across its append). The orphaned append
+   in the closed epoch is a harmless leaked object (reclaimed by reconciliation). This converts the
+   straggler from *lost* to *re-logged*.
+3. **Session held until folded (safety net).** The in-flight session pin (§7.3) is retained until the
+   writer's `+` is observed **folded into a durable snapshot**, not merely until commit. So at every
+   instant, *(live sessions) ∪ (folded snapshot)* covers every live reference. Any residual straggler that
+   slips past rules 1–2 therefore degrades from a **safety** bug (data loss) to a **liveness** bug (the
+   session, and thus the blob, leaks until detected) — a category we can tolerate and bound.
+
+**Completeness invariant (strengthened I6).** Once a compaction closes epoch `E`, every reference whose `+`
+targeted `E` is either (a) folded from `E`, (b) re-logged by its writer into an open epoch, or (c) still
+covered by a live session. No live reference is ever both unfolded and unpinned.
+
+This must be covered by a dedicated S4 interleaving oracle: a writer appending exactly as its epoch folds,
+asserting the blob is never swept while the part is live.
 
 ## 6. Generations and tombstones {#generations}
 
@@ -164,42 +203,95 @@ Generations exist only to make a **lockless, unconditional delete ABA-safe** (do
   to seal `blobs/H/g.tombstone`.
 - **The manifest stays content-only (bare `H`).** This is a deliberate divergence from the doc's literal
   "manifest pins `(H,g)`" wording, chosen to preserve the PoC's dedup and write-once idempotency: a manifest
-  remains a pure function of `part_id`, so two identical-content parts that resolved different generations
-  during a race still share one manifest. Generation lives only where GC needs it — in the **physical store
-  key** and in the **delta log** (the `+` records the resolved `(H,g)`). A reader resolves `g` via the
-  `active` hint (default 0) at read time.
-- **`<g>.tombstone` — one object, three fates** (doc §5): created by the GC leader as a single-owner seal;
-  *deleted* if a writer re-references `(H,g)` before the GC re-check (RECOVER → un-seal); *kept forever* as
-  the gravestone if the sweep deletes `<g>`. Once sealed, no new reference may attach to `g`; reuse routes
-  to `g+1`; therefore the delete of `g` is **unconditional and ABA-proof** (I4). Generation lineage
-  (`max(gen)`) is reconstructable from the surviving `<g>` / `.tombstone` objects even if `active` is lost.
-- **`active`** is absent in the common case (readers assume `g=0`); written only on resurrection
-  (`→ g+1`), idempotent, and reconstructable — a hint, not authority.
+  remains a pure function of `part_id`, so concurrent writers of the *same* part share one manifest (it is
+  their deltas, not the manifest, that the handshake/lock collapses to one generation). Generation lives
+  only where GC needs it — in the **physical store key** and in the **delta log** (the `+` records the
+  resolved `(H,g)`). A reader resolves `g` via the `active` hint at read time (§6.1).
+- **`<g>.tombstone` — one object, three fates, all GC-owned** (doc §5): created by the GC leader as a
+  single-owner seal; *deleted by the GC leader* during RECOVER, when its post-seal reference check observes
+  a session/ref that already protects `g` (un-seal); *kept forever* as the gravestone if the sweep deletes
+  `<g>`. **Writers never delete a tombstone** — on seeing one they only resurrect (below). Once sealed, no
+  new reference may attach to `g`; reuse routes to `g+1`; therefore the delete of `g` is **unconditional and
+  ABA-proof** (I4). Generation lineage (`max(gen)`) is reconstructable from the surviving `<g>` /
+  `.tombstone` objects even if `active` is lost.
 - **Resurrection (doc §8.2):** a contended writer that finds `blobs/H/g.tombstone` present does
-  `create blobs/H/(g+1)` → set `active = g+1` (idempotent) → pin / log `(H, g+1)`. It never waits, never
-  rescues `g`, never re-uploads to the sealed key.
+  `create blobs/H/(g+1)` → advance `active → g+1` (monotonic, §6.1) → pin / log `(H, g+1)`. It never waits,
+  never rescues `g`, never deletes the tombstone, never re-uploads to the sealed key.
 - **GC becomes mark / recover / sweep** (doc §8.4), replacing the current direct `removeObjectsIfExist`:
   candidate from the compaction → **seal** `<g>.tombstone` → **grace** (liveness only, never a safety
-  fence — doc §6.3) → re-check no-reference **and** tomb intact → delete `blobs/H/g`, keep the gravestone.
+  fence — doc §6.3) → **fresh authoritative re-check** (§6.2) showing no reference **and** tomb intact →
+  delete `blobs/H/g`, **reset `active` off `g`** (§6.1), keep the gravestone.
+
+### 6.1 The single-live-generation lemma, `active`, and the read path {#read-safety}
+
+The bare-`H` manifest decouples a part's **read generation** (resolved via `active`) from its **pinned
+generation** (recorded in the `+` delta). This is safe only because of a lemma that must be stated and
+relied on:
+
+**Lemma (single live generation).** At most one generation of a content `H` is live at any time. *Proof
+sketch:* a live part pins `g`; the §7 handshake forbids condemning a pinned `g`; resurrection proceeds only
+from an already-*condemned* predecessor; so a second live generation cannot appear. Hence `active` always
+denotes the unique live generation.
+
+**Read-safety invariant.** Any generation that `active` can resolve to has a live (non-tombstoned, present)
+blob. This is what guarantees a reader never resolves to a swept generation.
+
+Concrete rules:
+- **`active` is a hint, not authority**, and is absent in the common case (readers assume `g=0`). It is
+  written only on resurrection and **advanced monotonically** (conditional update; a stale writer can never
+  set `active = 1` after another set `active = 2`).
+- **Sweep maintains `active`.** When the sweep deletes `blobs/H/g`, it resets `active` off `g` (mirrors the
+  north-star deleting `current/H` on sweep). `active` must never point at a swept generation.
+- **Reader fallback.** A reader reads `active` (default 0), tries `blobs/H/<g>`; if absent or tombstoned, it
+  `LIST`s `blobs/H/`, picks the highest non-deleted generation, reads it, and opportunistically repairs
+  `active`. The resolved `g` is cached on the node (memory / page cache) so a resurrected (`g>0`) content
+  does not pay a repeated S3 round-trip per read — important when Keeper's accelerator cache is absent.
+
+### 6.2 The sweep's authoritative re-check {#authoritative-recheck}
+
+With the non-materialized refcount (model **C**), the sweep's "no reference?" gate cannot be a re-read of
+the epoch's compaction result — that is epoch-stale and would break the §7 proof (GC's check `L` must be
+able to observe a `publish` that completed before it). The authoritative re-check, performed **after** the
+seal, is: *no live session pins `(H,g)`* **and** *no `+` for `(H,g)` in the log tail since the last fold*
+(equivalently, it is the very compaction running at the later sweep epoch, which has folded everything up to
+its own post-seal `LIST`). Combined with §5.1 rule 3 (sessions held until folded), *sessions + current
+compaction* is a complete, fresh view of all live references — which is exactly what makes the gate
+authoritative.
 
 ## 7. The lockless handshake and sessions {#handshake}
 
-This is the payoff. It is safe to ship **only after §6's tomb barrier exists** (S4 depends on S3).
+This is the payoff. It is safe to ship **only after §6's tomb barrier (S3) and §5.1's log-completeness
+protocol exist** — dropping `gc_lock` exposes both the handshake race *and* the concurrent-append race.
 
 ### 7.1 The two-flag handshake (doc §7) {#two-flag}
 
 Both sides do store-then-load; the order *within* each side is what matters, not atomicity across sides.
+**The writer-side flag is the session pin (+ the `+` delta), not the visible live ref** — so the live ref
+stays the true reader-facing commit point and is written only after the handshake passes, avoiding a window
+where a visible ref names a generation the writer then abandons.
 
-- **Writer:** publish the reference → **then** re-check `blobs/H/g.tombstone` → commit iff absent, else
-  resurrect to `g+1`. In code, the publish currently *inside* the `gc_lock` window
-  (`...Transaction.cpp:1199`) moves out, followed by the tomb re-check.
-- **GC:** seal `<g>.tombstone` → **then** the authoritative reference check (no live ref, no unmatched `+`
-  in the merged state, no session pin) → delete iff none and tomb intact.
+**Writer (explicit order):**
+1. resolve `H → g` (via `active`, default 0);
+2. create/extend `sessions/<id>` with the resolved `[(H,g)…]` and the `parts/<part_id>` key;
+3. upload missing blobs / manifest via conditional-create;
+4. append the `gc/log +` for the pinset (then the epoch re-append check, §5.1 rule 2);
+5. **re-check** `blobs/H/g.tombstone` for every pinned `(H,g)`;
+6. if any tomb is present → abandon, resurrect to `g+1`, retry from (2);
+7. else write the **live ref** (`store/.../refs/<part>`) — the commit point;
+8. keep the session until the `+` is folded (§5.1 rule 3), then delete it.
 
-The chain `end(publish) ≤ start(recheck) < end(seal) ≤ start(refcheck) < end(publish)` is unsatisfiable
-(doc §7), so "writer commits to `g`" and "GC deletes `g`" cannot both hold — with **no lock and no
-transaction**, only read/list-after-write. **Dropping the shared `gc_lock` between `commit` and
-`runSweepOnce` is the act that lands G1.**
+**GC (explicit order):** seal `<g>.tombstone` → **then** the fresh authoritative reference check (§6.2:
+sessions + current compaction) → delete iff none and tomb intact.
+
+The chain `end(publish) ≤ start(recheck) < end(seal) ≤ start(refcheck) < end(publish)` (where *publish* = the
+session pin / `+`) is unsatisfiable (doc §7), so "writer commits to `g`" and "GC deletes `g`" cannot both
+hold — with **no lock and no transaction**, only read/list-after-write. **Dropping the shared `gc_lock`
+between `commit` and `runSweepOnce` is the act that lands G1.**
+
+**Unlink / drop ordering (bias to over-count).** Remove (or tombstone) the live ref **before** appending the
+`-` delta. A crash between the two then leaves a not-live part whose blob is briefly over-counted (safe,
+reconciled), never an under-count that could strand a delete. Symmetric to the commit ordering (`+` before
+ref; ref before session removal).
 
 ### 7.2 What carries safety once the lock is gone {#carriers}
 
@@ -223,27 +315,47 @@ every listed key as reachable for the session's lifetime (`sessionPinnedBlobs` /
 It serves three uses with one primitive: normal in-flight write, dedup-skip (pin *before* deciding not to
 re-upload), and relink (pin the existing manifest's blobs *before* publishing a ref).
 
+**Session lifetime = until folded, not until commit.** A session is retained until its `+` deltas are
+observed folded into a durable snapshot (§5.1 rule 3), so *sessions ∪ folded-snapshot* always covers every
+live reference and the §6.2 gate is complete. Abort before commit is still O(1) (drop the session, nothing
+was ever referenced).
+
+**Session reaping is timer-safe — and here's why that doesn't reintroduce the §6.3 time-fence trap.** A
+crashed/paused writer's session would otherwise pin blobs forever, so a background reaper deletes sessions
+past a deadline. A *timer* is sound **here** precisely because the gravestone is permanent: a reaped,
+then-resumed writer re-checks the tomb at step 5 and **resurrects** rather than committing to a swept
+generation — the timer governs liveness, never the commit-vs-delete safety decision. (A reaped in-flight
+*new* upload becomes an abandoned-upload orphan for the rare full scan.) The reaper must respect "folded"
+status so it never drops a session still covering an unfolded `+`.
+
 **Sessions and tombstones stay separate** — they are opposite-polarity flags written by opposite parties
 (writer vs single GC leader), and the handshake *requires* two distinct objects: each party raises its own
 flag and reads the *other's*. Merging them would lose single-owner sealing and collapse the §7 proof back
-into needing a lock. The session is the writer-side realization of "publish the reference before the
-re-check" for not-yet-committed parts; conversely, on commit a session's pins become durable `gc/log +`
-entries and the session is deleted (O(1) abort: drop the session, nothing was ever referenced).
+into needing a lock.
 
 ## 8. Safety invariants {#invariants}
 
 Carried from doc §13, restated against this layout:
 
-- **I1 / I6 (log completeness).** `gc/log +` is written before the ref ⇒ ref exists ⇒ delta exists ⇒
+- **I1 / I6 (log completeness under concurrent appends).** `gc/log +` is written before the ref, and — once
+  the lock is gone — every reference whose `+` targeted a closed epoch is folded, re-logged, or
+  session-covered (§5.1). So *(live sessions) ∪ (folded snapshot)* covers every live reference at all times;
   rebuild never under-counts.
-- **I2 (delete gating).** A blob generation is deleted only after an authoritative no-reference check, a
-  seal, a grace, and a re-check still showing no reference and an intact tombstone.
-- **I3 (writer handshake).** A writer commits a reference to `(H,g)` only after publishing it (ref or
-  session pin) and then observing `<g>.tombstone` absent; otherwise it resurrects to `g+1`.
-- **I4 (sealed generation).** A sealed generation never gains a new reference; reuse routes to `g+1`;
-  delete of a sealed generation is unconditional-safe.
+- **I2 (delete gating).** A blob generation is deleted only after a seal, a grace, and a **fresh
+  authoritative** no-reference re-check (§6.2 — sessions + current compaction, not an epoch-stale count)
+  still showing no reference and an intact tombstone.
+- **I3 (writer handshake).** A writer commits the live ref for `(H,g)` only after publishing the session
+  pin / `+` and then observing `<g>.tombstone` absent; otherwise it resurrects to `g+1`. The live ref is
+  written last (§7.1).
+- **I4 (sealed generation, GC-owned tombstone).** A sealed generation never gains a new reference; reuse
+  routes to `g+1`; only the GC leader removes a tombstone (RECOVER); delete of a sealed generation is
+  unconditional-safe.
 - **I5 (uniqueness).** At most one object per `(H,g)`; concurrent creators collapse via conditional-create.
-- **Theorem.** No committed ref names a deleted blob (proof §7).
+- **I7 (single live generation / read safety).** At most one generation of `H` is live at a time (§6.1); any
+  generation `active` resolves to has a live blob; sweep resets `active` off a deleted generation.
+- **I8 (ordering biases to over-count).** Commit: `+` before live ref, live ref before session removal.
+  Drop: live ref removal before `-`. A crash thus over-counts (safe), never under-counts.
+- **Theorem.** No committed ref names a deleted blob (proof §7, given I1–I8).
 
 ## 9. Failure handling and degraded modes {#failures}
 
@@ -253,10 +365,19 @@ Carried from doc §13, restated against this layout:
 - **GC leader crash mid-sweep.** The fence lease expires; a successor takes a higher fence. Seals are
   idempotent; deletes are gated on "fence still mine," so a stale leader cannot authorize a delete after
   losing leadership (generalizes the existing `leadership_lost` check).
-- **Writer crash mid-commit.** Order is session/ref → `gc/log +` → manifest → ref. A crash before the ref
-  leaves the part not-live; an orphan `+` / blob becomes an over-count (safe), corrected by the
-  reconcile-against-root-markers pass (doc §12); orphan blobs are swept by the rare full reconciliation
-  scan, kept as a fallback only.
+- **Writer crash mid-commit.** Order is session → blobs/manifest → `gc/log +` → live ref → (fold) → session
+  delete (§7.1). A crash before the live ref leaves the part not-live; an orphan `+` / blob becomes an
+  over-count (safe), corrected by the reconcile-against-root-markers pass (doc §12); the still-present
+  session keeps the blob reachable until reaped, after which an orphan blob is swept by the rare full scan.
+- **Manifest reclamation.** The reverse graph is ref → `parts/<part_id>` → blobs, but a blob-only `+` delta
+  cannot tell GC when the *manifest* becomes unreferenced. The delta therefore carries a **`part_id` edge**
+  alongside the blob pins; the compaction counts `part_id` references the same way, and a `part_id` whose
+  count reaches zero is a candidate to reclaim `parts/<part_id>` (sealed/swept by the same mark/recover/sweep
+  machinery). Without this the manifest object would leak.
+- **Orphan-drift bound.** Over-counts and abandoned uploads accumulate until the heavy reconciliation scan
+  runs. That scan is scheduled by a **bounded policy** — a cadence plus a threshold (e.g. run a shard's full
+  reconciliation when estimated orphan bytes exceed a configured fraction of the shard) — so storage drift
+  is bounded, not left to a vague "rare" cadence.
 - **Rebuild / catch-up.** Snapshot + log are sufficient to recompute counts without scanning blobs;
   reconcile against the metadata-sized root-marker listing corrects over-counts. The heavy full scan is the
   last resort only.
@@ -269,12 +390,15 @@ crutch**. The dangerous lock-removal is last and gated on the tomb barrier exist
 | Stage | Adds | Retires / changes | Safety rests on (until next stage) |
 |---|---|---|---|
 | **S1 — Reverse index becomes real** | Wire `InMemoryBlobRefIndex` as an incremental reverse index in the GC leader; commit/drop update it; the sweep *validates* it against the existing scan and logs drift | nothing yet (instrumentation only) | `gc_lock` + fence lease (unchanged) |
-| **S2 — Log-structured streaming GC** | `gc/log` (S3-only delta append, `+` before ref), `gc/snap` sorted runs, the streaming epoch compaction, shard-keyed layout, the doc §12 rebuild path | GC's full `parts/`+`blobs/` scan → candidate-from-compaction (G3) | `gc_lock` + fence lease |
-| **S3 — Generations + tombstones** | `blobs/H/g`, `<g>.tombstone` seal + gravestone, `active` hint, resurrection to `g+1`, mark/recover/sweep | bare-`H` blob key → `H/g`; direct delete → seal/grace/recheck/sweep (G2) | `gc_lock` (still held) + the new tomb barrier |
-| **S4 — Lockless handshake** | Writer publish-ref → recheck-tomb; GC seal → ref-check → delete (doc §7) | **Drop the in-process `gc_lock`** between commit and sweep (G1) | the §7 proof + session pins + fence lease |
+| **S2 — Log-structured streaming GC** | `gc/log` (S3-only, coalesced delta append, `+` before ref, `part_id` edge), `gc/snap` sorted runs, streaming epoch compaction with **CAS epoch-close before fold** (§5.1), shard-keyed layout, doc §12 rebuild | GC's full `parts/`+`blobs/` scan → candidate-from-compaction (G3) | `gc_lock` + fence lease |
+| **S3 — Generations + tombstones** | `blobs/H/g`, GC-owned `<g>.tombstone` seal + gravestone, monotonic `active` + sweep-maintains-`active` + reader fallback (§6.1), resurrection to `g+1`, mark/recover/sweep | bare-`H` blob key → `H/g`; direct delete → seal/grace/fresh-recheck/sweep (G2) | `gc_lock` (still held) + the new tomb barrier |
+| **S4 — Lockless handshake** | Writer order session→`+`→recheck-tomb→live-ref (§7.1); GC seal → fresh authoritative ref-check (§6.2) → delete; **session held until folded** (§5.1 rule 3) | **Drop the in-process `gc_lock`** between commit and sweep (G1) | the §7 proof + sessions-until-folded + fence lease |
 
-Dependencies: S2 → S1, S4 → S3. Each stage becomes its own `writing-plans` artifact; backlog items keep the
-branch's existing B-number scheme.
+Dependencies: S2 → S1, S4 → S3. **S4's real prerequisite is "log completeness under concurrent appends"
+(§5.1), not merely "the tomb barrier exists"** — the epoch-close protocol, writer re-append, and
+sessions-until-folded must all be in place, because dropping `gc_lock` is the first time both the handshake
+*and* the concurrent-append path are exercised in production. Each stage becomes its own `writing-plans`
+artifact; backlog items keep the branch's existing B-number scheme.
 
 **On the in-memory index.** S1's wired `InMemoryBlobRefIndex` is **transitional instrumentation** — its only
 job is to validate that incremental ref-counting agrees with the authoritative full scan before anything
@@ -288,22 +412,32 @@ an in-memory refcount.
 - **Per-stage gtests** extending `gtest_content_addressed*.cpp`:
   - S1 — refcount-vs-scan agreement (the validator must never disagree).
   - S2 — streaming-merge correctness, rebuild-from-snapshot+log, epoch fold + compaction, shard isolation.
-  - S3 — seal / resurrect / gravestone-lineage; `active` reconstruction; mark/recover/sweep transitions.
+  - S3 — seal / resurrect / gravestone-lineage; `active` monotonicity + sweep-resets-`active` + reader
+    fallback (a reader never resolves to a swept generation); mark/recover/sweep transitions.
   - S4 — the §7 interleaving oracle, modelled on the existing relink-race gtest (commit `c28411372fa`):
     publish-before-recheck vs seal-before-check, asserting no dangling ref under every interleaving.
 - **Race oracles**, each a deterministic interleaving test with **no sleeps**: drop-vs-reuse (C4),
-  reuse-vs-delete (C1), concurrent resurrection (C3), rebuild after state loss (C7).
+  reuse-vs-delete (C1), concurrent resurrection (C3), rebuild after state loss (C7), and — the load-bearing
+  one for model C — **append-as-epoch-folds** (§5.1): a writer's `+` lands as its epoch is closed/folded;
+  assert the blob is never swept while the part is live (covers epoch-close + re-append + session-until-fold
+  together).
 - **Stateless regression.** The `no-content-addressed-storage`-gated suite (per the `cas-test-triage`
   procedure) must stay green across every stage — the behavioral safety net.
 
 ## 12. Open questions and assumptions {#open}
 
 - **No back-compat assumption** (§1) — confirmed for the PoC branch; revisit before any non-PoC use.
-- **Delta-object volume.** One small `gc/log` object per commit; coalescing many commits' deltas into one
-  object per `(shard, window)` is the tuning lever if object count or `LIST` cost bites (an implementation
-  detail, not an architecture change).
+- **`gc/log` truth level — classified.** The log is a **rebuildable accelerator, not durable commit
+  truth.** Because at most one generation of `H` is live (I7), `(H,g)` reachability is reconstructable from
+  the live refs + manifests + the blob store's own tombstone state (the heavy fallback, doc §12) without the
+  log. The log only makes GC *fast*; losing it forces a slower rebuild, never a wrong answer.
 - **Grace duration** is a liveness knob only and never affects safety (doc §6.3); its value trades
   reclamation latency against the resurrect/recover rate.
+- **Observability (build alongside S1–S4).** Export `cas_generation_resurrections_total`,
+  `cas_duplicate_generation_bytes`, `cas_tombstones_total`, `cas_generations_per_hash` (p99),
+  `cas_orphan_bytes_estimate`, and `cas_unfolded_sessions`. Hot content that repeatedly cycles
+  zero-refs→resurrection grows tombstones/duplicate-bytes; permanent gravestones are safe but not free, so
+  these are guardrails, not just dashboards.
 
 ## 13. Future work {#future}
 
@@ -315,3 +449,7 @@ an in-memory refcount.
   a pure cache. No durable state moves to Keeper; losing it is only a slowdown.
 - **Parallel GC** (§5): run N per-shard compaction workers concurrently once a single-worker shard
   compaction is proven.
+- **Self-describing refs (optional optimization).** Inlining the resolved `(H,g)` pinset (or a
+  `pinsets/<hash>` pointer) into the live ref would let a rebuild resolve generations without reading the
+  blob store at all. It is *not* required for correctness — I7 already makes `(H,g)` reconstructable — so it
+  is deferred as a rebuild-speed optimization, weighed against the extra commit-path write.
