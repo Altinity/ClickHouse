@@ -3738,3 +3738,31 @@ TEST_F(ContentAddressedMetaTest, InFlightReadYourWritesBeforeCommit)
     tx.commit(DB::NoCommitOptions{});
     EXPECT_TRUE(ms->existsFile(col)); // now committed
 }
+
+// B59: the in-flight read of a MUTABLE per-part file (e.g. metadata_version.txt) — staged inline in
+// recorded_mutable, NOT as a content blob — is served as the inline bytes. It has no StoredObject, so
+// tryGetInFlightStorageObjects returns nullopt while tryReadFileInFlight returns the bytes.
+TEST_F(ContentAddressedMetaTest, InFlightReadYourWritesMutableFileBeforeCommit)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_inflight_mutable");
+    const std::string uuid = "uuid-inflight-mut";
+    const std::string part = "all_1_1_0";
+    const std::string mut = "uui/" + uuid + "/" + part + "/metadata_version.txt";
+    const std::string bytes = "42"; // a small mutable per-part value
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    {
+        auto buf = tx.writeFile(mut, 4096, DB::WriteMode::Rewrite, {});
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    // A mutable file has no blob object → no StoredObjects in-flight (must be read via tryReadFileInFlight).
+    EXPECT_FALSE(tx.tryGetInFlightStorageObjects(mut).has_value());
+    // But its size and inline bytes are resolvable before commit.
+    EXPECT_EQ(tx.tryGetInFlightFileSize(mut), std::optional<uint64_t>(bytes.size()));
+    auto rb = tx.tryReadFileInFlight(mut, DB::getReadSettings(), std::nullopt);
+    ASSERT_NE(rb, nullptr);
+    String got; DB::readStringUntilEOF(got, *rb);
+    EXPECT_EQ(got, bytes);
+}

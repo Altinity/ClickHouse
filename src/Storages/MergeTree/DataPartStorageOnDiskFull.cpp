@@ -116,6 +116,9 @@ std::vector<std::string> DataPartStorageOnDiskFull::getRemotePaths(const std::st
     const std::string path = fs::path(root_path) / part_dir / file_name;
 
     /// B59: a file staged by this transaction resolves to its already-uploaded blob object(s) before commit.
+    /// A mutable per-part file intentionally does NOT resolve here (tryGetInFlightStorageObjects returns
+    /// nullopt → falls through): it has no blob object and must be read via tryReadFileInFlight. The merge
+    /// reads projection column blocks (blob-backed) through this path, not mutable files.
     StoredObjects objects;
     if (transaction)
         if (auto inflight = transaction->tryGetInFlightStorageObjects(path))
@@ -168,6 +171,9 @@ void DataPartStorageOnDiskFull::prepareRead(
 
         if (!inflight_objects.empty())
         {
+            /// Safe to capture the raw transaction pointer: no cache/gather/async stage is added on this
+            /// branch, so the custom source is consumed synchronously inside build() during this read and
+            /// the pointer is never retained past it.
             auto * tx = transaction.get();
             pipeline.setSource(
                 [tx, path](const StoredObject &, const ReadSettings & read_settings, bool /*use_external_buffer*/, bool /*restrict_seek*/)
