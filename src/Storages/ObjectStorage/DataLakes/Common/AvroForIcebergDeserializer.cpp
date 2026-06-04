@@ -47,7 +47,7 @@ try
     ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergAvroFileParsingMicroseconds);
 
     auto manifest_file_reader
-        = std::make_unique<avro::DataFileReaderBase>(std::make_unique<AvroInputStreamReadBufferAdapter>(*buffer));
+        = std::make_unique<avro::DataFileReaderBase>(std::make_unique<AvroInputStreamReadBufferAdapter>(*buffer), MAX_AVRO_SCHEMA_DEPTH);
 
     avro::NodePtr root_node = manifest_file_reader->dataSchema().root();
     auto data_type = AvroSchemaReader::avroNodeToDataType(root_node);
