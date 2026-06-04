@@ -264,20 +264,29 @@ void ContentAddressedTransaction::createHardLink(const std::string & from, const
     /// sidecar. It never enters the manifest, so it must not go through recordBlob. The mutable
     /// decision is made on the SOURCE file's basename: clone paths (e.g. DETACH into detached/) hand a
     /// destination whose parsed "file" is a nested <part>/<file>, so only the source parses cleanly to
-    /// the logical file name; the carried bytes are keyed by the destination's basename.
+    /// the logical file name. The carried bytes are keyed by the FULL destination part-relative path
+    /// (dst->file), exactly as the content blobs are keyed via recordBlob (recorded[dst->file]). For an
+    /// ordinary part dst->file is the bare logical name (e.g. metadata_version.txt); for a DETACH clone
+    /// into detached/<part>/ it is <part>/metadata_version.txt — the SAME <part>/ prefix the manifest
+    /// blobs carry, so the detached part's mutable sidecar lives under the same key prefix as its blobs.
+    /// This is what the ATTACH rekey/republish chain (rekeyDetachedPartDir,
+    /// republishDetachedStagingIntoActive) expects: it re-keys the staging <part>/ prefix off the sidecar
+    /// entries to publish the active part. Keying by the bare basename here dropped that prefix, so the
+    /// staging-prefix filter never matched and the active part lost its metadata_version.txt entirely —
+    /// the part then fell back to the table's CURRENT metadata version and skipped the on-fly RENAME
+    /// COLUMN conversion, surfacing as "no column c0" on SELECT after a detach/rename/attach (B62).
     if (auto src = ContentAddressed::parsePartFilePath(from); src && !src->file.empty()
         && ContentAddressed::isMutablePerPartFile(src->file))
     {
-        const std::string dst_basename = fs::path(dst->file).filename().string();
         if (src->table_uuid == table_uuid && src->part_name == part_name)
         {
             if (auto it = recorded_mutable.find(src->file); it != recorded_mutable.end())
             {
-                recorded_mutable[dst_basename] = it->second;
+                recorded_mutable[dst->file] = it->second;
                 return;
             }
         }
-        recorded_mutable[dst_basename] = metadata_storage.resolveMutableFileBytes(from);
+        recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
         return;
     }
 

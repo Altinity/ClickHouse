@@ -1,5 +1,4 @@
--- Tags: zookeeper, no-parallel-replicas, no-content-addressed-storage
--- no-content-addressed-storage: ATTACH PARTITION of the table's own detached part after a chained RENAME COLUMN fails on CA only ("no column c0" on SELECT *) — the detached part keeps its pre-rename column metadata and the rename-mutation reconciliation is not applied on the CA attach path. Distinct from the queue-clone path (REPLACE/MOVE PARTITION FROM are un-gated and pass). Passes on plain. Backlog B62.
+-- Tags: zookeeper, no-parallel-replicas
 
 -- Test for chained RENAME COLUMN mutations applied to a part that was attached
 -- with old column names. When multiple renames like c0->c1->c2->...->cN are applied

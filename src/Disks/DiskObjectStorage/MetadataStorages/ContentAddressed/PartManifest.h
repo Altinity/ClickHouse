@@ -27,10 +27,19 @@ constexpr const std::array<std::string_view, 3> & mutablePerPartFiles()
 
 /// True iff file is a mutable per-part file (see kMutablePerPartFiles). The ONE predicate shared by
 /// computePartId (exclude from identity) and the transaction/read path (route to the per-ref sidecar).
+///
+/// The match is on the LAST path component (basename), not the whole string: a part-relative file is
+/// usually a bare name (e.g. `metadata_version.txt`), but a DETACHED part carries its files under a
+/// `<detached_part>/` prefix inside the shared `detached` ref (e.g. `attaching_all_0_0_0/metadata_version.txt`,
+/// B36/B46). Both must route to the per-ref sidecar; matching only the bare string left the prefixed
+/// detached form unrecognized, so loading the detached part's `metadata_version.txt` (the on-fly RENAME
+/// COLUMN reconciliation on ATTACH) fell back to the table's current version and skipped the rename (B62).
 constexpr bool isMutablePerPartFile(std::string_view file)
 {
+    const auto slash = file.rfind('/');
+    const std::string_view basename = (slash == std::string_view::npos) ? file : file.substr(slash + 1);
     for (const auto & name : kMutablePerPartFiles)
-        if (file == name)
+        if (basename == name)
             return true;
     return false;
 }
