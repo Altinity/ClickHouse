@@ -3892,6 +3892,92 @@ TEST_F(ContentAddressedMetaTest, FreezePublishesShadowRefWithoutClobberingLiveRe
         << "live and shadow ref keys must be at distinct object-storage paths";
 }
 
+// GC reachability: shadow/ refs are GC roots — a frozen snapshot's blobs must remain reachable even
+// after the live part is merged/dropped (its store/ ref removed). Without this, the GC would reclaim
+// the blobs the moment the live ref disappeared, breaking the FREEZE guarantee.
+//
+// The test walks three states:
+//   A. both refs present   → part_id is live (trivially)
+//   B. only shadow ref     → part_id is STILL live (this is the key invariant)
+//   C. no refs at all      → part_id is gone (reachability is correctly bounded)
+TEST_F(ContentAddressedMetaTest, GcShadowRefIsAGcRoot)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_gc_shadow_root");
+    auto os = getObjectStorage("cas_gc_shadow_root");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-gc-shadow";
+    const std::string part = "all_1_1_0";
+    const std::string backup = "b1";
+    const std::string uuid3 = uuid.substr(0, 3);
+
+    // === 1. Write the live part. ===
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"data.bin", "COL-BYTES"}, {"columns.txt", "a b"}, {"metadata_version.txt", "1"}})
+        {
+            auto buf = tx.writeFile(uuid3 + "/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // Capture the live ref key and the part_id it names.
+    const std::string live_ref_key = refKey("", sid, uuid, part).string();
+    ASSERT_TRUE(os->tryGetObjectMetadata(live_ref_key, /*with_tags=*/false).has_value());
+    const PartId pid = partIdFromRefPayload(readObject(os, live_ref_key));
+
+    // === 2. Freeze (publish a shadow ref for the same part). ===
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"data.bin", "COL-BYTES"}, {"columns.txt", "a b"}, {"metadata_version.txt", "1"}})
+        {
+            const std::string path = "shadow/" + backup + "/" + uuid3 + "/" + uuid + "/" + part + "/" + name;
+            auto buf = tx.writeFile(path, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    const std::string shadow_key = shadowRefKey("", backup, sid, uuid, part).string();
+    ASSERT_TRUE(os->tryGetObjectMetadata(shadow_key, /*with_tags=*/false).has_value())
+        << "shadow ref must exist after the freeze commit";
+
+    // === State A: both refs present — part_id appears in the live set. ===
+    {
+        std::set<PartId> live = listLivePartIds(os, "");
+        EXPECT_TRUE(live.count(pid)) << "State A: part_id must be in live set when both refs exist";
+    }
+
+    // === State B: remove the live (store/) ref, keep only the shadow ref. ===
+    // This simulates the live part being merged/dropped after the FREEZE snapshot was taken.
+    os->removeObjectIfExists(DB::StoredObject(live_ref_key));
+    ASSERT_FALSE(os->tryGetObjectMetadata(live_ref_key, /*with_tags=*/false).has_value())
+        << "live ref must be gone";
+
+    {
+        std::set<PartId> live = listLivePartIds(os, "");
+        EXPECT_TRUE(live.count(pid))
+            << "State B: part_id must still be in live set when only the shadow ref exists "
+               "(frozen blobs must not be reclaimed after the live part is gone)";
+    }
+
+    // === State C: remove the shadow ref too — the part_id must now be absent. ===
+    os->removeObjectIfExists(DB::StoredObject(shadow_key));
+    ASSERT_FALSE(os->tryGetObjectMetadata(shadow_key, /*with_tags=*/false).has_value())
+        << "shadow ref must be gone";
+
+    {
+        std::set<PartId> live = listLivePartIds(os, "");
+        EXPECT_FALSE(live.count(pid))
+            << "State C: part_id must be gone from the live set once all refs are removed";
+    }
+}
+
 // B59: the in-flight read of a MUTABLE per-part file (e.g. metadata_version.txt) — staged inline in
 // recorded_mutable, NOT as a content blob — is served as the inline bytes. It has no StoredObject, so
 // tryGetInFlightStorageObjects returns nullopt while tryReadFileInFlight returns the bytes.

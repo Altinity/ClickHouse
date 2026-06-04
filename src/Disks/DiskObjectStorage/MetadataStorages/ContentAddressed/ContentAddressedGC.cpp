@@ -87,21 +87,37 @@ std::vector<std::string> listKeysUnder(const ObjectStoragePtr & object_storage, 
 
 std::set<PartId> listLivePartIds(const ObjectStoragePtr & object_storage, const std::string & key_prefix)
 {
-    /// Every server's/table's refs live under refsRootPrefix. The same root also holds verbatim
-    /// table-level files under the store/server/uuid/files/ layout, so we keep only keys whose path has a
-    /// /refs/ segment (the ref objects); their payload is the live part id. Per-ref sidecars (.meta)
-    /// also live under /refs/ but are NOT refs (their payload is a RefSidecar, not a part id), so skip
-    /// them: a sidecar is ref-scoped, removed with the ref, and never a GC root.
+    /// Live part ids are collected from TWO families of GC roots:
+    ///
+    /// 1. refsRootPrefix (store/.../refs/): every server's/table's active refs. The root also holds
+    ///    verbatim table-level files under the store/server/uuid/files/ layout, so we keep only keys
+    ///    whose path has a /refs/ segment (the ref objects); their payload is the live part id.
+    ///    Per-ref sidecars (.meta) also live under /refs/ but are NOT refs (their payload is a
+    ///    RefSidecar, not a part id), so skip them: a sidecar is ref-scoped, removed with the ref,
+    ///    and never a GC root.
+    ///
+    /// 2. shadowRefsRootPrefix (shadow/<backup>/.../refs/): FREEZE snapshot refs. When a part is
+    ///    frozen via BACKUP / FREEZE, its files are copied into the shadow/ namespace and a shadow ref
+    ///    is published at shadowRefKey(...). These refs use the same /refs/ + .meta conventions as
+    ///    store/ refs. Without scanning this root, a frozen snapshot's blobs would be reclaimed once
+    ///    the live part is merged or dropped — defeating FREEZE. Treating shadow/ as an additional GC
+    ///    root keeps the frozen blobs reachable until the shadow ref is explicitly removed.
     static const std::string refs_segment = "/refs/";
     std::set<PartId> live;
-    for (const auto & key : listKeysUnder(object_storage, refsRootPrefix(key_prefix)))
+    auto scan_root = [&](const std::string & root)
     {
-        if (key.find(refs_segment) == std::string::npos)
-            continue;
-        if (isRefMetaKey(key))
-            continue;
-        live.insert(partIdFromRefPayload(readSmallObject(object_storage, key)));
-    }
+        for (const auto & key : listKeysUnder(object_storage, root))
+        {
+            if (key.find(refs_segment) == std::string::npos)
+                continue;
+            if (isRefMetaKey(key))
+                continue;
+            live.insert(partIdFromRefPayload(readSmallObject(object_storage, key)));
+        }
+    };
+    scan_root(refsRootPrefix(key_prefix));        /// live active parts (store/.../refs/)
+    scan_root(shadowRefsRootPrefix(key_prefix));  /// FREEZE snapshots (shadow/<backup>/.../refs/) — keep
+                                                  /// frozen blobs reachable even after the live part is gone
     return live;
 }
 
