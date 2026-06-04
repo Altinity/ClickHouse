@@ -4313,3 +4313,190 @@ TEST_F(ContentAddressedMetaTest, RemoveTmpMutableFile)
     // The content file is still resolvable.
     EXPECT_EQ(readObject(os, ms->getStorageObjects(base + "data.bin")[0].remote_path), "PAYLOAD");
 }
+
+// MULTI-PART (B67): ONE ContentAddressedTransaction stages two distinct NEW content parts (A and B,
+// each its own (uuid, part)) AND a mutable-only update (txn_version.txt) to a THIRD, already-committed
+// part C. commit() iterates the per-part staging map under one gc_lock, calling commitOnePart per part.
+// Assert: A and B each publish a fresh ref + manifest carrying their own content; C's ref / part_id /
+// manifest are UNCHANGED (the mutable-only branch must not clobber the committed part) and C's sidecar
+// now carries the new txn_version.txt bytes. This is the core of the single-transaction merge/mutation
+// shape the per-part refactor exists to support.
+TEST_F(ContentAddressedMetaTest, MultiPartCommitPublishesAllParts)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_mpt_all");
+    auto os = getObjectStorage("cas_mpt_all");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-mpt-all";
+    const std::string part_a = "all_1_1_0";
+    const std::string part_b = "all_2_2_0";
+    const std::string part_c = "all_3_3_0";
+    const std::string base_a = "uui/" + uuid + "/" + part_a + "/";
+    const std::string base_b = "uui/" + uuid + "/" + part_b + "/";
+    const std::string base_c = "uui/" + uuid + "/" + part_c + "/";
+
+    // 1. Pre-commit part C (it must already have a ref for the mutable-only branch to update, not throw).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(base_c + "data.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string data = "C-DATA";
+        buf->write(data.data(), data.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    const std::string ref_c_key = refKey("", sid, uuid, part_c).string();
+    const PartId pid_c_before = partIdFromRefPayload(readObject(os, ref_c_key));
+    const std::string manifest_c_bytes_before = readObject(os, partKey("", pid_c_before).string());
+
+    // 2. ONE transaction: write content for A and B, AND a mutable-only update to the committed C.
+    const std::string txn_bytes = "777";
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+
+        auto a_data = tx.writeFile(base_a + "data.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string adata = "A-DATA";
+        a_data->write(adata.data(), adata.size());
+        a_data->finalize();
+        auto a_cols = tx.writeFile(base_a + "columns.txt", 4096, DB::WriteMode::Rewrite, {});
+        const std::string acols = "a b";
+        a_cols->write(acols.data(), acols.size());
+        a_cols->finalize();
+
+        auto b_data = tx.writeFile(base_b + "data.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string bdata = "B-DATA";
+        b_data->write(bdata.data(), bdata.size());
+        b_data->finalize();
+
+        // Mutable-only update to the already-committed C (the tmp + replaceFile dance).
+        auto c_txn = tx.writeFile(base_c + "txn_version.txt.tmp", 4096, DB::WriteMode::Rewrite, {});
+        c_txn->write(txn_bytes.data(), txn_bytes.size());
+        c_txn->finalize();
+        tx.replaceFile(base_c + "txn_version.txt.tmp", base_c + "txn_version.txt");
+
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // 3. A and B each resolve to a published ref + manifest carrying their own content.
+    const std::string ref_a_key = refKey("", sid, uuid, part_a).string();
+    const std::string ref_b_key = refKey("", sid, uuid, part_b).string();
+    ASSERT_TRUE(os->tryGetObjectMetadata(ref_a_key, /*with_tags=*/false).has_value())
+        << "part A ref must exist after the multi-part commit";
+    ASSERT_TRUE(os->tryGetObjectMetadata(ref_b_key, /*with_tags=*/false).has_value())
+        << "part B ref must exist after the multi-part commit";
+
+    const PartId pid_a = partIdFromRefPayload(readObject(os, ref_a_key));
+    const PartId pid_b = partIdFromRefPayload(readObject(os, ref_b_key));
+    const PartManifest manifest_a = PartManifest::deserialize(readObject(os, partKey("", pid_a).string()));
+    const PartManifest manifest_b = PartManifest::deserialize(readObject(os, partKey("", pid_b).string()));
+    EXPECT_TRUE(manifest_a.blobs.contains("data.bin"));
+    EXPECT_TRUE(manifest_a.blobs.contains("columns.txt"));
+    EXPECT_TRUE(manifest_b.blobs.contains("data.bin"));
+
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base_a + "data.bin")[0].remote_path), "A-DATA");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base_a + "columns.txt")[0].remote_path), "a b");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base_b + "data.bin")[0].remote_path), "B-DATA");
+
+    // 4. C's ref / part_id / manifest are UNCHANGED (the mutable-only branch must not clobber the part).
+    ASSERT_TRUE(os->tryGetObjectMetadata(ref_c_key, /*with_tags=*/false).has_value())
+        << "part C ref must still exist after the multi-part commit";
+    const PartId pid_c_after = partIdFromRefPayload(readObject(os, ref_c_key));
+    EXPECT_EQ(pid_c_before, pid_c_after)
+        << "C's mutable-only update must not change its part_id / ref";
+    EXPECT_EQ(manifest_c_bytes_before, readObject(os, partKey("", pid_c_after).string()))
+        << "C's manifest must be byte-for-byte unchanged";
+    const PartManifest manifest_c_after = PartManifest::deserialize(readObject(os, partKey("", pid_c_after).string()));
+    EXPECT_FALSE(manifest_c_after.blobs.contains("txn_version.txt"))
+        << "C's mutable file must never enter the manifest";
+
+    // 5. C's sidecar now carries the mutable txn_version.txt bytes; reading it back returns them.
+    const std::string meta_c_key = refMetaKey("", sid, uuid, part_c).string();
+    ASSERT_TRUE(os->tryGetObjectMetadata(meta_c_key, /*with_tags=*/false).has_value())
+        << "C's sidecar must exist after the mutable-only update";
+    const RefSidecar sidecar_c = RefSidecar::deserialize(readObject(os, meta_c_key));
+    ASSERT_TRUE(sidecar_c.files.contains("txn_version.txt"));
+    EXPECT_EQ(sidecar_c.files.at("txn_version.txt"), txn_bytes);
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base_c + "txn_version.txt")[0].remote_path), txn_bytes);
+
+    // 6. C's content still resolves unchanged.
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base_c + "data.bin")[0].remote_path), "C-DATA");
+
+    // 7. A and B are distinct parts, not deduped onto each other (different content).
+    EXPECT_NE(pid_a, pid_b);
+}
+
+// MULTI-PART moveDirectory re-key (B67 deferred tmp_merge_X -> X window): in ONE transaction, write
+// the merge-output content under the temporary tmp_merge_X part, then write a mutable file (txn_version.txt)
+// under the FINAL part X (so the staging map holds BOTH a tmp_merge_X entry and an X entry), then
+// moveDirectory(tmp_merge_X -> X). The re-key must MERGE the tmp source staging entry into the final
+// destination entry: carry the content blobs over from tmp_merge_X while PRESERVING the txn_version.txt
+// already staged under X. After commit, part X must resolve with BOTH the content blobs (from tmp_merge_X)
+// AND the mutable txn_version.txt (already under X), and tmp_merge_X must have NO ref of its own.
+TEST_F(ContentAddressedMetaTest, MoveDirectoryMergesStagingTmpToFinal)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_mpt_movedir");
+    auto os = getObjectStorage("cas_mpt_movedir");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-mpt-movedir";
+    const std::string final_part = "all_1_2_1";
+    const std::string tmp_part = "tmp_merge_all_1_2_1";
+    const std::string base_tmp = "uui/" + uuid + "/" + tmp_part + "/";
+    const std::string base_final = "uui/" + uuid + "/" + final_part + "/";
+    const std::string txn_bytes = "13";
+
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+
+        // Merge output content staged under the TEMPORARY part name.
+        auto m_data = tx.writeFile(base_tmp + "data.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string mdata = "MERGED-DATA";
+        m_data->write(mdata.data(), mdata.size());
+        m_data->finalize();
+        auto m_cols = tx.writeFile(base_tmp + "columns.txt", 4096, DB::WriteMode::Rewrite, {});
+        const std::string mcols = "x y";
+        m_cols->write(mcols.data(), mcols.size());
+        m_cols->finalize();
+
+        // A CSN write arrives under the FINAL part name BEFORE the rename re-keys (the deferred window),
+        // so the staging map gains a separate entry for the final part holding only the mutable file.
+        auto f_txn = tx.writeFile(base_final + "txn_version.txt.tmp", 4096, DB::WriteMode::Rewrite, {});
+        f_txn->write(txn_bytes.data(), txn_bytes.size());
+        f_txn->finalize();
+        tx.replaceFile(base_final + "txn_version.txt.tmp", base_final + "txn_version.txt");
+
+        // The deferred merge rename: re-key tmp_merge_X -> X, MERGING the two staging entries.
+        tx.moveDirectory("uui/" + uuid + "/" + tmp_part, "uui/" + uuid + "/" + final_part);
+
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // The FINAL part resolves with BOTH the content blobs (re-keyed from tmp_merge_X) AND the mutable file.
+    const std::string ref_final_key = refKey("", sid, uuid, final_part).string();
+    ASSERT_TRUE(os->tryGetObjectMetadata(ref_final_key, /*with_tags=*/false).has_value())
+        << "final part ref must exist after the merge rename + commit";
+    const PartId pid_final = partIdFromRefPayload(readObject(os, ref_final_key));
+    const PartManifest manifest_final = PartManifest::deserialize(readObject(os, partKey("", pid_final).string()));
+    EXPECT_TRUE(manifest_final.blobs.contains("data.bin"))
+        << "content blobs must have been re-keyed from tmp_merge_X into the final part manifest";
+    EXPECT_TRUE(manifest_final.blobs.contains("columns.txt"));
+    EXPECT_FALSE(manifest_final.blobs.contains("txn_version.txt"))
+        << "the mutable file must never enter the manifest";
+
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base_final + "data.bin")[0].remote_path), "MERGED-DATA");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base_final + "columns.txt")[0].remote_path), "x y");
+
+    // The mutable txn_version.txt (staged under X, preserved across the merge) is in the sidecar.
+    const std::string meta_final_key = refMetaKey("", sid, uuid, final_part).string();
+    ASSERT_TRUE(os->tryGetObjectMetadata(meta_final_key, /*with_tags=*/false).has_value())
+        << "final part sidecar must exist (it carries the preserved txn_version.txt)";
+    const RefSidecar sidecar_final = RefSidecar::deserialize(readObject(os, meta_final_key));
+    ASSERT_TRUE(sidecar_final.files.contains("txn_version.txt"));
+    EXPECT_EQ(sidecar_final.files.at("txn_version.txt"), txn_bytes)
+        << "the txn_version.txt staged under the final part must survive the tmp->final merge re-key";
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base_final + "txn_version.txt")[0].remote_path), txn_bytes);
+
+    // tmp_merge_X has NO ref of its own (its staging entry was merged into the final part, not published).
+    const std::string ref_tmp_key = refKey("", sid, uuid, tmp_part).string();
+    EXPECT_FALSE(os->tryGetObjectMetadata(ref_tmp_key, /*with_tags=*/false).has_value())
+        << "tmp_merge_X must not have a published ref of its own after the merge re-key";
+}
