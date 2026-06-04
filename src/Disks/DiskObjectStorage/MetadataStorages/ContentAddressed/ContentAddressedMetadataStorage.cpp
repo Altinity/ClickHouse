@@ -33,6 +33,35 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
 }
 
+namespace
+{
+
+/// A projection DIRECTORY is any part-file path whose LAST path component is `<proj>.proj` (or
+/// `<proj>.tmp_proj`). The common case is a DIRECT child of a part (`<part>/<proj>.proj`, so the
+/// parsed `file` is the single component `<proj>.proj`). But during `ATTACH PARTITION` on CA the
+/// part is read from its DETACHED STAGING dir (`detached/attaching_<part>/<proj>.proj`): there the
+/// path parses to `part_name=detached`, `file=attaching_<part>/<proj>.proj` — the projection dir is
+/// NESTED one level deeper, so a single-component gate (`file.find('/') == npos`) would miss it and
+/// the projection would not be discovered (`existsDirectory`/`listDirectory` return false/empty) →
+/// `IMergeTreeDataPart::loadProjections` registers the surviving projection part with empty columns
+/// and `rows_count == 0`, breaking it (B64; same projection-on-CA family as B58/B63). Recognize the
+/// projection dir by its LAST component and return the manifest key prefix to match (the WHOLE
+/// `file` + '/', so the staging prefix is preserved for the detached-staging case). Returns
+/// std::nullopt when the path is not a projection directory.
+std::optional<std::string> projectionDirManifestPrefix(const ContentAddressed::PartFilePath & p)
+{
+    if (p.file.empty())
+        return std::nullopt;
+    const auto last_slash = p.file.find_last_of('/');
+    const std::string_view last_component
+        = last_slash == std::string::npos ? std::string_view(p.file) : std::string_view(p.file).substr(last_slash + 1);
+    if (last_component.ends_with(".proj") || last_component.ends_with(".tmp_proj"))
+        return p.file + "/";
+    return std::nullopt;
+}
+
+}
+
 ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     ObjectStoragePtr object_storage_,
     String storage_path_prefix_,
@@ -414,13 +443,12 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
     // the PARENT part's manifest under the key prefix <proj>.proj/ (Approach A — no separate part/ref).
     // The directory exists iff the part's manifest (or per-ref sidecar) carries at least one key with
     // that prefix. This is what makes IMergeTreeDataPart::loadProjections (which calls
-    // existsDirectory("<proj>.proj")) discover a projection on a content-addressed part. Mirrors the
-    // single-detached-part-dir branch above; keyed on the .proj/.tmp_proj suffix instead of "detached".
-    if (auto p = ContentAddressed::parsePartFilePath(path);
-        p && !p->file.empty() && p->file.find('/') == std::string::npos
-        && (p->file.ends_with(".proj") || p->file.ends_with(".tmp_proj")))
+    // existsDirectory("<proj>.proj")) discover a projection on a content-addressed part. Recognized by
+    // its LAST path component (.proj/.tmp_proj), so it also matches the NESTED detached-staging shape
+    // detached/attaching_<part>/<proj>.proj read during ATTACH PARTITION (B64).
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && projectionDirManifestPrefix(*p))
     {
-        const std::string prefix = p->file + "/";
+        const std::string prefix = *projectionDirManifestPrefix(*p);
         if (auto pid = readRefPartId(p->table_uuid, p->part_name))
         {
             auto manifest = loadPartManifestOrThrow(*pid);
@@ -534,10 +562,9 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
     // getStorageObjects treats <proj>.proj as a missing blob and throws FILE_DOESNT_EXIST — which breaks
     // isOldPartDirectory's per-child getLastModified during clearOldTemporaryDirectories (the DROP path,
     // which walks a delete_tmp_<part> dir and its <proj>.proj child), wedging DROP in an infinite retry.
-    // Mirrors the .proj/.tmp_proj-suffix gate the existsDirectory/listDirectory/getFileSize branches use.
-    if (auto p = ContentAddressed::parsePartFilePath(path);
-        p && !p->file.empty() && p->file.find('/') == std::string::npos
-        && (p->file.ends_with(".proj") || p->file.ends_with(".tmp_proj")))
+    // Recognized by its LAST path component (.proj/.tmp_proj), the same recognizer the
+    // existsDirectory/listDirectory branches use, so it also matches the nested detached-staging shape (B64).
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && projectionDirManifestPrefix(*p))
     {
         auto pid = readRefPartId(p->table_uuid, p->part_name);
         if (!pid)
@@ -673,12 +700,11 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
     // A projection DIRECTORY <uuid[:3]>/<uuid>/<part>/<proj>.proj: list the projection's inner file
     // names by stripping the <proj>.proj/ prefix from the PARENT part's manifest (and per-ref sidecar)
     // keys, so the projection's child DataPartStorage enumerates and reads exactly its own files.
-    // Mirrors the single-detached-part-dir listing branch; keyed on the .proj/.tmp_proj suffix.
-    if (auto p = ContentAddressed::parsePartFilePath(path);
-        p && !p->file.empty() && p->file.find('/') == std::string::npos
-        && (p->file.ends_with(".proj") || p->file.ends_with(".tmp_proj")))
+    // Recognized by its LAST path component (.proj/.tmp_proj), so it also matches the NESTED
+    // detached-staging shape detached/attaching_<part>/<proj>.proj read during ATTACH PARTITION (B64).
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && projectionDirManifestPrefix(*p))
     {
-        const std::string prefix = p->file + "/";
+        const std::string prefix = *projectionDirManifestPrefix(*p);
         std::unordered_set<std::string> result;
         if (auto pid = readRefPartId(p->table_uuid, p->part_name))
         {
@@ -743,11 +769,10 @@ bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path)
     // files and reports the subdir as NON-empty, so DiskObjectStorage::removeDirectory would attempt rmdir on
     // it and throw CANNOT_RMDIR (logged as <Error>), forcing a noisy recursive fallback even though the result
     // is correct (B60). Report it empty so removeDirectory skips the failing rmdir, exactly as for the part dir
-    // itself (B45). Gated on a SINGLE-component .proj/.tmp_proj file, the same gate the projection branches in
-    // existsDirectory/listDirectory use — so this never matches the detached namespace or a real table dir.
-    if (auto p = ContentAddressed::parsePartFilePath(path);
-        p && !p->file.empty() && p->file.find('/') == std::string::npos
-        && (p->file.ends_with(".proj") || p->file.ends_with(".tmp_proj")))
+    // itself (B45). Recognized by its LAST path component (.proj/.tmp_proj), the same recognizer the projection
+    // branches in existsDirectory/listDirectory use — so this never matches the detached namespace or a real
+    // table dir, and also matches the nested detached-staging shape (B64).
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && projectionDirManifestPrefix(*p))
         return true;
 
     return !iterateDirectory(path)->isValid();

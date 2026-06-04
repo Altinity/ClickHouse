@@ -911,6 +911,81 @@ TEST_F(ContentAddressedMetaTest, ListDetachedPartDirReturnsInnerFiles)
     EXPECT_EQ(container_got, (std::set<std::string>{"all_1_2_1"}));
 }
 
+// B64: a projection sub-directory must be recognized even when NESTED one level deeper than a direct
+// child of a part — the shape read during ATTACH PARTITION, where the part is loaded from its detached
+// STAGING directory detached/attaching_<part>/<proj>.proj. The CA metadata storage recognizes a
+// projection dir by its LAST path component (.proj/.tmp_proj), so both the direct child shape
+// (<part>/<proj>.proj) and the nested staging shape resolve. Before the fix the projection branches were
+// gated on a SINGLE-component .proj file, so the nested staging projection was missed:
+// existsDirectory("<proj>.proj") returned false during the attach-time load, and
+// IMergeTreeDataPart::loadProjections registered the surviving projection part with empty columns /
+// rows_count == 0, breaking it (CHECK TABLE then threw BROKEN_PROJECTION).
+TEST_F(ContentAddressedMetaTest, NestedStagingProjectionDirIsRecognized)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_nestedproj");
+    auto os = getObjectStorage("cas_nestedproj");
+    const std::string uuid = "uuid-nestedproj";
+
+    // Commit an active part that carries a projection p (its files nested under p.proj/ in the manifest),
+    // then move it into detached/<part> and rename to detached/attaching_<part> (the staging name the
+    // ATTACH PARTITION load reads from). This goes through the real re-keying path so the manifest keys
+    // become attaching_<part>/<file> and attaching_<part>/p.proj/<file>.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"columns.txt", "cols"},
+                 {"data.bin", "DAT"},
+                 {"p.proj/columns.txt", "pcols"},
+                 {"p.proj/count.txt", "7"},
+                 {"p.proj/data.bin", "PDAT"}})
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveDirectory("uui/" + uuid + "/all_1_1_0", "uui/" + uuid + "/detached/all_1_1_0");
+        tx.commit(DB::NoCommitOptions{});
+    }
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveDirectory("uui/" + uuid + "/detached/all_1_1_0", "uui/" + uuid + "/detached/attaching_all_1_1_0");
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    const std::string staging_proj = "uui/" + uuid + "/detached/attaching_all_1_1_0/p.proj";
+
+    // The NESTED staging projection dir is recognized as a directory (was false before the fix).
+    EXPECT_TRUE(ms->existsDirectory(staging_proj));
+
+    // Listing it yields the projection's OWN inner files (the p.proj/ prefix stripped), so the projection's
+    // child DataPartStorage enumerates and reads exactly its files.
+    auto names = ms->listDirectory(staging_proj);
+    std::set<std::string> got(names.begin(), names.end());
+    EXPECT_EQ(got, (std::set<std::string>{"columns.txt", "count.txt", "data.bin"}));
+
+    // The projection's inner files resolve to their blobs through the manifest (full read-time state).
+    auto cols = ms->getStorageObjects(staging_proj + "/columns.txt");
+    ASSERT_EQ(cols.size(), 1u);
+    EXPECT_EQ(readObject(os, cols[0].remote_path), "pcols");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(staging_proj + "/count.txt")[0].remote_path), "7");
+
+    // The DIRECT-child projection shape is still recognized too (regression guard for the common case).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveDirectory("uui/" + uuid + "/detached/attaching_all_1_1_0", "uui/" + uuid + "/all_2_2_0");
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(ms->existsDirectory("uui/" + uuid + "/all_2_2_0/p.proj"));
+    auto active_names = ms->listDirectory("uui/" + uuid + "/all_2_2_0/p.proj");
+    std::set<std::string> active_got(active_names.begin(), active_names.end());
+    EXPECT_EQ(active_got, (std::set<std::string>{"columns.txt", "count.txt", "data.bin"}));
+}
+
 // B23 Task 2 (collision regression): two parts with IDENTICAL column content but DIFFERENT mutable
 // per-part files (uuid.txt / txn_version.txt). They MUST still dedup to the same part_id / manifest,
 // but each MUST keep its own per-ref .meta sidecar, so resolving a mutable file returns that part's
