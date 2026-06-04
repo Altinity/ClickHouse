@@ -1,4 +1,5 @@
--- Tags: long, no-shared-merge-tree
+-- Tags: long, no-shared-merge-tree, no-content-addressed-storage
+-- no-content-addressed-storage: ALTER FETCH PARTITION fails closed with Code 344 SUPPORT_IS_DISABLED on a content_addressed disk (partition-clone not supported, B21)
 
 DROP TABLE IF EXISTS test_01640;
 DROP TABLE IF EXISTS restore_01640;

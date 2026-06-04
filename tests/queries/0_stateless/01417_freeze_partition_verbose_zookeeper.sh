@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-parallel
+# Tags: zookeeper, no-replicated-database, no-parallel, no-content-addressed-storage
+# no-content-addressed-storage: ALTER FREEZE WITH NAME fails closed with Code 344 SUPPORT_IS_DISABLED on a content_addressed disk (partition-clone not supported, B21)
 # Tag no-replicated-database: Fails due to additional replicas or shards
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

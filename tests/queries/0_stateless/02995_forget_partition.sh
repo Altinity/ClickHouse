@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-fasttest
+# Tags: zookeeper, no-replicated-database, no-fasttest, no-content-addressed-storage
+# no-content-addressed-storage: FORGET PARTITION hits the partition-clone gate (Code 344 SUPPORT_IS_DISABLED) on a content_addressed disk before the expected CANNOT_FORGET_PARTITION (B21)
 # no-fasttest: Slow wait
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: no-ordinary-database, no-random-merge-tree-settings, no-replicated-database
+# Tags: no-ordinary-database, no-random-merge-tree-settings, no-replicated-database, no-content-addressed-storage
+# no-content-addressed-storage: uses experimental transactions; MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED; object-storage-wide, B39)
 
 # Test for the race condition where a transaction commits before all mutations
 # started by that transaction have been applied to all parts.

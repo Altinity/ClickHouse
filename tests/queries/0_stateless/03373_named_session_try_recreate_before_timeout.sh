@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: no-encrypted-storage
+# Tags: no-encrypted-storage, no-content-addressed-storage
+# no-content-addressed-storage: uses experimental transactions (begin/implicit_transaction); MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED; passes on plain, B39)
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

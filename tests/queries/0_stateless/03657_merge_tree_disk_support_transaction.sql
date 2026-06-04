@@ -1,4 +1,5 @@
--- Tags: no-ordinary-database, no-fasttest, no-async-insert
+-- Tags: no-ordinary-database, no-fasttest, no-async-insert, no-content-addressed-storage
+-- no-content-addressed-storage: uses implicit_transaction; MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED; object-storage-wide, B39)
 
 CREATE OR REPLACE TABLE t (x INT) ENGINE=MergeTree ORDER BY x;
 SET implicit_transaction=True;

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-replicated-database, no-ordinary-database, long
+# Tags: no-fasttest, no-replicated-database, no-ordinary-database, long, no-content-addressed-storage
+# no-content-addressed-storage: uses experimental transactions (transactions.lib); MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED; object-storage-wide, B39)
 
 set -e -o pipefail
 

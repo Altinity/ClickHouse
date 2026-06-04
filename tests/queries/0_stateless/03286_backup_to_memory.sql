@@ -1,3 +1,5 @@
+-- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: RESTORE writes part files via autocommit which is not supported on a content_addressed disk (Code 48 NOT_IMPLEMENTED; BACKUP/RESTORE, B16/B34)
 DROP TABLE IF EXISTS t1;
 
 CREATE TABLE t1(x Int32) ENGINE=MergeTree() ORDER BY tuple();

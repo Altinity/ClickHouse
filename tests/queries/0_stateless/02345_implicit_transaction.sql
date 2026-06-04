@@ -1,4 +1,5 @@
--- Tags: no-ordinary-database, no-fasttest
+-- Tags: no-ordinary-database, no-fasttest, no-content-addressed-storage
+-- no-content-addressed-storage: uses implicit_transaction; MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED; object-storage-wide, B39)
 DROP TABLE IF EXISTS landing_to_target;
 DROP TABLE IF EXISTS target;
 DROP TABLE IF EXISTS landing;

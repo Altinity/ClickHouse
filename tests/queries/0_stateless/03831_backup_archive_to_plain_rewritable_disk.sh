@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-encrypted-storage
+# Tags: no-fasttest, no-encrypted-storage, no-content-addressed-storage
+# no-content-addressed-storage: RESTORE writes part files via autocommit which is not supported on a content_addressed disk (Code 48 NOT_IMPLEMENTED; BACKUP/RESTORE, B16/B34)
 # Backup with an archive extension to a plain_rewritable disk.
 # The archive format causes root_path to be empty (parent_path of "name.zip"),
 # which previously led to stack overflow during cleanup by traversing the entire disk.

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-replicated-database, no-ordinary-database
+# Tags: no-fasttest, no-replicated-database, no-ordinary-database, no-content-addressed-storage
+# no-content-addressed-storage: uses experimental transactions; MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED, append-based txn log; object-storage-wide, B39)
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

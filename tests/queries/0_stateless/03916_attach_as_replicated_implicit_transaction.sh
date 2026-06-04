@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-ordinary-database, no-shared-merge-tree
+# Tags: zookeeper, no-replicated-database, no-ordinary-database, no-shared-merge-tree, no-content-addressed-storage
+# no-content-addressed-storage: uses implicit_transaction; MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED; object-storage-wide, B39)
 
 # Regression test: ATTACH TABLE AS REPLICATED with implicit_transaction caused
 # assertHasValidVersionMetadata() LOGICAL_ERROR in debug/sanitizer builds.

@@ -1,4 +1,5 @@
--- Tags: no-replicated-database, no-ordinary-database
+-- Tags: no-replicated-database, no-ordinary-database, no-content-addressed-storage
+-- no-content-addressed-storage: uses experimental transactions; MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED; object-storage-wide, B39)
 
 SET mutations_sync = 1;
 SET check_query_single_value_result = 0;

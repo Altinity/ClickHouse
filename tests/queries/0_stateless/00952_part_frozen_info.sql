@@ -1,3 +1,5 @@
+-- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: ALTER FREEZE PARTITION fails closed with Code 344 SUPPORT_IS_DISABLED on a content_addressed disk (partition-clone not supported, B21)
 DROP TABLE IF EXISTS part_info;
 CREATE TABLE part_info (t DateTime) ENGINE = MergeTree PARTITION BY toDate(t) ORDER BY (t);
 INSERT INTO part_info VALUES (toDateTime('1970-10-01 00:00:01')), (toDateTime('1970-10-02 00:00:01')), (toDateTime('1970-10-03 00:00:01'));

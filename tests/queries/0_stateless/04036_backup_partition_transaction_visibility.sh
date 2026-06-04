@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: no-ordinary-database
+# Tags: no-ordinary-database, no-content-addressed-storage
+# no-content-addressed-storage: RESTORE/part-file write via autocommit which is not supported on a content_addressed disk (Code 48 NOT_IMPLEMENTED; BACKUP/RESTORE, B16/B34)
 
 # Regression test for PR #99775:
 # getVisibleDataPartsVectorInPartitions used Active state twice instead of
