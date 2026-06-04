@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-replicated-database, no-content-addressed-storage
-# no-content-addressed-storage: ALTER FREEZE WITH NAME fails closed with Code 344 SUPPORT_IS_DISABLED on a content_addressed disk (partition-clone not supported, B21)
+# Tags: no-replicated-database
 # Tag no-replicated-database: Unsupported type of ALTER query
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

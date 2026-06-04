@@ -1,5 +1,3 @@
--- Tags: no-content-addressed-storage
--- no-content-addressed-storage: ALTER FREEZE fails closed with Code 344 SUPPORT_IS_DISABLED on a content_addressed disk (partition-clone not supported, B21)
 -- In previous ClickHouse versions, parts were not 100% immutable and FREEZE may prevent subsequent ALTERs.
 -- It's not longer the case. Let's prove it.
 
