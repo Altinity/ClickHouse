@@ -5,6 +5,10 @@
 #include <Disks/IO/createReadBufferFromFileBase.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/createVolume.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
+#include <Storages/MergeTree/MergeTreeDataPartBuilder.h>
 #include <Formats/NativeWriter.h>
 #include <IO/HTTPCommon.h>
 #include <IO/ReadWriteBufferFromHTTP.h>
@@ -76,10 +80,33 @@ constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_PARTS_ZERO_COPY = 6;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_PARTS_PROJECTION = 7;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_METADATA_VERSION = 8;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_COLUMNS_SUBSTREAMS = 9;
+/// CAS replication 2b: fetch-by-relink. The receiver advertises its content-addressed pool identity
+/// (`content_addressed_pool_uuid`) and, if it matches the sender's own pool, the sender sends only the
+/// part's content id (`part_id`) + the mutable header — no file bytes — and the receiver "fetches" by
+/// publishing its own ref to the blobs already present in the shared pool (the CA analogue of the
+/// zero-copy metadata-only fetch). Everything is gated behind a matching pool_uuid, so a non-CA fetch
+/// is byte-for-byte unchanged.
+constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK = 10;
 
 std::string getEndpointId(const std::string & node_id)
 {
     return "DataPartsExchange:" + node_id;
+}
+
+/// CAS replication 2b. The receiver advertises its target pool's identity under this request param so
+/// the sender can decide whether a fetch-by-relink (same pool) is possible.
+constexpr auto CA_POOL_UUID_PARAM = "content_addressed_pool_uuid";
+/// Set on the response when the sender chose the relink path; the receiver then reads the relink payload
+/// (part_id + metadata_version) instead of the byte stream.
+constexpr auto CA_RELINK_COOKIE = "content_addressed_relink";
+
+/// Resolve a disk to its content-addressed metadata storage, or nullptr if the disk is not CA. Used by
+/// both the relink sender (the part's disk) and the relink receiver (the target disk).
+ContentAddressedMetadataStorage * tryGetContentAddressedMetadataStorage(const DiskPtr & disk)
+{
+    if (!disk || !disk->isContentAddressed())
+        return nullptr;
+    return dynamic_cast<ContentAddressedMetadataStorage *>(disk->getMetadataStorage().get());
 }
 
 /// Simple functor for tracking fetch progress in system.replicated_fetches table.
@@ -134,7 +161,7 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
     MergeTreePartInfo::fromPartName(part_name, data.format_version);
 
     /// We pretend to work as older server version, to be sure that client will correctly process our version
-    response.addCookie({"server_protocol_version", toString(std::min(client_protocol_version, REPLICATION_PROTOCOL_VERSION_WITH_COLUMNS_SUBSTREAMS))});
+    response.addCookie({"server_protocol_version", toString(std::min(client_protocol_version, REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK))});
 
     LOG_TRACE(log, "Sending part {}", part_name);
 
@@ -196,6 +223,38 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
         {
             const auto & projections = part->getProjectionParts();
             writeBinary(projections.size(), out);
+        }
+
+        /// CAS replication 2b — fetch-by-relink (spec §4). If the part is on a content-addressed disk and
+        /// the receiver advertised a `content_addressed_pool_uuid` equal to THIS server's own pool_uuid
+        /// (same shared pool), send only the part's content id + the mutable header — no file bytes — so
+        /// the receiver can "fetch" by publishing its own ref to the blobs already in the shared pool.
+        /// Strictly gated on a matching pool_uuid: a non-CA part, a CA part on a different pool, or a
+        /// receiver without the capability all fall through to the unchanged byte path below.
+        if (client_protocol_version >= REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK
+            && part->getDataPartStorage().isContentAddressed())
+        {
+            const String receiver_pool_uuid = parse<String>(params.get(CA_POOL_UUID_PARAM, ""));
+            DiskPtr part_disk = data.getStoragePolicy()->tryGetDiskByName(part->getDataPartStorage().getDiskName());
+            auto * ca_meta = tryGetContentAddressedMetadataStorage(part_disk);
+            if (ca_meta && !receiver_pool_uuid.empty() && receiver_pool_uuid == ca_meta->getPoolUUID())
+            {
+                auto part_id = ca_meta->getPartId(part->getDataPartStorage().getRelativePath());
+                if (part_id)
+                {
+                    LOG_DEBUG(log, "Sending part {} by relink (content-addressed, shared pool {}), part_id {}",
+                        part_name, receiver_pool_uuid, part_id->string());
+                    response.addCookie({CA_RELINK_COOKIE, "1"});
+                    /// The relink payload: the authoritative content id (the receiver reads the manifest
+                    /// from the shared pool itself) + the mutable per-part header the manifest does not
+                    /// carry (metadata_version; the UUID is already in the protocol >= 5 header field).
+                    writeStringBinary(part_id->string(), out);
+                    writeBinary(static_cast<Int32>(part->getMetadataVersion()), out);
+                    data.addLastSentPart(part->info);
+                    return;
+                }
+                /// part_id absent (no ref for this part on this server) — fall through to the byte path.
+            }
         }
 
         if ((*data_settings)[MergeTreeSetting::allow_remote_fs_zero_copy_replication] &&
@@ -443,12 +502,37 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     {
         {"endpoint",                endpoint_id},
         {"part",                    part_name},
-        {"client_protocol_version", toString(REPLICATION_PROTOCOL_VERSION_WITH_COLUMNS_SUBSTREAMS)},
+        {"client_protocol_version", toString(REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK)},
         {"compress",                "false"}
     });
 
     if (disk)
         LOG_TRACE(log, "Will fetch to disk {} with type {}", disk->getName(), disk->getDataSourceDescription().toString());
+
+    /// CAS replication 2b — fetch-by-relink (spec §4). Advertise this replica's target content-addressed
+    /// pool identity so a same-pool sender can relink instead of streaming bytes. The target disk is the
+    /// provided one if it is CA, else the first CA disk among the table's disks. A non-CA fetch adds
+    /// nothing here and is byte-for-byte unchanged.
+    /// Gated on `try_zero_copy` so the byte-fetch FALLBACK (which re-requests with try_zero_copy=false)
+    /// does NOT re-advertise relink — otherwise a sender that keeps choosing relink would loop.
+    if (try_zero_copy)
+    {
+        if (auto * ca_meta = tryGetContentAddressedMetadataStorage(disk))
+        {
+            uri.addQueryParameter(CA_POOL_UUID_PARAM, ca_meta->getPoolUUID());
+        }
+        else if (!disk)
+        {
+            for (const auto & data_disk : data.getDisks())
+            {
+                if (auto * ca_disk_meta = tryGetContentAddressedMetadataStorage(data_disk))
+                {
+                    uri.addQueryParameter(CA_POOL_UUID_PARAM, ca_disk_meta->getPoolUUID());
+                    break;
+                }
+            }
+        }
+    }
 
     Strings capability;
     if (try_zero_copy && (*data_settings)[MergeTreeSetting::allow_remote_fs_zero_copy_replication])
@@ -603,6 +687,41 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     size_t projections = 0;
     if (server_protocol_version >= REPLICATION_PROTOCOL_VERSION_WITH_PARTS_PROJECTION)
         readBinary(projections, *in);
+
+    /// CAS replication 2b — fetch-by-relink (spec §4). The sender chose to relink: it sent only the
+    /// part's content id + metadata_version, no file bytes. Build the part by publishing this server's
+    /// own ref to the blobs already in the shared pool (pin -> revalidate -> publish -> release inside
+    /// relinkExistingPart). If the relink is not possible (manifest/blob missing — a transient or a
+    /// genuinely-different pool the cheap pre-filter let through), fall back to a normal byte fetch by
+    /// re-requesting WITHOUT the relink capability.
+    String ca_relink = parse<String>(in->getResponseCookie(CA_RELINK_COOKIE, ""));
+    if (!ca_relink.empty())
+    {
+        String sender_part_id;
+        readStringBinary(sender_part_id, *in);
+        Int32 metadata_version = 0;
+        readBinary(metadata_version, *in);
+        assertEOF(*in);
+
+        auto * ca_meta = tryGetContentAddressedMetadataStorage(disk);
+        if (!ca_meta)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Got '{}' cookie but the target disk {} is not content-addressed", CA_RELINK_COOKIE, disk->getName());
+
+        auto relinked = relinkPartToDisk(
+            part_name, tmp_prefix, disk, sender_part_id, part_uuid, metadata_version);
+        if (relinked)
+            return std::make_pair(std::move(relinked), std::move(temporary_directory_lock));
+
+        LOG_INFO(log, "Relink of part {} not possible (content id {} not resolvable in the shared pool); "
+            "falling back to a byte fetch", part_name, sender_part_id);
+        temporary_directory_lock = {};
+        /// Re-request without the relink capability: pass the SAME (CA) disk but disable zero-copy/relink
+        /// so the sender streams bytes; on CA the downloaded files content-address and dedup.
+        return fetchSelectedPart(
+            metadata_snapshot, context, part_name, zookeeper_name, replica_path, host, port, timeouts,
+            user, password, interserver_scheme, throttler, to_detached, tmp_prefix, nullptr, false, disk);
+    }
 
     if (!remote_fs_metadata.empty())
     {
@@ -925,6 +1044,76 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
     if (zero_copy_temporary_lock_holder)
         zero_copy_temporary_lock_holder->setAlreadyRemoved();
 
+    return new_data_part;
+}
+
+MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
+    const String & part_name,
+    const String & tmp_prefix,
+    DiskPtr disk,
+    const String & sender_part_id,
+    UUID part_uuid,
+    Int32 metadata_version)
+{
+    auto * ca_meta = tryGetContentAddressedMetadataStorage(disk);
+    if (!ca_meta)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "relinkPartToDisk called for a non-content-addressed disk {}", disk->getName());
+
+    if (tmp_prefix.empty()
+        || part_name.empty()
+        || std::string::npos != tmp_prefix.find_first_of("/.")
+        || std::string::npos != part_name.find_first_of("/."))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "`tmp_prefix` and `part_name` cannot be empty or contain '.' or '/' characters.");
+
+    /// Stage under the tmp-fetch dir. The caller commits via renameTempPartAndReplace, whose
+    /// moveDirectory(tmp-fetch_<part> -> <part>) re-keys this server's committed ref to the final part
+    /// name (the existing renameCommittedPartRef path) — exactly as for a byte-fetched part.
+    const String part_dir = tmp_prefix + part_name;
+    const auto part_relative_path = data.getRelativeDataPath();
+
+    auto table_uuid = ContentAddressed::parseTableUuid(part_relative_path);
+    if (!table_uuid)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Cannot derive content-addressed table uuid from data path {} for relink of part {}",
+            part_relative_path, part_name);
+
+    /// The mutable per-part files the shared manifest does NOT carry, reconstructed from the transferred
+    /// header (spec §7). metadata_version.txt is always present; uuid.txt only when the part has a UUID
+    /// (mirrors the normal write, which omits uuid.txt for the Nil UUID).
+    std::map<std::string, std::string> sidecar_values;
+    sidecar_values[IMergeTreeDataPart::METADATA_VERSION_FILE_NAME] = toString(metadata_version);
+    if (part_uuid != UUIDHelpers::Nil)
+        sidecar_values[IMergeTreeDataPart::UUID_FILE_NAME] = toString(part_uuid);
+
+    LOG_DEBUG(log, "Relinking part {} (staged as {}) onto content-addressed disk {} from shared part_id {}.",
+        part_name, part_dir, disk->getName(), sender_part_id);
+
+    /// PIN -> RE-VALIDATE -> PUBLISH -> RELEASE (the data-loss-safe relink, spec §4). Returns false if the
+    /// part_id is not resolvable in this pool (manifest/blob missing) — relink not possible, caller falls
+    /// back to a byte fetch; in that case nothing was published (no dangling ref).
+    const bool published = ca_meta->relinkExistingPart(
+        *table_uuid, part_dir, ContentAddressed::PartId(sender_part_id), sidecar_values);
+    if (!published)
+        return nullptr;
+
+    auto volume = std::make_shared<SingleDiskVolume>("volume_" + part_name, disk);
+
+    MergeTreeData::MutableDataPartPtr new_data_part;
+    MergeTreeDataPartBuilder builder(data, part_name, volume, part_relative_path, part_dir, getReadSettings());
+    /// Read the part format from the now-published manifest (type + storage type), exactly as the byte
+    /// fetch does — authoritative over the transferred `part_type` header (kept for protocol symmetry).
+    new_data_part = builder.withPartFormatFromDisk().build();
+
+    new_data_part->version->setAndStoreCreationTID(Tx::NonTransactionalTID, nullptr);
+    new_data_part->is_temp = true;
+    /// The blobs are shared in the pool; a discarded temporary relink part must NOT reclaim them (another
+    /// replica's ref keeps them alive). Same policy a zero-copy-fetched temporary part uses.
+    new_data_part->remove_tmp_policy = IMergeTreeDataPart::BlobsRemovalPolicyForTemporaryParts::PRESERVE_BLOBS;
+    new_data_part->modification_time = time(nullptr);
+    new_data_part->loadColumnsChecksumsIndexes(true, false);
+
+    LOG_DEBUG(log, "Relink of part {} onto disk {} finished (no bytes transferred).", part_name, disk->getName());
     return new_data_part;
 }
 

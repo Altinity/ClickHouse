@@ -279,6 +279,17 @@ std::optional<ContentAddressed::PartId> ContentAddressedMetadataStorage::readRef
     return ContentAddressed::partIdFromRefPayload(*payload);
 }
 
+std::optional<ContentAddressed::PartId> ContentAddressedMetadataStorage::getPartId(const std::string & part_path) const
+{
+    /// The fetch-by-relink SENDER path: resolve a part directory path to the part_id named by this
+    /// server's own ref. The path is the part STORAGE's relative path (`store/<uuid[:3]>/<uuid>/<part>/`);
+    /// `parsePartFilePath` anchors on the uuid pair and is robust to the trailing slash / `store/` prefix.
+    auto p = ContentAddressed::parsePartFilePath(part_path);
+    if (!p || !p->file.empty())
+        return std::nullopt;
+    return readRefPartId(p->table_uuid, p->part_name);
+}
+
 ContentAddressed::PartManifest ContentAddressedMetadataStorage::loadPartManifestOrThrow(const ContentAddressed::PartId & part_id) const
 {
     auto bytes = readSmallObjectIfExists(ContentAddressed::partKey(storage_path_prefix, part_id).string());

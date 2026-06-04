@@ -68,6 +68,13 @@ public:
     /// string-matching is unsafe (false positives → mis-relink).
     const std::string & getPoolUUID() const { return pool_uuid; }
 
+    /// Resolve a part directory path (`store/<uuid[:3]>/<uuid>/<part>/`, relative to the disk) to the
+    /// `part_id` named by THIS server's ref for that part, if the ref exists (else nullopt). Used by the
+    /// fetch-by-relink SENDER (`DataPartsExchange::Service`) to read the authoritative content id of the
+    /// part it is asked to send so it can transmit the id (not the bytes) for a same-pool receiver to
+    /// relink against. A thin public wrapper over the private ref resolution.
+    std::optional<ContentAddressed::PartId> getPartId(const std::string & part_path) const;
+
     /// Test hook: run one synchronous GC sweep round and wait for it (no-op if no GC thread).
     const ContentAddressedGCThreadPtr & gcThreadForTest() const { return gc_thread; }
 

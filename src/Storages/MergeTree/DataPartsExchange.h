@@ -111,6 +111,20 @@ private:
         ThrottlerPtr throttler,
         bool sync);
 
+    /// CAS replication 2b — fetch-by-relink (spec §4). Build a part WITHOUT downloading any bytes by
+    /// publishing this server's own ref to the blobs already in the shared content-addressed pool. Stages
+    /// the ref under the tmp-fetch dir (so the caller's renameTempPartAndReplace re-keys it to the final
+    /// part name, exactly as for a byte-fetched part), loads the part from the shared manifest, and
+    /// returns it. Returns nullptr if the relink is not possible (the sender's part_id is not resolvable
+    /// in this pool — manifest/blob missing), in which case the caller falls back to a byte fetch.
+    MergeTreeData::MutableDataPartPtr relinkPartToDisk(
+        const String & part_name,
+        const String & tmp_prefix,
+        DiskPtr disk,
+        const String & sender_part_id,
+        UUID part_uuid,
+        Int32 metadata_version);
+
     MergeTreeData::MutableDataPartPtr downloadPartToDiskRemoteMeta(
        const String & part_name,
        const String & replica_path,
