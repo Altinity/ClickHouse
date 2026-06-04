@@ -375,6 +375,11 @@ private:
     std::map<std::string, std::string> recorded_mutable;
     std::string table_uuid;
     std::string part_name;
+    /// Non-empty iff this transaction writes a FREEZE target (shadow/<backup_name>/…). The commit then
+    /// publishes the ref + sidecar in the shadow/ namespace (shadowRefKey) instead of the live
+    /// store/.../refs/ location, so a freeze publishes an independent, GC-rooted snapshot ref rather than
+    /// clobbering the live part's ref.
+    std::string frozen_backup_name;
     /// B52: full blob object keys this transaction pinned in the pool's in-flight set (via the write
     /// buffer, under the GC lock). Released once the ref is published or the transaction is destroyed.
     std::set<std::string> pinned_blob_keys;

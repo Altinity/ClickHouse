@@ -237,6 +237,7 @@ public:
         fs::remove_all("blobs", ec);
         fs::remove_all("parts", ec);
         fs::remove_all("store", ec);
+        fs::remove_all("shadow", ec); // FREEZE shadow-ref namespace (shadowRefKey, empty key prefix)
         fs::remove_all("sessions", ec);
         fs::remove_all("cas_wbuf_tmp", ec);
         fs::remove_all(kCasTestScratch, ec);
@@ -3812,6 +3813,83 @@ TEST_F(ContentAddressedMetaTest, InFlightReadYourWritesBeforeCommit)
     EXPECT_FALSE(tx.tryGetInFlightStorageObjects("uui/" + uuid + "/" + part + "/absent.bin").has_value());
     tx.commit(DB::NoCommitOptions{});
     EXPECT_TRUE(ms->existsFile(col)); // now committed
+}
+
+// FREEZE path: writing a FREEZE target (shadow/<backup>/…) must publish the ref at the shadow/ key,
+// not at the live store/.../refs/ location. The live ref must be completely unchanged; the shadow ref
+// and the live ref resolve to the SAME part_id (content-only id is identical for identical bytes) but
+// they live at distinct keys so neither clobbers the other.
+TEST_F(ContentAddressedMetaTest, FreezePublishesShadowRefWithoutClobberingLiveRef)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_freeze_shadow");
+    auto os = getObjectStorage("cas_freeze_shadow");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-freeze";
+    const std::string part = "all_1_1_0";
+    const std::string backup = "b1";
+
+    // Determine the uuid[:3] prefix used in disk-relative paths (standard ClickHouse layout).
+    const std::string uuid3 = uuid.substr(0, 3);
+
+    // === 1. Write the LIVE part. ===
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"data.bin", "COL-BYTES"}, {"columns.txt", "a b"}, {"metadata_version.txt", "1"}})
+        {
+            const std::string path = uuid3 + "/" + uuid + "/" + part + "/" + name;
+            auto buf = tx.writeFile(path, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // Capture the live ref key and its part_id BEFORE the freeze.
+    const std::string live_ref_key = refKey("", sid, uuid, part).string();
+    ASSERT_TRUE(os->tryGetObjectMetadata(live_ref_key, /*with_tags=*/false).has_value())
+        << "live ref must exist after the first commit";
+    const std::string live_ref_bytes_before = readObject(os, live_ref_key);
+    const PartId live_pid = partIdFromRefPayload(live_ref_bytes_before);
+    ASSERT_FALSE(live_pid.string().empty());
+
+    // === 2. Write the FREEZE (shadow) copy of the SAME part with IDENTICAL content. ===
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"data.bin", "COL-BYTES"}, {"columns.txt", "a b"}, {"metadata_version.txt", "1"}})
+        {
+            // FREEZE writes to shadow/<backup>/<uuid[:3]>/<uuid>/<part>/<file>.
+            const std::string path = "shadow/" + backup + "/" + uuid3 + "/" + uuid + "/" + part + "/" + name;
+            auto buf = tx.writeFile(path, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // === 3. Assertions. ===
+
+    // 3a. The live ref at refKey(...) is INTACT and UNCHANGED — not clobbered by the freeze.
+    ASSERT_TRUE(os->tryGetObjectMetadata(live_ref_key, /*with_tags=*/false).has_value())
+        << "live ref must still exist after the freeze commit";
+    const std::string live_ref_bytes_after = readObject(os, live_ref_key);
+    EXPECT_EQ(live_ref_bytes_before, live_ref_bytes_after)
+        << "freeze must not alter the live ref bytes";
+
+    // 3b. A shadow ref now exists at shadowRefKey(...) and resolves to the SAME part_id (identical
+    // content means identical content-only part_id — deduplication via the blob hash chain).
+    const std::string shadow_ref_key = shadowRefKey("", backup, sid, uuid, part).string();
+    ASSERT_TRUE(os->tryGetObjectMetadata(shadow_ref_key, /*with_tags=*/false).has_value())
+        << "shadow ref must be published by the freeze commit";
+    const PartId shadow_pid = partIdFromRefPayload(readObject(os, shadow_ref_key));
+    EXPECT_EQ(live_pid, shadow_pid)
+        << "identical content must produce the same content-only part_id in the shadow ref";
+
+    // 3c. The shadow ref key and the live ref key are distinct (no aliasing).
+    EXPECT_NE(live_ref_key, shadow_ref_key)
+        << "live and shadow ref keys must be at distinct object-storage paths";
 }
 
 // B59: the in-flight read of a MUTABLE per-part file (e.g. metadata_version.txt) — staged inline in

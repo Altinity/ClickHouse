@@ -172,13 +172,14 @@ void ContentAddressedTransaction::rememberTarget(const std::string & path)
     {
         table_uuid = p->table_uuid;
         part_name = p->part_name;
+        frozen_backup_name = p->backup_name; /// empty for a live part; the FREEZE backup name otherwise
     }
-    else if (table_uuid != p->table_uuid || part_name != p->part_name)
+    else if (table_uuid != p->table_uuid || part_name != p->part_name || frozen_backup_name != p->backup_name)
     {
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressed: a single transaction must write one part, got {}/{} and {}/{}",
-            table_uuid, part_name, p->table_uuid, p->part_name);
+            "ContentAddressed: a single transaction must write one part, got {}/{} (backup '{}') and {}/{} (backup '{}')",
+            table_uuid, part_name, frozen_backup_name, p->table_uuid, p->part_name, p->backup_name);
     }
 }
 
@@ -1031,6 +1032,8 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// files (recorded_mutable) go to this part's PRIVATE per-ref sidecar, never the manifest. The
     /// manifest holds only content state, so two parts with identical content share one manifest while
     /// each keeps its own uuid / txn / metadata version (B23).
+    /// NOTE: frozen targets (FREEZE, shadow/<backup>/…) are always a real part_name (never "detached"),
+    /// so the two kDetachedDirName manifest-merge + sidecar-merge branches below are skipped for them.
     ContentAddressed::PartManifest manifest;
     manifest.blobs = recorded;
 
@@ -1123,6 +1126,19 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
                 merged_mutable.emplace(file, bytes); /// keep the new bytes on a key collision (re-detach)
     }
 
+    /// FREEZE publishes into the shadow/<backup>/ namespace (one ref per frozen part); a live part uses
+    /// the store/.../refs/ location. Select the ref-family keys accordingly.
+    const bool is_frozen = !frozen_backup_name.empty();
+    auto mutable_file_key = [&](const std::string & file)
+    {
+        return is_frozen
+            ? ContentAddressed::shadowRefMutableFileKey(key_prefix, frozen_backup_name, metadata_storage.server_id, table_uuid, part_name, file).string()
+            : ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid, part_name, file).string();
+    };
+    const std::string meta_key = is_frozen
+        ? ContentAddressed::shadowRefMetaKey(key_prefix, frozen_backup_name, metadata_storage.server_id, table_uuid, part_name).string()
+        : ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
+
     if (!merged_mutable.empty())
     {
         /// Per-file objects FIRST: each mutable file's bytes verbatim in its own tiny object so the
@@ -1130,7 +1146,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         /// detach's NEW files need writing; prior detached parts' per-file objects already exist.
         for (const auto & [file, bytes] : recorded_mutable)
         {
-            const std::string file_key = ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid, part_name, file).string();
+            const std::string file_key = mutable_file_key(file);
             auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite);
             file_out->write(bytes.data(), bytes.size());
             file_out->finalize();
@@ -1142,17 +1158,19 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         /// that removeRecursive reclaims and the reachability sweep (blobs/+parts/ only) cannot miss.
         ContentAddressed::RefSidecar sidecar;
         sidecar.files = merged_mutable;
-        const std::string meta_key = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
         const std::string meta_bytes = sidecar.serialize();
         auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
         meta_out->write(meta_bytes.data(), meta_bytes.size());
         meta_out->finalize();
     }
 
-    // Publish the ref last: store/{server_id}/{table_uuid}/refs/{part_name}. The on-disk payload is the
-    // versioned ref-payload struct (MAGIC+version+part_id) written by serializeRefPayload and parsed by
-    // the single partIdFromRefPayload shared with the read path and the GC live-set scan (B28).
-    const std::string ref_key = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
+    // Publish the ref last: store/{server_id}/{table_uuid}/refs/{part_name} for a live part, or
+    // shadow/<backup>/{server_id}/{table_uuid}/refs/{part_name} for a FREEZE target. The on-disk payload
+    // is the versioned ref-payload struct (MAGIC+version+part_id) written by serializeRefPayload and
+    // parsed by the single partIdFromRefPayload shared with the read path and the GC live-set scan (B28).
+    const std::string ref_key = is_frozen
+        ? ContentAddressed::shadowRefKey(key_prefix, frozen_backup_name, metadata_storage.server_id, table_uuid, part_name).string()
+        : ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
     const std::string ref_payload = ContentAddressed::serializeRefPayload(part_id);
     auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
     ref_out->write(ref_payload.data(), ref_payload.size());
