@@ -78,24 +78,39 @@ std::string shadowRefsRootPrefix(const std::string & key_prefix)
     return withPrefix(key_prefix, "shadow/");
 }
 
-std::string shadowRefsPrefix(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid)
+std::string shadowRefsPrefix(const std::string & key_prefix, const std::string & shadow_table_dir)
 {
-    return withPrefix(key_prefix, "shadow/" + backup_name + "/" + server_id + "/" + table_uuid + "/refs/");
+    /// Mirror the physical store tree: the refs live directly under the literal shadow table dir
+    /// (shadow/<backup>/store/<uuid[:3]>/<uuid>) so the enumeration's intermediate levels resolve via
+    /// the same generic child-derivation as the live table dir.
+    return withPrefix(key_prefix, shadow_table_dir + "/refs/");
 }
 
-RefObjectKey shadowRefKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name)
+RefObjectKey shadowRefKey(const std::string & key_prefix, const std::string & shadow_table_dir, const std::string & part_name)
 {
-    return RefObjectKey(shadowRefsPrefix(key_prefix, backup_name, server_id, table_uuid) + part_name);
+    return RefObjectKey(shadowRefsPrefix(key_prefix, shadow_table_dir) + part_name);
 }
 
-RefMetaObjectKey shadowRefMetaKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name)
+RefMetaObjectKey shadowRefMetaKey(const std::string & key_prefix, const std::string & shadow_table_dir, const std::string & part_name)
 {
-    return RefMetaObjectKey(shadowRefsPrefix(key_prefix, backup_name, server_id, table_uuid) + part_name + std::string(kRefMetaSuffix));
+    return RefMetaObjectKey(shadowRefsPrefix(key_prefix, shadow_table_dir) + part_name + std::string(kRefMetaSuffix));
 }
 
-RefMetaObjectKey shadowRefMutableFileKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name, const std::string & file)
+RefMetaObjectKey shadowRefMutableFileKey(const std::string & key_prefix, const std::string & shadow_table_dir, const std::string & part_name, const std::string & file)
 {
-    return RefMetaObjectKey(shadowRefsPrefix(key_prefix, backup_name, server_id, table_uuid) + part_name + "." + file + std::string(kRefMetaSuffix));
+    return RefMetaObjectKey(shadowRefsPrefix(key_prefix, shadow_table_dir) + part_name + "." + file + std::string(kRefMetaSuffix));
+}
+
+bool isShadowPath(const std::string & path)
+{
+    size_t i = 0;
+    while (i < path.size() && path[i] == '/')
+        ++i;
+    const auto first_end = path.find('/', i);
+    const std::string_view first = first_end == std::string::npos
+        ? std::string_view(path).substr(i)
+        : std::string_view(path).substr(i, first_end - i);
+    return first == kShadowDirName;
 }
 
 bool isRefMetaKey(const std::string & key)
@@ -323,10 +338,15 @@ std::optional<PartFilePath> parsePartFilePath(const std::string & path)
         r.file = file;
     }
     // FREEZE target: shadow/<backup_name>/…/<part>. The frozen ref lives in the shadow/ namespace, so
-    // capture the backup name (the component right after the reserved "shadow" root) for the commit /
-    // read routing. The inner store/<uuid>/<part> anchor above is unaffected by the prefix.
+    // capture both the backup name (the component right after the reserved "shadow" root) and the
+    // literal shadow table dir — the joined components before the part dir
+    // (shadow/<backup>/store/<uuid[:3]>/<uuid>) — for the commit / read / remove routing. The inner
+    // store/<uuid>/<part> anchor above is unaffected by the prefix.
     if (p.size() >= 2 && p[0] == kShadowDirName)
+    {
         r.backup_name = p[1];
+        r.shadow_table_dir = joinTableId(p, 0, anchor->part_idx);
+    }
     return r;
 }
 
@@ -346,6 +366,13 @@ std::optional<std::string> parseTableUuid(const std::string & path)
     if (p.size() >= 2 && !findPartDirComponent(p))
         return joinTableId(p, 0, p.size());
     return std::nullopt;
+}
+
+bool endsWithTableUuidPair(const std::string & path)
+{
+    auto p = splitNonEmpty(path);
+    auto uuid_idx = findTableUuidComponent(p);
+    return uuid_idx && *uuid_idx + 1 == p.size();
 }
 
 bool isPartFilePath(const std::string & path)

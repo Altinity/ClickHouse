@@ -380,6 +380,11 @@ private:
     /// store/.../refs/ location, so a freeze publishes an independent, GC-rooted snapshot ref rather than
     /// clobbering the live part's ref.
     std::string frozen_backup_name;
+    /// Set (alongside frozen_backup_name) for a FREEZE target: the literal shadow table dir
+    /// (shadow/<backup>/store/<uuid[:3]>/<uuid>) the frozen ref-family keys mirror. This is what the
+    /// commit feeds to the shadowRef* key builders so the shadow refs physically live under the same
+    /// store tree the read/list/remove enumeration walks.
+    std::string frozen_table_dir;
     /// B52: full blob object keys this transaction pinned in the pool's in-flight set (via the write
     /// buffer, under the GC lock). Released once the ref is published or the transaction is destroyed.
     std::set<std::string> pinned_blob_keys;

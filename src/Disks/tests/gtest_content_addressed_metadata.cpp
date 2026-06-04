@@ -3880,7 +3880,10 @@ TEST_F(ContentAddressedMetaTest, FreezePublishesShadowRefWithoutClobberingLiveRe
 
     // 3b. A shadow ref now exists at shadowRefKey(...) and resolves to the SAME part_id (identical
     // content means identical content-only part_id — deduplication via the blob hash chain).
-    const std::string shadow_ref_key = shadowRefKey("", backup, sid, uuid, part).string();
+    // The shadow ref-family keys mirror the physical store tree: the shadow table dir is everything
+    // before the part component (shadow/<backup>/<uuid[:3]>/<uuid>).
+    const std::string shadow_table_dir = "shadow/" + backup + "/" + uuid3 + "/" + uuid;
+    const std::string shadow_ref_key = shadowRefKey("", shadow_table_dir, part).string();
     ASSERT_TRUE(os->tryGetObjectMetadata(shadow_ref_key, /*with_tags=*/false).has_value())
         << "shadow ref must be published by the freeze commit";
     const PartId shadow_pid = partIdFromRefPayload(readObject(os, shadow_ref_key));
@@ -3943,7 +3946,8 @@ TEST_F(ContentAddressedMetaTest, GcShadowRefIsAGcRoot)
         tx.commit(DB::NoCommitOptions{});
     }
 
-    const std::string shadow_key = shadowRefKey("", backup, sid, uuid, part).string();
+    const std::string shadow_table_dir = "shadow/" + backup + "/" + uuid3 + "/" + uuid;
+    const std::string shadow_key = shadowRefKey("", shadow_table_dir, part).string();
     ASSERT_TRUE(os->tryGetObjectMetadata(shadow_key, /*with_tags=*/false).has_value())
         << "shadow ref must exist after the freeze commit";
 

@@ -173,6 +173,7 @@ void ContentAddressedTransaction::rememberTarget(const std::string & path)
         table_uuid = p->table_uuid;
         part_name = p->part_name;
         frozen_backup_name = p->backup_name; /// empty for a live part; the FREEZE backup name otherwise
+        frozen_table_dir = p->shadow_table_dir; /// empty for a live part; the shadow table dir otherwise
     }
     else if (table_uuid != p->table_uuid || part_name != p->part_name || frozen_backup_name != p->backup_name)
     {
@@ -1132,11 +1133,11 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     auto mutable_file_key = [&](const std::string & file)
     {
         return is_frozen
-            ? ContentAddressed::shadowRefMutableFileKey(key_prefix, frozen_backup_name, metadata_storage.server_id, table_uuid, part_name, file).string()
+            ? ContentAddressed::shadowRefMutableFileKey(key_prefix, frozen_table_dir, part_name, file).string()
             : ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid, part_name, file).string();
     };
     const std::string meta_key = is_frozen
-        ? ContentAddressed::shadowRefMetaKey(key_prefix, frozen_backup_name, metadata_storage.server_id, table_uuid, part_name).string()
+        ? ContentAddressed::shadowRefMetaKey(key_prefix, frozen_table_dir, part_name).string()
         : ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
 
     if (!merged_mutable.empty())
@@ -1169,7 +1170,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     // is the versioned ref-payload struct (MAGIC+version+part_id) written by serializeRefPayload and
     // parsed by the single partIdFromRefPayload shared with the read path and the GC live-set scan (B28).
     const std::string ref_key = is_frozen
-        ? ContentAddressed::shadowRefKey(key_prefix, frozen_backup_name, metadata_storage.server_id, table_uuid, part_name).string()
+        ? ContentAddressed::shadowRefKey(key_prefix, frozen_table_dir, part_name).string()
         : ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
     const std::string ref_payload = ContentAddressed::serializeRefPayload(part_id);
     auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
@@ -1372,6 +1373,45 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         if (!to_remove.empty())
             metadata_storage.object_storage->removeObjectsIfExist(to_remove);
     };
+
+    /// FREEZE shadow namespace (shadow/<backup>/store/…). Routed BEFORE every live branch so a shadow
+    /// part dir never hits unlinkPartDirRefs (which uses the LIVE refsPrefix and would mistarget), and a
+    /// shadow table/intermediate/backup dir never hits the live parseTableUuid branch.
+    if (ContentAddressed::isShadowPath(path))
+    {
+        /// Shadow PART dir shadow/<backup>/store/<uuid[:3]>/<uuid>/<part>: delete this frozen part's
+        /// shadow ref plus its sidecars (the bundle <part>.meta and each per-file <part>.<file>.meta).
+        /// Mirror unlinkPartDirRefs but list under the SHADOW refs prefix and match the basename exactly
+        /// <part> or beginning with "<part>." (never a sibling part sharing a name prefix). Blobs and the
+        /// manifest are kept (deferred GC); the shadow ref's disappearance lets the GC reclaim them once
+        /// no other ref keeps them reachable.
+        if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
+        {
+            const std::string refs_prefix = ContentAddressed::shadowRefsPrefix(key_prefix, p->shadow_table_dir);
+            RelativePathsWithMetadata children;
+            metadata_storage.object_storage->listObjects(refs_prefix, children, /*max_keys=*/0);
+            StoredObjects to_remove;
+            for (const auto & child : children)
+            {
+                const std::string & key = child->relative_path;
+                const auto pos = key.rfind(refs_prefix);
+                if (pos == std::string::npos)
+                    continue;
+                const std::string name = key.substr(pos + refs_prefix.size());
+                if (name == p->part_name || name.rfind(p->part_name + ".", 0) == 0)
+                    to_remove.emplace_back(key);
+            }
+            if (!to_remove.empty())
+                metadata_storage.object_storage->removeObjectsIfExist(to_remove);
+            return;
+        }
+
+        /// Shadow TABLE dir / INTERMEDIATE / backup root (shadow/<backup>[/store[/<uuid[:3]>[/<uuid>]]]):
+        /// delete every object under the dir's key prefix — all shadow refs/sidecars beneath it. This
+        /// handles removeRecursive(shadow/<backup>) (the full UNFREEZE WITH NAME cleanup) and any subtree.
+        remove_under_prefix(ContentAddressed::diskFileKey(key_prefix, path + "/"));
+        return;
+    }
 
     /// Part directory <uuid[:3]>/<uuid>/<part> (a part path with no file component): delete the
     /// single ref AND the part's per-ref sidecar objects (the bundle <part>.meta and each per-file

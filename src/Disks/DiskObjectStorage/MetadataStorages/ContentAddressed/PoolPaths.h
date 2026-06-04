@@ -47,18 +47,34 @@ RefMetaObjectKey refMetaKey(const std::string & key_prefix, const std::string & 
 // ref-enumerators skip them (isRefMetaKey) and removeRecursive's ref-scoped deletion reclaims them.
 RefMetaObjectKey refMutableFileKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name, const std::string & file);
 
-// FREEZE namespace. A frozen part is published as its OWN ref under shadow/<backup>/<server>/<uuid>/refs/
-// (one ref per frozen part, unlike the shared "detached" ref). shadowRefsRootPrefix is an additional GC
-// root the reachability scan walks alongside refsRootPrefix, so a frozen snapshot's blobs stay reachable
-// even after the live part is merged/dropped — the whole point of FREEZE.
+// FREEZE namespace. A frozen part is published as its OWN ref under the shadow MIRROR of the physical
+// store tree: shadow/<backup>/store/<uuid[:3]>/<uuid>/refs/<part> (one ref per frozen part, unlike the
+// shared "detached" ref). The ref objects therefore physically live under the same intermediate
+// prefixes the enumeration walks (shadow/<backup>/store, shadow/<backup>/store/<uuid[:3]>), so the
+// SAME generic child-derivation that lists a live table dir resolves those shadow levels. The shadow
+// helpers key off the LITERAL shadow table dir (the dir under the disk root excluding the part/file,
+// i.e. shadow/<backup>/store/<uuid[:3]>/<uuid>) rather than (backup, server, uuid): each replica's
+// uuid already separates replicas, and a same-server re-freeze with the same backup name is an
+// idempotent overwrite of byte-identical content (no server_id segment is needed).
+//
+// shadowRefsRootPrefix is an additional GC root the reachability scan walks alongside refsRootPrefix,
+// so a frozen snapshot's blobs stay reachable even after the live part is merged/dropped — the whole
+// point of FREEZE.
 std::string shadowRefsRootPrefix(const std::string & key_prefix);
-std::string shadowRefsPrefix(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid);
-RefObjectKey shadowRefKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
-RefMetaObjectKey shadowRefMetaKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
-RefMetaObjectKey shadowRefMutableFileKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name, const std::string & file);
+std::string shadowRefsPrefix(const std::string & key_prefix, const std::string & shadow_table_dir);
+RefObjectKey shadowRefKey(const std::string & key_prefix, const std::string & shadow_table_dir, const std::string & part_name);
+RefMetaObjectKey shadowRefMetaKey(const std::string & key_prefix, const std::string & shadow_table_dir, const std::string & part_name);
+RefMetaObjectKey shadowRefMutableFileKey(const std::string & key_prefix, const std::string & shadow_table_dir, const std::string & part_name, const std::string & file);
 
 // The literal first path component reserved for FREEZE snapshots (mirrors kDetachedDirName).
 inline constexpr std::string_view kShadowDirName = "shadow";
+
+// True iff the disk-relative path's FIRST component is the reserved FREEZE shadow root (kShadowDirName),
+// i.e. the path lives in the shadow snapshot namespace (shadow/<backup>/store/<uuid[:3]>/<uuid>/…). Used
+// to route shadow reads/lists/existence/removal to the shadow ref-set BEFORE the live-table-dir branch
+// (a shadow table dir also satisfies parseTableUuid and would otherwise be mis-routed to the live refs
+// prefix). Leading slashes are ignored.
+bool isShadowPath(const std::string & path);
 
 // The suffix that distinguishes a per-ref sidecar object from a ref object under the SAME refs/
 // prefix. Every enumerator that treats a key under refsPrefix as a ref (the table-dir listing,
@@ -153,6 +169,12 @@ struct PartFilePath
     /// (shadowRefKey) rather than the live store/.../refs/ location, so a freeze never clobbers the
     /// live part's ref (the shadow ref is also an independent GC root).
     std::string backup_name;
+    /// Set (alongside backup_name) when the path is a FREEZE target: the LITERAL shadow table dir under
+    /// the disk root excluding the part and file, i.e. the joined components [0 .. part_idx-1]
+    /// (shadow/<backup>/store/<uuid[:3]>/<uuid>). The shadow ref-family keys mirror the physical store
+    /// tree under this dir (shadowRefsPrefix), so the enumeration's intermediate levels resolve via the
+    /// same generic child-derivation as the live table dir. Empty for a normal live-part path.
+    std::string shadow_table_dir;
 };
 
 // Parse a disk-relative ClickHouse path <uuid[:3]>/<uuid>/<part>[/<file>].
@@ -161,6 +183,14 @@ std::optional<PartFilePath> parsePartFilePath(const std::string & path);
 
 // Returns the table_uuid iff path is exactly the table dir <uuid[:3]>/<uuid>[/] (2 components).
 std::optional<std::string> parseTableUuid(const std::string & path);
+
+// True iff the path's LAST two components form an Atomic-style <uuid[:3]>/<uuid> pair (the 3-char
+// prefix component immediately followed by the matching uuid, with nothing after it). Unlike
+// parseTableUuid this does NOT accept the non-Atomic fallback (any 2+-component dir): it is the strict
+// "this dir IS a uuid-anchored table dir" predicate the shadow router uses to tell a shadow TABLE dir
+// (shadow/<backup>/store/<uuid[:3]>/<uuid>) apart from a shadow INTERMEDIATE dir (shadow/<backup>,
+// shadow/<backup>/store, shadow/<backup>/store/<uuid[:3]>), which parseTableUuid would mis-accept.
+bool endsWithTableUuidPair(const std::string & path);
 
 // True iff the path addresses a file inside a part dir, i.e. <uuid[:3]>/<uuid>/<part>/<file>
 // (4+ components, non-empty file). These are content-addressed (ref + manifest + blob). Everything
