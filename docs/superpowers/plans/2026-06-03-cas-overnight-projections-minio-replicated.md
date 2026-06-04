@@ -137,6 +137,20 @@ Write the implementation plan to `docs/superpowers/plans/2026-06-04-cas-mergetre
   parallel)` — CA disk over minio S3 as default. Smoke-tested 10/10, full CAS layout written to minio,
   minio auto-starts for every stateless job. Full-suite minio+CA triage running in a BACKGROUND subagent
   (bounded per-shard; finds the S3-specific delta = passes-on-local-CA-but-fails-on-s3-CA). Awaiting it.
+- Stage B harness fixes DONE (this commit): the s3-CA job was passing NO storage flag to `clickhouse-test`
+  (gating inert — `no-content-addressed-storage`/`no-object-storage`/`no-s3-storage` tests all RAN), and the
+  server could not start on a non-fresh bucket (the persisted CA pool's `_pool_meta` was owned by a previous
+  `ServerUUID` → `claimPoolOwnership` Code 344 "already owned by another mounter"). Fixed (1) by adding
+  `--content-addressed-s3-storage` to `clickhouse-test` (sets `content_addressed_storage` + `s3_storage`, so
+  it mirrors local-CA gating AND honours `no-s3-storage`) and wiring it through `OPTIONS_TO_TEST_RUNNER_ARGUMENTS`;
+  (2) by wiping `clickminio/test/content_addressed_s3/` after minio is up and the bucket exists but BEFORE the
+  server starts, gated on the s3-CA option (S3 analogue of local-CA's per-run store wipe). Also handled two
+  stale rejection tests (M9 W2 lifted the partition-clone gate): `04280` repurposed to a positive test
+  (`04280_content_addressed_clone_partition_works` — REPLACE/ATTACH-FROM/MOVE PARTITION + DETACH/ATTACH + DROP
+  all succeed and read back correct data on the default CA disk); `04291` removed as redundant. Bounded s3-CA
+  validation (12 stems): server start clean (0 "already owned"); gated tests SKIPPED correctly
+  (`00988_parallel_parts_removal`=no-object-storage, `02920`/`01710_projection_detach_part`=no-content-addressed-storage,
+  etc.); CA-specific + correctness batch all green. Result: Failed: 0, Passed: 43, Skipped: 5.
 - Stage C (replication brainstorm) DONE while minio ran: spec `2026-06-04-cas-mergetree-replication-design.md`
   (`0f24cea5ab2`), adversarially reviewed + revised (`de2cfa5e8ed`). Core: refs ARE the cross-replica
   tracking (GC already roots at union of `store/*/refs/`), fetch = publish-a-ref (no download, no ZK

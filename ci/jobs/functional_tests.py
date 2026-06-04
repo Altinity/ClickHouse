@@ -129,6 +129,7 @@ OPTIONS_TO_INSTALL_ARGUMENTS = {
 OPTIONS_TO_TEST_RUNNER_ARGUMENTS = {
     "s3 storage": "--s3-storage --no-stateful",
     "content_addressed storage": "--content-addressed-storage",
+    "content_addressed s3 storage": "--content-addressed-s3-storage",
     "ParallelReplicas": "--no-zookeeper --no-shard --no-parallel-replicas",
     "AsyncInsert": " --no-async-insert",
     "DatabaseReplicated": " --no-stateful --replicated-database",
@@ -188,6 +189,7 @@ def main():
     is_targeted_check = False
     is_bugfix_validation = False
     is_s3_storage = False
+    is_content_addressed_s3 = False
     is_azure_storage = False
     is_database_replicated = False
     is_shared_catalog = False
@@ -246,6 +248,8 @@ def main():
             # only its own default policy and must not pull in the s3 stateful-data / encrypted
             # storage machinery, so it is deliberately excluded from is_s3_storage.
             is_s3_storage = True
+        if "content_addressed s3 storage" in to:
+            is_content_addressed_s3 = True
         if "azure" in to:
             is_azure_storage = True
         if "DatabaseReplicated" in to:
@@ -544,6 +548,20 @@ def main():
 
         def start():
             res = CH.start_minio(test_type="stateless") and CH.start_azurite()
+            if res and is_content_addressed_s3:
+                # The content-addressed-over-S3 pool (incl. its _pool_meta ownership
+                # marker) persists in the minio bucket at test/content_addressed_s3/.
+                # ServerUUID is regenerated each run, so a stale-owned pool would lock
+                # the fresh server out (`claimPoolOwnership` -> Code: 344 "already owned
+                # by another mounter"). Local-CA never hits this because its pool lives
+                # under the per-run server store that is wiped each run; the bucket-prefix
+                # wipe below is the S3 analogue. Done AFTER minio is up and the bucket
+                # exists (start_minio returned True) and BEFORE the server starts.
+                print("Resetting content_addressed_s3 pool prefix in minio bucket")
+                Shell.check(
+                    "/mc rm --recursive --force clickminio/test/content_addressed_s3/ 2>/dev/null ||:",
+                    verbose=True,
+                )
             res = res and CH.start()
             res = res and CH.wait_ready()
             if res:
