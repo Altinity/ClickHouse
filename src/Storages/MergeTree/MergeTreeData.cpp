@@ -6574,8 +6574,9 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     /// downloaded files content-address into the `detached/` namespace (relink-into-detached
                     /// is deferred, see backlog). `ALTER ... FETCH PART` parses to the same `FETCH_PARTITION`
                     /// command type (with `part=true`), so this entry covers both.
-                    /// STILL GATED (fail closed): `FREEZE`/`UNFREEZE` (the `shadow/` snapshot namespace is
-                    /// not handled on CA — it would silently produce no usable snapshot; B4 frozen-ref-set).
+                    /// `FREEZE PARTITION`/`FREEZE ALL` and `UNFREEZE PARTITION`/`UNFREEZE ALL` are now SUPPORTED:
+                    /// a freeze publishes each part as its own ref in the `shadow/` namespace (a GC root sharing
+                    /// the live blobs zero-copy — no byte copy); UNFREEZE removes the backup's refs.
                     /// NOTE: `MOVE_PARTITION` also admits cross-disk
                     /// `MOVE ... TO DISK/VOLUME` (this check cannot distinguish the destination); that uses
                     /// the byte-copy `clonePart` path (NOT the corrupting per-file hardlink), but only
@@ -6587,6 +6588,10 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                         PartitionCommand::REPLACE_PARTITION,
                         PartitionCommand::MOVE_PARTITION,
                         PartitionCommand::FETCH_PARTITION,
+                        PartitionCommand::FREEZE_PARTITION,
+                        PartitionCommand::FREEZE_ALL_PARTITIONS,
+                        PartitionCommand::UNFREEZE_PARTITION,
+                        PartitionCommand::UNFREEZE_ALL_PARTITIONS,
                     };
 
                     if (!std::ranges::contains(supported_commands, command.type))
