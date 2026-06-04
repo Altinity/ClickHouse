@@ -1,5 +1,3 @@
--- Tags: no-content-addressed-storage
--- no-content-addressed-storage: CA serves silently-wrong/partial projection-aggregation results here (verified: passes on a plain disk, fails only on CA). B59 read-your-writes closed the clean merge/materialize multi-block read-back (oracle 04300), but these mixed-coverage / 1.7M-row cases still read back partial projection data — residual B59.
 -- { echo ON }
 
 DROP TABLE IF EXISTS test;

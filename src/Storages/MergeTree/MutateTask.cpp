@@ -1250,6 +1250,23 @@ void registerCarriedForwardProjectionForCA(
         src_projection_part->getMetadataVersion());
     projection_part->setColumnsSubstreams(src_projection_part->getColumnsSubstreams());
     projection_part->checksums = src_projection_part->checksums;
+
+    /// The carried-forward projection is byte-identical to the source (its files are hardlinked into this
+    /// part's transaction), and on a content-addressed disk those files are not yet committed, so we cannot
+    /// reload index/granularity/rows from disk here (B58). `loadColumnsChecksumsIndexes` would load them on a
+    /// normal disk; here we copy the SOURCE projection part's already-loaded read-time state instead. Without
+    /// this the registered projection part has rows_count == 0 and an empty index granularity, so a
+    /// projection-served SELECT reads back NOTHING from it — silently dropping this part's rows from the
+    /// aggregate (B63). The source projection part is fully loaded and points at the same content.
+    projection_part->rows_count = src_projection_part->rows_count;
+    projection_part->index_granularity = src_projection_part->index_granularity;
+    projection_part->setBytesOnDisk(src_projection_part->getBytesOnDisk());
+    projection_part->setBytesUncompressedOnDisk(src_projection_part->getBytesUncompressedOnDisk());
+    if (src_projection_part->getMinMaxIndex())
+        projection_part->setMinMaxIndex(std::make_shared<IMergeTreeDataPart::MinMaxIndex>(*src_projection_part->getMinMaxIndex()));
+    if (auto src_index = src_projection_part->getIndex())
+        projection_part->setIndex(*src_index);
+
     new_data_part->addProjectionPart(projection_name, std::move(projection_part));
 }
 
