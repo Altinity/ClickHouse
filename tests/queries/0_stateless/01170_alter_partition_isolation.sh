@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-replicated-database, no-ordinary-database, no-content-addressed-storage
-# no-content-addressed-storage: uses experimental transactions; MergeTree does not support transactions on a content_addressed disk (Code 48 NOT_IMPLEMENTED, append-based txn log; object-storage-wide, B39)
+# Tags: no-fasttest, no-replicated-database, no-ordinary-database
 # Looks like server does not listen https port in fasttest
 # FIXME Replicated database executes ALTERs in separate context, so transaction info is lost
 
