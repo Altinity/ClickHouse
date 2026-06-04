@@ -340,6 +340,12 @@ public:
     /// True if write with Append mode supported.
     virtual bool supportWritingWithAppend() const { return false; }
 
+    /// True iff this metadata storage can persist the per-part mutable transaction file (txn_version.txt)
+    /// under MVCC. Distinct from supportWritingWithAppend: transactions rewrite txn_version.txt (tmp +
+    /// replaceFile), they never WriteMode::Append, so append-capability is the wrong proxy. A
+    /// content-addressed disk supports the mutable txn file via its per-ref sidecar.
+    virtual bool supportsTransactionalMutableFiles() const { return false; }
+
 protected:
     [[noreturn]] static void throwNotImplemented()
     {
