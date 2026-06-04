@@ -1067,7 +1067,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// PARTITION downloads its parts concurrently (the FETCH thread pool, 03350) and each part's commit
     /// publishes into the same "detached" ref, so an unlocked read-merge-publish loses entries — two
     /// concurrent commits both read the same prior manifest and the second overwrites the first's
-    /// contribution, leaving only one part's blobs and a FILE_DOESNT_EXIST on the lost parts (B63). The
+    /// contribution, leaving only one part's blobs and a FILE_DOESNT_EXIST on the lost parts (B66). The
     /// lock serializes the read-merge-publish so every part accumulates. (A regular part_name is never
     /// re-committed with new content under the same name, so this only affects "detached".)
     if (part_name == ContentAddressed::kDetachedDirName)
