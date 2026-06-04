@@ -527,6 +527,25 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         return metadata.last_modified;
     }
 
+    // A projection DIRECTORY <uuid[:3]>/<uuid>/<part>/<proj>.proj (or <proj>.tmp_proj): the projection's
+    // files are nested in the PARENT part's manifest under the <proj>.proj/ prefix (Approach A — no single
+    // blob for the directory itself), so it has no resolvable object. Report the parent part's manifest
+    // mtime, exactly as the part-directory branch above. Without this branch the fallthrough to
+    // getStorageObjects treats <proj>.proj as a missing blob and throws FILE_DOESNT_EXIST — which breaks
+    // isOldPartDirectory's per-child getLastModified during clearOldTemporaryDirectories (the DROP path,
+    // which walks a delete_tmp_<part> dir and its <proj>.proj child), wedging DROP in an infinite retry.
+    // Mirrors the .proj/.tmp_proj-suffix gate the existsDirectory/listDirectory/getFileSize branches use.
+    if (auto p = ContentAddressed::parsePartFilePath(path);
+        p && !p->file.empty() && p->file.find('/') == std::string::npos
+        && (p->file.ends_with(".proj") || p->file.ends_with(".tmp_proj")))
+    {
+        auto pid = readRefPartId(p->table_uuid, p->part_name);
+        if (!pid)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
+        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(storage_path_prefix, *pid).string(), /*with_tags=*/false);
+        return metadata.last_modified;
+    }
+
     // Mirror MetadataStorageFromPlainObjectStorage: report the resolved blob object's mtime.
     auto objects = getStorageObjects(path);
     chassert(!objects.empty());
