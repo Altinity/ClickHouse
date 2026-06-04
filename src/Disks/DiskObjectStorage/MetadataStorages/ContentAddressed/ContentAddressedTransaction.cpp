@@ -1034,26 +1034,6 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     ContentAddressed::PartManifest manifest;
     manifest.blobs = recorded;
 
-    /// The "detached" ref is a SHARED container of detached part directories: each DETACH PARTITION
-    /// clones one part into detached/<detached_part>/ via a fresh freeze transaction whose recorded keys
-    /// are <detached_part>/<file> (B36). Several partitions detach independently and must COEXIST under
-    /// the one "detached" ref. The default publish below rewrites the ref, which would make each detach
-    /// overwrite the previous one (only the last detached part would be listed — B46). So when the target
-    /// is the detached namespace, merge the new keys into the existing detached ref's manifest first,
-    /// mirroring the moveDirectory-based republishCommittedPartIntoDetached path. (A regular part_name is
-    /// never re-committed with new content under the same name, so this only affects "detached".)
-    if (part_name == ContentAddressed::kDetachedDirName)
-    {
-        if (auto existing_pid = metadata_storage.readRefPartId(table_uuid, part_name))
-        {
-            auto existing = metadata_storage.loadPartManifestOrThrow(*existing_pid);
-            for (const auto & [file, entry] : existing.blobs)
-                manifest.blobs.emplace(file, entry); /// keep the new entry on a key collision (re-detach)
-        }
-    }
-
-    const ContentAddressed::PartId part_id = ContentAddressed::computePartId(manifest.blobs);
-
     /// B49: take the per-pool in-process GC lock for the publish, and re-validate every referenced blob
     /// UNDER it before writing the manifest or publishing the ref. finalizeImpl skips re-uploading a
     /// blob that already exists (dedup); in the window between that skip and this publish a concurrent
@@ -1076,6 +1056,31 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         persistSession();
 
     std::lock_guard<std::mutex> gc_guard(*metadata_storage.gc_lock);
+
+    /// The "detached" ref is a SHARED container of detached part directories: each detach/FETCH lands one
+    /// part into detached/<detached_part>/ via its own transaction whose recorded keys are
+    /// <detached_part>/<file> (B36). Several parts land independently and must COEXIST under the one
+    /// "detached" ref. The default publish below rewrites the ref, which would make each publish overwrite
+    /// the previous one (only the last detached part would be listed — B46). So when the target is the
+    /// detached namespace, merge the new keys into the existing detached ref's manifest first. This
+    /// read-modify-write of the SHARED detached ref MUST happen UNDER the per-pool gc_lock: a FETCH
+    /// PARTITION downloads its parts concurrently (the FETCH thread pool, 03350) and each part's commit
+    /// publishes into the same "detached" ref, so an unlocked read-merge-publish loses entries — two
+    /// concurrent commits both read the same prior manifest and the second overwrites the first's
+    /// contribution, leaving only one part's blobs and a FILE_DOESNT_EXIST on the lost parts (B63). The
+    /// lock serializes the read-merge-publish so every part accumulates. (A regular part_name is never
+    /// re-committed with new content under the same name, so this only affects "detached".)
+    if (part_name == ContentAddressed::kDetachedDirName)
+    {
+        if (auto existing_pid = metadata_storage.readRefPartId(table_uuid, part_name))
+        {
+            auto existing = metadata_storage.loadPartManifestOrThrow(*existing_pid);
+            for (const auto & [file, entry] : existing.blobs)
+                manifest.blobs.emplace(file, entry); /// keep the new entry on a key collision (re-land)
+        }
+    }
+
+    const ContentAddressed::PartId part_id = ContentAddressed::computePartId(manifest.blobs);
 
     for (const auto & [file, entry] : manifest.blobs)
     {
