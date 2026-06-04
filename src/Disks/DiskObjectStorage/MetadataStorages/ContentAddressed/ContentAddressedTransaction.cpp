@@ -9,6 +9,7 @@
 #include <Common/Exception.h>
 #include <Common/ObjectStorageKey.h>
 #include <Common/getRandomASCIIString.h>
+#include <Common/logger_useful.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadSettings.h>
@@ -1404,6 +1405,28 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
     auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
     ref_out->write(ref_payload.data(), ref_payload.size());
     ref_out->finalize();
+
+    /// CA GC S1 (B9): record this part's blob pins in the per-pool incremental reverse index. This is
+    /// the live-ref CONTENT publish branch (a mutable-only sidecar update returned far above and pins no
+    /// new blobs). Scope it to a LIVE regular part: a FREEZE/shadow ref and the shared "detached" ref
+    /// also pin blobs but are out of S1 scope (the sweep's drift log notes them as a known under-count;
+    /// the detached ref also re-keys its part_id on each merge, which would mis-track here). The update
+    /// is idempotent (applied_parts) and INSTRUMENTATION ONLY: the sweep's authoritative full-scan still
+    /// drives every deletion, so an exception here must NEVER break the commit — log and swallow it.
+    if (!is_frozen && part_name_ != ContentAddressed::kDetachedDirName)
+    {
+        try
+        {
+            metadata_storage.blobRefIndex()->addPart(part_id, manifest);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(
+                getLogger("ContentAddressedTransaction"),
+                "CA GC S1: failed to add part " + part_id.string() + " to the reverse index (instrumentation only; "
+                "the authoritative GC scan is unaffected)");
+        }
+    }
 }
 
 void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant & options)
@@ -1567,6 +1590,29 @@ bool ContentAddressedTransaction::unlinkPartDirRefs(const std::string & path)
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || !p->file.empty() || p->part_name == ContentAddressed::kDetachedDirName)
         return false;
+
+    /// CA GC S1 (B9): mirror the commit-side addPart by removing this part's blob pins from the per-pool
+    /// reverse index as its live ref is unlinked. Resolve the (part_id, manifest) FROM the ref BEFORE the
+    /// deletion below (the ref/manifest still exist now). INSTRUMENTATION ONLY: the sweep's authoritative
+    /// full-scan still drives every deletion, so an exception here must NEVER block the drop — log and
+    /// continue (the scan stays authoritative; a missed removePart only makes the index over-count, which
+    /// the drift log surfaces and the scan corrects). removePart is idempotent (applied_parts), so a part
+    /// the index never saw (committed by another process, or before this process started) is a no-op.
+    try
+    {
+        if (auto part_id = metadata_storage.readRefPartId(p->table_uuid, p->part_name))
+        {
+            auto manifest = metadata_storage.loadPartManifestOrThrow(*part_id);
+            metadata_storage.blobRefIndex()->removePart(*part_id, manifest);
+        }
+    }
+    catch (...)
+    {
+        tryLogCurrentException(
+            getLogger("ContentAddressedTransaction"),
+            "CA GC S1: failed to remove part " + p->part_name + " from the reverse index (instrumentation only; "
+            "the authoritative GC scan is unaffected)");
+    }
 
     const std::string refs_prefix
         = ContentAddressed::refsPrefix(key_prefix, metadata_storage.server_id, p->table_uuid);
