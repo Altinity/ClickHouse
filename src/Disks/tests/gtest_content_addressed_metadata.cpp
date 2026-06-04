@@ -4009,3 +4009,255 @@ TEST_F(ContentAddressedMetaTest, InFlightReadYourWritesMutableFileBeforeCommit)
     String got; DB::readStringUntilEOF(got, *rb);
     EXPECT_EQ(got, bytes);
 }
+
+// ============================================================================================
+// TXN-T3: replaceFile + mutable-only sidecar update
+// ============================================================================================
+
+// Core invariant: writing txn_version.txt via the tmp+replaceFile sequence on a COMMITTED part
+// updates only the per-ref sidecar (the mutable-only commit branch) and KEEPS the existing
+// manifest, part_id and ref. The live content blobs are never affected, and the sidecar now
+// holds exactly the written bytes under "txn_version.txt".
+TEST_F(ContentAddressedMetaTest, TxnVersionRewriteKeepsManifestAndRef)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_txnrewrite");
+    auto os = getObjectStorage("cas_txnrewrite");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-txnrewrite";
+    const std::string part = "all_1_1_0";
+    const std::string base = "uui/" + uuid + "/" + part + "/";
+
+    // 1. Write and commit a live part with a content file.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(base + "data.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string data = "COLUMN-DATA";
+        buf->write(data.data(), data.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // Capture the part_id and the manifest object key BEFORE the mutable-only update.
+    const std::string ref_key = refKey("", sid, uuid, part).string();
+    ASSERT_TRUE(os->tryGetObjectMetadata(ref_key, /*with_tags=*/false).has_value())
+        << "ref must exist after first commit";
+    const PartId pid_before = partIdFromRefPayload(readObject(os, ref_key));
+    const std::string manifest_bytes_before = readObject(os, partKey("", pid_before).string());
+    const PartManifest manifest_before = PartManifest::deserialize(manifest_bytes_before);
+    EXPECT_TRUE(manifest_before.blobs.contains("data.bin"))
+        << "manifest must contain the content file";
+    EXPECT_FALSE(manifest_before.blobs.contains("txn_version.txt"))
+        << "manifest must NOT contain txn_version.txt before the mutable-only write";
+    EXPECT_FALSE(manifest_before.blobs.contains("txn_version.txt.tmp"))
+        << "manifest must NOT contain the tmp form either";
+
+    // 2. Simulate VersionMetadataOnDisk::storeInfoToDataPartStorage: write .tmp then replaceFile.
+    const std::string txn_bytes = "42";
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(base + "txn_version.txt.tmp", 4096, DB::WriteMode::Rewrite, {});
+        buf->write(txn_bytes.data(), txn_bytes.size());
+        buf->finalize();
+        tx.replaceFile(base + "txn_version.txt.tmp", base + "txn_version.txt");
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // 3. The ref still resolves to the SAME part_id (mutable-only commit must not clobber the ref).
+    ASSERT_TRUE(os->tryGetObjectMetadata(ref_key, /*with_tags=*/false).has_value())
+        << "ref must still exist after the mutable-only commit";
+    const PartId pid_after = partIdFromRefPayload(readObject(os, ref_key));
+    EXPECT_EQ(pid_before, pid_after)
+        << "mutable-only commit must not change the part_id / ref";
+
+    // 4. The manifest is UNCHANGED.
+    const std::string manifest_bytes_after = readObject(os, partKey("", pid_after).string());
+    EXPECT_EQ(manifest_bytes_before, manifest_bytes_after)
+        << "manifest must be byte-for-byte unchanged after the mutable-only commit";
+    const PartManifest manifest_after = PartManifest::deserialize(manifest_bytes_after);
+    EXPECT_FALSE(manifest_after.blobs.contains("txn_version.txt"))
+        << "txn_version.txt must NOT appear in the manifest after the mutable-only commit";
+    EXPECT_FALSE(manifest_after.blobs.contains("txn_version.txt.tmp"))
+        << "txn_version.txt.tmp must NOT appear in the manifest";
+
+    // 5. The sidecar now carries txn_version.txt with exactly the written bytes.
+    const std::string meta_key = refMetaKey("", sid, uuid, part).string();
+    ASSERT_TRUE(os->tryGetObjectMetadata(meta_key, /*with_tags=*/false).has_value())
+        << "sidecar bundle object must exist after the mutable-only commit";
+    const RefSidecar sidecar = RefSidecar::deserialize(readObject(os, meta_key));
+    ASSERT_TRUE(sidecar.files.contains("txn_version.txt"))
+        << "sidecar must contain txn_version.txt";
+    EXPECT_EQ(sidecar.files.at("txn_version.txt"), txn_bytes)
+        << "sidecar must hold exactly the bytes written to txn_version.txt";
+    EXPECT_FALSE(sidecar.files.contains("txn_version.txt.tmp"))
+        << "the tmp form must not appear in the sidecar (it was the source of the replaceFile)";
+
+    // 6. Reading back the mutable file through the metadata storage returns the same bytes.
+    auto txn_objs = ms->getStorageObjects(base + "txn_version.txt");
+    ASSERT_EQ(txn_objs.size(), 1u);
+    EXPECT_EQ(readObject(os, txn_objs[0].remote_path), txn_bytes);
+
+    // 7. The content file still resolves via the manifest -> blob path (unchanged).
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base + "data.bin")[0].remote_path), "COLUMN-DATA");
+}
+
+// A SECOND mutable-only commit with different txn_version.txt bytes overwrites the sidecar in
+// place. The ref and part_id stay unchanged after both rewrites; only the sidecar bytes change.
+TEST_F(ContentAddressedMetaTest, TxnVersionOverwrite)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_txnoverwrite");
+    auto os = getObjectStorage("cas_txnoverwrite");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-txnoverwrite";
+    const std::string part = "all_1_1_0";
+    const std::string base = "uui/" + uuid + "/" + part + "/";
+
+    // Write and commit the live part.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(base + "data.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string data = "ROWS";
+        buf->write(data.data(), data.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    const std::string ref_key = refKey("", sid, uuid, part).string();
+    const PartId pid_original = partIdFromRefPayload(readObject(os, ref_key));
+
+    // First mutable-only commit: write txn_version.txt = "10".
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(base + "txn_version.txt.tmp", 4096, DB::WriteMode::Rewrite, {});
+        const std::string v = "10";
+        buf->write(v.data(), v.size());
+        buf->finalize();
+        tx.replaceFile(base + "txn_version.txt.tmp", base + "txn_version.txt");
+        tx.commit(DB::NoCommitOptions{});
+    }
+    const std::string meta_key = refMetaKey("", sid, uuid, part).string();
+    // Sidecar carries "10"; part_id unchanged.
+    {
+        const PartId pid = partIdFromRefPayload(readObject(os, ref_key));
+        EXPECT_EQ(pid, pid_original);
+        ASSERT_TRUE(os->tryGetObjectMetadata(meta_key, /*with_tags=*/false).has_value());
+        const RefSidecar sc1 = RefSidecar::deserialize(readObject(os, meta_key));
+        EXPECT_EQ(sc1.files.at("txn_version.txt"), "10");
+    }
+
+    // Second mutable-only commit: overwrite with "99".
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(base + "txn_version.txt.tmp", 4096, DB::WriteMode::Rewrite, {});
+        const std::string v = "99";
+        buf->write(v.data(), v.size());
+        buf->finalize();
+        tx.replaceFile(base + "txn_version.txt.tmp", base + "txn_version.txt");
+        tx.commit(DB::NoCommitOptions{});
+    }
+    // After the second update the sidecar holds "99" and the part_id is still unchanged.
+    {
+        const PartId pid = partIdFromRefPayload(readObject(os, ref_key));
+        EXPECT_EQ(pid, pid_original)
+            << "part_id must be unchanged after two mutable-only commits";
+        ASSERT_TRUE(os->tryGetObjectMetadata(meta_key, /*with_tags=*/false).has_value());
+        const RefSidecar sc2 = RefSidecar::deserialize(readObject(os, meta_key));
+        EXPECT_EQ(sc2.files.at("txn_version.txt"), "99")
+            << "second mutable-only commit must overwrite the first";
+        // The content file still resolves correctly.
+        EXPECT_EQ(readObject(os, ms->getStorageObjects(base + "data.bin")[0].remote_path), "ROWS");
+    }
+}
+
+// Fail-closed: a mutable-only commit (replaceFile of txn_version.txt) on a part that was NEVER
+// committed (no ref) must throw LOGICAL_ERROR. Publishing a sidecar update to a non-existent ref
+// would leave a dangling sidecar with no manifest; the commit detects the absence of an existing
+// ref and throws before writing anything.
+TEST_F(ContentAddressedMetaTest, MutableOnlyCommitWithoutRefThrows)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_mut_nothrow");
+    const std::string uuid = "uuid-mut-nothrow";
+    const std::string part = "all_1_1_0";
+    const std::string base = "uui/" + uuid + "/" + part + "/";
+
+    // Build a transaction that stages only a mutable file (no content file -> no ref will exist).
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    {
+        auto buf = tx.writeFile(base + "txn_version.txt.tmp", 4096, DB::WriteMode::Rewrite, {});
+        const std::string v = "77";
+        buf->write(v.data(), v.size());
+        buf->finalize();
+    }
+    tx.replaceFile(base + "txn_version.txt.tmp", base + "txn_version.txt");
+    // No ref for this part exists — commit must throw.
+    EXPECT_THROW(tx.commit(DB::NoCommitOptions{}), DB::Exception);
+}
+
+// RemoveTmpMutableFile: after a successful mutable-only commit, a transaction that removes the
+// tmp mutable file (unlinkFile on txn_version.txt.tmp — MergeTree's removeTmpMetadataFile) on the
+// same committed part commits cleanly. The sidecar loses the ".tmp" entry (if any) but keeps the
+// non-tmp txn_version.txt entry written by the prior commit; the ref and part_id are unchanged.
+TEST_F(ContentAddressedMetaTest, RemoveTmpMutableFile)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_rmtmp");
+    auto os = getObjectStorage("cas_rmtmp");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-rmtmp";
+    const std::string part = "all_1_1_0";
+    const std::string base = "uui/" + uuid + "/" + part + "/";
+
+    // Write a live part.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(base + "data.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string data = "PAYLOAD";
+        buf->write(data.data(), data.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    const std::string ref_key = refKey("", sid, uuid, part).string();
+    const PartId pid_original = partIdFromRefPayload(readObject(os, ref_key));
+
+    // Write txn_version.txt via the tmp+replaceFile sequence.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(base + "txn_version.txt.tmp", 4096, DB::WriteMode::Rewrite, {});
+        const std::string v = "5";
+        buf->write(v.data(), v.size());
+        buf->finalize();
+        tx.replaceFile(base + "txn_version.txt.tmp", base + "txn_version.txt");
+        tx.commit(DB::NoCommitOptions{});
+    }
+    const std::string meta_key = refMetaKey("", sid, uuid, part).string();
+    // Confirm the sidecar has txn_version.txt = "5".
+    {
+        ASSERT_TRUE(os->tryGetObjectMetadata(meta_key, /*with_tags=*/false).has_value());
+        const RefSidecar sc = RefSidecar::deserialize(readObject(os, meta_key));
+        EXPECT_EQ(sc.files.at("txn_version.txt"), "5");
+    }
+
+    // MergeTree calls removeTmpMetadataFile → unlinkFile(txn_version.txt.tmp) on the committed part.
+    // This is a mutable-only removal (the .tmp is recognized by isMutablePerPartFile). Commit must
+    // succeed cleanly and the sidecar must NOT gain a ".tmp" entry.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.unlinkFile(base + "txn_version.txt.tmp", /*if_exists=*/true, /*should_remove_objects=*/false);
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // The ref and part_id are unchanged.
+    EXPECT_EQ(partIdFromRefPayload(readObject(os, ref_key)), pid_original);
+
+    // The sidecar no longer has the ".tmp" entry; it does still have "txn_version.txt".
+    ASSERT_TRUE(os->tryGetObjectMetadata(meta_key, /*with_tags=*/false).has_value());
+    const RefSidecar sc_final = RefSidecar::deserialize(readObject(os, meta_key));
+    EXPECT_FALSE(sc_final.files.contains("txn_version.txt.tmp"))
+        << "sidecar must not contain the tmp form after the remove";
+    EXPECT_EQ(sc_final.files.at("txn_version.txt"), "5")
+        << "the non-tmp txn_version.txt must remain in the sidecar";
+
+    // The content file is still resolvable.
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(base + "data.bin")[0].remote_path), "PAYLOAD");
+}

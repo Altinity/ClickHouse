@@ -1065,7 +1065,13 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool, boo
         /// recorded_mutable_removed to do so. This handles removeTmpMetadataFile's
         /// removeFile(txn_version.txt.tmp) on a committed part (the .tmp is recognized as mutable by Piece 1).
         if (!staged_here && ContentAddressed::isMutablePerPartFile(p->file))
+        {
+            /// Pin the (table_uuid, part_name) target so a standalone remove of a mutable per-part file
+            /// (e.g. removeTmpMetadataFile calling removeFile(txn_version.txt.tmp) with no other staged
+            /// operations) sets the target that the mutable-only commit branch requires.
+            rememberTarget(path);
             recorded_mutable_removed.insert(p->file);
+        }
         return;
     }
 
