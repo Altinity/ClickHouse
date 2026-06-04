@@ -1935,6 +1935,19 @@ void ContentAddressedWriteBuffer::finalizeImpl()
         on_finalized(BlobHash(blob_hash), size);
 }
 
+void ContentAddressedWriteBuffer::cancelImpl() noexcept
+{
+    /// The insert-cancel path (~MergeTreeSink -> Finalizer::cancel) destroys this buffer without
+    /// finalizing. Propagate the cancel to the inner buffers (hashing wraps temp_file) so they are not
+    /// destroyed "neither finalized nor canceled". No blob is uploaded or recorded on cancel (only
+    /// finalizeImpl uploads); the destructor's removeTempFile reclaims the scratch file.
+    WriteBufferFromFileBase::cancelImpl();
+    if (hashing)
+        hashing->cancel();
+    if (temp_file)
+        temp_file->cancel();
+}
+
 void ContentAddressedWriteBuffer::sync()
 {
     next();

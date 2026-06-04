@@ -80,6 +80,7 @@ public:
 private:
     void nextImpl() override;
     void finalizeImpl() override;
+    void cancelImpl() noexcept override;
     void removeTempFile() noexcept;
 
     /// Publish the spilled temp file to the final content-hash blob key so a concurrent reader/writer
