@@ -73,6 +73,31 @@ RefMetaObjectKey refMutableFileKey(const std::string & key_prefix, const std::st
     return RefMetaObjectKey(refsPrefix(key_prefix, server_id, table_uuid) + part_name + "." + file + std::string(kRefMetaSuffix));
 }
 
+std::string shadowRefsRootPrefix(const std::string & key_prefix)
+{
+    return withPrefix(key_prefix, "shadow/");
+}
+
+std::string shadowRefsPrefix(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid)
+{
+    return withPrefix(key_prefix, "shadow/" + backup_name + "/" + server_id + "/" + table_uuid + "/refs/");
+}
+
+RefObjectKey shadowRefKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name)
+{
+    return RefObjectKey(shadowRefsPrefix(key_prefix, backup_name, server_id, table_uuid) + part_name);
+}
+
+RefMetaObjectKey shadowRefMetaKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name)
+{
+    return RefMetaObjectKey(shadowRefsPrefix(key_prefix, backup_name, server_id, table_uuid) + part_name + std::string(kRefMetaSuffix));
+}
+
+RefMetaObjectKey shadowRefMutableFileKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name, const std::string & file)
+{
+    return RefMetaObjectKey(shadowRefsPrefix(key_prefix, backup_name, server_id, table_uuid) + part_name + "." + file + std::string(kRefMetaSuffix));
+}
+
 bool isRefMetaKey(const std::string & key)
 {
     return key.size() >= kRefMetaSuffix.size()
@@ -297,6 +322,11 @@ std::optional<PartFilePath> parsePartFilePath(const std::string & path)
             file += "/" + p[i];
         r.file = file;
     }
+    // FREEZE target: shadow/<backup_name>/…/<part>. The frozen ref lives in the shadow/ namespace, so
+    // capture the backup name (the component right after the reserved "shadow" root) for the commit /
+    // read routing. The inner store/<uuid>/<part> anchor above is unaffected by the prefix.
+    if (p.size() >= 2 && p[0] == kShadowDirName)
+        r.backup_name = p[1];
     return r;
 }
 

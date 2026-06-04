@@ -47,6 +47,19 @@ RefMetaObjectKey refMetaKey(const std::string & key_prefix, const std::string & 
 // ref-enumerators skip them (isRefMetaKey) and removeRecursive's ref-scoped deletion reclaims them.
 RefMetaObjectKey refMutableFileKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name, const std::string & file);
 
+// FREEZE namespace. A frozen part is published as its OWN ref under shadow/<backup>/<server>/<uuid>/refs/
+// (one ref per frozen part, unlike the shared "detached" ref). shadowRefsRootPrefix is an additional GC
+// root the reachability scan walks alongside refsRootPrefix, so a frozen snapshot's blobs stay reachable
+// even after the live part is merged/dropped — the whole point of FREEZE.
+std::string shadowRefsRootPrefix(const std::string & key_prefix);
+std::string shadowRefsPrefix(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid);
+RefObjectKey shadowRefKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
+RefMetaObjectKey shadowRefMetaKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
+RefMetaObjectKey shadowRefMutableFileKey(const std::string & key_prefix, const std::string & backup_name, const std::string & server_id, const std::string & table_uuid, const std::string & part_name, const std::string & file);
+
+// The literal first path component reserved for FREEZE snapshots (mirrors kDetachedDirName).
+inline constexpr std::string_view kShadowDirName = "shadow";
+
 // The suffix that distinguishes a per-ref sidecar object from a ref object under the SAME refs/
 // prefix. Every enumerator that treats a key under refsPrefix as a ref (the table-dir listing,
 // existsDirectory, and the GC live-set scan) must skip keys ending in this suffix, since a sidecar
@@ -135,6 +148,11 @@ struct PartFilePath
     std::string table_uuid;
     std::string part_name;
     std::string file; /// empty when the path is a part directory
+    /// Set to the backup name when the path is a FREEZE target shadow/<backup_name>/…/<part>[/<file>].
+    /// Empty for a normal live-part path. The frozen ref then lives in the shadow/ namespace
+    /// (shadowRefKey) rather than the live store/.../refs/ location, so a freeze never clobbers the
+    /// live part's ref (the shadow ref is also an independent GC root).
+    std::string backup_name;
 };
 
 // Parse a disk-relative ClickHouse path <uuid[:3]>/<uuid>/<part>[/<file>].
