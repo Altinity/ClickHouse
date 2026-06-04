@@ -232,6 +232,7 @@ SweepResult selectForSweep(const std::set<std::string> & unreferenced,
 
 void InMemoryBlobRefIndex::addPart(const PartId & part_id, const PartManifest & manifest)
 {
+    std::lock_guard<std::mutex> lock(mtx);
     if (!applied_parts.insert(part_id).second)
         return; /// idempotent: this part's refs are already counted
 
@@ -241,6 +242,7 @@ void InMemoryBlobRefIndex::addPart(const PartId & part_id, const PartManifest & 
 
 void InMemoryBlobRefIndex::removePart(const PartId & part_id, const PartManifest & manifest)
 {
+    std::lock_guard<std::mutex> lock(mtx);
     if (applied_parts.erase(part_id) == 0)
         return; /// this part was not applied
 
@@ -254,12 +256,14 @@ void InMemoryBlobRefIndex::removePart(const PartId & part_id, const PartManifest
 
 int64_t InMemoryBlobRefIndex::refcount(const BlobHash & blob_hash) const
 {
+    std::lock_guard<std::mutex> lock(mtx);
     auto it = counts.find(blob_hash);
     return it == counts.end() ? 0 : it->second;
 }
 
 std::set<BlobHash> InMemoryBlobRefIndex::unreferenced() const
 {
+    std::lock_guard<std::mutex> lock(mtx);
     std::set<BlobHash> result;
     for (const auto & item : counts)
         if (item.second <= 0)

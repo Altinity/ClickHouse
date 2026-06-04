@@ -91,6 +91,13 @@ public:
     /// dedup-skipping insert decided to reuse cannot be reclaimed in the finalize -> commit window.
     const std::shared_ptr<std::set<std::string>> & inFlightPinnedBlobs() const { return in_flight_pinned_blobs; }
 
+    /// The per-pool incremental reverse index (B9 / CA GC S1). The commit path adds a part's blob pins
+    /// and the drop path removes them, so it tracks a per-process refcount over blob hashes. It is
+    /// instrumentation only: the GC sweep validates it against the authoritative full-scan and logs
+    /// drift, but never gates a deletion on it (the scan stays authoritative). Shared by reference with
+    /// the background sweep (ContentAddressedGC) and the transaction commit/drop path.
+    const std::shared_ptr<ContentAddressed::InMemoryBlobRefIndex> & blobRefIndex() const { return blob_ref_index; }
+
     /// Pin a blob object key for the lifetime of an in-flight transaction (B52). Must be called with
     /// gc_lock held so the pin is visible to a concurrent sweep before the caller's dedup-skip decision.
     void pinBlobLocked(const std::string & blob_key) { in_flight_pinned_blobs->insert(blob_key); }
@@ -228,6 +235,11 @@ private:
     /// Guarded by gc_lock and shared by reference with the background sweep so a blob a dedup-skipping
     /// insert decided to reuse is treated as reachable until the insert commits its ref (or aborts).
     const std::shared_ptr<std::set<std::string>> in_flight_pinned_blobs = std::make_shared<std::set<std::string>>();
+
+    /// Per-pool incremental reverse index (B9 / CA GC S1), one instance per pool alongside `gc_lock`.
+    /// Maintained best-effort by the commit/drop path and validated (never gated on) by the sweep.
+    /// Thread-safe internally; shared by reference with the sweep and the commit/drop path.
+    const std::shared_ptr<ContentAddressed::InMemoryBlobRefIndex> blob_ref_index = std::make_shared<ContentAddressed::InMemoryBlobRefIndex>();
 
     /// Background pool garbage collector, present only on the disk-factory path (context non-null).
     ContentAddressedGCThreadPtr gc_thread;

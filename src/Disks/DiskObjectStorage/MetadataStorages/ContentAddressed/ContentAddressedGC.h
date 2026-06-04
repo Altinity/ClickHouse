@@ -132,6 +132,9 @@ public:
     std::set<BlobHash> unreferenced() const override;
 
 private:
+    /// Commits (and drops) run concurrently across threads, so every mutator and observer locks `mtx`.
+    /// The `applied_parts` idempotency guard makes add/remove safe to retry within the held lock.
+    mutable std::mutex mtx;
     std::unordered_map<BlobHash, int64_t> counts;
     std::unordered_set<PartId> applied_parts; /// idempotency guard for add/remove
 };
