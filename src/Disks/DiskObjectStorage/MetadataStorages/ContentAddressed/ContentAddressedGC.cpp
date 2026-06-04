@@ -159,6 +159,40 @@ std::set<BlobObjectKey> sessionPinnedBlobs(
     return pinned;
 }
 
+std::set<PartObjectKey> sessionPinnedPartKeys(
+    const ObjectStoragePtr & object_storage, const std::string & key_prefix, int64_t now)
+{
+    std::set<PartObjectKey> pinned;
+    for (const auto & key : listKeysUnder(object_storage, sessionsPrefix(key_prefix)))
+    {
+        /// A vanished session (its owner committed/aborted between this LIST and the READ) is simply
+        /// gone — skip it (same rationale as sessionPinnedBlobs). Only the missing-object errors are
+        /// swallowed; a malformed session still fails closed via deserialize.
+        std::string raw;
+        try
+        {
+            raw = readSmallObject(object_storage, key);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::CANNOT_OPEN_FILE || e.code() == ErrorCodes::FILE_DOESNT_EXIST)
+                continue;
+            throw;
+        }
+        const WriteSession session = WriteSession::deserialize(raw);
+        if (static_cast<int64_t>(session.lease_deadline_unix) < now)
+            continue; /// expired -> itself reclaimable, not a root.
+        /// Pin the manifest the session names ONLY if it resolves to a real parts/ object. The write
+        /// path's session carries a part NAME (no manifest at that key), so its key simply does not exist
+        /// and contributes nothing; the relink path carries a real committed part_id, so its manifest is
+        /// kept reachable across the source-ref-drop window.
+        const PartObjectKey manifest_key = partKey(key_prefix, session.part_id);
+        if (object_storage->tryGetObjectMetadata(manifest_key.string(), /*with_tags=*/false).has_value())
+            pinned.insert(manifest_key);
+    }
+    return pinned;
+}
+
 SweepResult selectForSweep(const std::set<std::string> & unreferenced,
                            const std::unordered_map<std::string, int64_t> & first_unreachable,
                            int64_t now, int64_t grace)
@@ -280,6 +314,14 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
         /// out from under the writer. An expired session is not a root (it is itself reclaimable).
         for (const auto & pinned : sessionPinnedBlobs(object_storage, key_prefix, now))
             r.reachable_blobs.insert(pinned);
+        /// Session-pinned MANIFEST roots (fetch-by-relink, spec §4): a relink opens its session over an
+        /// already-committed part_id and pins that `parts/<part_id>` manifest, because it holds no ref
+        /// yet and the source replica may drop its ref before this server publishes — the manifest must
+        /// not be reclaimed in that window. (The write path's session names a part NAME, not a manifest
+        /// key, so it pins nothing here.) Keep the manifest live so its blobs (already in reachable_blobs
+        /// via the session pin) and the manifest object both survive until the relink ref is published.
+        for (const auto & pinned : sessionPinnedPartKeys(object_storage, key_prefix, now))
+            r.live_part_keys.insert(pinned);
         return r;
     };
 

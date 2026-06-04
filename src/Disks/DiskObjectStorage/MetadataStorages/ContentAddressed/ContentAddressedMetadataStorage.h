@@ -3,8 +3,10 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/WriteSession.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
 #include <Interpreters/Context_fwd.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -87,6 +89,62 @@ public:
     /// Release an in-flight blob pin (B52). Takes gc_lock internally; called after the ref is published
     /// (the ref now keeps the blob reachable) or when an uncommitted transaction is destroyed.
     void unpinBlob(const std::string & blob_key);
+
+    /// ==== Fetch-by-relink (CAS replication Phase 2a) ====
+    ///
+    /// A handle on the durable cross-mounter `WriteSession` opened by a relink to PIN an existing part's
+    /// blob set before this server publishes its own ref. It is the exact analogue of the write path's
+    /// per-blob `WriteSession`, but seeded with a KNOWN hash set (the source part's manifest) instead of
+    /// accumulating hashes as blobs are uploaded — the relink uploads no blobs (another replica already
+    /// wrote them), so without this pin a concurrent source-ref drop + GC sweep could reclaim the blobs
+    /// in the window before this server's ref is published (spec §4, the one true data-loss hole).
+    struct RelinkPin
+    {
+        std::string session_id; /// the unique sessions/<id> key this pin is persisted at
+        ContentAddressed::PartId part_id;
+        bool open = false; /// false => no pin held (default-constructed / already released)
+    };
+
+    /// STEP 1 — PIN. Read `parts/<part_id>`'s manifest, open a durable `WriteSession` whose `pending` =
+    /// every blob hash the manifest names, stamp this server's identity + an advisory lease, and persist
+    /// it to `sessions/<id>` BEFORE returning. Once this returns, a GC sweep on ANY mounter treats those
+    /// hashes as reachable (via `sessionPinnedBlobs`) for the lease lifetime, closing the relink window.
+    /// Returns nullopt WITHOUT publishing anything if the manifest object is absent (the part_id this
+    /// server was asked to relink does not exist in the pool — relink not possible, fall back to a byte
+    /// fetch). A present-but-corrupt manifest throws (fail-closed).
+    std::optional<RelinkPin> relinkPin(const ContentAddressed::PartId & part_id);
+
+    /// STEP 2 — RE-VALIDATE. Under the held pin, confirm `parts/<part_id>` still exists AND every blob
+    /// hash it names exists in `blobs/`. Returns false (relink not possible) if the manifest or any blob
+    /// is missing — the caller must then release the pin and fall back to a byte fetch; a ref is NEVER
+    /// published to a missing blob. A present-but-corrupt manifest throws (fail-closed).
+    bool relinkRevalidate(const ContentAddressed::PartId & part_id) const;
+
+    /// STEP 3 — PUBLISH. Write this server's ref `refKey(self, table_uuid, part_name)` -> part_id plus
+    /// the per-ref sidecar (`refMetaKey` + the per-file mutable objects) from `sidecar_values` (the
+    /// per-part mutable files uuid.txt / txn_version.txt / metadata_version.txt carried in the fetch
+    /// header). Mirrors `ContentAddressedTransaction::commit`'s ref+sidecar publish: per-file objects and
+    /// the bundle sidecar BEFORE the ref (the ref is the last, publishing step). No blob bytes are written.
+    void relinkPublishRef(
+        const std::string & table_uuid,
+        const std::string & part_name,
+        const ContentAddressed::PartId & part_id,
+        const std::map<std::string, std::string> & sidecar_values);
+
+    /// STEP 4 — RELEASE. Remove the durable pin's `sessions/<id>` object (best-effort, never throws): the
+    /// published ref now keeps the blobs reachable, so the pin is no longer needed. Idempotent.
+    void relinkReleasePin(RelinkPin & pin) noexcept;
+
+    /// The full pin-before-publish relink (spec §4): PIN -> RE-VALIDATE -> PUBLISH -> RELEASE, in that
+    /// strict order. Returns true if the ref was published (relink succeeded), false if the relink is not
+    /// possible (the manifest or a blob is missing) — in which case NOTHING was published (no dangling
+    /// ref) and the pin was released, so the caller falls back to a byte fetch. The 4 steps are also
+    /// public so a test can interleave a concurrent source-ref drop + GC sweep BETWEEN pin and publish.
+    bool relinkExistingPart(
+        const std::string & table_uuid,
+        const std::string & part_name,
+        const ContentAddressed::PartId & part_id,
+        const std::map<std::string, std::string> & sidecar_values);
 
 private:
     friend class ContentAddressedTransaction;

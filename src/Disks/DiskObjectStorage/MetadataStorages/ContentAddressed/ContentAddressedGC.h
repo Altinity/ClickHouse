@@ -82,6 +82,19 @@ std::set<BlobObjectKey> markReachableBlobs(
 std::set<BlobObjectKey> sessionPinnedBlobs(
     const ObjectStoragePtr & object_storage, const std::string & key_prefix, int64_t now);
 
+/// Part-manifest object keys pinned by LIVE cross-mounter write sessions. The write path's session
+/// identifies its part by the writer's part NAME (the content part_id is only known at commit), so its
+/// `part_id` field is not a manifest key and contributes nothing here. The fetch-by-relink path, by
+/// contrast, opens its session over an ALREADY-COMMITTED `part_id` (CAS replication Phase 2a): it pins
+/// not only the part's blobs but the `parts/<part_id>` MANIFEST object itself, because a relink onto
+/// this server holds no ref yet and the source replica may concurrently drop its ref — after which a
+/// sweep would see the manifest named by no ref and reclaim it in the window before this server's ref is
+/// published (spec §4, the relink data-loss hole). So a live session whose `part_id` resolves to a real
+/// `parts/` object pins that manifest as reachable. Mirrors `sessionPinnedBlobs`: an EXPIRED session is
+/// itself reclaimable; list/read errors PROPAGATE (fail-close); a vanished session is simply skipped.
+std::set<PartObjectKey> sessionPinnedPartKeys(
+    const ObjectStoragePtr & object_storage, const std::string & key_prefix, int64_t now);
+
 struct SweepResult
 {
     std::vector<std::string> to_delete;

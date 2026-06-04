@@ -3432,3 +3432,274 @@ TEST_F(ContentAddressedMetaTest, TempProjectionSubdirIsRecognized)
     std::set<std::string> top(names.begin(), names.end());
     EXPECT_TRUE(top.count("p_sum.tmp_proj") == 1);
 }
+
+// ============================================================================================
+// CAS replication Phase 2a: fetch-by-relink (pin-before-publish) at the metadata layer (spec §4).
+// ============================================================================================
+
+namespace
+{
+/// Count the objects directly under blobs/ (the content-blob store) for a pool prefix. Relink must add
+/// ZERO new blobs — the proof that it published a ref to ALREADY-PRESENT shared content (re-link) rather
+/// than downloading bytes.
+size_t countBlobs(const std::shared_ptr<DB::IObjectStorage> & os, const std::string & prefix)
+{
+    return DB::ContentAddressed::listKeysUnder(os, DB::ContentAddressed::blobsPrefix(prefix)).size();
+}
+
+/// Resolve the part_id a published ref names, reading the ref object directly (the read-path/GC-scan
+/// parser). Used by the relink tests to learn the part_id server A committed, which server B then relinks.
+DB::ContentAddressed::PartId refPartId(
+    const std::shared_ptr<DB::IObjectStorage> & os, const std::string & prefix,
+    const std::string & sid, const std::string & uuid, const std::string & part)
+{
+    using namespace DB::ContentAddressed;
+    return partIdFromRefPayload(ContentAddressedMetaTest::readObject(os, refKey(prefix, sid, uuid, part).string()));
+}
+}
+
+// Happy path: server A commits a real part (blobs + parts/<part_id> manifest + its ref). Server B (a
+// second metadata storage, distinct server id, SAME pool, allow_shared) relinks the same part_id. B's
+// ref resolves, B reads the part's files back correctly, ZERO new blobs were created (relink not
+// download), and B's sidecar carries the passed-in mutable values.
+TEST_F(ContentAddressedMetaTest, RelinkHappyPathPublishesRefWithoutNewBlobs)
+{
+    using namespace DB::ContentAddressed;
+    const std::string p = "cas_relink_happy";
+    fs::remove_all("./" + p);
+
+    DB::LocalObjectStorageSettings settings("test", "./" + p, /*read_only_=*/false);
+    auto os = std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+    auto make_storage = [&](const std::string & sid)
+    {
+        return std::make_shared<DB::ContentAddressedMetadataStorage>(
+            os, /*storage_path_prefix=*/p, sid, kCasTestScratch, /*context=*/nullptr, /*allow_shared_pool=*/true);
+    };
+    auto a = make_storage("serverA");
+    auto b = make_storage("serverB");
+    a->startup();
+    b->startup();
+
+    const std::string uuid = "uuid-relink";
+    const std::string part = "all_1_1_0";
+
+    // Server A commits a part (the source another replica wrote).
+    {
+        DB::ContentAddressedTransaction tx(*a, /*key_prefix=*/p, kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"data.bin", "PAYLOAD"}, {"columns.txt", "a b"}, {"metadata_version.txt", "7"}})
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    const PartId part_id = refPartId(os, p, "serverA", uuid, part);
+    const size_t blobs_before = countBlobs(os, p);
+    ASSERT_GT(blobs_before, 0u);
+
+    // Server B has NO ref yet for this part.
+    EXPECT_FALSE(objectExists(os, refKey(p, "serverB", uuid, part).string()));
+
+    // Server B relinks: publishes its own ref for the same part_id with a fresh mutable set.
+    const std::map<std::string, std::string> sidecar{{"uuid.txt", "b-uuid"}, {"metadata_version.txt", "9"}};
+    EXPECT_TRUE(b->relinkExistingPart(uuid, part, part_id, sidecar));
+
+    // B's ref resolves to the same part_id and B reads the part's content back correctly.
+    EXPECT_TRUE(objectExists(os, refKey(p, "serverB", uuid, part).string()));
+    EXPECT_EQ(refPartId(os, p, "serverB", uuid, part), part_id);
+    EXPECT_EQ(readObject(os, b->getStorageObjects("uui/" + uuid + "/" + part + "/data.bin")[0].remote_path), "PAYLOAD");
+    EXPECT_EQ(readObject(os, b->getStorageObjects("uui/" + uuid + "/" + part + "/columns.txt")[0].remote_path), "a b");
+
+    // ZERO new blobs — the relink published a ref to already-present content, it did NOT download bytes.
+    EXPECT_EQ(countBlobs(os, p), blobs_before) << "relink must create no new blobs";
+
+    // B's sidecar carries the passed-in mutable values (its OWN per-part state, distinct from A's).
+    EXPECT_EQ(readObject(os, b->getStorageObjects("uui/" + uuid + "/" + part + "/uuid.txt")[0].remote_path), "b-uuid");
+    EXPECT_EQ(readObject(os, b->getStorageObjects("uui/" + uuid + "/" + part + "/metadata_version.txt")[0].remote_path), "9");
+
+    // The pin is released: no leftover write-session object after a successful relink.
+    EXPECT_TRUE(listKeysUnder(os, sessionsPrefix(p)).empty()) << "relink must release its pin on success";
+
+    a->shutdown();
+    b->shutdown();
+    os->shutdown();
+    fs::remove_all("./" + p);
+}
+
+// THE RACE (the data-loss hole the adversarial review found). Server A commits the source part. Server B
+// begins a relink: it PINS (step 1) and RE-VALIDATES (step 2). BETWEEN B's pin and B's ref publish we
+// simulate the hazard: (i) drop server A's ref (the part_id is now named by NO ref), (ii) run a GC sweep
+// with grace=0. The sweep MUST NOT reclaim the part's blobs — B's live WriteSession pins them. Then B
+// publishes its ref and the part still reads. This proves the pin closes the window.
+TEST_F(ContentAddressedMetaTest, RelinkPinSurvivesConcurrentSourceDropAndSweep)
+{
+    using namespace DB::ContentAddressed;
+    const std::string p = "cas_relink_race";
+    fs::remove_all("./" + p);
+
+    DB::LocalObjectStorageSettings settings("test", "./" + p, /*read_only_=*/false);
+    auto os = std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+    auto make_storage = [&](const std::string & sid)
+    {
+        return std::make_shared<DB::ContentAddressedMetadataStorage>(
+            os, /*storage_path_prefix=*/p, sid, kCasTestScratch, /*context=*/nullptr, /*allow_shared_pool=*/true);
+    };
+    auto a = make_storage("serverA");
+    auto b = make_storage("serverB");
+    a->startup();
+    b->startup();
+
+    const std::string uuid = "uuid-race";
+    const std::string part = "all_1_1_0";
+
+    {
+        DB::ContentAddressedTransaction tx(*a, /*key_prefix=*/p, kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{{"data.bin", "RACE-PAYLOAD"}, {"columns.txt", "c"}})
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    const PartId part_id = refPartId(os, p, "serverA", uuid, part);
+    const std::string data_blob = a->getStorageObjects("uui/" + uuid + "/" + part + "/data.bin")[0].remote_path;
+    ASSERT_TRUE(objectExists(os, data_blob));
+
+    // STEP 1 — B PINS the existing part's blob set (durable WriteSession), and RE-VALIDATES (step 2).
+    auto pin = b->relinkPin(part_id);
+    ASSERT_TRUE(pin.has_value());
+    ASSERT_TRUE(b->relinkRevalidate(part_id));
+    // Exactly one live write-session pins the part's blobs (B's relink pin).
+    ASSERT_EQ(listKeysUnder(os, sessionsPrefix(p)).size(), 1u);
+
+    // BETWEEN B's pin and B's publish, the hazard fires:
+    //   (i) server A drops its ref -> the part_id is now named by NO ref.
+    os->removeObjectIfExists(DB::StoredObject(refKey(p, "serverA", uuid, part).string()));
+    EXPECT_TRUE(listLivePartIds(os, p).empty()) << "no ref names the part_id anymore";
+
+    //   (ii) a GC sweep runs with grace=0 (any TRULY orphaned object would be reclaimed this round).
+    {
+        const int64_t now = 1; // below B's 300s lease so its session is LIVE
+        auto held = tryAcquireGcLock(*os, p, "serverGc", /*lease_seconds=*/100, /*now_unix=*/static_cast<uint64_t>(now));
+        ASSERT_TRUE(held.has_value());
+        DB::ContentAddressed::ContentAddressedGC gc(os, p);
+        gc.runSweepOnce(now, /*grace=*/0, /*held=*/held);
+        releaseGcLock(*os, p, *held);
+    }
+
+    // The pin held: the part's blobs and manifest were NOT reclaimed despite no ref naming them.
+    EXPECT_TRUE(objectExists(os, data_blob)) << "B's live relink pin must keep the blob across the sweep";
+    EXPECT_TRUE(objectExists(os, partKey(p, part_id).string())) << "the manifest must survive too";
+
+    // STEP 3 — B publishes its ref; STEP 4 — release the pin. The part now reads back from B.
+    b->relinkPublishRef(uuid, part, part_id, /*sidecar_values=*/{});
+    b->relinkReleasePin(*pin);
+    EXPECT_TRUE(objectExists(os, refKey(p, "serverB", uuid, part).string()));
+    EXPECT_EQ(readObject(os, b->getStorageObjects("uui/" + uuid + "/" + part + "/data.bin")[0].remote_path), "RACE-PAYLOAD");
+
+    a->shutdown();
+    b->shutdown();
+    os->shutdown();
+    fs::remove_all("./" + p);
+}
+
+// Reclaim: after a relink, dropping BOTH A's and B's refs and sweeping with grace=0 reclaims the part's
+// blobs and manifest — no leftovers once no replica references the part_id (the union-of-refs invariant).
+TEST_F(ContentAddressedMetaTest, RelinkReclaimedWhenBothRefsDropped)
+{
+    using namespace DB::ContentAddressed;
+    const std::string p = "cas_relink_reclaim";
+    fs::remove_all("./" + p);
+
+    DB::LocalObjectStorageSettings settings("test", "./" + p, /*read_only_=*/false);
+    auto os = std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+    auto make_storage = [&](const std::string & sid)
+    {
+        return std::make_shared<DB::ContentAddressedMetadataStorage>(
+            os, /*storage_path_prefix=*/p, sid, kCasTestScratch, /*context=*/nullptr, /*allow_shared_pool=*/true);
+    };
+    auto a = make_storage("serverA");
+    auto b = make_storage("serverB");
+    a->startup();
+    b->startup();
+
+    const std::string uuid = "uuid-reclaim";
+    const std::string part = "all_1_1_0";
+    {
+        DB::ContentAddressedTransaction tx(*a, /*key_prefix=*/p, kCasTestScratch);
+        auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/data.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = "RECLAIM-PAYLOAD";
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    const PartId part_id = refPartId(os, p, "serverA", uuid, part);
+    const std::string data_blob = a->getStorageObjects("uui/" + uuid + "/" + part + "/data.bin")[0].remote_path;
+
+    ASSERT_TRUE(b->relinkExistingPart(uuid, part, part_id, /*sidecar_values=*/{}));
+
+    // Drop BOTH refs: no replica references the part_id anymore.
+    os->removeObjectIfExists(DB::StoredObject(refKey(p, "serverA", uuid, part).string()));
+    os->removeObjectIfExists(DB::StoredObject(refKey(p, "serverB", uuid, part).string()));
+    EXPECT_TRUE(listLivePartIds(os, p).empty());
+
+    // Sweep with grace=0 reclaims the now-unreferenced blob and manifest (no leftovers).
+    {
+        const int64_t now = 1000000; // past any session lease (there is none — relink released its pin)
+        auto held = tryAcquireGcLock(*os, p, "serverGc", /*lease_seconds=*/100, /*now_unix=*/static_cast<uint64_t>(now));
+        ASSERT_TRUE(held.has_value());
+        DB::ContentAddressed::ContentAddressedGC gc(os, p);
+        auto stats = gc.runSweepOnce(now, /*grace=*/0, /*held=*/held);
+        releaseGcLock(*os, p, *held);
+        EXPECT_GE(stats.deleted_blobs, 1u);
+        EXPECT_GE(stats.deleted_parts, 1u);
+    }
+    EXPECT_FALSE(objectExists(os, data_blob)) << "the blob must be reclaimed once no ref references it";
+    EXPECT_FALSE(objectExists(os, partKey(p, part_id).string())) << "the manifest must be reclaimed too";
+
+    a->shutdown();
+    b->shutdown();
+    os->shutdown();
+    fs::remove_all("./" + p);
+}
+
+// Missing blob -> no dangling ref. A parts/<part_id> manifest names a blob that is NOT present. A relink
+// MUST NOT publish a ref (it returns "not possible" so the caller falls back to a byte fetch), and it
+// leaves no ref behind and releases its pin. Never publish a ref to a missing blob.
+TEST_F(ContentAddressedMetaTest, RelinkMissingBlobPublishesNoRef)
+{
+    using namespace DB::ContentAddressed;
+    const std::string p = "cas_relink_missing";
+    fs::remove_all("./" + p);
+
+    DB::LocalObjectStorageSettings settings("test", "./" + p, /*read_only_=*/false);
+    auto os = std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+    auto b = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        os, /*storage_path_prefix=*/p, "serverB", kCasTestScratch, /*context=*/nullptr, /*allow_shared_pool=*/true);
+    b->startup();
+
+    const std::string uuid = "uuid-missing";
+    const std::string part = "all_1_1_0";
+
+    // Seed a manifest naming a blob that is NOT present in blobs/ (no put_blob for it).
+    const std::string pid = "abcdef0000000000000000000000abcd";
+    PartManifest f;
+    f.blobs["data.bin"] = BlobEntry{BlobHash("deadbeefdead"), 5, "deadbeefdead"};
+    writeObject(os, partKey(p, PartId(pid)).string(), f.serialize());
+
+    // The relink must NOT publish a ref (it returns false — fall back to byte fetch).
+    EXPECT_FALSE(b->relinkExistingPart(uuid, part, PartId(pid), /*sidecar_values=*/{}));
+
+    // No ref was left behind, and the pin was released (no dangling ref, no leftover session).
+    EXPECT_FALSE(objectExists(os, refKey(p, "serverB", uuid, part).string())) << "no ref to a missing blob";
+    EXPECT_TRUE(listKeysUnder(os, sessionsPrefix(p)).empty()) << "the pin must be released on the not-possible path";
+
+    b->shutdown();
+    os->shutdown();
+    fs::remove_all("./" + p);
+}

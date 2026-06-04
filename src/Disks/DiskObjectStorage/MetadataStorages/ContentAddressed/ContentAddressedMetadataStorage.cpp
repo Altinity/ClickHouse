@@ -3,9 +3,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/WriteSession.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <Disks/WriteMode.h>
 
+#include <chrono>
 #include <unordered_set>
 
 #include <filesystem>
@@ -15,6 +18,7 @@
 
 #include <Common/Exception.h>
 #include <Common/Logger.h>
+#include <Common/getRandomASCIIString.h>
 
 #include <fmt/format.h>
 
@@ -62,6 +66,167 @@ void ContentAddressedMetadataStorage::unpinBlob(const std::string & blob_key)
 {
     std::lock_guard<std::mutex> gc_guard(*gc_lock);
     in_flight_pinned_blobs->erase(blob_key);
+}
+
+std::optional<ContentAddressedMetadataStorage::RelinkPin>
+ContentAddressedMetadataStorage::relinkPin(const ContentAddressed::PartId & part_id)
+{
+    /// STEP 1 — PIN (spec §4). The relink uploads NO blobs (another replica already wrote them), so it
+    /// creates none of the per-blob WriteSession pins a normal write does. Without a pin, a concurrent
+    /// source-ref drop + GC sweep on ANY mounter would see this part_id named by no ref and no session
+    /// and reclaim its blobs in the window before this server publishes its own ref → a dangling ref /
+    /// lost part. So we open a durable WriteSession seeded with the EXISTING part's blob hash set (read
+    /// from parts/<part_id>) and persist it BEFORE trusting the source: from now until release, a remote
+    /// sweep treats every listed hash as reachable (sessionPinnedBlobs), closing the window.
+    const std::string manifest_key = ContentAddressed::partKey(storage_path_prefix, part_id).string();
+    auto manifest_bytes = readSmallObjectIfExists(manifest_key);
+    if (!manifest_bytes)
+        /// The part_id this server was asked to relink does not exist in the pool: relink not possible.
+        /// Publish NOTHING; the caller falls back to a byte fetch. (A present-but-corrupt manifest throws
+        /// in deserialize below — fail-closed, never best-effort.)
+        return std::nullopt;
+
+    const ContentAddressed::PartManifest manifest = ContentAddressed::PartManifest::deserialize(*manifest_bytes);
+
+    /// Seed the session's pending set with the EXISTING blob hashes the manifest names, AND identify the
+    /// part_id/manifest object itself (session.part_id). This is the relink analogue of the write path's
+    /// recordBlobInSession, except the hash set is KNOWN up front rather than accumulated per upload.
+    ContentAddressed::WriteSession session;
+    session.server_id = server_id;
+    session.fence_token = 0;
+    session.part_id = part_id;
+    session.pending.reserve(manifest.blobs.size());
+    for (const auto & [file, entry] : manifest.blobs)
+        session.pending.push_back(entry.key);
+
+    /// Advisory lease: a liveness HINT only (a remote sweep treats an EXPIRED session as reclaimable so a
+    /// crashed relink cannot pin blobs forever). Mirrors persistSession in the transaction.
+    constexpr UInt64 lease_seconds = 300;
+    const UInt64 now_unix = static_cast<UInt64>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    session.lease_deadline_unix = now_unix + lease_seconds;
+
+    RelinkPin pin;
+    pin.session_id = server_id + "-relink-" + getRandomASCIIString(24);
+    pin.part_id = part_id;
+    pin.open = true;
+
+    /// Persist the session object at a unique key owned by this relink (no CAS needed — no other writer
+    /// touches it). After finalize the cross-mounter pin is durable and the blobs are protected.
+    const std::string key = ContentAddressed::sessionKey(storage_path_prefix, pin.session_id);
+    const std::string bytes = session.serialize();
+    auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
+    out->write(bytes.data(), bytes.size());
+    out->finalize();
+
+    return pin;
+}
+
+bool ContentAddressedMetadataStorage::relinkRevalidate(const ContentAddressed::PartId & part_id) const
+{
+    /// STEP 2 — RE-VALIDATE (spec §4). Under the held pin, confirm the manifest still exists and every
+    /// blob it names is present. A missing manifest or blob means the relink is not possible: return
+    /// false so the caller releases the pin and falls back to a byte fetch — a ref must NEVER be
+    /// published to a missing blob (that would be a dangling ref / data loss).
+    auto manifest_bytes = readSmallObjectIfExists(ContentAddressed::partKey(storage_path_prefix, part_id).string());
+    if (!manifest_bytes)
+        return false;
+
+    const ContentAddressed::PartManifest manifest = ContentAddressed::PartManifest::deserialize(*manifest_bytes);
+    for (const auto & [file, entry] : manifest.blobs)
+    {
+        const std::string blob_key = ContentAddressed::blobKey(storage_path_prefix, entry.key).string();
+        if (!object_storage->tryGetObjectMetadata(blob_key, /*with_tags=*/false).has_value())
+            return false;
+    }
+    return true;
+}
+
+void ContentAddressedMetadataStorage::relinkPublishRef(
+    const std::string & table_uuid,
+    const std::string & part_name,
+    const ContentAddressed::PartId & part_id,
+    const std::map<std::string, std::string> & sidecar_values)
+{
+    /// STEP 3 — PUBLISH (spec §4). Write the per-ref sidecar (the per-part MUTABLE files carried in the
+    /// fetch header — uuid.txt / txn_version.txt / metadata_version.txt) THEN the ref, mirroring
+    /// ContentAddressedTransaction::commit's publish order (sidecar before the ref, the ref last, since
+    /// the ref is the publishing step). The blobs and manifest already exist (another replica wrote
+    /// them); this writes only the small pointer objects.
+    if (!sidecar_values.empty())
+    {
+        /// Per-file objects FIRST: each mutable file's bytes verbatim in its own tiny object so the read
+        /// path (getStorageObjects -> readObject) returns exactly that file's bytes.
+        for (const auto & [file, bytes] : sidecar_values)
+        {
+            const std::string file_key
+                = ContentAddressed::refMutableFileKey(storage_path_prefix, server_id, table_uuid, part_name, file).string();
+            auto file_out = object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite);
+            file_out->write(bytes.data(), bytes.size());
+            file_out->finalize();
+        }
+
+        /// The bundle sidecar (the atomic per-part index of mutable files), written before the ref.
+        ContentAddressed::RefSidecar sidecar;
+        sidecar.files = sidecar_values;
+        const std::string meta_key = ContentAddressed::refMetaKey(storage_path_prefix, server_id, table_uuid, part_name).string();
+        const std::string meta_bytes = sidecar.serialize();
+        auto meta_out = object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+        meta_out->write(meta_bytes.data(), meta_bytes.size());
+        meta_out->finalize();
+    }
+
+    /// Publish the ref last (the commit point): refKey(self, table_uuid, part_name) -> part_id.
+    /// The on-disk payload is the same versioned ref-payload struct the write path publishes, so the read
+    /// path and the GC live-set scan resolve it identically (B28).
+    const std::string ref_key = ContentAddressed::refKey(storage_path_prefix, server_id, table_uuid, part_name).string();
+    const std::string ref_payload = ContentAddressed::serializeRefPayload(part_id);
+    auto ref_out = object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
+    ref_out->write(ref_payload.data(), ref_payload.size());
+    ref_out->finalize();
+}
+
+void ContentAddressedMetadataStorage::relinkReleasePin(RelinkPin & pin) noexcept
+{
+    /// STEP 4 — RELEASE (spec §4). The published ref now keeps every referenced blob reachable for a
+    /// sweep on ANY mounter, so the cross-mounter pin is no longer needed; remove it. Best-effort: a
+    /// failure to remove the session object only over-retains the pin (conservative — never data loss;
+    /// the lease expires anyway). Idempotent.
+    if (!pin.open)
+        return;
+    try
+    {
+        object_storage->removeObjectIfExists(StoredObject(ContentAddressed::sessionKey(storage_path_prefix, pin.session_id)));
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+    }
+    pin.open = false;
+}
+
+bool ContentAddressedMetadataStorage::relinkExistingPart(
+    const std::string & table_uuid,
+    const std::string & part_name,
+    const ContentAddressed::PartId & part_id,
+    const std::map<std::string, std::string> & sidecar_values)
+{
+    /// The full pin-before-publish relink (spec §4), in STRICT order. The four steps are also public so a
+    /// test can interleave a concurrent source-ref drop + GC sweep between PIN and PUBLISH.
+    auto pin = relinkPin(part_id);
+    if (!pin)
+        return false; /// the manifest is absent — relink not possible; the caller falls back to a byte fetch.
+
+    /// RE-VALIDATE under the pin. If the source vanished (manifest or a blob missing) between the pin and
+    /// now, release the pin and signal "not possible" — never publish a ref to a missing blob.
+    if (!relinkRevalidate(part_id))
+    {
+        relinkReleasePin(*pin);
+        return false;
+    }
+
+    relinkPublishRef(table_uuid, part_name, part_id, sidecar_values);
+    relinkReleasePin(*pin);
+    return true;
 }
 
 void ContentAddressedMetadataStorage::startup()
