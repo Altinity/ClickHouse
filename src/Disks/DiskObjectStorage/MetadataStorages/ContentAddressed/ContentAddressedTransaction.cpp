@@ -168,28 +168,31 @@ void ContentAddressedTransaction::rememberTarget(const std::string & path)
     if (!p || p->file.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: not a part file path: {}", path);
 
-    /// All files of one commit must belong to the same (table_uuid, part_name).
-    if (table_uuid.empty() && part_name.empty())
+    /// The LAST-remembered target (most recent rememberTarget). A single transaction may write more than
+    /// one part (a transactional merge — B67), so this no longer means "the only part".
+    table_uuid = p->table_uuid;
+    part_name = p->part_name;
+
+    auto & st = stagingForPath(*p);
+    /// Pin the FREEZE target this part's files must agree on. The first remember of a part stamps it;
+    /// later files of the same part must carry the same backup name.
+    if (st.frozen_backup_name.empty() && st.frozen_table_dir.empty())
     {
-        table_uuid = p->table_uuid;
-        part_name = p->part_name;
-        frozen_backup_name = p->backup_name; /// empty for a live part; the FREEZE backup name otherwise
-        frozen_table_dir = p->shadow_table_dir; /// empty for a live part; the shadow table dir otherwise
+        st.frozen_backup_name = p->backup_name; /// empty for a live part; the FREEZE backup name otherwise
+        st.frozen_table_dir = p->shadow_table_dir; /// empty for a live part; the shadow table dir otherwise
     }
-    else if (table_uuid != p->table_uuid || part_name != p->part_name || frozen_backup_name != p->backup_name)
-    {
+    else if (st.frozen_backup_name != p->backup_name)
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressed: a single transaction must write one part, got {}/{} (backup '{}') and {}/{} (backup '{}')",
-            table_uuid, part_name, frozen_backup_name, p->table_uuid, p->part_name, p->backup_name);
-    }
+            "ContentAddressed: inconsistent FREEZE target for {}/{}: '{}' vs '{}'",
+            p->table_uuid, p->part_name, st.frozen_backup_name, p->backup_name);
 }
 
 void ContentAddressedTransaction::recordBlob(const std::string & path, ContentAddressed::BlobEntry entry)
 {
     auto p = ContentAddressed::parsePartFilePath(path);
     chassert(p && !p->file.empty());
-    recorded[p->file] = std::move(entry);
+    stagingForPath(*p).recorded[p->file] = std::move(entry);
 }
 
 std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageObjects(const std::string & path) const
@@ -197,9 +200,12 @@ std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageO
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
         return {};
+    const auto * st = findStaging(p->table_uuid, p->part_name);
+    if (!st)
+        return {};
     /// A content file: its blob is already uploaded (recorded under the in-part file name). Mirror the
     /// committed getStorageObjects resolve: project the BARE BlobHash to the full blob object key.
-    if (auto it = recorded.find(p->file); it != recorded.end())
+    if (auto it = st->recorded.find(p->file); it != st->recorded.end())
         return StoredObjects{StoredObject(ContentAddressed::blobKey(key_prefix, it->second.key).string(), path, it->second.size)};
     /// Mutable per-part files are staged inline (recorded_mutable), not as a blob object — they have no
     /// StoredObject; readers must use tryReadFileInFlight for them. Return nullopt here.
@@ -212,12 +218,15 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFile
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
         return nullptr;
-    if (auto it = recorded.find(p->file); it != recorded.end())
+    const auto * st = findStaging(p->table_uuid, p->part_name);
+    if (!st)
+        return nullptr;
+    if (auto it = st->recorded.find(p->file); it != st->recorded.end())
     {
         StoredObject obj(ContentAddressed::blobKey(key_prefix, it->second.key).string(), path, it->second.size);
         return metadata_storage.object_storage->readObject(obj, settings, read_hint);
     }
-    if (auto it = recorded_mutable.find(p->file); it != recorded_mutable.end())
+    if (auto it = st->recorded_mutable.find(p->file); it != st->recorded_mutable.end())
         return std::make_unique<ReadBufferFromOwnMemoryFile>(path, it->second); // inline staged bytes
     return nullptr;
 }
@@ -227,9 +236,12 @@ std::optional<uint64_t> ContentAddressedTransaction::tryGetInFlightFileSize(cons
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
         return {};
-    if (auto it = recorded.find(p->file); it != recorded.end())
+    const auto * st = findStaging(p->table_uuid, p->part_name);
+    if (!st)
+        return {};
+    if (auto it = st->recorded.find(p->file); it != st->recorded.end())
         return it->second.size;
-    if (auto it = recorded_mutable.find(p->file); it != recorded_mutable.end())
+    if (auto it = st->recorded_mutable.find(p->file); it != st->recorded_mutable.end())
         return static_cast<uint64_t>(it->second.size());
     return {};
 }
@@ -279,6 +291,11 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
 
     auto p = ContentAddressed::parsePartFilePath(path);
     const std::string file = p->file;
+    /// Route the staged file into THIS part's entry. The callbacks below fire on finalize, possibly after
+    /// other parts have been remembered, so they must address the part by its own (table_uuid, part_name)
+    /// rather than the transaction-wide "last remembered" target.
+    const std::string part_table_uuid = p->table_uuid;
+    const std::string part_part_name = p->part_name;
 
     /// A MUTABLE per-part file (uuid.txt / txn_version.txt / metadata_version.txt) is NOT
     /// content-addressed: it is stored inline in this part's per-ref sidecar so two parts with
@@ -287,7 +304,8 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     if (ContentAddressed::isMutablePerPartFile(file))
     {
         return std::make_unique<ContentAddressed::ContentAddressedInlineWriteBuffer>(
-            [this, file](std::string bytes) { recorded_mutable[file] = std::move(bytes); });
+            [this, part_table_uuid, part_part_name, file](std::string bytes)
+            { stagingFor(part_table_uuid, part_part_name).recorded_mutable[file] = std::move(bytes); });
     }
 
     /// The blob is keyed under the same common key prefix as the read path (key_prefix, taken from
@@ -301,9 +319,10 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         local_scratch_path,
         metadata_storage.gcLock(),
         metadata_storage.inFlightPinnedBlobs(),
-        [this, file](const ContentAddressed::BlobHash & blob_hash, size_t size)
+        [this, part_table_uuid, part_part_name, file](const ContentAddressed::BlobHash & blob_hash, size_t size)
         {
-            recorded[file] = ContentAddressed::BlobEntry{blob_hash, size, blob_hash.string()};
+            stagingFor(part_table_uuid, part_part_name).recorded[file]
+                = ContentAddressed::BlobEntry{blob_hash, size, blob_hash.string()};
             /// B52: track the pinned blob key so it is released when the ref is published (commit) or
             /// when an uncommitted transaction is destroyed. The write buffer pinned it under the GC lock.
             pinned_blob_keys.insert(ContentAddressed::blobKey(key_prefix, blob_hash).string());
@@ -337,18 +356,19 @@ void ContentAddressedTransaction::createHardLink(const std::string & from, const
     /// staging-prefix filter never matched and the active part lost its metadata_version.txt entirely —
     /// the part then fell back to the table's CURRENT metadata version and skipped the on-fly RENAME
     /// COLUMN conversion, surfacing as "no column c0" on SELECT after a detach/rename/attach (B62).
+    auto & dst_st = stagingForPath(*dst);
     if (auto src = ContentAddressed::parsePartFilePath(from); src && !src->file.empty()
         && ContentAddressed::isMutablePerPartFile(src->file))
     {
-        if (src->table_uuid == table_uuid && src->part_name == part_name)
+        if (const auto * src_st = findStaging(src->table_uuid, src->part_name))
         {
-            if (auto it = recorded_mutable.find(src->file); it != recorded_mutable.end())
+            if (auto it = src_st->recorded_mutable.find(src->file); it != src_st->recorded_mutable.end())
             {
-                recorded_mutable[dst->file] = it->second;
+                dst_st.recorded_mutable[dst->file] = it->second;
                 return;
             }
         }
-        recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
+        dst_st.recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
         return;
     }
 
@@ -356,9 +376,9 @@ void ContentAddressedTransaction::createHardLink(const std::string & from, const
     /// else fall back to the committed source part via the metadata storage.
     if (auto src = ContentAddressed::parsePartFilePath(from); src && !src->file.empty())
     {
-        if (src->table_uuid == table_uuid && src->part_name == part_name)
+        if (const auto * src_st = findStaging(src->table_uuid, src->part_name))
         {
-            if (auto it = recorded.find(src->file); it != recorded.end())
+            if (auto it = src_st->recorded.find(src->file); it != src_st->recorded.end())
             {
                 recordBlob(to, it->second);
                 return;
@@ -755,6 +775,11 @@ bool ContentAddressedTransaction::rekeyStagedProjectionDir(
         || src.table_uuid != table_uuid || src.part_name != part_name)
         return false;
 
+    auto st_it = parts.find(PartKey{src.table_uuid, src.part_name});
+    if (st_it == parts.end())
+        return false;
+    PartStaging & st = st_it->second;
+
     /// Re-key every staged blob and inline mutable file whose in-part name lives under the old projection
     /// directory (<src.file>/...) to the new one (<dst.file>/...). The blob/byte payloads are unchanged —
     /// only the logical key changes — so the manifest published at commit carries the final <proj>.proj/
@@ -781,8 +806,8 @@ bool ContentAddressedTransaction::rekeyStagedProjectionDir(
             m[k] = std::move(v);
     };
 
-    rekey_map(recorded);
-    rekey_map(recorded_mutable);
+    rekey_map(st.recorded);
+    rekey_map(st.recorded_mutable);
     return true;
 }
 
@@ -894,6 +919,42 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
     if (!dst_part || !dst_part->file.empty())
         return;
 
+    auto src_part = ContentAddressed::parsePartFilePath(from);
+
+    /// Re-key any STAGED source part into the destination key (B67 deferred merge tmp_merge_X -> X). A
+    /// transactional merge stages the merge-output part under a temporary name and a CSN write can arrive
+    /// under the FINAL name before this rename re-keys (the deferred-rename window). Merge the source
+    /// staging entry into the destination entry: carry over the content blobs and the mutable files; on a
+    /// recorded_mutable key collision PREFER the existing DEST bytes (a txn_version.txt already staged under
+    /// the final name is the newer MVCC state); preserve the FREEZE target (dest's if set, else source's).
+    /// For the single-part case the source key equals the LAST-remembered target and the dest is a fresh
+    /// key, so this is exactly the old "re-pin to destination" with no collisions — byte-equivalent.
+    if (src_part && src_part->file.empty())
+    {
+        const PartKey src_key{src_part->table_uuid, src_part->part_name};
+        const PartKey dst_key{dst_part->table_uuid, dst_part->part_name};
+        if (src_key != dst_key)
+        {
+            if (auto src_it = parts.find(src_key); src_it != parts.end())
+            {
+                PartStaging & dst_st = stagingFor(dst_part->table_uuid, dst_part->part_name);
+                PartStaging & src_st = src_it->second;
+                for (auto & [file, entry] : src_st.recorded)
+                    dst_st.recorded.insert_or_assign(file, std::move(entry));
+                for (auto & [file, bytes] : src_st.recorded_mutable)
+                    dst_st.recorded_mutable.emplace(file, std::move(bytes)); /// PREFER existing dest bytes on collision
+                for (const auto & file : src_st.recorded_mutable_removed)
+                    dst_st.recorded_mutable_removed.insert(file);
+                if (dst_st.frozen_backup_name.empty() && dst_st.frozen_table_dir.empty())
+                {
+                    dst_st.frozen_backup_name = src_st.frozen_backup_name;
+                    dst_st.frozen_table_dir = src_st.frozen_table_dir;
+                }
+                parts.erase(src_it);
+            }
+        }
+    }
+
     /// Nothing staged yet. Two distinct cases share this shape:
     ///   (a) a rename of a COMMITTED part (MergeTree renames a part to delete_tmp_<part> before
     ///       removing it, and renames merged/mutated parts) — the source has a live ref that must be
@@ -905,8 +966,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
     /// renameCommittedPartRef distinguishes them: it returns true iff a committed source ref existed.
     if (table_uuid.empty() && part_name.empty())
     {
-        if (auto src_part = ContentAddressed::parsePartFilePath(from);
-            src_part && src_part->file.empty() && renameCommittedPartRef(*src_part, *dst_part))
+        if (src_part && src_part->file.empty() && renameCommittedPartRef(*src_part, *dst_part))
             return;
 
         table_uuid = dst_part->table_uuid;
@@ -915,7 +975,6 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
     }
 
     /// The source must be the part we have been assembling.
-    auto src_part = ContentAddressed::parsePartFilePath(from);
     if (src_part && src_part->file.empty()
         && src_part->table_uuid == table_uuid && src_part->part_name == part_name)
     {
@@ -933,14 +992,29 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
 
         table_uuid = dst_part->table_uuid;
         part_name = dst_part->part_name;
+        return;
     }
-    else
+
+    /// The source is NOT the last-remembered part. With per-part staging a single transaction may rename a
+    /// part other than the most-recently-touched one (B67: a merge's deferred tmp_merge_X -> X while the
+    /// last write touched a covered source part's txn_version). The staging re-key above already moved the
+    /// source entry into the destination key. If the source was a COMMITTED part (a merged/mutated part, or
+    /// a delete_tmp_ rename), re-key its ref so it is not rediscovered (B45); otherwise it was an
+    /// in-this-transaction tmp dir whose ref does not exist yet — unlink is a no-op. Re-pin the
+    /// last-remembered target to the destination so a subsequent bare reference resolves it.
+    if (src_part && src_part->file.empty())
     {
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressed: moveDirectory from {} to {} does not match the staged part {}/{}",
-            from, to, table_uuid, part_name);
+        if (!renameCommittedPartRef(*src_part, *dst_part))
+            unlinkPartDirRefs(from);
+        table_uuid = dst_part->table_uuid;
+        part_name = dst_part->part_name;
+        return;
     }
+
+    throw Exception(
+        ErrorCodes::LOGICAL_ERROR,
+        "ContentAddressed: moveDirectory from {} to {} does not match the staged part {}/{}",
+        from, to, table_uuid, part_name);
 }
 
 void ContentAddressedTransaction::moveFile(const std::string & from, const std::string & to)
@@ -981,20 +1055,26 @@ void ContentAddressedTransaction::moveFile(const std::string & from, const std::
 
     rememberTarget(to);
 
+    /// Re-key the file from the source part's entry to the destination part's entry. For the common
+    /// same-part rename both resolve to the SAME entry (current behavior); a cross-part rename moves the
+    /// file between two distinct entries.
+    auto & src_st = stagingForPath(*src);
+    auto & dst_st = stagingForPath(*dst);
+
     /// A mutable per-part file is staged inline (recorded_mutable), not as a blob; re-key it there.
-    if (auto mit = recorded_mutable.find(src->file); mit != recorded_mutable.end())
+    if (auto mit = src_st.recorded_mutable.find(src->file); mit != src_st.recorded_mutable.end())
     {
         auto bytes = std::move(mit->second);
-        recorded_mutable.erase(mit);
-        recorded_mutable[dst->file] = std::move(bytes);
+        src_st.recorded_mutable.erase(mit);
+        dst_st.recorded_mutable[dst->file] = std::move(bytes);
         return;
     }
 
-    if (auto it = recorded.find(src->file); it != recorded.end())
+    if (auto it = src_st.recorded.find(src->file); it != src_st.recorded.end())
     {
         auto entry = it->second;
-        recorded.erase(it);
-        recorded[dst->file] = std::move(entry);
+        src_st.recorded.erase(it);
+        dst_st.recorded[dst->file] = std::move(entry);
         return;
     }
 
@@ -1008,8 +1088,8 @@ void ContentAddressedTransaction::moveFile(const std::string & from, const std::
     /// cannot be renamed standalone — its blob+manifest were never committed without a part target.)
     if (ContentAddressed::isMutablePerPartFile(dst->file))
     {
-        recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
-        recorded_mutable_removed.insert(src->file);
+        dst_st.recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
+        src_st.recorded_mutable_removed.insert(src->file);
         return;
     }
 
@@ -1022,7 +1102,8 @@ std::string ContentAddressedTransaction::readStagedOrCommittedBytes(const std::s
     /// rename whose destination is mutable can re-stage them inline. Falls back to the committed sidecar.
     if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->file.empty())
     {
-        if (auto it = recorded.find(p->file); it != recorded.end())
+        if (const auto * st = findStaging(p->table_uuid, p->part_name); st)
+        if (auto it = st->recorded.find(p->file); it != st->recorded.end())
         {
             StoredObject obj(ContentAddressed::blobKey(key_prefix, it->second.key).string(), path, it->second.size);
             auto in = metadata_storage.object_storage->readObject(obj, ReadSettings{}, std::nullopt);
@@ -1051,37 +1132,43 @@ void ContentAddressedTransaction::replaceFile(const std::string & from, const st
         return;
     }
     rememberTarget(to);
+
+    /// Re-key from the source part's entry to the destination part's entry. Same-part rename (common) →
+    /// both resolve to the SAME entry; cross-part → move the file between the two entries.
+    auto & src_st = stagingForPath(*src);
+    auto & dst_st = stagingForPath(*dst);
+
     /// Overwrite: drop any staged destination entry first.
-    recorded.erase(dst->file);
-    recorded_mutable.erase(dst->file);
-    recorded_mutable_removed.erase(dst->file);
+    dst_st.recorded.erase(dst->file);
+    dst_st.recorded_mutable.erase(dst->file);
+    dst_st.recorded_mutable_removed.erase(dst->file);
     /// Common case — source staged inline (txn_version.txt.tmp recognized as mutable by Piece 1): move bytes.
-    if (auto mit = recorded_mutable.find(src->file); mit != recorded_mutable.end())
+    if (auto mit = src_st.recorded_mutable.find(src->file); mit != src_st.recorded_mutable.end())
     {
-        recorded_mutable[dst->file] = std::move(mit->second);
-        recorded_mutable.erase(mit);
+        dst_st.recorded_mutable[dst->file] = std::move(mit->second);
+        src_st.recorded_mutable.erase(mit);
         return;
     }
     /// Source staged as a content blob but destination is mutable: should be rare after Piece 1. Read the
     /// just-written bytes back inline (the orphan tmp blob is GC-reclaimed). Otherwise re-key the blob.
-    if (auto it = recorded.find(src->file); it != recorded.end())
+    if (auto it = src_st.recorded.find(src->file); it != src_st.recorded.end())
     {
         if (ContentAddressed::isMutablePerPartFile(dst->file))
         {
-            recorded_mutable[dst->file] = readStagedOrCommittedBytes(from);
-            recorded.erase(it);
+            dst_st.recorded_mutable[dst->file] = readStagedOrCommittedBytes(from);
+            src_st.recorded.erase(it);
         }
         else
         {
-            recorded[dst->file] = std::move(it->second);
-            recorded.erase(it);
+            dst_st.recorded[dst->file] = std::move(it->second);
+            src_st.recorded.erase(it);
         }
         return;
     }
     /// Source not staged in THIS transaction (standalone autocommit across ops): resolve the committed
     /// source bytes from the sidecar and re-stage under the destination, marking the source removed.
-    recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
-    recorded_mutable_removed.insert(src->file);
+    dst_st.recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
+    src_st.recorded_mutable_removed.insert(src->file);
 }
 
 void ContentAddressedTransaction::unlinkFile(const std::string & path, bool, bool)
@@ -1090,9 +1177,10 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool, boo
     /// blob, if shared, is reclaimed by GC, not here.
     if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->file.empty())
     {
-        const bool staged_here = recorded.contains(p->file) || recorded_mutable.contains(p->file);
-        recorded.erase(p->file);
-        recorded_mutable.erase(p->file);
+        auto & st = stagingForPath(*p);
+        const bool staged_here = st.recorded.contains(p->file) || st.recorded_mutable.contains(p->file);
+        st.recorded.erase(p->file);
+        st.recorded_mutable.erase(p->file);
         /// A mutable per-part file that exists only in the already-committed sidecar (not staged in THIS
         /// transaction) must be deleted from that sidecar at commit — the mutable-only commit branch reads
         /// recorded_mutable_removed to do so. This handles removeTmpMetadataFile's
@@ -1103,7 +1191,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool, boo
             /// (e.g. removeTmpMetadataFile calling removeFile(txn_version.txt.tmp) with no other staged
             /// operations) sets the target that the mutable-only commit branch requires.
             rememberTarget(path);
-            recorded_mutable_removed.insert(p->file);
+            stagingForPath(*p).recorded_mutable_removed.insert(p->file);
         }
         return;
     }
@@ -1132,57 +1220,50 @@ void ContentAddressedTransaction::truncateFile(const std::string &, size_t)
     /// No-op: content-addressed blobs are immutable; committed part files are never truncated.
 }
 
-void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant & options)
+void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging & st)
 {
-    if (!std::holds_alternative<NoCommitOptions>(options))
-        throwNotImplemented();
+    const std::string & table_uuid_ = key.first;
+    const std::string & part_name_ = key.second;
 
-    /// Nothing was staged (e.g. a directory-only transaction): no part to publish.
-    if (recorded.empty() && recorded_mutable.empty() && recorded_mutable_removed.empty())
+    /// A part entry with ALL-empty staging is a no-op (a part that was remembered but never written, e.g.
+    /// adopted as a tmp rename target with nothing staged under it).
+    if (st.recorded.empty() && st.recorded_mutable.empty() && st.recorded_mutable_removed.empty())
         return;
-
-    if (table_uuid.empty() || part_name.empty())
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: commit without a resolved part target");
 
     /// Mutable-only update of an ALREADY-COMMITTED part: this transaction staged NO content blobs, only
     /// mutable per-part files (txn_version.txt and/or removals) — the MVCC creation-CSN fill-in and
     /// removal-TID lock/unlock rewrite txn_version.txt on a LIVE part. Update only the per-ref sidecar +
     /// the per-file mutable objects in place; KEEP the existing manifest, part_id and ref. The normal path
     /// below would compute a part_id over an empty manifest and republish the ref — clobbering the part.
-    if (recorded.empty() && (!recorded_mutable.empty() || !recorded_mutable_removed.empty()))
+    if (st.recorded.empty() && (!st.recorded_mutable.empty() || !st.recorded_mutable_removed.empty()))
     {
-        auto existing_pid = metadata_storage.readRefPartId(table_uuid, part_name);
+        auto existing_pid = metadata_storage.readRefPartId(table_uuid_, part_name_);
         if (!existing_pid)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "ContentAddressed: mutable-only commit for {}/{} with no existing ref", table_uuid, part_name);
-
-        std::lock_guard<std::mutex> gc_guard(*metadata_storage.gc_lock);
+                "ContentAddressed: mutable-only commit for {}/{} with no existing ref", table_uuid_, part_name_);
 
         ContentAddressed::RefSidecar sidecar;
-        if (auto existing = metadata_storage.readRefSidecarIfExists(table_uuid, part_name))
+        if (auto existing = metadata_storage.readRefSidecarIfExists(table_uuid_, part_name_))
             sidecar = *existing;
-        for (const auto & f : recorded_mutable_removed)
+        for (const auto & f : st.recorded_mutable_removed)
         {
             sidecar.files.erase(f);
             metadata_storage.object_storage->removeObjectIfExists(StoredObject(
-                ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid, part_name, f).string()));
+                ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid_, part_name_, f).string()));
         }
-        for (const auto & [file, bytes] : recorded_mutable)
+        for (const auto & [file, bytes] : st.recorded_mutable)
         {
             sidecar.files[file] = bytes;
-            const std::string fk = ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid, part_name, file).string();
+            const std::string fk = ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid_, part_name_, file).string();
             auto out = metadata_storage.object_storage->writeObject(StoredObject(fk), WriteMode::Rewrite);
             out->write(bytes.data(), bytes.size());
             out->finalize();
         }
-        const std::string meta_key = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
+        const std::string meta_key = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid_, part_name_).string();
         const std::string meta_bytes = sidecar.serialize();
         auto mo = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
         mo->write(meta_bytes.data(), meta_bytes.size());
         mo->finalize();
-
-        if (session_open)
-            releaseSession();
         return;
     }
 
@@ -1193,30 +1274,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// NOTE: frozen targets (FREEZE, shadow/<backup>/…) are always a real part_name (never "detached"),
     /// so the two kDetachedDirName manifest-merge + sidecar-merge branches below are skipped for them.
     ContentAddressed::PartManifest manifest;
-    manifest.blobs = recorded;
-
-    /// B49: take the per-pool in-process GC lock for the publish, and re-validate every referenced blob
-    /// UNDER it before writing the manifest or publishing the ref. finalizeImpl skips re-uploading a
-    /// blob that already exists (dedup); in the window between that skip and this publish a concurrent
-    /// background sweep could reclaim such a blob (it was unreferenced + past grace), leaving the ref we
-    /// are about to publish dangling -> data loss on read. The sweep holds this SAME lock for its whole
-    /// mark+delete, so once we hold it the live set is stable: re-HEAD every blob the manifest names and,
-    /// if any is missing, FAIL CLOSED (a retryable error) WITHOUT publishing a dangling ref. The insert
-    /// is then retried and re-uploads the blob. With mutual exclusion the only outcomes are: we publish
-    /// first (the sweep's next pass sees the blob reachable and keeps it) or the sweep reclaimed it first
-    /// (we throw and retry) — never a published ref to a deleted blob.
-    /// Renew the write-session pin so it is FRESHLY live across the ref publish below (cross-process
-    /// data-loss fix): the per-blob renewals kept it live during the write, but the session must not be
-    /// allowed to lapse before the ref is published. A live session root covers every freshly-written
-    /// blob this part is about to reference; a REMOTE mounter's sweep re-reads sessions in its
-    /// re-validate-under-lock step immediately before deleting, so a live session makes it skip these
-    /// blobs. (Carried-forward blobs are instead covered by their source part's ref.) The in-process
-    /// re-HEAD below is the same-process backstop (B49). Renew before taking the in-process lock since
-    /// this is a bucket write coordinating with OTHER mounters, not the local sweep.
-    if (session_open)
-        persistSession();
-
-    std::lock_guard<std::mutex> gc_guard(*metadata_storage.gc_lock);
+    manifest.blobs = st.recorded;
 
     /// The "detached" ref is a SHARED container of detached part directories: each detach/FETCH lands one
     /// part into detached/<detached_part>/ via its own transaction whose recorded keys are
@@ -1224,16 +1282,16 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// "detached" ref. The default publish below rewrites the ref, which would make each publish overwrite
     /// the previous one (only the last detached part would be listed — B46). So when the target is the
     /// detached namespace, merge the new keys into the existing detached ref's manifest first. This
-    /// read-modify-write of the SHARED detached ref MUST happen UNDER the per-pool gc_lock: a FETCH
-    /// PARTITION downloads its parts concurrently (the FETCH thread pool, 03350) and each part's commit
-    /// publishes into the same "detached" ref, so an unlocked read-merge-publish loses entries — two
-    /// concurrent commits both read the same prior manifest and the second overwrites the first's
+    /// read-modify-write of the SHARED detached ref MUST happen UNDER the per-pool gc_lock (held by the
+    /// caller): a FETCH PARTITION downloads its parts concurrently (the FETCH thread pool, 03350) and each
+    /// part's commit publishes into the same "detached" ref, so an unlocked read-merge-publish loses entries
+    /// — two concurrent commits both read the same prior manifest and the second overwrites the first's
     /// contribution, leaving only one part's blobs and a FILE_DOESNT_EXIST on the lost parts (B66). The
     /// lock serializes the read-merge-publish so every part accumulates. (A regular part_name is never
     /// re-committed with new content under the same name, so this only affects "detached".)
-    if (part_name == ContentAddressed::kDetachedDirName)
+    if (part_name_ == ContentAddressed::kDetachedDirName)
     {
-        if (auto existing_pid = metadata_storage.readRefPartId(table_uuid, part_name))
+        if (auto existing_pid = metadata_storage.readRefPartId(table_uuid_, part_name_))
         {
             auto existing = metadata_storage.loadPartManifestOrThrow(*existing_pid);
             for (const auto & [file, entry] : existing.blobs)
@@ -1243,6 +1301,16 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
 
     const ContentAddressed::PartId part_id = ContentAddressed::computePartId(manifest.blobs);
 
+    /// B49: re-validate every referenced blob UNDER the gc_lock (held by the caller) before writing the
+    /// manifest or publishing the ref. finalizeImpl skips re-uploading a blob that already exists (dedup);
+    /// in the window between that skip and this publish a concurrent background sweep could reclaim such a
+    /// blob (it was unreferenced + past grace), leaving the ref we are about to publish dangling -> data
+    /// loss on read. The sweep holds this SAME lock for its whole mark+delete, so once the caller holds it
+    /// the live set is stable: re-HEAD every blob the manifest names and, if any is missing, FAIL CLOSED (a
+    /// retryable error) WITHOUT publishing a dangling ref. The insert is then retried and re-uploads the
+    /// blob. With mutual exclusion the only outcomes are: we publish first (the sweep's next pass sees the
+    /// blob reachable and keeps it) or the sweep reclaimed it first (we throw and retry) — never a published
+    /// ref to a deleted blob.
     for (const auto & [file, entry] : manifest.blobs)
     {
         const std::string blob_key = ContentAddressed::blobKey(key_prefix, entry.key).string();
@@ -1251,7 +1319,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
                 ErrorCodes::CORRUPTED_DATA,
                 "ContentAddressed: blob {} (file {}) referenced by part {}/{} was concurrently reclaimed "
                 "by GC before the ref could be published; retry the insert",
-                blob_key, file, table_uuid, part_name);
+                blob_key, file, table_uuid_, part_name_);
     }
 
     /// Put-if-absent the manifest: identical parts (same deterministic blobs) share one manifest object.
@@ -1276,33 +1344,33 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// only the bundle index overwrites, so merge the existing bundle in. The merged map also drives
     /// whether the sidecar must be (re)written even when this detach contributed no mutable files but a
     /// prior one did.
-    std::map<std::string, std::string> merged_mutable(recorded_mutable.begin(), recorded_mutable.end());
-    if (part_name == ContentAddressed::kDetachedDirName)
+    std::map<std::string, std::string> merged_mutable(st.recorded_mutable.begin(), st.recorded_mutable.end());
+    if (part_name_ == ContentAddressed::kDetachedDirName)
     {
-        if (auto existing = metadata_storage.readRefSidecarIfExists(table_uuid, part_name))
+        if (auto existing = metadata_storage.readRefSidecarIfExists(table_uuid_, part_name_))
             for (const auto & [file, bytes] : existing->files)
                 merged_mutable.emplace(file, bytes); /// keep the new bytes on a key collision (re-detach)
     }
 
     /// FREEZE publishes into the shadow/<backup>/ namespace (one ref per frozen part); a live part uses
     /// the store/.../refs/ location. Select the ref-family keys accordingly.
-    const bool is_frozen = !frozen_backup_name.empty();
+    const bool is_frozen = !st.frozen_backup_name.empty();
     auto mutable_file_key = [&](const std::string & file)
     {
         return is_frozen
-            ? ContentAddressed::shadowRefMutableFileKey(key_prefix, frozen_table_dir, part_name, file).string()
-            : ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid, part_name, file).string();
+            ? ContentAddressed::shadowRefMutableFileKey(key_prefix, st.frozen_table_dir, part_name_, file).string()
+            : ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid_, part_name_, file).string();
     };
     const std::string meta_key = is_frozen
-        ? ContentAddressed::shadowRefMetaKey(key_prefix, frozen_table_dir, part_name).string()
-        : ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
+        ? ContentAddressed::shadowRefMetaKey(key_prefix, st.frozen_table_dir, part_name_).string()
+        : ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid_, part_name_).string();
 
     if (!merged_mutable.empty())
     {
         /// Per-file objects FIRST: each mutable file's bytes verbatim in its own tiny object so the
         /// read path (getStorageObjects -> readObject) returns exactly that file's bytes. Only this
         /// detach's NEW files need writing; prior detached parts' per-file objects already exist.
-        for (const auto & [file, bytes] : recorded_mutable)
+        for (const auto & [file, bytes] : st.recorded_mutable)
         {
             const std::string file_key = mutable_file_key(file);
             auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite);
@@ -1327,28 +1395,58 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     // is the versioned ref-payload struct (MAGIC+version+part_id) written by serializeRefPayload and
     // parsed by the single partIdFromRefPayload shared with the read path and the GC live-set scan (B28).
     const std::string ref_key = is_frozen
-        ? ContentAddressed::shadowRefKey(key_prefix, frozen_table_dir, part_name).string()
-        : ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
+        ? ContentAddressed::shadowRefKey(key_prefix, st.frozen_table_dir, part_name_).string()
+        : ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_uuid_, part_name_).string();
     const std::string ref_payload = ContentAddressed::serializeRefPayload(part_id);
     auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
     ref_out->write(ref_payload.data(), ref_payload.size());
     ref_out->finalize();
+}
 
-    /// B52: the ref now names this part and keeps every referenced blob reachable, so the in-flight
+void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant & options)
+{
+    if (!std::holds_alternative<NoCommitOptions>(options))
+        throwNotImplemented();
+
+    /// Nothing was staged (e.g. a directory-only transaction): no part to publish.
+    if (parts.empty())
+        return;
+
+    /// Renew the write-session pin so it is FRESHLY live across the ref publishes below (cross-process
+    /// data-loss fix): the per-blob renewals kept it live during the write, but the session must not be
+    /// allowed to lapse before the refs are published. A live session root covers every freshly-written
+    /// blob this transaction's parts are about to reference; a REMOTE mounter's sweep re-reads sessions in
+    /// its re-validate-under-lock step immediately before deleting, so a live session makes it skip these
+    /// blobs. (Carried-forward blobs are instead covered by their source part's ref.) The in-process re-HEAD
+    /// in commitOnePart is the same-process backstop (B49). Renew before taking the in-process lock since
+    /// this is a bucket write coordinating with OTHER mounters, not the local sweep.
+    if (session_open)
+        persistSession();
+
+    /// Take the per-pool in-process GC lock ONCE around the whole multi-part publish (B49). The sweep holds
+    /// this SAME lock for its entire mark+delete, so once we hold it the live set is stable for every part.
+    std::lock_guard<std::mutex> gc_guard(*metadata_storage.gc_lock);
+
+    /// A single transaction may write more than one part (a transactional merge — B67). Publish each staged
+    /// part under the one lock; an all-empty entry is a no-op (handled inside commitOnePart).
+    for (auto & [key, st] : parts)
+        commitOnePart(key, st);
+
+    /// B52: the refs now name these parts and keep every referenced blob reachable, so the in-flight
     /// pins are no longer needed. Release them while STILL holding gc_lock (gc_guard above) so the pin
-    /// drop and the ref publish are atomic w.r.t. the sweep: it can never observe a blob this commit
+    /// drop and the ref publishes are atomic w.r.t. the sweep: it can never observe a blob this commit
     /// reused as both unpinned AND not-yet-referenced. Erase directly here (do NOT call the lock-taking
     /// releasePinnedBlobs / unpinBlob — gc_lock is already held) and clear the local set so the
     /// destructor's release is a no-op.
-    for (const auto & key : pinned_blob_keys)
-        metadata_storage.inFlightPinnedBlobs()->erase(key);
+    for (const auto & blob_key : pinned_blob_keys)
+        metadata_storage.inFlightPinnedBlobs()->erase(blob_key);
     pinned_blob_keys.clear();
 
-    /// M8: the ref is published, so the cross-mounter pin (the WriteSession object) is no longer needed
-    /// — the ref now keeps every referenced blob reachable for a sweep on ANY mounter. Remove it. This
+    /// M8: the refs are published, so the cross-mounter pin (the WriteSession object) is no longer needed
+    /// — the refs now keep every referenced blob reachable for a sweep on ANY mounter. Remove it. This
     /// is done OUTSIDE the gc_lock window above on purpose: it is a plain object delete on this
     /// transaction's OWN uniquely-keyed session object (no in-process state, so the local lock is
-    /// irrelevant), and the ref publish above already closed the local race.
+    /// irrelevant), and the ref publishes above already closed the local race.
     releaseSession();
 }
 

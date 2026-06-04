@@ -276,6 +276,34 @@ public:
     void createHardLinkFrom(const std::string & from, const std::string & to) { createHardLink(from, to); }
 
 private:
+    /// Per-part staging. A single transaction may write more than one part — a transactional merge's one
+    /// disk transaction spans the merge-output part PLUS the covered source parts' txn_version rewrites
+    /// (B67). The single-part case (every INSERT / non-merge write) is exactly one entry.
+    struct PartStaging
+    {
+        std::map<std::string, ContentAddressed::BlobEntry> recorded;     /// content blobs -> manifest
+        std::map<std::string, std::string> recorded_mutable;             /// mutable per-part files -> sidecar
+        std::set<std::string> recorded_mutable_removed;                  /// mutable files to delete from a committed sidecar
+        std::string frozen_backup_name;                                  /// FREEZE target (per-part)
+        std::string frozen_table_dir;
+    };
+    using PartKey = std::pair<std::string /*table_uuid*/, std::string /*part_name*/>;
+    std::map<PartKey, PartStaging> parts;
+
+    PartStaging & stagingFor(const std::string & table_uuid_, const std::string & part_name_) { return parts[PartKey{table_uuid_, part_name_}]; }
+    PartStaging & stagingForPath(const ContentAddressed::PartFilePath & p) { return stagingFor(p.table_uuid, p.part_name); }
+    const PartStaging * findStaging(const std::string & table_uuid_, const std::string & part_name_) const
+    {
+        auto it = parts.find(PartKey{table_uuid_, part_name_});
+        return it == parts.end() ? nullptr : &it->second;
+    }
+
+    // Publish one staged part: the per-part body of commit(). Either the mutable-only sidecar update of an
+    // already-committed part (no content blobs staged), or the whole-part publish (manifest + sidecar + ref)
+    // for new content. An all-empty staging entry is a no-op. Does NOT take the gc_lock or persistSession —
+    // commit() does that once around the loop over all parts.
+    void commitOnePart(const PartKey & key, PartStaging & st);
+
     // Record (logical_file -> blob) for the part being written; the part_id is derived from this.
     void recordBlob(const std::string & path, ContentAddressed::BlobEntry entry);
     // Pin/verify the (table_uuid, part_name) all files of one commit must agree on.
@@ -382,25 +410,10 @@ private:
     const std::string key_prefix;
     /// Server-local scratch dir for the write-buffer spill (see ctor).
     const std::string local_scratch_path;
-    std::map<std::string, ContentAddressed::BlobEntry> recorded;
-    /// Mutable per-part files (isMutablePerPartFile): their raw bytes, stored inline in the per-ref
-    /// sidecar at commit instead of the shared manifest. Keyed by in-part logical file name.
-    std::map<std::string, std::string> recorded_mutable;
-    /// Mutable per-part files to DELETE from an already-committed part's sidecar at commit (removeFile of
-    /// txn_version.txt.tmp; the source of a mutable rename resolved from the committed sidecar).
-    std::set<std::string> recorded_mutable_removed;
+    /// The LAST-remembered target (most recent rememberTarget). Many methods reference these to scope a
+    /// staging lookup; they no longer mean "the only part".
     std::string table_uuid;
     std::string part_name;
-    /// Non-empty iff this transaction writes a FREEZE target (shadow/<backup_name>/…). The commit then
-    /// publishes the ref + sidecar in the shadow/ namespace (shadowRefKey) instead of the live
-    /// store/.../refs/ location, so a freeze publishes an independent, GC-rooted snapshot ref rather than
-    /// clobbering the live part's ref.
-    std::string frozen_backup_name;
-    /// Set (alongside frozen_backup_name) for a FREEZE target: the literal shadow table dir
-    /// (shadow/<backup>/store/<uuid[:3]>/<uuid>) the frozen ref-family keys mirror. This is what the
-    /// commit feeds to the shadowRef* key builders so the shadow refs physically live under the same
-    /// store tree the read/list/remove enumeration walks.
-    std::string frozen_table_dir;
     /// B52: full blob object keys this transaction pinned in the pool's in-flight set (via the write
     /// buffer, under the GC lock). Released once the ref is published or the transaction is destroyed.
     std::set<std::string> pinned_blob_keys;
