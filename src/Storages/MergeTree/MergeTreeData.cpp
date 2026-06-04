@@ -6577,6 +6577,9 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     /// `FREEZE PARTITION`/`FREEZE ALL` and `UNFREEZE PARTITION`/`UNFREEZE ALL` are now SUPPORTED:
                     /// a freeze publishes each part as its own ref in the `shadow/` namespace (a GC root sharing
                     /// the live blobs zero-copy — no byte copy); UNFREEZE removes the backup's refs.
+                    /// `FORGET PARTITION` is SUPPORTED on CA — it only manipulates ZooKeeper partition metadata
+                    /// (removes block-number nodes from ZooKeeper) and does not write, clone, or touch any part
+                    /// files on disk, so it is safe on a content-addressed disk.
                     /// NOTE: `MOVE_PARTITION` also admits cross-disk
                     /// `MOVE ... TO DISK/VOLUME` (this check cannot distinguish the destination); that uses
                     /// the byte-copy `clonePart` path (NOT the corrupting per-file hardlink), but only
@@ -6584,6 +6587,7 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     const static auto supported_commands = {
                         PartitionCommand::DROP_PARTITION,
                         PartitionCommand::DROP_DETACHED_PARTITION,
+                        PartitionCommand::FORGET_PARTITION,
                         PartitionCommand::ATTACH_PARTITION,
                         PartitionCommand::REPLACE_PARTITION,
                         PartitionCommand::MOVE_PARTITION,
