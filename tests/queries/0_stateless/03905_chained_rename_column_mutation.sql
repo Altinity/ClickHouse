@@ -1,4 +1,5 @@
--- Tags: zookeeper, no-parallel-replicas
+-- Tags: zookeeper, no-parallel-replicas, no-content-addressed-storage
+-- no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
 
 -- Test for chained RENAME COLUMN mutations applied to a part that was attached
 -- with old column names. When multiple renames like c0->c1->c2->...->cN are applied

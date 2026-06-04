@@ -1,4 +1,5 @@
--- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
+-- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: Replicated-CA queue-clone ATTACH PARTITION not yet audited (B33/Phase-3.2)
 -- { echo ON }
 
 SET enable_analyzer = 1;

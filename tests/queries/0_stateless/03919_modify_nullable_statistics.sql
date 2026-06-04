@@ -1,3 +1,5 @@
+-- Tags: no-content-addressed-storage
+-- no-content-addressed-storage: Replicated-CA queue-clone REPLACE/MOVE/ATTACH not yet audited (B33/Phase-3.2)
 drop table if exists t_stat_nullable_1 sync;
 drop table if exists t_stat_nullable_2 sync;
 SET materialize_statistics_on_insert = 1;
