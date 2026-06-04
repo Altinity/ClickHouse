@@ -44,7 +44,7 @@ workflow = Workflow.Config(
     name="Community PR",
     event=Workflow.Event.PULL_REQUEST,
     base_branches=[BASE_BRANCH, "releases/*", "antalya-*"],
-    if_condition="github.repository != github.event.pull_request.head.repo.full_name",
+    if_condition='!contains(fromJson(\'["MEMBER","COLLABORATOR","OWNER"]\'), github.event.pull_request.author_association)',
     jobs=[
         JobConfigs.fast_test,
         *[job.set_dependency(STYLE_AND_FAST_TESTS) for job in JobConfigs.build_jobs],

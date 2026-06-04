@@ -28,7 +28,7 @@ jobs:
   config_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: []
-    if: ${{ github.repository != github.event.pull_request.head.repo.full_name }}
+    if: ${{ !contains(fromJson('["MEMBER","COLLABORATOR","OWNER"]'), github.event.pull_request.author_association) }}
     name: "Config Workflow"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
