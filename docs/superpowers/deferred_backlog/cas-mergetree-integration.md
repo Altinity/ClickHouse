@@ -470,5 +470,64 @@ The three user hypotheses, resolved with evidence:
 | B66b | **(CAS FETCH, 2026-06-04) Relink-into-detached deferred — the same-pool FETCH optimization (move no bytes).** A `to_detached` FETCH currently STREAMS bytes (B66 forces the byte path) even when the source part lives in the SAME content-addressed pool, where it could be published by REFERENCE (relink) at zero byte cost — exactly as a same-pool active fetch already does (CAS replication 2b, `relinkPartToDisk`). The relink path was wired for ACTIVE fetches: it stages at `getRelativeDataPath()` (the active part path) and ignores the `to_detached` parameter, so a detached relink would publish into the active namespace, not `detached/`. **Where it plugs in:** extend `Fetcher::relinkPartToDisk` / `MergeTreeData::relinkExistingPart` (the receive-side relink branch in `DataPartsExchange.cpp` ~L700-725) to honor `to_detached` — publish the relinked ref into the `detached/<tmp-fetch_part>/` namespace (mirroring `republishCommittedPartIntoDetached`'s detached-ref publish, but from the sender-advertised same-pool source part id rather than a local source manifest), then re-advertise the relink capability for `to_detached` (revert the `&& !to_detached` guard added in B66). Until then a detached fetch always byte-streams (correct, just not free). | Decided during the CAS FETCH design (byte-fetch first, relink-into-detached later) | **FIX:** teach the relink receive path to publish into `detached/` and lift the `!to_detached` advertise guard. Files: `src/Storages/MergeTree/DataPartsExchange.cpp` (`fetchSelectedPart` advertise + the relink-cookie receive branch / `relinkPartToDisk`), `src/Storages/MergeTree/MergeTreeData.cpp` (`relinkExistingPart`). |
 | B67 | **DONE (both layers, 2026-06-04). Transactional merges/mutations now work on a content-addressed disk via a MULTI-PART CA transaction.** Tier-1 transactional `INSERT`/`COMMIT`/`ROLLBACK` was DONE in B39; B67 closed the remaining gap — transactional merges/mutations. **B67 had TWO layers, both now DONE.** **(Layer 1, DONE — commit `ad136563cfe`)** a transactional `COMMIT` appends the CSN to the table-level `mutation_<n>.txt` via `WriteMode::Append`, which CA rejected (`NOT_IMPLEMENTED`) INSIDE the `noexcept MergeTreeTransaction::afterCommit` → `std::terminate`/abort. Fixed by servicing `WriteMode::Append` on a CA non-part VERBATIM file via read-modify-rewrite (relaxed the CA branch of the `writeFileImpl` append guard; read existing bytes, rewrite existing+new; append on a CA PART file stays rejected). gtest `AppendOnTableLevelVerbatimFileRewrites`. This layer had been MASKING layer 2 (the append crashed first, so an early clean-binary probe mis-concluded "B67 is only the append"). **(Layer 2, DONE — commit `e055a13243e`)** with the append fixed, a transactional merge reached the single-part `ContentAddressedTransaction` limit. A transactional `OPTIMIZE`/mutation/`DELETE` runs a background merge whose ONE `DiskObjectStorageTransaction` touches MULTIPLE parts at once — the merge-output part PLUS removal-TID-lock `txn_version.txt` rewrites on the covered SOURCE parts (so a rollback can un-cover them). The old `ContentAddressedTransaction` was SINGLE-part: one `(table_uuid, part_name)` keyed to one manifest/sidecar, so recording a second part aborted in `rememberTarget` with a `LOGICAL_ERROR` and the server aborted on rollback. **FIX (landed):** generalized the CA transaction to multiple parts — per-part `recorded`/`recorded_mutable`/sidecar staging maps keyed by `(table_uuid, part_name)`, a multi-part `commit`/`commitOnePart` under a single `gc_lock` (each NEW whole part published normally, each EXISTING part updated via the B39 mutable-only branch `recorded.empty()` → sidecar-in-place, atomically over all parts), and `moveDirectory` re-keys staging across parts including the deferred `tmp_merge→final` merge. **Plus two ancillary fixes that landed with this milestone:** (a) a `LocalObjectStorage::listObjects`/`tryGetObjectMetadata` TOCTOU fix that tolerates concurrently-deleted objects (shared with non-CA local-object-storage; plain regression confirmed clean); (b) a `cancelImpl` fix for `ContentAddressedWriteBuffer` so an insert-cancel no longer leaks the inner buffers. **Un-gated + passing on CA:** `01168_mutations_isolation`(+`_2`,+`_3`), `01170_alter_partition_isolation`, `01174_select_insert_isolation`, `01167_isolation_hermitage`, `01169_alter_partition_isolation_stress`(+`_old`), `01171_mv_select_insert_isolation_long`, `02421_truncate_isolation_no_merges`(+`_with_mutations`), `02435_rollback_cancelled_queries`, `03803_transaction_mutation_race`, `03657_merge_tree_disk_support_transaction`, `03752_attach_as_replicated_transaction_metadata`, `03916_attach_as_replicated_implicit_transaction`. **Still gated → moved to BACKUP/RESTORE-on-CA blocked set (B16/B34), NOT B67:** `04036_backup_partition_transaction_visibility` — RESTORE materializes content part files via an autocommit one-shot which CA rejects (`NOT_IMPLEMENTED Autocommit writes are not supported for content part files`); needs RESTORE to drive a `ContentAddressedTransaction`. | Found + fixed finalizing the CAS txn milestone (2026-06-04): a transactional merge's single `DiskObjectStorageTransaction` spans the merge-output part plus source-part `txn_version.txt` rewrites, exceeding CA's old single-part transaction | **DONE:** multi-part `ContentAddressedTransaction` — per-part `recorded`/`recorded_mutable`/sidecar maps + a multi-part atomic `commit`/`commitOnePart` under one `gc_lock` (new parts published normally, existing parts updated via the B39 mutable-only branch); `moveDirectory` re-keys staging across parts incl. deferred `tmp_merge→final`. Files: `src/Disks/DiskObjectStorage/ObjectStorages/ContentAddressed/ContentAddressedTransaction.{h,cpp}` (`rememberTarget`/`recorded`/`commit`/`commitOnePart`/`moveDirectory`/`rollback`); `LocalObjectStorage::{listObjects,tryGetObjectMetadata}` TOCTOU; `ContentAddressedWriteBuffer::cancelImpl`. Commits `ad136563cfe` (layer 1) + `e055a13243e` (layer 2). |
 
+## Goal A test-stabilization (2026-06-04 night) — END STATE {#goal-a-stabilization}
+
+The "un-gate all CA-incompatible stateless tests, run on the CA-default job, fix-small / document-big /
+re-gate-only-disk-incompatible-by-definition" milestone reached its end state this session. Net: the
+directly-tagged `no-content-addressed-storage` set dropped from **43 → ~22**, and the ~21 un-gated tests
+are green on `Stateless tests (arm_binary, content_addressed storage, parallel)`. Companion running log:
+`docs/superpowers/NIGHT_LOG_2026-06-04.md`.
+
+- **B65 DONE** — `ContentAddressedWriteBuffer` now honors `buf_size` + `use_adaptive_write_buffer` /
+  `adaptive_write_buffer_initial_size` (it had hard-coded `DBMS_DEFAULT_BUFFER_SIZE`, so a wide part
+  pre-allocated ~1 MiB per column and blew the INSERT memory budget → `MEMORY_LIMIT_EXCEEDED`). The
+  flags are now threaded through exactly as the S3/Azure write buffers do. **Supersedes the B65 row
+  above** (which recorded it as a re-gated "REAL CA BUG candidate" — that row is now resolved). Un-gated
+  + passing: `03770_min_columns_to_activate_adaptive_write_buffer`, `03829_insert_deduplication_info_memory`.
+  Commit `c0287d2219c`.
+- **B67 DONE** — multi-part `ContentAddressedTransaction` (transactional merges/mutations); recorded in
+  full in the B67 row above. Cross-reference only.
+- **Un-gated this session (now green on CA):**
+  - **transaction / isolation cluster (B67)** — `01168_mutations_isolation`(+`_2`,+`_3`),
+    `01170_alter_partition_isolation`, `01174_select_insert_isolation`, `01167_isolation_hermitage`,
+    `01169_alter_partition_isolation_stress`(+`_old`), `01171_mv_select_insert_isolation_long`,
+    `02421_truncate_isolation_no_merges`(+`_with_mutations`), `02435_rollback_cancelled_queries`,
+    `03803_transaction_mutation_race`, `03657_merge_tree_disk_support_transaction`,
+    `03752_attach_as_replicated_transaction_metadata`, `03916_attach_as_replicated_implicit_transaction`.
+  - **JSON / dynamic-ALTER** — `01825_json_type_3`, `01825_json_type_add_column`,
+    `03210_json_type_alter_add_column`, `03246_alter_from_string_to_json`, `03272_json_to_json_alter`.
+  - **parallel-replicas / distributed** — `02967_parallel_replicas_joins_and_analyzer`,
+    `02980_dist_insert_readonly_replica`, `03279_pr_3_way_joins_{full,inner,left,right}_first`.
+  - **read / merge** — `03001_block_offset_column`, `02461_prewhere_row_level_policy_lightweight_delete`,
+    `02994_merge_tree_mutations_cleanup`, `02260_alter_compact_part_drop_nested_column`.
+  - **stale transaction gate** — `03373_named_session_try_recreate_before_timeout`,
+    `02497_source_part_is_intact_when_mutation` (their B39 "append-based / object-storage-wide" reason
+    is stale now that B67 landed).
+  - **FORGET PARTITION** — `02995_forget_partition` (only manipulates ZK metadata, no part write — a
+    simple gate-lift). Commit `604cc66aec9`.
+  - Plus the two ancillary CA-path fixes recorded under B67: the `LocalObjectStorage::listObjects` /
+    `tryGetObjectMetadata` TOCTOU fix (shared with non-CA local-object-storage) and the
+    `ContentAddressedWriteBuffer::cancelImpl` fix.
+- **B16/B34 BACKUP/RESTORE on CA — OPEN, documented.** All 13 backup tests fail on the SAME root cause:
+  RESTORE materializes restored content part files via an autocommit one-shot write, which CA rejects
+  (`NOT_IMPLEMENTED: Autocommit writes are not supported for content part files`). BACKUP-read works;
+  only the restore-write path fails. **FIX direction (big feature, NOT attempted — user decision item):**
+  RESTORE must materialize parts through a `ContentAddressedTransaction` (the INSERT/merge write path)
+  instead of per-file autocommit. Gated tests: `02843_backup_use_same_password_for_base_backup`,
+  `02843_backup_use_same_s3_credentials_for_base_backup`, `02864_restore_table_with_broken_part`,
+  `02974_backup_query_format_null`, `03001_backup_matview_after_modify_query`,
+  `03001_restore_from_old_backup_with_matview_inner_table_metadata`, `03032_async_backup_restore`,
+  `03145_non_loaded_projection_backup`, `03214_backup_and_clear_old_temporary_directories`,
+  `03286_backup_to_memory`, `03315_query_log_privileges_backup_restore`, `03760_backup_tar_archive`,
+  `03831_backup_archive_to_plain_rewritable_disk`, `04036_backup_partition_transaction_visibility`.
+- **Legitimately gated by definition (not bugs):** broken-part / lost-part path-shape tests —
+  `02253_empty_part_checksums`, `02254_projection_broken_part`, `02255_broken_parts_chain_on_start`,
+  `02369_lost_part_intersecting_merges`, `02370_lost_part_intersecting_merges`,
+  `02444_async_broken_outdated_part_loading` (they `rm`/`truncate` a raw `system.parts.path`, which on
+  CA is a relative object-store key — would also fail on plain s3); `02980_s3_plain_DROP_TABLE_MergeTree`,
+  `02980_s3_plain_DROP_TABLE_ReplicatedMergeTree` (test the `s3_plain` disk type specifically);
+  `03350_alter_table_fetch_partition_thread_pool` (B66a concurrent-FETCH fan-out torn read, local-only,
+  known — see B66a).
+
 > Add new deferred items here as they arise during planning/implementation, always filling the
 > "where it plugs in" column so the architecture stays dead-end-free.
