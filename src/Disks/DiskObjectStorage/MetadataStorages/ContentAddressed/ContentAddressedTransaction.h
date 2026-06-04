@@ -254,6 +254,13 @@ public:
     // is moved in storage since the blob is content-addressed.
     void moveFile(const std::string & path_from, const std::string & path_to) override;
 
+    // Replace (overwrite-rename) of a single file. replaceFile = moveFile that overwrites the
+    // destination. Reached by VersionMetadataOnDisk::storeInfoToDataPartStorage, which atomically
+    // installs txn_version.txt via replaceFile(txn_version.txt.tmp, txn_version.txt) — both mutable
+    // per-part files. Mutable-aware: the result must land in the per-ref sidecar (recorded_mutable),
+    // never the manifest.
+    void replaceFile(const std::string & path_from, const std::string & path_to) override;
+
     // Unlink a logical file. For a part file still being assembled in this commit, drop the
     // recorded blob so it is excluded from the manifest. For files that were never recorded (or
     // non-part files), there is nothing CA-resolution-relevant to remove, so it is a no-op.
@@ -273,6 +280,12 @@ private:
     void recordBlob(const std::string & path, ContentAddressed::BlobEntry entry);
     // Pin/verify the (table_uuid, part_name) all files of one commit must agree on.
     void rememberTarget(const std::string & path);
+
+    // replaceFile safety-net helper: read the bytes of a part file that was just written in THIS
+    // transaction as a content blob (`recorded`), so a rename whose destination is mutable can re-stage
+    // them inline in the sidecar. Reads the just-uploaded blob object; falls back to the committed sidecar
+    // bytes if the source is not staged as a blob here. Rare after Piece-1 .tmp inline recognition.
+    std::string readStagedOrCommittedBytes(const std::string & path) const;
 
     // B52: release all in-flight blob pins this transaction holds (after the ref is published, or on
     // destruction of an uncommitted transaction). Idempotent.
@@ -373,6 +386,9 @@ private:
     /// Mutable per-part files (isMutablePerPartFile): their raw bytes, stored inline in the per-ref
     /// sidecar at commit instead of the shared manifest. Keyed by in-part logical file name.
     std::map<std::string, std::string> recorded_mutable;
+    /// Mutable per-part files to DELETE from an already-committed part's sidecar at commit (removeFile of
+    /// txn_version.txt.tmp; the source of a mutable rename resolved from the committed sidecar).
+    std::set<std::string> recorded_mutable_removed;
     std::string table_uuid;
     std::string part_name;
     /// Non-empty iff this transaction writes a FREEZE target (shadow/<backup_name>/…). The commit then

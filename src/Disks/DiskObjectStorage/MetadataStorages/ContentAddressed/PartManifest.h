@@ -38,8 +38,15 @@ constexpr bool isMutablePerPartFile(std::string_view file)
 {
     const auto slash = file.rfind('/');
     const std::string_view basename = (slash == std::string_view::npos) ? file : file.substr(slash + 1);
+    /// The atomic write of a mutable per-part file goes via a sibling tmp (e.g. txn_version.txt.tmp,
+    /// VersionMetadataOnDisk). Treat that tmp as mutable too, so it stages inline in the per-ref sidecar
+    /// instead of content-addressing into the manifest — otherwise a standalone autocommit write of the
+    /// tmp on an already-committed part would republish the part with a one-file manifest (data loss).
+    std::string_view stem = basename;
+    if (stem.ends_with(".tmp"))
+        stem = stem.substr(0, stem.size() - 4);
     for (const auto & name : kMutablePerPartFiles)
-        if (basename == name)
+        if (basename == name || stem == name)
             return true;
     return false;
 }

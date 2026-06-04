@@ -13,6 +13,7 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadSettings.h>
 #include <IO/copyData.h>
+#include <IO/WriteBufferFromString.h>
 
 #include <base/hex.h>
 
@@ -982,14 +983,89 @@ void ContentAddressedTransaction::moveFile(const std::string & from, const std::
     recorded[dst->file] = std::move(entry);
 }
 
+std::string ContentAddressedTransaction::readStagedOrCommittedBytes(const std::string & path) const
+{
+    /// Read the bytes of a part file written in THIS transaction as a content blob (just uploaded), so a
+    /// rename whose destination is mutable can re-stage them inline. Falls back to the committed sidecar.
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->file.empty())
+    {
+        if (auto it = recorded.find(p->file); it != recorded.end())
+        {
+            StoredObject obj(ContentAddressed::blobKey(key_prefix, it->second.key).string(), path, it->second.size);
+            auto in = metadata_storage.object_storage->readObject(obj, ReadSettings{}, std::nullopt);
+            std::string bytes;
+            WriteBufferFromString out(bytes);
+            copyData(*in, out);
+            out.finalize();
+            return bytes;
+        }
+    }
+    return metadata_storage.resolveMutableFileBytes(path);
+}
+
+void ContentAddressedTransaction::replaceFile(const std::string & from, const std::string & to)
+{
+    /// replaceFile = moveFile that overwrites the destination. A content-addressed rename of an in-part
+    /// file re-keys the staged entry (no object moves). The txn_version.txt destination is a mutable
+    /// per-part file, so the result must land in recorded_mutable (the per-ref sidecar), never the manifest.
+    auto src = ContentAddressed::parsePartFilePath(from);
+    auto dst = ContentAddressed::parsePartFilePath(to);
+    if (!src || src->file.empty() || !dst || dst->file.empty())
+    {
+        /// Table-level / generic verbatim path: delegate to moveFile (its non-part branch does a
+        /// copyObject(Rewrite)+remove, which already overwrites the destination).
+        moveFile(from, to);
+        return;
+    }
+    rememberTarget(to);
+    /// Overwrite: drop any staged destination entry first.
+    recorded.erase(dst->file);
+    recorded_mutable.erase(dst->file);
+    recorded_mutable_removed.erase(dst->file);
+    /// Common case — source staged inline (txn_version.txt.tmp recognized as mutable by Piece 1): move bytes.
+    if (auto mit = recorded_mutable.find(src->file); mit != recorded_mutable.end())
+    {
+        recorded_mutable[dst->file] = std::move(mit->second);
+        recorded_mutable.erase(mit);
+        return;
+    }
+    /// Source staged as a content blob but destination is mutable: should be rare after Piece 1. Read the
+    /// just-written bytes back inline (the orphan tmp blob is GC-reclaimed). Otherwise re-key the blob.
+    if (auto it = recorded.find(src->file); it != recorded.end())
+    {
+        if (ContentAddressed::isMutablePerPartFile(dst->file))
+        {
+            recorded_mutable[dst->file] = readStagedOrCommittedBytes(from);
+            recorded.erase(it);
+        }
+        else
+        {
+            recorded[dst->file] = std::move(it->second);
+            recorded.erase(it);
+        }
+        return;
+    }
+    /// Source not staged in THIS transaction (standalone autocommit across ops): resolve the committed
+    /// source bytes from the sidecar and re-stage under the destination, marking the source removed.
+    recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
+    recorded_mutable_removed.insert(src->file);
+}
+
 void ContentAddressedTransaction::unlinkFile(const std::string & path, bool, bool)
 {
     /// Part file: drop the staged blob so it is excluded from the manifest. The underlying content
     /// blob, if shared, is reclaimed by GC, not here.
     if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->file.empty())
     {
+        const bool staged_here = recorded.contains(p->file) || recorded_mutable.contains(p->file);
         recorded.erase(p->file);
         recorded_mutable.erase(p->file);
+        /// A mutable per-part file that exists only in the already-committed sidecar (not staged in THIS
+        /// transaction) must be deleted from that sidecar at commit — the mutable-only commit branch reads
+        /// recorded_mutable_removed to do so. This handles removeTmpMetadataFile's
+        /// removeFile(txn_version.txt.tmp) on a committed part (the .tmp is recognized as mutable by Piece 1).
+        if (!staged_here && ContentAddressed::isMutablePerPartFile(p->file))
+            recorded_mutable_removed.insert(p->file);
         return;
     }
 
@@ -1023,11 +1099,53 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         throwNotImplemented();
 
     /// Nothing was staged (e.g. a directory-only transaction): no part to publish.
-    if (recorded.empty() && recorded_mutable.empty())
+    if (recorded.empty() && recorded_mutable.empty() && recorded_mutable_removed.empty())
         return;
 
     if (table_uuid.empty() || part_name.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: commit without a resolved part target");
+
+    /// Mutable-only update of an ALREADY-COMMITTED part: this transaction staged NO content blobs, only
+    /// mutable per-part files (txn_version.txt and/or removals) — the MVCC creation-CSN fill-in and
+    /// removal-TID lock/unlock rewrite txn_version.txt on a LIVE part. Update only the per-ref sidecar +
+    /// the per-file mutable objects in place; KEEP the existing manifest, part_id and ref. The normal path
+    /// below would compute a part_id over an empty manifest and republish the ref — clobbering the part.
+    if (recorded.empty() && (!recorded_mutable.empty() || !recorded_mutable_removed.empty()))
+    {
+        auto existing_pid = metadata_storage.readRefPartId(table_uuid, part_name);
+        if (!existing_pid)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "ContentAddressed: mutable-only commit for {}/{} with no existing ref", table_uuid, part_name);
+
+        std::lock_guard<std::mutex> gc_guard(*metadata_storage.gc_lock);
+
+        ContentAddressed::RefSidecar sidecar;
+        if (auto existing = metadata_storage.readRefSidecarIfExists(table_uuid, part_name))
+            sidecar = *existing;
+        for (const auto & f : recorded_mutable_removed)
+        {
+            sidecar.files.erase(f);
+            metadata_storage.object_storage->removeObjectIfExists(StoredObject(
+                ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid, part_name, f).string()));
+        }
+        for (const auto & [file, bytes] : recorded_mutable)
+        {
+            sidecar.files[file] = bytes;
+            const std::string fk = ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid, part_name, file).string();
+            auto out = metadata_storage.object_storage->writeObject(StoredObject(fk), WriteMode::Rewrite);
+            out->write(bytes.data(), bytes.size());
+            out->finalize();
+        }
+        const std::string meta_key = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
+        const std::string meta_bytes = sidecar.serialize();
+        auto mo = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+        mo->write(meta_bytes.data(), meta_bytes.size());
+        mo->finalize();
+
+        if (session_open)
+            releaseSession();
+        return;
+    }
 
     /// Partition: content-identical files go to the shared manifest (and dedup); the mutable per-part
     /// files (recorded_mutable) go to this part's PRIVATE per-ref sidecar, never the manifest. The
