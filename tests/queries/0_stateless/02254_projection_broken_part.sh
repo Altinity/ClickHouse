@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, zookeeper, no-shared-merge-tree, no-content-addressed-storage
-# no-content-addressed-storage: projection (B5) + on-disk part-file manipulation via system.parts.path (orthogonal)
+# Tags: long, zookeeper, no-shared-merge-tree
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

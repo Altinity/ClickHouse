@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, no-ordinary-database, no-content-addressed-storage
+# Tags: long, no-ordinary-database
 
 # shellcheck disable=SC2015
 # shellcheck disable=SC2119

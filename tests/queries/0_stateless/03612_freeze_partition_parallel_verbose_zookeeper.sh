@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-content-addressed-storage
-# no-content-addressed-storage: FREEZE partition-clone not supported on CA (B21 partition-clone)
+# Tags: zookeeper, no-replicated-database
 # Tag no-replicated-database: Fails due to additional replicas or shards
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

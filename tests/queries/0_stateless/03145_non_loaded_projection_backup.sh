@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Tags: no-content-addressed-storage
-# no-content-addressed-storage: uses ATTACH/MOVE PARTITION (B21 whole-part clone)
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

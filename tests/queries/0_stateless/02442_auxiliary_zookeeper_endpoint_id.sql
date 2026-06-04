@@ -1,5 +1,4 @@
--- Tags: no-fasttest, no-shared-merge-tree, no-content-addressed-storage
--- no-content-addressed-storage: needs an auxiliary ZooKeeper ensemble (root auxiliary_zookeeper2 absent); orthogonal topology, not CA
+-- Tags: no-fasttest, no-shared-merge-tree
 -- no-shared-merge-tree -- shared merge tree doesn't support aux zookeepers
 
 drop table if exists t1_r1 sync;

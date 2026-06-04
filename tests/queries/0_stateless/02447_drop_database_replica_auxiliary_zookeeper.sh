@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
-# Tags: no-parallel, no-fasttest, no-content-addressed-storage
-# no-content-addressed-storage: needs an auxiliary ZooKeeper ensemble (auxiliary_zookeeper2 root absent); orthogonal topology, not CA
+# Tags: no-parallel, no-fasttest
 # no-parallel: This test is not parallel because when we execute system-wide SYSTEM DROP REPLICA,
 #  other tests might shut down the storage in parallel and the test will fail.
 # no-fasttest: It has several tests with timeouts for inactive replicas

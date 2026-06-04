@@ -1,4 +1,4 @@
--- Tags: no-replicated-database, no-content-addressed-storage
+-- Tags: no-replicated-database
 -- Reproducer for https://github.com/ClickHouse/ClickHouse/issues/93906
 -- CREATE OR REPLACE TABLE ... CLONE AS triggered LOGICAL_ERROR
 -- "Query pipeline requires output, but no output buffer provided"

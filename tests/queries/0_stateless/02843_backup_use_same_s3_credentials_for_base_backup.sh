@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-content-addressed-storage
+# Tags: no-fasttest
 # Tag: no-fasttest - requires S3
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

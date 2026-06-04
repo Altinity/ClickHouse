@@ -1,5 +1,4 @@
--- Tags: no-parallel, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
--- no-content-addressed-storage: FETCH PARTITION partition-clone not supported on CA (B21 partition-clone)
+-- Tags: no-parallel, no-replicated-database, no-shared-merge-tree
 -- Tag: no-parallel - to avoid polluting FETCH PARTITION thread pool with other fetches
 -- Tag: no-replicated-database - replica_path is different
 

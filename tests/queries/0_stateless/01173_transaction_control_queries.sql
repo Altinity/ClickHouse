@@ -1,4 +1,4 @@
--- Tags: no-ordinary-database, no-content-addressed-storage
+-- Tags: no-ordinary-database
 
 drop table if exists mt1;
 drop table if exists mt2;

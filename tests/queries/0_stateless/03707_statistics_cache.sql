@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-content-addressed-storage
+-- Tags: no-fasttest
 
 SET optimize_move_to_prewhere = 1, query_plan_optimize_prewhere = 1;
 SET enable_analyzer = 1;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-content-addressed-storage
+# Tags: no-fasttest
 
 # https://github.com/ClickHouse/ClickHouse/issues/45328
 # Check that replacing one partition on a table with `ALTER TABLE REPLACE PARTITION`

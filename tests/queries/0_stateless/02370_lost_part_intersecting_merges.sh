@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, zookeeper, no-shared-merge-tree, no-content-addressed-storage
-# no-content-addressed-storage: manipulates on-disk part files via system.parts.path; CA path is a relative object-storage key, not a local FS path (orthogonal)
+# Tags: long, zookeeper, no-shared-merge-tree
 # no-shared-merge-tree: depend on local fs (remove parts)
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

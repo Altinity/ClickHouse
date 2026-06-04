@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- https://github.com/ClickHouse/ClickHouse/issues/79110
 CREATE TABLE t0 (c0 Int) ENGINE = MergeTree() ORDER BY tuple();
 INSERT INTO TABLE t0 (c0) VALUES (1);
