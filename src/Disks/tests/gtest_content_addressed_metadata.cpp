@@ -597,6 +597,58 @@ TEST_F(ContentAddressedMetaTest, WritePartThenReadBackAndDedup)
               ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path);
 }
 
+// B67: a transactional COMMIT appends the CSN line to the TABLE-LEVEL mutation entry mutation_<n>.txt
+// via WriteMode::Append (MergeTreeMutationEntry::writeCSN, inside the noexcept afterCommit). A
+// content-addressed metadata storage reports no native append, but it CAN service an append on a
+// non-part / table-level verbatim file by read-modify-rewrite: read the existing bytes at the stable
+// key, rewrite them, then write the appended bytes after them. Pin that behavior here (write Rewrite,
+// then Append, then read back the concatenation), and pin that an Append on a PART file path is still
+// rejected (a part file is a content blob or a whole-rewritten mutable file — append is meaningless).
+TEST_F(ContentAddressedMetaTest, AppendOnTableLevelVerbatimFileRewrites)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_append");
+    auto os = getObjectStorage("cas_append");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-append";
+    // A table-level file (no part component), e.g. the mutation entry mutation_5.txt.
+    const std::string path = "uui/" + uuid + "/mutation_5.txt";
+
+    // The verbatim object lives at the table-file key derived from the path; resolve it the same way
+    // the write path does so the read-back checks the actual on-disk bytes.
+    const std::string key = tableFileKey("", sid, uuid, "mutation_5.txt");
+
+    // Initial create with Rewrite (the mutation entry body).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(path, 4096, DB::WriteMode::Rewrite, {});
+        const std::string body = "commands: x\n";
+        buf->write(body.data(), body.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_EQ(readObject(os, key), "commands: x\n");
+
+    // Append the CSN line (read-modify-rewrite): the existing bytes are carried forward and the new
+    // bytes land after them.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(path, 256, DB::WriteMode::Append, {});
+        const std::string csn = "csn: 7\n";
+        buf->write(csn.data(), csn.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_EQ(readObject(os, key), "commands: x\ncsn: 7\n");
+
+    // The read-modify-rewrite Append is serviced ONLY for a non-part / table-level verbatim file. The
+    // DiskObjectStorageTransaction guard that rejects Append on a part file (a content blob / a
+    // whole-rewritten mutable file — append is meaningless there) keys on isPartFilePath; pin that
+    // classification so the table-level path takes the serviceable branch and a part file does not.
+    EXPECT_FALSE(isPartFilePath(path));                                  // mutation_5.txt -> serviceable append
+    EXPECT_TRUE(isPartFilePath("uui/" + uuid + "/all_1_1_0/data.bin"));  // a part file -> append rejected upstream
+}
+
 // B40 (data-integrity, end-to-end): a part written and committed under a NON-Atomic database path
 // (data/<db>/<table>/<part>/<file>), including the MergeTree tmp_insert_<part> -> final <part> rename,
 // must be readable from the final part dir. Before the part-dir-grammar fallback the part files were

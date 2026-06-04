@@ -256,6 +256,22 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         else
             key = ContentAddressed::diskFileKey(key_prefix, path);
 
+        if (mode == WriteMode::Append)
+        {
+            /// Object storage cannot append; carry the existing bytes forward and rewrite the whole
+            /// object so the caller's appended bytes land after them. The verbatim object is small
+            /// (e.g. mutation_<n>.txt, to which the MVCC commit appends the CSN line in afterCommit) and
+            /// fully readable at its stable key. readSmallObjectIfExists returns nullopt when the object
+            /// does not exist yet (an append that creates the file), in which case there is nothing to
+            /// carry forward.
+            std::optional<std::string> existing = metadata_storage.readSmallObjectIfExists(key);
+            auto out = metadata_storage.object_storage->writeObject(
+                StoredObject(key, path), WriteMode::Rewrite, /*attributes=*/std::nullopt, buf_size, settings);
+            if (existing && !existing->empty())
+                out->write(existing->data(), existing->size());
+            return out;
+        }
+
         return metadata_storage.object_storage->writeObject(StoredObject(key, path), mode, /*attributes=*/std::nullopt, buf_size, settings);
     }
 

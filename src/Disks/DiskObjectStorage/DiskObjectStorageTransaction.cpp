@@ -267,7 +267,13 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
 
     /// NOTE: We check it here and not after writing blob because in case of plain/plain-rewritable metadata storages
     ///       undo of disk tx will actually remove existing data.
-    if (mode == WriteMode::Append && !metadata_storage->supportWritingWithAppend())
+    /// A content-addressed metadata storage reports no native append, but CAN service an append on a
+    /// non-part / table-level VERBATIM file (e.g. the mutation entry mutation_<n>.txt, to which the MVCC
+    /// commit appends the CSN line in afterCommit) by read-modify-rewrite: the file is a verbatim object
+    /// at a stable key and is fully readable, so the existing bytes are carried forward and the new bytes
+    /// written after them (handled in the CA write path below). Append on a CA PART file stays rejected.
+    if (mode == WriteMode::Append && !metadata_storage->supportWritingWithAppend()
+        && !metadata_storage->isContentAddressed())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Disk does not support WriteMode::Append");
 
     /// Gated content-addressed write path. For a content-addressed metadata storage the blob key
@@ -284,6 +290,12 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
             throw Exception(
                 ErrorCodes::LOGICAL_ERROR,
                 "Content-addressed metadata storage did not produce a ContentAddressedTransaction");
+
+        /// Append is serviceable (read-modify-rewrite) only for a non-part / table-level verbatim file.
+        /// A part file is either a content blob (the key is the content hash — append is meaningless) or a
+        /// mutable per-part file (always rewritten whole), so append on a part-file path is unsupported.
+        if (mode == WriteMode::Append && ContentAddressed::isPartFilePath(path))
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Disk does not support WriteMode::Append for content part files");
 
         /// Autocommit cannot work for CONTENT part files: their manifest + ref are published only
         /// when `commit` invokes `metadata_transaction->commit`, which the buffer finalize does not
