@@ -1558,6 +1558,7 @@ def test_object_storage_remote_initiator_aggregation(started_cluster):
             'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
             'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
         GROUP BY bit
+        ORDER BY bit
         SETTINGS
             object_storage_remote_initiator=1,
             object_storage_remote_initiator_cluster='cluster_with_dots_and_user'
