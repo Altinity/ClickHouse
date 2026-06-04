@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tags: no-fasttest, no-replicated-database, no-ordinary-database, no-content-addressed-storage
-# no-content-addressed-storage: transactional OPTIMIZE/mutation runs a background merge whose ONE disk transaction touches multiple parts (merge output + source-part removal-TID locks); the content-addressed transaction is single-part (one (table_uuid, part_name) + one manifest/sidecar), so ContentAddressedTransaction::rememberTarget aborts with a LOGICAL_ERROR and the server aborts on rollback. Needs a multi-part CA disk transaction (B53).
+# no-content-addressed-storage: transactional OPTIMIZE/mutation runs a background merge whose ONE disk transaction touches multiple parts (merge output + source-part removal-TID locks); the content-addressed transaction is single-part (one (table_uuid, part_name) + one manifest/sidecar), so ContentAddressedTransaction::rememberTarget aborts with a LOGICAL_ERROR and the server aborts on rollback. Needs a multi-part CA disk transaction (B67).
 # Looks like server does not listen https port in fasttest
 # FIXME Replicated database executes ALTERs in separate context, so transaction info is lost
 

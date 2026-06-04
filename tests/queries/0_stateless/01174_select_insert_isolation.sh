@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tags: long, no-ordinary-database, no-content-addressed-storage
-# no-content-addressed-storage: concurrent transactional inserts with old_parts_lifetime=0 trigger background merges whose ONE disk transaction touches multiple parts (merge output + source-part removal-TID locks); the content-addressed transaction is single-part (one (table_uuid, part_name) + one manifest/sidecar), so ContentAddressedTransaction::rememberTarget aborts with a LOGICAL_ERROR and the server aborts on rollback. Needs a multi-part CA disk transaction (B53).
+# no-content-addressed-storage: concurrent transactional inserts with old_parts_lifetime=0 trigger background merges whose ONE disk transaction touches multiple parts (merge output + source-part removal-TID locks); the content-addressed transaction is single-part (one (table_uuid, part_name) + one manifest/sidecar), so ContentAddressedTransaction::rememberTarget aborts with a LOGICAL_ERROR and the server aborts on rollback. Needs a multi-part CA disk transaction (B67).
 
 # shellcheck disable=SC2015
 # shellcheck disable=SC2119
