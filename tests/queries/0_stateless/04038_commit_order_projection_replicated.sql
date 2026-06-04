@@ -1,5 +1,4 @@
 -- Tags: no-parallel-replicas
--- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 
 set enable_analyzer = 1;
 set insert_keeper_fault_injection_probability = 0;

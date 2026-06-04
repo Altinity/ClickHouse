@@ -1,5 +1,4 @@
 -- Tags: zookeeper, no-replicated-database, no-parallel, no-object-storage
--- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 
 drop table if exists x;
 

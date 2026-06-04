@@ -1,4 +1,3 @@
--- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 DROP TABLE IF EXISTS weird_projections;
 
 CREATE TABLE weird_projections(

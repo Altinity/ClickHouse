@@ -1,4 +1,3 @@
--- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 CREATE TABLE test (
     `c_id` String,
     `p_id` String,
