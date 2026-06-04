@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-random-settings, no-random-merge-tree-settings, no-shared-merge-tree, no-encrypted-storage
+# Tags: no-fasttest, no-random-settings, no-random-merge-tree-settings, no-shared-merge-tree, no-encrypted-storage, no-content-addressed-storage
+# no-content-addressed-storage: needs s3_plain disk; also hits BACKUP-via-hardlink gate (B16/B34); orthogonal
 # Tag no-fasttest: requires S3
 # Tag no-random-settings, no-random-merge-tree-settings: to avoid creating extra files like serialization.json, this test too exocit anyway
 # Tag no-shared-merge-tree: use database ordinary

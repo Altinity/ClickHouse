@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-fasttest
+# Tags: zookeeper, no-replicated-database, no-fasttest, no-content-addressed-storage
+# no-content-addressed-storage: FORGET PARTITION partition-clone not supported on CA (B21 partition-clone)
 # no-fasttest: Slow wait
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
