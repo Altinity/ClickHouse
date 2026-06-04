@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-shared-merge-tree
+# Tags: zookeeper, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
+# no-content-addressed-storage: manipulates on-disk part files via system.parts.path; CA path is a relative object-storage key, not a local FS path (orthogonal)
 # no-replicated-database because it adds extra replicas
 # no-shared-merge-tree do something with parts on local fs
 # add_minmax_index_for_numeric_columns=0: Adds extra files, which changes the hashes
