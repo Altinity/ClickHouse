@@ -6569,9 +6569,14 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     /// detached parts), `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` (parses to
                     /// `REPLACE_PARTITION`), and `MOVE PARTITION ... TO TABLE`. The pointer-unlink commands
                     /// `DROP PARTITION` / `DETACH PARTITION` / `DROP DETACHED PARTITION` are also fine.
+                    /// `FETCH PARTITION`/`FETCH PART` is also SUPPORTED — it is a `ReplicatedMergeTree` op
+                    /// (now supported on CA), and a `to_detached` fetch takes the byte-fetch path: the
+                    /// downloaded files content-address into the `detached/` namespace (relink-into-detached
+                    /// is deferred, see backlog). `ALTER ... FETCH PART` parses to the same `FETCH_PARTITION`
+                    /// command type (with `part=true`), so this entry covers both.
                     /// STILL GATED (fail closed): `FREEZE`/`UNFREEZE` (the `shadow/` snapshot namespace is
-                    /// not handled on CA — it would silently produce no usable snapshot; B4 frozen-ref-set)
-                    /// and `FETCH PARTITION` (replication, B1). NOTE: `MOVE_PARTITION` also admits cross-disk
+                    /// not handled on CA — it would silently produce no usable snapshot; B4 frozen-ref-set).
+                    /// NOTE: `MOVE_PARTITION` also admits cross-disk
                     /// `MOVE ... TO DISK/VOLUME` (this check cannot distinguish the destination); that uses
                     /// the byte-copy `clonePart` path (NOT the corrupting per-file hardlink), but only
                     /// same-disk `MOVE ... TO TABLE` is verified here — cross-disk is a follow-up to verify.
@@ -6581,6 +6586,7 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                         PartitionCommand::ATTACH_PARTITION,
                         PartitionCommand::REPLACE_PARTITION,
                         PartitionCommand::MOVE_PARTITION,
+                        PartitionCommand::FETCH_PARTITION,
                     };
 
                     if (!std::ranges::contains(supported_commands, command.type))

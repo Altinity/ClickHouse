@@ -515,7 +515,11 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     /// nothing here and is byte-for-byte unchanged.
     /// Gated on `try_zero_copy` so the byte-fetch FALLBACK (which re-requests with try_zero_copy=false)
     /// does NOT re-advertise relink — otherwise a sender that keeps choosing relink would loop.
-    if (try_zero_copy)
+    /// Also gated on `!to_detached`: the relink path (`relinkPartToDisk`) stages at the ACTIVE part path
+    /// and ignores `to_detached`, so a `FETCH PARTITION ... TO detached` must NOT advertise relink —
+    /// not advertising forces the sender to stream bytes, which `downloadPartToDisk` writes into the
+    /// `detached/` namespace. Relink-into-detached is a deferred optimization (see backlog).
+    if (try_zero_copy && !to_detached)
     {
         if (auto * ca_meta = tryGetContentAddressedMetadataStorage(disk))
         {
