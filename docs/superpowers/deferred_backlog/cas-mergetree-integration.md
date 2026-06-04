@@ -529,5 +529,43 @@ are green on `Stateless tests (arm_binary, content_addressed storage, parallel)`
   `03350_alter_table_fetch_partition_thread_pool` (B66a concurrent-FETCH fan-out torn read, local-only,
   known — see B66a).
 
+## CA GC convergence — S1 DONE (2026-06-05) {#ca-gc-convergence-s1}
+
+S1 of the GC convergence spec (`../specs/2026-06-04-ca-gc-convergence-design.md`, §10 stage table,
+§5 end-state, §11 S1 test) is **DONE** (commits `9fb5b1cb7a3`, `3864c7be507`, `891538596e9`,
+`0476946f35d`). S1 is **instrumentation only** — it wires the dormant `InMemoryBlobRefIndex` (the B9
+seam) as an incremental reverse index and *validates* it against the authoritative full-scan, but
+changes **no deletion behaviour**: the `gc_lock` + full `parts/`+`blobs/` scan stay authoritative, and
+the fence lease is unchanged.
+
+- **`InMemoryBlobRefIndex` wired.** Owned per pool by `ContentAddressedMetadataStorage` (alongside
+  `gc_lock`), thread-safe (mutex-guarded `addPart`/`removePart`/`refcount`/`unreferenced`, with the
+  `applied_parts` idempotency guard kept). `commit` (the content-publish branch) calls `addPart`; ref
+  unlink/`drop` calls `removePart`. Index updates are **best-effort and exception-swallowed** — a
+  failure to update the index logs and continues, never blocking the data path (instrumentation must
+  never break commit/drop).
+- **Sweep logs drift, deletes nothing differently.** `runSweepOnce` computes the index's reachable view
+  after the authoritative `markReachableBlobs` and logs the disagreement as `cas_gc_index_drift`
+  (`missing_in_index` / `extra_in_index`) — `to_remove` and every delete decision are unchanged. In a
+  multi-node pool, or a process that started after parts existed, the index is expected to under-count
+  (it only sees this process's commits since startup), so the drift line is **informational**.
+- **gtest proves index ≡ authoritative scan** on a single-node-from-empty pool —
+  `ReverseIndexEqualsAuthoritativeScan` — covering shared-blob dedup (two parts pin the same `H` →
+  refcount 2 → drop one → still reachable → drop both → unreferenced) and idempotent re-add. This is the
+  spec's S1 gate ("the validator must never disagree"). 123 `ContentAddressed*` gtests pass; CA-default
+  smoke green incl. `04279_content_addressed_gc` (the sweep deletes exactly as before).
+- **Transitional.** Per spec §10, the wired in-memory index is transitional instrumentation. Once S2's
+  streaming snapshot+log compaction (`gc/snap` + `gc/log`) becomes the **authoritative candidate
+  source**, the in-memory index downgrades to an optional per-epoch pre-filter hint (or is removed) —
+  consistent with §5's "never materialized" end-state, where the durable authoritative reverse index is
+  always the sorted snapshot + log.
+
+**Plans:** S1 `../plans/2026-06-05-ca-gc-s1-reverse-index.md`;
+S2 `../plans/2026-06-05-ca-gc-s2-log-structured.md`;
+S3 `../plans/2026-06-05-ca-gc-s3-generations-tombstones.md`;
+S4 `../plans/2026-06-05-ca-gc-s4-lockless-handshake.md`.
+S3/S4 change deletion/locking semantics and carry a **data-loss RISK / attended-review** flag in their
+headers — they must not ship until the §5.1 + §6 race oracles are proven.
+
 > Add new deferred items here as they arise during planning/implementation, always filling the
 > "where it plugs in" column so the architecture stays dead-end-free.
