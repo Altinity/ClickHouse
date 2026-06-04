@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tags: replica, no-shared-merge-tree, no-content-addressed-storage
 # Tag no-shared-merge-tree because detaching a partition on one replica should not affect the other replica, so the test relies on the fact that the detached part is still present on disk and can be re-attached.
-# no-content-addressed-storage: DETACH+drop-projection+ATTACH PARTITION loses the orphaned on-disk pp.proj projection directory on CA (CHECK TABLE no longer reports "Found unexpected projection directories: pp.proj"); passes on plain. Real CA bug — B64.
+# no-content-addressed-storage: ATTACH PARTITION on CA breaks the SURVIVING in-metadata projection (loads it with rows=0/empty columns), so CHECK TABLE throws BROKEN_PROJECTION for the surviving projection FIRST, masking the expected "Found unexpected projection directories: pp.proj" line. The orphaned pp.proj IS preserved on CA (manifest carries it; CHECK reports it identically to plain when not masked) — the divergence is the ATTACH-PARTITION-breaks-projection bug (B5/B63 family on the attach-clone path), not a lost orphan. B64.
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
