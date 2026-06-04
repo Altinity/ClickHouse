@@ -1,5 +1,4 @@
--- Tags: no-random-settings, no-content-addressed-storage
--- no-content-addressed-storage: REAL CA BUG (B65): the content_addressed write path adds peak-memory overhead on INSERT so a tight max_memory_usage=150M INSERT hits Code 241 MEMORY_LIMIT_EXCEEDED on CA while it passes on plain
+-- Tags: no-random-settings
 -- Verify that DeduplicationInfo does not store original_block when deduplication is disabled,
 -- which would otherwise roughly double the peak memory during INSERT.
 
