@@ -974,13 +974,30 @@ void ContentAddressedTransaction::moveFile(const std::string & from, const std::
         return;
     }
 
-    auto it = recorded.find(src->file);
-    if (it == recorded.end())
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: moveFile source not recorded: {}", from);
+    if (auto it = recorded.find(src->file); it != recorded.end())
+    {
+        auto entry = it->second;
+        recorded.erase(it);
+        recorded[dst->file] = std::move(entry);
+        return;
+    }
 
-    auto entry = it->second;
-    recorded.erase(it);
-    recorded[dst->file] = std::move(entry);
+    /// Source not staged in THIS transaction: a standalone autocommit rename across one-shot
+    /// transactions (e.g. the MVCC layer's first txn_version.txt write — VersionMetadataOnDisk
+    /// autocommits txn_version.txt.tmp into the part's sidecar, then DiskObjectStorage::replaceFile
+    /// finds no existing txn_version.txt and so calls moveFile(.tmp -> txn_version.txt) as its own
+    /// one-shot). The destination is a mutable per-part file, so resolve the already-committed source
+    /// bytes from the sidecar and re-stage them under the destination, marking the source removed; the
+    /// mutable-only commit branch then publishes the rename to the sidecar. (A content destination
+    /// cannot be renamed standalone — its blob+manifest were never committed without a part target.)
+    if (ContentAddressed::isMutablePerPartFile(dst->file))
+    {
+        recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
+        recorded_mutable_removed.insert(src->file);
+        return;
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: moveFile source not recorded: {}", from);
 }
 
 std::string ContentAddressedTransaction::readStagedOrCommittedBytes(const std::string & path) const
