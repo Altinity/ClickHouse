@@ -184,7 +184,34 @@ Write the implementation plan to `docs/superpowers/plans/2026-06-04-cas-mergetre
 - Stage E (un-gate ~354 ReplicatedMergeTree stateless tests, triage on CA) RUNNING in a background subagent
   (bounded batches, commits per batch). Single-replica Replicated-CA INSERT/SELECT/merge/mutation should pass;
   the fail-closed queue-clone ops + orthogonal/real-bug failures get re-gated with reasons. Awaiting it.
-- DEFERRED for follow-up (documented, not blocking the night): B59 (projection mutation read-your-staged-writes,
-  7 tests); Phase 3.2 (audit/un-gate the Replicated-CA queue-clone REPLACE/MOVE/ATTACH paths); dead-replica
-  stale-ref cleanup; cross-pool relink optimization; Keeper-accelerated refs (B11). A full multi-hour s3-CA
-  stateless run (Stage B) — config + gating proven, no correctness delta found; lower-value than the above.
+- Stage E DONE (9 commits, through `b291c80dae1`): un-gated 350 runnable ReplicatedMergeTree stateless tests,
+  triaged on CA. **310/350 pass un-gated (88.6%)** — single-replica Replicated-CA INSERT/SELECT/merge/mutation
+  broadly works. 40 re-gated: 23 queue-clone (→ Phase 3.2), 5 FREEZE/FETCH (B4/B21), 11 orthogonal
+  (local-FS-path / auxiliary-ZK assumptions = disk-specific, the allowed exception), 1 real bug (B61).
+- Phase 3.2 DONE (`8fcea70ae3d`): audited the Replicated-CA queue-clone paths — they DO route through the
+  whole-part transaction (M9 W2), so the fail-closed gate was over-conservative. Lifted it + fixed a masked
+  autocommit bug (`metadata_version.txt` now written inside the freeze transaction). **21 of 22 re-gated
+  queue-clone tests now pass un-gated** (REPLACE/MOVE/ATTACH PARTITION work on Replicated CA); 1 re-gated as
+  the distinct B62. Replicated tally ≈ **331 passing**.
+- B62 DONE (`6722fb729df`): ATTACH-own-detached-after-RENAME-COLUMN failed on CA — root cause a
+  prefix-vs-basename inconsistency in CA mutable-per-part-file keying (`createHardLink` dropped the
+  `<detached_part>/` prefix; `isMutablePerPartFile` matched whole-string not basename), so the detached
+  part's `metadata_version.txt` was lost and the attach skipped the on-fly RENAME. Fixed CA-gated; `03905`
+  un-gated and passing; 110 gtests + plain rename/attach tests pass (no regression).
+
+## FINAL STATE (night end)
+All 5 stages substantially delivered, committed, and pushed to `filimonov/cas-mergetree-poc`.
+- **Projections on CA**: durable through merge/mutate; ~131 tests un-gated. ONE deferred gap: **B59** (7
+  tests) — mutation/MATERIALIZE that merges multiple temp projection blocks can't read its own in-flight
+  staged temp parts on CA (read-your-staged-writes). Architectural; two fix options documented (in-flight
+  read-overlay vs early standalone sub-commit) — left for a deliberate design pass, not an hour-7 hack.
+- **minio + CA stateless config**: job `Stateless tests (arm_binary, content_addressed s3 storage, parallel)`,
+  gating fixed, per-run pool reset; no correctness delta vs local-CA on the validated families. A full
+  multi-hour s3-CA suite run was not done (lower value — gating + correctness proven on a large sample).
+- **ReplicatedMergeTree on CA**: fetch-by-relink works end-to-end (integration test: fetch moves zero blob
+  bytes); the shared-pool refs ARE the cross-replica reference tracking (no ZK blob-locks); ~331 replicated
+  stateless tests un-gated incl. REPLACE/MOVE/ATTACH PARTITION.
+- **Remaining deferred** (documented in the backlog, each with a fix sketch): B59 (7 projection tests);
+  **B61** (`02486` reattach→TABLE_IS_READ_ONLY recovery path, 1 test); 5 FREEZE/FETCH (B4/B21 — genuinely
+  unsupported features); ~11 orthogonal disk-specific replicated tests (the north-star's allowed exception);
+  dead-replica stale-ref cleanup; cross-pool relink optimization; Keeper-accelerated refs (B11).
