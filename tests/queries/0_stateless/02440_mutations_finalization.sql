@@ -1,4 +1,4 @@
--- Tags: no-shared-merge-tree, no-content-addressed-storage
+-- Tags: no-shared-merge-tree
 -- no-shared-merge-tree -- smt don't assign mutation with stop merges. so last `system sync replica mut` doesn't help.
 -- Actually if we add sleep before last `system sync replica mut` test will pass, but I don't want to rewrite it as a separate test.
 

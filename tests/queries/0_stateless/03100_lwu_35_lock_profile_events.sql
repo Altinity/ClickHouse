@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_lwu_lock_profile_events SYNC;
 
 CREATE TABLE t_lwu_lock_profile_events (id UInt64)

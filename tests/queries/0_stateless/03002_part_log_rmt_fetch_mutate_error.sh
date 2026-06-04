@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-replicated-database, no-shared-merge-tree, no-fasttest, no-content-addressed-storage
+# Tags: no-replicated-database, no-shared-merge-tree, no-fasttest
 # SMT: The merge process is completely different from RMT
 # no-fasttest: Avoid long waits
 

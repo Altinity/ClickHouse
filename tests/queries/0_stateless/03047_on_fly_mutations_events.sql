@@ -1,4 +1,4 @@
--- Tags: no-shared-catalog, no-parallel-replicas, no-content-addressed-storage
+-- Tags: no-shared-catalog, no-parallel-replicas
 -- FIXME no-shared-catalog: STOP MERGES will only stop them on the current replica, the second one will continue to merge
 -- no-parallel-replicas: profile events may differ with parallel replicas.
 

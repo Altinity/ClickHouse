@@ -1,4 +1,4 @@
--- Tags: no-parallel-replicas, no-content-addressed-storage
+-- Tags: no-parallel-replicas
 -- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 
 set enable_analyzer = 1;

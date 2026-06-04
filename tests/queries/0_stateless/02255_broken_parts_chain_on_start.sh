@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, zookeeper, no-shared-merge-tree, no-content-addressed-storage
+# Tags: long, zookeeper, no-shared-merge-tree
 # no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

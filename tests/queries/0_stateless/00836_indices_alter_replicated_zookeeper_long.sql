@@ -1,4 +1,4 @@
--- Tags: long, replica, no-content-addressed-storage
+-- Tags: long, replica
 
 DROP TABLE IF EXISTS minmax_idx;
 DROP TABLE IF EXISTS minmax_idx_r;

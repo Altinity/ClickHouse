@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-parallel, no-content-addressed-storage
+-- Tags: zookeeper, no-parallel
 
 DROP TABLE IF EXISTS test_temporary_table_02989;
 CREATE TEMPORARY TABLE test_temporary_table_02989

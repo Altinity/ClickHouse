@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
+-- Tags: long, zookeeper, no-replicated-database, no-shared-merge-tree
 -- Tag no-replicated-database: Old syntax is not allowed
 -- no-shared-merge-tree: implemented replacement
 

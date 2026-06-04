@@ -1,4 +1,4 @@
--- Tags: no-parallel, no-content-addressed-storage
+-- Tags: no-parallel
 -- Tag no-parallel: creates database
 
 drop database if exists {CLICKHOUSE_DATABASE_1:Identifier} sync;

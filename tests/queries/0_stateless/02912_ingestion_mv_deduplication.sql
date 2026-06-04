@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-content-addressed-storage
+-- Tags: zookeeper
 SET session_timezone = 'UTC';
 SET optimize_on_insert = 1;
 

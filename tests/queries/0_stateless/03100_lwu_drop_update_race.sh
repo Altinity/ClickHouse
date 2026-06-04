@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, no-fasttest, no-sanitize-coverage, no-replicated-database, no-content-addressed-storage
+# Tags: long, no-fasttest, no-sanitize-coverage, no-replicated-database
 
 set -e
 

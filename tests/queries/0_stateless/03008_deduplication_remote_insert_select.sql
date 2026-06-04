@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS src;
 
 CREATE TABLE src (a UInt64, b UInt64)

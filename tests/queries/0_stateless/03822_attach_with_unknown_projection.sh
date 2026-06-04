@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: replica, no-shared-merge-tree, no-content-addressed-storage
+# Tags: replica, no-shared-merge-tree
 # no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 # Tag no-shared-merge-tree because detaching a partition on one replica should not affect the other replica, so the test relies on the fact that the detached part is still present on disk and can be re-attached.
 

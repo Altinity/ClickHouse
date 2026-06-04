@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_table;
 SET allow_statistics = 1;
 SET insert_keeper_fault_injection_probability = 0.0;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-async-insert, no-content-addressed-storage
+# Tags: no-async-insert
 # Tag no-content-addressed-storage: random settings can enable a non-replicated deduplication window,
 # which is gated off on an immutable content_addressed disk (B37), so the deduplicate_dst_table cases
 # diverge from the reference. Same dedup family as B37.

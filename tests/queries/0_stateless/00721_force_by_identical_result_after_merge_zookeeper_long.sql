@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-content-addressed-storage
+-- Tags: long, zookeeper
 
 SET prefer_warmed_unmerged_parts_seconds = 0;
 

@@ -1,4 +1,4 @@
--- Tags: no-parallel, no-content-addressed-storage
+-- Tags: no-parallel
 
 SET parallel_replicas_local_plan = 1;
 

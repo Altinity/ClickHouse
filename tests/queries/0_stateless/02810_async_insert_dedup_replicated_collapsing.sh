@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-content-addressed-storage
+# Tags: no-fasttest
 # no-fasttest: Slow async_insert_busy_timeout_ms
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

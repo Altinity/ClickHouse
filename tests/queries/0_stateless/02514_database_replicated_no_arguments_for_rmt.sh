@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: replica, no-replicated-database, no-content-addressed-storage
+# Tags: replica, no-replicated-database
 # I don't understand why this test fails in ReplicatedDatabase run
 # but too many magic included in it, so I just disabled it for ReplicatedDatabase run becase
 # here we explicitely create it and check is alright.

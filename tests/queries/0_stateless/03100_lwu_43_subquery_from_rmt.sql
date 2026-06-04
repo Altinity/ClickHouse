@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS lightweight_test SYNC;
 DROP TABLE IF EXISTS keys SYNC;
 

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 DROP TABLE IF EXISTS 02691_drop_column_replicated;
 

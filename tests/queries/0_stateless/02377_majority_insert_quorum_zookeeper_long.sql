@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-replicated-database, no-shared-merge-tree, no-async-insert, no-content-addressed-storage
+-- Tags: long, zookeeper, no-replicated-database, no-shared-merge-tree, no-async-insert
 
 -- no-replicated-database:
 --   The number of replicas is doubled, so `SYSTEM STOP FETCHES` stop not enough replicas.

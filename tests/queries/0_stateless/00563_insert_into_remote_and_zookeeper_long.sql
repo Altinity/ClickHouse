@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-content-addressed-storage
+-- Tags: zookeeper
 
 -- Check that settings are correctly passed through Distributed table
 DROP TABLE IF EXISTS simple;

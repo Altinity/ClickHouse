@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-replicated-database, no-shared-merge-tree, no-async-insert, no-content-addressed-storage
+-- Tags: long, zookeeper, no-replicated-database, no-shared-merge-tree, no-async-insert
 -- Tag no-replicated-database: Old syntax is not allowed
 -- no-shared-merge-tree: implemented replacement
 -- Tag no-async-insert: async insert calculate deduplicate block differently, it takes all inserted blocks into account as it is, the order is is matteer here

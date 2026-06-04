@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-replicated-database, no-ordinary-database, no-content-addressed-storage
+-- Tags: zookeeper, no-replicated-database, no-ordinary-database
 -- no-replicated-database: we explicitly run this test by creating a replicated database
 
 DROP DATABASE IF EXISTS {CLICKHOUSE_DATABASE:Identifier};

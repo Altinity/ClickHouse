@@ -1,4 +1,4 @@
--- Tags: no-parallel, no-ordinary-database, no-replicated-database, no-content-addressed-storage
+-- Tags: no-parallel, no-ordinary-database, no-replicated-database
 -- Tag no-parallel: static UUID
 -- Tag no-ordinary-database: requires UUID
 -- Tag no-replicated-database: executes with ON CLUSTER anyway

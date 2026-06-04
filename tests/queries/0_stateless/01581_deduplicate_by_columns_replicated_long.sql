@@ -1,4 +1,4 @@
--- Tags: long, replica, no-content-addressed-storage
+-- Tags: long, replica
 
 --- See also tests/queries/0_stateless/01581_deduplicate_by_columns_local.sql
 

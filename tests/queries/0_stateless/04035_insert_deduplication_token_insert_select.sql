@@ -1,4 +1,4 @@
--- Tags: replica, no-content-addressed-storage
+-- Tags: replica
 
 -- insert_deduplication_token should work for INSERT SELECT without ORDER BY ALL
 

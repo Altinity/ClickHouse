@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS table_3 SYNC;
 
 CREATE TABLE table_3 (uid UUID, date DateTime('Asia/Kamchatka')) ENGINE = ReplicatedMergeTree('/pr_local_plan/{database}/table_3', 'r1') ORDER BY date;

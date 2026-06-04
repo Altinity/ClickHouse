@@ -1,4 +1,4 @@
--- Tags: no-parallel, no-shared-merge-tree, no-content-addressed-storage
+-- Tags: no-parallel, no-shared-merge-tree
 
 DROP TABLE IF EXISTS t_prewarm_cache_rmt_1;
 DROP TABLE IF EXISTS t_prewarm_cache_rmt_2;

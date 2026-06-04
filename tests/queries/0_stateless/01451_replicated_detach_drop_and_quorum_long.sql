@@ -1,4 +1,4 @@
--- Tags: long, replica, no-replicated-database, no-shared-merge-tree, no-async-insert, no-content-addressed-storage
+-- Tags: long, replica, no-replicated-database, no-shared-merge-tree, no-async-insert
 -- no-shared-merge-tree: depends on max_replicated_merges_in_queue
 -- Tag no-async-insert: async inserts with quorum inserts are only have sence with enabled quorum_parallel setting
 

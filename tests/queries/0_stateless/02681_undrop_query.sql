@@ -1,4 +1,4 @@
--- Tags: no-ordinary-database, no-replicated-database, distributed, zookeeper, no-content-addressed-storage
+-- Tags: no-ordinary-database, no-replicated-database, distributed, zookeeper
 
 set database_atomic_wait_for_drop_and_detach_synchronously = 0;
 

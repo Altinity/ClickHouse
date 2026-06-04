@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS ANIMAL SYNC;
 
 CREATE TABLE ANIMAL ( ANIMAL Nullable(String) ) ENGINE = ReplicatedMergeTree('/clickhouse/test/{database}/animal', 'r1') ORDER BY tuple();

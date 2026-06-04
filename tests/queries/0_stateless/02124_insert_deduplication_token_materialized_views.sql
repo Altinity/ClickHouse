@@ -1,4 +1,4 @@
--- Tags: long, no-content-addressed-storage
+-- Tags: long
 
 select 'deduplicate_blocks_in_dependent_materialized_views=0, insert_deduplication_token = no, results: test_mv_a and test_mv_c have all data, test_mv_b has data obly with max_partitions_per_insert_block=0';
 

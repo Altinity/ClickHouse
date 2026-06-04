@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-shared-merge-tree, no-content-addressed-storage
+# Tags: zookeeper, no-shared-merge-tree
 # no-shared-merge-tree: non determenistic is just allowed with shared merge tree
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

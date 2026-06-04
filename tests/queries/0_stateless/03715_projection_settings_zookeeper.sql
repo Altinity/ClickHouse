@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-random-merge-tree-settings, no-replicated-database, no-content-addressed-storage
+-- Tags: long, zookeeper, no-random-merge-tree-settings, no-replicated-database
 -- no-content-addressed-storage: uses ReplicatedMergeTree (B1)
 -- { echo ON }
 

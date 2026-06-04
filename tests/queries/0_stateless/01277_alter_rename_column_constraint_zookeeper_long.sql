@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-content-addressed-storage
+-- Tags: long, zookeeper
 
 DROP TABLE IF EXISTS table_for_rename1;
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: replica, no-debug, no-fasttest, no-shared-merge-tree, no-content-addressed-storage
+# Tags: replica, no-debug, no-fasttest, no-shared-merge-tree
 # no-fasttest: Waiting for failed mutations is slow: https://github.com/ClickHouse/ClickHouse/issues/67936
 # no-shared-merge-tree: kill mutation looks different for shared merge tree, implemented another test
 

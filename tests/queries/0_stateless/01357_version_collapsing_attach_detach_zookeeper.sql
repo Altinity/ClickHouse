@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-random-merge-tree-settings, no-content-addressed-storage
+-- Tags: zookeeper, no-random-merge-tree-settings
 
 DROP TABLE IF EXISTS versioned_collapsing_table;
 

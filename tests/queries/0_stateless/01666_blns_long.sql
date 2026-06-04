@@ -1,4 +1,4 @@
--- Tags: long, no-content-addressed-storage
+-- Tags: long
 
 -- https://github.com/minimaxir/big-list-of-naughty-strings
 

@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
+-- Tags: zookeeper, no-replicated-database, no-shared-merge-tree
 -- Tag no-replicated-database: Unsupported type of ALTER query
 -- Tag no-shared-merge-tree: for smt works
 

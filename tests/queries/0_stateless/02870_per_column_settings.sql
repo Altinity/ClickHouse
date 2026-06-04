@@ -1,4 +1,4 @@
--- Tags: no-random-merge-tree-settings, no-replicated-database, no-content-addressed-storage
+-- Tags: no-random-merge-tree-settings, no-replicated-database
 -- Tag no-replicated-database: Old syntax is not allowed
 -- The test use replicated table to test serialize and deserialize column with settings declaration on zookeeper
 -- Tests column-level settings for MergeTree* tables

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Tags: no-content-addressed-storage
 
 CLICKHOUSE_CLIENT_SERVER_LOGS_LEVEL=error
 

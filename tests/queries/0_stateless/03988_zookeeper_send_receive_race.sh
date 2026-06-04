@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-fasttest, no-content-addressed-storage
+# Tags: zookeeper, no-fasttest
 
 # Regression test for a data race in ZooKeeper client between sendThread and receiveThread.
 #

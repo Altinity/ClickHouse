@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_lwu_bytes_limits;
 
 CREATE TABLE t_lwu_bytes_limits (id UInt64, s String)

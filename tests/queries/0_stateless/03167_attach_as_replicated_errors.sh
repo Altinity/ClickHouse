@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-ordinary-database, no-shared-merge-tree, no-content-addressed-storage
+# Tags: zookeeper, no-replicated-database, no-ordinary-database, no-shared-merge-tree
 
 # Creation of a database with Ordinary engine emits a warning.
 CLICKHOUSE_CLIENT_SERVER_LOGS_LEVEL=fatal

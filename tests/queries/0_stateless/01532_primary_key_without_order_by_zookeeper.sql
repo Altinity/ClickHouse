@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-content-addressed-storage
+-- Tags: zookeeper
 
 DROP TABLE IF EXISTS merge_tree_pk SYNC;
 

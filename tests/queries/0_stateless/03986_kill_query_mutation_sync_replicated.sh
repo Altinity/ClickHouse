@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: replica, zookeeper, no-fasttest, no-sanitizers-lsan, long, no-content-addressed-storage
+# Tags: replica, zookeeper, no-fasttest, no-sanitizers-lsan, long
 # Test that KILL QUERY works for ALTER DELETE with mutations_sync=1 on ReplicatedMergeTree.
 # Ref: https://github.com/ClickHouse/ClickHouse/issues/97535
 

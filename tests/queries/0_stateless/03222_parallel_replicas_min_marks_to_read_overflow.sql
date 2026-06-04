@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test__fuzz_22 SYNC;
 
 CREATE TABLE test__fuzz_22 (k Float32, v String) ENGINE = ReplicatedMergeTree('/clickhouse/03222/{database}/test__fuzz_22', 'r1') ORDER BY k SETTINGS index_granularity = 1;

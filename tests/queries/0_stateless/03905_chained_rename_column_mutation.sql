@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-parallel-replicas, no-content-addressed-storage
+-- Tags: zookeeper, no-parallel-replicas
 
 -- Test for chained RENAME COLUMN mutations applied to a part that was attached
 -- with old column names. When multiple renames like c0->c1->c2->...->cN are applied

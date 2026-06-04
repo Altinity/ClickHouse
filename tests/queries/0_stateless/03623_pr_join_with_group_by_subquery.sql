@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists users sync;
 drop table if exists messages sync;
 

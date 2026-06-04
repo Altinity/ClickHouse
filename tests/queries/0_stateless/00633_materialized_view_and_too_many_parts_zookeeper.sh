@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-content-addressed-storage
+# Tags: zookeeper
 
 set -e
 

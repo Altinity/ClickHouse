@@ -1,4 +1,4 @@
--- Tags: long, replica, no-content-addressed-storage
+-- Tags: long, replica
 
 -- in case of keeper fault injection on insert, set bigger number of retries because partitions
 set insert_keeper_max_retries=100;

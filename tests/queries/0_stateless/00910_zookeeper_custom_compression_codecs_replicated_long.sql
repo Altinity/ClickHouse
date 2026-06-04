@@ -1,4 +1,4 @@
--- Tags: long, replica, no-content-addressed-storage
+-- Tags: long, replica
 
 SET send_logs_level = 'fatal';
 SET allow_suspicious_codecs = 1;

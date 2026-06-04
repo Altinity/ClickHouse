@@ -1,4 +1,4 @@
--- Tags: long, replica, no-replicated-database, no-parallel, no-object-storage, no-content-addressed-storage
+-- Tags: long, replica, no-replicated-database, no-parallel, no-object-storage
 -- Tag no-replicated-database: Fails due to additional replicas or shards
 -- Tag no-parallel: static zk path
 

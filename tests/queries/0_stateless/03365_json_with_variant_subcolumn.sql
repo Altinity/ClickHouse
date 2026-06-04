@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 SET allow_experimental_variant_type = 1;
 SET enable_json_type = 1;
 

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS partitioned_table;
 DROP TABLE IF EXISTS mv_table;
 

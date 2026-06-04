@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_lwu_merges SYNC;
 SET enable_lightweight_update = 1;
 

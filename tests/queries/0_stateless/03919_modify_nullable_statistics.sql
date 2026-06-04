@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists t_stat_nullable_1 sync;
 drop table if exists t_stat_nullable_2 sync;
 SET materialize_statistics_on_insert = 1;

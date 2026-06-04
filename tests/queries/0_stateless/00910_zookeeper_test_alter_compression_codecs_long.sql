@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-content-addressed-storage
+-- Tags: long, zookeeper
 
 SET send_logs_level = 'fatal';
 SET replication_alter_partitions_sync = 2;

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 set optimize_on_insert = 0;
 
 drop table if exists tab_00577;

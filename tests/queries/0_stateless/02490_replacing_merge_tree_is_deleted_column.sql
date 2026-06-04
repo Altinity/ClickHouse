@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-content-addressed-storage
+-- Tags: zookeeper
 
 -- Settings allow_deprecated_syntax_for_merge_tree prevent to enable the is_deleted column
 set allow_deprecated_syntax_for_merge_tree=0;

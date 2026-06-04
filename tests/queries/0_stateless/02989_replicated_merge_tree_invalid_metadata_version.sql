@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-content-addressed-storage
+-- Tags: zookeeper
 
 DROP TABLE IF EXISTS test_table_replicated;
 CREATE TABLE test_table_replicated

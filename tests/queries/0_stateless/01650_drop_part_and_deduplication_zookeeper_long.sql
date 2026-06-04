@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-replicated-database, no-async-insert, no-content-addressed-storage
+-- Tags: long, zookeeper, no-replicated-database, no-async-insert
 -- Tag no-replicated-database: Fails due to additional replicas or shards
 -- Tag no-async-insert: Async insert calculate block_id differently, it takes all inserted data into account
 

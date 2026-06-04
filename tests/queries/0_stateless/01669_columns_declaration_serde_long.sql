@@ -1,4 +1,4 @@
--- Tags: long, no-content-addressed-storage
+-- Tags: long
 
 CREATE TEMPORARY TABLE test ("\\" String DEFAULT '\r\n\t\\' || '
 ');

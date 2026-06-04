@@ -1,4 +1,4 @@
--- Tags: no-shared-merge-tree, no-content-addressed-storage
+-- Tags: no-shared-merge-tree
 -- Tag no-shared-merge-tree - in SMT this works differently
 
 -- Test for MergeTreeData::checkDropCommandDoesntAffectInProgressMutations() basically

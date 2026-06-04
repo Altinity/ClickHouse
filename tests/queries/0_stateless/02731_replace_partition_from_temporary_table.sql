@@ -1,4 +1,4 @@
--- Tags: no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
+-- Tags: no-replicated-database, no-shared-merge-tree
 -- SharedMergeTree doesn't support replace partition from MergeTree engine
 
 DROP TEMPORARY TABLE IF EXISTS src;

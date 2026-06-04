@@ -1,4 +1,4 @@
--- Tags: replica, no-content-addressed-storage
+-- Tags: replica
 
 DROP TABLE IF EXISTS keeper_retries_r1 SYNC;
 DROP TABLE IF EXISTS keeper_retries_r2 SYNC;

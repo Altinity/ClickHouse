@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-content-addressed-storage
+-- Tags: no-fasttest
 
 DROP TABLE IF EXISTS partslost_0;
 DROP TABLE IF EXISTS partslost_1;

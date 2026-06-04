@@ -1,4 +1,4 @@
--- Tags: no-tsan, no-asan, no-msan, no-ubsan, no-debug, no-parallel, no-fasttest, no-content-addressed-storage
+-- Tags: no-tsan, no-asan, no-msan, no-ubsan, no-debug, no-parallel, no-fasttest
 -- `OPTIMIZE` can be slow under parallel load, causing flaky timeouts.
 
 DROP TABLE IF EXISTS t_patch_join_cache;

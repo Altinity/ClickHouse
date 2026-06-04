@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- If filtering is not done correctly on databases, then this query report to read 3 rows, which are: `system.tables`, `information_schema.tables` and `INFORMATION_SCHEMA.tables`
 SELECT database, table FROM system.tables WHERE database = 'information_schema' AND table = 'tables';
 

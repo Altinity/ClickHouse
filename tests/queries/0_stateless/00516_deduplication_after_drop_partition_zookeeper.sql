@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-content-addressed-storage
+-- Tags: zookeeper
 
 DROP TABLE IF EXISTS deduplication_by_partition;
 CREATE TABLE deduplication_by_partition(d Date, x UInt32) ENGINE =

@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-parallel, no-shared-merge-tree, no-content-addressed-storage
+-- Tags: zookeeper, no-parallel, no-shared-merge-tree
 
 # no-shared-merge-tree: quorum logic is specifit to replicated tables
 

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_table SYNC;
 CREATE TABLE test_table
 (

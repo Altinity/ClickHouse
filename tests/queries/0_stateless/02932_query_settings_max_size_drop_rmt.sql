@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_max_size_drop SYNC;
 SET insert_keeper_fault_injection_probability = 0.0;
 

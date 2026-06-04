@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
+# Tags: zookeeper, no-replicated-database, no-shared-merge-tree
 # no-replicated-database because it adds extra replicas
 # no-shared-merge-tree do something with parts on local fs
 # add_minmax_index_for_numeric_columns=0: Adds extra files, which changes the hashes

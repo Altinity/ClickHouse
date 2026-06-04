@@ -1,4 +1,4 @@
--- Tags: no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
+-- Tags: no-replicated-database, no-shared-merge-tree
 -- Tag no-replicated-database: different number of replicas
 -- Tag no-shared-merge-tree: sync replica lightweight by default
 
