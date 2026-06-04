@@ -138,6 +138,14 @@ public:
 
     /// Truncate file to the target size.
     virtual void truncateFile(const std::string & src_path, size_t size) = 0;
+
+    /// In-flight read-your-writes for a part being assembled by THIS transaction (B59). Forwarded to the
+    /// metadata transaction by object-storage disk transactions; default (e.g. local disk) is no in-flight
+    /// visibility, so a reader falls through to the committed path.
+    virtual std::optional<StoredObjects> tryGetInFlightStorageObjects(const std::string & /*path*/) const { return {}; }
+    virtual std::unique_ptr<ReadBufferFromFileBase> tryReadFileInFlight(
+        const std::string & /*path*/, const ReadSettings & /*settings*/, std::optional<size_t> /*read_hint*/) const { return nullptr; }
+    virtual std::optional<uint64_t> tryGetInFlightFileSize(const std::string & /*path*/) const { return {}; }
 };
 
 using DiskTransactionPtr = std::shared_ptr<IDiskTransaction>;

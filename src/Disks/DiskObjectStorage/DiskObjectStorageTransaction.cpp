@@ -444,6 +444,22 @@ void DiskObjectStorageTransaction::createHardLink(const std::string & src_path, 
     });
 }
 
+std::optional<StoredObjects> DiskObjectStorageTransaction::tryGetInFlightStorageObjects(const std::string & path) const
+{
+    return metadata_transaction->tryGetInFlightStorageObjects(path);
+}
+
+std::unique_ptr<ReadBufferFromFileBase> DiskObjectStorageTransaction::tryReadFileInFlight(
+    const std::string & path, const ReadSettings & settings, std::optional<size_t> read_hint) const
+{
+    return metadata_transaction->tryReadFileInFlight(path, settings, read_hint);
+}
+
+std::optional<uint64_t> DiskObjectStorageTransaction::tryGetInFlightFileSize(const std::string & path) const
+{
+    return metadata_transaction->tryGetInFlightFileSize(path);
+}
+
 void DiskObjectStorageTransaction::setReadOnly(const std::string & path)
 {
     operations_to_execute.push_back([path](MetadataTransactionPtr tx)

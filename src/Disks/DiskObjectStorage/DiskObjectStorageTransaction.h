@@ -98,6 +98,13 @@ public:
     void setReadOnly(const std::string & path) override;
     void createHardLink(const std::string & src_path, const std::string & dst_path) override;
 
+    /// B59 in-flight read-your-writes: forward to the metadata transaction (e.g. a CA part-build
+    /// transaction resolving its own staged-but-uncommitted files).
+    std::optional<StoredObjects> tryGetInFlightStorageObjects(const std::string & path) const override;
+    std::unique_ptr<ReadBufferFromFileBase> tryReadFileInFlight(
+        const std::string & path, const ReadSettings & settings, std::optional<size_t> read_hint) const override;
+    std::optional<uint64_t> tryGetInFlightFileSize(const std::string & path) const override;
+
 private:
     std::unique_ptr<WriteBufferFromFileBase> writeFileImpl( /// NOLINT
         bool autocommit,
