@@ -170,6 +170,16 @@ public:
     ObjectStorageKey generateObjectKeyForPath(const std::string & path) override;
     StoredObjects getSubmittedForRemovalBlobs() override;
 
+    // B59 in-flight read-your-writes: resolve a part file this transaction has STAGED (uploaded blob in
+    // `recorded`, or inline mutable bytes in `recorded_mutable`) but not yet committed. Used by
+    // DataPartStorageOnDiskFull when a projection spill-and-merge reads back its own temp blocks before
+    // the parent part's single commit. A file this transaction never staged resolves to nullopt/nullptr,
+    // so the caller falls through to the committed metadata path (fail-close preserved).
+    std::optional<StoredObjects> tryGetInFlightStorageObjects(const std::string & path) const override;
+    std::unique_ptr<ReadBufferFromFileBase> tryReadFileInFlight(
+        const std::string & path, const ReadSettings & settings, std::optional<size_t> read_hint) const override;
+    std::optional<uint64_t> tryGetInFlightFileSize(const std::string & path) const override;
+
     void createMetadataFile(const std::string & path, const StoredObjects & objects) override;
 
     // Open a write buffer for a file.

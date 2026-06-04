@@ -10,6 +10,7 @@
 #include <Common/ObjectStorageKey.h>
 #include <Common/getRandomASCIIString.h>
 #include <IO/ReadBufferFromFile.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadSettings.h>
 #include <IO/copyData.h>
 
@@ -186,6 +187,48 @@ void ContentAddressedTransaction::recordBlob(const std::string & path, ContentAd
     auto p = ContentAddressed::parsePartFilePath(path);
     chassert(p && !p->file.empty());
     recorded[p->file] = std::move(entry);
+}
+
+std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageObjects(const std::string & path) const
+{
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (!p || p->file.empty())
+        return {};
+    /// A content file: its blob is already uploaded (recorded under the in-part file name). Mirror the
+    /// committed getStorageObjects resolve: project the BARE BlobHash to the full blob object key.
+    if (auto it = recorded.find(p->file); it != recorded.end())
+        return StoredObjects{StoredObject(ContentAddressed::blobKey(key_prefix, it->second.key).string(), path, it->second.size)};
+    /// Mutable per-part files are staged inline (recorded_mutable), not as a blob object — they have no
+    /// StoredObject; readers must use tryReadFileInFlight for them. Return nullopt here.
+    return {};
+}
+
+std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFileInFlight(
+    const std::string & path, const ReadSettings & settings, std::optional<size_t> read_hint) const
+{
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (!p || p->file.empty())
+        return nullptr;
+    if (auto it = recorded.find(p->file); it != recorded.end())
+    {
+        StoredObject obj(ContentAddressed::blobKey(key_prefix, it->second.key).string(), path, it->second.size);
+        return metadata_storage.object_storage->readObject(obj, settings, read_hint);
+    }
+    if (auto it = recorded_mutable.find(p->file); it != recorded_mutable.end())
+        return std::make_unique<ReadBufferFromOwnMemoryFile>(path, it->second); // inline staged bytes
+    return nullptr;
+}
+
+std::optional<uint64_t> ContentAddressedTransaction::tryGetInFlightFileSize(const std::string & path) const
+{
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (!p || p->file.empty())
+        return {};
+    if (auto it = recorded.find(p->file); it != recorded.end())
+        return it->second.size;
+    if (auto it = recorded_mutable.find(p->file); it != recorded_mutable.end())
+        return static_cast<uint64_t>(it->second.size());
+    return {};
 }
 
 std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(

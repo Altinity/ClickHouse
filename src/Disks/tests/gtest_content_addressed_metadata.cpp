@@ -3703,3 +3703,38 @@ TEST_F(ContentAddressedMetaTest, RelinkMissingBlobPublishesNoRef)
     os->shutdown();
     fs::remove_all("./" + p);
 }
+
+// B59: a CA part-build transaction can read a part file it staged but has NOT committed (read-your-writes).
+// The blob is uploaded as soon as the write buffer finalizes; only the ref/manifest commit is deferred.
+TEST_F(ContentAddressedMetaTest, InFlightReadYourWritesBeforeCommit)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_inflight");
+    const std::string uuid = "uuid-inflight";
+    const std::string part = "all_1_1_0";
+    const std::string col = "uui/" + uuid + "/" + part + "/data.bin";
+    const std::string bytes = "INFLIGHT-COLUMN-BYTES";
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    {
+        auto buf = tx.writeFile(col, 4096, DB::WriteMode::Rewrite, {});
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    // NOT committed yet: the committed read path can't see it.
+    EXPECT_FALSE(ms->existsFile(col));
+    // But the transaction resolves its own staged file.
+    auto objs = tx.tryGetInFlightStorageObjects(col);
+    ASSERT_TRUE(objs.has_value());
+    ASSERT_EQ(objs->size(), 1u);
+    EXPECT_EQ((*objs)[0].remote_path.rfind("blobs/", 0), 0u); // a content-addressed blob key
+    EXPECT_EQ(tx.tryGetInFlightFileSize(col), std::optional<uint64_t>(bytes.size()));
+    auto rb = tx.tryReadFileInFlight(col, DB::getReadSettings(), std::nullopt);
+    ASSERT_NE(rb, nullptr);
+    String got; DB::readStringUntilEOF(got, *rb);
+    EXPECT_EQ(got, bytes);
+    // A file this transaction never wrote → nullopt.
+    EXPECT_FALSE(tx.tryGetInFlightStorageObjects("uui/" + uuid + "/" + part + "/absent.bin").has_value());
+    tx.commit(DB::NoCommitOptions{});
+    EXPECT_TRUE(ms->existsFile(col)); // now committed
+}
