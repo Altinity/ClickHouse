@@ -50,6 +50,7 @@ public:
         std::string server_id_,
         std::shared_ptr<std::mutex> gc_lock_,
         std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_,
+        std::shared_ptr<ContentAddressed::InMemoryBlobRefIndex> blob_ref_index_,
         LoggerPtr log_);
 
     /// Background deletion is OPT-IN. startup activates and schedules the recurring sweep ONLY when

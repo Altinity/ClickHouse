@@ -16,6 +16,7 @@
 #include <IO/WriteHelpers.h>
 
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
 
 #include <set>
 #include <vector>
@@ -271,17 +272,29 @@ std::set<BlobHash> InMemoryBlobRefIndex::unreferenced() const
     return result;
 }
 
+std::set<BlobHash> InMemoryBlobRefIndex::referenced() const
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    std::set<BlobHash> result;
+    for (const auto & item : counts)
+        if (item.second > 0)
+            result.insert(item.first);
+    return result;
+}
+
 /// ==== Sweep driver ====
 
 ContentAddressedGC::ContentAddressedGC(
     ObjectStoragePtr object_storage_,
     std::string key_prefix_,
     std::shared_ptr<std::mutex> gc_lock_,
-    std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_)
+    std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_,
+    std::shared_ptr<InMemoryBlobRefIndex> blob_ref_index_)
     : object_storage(std::move(object_storage_))
     , key_prefix(std::move(key_prefix_))
     , gc_lock(gc_lock_ ? std::move(gc_lock_) : std::make_shared<std::mutex>())
     , in_flight_pinned_blobs(std::move(in_flight_pinned_blobs_))
+    , blob_ref_index(std::move(blob_ref_index_))
 {
 }
 
@@ -346,6 +359,47 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
     };
 
     const Reachability snapshot = compute_reachability();
+
+    /// CA GC S1 (B9): VALIDATE the incremental reverse index against this authoritative reachable-blob
+    /// snapshot and LOG any disagreement. This is INSTRUMENTATION ONLY — `to_remove`, the deletion
+    /// decision and `gc_lock` are untouched below; the full scan above stays the sole authority. The
+    /// index view is the set of FULL blob object keys whose per-process refcount is positive, built with
+    /// the SAME `blobKey(key_prefix, H)` fan-out the scan uses so the two are directly comparable (a
+    /// bare-hash-vs-object-key mismatch — the historical data-loss bug class — cannot arise here).
+    ///
+    /// EXPECTED drift, never an error: the index is PER-PROCESS (it sees only blob pins this process
+    /// committed/dropped since startup), so in a multi-node pool or a process that started after parts
+    /// existed it UNDER-counts vs the bucket-wide scan (`missing_in_index`). It also deliberately omits
+    /// the FREEZE/shadow refs, the shared "detached" ref, and any detached refs — those pin blobs but
+    /// are out of S1 scope (see commitOnePart) — another expected source of under-count. `extra_in_index`
+    /// (a blob the index still pins but the scan no longer reaches) reflects a removePart this process
+    /// missed; the scan is authoritative and reclaims it. The gtest validates EXACT agreement only in the
+    /// controlled single-node-from-empty case (the spec's S1 gate: "the validator must never disagree").
+    if (blob_ref_index)
+    {
+        std::set<BlobObjectKey> index_reachable;
+        for (const auto & bare_hash : blob_ref_index->referenced())
+            index_reachable.insert(blobKey(key_prefix, bare_hash));
+
+        size_t missing_in_index = 0; /// reachable by the scan but not pinned by the index (under-count)
+        for (const auto & key : snapshot.reachable_blobs)
+            if (!index_reachable.contains(key))
+                ++missing_in_index;
+
+        size_t extra_in_index = 0; /// pinned by the index but not reachable by the scan (over-count)
+        for (const auto & key : index_reachable)
+            if (!snapshot.reachable_blobs.contains(key))
+                ++extra_in_index;
+
+        if (missing_in_index != 0 || extra_in_index != 0)
+            LOG_INFO(
+                getLogger("ContentAddressedGC"),
+                "cas_gc_index_drift{{missing_in_index={}, extra_in_index={}}} (informational: the per-process "
+                "reverse index disagrees with the authoritative full scan; the scan drives deletion, the index "
+                "is observational — see CA GC S1)",
+                missing_in_index,
+                extra_in_index);
+    }
 
     /// The full unreferenced object-key set: every manifest not backing a live part, plus every blob
     /// not reachable from a live manifest or a live session. Sweep scope is strictly parts/ and blobs/.

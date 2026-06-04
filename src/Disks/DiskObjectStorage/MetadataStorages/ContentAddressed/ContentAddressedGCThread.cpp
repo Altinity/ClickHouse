@@ -44,13 +44,14 @@ ContentAddressedGCThread::ContentAddressedGCThread(
     std::string server_id_,
     std::shared_ptr<std::mutex> gc_lock_,
     std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_,
+    std::shared_ptr<ContentAddressed::InMemoryBlobRefIndex> blob_ref_index_,
     LoggerPtr log_)
     : disk_name(std::move(disk_name_))
     , log(std::move(log_))
     , object_storage(object_storage_)
     , key_prefix(key_prefix_)
     , server_id(std::move(server_id_))
-    , gc(object_storage_, key_prefix_, std::move(gc_lock_), std::move(in_flight_pinned_blobs_))
+    , gc(object_storage_, key_prefix_, std::move(gc_lock_), std::move(in_flight_pinned_blobs_), std::move(blob_ref_index_))
     , interval_sec(DEFAULT_GC_INTERVAL_SEC)
     , grace_sec(DEFAULT_GC_GRACE_SEC)
 {

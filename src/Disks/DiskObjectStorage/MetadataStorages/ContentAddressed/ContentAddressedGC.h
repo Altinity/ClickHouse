@@ -131,6 +131,11 @@ public:
     int64_t refcount(const BlobHash & blob_hash) const override;
     std::set<BlobHash> unreferenced() const override;
 
+    /// The set of bare blob hashes the index currently PINS (refcount > 0). The complement of
+    /// `unreferenced` over the tracked hashes; used by the sweep's drift validator (CA GC S1) to build
+    /// the index's reachable view in the same key space as the authoritative scan.
+    std::set<BlobHash> referenced() const;
+
 private:
     /// Commits (and drops) run concurrently across threads, so every mutator and observer locks `mtx`.
     /// The `applied_parts` idempotency guard makes add/remove safe to retry within the held lock.
@@ -171,11 +176,16 @@ public:
     /// key as reachable so a blob a dedup-skipping insert decided to reuse (and so did NOT re-upload)
     /// cannot be deleted in the window between that skip and the ref publish. May be null (legacy direct
     /// construction / tests that drive no concurrent inserts): then nothing is pinned.
+    /// `blob_ref_index_` is the per-pool incremental reverse index (B9 / CA GC S1), shared by reference
+    /// with the commit/drop path. The sweep VALIDATES it against the authoritative full-scan and LOGS
+    /// drift — it never gates a deletion on it (the scan stays authoritative). May be null (legacy direct
+    /// construction / unit tests that build their own index): then the drift validator is skipped.
     ContentAddressedGC(
         ObjectStoragePtr object_storage_,
         std::string key_prefix_,
         std::shared_ptr<std::mutex> gc_lock_ = nullptr,
-        std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_ = nullptr);
+        std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_ = nullptr,
+        std::shared_ptr<InMemoryBlobRefIndex> blob_ref_index_ = nullptr);
 
     /// Run one sweep. Deletes nothing if any step before the removal throws (fail-close): a missing
     /// manifest for a live ref (B18), or any list/read error, aborts the sweep with the pool intact.
@@ -203,6 +213,9 @@ private:
     /// Per-pool in-flight blob pins (B52), read under gc_lock; pinned keys are excluded from sweep.
     /// Null when the GC was built without a metadata storage (no concurrent inserts to protect).
     const std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs;
+    /// Per-pool incremental reverse index (B9 / CA GC S1), validated against the authoritative scan and
+    /// logged for drift only — NEVER gating a deletion. Null when no index was supplied (drift skipped).
+    const std::shared_ptr<InMemoryBlobRefIndex> blob_ref_index;
     std::unordered_map<std::string, int64_t> first_unreachable;
 };
 
