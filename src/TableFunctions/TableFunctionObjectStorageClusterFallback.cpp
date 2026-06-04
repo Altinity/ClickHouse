@@ -117,7 +117,10 @@ void TableFunctionObjectStorageClusterFallback<Definition, Base>::parseArguments
     const auto & settings = context->getSettingsRef();
 
     is_cluster_function = !settings[Setting::object_storage_cluster].value.empty() && typename Base::Configuration().isClusterSupported();
-    is_remote = settings[Setting::object_storage_remote_initiator];
+    // Remote initiator requires 'object_storage_cluster' or 'object_storage_remote_initiator_cluster'
+    is_remote = settings[Setting::object_storage_remote_initiator]
+        && (!settings[Setting::object_storage_cluster].value.empty()
+            || !settings[Setting::object_storage_remote_initiator_cluster].value.empty());
 
     if (is_cluster_function)
     {

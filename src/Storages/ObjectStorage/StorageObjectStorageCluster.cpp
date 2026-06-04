@@ -36,6 +36,8 @@ namespace Setting
     extern const SettingsObjectStorageGranularityLevel cluster_table_function_split_granularity;
     extern const SettingsBool parallel_replicas_for_cluster_engines;
     extern const SettingsString object_storage_cluster;
+    extern const SettingsBool object_storage_remote_initiator;
+    extern const SettingsString object_storage_remote_initiator_cluster;
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
@@ -720,7 +722,9 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr & storage_snapshot, SelectQueryInfo & query_info) const
 {
     /// Full query if fall back to pure storage.
-    if (getClusterName(context).empty())
+    if (getClusterName(context).empty()  // Not cluster request
+        && !(context->getSettingsRef()[Setting::object_storage_remote_initiator]  // Not request with remote initiator
+            && !context->getSettingsRef()[Setting::object_storage_remote_initiator_cluster].value.empty()))
         return QueryProcessingStage::Enum::FetchColumns;
 
     /// Distributed storage.
