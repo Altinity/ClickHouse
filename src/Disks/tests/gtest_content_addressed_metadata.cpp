@@ -1225,6 +1225,102 @@ TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
     EXPECT_EQ(readObject(os, blob_shared), "SHARED"); // blob content intact, reclaimable by GC
 }
 
+// CA GC S1 (B9): the incremental reverse index (InMemoryBlobRefIndex), wired on the commit/drop path,
+// must EXACTLY agree with the authoritative full-scan reachable-blob set on a single-node-from-empty
+// pool — the spec's S1 gate ("the validator must never disagree"). This drives the real transaction
+// commit/drop path (so the index is updated through the production seams), and after EACH operation
+// asserts that the index's reachable view ({ blobKey(prefix, H) : refcount(H) > 0 }) equals
+// markReachableBlobs(prefix, listLivePartIds(...)). Covers shared-blob dedup (two parts pin the same
+// blob -> refcount 2 -> drop one -> still reachable -> drop both -> unreferenced) and idempotent re-add.
+TEST_F(ContentAddressedMetaTest, ReverseIndexEqualsAuthoritativeScan)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_revidx");
+    auto os = getObjectStorage("cas_revidx");
+    const std::string uuid = "uuid-revidx";
+
+    auto write_part = [&](const std::string & part, const std::map<std::string, std::string> & files)
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    auto drop_part = [&](const std::string & part)
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeRecursive("uui/" + uuid + "/" + part, /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    /// The authoritative reachable-blob set (full scan): resolve every live ref to its manifest by
+    /// reading the parts/<part_id> object directly (the same key the sweep's resolver reads), then
+    /// project to full blob object keys via blobKey — using only public surfaces (no friend access).
+    PartManifestResolver resolve = [&](const PartId & pid) -> PartManifest
+    { return PartManifest::deserialize(readObject(os, partKey("", pid).string())); };
+    auto authoritative = [&]() -> std::set<BlobObjectKey>
+    { return markReachableBlobs("", listLivePartIds(os, ""), resolve); };
+
+    /// Resolve a live part's manifest through its published ref payload (the read path's resolution),
+    /// again with only public surfaces, so the test can read a specific blob's hash.
+    auto manifest_of = [&](const std::string & part) -> PartManifest
+    {
+        const PartId pid = partIdFromRefPayload(readObject(os, refKey("", ms->serverIdForTest(), uuid, part).string()));
+        return resolve(pid);
+    };
+
+    /// The index's reachable view: every bare hash with a positive per-process refcount, projected to a
+    /// full blob object key with the SAME blobKey fan-out, so the two sets are directly comparable.
+    auto from_index = [&]() -> std::set<BlobObjectKey>
+    {
+        std::set<BlobObjectKey> r;
+        for (const auto & h : ms->blobRefIndex()->referenced())
+            r.insert(blobKey("", h));
+        return r;
+    };
+
+    /// Empty pool: nothing reachable, nothing in the index.
+    EXPECT_EQ(from_index(), authoritative());
+    EXPECT_TRUE(authoritative().empty());
+
+    /// Two parts SHARING one blob ("SHARED"): after both commits, the shared blob is pinned twice
+    /// (refcount 2) while the index's reachable set still equals the scan (a blob is reachable iff
+    /// refcount > 0, regardless of the count).
+    write_part("all_1_1_0", {{"a.bin", "AAA"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
+    EXPECT_EQ(from_index(), authoritative());
+    write_part("all_2_2_0", {{"a.bin", "ZZZ"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
+    EXPECT_EQ(from_index(), authoritative());
+
+    /// The shared blob's refcount is exactly 2 (pinned by both parts).
+    const PartManifest m1 = manifest_of("all_1_1_0");
+    const BlobHash shared_hash = m1.blobs.at("b.bin").key;
+    EXPECT_EQ(ms->blobRefIndex()->refcount(shared_hash), 2);
+
+    /// Idempotent re-add: re-committing the SAME part (same content -> same part_id) must not double
+    /// count (applied_parts guard) and must keep index == scan.
+    write_part("all_1_1_0", {{"a.bin", "AAA"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
+    EXPECT_EQ(ms->blobRefIndex()->refcount(shared_hash), 2);
+    EXPECT_EQ(from_index(), authoritative());
+
+    /// Drop ONE of the two sharers: the shared blob is STILL reachable (refcount drops 2 -> 1) and the
+    /// dropped part's private blob ("AAA") becomes unreferenced — index and scan agree on both.
+    drop_part("all_1_1_0");
+    EXPECT_EQ(ms->blobRefIndex()->refcount(shared_hash), 1);
+    EXPECT_EQ(from_index(), authoritative());
+
+    /// Drop the LAST sharer: the shared blob is now unreferenced (refcount 0) and the index's reachable
+    /// set is empty, exactly matching the now-empty authoritative scan.
+    drop_part("all_2_2_0");
+    EXPECT_EQ(ms->blobRefIndex()->refcount(shared_hash), 0);
+    EXPECT_EQ(from_index(), authoritative());
+    EXPECT_TRUE(from_index().empty());
+}
+
 // B45: the MergeTree FAST removal path (DataPartStorageOnDiskBase::clearDirectory, used for a
 // complete part) unlinks the part's files one by one and then calls disk->removeDirectory(<part>) —
 // it never calls removeRecursive on the part directory. For a content-addressed disk the per-file
@@ -2034,6 +2130,7 @@ TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
         ms->serverIdForTest(),
         std::make_shared<std::mutex>(),
         std::make_shared<const std::set<std::string>>(),
+        /*blob_ref_index_=*/nullptr, /// hand-seeded pool (no transaction) -> drift validator skipped
         getLogger("ContentAddressedGCThreadTest"));
 
     /// grace 0 so a single round past first-unreachable reclaims orphans immediately.
