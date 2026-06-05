@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Tags: no-content-addressed-storage
-# no-content-addressed-storage: BACKUP/RESTORE part-file write is not supported on a content_addressed disk so query_log/privilege rows diverge (BACKUP/RESTORE, B16/B34)
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

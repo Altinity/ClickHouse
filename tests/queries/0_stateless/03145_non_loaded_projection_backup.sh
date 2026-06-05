@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Tags: no-content-addressed-storage
-# no-content-addressed-storage: RESTORE writes part files via autocommit which is not supported on a content_addressed disk (Code 48 NOT_IMPLEMENTED; BACKUP/RESTORE, B16/B34)
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

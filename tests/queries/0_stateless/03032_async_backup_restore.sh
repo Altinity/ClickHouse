@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Tags: no-content-addressed-storage
-# no-content-addressed-storage: async RESTORE writes part files via autocommit which is not supported on a content_addressed disk (RESTORE_FAILED, Code 48 NOT_IMPLEMENTED; BACKUP/RESTORE, B16/B34)
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
