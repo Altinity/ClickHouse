@@ -133,12 +133,17 @@ void GcLogWriter::flushBufferLocked(ShardId shard, uint64_t epoch, Buffer & buff
     const GcLogObjectKey object_key = gcLogEventKey(key_prefix, epoch, shard, object_event_id);
     const std::string bytes = batch.serialize();
 
+    /// Clear the buffer BEFORE the (throwing) write: batch.deltas already MOVED every fragment's delta out,
+    /// so buffer.fragments now holds moved-from zombies. If the write throws, leaving them in place would
+    /// have the next flush serialize junk gc/log entries. The data we are about to write is captured in
+    /// `bytes`; on a throw the caller's #2 fail-closed path re-logs from the durable failed-delta record.
+    buffer.fragments.clear();
+
     auto out = object_storage->writeObject(StoredObject(object_key.string()), WriteMode::Rewrite);
     out->write(bytes.data(), bytes.size());
     out->finalize();
 
     last_batch_size.store(batch.deltas.size(), std::memory_order_relaxed);
-    buffer.fragments.clear();
 }
 
 uint64_t GcLogWriter::reappendIfAdvancedLocked(ShardId shard, uint64_t written_epoch, const std::vector<Fragment> & retained)
