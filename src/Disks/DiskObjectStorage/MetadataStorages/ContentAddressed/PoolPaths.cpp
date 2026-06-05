@@ -112,6 +112,61 @@ std::optional<uint64_t> parseGenFromKey(const std::string & key, bool & is_tombs
     return value;
 }
 
+std::optional<GenObjectKeyParts> parseGenObjectKey(const std::string & key_prefix, const std::string & key)
+{
+    /// The inverse of blobGenKey / partGenKey. The key is `<prefix>/{blobs,parts}/<fan-out…>/<id>/<g>`,
+    /// so the LAST component is the generation, the SECOND-to-last is the bare identity, and the FIRST
+    /// component after the prefix is the kind root (`blobs` / `parts`). A tombstone / active / malformed
+    /// shape returns nullopt (parseGenFromKey screens out the tombstone suffix and `active`).
+    bool is_tombstone = false;
+    const std::optional<uint64_t> gen = parseGenFromKey(key, is_tombstone);
+    if (!gen || is_tombstone)
+        return std::nullopt;
+
+    /// Strip the common prefix to get the bare key, mirroring withPrefix (single '/' join, no leading '/').
+    std::string bare = key;
+    {
+        std::string p = key_prefix;
+        while (!p.empty() && p.back() == '/')
+            p.pop_back();
+        if (!p.empty())
+        {
+            const std::string joined = p + "/";
+            if (key.rfind(joined, 0) != 0)
+                return std::nullopt;
+            bare = key.substr(joined.size());
+        }
+    }
+
+    /// Split the bare key into components. The first is the kind root; the last is `<g>` (already parsed);
+    /// the one before it is the bare identity `<H>` / `<part_id>`.
+    std::vector<std::string_view> parts;
+    size_t start = 0;
+    for (size_t i = 0; i <= bare.size(); ++i)
+    {
+        if (i == bare.size() || bare[i] == '/')
+        {
+            parts.emplace_back(std::string_view(bare).substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    if (parts.size() < 3) /// at minimum `{blobs,parts}/<id>/<g>` (short-hash, no fan-out)
+        return std::nullopt;
+
+    GenObjectKeyParts result;
+    if (parts.front() == "blobs")
+        result.is_blob = true;
+    else if (parts.front() == "parts")
+        result.is_blob = false;
+    else
+        return std::nullopt;
+    result.identity = std::string(parts[parts.size() - 2]);
+    result.generation = *gen;
+    if (result.identity.empty())
+        return std::nullopt;
+    return result;
+}
+
 std::string partsPrefix(const std::string & key_prefix)
 {
     return withPrefix(key_prefix, "parts");

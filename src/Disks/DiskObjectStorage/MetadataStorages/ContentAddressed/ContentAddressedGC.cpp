@@ -392,44 +392,36 @@ SweepStats ContentAddressedGC::sweepCandidatesLocked(
                 extra_in_index);
     }
 
-    /// Filter the candidates to the genuinely-unreferenced set against this snapshot, then apply grace.
-    /// A candidate still reachable from a live manifest or a live session is DROPPED here (the safety net):
-    /// the compaction may emit a count-0 key, but if reachability still reaches it the part is live and we
-    /// keep it. A B52 in-flight pin keeps a blob too.
+    /// CA GC S3 — `unreferenced` is the set of VALID generationed candidates that flow through
+    /// seal/grace/recheck/branch. A non-generation key (a stray tombstone/active shape) is dropped here so
+    /// it is never sealed or swept; everything else is kept, because even an already-sealed,
+    /// now-identity-reachable candidate must reach the branch so RECOVER can un-seal it. The "do we create a
+    /// NEW tombstone?" decision is made per-candidate in the seal loop below (it skips the RECOVER-would-fire
+    /// case), so this set is deliberately NOT pre-filtered by reachability.
     std::set<std::string> unreferenced;
-    const std::string parts_root_for_filter = partsPrefix(key_prefix);
     for (const auto & key : candidate_object_keys)
     {
-        const bool is_part = key.rfind(parts_root_for_filter, 0) == 0;
-        if (is_part)
-        {
-            if (snapshot.live_part_keys.contains(PartObjectKey(key)))
-                continue;
-        }
-        else
-        {
-            if (snapshot.reachable_blobs.contains(BlobObjectKey(key)))
-                continue;
-            if (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(key))
-                continue;
-        }
-        unreferenced.insert(key);
+        if (parseGenObjectKey(key_prefix, key).has_value())
+            unreferenced.insert(key);
     }
 
-    /// Apply the grace-from-unreachability policy and carry the updated timer state forward.
-    SweepResult res = selectForSweep(unreferenced, first_unreachable, now, grace);
-    first_unreachable = std::move(res.first_unreachable);
-
-    if (res.to_delete.empty())
-        return {};
-
-    /// Re-validate-under-lock: a fresh full reachability pass immediately before deletion, dropping any
-    /// candidate now reachable (closes the read-refs-then-list race). B18 fail-close still holds.
-    const Reachability revalidated = compute_reachability();
+    /// Helper: identity-level reachability for a candidate against the supplied snapshot (the S3 safety
+    /// net keys reachability at the g=0 identity key — the manifest pins bare `H` — plus B52 in-flight pins).
+    auto identity_reachable_in = [&](const Reachability & r, const GenObjectKeyParts & parts) -> bool
+    {
+        if (parts.is_blob)
+        {
+            const BlobObjectKey identity_key = blobKey(key_prefix, BlobHash(parts.identity));
+            return r.reachable_blobs.contains(identity_key)
+                || (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(identity_key.string()));
+        }
+        return r.live_part_keys.contains(partKey(key_prefix, PartId(parts.identity)));
+    };
 
     /// Fence-ownership guard (the safety backstop): if this caller holds the GC-leader lock, re-confirm
-    /// before deleting that `gc.lock` STILL carries our fence token. A paused holder must NOT delete after
-    /// a successor took a higher fence. When no lock was supplied (single-owner / unit tests) it is skipped.
+    /// before every seal/delete that `gc.lock` STILL carries our fence token. A paused holder must NOT
+    /// seal or delete after a successor took a higher fence. When no lock was supplied (single-owner /
+    /// unit tests) it is skipped.
     auto leadership_lost = [&]() -> bool
     {
         if (!held)
@@ -443,42 +435,236 @@ SweepStats ContentAddressedGC::sweepCandidatesLocked(
         return GcLock::deserialize(bytes).fence_token != held->fence_token;
     };
 
+    /// CA GC S3 step (a) — SEAL every still-unreferenced candidate that is not already sealed. The seal is
+    /// a DURABLE, single-owner condemnation: `condCreateIfAbsent(<g>.tombstone)`. It is the persistent
+    /// condemned-state — once written, the candidate is re-discovered as a sealed-tombstone candidate every
+    /// later round (closing the S2 grace>0 gap), and the writer's tomb re-check routes any reuse of the
+    /// identity to `g+1` (so no new attach can land on a sealed `g`, I4). Sealing is fence-gated and
+    /// idempotent (a lost CAS just means it was already sealed). We seal here, BEFORE grace + the fresh
+    /// re-check, so the condemnation outlives this process even if the round is interrupted before sweep.
+    if (leadership_lost())
+        return {}; /// a successor took a higher fence; seal/delete NOTHING.
+
+    for (const auto & key : unreferenced)
+    {
+        const auto parts = parseGenObjectKey(key_prefix, key);
+        if (!parts)
+            continue; /// not a generationed object key (e.g. a reconciliation orphan in an unexpected shape) — skip.
+        const std::string tombstone = parts->is_blob
+            ? blobTombstoneKey(key_prefix, BlobHash(parts->identity), parts->generation).string()
+            : partTombstoneKey(key_prefix, PartId(parts->identity), parts->generation).string();
+        /// Idempotent seal: if the tombstone already exists the CAS is lost and we simply proceed; the
+        /// candidate stays condemned. (We never re-create a tombstone we already swept under — a swept
+        /// gravestone persists, so condCreateIfAbsent there is a harmless no-op too.)
+        if (object_storage->tryGetObjectMetadata(tombstone, /*with_tags=*/false).has_value())
+            continue; /// already sealed — leave it; the branch decides its fate (sweep / drain / recover).
+        /// Do NOT create a NEW tombstone for the actively-attachable, still-referenced generation (identity
+        /// reachable AND no successor — the RECOVER case): condemning the live attach target each round is
+        /// pointless churn. An ALREADY-sealed such candidate still flows to the branch (un-sealed by RECOVER).
+        if (identity_reachable_in(snapshot, *parts) && !successorGenerationExists(parts->is_blob, parts->identity, parts->generation))
+            continue;
+        if (leadership_lost())
+            return {};
+        condCreateIfAbsent(*object_storage, tombstone, /*bytes=*/std::string());
+    }
+
+    /// Step (b) — GRACE: liveness ageing measured from the seal (the first round we condemned the object),
+    /// carried in `first_unreachable`. This is a delay knob ONLY — the fresh re-check below, NOT the timer,
+    /// is the safety gate. Objects no longer unreferenced drop out of `first_unreachable` (timer cleared).
+    SweepResult res = selectForSweep(unreferenced, first_unreachable, now, grace);
+    first_unreachable = std::move(res.first_unreachable);
+
+    if (res.to_delete.empty())
+        return {};
+
+    /// Step (c) — FRESH authoritative re-check (§6.2): a fresh reachability pass AFTER the seal, dropping
+    /// any candidate now reachable. In S3 this is the existing refs -> manifests + live-sessions pass (the
+    /// §6.2 sessions+compaction-only form is S4). It is the SAFETY GATE: a generation whose identity is
+    /// reachable is never blindly swept.
+    const Reachability revalidated = compute_reachability();
+
     if (leadership_lost())
         return {}; /// a successor took a higher fence; delete NOTHING further.
 
-    const std::string parts_root = partsPrefix(key_prefix);
+    /// Step (d) — BRANCH per candidate into {recover | drain | sweep}. The branch is generation-aware but
+    /// gates on the IDENTITY-level safety net (S3): a candidate `(id, g)` whose identity is unreachable is
+    /// SWEPT; a candidate whose identity is still reachable is RECOVERED (un-sealed) when no successor
+    /// generation exists, or DRAINED (kept, tombstone kept, not re-opened) when a successor `g+1…` exists.
+    /// SWEEP keeps the `<g>.tombstone` gravestone forever; only RECOVER deletes a tombstone, and only the
+    /// fenced leader does, and only when no successor exists.
     SweepStats stats;
-    StoredObjects to_remove;
-    to_remove.reserve(res.to_delete.size());
+    StoredObjects to_remove; /// generation objects to SWEEP this round
+    StoredObjects tombstones_to_remove; /// tombstones to delete on RECOVER (un-seal)
     for (const auto & key : res.to_delete)
     {
-        const bool is_part = key.rfind(parts_root, 0) == 0;
-        if (is_part)
-        {
-            if (revalidated.live_part_keys.contains(PartObjectKey(key)))
-                continue; /// a ref to this part appeared after the snapshot -> keep it.
-        }
-        else
-        {
-            if (revalidated.reachable_blobs.contains(BlobObjectKey(key)))
-                continue; /// reachable again (new ref or live session) -> keep it.
-            if (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(key))
-                continue;
-        }
+        const auto parts = parseGenObjectKey(key_prefix, key);
+        if (!parts)
+            continue;
+        const bool is_part = !parts->is_blob;
 
-        if (is_part)
-            ++stats.deleted_parts;
+        /// Identity-level reachability against the FRESH re-check snapshot (markReachableBlobs +
+        /// sessionPinnedBlobs project to the g=0 `blobKey`; sessionPinnedPartKeys + live manifests to the
+        /// g=0 `partKey`; the manifest pins bare `H`, so the safety net is identity-level — see the S3
+        /// re-check note).
+        const bool identity_reachable = identity_reachable_in(revalidated, *parts);
+
+        const std::string tombstone = parts->is_blob
+            ? blobTombstoneKey(key_prefix, BlobHash(parts->identity), parts->generation).string()
+            : partTombstoneKey(key_prefix, PartId(parts->identity), parts->generation).string();
+
+        if (!identity_reachable)
+        {
+            /// SWEEP — no ref/session for the identity: delete the generation object, best-effort reset
+            /// `active` off `g` (§6.1), KEEP the gravestone `<g>.tombstone` forever. The delete is
+            /// unconditional + ABA-proof: `g` is sealed, so no new attach can land on it (I4); a re-created
+            /// identity routes to `g+1` (a different key), so re-creation can never resurrect THIS object.
+            resetActiveOffGeneration(parts->is_blob, parts->identity, parts->generation);
+            if (is_part)
+                ++stats.deleted_parts;
+            else
+                ++stats.deleted_blobs;
+            to_remove.emplace_back(key);
+        }
+        else if (successorGenerationExists(parts->is_blob, parts->identity, parts->generation))
+        {
+            /// DRAIN — the identity is still reachable AND a successor `g+1…` exists: KEEP the tombstone AND
+            /// the generation object (do NOT delete — it may still be the generation a live reference
+            /// resolves to), and do NOT re-open `g`. New attaches go to the successor. `g` is reclaimed in a
+            /// later round once its identity is fully unreachable (the S3 identity-level net cannot prove an
+            /// individual generation drained while a successor still lives — see the S4 precision note).
+        }
         else
-            ++stats.deleted_blobs;
-        to_remove.emplace_back(key);
+        {
+            /// RECOVER — the identity is still reachable and NO successor exists: the live reference must
+            /// resolve to `g` itself, so un-seal it. Delete the `<g>.tombstone` (only the fenced leader does
+            /// this, only when no successor exists) and re-open `g` as the attachable generation. Only
+            /// queue the un-seal if a tombstone actually exists (a candidate may reach here un-sealed when
+            /// it was filtered out of the seal loop as the live attach target).
+            if (object_storage->tryGetObjectMetadata(tombstone, /*with_tags=*/false).has_value())
+                tombstones_to_remove.emplace_back(tombstone);
+        }
     }
 
-    /// Final fence re-check immediately before issuing the removal.
+    /// Final fence re-check immediately before issuing any removal (seal/delete are all fence-gated).
     if (leadership_lost())
         return {};
 
-    object_storage->removeObjectsIfExist(to_remove);
+    if (!to_remove.empty())
+        object_storage->removeObjectsIfExist(to_remove);
+    if (!tombstones_to_remove.empty())
+        object_storage->removeObjectsIfExist(tombstones_to_remove); /// RECOVER: un-seal
     return stats;
+}
+
+std::set<std::string> ContentAddressedGC::collectSealedTombstoneCandidatesLocked()
+{
+    /// Enumerate every sealed-but-unswept tombstone in the pool and map it back to its generation object
+    /// key, so a generation condemned in an earlier round (its `<g>.tombstone` is durable) is re-presented
+    /// as a candidate every round until it is swept or recovered. This is what makes the condemnation
+    /// SURVIVE across rounds (closing the S2 grace>0 gap). MUST be called with gc_lock held.
+    ///
+    /// A tombstone key is `<…>/<g>.tombstone`; its generation object is the byte-identical key without the
+    /// suffix (`<…>/<g>`). We never re-seal here (the tombstone already exists); the sweep tail decides the
+    /// fate (sweep / drain — recover then deletes the tombstone). A gravestone of an ALREADY-swept
+    /// generation re-appears here too, but its generation object is gone, so the sweep's `removeObjectsIfExist`
+    /// is a harmless no-op and the identity-level re-check keeps it from churning.
+    std::set<std::string> candidates;
+    auto scan = [&](const std::string & root)
+    {
+        for (const auto & key : listKeysUnder(object_storage, root))
+        {
+            bool is_tombstone = false;
+            const std::optional<uint64_t> gen = parseGenFromKey(key, is_tombstone);
+            if (!gen || !is_tombstone)
+                continue;
+            /// Strip the `.tombstone` suffix to recover the generation object key.
+            candidates.insert(key.substr(0, key.size() - kTombstoneSuffix.size()));
+        }
+    };
+    scan(blobsPrefix(key_prefix));
+    scan(partsPrefix(key_prefix));
+    return candidates;
+}
+
+bool ContentAddressedGC::successorGenerationExists(bool is_blob, const std::string & identity, uint64_t generation) const
+{
+    /// True iff a present GENERATION OBJECT (not a tombstone, not `active`) with a generation strictly
+    /// greater than `generation` exists under the identity's directory. A resurrection always lands at
+    /// max+1, so the presence of any higher generation object is the "a successor exists" signal that
+    /// distinguishes DRAIN (keep `g`) from RECOVER (un-seal `g`). LISTs the per-identity prefix only.
+    const std::string prefix = is_blob
+        ? blobGenPrefix(key_prefix, BlobHash(identity))
+        : partGenPrefix(key_prefix, PartId(identity));
+    for (const auto & key : listKeysUnder(object_storage, prefix))
+    {
+        bool is_tombstone = false;
+        const std::optional<uint64_t> g = parseGenFromKey(key, is_tombstone);
+        if (!g || is_tombstone)
+            continue; /// skip tombstones and the `active` hint — only present generation OBJECTS count.
+        if (*g > generation)
+            return true;
+    }
+    return false;
+}
+
+void ContentAddressedGC::resetActiveOffGeneration(bool is_blob, const std::string & identity, uint64_t swept_generation)
+{
+    /// Best-effort §6.1 reset: if `active` currently points at the generation we are sweeping, repair it to
+    /// the highest surviving generation OBJECT (so a reader's default/active hint no longer names a deleted
+    /// object). A plain PUT, NOT a CAS (G4/I7d) — `active` is a hint; a stale value is corrected by the
+    /// reader's 404 -> LIST fallback, so this reset never gates safety and a failure is non-fatal. If no
+    /// surviving generation remains, leave `active` as-is (it will 404 -> LIST -> repair, or the identity is
+    /// gone entirely). NOTE: the active key is read once to avoid a needless PUT when it does not point here.
+    const std::string active_key = is_blob
+        ? blobActiveKey(key_prefix, BlobHash(identity))
+        : partActiveKey(key_prefix, PartId(identity));
+
+    /// Read the current active hint (absent -> default 0).
+    uint64_t current_active = 0;
+    if (object_storage->tryGetObjectMetadata(active_key, /*with_tags=*/false).has_value())
+    {
+        try
+        {
+            const std::string content = readSmallObject(object_storage, active_key);
+            if (!content.empty())
+                current_active = std::stoull(content);
+        }
+        catch (...)
+        {
+            current_active = 0; /// a malformed hint is treated as default-0; the reader fallback repairs it.
+        }
+    }
+    if (current_active != swept_generation)
+        return; /// `active` does not name the swept generation — nothing to repair.
+
+    /// Find the highest SURVIVING generation object other than the one being swept.
+    const std::string prefix = is_blob
+        ? blobGenPrefix(key_prefix, BlobHash(identity))
+        : partGenPrefix(key_prefix, PartId(identity));
+    std::optional<uint64_t> best;
+    for (const auto & key : listKeysUnder(object_storage, prefix))
+    {
+        bool is_tombstone = false;
+        const std::optional<uint64_t> g = parseGenFromKey(key, is_tombstone);
+        if (!g || is_tombstone || *g == swept_generation)
+            continue;
+        if (!best || *g > *best)
+            best = *g;
+    }
+    if (!best)
+        return; /// no surviving generation — leave `active` (reader fallback / identity gone handles it).
+
+    try
+    {
+        const std::string bytes = std::to_string(*best);
+        auto out = object_storage->writeObject(StoredObject(active_key), WriteMode::Rewrite);
+        out->write(bytes.data(), bytes.size());
+        out->finalize();
+    }
+    catch (...)
+    {
+        /// Best-effort: a failed `active` repair is non-fatal (the reader's 404 -> LIST fallback repairs it).
+    }
 }
 
 SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::optional<GcLock> held)
@@ -517,6 +703,15 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
         for (const auto & candidate : fold.candidates)
             candidate_object_keys.insert(candidate.object_key);
     }
+
+    /// CA GC S3 — re-present every sealed-but-unswept tombstone as a candidate. The compaction emits a
+    /// count-0 candidate ONLY in the crossing fold (the epoch where the count first hits 0); on later rounds
+    /// the key is gone from the folded counts, so without this the condemnation would be forgotten before
+    /// grace expired (the S2 grace>0 gap). The DURABLE `<g>.tombstone` is the persistent condemned-state:
+    /// re-discovering it here keeps the candidate flowing through seal(no-op)/grace/recheck/branch every
+    /// round until it is swept or recovered.
+    for (const auto & key : collectSealedTombstoneCandidatesLocked())
+        candidate_object_keys.insert(key);
 
     /// §9 orphan-drift bound: occasionally fold in the heavy reconciliation scan's candidates too, so
     /// over-counts / abandoned uploads the compaction cannot see (orphan drift) are bounded. This only
@@ -560,17 +755,35 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidatesLocked(
     for (const auto & pinned : sessionPinnedPartKeys(object_storage, key_prefix, now))
         live_part_keys.insert(pinned);
 
+    /// CA GC S3 (concern 2) — the `parts/`/`blobs/` directories now hold a generation FAMILY per identity:
+    /// `<g>` (generation objects), `<g>.tombstone` (gravestones), and `active` (the hint). Fold each
+    /// directory generation-aware:
+    ///   - NEVER flag a `.tombstone` (a gravestone is KEPT forever) or the `active` hint as an orphan — they
+    ///     are not generation objects (parseGenObjectKey returns nullopt for both), so they are skipped.
+    ///   - A generation OBJECT `<g>` is a candidate only if its IDENTITY is unreachable. The reachable set
+    ///     is keyed at the g=0 identity key (`blobKey`/`partKey`), and the manifest pins bare `H`, so a
+    ///     reachable identity keeps ALL its present generations off the orphan list (a referenced `<g>` is
+    ///     never an orphan). An unreachable identity's generation objects are fed to the shared
+    ///     seal/grace/recheck/branch tail, which re-confirms unreachability before sweeping.
     std::set<std::string> candidate_object_keys;
     for (const auto & key : listKeysUnder(object_storage, partsPrefix(key_prefix)))
     {
-        if (!live_part_keys.contains(PartObjectKey(key)))
-            candidate_object_keys.insert(key);
+        const auto parts = parseGenObjectKey(key_prefix, key);
+        if (!parts || parts->is_blob)
+            continue; /// a tombstone, the `active` hint, or a malformed shape — never an orphan candidate.
+        if (live_part_keys.contains(partKey(key_prefix, PartId(parts->identity))))
+            continue; /// the identity is reachable — keep ALL its generations.
+        candidate_object_keys.insert(key);
     }
     for (const auto & key : listKeysUnder(object_storage, blobsPrefix(key_prefix)))
     {
-        if (reachable_blobs.contains(BlobObjectKey(key)))
-            continue;
-        if (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(key))
+        const auto parts = parseGenObjectKey(key_prefix, key);
+        if (!parts || !parts->is_blob)
+            continue; /// a tombstone, the `active` hint, or a malformed shape — never an orphan candidate.
+        const BlobObjectKey identity_key = blobKey(key_prefix, BlobHash(parts->identity));
+        if (reachable_blobs.contains(identity_key))
+            continue; /// the identity is reachable — keep ALL its generations.
+        if (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(identity_key.string()))
             continue;
         candidate_object_keys.insert(key);
     }
@@ -584,7 +797,12 @@ SweepStats ContentAddressedGC::runReconciliationScan(int64_t now, int64_t grace,
     /// is the full bucket scan, so it reclaims orphans the compaction cannot see (over-counts, abandoned
     /// uploads) and recovers from a lost log+snapshot.
     std::lock_guard<std::mutex> gc_guard(*gc_lock);
-    const std::set<std::string> candidate_object_keys = collectReconciliationCandidatesLocked(now);
+    std::set<std::string> candidate_object_keys = collectReconciliationCandidatesLocked(now);
+    /// CA GC S3 — also re-present every sealed-but-unswept tombstone, so the reconciliation path drives the
+    /// same seal/grace/recheck/branch tail (sweep / drain / recover) on already-condemned generations, not
+    /// only on freshly-discovered orphans.
+    for (const auto & key : collectSealedTombstoneCandidatesLocked())
+        candidate_object_keys.insert(key);
     return sweepCandidatesLocked(candidate_object_keys, now, grace, held);
 }
 

@@ -76,6 +76,22 @@ PartObjectKey partKey(const std::string & key_prefix, const PartId & part_id);
 // reconstructable from the surviving objects even if `active` is lost, §6 last bullet / I7d).
 std::optional<uint64_t> parseGenFromKey(const std::string & key, bool & is_tombstone);
 
+// CA GC S3 — the GC state machine's inverse of `blobGenKey` / `partGenKey`. Decompose a generationed
+// blob/manifest object key (`<prefix>/blobs/<H0>/<H1>/<H>/<g>` resp. `<prefix>/parts/<p0>/<p1>/<id>/<mg>`)
+// back into its `(is_blob, identity, generation)` parts, so the sweep can derive the sibling keys it must
+// touch — the `<g>.tombstone` (seal/gravestone), the `active` hint, and a successor-generation probe —
+// from a count-0 candidate's object key alone. `is_blob` is true iff the key is under `blobsPrefix` (vs
+// `partsPrefix`). `identity` is the bare `<H>` / `<part_id>` digest; `generation` is the trailing `<g>`.
+// Returns nullopt for any key that is not a generation object (e.g. a tombstone, the `active` hint, or a
+// shape that does not match the fan-out layout) — the GC then skips it rather than misparsing.
+struct GenObjectKeyParts
+{
+    bool is_blob = true;
+    std::string identity;
+    uint64_t generation = 0;
+};
+std::optional<GenObjectKeyParts> parseGenObjectKey(const std::string & key_prefix, const std::string & key);
+
 // Pool roots for enumeration (GC scan). Each is the object-key prefix under which all objects of a
 // given kind live: manifests under partsPrefix (<key_prefix>/parts), content blobs under blobsPrefix
 // (<key_prefix>/blobs), and every server's/table's refs under refsRootPrefix (<key_prefix>/store/).

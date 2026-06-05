@@ -223,15 +223,51 @@ public:
     void setReconciliationCadenceRounds(int64_t rounds) { reconciliation_cadence_rounds = rounds; }
 
 private:
-    /// The shared re-validate + grace + fence + delete tail used by BOTH the compaction-driven normal path
-    /// and the reconciliation fallback. `candidate_object_keys` are the candidate object keys to consider
-    /// for deletion (compaction count-0 candidates, or the full-scan unreferenced complement). The tail
-    /// applies the grace timer, re-validates each candidate against a fresh full reachability snapshot
-    /// (refs -> manifests -> blobs + live sessions — the safety net that drops any candidate still
-    /// reachable, so a live blob wrongly proposed as a candidate is never deleted), re-checks the fence,
-    /// and issues the unchanged `removeObjectsIfExist`. MUST be called with `gc_lock` already held.
+    /// CA GC S3 — the GENERATION-AWARE seal -> grace -> fresh re-check -> {recover|drain|sweep} tail used by
+    /// BOTH the compaction-driven normal path and the reconciliation fallback. `candidate_object_keys` are
+    /// the generationed candidate object keys (`blobs/<H>/<g>` / `parts/<part_id>/<mg>`) whose folded count
+    /// reached 0 (compaction), or the full-scan unreferenced complement (reconciliation). The tail, per
+    /// candidate:
+    ///   (a) SEAL — `condCreateIfAbsent(<g>.tombstone)`: a DURABLE, single-owner, fence-gated condemnation.
+    ///       Once sealed no new attach may target `g` (the writer's tomb re-check routes reuse to `g+1`).
+    ///       The seal — NOT an in-memory timer — is the persistent condemned-state, so a candidate
+    ///       condemned in round 1 is re-discovered (via `collectSealedTombstoneCandidatesLocked`) and
+    ///       processed in round N after grace, closing the S2 grace>0 liveness gap.
+    ///   (b) GRACE — liveness ageing from the seal (NEVER a safety fence — the fresh re-check is the gate).
+    ///   (c) FRESH authoritative re-check (§6.2) AFTER the seal: refs -> manifests reachability + live
+    ///       sessions (S3 keeps this pass; the §6.2 sessions+compaction-only form is S4).
+    ///   (d) BRANCH:
+    ///       - no ref/session for `(id, g)` -> SWEEP: delete the gen object, best-effort reset `active` off
+    ///         `g`, KEEP the `<g>.tombstone` gravestone forever.
+    ///       - ref/session for `(id, g)` AND no successor generation exists -> RECOVER: delete the tombstone
+    ///         (un-seal), re-open `g` as attachable.
+    ///       - ref/session for `(id, g)` BUT a successor `g+1…` already exists -> DRAIN: KEEP the tombstone
+    ///         AND the gen object (still referenced — do NOT delete), do NOT re-open `g`.
+    /// MUST be called with `gc_lock` already held. Symmetric for blobs and manifests (§9): both run the
+    /// identical machinery on their `(identity, generation)` key family.
     SweepStats sweepCandidatesLocked(
         const std::set<std::string> & candidate_object_keys, int64_t now, int64_t grace, const std::optional<GcLock> & held);
+
+    /// CA GC S3 — enumerate every sealed-but-unswept tombstone in the pool as a candidate, so a generation
+    /// condemned in an earlier round (its `<g>.tombstone` is durable) is re-processed every round until it
+    /// is swept or recovered (closing the S2 grace>0 gap where a count-0 candidate emitted only in the
+    /// crossing fold was forgotten before grace expired). Lists `blobsPrefix` + `partsPrefix`, keeps only
+    /// `.tombstone` keys, and maps each back to its generation object key (`<g>`). MUST be called with
+    /// `gc_lock` held.
+    std::set<std::string> collectSealedTombstoneCandidatesLocked();
+
+    /// CA GC S3 — true iff a present generation OBJECT (not a tombstone / not `active`) with a generation
+    /// strictly greater than `generation` exists under the identity's directory. A resurrection lands at
+    /// max+1, so this is the "a successor `g+1…` exists" signal that splits DRAIN (keep `g`) from RECOVER
+    /// (un-seal `g`). LISTs the per-identity generation prefix only.
+    bool successorGenerationExists(bool is_blob, const std::string & identity, uint64_t generation) const;
+
+    /// CA GC S3 (§6.1) — best-effort reset of the `active` hint off a generation being SWEPT: if `active`
+    /// names `swept_generation`, repair it (plain PUT, not a CAS — a hint) to the highest surviving
+    /// generation object, so a reader's default no longer points at a deleted object. Non-fatal on failure
+    /// (the reader's 404 -> LIST fallback repairs a stale hint); leaves `active` untouched if it does not
+    /// name the swept generation or no surviving generation remains.
+    void resetActiveOffGeneration(bool is_blob, const std::string & identity, uint64_t swept_generation);
 
     /// The full `parts/`+`blobs/` scan's unreferenced complement — the reconciliation fallback's candidate
     /// source (spec §9), shared by `runReconciliationScan` and the scheduled orphan-drift fold inside
