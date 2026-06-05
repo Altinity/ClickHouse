@@ -70,11 +70,23 @@ std::map<ShardId, GcLogWriter::Fragment> GcLogWriter::splitDeltaByShard(const Gc
             it->second.delta.op = delta.op;
             it->second.delta.event_id = delta.event_id;
             it->second.delta.part_id = delta.part_id;
+            /// CA GC S3 (#1 fix): carry the resolved manifest generation onto every shard fragment. The
+            /// fold only applies the (part_id) edge on the home shard (shardForPartId guard), so a fragment
+            /// that does not own the edge carries an unused mg — harmless; the home-shard fragment now keys
+            /// the manifest at its real `mg` instead of 0.
+            it->second.delta.manifest_generation = delta.manifest_generation;
         }
         return it->second;
     };
-    for (const auto & pin : delta.pins)
-        fragment_for(shardForHash(pin)).delta.pins.push_back(pin);
+    /// CA GC S3 (#1 fix): each pin goes to its hash-prefix shard CARRYING its resolved generation (parallel
+    /// to delta.pins). An empty pin_generations (an S2 delta, or one read from an older log object) takes
+    /// every g as 0, matching the codec/fold default — so the fold keys CountKey{Blob,H,g} at the real g.
+    for (size_t i = 0; i < delta.pins.size(); ++i)
+    {
+        Fragment & fragment = fragment_for(shardForHash(delta.pins[i]));
+        fragment.delta.pins.push_back(delta.pins[i]);
+        fragment.delta.pin_generations.push_back(i < delta.pin_generations.size() ? delta.pin_generations[i] : 0);
+    }
     fragment_for(shardForPartId(delta.part_id)).carries_part_edge = true;
     return by_shard;
 }
