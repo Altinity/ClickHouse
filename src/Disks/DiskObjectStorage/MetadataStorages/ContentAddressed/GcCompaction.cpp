@@ -393,7 +393,7 @@ std::vector<uint64_t> GcCompaction::logEpochs(ShardId shard) const
     return {epochs.begin(), epochs.end()};
 }
 
-std::optional<std::map<GcCompaction::CountKey, int64_t>> GcCompaction::rebuildFromSnapshotAndLog(ShardId shard)
+std::optional<GcCompaction::RebuildResult> GcCompaction::rebuildFromSnapshotAndLog(ShardId shard)
 {
     /// §9 rebuild / catch-up: recompute counts from the LATEST snapshot run + every un-folded log epoch for
     /// the shard, with NO blob LIST. Used on leader startup. The result is the reverse index the next fold
@@ -443,16 +443,30 @@ std::optional<std::map<GcCompaction::CountKey, int64_t>> GcCompaction::rebuildFr
     for (const auto & [key, fold] : folds)
         counts[key] += fold.delta;
 
-    /// Drop net-zero / negative keys from the rebuilt view (they carry no live reference) — symmetric with
-    /// the snapshot persistence rule, so a rebuild is byte-equivalent to a fresh fold's folded_counts.
+    /// Emit every net-zero / negative key as a candidate (the catch-up leader hands these to the grace +
+    /// re-validate + delete tail without re-folding), then drop them from the rebuilt count view — symmetric
+    /// with the snapshot persistence rule, so the rebuilt counts are byte-equivalent to a fresh fold's
+    /// folded_counts.
+    RebuildResult result;
     for (auto it = counts.begin(); it != counts.end();)
     {
         if (it->second <= 0)
+        {
+            Candidate candidate;
+            candidate.key = it->first;
+            candidate.object_key = (it->first.kind == KeyKind::Blob)
+                ? blobKey(key_prefix, BlobHash(it->first.identity)).string()
+                : partKey(key_prefix, PartId(it->first.identity)).string();
+            result.candidates.push_back(std::move(candidate));
             it = counts.erase(it);
+        }
         else
+        {
             ++it;
+        }
     }
-    return counts;
+    result.counts = std::move(counts);
+    return result;
 }
 
 }

@@ -94,11 +94,25 @@ public:
     /// leader never advances an epoch under a successor.
     CompactionResult compactShard(ShardId shard, const std::function<bool()> & fence_still_mine);
 
+    /// The result of a §9 rebuild / catch-up fold (read-only — it neither advances the epoch nor reclaims).
+    struct RebuildResult
+    {
+        /// The reverse index (positive counts only) recomputed from snapshot + un-folded log, byte-equivalent
+        /// to what the next fold's `folded_counts` would hold. Seeds / validates the leader's reverse view.
+        std::map<CountKey, int64_t> counts;
+        /// Keys already at count 0 in the rebuilt view (every reference netted away) — the candidates a
+        /// catch-up leader can hand straight to the grace + re-validate + delete tail without re-folding.
+        std::vector<Candidate> candidates;
+    };
+
     /// §9 rebuild / catch-up: recompute the reverse counts for a shard from the LATEST `gc/snap` run plus
-    /// every un-folded `gc/log/<epoch>.<shard>/` (epochs strictly greater than the snapshot's), WITHOUT any
-    /// blob `LIST`. Used on leader startup. Returns nullopt iff BOTH the snapshot and the log are entirely
-    /// absent (total loss) — the caller then falls back to the heavy reconciliation scan.
-    std::optional<std::map<CountKey, int64_t>> rebuildFromSnapshotAndLog(ShardId shard);
+    /// every un-folded `gc/log/<epoch>.<shard>/` (epochs at or after the snapshot's), WITHOUT any blob
+    /// `LIST` (the snapshot + log are sufficient — spec §9). Used on leader startup / catch-up to rebind the
+    /// reverse index after a restart. READ-ONLY: it does not close, advance, reclaim, or write the snapshot.
+    /// Returns nullopt iff BOTH the snapshot and the log are entirely absent (total log+snap loss) — the
+    /// caller then falls back to the heavy `runReconciliationScan` (which rebinds reachability from live
+    /// refs + manifests, the only source left when the log truth is gone).
+    std::optional<RebuildResult> rebuildFromSnapshotAndLog(ShardId shard);
 
 private:
     /// Read the current open epoch for a shard (gcCurrentEpochKey, default 0 if absent or malformed —
