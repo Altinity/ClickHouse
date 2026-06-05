@@ -1640,24 +1640,43 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     if (parts.empty())
         return;
 
-    /// Renew the write-session pin so it is FRESHLY live across the ref publishes below (cross-process
-    /// data-loss fix): the per-blob renewals kept it live during the write, but the session must not be
-    /// allowed to lapse before the refs are published. A live session root covers every freshly-written
-    /// blob this transaction's parts are about to reference; a REMOTE mounter's sweep re-reads sessions in
-    /// its re-validate-under-lock step immediately before deleting, so a live session makes it skip these
-    /// blobs. (Carried-forward blobs are instead covered by their source part's ref.) The in-process re-HEAD
-    /// in commitOnePart is the same-process backstop (B49). Renew before taking the in-process lock since
-    /// this is a bucket write coordinating with OTHER mounters, not the local sweep.
+    /// CA GC S4 (§7.1) — the writer commit follows the EXACT handshake order: the durable WriteSession is
+    /// the SYNCHRONOUS REFERENCE FLAG (written FIRST, before any upload), then per part: upload missing
+    /// blobs+manifest, RE-CHECK every pinned generation's `.tombstone` and resurrect on a seal, enqueue the
+    /// `+` (AFTER the re-check, so an abandoned generation leaves no stale `+`), and publish the LIVE REF
+    /// LAST (the commit point). The session is the flag — NOT the `+`, NOT the visible ref — so in the
+    /// lockless phase the writer's re-check can precede the `+`: the session was already raised (durable,
+    /// GC-visible via `sessionPinnedBlobs`/`sessionPinnedPartKeys`) before either, so a concurrent GC's
+    /// §6.2 re-check observes it and skips the blobs. It is then kept UNTIL FOLDED (Task 1).
+    ///
+    /// STEP 2 — raise/renew the flag FRESHLY before the publish sequence: the per-blob renewals kept it live
+    /// during the write, but it must not lapse before the refs are published. A live session root covers
+    /// every freshly-written blob this transaction's parts are about to reference; a REMOTE mounter's sweep
+    /// re-reads sessions in its re-validate step immediately before deleting, so a live session makes it
+    /// skip these blobs. (Carried-forward blobs are instead covered by their source part's ref.) Renew
+    /// before taking the in-process lock since this is a bucket write coordinating with OTHER mounters.
     if (session_open)
         persistSession();
 
     /// Take the per-pool in-process GC lock ONCE around the whole multi-part publish (B49). The sweep holds
     /// this SAME lock for its entire mark+delete, so once we hold it the live set is stable for every part.
+    /// (The lock is STILL HELD in this phase — the §7.1 order + session-as-flag are now in place so the
+    /// later phase can drop it; this phase is behavior-equivalent at the safety level.)
     std::lock_guard<std::mutex> gc_guard(*metadata_storage.gc_lock);
 
-    /// A single transaction may write more than one part (a transactional merge — B67). Publish each staged
-    /// part under the one lock; an all-empty entry is a no-op (handled inside commitOnePart). CA GC S4: each
-    /// part's `+`-delta settled `(shard, epoch)` is collected so the session can be retained until folded.
+    /// Re-assert the flag is durable AT the §7.1 step-2 point — under the lock, BEFORE any per-part upload /
+    /// recheck / `+` / ref below. This is the store of the §7 proof's flag `A` (the session pin) that, in
+    /// the lockless phase, must PRECEDE both the writer's own tomb re-check and GC's §6.2 load. Behaviorally
+    /// equivalent under the held lock (the renew just above already made it live); it makes the ordering
+    /// explicit so the lock can come out later without moving this step.
+    if (session_open)
+        persistSession();
+
+    /// STEPS 3–7, per part (§7.1): upload (manifest condCreate) -> RE-CHECK tomb + resurrect -> enqueue the
+    /// `+` (after the re-check) -> publish the LIVE REF LAST. A single transaction may write more than one
+    /// part (a transactional merge — B67); an all-empty entry is a no-op (handled inside commitOnePart).
+    /// CA GC S4: each part's `+`-delta settled `(shard, epoch)` is collected so the session can be retained
+    /// until folded (Task 1 / step 8).
     std::vector<std::pair<ContentAddressed::ShardId, uint64_t>> settled_delta_epochs;
     for (auto & [key, st] : parts)
         commitOnePart(key, st, settled_delta_epochs);
