@@ -17,10 +17,19 @@
 #include <IO/WriteHelpers.h>
 
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 
 #include <set>
 #include <vector>
+
+namespace ProfileEvents
+{
+    extern const Event ContentAddressedTombstonesTotal;
+    extern const Event ContentAddressedGenerationsObserved;
+    extern const Event ContentAddressedHashesObserved;
+    extern const Event ContentAddressedOrphanBytesEstimate;
+}
 
 namespace DB
 {
@@ -492,7 +501,10 @@ SweepStats ContentAddressedGC::sweepCandidatesLocked(
             continue;
         if (leadership_lost())
             return {};
-        condCreateIfAbsent(*object_storage, tombstone, /*bytes=*/std::string());
+        /// §13 observability: count a DURABLE condemnation actually sealed by this leader (the CAS winner).
+        /// A swept generation keeps its gravestone forever, so this is the count of distinct condemnations.
+        if (condCreateIfAbsent(*object_storage, tombstone, /*bytes=*/std::string()))
+            ProfileEvents::increment(ProfileEvents::ContentAddressedTombstonesTotal);
     }
 
     /// Step (b) — GRACE: liveness ageing measured from the seal (the first round we condemned the object),
@@ -550,6 +562,10 @@ SweepStats ContentAddressedGC::sweepCandidatesLocked(
                 ++stats.deleted_parts;
             else
                 ++stats.deleted_blobs;
+            /// §13 observability: estimate the reclaimed orphan bytes (one HEAD; 0 if already gone — a
+            /// swept-twice gravestone). A guardrail for orphan drift / leaked uploads.
+            if (auto meta = object_storage->tryGetObjectMetadata(key, /*with_tags=*/false))
+                ProfileEvents::increment(ProfileEvents::ContentAddressedOrphanBytesEstimate, meta->size_bytes);
             to_remove.emplace_back(key);
         }
         else if (successorGenerationExists(parts->is_blob, parts->identity, parts->generation))
@@ -596,20 +612,40 @@ std::set<std::string> ContentAddressedGC::collectSealedTombstoneCandidatesLocked
     /// generation re-appears here too, but its generation object is gone, so the sweep's `removeObjectsIfExist`
     /// is a harmless no-op and the identity-level re-check keeps it from churning.
     std::set<std::string> candidates;
+    /// §13 observability: while we already walk the full blobs/+parts/ listing here, tally the
+    /// generations-per-hash PROXY — count present generation OBJECTS (ContentAddressedGenerationsObserved)
+    /// and the distinct identities that carry at least one (ContentAddressedHashesObserved). Their ratio is
+    /// the mean generations-per-hash; a p99 follow-up reads the per-identity distribution. A hash with >1
+    /// generation is the hot-content-cycling guardrail (gravestones are safe but not free).
+    std::set<std::string> identities_with_generation;
+    size_t generation_objects = 0;
     auto scan = [&](const std::string & root)
     {
         for (const auto & key : listKeysUnder(object_storage, root))
         {
             bool is_tombstone = false;
             const std::optional<uint64_t> gen = parseGenFromKey(key, is_tombstone);
-            if (!gen || !is_tombstone)
+            if (!gen)
                 continue;
-            /// Strip the `.tombstone` suffix to recover the generation object key.
+            if (!is_tombstone)
+            {
+                /// A present generation OBJECT: tally it and its identity for the per-hash proxy.
+                ++generation_objects;
+                if (const auto parts = parseGenObjectKey(key_prefix, key))
+                    identities_with_generation.insert(parts->identity);
+                continue;
+            }
+            /// A tombstone: strip the `.tombstone` suffix to recover the generation object key (the
+            /// re-presented candidate that keeps the condemnation flowing across rounds).
             candidates.insert(key.substr(0, key.size() - kTombstoneSuffix.size()));
         }
     };
     scan(blobsPrefix(key_prefix));
     scan(partsPrefix(key_prefix));
+    if (generation_objects != 0)
+        ProfileEvents::increment(ProfileEvents::ContentAddressedGenerationsObserved, generation_objects);
+    if (!identities_with_generation.empty())
+        ProfileEvents::increment(ProfileEvents::ContentAddressedHashesObserved, identities_with_generation.size());
     return candidates;
 }
 

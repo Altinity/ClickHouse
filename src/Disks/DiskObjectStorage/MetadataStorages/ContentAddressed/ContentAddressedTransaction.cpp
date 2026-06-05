@@ -11,6 +11,7 @@
 
 #include <Common/Exception.h>
 #include <Common/ObjectStorageKey.h>
+#include <Common/ProfileEvents.h>
 #include <Common/getRandomASCIIString.h>
 #include <Common/logger_useful.h>
 #include <IO/ReadBufferFromFile.h>
@@ -26,6 +27,12 @@
 #include <mutex>
 
 namespace fs = std::filesystem;
+
+namespace ProfileEvents
+{
+    extern const Event ContentAddressedGenerationResurrectionsTotal;
+    extern const Event ContentAddressedDuplicateGenerationBytes;
+}
 
 namespace DB
 {
@@ -1307,6 +1314,11 @@ uint64_t ContentAddressedTransaction::resolveAndResurrectGeneration(
         /// (its tombstone/active will route us there).
         const uint64_t next = g + 1;
         const std::string next_key = make_gen_key(next);
+        /// §13 observability: a resurrection happened (a sealed generation forced us to advance to g+1).
+        /// Counted once per advance, regardless of whether THIS caller wins the condCreate race for the new
+        /// object (a high rate flags hot content cycling zero-refs→resurrection — gravestones are safe but
+        /// not free).
+        ProfileEvents::increment(ProfileEvents::ContentAddressedGenerationResurrectionsTotal);
         if (!object_storage.tryGetObjectMetadata(next_key, /*with_tags=*/false).has_value())
         {
             /// Source the bytes from whichever generation is still present (prefer the just-checked g).
@@ -1314,7 +1326,12 @@ uint64_t ContentAddressedTransaction::resolveAndResurrectGeneration(
             if (present)
                 content = metadata_storage.readSmallObjectIfExists(gen_key);
             if (content)
-                ContentAddressed::condCreateIfAbsent(object_storage, next_key, *content);
+            {
+                /// The resurrected object is a byte-identical DUPLICATE of the condemned predecessor (kept by
+                /// the GC until it drains) — track the duplicate bytes only when WE create it (the winner).
+                if (ContentAddressed::condCreateIfAbsent(object_storage, next_key, *content))
+                    ProfileEvents::increment(ProfileEvents::ContentAddressedDuplicateGenerationBytes, content->size());
+            }
         }
 
         /// Best-effort advance `active → g+1` (a plain PUT, NOT a CAS — G4/I7d). A failure only costs the

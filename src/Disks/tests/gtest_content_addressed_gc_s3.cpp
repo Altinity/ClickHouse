@@ -16,6 +16,7 @@
 
 #include <Core/ServerUUID.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 
 #include <base/types.h>
 
@@ -35,6 +36,14 @@ namespace ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
 }
+}
+
+namespace ProfileEvents
+{
+    extern const Event ContentAddressedTombstonesTotal;
+    extern const Event ContentAddressedOrphanBytesEstimate;
+    extern const Event ContentAddressedGenerationsObserved;
+    extern const Event ContentAddressedHashesObserved;
 }
 
 /// CA GC S3 — the §11 race oracles: the DATA-LOSS SAFETY PROOF for the generation + tombstone deletion
@@ -504,4 +513,41 @@ TEST_F(ContentAddressedGcS3, ManifestSymmetrySealSweepGravestoneAndResurrect)
     EXPECT_TRUE(exists(partGenKey(prefix, pid, 1).string()));
     /// The old mg=0 gravestone still stands and does NOT shadow the re-created mg=1 manifest.
     EXPECT_TRUE(exists(partTombstoneKey(prefix, pid, 0).string()));
+}
+
+/// ── Observability (§13) — the GC counters are deterministically bumped ───────────────────────────────
+///
+/// PROVES the §13 guardrail counters fire on the events they guard: SEAL bumps the durable-condemnation
+/// counter; SWEEP bumps the orphan-bytes estimate; the per-round generation walk bumps the
+/// generations-per-hash proxy (generations observed / distinct identities observed).
+TEST_F(ContentAddressedGcS3, ObservabilityCountersBumpOnSealSweepAndGenerationWalk)
+{
+    const BlobHash h = blobHash("ctr01");
+    /// Two generations of one hash present, both orphan (no ref/session) — so the per-hash proxy sees one
+    /// identity with two generation objects, and the sweep reclaims both.
+    put(blobGenKey(prefix, h, 0).string(), "vvvv0");  /// 5 bytes
+    put(blobGenKey(prefix, h, 1).string(), "vvvvvv1"); /// 7 bytes
+
+    DB::ContentAddressed::ContentAddressedGC gc(os, prefix);
+
+    /// Round 1 (now=0): SEAL both generations (durable condemnations) + walk the generation listing.
+    const auto seals_before = ProfileEvents::global_counters[ProfileEvents::ContentAddressedTombstonesTotal].load();
+    const auto gens_before = ProfileEvents::global_counters[ProfileEvents::ContentAddressedGenerationsObserved].load();
+    const auto hashes_before = ProfileEvents::global_counters[ProfileEvents::ContentAddressedHashesObserved].load();
+    gc.runReconciliationScan(/*now=*/0, /*grace=*/100);
+    const auto seals_after = ProfileEvents::global_counters[ProfileEvents::ContentAddressedTombstonesTotal].load();
+    const auto gens_after = ProfileEvents::global_counters[ProfileEvents::ContentAddressedGenerationsObserved].load();
+    const auto hashes_after = ProfileEvents::global_counters[ProfileEvents::ContentAddressedHashesObserved].load();
+
+    EXPECT_GE(seals_after - seals_before, 2); /// both (H,0) and (H,1) sealed (durable condemnations)
+    EXPECT_GE(gens_after - gens_before, 2);   /// two present generation OBJECTS observed
+    EXPECT_GE(hashes_after - hashes_before, 1); /// one distinct identity carrying generations
+
+    /// Round 2 (now=200): past grace -> SWEEP both -> orphan-bytes estimate bumps by ~the swept sizes.
+    const auto bytes_before = ProfileEvents::global_counters[ProfileEvents::ContentAddressedOrphanBytesEstimate].load();
+    auto stats = gc.runReconciliationScan(/*now=*/200, /*grace=*/100);
+    const auto bytes_after = ProfileEvents::global_counters[ProfileEvents::ContentAddressedOrphanBytesEstimate].load();
+
+    EXPECT_EQ(stats.deleted_blobs, 2u);
+    EXPECT_GE(bytes_after - bytes_before, 12); /// 5 + 7 bytes reclaimed (estimate; HEAD-before-delete)
 }

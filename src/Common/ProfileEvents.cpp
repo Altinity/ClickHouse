@@ -738,6 +738,13 @@ The server successfully detected this situation and will download merged part fr
     M(DiskS3PutObject, "Number of DiskS3 API PutObject calls.", ValueType::Number) \
     M(DiskS3GetObject, "Number of DiskS3 API GetObject calls.", ValueType::Number) \
     \
+    M(ContentAddressedGenerationResurrectionsTotal, "Number of times a content-addressed write resurrected a blob/manifest to a higher generation because the resolved generation was sealed by GC (CA GC S3). A high rate signals hot content cycling zero-refs to resurrection.", ValueType::Number) \
+    M(ContentAddressedDuplicateGenerationBytes, "Bytes uploaded as a RESURRECTED (g>0) content-addressed blob/manifest generation — a byte-identical copy of a still-condemned predecessor (CA GC S3). Grows with resurrection churn; the predecessor is reclaimed once it drains.", ValueType::Bytes) \
+    M(ContentAddressedTombstonesTotal, "Number of GC-owned generation tombstones SEALED (created) by the content-addressed garbage collector (CA GC S3). A swept generation keeps its tombstone as a permanent gravestone, so this counts durable condemnations.", ValueType::Number) \
+    M(ContentAddressedGenerationsObserved, "Number of present content-addressed generation OBJECTS observed across the GC's per-identity generation listings (CA GC S3). Paired with ContentAddressedHashesObserved it is the generations-per-hash proxy (a p99 guardrail for hot-content cycling).", ValueType::Number) \
+    M(ContentAddressedHashesObserved, "Number of distinct content-addressed identities (hashes / part ids) whose generation set the GC listed (CA GC S3). The denominator of the generations-per-hash proxy.", ValueType::Number) \
+    M(ContentAddressedOrphanBytesEstimate, "Estimated bytes of content-addressed generation objects swept by the GC as unreachable orphans (CA GC S3). A guardrail for orphan drift / leaked uploads.", ValueType::Bytes) \
+    \
     M(DiskPlainRewritableAzureDirectoryCreated, "Number of directories created by the 'plain_rewritable' metadata storage for AzureObjectStorage.", ValueType::Number) \
     M(DiskPlainRewritableAzureDirectoryRemoved, "Number of directories removed by the 'plain_rewritable' metadata storage for AzureObjectStorage.", ValueType::Number) \
     M(DiskPlainRewritableLocalDirectoryCreated, "Number of directories created by the 'plain_rewritable' metadata storage for LocalObjectStorage.", ValueType::Number) \
