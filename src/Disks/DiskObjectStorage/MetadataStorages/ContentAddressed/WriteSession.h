@@ -52,6 +52,14 @@ struct WriteSession
     bool committed = false;
     std::vector<std::pair<ShardId, UInt64>> delta_epochs;
 
+    /// CA GC S4 (#2) — fail-closed session coverage. Set true when the commit's `+`-flush threw: the
+    /// reference is published but no `+` is durable, so the session must NOT be released and must NOT be
+    /// lease-reaped (a crashed-writer leak is acceptable; a dropped pin under the future §6.2 gate is data
+    /// loss). `pending_add_delta` is the serialized `+` GcDelta the GC reaper re-logs (idempotent by
+    /// event_id) on a bounded path; once re-logged AND folded, the reaper clears sticky and reaps.
+    bool deltas_failed = false;
+    std::string pending_add_delta;
+
     /// Binary, deterministic, explicitly little-endian on the shared codec (cross-arch determinism).
     std::string serialize() const;
 
@@ -64,11 +72,10 @@ struct WriteSession
     /// is distinct from the manifest (`CAMF`), sidecar (`CASC`), ref payload (`CARF`) and pool meta
     /// (`CAPM`) families.
     static constexpr FormatMagic MAGIC = makeMagic("CAWS");
-    /// Version 2 (CA GC S4) appends the `committed` flag and the `delta_epochs` `(shard, epoch)` list to the
-    /// body so the session-until-folded reaper can decide reapability durably (§5.1 rule 3, §7.3). A v3 pool
-    /// is created fresh (PoolMeta v3, no back-compat), so no v1 session can exist in it — reading only v2 is
-    /// correct and fail-closed.
-    static constexpr uint8_t ENCODING_VERSION = 2;
+    /// Version 3 (CA GC S4 #2) appends `deltas_failed` (1 byte) and `pending_add_delta` (length-prefixed
+    /// string) to the v2 body so the reaper can re-log and fold a commit whose `+`-flush threw. A v3 pool
+    /// is created fresh (no back-compat), so reading only v3 is correct and fail-closed.
+    static constexpr uint8_t ENCODING_VERSION = 3;
 };
 
 }

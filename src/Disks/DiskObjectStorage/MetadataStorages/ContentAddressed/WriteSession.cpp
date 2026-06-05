@@ -36,6 +36,9 @@ std::string WriteSession::serialize() const
         DB::writeBinaryLittleEndian(static_cast<UInt32>(shard), buf);
         DB::writeBinaryLittleEndian(epoch, buf);
     }
+    /// CA GC S4 (#2, v3): the sticky fail-closed state.
+    DB::writeBinaryLittleEndian(static_cast<uint8_t>(deltas_failed ? 1 : 0), buf);
+    DB::writeStringBinary(pending_add_delta, buf);
     buf.finalize();
     return out;
 }
@@ -76,6 +79,11 @@ WriteSession WriteSession::deserialize(const std::string & bytes)
         DB::readBinaryLittleEndian(epoch, buf);
         session.delta_epochs.emplace_back(static_cast<ShardId>(shard), epoch);
     }
+    /// CA GC S4 (#2, v3): the sticky fail-closed state (always present in a v3 object).
+    uint8_t deltas_failed_raw = 0;
+    DB::readBinaryLittleEndian(deltas_failed_raw, buf);
+    session.deltas_failed = deltas_failed_raw != 0;
+    DB::readStringBinary(session.pending_add_delta, buf);
     return session;
 }
 
