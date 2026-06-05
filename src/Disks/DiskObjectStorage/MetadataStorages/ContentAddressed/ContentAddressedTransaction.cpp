@@ -1891,6 +1891,7 @@ bool ContentAddressedTransaction::unlinkPartDirRefs(const std::string & path)
     /// never an under-count that could strand a delete.
     std::optional<ContentAddressed::PartId> dropped_part_id;
     std::optional<ContentAddressed::PartManifest> dropped_manifest;
+    std::optional<ContentAddressed::RefSidecar> dropped_sidecar;
     try
     {
         if (auto part_id = metadata_storage.readRefPartId(p->table_uuid, p->part_name))
@@ -1899,6 +1900,8 @@ bool ContentAddressedTransaction::unlinkPartDirRefs(const std::string & path)
             metadata_storage.blobRefIndex()->removePart(*part_id, manifest);
             dropped_part_id = part_id;
             dropped_manifest = std::move(manifest);
+            /// CA GC S3 (#6): read the per-part generations the `+` settled on, so the `-` is keyed to match.
+            dropped_sidecar = metadata_storage.readRefSidecarIfExists(p->table_uuid, p->part_name);
         }
     }
     catch (...)
@@ -1938,11 +1941,13 @@ bool ContentAddressedTransaction::unlinkPartDirRefs(const std::string & path)
             ContentAddressed::GcDelta delta;
             delta.op = ContentAddressed::GcDelta::Op::Remove;
             delta.part_id = *dropped_part_id;
-            /// CA GC S3: record the SAME resolved generations the matching `+` settled on, resolved
-            /// read-only via the `active` hints (a drop never resurrects). The common case is all-zero
-            /// (g=0/mg=0). The manifest generation is folded into the event_id, parallel to the `+`.
-            delta.manifest_generation
-                = readActiveGenHint(ContentAddressed::partActiveKey(key_prefix, *dropped_part_id));
+            /// CA GC S3 (#6): key the `-` at the generation the `+` SETTLED on, recorded in the sidecar at
+            /// commit. A resurrection between commit and drop changes `active`, so re-deriving from the hint
+            /// would mis-key the `-` and leave the old generation's count >0 forever. Fall back to g=0 (the
+            /// `active` hint, the legacy/common case) only when the sidecar is absent.
+            delta.manifest_generation = dropped_sidecar
+                ? dropped_sidecar->manifest_generation
+                : readActiveGenHint(ContentAddressed::partActiveKey(key_prefix, *dropped_part_id));
             delta.event_id
                 = ContentAddressed::GcDelta::computeEventId(*dropped_part_id, delta.op, delta.manifest_generation);
             std::set<ContentAddressed::BlobHash> seen;
@@ -1953,7 +1958,16 @@ bool ContentAddressedTransaction::unlinkPartDirRefs(const std::string & path)
                 if (!seen.insert(entry.key).second)
                     continue;
                 delta.pins.push_back(entry.key);
-                delta.pin_generations.push_back(readActiveGenHint(ContentAddressed::blobActiveKey(key_prefix, entry.key)));
+                uint64_t g = 0;
+                if (dropped_sidecar)
+                {
+                    if (auto it = dropped_sidecar->pin_generations.find(entry.key.string());
+                        it != dropped_sidecar->pin_generations.end())
+                        g = it->second;
+                }
+                else
+                    g = readActiveGenHint(ContentAddressed::blobActiveKey(key_prefix, entry.key));
+                delta.pin_generations.push_back(g);
             }
             metadata_storage.gcLogWriter()->enqueue(delta);
             metadata_storage.gcLogWriter()->flushAll();

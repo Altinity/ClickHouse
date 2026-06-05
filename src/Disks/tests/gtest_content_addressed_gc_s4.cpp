@@ -486,3 +486,21 @@ TEST_F(ContentAddressedGcS4, Sec6_GenerationsSurviveTheRealWriterPath_WouldHaveC
     /// With the #1 bug everything collapses to g=0: count(b,0)=+1+1-1=+1 -> b_g0_is_candidate is FALSE and
     /// no (b,1) key exists -> this test fails, exactly catching the blocker.
 }
+
+/// CA GC S3 (#6): RefSidecar v2 serialize/deserialize round-trips the settled generations.
+/// Proves that `manifest_generation` and `pin_generations` survive the codec so the DROP path
+/// can reliably read back what the `+` path wrote.
+TEST_F(ContentAddressedGcS4, Sec6_RefSidecarRoundTripsSettledGenerations)
+{
+    const BlobHash b = blobHash("s01");
+    RefSidecar in;
+    in.files["uuid.txt"] = "deadbeef";
+    in.manifest_generation = 1;
+    in.pin_generations[b.string()] = 1;
+
+    const RefSidecar out = RefSidecar::deserialize(in.serialize());
+    EXPECT_EQ(out.files.at("uuid.txt"), "deadbeef");
+    EXPECT_EQ(out.manifest_generation, 1u);
+    ASSERT_TRUE(out.pin_generations.contains(b.string()));
+    EXPECT_EQ(out.pin_generations.at(b.string()), 1u);
+}
