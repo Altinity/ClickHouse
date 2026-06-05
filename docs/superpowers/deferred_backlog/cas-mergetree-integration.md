@@ -560,6 +560,48 @@ the fence lease is unchanged.
   consistent with §5's "never materialized" end-state, where the durable authoritative reverse index is
   always the sorted snapshot + log.
 
+### CA GC S2 DONE — log-structured streaming compaction is the authoritative candidate source
+
+S2 (`../plans/2026-06-05-ca-gc-s2-log-structured.md`, spec §5/§5.1/§9/§11/§12.3) is implemented and tested:
+
+- **Candidate source = the per-shard streaming compaction.** `runSweepOnce` no longer calls
+  `listLivePartIds` / `markReachableBlobs` / `LIST blobs/` on the normal path (**G3 retired**). Per shard it
+  closes the epoch (a plain fenced PUT `gc/current_epoch/<shard>=E+1`, no CAS — §5.1 rule 1) **before**
+  folding, then streaming merge-joins `gc/snap/<E>.<shard>` + `gc/log/<E>.<shard>/` with **dedup-on-fold by
+  `event_id`**, streams the new `gc/snap/<E+1>`, and emits every key whose running count reaches 0 (blob
+  `(H)` pins **and** the `(part_id)` manifest edge) as a candidate in one pass.
+- **The refs→manifests re-validate stays as the authoritative safety net** (`sweepCandidatesLocked`): it
+  lists `refs/` (NOT `blobs/`/`parts/`), recomputes reachability, and drops any candidate still reachable,
+  then applies the unchanged `grace` + fence + `removeObjectsIfExist` delete tail. S4 swaps this re-validate
+  for the sessions + compaction handshake (§6.2).
+- **Full scan survives only as `runReconciliationScan`** (the §9 orphan-drift / abandoned-upload / rebuild
+  fallback), scheduled by the now-configurable `reconciliation_cadence_rounds` (disk knob
+  `content_addressed_gc_reconciliation_cadence_rounds`, default 0 = off). `rebuildFromSnapshotAndLog`
+  recomputes counts from snapshot + un-folded log with **no blob `LIST`**; total log+snap loss falls back to
+  the scan.
+- **Epoch-close-before-fold + writer epoch re-append + dedup are wired under the still-held `gc_lock`** so S4
+  (which drops the lock) can rely on log-completeness; the in-memory `InMemoryBlobRefIndex` is downgraded to
+  an optional pre-filter / drift cross-check (`cas_gc_index_drift`).
+- **Tests (132 `ContentAddressed*` gtests green; CA-default smoke green incl. `04279_content_addressed_gc`):**
+  9 new S2 oracles in `gtest_content_addressed_gc_s2.cpp` over an op-counting in-memory `IObjectStorage`
+  fake — streaming-merge correctness + exactly-the-count-0 candidates (incl. the part edge), rebuild with
+  **0 `blobs/`+`parts/` LISTs**, epoch advance/reclaim + idempotent empty re-run, shard isolation,
+  append-as-epoch-folds (no under-count), duplicate-`+` dedup-on-fold, and live-part-is-never-a-candidate;
+  plus op-budget asserts (0 `blobs/`+`parts/` LISTs on the normal compaction path; a burst of N commits
+  coalesces into one log object, `cas_log_batch_size == N`).
+
+- **OPEN (flagged for the attended S3/S4 review):** on the compaction-driven normal path a key is emitted as
+  a count-0 candidate **only in the fold where it crosses to 0** (`writeSnapshot` drops `<=0` keys, so a
+  later empty-epoch fold never re-emits it). With `grace > 0`, `selectForSweep` records the timer on that one
+  round, the key is absent next round, the timer is cleared, and the candidate is **never deleted on the
+  normal path** — only the (default-off) reconciliation scan re-derives it. So S2 normal-path reclamation is
+  effective only at `grace == 0`; `grace > 0` currently relies on reconciliation. `04279` stays green because
+  it is a **safety** oracle (CA == reference table; never asserts reclamation by a deadline). S3/S4 must add a
+  **candidate-timer carry-forward** (persist count-0 keys with their first-unreachable timer, or age
+  candidates across folds) — a deletion-timer semantic change deliberately NOT made in S2 (candidate-source
+  only; lock + grace + fence + delete tail unchanged). The white-box scan-based gtests drive the
+  reconciliation cadence to exercise reclamation in the meantime.
+
 **Plans:** S1 `../plans/2026-06-05-ca-gc-s1-reverse-index.md`;
 S2 `../plans/2026-06-05-ca-gc-s2-log-structured.md`;
 S3 `../plans/2026-06-05-ca-gc-s3-generations-tombstones.md`;
