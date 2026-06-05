@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcCompaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
@@ -298,21 +299,31 @@ ContentAddressedGC::ContentAddressedGC(
 {
 }
 
-SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::optional<GcLock> held)
+bool ContentAddressedGC::reconciliationDue()
 {
-    /// Hold the per-pool GC lock for the whole sweep (B49): the live-set computation, the
-    /// reachable-blob mark and the delete must not interleave with a transaction commit's
-    /// re-validate + ref publish, or a blob just deemed unreferenced could be deleted in the window
-    /// between a dedup commit's blob HEAD and its ref publish (dangling ref -> data loss). The commit
-    /// path takes the SAME lock and re-HEADs every referenced blob before publishing, failing closed
-    /// if any is gone, so the two are mutually exclusive and a reused blob is either kept reachable
-    /// (commit published its ref first) or the commit retries (sweep reclaimed it first).
-    std::lock_guard<std::mutex> gc_guard(*gc_lock);
+    /// §9 orphan-drift bound: run the heavy reconciliation scan every Nth round. 0 disables the scheduled
+    /// scan (then reconciliation is only manual / the total-loss fallback). The counter advances each
+    /// normal round; when it reaches the cadence it resets and reports due.
+    if (reconciliation_cadence_rounds <= 0)
+        return false;
+    if (++rounds_since_reconciliation >= reconciliation_cadence_rounds)
+    {
+        rounds_since_reconciliation = 0;
+        return true;
+    }
+    return false;
+}
 
-    /// The reachable-blob computation, factored so it can be re-run at the snapshot AND again
-    /// immediately before deletion (the re-validate-under-lock step). B18 fail-close: a live ref whose
-    /// manifest is missing throws CORRUPTED_DATA so the sweep aborts WITHOUT deleting anything (a
-    /// partial reachable set must never drive deletion — it would drop a live part's blobs).
+SweepStats ContentAddressedGC::sweepCandidatesLocked(
+    const std::set<std::string> & candidate_object_keys, int64_t now, int64_t grace, const std::optional<GcLock> & held)
+{
+    /// The SHARED re-validate + grace + fence + delete tail (UNCHANGED semantics from the pre-S2 sweep —
+    /// only the candidate SOURCE differs between the compaction-driven normal path and the reconciliation
+    /// fallback). MUST be called with gc_lock held by the caller.
+    ///
+    /// The reachable-blob computation, factored so it can be re-run immediately before deletion (the
+    /// re-validate-under-lock step) AND used by the S1 drift validator. B18 fail-close: a live ref whose
+    /// manifest is missing throws CORRUPTED_DATA so the sweep aborts WITHOUT deleting anything.
     PartManifestResolver resolve = [this](const PartId & part_id) -> PartManifest
     {
         const PartObjectKey manifest_key = partKey(key_prefix, part_id);
@@ -325,11 +336,11 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
         return PartManifest::deserialize(bytes);
     };
 
-    /// One reachability snapshot: the live part ids (every part named by a published ref), the live
-    /// part manifest keys, and the reachable blob set = (refs -> manifests -> blob keys) UNION every
-    /// LIVE write-session's pending blobs (M8 session-pin roots). All blob keys are FULL object keys
-    /// (BlobObjectKey) so they are directly comparable to the listed blobs/ keys — a bare-hash mismatch
-    /// (the historical data-loss bug class) cannot compile.
+    /// One reachability snapshot: the live part ids, the live part manifest keys, and the reachable blob
+    /// set = (refs -> manifests -> blob keys) UNION every LIVE write-session's pending blobs (M8). NOTE
+    /// (G3): this computes reachability from refs -> manifests + sessions; it does NOT `LIST blobs/`. It is
+    /// the SAFETY NET that drops any candidate still reachable (so a live blob wrongly emitted as a
+    /// count-0 candidate by the compaction is never deleted), NOT the candidate source.
     struct Reachability
     {
         std::set<PartObjectKey> live_part_keys;
@@ -342,17 +353,8 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
         for (const auto & part_id : live)
             r.live_part_keys.insert(partKey(key_prefix, part_id));
         r.reachable_blobs = markReachableBlobs(key_prefix, live, resolve);
-        /// Session-pin roots: a blob uploaded but not yet referenced by a published ref is pinned by a
-        /// live write session in the bucket. Treat it as reachable so a remote sweep cannot reclaim it
-        /// out from under the writer. An expired session is not a root (it is itself reclaimable).
         for (const auto & pinned : sessionPinnedBlobs(object_storage, key_prefix, now))
             r.reachable_blobs.insert(pinned);
-        /// Session-pinned MANIFEST roots (fetch-by-relink, spec §4): a relink opens its session over an
-        /// already-committed part_id and pins that `parts/<part_id>` manifest, because it holds no ref
-        /// yet and the source replica may drop its ref before this server publishes — the manifest must
-        /// not be reclaimed in that window. (The write path's session names a part NAME, not a manifest
-        /// key, so it pins nothing here.) Keep the manifest live so its blobs (already in reachable_blobs
-        /// via the session pin) and the manifest object both survive until the relink ref is published.
         for (const auto & pinned : sessionPinnedPartKeys(object_storage, key_prefix, now))
             r.live_part_keys.insert(pinned);
         return r;
@@ -361,20 +363,9 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
     const Reachability snapshot = compute_reachability();
 
     /// CA GC S1 (B9): VALIDATE the incremental reverse index against this authoritative reachable-blob
-    /// snapshot and LOG any disagreement. This is INSTRUMENTATION ONLY — `to_remove`, the deletion
-    /// decision and `gc_lock` are untouched below; the full scan above stays the sole authority. The
-    /// index view is the set of FULL blob object keys whose per-process refcount is positive, built with
-    /// the SAME `blobKey(key_prefix, H)` fan-out the scan uses so the two are directly comparable (a
-    /// bare-hash-vs-object-key mismatch — the historical data-loss bug class — cannot arise here).
-    ///
-    /// EXPECTED drift, never an error: the index is PER-PROCESS (it sees only blob pins this process
-    /// committed/dropped since startup), so in a multi-node pool or a process that started after parts
-    /// existed it UNDER-counts vs the bucket-wide scan (`missing_in_index`). It also deliberately omits
-    /// the FREEZE/shadow refs, the shared "detached" ref, and any detached refs — those pin blobs but
-    /// are out of S1 scope (see commitOnePart) — another expected source of under-count. `extra_in_index`
-    /// (a blob the index still pins but the scan no longer reaches) reflects a removePart this process
-    /// missed; the scan is authoritative and reclaims it. The gtest validates EXACT agreement only in the
-    /// controlled single-node-from-empty case (the spec's S1 gate: "the validator must never disagree").
+    /// snapshot and LOG any disagreement. INSTRUMENTATION ONLY — the deletion decision below never gates
+    /// on it. Kept running against the compaction-driven path for one more stage (the cheap cross-check
+    /// that the in-memory pre-filter agrees with the folded reverse index / scan). See CA GC S1.
     if (blob_ref_index)
     {
         std::set<BlobObjectKey> index_reachable;
@@ -395,33 +386,33 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
             LOG_INFO(
                 getLogger("ContentAddressedGC"),
                 "cas_gc_index_drift{{missing_in_index={}, extra_in_index={}}} (informational: the per-process "
-                "reverse index disagrees with the authoritative full scan; the scan drives deletion, the index "
-                "is observational — see CA GC S1)",
+                "reverse index disagrees with the authoritative reachability; the scan/compaction drives "
+                "deletion, the index is observational — see CA GC S1)",
                 missing_in_index,
                 extra_in_index);
     }
 
-    /// The full unreferenced object-key set: every manifest not backing a live part, plus every blob
-    /// not reachable from a live manifest or a live session. Sweep scope is strictly parts/ and blobs/.
-    /// This is the ONE well-marked boundary where the raw listed strings are wrapped into typed keys.
+    /// Filter the candidates to the genuinely-unreferenced set against this snapshot, then apply grace.
+    /// A candidate still reachable from a live manifest or a live session is DROPPED here (the safety net):
+    /// the compaction may emit a count-0 key, but if reachability still reaches it the part is live and we
+    /// keep it. A B52 in-flight pin keeps a blob too.
     std::set<std::string> unreferenced;
-    for (const auto & key : listKeysUnder(object_storage, partsPrefix(key_prefix)))
+    const std::string parts_root_for_filter = partsPrefix(key_prefix);
+    for (const auto & key : candidate_object_keys)
     {
-        if (!snapshot.live_part_keys.contains(PartObjectKey(key)))
-            unreferenced.insert(key);
-    }
-    for (const auto & key : listKeysUnder(object_storage, blobsPrefix(key_prefix)))
-    {
-        if (snapshot.reachable_blobs.contains(BlobObjectKey(key)))
-            continue;
-        /// B52: a blob staged by an in-flight (uncommitted) transaction is not yet named by any
-        /// published ref, so it would look unreferenced — but a dedup-skipping insert decided to reuse
-        /// it (and did NOT re-upload it), and is about to publish a ref to it. Deleting it here would
-        /// leave that ref dangling. We hold gc_lock for the whole sweep and the insert holds the SAME
-        /// lock while it pins the key and makes its skip decision, so the pin set we read here is a
-        /// consistent snapshot: treat every pinned key as reachable.
-        if (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(key))
-            continue;
+        const bool is_part = key.rfind(parts_root_for_filter, 0) == 0;
+        if (is_part)
+        {
+            if (snapshot.live_part_keys.contains(PartObjectKey(key)))
+                continue;
+        }
+        else
+        {
+            if (snapshot.reachable_blobs.contains(BlobObjectKey(key)))
+                continue;
+            if (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(key))
+                continue;
+        }
         unreferenced.insert(key);
     }
 
@@ -432,18 +423,13 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
     if (res.to_delete.empty())
         return {};
 
-    /// Re-validate-under-lock: re-read the live roots (refs + live sessions) immediately before
-    /// deletion. The snapshot above listed objects AFTER reading refs, so a ref published in that
-    /// enumeration window would have been missed; recomputing reachability here and dropping any
-    /// candidate now reachable closes that read-refs-then-list-objects race. Keep it correct over
-    /// clever: a fresh full reachability pass, then filter the candidates. B18 fail-close still holds.
+    /// Re-validate-under-lock: a fresh full reachability pass immediately before deletion, dropping any
+    /// candidate now reachable (closes the read-refs-then-list race). B18 fail-close still holds.
     const Reachability revalidated = compute_reachability();
 
     /// Fence-ownership guard (the safety backstop): if this caller holds the GC-leader lock, re-confirm
-    /// before deleting that `gc.lock` STILL carries our fence token. A peer may have stolen leadership
-    /// (a higher fence on disk) while we were paused; a paused holder must NOT delete after a successor
-    /// took a higher fence. Mirror `renewGcLock`'s ownership read-check. When no lock was supplied
-    /// (single-owner / unit tests) the guard is skipped.
+    /// before deleting that `gc.lock` STILL carries our fence token. A paused holder must NOT delete after
+    /// a successor took a higher fence. When no lock was supplied (single-owner / unit tests) it is skipped.
     auto leadership_lost = [&]() -> bool
     {
         if (!held)
@@ -460,10 +446,6 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
     if (leadership_lost())
         return {}; /// a successor took a higher fence; delete NOTHING further.
 
-    /// Delete only the candidates that are STILL unreferenced after re-validation. NOTHING above can
-    /// have deleted anything: a throw in any list/read step aborts before this point with the pool
-    /// intact. The fence guard is also re-checked within the loop so a leadership loss observed
-    /// mid-delete stops further deletions (a paused holder must not keep deleting).
     const std::string parts_root = partsPrefix(key_prefix);
     SweepStats stats;
     StoredObjects to_remove;
@@ -471,7 +453,6 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
     for (const auto & key : res.to_delete)
     {
         const bool is_part = key.rfind(parts_root, 0) == 0;
-        /// Re-validate this specific candidate against the freshly recomputed reachability.
         if (is_part)
         {
             if (revalidated.live_part_keys.contains(PartObjectKey(key)))
@@ -492,13 +473,119 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
         to_remove.emplace_back(key);
     }
 
-    /// Final fence re-check immediately before issuing the removal, in case leadership was lost while
-    /// re-validating (which itself does object-store reads).
+    /// Final fence re-check immediately before issuing the removal.
     if (leadership_lost())
         return {};
 
     object_storage->removeObjectsIfExist(to_remove);
     return stats;
+}
+
+SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::optional<GcLock> held)
+{
+    /// Hold the per-pool GC lock for the whole sweep (B49): the candidate computation and the delete must
+    /// not interleave with a transaction commit's re-validate + ref publish. In S2 the lock does a SECOND
+    /// job (§5.1): while it is held no commit is appending, so the compaction's `LIST gc/log/E.shard/` sees
+    /// a STABLE, complete epoch (the close-before-fold + the held lock together make the fold authoritative).
+    std::lock_guard<std::mutex> gc_guard(*gc_lock);
+
+    /// CA GC S2 — the NORMAL path is COMPACTION-DRIVEN (G3 retired): the candidate source is the per-shard
+    /// streaming compaction's count-0 stream, NOT `listLivePartIds` / `markReachableBlobs` / `LIST blobs/`.
+    /// For each shard we close its epoch (fenced PUT, no CAS) before folding, fold `gc/snap` + `gc/log`,
+    /// and collect every count-0 key's FULL object key as a deletion candidate. The fence guard is the same
+    /// `leadership_lost` read-check the delete tail uses, passed into the compaction so a paused leader
+    /// never advances an epoch.
+    GcCompaction compaction(object_storage, key_prefix);
+
+    auto fence_still_mine = [&]() -> bool
+    {
+        if (!held)
+            return true; /// single-owner / unit tests: no fence to lose.
+        const StoredObject lock_object(gcLockKey(key_prefix));
+        if (!object_storage->exists(lock_object))
+            return false;
+        auto buf = object_storage->readObject(lock_object, getReadSettings(), /*read_hint=*/std::nullopt);
+        String bytes;
+        readStringUntilEOF(bytes, *buf);
+        return GcLock::deserialize(bytes).fence_token == held->fence_token;
+    };
+
+    std::set<std::string> candidate_object_keys;
+    for (ShardId shard = 0; shard < kGcShardCount; ++shard)
+    {
+        const GcCompaction::CompactionResult fold = compaction.compactShard(shard, fence_still_mine);
+        for (const auto & candidate : fold.candidates)
+            candidate_object_keys.insert(candidate.object_key);
+    }
+
+    /// §9 orphan-drift bound: occasionally fold in the heavy reconciliation scan's candidates too, so
+    /// over-counts / abandoned uploads the compaction cannot see (orphan drift) are bounded. This only
+    /// WIDENS the candidate set; the same grace + re-validate + delete tail (and its safety net) applies.
+    if (reconciliationDue())
+    {
+        for (const auto & key : collectReconciliationCandidatesLocked(now))
+            candidate_object_keys.insert(key);
+    }
+
+    /// The unchanged grace + re-validate + fence + delete tail. The candidate SOURCE changed; everything
+    /// downstream (grace ageing, the re-validate-under-lock safety net, the fence guard, the delete
+    /// primitive) is identical to the pre-S2 sweep.
+    return sweepCandidatesLocked(candidate_object_keys, now, grace, held);
+}
+
+std::set<std::string> ContentAddressedGC::collectReconciliationCandidatesLocked(int64_t now)
+{
+    /// The full bucket scan's unreferenced complement (spec §9): every parts/ manifest not backing a live
+    /// part, plus every blobs/ object not reachable from a live manifest or a live session. This is the
+    /// PRE-S2 candidate source, kept ONLY as the reconciliation fallback. MUST be called with gc_lock held.
+    PartManifestResolver resolve = [this](const PartId & part_id) -> PartManifest
+    {
+        const PartObjectKey manifest_key = partKey(key_prefix, part_id);
+        if (!object_storage->tryGetObjectMetadata(manifest_key.string(), /*with_tags=*/false))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed GC: live ref points at missing manifest {}", manifest_key.string());
+        StoredObject object(manifest_key.string());
+        auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
+        String bytes;
+        readStringUntilEOF(bytes, *buf);
+        return PartManifest::deserialize(bytes);
+    };
+
+    std::set<PartId> live = listLivePartIds(object_storage, key_prefix);
+    std::set<PartObjectKey> live_part_keys;
+    for (const auto & part_id : live)
+        live_part_keys.insert(partKey(key_prefix, part_id));
+    std::set<BlobObjectKey> reachable_blobs = markReachableBlobs(key_prefix, live, resolve);
+    for (const auto & pinned : sessionPinnedBlobs(object_storage, key_prefix, now))
+        reachable_blobs.insert(pinned);
+    for (const auto & pinned : sessionPinnedPartKeys(object_storage, key_prefix, now))
+        live_part_keys.insert(pinned);
+
+    std::set<std::string> candidate_object_keys;
+    for (const auto & key : listKeysUnder(object_storage, partsPrefix(key_prefix)))
+    {
+        if (!live_part_keys.contains(PartObjectKey(key)))
+            candidate_object_keys.insert(key);
+    }
+    for (const auto & key : listKeysUnder(object_storage, blobsPrefix(key_prefix)))
+    {
+        if (reachable_blobs.contains(BlobObjectKey(key)))
+            continue;
+        if (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(key))
+            continue;
+        candidate_object_keys.insert(key);
+    }
+    return candidate_object_keys;
+}
+
+SweepStats ContentAddressedGC::runReconciliationScan(int64_t now, int64_t grace, std::optional<GcLock> held)
+{
+    /// The EXPLICIT reconciliation fallback (spec §9): the rare full `parts/`+`blobs/` scan, retired from
+    /// the normal path. Same gc_lock + grace + re-validate + fence + delete tail; only the candidate source
+    /// is the full bucket scan, so it reclaims orphans the compaction cannot see (over-counts, abandoned
+    /// uploads) and recovers from a lost log+snapshot.
+    std::lock_guard<std::mutex> gc_guard(*gc_lock);
+    const std::set<std::string> candidate_object_keys = collectReconciliationCandidatesLocked(now);
+    return sweepCandidatesLocked(candidate_object_keys, now, grace, held);
 }
 
 }

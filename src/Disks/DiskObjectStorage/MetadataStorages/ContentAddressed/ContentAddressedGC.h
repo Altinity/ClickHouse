@@ -204,7 +204,39 @@ public:
     /// (single-owner / unit tests) the guard is skipped.
     SweepStats runSweepOnce(int64_t now, int64_t grace, std::optional<GcLock> held = std::nullopt);
 
+    /// CA GC S2 — the EXPLICIT reconciliation fallback (the rare full `parts/`+`blobs/` scan, spec §9).
+    /// This is the PRE-S2 candidate source, kept ONLY as the recovery path for rebuild / abandoned-upload /
+    /// orphan-drift: it lists every object under `parts/` and `blobs/`, computes reachability from the live
+    /// refs + manifests + live sessions, and reclaims the unreferenced complement under the SAME grace +
+    /// fence + delete primitive as the normal path. It is NOT on the normal path (the normal path is
+    /// compaction-driven — `runSweepOnce`); it is scheduled by the bounded policy (`reconciliationDue`),
+    /// run manually, or used as the total-loss fallback when the log+snapshot are gone. Same fail-close,
+    /// re-validate-under-lock, and fence guarantees as `runSweepOnce`.
+    SweepStats runReconciliationScan(int64_t now, int64_t grace, std::optional<GcLock> held = std::nullopt);
+
 private:
+    /// The shared re-validate + grace + fence + delete tail used by BOTH the compaction-driven normal path
+    /// and the reconciliation fallback. `candidate_object_keys` are the candidate object keys to consider
+    /// for deletion (compaction count-0 candidates, or the full-scan unreferenced complement). The tail
+    /// applies the grace timer, re-validates each candidate against a fresh full reachability snapshot
+    /// (refs -> manifests -> blobs + live sessions — the safety net that drops any candidate still
+    /// reachable, so a live blob wrongly proposed as a candidate is never deleted), re-checks the fence,
+    /// and issues the unchanged `removeObjectsIfExist`. MUST be called with `gc_lock` already held.
+    SweepStats sweepCandidatesLocked(
+        const std::set<std::string> & candidate_object_keys, int64_t now, int64_t grace, const std::optional<GcLock> & held);
+
+    /// The full `parts/`+`blobs/` scan's unreferenced complement — the reconciliation fallback's candidate
+    /// source (spec §9), shared by `runReconciliationScan` and the scheduled orphan-drift fold inside
+    /// `runSweepOnce`. MUST be called with `gc_lock` held.
+    std::set<std::string> collectReconciliationCandidatesLocked(int64_t now);
+
+    /// The bounded reconciliation policy (§9 "orphan-drift bound"): true iff the heavy reconciliation scan
+    /// is due this round — every `reconciliation_cadence_rounds` rounds (a cadence knob), so orphan drift
+    /// (over-counts, abandoned uploads the compaction cannot see) is bounded rather than left to a vague
+    /// "rare". The orphan-byte threshold is a future knob; for S2 the cadence is the bound. Returns false
+    /// when the cadence is 0 (disabled — tests / single-shot drive reconciliation explicitly).
+    bool reconciliationDue();
+
     const ObjectStoragePtr object_storage;
     const std::string key_prefix;
     /// Per-pool in-process GC lock, shared with ContentAddressedTransaction::commit (B49). Never null
@@ -217,6 +249,13 @@ private:
     /// logged for drift only — NEVER gating a deletion. Null when no index was supplied (drift skipped).
     const std::shared_ptr<InMemoryBlobRefIndex> blob_ref_index;
     std::unordered_map<std::string, int64_t> first_unreachable;
+
+    /// §9 orphan-drift bound: run the heavy reconciliation scan every Nth normal round. 0 disables the
+    /// scheduled reconciliation (the normal path is purely compaction-driven; reconciliation is then only
+    /// manual / total-loss fallback). A configurable knob — modest default so drift is bounded but the
+    /// hot path stays scan-free. `rounds_since_reconciliation` is the cadence counter.
+    int64_t reconciliation_cadence_rounds = 0;
+    int64_t rounds_since_reconciliation = 0;
 };
 
 }
