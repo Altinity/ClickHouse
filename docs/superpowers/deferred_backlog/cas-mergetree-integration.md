@@ -662,6 +662,33 @@ adds the tomb barrier; S4 drops the lock).
   attended-review-gated** (it changes deletion semantics — a bug is data loss); the §11 race oracles above
   are that proof.
 
+- **CA GC S4 DONE (lockless handshake, G1):** the §7 commit-vs-sweep handshake replaces the
+  `gc_lock`. **Writer order:** session → upload → recheck-tomb → `+` (the `active`/generation publish)
+  → live-ref — the **session is the §7 flag** (a writer is in-flight iff its session is live).
+  **Session-held-until-folded** (§5.1 rule 3): a writer's session stays live until its `+` is folded
+  into a durable epoch, so a GC that seals between a writer's recheck-tomb and its `+` still observes
+  the session and backs off (the §7.3 reaper handles a crashed writer's stale session). **GC order:**
+  seal → fresh §6.2 re-check (live-refs + manifests + **live sessions**) → recover / drain / sweep.
+  **`gc_lock` DROPPED between commit and sweep (G1)** — demoted to a narrow **in-process-pin-set
+  guard** (the B49 in-process blob PIN) plus a scoped **shared-`detached`-ref commit-vs-commit guard**;
+  the §7 handshake now carries commit-vs-sweep safety and the fence lease carries GC-vs-GC. Safety
+  proven by the §7 interleaving oracle + the lock-free **append-as-epoch-folds** + the **reaper-race**
+  oracles (**148 `ContentAddressed*` gtests green**; CA-default smoke green incl.
+  `04279_content_addressed_gc`; broad CA regression of 27 non-gated merge/mutation/optimize/insert/alter
+  + txn-isolation tests all green, no lock-removal regression). **Op-budget:** ≤2 sequential control
+  writes (the S3-only floor), measured as distinct-control-object depth (not raw PUTs).
+  **FLAG — data-loss-risk stage: a DO-NOT-MERGE-UNTIL-PROVEN attended-review gate is OUTSTANDING**
+  (the §7/§5.1 oracles want human review before a production merge — S4 changes locking + deletion
+  semantics). **Residual review concerns:** (1) the in-process-pin-set narrow-guard shape; (2) the
+  scoped `detached`-ref serializer; (3) op-budget measured as distinct-control-object depth, not raw
+  PUTs. **REMAINING (optional): Phase 4 Keeper acceleration (§12.2)** — a pure **bounded cache**
+  (ephemeral sessions, per-shard epoch mirror, a valid-negative tombstone cache with
+  seal-to-Keeper-before-recheck, a log-tail mirror) reaching the 1-PUT normal-mode floor; the lockless
+  model is **complete + correct WITHOUT it** (the "tests pass without Keeper" half of the north star
+  holds), and "with Keeper" is purely the remaining acceleration.
+  **Plan:** `../plans/2026-06-05-ca-gc-s4-lockless-handshake.md`; spec
+  `../specs/content_addressed_shared_mergetree_design.md` (v3, §5.1/§6.2/§7/§12.2/§13).
+
 **Plans:** S1 `../plans/2026-06-05-ca-gc-s1-reverse-index.md`;
 S2 `../plans/2026-06-05-ca-gc-s2-log-structured.md`;
 S3 `../plans/2026-06-05-ca-gc-s3-generations-tombstones.md`;
