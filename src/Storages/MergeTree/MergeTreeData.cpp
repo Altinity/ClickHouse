@@ -30,9 +30,11 @@
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/hasNullable.h>
+#include <Disks/IDiskTransaction.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/TemporaryFileOnDisk.h>
 #include <Disks/createVolume.h>
+#include <IO/copyData.h>
 #include <IO/Operators.h>
 #include <IO/S3Common.h>
 #include <IO/SharedThreadPools.h>
@@ -7337,6 +7339,14 @@ void MergeTreeData::restorePartFromBackup(std::shared_ptr<RestoredPartsHolder> r
     /// Copy files from the backup to the directory `tmp_part_dir`.
     disk->createDirectories(temp_part_dir);
 
+    /// A content-addressed disk publishes a part as ONE manifest (N files -> one ref) atomically, so the
+    /// per-file copyFileToDisk autocommit below is rejected for content part files. Route the restore
+    /// through one whole-part transaction (mirrors DataPartStorageOnDiskBase::freeze's owned_transaction):
+    /// all files land in a single content-addressed part at tmp_restore_<part>, published by tx->commit().
+    DiskTransactionPtr restore_tx;
+    if (disk->isContentAddressed())
+        restore_tx = disk->createTransaction();
+
     for (const String & filename : filenames)
     {
         /// Needs to create subdirectories before copying the files. Subdirectories are used to represent projections.
@@ -7357,9 +7367,23 @@ void MergeTreeData::restorePartFromBackup(std::shared_ptr<RestoredPartsHolder> r
             continue;
         }
 
-        size_t file_size = backup->copyFileToDisk(part_path_in_backup_fs / filename, disk, temp_part_dir / filename, WriteMode::Rewrite);
-        reservation->update(reservation->getSize() - file_size);
+        if (restore_tx)
+        {
+            auto in = backup->readFile(part_path_in_backup_fs / filename);
+            auto out = restore_tx->writeFile(temp_part_dir / filename, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, getContext()->getWriteSettings());
+            copyData(*in, *out);
+            out->finalize();
+            reservation->update(reservation->getSize() - backup->getFileSize(part_path_in_backup_fs / filename));
+        }
+        else
+        {
+            size_t file_size = backup->copyFileToDisk(part_path_in_backup_fs / filename, disk, temp_part_dir / filename, WriteMode::Rewrite);
+            reservation->update(reservation->getSize() - file_size);
+        }
     }
+
+    if (restore_tx)
+        restore_tx->commit();
 
     if (auto part = loadPartRestoredFromBackup(part_name, disk, temp_part_dir, detach_if_broken))
         restored_parts_holder->addPart(part);
