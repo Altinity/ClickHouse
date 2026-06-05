@@ -590,7 +590,7 @@ S2 (`../plans/2026-06-05-ca-gc-s2-log-structured.md`, spec §5/§5.1/§9/§11/§
   plus op-budget asserts (0 `blobs/`+`parts/` LISTs on the normal compaction path; a burst of N commits
   coalesces into one log object, `cas_log_batch_size == N`).
 
-- **OPEN (flagged for the attended S3/S4 review):** on the compaction-driven normal path a key is emitted as
+- **OPEN (CLOSED BY S3 — see the S3 DONE note below):** on the compaction-driven normal path a key is emitted as
   a count-0 candidate **only in the fold where it crosses to 0** (`writeSnapshot` drops `<=0` keys, so a
   later empty-epoch fold never re-emits it). With `grace > 0`, `selectForSweep` records the timer on that one
   round, the key is absent next round, the timer is cleared, and the candidate is **never deleted on the
@@ -601,6 +601,66 @@ S2 (`../plans/2026-06-05-ca-gc-s2-log-structured.md`, spec §5/§5.1/§9/§11/§
   candidates across folds) — a deletion-timer semantic change deliberately NOT made in S2 (candidate-source
   only; lock + grace + fence + delete tail unchanged). The white-box scan-based gtests drive the
   reconciliation cadence to exercise reclamation in the meantime.
+
+### CA GC S3 DONE — generations + GC-owned tombstones make the lockless delete ABA-safe
+
+S3 (`../plans/2026-06-05-ca-gc-s3-generations-tombstones.md`, spec §6/§6.1/§6.2/§9/§11/§13) is implemented
+and tested. It replaces the bare-key direct `removeObjectsIfExist` (G2) with the generation + tombstone
+state machine, the **carrier the S4 lockless handshake needs** — while the `gc_lock` is **still held** (S3
+adds the tomb barrier; S4 drops the lock).
+
+- **Generations on BOTH `blobs/<H>/<g>` AND `parts/<part_id>/<mg>` (symmetric, §9).** Every content/manifest
+  key carries an explicit generation (`PoolMeta` v3, no back-compat); `blobKey(H)` == `blobGenKey(H, 0)` is
+  the common-case wrapper. The manifest body still pins **bare `H`**, so `part_id` stays a pure content
+  function (dedup/idempotency unchanged). A best-effort `active` hint (a plain PUT, never a CAS — G4/I7d)
+  names the preferred generation; it is absent in the common g=0 case (readers default to 0).
+- **GC-owned `.tombstone` seal + permanent gravestone.** A count-0 candidate is **sealed**
+  (`condCreateIfAbsent(<g>.tombstone)`, single-owner, fence-gated) — a DURABLE condemnation that survives
+  the process and is **re-presented every round** via `collectSealedTombstoneCandidatesLocked` (this closes
+  the S2 `grace>0` liveness gap: a candidate condemned in the crossing fold is re-discovered until swept or
+  recovered). SWEEP **keeps the gravestone forever** (only RECOVER deletes a tombstone).
+- **Resurrection to `g+1`/`mg+1`.** A writer that finds its resolved generation **sealed** abandons it and
+  `condCreateIfAbsent`s the next generation (a different physical key → ABA-proof, I4); the `+` delta carries
+  the resolved `(H,g)`/`(part_id,mg)` (the S2 `event_id` generation discriminator is now used). **The
+  tombstone — not the object's presence — is the only condemnation signal:** an absent-but-UNSEALED
+  generation is a fresh object (the g=0 blob the write buffer already uploaded, or the manifest the commit is
+  about to `condCreate`), so resurrection fires **iff sealed**.
+- **mark / recover / drain / sweep** (`sweepCandidatesLocked`, generation-aware, the SAME tail for the
+  compaction normal path and the reconciliation fallback): seal → grace (liveness only) → **fresh
+  authoritative re-check** (refs→manifests reachability + live sessions — S3 keeps this pass; S4 swaps it for
+  the sessions+compaction-only §6.2 form) → branch: **SWEEP** (identity unreachable → delete `<g>`,
+  best-effort reset `active`, keep gravestone) / **RECOVER** (identity reachable, no successor → delete the
+  tombstone, re-open `g`) / **DRAIN** (identity reachable, a successor `g+1…` exists → keep BOTH the tombstone
+  and `<g>`, do NOT re-open — the I7a two-generations-pinned reality).
+- **Reader: `active`+404→LIST fallback; a tombstone NEVER blocks a read** (§6.1). The steady g=0 read is one
+  GET; a 404 LISTs the generation prefix and reads the highest present generation (byte-identical, I7c),
+  opportunistically repairing `active`.
+- **Reconciliation folds generation dirs** (`collectReconciliationCandidatesLocked`): a `.tombstone`/`active`
+  is never an orphan (`parseGenObjectKey` skips them); a present `<g>` is an orphan only if its **identity**
+  is unreachable (the manifest pins bare `H`, so the safety net is identity-level).
+- **Observability (§13):** `ContentAddressedGenerationResurrectionsTotal`, `…DuplicateGenerationBytes`,
+  `…TombstonesTotal`, `…GenerationsObserved`/`…HashesObserved` (the generations-per-hash p99 proxy), and
+  `…OrphanBytesEstimate` are exported as ProfileEvents and asserted by a gtest.
+
+- **Two real bugs the oracles + the (never-rebuilt) S1/S2 gtest suite exposed, fixed at the source:**
+  (1) `resolveAndResurrectGeneration` resurrected on `!present`, so a freshly-created manifest (absent at
+  `mg=0` before `condCreate`) spun to the 8-iteration cap and threw on **every insert** — fixed to resurrect
+  iff **sealed** (a swept generation keeps its gravestone, so it is still `sealed` and routes to `g+1`).
+  (2) the GC manifest resolver read `parts/<id>/0` only, so a live part whose manifest was **resurrected to
+  `mg>0`** was mis-reported as a missing manifest (`CORRUPTED_DATA`, sweep aborts) — added
+  `resolveManifestAtAnyGeneration` (mirrors the reader's `repairPartGenOn404`; B18 fail-close preserved).
+- **Tests:** 9 new S3 oracles in `gtest_content_addressed_gc_s3.cpp` over a real `LocalObjectStorage`
+  (real `O_EXCL` `condCreateIfAbsent`, real `runReconciliationScan` seal/recover/drain/sweep tail) —
+  seal/resurrect/gravestone-lineage, active-reset+reader-fallback, tombstone-doesn't-block-reads,
+  SWEEP/RECOVER/**DRAIN** branches, two-generations-pinned (byte-correct from either generation, the
+  single-live-generation lemma NOT assumed), manifest symmetry (relink→`mg+1`), and the §13 counter asserts.
+  **141 `ContentAddressed*` gtests green; CA-default smoke green incl. `04279_content_addressed_gc`.**
+- **Known S3 caveat (S4 tightens):** the DRAIN re-check is **identity-level**, so a predecessor `g` is
+  reclaimed only once the WHOLE identity becomes unreachable (a conservative leak while a successor still
+  lives — **never data loss**). S4's generation-precise re-check (sessions + compaction, §6.2) tightens it
+  AND drops the `gc_lock`; the durable tomb barrier built here is the safety carrier S4 relies on. **S3 is
+  attended-review-gated** (it changes deletion semantics — a bug is data loss); the §11 race oracles above
+  are that proof.
 
 **Plans:** S1 `../plans/2026-06-05-ca-gc-s1-reverse-index.md`;
 S2 `../plans/2026-06-05-ca-gc-s2-log-structured.md`;
