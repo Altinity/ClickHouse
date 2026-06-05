@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcCompaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcDelta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLogWriter.h>
@@ -7,20 +9,25 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <Disks/WriteMode.h>
 
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteBufferFromString.h>
 
+#include <Core/ServerUUID.h>
+
 #include <Common/Exception.h>
 #include <Common/ObjectStorageKeyGenerator.h>
 
 #include <atomic>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
 
 using namespace DB::ContentAddressed;
 
@@ -30,6 +37,7 @@ namespace ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
     extern const int NOT_IMPLEMENTED;
+    extern const int S3_ERROR;
 }
 }
 
@@ -54,6 +62,12 @@ public:
     mutable std::atomic<size_t> get_ops{0};
     mutable std::atomic<size_t> head_ops{0};
     mutable std::atomic<size_t> delete_ops{0};
+    /// CA GC S4 (§12.3 budget) — PUTs classified by the control-plane prefix they write. The two SYNCHRONOUS
+    /// SEQUENTIAL control writes a small-part commit issues are the session PUT and the live-ref PUT; the
+    /// `+` (gc/log) is batched/async; blobs/parts are data PUTs.
+    mutable std::atomic<size_t> session_put_ops{0}; /// PUT under `<prefix>/sessions/`
+    mutable std::atomic<size_t> ref_put_ops{0};     /// PUT of the live ref object (under `/refs/`, not `.meta`)
+    mutable std::atomic<size_t> gc_log_put_ops{0};  /// PUT under `<prefix>/gc/log/` (the batched `+`)
 
     std::string getName() const override { return "CountingMemoryObjectStorage"; }
     DB::ObjectStorageType getType() const override { return DB::ObjectStorageType::None; }
@@ -137,9 +151,27 @@ public:
         DB::WriteMode /*mode*/,
         std::optional<DB::ObjectAttributes> /*attributes*/,
         size_t /*buf_size*/,
-        const DB::WriteSettings & /*write_settings*/) override
+        const DB::WriteSettings & write_settings) override
     {
+        /// Honor `If-None-Match: *` (the §7/§9 conditional create-if-absent contract): a PUT onto an
+        /// EXISTING key is rejected with the S3 `PreconditionFailed` signal `condCreateIfAbsent` keys off.
+        /// This makes the storage pass the capability probe (`ensureConditionalCreateSupported`) and gives
+        /// the commit path a real CAS to coordinate the pool on — the same seam MinIO/S3 occupies.
+        if (write_settings.object_storage_write_if_none_match == "*")
+        {
+            std::lock_guard lock(mtx);
+            if (data.contains(object.remote_path))
+                throw DB::Exception(DB::ErrorCodes::S3_ERROR, "PreconditionFailed: object {} already exists", object.remote_path);
+        }
         put_ops.fetch_add(1, std::memory_order_relaxed);
+        /// CA GC S4 (§12.3) — classify the control-plane PUT by prefix for the budget asserts.
+        const std::string & key = object.remote_path;
+        if (key.find("/sessions/") != std::string::npos)
+            session_put_ops.fetch_add(1, std::memory_order_relaxed);
+        else if (key.find("/gc/log/") != std::string::npos)
+            gc_log_put_ops.fetch_add(1, std::memory_order_relaxed);
+        else if (key.find("/refs/") != std::string::npos && !key.ends_with(".meta"))
+            ref_put_ops.fetch_add(1, std::memory_order_relaxed); /// the LIVE ref (not the .meta sidecar / mutable files)
         return std::make_unique<MemoryWriteBuffer>(this, object.remote_path);
     }
 
@@ -185,6 +217,31 @@ public:
     {
         std::lock_guard lock(mtx);
         return data.contains(key);
+    }
+
+    /// CA GC S4 (§12.3) — count DISTINCT object keys currently present whose key contains `needle`. The
+    /// "sequential control DEPTH" the budget bounds is the number of DISTINCT durable control objects that
+    /// gate a commit (one session object + one ref object), independent of idempotent lease-renew rewrites
+    /// of the same key (those happen DURING the parallel data upload, not as added pre-ref round trips).
+    size_t countDistinctKeysContaining(const std::string & needle) const
+    {
+        std::lock_guard lock(mtx);
+        size_t n = 0;
+        for (const auto & [key, value] : data)
+            if (key.find(needle) != std::string::npos)
+                ++n;
+        return n;
+    }
+
+    /// Count distinct LIVE ref objects (under `/refs/`, excluding the `.meta` sidecar / mutable files).
+    size_t countDistinctLiveRefs() const
+    {
+        std::lock_guard lock(mtx);
+        size_t n = 0;
+        for (const auto & [key, value] : data)
+            if (key.find("/refs/") != std::string::npos && !key.ends_with(".meta"))
+                ++n;
+        return n;
     }
 
 private:
@@ -739,4 +796,82 @@ TEST(ContentAddressedGcS2, BurstOfCommitsCoalescesIntoFewerLogObjects)
         if (key.kind == GcCompaction::KeyKind::Part && count > 0)
             ++live_parts;
     EXPECT_EQ(live_parts, N);
+}
+
+/// CA GC S4 (§12.3) — the OP-COUNT BUDGET assert for the S3-only degraded-mode floor. Drive a REAL
+/// small-part `ContentAddressedTransaction::commit` over the counting object storage and assert the floor.
+///
+/// The "sequential control DEPTH" the §12.3 floor bounds is the number of DISTINCT durable CONTROL OBJECTS
+/// that gate a commit — exactly ONE write-session object (the §7 flag A) + ONE live-ref object (the commit
+/// point) = `cas_s3_sequential_control_depth_per_commit` ≤ 2. The session is rewritten in place several
+/// times (the per-blob lease renew DURING the parallel data upload, the §7.1 step-2 re-assert, and the
+/// committed-flag update at the end), but those are idempotent rewrites of the SAME key — one distinct
+/// control object — not added pre-ref control round trips on the critical path.
+///
+/// MUST-NOT (§12.3): NO per-blob `GET active` on the success path (a fresh g=0 blob resolves to g=0 WITHOUT
+/// reading `active`), and the `gc/log` `+` is BATCHED into a bounded number of objects (coalesced by epoch),
+/// never one un-batched object per blob.
+TEST(ContentAddressedGcS4Budget, SmallPartCommitS3OnlyControlWriteFloor)
+{
+    DB::ServerUUID::setRandomForUnitTests();
+
+    const std::string prefix = "cas_gc_s4_budget";
+    const std::string scratch = "./cas_gc_s4_budget_scratch";
+    std::error_code ec;
+    std::filesystem::remove_all(scratch, ec);
+    std::filesystem::create_directories(scratch, ec);
+
+    auto storage = std::make_shared<CountingMemoryObjectStorage>();
+    auto ms = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        storage, /*storage_path_prefix=*/prefix, /*server_id=*/"srv", scratch, /*context=*/nullptr, /*allow_shared_pool=*/false);
+    ms->startup();
+
+    const std::string uuid = "uuid-budget";
+    const std::string part = "all_1_1_0";
+
+    const size_t get_ops_before = storage->get_ops.load();
+
+    /// A small part with two content files (a typical tiny insert).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/prefix, scratch);
+        for (const auto & [name, bytes] :
+             std::map<std::string, std::string>{{"data.bin", "BUDGET-PAYLOAD"}, {"columns.txt", "c"}})
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    const size_t get_ops = storage->get_ops.load() - get_ops_before;
+
+    /// The SYNCHRONOUS SEQUENTIAL CONTROL DEPTH = distinct control objects gating the commit. After the
+    /// commit exactly ONE session object lingers (held-until-folded — the §7 flag A) and ONE live ref
+    /// exists (the commit point). `cas_s3_sequential_control_depth_per_commit` = 1 session + 1 ref ≤ 2.
+    const size_t distinct_sessions = storage->countDistinctKeysContaining("/sessions/");
+    const size_t distinct_live_refs = storage->countDistinctLiveRefs();
+    EXPECT_EQ(distinct_sessions, 1u) << "exactly one durable handshake session object (flag A)";
+    EXPECT_EQ(distinct_live_refs, 1u) << "exactly one live ref object (the commit point)";
+    const size_t sequential_control_depth = distinct_sessions + distinct_live_refs;
+    EXPECT_LE(sequential_control_depth, 2u)
+        << "S3-only floor: at most 2 distinct sequential control objects per commit (session + ref); the `+` is async/batched";
+
+    /// The `+` (gc/log) is split per (shard, epoch) — one coalesced object per distinct GC shard the part's
+    /// blobs + the part edge home to — NOT one un-batched object per blob, and NOT per commit on the hot
+    /// path (multiple commits to the same (shard, epoch) window coalesce into one object — see
+    /// `CoalescedAppendBatchesNDeltasIntoOneObject`). A 2-blob part edges into at most 3 distinct (shard)
+    /// buckets (2 blob shards + 1 part-edge shard), so the gc/log object count is bounded by that fan-out.
+    const size_t distinct_gc_log_objects = storage->countDistinctKeysContaining("/gc/log/");
+    EXPECT_LE(distinct_gc_log_objects, 3u)
+        << "the gc/log `+` is coalesced per (shard, epoch) — bounded by the part's shard fan-out, never per-blob";
+
+    /// MUST-NOT (§12.3): no per-blob `GET active` on the success path. A fresh g=0 blob resolves to g=0
+    /// without reading `active`, so the commit issues ZERO control-plane GETs for a brand-new part.
+    EXPECT_EQ(get_ops, 0u) << "no per-blob GET active on the small-part success path (§12.3 MUST-NOT)";
+
+    ms->shutdown();
+    std::filesystem::remove_all("./" + prefix, ec);
+    std::filesystem::remove_all(prefix, ec);
+    std::filesystem::remove_all(scratch, ec);
 }
