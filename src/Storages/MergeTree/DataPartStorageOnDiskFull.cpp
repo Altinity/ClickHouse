@@ -62,7 +62,13 @@ bool DataPartStorageOnDiskFull::existsFile(const std::string & name) const
 
 bool DataPartStorageOnDiskFull::existsDirectory(const std::string & name) const
 {
-    return volume->getDisk()->existsDirectory(fs::path(root_path) / part_dir / name);
+    auto path = fs::path(root_path) / part_dir / name;
+    /// CA read-your-writes: a part still being assembled by this transaction can have a staged-but-uncommitted
+    /// directory (e.g. a carried-forward projection hardlinked into the open whole-part txn) that committed
+    /// metadata cannot see yet. Mirrors existsFile (B59) at directory granularity.
+    if (transaction && transaction->hasInFlightDirectory(path))
+        return true;
+    return volume->getDisk()->existsDirectory(path);
 }
 
 class DataPartStorageIteratorOnDisk final : public IDataPartStorageIterator
