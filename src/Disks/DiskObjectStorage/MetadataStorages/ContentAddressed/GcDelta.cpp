@@ -53,6 +53,13 @@ std::string GcLogBatch::serialize() const
         DB::writeVarUInt(d.pins.size(), buf);
         for (const auto & pin : d.pins)
             DB::writeStringBinary(pin.string(), buf);
+        /// CA GC S3 (version 2): the resolved manifest generation, then a parallel vector of the resolved
+        /// per-pin generations. The pin-generation count is written explicitly (rather than assumed equal
+        /// to pins.size()) so a defensive size mismatch fails closed on read.
+        DB::writeVarUInt(d.manifest_generation, buf);
+        DB::writeVarUInt(d.pin_generations.size(), buf);
+        for (uint64_t g : d.pin_generations)
+            DB::writeVarUInt(g, buf);
     }
     buf.finalize();
     return out;
@@ -87,6 +94,24 @@ GcLogBatch GcLogBatch::deserialize(const std::string & bytes)
             std::string pin;
             DB::readStringBinary(pin, buf);
             d.pins.emplace_back(std::move(pin));
+        }
+        /// CA GC S3 (version 2): the resolved manifest generation and the parallel per-pin generations.
+        /// The count must either be 0 (no resolved generations recorded — every pin is g=0) or exactly
+        /// match the pin count; any other size is a corrupt log object (fail closed).
+        DB::readVarUInt(d.manifest_generation, buf);
+        uint64_t ng = 0;
+        DB::readVarUInt(ng, buf);
+        if (ng != 0 && ng != np)
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "ContentAddressed gc delta log: pin_generations count {} does not match pins count {}",
+                ng, np);
+        d.pin_generations.reserve(ng);
+        for (uint64_t j = 0; j < ng; ++j)
+        {
+            uint64_t g = 0;
+            DB::readVarUInt(g, buf);
+            d.pin_generations.push_back(g);
         }
         batch.deltas.push_back(std::move(d));
     }

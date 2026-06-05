@@ -318,6 +318,32 @@ private:
     // commit() does that once around the loop over all parts.
     void commitOnePart(const PartKey & key, PartStaging & st);
 
+    // ==== CA GC S3: the writer's tomb re-check + resurrection (spec §6, §7.1 steps 4-5) ====
+    //
+    // A generic resolve-and-resurrect over a (id, gen)-key family, instantiated for both blobs and the
+    // manifest. Resolve the current generation `g` for `id` via the best-effort `active` hint (default 0),
+    // ensure `gen_key(id, g)` exists (the fresh-upload path created g=0; a reused/resurrected object exists
+    // already), then RE-CHECK `tombstone_key(id, g)`: if the generation has been SEALED, ABANDON it and
+    // RESURRECT to g+1 — condCreateIfAbsent the g+1 object (copying the still-present sealed generation's
+    // byte-identical content), best-effort advance `active → g+1`, and retry the re-check (bounded). Never
+    // wait, never rescue `g`, never delete the tombstone, never re-upload to the sealed key (§6). Returns
+    // the RESOLVED, non-tombstoned generation the writer settled on (threaded into the `+` delta). In S3 the
+    // gc_lock is still held across commit + sweep, so a seal rarely races the re-check — but the handshake
+    // is wired correctly now (S4 drops the lock and relies on it).
+    //
+    // `make_gen_key` / `make_tomb_key` / `make_active_key` build the per-generation object/tombstone/active
+    // keys for the id; `obj_exists` HEADs a key. The content for a resurrected generation is copied from the
+    // present (sealed) generation, which the GC keeps until sweep (seal != delete).
+    uint64_t resolveAndResurrectGeneration(
+        const std::string & id_for_log,
+        const std::function<std::string(uint64_t)> & make_gen_key,
+        const std::function<std::string(uint64_t)> & make_tomb_key,
+        const std::function<std::string()> & make_active_key);
+
+    // Read-only `active` generation hint (default 0). The DROP path resolves the generation its `+` settled
+    // on without ever resurrecting (a drop removes a reference, it never attaches one).
+    uint64_t readActiveGenHint(const std::string & active_key) const;
+
     // Record (logical_file -> blob) for the part being written; the part_id is derived from this.
     void recordBlob(const std::string & path, ContentAddressed::BlobEntry entry);
     // Pin/verify the (table_uuid, part_name) all files of one commit must agree on.

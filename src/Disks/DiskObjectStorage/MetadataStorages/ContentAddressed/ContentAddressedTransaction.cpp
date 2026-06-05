@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLogWriter.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/DiskType.h>
 #include <Disks/WriteMode.h>
@@ -1226,6 +1227,115 @@ void ContentAddressedTransaction::truncateFile(const std::string &, size_t)
     /// No-op: content-addressed blobs are immutable; committed part files are never truncated.
 }
 
+uint64_t ContentAddressedTransaction::readActiveGenHint(const std::string & active_key) const
+{
+    /// Read a best-effort `active` generation hint (default 0 if absent or unparseable). Used on the
+    /// read-only DROP path: a drop resolves the generation its `+` settled on but NEVER resurrects (it is
+    /// removing a reference, not attaching one). A stale/absent hint resolves to 0 — the common case.
+    auto bytes = metadata_storage.readSmallObjectIfExists(active_key);
+    if (!bytes || bytes->empty())
+        return 0;
+    uint64_t parsed = 0;
+    for (char c : *bytes)
+    {
+        if (c < '0' || c > '9')
+            return 0;
+        parsed = parsed * 10 + static_cast<uint64_t>(c - '0');
+    }
+    return parsed;
+}
+
+uint64_t ContentAddressedTransaction::resolveAndResurrectGeneration(
+    const std::string & id_for_log,
+    const std::function<std::string(uint64_t)> & make_gen_key,
+    const std::function<std::string(uint64_t)> & make_tomb_key,
+    const std::function<std::string()> & make_active_key)
+{
+    auto & object_storage = *metadata_storage.object_storage;
+
+    /// Resolve the current generation via the best-effort `active` hint (default 0 — absent in the common
+    /// case). `active` is a plain hint, never authoritative: a stale value only costs an extra re-check.
+    uint64_t g = 0;
+    if (auto active_bytes = metadata_storage.readSmallObjectIfExists(make_active_key()))
+    {
+        uint64_t parsed = 0;
+        bool ok = !active_bytes->empty();
+        for (char c : *active_bytes)
+        {
+            if (c < '0' || c > '9')
+            {
+                ok = false;
+                break;
+            }
+            parsed = parsed * 10 + static_cast<uint64_t>(c - '0');
+        }
+        if (ok)
+            g = parsed;
+    }
+
+    /// Bounded re-check + resurrect loop (§6, §7.1 steps 4-5). Each iteration: ensure g exists, re-check its
+    /// tombstone; if SEALED, resurrect to g+1 and retry. The bound caps a pathological hot-content cycle of
+    /// zero-refs→resurrection; in S3 the held gc_lock means a seal essentially never races this, so one or
+    /// two iterations is the norm.
+    constexpr size_t max_iterations = 8;
+    for (size_t iter = 0; iter < max_iterations; ++iter)
+    {
+        const std::string gen_key = make_gen_key(g);
+
+        /// Ensure the resolved generation's object is PRESENT. The fresh-upload path created blobs/H/0
+        /// already; a reused/resurrected object exists at its g. If it is absent here, a concurrent sweep
+        /// reclaimed it (only possible if it was sealed first) — treat exactly like a sealed generation and
+        /// resurrect, since we cannot attach to a missing/condemned generation.
+        const bool present = object_storage.tryGetObjectMetadata(gen_key, /*with_tags=*/false).has_value();
+
+        /// RE-CHECK the tombstone for this exact generation. The seal is GC-owned; its presence means "no
+        /// new attachment may target g" (I4). We never delete it, never rescue g.
+        const bool sealed
+            = object_storage.tryGetObjectMetadata(make_tomb_key(g), /*with_tags=*/false).has_value();
+
+        if (present && !sealed)
+            return g; /// settled: a present, non-tombstoned generation we may attach to.
+
+        /// Abandon g, resurrect to g+1 (§6). condCreateIfAbsent the g+1 object so concurrent resurrectors
+        /// collapse onto one object (I5). Its bytes are the byte-identical content of the present (sealed)
+        /// generation, which the GC keeps until sweep — read it and create g+1. If the present generation
+        /// is itself gone (already swept), fall through to the next higher generation the next iteration
+        /// (its tombstone/active will route us there).
+        const uint64_t next = g + 1;
+        const std::string next_key = make_gen_key(next);
+        if (!object_storage.tryGetObjectMetadata(next_key, /*with_tags=*/false).has_value())
+        {
+            /// Source the bytes from whichever generation is still present (prefer the just-checked g).
+            std::optional<std::string> content;
+            if (present)
+                content = metadata_storage.readSmallObjectIfExists(gen_key);
+            if (content)
+                ContentAddressed::condCreateIfAbsent(object_storage, next_key, *content);
+        }
+
+        /// Best-effort advance `active → g+1` (a plain PUT, NOT a CAS — G4/I7d). A failure only costs the
+        /// next writer/reader an extra re-check/fallback.
+        try
+        {
+            const std::string bytes = std::to_string(next);
+            auto out = object_storage.writeObject(StoredObject(make_active_key()), WriteMode::Rewrite);
+            out->write(bytes.data(), bytes.size());
+            out->finalize();
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+        }
+
+        g = next;
+    }
+
+    throw Exception(
+        ErrorCodes::CORRUPTED_DATA,
+        "ContentAddressed: generation resurrection for {} exceeded {} iterations (hot content cycling "
+        "zero-refs→resurrection); retry the operation",
+        id_for_log, max_iterations);
+}
+
 void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging & st)
 {
     const std::string & table_uuid_ = key.first;
@@ -1307,35 +1417,42 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
 
     const ContentAddressed::PartId part_id = ContentAddressed::computePartId(manifest.blobs);
 
-    /// B49: re-validate every referenced blob UNDER the gc_lock (held by the caller) before writing the
-    /// manifest or publishing the ref. finalizeImpl skips re-uploading a blob that already exists (dedup);
-    /// in the window between that skip and this publish a concurrent background sweep could reclaim such a
-    /// blob (it was unreferenced + past grace), leaving the ref we are about to publish dangling -> data
-    /// loss on read. The sweep holds this SAME lock for its whole mark+delete, so once the caller holds it
-    /// the live set is stable: re-HEAD every blob the manifest names and, if any is missing, FAIL CLOSED (a
-    /// retryable error) WITHOUT publishing a dangling ref. The insert is then retried and re-uploads the
-    /// blob. With mutual exclusion the only outcomes are: we publish first (the sweep's next pass sees the
-    /// blob reachable and keeps it) or the sweep reclaimed it first (we throw and retry) — never a published
-    /// ref to a deleted blob.
+    /// CA GC S3: resolve every referenced blob's GENERATION and RE-CHECK its tombstone before publishing
+    /// (spec §6, §7.1 steps 4-5). This generalizes the B49 re-validate: resolve (H → g) per blob via its
+    /// `active` hint (default 0), confirm a present, non-tombstoned generation, and — if the resolved
+    /// generation has been SEALED — resurrect to g+1 (a different physical key, ABA-proof: I4). The held
+    /// gc_lock still makes the live set stable for the common case (a fresh g=0 blob the sweep cannot have
+    /// sealed); resurrection is the carrier the S4 lockless handshake will rely on. The resolved generation
+    /// is captured per pin so the `+` delta records the exact (H,g) the manifest now references. The
+    /// manifest body still pins BARE H (part_id is content-only), so dedup/idempotency are unchanged.
+    std::map<ContentAddressed::BlobHash, uint64_t> resolved_blob_gen;
     for (const auto & [file, entry] : manifest.blobs)
     {
-        const std::string blob_key = ContentAddressed::blobKey(key_prefix, entry.key).string();
-        if (!metadata_storage.object_storage->tryGetObjectMetadata(blob_key, /*with_tags=*/false).has_value())
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "ContentAddressed: blob {} (file {}) referenced by part {}/{} was concurrently reclaimed "
-                "by GC before the ref could be published; retry the insert",
-                blob_key, file, table_uuid_, part_name_);
+        if (resolved_blob_gen.contains(entry.key))
+            continue; /// two files can reference the same blob — resolve each unique hash once.
+        const uint64_t g = resolveAndResurrectGeneration(
+            entry.key.string(),
+            [&](uint64_t gen) { return ContentAddressed::blobGenKey(key_prefix, entry.key, gen).string(); },
+            [&](uint64_t gen) { return ContentAddressed::blobTombstoneKey(key_prefix, entry.key, gen).string(); },
+            [&]() { return ContentAddressed::blobActiveKey(key_prefix, entry.key); });
+        resolved_blob_gen.emplace(entry.key, g);
     }
 
-    /// Put-if-absent the manifest: identical parts (same deterministic blobs) share one manifest object.
-    const std::string part_key = ContentAddressed::partKey(key_prefix, part_id).string();
+    /// Resolve the manifest GENERATION mg the same way (§9, symmetric to blobs): the manifest object lives
+    /// at parts/<part_id>/<mg>. A freshly-created manifest is mg=0; a relink-after-full-drop re-creation
+    /// routes to mg+1 if mg=0 was sealed (the ABA hole the bare-key delete had). Put-if-absent the manifest
+    /// at the resolved generation: identical parts (same deterministic blobs → same part_id) still share
+    /// ONE manifest object at that generation (dedup unchanged).
+    const uint64_t manifest_gen = resolveAndResurrectGeneration(
+        part_id.string(),
+        [&](uint64_t gen) { return ContentAddressed::partGenKey(key_prefix, part_id, gen).string(); },
+        [&](uint64_t gen) { return ContentAddressed::partTombstoneKey(key_prefix, part_id, gen).string(); },
+        [&]() { return ContentAddressed::partActiveKey(key_prefix, part_id); });
+    const std::string part_key = ContentAddressed::partGenKey(key_prefix, part_id, manifest_gen).string();
     if (!metadata_storage.object_storage->tryGetObjectMetadata(part_key, /*with_tags=*/false).has_value())
     {
-        const std::string bytes = manifest.serialize();
-        auto out = metadata_storage.object_storage->writeObject(StoredObject(part_key), WriteMode::Rewrite);
-        out->write(bytes.data(), bytes.size());
-        out->finalize();
+        /// condCreateIfAbsent so concurrent creators of the same (part_id, mg) collapse onto one object (I5).
+        ContentAddressed::condCreateIfAbsent(*metadata_storage.object_storage, part_key, manifest.serialize());
     }
 
     /// Write the per-ref sidecar BEFORE the ref (the ref is the last, publishing step). A crashed
@@ -1413,10 +1530,24 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
             ContentAddressed::GcDelta delta;
             delta.op = ContentAddressed::GcDelta::Op::Add;
             delta.part_id = part_id;
-            delta.event_id = ContentAddressed::GcDelta::computeEventId(part_id, delta.op);
-            delta.pins.reserve(manifest.blobs.size());
+            /// CA GC S3: thread the RESOLVED (part_id, mg) and (H, g) into the `+` delta — the generation
+            /// discriminator the S2 codec reserved. The manifest generation is folded into the event_id so
+            /// two re-appends of the SAME resolved delta still dedup; the per-pin generations are recorded
+            /// parallel to the pins. The delta is logged AFTER the tomb re-check / resurrection above, so an
+            /// abandoned generation never leaves a stale `+` (§7.1 step 4 ordering).
+            delta.manifest_generation = manifest_gen;
+            delta.event_id = ContentAddressed::GcDelta::computeEventId(part_id, delta.op, manifest_gen);
+            /// De-duplicate the pins by hash (a blob referenced by several files is one pinned (H,g)).
+            std::set<ContentAddressed::BlobHash> seen;
+            delta.pins.reserve(resolved_blob_gen.size());
+            delta.pin_generations.reserve(resolved_blob_gen.size());
             for (const auto & [file, entry] : manifest.blobs)
+            {
+                if (!seen.insert(entry.key).second)
+                    continue;
                 delta.pins.push_back(entry.key);
+                delta.pin_generations.push_back(resolved_blob_gen.at(entry.key));
+            }
             metadata_storage.gcLogWriter()->appendAndFlushForCommit(delta);
         }
         catch (...)
@@ -1686,10 +1817,23 @@ bool ContentAddressedTransaction::unlinkPartDirRefs(const std::string & path)
             ContentAddressed::GcDelta delta;
             delta.op = ContentAddressed::GcDelta::Op::Remove;
             delta.part_id = *dropped_part_id;
-            delta.event_id = ContentAddressed::GcDelta::computeEventId(*dropped_part_id, delta.op);
+            /// CA GC S3: record the SAME resolved generations the matching `+` settled on, resolved
+            /// read-only via the `active` hints (a drop never resurrects). The common case is all-zero
+            /// (g=0/mg=0). The manifest generation is folded into the event_id, parallel to the `+`.
+            delta.manifest_generation
+                = readActiveGenHint(ContentAddressed::partActiveKey(key_prefix, *dropped_part_id));
+            delta.event_id
+                = ContentAddressed::GcDelta::computeEventId(*dropped_part_id, delta.op, delta.manifest_generation);
+            std::set<ContentAddressed::BlobHash> seen;
             delta.pins.reserve(dropped_manifest->blobs.size());
+            delta.pin_generations.reserve(dropped_manifest->blobs.size());
             for (const auto & [file, entry] : dropped_manifest->blobs)
+            {
+                if (!seen.insert(entry.key).second)
+                    continue;
                 delta.pins.push_back(entry.key);
+                delta.pin_generations.push_back(readActiveGenHint(ContentAddressed::blobActiveKey(key_prefix, entry.key)));
+            }
             metadata_storage.gcLogWriter()->enqueue(delta);
             metadata_storage.gcLogWriter()->flushAll();
         }

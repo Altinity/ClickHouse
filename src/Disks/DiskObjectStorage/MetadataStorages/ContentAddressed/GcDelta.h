@@ -37,6 +37,17 @@ struct GcDelta
     /// The resolved bare blob hashes the part's manifest pins (the `(H)` keys the compaction counts).
     std::vector<BlobHash> pins;
 
+    /// CA GC S3 — the resolved GENERATIONS the writer settled on after its tomb re-check / resurrection
+    /// (spec §6, §7.1). `manifest_generation` is the `mg` of the manifest object this delta references
+    /// (`parts/<part_id>/<mg>`); `pin_generations` is parallel to `pins` and carries each pinned blob's
+    /// resolved `g` (`blobs/<H>/<g>`). The common case is all-zero (g=0/mg=0). The generation lives ONLY
+    /// here and in the physical key — never in `part_id`/manifest identity (dedup is unchanged). When
+    /// `pin_generations` is empty (an S2 delta, or a delta read from an older log object) every pin is
+    /// taken as g=0. The manifest generation is also folded into `event_id` via computeEventId's
+    /// `generation` argument, so two re-appends of the SAME resolved delta still dedup.
+    uint64_t manifest_generation = 0;
+    std::vector<uint64_t> pin_generations;
+
     /// Compute the stable `event_id` for a logical delta. Deterministic from (part_id, op, generation):
     /// the same logical delta — including a §5.1 rule-2 re-append into a later epoch — yields the same
     /// id, so the fold dedups it. `generation` is reserved for S3 (manifest/blob generations); pass 0 in
@@ -60,8 +71,12 @@ struct GcLogBatch
     static GcLogBatch deserialize(const std::string & bytes);
 
     /// 4-byte magic `CAGD` ("Content-Addressed Gc Delta") + a 1-byte version, per the shared codec.
+    ///
+    /// Version 2 (CA GC S3) appends the resolved per-delta `manifest_generation` and the parallel
+    /// `pin_generations` vector to each delta's body (spec §6). A v3 pool is created fresh (PoolMeta v3,
+    /// no back-compat), so no v1 log object can exist in it — reading only v2 is correct and fail-closed.
     static constexpr FormatMagic MAGIC = makeMagic("CAGD");
-    static constexpr uint8_t VERSION = 1;
+    static constexpr uint8_t VERSION = 2;
 };
 
 }
