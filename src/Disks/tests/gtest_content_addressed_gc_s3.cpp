@@ -51,7 +51,7 @@ namespace ProfileEvents
 /// machinery over a REAL LocalObjectStorage:
 ///   - `condCreateIfAbsent` runs the real `O_EXCL` single-owner create (the seal/resurrect primitive).
 ///   - `ContentAddressedGC::runReconciliationScan` runs the real seal -> grace -> fresh re-check ->
-///     {sweep | recover | drain} tail (`sweepCandidatesLocked`) — the same code the compaction-driven
+///     {sweep | recover | drain} tail (`sweepCandidates`) — the same code the compaction-driven
 ///     `runSweepOnce` runs, only the candidate SOURCE differs (here the full-scan + sealed-tombstone
 ///     re-presentation, which is exactly what exercises the branch on hand-seeded generationed objects).
 ///   - the generation key helpers (`blobGenKey`, `blobTombstoneKey`, `blobActiveKey`, `blobGenPrefix`,

@@ -365,7 +365,7 @@ PartManifest ContentAddressedGC::resolveManifestAtAnyGeneration(const PartId & p
     return PartManifest::deserialize(bytes);
 }
 
-SweepStats ContentAddressedGC::sweepCandidatesLocked(
+SweepStats ContentAddressedGC::sweepCandidates(
     const std::set<std::string> & candidate_object_keys,
     const std::set<std::string> & pinned_snapshot,
     int64_t now,
@@ -374,7 +374,9 @@ SweepStats ContentAddressedGC::sweepCandidatesLocked(
 {
     /// The SHARED re-validate + grace + fence + delete tail (UNCHANGED semantics from the pre-S2 sweep —
     /// only the candidate SOURCE differs between the compaction-driven normal path and the reconciliation
-    /// fallback). MUST be called with gc_lock held by the caller.
+    /// fallback).
+    /// CA GC S4 (G1): runs LOCK-FREE — the gc_lock is no longer held across the sweep. Reads in-flight pins
+    /// only from the supplied lock-free pinned_snapshot (never the shared set).
     ///
     /// The reachable-blob computation, factored so it can be re-run immediately before deletion (the
     /// re-validate-under-lock step) AND used by the S1 drift validator. B18 fail-close: a live ref whose
@@ -614,12 +616,13 @@ SweepStats ContentAddressedGC::sweepCandidatesLocked(
     return stats;
 }
 
-std::set<std::string> ContentAddressedGC::collectSealedTombstoneCandidatesLocked()
+std::set<std::string> ContentAddressedGC::collectSealedTombstoneCandidates()
 {
     /// Enumerate every sealed-but-unswept tombstone in the pool and map it back to its generation object
     /// key, so a generation condemned in an earlier round (its `<g>.tombstone` is durable) is re-presented
     /// as a candidate every round until it is swept or recovered. This is what makes the condemnation
-    /// SURVIVE across rounds (closing the S2 grace>0 gap). MUST be called with gc_lock held.
+    /// SURVIVE across rounds (closing the S2 grace>0 gap).
+    /// CA GC S4 (G1): runs lock-free (the gc_lock is not held across the sweep).
     ///
     /// A tombstone key is `<…>/<g>.tombstone`; its generation object is the byte-identical key without the
     /// suffix (`<…>/<g>`). We never re-seal here (the tombstone already exists); the sweep tail decides the
@@ -812,7 +815,7 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
     /// grace expired (the S2 grace>0 gap). The DURABLE `<g>.tombstone` is the persistent condemned-state:
     /// re-discovering it here keeps the candidate flowing through seal(no-op)/grace/recheck/branch every
     /// round until it is swept or recovered.
-    for (const auto & key : collectSealedTombstoneCandidatesLocked())
+    for (const auto & key : collectSealedTombstoneCandidates())
         candidate_object_keys.insert(key);
 
     /// §9 orphan-drift bound: occasionally fold in the heavy reconciliation scan's candidates too, so
@@ -820,14 +823,14 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
     /// WIDENS the candidate set; the same grace + re-validate + delete tail (and its safety net) applies.
     if (reconciliationDue())
     {
-        for (const auto & key : collectReconciliationCandidatesLocked(now))
+        for (const auto & key : collectReconciliationCandidates(now, pinned_snapshot))
             candidate_object_keys.insert(key);
     }
 
     /// The unchanged grace + re-validate + fence + delete tail. The candidate SOURCE changed; everything
     /// downstream (grace ageing, the re-validate-under-lock safety net, the fence guard, the delete
     /// primitive) is identical to the pre-S2 sweep.
-    return sweepCandidatesLocked(candidate_object_keys, pinned_snapshot, now, grace, held);
+    return sweepCandidates(candidate_object_keys, pinned_snapshot, now, grace, held);
 }
 
 std::set<std::string> ContentAddressedGC::snapshotInFlightPinnedBlobs() const
@@ -841,11 +844,13 @@ std::set<std::string> ContentAddressedGC::snapshotInFlightPinnedBlobs() const
     return *in_flight_pinned_blobs;
 }
 
-std::set<std::string> ContentAddressedGC::collectReconciliationCandidatesLocked(int64_t now)
+std::set<std::string> ContentAddressedGC::collectReconciliationCandidates(
+    int64_t now, const std::set<std::string> & pinned_snapshot)
 {
     /// The full bucket scan's unreferenced complement (spec §9): every parts/ manifest not backing a live
     /// part, plus every blobs/ object not reachable from a live manifest or a live session. This is the
-    /// PRE-S2 candidate source, kept ONLY as the reconciliation fallback. MUST be called with gc_lock held.
+    /// PRE-S2 candidate source, kept ONLY as the reconciliation fallback.
+    /// CA GC S4 (G1/#5): runs lock-free; reads in-flight pins only from the supplied pinned_snapshot.
     /// CA GC S3: resolve a live part's manifest at ANY present generation (resurrected manifests live at
     /// mg>0). Same B18 fail-close on a genuinely-missing manifest. See resolveManifestAtAnyGeneration.
     PartManifestResolver resolve = [this](const PartId & part_id) -> PartManifest
@@ -889,7 +894,9 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidatesLocked(
         const BlobObjectKey identity_key = blobKey(key_prefix, BlobHash(parts->identity));
         if (reachable_blobs.contains(identity_key))
             continue; /// the identity is reachable — keep ALL its generations.
-        if (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(identity_key.string()))
+        /// CA GC S4 (#5): read the B52 in-flight pin from the lock-free SNAPSHOT taken at the start of the
+        /// sweep, not from the shared std::set a concurrent commit is mutating (the data race this fixes).
+        if (pinned_snapshot.contains(identity_key.string()))
             continue;
         candidate_object_keys.insert(key);
     }
@@ -1014,13 +1021,13 @@ SweepStats ContentAddressedGC::runReconciliationScan(int64_t now, int64_t grace,
     /// in-flight pin set is snapshotted once (the §7 handshake + fence lease carry the safety, as in the
     /// normal path).
     const std::set<std::string> pinned_snapshot = snapshotInFlightPinnedBlobs();
-    std::set<std::string> candidate_object_keys = collectReconciliationCandidatesLocked(now);
+    std::set<std::string> candidate_object_keys = collectReconciliationCandidates(now, pinned_snapshot);
     /// CA GC S3 — also re-present every sealed-but-unswept tombstone, so the reconciliation path drives the
     /// same seal/grace/recheck/branch tail (sweep / drain / recover) on already-condemned generations, not
     /// only on freshly-discovered orphans.
-    for (const auto & key : collectSealedTombstoneCandidatesLocked())
+    for (const auto & key : collectSealedTombstoneCandidates())
         candidate_object_keys.insert(key);
-    return sweepCandidatesLocked(candidate_object_keys, pinned_snapshot, now, grace, held);
+    return sweepCandidates(candidate_object_keys, pinned_snapshot, now, grace, held);
 }
 
 }

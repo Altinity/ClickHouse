@@ -243,7 +243,7 @@ private:
     ///   (a) SEAL — `condCreateIfAbsent(<g>.tombstone)`: a DURABLE, single-owner, fence-gated condemnation.
     ///       Once sealed no new attach may target `g` (the writer's tomb re-check routes reuse to `g+1`).
     ///       The seal — NOT an in-memory timer — is the persistent condemned-state, so a candidate
-    ///       condemned in round 1 is re-discovered (via `collectSealedTombstoneCandidatesLocked`) and
+    ///       condemned in round 1 is re-discovered (via `collectSealedTombstoneCandidates`) and
     ///       processed in round N after grace, closing the S2 grace>0 liveness gap.
     ///   (b) GRACE — liveness ageing from the seal (NEVER a safety fence — the fresh re-check is the gate).
     ///   (c) FRESH authoritative re-check (§6.2) AFTER the seal: refs -> manifests reachability + live
@@ -255,9 +255,11 @@ private:
     ///         (un-seal), re-open `g` as attachable.
     ///       - ref/session for `(id, g)` BUT a successor `g+1…` already exists -> DRAIN: KEEP the tombstone
     ///         AND the gen object (still referenced — do NOT delete), do NOT re-open `g`.
-    /// MUST be called with `gc_lock` already held. Symmetric for blobs and manifests (§9): both run the
-    /// identical machinery on their `(identity, generation)` key family.
-    SweepStats sweepCandidatesLocked(
+    /// CA GC S4 (G1): runs LOCK-FREE — the gc_lock is no longer held across the sweep. Reads in-flight pins
+    /// only from the supplied lock-free pinned_snapshot (never the shared set).
+    /// Symmetric for blobs and manifests (§9): both run the identical machinery on their
+    /// `(identity, generation)` key family.
+    SweepStats sweepCandidates(
         const std::set<std::string> & candidate_object_keys,
         const std::set<std::string> & pinned_snapshot,
         int64_t now,
@@ -278,9 +280,9 @@ private:
     /// condemned in an earlier round (its `<g>.tombstone` is durable) is re-processed every round until it
     /// is swept or recovered (closing the S2 grace>0 gap where a count-0 candidate emitted only in the
     /// crossing fold was forgotten before grace expired). Lists `blobsPrefix` + `partsPrefix`, keeps only
-    /// `.tombstone` keys, and maps each back to its generation object key (`<g>`). MUST be called with
-    /// `gc_lock` held.
-    std::set<std::string> collectSealedTombstoneCandidatesLocked();
+    /// `.tombstone` keys, and maps each back to its generation object key (`<g>`).
+    /// CA GC S4 (G1): runs lock-free (the gc_lock is not held across the sweep).
+    std::set<std::string> collectSealedTombstoneCandidates();
 
     /// CA GC S3 — resolve a part's manifest body at ANY present generation (§6.1/§9). A live ref pins the
     /// bare `part_id`, but the physical manifest may have been RESURRECTED to `mg>0` (the GC sealed `mg=0`
@@ -307,8 +309,9 @@ private:
 
     /// The full `parts/`+`blobs/` scan's unreferenced complement — the reconciliation fallback's candidate
     /// source (spec §9), shared by `runReconciliationScan` and the scheduled orphan-drift fold inside
-    /// `runSweepOnce`. MUST be called with `gc_lock` held.
-    std::set<std::string> collectReconciliationCandidatesLocked(int64_t now);
+    /// `runSweepOnce`.
+    /// CA GC S4 (G1/#5): runs lock-free; reads in-flight pins only from the supplied pinned_snapshot.
+    std::set<std::string> collectReconciliationCandidates(int64_t now, const std::set<std::string> & pinned_snapshot);
 
     /// CA GC S4 — the session-until-folded REAPER (§5.1 rule 3, §7.3 mechanical rule). A write session is the
     /// durable handshake flag covering a `+`-before-fold gap (§7.1): it must be retained until EVERY one of
