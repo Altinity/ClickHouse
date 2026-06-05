@@ -604,6 +604,76 @@ TEST_F(ContentAddressedGcS4, Sec5_1_ReappendIfAdvancedActuallyFires)
     EXPECT_FALSE(b_dropped_as_candidate) << "the re-appended + must keep b counted across the epoch advance";
 }
 
+/// ── Oracle 2 (new, Task 16) — real lockless interleaving: a `+` lands as its epoch folds → the blob survives.
+///
+/// Unlike the pre-existing `Sec5_1_AppendAsEpochFolds` oracle which pre-advances all shards and has
+/// reconciliation ON, this oracle runs with reconciliation OFF (the GcLogWriter / GcCompaction path only —
+/// exactly the lockless regime the spec §7 says the old lock used to cover). The `+` is appended and
+/// IMMEDIATELY each settled epoch is folded; the blob must NEVER appear as a count-0 candidate.
+TEST_F(ContentAddressedGcS4, Sec7_RealLocklessInterleaving_PlusLandsAsEpochFolds_BlobSurvives)
+{
+    GcLogWriter writer(os, prefix);
+    GcCompaction compaction(os, prefix);
+    const auto kStillLeader = [] { return true; };
+
+    const BlobHash b = blobHash("i01");
+    const PartId p = partId("i01");
+
+    /// reconciliationCadence stays at its default (off): the candidate source is the compaction/lockless
+    /// path only — exactly the regime the spec says the old oracles never exercised.
+    GcDelta add;
+    add.op = GcDelta::Op::Add;
+    add.part_id = p;
+    add.pins = {b};
+    add.pin_generations = {0};
+    add.event_id = GcDelta::computeEventId(p, GcDelta::Op::Add, 0);
+    const auto settled = writer.appendAndFlushForCommit(add);
+    ASSERT_FALSE(settled.empty());
+
+    /// Close each settled epoch (fold) — the `+` is carried into the snapshot, b is COUNTED, never a
+    /// count-0 candidate (the lock-free re-append + dedup made the log complete).
+    for (const auto & [s, e] : settled)
+    {
+        const auto folded = compaction.compactShard(s, kStillLeader);
+        EXPECT_GT(folded.new_epoch, e);
+        for (const auto & c : folded.candidates)
+            EXPECT_NE(c.key.identity, b.string()) << "a live blob must never fall out as a count-0 candidate under the lockless fold";
+    }
+}
+
+/// ── Oracle 5 (new, Task 16) — negative codec for the session delta batch (fail-closed).
+///
+/// `serializeGcDeltasForSession` / `deserializeGcDeltasFromSession` (the PLURAL helpers, CA GC S4 #2)
+/// must round-trip a single delta exactly, and must throw (fail-closed) on both magic corruption and
+/// truncation. This closes the negative-path gap in the codec test coverage.
+TEST_F(ContentAddressedGcS4, Sec5_NegativeCodec_GcDeltasSession_FailsClosed)
+{
+    const PartId p = partId("n01");
+    GcDelta d;
+    d.op = GcDelta::Op::Add;
+    d.part_id = p;
+    d.pins = {blobHash("n01")};
+    d.pin_generations = {0};
+    d.event_id = GcDelta::computeEventId(p, GcDelta::Op::Add, 0);
+
+    const std::string good = serializeGcDeltasForSession({d});
+    EXPECT_NO_THROW(deserializeGcDeltasFromSession(good));
+    /// round-trip preserves the single delta
+    {
+        const auto parsed = deserializeGcDeltasFromSession(good);
+        ASSERT_EQ(parsed.size(), 1u);
+        EXPECT_EQ(parsed.front().part_id.string(), p.string());
+    }
+
+    /// Corrupt the magic (first byte) -> must throw (fail-closed), not misparse.
+    std::string bad_magic = good;
+    bad_magic[0] = static_cast<char>(bad_magic[0] ^ 0xFF);
+    EXPECT_ANY_THROW(deserializeGcDeltasFromSession(bad_magic));
+
+    /// Truncate the body -> must throw.
+    EXPECT_ANY_THROW(deserializeGcDeltasFromSession(good.substr(0, good.size() / 2)));
+}
+
 /// CA GC S4 (#4): round-trip unit test for the gc/sealed/<shard> index path builders + parser.
 /// Verifies gcSealedKey/parseSealedIndexKey round-trip for both blob and part entries at multiple
 /// generations, and that parseSealedIndexKey returns nullopt for malformed inputs.
