@@ -484,6 +484,11 @@ private:
     bool session_open = false;
     std::string session_id;
     ContentAddressed::WriteSession session;
+
+    /// CA GC S4 (#2): set when a part's `+`-flush threw during commit. The serialized `+` delta is kept so
+    /// commit() can stamp it onto the durable session for the GC reaper's bounded re-log.
+    bool commit_delta_flush_failed = false;
+    std::string failed_add_delta_bytes;
 };
 
 }

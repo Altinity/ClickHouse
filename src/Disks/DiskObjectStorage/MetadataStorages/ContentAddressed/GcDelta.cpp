@@ -118,4 +118,22 @@ GcLogBatch GcLogBatch::deserialize(const std::string & bytes)
     return batch;
 }
 
+std::string serializeGcDeltaForSession(const GcDelta & delta)
+{
+    /// One delta wrapped in a single-element GcLogBatch — reuses the versioned batch codec so the on-disk
+    /// shape is identical to a gc/log object and the reaper can append it verbatim.
+    GcLogBatch batch;
+    batch.deltas.push_back(delta);
+    return batch.serialize();
+}
+
+GcDelta deserializeGcDeltaFromSession(const std::string & bytes)
+{
+    const GcLogBatch batch = GcLogBatch::deserialize(bytes);
+    if (batch.deltas.size() != 1)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "ContentAddressed session pending_add_delta must hold exactly one delta, got {}", batch.deltas.size());
+    return batch.deltas.front();
+}
+
 }

@@ -1604,18 +1604,35 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
                 delta.pins.push_back(entry.key);
                 delta.pin_generations.push_back(resolved_blob_gen.at(entry.key));
             }
-            /// CA GC S4: capture the `(shard, epoch)` each fragment settled in (after the §5.1 rule-2
-            /// re-append) so the session-until-folded reaper can gate this commit's session on the folded
-            /// watermark of exactly those epochs.
-            for (auto & shard_epoch : metadata_storage.gcLogWriter()->appendAndFlushForCommit(delta))
-                settled_delta_epochs.push_back(shard_epoch);
+            /// CA GC S4 (#2): keep the serialized `+` so a flush failure below can stamp it onto the durable
+            /// session for the GC reaper's bounded re-log (fail-closed: never drop the session's coverage).
+            const std::string this_add_delta_bytes = ContentAddressed::serializeGcDeltaForSession(delta);
+            try
+            {
+                /// CA GC S4: capture the `(shard, epoch)` each fragment settled in (after the §5.1 rule-2
+                /// re-append) so the session-until-folded reaper can gate this commit's session on the folded
+                /// watermark of exactly those epochs.
+                for (auto & shard_epoch : metadata_storage.gcLogWriter()->appendAndFlushForCommit(delta))
+                    settled_delta_epochs.push_back(shard_epoch);
+            }
+            catch (...)
+            {
+                /// FAIL-CLOSED (#2): the ref is about to be published but the `+` did not land durably.
+                /// Record the delta + mark the transaction so commit() makes the session STICKY (retained,
+                /// lease-exempt) instead of releasing it. The GC reaper re-logs `pending_add_delta`.
+                commit_delta_flush_failed = true;
+                failed_add_delta_bytes = this_add_delta_bytes;
+                tryLogCurrentException(
+                    getLogger("ContentAddressedTransaction"),
+                    "CA GC S4 (#2): + flush failed for part " + part_id.string()
+                        + " — session will be retained sticky and the + re-logged by the GC reaper");
+            }
         }
         catch (...)
         {
             tryLogCurrentException(
                 getLogger("ContentAddressedTransaction"),
-                "CA GC S2: failed to append the + delta for part " + part_id.string() + " to gc/log "
-                "(the authoritative GC scan is unaffected for S2)");
+                "CA GC S2: failed to build the + delta for part " + part_id.string());
         }
     }
 
@@ -1730,6 +1747,17 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     {
         session.committed = true;
         session.delta_epochs = settled_delta_epochs;
+        /// CA GC S4 (#2): if a part's `+` flush threw, the ref is published but no `+` is durable. Mark the
+        /// session STICKY (retained, lease-exempt, carrying the serialized `+`) so neither the lease reaper
+        /// nor the folded reaper drops it; the GC reaper re-logs `pending_add_delta` and clears sticky once
+        /// the re-logged `+` is folded. NEVER release the session in this state.
+        if (commit_delta_flush_failed)
+        {
+            session.deltas_failed = true;
+            session.pending_add_delta = failed_add_delta_bytes;
+            persistSession();
+            return; /// fail-closed: keep the sticky session; do not run the folded-release below.
+        }
         persistSession();
 
         if (allSettledEpochsFolded(settled_delta_epochs))
