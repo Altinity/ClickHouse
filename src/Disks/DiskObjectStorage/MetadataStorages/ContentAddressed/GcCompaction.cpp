@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcCompaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ObjectIO.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLogWriter.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
@@ -6,7 +7,6 @@
 
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
-#include <IO/ReadSettings.h>
 #include <IO/VarInt.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
@@ -136,15 +136,6 @@ std::optional<std::pair<uint64_t, ShardId>> parseLogTail(const std::string & key
     if (slash == std::string::npos)
         return std::nullopt;
     return parseEpochShard(tail.substr(0, slash));
-}
-
-std::string readSmallObject(const ObjectStoragePtr & object_storage, const std::string & key)
-{
-    StoredObject object(key);
-    auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
-    String content;
-    readStringUntilEOF(content, *buf);
-    return content;
 }
 
 /// Fold a set of deltas into a per-key NET count delta, deduped on fold. Shared by `compactShard` and

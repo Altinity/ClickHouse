@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ObjectIO.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/RefPayload.h>
@@ -14,8 +15,6 @@
 
 #include <filesystem>
 
-#include <IO/ReadHelpers.h>
-#include <IO/ReadSettings.h>
 
 #include <Common/Exception.h>
 #include <Common/Logger.h>
@@ -360,14 +359,7 @@ MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 
 std::optional<std::string> ContentAddressedMetadataStorage::readSmallObjectIfExists(const std::string & key) const
 {
-    if (!object_storage->tryGetObjectMetadata(key, /*with_tags=*/false))
-        return std::nullopt;
-
-    StoredObject object(key);
-    auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
-    String content;
-    readStringUntilEOF(content, *buf);
-    return content;
+    return ContentAddressed::readSmallObjectIfExists(*object_storage, key);
 }
 
 ContentAddressed::BlobObjectKey ContentAddressedMetadataStorage::resolveBlobGenKeyForRead(const ContentAddressed::BlobHash & blob_hash) const

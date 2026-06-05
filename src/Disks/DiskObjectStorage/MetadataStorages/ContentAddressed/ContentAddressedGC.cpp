@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ObjectIO.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/RefPayload.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcCompaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLogWriter.h>
@@ -48,15 +49,6 @@ namespace ContentAddressed
 
 namespace
 {
-
-std::string readSmallObject(const ObjectStoragePtr & object_storage, const std::string & key)
-{
-    StoredObject object(key);
-    auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
-    String content;
-    readStringUntilEOF(content, *buf);
-    return content;
-}
 
 /// Read + deserialize the session at `key`, returning nullopt if it VANISHED between the caller's LIST and
 /// this READ (its owner committed/aborted — on commit the blobs are reachable via the published ref; on

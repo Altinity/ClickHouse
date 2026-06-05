@@ -1,12 +1,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ObjectIO.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
-#include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
-
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
-#include <IO/ReadSettings.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 
@@ -118,12 +116,7 @@ std::string claimPoolOwnership(
 
     /// The CAS was lost: the marker already existed (a prior mount of ours, or another mounter that won
     /// the concurrent claim). Read it and apply the EXISTING single-owner compatibility rules unchanged.
-    StoredObject object(key);
-    auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
-    String content;
-    readStringUntilEOF(content, *buf);
-
-    const PoolMeta existing = PoolMeta::deserialize(content);
+    const PoolMeta existing = PoolMeta::deserialize(readSmallObject(object_storage, key));
 
     if (existing.version != PoolMeta::CURRENT_VERSION)
         throw Exception(
