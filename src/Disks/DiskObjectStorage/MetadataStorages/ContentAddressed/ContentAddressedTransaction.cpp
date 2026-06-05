@@ -1370,6 +1370,19 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
     const std::string & table_uuid_ = key.first;
     const std::string & part_name_ = key.second;
 
+    /// CA GC S4 (G1) — the held-across-commit `gc_lock` is gone, but the SHARED "detached" ref still needs
+    /// COMMIT-vs-COMMIT serialization (B66): a FETCH PARTITION downloads parts concurrently and each part's
+    /// commit does a read-merge-publish into the ONE `detached` ref; without serialization two commits read
+    /// the same prior manifest and the second overwrites the first's contribution (lost parts). This is a
+    /// concurrent-writer-to-a-shared-mutable-object problem, NOT the commit-vs-sweep handshake, so the §7
+    /// proof does not cover it. Re-use the per-pool in-process mutex (now the narrow container guard) as the
+    /// detached-ref serializer, scoped to THIS commit's read-merge-publish — a regular part_name is never
+    /// re-committed with new content under the same name, so only "detached" needs it. The sweep no longer
+    /// takes this lock, so detached commits serialize only among themselves, never against the GC.
+    std::optional<std::lock_guard<std::mutex>> detached_ref_guard;
+    if (part_name_ == ContentAddressed::kDetachedDirName && metadata_storage.gc_lock)
+        detached_ref_guard.emplace(*metadata_storage.gc_lock);
+
     /// A part entry with ALL-empty staging is a no-op (a part that was remembered but never written, e.g.
     /// adopted as a tmp rename target with nothing staged under it).
     if (st.recorded.empty() && st.recorded_mutable.empty() && st.recorded_mutable_removed.empty())
@@ -1427,13 +1440,14 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
     /// "detached" ref. The default publish below rewrites the ref, which would make each publish overwrite
     /// the previous one (only the last detached part would be listed — B46). So when the target is the
     /// detached namespace, merge the new keys into the existing detached ref's manifest first. This
-    /// read-modify-write of the SHARED detached ref MUST happen UNDER the per-pool gc_lock (held by the
-    /// caller): a FETCH PARTITION downloads its parts concurrently (the FETCH thread pool, 03350) and each
-    /// part's commit publishes into the same "detached" ref, so an unlocked read-merge-publish loses entries
-    /// — two concurrent commits both read the same prior manifest and the second overwrites the first's
-    /// contribution, leaving only one part's blobs and a FILE_DOESNT_EXIST on the lost parts (B66). The
-    /// lock serializes the read-merge-publish so every part accumulates. (A regular part_name is never
-    /// re-committed with new content under the same name, so this only affects "detached".)
+    /// read-modify-write of the SHARED detached ref happens UNDER `detached_ref_guard` (taken at the top of
+    /// commitOnePart for the detached case — CA GC S4 G1): a FETCH PARTITION downloads its parts
+    /// concurrently (the FETCH thread pool, 03350) and each part's commit publishes into the same "detached"
+    /// ref, so an unlocked read-merge-publish loses entries — two concurrent commits both read the same
+    /// prior manifest and the second overwrites the first's contribution, leaving only one part's blobs and
+    /// a FILE_DOESNT_EXIST on the lost parts (B66). The guard serializes the read-merge-publish so every
+    /// part accumulates. (A regular part_name is never re-committed with new content under the same name, so
+    /// this only affects "detached".)
     if (part_name_ == ContentAddressed::kDetachedDirName)
     {
         if (auto existing_pid = metadata_storage.readRefPartId(table_uuid_, part_name_))
@@ -1658,17 +1672,17 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     if (session_open)
         persistSession();
 
-    /// Take the per-pool in-process GC lock ONCE around the whole multi-part publish (B49). The sweep holds
-    /// this SAME lock for its entire mark+delete, so once we hold it the live set is stable for every part.
-    /// (The lock is STILL HELD in this phase — the §7.1 order + session-as-flag are now in place so the
-    /// later phase can drop it; this phase is behavior-equivalent at the safety level.)
-    std::lock_guard<std::mutex> gc_guard(*metadata_storage.gc_lock);
-
-    /// Re-assert the flag is durable AT the §7.1 step-2 point — under the lock, BEFORE any per-part upload /
-    /// recheck / `+` / ref below. This is the store of the §7 proof's flag `A` (the session pin) that, in
-    /// the lockless phase, must PRECEDE both the writer's own tomb re-check and GC's §6.2 load. Behaviorally
-    /// equivalent under the held lock (the renew just above already made it live); it makes the ordering
-    /// explicit so the lock can come out later without moving this step.
+    /// CA GC S4 (G1) — the per-pool GC lock is NO LONGER held across the multi-part publish. The §7
+    /// handshake is the sole cross-process commit-vs-sweep gate: the session pin (raised above, the §7
+    /// proof's flag `A`) is durable and GC-visible BEFORE the per-part tomb re-check and the `+` below, and
+    /// the GC seals `.tombstone` (flag `M`) BEFORE its fresh §6.2 re-check that reads the live session set.
+    /// The lock survives ONLY as the narrow container guard for `in_flight_pinned_blobs` (taken around the
+    /// per-blob pin insert in `decide_and_pin` and around the pin-erase loop below) — it no longer
+    /// serializes commit against the whole sweep.
+    ///
+    /// Re-assert the flag is durable AT the §7.1 step-2 point, BEFORE any per-part upload / recheck / `+` /
+    /// ref below. This is the store of the §7 proof's flag `A` (the session pin) that must PRECEDE both the
+    /// writer's own tomb re-check and GC's §6.2 load.
     if (session_open)
         persistSession();
 
@@ -1681,14 +1695,17 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     for (auto & [key, st] : parts)
         commitOnePart(key, st, settled_delta_epochs);
 
-    /// B52: the refs now name these parts and keep every referenced blob reachable, so the in-flight
-    /// pins are no longer needed. Release them while STILL holding gc_lock (gc_guard above) so the pin
-    /// drop and the ref publishes are atomic w.r.t. the sweep: it can never observe a blob this commit
-    /// reused as both unpinned AND not-yet-referenced. Erase directly here (do NOT call the lock-taking
-    /// releasePinnedBlobs / unpinBlob — gc_lock is already held) and clear the local set so the
-    /// destructor's release is a no-op.
-    for (const auto & blob_key : pinned_blob_keys)
-        metadata_storage.inFlightPinnedBlobs()->erase(blob_key);
+    /// B52: the refs now name these parts and keep every referenced blob reachable, so the in-flight pins
+    /// are no longer needed. CA GC S4 (G1): the refs are ALREADY published above (the live ref is the
+    /// commit point), so a blob this commit reused is now reachable via its ref; dropping the in-process
+    /// pin here can only ever release a now-referenced blob. Take the NARROW container guard just around the
+    /// erase (the same mutex `decide_and_pin` / `unpinBlob` take) so the `std::set` mutation does not race a
+    /// concurrent sweep's snapshot read. Clear the local set so the destructor's release is a no-op.
+    {
+        std::lock_guard<std::mutex> pin_guard(*metadata_storage.gc_lock);
+        for (const auto & blob_key : pinned_blob_keys)
+            metadata_storage.inFlightPinnedBlobs()->erase(blob_key);
+    }
     pinned_blob_keys.clear();
 
     /// CA GC S4 (§5.1 rule 3, §7.3) — session lifetime = UNTIL FOLDED, not until commit. The refs are now
@@ -2257,24 +2274,27 @@ void ContentAddressedWriteBuffer::finalizeImpl()
     const std::string key = blobKey(key_prefix, BlobHash(blob_hash)).string();
 
     /// B52: PIN the blob key for the lifetime of this transaction BEFORE deciding whether to skip the
-    /// upload, and make that existence-check decision UNDER the GC lock. The background sweep holds the
-    /// SAME lock for its whole mark+delete and treats every pinned key as reachable, so the only two
-    /// orderings are: (a) we pin first -> the next sweep sees the pin and keeps the blob, even though no
-    /// ref names it yet; (b) the sweep deleted the blob just before we took the lock -> our existence
-    /// check now sees it absent and we RE-UPLOAD it (we still hold the local temp file). Either way the
-    /// blob this transaction reuses is alive when the ref is later published. The pin is released by the
-    /// owning transaction once the ref is published (commit) or when an uncommitted transaction is
-    /// destroyed. Without the background GC wiring (unit/legacy construction) gc_lock is null and we
-    /// fall back to a plain existence check (no concurrent sweep can race).
+    /// upload. CA GC S4 (G1): the `gc_lock` here is now only the NARROW container guard — it makes the pin
+    /// insert + the existence check a single atomic step against a concurrent sweep's pin-set SNAPSHOT (no
+    /// data race on the `std::set`), but it no longer excludes the whole sweep. The CROSS-process protection
+    /// for a dedup-reused blob in the existence-check -> ref-publish window is the durable session pin
+    /// (`on_pin_blob` below, raised before the blob even exists) read by the sweep's §6.2 re-check, NOT this
+    /// in-process pin. The two orderings against a same-process sweep are still: (a) we pin first -> the
+    /// sweep's snapshot sees the pin and keeps the blob; (b) the sweep deleted the blob just before our
+    /// existence check -> we see it absent and RE-UPLOAD it (we still hold the local temp file). Either way
+    /// the blob is alive when the ref is published. The pin is released by the owning transaction once the
+    /// ref is published (commit) or when an uncommitted transaction is destroyed. Without the background GC
+    /// wiring (unit/legacy construction) gc_lock is null and we fall back to a plain existence check.
     auto decide_and_pin = [&]() -> std::optional<ObjectMetadata>
     {
         if (in_flight_pinned_blobs)
             in_flight_pinned_blobs->insert(key);
-        /// M8: also publish the CROSS-mounter pin (the WriteSession object) BEFORE the upload, while
-        /// the GC lock is held. The in-process pin above only protects this server's own sweep; the
-        /// session object protects a sweep running on ANOTHER mounter that lists the bucket and would
-        /// otherwise see this just-uploaded-but-not-yet-referenced blob as unreachable (data loss). It
-        /// must be durable before the blob exists, so it is taken here (pin-before-upload), not in the
+        /// M8: also publish the CROSS-mounter pin (the WriteSession object) BEFORE the upload. The
+        /// in-process pin above only protects this server's own sweep; the durable session object is the
+        /// §7 handshake flag `A` — it protects a sweep running on ANY mounter (including this one, now that
+        /// the in-process lock no longer excludes the sweep — CA GC S4 G1) that lists the bucket and would
+        /// otherwise see this just-uploaded-but-not-yet-referenced blob as unreachable (data loss). It must
+        /// be durable before the blob exists, so it is taken here (pin-before-upload), not in the
         /// post-upload on_finalized callback.
         if (on_pin_blob)
             on_pin_blob(BlobHash(blob_hash));

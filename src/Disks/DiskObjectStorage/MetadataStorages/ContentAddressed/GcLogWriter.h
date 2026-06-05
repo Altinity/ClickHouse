@@ -31,9 +31,9 @@ namespace DB::ContentAddressed
 ///      SAME logical fragment (same event_id) into the now-open epoch (bounded retry) — §5.1 rule 2. The
 ///      orphaned append in the closed epoch is a harmless leaked object (deduped by event_id on fold).
 ///
-/// NOTE for S2: the `gc_lock` is still held across commit/drop + the whole sweep, so the epoch close
-/// cannot race a concurrent append — rule 4's re-append path is WIRED but rarely taken. It is here so S4
-/// (which drops the lock) can rely on log completeness under concurrent appends.
+/// CA GC S4 (G1): the commit-vs-sweep `gc_lock` is DROPPED, so a GC epoch close CAN race a concurrent
+/// append — rule 4's re-append path is now LIVE and is what makes the log complete under concurrent
+/// appends (the §5.1 rule-2 carrier the lockless handshake relies on).
 ///
 /// `cas_log_batch_size` (deltas per flushed object) is exposed so a later op-budget test can assert that
 /// a burst of N commits coalesces into ⌈N/window⌉ objects, not N.

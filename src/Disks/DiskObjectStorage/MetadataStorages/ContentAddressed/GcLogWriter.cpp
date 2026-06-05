@@ -134,9 +134,10 @@ uint64_t GcLogWriter::reappendIfAdvancedLocked(ShardId shard, uint64_t written_e
     /// §5.1 rule 2: after flushing into `written_epoch`, re-read the shard epoch; WHILE it has advanced
     /// PAST the epoch we wrote, re-buffer the SAME fragments (same event_ids) into the now-open epoch and
     /// re-flush — so the straggler is re-logged rather than lost. The orphaned append in the closed epoch
-    /// is a harmless leaked object (deduped by event_id on fold). Bounded retry. Under the still-held
-    /// gc_lock (S2) the close cannot race a commit, so this loop body never executes; it is wired so S4
-    /// (which drops the lock) can rely on log completeness under concurrent appends.
+    /// is a harmless leaked object (deduped by event_id on fold). Bounded retry. CA GC S4 (G1): with the
+    /// commit-vs-sweep `gc_lock` dropped, a GC epoch close CAN now race a commit's append, so this loop is
+    /// LIVE — it is the §5.1 rule-2 carrier that makes the log complete under concurrent appends (a `+` that
+    /// lands as its epoch is closed is re-appended into the now-open epoch, so the fold never loses it).
     ///
     /// CA GC S4: returns the FINAL epoch the fragments durably settled in (the highest epoch we wrote into,
     /// = `written_epoch` if no advance occurred). The caller threads this into the session's `delta_epochs`

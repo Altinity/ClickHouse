@@ -167,12 +167,18 @@ struct SweepStats
 class ContentAddressedGC
 {
 public:
-    /// `gc_lock_` is the per-pool in-process GC mutex shared with the transaction commit path (B49). The
-    /// sweep holds it across the live-set computation + delete so a delete can never interleave with a
-    /// commit's blob re-validate + ref publish, and a commit fails closed if a blob it references was
-    /// reclaimed in the finalize -> commit window. When null (legacy direct construction) a private
-    /// mutex is created so the sweep is still internally consistent; production and the B49 regression
-    /// tests pass the metadata storage's shared lock so the sweep and commit truly exclude each other.
+    /// `gc_lock_` is the per-pool in-process mutex shared with the transaction commit path (B49/B52).
+    ///
+    /// CA GC S4 (G1) — the lock is DEMOTED to a narrow CONTAINER GUARD: it no longer serializes the whole
+    /// commit against the whole sweep. It now protects ONLY in-process mutation/read of the shared
+    /// `in_flight_pinned_blobs` `std::set` (so concurrent insert/erase/read is not a data race). The sweep
+    /// takes it briefly to snapshot that set (`snapshotInFlightPinnedBlobs`) and then runs lock-free; the
+    /// commit takes it only around its pin insert/erase. The cross-process commit-vs-sweep safety that the
+    /// old held-across-the-sweep lock provided is now carried by the durable two-flag §7 handshake (the
+    /// writer raises the session pin BEFORE its tomb re-check and the `+`; the GC seals `.tombstone` BEFORE
+    /// its fresh authoritative §6.2 re-check, which reads the live session set) plus the fence lease for
+    /// GC-vs-GC. When null (legacy direct construction) a private mutex is created so the container guard is
+    /// still internally consistent.
     /// `in_flight_pinned_blobs_` is the per-pool set of blob object keys staged by uncommitted
     /// transactions (B52), shared by reference and read under `gc_lock_`. The sweep treats every pinned
     /// key as reachable so a blob a dedup-skipping insert decided to reuse (and so did NOT re-upload)
@@ -191,8 +197,11 @@ public:
 
     /// Run one sweep. Deletes nothing if any step before the removal throws (fail-close): a missing
     /// manifest for a live ref (B18), or any list/read error, aborts the sweep with the pool intact.
-    /// The whole sweep is run under the per-pool GC lock (B49); holding it for the entire sweep rather
-    /// than only mark+delete is acceptable for the PoC — the contention is a B9/B32 optimization.
+    /// CA GC S4 (G1) — the sweep NO LONGER holds the `gc_lock` across mark+delete. It snapshots the
+    /// in-flight pin set once under the narrow container guard, then runs lock-free; the sole cross-process
+    /// commit-vs-sweep gate is the §7 handshake (seal `.tombstone` BEFORE the fresh §6.2 re-check, which
+    /// reads the live session set the writer raised before its own tomb re-check). The fence lease still
+    /// gates GC-vs-GC.
     ///
     /// Roots = live refs UNION every LIVE write-session's `pending` blobs (M8): a blob uploaded but not
     /// yet referenced by a published ref is pinned by its writer's session object in the bucket, so a
@@ -248,7 +257,21 @@ private:
     /// MUST be called with `gc_lock` already held. Symmetric for blobs and manifests (§9): both run the
     /// identical machinery on their `(identity, generation)` key family.
     SweepStats sweepCandidatesLocked(
-        const std::set<std::string> & candidate_object_keys, int64_t now, int64_t grace, const std::optional<GcLock> & held);
+        const std::set<std::string> & candidate_object_keys,
+        const std::set<std::string> & pinned_snapshot,
+        int64_t now,
+        int64_t grace,
+        const std::optional<GcLock> & held);
+
+    /// CA GC S4 (G1) — take a CONSISTENT snapshot of the per-pool in-flight blob pin set (B49/B52) under the
+    /// narrow container mutex (`gc_lock`, demoted from the old commit-vs-sweep serialization mutex to a pure
+    /// container guard — see the class doc). With the lock no longer held across the whole sweep, the sweep
+    /// must not read the shared `std::set` while a commit mutates it (a data race); instead it copies it ONCE
+    /// here under the brief lock and runs the rest of the sweep lock-free against the copy. A pin that lands
+    /// AFTER the snapshot is irrelevant: a freshly-pinned blob is a fresh g=0 the compaction cannot yet have
+    /// emitted as a count-0 candidate, and the cross-process safety rests on the durable session + the §7
+    /// handshake, not on this in-process pin.
+    std::set<std::string> snapshotInFlightPinnedBlobs() const;
 
     /// CA GC S3 — enumerate every sealed-but-unswept tombstone in the pool as a candidate, so a generation
     /// condemned in an earlier round (its `<g>.tombstone` is durable) is re-processed every round until it
@@ -296,8 +319,15 @@ private:
     /// (`compaction.isEpochFolded`). NEVER on a bare timer for a committed-but-unfolded session — the
     /// foldedness watermark, not the lease, is the reap gate (the lease only reclaims a CRASHED writer's
     /// pin). Timer-safe: the seal/gravestone is permanent, so a reaped-then-resumed writer re-checks the
-    /// tomb and resurrects (§7.3). MUST be called with `gc_lock` held. Returns the number reaped.
-    size_t reapFoldedSessionsLocked(GcCompaction & compaction);
+    /// tomb and resurrects (§7.3). Returns the number reaped.
+    ///
+    /// CA GC S4 (G1) — runs WITHOUT the `gc_lock` (it is no longer held across the sweep). The reaper is
+    /// race-safe by construction against a concurrent commit raising a new session: it (a) skips a session
+    /// that vanished between the LIST and the READ (an owner commit/abort deleted it), (b) skips any
+    /// `committed == false` session (a just-raised, still-uploading pin), and (c) deletes only when EVERY
+    /// delta epoch is provably folded. A session raised AFTER the LIST is simply not seen this round (it is
+    /// reaped a later round once folded). So it can never delete a just-created or unfolded session.
+    size_t reapFoldedSessions(GcCompaction & compaction);
 
     /// The bounded reconciliation policy (§9 "orphan-drift bound"): true iff the heavy reconciliation scan
     /// is due this round — every `reconciliation_cadence_rounds` rounds (a cadence knob), so orphan drift
@@ -308,10 +338,11 @@ private:
 
     const ObjectStoragePtr object_storage;
     const std::string key_prefix;
-    /// Per-pool in-process GC lock, shared with ContentAddressedTransaction::commit (B49). Never null
-    /// after construction.
+    /// Per-pool in-process mutex, shared with ContentAddressedTransaction::commit (B49/B52). CA GC S4 (G1):
+    /// demoted to a NARROW container guard — it protects only `in_flight_pinned_blobs` access, NOT the whole
+    /// commit-vs-sweep ordering (that is the §7 handshake's job now). Never null after construction.
     const std::shared_ptr<std::mutex> gc_lock;
-    /// Per-pool in-flight blob pins (B52), read under gc_lock; pinned keys are excluded from sweep.
+    /// Per-pool in-flight blob pins (B52), snapshotted under gc_lock; pinned keys are excluded from sweep.
     /// Null when the GC was built without a metadata storage (no concurrent inserts to protect).
     const std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs;
     /// Per-pool incremental reverse index (B9 / CA GC S1), validated against the authoritative scan and

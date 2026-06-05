@@ -357,7 +357,11 @@ PartManifest ContentAddressedGC::resolveManifestAtAnyGeneration(const PartId & p
 }
 
 SweepStats ContentAddressedGC::sweepCandidatesLocked(
-    const std::set<std::string> & candidate_object_keys, int64_t now, int64_t grace, const std::optional<GcLock> & held)
+    const std::set<std::string> & candidate_object_keys,
+    const std::set<std::string> & pinned_snapshot,
+    int64_t now,
+    int64_t grace,
+    const std::optional<GcLock> & held)
 {
     /// The SHARED re-validate + grace + fence + delete tail (UNCHANGED semantics from the pre-S2 sweep —
     /// only the candidate SOURCE differs between the compaction-driven normal path and the reconciliation
@@ -448,8 +452,10 @@ SweepStats ContentAddressedGC::sweepCandidatesLocked(
         if (parts.is_blob)
         {
             const BlobObjectKey identity_key = blobKey(key_prefix, BlobHash(parts.identity));
+            /// CA GC S4 (G1): read the B52 in-flight pin from the lock-free SNAPSHOT taken at the start of
+            /// the sweep, not from the shared set a concurrent commit is mutating.
             return r.reachable_blobs.contains(identity_key)
-                || (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(identity_key.string()));
+                || pinned_snapshot.contains(identity_key.string());
         }
         return r.live_part_keys.contains(partKey(key_prefix, PartId(parts.identity)));
     };
@@ -732,11 +738,16 @@ void ContentAddressedGC::resetActiveOffGeneration(bool is_blob, const std::strin
 
 SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::optional<GcLock> held)
 {
-    /// Hold the per-pool GC lock for the whole sweep (B49): the candidate computation and the delete must
-    /// not interleave with a transaction commit's re-validate + ref publish. In S2 the lock does a SECOND
-    /// job (§5.1): while it is held no commit is appending, so the compaction's `LIST gc/log/E.shard/` sees
-    /// a STABLE, complete epoch (the close-before-fold + the held lock together make the fold authoritative).
-    std::lock_guard<std::mutex> gc_guard(*gc_lock);
+    /// CA GC S4 (G1) — the per-pool GC lock is NO LONGER held across the sweep. We take a CONSISTENT
+    /// snapshot of the in-flight pin set ONCE under the narrow container guard, then run the entire sweep
+    /// lock-free against the copy. The cross-process commit-vs-sweep safety the held-across-the-sweep lock
+    /// used to provide is now the durable two-flag §7 handshake: the GC seals `.tombstone` BEFORE its fresh
+    /// authoritative §6.2 re-check (`compute_reachability`, which re-reads the LIVE session set), and the
+    /// writer raises its session pin BEFORE its own tomb re-check and the `+`. The §5.1 epoch-close
+    /// (fenced PUT) before the fold makes the compaction's `LIST gc/log/E.shard/` see a stable, complete
+    /// epoch WITHOUT the lock (the close is the barrier, not the mutex); a writer racing the close
+    /// re-appends into the open epoch (rule 2) and its session covers the reference until folded (rule 3).
+    const std::set<std::string> pinned_snapshot = snapshotInFlightPinnedBlobs();
 
     /// CA GC S2 — the NORMAL path is COMPACTION-DRIVEN (G3 retired): the candidate source is the per-shard
     /// streaming compaction's count-0 stream, NOT `listLivePartIds` / `markReachableBlobs` / `LIST blobs/`.
@@ -775,7 +786,7 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
     /// session lifetime extension — purely additive in S2 (the lock still serializes commit vs sweep).
     try
     {
-        const size_t reaped = reapFoldedSessionsLocked(compaction);
+        const size_t reaped = reapFoldedSessions(compaction);
         if (reaped != 0)
             LOG_TEST(getLogger("ContentAddressedGC"), "CA GC S4: reaped {} folded write session(s)", reaped);
     }
@@ -807,7 +818,18 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
     /// The unchanged grace + re-validate + fence + delete tail. The candidate SOURCE changed; everything
     /// downstream (grace ageing, the re-validate-under-lock safety net, the fence guard, the delete
     /// primitive) is identical to the pre-S2 sweep.
-    return sweepCandidatesLocked(candidate_object_keys, now, grace, held);
+    return sweepCandidatesLocked(candidate_object_keys, pinned_snapshot, now, grace, held);
+}
+
+std::set<std::string> ContentAddressedGC::snapshotInFlightPinnedBlobs() const
+{
+    /// CA GC S4 (G1) — copy the shared in-flight pin set under the narrow container guard so the lock-free
+    /// remainder of the sweep reads a stable set, not a `std::set` a concurrent commit is mutating. If no
+    /// pin set was wired (legacy / unit tests with no concurrent inserts) the snapshot is empty.
+    if (!in_flight_pinned_blobs)
+        return {};
+    std::lock_guard<std::mutex> guard(*gc_lock);
+    return *in_flight_pinned_blobs;
 }
 
 std::set<std::string> ContentAddressedGC::collectReconciliationCandidatesLocked(int64_t now)
@@ -865,7 +887,7 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidatesLocked(
     return candidate_object_keys;
 }
 
-size_t ContentAddressedGC::reapFoldedSessionsLocked(GcCompaction & compaction)
+size_t ContentAddressedGC::reapFoldedSessions(GcCompaction & compaction)
 {
     /// CA GC S4 (§5.1 rule 3, §7.3) — delete every COMMITTED write session whose `+` deltas are all folded
     /// into a durable snapshot. The session is the durable handshake flag (§7.1) that covers the
@@ -877,8 +899,12 @@ size_t ContentAddressedGC::reapFoldedSessionsLocked(GcCompaction & compaction)
     /// it at commit/abort, and a crashed owner's session is reclaimed by the lease (in
     /// `sessionPinnedBlobs`/`sessionPinnedPartKeys`, an expired session is already treated as reclaimable).
     /// We never reap a committed-but-unfolded session on a timer — the folded watermark is the only gate.
-    /// Timer-safe: the seal/gravestone is permanent, so a reaped-then-resumed writer re-checks the tomb and
-    /// resurrects. MUST be called with `gc_lock` held.
+    ///
+    /// CA GC S4 (G1) — runs WITHOUT the `gc_lock`. Race-safe against a concurrent commit raising a new
+    /// session: a session that vanished between the LIST and the READ is skipped (rule a, swallowed as a
+    /// missing object); an uncommitted (still-uploading) session is skipped (rule a, `committed == false`);
+    /// a committed session is deleted ONLY when every delta epoch is provably folded (rule b). A session
+    /// raised AFTER this LIST is simply not enumerated this round, so it is never mistakenly reaped.
     size_t reaped = 0;
     for (const auto & key : listKeysUnder(object_storage, sessionsPrefix(key_prefix)))
     {
@@ -931,15 +957,17 @@ SweepStats ContentAddressedGC::runReconciliationScan(int64_t now, int64_t grace,
     /// The EXPLICIT reconciliation fallback (spec §9): the rare full `parts/`+`blobs/` scan, retired from
     /// the normal path. Same gc_lock + grace + re-validate + fence + delete tail; only the candidate source
     /// is the full bucket scan, so it reclaims orphans the compaction cannot see (over-counts, abandoned
-    /// uploads) and recovers from a lost log+snapshot.
-    std::lock_guard<std::mutex> gc_guard(*gc_lock);
+    /// uploads) and recovers from a lost log+snapshot. CA GC S4 (G1): no `gc_lock` across the scan; the
+    /// in-flight pin set is snapshotted once (the §7 handshake + fence lease carry the safety, as in the
+    /// normal path).
+    const std::set<std::string> pinned_snapshot = snapshotInFlightPinnedBlobs();
     std::set<std::string> candidate_object_keys = collectReconciliationCandidatesLocked(now);
     /// CA GC S3 — also re-present every sealed-but-unswept tombstone, so the reconciliation path drives the
     /// same seal/grace/recheck/branch tail (sweep / drain / recover) on already-condemned generations, not
     /// only on freshly-discovered orphans.
     for (const auto & key : collectSealedTombstoneCandidatesLocked())
         candidate_object_keys.insert(key);
-    return sweepCandidatesLocked(candidate_object_keys, now, grace, held);
+    return sweepCandidatesLocked(candidate_object_keys, pinned_snapshot, now, grace, held);
 }
 
 }
