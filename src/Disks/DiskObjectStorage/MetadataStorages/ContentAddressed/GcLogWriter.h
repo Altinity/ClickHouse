@@ -21,41 +21,38 @@ namespace DB::ContentAddressed
 /// A commit/drop hands the writer ONE logical `GcDelta` (op, event_id, part_id, ALL the part's resolved
 /// blob pins). The writer:
 ///   1. SPLITS the delta by hash-prefix shard (shardForHash per pin) so each shard's log holds only its
-///      own blobs; the `(part_id) edge` (§9) is buffered into the PART's home shard (shardForPartId), so
-///      a manifest reference is counted in exactly one shard. The same `event_id` is reused across shards
-///      (it is per (part_id, op)) — dedup is per-shard-per-fold, so reuse is correct.
-///   2. Stamps each shard fragment with the shard's CURRENT epoch (read from gcCurrentEpochKey, default 0)
-///      — §5.1 rule 2 (writer epoch read).
-///   3. Buffers the fragments grouped by (shard, epoch) and, on a short size/time WINDOW, flushes ONE
-///      coalesced object per (shard, window) to gcLogEventKey — group-commit, NOT one object per commit.
-///   4. After a flush, RE-READS each shard's epoch; if it advanced past the one written, RE-APPENDS the
-///      SAME logical fragment (same event_id) into the now-open epoch (bounded retry) — §5.1 rule 2. The
-///      orphaned append in the closed epoch is a harmless leaked object (deduped by event_id on fold).
+///      own blobs; the `(part_id) edge` (§9) goes to the part's home shard (shardForPartId), so a manifest
+///      reference is counted in exactly one shard. The same `event_id` is reused across shards (it is per
+///      (part_id, op); dedup is per-shard-per-fold, so reuse is correct).
+///   2. Stamps each fragment with the shard's CURRENT epoch (gcCurrentEpochKey, default 0) — §5.1 rule 2.
+///   3. Buffers the fragments by (shard, epoch) and, on a short size/time WINDOW, flushes ONE coalesced
+///      object per (shard, window) — group-commit, NOT one object per commit.
+///   4. After a flush, re-reads each shard's epoch; if it advanced past the one written, RE-APPENDS the
+///      same fragment (same event_id) into the now-open epoch — §5.1 rule 2, bounded retry. The orphaned
+///      append in the closed epoch is a harmless leaked object (deduped by event_id on fold).
 ///
 /// CA GC S4 (G1): the commit-vs-sweep `gc_lock` is DROPPED, so a GC epoch close CAN race a concurrent
-/// append — rule 4's re-append path is now LIVE and is what makes the log complete under concurrent
-/// appends (the §5.1 rule-2 carrier the lockless handshake relies on).
+/// append. Rule 4's re-append is the §5.1 rule-2 carrier that makes the log complete under that race — the
+/// lockless handshake relies on it.
 ///
-/// `cas_log_batch_size` (deltas per flushed object) is exposed so a later op-budget test can assert that
-/// a burst of N commits coalesces into ⌈N/window⌉ objects, not N.
+/// `lastBatchSize` (deltas per flushed object) is exposed so an op-budget test can assert that a burst of
+/// N commits coalesces into ⌈N/window⌉ objects, not N.
 class GcLogWriter
 {
 public:
     /// `flush_max_deltas` / `flush_window` bound the group-commit window: a (shard, epoch) buffer flushes
     /// when it reaches `flush_max_deltas` fragments OR `flush_window` elapses since its first buffered
-    /// fragment (whichever first). For S2 under the held lock the synchronous-flush-before-ref discipline
-    /// (see flushShardForCommit) is what preserves I1/I6; the window is a load-shedding lever for the
-    /// drop/async side.
+    /// fragment. On the commit path the synchronous flush-before-ref (appendAndFlushForCommit) is what
+    /// preserves I1/I6; the window is a load-shedding lever for the drop/async side.
     GcLogWriter(
         ObjectStoragePtr object_storage_,
         std::string key_prefix_,
         size_t flush_max_deltas_ = 256,
         std::chrono::milliseconds flush_window_ = std::chrono::milliseconds(200));
 
-    /// Enqueue one logical delta. Splits it by shard, stamps each fragment with the shard's current epoch,
-    /// and buffers the fragments. Does NOT necessarily flush (group-commit) — call flushDueWindows or
-    /// flushAll to push buffered fragments out. Returns the set of shards this delta touched.
-    std::vector<ShardId> enqueue(const GcDelta & delta);
+    /// Enqueue one logical delta: split it by shard, stamp each fragment with the shard's current epoch, and
+    /// buffer the fragments. Does NOT necessarily flush (group-commit) — call flushAll to push them out.
+    void enqueue(const GcDelta & delta);
 
     /// I1/I6 commit-path helper. Enqueue the `+` AND synchronously flush every shard it touched BEFORE the
     /// caller writes the live ref, so `+ before ref` holds (for S2, with the lock held, a synchronous
@@ -126,6 +123,11 @@ private:
     };
     std::optional<PendingWrite> drainBufferLocked(ShardId shard, uint64_t epoch, Buffer & buffer);
     void writePending(const PendingWrite & pending);
+
+    /// Drain + write (lock-free PUT) each of the given (shard, epoch) buffers, then run the rule-2
+    /// re-append on each. The shared body of flushDueWindows / flushAll. The caller must pass a SNAPSHOT of
+    /// the keys (taken under `mtx`): a re-append may insert new buffer entries mid-flush.
+    void flushShardEpochs(const std::vector<ShardEpoch> & shard_epochs);
 
     /// §5.1 rule 2: re-read the shard epoch; while it has advanced past `written_epoch`, re-buffer the
     /// `retained` fragments (same event_ids) under the now-open epoch and re-flush (bounded retry). CA GC

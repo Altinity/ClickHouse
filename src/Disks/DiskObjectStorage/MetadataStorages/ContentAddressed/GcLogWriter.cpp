@@ -80,9 +80,9 @@ uint64_t GcLogWriter::cachedShardEpoch(ShardId shard) const
 
 std::map<ShardId, GcLogWriter::Fragment> GcLogWriter::splitDeltaByShard(const GcDelta & delta)
 {
-    /// Each pin to its hash-prefix shard; the (part_id) edge to the part's home shard (always present,
-    /// even for a blob-less part — the manifest reference must still be counted). The same event_id is
-    /// reused across shards (it is per (part_id, op); dedup is per-shard-per-fold, so reuse is correct).
+    /// Each pin to its hash-prefix shard; the (part_id) edge to the part's home shard (always present, even
+    /// for a blob-less part — the manifest reference must still be counted). The same event_id is reused
+    /// across shards (it is per (part_id, op); dedup is per-shard-per-fold, so reuse is correct).
     std::map<ShardId, Fragment> by_shard;
     auto fragment_for = [&](ShardId shard) -> Fragment &
     {
@@ -92,17 +92,16 @@ std::map<ShardId, GcLogWriter::Fragment> GcLogWriter::splitDeltaByShard(const Gc
             it->second.delta.op = delta.op;
             it->second.delta.event_id = delta.event_id;
             it->second.delta.part_id = delta.part_id;
-            /// CA GC S3 (#1 fix): carry the resolved manifest generation onto every shard fragment. The
-            /// fold only applies the (part_id) edge on the home shard (shardForPartId guard), so a fragment
-            /// that does not own the edge carries an unused mg — harmless; the home-shard fragment now keys
-            /// the manifest at its real `mg` instead of 0.
+            /// Carry the resolved manifest generation onto every fragment. Only the home-shard fragment
+            /// applies the (part_id) edge (shardForPartId guard in the fold), so on the others the `mg` is
+            /// unused — harmless; the home-shard fragment keys the manifest at its real `mg` instead of 0.
             it->second.delta.manifest_generation = delta.manifest_generation;
         }
         return it->second;
     };
-    /// CA GC S3 (#1 fix): each pin goes to its hash-prefix shard CARRYING its resolved generation (parallel
-    /// to delta.pins). An empty pin_generations (an S2 delta, or one read from an older log object) takes
-    /// every g as 0, matching the codec/fold default — so the fold keys CountKey{Blob,H,g} at the real g.
+    /// Each pin carries its resolved generation (parallel to delta.pins). An empty pin_generations (an S2
+    /// delta, or one read from an older log object) takes every g as 0, matching the codec/fold default —
+    /// so the fold keys CountKey{Blob, H, g} at the real g.
     for (size_t i = 0; i < delta.pins.size(); ++i)
     {
         Fragment & fragment = fragment_for(shardForHash(delta.pins[i]));
@@ -113,14 +112,10 @@ std::map<ShardId, GcLogWriter::Fragment> GcLogWriter::splitDeltaByShard(const Gc
     return by_shard;
 }
 
-std::vector<ShardId> GcLogWriter::enqueue(const GcDelta & delta)
+void GcLogWriter::enqueue(const GcDelta & delta)
 {
-    auto by_shard = splitDeltaByShard(delta);
-
-    std::vector<ShardId> result;
-    result.reserve(by_shard.size());
     const auto now = std::chrono::steady_clock::now();
-    for (auto & [shard, fragment] : by_shard)
+    for (auto & [shard, fragment] : splitDeltaByShard(delta))
     {
         const uint64_t epoch = cachedShardEpoch(shard);
         std::lock_guard<std::mutex> lock(mtx);
@@ -128,9 +123,7 @@ std::vector<ShardId> GcLogWriter::enqueue(const GcDelta & delta)
         if (buffer.fragments.empty())
             buffer.opened_at = now;
         buffer.fragments.push_back(std::move(fragment));
-        result.push_back(shard);
     }
-    return result;
 }
 
 std::optional<GcLogWriter::PendingWrite> GcLogWriter::drainBufferLocked(ShardId shard, uint64_t epoch, Buffer & buffer)
@@ -224,27 +217,12 @@ std::vector<std::pair<ShardId, uint64_t>> GcLogWriter::appendAndFlushForCommit(c
     return settled;
 }
 
-void GcLogWriter::flushDueWindows()
+void GcLogWriter::flushShardEpochs(const std::vector<ShardEpoch> & shard_epochs)
 {
-    /// Collect the due (shard, epoch) keys (size- or window-due) under `mtx`, then for each: drain under
-    /// `mtx` and write outside it, plus the rule-2 re-append (also lock-free I/O). No S3 PUT is ever held
-    /// under the lock (G1). Flushing mutates `buffers` (re-append may insert new entries), so iterate over a
-    /// snapshot of keys rather than the live map.
-    std::vector<ShardEpoch> due;
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        const auto now = std::chrono::steady_clock::now();
-        for (auto & [shard_epoch, buffer] : buffers)
-        {
-            if (buffer.fragments.empty())
-                continue;
-            const bool size_due = buffer.fragments.size() >= flush_max_deltas;
-            const bool time_due = (now - buffer.opened_at) >= flush_window;
-            if (size_due || time_due)
-                due.push_back(shard_epoch);
-        }
-    }
-    for (const auto & shard_epoch : due)
+    /// For each (shard, epoch): drain under `mtx` and write outside it, plus the rule-2 re-append (also
+    /// lock-free I/O). No S3 PUT is ever held under the lock (G1). The caller snapshots the keys under `mtx`
+    /// first because the re-append may insert new buffer entries (we must not iterate the live map).
+    for (const auto & shard_epoch : shard_epochs)
     {
         std::optional<PendingWrite> pending;
         std::vector<Fragment> retained;
@@ -262,10 +240,29 @@ void GcLogWriter::flushDueWindows()
     }
 }
 
+void GcLogWriter::flushDueWindows()
+{
+    /// Flush only the (shard, epoch) buffers that are size- or window-due.
+    std::vector<ShardEpoch> due;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        const auto now = std::chrono::steady_clock::now();
+        for (auto & [shard_epoch, buffer] : buffers)
+        {
+            if (buffer.fragments.empty())
+                continue;
+            const bool size_due = buffer.fragments.size() >= flush_max_deltas;
+            const bool time_due = (now - buffer.opened_at) >= flush_window;
+            if (size_due || time_due)
+                due.push_back(shard_epoch);
+        }
+    }
+    flushShardEpochs(due);
+}
+
 void GcLogWriter::flushAll()
 {
-    /// Snapshot the keys under `mtx`, then for each: drain under `mtx` and write outside it, plus the rule-2
-    /// re-append (also lock-free I/O). No S3 PUT is ever held under the lock (G1).
+    /// Flush every non-empty buffer regardless of window (the drop path and shutdown).
     std::vector<ShardEpoch> all;
     {
         std::lock_guard<std::mutex> lock(mtx);
@@ -273,22 +270,7 @@ void GcLogWriter::flushAll()
             if (!buffer.fragments.empty())
                 all.push_back(shard_epoch);
     }
-    for (const auto & shard_epoch : all)
-    {
-        std::optional<PendingWrite> pending;
-        std::vector<Fragment> retained;
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            auto & buffer = buffers[shard_epoch];
-            if (buffer.fragments.empty())
-                continue;
-            retained = buffer.fragments;
-            pending = drainBufferLocked(shard_epoch.first, shard_epoch.second, buffer);
-        }
-        if (pending)
-            writePending(*pending);
-        reappendIfAdvanced(shard_epoch.first, shard_epoch.second, retained);
-    }
+    flushShardEpochs(all);
 }
 
 }

@@ -97,27 +97,32 @@ std::map<GcCompaction::CountKey, int64_t> deserializeSnapshot(const std::string 
     return counts;
 }
 
-/// Parse the `<padded-epoch>.<shard>` tail of a gc/snap object key into (epoch, shard). The key under
-/// gcSnapPrefix is `<padded-epoch>.<shard>` (no trailing slash); a key that does not match the (epoch,
-/// shard) shape is ignored (nullopt) rather than misparsed.
-std::optional<std::pair<uint64_t, ShardId>> parseSnapTail(const std::string & key, const std::string & snap_prefix)
+/// Parse an `<epoch>.<shard>` token into (epoch, shard); nullopt for any token that does not match the
+/// shape. Shared by parseSnapTail / parseLogTail (which differ only in how they isolate the token).
+std::optional<std::pair<uint64_t, ShardId>> parseEpochShard(const std::string & token)
 {
-    if (key.rfind(snap_prefix, 0) != 0)
-        return std::nullopt;
-    const std::string tail = key.substr(snap_prefix.size());
-    const auto dot = tail.find('.');
+    const auto dot = token.find('.');
     if (dot == std::string::npos)
         return std::nullopt;
     try
     {
-        const uint64_t epoch = std::stoull(tail.substr(0, dot));
-        const ShardId shard = static_cast<ShardId>(std::stoul(tail.substr(dot + 1)));
+        const uint64_t epoch = std::stoull(token.substr(0, dot));
+        const ShardId shard = static_cast<ShardId>(std::stoul(token.substr(dot + 1)));
         return std::make_pair(epoch, shard);
     }
     catch (...)
     {
         return std::nullopt;
     }
+}
+
+/// Parse a gc/snap object key into (epoch, shard). The key under gcSnapPrefix is `<padded-epoch>.<shard>`
+/// (no trailing slash). nullopt (rather than a misparse) for a key that does not match.
+std::optional<std::pair<uint64_t, ShardId>> parseSnapTail(const std::string & key, const std::string & snap_prefix)
+{
+    if (key.rfind(snap_prefix, 0) != 0)
+        return std::nullopt;
+    return parseEpochShard(key.substr(snap_prefix.size()));
 }
 
 /// Parse the `<epoch>.<shard>` component of a gc/log object key (`<root>/<epoch>.<shard>/<event_id>`) into
@@ -130,20 +135,7 @@ std::optional<std::pair<uint64_t, ShardId>> parseLogTail(const std::string & key
     const auto slash = tail.find('/');
     if (slash == std::string::npos)
         return std::nullopt;
-    const std::string component = tail.substr(0, slash);
-    const auto dot = component.find('.');
-    if (dot == std::string::npos)
-        return std::nullopt;
-    try
-    {
-        const uint64_t epoch = std::stoull(component.substr(0, dot));
-        const ShardId shard = static_cast<ShardId>(std::stoul(component.substr(dot + 1)));
-        return std::make_pair(epoch, shard);
-    }
-    catch (...)
-    {
-        return std::nullopt;
-    }
+    return parseEpochShard(tail.substr(0, slash));
 }
 
 std::string readSmallObject(const ObjectStoragePtr & object_storage, const std::string & key)
@@ -153,6 +145,63 @@ std::string readSmallObject(const ObjectStoragePtr & object_storage, const std::
     String content;
     readStringUntilEOF(content, *buf);
     return content;
+}
+
+/// Fold a set of deltas into a per-key NET count delta, deduped on fold. Shared by `compactShard` and
+/// `rebuildFromSnapshotAndLog` so the two paths cannot diverge in how they count.
+///
+/// Per key we accumulate the set of (op, event_id) already applied (the §5.1 dedup-on-fold guard — a
+/// re-appended duplicate carries the SAME event_id and collapses to one count) and the running count
+/// delta. Each pin counts its `(H, g)` key under its resolved generation (default 0 — the common path, so
+/// `(H, g)` and `(H, g+1)` net INDEPENDENTLY); the `(part_id) edge` counts its `(part_id, mg)` key, but
+/// ONLY in the part's home shard (`shardForPartId == shard`) — mirroring the writer's split, so a manifest
+/// reference is counted in exactly one shard.
+std::map<GcCompaction::CountKey, int64_t> foldDeltas(const std::vector<GcDelta> & deltas, ShardId shard)
+{
+    using CountKey = GcCompaction::CountKey;
+    using KeyKind = GcCompaction::KeyKind;
+
+    struct KeyFold
+    {
+        int64_t delta = 0;
+        std::set<std::pair<uint8_t, std::string>> applied; /// (op, event_id) dedup guard
+    };
+    std::map<CountKey, KeyFold> folds;
+    auto apply = [&](const CountKey & key, GcDelta::Op op, const std::string & event_id)
+    {
+        auto & fold = folds[key];
+        if (!fold.applied.emplace(static_cast<uint8_t>(op), event_id).second)
+            return; /// this exact (op, event_id) already folded into this key.
+        fold.delta += (op == GcDelta::Op::Add) ? 1 : -1;
+    };
+
+    for (const auto & d : deltas)
+    {
+        for (size_t i = 0; i < d.pins.size(); ++i)
+        {
+            const uint64_t g = (i < d.pin_generations.size()) ? d.pin_generations[i] : 0;
+            apply(CountKey{KeyKind::Blob, d.pins[i].string(), g}, d.op, d.event_id);
+        }
+        /// A foreign-shard delta fragment still serializes part_id, so this guard — not the absence of the
+        /// field — is what scopes the edge to the home shard.
+        if (GcLogWriter::shardForPartId(d.part_id) == shard)
+            apply(CountKey{KeyKind::Part, d.part_id.string(), d.manifest_generation}, d.op, d.event_id);
+    }
+
+    std::map<CountKey, int64_t> net;
+    for (auto & [key, fold] : folds)
+        net.emplace(key, fold.delta);
+    return net;
+}
+
+/// The FULL generationed object key a count-0 candidate addresses: `blobGenKey(H, g)` / `partGenKey(id, mg)`
+/// — so seal/sweep targets exactly the physical object whose references netted to zero, never a sibling
+/// generation. For a g=0 candidate this equals the old `blobKey` / `partKey`.
+std::string candidateObjectKey(const std::string & key_prefix, const GcCompaction::CountKey & key)
+{
+    return key.kind == GcCompaction::KeyKind::Blob
+        ? blobGenKey(key_prefix, BlobHash(key.identity), key.generation).string()
+        : partGenKey(key_prefix, PartId(key.identity), key.generation).string();
 }
 
 }
@@ -277,49 +326,10 @@ GcCompaction::CompactionResult GcCompaction::compactShard(ShardId shard, const s
     std::vector<GcDelta> deltas = listAndDecodeDeltas(E, shard);
     std::map<CountKey, int64_t> base = readSnapshot(E, shard);
 
-    /// External-sort the deltas by the unified count key. We expand each delta into per-(key, event_id, op)
-    /// contributions; the per-key dedup-on-fold collapses a re-appended duplicate (same event_id, same op)
-    /// to a single count. The std::map keying gives the sorted (kind, identity) order the merge-join needs;
-    /// memory is bounded by the merge frontier (the distinct keys + their per-key event_id sets), not the
-    /// number of log objects.
-    ///
-    /// Per key we accumulate the set of (op, event_id) already applied (the dedup guard) and the running
-    /// delta to that key's count. A `+` for a part's home shard counts the (part_id) edge; pins count their
-    /// (H) keys. The part edge is counted ONLY in the part's home shard (shardForPartId) — mirroring the
-    /// writer's split, so a manifest reference is counted in exactly one shard.
-    struct KeyFold
-    {
-        int64_t delta = 0;
-        std::set<std::pair<uint8_t, std::string>> applied; /// (op, event_id) dedup guard
-    };
-    std::map<CountKey, KeyFold> folds;
-
-    auto apply = [&](const CountKey & key, GcDelta::Op op, const std::string & event_id)
-    {
-        auto & fold = folds[key];
-        if (!fold.applied.emplace(static_cast<uint8_t>(op), event_id).second)
-            return; /// §5.1 dedup-on-fold: this exact (op, event_id) already folded into this key.
-        fold.delta += (op == GcDelta::Op::Add) ? 1 : -1;
-    };
-
-    for (const auto & d : deltas)
-    {
-        /// CA GC S3: each pin is counted under its RESOLVED generation `g` (`pin_generations[i]`, parallel
-        /// to `pins`). An S2 delta (or any delta whose `pin_generations` is empty) takes every pin as g=0
-        /// — the common path. The generation is part of the count key, so `(H, g)` and `(H, g+1)` net
-        /// independently (a resurrected blob never sweeps its byte-identical predecessor and vice versa).
-        for (size_t i = 0; i < d.pins.size(); ++i)
-        {
-            const uint64_t g = (i < d.pin_generations.size()) ? d.pin_generations[i] : 0;
-            apply(CountKey{KeyKind::Blob, d.pins[i].string(), g}, d.op, d.event_id);
-        }
-        /// The (part_id) edge — counted only in the part's home shard (the writer put it there). We are
-        /// folding `shard`, so count it iff this is the part's home shard. (A foreign-shard delta fragment
-        /// still serializes part_id, so this guard — not the absence of the field — is what scopes it.)
-        /// The manifest's resolved generation `mg` (`manifest_generation`, default 0) keys the part edge.
-        if (GcLogWriter::shardForPartId(d.part_id) == shard)
-            apply(CountKey{KeyKind::Part, d.part_id.string(), d.manifest_generation}, d.op, d.event_id);
-    }
+    /// Fold E's deltas into a per-key net count delta, deduped on fold (see foldDeltas). The std::map keying
+    /// gives the sorted (kind, identity, generation) order the merge-join needs; memory is bounded by the
+    /// merge frontier (the distinct keys), not the number of log objects.
+    const std::map<CountKey, int64_t> folds = foldDeltas(deltas, shard);
 
     /// Streaming MERGE-JOIN: the snapshot base (sorted) and the folds (sorted) are both std::maps keyed by
     /// CountKey, so a key-ordered union walk sums per key, streams the new snapshot, and emits count-0
@@ -327,7 +337,7 @@ GcCompaction::CompactionResult GcCompaction::compactShard(ShardId shard, const s
     std::set<CountKey> all_keys;
     for (const auto & [key, count] : base)
         all_keys.insert(key);
-    for (const auto & [key, fold] : folds)
+    for (const auto & [key, delta] : folds)
         all_keys.insert(key);
 
     std::map<CountKey, int64_t> folded;
@@ -337,22 +347,14 @@ GcCompaction::CompactionResult GcCompaction::compactShard(ShardId shard, const s
         if (auto it = base.find(key); it != base.end())
             count = it->second;
         if (auto it = folds.find(key); it != folds.end())
-            count += it->second.delta;
+            count += it->second;
 
         /// A count <= 0 is a key whose every reference has been netted away: emit it as a candidate. Clamp
         /// to 0 in the folded view (counts never go negative durably — an over-decrement reflects a `-`
         /// whose matching `+` was already folded in an earlier epoch; reconciliation corrects any drift).
         if (count <= 0)
         {
-            Candidate candidate;
-            candidate.key = key;
-            /// CA GC S3: the candidate addresses the GENERATIONED physical object whose references netted
-            /// to zero — `blobGenKey(H, g)` / `partGenKey(part_id, mg)` — so the seal/sweep targets exactly
-            /// that object, never a sibling generation. For g=0 this equals the old `blobKey` / `partKey`.
-            candidate.object_key = (key.kind == KeyKind::Blob)
-                ? blobGenKey(key_prefix, BlobHash(key.identity), key.generation).string()
-                : partGenKey(key_prefix, PartId(key.identity), key.generation).string();
-            result.candidates.push_back(std::move(candidate));
+            result.candidates.push_back(Candidate{key, candidateObjectKey(key_prefix, key)});
             folded[key] = 0; /// recorded for the drift cross-check; NOT persisted (writeSnapshot drops <=0)
         }
         else
@@ -437,45 +439,23 @@ std::optional<GcCompaction::RebuildResult> GcCompaction::rebuildFromSnapshotAndL
 
     std::map<CountKey, int64_t> counts = snap_epoch ? readSnapshot(*snap_epoch, shard) : std::map<CountKey, int64_t>{};
 
-    /// Fold every log epoch STRICTLY AFTER the snapshot's epoch (those whose deltas the snapshot does not
+    /// Gather every log epoch STRICTLY AFTER the snapshot's epoch (those whose deltas the snapshot does not
     /// yet incorporate). A snapshot at epoch S already folded the deltas of epochs <= S-1 (the snapshot for
-    /// E+1 incorporates E), so the un-folded tail is epochs >= S. Folding epoch == S over the snapshot
-    /// named S is correct: that snapshot was the PREDECESSOR base of S's fold, so S's deltas are not yet in
-    /// it. Use a per-key (op, event_id) dedup guard exactly as compactShard does.
-    struct KeyFold
-    {
-        int64_t delta = 0;
-        std::set<std::pair<uint8_t, std::string>> applied;
-    };
-    std::map<CountKey, KeyFold> folds;
-    auto apply = [&](const CountKey & key, GcDelta::Op op, const std::string & event_id)
-    {
-        auto & fold = folds[key];
-        if (!fold.applied.emplace(static_cast<uint8_t>(op), event_id).second)
-            return;
-        fold.delta += (op == GcDelta::Op::Add) ? 1 : -1;
-    };
-
+    /// E+1 incorporates E), so the un-folded tail is epochs >= S. Folding epoch == S over the snapshot named
+    /// S is correct: that snapshot was the PREDECESSOR base of S's fold, so S's deltas are not yet in it.
+    /// All un-folded deltas are folded TOGETHER (one foldDeltas call) so the (op, event_id) dedup guard
+    /// spans epochs — a rule-2 re-append of the SAME delta into a later epoch still collapses to one count.
+    std::vector<GcDelta> unfolded;
     for (const uint64_t epoch : epochs)
     {
         if (snap_epoch && epoch < *snap_epoch)
             continue; /// already folded into the snapshot.
-        for (const auto & d : listAndDecodeDeltas(epoch, shard))
-        {
-            /// Generation-aware fold, identical to compactShard: each pin under its resolved generation
-            /// (default 0), the part edge under the resolved manifest generation (default 0).
-            for (size_t i = 0; i < d.pins.size(); ++i)
-            {
-                const uint64_t g = (i < d.pin_generations.size()) ? d.pin_generations[i] : 0;
-                apply(CountKey{KeyKind::Blob, d.pins[i].string(), g}, d.op, d.event_id);
-            }
-            if (GcLogWriter::shardForPartId(d.part_id) == shard)
-                apply(CountKey{KeyKind::Part, d.part_id.string(), d.manifest_generation}, d.op, d.event_id);
-        }
+        for (auto & d : listAndDecodeDeltas(epoch, shard))
+            unfolded.push_back(std::move(d));
     }
 
-    for (const auto & [key, fold] : folds)
-        counts[key] += fold.delta;
+    for (const auto & [key, delta] : foldDeltas(unfolded, shard))
+        counts[key] += delta;
 
     /// Emit every net-zero / negative key as a candidate (the catch-up leader hands these to the grace +
     /// re-validate + delete tail without re-folding), then drop them from the rebuilt count view — symmetric
@@ -486,12 +466,7 @@ std::optional<GcCompaction::RebuildResult> GcCompaction::rebuildFromSnapshotAndL
     {
         if (it->second <= 0)
         {
-            Candidate candidate;
-            candidate.key = it->first;
-            candidate.object_key = (it->first.kind == KeyKind::Blob)
-                ? blobGenKey(key_prefix, BlobHash(it->first.identity), it->first.generation).string()
-                : partGenKey(key_prefix, PartId(it->first.identity), it->first.generation).string();
-            result.candidates.push_back(std::move(candidate));
+            result.candidates.push_back(Candidate{it->first, candidateObjectKey(key_prefix, it->first)});
             it = counts.erase(it);
         }
         else

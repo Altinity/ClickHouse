@@ -23,10 +23,9 @@ namespace DB::ContentAddressed
 std::string GcDelta::computeEventId(const PartId & part_id, Op op, uint64_t generation)
 {
     /// SipHash-128 (lowercase hex) over (op, generation, part_id) — stable and reproducible without any
-    /// shared state, so the §5.1 rule-2 re-append of the SAME logical delta into a later epoch produces
-    /// an identical id and the compaction dedups it on fold. The op byte and generation are folded in via
-    /// fixed-width updates; the part id via its string. (No host-byte-order int is exposed: the id is the
-    /// hex digest, so the log object key it forms is cross-arch stable.)
+    /// shared state, so a §5.1 rule-2 re-append of the SAME logical delta into a later epoch produces an
+    /// identical id and the compaction dedups it on fold. The hex digest (not a host-byte-order int) keeps
+    /// the log object key it forms cross-arch stable.
     SipHash hash;
     hash.update(static_cast<uint8_t>(op));
     hash.update(generation);
@@ -36,11 +35,9 @@ std::string GcDelta::computeEventId(const PartId & part_id, Op op, uint64_t gene
 
 std::string GcLogBatch::serialize() const
 {
-    /// MAGIC(4) + version(1) + body, on the shared codec. The body is a varint count of deltas, then per
-    /// delta: the op (1 byte little-endian), the event_id (length-prefixed string — the stable hex id),
-    /// the part_id (length-prefixed string), a varint count of pins and that many bare blob hashes (each
-    /// length-prefixed). All explicitly little-endian so the object is byte-identical regardless of the
-    /// writer's architecture (cross-arch determinism — the log is read by whichever mounter compacts it).
+    /// MAGIC(4) + version(1) + body, on the shared LE codec (cross-arch determinism — the log is read by
+    /// whichever mounter compacts it). Body: a varint delta count, then per delta the op, event_id, part_id,
+    /// the pins, the manifest generation, and the parallel pin generations (see below).
     std::string out;
     DB::WriteBufferFromString buf(out);
     FormatHeader{MAGIC, VERSION}.write(buf);
@@ -53,9 +50,8 @@ std::string GcLogBatch::serialize() const
         DB::writeVarUInt(d.pins.size(), buf);
         for (const auto & pin : d.pins)
             DB::writeStringBinary(pin.string(), buf);
-        /// CA GC S3 (version 2): the resolved manifest generation, then a parallel vector of the resolved
-        /// per-pin generations. The pin-generation count is written explicitly (rather than assumed equal
-        /// to pins.size()) so a defensive size mismatch fails closed on read.
+        /// The resolved manifest generation, then the parallel per-pin generations. The pin-generation
+        /// count is written explicitly (not assumed equal to pins.size()) so a size mismatch fails closed.
         DB::writeVarUInt(d.manifest_generation, buf);
         DB::writeVarUInt(d.pin_generations.size(), buf);
         for (uint64_t g : d.pin_generations)
@@ -95,9 +91,8 @@ GcLogBatch GcLogBatch::deserialize(const std::string & bytes)
             DB::readStringBinary(pin, buf);
             d.pins.emplace_back(std::move(pin));
         }
-        /// CA GC S3 (version 2): the resolved manifest generation and the parallel per-pin generations.
-        /// The count must either be 0 (no resolved generations recorded — every pin is g=0) or exactly
-        /// match the pin count; any other size is a corrupt log object (fail closed).
+        /// The resolved manifest generation and the parallel per-pin generations. The count must be either 0
+        /// (none recorded — every pin is g=0) or exactly the pin count; any other size is corrupt (fail closed).
         DB::readVarUInt(d.manifest_generation, buf);
         uint64_t ng = 0;
         DB::readVarUInt(ng, buf);

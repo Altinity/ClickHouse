@@ -57,6 +57,27 @@ std::string readSmallObject(const ObjectStoragePtr & object_storage, const std::
     return content;
 }
 
+/// Read + deserialize the session at `key`, returning nullopt if it VANISHED between the caller's LIST and
+/// this READ (its owner committed/aborted — on commit the blobs are reachable via the published ref; on
+/// abort they were never referenced, so a missing session is simply skipped). Only the missing-object
+/// errors are swallowed; a malformed/truncated session still fails closed via deserialize (never
+/// best-effort on corruption). Shared by every sessions/ scan so they cannot diverge on this race.
+std::optional<WriteSession> tryReadSession(const ObjectStoragePtr & object_storage, const std::string & key)
+{
+    std::string raw;
+    try
+    {
+        raw = readSmallObject(object_storage, key);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() == ErrorCodes::CANNOT_OPEN_FILE || e.code() == ErrorCodes::FILE_DOESNT_EXIST)
+            return std::nullopt;
+        throw;
+    }
+    return WriteSession::deserialize(raw);
+}
+
 }
 
 /// ==== Pool enumeration (was PoolScan) ====
@@ -99,21 +120,18 @@ std::vector<std::string> listKeysUnder(const ObjectStoragePtr & object_storage, 
 
 std::set<PartId> listLivePartIds(const ObjectStoragePtr & object_storage, const std::string & key_prefix)
 {
-    /// Live part ids are collected from TWO families of GC roots:
+    /// Live part ids are collected from TWO families of GC roots, both under a `/refs/` segment whose ref
+    /// objects each carry a live part id as their payload:
     ///
-    /// 1. refsRootPrefix (store/.../refs/): every server's/table's active refs. The root also holds
-    ///    verbatim table-level files under the store/server/uuid/files/ layout, so we keep only keys
-    ///    whose path has a /refs/ segment (the ref objects); their payload is the live part id.
-    ///    Per-ref sidecars (.meta) also live under /refs/ but are NOT refs (their payload is a
-    ///    RefSidecar, not a part id), so skip them: a sidecar is ref-scoped, removed with the ref,
-    ///    and never a GC root.
+    /// 1. refsRootPrefix (store/.../refs/): active refs. The root also holds verbatim table-level files
+    ///    (store/server/uuid/files/), so we keep only keys with a /refs/ segment. Per-ref sidecars (.meta)
+    ///    also live under /refs/ but are ref-scoped, not GC roots (their payload is a RefSidecar, not a
+    ///    part id) — skip them.
     ///
-    /// 2. shadowRefsRootPrefix (shadow/<backup>/.../refs/): FREEZE snapshot refs. When a part is
-    ///    frozen via BACKUP / FREEZE, its files are copied into the shadow/ namespace and a shadow ref
-    ///    is published at shadowRefKey(...). These refs use the same /refs/ + .meta conventions as
-    ///    store/ refs. Without scanning this root, a frozen snapshot's blobs would be reclaimed once
-    ///    the live part is merged or dropped — defeating FREEZE. Treating shadow/ as an additional GC
-    ///    root keeps the frozen blobs reachable until the shadow ref is explicitly removed.
+    /// 2. shadowRefsRootPrefix (shadow/<backup>/.../refs/): FREEZE/BACKUP snapshot refs, same /refs/ + .meta
+    ///    conventions. Scanning this root keeps a frozen snapshot's blobs reachable until its shadow ref is
+    ///    explicitly removed; without it they would be reclaimed once the live part is merged or dropped,
+    ///    defeating FREEZE.
     static const std::string refs_segment = "/refs/";
     std::set<PartId> live;
     auto scan_root = [&](const std::string & root)
@@ -156,36 +174,21 @@ std::set<BlobObjectKey> sessionPinnedBlobs(
     std::set<BlobObjectKey> pinned;
     for (const auto & key : listKeysUnder(object_storage, sessionsPrefix(key_prefix)))
     {
-        /// A session listed here can be removed by its owner (commit/abort -> releaseSession) between
-        /// this LIST and the READ. A vanished session is simply gone: on commit its blobs are now
-        /// reachable via the published ref; on abort they were never referenced — so skip it instead of
-        /// throwing. Only the missing-object errors are swallowed; a malformed/truncated session still
-        /// fails closed via deserialize (never best-effort on corruption).
-        std::string raw;
-        try
-        {
-            raw = readSmallObject(object_storage, key);
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() == ErrorCodes::CANNOT_OPEN_FILE || e.code() == ErrorCodes::FILE_DOESNT_EXIST)
-                continue;
-            throw;
-        }
-        const WriteSession session = WriteSession::deserialize(raw);
-        /// An EXPIRED session is itself reclaimable (a crashed writer must not pin blobs forever): the
-        /// lease is a liveness HINT only, never the basis of a positive "still pinned" decision. `now`
-        /// is the sweep clock; the lease is unsigned, so compare in a common signed domain (a negative
-        /// `now` — never produced in practice — would simply treat every session as expired).
-        /// CA GC S4 (#2): a sticky session (its `+` flush failed and is not yet durably re-logged) is EXEMPT
-        /// from lease-expiry reaping — its reference is covered by neither the log nor a fresh session, so
-        /// dropping the pin would be the under-count the design forbids. A crashed-writer leak is acceptable
-        /// (reclaimed once the reaper re-logs + folds, or by reconciliation); a dropped pin is not.
-        if (!session.deltas_failed && static_cast<int64_t>(session.lease_deadline_unix) < now)
+        const std::optional<WriteSession> session = tryReadSession(object_storage, key);
+        if (!session)
+            continue; /// vanished between LIST and READ — see tryReadSession.
+        /// An EXPIRED session is itself reclaimable (a crashed writer must not pin blobs forever): the lease
+        /// is a liveness HINT only, never the basis of a positive "still pinned" decision. Compare in a
+        /// common signed domain (the lease is unsigned). CA GC S4 (#2): a sticky session (its `+` flush
+        /// failed and is not yet durably re-logged) is EXEMPT from lease-expiry reaping — its reference is
+        /// covered by neither the log nor a fresh session, so dropping the pin would be the forbidden
+        /// under-count. A crashed-writer leak is acceptable (reclaimed once the reaper re-logs + folds, or by
+        /// reconciliation); a dropped pin is not.
+        if (!session->deltas_failed && static_cast<int64_t>(session->lease_deadline_unix) < now)
             continue;
-        for (const auto & hash : session.pending)
-            /// Project the BARE content hash to the FULL blob object key with the SAME `blobKey` fan-out
-            /// `markReachableBlobs` uses, so the pinned set is directly comparable to the reachable set.
+        /// Project each BARE content hash to the FULL blob object key with the SAME `blobKey` fan-out
+        /// `markReachableBlobs` uses, so the pinned set is directly comparable to the reachable set.
+        for (const auto & hash : session->pending)
             pinned.insert(blobKey(key_prefix, hash));
     }
     return pinned;
@@ -197,32 +200,18 @@ std::set<PartObjectKey> sessionPinnedPartKeys(
     std::set<PartObjectKey> pinned;
     for (const auto & key : listKeysUnder(object_storage, sessionsPrefix(key_prefix)))
     {
-        /// A vanished session (its owner committed/aborted between this LIST and the READ) is simply
-        /// gone — skip it (same rationale as sessionPinnedBlobs). Only the missing-object errors are
-        /// swallowed; a malformed session still fails closed via deserialize.
-        std::string raw;
-        try
-        {
-            raw = readSmallObject(object_storage, key);
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() == ErrorCodes::CANNOT_OPEN_FILE || e.code() == ErrorCodes::FILE_DOESNT_EXIST)
-                continue;
-            throw;
-        }
-        const WriteSession session = WriteSession::deserialize(raw);
-        /// CA GC S4 (#2): a sticky session (its `+` flush failed and is not yet durably re-logged) is EXEMPT
-        /// from lease-expiry reaping — its reference is covered by neither the log nor a fresh session, so
-        /// dropping the pin would be the under-count the design forbids. A crashed-writer leak is acceptable
-        /// (reclaimed once the reaper re-logs + folds, or by reconciliation); a dropped pin is not.
-        if (!session.deltas_failed && static_cast<int64_t>(session.lease_deadline_unix) < now)
-            continue; /// expired -> itself reclaimable, not a root.
-        /// Pin the manifest the session names ONLY if it resolves to a real parts/ object. The write
-        /// path's session carries a part NAME (no manifest at that key), so its key simply does not exist
-        /// and contributes nothing; the relink path carries a real committed part_id, so its manifest is
-        /// kept reachable across the source-ref-drop window.
-        const PartObjectKey manifest_key = partKey(key_prefix, session.part_id);
+        const std::optional<WriteSession> session = tryReadSession(object_storage, key);
+        if (!session)
+            continue; /// vanished between LIST and READ — see tryReadSession.
+        /// CA GC S4 (#2): a sticky session is EXEMPT from lease-expiry reaping (same under-count rationale as
+        /// sessionPinnedBlobs). Otherwise an expired session is itself reclaimable, not a root.
+        if (!session->deltas_failed && static_cast<int64_t>(session->lease_deadline_unix) < now)
+            continue;
+        /// Pin the manifest the session names ONLY if it resolves to a real parts/ object. The write path's
+        /// session carries a part NAME (no manifest at that key), so its key does not exist and contributes
+        /// nothing; the relink path carries a real committed part_id, so its manifest is kept reachable
+        /// across the source-ref-drop window.
+        const PartObjectKey manifest_key = partKey(key_prefix, session->part_id);
         if (object_storage->tryGetObjectMetadata(manifest_key.string(), /*with_tags=*/false).has_value())
             pinned.insert(manifest_key);
     }
@@ -365,6 +354,26 @@ PartManifest ContentAddressedGC::resolveManifestAtAnyGeneration(const PartId & p
     return PartManifest::deserialize(bytes);
 }
 
+ContentAddressedGC::Reachability ContentAddressedGC::computeReachability(int64_t now) const
+{
+    /// CA GC S3: resolve a live part's manifest at ANY present generation (a resurrected manifest lives at
+    /// mg>0; the steady g=0 key can be absent for a live part — see resolveManifestAtAnyGeneration). B18
+    /// fail-close is preserved: a live ref with NO present manifest generation throws CORRUPTED_DATA.
+    PartManifestResolver resolve = [this](const PartId & part_id) -> PartManifest
+    { return resolveManifestAtAnyGeneration(part_id); };
+
+    const std::set<PartId> live = listLivePartIds(object_storage, key_prefix);
+    Reachability r;
+    for (const auto & part_id : live)
+        r.live_part_keys.insert(partKey(key_prefix, part_id));
+    r.reachable_blobs = markReachableBlobs(key_prefix, live, resolve);
+    for (const auto & pinned : sessionPinnedBlobs(object_storage, key_prefix, now))
+        r.reachable_blobs.insert(pinned);
+    for (const auto & pinned : sessionPinnedPartKeys(object_storage, key_prefix, now))
+        r.live_part_keys.insert(pinned);
+    return r;
+}
+
 SweepStats ContentAddressedGC::sweepCandidates(
     const std::set<std::string> & candidate_object_keys,
     const std::set<std::string> & pinned_snapshot,
@@ -377,41 +386,7 @@ SweepStats ContentAddressedGC::sweepCandidates(
     /// fallback).
     /// CA GC S4 (G1): runs LOCK-FREE — the gc_lock is no longer held across the sweep. Reads in-flight pins
     /// only from the supplied lock-free pinned_snapshot (never the shared set).
-    ///
-    /// The reachable-blob computation, factored so it can be re-run immediately before deletion (the
-    /// re-validate-under-lock step) AND used by the S1 drift validator. B18 fail-close: a live ref whose
-    /// manifest is missing throws CORRUPTED_DATA so the sweep aborts WITHOUT deleting anything.
-    /// CA GC S3: resolve a live part's manifest at ANY present generation (a resurrected manifest lives at
-    /// mg>0; the steady g=0 key can be absent for a live part — see resolveManifestAtAnyGeneration). B18
-    /// fail-close is preserved: a live ref with NO present manifest generation still throws CORRUPTED_DATA.
-    PartManifestResolver resolve = [this](const PartId & part_id) -> PartManifest
-    { return resolveManifestAtAnyGeneration(part_id); };
-
-    /// One reachability snapshot: the live part ids, the live part manifest keys, and the reachable blob
-    /// set = (refs -> manifests -> blob keys) UNION every LIVE write-session's pending blobs (M8). NOTE
-    /// (G3): this computes reachability from refs -> manifests + sessions; it does NOT `LIST blobs/`. It is
-    /// the SAFETY NET that drops any candidate still reachable (so a live blob wrongly emitted as a
-    /// count-0 candidate by the compaction is never deleted), NOT the candidate source.
-    struct Reachability
-    {
-        std::set<PartObjectKey> live_part_keys;
-        std::set<BlobObjectKey> reachable_blobs;
-    };
-    auto compute_reachability = [&]() -> Reachability
-    {
-        std::set<PartId> live = listLivePartIds(object_storage, key_prefix);
-        Reachability r;
-        for (const auto & part_id : live)
-            r.live_part_keys.insert(partKey(key_prefix, part_id));
-        r.reachable_blobs = markReachableBlobs(key_prefix, live, resolve);
-        for (const auto & pinned : sessionPinnedBlobs(object_storage, key_prefix, now))
-            r.reachable_blobs.insert(pinned);
-        for (const auto & pinned : sessionPinnedPartKeys(object_storage, key_prefix, now))
-            r.live_part_keys.insert(pinned);
-        return r;
-    };
-
-    const Reachability snapshot = compute_reachability();
+    const Reachability snapshot = computeReachability(now);
 
     /// CA GC S1 (B9): VALIDATE the incremental reverse index against this authoritative reachable-blob
     /// snapshot and LOG any disagreement. INSTRUMENTATION ONLY — the deletion decision below never gates
@@ -561,7 +536,7 @@ SweepStats ContentAddressedGC::sweepCandidates(
     /// any candidate now reachable. In S3 this is the existing refs -> manifests + live-sessions pass (the
     /// §6.2 sessions+compaction-only form is S4). It is the SAFETY GATE: a generation whose identity is
     /// reachable is never blindly swept.
-    const Reachability revalidated = compute_reachability();
+    const Reachability revalidated = computeReachability(now);
 
     if (leadership_lost())
         return {}; /// a successor took a higher fence; delete NOTHING further.
@@ -874,20 +849,9 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidates(
     /// part, plus every blobs/ object not reachable from a live manifest or a live session. This is the
     /// PRE-S2 candidate source, kept ONLY as the reconciliation fallback.
     /// CA GC S4 (G1/#5): runs lock-free; reads in-flight pins only from the supplied pinned_snapshot.
-    /// CA GC S3: resolve a live part's manifest at ANY present generation (resurrected manifests live at
-    /// mg>0). Same B18 fail-close on a genuinely-missing manifest. See resolveManifestAtAnyGeneration.
-    PartManifestResolver resolve = [this](const PartId & part_id) -> PartManifest
-    { return resolveManifestAtAnyGeneration(part_id); };
-
-    std::set<PartId> live = listLivePartIds(object_storage, key_prefix);
-    std::set<PartObjectKey> live_part_keys;
-    for (const auto & part_id : live)
-        live_part_keys.insert(partKey(key_prefix, part_id));
-    std::set<BlobObjectKey> reachable_blobs = markReachableBlobs(key_prefix, live, resolve);
-    for (const auto & pinned : sessionPinnedBlobs(object_storage, key_prefix, now))
-        reachable_blobs.insert(pinned);
-    for (const auto & pinned : sessionPinnedPartKeys(object_storage, key_prefix, now))
-        live_part_keys.insert(pinned);
+    const Reachability reach = computeReachability(now);
+    const std::set<PartObjectKey> & live_part_keys = reach.live_part_keys;
+    const std::set<BlobObjectKey> & reachable_blobs = reach.reachable_blobs;
 
     /// CA GC S3 (concern 2) — the `parts/`/`blobs/` directories now hold a generation FAMILY per identity:
     /// `<g>` (generation objects), `<g>.tombstone` (gravestones), and `active` (the hint). Fold each
@@ -899,14 +863,12 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidates(
     ///     reachable identity keeps ALL its present generations off the orphan list (a referenced `<g>` is
     ///     never an orphan). An unreachable identity's generation objects are fed to the shared
     ///     seal/grace/recheck/branch tail, which re-confirms unreachability before sweeping.
-    /// §13 observability (CA GC S4 #4): tally the generations-per-hash PROXY HERE, on the reconciliation
-    /// full-scan, where we already walk the entire parts/+blobs/ listing — count present generation OBJECTS
-    /// (ContentAddressedGenerationsObserved) and the distinct identities that carry at least one
-    /// (ContentAddressedHashesObserved). The compaction-driven normal path no longer LISTs the full tree
-    /// (Scan A now reads only the gc/sealed index), so it cannot see the full generation population; the tally
-    /// moved here so it still reflects the true distribution. Reconciliation runs at its own cadence and the
-    /// index path emits nothing, so this never double-counts. Their ratio is the mean generations-per-hash; a
-    /// hash with >1 generation is the hot-content-cycling guardrail (gravestones are safe but not free).
+    /// §13 observability (CA GC S4 #4): tally the generations-per-hash proxy HERE, where we already walk the
+    /// whole parts/+blobs/ listing — present generation OBJECTS (ContentAddressedGenerationsObserved) and the
+    /// distinct identities carrying at least one (ContentAddressedHashesObserved). The compaction-driven path
+    /// no longer LISTs the full tree (Scan A reads only the gc/sealed index), so the tally must live here to
+    /// see the true distribution; reconciliation's own cadence means this never double-counts. Their ratio is
+    /// the mean generations-per-hash — the hot-content-cycling guardrail (gravestones are safe but not free).
     std::set<std::string> identities_with_generation;
     size_t generation_objects = 0;
 
@@ -976,21 +938,10 @@ size_t ContentAddressedGC::reapFoldedSessions(GcCompaction & compaction)
     size_t reaped = 0;
     for (const auto & key : listKeysUnder(object_storage, sessionsPrefix(key_prefix)))
     {
-        /// A session can be removed by its owner (commit/abort) between this LIST and the READ — a vanished
-        /// session is simply gone (skip). Only the missing-object errors are swallowed; a malformed session
-        /// still fails closed via deserialize (never best-effort on corruption).
-        std::string raw;
-        try
-        {
-            raw = readSmallObject(object_storage, key);
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() == ErrorCodes::CANNOT_OPEN_FILE || e.code() == ErrorCodes::FILE_DOESNT_EXIST)
-                continue;
-            throw;
-        }
-        WriteSession session = WriteSession::deserialize(raw);
+        std::optional<WriteSession> read = tryReadSession(object_storage, key);
+        if (!read)
+            continue; /// vanished between LIST and READ — see tryReadSession.
+        WriteSession session = std::move(*read);
 
         /// CA GC S4 (#2): a sticky session's `+` flush failed at commit — the ref is published but no `+` is
         /// durable. Re-log the stored `+` delta(s) (idempotent by event_id), record their settled epochs, and

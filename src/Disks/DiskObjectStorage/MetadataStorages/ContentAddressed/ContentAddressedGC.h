@@ -235,6 +235,22 @@ public:
     void setReconciliationCadenceRounds(int64_t rounds) { reconciliation_cadence_rounds = rounds; }
 
 private:
+    /// One authoritative reachability snapshot (§6.2): the live part-manifest keys and the reachable blob
+    /// set = (refs -> manifests -> blob keys) UNION every LIVE write-session's pinned blobs/manifests (M8).
+    /// Built from refs -> manifests + sessions; it does NOT `LIST blobs/`. It is the SAFETY NET that drops
+    /// any candidate still reachable (so a live blob wrongly emitted as a count-0 candidate is never
+    /// deleted), NOT the candidate source.
+    struct Reachability
+    {
+        std::set<PartObjectKey> live_part_keys;
+        std::set<BlobObjectKey> reachable_blobs;
+    };
+    /// Compute a Reachability snapshot at sweep clock `now`. B18 fail-close: a live ref whose manifest is
+    /// missing at EVERY present generation throws CORRUPTED_DATA (resolveManifestAtAnyGeneration), so the
+    /// sweep aborts WITHOUT deleting. Shared by sweepCandidates (snapshot + the fresh §6.2 re-check) and
+    /// collectReconciliationCandidates so the three passes cannot disagree on reachability.
+    Reachability computeReachability(int64_t now) const;
+
     /// CA GC S3 — the GENERATION-AWARE seal -> grace -> fresh re-check -> {recover|drain|sweep} tail used by
     /// BOTH the compaction-driven normal path and the reconciliation fallback. `candidate_object_keys` are
     /// the generationed candidate object keys (`blobs/<H>/<g>` / `parts/<part_id>/<mg>`) whose folded count
