@@ -26,7 +26,15 @@ struct PoolMeta
     /// Version 2 (CAS replication Phase 1.1) adds `pool_uuid` to the body. The fail-closed gate is the
     /// migration story: a pre-version-2 pool reads as version 1 and fails closed here, and a version-1
     /// reader seeing a version-2 marker also fails closed — neither silently misinterprets the other.
-    static constexpr uint32_t CURRENT_VERSION = 2;
+    ///
+    /// Version 3 (CA GC S3 — generations + tombstones) makes blob and manifest keys generationed
+    /// (`blobs/<H>/<g>`, `parts/<part_id>/<mg>`) with GC-owned `<g>.tombstone` and best-effort `active`
+    /// hints (spec §6). This is an INCOMPATIBLE on-disk layout change with NO back-compat (spec §1): a v2
+    /// pool stored every blob/manifest at the bare key (`blobs/<H>`), so a v3 reader would find no object
+    /// at the generationed key and a v2 reader would not understand a generationed pool. There is NO
+    /// migration/upgrade path — a v2 pool is REJECTED (fail-closed) at the version gate in
+    /// `claimPoolOwnership`, never silently upgraded.
+    static constexpr uint32_t CURRENT_VERSION = 3;
 
     /// 4-byte magic `CAPM` ("Content-Addressed Pool Meta") + a 1-byte ENCODING version, per the shared
     /// codec. A stray / foreign object at `_pool_meta` is rejected (bad magic) rather than misparsed.

@@ -27,14 +27,89 @@ static std::string fanOut(const std::string & prefix, const std::string & hash)
     return prefix + "/" + hash.substr(0, 2) + "/" + hash.substr(2, 2) + "/" + hash;
 }
 
+// ==== CA GC S3: generationed key builders (spec §6) ====
+//
+// The fan-out directory `blobs/<H0>/<H1>/<H>/` (resp. `parts/<p0>/<p1>/<part_id>/`) is the SAME fan-out as
+// before; what changes is that `<H>` is now a directory whose children are the per-generation objects. So
+// the g=0 object lands at `blobs/<H0>/<H1>/<H>/0`, exactly one component deeper than the old bare key.
+
+BlobObjectKey blobGenKey(const std::string & key_prefix, const BlobHash & blob_hash, uint64_t generation)
+{
+    return BlobObjectKey(withPrefix(key_prefix, fanOut("blobs", blob_hash.string()) + "/" + std::to_string(generation)));
+}
+
+BlobObjectKey blobTombstoneKey(const std::string & key_prefix, const BlobHash & blob_hash, uint64_t generation)
+{
+    return BlobObjectKey(
+        withPrefix(key_prefix, fanOut("blobs", blob_hash.string()) + "/" + std::to_string(generation) + std::string(kTombstoneSuffix)));
+}
+
+std::string blobActiveKey(const std::string & key_prefix, const BlobHash & blob_hash)
+{
+    return withPrefix(key_prefix, fanOut("blobs", blob_hash.string()) + "/" + std::string(kActiveHintName));
+}
+
+std::string blobGenPrefix(const std::string & key_prefix, const BlobHash & blob_hash)
+{
+    /// The LIST prefix for ALL generations / tombstones / the active hint of one H (trailing '/').
+    return withPrefix(key_prefix, fanOut("blobs", blob_hash.string()) + "/");
+}
+
+PartObjectKey partGenKey(const std::string & key_prefix, const PartId & part_id, uint64_t generation)
+{
+    return PartObjectKey(withPrefix(key_prefix, fanOut("parts", part_id.string()) + "/" + std::to_string(generation)));
+}
+
+PartObjectKey partTombstoneKey(const std::string & key_prefix, const PartId & part_id, uint64_t generation)
+{
+    return PartObjectKey(
+        withPrefix(key_prefix, fanOut("parts", part_id.string()) + "/" + std::to_string(generation) + std::string(kTombstoneSuffix)));
+}
+
+std::string partActiveKey(const std::string & key_prefix, const PartId & part_id)
+{
+    return withPrefix(key_prefix, fanOut("parts", part_id.string()) + "/" + std::string(kActiveHintName));
+}
+
+std::string partGenPrefix(const std::string & key_prefix, const PartId & part_id)
+{
+    return withPrefix(key_prefix, fanOut("parts", part_id.string()) + "/");
+}
+
 BlobObjectKey blobKey(const std::string & key_prefix, const BlobHash & blob_hash)
 {
-    return BlobObjectKey(withPrefix(key_prefix, fanOut("blobs", blob_hash.string())));
+    return blobGenKey(key_prefix, blob_hash, 0);
 }
 
 PartObjectKey partKey(const std::string & key_prefix, const PartId & part_id)
 {
-    return PartObjectKey(withPrefix(key_prefix, fanOut("parts", part_id.string())));
+    return partGenKey(key_prefix, part_id, 0);
+}
+
+std::optional<uint64_t> parseGenFromKey(const std::string & key, bool & is_tombstone)
+{
+    is_tombstone = false;
+    /// The generation component is the last path component: `…/<g>` or `…/<g>.tombstone`.
+    const auto slash = key.rfind('/');
+    std::string_view last = slash == std::string::npos ? std::string_view(key) : std::string_view(key).substr(slash + 1);
+
+    if (last.size() >= kTombstoneSuffix.size() && last.substr(last.size() - kTombstoneSuffix.size()) == kTombstoneSuffix)
+    {
+        is_tombstone = true;
+        last = last.substr(0, last.size() - kTombstoneSuffix.size());
+    }
+
+    if (last.empty() || last == kActiveHintName)
+        return std::nullopt;
+
+    uint64_t value = 0;
+    for (char c : last)
+    {
+        if (c < '0' || c > '9')
+            return std::nullopt;
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+    }
+    return value;
 }
 
 std::string partsPrefix(const std::string & key_prefix)

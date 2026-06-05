@@ -14,11 +14,67 @@ namespace DB::ContentAddressed
 // truth for the prefix is ContentAddressedMetadataStorage::storage_path_prefix, threaded through
 // the metadata storage and its transaction so the read and write sides can never disagree.
 
-// Content-addressed object keys with 2x2 hex prefix fan-out (S3 per-prefix limits). The builders
-// take a typed bare identity (BlobHash / PartId) and return a typed full object key
-// (BlobObjectKey / PartObjectKey) so a bare hash and a full key can never be confused.
+// ==== CA GC S3: generationed content-addressed keys (spec §6, §6.1) ====
+//
+// A content hash `H` (and symmetrically a `part_id`) is no longer a single leaf object. It is a small
+// keyspace under the fan-out directory `blobs/<H0>/<H1>/<H>/` (resp. `parts/<p0>/<p1>/<part_id>/`):
+//   - `…/<g>`            — the blob bytes (resp. manifest body) at GENERATION g. g=0 is the common case
+//                          (a fresh blob/manifest is always g=0); a g>0 object only ever appears after the
+//                          GC has condemned an older generation (resurrection, §6).
+//   - `…/<g>.tombstone`  — the GC-owned seal/gravestone for generation g (created by the GC leader, never
+//                          by a writer; three fates per §6: seal → recover/un-seal, or → permanent grave).
+//   - `…/active`         — a best-effort preferred-generation HINT (a plain PUT, NOT a CAS — G4/I7d). It is
+//                          ABSENT in the common g=0 case (readers default to 0); written lazily only on a
+//                          resurrection/sweep. A stale `active` is repaired by the reader's LIST fallback,
+//                          never treated as corruption.
+// Generation lives ONLY in the physical store key and the delta log — never in `part_id`/manifest identity:
+// the manifest body still pins bare `H`, so `part_id` stays a pure content function and dedup/idempotency
+// are unchanged (two parts with identical content share the same `part_id` and, at g=0, the same blob key).
+//
+// `blobGenPrefix` is the LIST prefix for ALL generations of one `H` (`blobs/<H0>/<H1>/<H>/`): the reader's
+// 404→LIST fallback (§6.1) and the writer's tomb re-check (§7.1) list it to reconstruct the present
+// generations / tombstones from the bucket alone.
+//
+// NO bare-key builder remains: there is no back-compat (PoolMeta v2→v3, §1), so every blob/manifest key
+// carries an explicit generation. The 2x2 hex prefix fan-out (S3 per-prefix limits) is preserved on the
+// `<H>` component as before. All builders return a typed full object key so a bare hash and a full key can
+// never be confused (B29).
+BlobObjectKey blobGenKey(const std::string & key_prefix, const BlobHash & blob_hash, uint64_t generation);
+BlobObjectKey blobTombstoneKey(const std::string & key_prefix, const BlobHash & blob_hash, uint64_t generation);
+std::string blobActiveKey(const std::string & key_prefix, const BlobHash & blob_hash);
+std::string blobGenPrefix(const std::string & key_prefix, const BlobHash & blob_hash);
+
+PartObjectKey partGenKey(const std::string & key_prefix, const PartId & part_id, uint64_t generation);
+PartObjectKey partTombstoneKey(const std::string & key_prefix, const PartId & part_id, uint64_t generation);
+std::string partActiveKey(const std::string & key_prefix, const PartId & part_id);
+std::string partGenPrefix(const std::string & key_prefix, const PartId & part_id);
+
+// The literal object-key component name reserved for the best-effort preferred-generation hint
+// (`…/active`). A generation child is a decimal number, so this name can never collide with a `<g>` or a
+// `<g>.tombstone` object.
+inline constexpr std::string_view kActiveHintName = "active";
+
+// The suffix that distinguishes a GC-owned tombstone object (`…/<g>.tombstone`) from the blob/manifest
+// generation object (`…/<g>`) under the SAME `<H>`/`<part_id>` directory. The reader/writer LIST scan uses
+// it to split a directory listing into present generations vs sealed-generation tombstones.
+inline constexpr std::string_view kTombstoneSuffix = ".tombstone";
+
+// Generation-0 convenience wrappers. `blobKey(H)` == `blobGenKey(H, 0)` and `partKey(id)` == `partGenKey(id, 0)`.
+// A fresh blob/manifest is ALWAYS g=0, so these name the common-case object directly. They keep every caller
+// that does not (yet) reason about generations — the GC reachability scan, the reconciliation fold, the
+// non-resurrecting read/commit fast path — addressing the g=0 object, so the common path is byte-for-byte the
+// pre-S3 behavior with one extra `/0` component. Generation-aware code (the read fallback, the writer tomb
+// re-check/resurrection, the Phase-3 GC state machine) uses the explicit `…GenKey(…, g)` builders instead.
 BlobObjectKey blobKey(const std::string & key_prefix, const BlobHash & blob_hash);
 PartObjectKey partKey(const std::string & key_prefix, const PartId & part_id);
+
+// Parse the generation number from a generation object key (`…/<g>`) or a tombstone key (`…/<g>.tombstone`).
+// Returns nullopt for the `active` hint or any key that does not end in a numeric generation component
+// (optionally followed by the tombstone suffix). `is_tombstone` is set to whether the key carried the
+// tombstone suffix. Used by the reader fallback and the writer re-check to fold a directory LIST into the
+// set of present generations and sealed-generation tombstones (so generation lineage — `max(gen)` — is
+// reconstructable from the surviving objects even if `active` is lost, §6 last bullet / I7d).
+std::optional<uint64_t> parseGenFromKey(const std::string & key, bool & is_tombstone);
 
 // Pool roots for enumeration (GC scan). Each is the object-key prefix under which all objects of a
 // given kind live: manifests under partsPrefix (<key_prefix>/parts), content blobs under blobsPrefix
