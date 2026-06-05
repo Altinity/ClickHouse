@@ -110,6 +110,11 @@ private:
     /// it; here it is just a read to stamp the delta's epoch (§5.1 rule 2).
     uint64_t readShardEpoch(ShardId shard) const;
 
+    /// CA GC S4 (#3): the cached open epoch for a shard (refreshes once on a cold miss). NOT under `mtx`.
+    uint64_t cachedShardEpoch(ShardId shard) const;
+    /// CA GC S4 (#3): HEAD+GET the authoritative epoch (outside any lock) and monotonically update the cache.
+    uint64_t refreshShardEpoch(ShardId shard) const;
+
     /// Serialize the (shard, epoch) buffer to ONE coalesced gc/log object and write it. Sets
     /// last_batch_size. The event_id of the FIRST fragment names the object (one object per window).
     void flushBufferLocked(ShardId shard, uint64_t epoch, Buffer & buffer);
@@ -127,6 +132,15 @@ private:
 
     mutable std::mutex mtx;
     std::map<ShardEpoch, Buffer> buffers;
+
+    /// CA GC S4 (#3, G1): cache of shard -> last-observed open epoch, so the hot append path does not do a
+    /// HEAD+GET under the lock on every commit. The epoch advances at most once per GC round (a fold); a
+    /// stale-low cache only widens the window the writer logs into (the re-append catches the advance), and
+    /// a stale-high cache cannot happen (the cache is only ever refreshed from object storage, monotonically).
+    /// Guarded by `epoch_cache_mtx` (distinct from `mtx`, which guards the buffers), so an epoch refresh
+    /// never blocks a concurrent buffer move.
+    mutable std::mutex epoch_cache_mtx;
+    mutable std::map<ShardId, uint64_t> epoch_cache;
 
     std::atomic<size_t> last_batch_size{0};
 };

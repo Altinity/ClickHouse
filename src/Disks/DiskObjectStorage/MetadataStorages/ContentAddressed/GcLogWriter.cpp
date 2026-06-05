@@ -56,6 +56,29 @@ uint64_t GcLogWriter::readShardEpoch(ShardId shard) const
     }
 }
 
+uint64_t GcLogWriter::refreshShardEpoch(ShardId shard) const
+{
+    /// HEAD+GET the authoritative epoch (outside any lock) and update the cache. Returns the fresh value.
+    const uint64_t epoch = readShardEpoch(shard);
+    std::lock_guard<std::mutex> guard(epoch_cache_mtx);
+    auto & cached = epoch_cache[shard];
+    if (epoch > cached)
+        cached = epoch; /// monotonic: never let a racing lower read move the cache backwards.
+    return cached;
+}
+
+uint64_t GcLogWriter::cachedShardEpoch(ShardId shard) const
+{
+    {
+        std::lock_guard<std::mutex> guard(epoch_cache_mtx);
+        if (auto it = epoch_cache.find(shard); it != epoch_cache.end())
+            return it->second;
+    }
+    /// Cold miss: refresh once (the warm-path HEAD+GET is gone — subsequent commits hit the cache; the
+    /// re-append's refresh keeps it current when a fold advances the epoch).
+    return refreshShardEpoch(shard);
+}
+
 std::map<ShardId, GcLogWriter::Fragment> GcLogWriter::splitDeltaByShard(const GcDelta & delta)
 {
     /// Each pin to its hash-prefix shard; the (part_id) edge to the part's home shard (always present,
