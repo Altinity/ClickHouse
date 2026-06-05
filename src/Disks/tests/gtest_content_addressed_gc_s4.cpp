@@ -108,8 +108,16 @@ public:
 
     bool exists(const std::string & key) const { return os->tryGetObjectMetadata(key, /*with_tags=*/false).has_value(); }
 
-    /// STORE flag M: the GC seal — a durable single-owner `condCreateIfAbsent(<g>.tombstone)`.
-    bool seal(const BlobHash & h, uint64_t g) { return condCreateIfAbsent(*os, blobTombstoneKey(prefix, h, g).string(), std::string()); }
+    /// STORE flag M: the GC seal — a durable single-owner `condCreateIfAbsent(<g>.tombstone)`. The real seal
+    /// site (CA GC S4 #4, G3) ALSO records the open tombstone in the compact per-shard gc/sealed index, and
+    /// Scan A now re-presents sealed candidates from that index instead of LISTing the whole tree. A faithful
+    /// manual seal must write BOTH so the candidate is re-discovered exactly as a real condemnation would be.
+    bool seal(const BlobHash & h, uint64_t g)
+    {
+        const bool created = condCreateIfAbsent(*os, blobTombstoneKey(prefix, h, g).string(), std::string());
+        condCreateIfAbsent(*os, gcSealedKey(prefix, shardForHash(h), h.string(), g, /*is_blob=*/true), std::string());
+        return created;
+    }
 
     /// STORE flag A: the writer raises a durable, GC-visible session pinning bare `H` (identity-level — the
     /// §7.1 conservative pin). `committed` distinguishes a still-uploading pin from a committed-until-folded
@@ -213,10 +221,15 @@ TEST_F(ContentAddressedGcS4, Sec7_GcRecheckBeforeWriterRaisesSession_WriterResur
     put(blobGenKey(prefix, h, 0).string(), "STALE-B01");
 
     /// GC: seal + re-check (no session, no ref) -> SWEEP (H,0); the gravestone (H,0).tombstone persists.
+    /// With grace=0 the seal and the sweep collapse into the SAME round (the seal arms grace at `since=now`
+    /// and `now - since >= 0` immediately gates the delete), so the actual deletion is counted in round 1.
+    /// Round 2 is the idempotent "stays swept" check: now that a swept generation's gc/sealed index entry is
+    /// removed on sweep (CA GC S4 #4), the gravestone is NOT re-presented forever — round 2 deletes nothing.
+    /// Sum the rounds: the orphan is swept EXACTLY once, total deleted_blobs >= 1.
     DB::ContentAddressed::ContentAddressedGC gc(os, prefix);
     gc.setReconciliationCadenceRounds(1);
-    gc.runSweepOnce(/*now=*/0, /*grace=*/0);    // seal
-    auto stats = gc.runSweepOnce(/*now=*/100, /*grace=*/0); // past grace -> sweep
+    auto stats = gc.runSweepOnce(/*now=*/0, /*grace=*/0);    // seal + (grace=0) sweep
+    stats.deleted_blobs += gc.runSweepOnce(/*now=*/100, /*grace=*/0).deleted_blobs; // stays swept (no re-present)
     EXPECT_GE(stats.deleted_blobs, 1u);
     EXPECT_FALSE(exists(blobGenKey(prefix, h, 0).string()));
     EXPECT_TRUE(exists(blobTombstoneKey(prefix, h, 0).string())) << "the gravestone persists (ABA-proof: reuse routes to g+1)";
@@ -677,4 +690,34 @@ TEST(ContentAddressedSealedIndex, RoundTrip)
         const std::string bad = gcSealedPrefix(pool_prefix, blob_shard) + ".0.b";
         EXPECT_FALSE(parseSealedIndexKey(pool_prefix, bad).has_value());
     }
+}
+
+/// ── Oracle 6 — §4 Scan A: the gc/sealed/<shard> index re-presents a sealed candidate ACROSS rounds with NO
+/// full bucket scan. Round 1 discovers the orphan via the reconciliation full-scan and SEALS it (which must
+/// create the gc/sealed index entry). Round 2 runs with reconciliation OFF — so the candidate can ONLY be
+/// re-presented from the index — and (grace satisfied) sweeps it. After the sweep the gen object is gone and
+/// the index entry is removed (a swept generation is not re-presented forever), while the gravestone remains.
+TEST_F(ContentAddressedGcS4, Sec4_SealedIndex_RePresentsAcrossRounds_NoBucketScan)
+{
+    const BlobHash b = blobHash("x01");
+
+    /// Put an unreferenced generation object (no ref pins it) so the sweep seals it.
+    put(blobGenKey(prefix, b, 0).string(), "ORPHAN");
+
+    DB::ContentAddressed::ContentAddressedGC gc(os, prefix);
+    gc.setReconciliationCadenceRounds(1); /// first round discovers via reconciliation (full scan) -> seals
+
+    /// Round 1: discover (reconciliation), seal (H,0), arm grace. The seal must create a gc/sealed entry.
+    gc.runSweepOnce(/*now=*/0, /*grace=*/100);
+    const ShardId shard = shardForHash(b);
+    EXPECT_TRUE(exists(gcSealedKey(prefix, shard, b.string(), 0, /*is_blob=*/true)))
+        << "seal must record the open tombstone in the gc/sealed index";
+
+    /// Round 2 with reconciliation OFF: the candidate must still be re-presented purely from the index, and
+    /// (grace satisfied) swept. The generation object is gone; the index entry is removed on sweep.
+    gc.setReconciliationCadenceRounds(0);
+    gc.runSweepOnce(/*now=*/1000, /*grace=*/100);
+    EXPECT_FALSE(exists(blobGenKey(prefix, b, 0).string())) << "the index re-presented the candidate and it was swept";
+    EXPECT_FALSE(exists(gcSealedKey(prefix, shard, b.string(), 0, /*is_blob=*/true)))
+        << "a swept generation's index entry is removed (not re-presented forever)";
 }

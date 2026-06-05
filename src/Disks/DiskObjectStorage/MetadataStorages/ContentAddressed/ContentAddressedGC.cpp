@@ -521,7 +521,31 @@ SweepStats ContentAddressedGC::sweepCandidates(
         /// §13 observability: count a DURABLE condemnation actually sealed by this leader (the CAS winner).
         /// A swept generation keeps its gravestone forever, so this is the count of distinct condemnations.
         if (condCreateIfAbsent(*object_storage, tombstone, /*bytes=*/std::string()))
+        {
             ProfileEvents::increment(ProfileEvents::ContentAddressedTombstonesTotal);
+            /// CA GC S4 (#4, G3, Scan A): BEST-EFFORT record this open tombstone in the compact per-shard
+            /// gc/sealed/<shard> index, so the next round re-discovers the condemnation by LISTing only that
+            /// tiny index instead of the whole blobs/+parts/ tree. The durable `<g>.tombstone` is the source
+            /// of truth; the index is only an accelerator — a missed write merely falls back to the
+            /// reconciliation full-scan cross-check, never loses safety. So a failure here is swallowed.
+            try
+            {
+                const ShardId shard = parts->is_blob
+                    ? shardForHash(BlobHash(parts->identity))
+                    : shardForPartId(PartId(parts->identity));
+                condCreateIfAbsent(
+                    *object_storage,
+                    gcSealedKey(key_prefix, shard, parts->identity, parts->generation, parts->is_blob),
+                    /*bytes=*/std::string());
+            }
+            catch (...)
+            {
+                tryLogCurrentException(
+                    getLogger("ContentAddressedGC"),
+                    "CA GC S4 (#4): best-effort gc/sealed index write failed (the durable tombstone is the "
+                    "truth; reconciliation re-discovers it)");
+            }
+        }
     }
 
     /// Step (b) — GRACE: liveness ageing measured from the seal (the first round we condemned the object),
@@ -568,6 +592,17 @@ SweepStats ContentAddressedGC::sweepCandidates(
             ? blobTombstoneKey(key_prefix, BlobHash(parts->identity), parts->generation).string()
             : partTombstoneKey(key_prefix, PartId(parts->identity), parts->generation).string();
 
+        /// CA GC S4 (#4, G3, Scan A): the matching gc/sealed index entry written at the seal site. It is
+        /// removed on BOTH the SWEEP and the RECOVER terminal of this generation's lifecycle — on SWEEP so an
+        /// already-swept generation (whose gravestone is KEPT forever) is not re-presented from the index every
+        /// round, and on RECOVER alongside the un-seal of the tombstone. The shard is the same canonical
+        /// assignment the seal used. `removeObjectsIfExist` is a no-op if the entry was never written
+        /// (best-effort seal-side write, or a directly-written tombstone with no index entry).
+        const ShardId shard = parts->is_blob
+            ? shardForHash(BlobHash(parts->identity))
+            : shardForPartId(PartId(parts->identity));
+        const std::string sealed_index_key = gcSealedKey(key_prefix, shard, parts->identity, parts->generation, parts->is_blob);
+
         if (!identity_reachable)
         {
             /// SWEEP — no ref/session for the identity: delete the generation object, best-effort reset
@@ -584,6 +619,10 @@ SweepStats ContentAddressedGC::sweepCandidates(
             if (auto meta = object_storage->tryGetObjectMetadata(key, /*with_tags=*/false))
                 ProfileEvents::increment(ProfileEvents::ContentAddressedOrphanBytesEstimate, meta->size_bytes);
             to_remove.emplace_back(key);
+            /// Remove the index entry on SWEEP: the generation object is gone (the gravestone remains), so the
+            /// candidate must no longer be re-listed from the index. This is what stops a swept generation from
+            /// being re-presented forever.
+            to_remove.emplace_back(sealed_index_key);
         }
         else if (successorGenerationExists(parts->is_blob, parts->identity, parts->generation))
         {
@@ -601,7 +640,12 @@ SweepStats ContentAddressedGC::sweepCandidates(
             /// queue the un-seal if a tombstone actually exists (a candidate may reach here un-sealed when
             /// it was filtered out of the seal loop as the live attach target).
             if (object_storage->tryGetObjectMetadata(tombstone, /*with_tags=*/false).has_value())
+            {
                 tombstones_to_remove.emplace_back(tombstone);
+                /// Un-seal also drops the gc/sealed index entry: the condemnation is lifted, so the candidate
+                /// must no longer be re-presented from the index.
+                tombstones_to_remove.emplace_back(sealed_index_key);
+            }
         }
     }
 
@@ -618,52 +662,31 @@ SweepStats ContentAddressedGC::sweepCandidates(
 
 std::set<std::string> ContentAddressedGC::collectSealedTombstoneCandidates()
 {
-    /// Enumerate every sealed-but-unswept tombstone in the pool and map it back to its generation object
-    /// key, so a generation condemned in an earlier round (its `<g>.tombstone` is durable) is re-presented
-    /// as a candidate every round until it is swept or recovered. This is what makes the condemnation
-    /// SURVIVE across rounds (closing the S2 grace>0 gap).
-    /// CA GC S4 (G1): runs lock-free (the gc_lock is not held across the sweep).
+    /// CA GC S4 (#4, G3, Scan A): discover sealed-but-unswept tombstones from the compact per-shard
+    /// gc/sealed/<shard> index instead of LISTing the entire blobs/+parts/ tree every round. Each index
+    /// entry maps back to its generation object key (the re-presented candidate). The durable .tombstone
+    /// object remains the source of truth; the index is the accelerator (a missed entry is bounded by the
+    /// reconciliation cross-check + Scan B still gates the delete). Runs lock-free (CA GC S4 G1).
     ///
-    /// A tombstone key is `<…>/<g>.tombstone`; its generation object is the byte-identical key without the
-    /// suffix (`<…>/<g>`). We never re-seal here (the tombstone already exists); the sweep tail decides the
-    /// fate (sweep / drain — recover then deletes the tombstone). A gravestone of an ALREADY-swept
-    /// generation re-appears here too, but its generation object is gone, so the sweep's `removeObjectsIfExist`
-    /// is a harmless no-op and the identity-level re-check keeps it from churning.
+    /// The generation object key produced here is byte-identical to what the OLD full-tree Scan A inserted
+    /// (it stripped `.tombstone` off the tombstone key; `blobTombstoneKey == blobGenKey + .tombstone`, so
+    /// `blobGenKey(...,g).string()` IS that exact key) — the sweep's candidate handling sees the same shape.
+    /// A gravestone of an ALREADY-swept generation no longer re-appears here (its index entry is removed on
+    /// sweep), so the swept generation is not re-presented forever.
     std::set<std::string> candidates;
-    /// §13 observability: while we already walk the full blobs/+parts/ listing here, tally the
-    /// generations-per-hash PROXY — count present generation OBJECTS (ContentAddressedGenerationsObserved)
-    /// and the distinct identities that carry at least one (ContentAddressedHashesObserved). Their ratio is
-    /// the mean generations-per-hash; a p99 follow-up reads the per-identity distribution. A hash with >1
-    /// generation is the hot-content-cycling guardrail (gravestones are safe but not free).
-    std::set<std::string> identities_with_generation;
-    size_t generation_objects = 0;
-    auto scan = [&](const std::string & root)
+    for (ShardId shard = 0; shard < kGcShardCount; ++shard)
     {
-        for (const auto & key : listKeysUnder(object_storage, root))
+        for (const auto & key : listKeysUnder(object_storage, gcSealedPrefix(key_prefix, shard)))
         {
-            bool is_tombstone = false;
-            const std::optional<uint64_t> gen = parseGenFromKey(key, is_tombstone);
-            if (!gen)
+            const auto entry = parseSealedIndexKey(key_prefix, key);
+            if (!entry)
                 continue;
-            if (!is_tombstone)
-            {
-                /// A present generation OBJECT: tally it and its identity for the per-hash proxy.
-                ++generation_objects;
-                if (const auto parts = parseGenObjectKey(key_prefix, key))
-                    identities_with_generation.insert(parts->identity);
-                continue;
-            }
-            /// A tombstone: strip the `.tombstone` suffix to recover the generation object key (the
-            /// re-presented candidate that keeps the condemnation flowing across rounds).
-            candidates.insert(key.substr(0, key.size() - kTombstoneSuffix.size()));
+            const std::string gen_object_key = entry->is_blob
+                ? blobGenKey(key_prefix, BlobHash(entry->identity), entry->generation).string()
+                : partGenKey(key_prefix, PartId(entry->identity), entry->generation).string();
+            candidates.insert(gen_object_key);
         }
-    };
-    scan(blobsPrefix(key_prefix));
-    scan(partsPrefix(key_prefix));
-    if (generation_objects != 0)
-        ProfileEvents::increment(ProfileEvents::ContentAddressedGenerationsObserved, generation_objects);
-    if (!identities_with_generation.empty())
-        ProfileEvents::increment(ProfileEvents::ContentAddressedHashesObserved, identities_with_generation.size());
+    }
     return candidates;
 }
 
@@ -876,12 +899,25 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidates(
     ///     reachable identity keeps ALL its present generations off the orphan list (a referenced `<g>` is
     ///     never an orphan). An unreachable identity's generation objects are fed to the shared
     ///     seal/grace/recheck/branch tail, which re-confirms unreachability before sweeping.
+    /// §13 observability (CA GC S4 #4): tally the generations-per-hash PROXY HERE, on the reconciliation
+    /// full-scan, where we already walk the entire parts/+blobs/ listing — count present generation OBJECTS
+    /// (ContentAddressedGenerationsObserved) and the distinct identities that carry at least one
+    /// (ContentAddressedHashesObserved). The compaction-driven normal path no longer LISTs the full tree
+    /// (Scan A now reads only the gc/sealed index), so it cannot see the full generation population; the tally
+    /// moved here so it still reflects the true distribution. Reconciliation runs at its own cadence and the
+    /// index path emits nothing, so this never double-counts. Their ratio is the mean generations-per-hash; a
+    /// hash with >1 generation is the hot-content-cycling guardrail (gravestones are safe but not free).
+    std::set<std::string> identities_with_generation;
+    size_t generation_objects = 0;
+
     std::set<std::string> candidate_object_keys;
     for (const auto & key : listKeysUnder(object_storage, partsPrefix(key_prefix)))
     {
         const auto parts = parseGenObjectKey(key_prefix, key);
         if (!parts || parts->is_blob)
             continue; /// a tombstone, the `active` hint, or a malformed shape — never an orphan candidate.
+        ++generation_objects;
+        identities_with_generation.insert(parts->identity);
         if (live_part_keys.contains(partKey(key_prefix, PartId(parts->identity))))
             continue; /// the identity is reachable — keep ALL its generations.
         candidate_object_keys.insert(key);
@@ -891,6 +927,8 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidates(
         const auto parts = parseGenObjectKey(key_prefix, key);
         if (!parts || !parts->is_blob)
             continue; /// a tombstone, the `active` hint, or a malformed shape — never an orphan candidate.
+        ++generation_objects;
+        identities_with_generation.insert(parts->identity);
         const BlobObjectKey identity_key = blobKey(key_prefix, BlobHash(parts->identity));
         if (reachable_blobs.contains(identity_key))
             continue; /// the identity is reachable — keep ALL its generations.
@@ -900,6 +938,12 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidates(
             continue;
         candidate_object_keys.insert(key);
     }
+
+    if (generation_objects != 0)
+        ProfileEvents::increment(ProfileEvents::ContentAddressedGenerationsObserved, generation_objects);
+    if (!identities_with_generation.empty())
+        ProfileEvents::increment(ProfileEvents::ContentAddressedHashesObserved, identities_with_generation.size());
+
     return candidate_object_keys;
 }
 

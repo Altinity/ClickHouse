@@ -394,6 +394,11 @@ TEST_F(ContentAddressedGcS3, BranchRecoverUnsealsWhenReachableNoSuccessor)
     /// (the session pins it) and no successor exists, so the GC must RECOVER it: delete the tombstone,
     /// re-open g=0.
     ASSERT_TRUE(condCreateIfAbsent(*os, blobTombstoneKey(prefix, h, 0).string(), std::string()));
+    /// CA GC S4 (#4, G3): the real seal path now also records the open tombstone in the gc/sealed index, and
+    /// Scan A re-presents sealed candidates from that index (not a full bucket scan). A manual seal must mirror
+    /// the real one or the reachable-identity candidate (which the reconciliation full-scan skips) would never
+    /// reach the RECOVER branch. Seed the matching index entry so this manual seal == a real seal.
+    ASSERT_TRUE(condCreateIfAbsent(*os, gcSealedKey(prefix, shardForHash(h), h.string(), 0, /*is_blob=*/true), std::string()));
 
     DB::ContentAddressed::ContentAddressedGC gc(os, prefix);
     gc.runReconciliationScan(/*now=*/0, /*grace=*/100);
