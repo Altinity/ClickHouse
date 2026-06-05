@@ -94,6 +94,9 @@ private:
     std::atomic<int64_t> grace_sec;
     /// Opt-in gate for the recurring background sweep (default OFF). See startup.
     std::atomic<bool> background_enabled{false};
+    /// §9 orphan-drift bound: every Nth sweep round also folds in the heavy reconciliation scan's
+    /// candidates (default 0 = never; the normal path stays compaction-driven). Pushed into `gc` on apply.
+    std::atomic<int64_t> reconciliation_cadence_rounds{0};
 
     BackgroundSchedulePoolTaskHolder task;
 };

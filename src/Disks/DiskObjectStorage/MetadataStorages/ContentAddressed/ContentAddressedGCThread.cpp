@@ -186,8 +186,13 @@ void ContentAddressedGCThread::applyNewSettings(const Poco::Util::AbstractConfig
     grace_sec = config.getInt64(config_prefix + ".content_addressed_gc_grace_sec", DEFAULT_GC_GRACE_SEC);
     /// Default OFF: the recurring background sweep only runs when explicitly opted in (see startup).
     background_enabled = config.getBool(config_prefix + ".content_addressed_gc_enabled", false);
-    LOG_INFO(log, "Applied content-addressed GC settings for disk {}: enabled={}, interval_sec={}, grace_sec={}",
-             disk_name, background_enabled.load(), interval_sec.load(), grace_sec.load());
+    /// §9 orphan-drift bound (default 0 = never): how often a sweep round also runs the heavy reconciliation
+    /// scan so abandoned uploads / externally-mutated objects with no `gc/log` delta are bounded. Pushed
+    /// into the GC so its `reconciliationDue` cadence counter honours it.
+    reconciliation_cadence_rounds = config.getInt64(config_prefix + ".content_addressed_gc_reconciliation_cadence_rounds", 0);
+    gc.setReconciliationCadenceRounds(reconciliation_cadence_rounds.load());
+    LOG_INFO(log, "Applied content-addressed GC settings for disk {}: enabled={}, interval_sec={}, grace_sec={}, reconciliation_cadence_rounds={}",
+             disk_name, background_enabled.load(), interval_sec.load(), grace_sec.load(), reconciliation_cadence_rounds.load());
 }
 
 }

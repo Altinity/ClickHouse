@@ -1882,6 +1882,9 @@ TEST_F(ContentAddressedMetaTest, SweepHonoursGraceWindow)
     auto s = seedGcPool(os, ms->serverIdForTest());
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
+    /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+    /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+    gc.setReconciliationCadenceRounds(1);
 
     // (a) First sweep at t=0: the 2 orphans (manifest + blob) just became unreachable → delete nothing.
     auto r0 = gc.runSweepOnce(/*now=*/0, /*grace=*/100);
@@ -1921,6 +1924,9 @@ TEST_F(ContentAddressedMetaTest, SweepKeepsBlobStillReferencedByAnotherPart)
     auto s = seedGcPool(os, ms->serverIdForTest());
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
+    /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+    /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+    gc.setReconciliationCadenceRounds(1);
 
     // Unlink part A's ref. pidA's manifest is now orphaned, but its blob b2 is also in pidB's manifest.
     os->removeObjectsIfExist({DB::StoredObject(refKey("", ms->serverIdForTest(), s.uuid, "all_1_1_0").string())});
@@ -1952,6 +1958,9 @@ TEST_F(ContentAddressedMetaTest, SweepClearsTimerWhenReachableAgain)
     auto s = seedGcPool(os, sid);
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
+    /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+    /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+    gc.setReconciliationCadenceRounds(1);
 
     // Unlink pidA's ref so pidA's manifest + its exclusive blob b1 become unreferenced at t=0.
     os->removeObjectsIfExist({DB::StoredObject(refKey("", sid, s.uuid, "all_1_1_0").string())});
@@ -2017,6 +2026,9 @@ TEST_F(ContentAddressedMetaTest, SweepTreatsLiveWriteSessionPinAsRoot)
     ContentAddressedMetaTest::writeObject(os, sessionKey("", "sess-1"), session.serialize());
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
+    /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+    /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+    gc.setReconciliationCadenceRounds(1);
 
     // First sweep records the (would-be) timer; the second is past grace. The live session keeps the
     // blob reachable across both, so it is NEVER deleted.
@@ -2046,6 +2058,9 @@ TEST_F(ContentAddressedMetaTest, SweepRevalidatesBeforeDelete)
     auto s = seedGcPool(os, sid);
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
+    /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+    /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+    gc.setReconciliationCadenceRounds(1);
 
     // Unlink pidA's ref so pidA's manifest + its exclusive blob b1 become unreferenced at the snapshot.
     os->removeObjectsIfExist({DB::StoredObject(refKey("", sid, s.uuid, "all_1_1_0").string())});
@@ -2097,11 +2112,17 @@ TEST_F(ContentAddressedMetaTest, SweepStopsWhenLeadershipLost)
 
     // A's sweep with its STALE lock must delete NOTHING (the on-disk fence is now f2 != f1).
     DB::ContentAddressed::ContentAddressedGC gc_stale(os, p);
+    /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+    /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+    gc_stale.setReconciliationCadenceRounds(1);
     gc_stale.runSweepOnce(/*now=*/1300, /*grace=*/0, /*held=*/a);
     EXPECT_TRUE(objectExists(os, blobKey(p, BlobHash(hash)).string())) << "stale holder must not delete";
 
     // The CURRENT holder B's sweep deletes the orphan normally (its fence matches the on-disk lock).
     DB::ContentAddressed::ContentAddressedGC gc_live(os, p);
+    /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+    /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+    gc_live.setReconciliationCadenceRounds(1);
     auto r = gc_live.runSweepOnce(/*now=*/1300, /*grace=*/0, /*held=*/b);
     EXPECT_FALSE(objectExists(os, blobKey(p, BlobHash(hash)).string()));
     EXPECT_EQ(r.deleted_blobs, 1u);
@@ -2133,10 +2154,14 @@ TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
         /*blob_ref_index_=*/nullptr, /// hand-seeded pool (no transaction) -> drift validator skipped
         getLogger("ContentAddressedGCThreadTest"));
 
-    /// grace 0 so a single round past first-unreachable reclaims orphans immediately.
+    /// grace 0 so a single round past first-unreachable reclaims orphans immediately. The pool is
+    /// hand-seeded (no transaction -> no gc/log deltas), so the compaction-driven normal path emits no
+    /// candidates; enable the §9 reconciliation cadence (every round) so the scheduled full scan discovers
+    /// the hand-seeded orphans — exactly the orphan-drift fallback for objects with no log delta (CA GC S2).
     Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg(new Poco::Util::XMLConfiguration());
     cfg->setInt("disk.content_addressed_gc_grace_sec", 0);
     cfg->setInt("disk.content_addressed_gc_interval_sec", 600);
+    cfg->setInt("disk.content_addressed_gc_reconciliation_cadence_rounds", 1);
     thread.applyNewSettings(*cfg, "disk");
 
     thread.startup();
@@ -2464,6 +2489,9 @@ TEST_F(ContentAddressedMetaTest, OrphanBlobReclaimedAfterTransactionUnpins)
 
     // The sweep shares the SAME per-pool GC lock AND in-flight pin set as the storage (production wiring).
     DB::ContentAddressed::ContentAddressedGC gc(os, "", ms->gcLock(), ms->inFlightPinnedBlobs());
+    /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+    /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+    gc.setReconciliationCadenceRounds(1);
 
     std::string blob_key;
     {
@@ -3257,6 +3285,9 @@ TEST_F(ContentAddressedMetaTest, PatchPartIsReachableThenReclaimedLikeAnyPart)
     // Step 3: a sweep must NOT reclaim blobs while the ref is live.
     {
         DB::ContentAddressed::ContentAddressedGC gc(os, "");
+        /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+        /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+        gc.setReconciliationCadenceRounds(1);
         gc.runSweepOnce(/*now=*/0, /*grace=*/100);
         gc.runSweepOnce(/*now=*/200, /*grace=*/100);
     }
@@ -3275,6 +3306,12 @@ TEST_F(ContentAddressedMetaTest, PatchPartIsReachableThenReclaimedLikeAnyPart)
 
     {
         DB::ContentAddressed::ContentAddressedGC gc2(os, "");
+        /// CA GC S2: a compaction count-0 candidate is emitted only in the fold where it crosses to 0; a
+        /// later fold no longer re-emits it (the key has left the snapshot), but the grace timer needs the
+        /// candidate to persist across both sweeps. Drive reconciliation (which RE-DERIVES the orphan from
+        /// the live refs each round) — the §9 orphan-drift fallback. Production's GC thread runs the same
+        /// scheduled reconciliation cadence; the normal-path one-shot reclaim is covered by 04279.
+        gc2.setReconciliationCadenceRounds(1);
         gc2.runSweepOnce(/*now=*/0, /*grace=*/100);
         gc2.runSweepOnce(/*now=*/200, /*grace=*/100);
     }
@@ -3813,6 +3850,9 @@ TEST_F(ContentAddressedMetaTest, RelinkPinSurvivesConcurrentSourceDropAndSweep)
         auto held = tryAcquireGcLock(*os, p, "serverGc", /*lease_seconds=*/100, /*now_unix=*/static_cast<uint64_t>(now));
         ASSERT_TRUE(held.has_value());
         DB::ContentAddressed::ContentAddressedGC gc(os, p);
+        /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+        /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+        gc.setReconciliationCadenceRounds(1);
         gc.runSweepOnce(now, /*grace=*/0, /*held=*/held);
         releaseGcLock(*os, p, *held);
     }
@@ -3879,6 +3919,9 @@ TEST_F(ContentAddressedMetaTest, RelinkReclaimedWhenBothRefsDropped)
         auto held = tryAcquireGcLock(*os, p, "serverGc", /*lease_seconds=*/100, /*now_unix=*/static_cast<uint64_t>(now));
         ASSERT_TRUE(held.has_value());
         DB::ContentAddressed::ContentAddressedGC gc(os, p);
+        /// CA GC S2: this white-box test seeds orphans / drops refs WITHOUT the transaction unlink path, so no gc/log `-` delta exists and the compaction-driven normal path emits no
+        /// candidates; enable the §9 reconciliation cadence so the scan discovers them (the orphan-drift fallback). Production drops log the `-` and reclaim on the normal path.
+        gc.setReconciliationCadenceRounds(1);
         auto stats = gc.runSweepOnce(now, /*grace=*/0, /*held=*/held);
         releaseGcLock(*os, p, *held);
         EXPECT_GE(stats.deleted_blobs, 1u);

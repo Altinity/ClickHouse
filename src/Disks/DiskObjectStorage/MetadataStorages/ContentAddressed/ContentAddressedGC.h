@@ -214,6 +214,14 @@ public:
     /// re-validate-under-lock, and fence guarantees as `runSweepOnce`.
     SweepStats runReconciliationScan(int64_t now, int64_t grace, std::optional<GcLock> held = std::nullopt);
 
+    /// §9 orphan-drift bound: set the cadence (in normal sweep rounds) at which `runSweepOnce` folds in the
+    /// heavy reconciliation scan's candidates, so orphan drift the compaction cannot see (abandoned uploads,
+    /// hand-seeded / externally-mutated objects with no `gc/log` delta) is bounded. 0 (the default) disables
+    /// the scheduled scan: the normal path stays purely compaction-driven and reconciliation is then only
+    /// manual / the total-loss fallback. A positive N runs reconciliation once every N rounds. Set from the
+    /// disk config by the background thread.
+    void setReconciliationCadenceRounds(int64_t rounds) { reconciliation_cadence_rounds = rounds; }
+
 private:
     /// The shared re-validate + grace + fence + delete tail used by BOTH the compaction-driven normal path
     /// and the reconciliation fallback. `candidate_object_keys` are the candidate object keys to consider
