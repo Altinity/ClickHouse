@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -115,15 +116,23 @@ private:
     /// CA GC S4 (#3): HEAD+GET the authoritative epoch (outside any lock) and monotonically update the cache.
     uint64_t refreshShardEpoch(ShardId shard) const;
 
-    /// Serialize the (shard, epoch) buffer to ONE coalesced gc/log object and write it. Sets
-    /// last_batch_size. The event_id of the FIRST fragment names the object (one object per window).
-    void flushBufferLocked(ShardId shard, uint64_t epoch, Buffer & buffer);
+    /// CA GC S4 (#3): a drained buffer ready to be written WITHOUT the lock. Produced under `mtx`
+    /// (drainBufferLocked), consumed lock-free (writePending).
+    struct PendingWrite
+    {
+        std::string object_key;
+        std::string bytes;
+        size_t delta_count = 0;
+    };
+    std::optional<PendingWrite> drainBufferLocked(ShardId shard, uint64_t epoch, Buffer & buffer);
+    void writePending(const PendingWrite & pending);
 
     /// §5.1 rule 2: re-read the shard epoch; while it has advanced past `written_epoch`, re-buffer the
-    /// `retained` fragments (same event_ids) under the now-open epoch and re-flush (bounded retry). Must
-    /// be called with `mtx` held. Inert under the still-held gc_lock (S2); wired for S4. Returns the FINAL
-    /// epoch the fragments durably settled in (= `written_epoch` if no advance occurred) — CA GC S4.
-    uint64_t reappendIfAdvancedLocked(ShardId shard, uint64_t written_epoch, const std::vector<Fragment> & retained);
+    /// `retained` fragments (same event_ids) under the now-open epoch and re-flush (bounded retry). CA GC
+    /// S4 (#3, G1): the epoch refresh (HEAD+GET) and the re-flush PUT run OUTSIDE the lock; `mtx` is taken
+    /// only to move the fragments into the buffer and drain them. Returns the FINAL epoch the fragments
+    /// durably settled in (= `written_epoch` if no advance occurred) — CA GC S4.
+    uint64_t reappendIfAdvanced(ShardId shard, uint64_t written_epoch, const std::vector<Fragment> & retained);
 
     const ObjectStoragePtr object_storage;
     const std::string key_prefix;
