@@ -87,12 +87,23 @@ struct RefSidecar
 {
     std::map<std::string, std::string> files;
 
+    /// CA GC S3 (#6) — the resolved generations the commit's `+` settled on, recorded per-part so the
+    /// DROP path emits its `-` at the SAME generation the `+` used (re-deriving from the racy `active`
+    /// hint would mis-key after an intervening resurrection, leaving the old generation's count >0
+    /// forever). `manifest_generation` is the part manifest's `mg`; `pin_generations` maps each pinned
+    /// bare blob-hash string to its resolved `g`. Empty on a mutable-only/legacy sidecar (every g=0).
+    uint64_t manifest_generation = 0;
+    std::map<std::string, uint64_t> pin_generations;
+
     std::string serialize() const;
     static RefSidecar deserialize(const std::string & bytes);
 
     /// 4-byte magic `CASC` ("Content-Addressed SideCar") + a 1-byte version, per the shared codec.
     static constexpr FormatMagic MAGIC = makeMagic("CASC");
-    static constexpr uint8_t VERSION = 1;
+    /// Version 2 (CA GC S3 #6) appends manifest_generation + the (blob-hash -> g) map. A v3 pool is
+    /// created fresh (PoolMeta v3, no back-compat), so no v1 sidecar can exist in it — reading only v2
+    /// is correct and fail-closed.
+    static constexpr uint8_t VERSION = 2;
 };
 
 /// Compute the deterministic content-addressed part identifier from a part's blob map.

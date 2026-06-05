@@ -82,6 +82,14 @@ std::string RefSidecar::serialize() const
         DB::writeStringBinary(k, buf);
         DB::writeStringBinary(v, buf);
     }
+    /// CA GC S3 (#6, version 2): the resolved manifest generation, then the (blob-hash -> g) map.
+    DB::writeVarUInt(manifest_generation, buf);
+    DB::writeVarUInt(pin_generations.size(), buf);
+    for (const auto & [hash, g] : pin_generations)
+    {
+        DB::writeStringBinary(hash, buf);
+        DB::writeVarUInt(g, buf);
+    }
     buf.finalize();
     return out;
 }
@@ -98,6 +106,18 @@ RefSidecar RefSidecar::deserialize(const std::string & bytes)
         std::string k;
         DB::readStringBinary(k, buf);
         DB::readStringBinary(s.files[k], buf);
+    }
+    /// CA GC S3 (#6, version 2): the resolved generations (always present in a v2 object).
+    DB::readVarUInt(s.manifest_generation, buf);
+    uint64_t ng = 0;
+    DB::readVarUInt(ng, buf);
+    for (uint64_t i = 0; i < ng; ++i)
+    {
+        std::string hash;
+        DB::readStringBinary(hash, buf);
+        uint64_t g = 0;
+        DB::readVarUInt(g, buf);
+        s.pin_generations.emplace(std::move(hash), g);
     }
     return s;
 }

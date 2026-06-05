@@ -253,15 +253,19 @@ TEST(ContentAddressedRefSidecar, RejectsBadMagicAndTruncation)
 
 // Task 4: the sidecar is on the shared header now. A future (unknown) version fails closed, and the
 // on-object bytes are pinned (cross-arch determinism).
+// CA GC S3 (#6): v2 appends manifest_generation (varint) and the (blob-hash -> g) map count (varint).
+// Both are zero for a sidecar with no pinned blobs, adding two \x00 bytes after the files section.
 TEST(ContentAddressedRefSidecar, GoldenBytesAndRejectsUnknownVersion)
 {
     RefSidecar s;
     s.files["uuid.txt"] = "ab";
     const std::string expected =
-        std::string("CASC\x01", 5)               // magic(4) + version(1)
+        std::string("CASC\x02", 5)               // magic(4) + version(2)
         + std::string("\x01", 1)                 // varint files count = 1
         + std::string("\x08", 1) + "uuid.txt"    // name
-        + std::string("\x02", 1) + "ab";         // bytes
+        + std::string("\x02", 1) + "ab"          // bytes
+        + std::string("\x00", 1)                 // varint manifest_generation = 0
+        + std::string("\x00", 1);                // varint pin_generations size = 0
     EXPECT_EQ(s.serialize(), expected);
 
     std::string future = s.serialize();
