@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/RefPayload.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>

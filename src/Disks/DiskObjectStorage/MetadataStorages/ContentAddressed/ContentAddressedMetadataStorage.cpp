@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/RefPayload.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/WriteSession.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
