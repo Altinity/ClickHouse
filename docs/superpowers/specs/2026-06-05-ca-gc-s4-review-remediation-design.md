@@ -1,5 +1,5 @@
 ---
-description: Design spec for remediating the CA GC S1–S4 review — Tier 1 (correctness: generation accounting, fail-closed session coverage, the data race, stale lock contracts) + Tier 2 (G1/G3: lock-free GcLogWriter I/O, sealed-tombstone index) + real lockless-path oracles. Tier 1 must precede Tier 2 because removing the full re-validate scan is what finally makes the lockless layer load-bearing for safety.
+description: Design spec for remediating the CA GC S1–S4 review — Tier 1 (correctness: generation accounting, fail-closed session coverage, the data race, stale lock contracts) + Tier 2 (G1/G3: lock-free GcLogWriter I/O, sealed-tombstone candidate-discovery index) + real lockless-path oracles. Two distinct scans: #4 replaces Scan A (candidate discovery); Scan B (the generation-blind re-validate delete gate) survives, so #1/#2 stay leak-only until a future follow-up swaps Scan B for the §6.2 sessions+compaction gate. Tier 1 + oracles are that follow-up's prerequisite.
 sidebar_label: 'CAS GC S4 review remediation'
 sidebar_position: 14
 slug: /superpowers/specs/ca-gc-s4-review-remediation
@@ -26,14 +26,21 @@ remaining needs-verify items (§7).
 
 ## 2. Framing correction — why these are Tier 1 (verified) {#framing}
 
-**The sweep's current safety net is a generation-BLIND full reachability re-validate scan.**
-`ContentAddressedGC::sweepCandidates` gates every delete on `identity_reachable_in` (`ContentAddressedGC.cpp:450`),
-which builds the reachable set from `markReachableBlobs` over `listLivePartIds` (a full scan of
-`store/.../refs/` + resolve every live manifest) and checks the candidate's **bare identity** `blobKey(H)`
-(g=0), never the generationed key (`:454-458`, `:880-881`). A candidate at any generation `(H,g)` is therefore
-spared from sweep iff any live part still references bare `H` — it **over-protects every generation** of any
-still-referenced content. The reconciliation collector uses the same identity-level check (`:880`), so it
-over-protects too.
+**There are TWO distinct full scans in the sweep — do not conflate them:**
+- **Scan A — candidate discovery.** `collectSealedTombstoneCandidates` LISTs `blobs/`+`parts/` every round
+  (`runSweepOnce:806`, `:649-650`) to re-present sealed-but-unswept tombstones. **This is what Tier 2 #4
+  (§4.2) replaces** with the `gc/sealed/<shard>` index.
+- **Scan B — the delete GATE.** Inside `sweepCandidates`, `identity_reachable_in` (`ContentAddressedGC.cpp:450`)
+  builds the reachable set from `markReachableBlobs` over `listLivePartIds` (`:395`, `:554` — a full scan of
+  `store/.../refs/` + resolve every live manifest) and checks the candidate's **bare identity** `blobKey(H)`
+  (g=0), never the generationed key (`:454-458`). It gates **every** delete, regardless of where the
+  candidate came from. The reconciliation collector uses the same identity-level check (`:880-881`).
+
+**Scan B is the real safety net, and it is generation-BLIND/over-protective by design.** A candidate at any
+generation `(H,g)` is spared from sweep iff any live part still references bare `H` — so it over-protects
+every generation of any still-referenced content. **Crucially, Scan B is NOT touched by this remediation:**
+#4 replaces Scan A (discovery) only; after #4 lands, `sweepCandidates` still calls `markReachableBlobs` and
+still over-protects. The safety net survives the entire remediation.
 
 **Consequences (this corrects the review's own severity wording on #1/#2):**
 - In the **current** code, **#1 and #2 are NOT data-loss.** A live part's blobs are protected by the
@@ -41,13 +48,19 @@ over-protects too.
   `+`/session existed at all (#2) — the published ref alone makes bare `H` reachable. So **#1 is a guaranteed
   leak of resurrected generations + the S3 reclamation feature is inert** (counts always key `g=0`); **#2 is
   log-drift/leak, not a swept-live-blob.**
-- They become **data-loss only once that full re-validate scan is removed** to actually achieve G3 (when the
-  compaction count becomes the *sole* delete authority). Right now the §5.1/§6.2/§7 lockless machinery is
-  **not yet load-bearing for safety** — the brute-force reachability scan silently is.
-- **Therefore Tier 1 MUST precede Tier 2.** The reason #1/#2 are Tier 1 is *"make the lockless layer
-  trustworthy before you lean on it,"* not *"stop a sweep happening today."* Tier 2 (#4, which replaces the
-  full scan) is the step that finally makes the compaction count authoritative — and must not land until
-  Tier 1 is solid and the new oracles prove it.
+- They **remain leak-only even after this remediation** (Tier 1 + Tier 2 as scoped), because Scan B (the
+  delete gate) is untouched and keeps over-protecting referenced content. They become **data-loss only when a
+  FUTURE step replaces Scan B** — the generation-blind `markReachableBlobs`/`identity_reachable_in` gate —
+  with the convergence spec's §6.2 *"no live session pins (H,g) AND no `+` since the last fold"*
+  (sessions + current compaction) authoritative check, the step that finally makes the compaction count the
+  *sole* delete authority. **That Scan-B replacement is NOT in this remediation** (it is a tracked follow-up,
+  §7) — right now, and after this remediation, the §5.1/§6.2/§7 lockless machinery is **not yet load-bearing
+  for safety**; Scan B silently is.
+- **Tier 1 still precedes Tier 2 — but the honest reason is sound practice, not "Tier 2 removes the net."**
+  #4 builds the `gc/sealed/<shard>` index whose seal/sweep/recover bookkeeping depends on #1's correct
+  generations, so generation correctness (#1/#6) must land first. The genuinely *safety-load-bearing*
+  coupling is **Tier 1 + oracles 1–4 → the future Scan-B replacement** (you must prove the lockless layer
+  generation-correct before you make it the sole delete authority) — not Tier 1 → #4.
 - **Do NOT make the re-validate scan generation-aware** — it is intentionally identity-level / over-protective
   (the safety net). Narrowing it would *remove* the net. (The review's "needs-verify: make it
   generation-aware" is retracted: blind-by-design, safe.)
@@ -76,7 +89,10 @@ generation.
 Today a throw from `appendAndFlushForCommit` (`ContentAddressedTransaction.cpp:~1573-1610`) is swallowed,
 `settled_delta_epochs` stays empty, `allSettledEpochsFolded({})` returns true (`:~1727`), and the covering
 session is released immediately after the ref is published — leaving the reference covered by neither the log
-nor a session. (Leak today; **data-loss once Tier 2 removes the full scan** — exactly the gap S4 forbids.)
+nor a session. (Leak/log-drift today **and after this remediation** — Scan B still protects the referenced
+blob; becomes **data-loss only when the future §6.2 Scan-B replacement** makes the compaction count the sole
+delete authority, §2/§7. Fixing it now is "make the lockless layer trustworthy before it becomes
+authoritative," not "stop a sweep today.")
 **Fix — three explicit session states, retain-not-abort:**
 1. **legit-no-deltas** (nothing to log) → release now.
 2. **deltas-folded** (`isEpochFolded` confirms every settled epoch) → release.
@@ -119,18 +135,21 @@ round, refreshed on a fold).
 
 ### 4.2 #4 (major, G3) — full bucket scan every sweep round {#fix4}
 `collectSealedTombstoneCandidates` (`runSweepOnce:806`) LISTs the entire `blobs/`+`parts/` tree every round
-(`:649-650`) to re-present sealed-but-unswept tombstones — so the "0 LISTs on the normal compaction path"
-claim is false at scale, and (per §2) this scan is currently the de-facto safety net. **Fix:** maintain a
-compact **`gc/sealed/<shard>`** index of open tombstones (the seal step adds an entry; sweep and recover
-remove it); the sweep LISTs only that index, not the whole tree. **This is the step that removes the
-generation-blind full scan as the implicit safety net — so it MUST land after Tier 1 + the new oracles
-prove the §5.1/§6.2/§7 lockless layer is the real, generation-correct authority.**
+(`:649-650`) to re-present sealed-but-unswept tombstones — this is **Scan A (candidate discovery)**, so the
+"0 LISTs on the normal compaction path" claim is false at scale. **Fix:** maintain a compact
+**`gc/sealed/<shard>`** index of open tombstones (the seal step adds an entry; sweep and recover remove it);
+the sweep LISTs only that index, not the whole tree. **#4 removes Scan A only — it does NOT touch Scan B
+(the `markReachableBlobs` delete gate, §2), which keeps over-protecting; so #4 is a perf/G3 fix, not a
+safety-semantics change.** It must land after Tier 1 because the seal/sweep/recover bookkeeping that
+maintains the index depends on #1's correct per-generation candidates (a `g`-blind candidate would index the
+wrong key).
 
 ## 5. Testing — close the lockless-path gap (the gate) {#testing}
 
 The current §7 oracles run with `reconciliationCadenceRounds=1`, so candidates come from the *reconciliation
 fallback*, not the compaction/lockless path; the safety claims are unproven. The new oracles are the gate
-that Tier 1 is solid before Tier 2 removes the scan. All deterministic, NO sleeps:
+that the lockless layer is generation-correct and proven — the prerequisite for the future Scan-B
+replacement (§7) that will make the compaction count authoritative. All deterministic, NO sleeps:
 1. **writer→log→compaction generation** — resurrect a blob to `g=1`, commit through the **real**
    `GcLogWriter` (not `makeDelta`), fold, assert `CountKey{Blob,H,1}` appears and nets to zero on drop (would
    have caught #1); a `(part_id,mg>0)` variant for the manifest edge.
@@ -152,14 +171,27 @@ stay green at every step; non-CA regression unchanged.
 ## 6. Sequencing & safety {#sequencing}
 **Tier 1 first** (#1+#6 generation correctness, #2 fail-closed session, #5 race, #7 contracts) + the new
 oracles 1–5 → this makes the lockless layer generation-correct and proven. **Then Tier 2** (#3 lock-free I/O +
-fold-ins, #4 sealed-index + oracle 6) → restores G1/G3 and removes the full-scan safety net. The ordering is
-**load-bearing**: #4 removes the generation-blind re-validate scan that is currently the real safety net, so
-it must not land until Tier 1 is solid and oracles 1–4 prove the §5.1/§6.2/§7 machinery is the correct
-authority. The `gc_lock` stays dropped (S4) throughout — these are fixes *on* the lockless path. After this
-remediation + oracles pass, the B69 attended-review gate can be re-evaluated for sign-off.
+fold-ins, #4 sealed-index + oracle 6) → restores G1 (non-blocking writers) and G3 (no Scan-A bucket scan on
+the normal path). **Why Tier 1 first (the honest reason):** #4's `gc/sealed` seal/sweep/recover bookkeeping
+depends on #1's correct per-generation candidates, so generation correctness must land before the index is
+built. **Neither Tier 2 item removes the Scan-B safety net** — Scan B (`markReachableBlobs`) survives, so this
+remediation makes the feature correct and the lockless layer *ready to be authoritative* without yet making
+it authoritative. The genuinely safety-load-bearing coupling is **Tier 1 + oracles 1–4 → the future Scan-B
+replacement** (§2, §7): that follow-up (swap Scan B for the §6.2 sessions+compaction gate) is the step that
+flips the compaction count to sole delete authority, and #1/#2 become load-bearing-for-safety only then — so
+it must not land until this remediation + the oracles prove the lockless layer generation-correct. The
+`gc_lock` stays dropped (S4) throughout — these are fixes *on* the lockless path. After this remediation +
+oracles pass, the B69 attended-review gate can be re-evaluated for sign-off (with the Scan-B replacement as
+the remaining step before the compaction count is trusted alone).
 
 ## 7. Out of scope → backlog {#backlog}
-Convert to tracked items (NOT in this spec): observability counters
+Convert to tracked items (NOT in this spec). **The headline follow-up — the true G3/authority completion:**
+**replace Scan B (the full-scan re-validate delete gate, `markReachableBlobs`/`identity_reachable_in`) with
+the convergence-spec §6.2 "sessions + current compaction" authoritative check.** This is the step that makes
+the compaction count the *sole* delete authority and removes the generation-blind over-protective safety net
+— at which point #1/#2 become load-bearing-for-safety. **Hard prerequisite:** this remediation's Tier 1 +
+oracles 1–4 (generation-correct lockless layer, proven). It is a separate, data-loss-critical stage with its
+own attended-review gate — deliberately NOT in this remediation. Then the rest: observability counters
 (`cas_s3_sequential_control_depth_per_commit`, `cas_writer_tombstone_s3_fallbacks`, `cas_log_batch_size`,
 `cas_s3_session_fallbacks`) + S1-drift `LOG_WARNING`+counter + sweep/reaper log levels; `GcCompaction`
 spill-or-correct-the-doc; `allSettledEpochsFolded` per-commit `gc/snap` LIST (cache the watermark or drop the
@@ -177,6 +209,12 @@ is identity-level (`:880`), over-protective, no data loss either way (§2).
   undurable, retry idempotently by `event_id`, and release only on `isEpochFolded` — proven by oracle 4.
 - **#4's sealed-index** must stay consistent with the actual tombstones (seal adds, sweep/recover removes,
   crash-idempotent); a missed entry re-introduces a leak (not data-loss — the tombstone object is still the
-  durable truth; the index is an accelerator). Oracle 6 + a reconciliation cross-check bound it.
-- **Tier-ordering discipline:** #4 must not merge before Tier 1 + oracles 1–4 are green (the load-bearing
-  coupling, §2/§6).
+  durable truth, AND Scan B still gates the delete; the index is an accelerator). Oracle 6 + a reconciliation
+  cross-check bound it.
+- **#2's residual exposure is bounded by Scan B:** a sticky-session bug (premature release of an undurable
+  `+`) is leak/log-drift today and after this remediation — it only becomes data-loss after the future
+  Scan-B replacement (§7). That is the load-bearing reason the Scan-B replacement must not land until #2 +
+  oracle 4 are proven — not a hazard of this remediation itself.
+- **Tier-ordering discipline:** #4 follows Tier 1 because its index bookkeeping needs #1's correct
+  generations (sound practice). The safety-load-bearing order is Tier 1 + oracles 1–4 → the *future* Scan-B
+  replacement (§2/§6/§7) — that step, not #4, is what makes the compaction count authoritative.
