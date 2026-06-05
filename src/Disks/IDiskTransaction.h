@@ -146,6 +146,11 @@ public:
     virtual std::unique_ptr<ReadBufferFromFileBase> tryReadFileInFlight(
         const std::string & /*path*/, const ReadSettings & /*settings*/, std::optional<size_t> /*read_hint*/) const { return nullptr; }
     virtual std::optional<uint64_t> tryGetInFlightFileSize(const std::string & /*path*/) const { return {}; }
+    /// In-flight read-your-writes at DIRECTORY granularity: true iff this transaction has STAGED at least one
+    /// file under `path` for `path`'s part (mirrors the file trio above). Forwarded to the metadata
+    /// transaction by object-storage disk transactions; default (e.g. local disk) is no in-flight directory
+    /// visibility, so a reader falls through to the committed path.
+    virtual bool hasInFlightDirectory(const std::string & /*path*/) const { return false; }
 };
 
 using DiskTransactionPtr = std::shared_ptr<IDiskTransaction>;

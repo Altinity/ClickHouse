@@ -265,6 +265,27 @@ std::optional<uint64_t> ContentAddressedTransaction::tryGetInFlightFileSize(cons
     return {};
 }
 
+bool ContentAddressedTransaction::hasInFlightDirectory(const std::string & path) const
+{
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (!p || p->file.empty())
+        return false;
+    const auto * st = findStaging(p->table_uuid, p->part_name);
+    if (!st)
+        return false;
+    // A staged file directly under p->file (i.e. p->file + "/" + inner) means the directory p->file exists
+    // in-flight. Scan both the content-blob staging (recorded) and the inline mutable-file staging
+    // (recorded_mutable).
+    const std::string prefix = p->file + "/";
+    auto under = [&prefix](const auto & m)
+    {
+        // map is sorted: the first key >= prefix that starts with it is the only one we need to check.
+        auto it = m.lower_bound(prefix);
+        return it != m.end() && it->first.starts_with(prefix);
+    };
+    return under(st->recorded) || under(st->recorded_mutable);
+}
+
 std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     const std::string & path,
     size_t buf_size,

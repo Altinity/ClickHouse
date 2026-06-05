@@ -197,6 +197,13 @@ public:
         const std::string & path, const ReadSettings & settings, std::optional<size_t> read_hint) const override;
     std::optional<uint64_t> tryGetInFlightFileSize(const std::string & path) const override;
 
+    // B59 read-your-writes at DIRECTORY granularity: true iff this open transaction has STAGED (hardlinked /
+    // written, not yet committed) at least one file under the directory `path` for `path`'s part. Mirrors the
+    // file-granularity tryGetInFlight* trio; used by DataPartStorageOnDiskFull::existsDirectory so a carried-
+    // forward projection dir is visible to loadProjections during finalize. Bails (false) on a path that is
+    // not a part-relative file/dir (empty `p->file`).
+    bool hasInFlightDirectory(const std::string & path) const override;
+
     void createMetadataFile(const std::string & path, const StoredObjects & objects) override;
 
     // Open a write buffer for a file.

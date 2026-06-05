@@ -4071,6 +4071,40 @@ TEST_F(ContentAddressedMetaTest, InFlightReadYourWritesBeforeCommit)
     EXPECT_TRUE(ms->existsFile(col)); // now committed
 }
 
+// B59 (directory granularity): a CA part-build transaction can answer "does this directory exist?" for a
+// directory it is STAGING but has not committed — the read-your-writes overlay extended from file to
+// directory granularity. A carried-forward projection's inner files (<proj>.proj/<inner>) are hardlinked
+// into the open whole-part transaction; hasInFlightDirectory(<proj>.proj) must return true so
+// loadProjections' existsDirectory probe registers the projection during finalize. The committed path can't
+// see it until commit. A directory the transaction never staged a file under → false.
+TEST_F(ContentAddressedMetaTest, InFlightDirectoryReadYourWritesBeforeCommit)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_inflight_dir");
+    const std::string uuid = "uuid-inflight-dir";
+    const std::string part = "all_1_1_0";
+    const std::string proj_dir = "uui/" + uuid + "/" + part + "/p.proj";
+    const std::string proj_inner = proj_dir + "/data.bin";
+    const std::string bytes = "PROJECTION-INNER-BYTES";
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    {
+        auto buf = tx.writeFile(proj_inner, 4096, DB::WriteMode::Rewrite, {});
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    // NOT committed yet: the committed read path can't see the directory.
+    EXPECT_FALSE(ms->existsDirectory(proj_dir));
+    // But the transaction recognizes the directory it is staging a file under.
+    EXPECT_TRUE(tx.hasInFlightDirectory(proj_dir));
+    // A directory this transaction never staged anything under → false.
+    EXPECT_FALSE(tx.hasInFlightDirectory("uui/" + uuid + "/" + part + "/absent.proj"));
+    // A non-part-relative path (empty file component) → false (defensive, mirrors the file trio).
+    EXPECT_FALSE(tx.hasInFlightDirectory("uui/" + uuid));
+    tx.commit(DB::NoCommitOptions{});
+    EXPECT_TRUE(ms->existsDirectory(proj_dir)); // now committed
+}
+
 // FREEZE path: writing a FREEZE target (shadow/<backup>/…) must publish the ref at the shadow/ key,
 // not at the live store/.../refs/ location. The live ref must be completely unchanged; the shadow ref
 // and the live ref resolve to the SAME part_id (content-only id is identical for identical bytes) but

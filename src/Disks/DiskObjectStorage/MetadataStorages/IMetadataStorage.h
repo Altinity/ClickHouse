@@ -149,6 +149,10 @@ public:
     virtual std::unique_ptr<ReadBufferFromFileBase> tryReadFileInFlight(
         const std::string & /*path*/, const ReadSettings & /*settings*/, std::optional<size_t> /*read_hint*/) const { return nullptr; }
     virtual std::optional<uint64_t> tryGetInFlightFileSize(const std::string & /*path*/) const { return {}; }
+    /// Directory-granularity counterpart of the file trio: true iff this transaction has STAGED at least one
+    /// file under `path` for `path`'s part. Used so a carried-forward projection dir is visible to
+    /// loadProjections during finalize. Default: no in-flight directory visibility.
+    virtual bool hasInFlightDirectory(const std::string & /*path*/) const { return false; }
 
     virtual ~IMetadataTransaction() = default;
 

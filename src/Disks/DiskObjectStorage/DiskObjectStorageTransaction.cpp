@@ -493,6 +493,11 @@ std::optional<uint64_t> DiskObjectStorageTransaction::tryGetInFlightFileSize(con
     return metadata_transaction->tryGetInFlightFileSize(path);
 }
 
+bool DiskObjectStorageTransaction::hasInFlightDirectory(const std::string & path) const
+{
+    return metadata_transaction->hasInFlightDirectory(path);
+}
+
 void DiskObjectStorageTransaction::setReadOnly(const std::string & path)
 {
     operations_to_execute.push_back([path](MetadataTransactionPtr tx)

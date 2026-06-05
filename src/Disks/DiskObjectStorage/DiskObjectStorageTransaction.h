@@ -104,6 +104,7 @@ public:
     std::unique_ptr<ReadBufferFromFileBase> tryReadFileInFlight(
         const std::string & path, const ReadSettings & settings, std::optional<size_t> read_hint) const override;
     std::optional<uint64_t> tryGetInFlightFileSize(const std::string & path) const override;
+    bool hasInFlightDirectory(const std::string & path) const override;
 
 private:
     std::unique_ptr<WriteBufferFromFileBase> writeFileImpl( /// NOLINT
