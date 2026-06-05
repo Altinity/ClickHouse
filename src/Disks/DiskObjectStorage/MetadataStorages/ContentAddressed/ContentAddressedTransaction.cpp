@@ -1282,19 +1282,23 @@ uint64_t ContentAddressedTransaction::resolveAndResurrectGeneration(
     {
         const std::string gen_key = make_gen_key(g);
 
-        /// Ensure the resolved generation's object is PRESENT. The fresh-upload path created blobs/H/0
-        /// already; a reused/resurrected object exists at its g. If it is absent here, a concurrent sweep
-        /// reclaimed it (only possible if it was sealed first) — treat exactly like a sealed generation and
-        /// resurrect, since we cannot attach to a missing/condemned generation.
-        const bool present = object_storage.tryGetObjectMetadata(gen_key, /*with_tags=*/false).has_value();
-
-        /// RE-CHECK the tombstone for this exact generation. The seal is GC-owned; its presence means "no
-        /// new attachment may target g" (I4). We never delete it, never rescue g.
+        /// RE-CHECK the tombstone for this exact generation FIRST. The seal is GC-owned; its presence means
+        /// "no new attachment may target g" (I4). We never delete it, never rescue g. The TOMBSTONE — not the
+        /// object's presence — is the only condemnation signal (§6, §12.1): a generation is condemned iff it
+        /// is sealed. SWEEP keeps the `<g>.tombstone` gravestone forever, so a swept (and therefore absent)
+        /// generation is still `sealed` here and routes to resurrection; an absent-but-UNSEALED generation
+        /// was never condemned and is simply a not-yet-created object (the fresh g=0 blob whose upload the
+        /// write buffer already did, or the manifest this commit is about to condCreate at g).
         const bool sealed
             = object_storage.tryGetObjectMetadata(make_tomb_key(g), /*with_tags=*/false).has_value();
 
-        if (present && !sealed)
-            return g; /// settled: a present, non-tombstoned generation we may attach to.
+        if (!sealed)
+            return g; /// not condemned — attach to / create this generation (fresh OR present, both safe).
+
+        /// Sealed: confirm whether the sealed object is still present (only to source the resurrected bytes
+        /// from it when it survives during grace; a swept generation is absent but its gravestone routes us
+        /// on to g+1 regardless).
+        const bool present = object_storage.tryGetObjectMetadata(gen_key, /*with_tags=*/false).has_value();
 
         /// Abandon g, resurrect to g+1 (§6). condCreateIfAbsent the g+1 object so concurrent resurrectors
         /// collapse onto one object (I5). Its bytes are the byte-identical content of the present (sealed)

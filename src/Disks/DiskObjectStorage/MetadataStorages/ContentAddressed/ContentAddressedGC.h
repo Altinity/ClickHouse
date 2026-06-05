@@ -256,6 +256,16 @@ private:
     /// `gc_lock` held.
     std::set<std::string> collectSealedTombstoneCandidatesLocked();
 
+    /// CA GC S3 — resolve a part's manifest body at ANY present generation (§6.1/§9). A live ref pins the
+    /// bare `part_id`, but the physical manifest may have been RESURRECTED to `mg>0` (the GC sealed `mg=0`
+    /// and a contended commit re-created the manifest at `mg+1`), so the steady `parts/<id>/0` key can be
+    /// absent for a perfectly-live part. Mirror the reader's `repairPartGenOn404`: try `mg=0` first (one
+    /// HEAD/GET in the common case), and on a 404 LIST the per-id generation prefix and read the HIGHEST
+    /// present generation. Throws `CORRUPTED_DATA` only when NO generation of a live part's manifest exists
+    /// (a genuine dangling ref — fail-close). Used by both the reachability re-check and the reconciliation
+    /// scan so the GC never mistakes a resurrected-manifest live part for a missing one.
+    PartManifest resolveManifestAtAnyGeneration(const PartId & part_id) const;
+
     /// CA GC S3 — true iff a present generation OBJECT (not a tombstone / not `active`) with a generation
     /// strictly greater than `generation` exists under the identity's directory. A resurrection lands at
     /// max+1, so this is the "a successor `g+1…` exists" signal that splits DRAIN (keep `g`) from RECOVER

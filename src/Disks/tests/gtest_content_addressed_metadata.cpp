@@ -49,14 +49,21 @@ static const std::string kCasTestScratch = "./cas_test_scratch";
 
 TEST(ContentAddressedPoolPaths, ContentKeysFanOut)
 {
-    // Empty prefix yields the bare key byte-for-byte (no leading slash).
-    EXPECT_EQ(blobKey("", BlobHash("abcdef0123")).string(), "blobs/ab/cd/abcdef0123");
-    EXPECT_EQ(partKey("", PartId("0011223344")).string(), "parts/00/11/0011223344");
-    EXPECT_EQ(blobKey("", BlobHash("ab")).string(), "blobs/ab"); // too short to fan out (test-only)
+    // CA GC S3: a content/manifest key now carries an explicit GENERATION suffix — `blobKey(H)` is the
+    // common-case convenience wrapper for `blobGenKey(H, 0)`, so the leaf is `…/<H>/0` (resp. `…/<id>/0`).
+    // Empty prefix yields the bare key byte-for-byte (no leading slash), with the generation appended.
+    EXPECT_EQ(blobKey("", BlobHash("abcdef0123")).string(), "blobs/ab/cd/abcdef0123/0");
+    EXPECT_EQ(partKey("", PartId("0011223344")).string(), "parts/00/11/0011223344/0");
+    EXPECT_EQ(blobKey("", BlobHash("ab")).string(), "blobs/ab/0"); // too short to fan out (test-only)
+    // blobKey(H) == blobGenKey(H, 0); a resurrected generation is a distinct sibling object.
+    EXPECT_EQ(blobKey("", BlobHash("abcdef0123")).string(), blobGenKey("", BlobHash("abcdef0123"), 0).string());
+    EXPECT_EQ(blobGenKey("", BlobHash("abcdef0123"), 1).string(), "blobs/ab/cd/abcdef0123/1");
+    EXPECT_EQ(blobTombstoneKey("", BlobHash("abcdef0123"), 0).string(), "blobs/ab/cd/abcdef0123/0.tombstone");
+    EXPECT_EQ(blobActiveKey("", BlobHash("abcdef0123")), "blobs/ab/cd/abcdef0123/active");
 
     // A non-empty prefix is prepended with a single '/' join (trailing slash collapsed).
-    EXPECT_EQ(blobKey("pool", BlobHash("abcdef0123")).string(), "pool/blobs/ab/cd/abcdef0123");
-    EXPECT_EQ(partKey("pool/", PartId("0011223344")).string(), "pool/parts/00/11/0011223344");
+    EXPECT_EQ(blobKey("pool", BlobHash("abcdef0123")).string(), "pool/blobs/ab/cd/abcdef0123/0");
+    EXPECT_EQ(partKey("pool/", PartId("0011223344")).string(), "pool/parts/00/11/0011223344/0");
 }
 
 TEST(ContentAddressedPoolPaths, RefKeys)
@@ -239,6 +246,17 @@ public:
         fs::remove_all("store", ec);
         fs::remove_all("shadow", ec); // FREEZE shadow-ref namespace (shadowRefKey, empty key prefix)
         fs::remove_all("sessions", ec);
+        // CA GC S2/S3: the streaming-compaction log/snapshot (gc/log/, gc/snap/, gc/current_epoch/) and the
+        // GC-leader coordination keyspace (fence/, gc.lock, _pool_meta) ALSO materialize at the CWD under the
+        // empty key prefix. They are NOT under blobs/parts/store, so without removing them here a prior
+        // test's leftover `gc/log` deltas would pollute the NEXT test's compaction (a stale `-` folds to a
+        // bogus count-0 candidate, sweeping a live manifest) — a test-isolation hazard, not a production bug
+        // (production pools live under a real per-pool key prefix). Remove the whole gc/ namespace and the
+        // coordination markers so every test starts from an empty pool.
+        fs::remove_all("gc", ec);
+        fs::remove_all("fence", ec);
+        fs::remove_all("gc.lock", ec);
+        fs::remove_all("_pool_meta", ec);
         fs::remove_all("cas_wbuf_tmp", ec);
         fs::remove_all(kCasTestScratch, ec);
     }

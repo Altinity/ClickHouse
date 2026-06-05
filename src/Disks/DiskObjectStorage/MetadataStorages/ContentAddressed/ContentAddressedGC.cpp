@@ -314,6 +314,39 @@ bool ContentAddressedGC::reconciliationDue()
     return false;
 }
 
+PartManifest ContentAddressedGC::resolveManifestAtAnyGeneration(const PartId & part_id) const
+{
+    /// Try the common-case g=0 manifest first (one HEAD/GET). On a 404 the manifest was resurrected to a
+    /// higher generation (the GC sealed mg=0 and a contended commit re-created it at mg+1); LIST the per-id
+    /// generation prefix and read the HIGHEST present generation. A live ref with NO present manifest
+    /// generation is a genuine dangling ref -> fail-close (CORRUPTED_DATA), exactly as the g=0-only resolver
+    /// did, so the safety property is unchanged — only the resurrected-manifest case is now resolved instead
+    /// of mis-reported as missing.
+    std::string manifest_key = partKey(key_prefix, part_id).string();
+    if (!object_storage->tryGetObjectMetadata(manifest_key, /*with_tags=*/false))
+    {
+        std::optional<uint64_t> best;
+        for (const auto & key : listKeysUnder(object_storage, partGenPrefix(key_prefix, part_id)))
+        {
+            bool is_tombstone = false;
+            if (auto gen = parseGenFromKey(key, is_tombstone); gen && !is_tombstone)
+                if (!best || *gen > *best)
+                    best = *gen;
+        }
+        if (!best)
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "ContentAddressed GC: live ref points at missing manifest {} (no present generation)",
+                partKey(key_prefix, part_id).string());
+        manifest_key = partGenKey(key_prefix, part_id, *best).string();
+    }
+    StoredObject object(manifest_key);
+    auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
+    String bytes;
+    readStringUntilEOF(bytes, *buf);
+    return PartManifest::deserialize(bytes);
+}
+
 SweepStats ContentAddressedGC::sweepCandidatesLocked(
     const std::set<std::string> & candidate_object_keys, int64_t now, int64_t grace, const std::optional<GcLock> & held)
 {
@@ -324,17 +357,11 @@ SweepStats ContentAddressedGC::sweepCandidatesLocked(
     /// The reachable-blob computation, factored so it can be re-run immediately before deletion (the
     /// re-validate-under-lock step) AND used by the S1 drift validator. B18 fail-close: a live ref whose
     /// manifest is missing throws CORRUPTED_DATA so the sweep aborts WITHOUT deleting anything.
+    /// CA GC S3: resolve a live part's manifest at ANY present generation (a resurrected manifest lives at
+    /// mg>0; the steady g=0 key can be absent for a live part — see resolveManifestAtAnyGeneration). B18
+    /// fail-close is preserved: a live ref with NO present manifest generation still throws CORRUPTED_DATA.
     PartManifestResolver resolve = [this](const PartId & part_id) -> PartManifest
-    {
-        const PartObjectKey manifest_key = partKey(key_prefix, part_id);
-        if (!object_storage->tryGetObjectMetadata(manifest_key.string(), /*with_tags=*/false))
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed GC: live ref points at missing manifest {}", manifest_key.string());
-        StoredObject object(manifest_key.string());
-        auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
-        String bytes;
-        readStringUntilEOF(bytes, *buf);
-        return PartManifest::deserialize(bytes);
-    };
+    { return resolveManifestAtAnyGeneration(part_id); };
 
     /// One reachability snapshot: the live part ids, the live part manifest keys, and the reachable blob
     /// set = (refs -> manifests -> blob keys) UNION every LIVE write-session's pending blobs (M8). NOTE
@@ -733,17 +760,10 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidatesLocked(
     /// The full bucket scan's unreferenced complement (spec §9): every parts/ manifest not backing a live
     /// part, plus every blobs/ object not reachable from a live manifest or a live session. This is the
     /// PRE-S2 candidate source, kept ONLY as the reconciliation fallback. MUST be called with gc_lock held.
+    /// CA GC S3: resolve a live part's manifest at ANY present generation (resurrected manifests live at
+    /// mg>0). Same B18 fail-close on a genuinely-missing manifest. See resolveManifestAtAnyGeneration.
     PartManifestResolver resolve = [this](const PartId & part_id) -> PartManifest
-    {
-        const PartObjectKey manifest_key = partKey(key_prefix, part_id);
-        if (!object_storage->tryGetObjectMetadata(manifest_key.string(), /*with_tags=*/false))
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed GC: live ref points at missing manifest {}", manifest_key.string());
-        StoredObject object(manifest_key.string());
-        auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
-        String bytes;
-        readStringUntilEOF(bytes, *buf);
-        return PartManifest::deserialize(bytes);
-    };
+    { return resolveManifestAtAnyGeneration(part_id); };
 
     std::set<PartId> live = listLivePartIds(object_storage, key_prefix);
     std::set<PartObjectKey> live_part_keys;
