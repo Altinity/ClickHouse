@@ -590,3 +590,91 @@ TEST_F(ContentAddressedGcS4, Sec5_1_ReappendIfAdvancedActuallyFires)
     }
     EXPECT_FALSE(b_dropped_as_candidate) << "the re-appended + must keep b counted across the epoch advance";
 }
+
+/// CA GC S4 (#4): round-trip unit test for the gc/sealed/<shard> index path builders + parser.
+/// Verifies gcSealedKey/parseSealedIndexKey round-trip for both blob and part entries at multiple
+/// generations, and that parseSealedIndexKey returns nullopt for malformed inputs.
+TEST(ContentAddressedSealedIndex, RoundTrip)
+{
+    const std::string pool_prefix = "mypool/prefix";
+
+    /// Realistic 32-char lowercase-hex digests (only [0-9a-f] — no dots).
+    const BlobHash blob_hash("aabbccddeeff00112233445566778899");
+    const PartId part_id("deadbeef01234567890abcdef1234567");
+
+    const ShardId blob_shard = shardForHash(blob_hash);
+    const ShardId part_shard = shardForPartId(part_id);
+
+    /// -- Blob entry, generation 0 --
+    {
+        const std::string key = gcSealedKey(pool_prefix, blob_shard, blob_hash.string(), 0, /*is_blob=*/true);
+        const auto parsed = parseSealedIndexKey(pool_prefix, key);
+        ASSERT_TRUE(parsed.has_value()) << "blob gen=0 must parse";
+        EXPECT_EQ(parsed->identity, blob_hash.string());
+        EXPECT_EQ(parsed->generation, 0u);
+        EXPECT_TRUE(parsed->is_blob);
+    }
+
+    /// -- Blob entry, generation 5 --
+    {
+        const std::string key = gcSealedKey(pool_prefix, blob_shard, blob_hash.string(), 5, /*is_blob=*/true);
+        const auto parsed = parseSealedIndexKey(pool_prefix, key);
+        ASSERT_TRUE(parsed.has_value()) << "blob gen=5 must parse";
+        EXPECT_EQ(parsed->identity, blob_hash.string());
+        EXPECT_EQ(parsed->generation, 5u);
+        EXPECT_TRUE(parsed->is_blob);
+    }
+
+    /// -- Part (manifest) entry, generation 0 --
+    {
+        const std::string key = gcSealedKey(pool_prefix, part_shard, part_id.string(), 0, /*is_blob=*/false);
+        const auto parsed = parseSealedIndexKey(pool_prefix, key);
+        ASSERT_TRUE(parsed.has_value()) << "part gen=0 must parse";
+        EXPECT_EQ(parsed->identity, part_id.string());
+        EXPECT_EQ(parsed->generation, 0u);
+        EXPECT_FALSE(parsed->is_blob);
+    }
+
+    /// -- Part entry, generation 5 --
+    {
+        const std::string key = gcSealedKey(pool_prefix, part_shard, part_id.string(), 5, /*is_blob=*/false);
+        const auto parsed = parseSealedIndexKey(pool_prefix, key);
+        ASSERT_TRUE(parsed.has_value()) << "part gen=5 must parse";
+        EXPECT_EQ(parsed->identity, part_id.string());
+        EXPECT_EQ(parsed->generation, 5u);
+        EXPECT_FALSE(parsed->is_blob);
+    }
+
+    /// -- shardForPartId in PoolPaths agrees with GcLogWriter::shardForPartId (single source of truth) --
+    EXPECT_EQ(shardForPartId(part_id), GcLogWriter::shardForPartId(part_id));
+
+    /// -- Reject: bare garbage string --
+    EXPECT_FALSE(parseSealedIndexKey(pool_prefix, "garbage").has_value());
+
+    /// -- Reject: key under a different prefix --
+    EXPECT_FALSE(parseSealedIndexKey(pool_prefix, "other/gc/sealed/0/aabb.0.b").has_value());
+
+    /// -- Reject: missing generation segment (only 2 dot-fields in basename) --
+    {
+        const std::string bad = gcSealedPrefix(pool_prefix, blob_shard) + blob_hash.string() + ".b";
+        EXPECT_FALSE(parseSealedIndexKey(pool_prefix, bad).has_value());
+    }
+
+    /// -- Reject: bad type char --
+    {
+        const std::string bad = gcSealedPrefix(pool_prefix, blob_shard) + blob_hash.string() + ".0.x";
+        EXPECT_FALSE(parseSealedIndexKey(pool_prefix, bad).has_value());
+    }
+
+    /// -- Reject: non-numeric generation --
+    {
+        const std::string bad = gcSealedPrefix(pool_prefix, blob_shard) + blob_hash.string() + ".abc.b";
+        EXPECT_FALSE(parseSealedIndexKey(pool_prefix, bad).has_value());
+    }
+
+    /// -- Reject: empty identity --
+    {
+        const std::string bad = gcSealedPrefix(pool_prefix, blob_shard) + ".0.b";
+        EXPECT_FALSE(parseSealedIndexKey(pool_prefix, bad).has_value());
+    }
+}

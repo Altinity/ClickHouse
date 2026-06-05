@@ -24,11 +24,10 @@ GcLogWriter::GcLogWriter(
 
 ShardId GcLogWriter::shardForPartId(const PartId & part_id)
 {
-    /// The `(part_id) edge` (§9) lands in the part's home shard, derived from the part_id hex prefix
-    /// exactly as a blob's shard is derived from its hash prefix (shardForHash). Reuse the same helper by
-    /// reinterpreting the part_id as a BlobHash for the purpose of prefix-bit extraction — both are
-    /// lowercase-hex digests, so the partition is identical and deterministic.
-    return shardForHash(BlobHash(part_id.string()));
+    /// Delegate to the canonical PoolPaths free function so the nibble-fold logic lives in exactly one
+    /// place. `PoolPaths::shardForPartId` is the single source of truth for both the sealed-index keying
+    /// (Task 14/15) and the log-writer's (part_id) edge sharding (§9) — they must always agree.
+    return DB::ContentAddressed::shardForPartId(part_id);
 }
 
 uint64_t GcLogWriter::readShardEpoch(ShardId shard) const

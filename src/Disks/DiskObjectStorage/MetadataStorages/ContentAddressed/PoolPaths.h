@@ -249,6 +249,13 @@ inline constexpr ShardId kGcShardCount = 16;
 // short synthetic hashes used in unit tests) maps to shard 0 deterministically.
 ShardId shardForHash(const BlobHash & blob_hash);
 
+// Derive the GC shard for a part id. A `PartId` is a lowercase-hex digest (the content hash of the
+// manifest body), so its prefix nibbles are uniformly distributed on [0, kGcShardCount) by the same
+// argument as `shardForHash`. This is the single canonical shard assignment for a part's sealed-index
+// entry; `GcLogWriter::shardForPartId` delegates here (rather than duplicating the nibble-fold logic)
+// so the two are always in sync.
+ShardId shardForPartId(const PartId & part_id);
+
 // Per-shard epoch counter object key: <key_prefix>/gc/current_epoch/<shard>. The epoch a writer
 // currently appends deltas under (per-shard, not global — §5.1 rule 1). A writer reads it (default 0 if
 // absent) to stamp its delta; the fenced shard leader closes the epoch by a plain fenced PUT of E+1
@@ -281,6 +288,47 @@ std::string gcSnapPrefix(const std::string & key_prefix);
 // lists this to discover which epochs still carry un-folded deltas for a shard (filtering the
 // <epoch>.<shard>/ component). The per-epoch fold uses the tighter gcLogPrefix instead.
 std::string gcLogRootPrefix(const std::string & key_prefix);
+
+// ==== CA GC S4 (#4): per-shard sealed-tombstone index ====
+//
+// A compact set of "open" (sealed-but-unswept) tombstones the sweep re-presents each round, replacing
+// the full blobs/+parts/ bucket LIST (Scan A). One tiny object per open tombstone:
+//   <prefix>/gc/sealed/<shard>/<identity>.<generation>.<type>
+// where <type> is `b` for a blob tombstone and `p` for a part tombstone.
+//
+// Encoding rationale:
+//   - `identity` is a lowercase hex digest (blob hash or part id) — it contains ONLY [0-9a-f], so it
+//     never contains a `.`. Splitting the basename on `.` therefore yields exactly 3 fields:
+//     `identity`, `generation` (decimal uint64), and `type` (`b` or `p`). The basename is unambiguously
+//     parseable without any quoting or escaping.
+//   - The shard is NOT encoded in the basename; it is implicit in the LIST prefix the sweep uses when it
+//     walks `gcSealedPrefix(p, shard)`. The parser does NOT validate the shard segment — a stray object
+//     under gc/sealed/ is ignored (parseSealedIndexKey returns nullopt) rather than misparsed.
+//
+// Lifecycle (maintained by Task 15):
+//   - SEAL path: PUT gcSealedKey(...) atomically after the `.tombstone` object is created (CREATE-then-PUT).
+//   - SWEEP/RECOVER path: DELETE gcSealedKey(...) once the tombstone is permanently resolved (sweep or recover).
+//
+// The index object carries NO payload (an empty body is fine — the key encodes all necessary state).
+
+// LIST prefix for a single shard: <key_prefix>/gc/sealed/<shard>/
+std::string gcSealedPrefix(const std::string & key_prefix, ShardId shard);
+
+// Full object key for a single sealed-index entry:
+// <key_prefix>/gc/sealed/<shard>/<identity>.<generation>.<b|p>
+std::string gcSealedKey(const std::string & key_prefix, ShardId shard, const std::string & identity, uint64_t generation, bool is_blob);
+
+// Inverse of gcSealedKey: parse a sealed-index entry back to (identity, generation, is_blob).
+// Returns nullopt on a malformed key (wrong path shape, wrong segment count, non-numeric generation,
+// bad type char) so a stray object under gc/sealed/ is silently ignored rather than misparsed.
+// Round-trip guarantee: parseSealedIndexKey(p, gcSealedKey(p, s, id, g, t)) == SealedIndexEntry{id, g, t}.
+struct SealedIndexEntry
+{
+    std::string identity;
+    uint64_t generation = 0;
+    bool is_blob = true;
+};
+std::optional<SealedIndexEntry> parseSealedIndexKey(const std::string & key_prefix, const std::string & key);
 
 // Verbatim object key for a generic disk-level file: a path that is neither a part file nor a
 // table-level file (e.g. the server's startup access-check probe clickhouse_access_check_<uuid>
