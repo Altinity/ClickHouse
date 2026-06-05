@@ -1604,9 +1604,6 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
                 delta.pins.push_back(entry.key);
                 delta.pin_generations.push_back(resolved_blob_gen.at(entry.key));
             }
-            /// CA GC S4 (#2): keep the serialized `+` so a flush failure below can stamp it onto the durable
-            /// session for the GC reaper's bounded re-log (fail-closed: never drop the session's coverage).
-            const std::string this_add_delta_bytes = ContentAddressed::serializeGcDeltaForSession(delta);
             try
             {
                 /// CA GC S4: capture the `(shard, epoch)` each fragment settled in (after the §5.1 rule-2
@@ -1618,10 +1615,11 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
             catch (...)
             {
                 /// FAIL-CLOSED (#2): the ref is about to be published but the `+` did not land durably.
-                /// Record the delta + mark the transaction so commit() makes the session STICKY (retained,
-                /// lease-exempt) instead of releasing it. The GC reaper re-logs `pending_add_delta`.
-                commit_delta_flush_failed = true;
-                failed_add_delta_bytes = this_add_delta_bytes;
+                /// Accumulate the delta so commit() makes the session STICKY (retained, lease-exempt),
+                /// carrying ALL failed parts' `+` deltas as one batch. The GC reaper re-logs each. Do NOT
+                /// serialize here — a per-part slot would drop all but the last failure in a multi-part
+                /// transaction (B67 merge), and an OOM in serialize would escape to the outer catch.
+                failed_add_deltas.push_back(delta);
                 tryLogCurrentException(
                     getLogger("ContentAddressedTransaction"),
                     "CA GC S4 (#2): + flush failed for part " + part_id.string()
@@ -1747,14 +1745,15 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     {
         session.committed = true;
         session.delta_epochs = settled_delta_epochs;
-        /// CA GC S4 (#2): if a part's `+` flush threw, the ref is published but no `+` is durable. Mark the
-        /// session STICKY (retained, lease-exempt, carrying the serialized `+`) so neither the lease reaper
-        /// nor the folded reaper drops it; the GC reaper re-logs `pending_add_delta` and clears sticky once
-        /// the re-logged `+` is folded. NEVER release the session in this state.
-        if (commit_delta_flush_failed)
+        /// CA GC S4 (#2): if one or more parts' `+` flush threw, the refs are published but those `+` are
+        /// not durable. Mark the session STICKY (retained, lease-exempt), carrying ALL the failed `+`
+        /// deltas as one batch, so neither the lease reaper nor the folded reaper drops it; the GC reaper
+        /// re-logs `pending_add_delta` and clears sticky once the re-logged `+` are folded. NEVER release
+        /// the session in this state.
+        if (!failed_add_deltas.empty())
         {
             session.deltas_failed = true;
-            session.pending_add_delta = failed_add_delta_bytes;
+            session.pending_add_delta = ContentAddressed::serializeGcDeltasForSession(failed_add_deltas);
             persistSession();
             return; /// fail-closed: keep the sticky session; do not run the folded-release below.
         }

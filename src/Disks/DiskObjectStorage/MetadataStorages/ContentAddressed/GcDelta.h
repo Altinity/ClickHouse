@@ -79,9 +79,10 @@ struct GcLogBatch
     static constexpr uint8_t VERSION = 2;
 };
 
-/// CA GC S4 (#2): serialize/parse a single GcDelta for durable storage in a WriteSession (the sticky
-/// fail-closed `pending_add_delta`). Mirrors the per-delta codec used inside GcLogBatch.
-std::string serializeGcDeltaForSession(const GcDelta & delta);
-GcDelta deserializeGcDeltaFromSession(const std::string & bytes);
+/// CA GC S4 (#2): serialize/parse the failed `+` GcDeltas for durable storage in a WriteSession (the
+/// sticky fail-closed `pending_add_delta`). A multi-part transaction may accumulate several, so they are
+/// stored as ONE GcLogBatch — reuses the versioned batch codec so the reaper can re-log each verbatim.
+std::string serializeGcDeltasForSession(const std::vector<GcDelta> & deltas);
+std::vector<GcDelta> deserializeGcDeltasFromSession(const std::string & bytes);
 
 }

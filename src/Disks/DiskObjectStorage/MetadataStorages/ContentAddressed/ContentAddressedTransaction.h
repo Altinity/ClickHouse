@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcDelta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
@@ -485,10 +486,9 @@ private:
     std::string session_id;
     ContentAddressed::WriteSession session;
 
-    /// CA GC S4 (#2): set when a part's `+`-flush threw during commit. The serialized `+` delta is kept so
-    /// commit() can stamp it onto the durable session for the GC reaper's bounded re-log.
-    bool commit_delta_flush_failed = false;
-    std::string failed_add_delta_bytes;
+    /// CA GC S4 (#2): the `+` deltas whose flush threw during commit (one per failed part in a multi-part
+    /// transaction). Serialized as ONE batch into the sticky session's pending_add_delta for the reaper.
+    std::vector<ContentAddressed::GcDelta> failed_add_deltas;
 };
 
 }

@@ -118,22 +118,19 @@ GcLogBatch GcLogBatch::deserialize(const std::string & bytes)
     return batch;
 }
 
-std::string serializeGcDeltaForSession(const GcDelta & delta)
+std::string serializeGcDeltasForSession(const std::vector<GcDelta> & deltas)
 {
-    /// One delta wrapped in a single-element GcLogBatch — reuses the versioned batch codec so the on-disk
-    /// shape is identical to a gc/log object and the reaper can append it verbatim.
+    /// The failed `+` deltas wrapped in ONE GcLogBatch — reuses the versioned batch codec so the on-disk
+    /// shape is identical to a gc/log object and the reaper can append each delta verbatim.
     GcLogBatch batch;
-    batch.deltas.push_back(delta);
+    batch.deltas = deltas;
     return batch.serialize();
 }
 
-GcDelta deserializeGcDeltaFromSession(const std::string & bytes)
+std::vector<GcDelta> deserializeGcDeltasFromSession(const std::string & bytes)
 {
-    const GcLogBatch batch = GcLogBatch::deserialize(bytes);
-    if (batch.deltas.size() != 1)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "ContentAddressed session pending_add_delta must hold exactly one delta, got {}", batch.deltas.size());
-    return batch.deltas.front();
+    /// No size restriction — an empty vector is a valid no-op (nothing to re-log).
+    return GcLogBatch::deserialize(bytes).deltas;
 }
 
 }
