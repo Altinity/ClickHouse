@@ -767,6 +767,25 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace, std::opt
             candidate_object_keys.insert(candidate.object_key);
     }
 
+    /// CA GC S4 (§5.1 rule 3, §7.3) — reap every COMMITTED write session whose `+` deltas are now folded
+    /// into a durable snapshot. We run this AFTER the per-shard fold above, so the folded watermark each
+    /// session is checked against is maximally advanced this round. A session lingers until folded; once
+    /// folded, the snapshot covers the reference and the pin is dropped (the §6.2 gate's
+    /// `sessions ∪ folded-snapshot` premise holds across the delete). This is the lockless-handshake's
+    /// session lifetime extension — purely additive in S2 (the lock still serializes commit vs sweep).
+    try
+    {
+        const size_t reaped = reapFoldedSessionsLocked(compaction);
+        if (reaped != 0)
+            LOG_TEST(getLogger("ContentAddressedGC"), "CA GC S4: reaped {} folded write session(s)", reaped);
+    }
+    catch (...)
+    {
+        /// A reaper failure only OVER-RETAINS a folded session (conservative — the snapshot already covers
+        /// the reference, so the lingering pin is harmless and reclaimed next round). Never abort the sweep.
+        tryLogCurrentException(getLogger("ContentAddressedGC"), "CA GC S4: folded-session reaper failed (sessions over-retained; harmless)");
+    }
+
     /// CA GC S3 — re-present every sealed-but-unswept tombstone as a candidate. The compaction emits a
     /// count-0 candidate ONLY in the crossing fold (the epoch where the count first hits 0); on later rounds
     /// the key is gone from the folded counts, so without this the condemnation would be forgotten before
@@ -844,6 +863,67 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidatesLocked(
         candidate_object_keys.insert(key);
     }
     return candidate_object_keys;
+}
+
+size_t ContentAddressedGC::reapFoldedSessionsLocked(GcCompaction & compaction)
+{
+    /// CA GC S4 (§5.1 rule 3, §7.3) — delete every COMMITTED write session whose `+` deltas are all folded
+    /// into a durable snapshot. The session is the durable handshake flag (§7.1) that covers the
+    /// `+`-before-fold gap; once folded, the folded snapshot itself covers the reference, so the pin is no
+    /// longer needed (the §6.2 gate's `sessions ∪ folded-snapshot` premise still holds after the delete).
+    ///
+    /// Mechanical rule (§7.3): reap iff EVERY `(shard, epoch)` in `delta_epochs` is folded. A session that
+    /// is not yet committed (the writer is still uploading, or aborted) is NOT reaped here — its OWNER drops
+    /// it at commit/abort, and a crashed owner's session is reclaimed by the lease (in
+    /// `sessionPinnedBlobs`/`sessionPinnedPartKeys`, an expired session is already treated as reclaimable).
+    /// We never reap a committed-but-unfolded session on a timer — the folded watermark is the only gate.
+    /// Timer-safe: the seal/gravestone is permanent, so a reaped-then-resumed writer re-checks the tomb and
+    /// resurrects. MUST be called with `gc_lock` held.
+    size_t reaped = 0;
+    for (const auto & key : listKeysUnder(object_storage, sessionsPrefix(key_prefix)))
+    {
+        /// A session can be removed by its owner (commit/abort) between this LIST and the READ — a vanished
+        /// session is simply gone (skip). Only the missing-object errors are swallowed; a malformed session
+        /// still fails closed via deserialize (never best-effort on corruption).
+        std::string raw;
+        try
+        {
+            raw = readSmallObject(object_storage, key);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::CANNOT_OPEN_FILE || e.code() == ErrorCodes::FILE_DOESNT_EXIST)
+                continue;
+            throw;
+        }
+        const WriteSession session = WriteSession::deserialize(raw);
+
+        /// Rule (a): not committed -> NOT reaped here (the owner/lease handles it). The pin must outlive an
+        /// in-flight upload.
+        if (!session.committed)
+            continue;
+
+        /// Rule (b): reap only when EVERY delta epoch is folded. An empty `delta_epochs` (a committed but
+        /// delta-less commit — a FREEZE/shadow/detached publish out of the count model) is trivially folded
+        /// (no `+` to cover), so the session is reapable immediately.
+        bool all_folded = true;
+        for (const auto & [shard, epoch] : session.delta_epochs)
+        {
+            if (!compaction.isEpochFolded(shard, epoch))
+            {
+                all_folded = false;
+                break;
+            }
+        }
+        if (!all_folded)
+            continue;
+
+        /// Folded: the durable snapshot now covers the reference, so the pin is safe to drop. Idempotent
+        /// best-effort delete (a concurrent owner-delete is a harmless no-op).
+        object_storage->removeObjectIfExists(StoredObject(key));
+        ++reaped;
+    }
+    return reaped;
 }
 
 SweepStats ContentAddressedGC::runReconciliationScan(int64_t now, int64_t grace, std::optional<GcLock> held)

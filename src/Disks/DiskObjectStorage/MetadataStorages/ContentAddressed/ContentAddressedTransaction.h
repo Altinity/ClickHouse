@@ -17,6 +17,8 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace DB
 {
@@ -316,7 +318,11 @@ private:
     // already-committed part (no content blobs staged), or the whole-part publish (manifest + sidecar + ref)
     // for new content. An all-empty staging entry is a no-op. Does NOT take the gc_lock or persistSession —
     // commit() does that once around the loop over all parts.
-    void commitOnePart(const PartKey & key, PartStaging & st);
+    //
+    // CA GC S4 (§5.1 rule 3): appends each `+`-delta's settled `(shard, epoch)` to `settled_delta_epochs`
+    // so commit() can record them in this transaction's WriteSession — the session is retained until EVERY
+    // such epoch is folded (the session-until-folded reaper gates on the folded watermark, §7.3).
+    void commitOnePart(const PartKey & key, PartStaging & st, std::vector<std::pair<ContentAddressed::ShardId, uint64_t>> & settled_delta_epochs);
 
     // ==== CA GC S3: the writer's tomb re-check + resurrection (spec §6, §7.1 steps 4-5) ====
     //
@@ -376,7 +382,20 @@ private:
     // destruction of an uncommitted transaction). The ref now keeps the blobs reachable, so the pin is
     // no longer needed; an aborted session would expire by its lease anyway, but clean it up eagerly.
     // Idempotent and never throws (mirrors releasePinnedBlobs).
+    //
+    // CA GC S4 (§5.1 rule 3): a COMMITTED session is NOT released here at commit (nor in the destructor) —
+    // it is retained until its `+` deltas are FOLDED. The session-until-folded reaper (in the GC sweep)
+    // deletes it once the folded watermark passes its recorded epochs. commit() drops it eagerly only when
+    // every settled epoch is ALREADY folded (allSettledEpochsFolded).
     void releaseSession() noexcept;
+
+    // CA GC S4 (§5.1 rule 3) — the post-commit folded check: true iff EVERY `(shard, epoch)` this commit's
+    // `+` deltas settled in is folded into a durable snapshot (GcCompaction::isEpochFolded). A delta-less
+    // commit (empty set) is trivially folded; a throw is treated as "not folded" (keep the session for the
+    // reaper). Lets commit() drop the session immediately on the common already-folded path while leaving an
+    // unfolded one for the watermark reaper — the commit NEVER blocks on folding.
+    bool allSettledEpochsFolded(
+        const std::vector<std::pair<ContentAddressed::ShardId, uint64_t>> & settled_delta_epochs) const;
 
     // DETACH PARTITION: re-publish a committed part directory as a detached ref. The detached ref is
     // named "detached" and carries the source part's manifest blob entries and mutable sidecar files

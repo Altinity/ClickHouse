@@ -18,6 +18,8 @@
 namespace DB::ContentAddressed
 {
 
+class GcCompaction;
+
 /// The whole garbage-collection concern for a content-addressed pool lives here: the pure
 /// reachability/sweep algorithms, the pool enumeration primitives, the un-wired refcount seam, and
 /// the sweep driver `ContentAddressedGC`. The threading/lifecycle driver is `ContentAddressedGCThread`.
@@ -283,6 +285,19 @@ private:
     /// source (spec §9), shared by `runReconciliationScan` and the scheduled orphan-drift fold inside
     /// `runSweepOnce`. MUST be called with `gc_lock` held.
     std::set<std::string> collectReconciliationCandidatesLocked(int64_t now);
+
+    /// CA GC S4 — the session-until-folded REAPER (§5.1 rule 3, §7.3 mechanical rule). A write session is the
+    /// durable handshake flag covering a `+`-before-fold gap (§7.1): it must be retained until EVERY one of
+    /// its `+` deltas is folded into a durable snapshot, so `sessions ∪ folded-snapshot` always covers every
+    /// live reference (the §6.2 gate's completeness premise). This reaper enumerates `sessions/` and deletes
+    /// a session ONLY when the §7.3 mechanical rule is met: (a) its ref was never committed (`committed` is
+    /// false — but those are dropped by the OWNER at abort, so a lingering uncommitted one is left to its
+    /// lease), OR (b) EVERY `(shard, epoch)` in its `delta_epochs` is folded
+    /// (`compaction.isEpochFolded`). NEVER on a bare timer for a committed-but-unfolded session — the
+    /// foldedness watermark, not the lease, is the reap gate (the lease only reclaims a CRASHED writer's
+    /// pin). Timer-safe: the seal/gravestone is permanent, so a reaped-then-resumed writer re-checks the
+    /// tomb and resurrects (§7.3). MUST be called with `gc_lock` held. Returns the number reaped.
+    size_t reapFoldedSessionsLocked(GcCompaction & compaction);
 
     /// The bounded reconciliation policy (§9 "orphan-drift bound"): true iff the heavy reconciliation scan
     /// is due this round — every `reconciliation_cadence_rounds` rounds (a cadence knob), so orphan drift

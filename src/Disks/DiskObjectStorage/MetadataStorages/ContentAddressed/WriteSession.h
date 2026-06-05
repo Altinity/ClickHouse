@@ -1,9 +1,11 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <base/types.h>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace DB::ContentAddressed
@@ -36,6 +38,20 @@ struct WriteSession
     /// treat every hash here as reachable while the (unexpired) session is present.
     std::vector<BlobHash> pending;
 
+    /// CA GC S4 (§5.1 rule 3, §7.3) — the session is now retained until its `+` deltas are FOLDED into a
+    /// durable snapshot, not merely until commit. These two fields carry the durable foldedness state so a
+    /// reaper (running on a different round, even after a crash/restart) can decide reapability on its own:
+    ///
+    ///   `committed` — false while the writer is still staging/uploading (an ABORT before commit drops the
+    ///   session in O(1): nothing was referenced). Set true once the live ref is published; only THEN does
+    ///   the session linger to cover the `+`-before-fold gap (rule 3).
+    ///   `delta_epochs` — the `(shard, epoch)` each of this commit's `+` fragments durably settled in (after
+    ///   the §5.1 rule-2 re-append). The reaper deletes the session once `GcCompaction::isEpochFolded` holds
+    ///   for EVERY pair (the §7.3 mechanical rule (b): all delta event_ids folded). Empty for an uncommitted
+    ///   session (then `committed` is false) or for a delta-less commit (then it is trivially folded).
+    bool committed = false;
+    std::vector<std::pair<ShardId, UInt64>> delta_epochs;
+
     /// Binary, deterministic, explicitly little-endian on the shared codec (cross-arch determinism).
     std::string serialize() const;
 
@@ -48,7 +64,11 @@ struct WriteSession
     /// is distinct from the manifest (`CAMF`), sidecar (`CASC`), ref payload (`CARF`) and pool meta
     /// (`CAPM`) families.
     static constexpr FormatMagic MAGIC = makeMagic("CAWS");
-    static constexpr uint8_t ENCODING_VERSION = 1;
+    /// Version 2 (CA GC S4) appends the `committed` flag and the `delta_epochs` `(shard, epoch)` list to the
+    /// body so the session-until-folded reaper can decide reapability durably (§5.1 rule 3, §7.3). A v3 pool
+    /// is created fresh (PoolMeta v3, no back-compat), so no v1 session can exist in it — reading only v2 is
+    /// correct and fail-closed.
+    static constexpr uint8_t ENCODING_VERSION = 2;
 };
 
 }

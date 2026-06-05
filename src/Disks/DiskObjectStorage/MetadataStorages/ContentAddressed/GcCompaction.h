@@ -123,6 +123,21 @@ public:
     /// refs + manifests, the only source left when the log truth is gone).
     std::optional<RebuildResult> rebuildFromSnapshotAndLog(ShardId shard);
 
+    /// CA GC S4 — the FOLDED WATERMARK (§5.1 rule 3, §7.3). The latest snapshot epoch present for a shard
+    /// (the highest `<padded-epoch>` under `gc/snap/` whose shard suffix matches), or nullopt if no snapshot
+    /// exists for the shard yet. A snapshot named `S` is the fold of epoch `S-1` over its predecessor (the
+    /// fold of `E` STREAMS `gc/snap/<E+1>.<shard>`), so the deltas of every epoch `< S` are durably folded
+    /// into it. This is the read the session reaper uses to learn when a `+` is "folded into a durable
+    /// snapshot" (the §7.3 reaper rule (b)). PUBLIC so the metadata storage / writer can query the watermark.
+    std::optional<uint64_t> latestSnapshotEpoch(ShardId shard) const;
+
+    /// CA GC S4 — true iff a `+` delta enqueued into `(shard, epoch)` is FOLDED into a durable snapshot
+    /// (§5.1 rule 3). A snapshot at epoch `S` incorporates every delta of epochs `< S` (the fold of `E`
+    /// writes `gc/snap/<E+1>`), so `epoch` is folded iff the latest snapshot's epoch is `> epoch`. Absent
+    /// snapshot => not folded. This is the watermark the session-until-folded reaper gates on: a session is
+    /// reapable only once EVERY one of its delta `(shard, epoch)` pairs is folded by this test.
+    bool isEpochFolded(ShardId shard, uint64_t epoch) const;
+
 private:
     /// Read the current open epoch for a shard (gcCurrentEpochKey, default 0 if absent or malformed —
     /// degrading to 0 only widens the window the fold covers, never an under-count).
@@ -146,10 +161,6 @@ private:
 
     /// Reclaim (delete) the old snapshot + every log object for a folded, already-closed epoch.
     void reclaimFoldedEpoch(uint64_t epoch, ShardId shard);
-
-    /// The latest snapshot epoch present for a shard (the highest <padded-epoch> under gc/snap/ whose shard
-    /// suffix matches). Returns nullopt if no snapshot exists for the shard. Used by rebuild.
-    std::optional<uint64_t> latestSnapshotEpoch(ShardId shard) const;
 
     /// The set of log epochs present for a shard (every <epoch> under gc/log/<epoch>.<shard>/), sorted
     /// ascending. Used by rebuild to fold every un-folded epoch over the snapshot.

@@ -60,7 +60,11 @@ public:
     /// caller writes the live ref, so `+ before ref` holds (for S2, with the lock held, a synchronous
     /// flush before the ref is the accepted discipline — the async/session-covers-gap path is S4). After
     /// the flush this also runs the §5.1 rule-2 re-append on each touched shard.
-    void appendAndFlushForCommit(const GcDelta & delta);
+    ///
+    /// CA GC S4 (§5.1 rule 3): returns the `(shard, epoch)` each fragment durably settled in AFTER the
+    /// rule-2 re-append (the epoch a fold of that shard must fold to incorporate this `+`). The caller
+    /// records these in its `WriteSession` so the session-until-folded reaper knows when the `+` is folded.
+    std::vector<std::pair<ShardId, uint64_t>> appendAndFlushForCommit(const GcDelta & delta);
 
     /// Flush every (shard, epoch) buffer whose window has elapsed or whose size hit the cap. Then run the
     /// rule-2 re-append for any flushed shard. Cheap to call frequently (no-op if nothing is due).
@@ -112,8 +116,9 @@ private:
 
     /// §5.1 rule 2: re-read the shard epoch; while it has advanced past `written_epoch`, re-buffer the
     /// `retained` fragments (same event_ids) under the now-open epoch and re-flush (bounded retry). Must
-    /// be called with `mtx` held. Inert under the still-held gc_lock (S2); wired for S4.
-    void reappendIfAdvancedLocked(ShardId shard, uint64_t written_epoch, const std::vector<Fragment> & retained);
+    /// be called with `mtx` held. Inert under the still-held gc_lock (S2); wired for S4. Returns the FINAL
+    /// epoch the fragments durably settled in (= `written_epoch` if no advance occurred) — CA GC S4.
+    uint64_t reappendIfAdvancedLocked(ShardId shard, uint64_t written_epoch, const std::vector<Fragment> & retained);
 
     const ObjectStoragePtr object_storage;
     const std::string key_prefix;

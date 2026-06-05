@@ -129,7 +129,7 @@ void GcLogWriter::flushBufferLocked(ShardId shard, uint64_t epoch, Buffer & buff
     buffer.fragments.clear();
 }
 
-void GcLogWriter::reappendIfAdvancedLocked(ShardId shard, uint64_t written_epoch, const std::vector<Fragment> & retained)
+uint64_t GcLogWriter::reappendIfAdvancedLocked(ShardId shard, uint64_t written_epoch, const std::vector<Fragment> & retained)
 {
     /// §5.1 rule 2: after flushing into `written_epoch`, re-read the shard epoch; WHILE it has advanced
     /// PAST the epoch we wrote, re-buffer the SAME fragments (same event_ids) into the now-open epoch and
@@ -137,11 +137,15 @@ void GcLogWriter::reappendIfAdvancedLocked(ShardId shard, uint64_t written_epoch
     /// is a harmless leaked object (deduped by event_id on fold). Bounded retry. Under the still-held
     /// gc_lock (S2) the close cannot race a commit, so this loop body never executes; it is wired so S4
     /// (which drops the lock) can rely on log completeness under concurrent appends.
+    ///
+    /// CA GC S4: returns the FINAL epoch the fragments durably settled in (the highest epoch we wrote into,
+    /// = `written_epoch` if no advance occurred). The caller threads this into the session's `delta_epochs`
+    /// so the folded watermark is checked against the epoch the `+` actually landed in.
     for (int attempt = 0; attempt < 8; ++attempt)
     {
         const uint64_t current = readShardEpoch(shard);
         if (current <= written_epoch)
-            return;
+            return written_epoch;
         auto & open_buffer = buffers[{shard, current}];
         if (open_buffer.fragments.empty())
             open_buffer.opened_at = std::chrono::steady_clock::now();
@@ -150,9 +154,10 @@ void GcLogWriter::reappendIfAdvancedLocked(ShardId shard, uint64_t written_epoch
         flushBufferLocked(shard, current, open_buffer);
         written_epoch = current;
     }
+    return written_epoch;
 }
 
-void GcLogWriter::appendAndFlushForCommit(const GcDelta & delta)
+std::vector<std::pair<ShardId, uint64_t>> GcLogWriter::appendAndFlushForCommit(const GcDelta & delta)
 {
     /// I1/I6 commit-path discipline: the `+` must be durably enqueued BEFORE the live ref. For S2 (the
     /// gc_lock is held across commit + sweep) a synchronous flush before the ref is the accepted
@@ -162,6 +167,8 @@ void GcLogWriter::appendAndFlushForCommit(const GcDelta & delta)
     /// fragment of THIS delta — draining anything else queued for those (shard, epoch)s along with it.
     auto by_shard = splitDeltaByShard(delta);
 
+    std::vector<std::pair<ShardId, uint64_t>> settled;
+    settled.reserve(by_shard.size());
     std::lock_guard<std::mutex> lock(mtx);
     for (auto & [shard, fragment] : by_shard)
     {
@@ -174,8 +181,12 @@ void GcLogWriter::appendAndFlushForCommit(const GcDelta & delta)
         /// Retain a copy of the batch for the rule-2 re-append BEFORE flushBufferLocked clears the buffer.
         const std::vector<Fragment> retained = buffer.fragments;
         flushBufferLocked(shard, epoch, buffer);
-        reappendIfAdvancedLocked(shard, epoch, retained);
+        /// CA GC S4: capture the FINAL epoch the fragment settled in (after any rule-2 re-append) so the
+        /// caller can record `(shard, final_epoch)` in its session for the folded-watermark check.
+        const uint64_t final_epoch = reappendIfAdvancedLocked(shard, epoch, retained);
+        settled.emplace_back(shard, final_epoch);
     }
+    return settled;
 }
 
 void GcLogWriter::flushDueWindows()

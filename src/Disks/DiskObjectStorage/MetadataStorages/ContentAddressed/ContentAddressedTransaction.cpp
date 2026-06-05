@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcCompaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcDelta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLogWriter.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
@@ -63,8 +64,15 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
 
     /// M8: an uncommitted transaction also leaves its cross-mounter WriteSession object behind. Its
     /// lease would expire anyway, but remove it eagerly (best-effort) so an aborted insert leaves no
-    /// lingering session. A committed transaction already cleared it in commit(), so this is a no-op.
-    releaseSession();
+    /// lingering session — abort-before-commit stays O(1) (drop the session; nothing was referenced).
+    ///
+    /// CA GC S4 (§5.1 rule 3, §7.3): a COMMITTED session must NOT be dropped here — it is retained until its
+    /// `+` deltas are FOLDED (the session-until-folded reaper in the GC sweep deletes it once the folded
+    /// watermark passes its recorded epochs). commit() already either dropped it (all epochs already folded)
+    /// or marked it committed and persisted it for the reaper; in the latter case the transaction object is
+    /// destroyed while its durable session legitimately lives on. So only release an UNCOMMITTED session.
+    if (session_open && !session.committed)
+        releaseSession();
 }
 
 void ContentAddressedTransaction::releasePinnedBlobs() noexcept
@@ -1357,7 +1365,7 @@ uint64_t ContentAddressedTransaction::resolveAndResurrectGeneration(
         id_for_log, max_iterations);
 }
 
-void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging & st)
+void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging & st, std::vector<std::pair<ContentAddressed::ShardId, uint64_t>> & settled_delta_epochs)
 {
     const std::string & table_uuid_ = key.first;
     const std::string & part_name_ = key.second;
@@ -1534,16 +1542,20 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
         meta_out->finalize();
     }
 
-    /// CA GC S2: enqueue the `+` GC delta and synchronously flush it BEFORE writing the live ref, so the
-    /// I1/I6 ordering (`+` before ref) holds — *ref exists ⇒ delta exists*, so the log is complete for
-    /// every live reference and a fold can only over-count (reconciled), never under-count a live blob.
-    /// For S2 the gc_lock is held across commit + the whole sweep, so a synchronous flush before the ref
-    /// is the accepted discipline (the async / session-covers-the-gap path is S4). The delta carries the
-    /// resolved blob pins AND the (part_id) edge (§9). Scope it to a LIVE regular part for the same reason
-    /// the S1 reverse-index update is so scoped (a FREEZE/shadow ref and the shared "detached" ref pin
-    /// blobs but re-key their part_id and are out of S2's count model — Phase 2 reconciliation covers
-    /// them). The append is wrapped so an exception is logged + swallowed, but the flush DOES precede the
-    /// ref so the ordering invariant is preserved on the success path.
+    /// CA GC S4 (§7.1 step 6) — enqueue the `+` GC delta AFTER the tomb re-check / resurrection above (so an
+    /// abandoned generation never leaves a stale `+`) and BEFORE the live ref. The `+` carries the RESOLVED
+    /// (part_id, mg) and (H, g). The I1/I6 ordering (`+` before ref) is preserved by the synchronous flush —
+    /// *ref exists ⇒ delta enqueued* — so a fold can only over-count (reconciled), never under-count a live
+    /// blob. In S4 the durable WriteSession (raised FIRST, before any upload — §7.1 step 2, the handshake
+    /// flag) ALSO covers the reference across the `+`-before-fold gap (§5.1 rule 3): the session is retained
+    /// until every `+` delta is folded, so `sessions ∪ folded-snapshot` covers every live reference even
+    /// before the `+` lands in a snapshot. The settled `(shard, epoch)` of each fragment is captured into
+    /// `settled_delta_epochs` so commit() records it in the session for the folded-watermark reaper. (Lock
+    /// still held in this phase — purely the §7.1 ordering + the session-until-folded lifetime; the lock
+    /// removal is the next phase.) Scope it to a LIVE regular part for the same reason the S1 reverse-index
+    /// update is so scoped (a FREEZE/shadow ref and the shared "detached" ref pin blobs but re-key their
+    /// part_id and are out of the count model — reconciliation covers them). The append is wrapped so an
+    /// exception is logged + swallowed, but the flush DOES precede the ref so the ordering is preserved.
     if (!is_frozen && part_name_ != ContentAddressed::kDetachedDirName)
     {
         try
@@ -1569,7 +1581,11 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
                 delta.pins.push_back(entry.key);
                 delta.pin_generations.push_back(resolved_blob_gen.at(entry.key));
             }
-            metadata_storage.gcLogWriter()->appendAndFlushForCommit(delta);
+            /// CA GC S4: capture the `(shard, epoch)` each fragment settled in (after the §5.1 rule-2
+            /// re-append) so the session-until-folded reaper can gate this commit's session on the folded
+            /// watermark of exactly those epochs.
+            for (auto & shard_epoch : metadata_storage.gcLogWriter()->appendAndFlushForCommit(delta))
+                settled_delta_epochs.push_back(shard_epoch);
         }
         catch (...)
         {
@@ -1640,9 +1656,11 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     std::lock_guard<std::mutex> gc_guard(*metadata_storage.gc_lock);
 
     /// A single transaction may write more than one part (a transactional merge — B67). Publish each staged
-    /// part under the one lock; an all-empty entry is a no-op (handled inside commitOnePart).
+    /// part under the one lock; an all-empty entry is a no-op (handled inside commitOnePart). CA GC S4: each
+    /// part's `+`-delta settled `(shard, epoch)` is collected so the session can be retained until folded.
+    std::vector<std::pair<ContentAddressed::ShardId, uint64_t>> settled_delta_epochs;
     for (auto & [key, st] : parts)
-        commitOnePart(key, st);
+        commitOnePart(key, st, settled_delta_epochs);
 
     /// B52: the refs now name these parts and keep every referenced blob reachable, so the in-flight
     /// pins are no longer needed. Release them while STILL holding gc_lock (gc_guard above) so the pin
@@ -1654,12 +1672,49 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         metadata_storage.inFlightPinnedBlobs()->erase(blob_key);
     pinned_blob_keys.clear();
 
-    /// M8: the refs are published, so the cross-mounter pin (the WriteSession object) is no longer needed
-    /// — the refs now keep every referenced blob reachable for a sweep on ANY mounter. Remove it. This
-    /// is done OUTSIDE the gc_lock window above on purpose: it is a plain object delete on this
-    /// transaction's OWN uniquely-keyed session object (no in-process state, so the local lock is
-    /// irrelevant), and the ref publishes above already closed the local race.
-    releaseSession();
+    /// CA GC S4 (§5.1 rule 3, §7.3) — session lifetime = UNTIL FOLDED, not until commit. The refs are now
+    /// published, but the `+` deltas covering them may not yet be folded into a durable snapshot. Until they
+    /// are, *sessions ∪ folded-snapshot* must still cover every live reference (the §6.2 gate's completeness
+    /// premise), so we MUST NOT drop the session at commit. Instead: mark the session COMMITTED, record the
+    /// `+` deltas' settled `(shard, epoch)`, and re-persist it (under the lock window's renewed lease). The
+    /// session-until-folded reaper (in the GC sweep, gated on the folded watermark) deletes it once every
+    /// recorded epoch is folded. We do a cheap POST-COMMIT folded check here too: if every settled epoch is
+    /// ALREADY folded (the common case where a recent fold has overtaken this commit), we can drop the
+    /// session immediately; otherwise it lingers for the reaper. The commit NEVER blocks on folding.
+    if (session_open)
+    {
+        session.committed = true;
+        session.delta_epochs = settled_delta_epochs;
+        persistSession();
+
+        if (allSettledEpochsFolded(settled_delta_epochs))
+            releaseSession(); /// already folded — the snapshot covers the reference, drop the pin now.
+        /// else: leave the durable committed session for the folded-watermark reaper (do NOT releaseSession;
+        /// the destructor also keeps a committed session — see ~ContentAddressedTransaction).
+    }
+}
+
+bool ContentAddressedTransaction::allSettledEpochsFolded(
+    const std::vector<std::pair<ContentAddressed::ShardId, uint64_t>> & settled_delta_epochs) const
+{
+    /// CA GC S4 — the post-commit folded check (§5.1 rule 3): true iff EVERY `(shard, epoch)` this commit's
+    /// `+` deltas settled in is folded into a durable snapshot (`GcCompaction::isEpochFolded`). A delta-less
+    /// commit (empty set) is trivially folded. A throw is treated conservatively as "not folded" so the
+    /// session lingers for the reaper rather than being dropped early.
+    if (settled_delta_epochs.empty())
+        return true;
+    try
+    {
+        ContentAddressed::GcCompaction compaction(metadata_storage.object_storage, key_prefix);
+        for (const auto & [shard, epoch] : settled_delta_epochs)
+            if (!compaction.isEpochFolded(shard, epoch))
+                return false;
+        return true;
+    }
+    catch (...)
+    {
+        return false; /// conservative: keep the session (it is reaped later once provably folded).
+    }
 }
 
 TransactionCommitOutcomeVariant ContentAddressedTransaction::tryCommit(const TransactionCommitOptionsVariant & options)

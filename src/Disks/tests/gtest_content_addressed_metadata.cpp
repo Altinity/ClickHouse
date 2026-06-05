@@ -2263,10 +2263,21 @@ TEST_F(ContentAddressedMetaTest, TwoMetadataStoragesShareOnePoolGcIsExclusiveAnd
         buf->write(data_b.data(), data_b.size());
         buf->finalize();
     }
-    /// B's blob exists on disk and exactly one live write session pins it (no ref yet).
+    /// B's blob exists on disk and a live write session pins it (no ref yet). CA GC S4: A's earlier COMMIT
+    /// now leaves a lingering COMMITTED-until-folded session (the §5.1 rule-3 pin covering the `+`-before-fold
+    /// gap), so the sessions prefix can hold more than one object. Identify B's UNCOMMITTED pin specifically
+    /// (the open transaction's session is the one not yet committed) — that is the live pin under test.
     auto session_keys = listKeysUnder(os, sessionsPrefix(p));
-    ASSERT_EQ(session_keys.size(), 1u) << "B's open transaction must leave one live write-session pin";
-    auto b_session = WriteSession::deserialize(readObject(os, session_keys[0]));
+    ASSERT_FALSE(session_keys.empty()) << "B's open transaction must leave a live write-session pin";
+    std::optional<WriteSession> b_session_opt;
+    for (const auto & sk : session_keys)
+    {
+        auto s = WriteSession::deserialize(readObject(os, sk));
+        if (!s.committed)
+            b_session_opt = std::move(s);
+    }
+    ASSERT_TRUE(b_session_opt.has_value()) << "B's open (uncommitted) transaction must leave one live write-session pin";
+    auto & b_session = *b_session_opt;
     ASSERT_EQ(b_session.pending.size(), 1u);
     const std::string b_blob_key = blobKey(p, b_session.pending.front()).string();
     EXPECT_TRUE(objectExists(os, b_blob_key)) << "B's uploaded blob must exist before commit";
@@ -2713,9 +2724,28 @@ TEST_F(ContentAddressedMetaTest, SessionPinListsPendingBlobsBeforeRefPublish)
     for (const auto & h : session.pending)
         pinned_blob_keys.insert(blobKey("", h).string());
 
-    // Now publish the ref: the session object must be GONE (the ref keeps the blobs reachable).
+    // Now publish the ref. CA GC S4 (§5.1 rule 3, §7.3): the session is retained UNTIL FOLDED, not cleared
+    // at commit — it covers the `+`-before-fold gap so *sessions ∪ folded-snapshot* always covers every live
+    // reference. No GC fold has run yet, so the `+`'s epoch is unfolded and the session must LINGER, now
+    // marked committed (the durable handshake flag).
     tx.commit(DB::NoCommitOptions{});
-    EXPECT_TRUE(listKeysUnder(os, sessionsPrefix("")).empty()) << "session object must be cleared on commit";
+    {
+        auto post_commit_keys = listKeysUnder(os, sessionsPrefix(""));
+        ASSERT_EQ(post_commit_keys.size(), 1u) << "the committed-until-folded session must linger after commit (no fold yet)";
+        auto lingering = WriteSession::deserialize(readObject(os, post_commit_keys[0]));
+        EXPECT_TRUE(lingering.committed) << "a lingering post-commit session must be marked committed";
+    }
+
+    // A GC sweep folds every shard's epoch (advancing the folded watermark past the `+`) and then reaps the
+    // now-folded session — proving the session-until-folded lifecycle. Single-owner sweep (no fence lock) so
+    // the empty-prefix coordination keyspace is not exercised; grace 0 so the round runs to completion.
+    {
+        const int64_t now = 1;
+        DB::ContentAddressed::ContentAddressedGC gc(os, "");
+        gc.runSweepOnce(now, /*grace=*/0);
+        EXPECT_TRUE(listKeysUnder(os, sessionsPrefix("")).empty())
+            << "the session must be reaped once its + delta is folded into a durable snapshot";
+    }
 
     // The part still reads back correctly, and the blobs the session pinned are exactly the part's blobs.
     std::set<std::string> committed_blob_keys;
@@ -3800,8 +3830,13 @@ TEST_F(ContentAddressedMetaTest, RelinkHappyPathPublishesRefWithoutNewBlobs)
     EXPECT_EQ(readObject(os, b->getStorageObjects("uui/" + uuid + "/" + part + "/uuid.txt")[0].remote_path), "b-uuid");
     EXPECT_EQ(readObject(os, b->getStorageObjects("uui/" + uuid + "/" + part + "/metadata_version.txt")[0].remote_path), "9");
 
-    // The pin is released: no leftover write-session object after a successful relink.
-    EXPECT_TRUE(listKeysUnder(os, sessionsPrefix(p)).empty()) << "relink must release its pin on success";
+    // The relink pin is released on success: relink's session is UNCOMMITTED (it pins a known hash set, it
+    // does not commit a `+`), so it must be gone. CA GC S4: server A's earlier COMMIT leaves a lingering
+    // committed-until-folded session (the §5.1 rule-3 pin), which is reaped by the GC once folded — so we
+    // assert no UNCOMMITTED (relink) session remains rather than an empty prefix.
+    for (const auto & sk : listKeysUnder(os, sessionsPrefix(p)))
+        EXPECT_TRUE(WriteSession::deserialize(readObject(os, sk)).committed)
+            << "relink must release its (uncommitted) pin on success; only committed-until-folded sessions may linger";
 
     a->shutdown();
     b->shutdown();
@@ -3854,8 +3889,15 @@ TEST_F(ContentAddressedMetaTest, RelinkPinSurvivesConcurrentSourceDropAndSweep)
     auto pin = b->relinkPin(part_id);
     ASSERT_TRUE(pin.has_value());
     ASSERT_TRUE(b->relinkRevalidate(part_id));
-    // Exactly one live write-session pins the part's blobs (B's relink pin).
-    ASSERT_EQ(listKeysUnder(os, sessionsPrefix(p)).size(), 1u);
+    // Exactly one UNCOMMITTED live write-session pins the part's blobs (B's relink pin). CA GC S4: server A's
+    // earlier commit leaves a lingering committed-until-folded session, so we count B's uncommitted pin.
+    {
+        size_t uncommitted = 0;
+        for (const auto & sk : listKeysUnder(os, sessionsPrefix(p)))
+            if (!WriteSession::deserialize(readObject(os, sk)).committed)
+                ++uncommitted;
+        ASSERT_EQ(uncommitted, 1u) << "exactly one uncommitted (relink) pin must be live";
+    }
 
     // BETWEEN B's pin and B's publish, the hazard fires:
     //   (i) server A drops its ref -> the part_id is now named by NO ref.

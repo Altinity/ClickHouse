@@ -395,6 +395,17 @@ std::optional<uint64_t> GcCompaction::latestSnapshotEpoch(ShardId shard) const
     return latest;
 }
 
+bool GcCompaction::isEpochFolded(ShardId shard, uint64_t epoch) const
+{
+    /// CA GC S4 (§5.1 rule 3): a `+` enqueued into `(shard, epoch)` is folded once a durable snapshot
+    /// incorporates it. The fold of epoch `E` writes `gc/snap/<E+1>.<shard>`, so a snapshot at epoch `S`
+    /// has folded every delta of epochs `< S`. Therefore `epoch` is folded iff the latest snapshot's epoch
+    /// is STRICTLY GREATER than `epoch`. Absent snapshot => nothing folded yet => false (conservative: the
+    /// session lingers, never reaped early). This is a pure read over `gc/snap/` (the §7.3 reaper rule (b)).
+    const std::optional<uint64_t> latest = latestSnapshotEpoch(shard);
+    return latest.has_value() && *latest > epoch;
+}
+
 std::vector<uint64_t> GcCompaction::logEpochs(ShardId shard) const
 {
     const std::string root = gcLogRootPrefix(key_prefix);
