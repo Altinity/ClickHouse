@@ -230,6 +230,16 @@ GcSnapObjectKey gcSnapKey(const std::string & key_prefix, uint64_t epoch, ShardI
     return GcSnapObjectKey(withPrefix(key_prefix, "gc/snap/" + paddedEpoch(epoch) + "." + std::to_string(shard)));
 }
 
+std::string gcSnapPrefix(const std::string & key_prefix)
+{
+    return withPrefix(key_prefix, "gc/snap/");
+}
+
+std::string gcLogRootPrefix(const std::string & key_prefix)
+{
+    return withPrefix(key_prefix, "gc/log/");
+}
+
 std::string diskFileKey(const std::string & key_prefix, const std::string & path)
 {
     /// Verbatim: the raw disk-relative path joined under the object-storage common key prefix with

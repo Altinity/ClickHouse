@@ -200,6 +200,16 @@ GcLogObjectKey gcLogEventKey(const std::string & key_prefix, uint64_t epoch, Sha
 // latest by listing — without padding, "10" would sort before "2"). Typed (GcSnapObjectKey) per B29.
 GcSnapObjectKey gcSnapKey(const std::string & key_prefix, uint64_t epoch, ShardId shard);
 
+// The LIST prefix for ALL snapshot runs of EVERY epoch and shard: <key_prefix>/gc/snap/. A lexical LIST
+// returns the objects in (padded-epoch, shard) order — the compaction's rebuild lists this and filters to
+// one shard's `.<shard>` suffix, taking the highest epoch as the latest snapshot for that shard.
+std::string gcSnapPrefix(const std::string & key_prefix);
+
+// The LIST prefix for ALL delta-log objects of EVERY epoch and shard: <key_prefix>/gc/log/. The rebuild
+// lists this to discover which epochs still carry un-folded deltas for a shard (filtering the
+// <epoch>.<shard>/ component). The per-epoch fold uses the tighter gcLogPrefix instead.
+std::string gcLogRootPrefix(const std::string & key_prefix);
+
 // Verbatim object key for a generic disk-level file: a path that is neither a part file nor a
 // table-level file (e.g. the server's startup access-check probe clickhouse_access_check_<uuid>
 // written at the disk root). Such files are stored verbatim at <key_prefix>/<path> (no content
