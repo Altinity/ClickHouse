@@ -18,6 +18,7 @@
 
 #include <Common/Exception.h>
 #include <Common/Logger.h>
+#include <Common/logger_useful.h>
 #include <Common/getRandomASCIIString.h>
 
 #include <fmt/format.h>
@@ -335,6 +336,20 @@ void ContentAddressedMetadataStorage::shutdown()
 {
     if (gc_thread)
         gc_thread->shutdown();
+    /// CA GC S4 (#3 fold-in): flush any buffered `-` deltas before teardown — otherwise a drop's `-` that
+    /// was only buffered (enqueue without an immediate flush) is silently lost, leaving a stale `+` count
+    /// (over-count/leak). Best-effort: a flush failure here must not throw out of shutdown.
+    if (gc_log_writer)
+    {
+        try
+        {
+            gc_log_writer->flushAll();
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+            tryLogCurrentException(getLogger("ContentAddressedMetadataStorage"), "CA GC: flushAll on shutdown failed (buffered deltas may be re-logged on the next run)");
+        }
+    }
 }
 
 MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()

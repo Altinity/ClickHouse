@@ -549,3 +549,44 @@ TEST_F(ContentAddressedGcS4, Sec2_StickySession_NotReapedUntilRelogged_ThenRelea
     gc.runSweepOnce(/*now=*/2'000'000, /*grace=*/0);
     EXPECT_FALSE(exists(sessionKey(prefix, "sess-sticky"))) << "once re-logged + folded, the converted session is reaped";
 }
+
+TEST_F(ContentAddressedGcS4, Sec5_1_ReappendIfAdvancedActuallyFires)
+{
+    GcLogWriter writer(os, prefix);
+    GcCompaction compaction(os, prefix);
+    const auto kStillLeader = [] { return true; };
+
+    const BlobHash b = blobHash("r01");
+    const PartId p = partId("r01");
+
+    /// Determine the home shard of the part so we can advance exactly it.
+    const ShardId home = GcLogWriter::shardForPartId(p);
+
+    /// Buffer a `+` into the CURRENT open epoch of the home shard (enqueue buffers; no flush yet).
+    GcDelta add;
+    add.op = GcDelta::Op::Add;
+    add.part_id = p;
+    add.pins = {b};
+    add.pin_generations = {0};
+    add.event_id = GcDelta::computeEventId(p, GcDelta::Op::Add, 0);
+    writer.enqueue(add);
+
+    /// Externally CLOSE the home shard's epoch (advance it) WHILE the `+` sits buffered in the old epoch.
+    const auto first_fold = compaction.compactShard(home, kStillLeader);
+    EXPECT_GE(first_fold.new_epoch, 1u);
+
+    /// flushAll: the buffered `+` flushes into the now-stale epoch, then reappendIfAdvanced detects the
+    /// advance and re-logs it into the open epoch. The next fold of the home shard must then COUNT b (not
+    /// drop it as a count-0 candidate) — proving the re-append carried the straggler forward.
+    writer.flushAll();
+
+    bool b_dropped_as_candidate = false;
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto folded = compaction.compactShard(home, kStillLeader);
+        for (const auto & c : folded.candidates)
+            if (c.key.identity == b.string())
+                b_dropped_as_candidate = true;
+    }
+    EXPECT_FALSE(b_dropped_as_candidate) << "the re-appended + must keep b counted across the epoch advance";
+}

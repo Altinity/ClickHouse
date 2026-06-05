@@ -1693,9 +1693,6 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// re-reads sessions in its re-validate step immediately before deleting, so a live session makes it
     /// skip these blobs. (Carried-forward blobs are instead covered by their source part's ref.) Renew
     /// before taking the in-process lock since this is a bucket write coordinating with OTHER mounters.
-    if (session_open)
-        persistSession();
-
     /// CA GC S4 (G1) — the per-pool GC lock is NO LONGER held across the multi-part publish. The §7
     /// handshake is the sole cross-process commit-vs-sweep gate: the session pin (raised above, the §7
     /// proof's flag `A`) is durable and GC-visible BEFORE the per-part tomb re-check and the `+` below, and
