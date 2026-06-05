@@ -400,3 +400,89 @@ TEST_F(ContentAddressedGcS4, Reaper_RaceSafe_NeverReapsUnfoldedOrJustRaised)
     gc.runSweepOnce(/*now=*/100, /*grace=*/0);
     EXPECT_FALSE(exists(sessionKey(prefix, "sess-unfolded"))) << "once folded, the committed session is reaped";
 }
+
+/// ── Oracle 5 (FAILING / blocker #1 proof) — generations must survive the real writer→log→compaction path.
+///
+/// The blocker: `GcLogWriter::splitDeltaByShard` drops the resolved `pin_generations` when splitting a
+/// logical delta across shards, so every `gc/log` fragment is serialised with an EMPTY `pin_generations`
+/// vector.  When the compaction folds that fragment it treats every pin as g=0 (the fallback).  This means
+/// a delta carrying (b, g=1) lands in the log as (b, g=0), collapsing distinct generations into the SAME
+/// count key — the generation-aware `CountKey{Blob, identity, generation}` is inert.
+///
+/// Proof: thread a g>0 delta through the REAL writer→log→compaction path and assert
+///   (a) the +/-  for (b, g=0) net to zero → (b,0) is a count-0 candidate, AND
+///   (b) (b, g=1) remains alive (still pinned by p1) → (b,1) is NOT a candidate.
+///
+/// With the bug both (b,0) and (b,1) collapse to (b,0) in the log, giving count(b,0) = +1+1-1 = +1
+/// → NOT a candidate → EXPECT_TRUE(b_g0_is_candidate) FAILS, catching the blocker.
+TEST_F(ContentAddressedGcS4, Sec6_GenerationsSurviveTheRealWriterPath_WouldHaveCaughtBlocker1)
+{
+    GcLogWriter writer(os, prefix);
+    GcCompaction compaction(os, prefix);
+    const auto kStillLeader = [] { return true; };
+
+    /// Pre-advance every shard so the open epoch is 1 (mirrors oracle 2).
+    for (ShardId s = 0; s < kGcShardCount; ++s)
+        ASSERT_EQ(compaction.compactShard(s, kStillLeader).new_epoch, 1u);
+
+    const BlobHash b = blobHash("g01");
+    const PartId p0 = partId("g0");   /// pins b at generation 0
+    const PartId p1 = partId("g1");   /// pins b at generation 1 (a resurrected blob)
+
+    /// + for (b, g=0) under part p0 (manifest mg=0).
+    {
+        GcDelta d;
+        d.op = GcDelta::Op::Add;
+        d.part_id = p0;
+        d.manifest_generation = 0;
+        d.pins = {b};
+        d.pin_generations = {0};
+        d.event_id = GcDelta::computeEventId(p0, GcDelta::Op::Add, 0);
+        writer.appendAndFlushForCommit(d);
+    }
+    /// + for (b, g=1) under part p1 (manifest mg=1) — the resurrected generation.
+    {
+        GcDelta d;
+        d.op = GcDelta::Op::Add;
+        d.part_id = p1;
+        d.manifest_generation = 1;
+        d.pins = {b};
+        d.pin_generations = {1};
+        d.event_id = GcDelta::computeEventId(p1, GcDelta::Op::Add, 1);
+        writer.appendAndFlushForCommit(d);
+    }
+    /// - for (b, g=0): drop p0. b@g0 now nets to zero; b@g1 is still pinned by p1.
+    {
+        GcDelta d;
+        d.op = GcDelta::Op::Remove;
+        d.part_id = p0;
+        d.manifest_generation = 0;
+        d.pins = {b};
+        d.pin_generations = {0};
+        d.event_id = GcDelta::computeEventId(p0, GcDelta::Op::Remove, 0);
+        writer.enqueue(d);
+    }
+    writer.flushAll();
+
+    /// Fold every shard and collect the count-0 candidates with their generation.
+    bool b_g0_is_candidate = false;
+    bool b_g1_is_candidate = false;
+    for (ShardId s = 0; s < kGcShardCount; ++s)
+    {
+        const auto folded = compaction.compactShard(s, kStillLeader);
+        for (const auto & c : folded.candidates)
+        {
+            if (c.key.identity == b.string() && c.key.generation == 0)
+                b_g0_is_candidate = true;
+            if (c.key.identity == b.string() && c.key.generation == 1)
+                b_g1_is_candidate = true;
+        }
+    }
+
+    /// With #1 fixed: (b,0) nets +1(p0) -1(dropP0) = 0 -> a count-0 candidate; (b,1) is +1(p1) -> NOT a
+    /// candidate (the resurrected generation survives, keyed independently at g=1).
+    EXPECT_TRUE(b_g0_is_candidate) << "g=0 must net to zero and become a candidate";
+    EXPECT_FALSE(b_g1_is_candidate) << "g=1 is still pinned and must NOT be swept — proves the generation survived splitDeltaByShard";
+    /// With the #1 bug everything collapses to g=0: count(b,0)=+1+1-1=+1 -> b_g0_is_candidate is FALSE and
+    /// no (b,1) key exists -> this test fails, exactly catching the blocker.
+}
