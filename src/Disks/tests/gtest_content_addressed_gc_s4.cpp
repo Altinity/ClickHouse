@@ -504,3 +504,48 @@ TEST_F(ContentAddressedGcS4, Sec6_RefSidecarRoundTripsSettledGenerations)
     ASSERT_TRUE(out.pin_generations.contains(b.string()));
     EXPECT_EQ(out.pin_generations.at(b.string()), 1u);
 }
+
+TEST_F(ContentAddressedGcS4, Sec2_StickySession_NotReapedUntilRelogged_ThenReleasedOnFold)
+{
+    const BlobHash b = blobHash("k01");
+    const PartId p = partId("k01");
+
+    /// A committed sticky session: its `+` flush "failed", so it carries the serialized `+` and deltas_failed.
+    /// Its lease is already in the PAST — a non-sticky session would be lease-reclaimed; a sticky one is not.
+    GcDelta add;
+    add.op = GcDelta::Op::Add;
+    add.part_id = p;
+    add.pins = {b};
+    add.pin_generations = {0};
+    add.event_id = GcDelta::computeEventId(p, GcDelta::Op::Add, 0);
+
+    WriteSession s;
+    s.server_id = "srv";
+    s.lease_deadline_unix = 1; /// far in the past relative to the sweep clock below
+    s.committed = true;
+    s.deltas_failed = true;
+    s.pending = {b};
+    s.pending_add_delta = serializeGcDeltasForSession({add});
+    put(sessionKey(prefix, "sess-sticky"), s.serialize());
+
+    DB::ContentAddressed::ContentAddressedGC gc(os, prefix);
+
+    /// Round 1: the reaper re-logs the `+`, clears sticky, and does NOT reap (foldedness rechecked next round).
+    gc.runSweepOnce(/*now=*/1'000'000, /*grace=*/0);
+    EXPECT_TRUE(exists(sessionKey(prefix, "sess-sticky"))) << "a sticky session is never reaped on the round it converts";
+    {
+        const WriteSession after = WriteSession::deserialize(get(sessionKey(prefix, "sess-sticky")));
+        EXPECT_FALSE(after.deltas_failed) << "the reaper cleared sticky after the bounded re-log landed";
+        EXPECT_FALSE(after.delta_epochs.empty()) << "the re-log recorded the settled (shard, epoch)";
+    }
+
+    /// Fold every recorded epoch, then run the reaper again: the now-normal committed session is reaped.
+    GcCompaction compaction(os, prefix);
+    const auto kStillLeader = [] { return true; };
+    const WriteSession converted = WriteSession::deserialize(get(sessionKey(prefix, "sess-sticky")));
+    for (const auto & [shard, epoch] : converted.delta_epochs)
+        for (int i = 0; i < 64 && !compaction.isEpochFolded(shard, epoch); ++i)
+            compaction.compactShard(shard, kStillLeader);
+    gc.runSweepOnce(/*now=*/2'000'000, /*grace=*/0);
+    EXPECT_FALSE(exists(sessionKey(prefix, "sess-sticky"))) << "once re-logged + folded, the converted session is reaped";
+}

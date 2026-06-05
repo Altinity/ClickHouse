@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcCompaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLogWriter.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
@@ -176,7 +177,11 @@ std::set<BlobObjectKey> sessionPinnedBlobs(
         /// lease is a liveness HINT only, never the basis of a positive "still pinned" decision. `now`
         /// is the sweep clock; the lease is unsigned, so compare in a common signed domain (a negative
         /// `now` — never produced in practice — would simply treat every session as expired).
-        if (static_cast<int64_t>(session.lease_deadline_unix) < now)
+        /// CA GC S4 (#2): a sticky session (its `+` flush failed and is not yet durably re-logged) is EXEMPT
+        /// from lease-expiry reaping — its reference is covered by neither the log nor a fresh session, so
+        /// dropping the pin would be the under-count the design forbids. A crashed-writer leak is acceptable
+        /// (reclaimed once the reaper re-logs + folds, or by reconciliation); a dropped pin is not.
+        if (!session.deltas_failed && static_cast<int64_t>(session.lease_deadline_unix) < now)
             continue;
         for (const auto & hash : session.pending)
             /// Project the BARE content hash to the FULL blob object key with the SAME `blobKey` fan-out
@@ -207,7 +212,11 @@ std::set<PartObjectKey> sessionPinnedPartKeys(
             throw;
         }
         const WriteSession session = WriteSession::deserialize(raw);
-        if (static_cast<int64_t>(session.lease_deadline_unix) < now)
+        /// CA GC S4 (#2): a sticky session (its `+` flush failed and is not yet durably re-logged) is EXEMPT
+        /// from lease-expiry reaping — its reference is covered by neither the log nor a fresh session, so
+        /// dropping the pin would be the under-count the design forbids. A crashed-writer leak is acceptable
+        /// (reclaimed once the reaper re-logs + folds, or by reconciliation); a dropped pin is not.
+        if (!session.deltas_failed && static_cast<int64_t>(session.lease_deadline_unix) < now)
             continue; /// expired -> itself reclaimable, not a root.
         /// Pin the manifest the session names ONLY if it resolves to a real parts/ object. The write
         /// path's session carries a part NAME (no manifest at that key), so its key simply does not exist
@@ -887,6 +896,14 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidatesLocked(
     return candidate_object_keys;
 }
 
+void ContentAddressedGC::rewriteSession(const std::string & session_key, const WriteSession & session)
+{
+    const std::string bytes = session.serialize();
+    auto out = object_storage->writeObject(StoredObject(session_key), WriteMode::Rewrite);
+    out->write(bytes.data(), bytes.size());
+    out->finalize();
+}
+
 size_t ContentAddressedGC::reapFoldedSessions(GcCompaction & compaction)
 {
     /// CA GC S4 (§5.1 rule 3, §7.3) — delete every COMMITTED write session whose `+` deltas are all folded
@@ -922,7 +939,43 @@ size_t ContentAddressedGC::reapFoldedSessions(GcCompaction & compaction)
                 continue;
             throw;
         }
-        const WriteSession session = WriteSession::deserialize(raw);
+        WriteSession session = WriteSession::deserialize(raw);
+
+        /// CA GC S4 (#2): a sticky session's `+` flush failed at commit — the ref is published but no `+` is
+        /// durable. Re-log the stored `+` delta(s) (idempotent by event_id), record their settled epochs, and
+        /// clear the sticky flag. The session then converts to a normal committed-until-folded session and is
+        /// reaped by the folded gate below on a later round. NEVER reap it while still sticky.
+        if (session.deltas_failed)
+        {
+            try
+            {
+                const std::vector<GcDelta> adds = deserializeGcDeltasFromSession(session.pending_add_delta);
+                if (!adds.empty())
+                {
+                    GcLogWriter relog_writer(object_storage, key_prefix);
+                    std::vector<std::pair<ShardId, uint64_t>> settled;
+                    for (const auto & add : adds)
+                    {
+                        const auto part_settled = relog_writer.appendAndFlushForCommit(add);
+                        settled.insert(settled.end(), part_settled.begin(), part_settled.end());
+                    }
+                    relog_writer.flushAll();
+                    session.delta_epochs = std::move(settled);
+                }
+                /// The re-log landed durably: drop sticky. Persist the converted session so a crash after this
+                /// point sees a normal committed session, not a sticky one.
+                session.deltas_failed = false;
+                session.pending_add_delta.clear();
+                rewriteSession(key, session);
+            }
+            catch (...)
+            {
+                /// The re-log failed again (still-throttled S3): keep the session sticky for the next round.
+                tryLogCurrentException(getLogger("ContentAddressedGC"),
+                    "CA GC S4 (#2): sticky-session + re-log failed; session kept for the next round");
+            }
+            continue; /// never reap a session on the same round it converts — re-check foldedness next round.
+        }
 
         /// Rule (a): not committed -> NOT reaped here (the owner/lease handles it). The pin must outlive an
         /// in-flight upload.

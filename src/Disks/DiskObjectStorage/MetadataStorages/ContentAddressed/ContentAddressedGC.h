@@ -19,6 +19,7 @@ namespace DB::ContentAddressed
 {
 
 class GcCompaction;
+struct WriteSession;
 
 /// The whole garbage-collection concern for a content-addressed pool lives here: the pure
 /// reachability/sweep algorithms, the pool enumeration primitives, the un-wired refcount seam, and
@@ -328,6 +329,11 @@ private:
     /// delta epoch is provably folded. A session raised AFTER the LIST is simply not seen this round (it is
     /// reaped a later round once folded). So it can never delete a just-created or unfolded session.
     size_t reapFoldedSessions(GcCompaction & compaction);
+
+    /// CA GC S4 (#2): persist a (possibly mutated) write session back to its key with a plain Rewrite PUT.
+    /// Used by the sticky-session conversion in `reapFoldedSessions` to clear the sticky flag durably after
+    /// the bounded `+` re-log lands, so a crash thereafter sees a normal committed session, not a sticky one.
+    void rewriteSession(const std::string & session_key, const WriteSession & session);
 
     /// The bounded reconciliation policy (§9 "orphan-drift bound"): true iff the heavy reconciliation scan
     /// is due this round — every `reconciliation_cadence_rounds` rounds (a cadence knob), so orphan drift
