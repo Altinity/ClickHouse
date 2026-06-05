@@ -151,6 +151,10 @@ public:
     /// transaction by object-storage disk transactions; default (e.g. local disk) is no in-flight directory
     /// visibility, so a reader falls through to the committed path.
     virtual bool hasInFlightDirectory(const std::string & /*path*/) const { return false; }
+    /// In-flight read-your-writes directory ENUMERATION: the immediate-child names this transaction has
+    /// STAGED directly under `path` (one level, the directory prefix stripped). Forwarded to the metadata
+    /// transaction; default (e.g. local disk) is empty.
+    virtual std::vector<std::string> listInFlightDirectory(const std::string & /*path*/) const { return {}; }
 };
 
 using DiskTransactionPtr = std::shared_ptr<IDiskTransaction>;

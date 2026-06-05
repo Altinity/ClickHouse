@@ -204,6 +204,12 @@ public:
     // not a part-relative file/dir (empty `p->file`).
     bool hasInFlightDirectory(const std::string & path) const override;
 
+    // B59 read-your-writes directory ENUMERATION: the immediate-child names this transaction has STAGED
+    // directly under the directory `path` (one level, the directory prefix stripped). Used by
+    // DataPartStorageOnDiskFull::iterate so loadProjections' withPartFormatFromDisk can find the staged
+    // projection's mark file (which determines the part format) before the whole-part commit.
+    std::vector<std::string> listInFlightDirectory(const std::string & path) const override;
+
     void createMetadataFile(const std::string & path, const StoredObjects & objects) override;
 
     // Open a write buffer for a file.

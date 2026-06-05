@@ -1206,70 +1206,6 @@ static void processStatisticsChanges(
     }
 }
 
-/// Register a carried-forward projection in the mutated part's in-memory state.
-///
-/// On a content-addressed disk a projection's files are hardlinked into the new (parent) part's still-open
-/// whole-part transaction, so they are not yet visible on the committed metadata that `loadProjections`
-/// probes via `existsDirectory` during finalize — the projection would only resurface after the next part
-/// reload (B58). On a normal disk the hardlinked directory is visible immediately, so `loadProjections`
-/// registers it and this is unnecessary. To keep the CA path equivalent, register the projection directly
-/// from the source part's already-loaded projection part (its committed, readable state), mirroring what
-/// `loadProjections` would have done. CA-only; never touches the non-CA path.
-void registerCarriedForwardProjectionForCA(
-    const MergeTreeDataPartPtr & source_part,
-    const MergeTreeData::MutableDataPartPtr & new_data_part,
-    const String & projection_dir_name)
-{
-    if (!new_data_part->getDataPartStorage().isContentAddressed())
-        return;
-    if (!projection_dir_name.ends_with(".proj"))
-        return;
-
-    const String projection_name = projection_dir_name.substr(0, projection_dir_name.size() - strlen(".proj"));
-    if (new_data_part->hasProjection(projection_name))
-        return;
-
-    auto src_it = source_part->getProjectionParts().find(projection_name);
-    if (src_it == source_part->getProjectionParts().end())
-        return;
-    const auto & src_projection_part = src_it->second;
-
-    const auto metadata_snapshot = source_part->storage.getInMemoryMetadataPtr(source_part->storage.getContext(), false);
-    if (!metadata_snapshot->projections.has(projection_name))
-        return;
-    const auto & projection_desc = metadata_snapshot->projections.get(projection_name);
-
-    /// Take the part format from the SOURCE projection part (committed, readable) rather than probing the
-    /// still-uncommitted destination on disk via `withPartFormatFromDisk`.
-    auto projection_part = new_data_part->getProjectionPartBuilder(projection_name, &projection_desc)
-                               .withPartType(src_projection_part->getType())
-                               .build();
-    projection_part->setColumns(
-        src_projection_part->getColumns(),
-        src_projection_part->getSerializationInfos(),
-        src_projection_part->getMetadataVersion());
-    projection_part->setColumnsSubstreams(src_projection_part->getColumnsSubstreams());
-    projection_part->checksums = src_projection_part->checksums;
-
-    /// The carried-forward projection is byte-identical to the source (its files are hardlinked into this
-    /// part's transaction), and on a content-addressed disk those files are not yet committed, so we cannot
-    /// reload index/granularity/rows from disk here (B58). `loadColumnsChecksumsIndexes` would load them on a
-    /// normal disk; here we copy the SOURCE projection part's already-loaded read-time state instead. Without
-    /// this the registered projection part has rows_count == 0 and an empty index granularity, so a
-    /// projection-served SELECT reads back NOTHING from it — silently dropping this part's rows from the
-    /// aggregate (B63). The source projection part is fully loaded and points at the same content.
-    projection_part->rows_count = src_projection_part->rows_count;
-    projection_part->index_granularity = src_projection_part->index_granularity;
-    projection_part->setBytesOnDisk(src_projection_part->getBytesOnDisk());
-    projection_part->setBytesUncompressedOnDisk(src_projection_part->getBytesUncompressedOnDisk());
-    if (src_projection_part->getMinMaxIndex())
-        projection_part->setMinMaxIndex(std::make_shared<IMergeTreeDataPart::MinMaxIndex>(*src_projection_part->getMinMaxIndex()));
-    if (auto src_index = src_projection_part->getIndex())
-        projection_part->setIndex(*src_index);
-
-    new_data_part->addProjectionPart(projection_name, std::move(projection_part));
-}
-
 /// Initialize and write to disk new part fields like checksums, columns, etc.
 void finalizeMutatedPart(
     const MergeTreeDataPartPtr & source_part,
@@ -2047,8 +1983,6 @@ private:
                     auto file_name_with_projection_prefix = fs::path(projection_data_part_storage_src->getPartDirectory()) / p_it->name();
                     hardlinked_files.insert(file_name_with_projection_prefix);
                 }
-
-                MutationHelpers::registerCarriedForwardProjectionForCA(ctx->source_part, ctx->new_data_part, it->name());
             }
         }
 
@@ -2354,8 +2288,6 @@ private:
                         hardlinked_files.insert(file_name_with_projection_prefix);
                     }
                 }
-
-                MutationHelpers::registerCarriedForwardProjectionForCA(ctx->source_part, ctx->new_data_part, destination);
             }
         }
 

@@ -4105,6 +4105,47 @@ TEST_F(ContentAddressedMetaTest, InFlightDirectoryReadYourWritesBeforeCommit)
     EXPECT_TRUE(ms->existsDirectory(proj_dir)); // now committed
 }
 
+// B59 (directory enumeration): a CA part-build transaction must enumerate the IMMEDIATE children it has
+// STAGED under a directory before commit. loadProjections -> withPartFormatFromDisk iterates the staged
+// projection directory to find the mark file (.cmrk4) that determines the part format; without a staged
+// listing the iteration is empty and the projection part is registered with rows_count == 0 (B63).
+// listInFlightDirectory returns the immediate-child names staged under the directory (the directory
+// prefix stripped, one level only), so the iterator sees exactly the projection's inner files.
+TEST_F(ContentAddressedMetaTest, ListInFlightDirectoryBeforeCommit)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_list_inflight_dir");
+    const std::string uuid = "uuid-list-inflight-dir";
+    const std::string part = "all_1_1_0";
+    const std::string proj_dir = "uui/" + uuid + "/" + part + "/p.proj";
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    for (const auto & name : {"columns.txt", "count.txt", "data.bin", "data.cmrk4"})
+    {
+        auto buf = tx.writeFile(proj_dir + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = std::string("X-") + name;
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    // Before commit, the committed listing is empty but the transaction enumerates its staged children.
+    auto staged = tx.listInFlightDirectory(proj_dir);
+    std::set<std::string> got(staged.begin(), staged.end());
+    EXPECT_EQ(got, (std::set<std::string>{"columns.txt", "count.txt", "data.bin", "data.cmrk4"}));
+    // Only the IMMEDIATE children are returned (one level), not deeper-nested paths.
+    {
+        auto buf = tx.writeFile(proj_dir + "/sub/deep.bin", 4096, DB::WriteMode::Rewrite, {});
+        buf->write("d", 1);
+        buf->finalize();
+    }
+    staged = tx.listInFlightDirectory(proj_dir);
+    got = std::set<std::string>(staged.begin(), staged.end());
+    EXPECT_TRUE(got.contains("sub"));          // the nested dir surfaces as a single child component
+    EXPECT_FALSE(got.contains("sub/deep.bin")); // not the full nested path
+    // A directory the transaction never staged anything under → empty.
+    EXPECT_TRUE(tx.listInFlightDirectory("uui/" + uuid + "/" + part + "/absent.proj").empty());
+    tx.commit(DB::NoCommitOptions{});
+}
+
 // FREEZE path: writing a FREEZE target (shadow/<backup>/…) must publish the ref at the shadow/ key,
 // not at the live store/.../refs/ location. The live ref must be completely unchanged; the shadow ref
 // and the live ref resolve to the SAME part_id (content-only id is identical for identical bytes) but

@@ -286,6 +286,33 @@ bool ContentAddressedTransaction::hasInFlightDirectory(const std::string & path)
     return under(st->recorded) || under(st->recorded_mutable);
 }
 
+std::vector<std::string> ContentAddressedTransaction::listInFlightDirectory(const std::string & path) const
+{
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (!p || p->file.empty())
+        return {};
+    const auto * st = findStaging(p->table_uuid, p->part_name);
+    if (!st)
+        return {};
+    const std::string prefix = p->file + "/";
+    std::set<std::string> children;
+    auto collect = [&](const auto & m)
+    {
+        for (auto it = m.lower_bound(prefix); it != m.end() && it->first.starts_with(prefix); ++it)
+        {
+            // The immediate child is the single path component following the prefix; a deeper-nested file
+            // surfaces only as its first component (a sub-directory name), one level only.
+            std::string_view rest(it->first);
+            rest.remove_prefix(prefix.size());
+            auto slash = rest.find('/');
+            children.emplace(slash == std::string_view::npos ? std::string(rest) : std::string(rest.substr(0, slash)));
+        }
+    };
+    collect(st->recorded);
+    collect(st->recorded_mutable);
+    return {children.begin(), children.end()};
+}
+
 std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     const std::string & path,
     size_t buf_size,

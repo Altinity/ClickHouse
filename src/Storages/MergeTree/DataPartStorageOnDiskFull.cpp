@@ -10,6 +10,9 @@
 #include <Interpreters/Context.h>
 #include <Common/typeid_cast.h>
 
+#include <set>
+#include <vector>
+
 namespace DB
 {
 
@@ -47,7 +50,13 @@ DataPartStoragePtr DataPartStorageOnDiskFull::getProjection(const std::string & 
 
 bool DataPartStorageOnDiskFull::exists() const
 {
-    return volume->getDisk()->existsDirectory(fs::path(root_path) / part_dir);
+    auto path = fs::path(root_path) / part_dir;
+    /// CA read-your-writes: a part dir being assembled by this transaction (e.g. a carried-forward
+    /// projection dir staged into the open whole-part txn) is not on committed metadata yet. Mirrors
+    /// existsDirectory at directory granularity for the part's OWN directory.
+    if (transaction && transaction->hasInFlightDirectory(path))
+        return true;
+    return volume->getDisk()->existsDirectory(path);
 }
 
 bool DataPartStorageOnDiskFull::existsFile(const std::string & name) const
@@ -90,11 +99,52 @@ private:
     DirectoryIteratorPtr it;
 };
 
+/// CA read-your-writes directory enumeration: a merged view of the committed disk entries PLUS the
+/// immediate children this transaction has STAGED under the part dir (deduplicated). Used so
+/// loadProjections' withPartFormatFromDisk can iterate a staged-but-uncommitted projection directory and
+/// find its mark file. Mirrors existsFile/existsDirectory (B59) at the enumeration level; the committed
+/// entries dominate (a name present both on disk and staged appears once).
+class DataPartStorageMergedIterator final : public IDataPartStorageIterator
+{
+public:
+    DataPartStorageMergedIterator(DiskPtr disk_, std::string dir_path_, std::vector<std::string> names_)
+        : disk(std::move(disk_)), dir_path(std::move(dir_path_)), names(std::move(names_))
+    {
+    }
+
+    void next() override { ++pos; }
+    bool isValid() const override { return pos < names.size(); }
+    std::string name() const override { return names[pos]; }
+    std::string path() const override { return fs::path(dir_path) / names[pos]; }
+    bool isFile() const override { return isValid() && disk->existsFile(path()); }
+
+private:
+    DiskPtr disk;
+    std::string dir_path;
+    std::vector<std::string> names;
+    size_t pos = 0;
+};
+
 DataPartStorageIteratorPtr DataPartStorageOnDiskFull::iterate() const
 {
+    auto dir_path = fs::path(root_path) / part_dir;
+    if (transaction)
+    {
+        if (auto staged = transaction->listInFlightDirectory(dir_path); !staged.empty())
+        {
+            /// Union the committed entries with the staged children (set semantics, committed dominates).
+            std::set<std::string> names(staged.begin(), staged.end());
+            if (volume->getDisk()->existsDirectory(dir_path))
+                for (auto it = volume->getDisk()->iterateDirectory(dir_path); it->isValid(); it->next())
+                    names.insert(it->name());
+            return std::make_unique<DataPartStorageMergedIterator>(
+                volume->getDisk(), dir_path, std::vector<std::string>(names.begin(), names.end()));
+        }
+    }
+
     return std::make_unique<DataPartStorageIteratorOnDisk>(
         volume->getDisk(),
-        volume->getDisk()->iterateDirectory(fs::path(root_path) / part_dir));
+        volume->getDisk()->iterateDirectory(dir_path));
 }
 
 Poco::Timestamp DataPartStorageOnDiskFull::getFileLastModified(const String & file_name) const

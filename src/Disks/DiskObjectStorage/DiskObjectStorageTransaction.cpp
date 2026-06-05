@@ -471,6 +471,21 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
 
 void DiskObjectStorageTransaction::createHardLink(const std::string & src_path, const std::string & dst_path)
 {
+    /// CA read-your-writes: a content-addressed transaction stages a hardlinked file into its per-part
+    /// `recorded` map so a reader holding the transaction can resolve it before commit — exactly as
+    /// `writeFile` stages eagerly (it has no `operations_to_execute` entry; commit publishes from the
+    /// staging). A carried-forward projection is hardlinked into the open whole-part transaction during a
+    /// mutation, and `loadProjections` (which runs in the SAME finalize, before commit) must see it via
+    /// the directory overlay. Deferring the hardlink to commit replay (the default below) would hide it
+    /// until after `loadProjections` ran, so the carried projection registered empty (B58/B63). The
+    /// metadata-level `createHardLink` is a map assignment (idempotent), so staging it eagerly and NOT
+    /// queuing it is equivalent to the queued replay — commit publishes the manifest from the staging.
+    if (metadata_storage->isContentAddressed())
+    {
+        metadata_transaction->createHardLink(src_path, dst_path);
+        return;
+    }
+
     operations_to_execute.push_back([src_path, dst_path](MetadataTransactionPtr tx)
     {
         tx->createHardLink(src_path, dst_path);
@@ -496,6 +511,11 @@ std::optional<uint64_t> DiskObjectStorageTransaction::tryGetInFlightFileSize(con
 bool DiskObjectStorageTransaction::hasInFlightDirectory(const std::string & path) const
 {
     return metadata_transaction->hasInFlightDirectory(path);
+}
+
+std::vector<std::string> DiskObjectStorageTransaction::listInFlightDirectory(const std::string & path) const
+{
+    return metadata_transaction->listInFlightDirectory(path);
 }
 
 void DiskObjectStorageTransaction::setReadOnly(const std::string & path)

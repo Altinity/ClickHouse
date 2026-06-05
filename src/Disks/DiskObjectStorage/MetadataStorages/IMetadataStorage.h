@@ -153,6 +153,9 @@ public:
     /// file under `path` for `path`'s part. Used so a carried-forward projection dir is visible to
     /// loadProjections during finalize. Default: no in-flight directory visibility.
     virtual bool hasInFlightDirectory(const std::string & /*path*/) const { return false; }
+    /// Immediate-child names staged directly under `path` (one level). Used so loadProjections'
+    /// withPartFormatFromDisk can iterate a staged projection dir to find its mark file. Default: empty.
+    virtual std::vector<std::string> listInFlightDirectory(const std::string & /*path*/) const { return {}; }
 
     virtual ~IMetadataTransaction() = default;
 
