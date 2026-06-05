@@ -112,8 +112,25 @@ ContentAddressedMetadataStorage::relinkPin(const ContentAddressed::PartId & part
     /// lost part. So we open a durable WriteSession seeded with the EXISTING part's blob hash set (read
     /// from parts/<part_id>) and persist it BEFORE trusting the source: from now until release, a remote
     /// sweep treats every listed hash as reachable (sessionPinnedBlobs), closing the window.
-    const std::string manifest_key = ContentAddressed::partKey(storage_path_prefix, part_id).string();
-    auto manifest_bytes = readSmallObjectIfExists(manifest_key);
+    /// CA GC S3: resolve the manifest generation (§6.1). Try the cache-fronted (g=0) key first; on a 404
+    /// LIST the part_id directory for any present generation. A part_id with NO present generation is
+    /// genuinely absent (relink not possible) — distinguished from a present-but-corrupt manifest (throws).
+    auto manifest_bytes = readSmallObjectIfExists(resolvePartGenKeyForRead(part_id).string());
+    if (!manifest_bytes)
+    {
+        RelativePathsWithMetadata gen_objects;
+        object_storage->listObjects(ContentAddressed::partGenPrefix(storage_path_prefix, part_id), gen_objects, 0);
+        std::optional<uint64_t> best;
+        for (const auto & elem : gen_objects)
+        {
+            bool is_tombstone = false;
+            if (auto gen = ContentAddressed::parseGenFromKey(elem->relative_path, is_tombstone); gen && !is_tombstone)
+                if (!best || *gen > *best)
+                    best = *gen;
+        }
+        if (best)
+            manifest_bytes = readSmallObjectIfExists(ContentAddressed::partGenKey(storage_path_prefix, part_id, *best).string());
+    }
     if (!manifest_bytes)
         /// The part_id this server was asked to relink does not exist in the pool: relink not possible.
         /// Publish NOTHING; the caller falls back to a byte fetch. (A present-but-corrupt manifest throws
@@ -162,15 +179,49 @@ bool ContentAddressedMetadataStorage::relinkRevalidate(const ContentAddressed::P
     /// blob it names is present. A missing manifest or blob means the relink is not possible: return
     /// false so the caller releases the pin and falls back to a byte fetch — a ref must NEVER be
     /// published to a missing blob (that would be a dangling ref / data loss).
-    auto manifest_bytes = readSmallObjectIfExists(ContentAddressed::partKey(storage_path_prefix, part_id).string());
+    /// CA GC S3: resolve the manifest generation, then check each blob is present at SOME generation
+    /// (§6.1/§9). The relink only needs SOME present generation of each blob (byte-identical — I7c); a
+    /// resurrected blob at g>0 is just as valid as g=0. The cache-fronted key is tried first (one HEAD in
+    /// the common g=0 case); a 404 falls back to a LIST of the blob's generation directory.
+    auto manifest_bytes = readSmallObjectIfExists(resolvePartGenKeyForRead(part_id).string());
+    if (!manifest_bytes)
+    {
+        RelativePathsWithMetadata gen_objects;
+        object_storage->listObjects(ContentAddressed::partGenPrefix(storage_path_prefix, part_id), gen_objects, 0);
+        std::optional<uint64_t> best;
+        for (const auto & elem : gen_objects)
+        {
+            bool is_tombstone = false;
+            if (auto gen = ContentAddressed::parseGenFromKey(elem->relative_path, is_tombstone); gen && !is_tombstone)
+                if (!best || *gen > *best)
+                    best = *gen;
+        }
+        if (best)
+            manifest_bytes = readSmallObjectIfExists(ContentAddressed::partGenKey(storage_path_prefix, part_id, *best).string());
+    }
     if (!manifest_bytes)
         return false;
 
     const ContentAddressed::PartManifest manifest = ContentAddressed::PartManifest::deserialize(*manifest_bytes);
     for (const auto & [file, entry] : manifest.blobs)
     {
-        const std::string blob_key = ContentAddressed::blobKey(storage_path_prefix, entry.key).string();
-        if (!object_storage->tryGetObjectMetadata(blob_key, /*with_tags=*/false).has_value())
+        /// Present at the cache-fronted (g=0) key? Common case: one HEAD, done.
+        if (object_storage->tryGetObjectMetadata(resolveBlobGenKeyForRead(entry.key).string(), /*with_tags=*/false).has_value())
+            continue;
+        /// 404 → does ANY present generation of this blob exist?
+        RelativePathsWithMetadata blob_objects;
+        object_storage->listObjects(ContentAddressed::blobGenPrefix(storage_path_prefix, entry.key), blob_objects, 0);
+        bool any_present = false;
+        for (const auto & elem : blob_objects)
+        {
+            bool is_tombstone = false;
+            if (auto gen = ContentAddressed::parseGenFromKey(elem->relative_path, is_tombstone); gen && !is_tombstone)
+            {
+                any_present = true;
+                break;
+            }
+        }
+        if (!any_present)
             return false;
     }
     return true;
@@ -303,6 +354,118 @@ std::optional<std::string> ContentAddressedMetadataStorage::readSmallObjectIfExi
     return content;
 }
 
+ContentAddressed::BlobObjectKey ContentAddressedMetadataStorage::resolveBlobGenKeyForRead(const ContentAddressed::BlobHash & blob_hash) const
+{
+    /// Cache hit: a previous read resolved a resurrected (g>0) generation. Return its key directly — no
+    /// `active` read, no LIST. (The common g=0 content is never cached, so this lookup misses then.)
+    {
+        std::lock_guard lock(gen_cache_mutex);
+        if (auto it = blob_gen_cache.find(blob_hash); it != blob_gen_cache.end())
+            return ContentAddressed::blobGenKey(storage_path_prefix, blob_hash, it->second);
+    }
+    /// Cache miss: default to g=0 with NO probe (§12.4 — the steady read is exactly one GET downstream).
+    /// A genuine 404 on this key is repaired by `repairBlobGenOn404`.
+    return ContentAddressed::blobGenKey(storage_path_prefix, blob_hash, 0);
+}
+
+ContentAddressed::PartObjectKey ContentAddressedMetadataStorage::resolvePartGenKeyForRead(const ContentAddressed::PartId & part_id) const
+{
+    {
+        std::lock_guard lock(gen_cache_mutex);
+        if (auto it = part_gen_cache.find(part_id); it != part_gen_cache.end())
+            return ContentAddressed::partGenKey(storage_path_prefix, part_id, it->second);
+    }
+    return ContentAddressed::partGenKey(storage_path_prefix, part_id, 0);
+}
+
+ContentAddressed::BlobObjectKey ContentAddressedMetadataStorage::repairBlobGenOn404(const ContentAddressed::BlobHash & blob_hash) const
+{
+    /// §6.1 reader fallback: the resolved generation 404'd. LIST every generation of H, pick the HIGHEST
+    /// PRESENT generation (all generations of H are byte-identical — I7c, so any present one is correct;
+    /// the highest is the current attachable one). A `<g>.tombstone` is IGNORED here — the tombstone gates
+    /// attachment, not reads (§6.1); only the absence of a present `<g>` object matters. If NO present
+    /// generation exists, a committed reference points at content with no surviving blob (I7b violated) —
+    /// fail closed.
+    RelativePathsWithMetadata objects;
+    object_storage->listObjects(ContentAddressed::blobGenPrefix(storage_path_prefix, blob_hash), objects, 0);
+    std::optional<uint64_t> best;
+    for (const auto & elem : objects)
+    {
+        bool is_tombstone = false;
+        auto gen = ContentAddressed::parseGenFromKey(elem->relative_path, is_tombstone);
+        if (!gen || is_tombstone) /// skip the `active` hint and the GC-owned tombstones (do not block reads)
+            continue;
+        if (!best || *gen > *best)
+            best = *gen;
+    }
+    if (!best)
+        throw Exception(
+            ErrorCodes::CORRUPTED_DATA,
+            "ContentAddressed: no present generation for blob {} (a committed ref points at missing content)",
+            blob_hash.string());
+
+    /// Opportunistically repair the best-effort `active` hint (a plain PUT, NOT a CAS — G4/I7d) so a future
+    /// reader resolves the present generation without a LIST. A failure to repair is non-fatal: the next
+    /// reader simply falls back again. Cache the resolved generation on this node so this read does not
+    /// re-pay the LIST.
+    try
+    {
+        const std::string active_key = ContentAddressed::blobActiveKey(storage_path_prefix, blob_hash);
+        const std::string bytes = std::to_string(*best);
+        auto out = object_storage->writeObject(StoredObject(active_key), WriteMode::Rewrite);
+        out->write(bytes.data(), bytes.size());
+        out->finalize();
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+        /// Best-effort hint repair — never fatal.
+    }
+    {
+        std::lock_guard lock(gen_cache_mutex);
+        blob_gen_cache[blob_hash] = *best;
+    }
+    return ContentAddressed::blobGenKey(storage_path_prefix, blob_hash, *best);
+}
+
+ContentAddressed::PartObjectKey ContentAddressedMetadataStorage::repairPartGenOn404(const ContentAddressed::PartId & part_id) const
+{
+    /// Symmetric to repairBlobGenOn404 for the manifest generation (§6.1, §9).
+    RelativePathsWithMetadata objects;
+    object_storage->listObjects(ContentAddressed::partGenPrefix(storage_path_prefix, part_id), objects, 0);
+    std::optional<uint64_t> best;
+    for (const auto & elem : objects)
+    {
+        bool is_tombstone = false;
+        auto gen = ContentAddressed::parseGenFromKey(elem->relative_path, is_tombstone);
+        if (!gen || is_tombstone)
+            continue;
+        if (!best || *gen > *best)
+            best = *gen;
+    }
+    if (!best)
+        throw Exception(
+            ErrorCodes::CORRUPTED_DATA,
+            "ContentAddressed: no present generation for manifest {} (a live ref points at missing manifest)",
+            part_id.string());
+
+    try
+    {
+        const std::string active_key = ContentAddressed::partActiveKey(storage_path_prefix, part_id);
+        const std::string bytes = std::to_string(*best);
+        auto out = object_storage->writeObject(StoredObject(active_key), WriteMode::Rewrite);
+        out->write(bytes.data(), bytes.size());
+        out->finalize();
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+    }
+    {
+        std::lock_guard lock(gen_cache_mutex);
+        part_gen_cache[part_id] = *best;
+    }
+    return ContentAddressed::partGenKey(storage_path_prefix, part_id, *best);
+}
+
 std::optional<ContentAddressed::PartId> ContentAddressedMetadataStorage::readRefPartId(const std::string & table_uuid, const std::string & part_name) const
 {
     auto payload = readSmallObjectIfExists(ContentAddressed::refKey(storage_path_prefix, server_id, table_uuid, part_name).string());
@@ -326,12 +489,22 @@ std::optional<ContentAddressed::PartId> ContentAddressedMetadataStorage::getPart
 
 ContentAddressed::PartManifest ContentAddressedMetadataStorage::loadPartManifestOrThrow(const ContentAddressed::PartId & part_id) const
 {
-    auto bytes = readSmallObjectIfExists(ContentAddressed::partKey(storage_path_prefix, part_id).string());
+    /// CA GC S3: resolve the manifest GENERATION (spec §6.1). The common case is the cache-fronted g=0 key
+    /// (one HEAD+GET, no `active` read). On a genuine 404 (the resolved generation is absent — a resurrected
+    /// manifest, or a stale cache after a sweep) fall back to LIST+pick-highest+repair-`active`. The
+    /// tombstone never blocks the read; only a 404 triggers fallback.
+    const std::string resolved_key = resolvePartGenKeyForRead(part_id).string();
+    auto bytes = readSmallObjectIfExists(resolved_key);
     if (!bytes)
-        throw Exception(
-            ErrorCodes::CORRUPTED_DATA,
-            "ContentAddressed: live ref points at missing manifest parts/{}",
-            part_id.string());
+    {
+        const std::string present_key = repairPartGenOn404(part_id).string();
+        bytes = readSmallObjectIfExists(present_key);
+        if (!bytes)
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "ContentAddressed: live ref points at missing manifest parts/{}",
+                part_id.string());
+    }
     return ContentAddressed::PartManifest::deserialize(*bytes);
 }
 
@@ -630,7 +803,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto pid = readShadowRefPartId(p->shadow_table_dir, p->part_name);
         if (!pid)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no shadow ref for {}", path);
-        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(storage_path_prefix, *pid).string(), /*with_tags=*/false);
+        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyForRead(*pid).string(), /*with_tags=*/false);
         return metadata.last_modified;
     }
 
@@ -642,7 +815,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto pid = readRefPartId(p->table_uuid, p->part_name);
         if (!pid)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(storage_path_prefix, *pid).string(), /*with_tags=*/false);
+        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyForRead(*pid).string(), /*with_tags=*/false);
         return metadata.last_modified;
     }
 
@@ -659,7 +832,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto pid = readRefPartId(p->table_uuid, p->part_name);
         if (!pid)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(storage_path_prefix, *pid).string(), /*with_tags=*/false);
+        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyForRead(*pid).string(), /*with_tags=*/false);
         return metadata.last_modified;
     }
 
@@ -677,7 +850,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto pid = readRefPartId(p->table_uuid, p->part_name);
         if (!pid)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(storage_path_prefix, *pid).string(), /*with_tags=*/false);
+        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyForRead(*pid).string(), /*with_tags=*/false);
         return metadata.last_modified;
     }
 
@@ -967,7 +1140,7 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         if (it == manifest.blobs.end())
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in shadow manifest of {}", p->file, path);
         const auto & e = it->second;
-        return {StoredObject(ContentAddressed::blobKey(storage_path_prefix, e.key).string(), path, e.size)};
+        return {StoredObject(resolveBlobGenKeyForRead(e.key).string(), path, e.size)};
     }
 
     /// Mutable per-part file: resolve to its OWN per-file sidecar object, whose bytes are EXACTLY this
@@ -993,9 +1166,10 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     const auto & e = it->second;
     /// Resolve under the same common key prefix used on the write side (single source of truth:
     /// storage_path_prefix), so blobs are read from where ContentAddressedWriteBuffer stored them.
-    /// e.key is the BARE BlobHash; blobKey projects it to the full BlobObjectKey, .string() at the
-    /// object-storage boundary.
-    return {StoredObject(ContentAddressed::blobKey(storage_path_prefix, e.key).string(), path, e.size)};
+    /// e.key is the BARE BlobHash; resolveBlobGenKeyForRead projects it to the full generationed
+    /// BlobObjectKey (cache-fronted; g=0 in the common case — one GET downstream), .string() at the
+    /// object-storage boundary. The downstream GET's 404 fallback is repairBlobGenOn404 (§6.1).
+    return {StoredObject(resolveBlobGenKeyForRead(e.key).string(), path, e.size)};
 }
 
 }

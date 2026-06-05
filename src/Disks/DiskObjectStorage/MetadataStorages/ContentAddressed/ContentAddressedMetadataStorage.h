@@ -13,6 +13,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace DB
@@ -213,6 +214,26 @@ private:
     // Read a small object (ref/manifest) into a string. Returns nullopt if the object is absent.
     std::optional<std::string> readSmallObjectIfExists(const std::string & key) const;
 
+    // ==== CA GC S3: generation resolution on the read path (spec §6.1) ====
+    //
+    // Resolve a blob hash H (resp. a part_id) to the full GENERATION object key the reader should GET. The
+    // common g=0 path is exactly ONE GET downstream (§12.4): the resolver defaults to g=0 WITHOUT reading
+    // `active` and WITHOUT a LIST. The on-node cache short-circuits a resurrected (g>0) content so it does
+    // not re-pay a round-trip per read. The 404→LIST fallback (`repairBlobGenOn404` / `repairPartGenOn404`)
+    // fires ONLY on a genuine miss: it LISTs the H/part_id directory, picks the highest present generation
+    // (byte-identical — I7c), opportunistically repairs the best-effort `active` hint (a plain PUT, no CAS —
+    // G4/I7d), caches the resolved generation, and returns the present key. A tombstone NEVER blocks a read
+    // (§6.1): the resolver does not read the tombstone at all; only a 404 on the resolved object triggers
+    // fallback.
+    ContentAddressed::BlobObjectKey resolveBlobGenKeyForRead(const ContentAddressed::BlobHash & blob_hash) const;
+    ContentAddressed::PartObjectKey resolvePartGenKeyForRead(const ContentAddressed::PartId & part_id) const;
+
+    // The 404 fallback: LIST the H (resp. part_id) generation directory, pick the highest present
+    // generation, repair `active` (best-effort), cache it, and return its key. Throws CORRUPTED_DATA if NO
+    // present generation exists (a committed ref to content with no surviving blob/manifest — I7b violated).
+    ContentAddressed::BlobObjectKey repairBlobGenOn404(const ContentAddressed::BlobHash & blob_hash) const;
+    ContentAddressed::PartObjectKey repairPartGenOn404(const ContentAddressed::PartId & part_id) const;
+
     // Generic directory-child derivation (shared by the live table-dir listing and the shadow
     // intermediate/table-dir listing): list every object under `prefix`, strip `prefix`, and collect
     // the immediate child component of each. When `skip_ref_meta` is set, per-ref sidecars (.meta keys
@@ -255,6 +276,15 @@ private:
 
     /// Background pool garbage collector, present only on the disk-factory path (context non-null).
     ContentAddressedGCThreadPtr gc_thread;
+
+    /// CA GC S3 — the on-node resolved-generation cache (spec §6.1, §12.4). Maps a bare content hash H
+    /// (resp. a part_id) to the generation a previous read resolved via the 404→LIST fallback, so a
+    /// resurrected (g>0) content does not re-pay the LIST per read. The common g=0 content is NEVER cached
+    /// (the resolver defaults to 0 with no probe), so a steady g=0 read stays one GET and the cache is empty
+    /// in the common case. Guarded by `gen_cache_mutex`; `mutable` because the read path is const.
+    mutable std::mutex gen_cache_mutex;
+    mutable std::unordered_map<ContentAddressed::BlobHash, uint64_t> blob_gen_cache;
+    mutable std::unordered_map<ContentAddressed::PartId, uint64_t> part_gen_cache;
 };
 
 }
