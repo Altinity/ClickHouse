@@ -59,21 +59,30 @@ public:
         Part = 2, /// a part-manifest `(part_id)` edge — the candidate's full key is partKey(key_prefix, identity)
     };
 
+    /// CA GC S3 — the count key is now GENERATION-AWARE: `(kind, identity, generation)`. A `(H, g)` blob
+    /// and a `(H, g+1)` resurrected blob are byte-identical content but DISTINCT physical objects, so they
+    /// must be counted INDEPENDENTLY — a count-0 on `g` must never sweep `g+1` (and vice versa). The
+    /// generation is taken from the delta's resolved `pin_generations` / `manifest_generation` (default 0,
+    /// the common path). `identity` stays the bare content digest (the manifest still pins bare `H`), so a
+    /// g=0 CountKey is byte-equivalent to the S2 two-field key — the common path is unchanged.
     struct CountKey
     {
         KeyKind kind = KeyKind::Blob;
         std::string identity; /// the bare hex digest (BlobHash or PartId string)
+        uint64_t generation = 0; /// the resolved physical generation `g` (blob) / `mg` (manifest); 0 is common
 
         auto operator<=>(const CountKey &) const = default;
         bool operator==(const CountKey &) const = default;
     };
 
-    /// One emitted count-0 candidate: the unified key plus its FULL object key in the pool layout (the
-    /// caller compares this directly against the parts/ + blobs/ keyspace, exactly as the legacy scan did).
+    /// One emitted count-0 candidate: the unified key plus its FULL object key in the pool layout. In S3
+    /// the object key is the GENERATIONED key `blobGenKey(H, g)` / `partGenKey(part_id, mg)`, so the GC
+    /// state machine seals/sweeps exactly the physical object whose references netted to zero (never a
+    /// sibling generation). For a g=0 candidate this is byte-equivalent to the old `blobKey` / `partKey`.
     struct Candidate
     {
         CountKey key;
-        std::string object_key; /// blobKey(...).string() or partKey(...).string()
+        std::string object_key; /// blobGenKey(..., g).string() or partGenKey(..., mg).string()
     };
 
     /// The result of folding one shard's epoch.

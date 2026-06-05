@@ -38,10 +38,15 @@ namespace
 /// The snapshot run codec. MAGIC `CAGN` ("Content-Addressed Gc sNapshot") + version, on the shared
 /// LE/varint codec (cross-arch determinism, fail-closed on bad magic / unknown version — B19/B28). The
 /// body is a varint count of entries, then per entry: the kind byte, the identity (length-prefixed hex
-/// string), and a varint-zigzag count. The entries are written in sorted (kind, identity) order so the run
-/// is a sorted run by construction (the merge-join walks it in lockstep with the sorted deltas).
+/// string), the resolved GENERATION (varint), and a varint count. The entries are written in sorted
+/// (kind, identity, generation) order so the run is a sorted run by construction (the merge-join walks it
+/// in lockstep with the sorted deltas).
+///
+/// CA GC S3 (version 2) appends the per-entry resolved generation, so a g>0 (resurrected) key's running
+/// count survives across epochs INDEPENDENTLY of its g=0 sibling. A v3 pool is created fresh (PoolMeta v3,
+/// no back-compat), so no v1 snapshot can exist in it — reading only v2 is correct and fail-closed.
 constexpr FormatMagic kSnapMagic = makeMagic("CAGN");
-constexpr uint8_t kSnapVersion = 1;
+constexpr uint8_t kSnapVersion = 2;
 
 std::string serializeSnapshot(const std::map<GcCompaction::CountKey, int64_t> & counts)
 {
@@ -60,6 +65,7 @@ std::string serializeSnapshot(const std::map<GcCompaction::CountKey, int64_t> & 
             continue;
         writeBinaryLittleEndian(static_cast<uint8_t>(key.kind), buf);
         writeStringBinary(key.identity, buf);
+        writeVarUInt(key.generation, buf);
         writeVarUInt(static_cast<uint64_t>(count), buf);
     }
     buf.finalize();
@@ -83,6 +89,7 @@ std::map<GcCompaction::CountKey, int64_t> deserializeSnapshot(const std::string 
         GcCompaction::CountKey key;
         key.kind = static_cast<GcCompaction::KeyKind>(kind_raw);
         readStringBinary(key.identity, buf);
+        readVarUInt(key.generation, buf);
         uint64_t count = 0;
         readVarUInt(count, buf);
         counts.emplace(std::move(key), static_cast<int64_t>(count));
@@ -297,13 +304,21 @@ GcCompaction::CompactionResult GcCompaction::compactShard(ShardId shard, const s
 
     for (const auto & d : deltas)
     {
-        for (const auto & pin : d.pins)
-            apply(CountKey{KeyKind::Blob, pin.string()}, d.op, d.event_id);
+        /// CA GC S3: each pin is counted under its RESOLVED generation `g` (`pin_generations[i]`, parallel
+        /// to `pins`). An S2 delta (or any delta whose `pin_generations` is empty) takes every pin as g=0
+        /// — the common path. The generation is part of the count key, so `(H, g)` and `(H, g+1)` net
+        /// independently (a resurrected blob never sweeps its byte-identical predecessor and vice versa).
+        for (size_t i = 0; i < d.pins.size(); ++i)
+        {
+            const uint64_t g = (i < d.pin_generations.size()) ? d.pin_generations[i] : 0;
+            apply(CountKey{KeyKind::Blob, d.pins[i].string(), g}, d.op, d.event_id);
+        }
         /// The (part_id) edge — counted only in the part's home shard (the writer put it there). We are
         /// folding `shard`, so count it iff this is the part's home shard. (A foreign-shard delta fragment
         /// still serializes part_id, so this guard — not the absence of the field — is what scopes it.)
+        /// The manifest's resolved generation `mg` (`manifest_generation`, default 0) keys the part edge.
         if (GcLogWriter::shardForPartId(d.part_id) == shard)
-            apply(CountKey{KeyKind::Part, d.part_id.string()}, d.op, d.event_id);
+            apply(CountKey{KeyKind::Part, d.part_id.string(), d.manifest_generation}, d.op, d.event_id);
     }
 
     /// Streaming MERGE-JOIN: the snapshot base (sorted) and the folds (sorted) are both std::maps keyed by
@@ -331,9 +346,12 @@ GcCompaction::CompactionResult GcCompaction::compactShard(ShardId shard, const s
         {
             Candidate candidate;
             candidate.key = key;
+            /// CA GC S3: the candidate addresses the GENERATIONED physical object whose references netted
+            /// to zero — `blobGenKey(H, g)` / `partGenKey(part_id, mg)` — so the seal/sweep targets exactly
+            /// that object, never a sibling generation. For g=0 this equals the old `blobKey` / `partKey`.
             candidate.object_key = (key.kind == KeyKind::Blob)
-                ? blobKey(key_prefix, BlobHash(key.identity)).string()
-                : partKey(key_prefix, PartId(key.identity)).string();
+                ? blobGenKey(key_prefix, BlobHash(key.identity), key.generation).string()
+                : partGenKey(key_prefix, PartId(key.identity), key.generation).string();
             result.candidates.push_back(std::move(candidate));
             folded[key] = 0; /// recorded for the drift cross-check; NOT persisted (writeSnapshot drops <=0)
         }
@@ -433,10 +451,15 @@ std::optional<GcCompaction::RebuildResult> GcCompaction::rebuildFromSnapshotAndL
             continue; /// already folded into the snapshot.
         for (const auto & d : listAndDecodeDeltas(epoch, shard))
         {
-            for (const auto & pin : d.pins)
-                apply(CountKey{KeyKind::Blob, pin.string()}, d.op, d.event_id);
+            /// Generation-aware fold, identical to compactShard: each pin under its resolved generation
+            /// (default 0), the part edge under the resolved manifest generation (default 0).
+            for (size_t i = 0; i < d.pins.size(); ++i)
+            {
+                const uint64_t g = (i < d.pin_generations.size()) ? d.pin_generations[i] : 0;
+                apply(CountKey{KeyKind::Blob, d.pins[i].string(), g}, d.op, d.event_id);
+            }
             if (GcLogWriter::shardForPartId(d.part_id) == shard)
-                apply(CountKey{KeyKind::Part, d.part_id.string()}, d.op, d.event_id);
+                apply(CountKey{KeyKind::Part, d.part_id.string(), d.manifest_generation}, d.op, d.event_id);
         }
     }
 
@@ -455,8 +478,8 @@ std::optional<GcCompaction::RebuildResult> GcCompaction::rebuildFromSnapshotAndL
             Candidate candidate;
             candidate.key = it->first;
             candidate.object_key = (it->first.kind == KeyKind::Blob)
-                ? blobKey(key_prefix, BlobHash(it->first.identity)).string()
-                : partKey(key_prefix, PartId(it->first.identity)).string();
+                ? blobGenKey(key_prefix, BlobHash(it->first.identity), it->first.generation).string()
+                : partGenKey(key_prefix, PartId(it->first.identity), it->first.generation).string();
             result.candidates.push_back(std::move(candidate));
             it = counts.erase(it);
         }
