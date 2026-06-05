@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -152,6 +153,52 @@ std::string sessionKey(const std::string & key_prefix, const std::string & sessi
 std::string fencePrefix(const std::string & key_prefix);
 std::string fenceKey(const std::string & key_prefix, uint64_t n);
 std::string gcLockKey(const std::string & key_prefix);
+
+// ==== CA GC S2: log-structured, streaming GC layout (spec §4, §5) ====
+//
+// The reverse index (blob -> referrers) is log-structured like an LSM tree: a sorted SNAPSHOT run plus
+// a tail of small +/- DELTA objects appended on commit/drop, compacted per GC epoch. All three families
+// — the snapshot, the log, and (later) the leadership lease — are keyed by HASH-PREFIX SHARD from day
+// one, so a shard is the unit of leadership/epoch/compaction. The first implementation runs ONE worker
+// across all shards; running N workers (one per shard) is then a configuration flip, NOT a layout change.
+//
+// `ShardId` is the small integer derived from a content hash's prefix (shardForHash). `kGcShardCount` is
+// the SINGLE source of truth for the shard count — change it in one place and the whole layout follows.
+
+using ShardId = uint32_t;
+
+// The number of GC shards. A power of two so shardForHash can mask the top hash-prefix bits cheaply and
+// the partition is uniform. This is the one knob that turns "1 worker over N shards" into "N workers".
+inline constexpr ShardId kGcShardCount = 16;
+
+// Derive the GC shard for a content hash from its hash prefix (the high bits of H0). The hash is the
+// lowercase-hex content digest; the first hex nibbles are uniformly distributed, so mapping them onto
+// [0, kGcShardCount) gives a uniform, stable partition. A hash too short to carry a prefix (only the
+// short synthetic hashes used in unit tests) maps to shard 0 deterministically.
+ShardId shardForHash(const BlobHash & blob_hash);
+
+// Per-shard epoch counter object key: <key_prefix>/gc/current_epoch/<shard>. The epoch a writer
+// currently appends deltas under (per-shard, not global — §5.1 rule 1). A writer reads it (default 0 if
+// absent) to stamp its delta; the fenced shard leader closes the epoch by a plain fenced PUT of E+1
+// before folding. Single-writer-per-shard (the GC leader), so no CAS is needed.
+std::string gcCurrentEpochKey(const std::string & key_prefix, ShardId shard);
+
+// Per-(epoch, shard) delta-log PREFIX: <key_prefix>/gc/log/<epoch>.<shard>/. List this to enumerate the
+// epoch's coalesced delta objects for the fold. The epoch is NOT zero-padded here: the log prefix is
+// LISTed by exact (epoch, shard), never scanned in lexical order, so numeric formatting is sufficient.
+std::string gcLogPrefix(const std::string & key_prefix, uint64_t epoch, ShardId shard);
+
+// A single coalesced delta-log object key: <key_prefix>/gc/log/<epoch>.<shard>/<event_id>. One object
+// holds one group-commit batch of deltas; `event_id` is the batch's stable id (so a re-append into a
+// later epoch lands an idempotent, dedup-able object — §5.1). Typed (GcLogObjectKey) so a log key can
+// never be confused with a blob/part/ref key (B29).
+GcLogObjectKey gcLogEventKey(const std::string & key_prefix, uint64_t epoch, ShardId shard, const std::string & event_id);
+
+// Per-(epoch, shard) snapshot object key: <key_prefix>/gc/snap/<padded-epoch>.<shard>. The sorted
+// (H)->count run for the shard at this epoch. The epoch is ZERO-PADDED to a fixed width so a LEXICAL
+// LIST of the gc/snap prefix yields the snapshots in NUMERIC epoch order (the compaction picks the
+// latest by listing — without padding, "10" would sort before "2"). Typed (GcSnapObjectKey) per B29.
+GcSnapObjectKey gcSnapKey(const std::string & key_prefix, uint64_t epoch, ShardId shard);
 
 // Verbatim object key for a generic disk-level file: a path that is neither a part file nor a
 // table-level file (e.g. the server's startup access-check probe clickhouse_access_check_<uuid>

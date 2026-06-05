@@ -47,6 +47,12 @@ CONTENT_ADDRESSED_STRONG_STRING(RefObjectKey)
 /// The full per-ref sidecar object key <prefix>/store/<server>/<uuid>/refs/<part>.meta. It holds the
 /// part's mutable per-part files (RefSidecar); ref-scoped, removed with the ref, never the manifest.
 CONTENT_ADDRESSED_STRONG_STRING(RefMetaObjectKey)
+/// The full GC delta-log object key <prefix>/gc/log/<epoch>.<shard>/<event_id> (CA GC S2). A single
+/// coalesced log object holding `+`/`-` deltas; typed so it can never be confused with a blob/part/ref.
+CONTENT_ADDRESSED_STRONG_STRING(GcLogObjectKey)
+/// The full GC snapshot object key <prefix>/gc/snap/<padded-epoch>.<shard> (CA GC S2). The sorted
+/// (H)->count run; typed so it can never be confused with a blob/part/ref/log key.
+CONTENT_ADDRESSED_STRONG_STRING(GcSnapObjectKey)
 
 #undef CONTENT_ADDRESSED_STRONG_STRING
 
@@ -68,5 +74,7 @@ CONTENT_ADDRESSED_STRONG_STRING_HASH(PartId)
 CONTENT_ADDRESSED_STRONG_STRING_HASH(PartObjectKey)
 CONTENT_ADDRESSED_STRONG_STRING_HASH(RefObjectKey)
 CONTENT_ADDRESSED_STRONG_STRING_HASH(RefMetaObjectKey)
+CONTENT_ADDRESSED_STRONG_STRING_HASH(GcLogObjectKey)
+CONTENT_ADDRESSED_STRONG_STRING_HASH(GcSnapObjectKey)
 
 #undef CONTENT_ADDRESSED_STRONG_STRING_HASH

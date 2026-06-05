@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
+#include <algorithm>
 #include <vector>
 
 namespace DB::ContentAddressed
@@ -167,6 +168,66 @@ std::string fenceKey(const std::string & key_prefix, uint64_t n)
 std::string gcLockKey(const std::string & key_prefix)
 {
     return withPrefix(key_prefix, "gc.lock");
+}
+
+ShardId shardForHash(const BlobHash & blob_hash)
+{
+    /// Map the content hash's prefix uniformly onto [0, kGcShardCount). The hash is lowercase hex, so its
+    /// first nibbles are uniformly distributed; fold the leading hex digits into an integer and mask the
+    /// low log2(kGcShardCount) bits (kGcShardCount is a power of two). A hash too short to carry a prefix
+    /// (only the short synthetic hashes used in unit tests) deterministically lands in shard 0.
+    const std::string & h = blob_hash.string();
+    uint32_t acc = 0;
+    /// Two hex digits = one byte = 8 bits is ample for kGcShardCount up to 256; consume up to 4 digits so
+    /// the partition stays uniform if kGcShardCount grows. A non-hex character (defensive) contributes 0.
+    const size_t take = std::min<size_t>(h.size(), 4);
+    for (size_t i = 0; i < take; ++i)
+    {
+        const char c = h[i];
+        uint32_t nibble = 0;
+        if (c >= '0' && c <= '9')
+            nibble = static_cast<uint32_t>(c - '0');
+        else if (c >= 'a' && c <= 'f')
+            nibble = static_cast<uint32_t>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F')
+            nibble = static_cast<uint32_t>(c - 'A' + 10);
+        acc = (acc << 4) | nibble;
+    }
+    return static_cast<ShardId>(acc & (kGcShardCount - 1));
+}
+
+/// Zero-pad an epoch to a fixed width so a LEXICAL LIST of gc/snap sorts in NUMERIC epoch order. 20 digits
+/// covers the full uint64_t range, so no real epoch ever overflows the field and the lexical order is
+/// total over every representable epoch.
+static std::string paddedEpoch(uint64_t epoch)
+{
+    std::string s = std::to_string(epoch);
+    if (s.size() < 20)
+        s.insert(s.begin(), 20 - s.size(), '0');
+    return s;
+}
+
+std::string gcCurrentEpochKey(const std::string & key_prefix, ShardId shard)
+{
+    return withPrefix(key_prefix, "gc/current_epoch/" + std::to_string(shard));
+}
+
+std::string gcLogPrefix(const std::string & key_prefix, uint64_t epoch, ShardId shard)
+{
+    /// <key_prefix>/gc/log/<epoch>.<shard>/ — the LIST prefix for one epoch's coalesced delta objects.
+    /// The epoch is LISTed by exact (epoch, shard), never scanned in lexical order, so it is not padded.
+    return withPrefix(key_prefix, "gc/log/" + std::to_string(epoch) + "." + std::to_string(shard) + "/");
+}
+
+GcLogObjectKey gcLogEventKey(const std::string & key_prefix, uint64_t epoch, ShardId shard, const std::string & event_id)
+{
+    return GcLogObjectKey(gcLogPrefix(key_prefix, epoch, shard) + event_id);
+}
+
+GcSnapObjectKey gcSnapKey(const std::string & key_prefix, uint64_t epoch, ShardId shard)
+{
+    /// <key_prefix>/gc/snap/<padded-epoch>.<shard> — zero-padded epoch so a lexical LIST is numeric order.
+    return GcSnapObjectKey(withPrefix(key_prefix, "gc/snap/" + paddedEpoch(epoch) + "." + std::to_string(shard)));
 }
 
 std::string diskFileKey(const std::string & key_prefix, const std::string & path)
