@@ -43,30 +43,30 @@ PartManifest PartManifest::deserialize(const std::string & bytes)
     DB::ReadBufferFromString buf(bytes);
     FormatHeader::readAndValidate(buf, MAGIC, VERSION, "manifest");
 
-    PartManifest f;
-    uint64_t nb = 0;
-    DB::readVarUInt(nb, buf);
-    for (uint64_t i = 0; i < nb; ++i)
+    PartManifest manifest;
+    uint64_t blob_count = 0;
+    DB::readVarUInt(blob_count, buf);
+    for (uint64_t i = 0; i < blob_count; ++i)
     {
-        std::string k;
-        DB::readStringBinary(k, buf);
-        BlobEntry e;
-        std::string key;
-        DB::readStringBinary(key, buf);
-        e.key = BlobHash(std::move(key));
-        DB::readBinaryLittleEndian(e.size, buf);
-        DB::readStringBinary(e.checksum, buf);
-        f.blobs[k] = std::move(e);
+        std::string logical_file;
+        DB::readStringBinary(logical_file, buf);
+        BlobEntry entry;
+        std::string hash;
+        DB::readStringBinary(hash, buf);
+        entry.key = BlobHash(std::move(hash));
+        DB::readBinaryLittleEndian(entry.size, buf);
+        DB::readStringBinary(entry.checksum, buf);
+        manifest.blobs[logical_file] = std::move(entry);
     }
-    uint64_t ni = 0;
-    DB::readVarUInt(ni, buf);
-    for (uint64_t i = 0; i < ni; ++i)
+    uint64_t inlined_count = 0;
+    DB::readVarUInt(inlined_count, buf);
+    for (uint64_t i = 0; i < inlined_count; ++i)
     {
-        std::string k;
-        DB::readStringBinary(k, buf);
-        DB::readStringBinary(f.inlined[k], buf);
+        std::string logical_file;
+        DB::readStringBinary(logical_file, buf);
+        DB::readStringBinary(manifest.inlined[logical_file], buf);
     }
-    return f;
+    return manifest;
 }
 
 std::string RefSidecar::serialize() const
@@ -98,28 +98,28 @@ RefSidecar RefSidecar::deserialize(const std::string & bytes)
 {
     DB::ReadBufferFromString buf(bytes);
     FormatHeader::readAndValidate(buf, MAGIC, VERSION, "ref sidecar");
-    RefSidecar s;
-    uint64_t n = 0;
-    DB::readVarUInt(n, buf);
-    for (uint64_t i = 0; i < n; ++i)
+    RefSidecar sidecar;
+    uint64_t file_count = 0;
+    DB::readVarUInt(file_count, buf);
+    for (uint64_t i = 0; i < file_count; ++i)
     {
-        std::string k;
-        DB::readStringBinary(k, buf);
-        DB::readStringBinary(s.files[k], buf);
+        std::string file_name;
+        DB::readStringBinary(file_name, buf);
+        DB::readStringBinary(sidecar.files[file_name], buf);
     }
     /// CA GC S3 (#6, version 2): the resolved generations (always present in a v2 object).
-    DB::readVarUInt(s.manifest_generation, buf);
-    uint64_t ng = 0;
-    DB::readVarUInt(ng, buf);
-    for (uint64_t i = 0; i < ng; ++i)
+    DB::readVarUInt(sidecar.manifest_generation, buf);
+    uint64_t pin_count = 0;
+    DB::readVarUInt(pin_count, buf);
+    for (uint64_t i = 0; i < pin_count; ++i)
     {
         std::string hash;
         DB::readStringBinary(hash, buf);
-        uint64_t g = 0;
-        DB::readVarUInt(g, buf);
-        s.pin_generations.emplace(std::move(hash), g);
+        uint64_t generation = 0;
+        DB::readVarUInt(generation, buf);
+        sidecar.pin_generations.emplace(std::move(hash), generation);
     }
-    return s;
+    return sidecar;
 }
 
 PartId computePartId(const std::map<std::string, BlobEntry> & blobs)

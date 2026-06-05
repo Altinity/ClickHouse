@@ -55,10 +55,10 @@ WriteSession WriteSession::deserialize(const std::string & bytes)
     std::string part_id;
     DB::readStringBinary(part_id, buf);
     session.part_id = PartId(std::move(part_id));
-    uint64_t n = 0;
-    DB::readVarUInt(n, buf);
-    session.pending.reserve(n);
-    for (uint64_t i = 0; i < n; ++i)
+    uint64_t pending_count = 0;
+    DB::readVarUInt(pending_count, buf);
+    session.pending.reserve(pending_count);
+    for (uint64_t i = 0; i < pending_count; ++i)
     {
         std::string hash;
         DB::readStringBinary(hash, buf);
@@ -68,10 +68,10 @@ WriteSession WriteSession::deserialize(const std::string & bytes)
     uint8_t committed_raw = 0;
     DB::readBinaryLittleEndian(committed_raw, buf);
     session.committed = committed_raw != 0;
-    uint64_t m = 0;
-    DB::readVarUInt(m, buf);
-    session.delta_epochs.reserve(m);
-    for (uint64_t i = 0; i < m; ++i)
+    uint64_t delta_epoch_count = 0;
+    DB::readVarUInt(delta_epoch_count, buf);
+    session.delta_epochs.reserve(delta_epoch_count);
+    for (uint64_t i = 0; i < delta_epoch_count; ++i)
     {
         UInt32 shard = 0;
         UInt64 epoch = 0;
