@@ -64,10 +64,6 @@ namespace DB
 namespace FailPoints
 {
     extern const char storage_merge_tree_background_clear_old_parts_pause[];
-    extern const char smt_merge_selecting_task_pause_when_scheduled[];
-    extern const char mt_select_parts_to_mutate_no_free_threads[];
-    extern const char mt_select_parts_to_mutate_max_part_size[];
-    extern const char storage_shared_merge_tree_mutate_pause_before_wait[];
     extern const char storage_merge_tree_background_schedule_merge_fail[];
 }
 
@@ -1528,8 +1524,6 @@ bool StorageMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & assign
         return false;
 
     assert(!isStaticStorage());
-
-    FailPointInjection::pauseFailPoint(FailPoints::smt_merge_selecting_task_pause_when_scheduled);
 
     cleanup_thread.wakeupEarlierIfNeeded();
     auto metadata_snapshot = getInMemoryMetadataPtr();

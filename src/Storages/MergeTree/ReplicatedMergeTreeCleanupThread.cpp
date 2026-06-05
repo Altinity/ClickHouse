@@ -2,12 +2,8 @@
 
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/StorageReplicatedMergeTree.h>
-#include <Common/ZooKeeper/ZooKeeperCommon.h>
-
-#include <unordered_set>
-
-#include <base/sort.h>
 #include <Common/ZooKeeper/KeeperException.h>
+#include <Common/ZooKeeper/ZooKeeperCommon.h>
 
 namespace DB
 {
