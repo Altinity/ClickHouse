@@ -2667,6 +2667,8 @@ TEST_F(ContentAddressedMetaTest, WriteSessionRoundTripsAndRejectsBadVersion)
     session.fence_token = 42;
     session.part_id = PartId("aaaa000000000000000000000000aaaa");
     session.pending = {BlobHash("deadbeef01"), BlobHash("cafef00d02"), BlobHash("0badc0de03")};
+    session.deltas_failed = true;
+    session.pending_add_delta = "some-delta-payload";
 
     auto parsed = WriteSession::deserialize(session.serialize());
     EXPECT_EQ(parsed.server_id, session.server_id);
@@ -2674,6 +2676,8 @@ TEST_F(ContentAddressedMetaTest, WriteSessionRoundTripsAndRejectsBadVersion)
     EXPECT_EQ(parsed.fence_token, session.fence_token);
     EXPECT_EQ(parsed.part_id, session.part_id);
     EXPECT_EQ(parsed.pending, session.pending);
+    EXPECT_TRUE(parsed.deltas_failed);
+    EXPECT_EQ(parsed.pending_add_delta, "some-delta-payload");
 
     // A stray / foreign object is rejected (bad magic), as is an empty body.
     EXPECT_THROW(WriteSession::deserialize("not a write session object"), DB::Exception);
