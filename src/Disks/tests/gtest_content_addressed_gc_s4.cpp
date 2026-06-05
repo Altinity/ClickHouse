@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/RefPayload.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcCompaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcDelta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLogWriter.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
