@@ -1401,6 +1401,9 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
                 "ContentAddressed: mutable-only commit for {}/{} with no existing ref", table_uuid_, part_name_);
 
         ContentAddressed::RefSidecar sidecar;
+        /// CA GC S3 (#6): carry forward manifest_generation + pin_generations from the prior sidecar so
+        /// a mutable-only update does not erase the generations a prior content publish recorded. The full
+        /// struct copy (sidecar = *existing) preserves all generation fields; only sidecar.files is patched.
         if (auto existing = metadata_storage.readRefSidecarIfExists(table_uuid_, part_name_))
             sidecar = *existing;
         for (const auto & f : st.recorded_mutable_removed)
@@ -1550,6 +1553,12 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
         /// that removeRecursive reclaims and the reachability sweep (blobs/+parts/ only) cannot miss.
         ContentAddressed::RefSidecar sidecar;
         sidecar.files = merged_mutable;
+        /// CA GC S3 (#6): record the resolved generations the `+` settled on, so the DROP path emits its
+        /// `-` at the matching generation (not the racy `active` hint). resolved_blob_gen / manifest_gen
+        /// are the same values threaded into the `+` delta above.
+        sidecar.manifest_generation = manifest_gen;
+        for (const auto & [hash, g] : resolved_blob_gen)
+            sidecar.pin_generations.emplace(hash.string(), g);
         const std::string meta_bytes = sidecar.serialize();
         auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
         meta_out->write(meta_bytes.data(), meta_bytes.size());
