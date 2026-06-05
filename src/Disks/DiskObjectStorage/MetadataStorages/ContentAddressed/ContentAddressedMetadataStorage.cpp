@@ -76,6 +76,10 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , local_scratch_path(std::move(local_scratch_path_))
     , allow_shared_pool(allow_shared_pool_)
 {
+    /// The per-pool coalesced gc/log delta writer (CA GC S2). Created for every storage (including the
+    /// unit-test path with a null context) so the commit/drop path always has a sink for its +/- deltas.
+    gc_log_writer = std::make_shared<ContentAddressed::GcLogWriter>(object_storage, storage_path_prefix);
+
     /// The GC thread exists only on the disk-factory path. The GC scans the same object storage under
     /// the same key prefix used by the read/write sides (single source of truth), so its live set and
     /// the read path resolve refs identically (B28).

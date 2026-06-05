@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/WriteSession.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLogWriter.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
 #include <Interpreters/Context_fwd.h>
 #include <map>
@@ -97,6 +98,13 @@ public:
     /// drift, but never gates a deletion on it (the scan stays authoritative). Shared by reference with
     /// the background sweep (ContentAddressedGC) and the transaction commit/drop path.
     const std::shared_ptr<ContentAddressed::InMemoryBlobRefIndex> & blobRefIndex() const { return blob_ref_index; }
+
+    /// The per-pool coalesced gc/log delta writer (CA GC S2). The commit path appends a `+` (before the
+    /// ref) and the drop path appends a `-` (after the ref removal), grouped by (shard, open-epoch) and
+    /// flushed as coalesced objects under gc/log/<epoch>.<shard>/ (spec §5). Shared by reference with the
+    /// transaction commit/drop path. Always present (created in the ctor) so a unit test driving commits
+    /// directly also exercises the log path.
+    const std::shared_ptr<ContentAddressed::GcLogWriter> & gcLogWriter() const { return gc_log_writer; }
 
     /// Pin a blob object key for the lifetime of an in-flight transaction (B52). Must be called with
     /// gc_lock held so the pin is visible to a concurrent sweep before the caller's dedup-skip decision.
@@ -240,6 +248,10 @@ private:
     /// Maintained best-effort by the commit/drop path and validated (never gated on) by the sweep.
     /// Thread-safe internally; shared by reference with the sweep and the commit/drop path.
     const std::shared_ptr<ContentAddressed::InMemoryBlobRefIndex> blob_ref_index = std::make_shared<ContentAddressed::InMemoryBlobRefIndex>();
+
+    /// Per-pool coalesced gc/log delta writer (CA GC S2), shared with the commit/drop path. Constructed in
+    /// the ctor body (it needs object_storage + storage_path_prefix, set in the init list).
+    std::shared_ptr<ContentAddressed::GcLogWriter> gc_log_writer;
 
     /// Background pool garbage collector, present only on the disk-factory path (context non-null).
     ContentAddressedGCThreadPtr gc_thread;

@@ -1,5 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcDelta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLogWriter.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
@@ -1394,6 +1396,38 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
         meta_out->finalize();
     }
 
+    /// CA GC S2: enqueue the `+` GC delta and synchronously flush it BEFORE writing the live ref, so the
+    /// I1/I6 ordering (`+` before ref) holds — *ref exists ⇒ delta exists*, so the log is complete for
+    /// every live reference and a fold can only over-count (reconciled), never under-count a live blob.
+    /// For S2 the gc_lock is held across commit + the whole sweep, so a synchronous flush before the ref
+    /// is the accepted discipline (the async / session-covers-the-gap path is S4). The delta carries the
+    /// resolved blob pins AND the (part_id) edge (§9). Scope it to a LIVE regular part for the same reason
+    /// the S1 reverse-index update is so scoped (a FREEZE/shadow ref and the shared "detached" ref pin
+    /// blobs but re-key their part_id and are out of S2's count model — Phase 2 reconciliation covers
+    /// them). The append is wrapped so an exception is logged + swallowed, but the flush DOES precede the
+    /// ref so the ordering invariant is preserved on the success path.
+    if (!is_frozen && part_name_ != ContentAddressed::kDetachedDirName)
+    {
+        try
+        {
+            ContentAddressed::GcDelta delta;
+            delta.op = ContentAddressed::GcDelta::Op::Add;
+            delta.part_id = part_id;
+            delta.event_id = ContentAddressed::GcDelta::computeEventId(part_id, delta.op);
+            delta.pins.reserve(manifest.blobs.size());
+            for (const auto & [file, entry] : manifest.blobs)
+                delta.pins.push_back(entry.key);
+            metadata_storage.gcLogWriter()->appendAndFlushForCommit(delta);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(
+                getLogger("ContentAddressedTransaction"),
+                "CA GC S2: failed to append the + delta for part " + part_id.string() + " to gc/log "
+                "(the authoritative GC scan is unaffected for S2)");
+        }
+    }
+
     // Publish the ref last: store/{server_id}/{table_uuid}/refs/{part_name} for a live part, or
     // shadow/<backup>/{server_id}/{table_uuid}/refs/{part_name} for a FREEZE target. The on-disk payload
     // is the versioned ref-payload struct (MAGIC+version+part_id) written by serializeRefPayload and
@@ -1598,12 +1632,21 @@ bool ContentAddressedTransaction::unlinkPartDirRefs(const std::string & path)
     /// continue (the scan stays authoritative; a missed removePart only makes the index over-count, which
     /// the drift log surfaces and the scan corrects). removePart is idempotent (applied_parts), so a part
     /// the index never saw (committed by another process, or before this process started) is a no-op.
+    /// CA GC S2: resolve the (part_id, manifest) FROM the ref BEFORE the deletion below (the ref/manifest
+    /// still exist now) so the `-` delta can carry the resolved pins + the (part_id) edge. The `-` is
+    /// appended AFTER the ref removal (§7.1 unlink ordering, bias to over-count): a crash between the
+    /// removal and the `-` leaves a not-live part whose blob is briefly over-counted (safe, reconciled),
+    /// never an under-count that could strand a delete.
+    std::optional<ContentAddressed::PartId> dropped_part_id;
+    std::optional<ContentAddressed::PartManifest> dropped_manifest;
     try
     {
         if (auto part_id = metadata_storage.readRefPartId(p->table_uuid, p->part_name))
         {
             auto manifest = metadata_storage.loadPartManifestOrThrow(*part_id);
             metadata_storage.blobRefIndex()->removePart(*part_id, manifest);
+            dropped_part_id = part_id;
+            dropped_manifest = std::move(manifest);
         }
     }
     catch (...)
@@ -1631,6 +1674,33 @@ bool ContentAddressedTransaction::unlinkPartDirRefs(const std::string & path)
     }
     if (!to_remove.empty())
         metadata_storage.object_storage->removeObjectsIfExist(to_remove);
+
+    /// CA GC S2: append the `-` delta AFTER the ref removal (bias to over-count, §7.1). Wrapped so an
+    /// exception is logged + swallowed — the authoritative scan is unaffected for S2. The drop side is
+    /// not on the I1/I6 critical ordering (that is the commit's `+`-before-ref), so a flushAll here is a
+    /// best-effort durability nudge, not a correctness requirement.
+    if (dropped_part_id)
+    {
+        try
+        {
+            ContentAddressed::GcDelta delta;
+            delta.op = ContentAddressed::GcDelta::Op::Remove;
+            delta.part_id = *dropped_part_id;
+            delta.event_id = ContentAddressed::GcDelta::computeEventId(*dropped_part_id, delta.op);
+            delta.pins.reserve(dropped_manifest->blobs.size());
+            for (const auto & [file, entry] : dropped_manifest->blobs)
+                delta.pins.push_back(entry.key);
+            metadata_storage.gcLogWriter()->enqueue(delta);
+            metadata_storage.gcLogWriter()->flushAll();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(
+                getLogger("ContentAddressedTransaction"),
+                "CA GC S2: failed to append the - delta for part " + p->part_name + " to gc/log "
+                "(the authoritative GC scan is unaffected for S2)");
+        }
+    }
     return true;
 }
 
