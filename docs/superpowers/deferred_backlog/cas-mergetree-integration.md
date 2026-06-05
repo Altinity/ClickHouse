@@ -27,7 +27,7 @@ Source design: `../specs/content_addressed_shared_mergetree_design.md` (v3) and 
 | B11 | **`coordination = keeper` — multi-server POOL coordination** (a *disk-level* property, orthogonal to table replication): single-leader Keeper-elected GC + GC lock + mark-over-union-of-refs + re-validate-at-delete; refs published via the Keeper `RefCatalog` whose watches are the leader's **delta feed** (so even multi-mounted *non-replicated* pools stay delta-driven, no `/log` needed). **Replication (B1) is one consumer of this**, not the only one. | Distributed concern; M1 ships `coordination = none` + the self-check | Layout UNCHANGED (pool shared by mounting the same root). M1 reserves the seams: **`RefCatalog`** (S3→Keeper), **GC coordination/lock** (in-process→Keeper leader+lock). **`_pool_meta` self-check ships in M1** (validates config + detects concurrent mounters → fail-closed), so multi-mount is *safe* before `keeper` coordination is *supported*. |
 | B14 | **Expedited / compliance delete** (`DROP … SYNC`-style immediate reclamation bypassing `grace`, for GDPR / right-to-erasure) | M1's `grace` is short (the upload window), so normal deferred-delete is minutes; immediate reclamation is a compliance feature, not a correctness need | Under the GC lock, confirm no reachable footer references the objects, then delete bypassing grace — a second entry point into the same GC sweeper; no layout change. |
 | B15 | **Operability**: introspection (`system.*` views for the pool, blob/part refcounts, GC status, outstanding frozen snapshots), GC metrics + coordinator-stall watchdog/alerts, and an optional **freeze TTL** to prevent forgotten-`FREEZE` cost leaks | Tooling; not needed to prove the model | Read-only views over `RefCatalog`/`BlobRefIndex`/GC state; freeze TTL is a retention policy on the `frozen/` ref namespace. No layout change. |
-| B16 | **`BACKUP`/`RESTORE` integration & validation** on content-addressed disks | Reuses the normal read path (`getStorageObjects`) and the CAS write path on restore, but needs explicit end-to-end validation (the `ATTACH_PART` path, interaction with `frozen/`) | BACKUP reads through the metadata storage like any read; RESTORE writes via the content-addressed write path; no layout change, just coverage. |
+| B16 | **`BACKUP`/`RESTORE` integration & validation** on content-addressed disks | Reuses the normal read path (`getStorageObjects`) and the CAS write path on restore, but needs explicit end-to-end validation (the `ATTACH_PART` path, interaction with `frozen/`) | **DONE (2026-06-05).** BACKUP-read already worked; RESTORE now routes each part-write through one whole-part `ContentAddressedTransaction` (`restorePartFromBackup`, `d384298602b`). All 13 BACKUP/RESTORE tests un-gated + passing on CA, zero re-gates (`868c4f869ef`). Oracle `05005_content_addressed_backup_restore` (CA + plain green). See the "B16/B34 … DONE" note below. |
 | B17 | **Encryption-at-rest × content-addressing** — dedup scope under encrypted disks (a content hash over ciphertext ⇒ dedup only within the same encryption key) | Edge interaction; not needed to prove the model | Key the blob by the deterministic on-disk (ciphertext) checksum; document that dedup is per-encryption-key. Local to key/hash derivation; no layout change. |
 
 **Concurrency invariant baked into M1 (not deferred):** one pool (disk root) = exactly one GC coordinator, and **delta-driven GC requires that coordinator to observe the *complete* delta feed of ref changes**. M1 (single process) is complete by construction. Coordinated multi-writer (B11) gets its global delta feed from the existing Keeper replication `/log` + per-replica `/parts` watches consumed by a single-leader GC — still no full `LIST`. Uncoordinated multi-writer has no global delta feed and is **fail-closed** by the **pool-ownership lease/marker** M1 ships (a process refuses to GC/mount if another live, non-coordinated owner holds the pool) — so two independent servers sharing a bucket are *safe by default* even before B11. Layout note: refs are namespaced **`store/<serverid>/<table_uuid>/`** (per server/replica; GC marks the union across serverids); `frozen/` lives outside the table path (independent lifetime).
@@ -106,7 +106,7 @@ A close review surfaced one live data-loss bug, one corruption bug, and a set of
 | ID | Item | Why / status | Where it plugs in |
 |----|------|-------------|-------------------|
 | B33 | **Hard-gate `ReplicatedMergeTree` (and any clone-on-commit engine) on a `content_addressed` disk — required before M6.** Replication-internal clones (fetch-fallback / REPLACE/MOVE via the queue → `cloneAndLoadDataPart`→`freeze`→`Backup`→ per-file `createHardLink` autocommit) are background/queue-driven, NOT routed through `checkAlterPartitionIsPossible`, so they would corrupt a part (B21 mode) if a Replicated table ran on CA. M1 sets `supportZeroCopyReplication=false` and is single-server, but there is **no hard rejection of `ReplicatedMergeTree` on a CA disk**. | Review IMPORTANT; the stateless suite (M6) contains Replicated tables → unguarded corruption path | Reject `Replicated*MergeTree` at `CREATE`/`ATTACH` on a `content_addressed` disk (extend `checkContentAddressedDiskRestrictions`) with a clear "not supported yet (B1)". Do in the M6 capability-gate prep. |
-| B34 | **Clean BACKUP gate (+ verify pointer-holding BACKUP).** `BACKUP` of a table in an **Ordinary** (non-UUID) DB reaches `disk->createHardLink` with a non-part-shaped temp path → CA throws a raw `LOGICAL_ERROR` (fail-closed, NOT corruption). Atomic/UUID DBs (normal) set `make_temporary_hard_links=false` → BACKUP uses pointer-holding (`getStorageObjects`), no `createHardLink`. | Review IMPORTANT (fail-closed, ugly error); ties to B16 | Add an explicit BACKUP rejection for the hard-link path on CA (clean message), OR verify pointer-holding BACKUP/RESTORE round-trips on CA + document. |
+| B34 | **Clean BACKUP gate (+ verify pointer-holding BACKUP).** `BACKUP` of a table in an **Ordinary** (non-UUID) DB reaches `disk->createHardLink` with a non-part-shaped temp path → CA throws a raw `LOGICAL_ERROR` (fail-closed, NOT corruption). Atomic/UUID DBs (normal) set `make_temporary_hard_links=false` → BACKUP uses pointer-holding (`getStorageObjects`), no `createHardLink`. | Review IMPORTANT (fail-closed, ugly error); ties to B16 | **DONE (2026-06-05).** Pointer-holding BACKUP/RESTORE round-trips on CA are verified end-to-end (Atomic/UUID DBs, the suite default, never reach `createHardLink`). RESTORE materializes parts through one whole-part `ContentAddressedTransaction` (`restorePartFromBackup`, `d384298602b`); all 13 tests pass on CA un-gated (`868c4f869ef`); oracle `05005_content_addressed_backup_restore`. See the "B16/B34 … DONE" note below. |
 
 Minors (acceptable for M1): `partIdFromRefPayload` throws on an empty ref payload (fail-closed; one corrupt ref aborts the sweep + fails that part's reads); `createHardLink` mutable-vs-content by source basename is safe (the 3 mutable names are reserved part-internal files).
 
@@ -508,18 +508,30 @@ are green on `Stateless tests (arm_binary, content_addressed storage, parallel)`
   - Plus the two ancillary CA-path fixes recorded under B67: the `LocalObjectStorage::listObjects` /
     `tryGetObjectMetadata` TOCTOU fix (shared with non-CA local-object-storage) and the
     `ContentAddressedWriteBuffer::cancelImpl` fix.
-- **B16/B34 BACKUP/RESTORE on CA — OPEN, documented.** All 13 backup tests fail on the SAME root cause:
-  RESTORE materializes restored content part files via an autocommit one-shot write, which CA rejects
-  (`NOT_IMPLEMENTED: Autocommit writes are not supported for content part files`). BACKUP-read works;
-  only the restore-write path fails. **FIX direction (big feature, NOT attempted — user decision item):**
-  RESTORE must materialize parts through a `ContentAddressedTransaction` (the INSERT/merge write path)
-  instead of per-file autocommit. Gated tests: `02843_backup_use_same_password_for_base_backup`,
+- **B16/B34 BACKUP/RESTORE on CA — DONE (2026-06-05).** RESTORE now materializes each restored part
+  through ONE whole-part `ContentAddressedTransaction` (`restorePartFromBackup`, commit `d384298602b`) —
+  the same INSERT/merge write seam — instead of the per-file autocommit one-shot that CA rejected
+  (`NOT_IMPLEMENTED: Autocommit writes are not supported for content part files`). BACKUP-read already
+  worked (it reads through the metadata storage like any read), so only the restore-write path needed
+  the wrap. The wrap is `isContentAddressed`-gated: when `restore_tx == nullptr` the path is
+  byte-identical to the original, so plain disks are unchanged. **All 13 BACKUP/RESTORE tests un-gated
+  and passing on CA with ZERO CA-source changes beyond the restore wrap and ZERO re-gates** (commit
+  `868c4f869ef`): projections, broken-part → detached, materialized-view inner tables, and the
+  `tmp_restore` → active rename all compose with existing CA mechanisms (nested-manifest projections,
+  detached-staging republish, `moveDirectory` branches). Un-gated tests:
+  `02843_backup_use_same_password_for_base_backup`,
   `02843_backup_use_same_s3_credentials_for_base_backup`, `02864_restore_table_with_broken_part`,
   `02974_backup_query_format_null`, `03001_backup_matview_after_modify_query`,
   `03001_restore_from_old_backup_with_matview_inner_table_metadata`, `03032_async_backup_restore`,
   `03145_non_loaded_projection_backup`, `03214_backup_and_clear_old_temporary_directories`,
   `03286_backup_to_memory`, `03315_query_log_privileges_backup_restore`, `03760_backup_tar_archive`,
   `03831_backup_archive_to_plain_rewritable_disk`, `04036_backup_partition_transaction_visibility`.
+  **Inline-CA round-trip oracle:** `05005_content_addressed_backup_restore` — `CREATE` a CA table with
+  a `PROJECTION`, two-insert/two-part deterministic data, `BACKUP TABLE … TO Disk('backups', …)`,
+  `RESTORE TABLE … AS …_restored`, then assert byte-for-byte data equality (`count`/`sum`/`arraySort
+  groupArray`) and a `force_optimize_projection = 1` projection-served query on the restored table.
+  Passes on BOTH the CA-default job and the plain job; non-CA regression (`02974`/`03286`/`03032`)
+  stays green. See the spec (`2c762c70d33`) + plan (`2effa99a21e`).
 - **Legitimately gated by definition (not bugs):** broken-part / lost-part path-shape tests —
   `02253_empty_part_checksums`, `02254_projection_broken_part`, `02255_broken_parts_chain_on_start`,
   `02369_lost_part_intersecting_merges`, `02370_lost_part_intersecting_merges`,
