@@ -327,7 +327,25 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
                 std::move(inner), std::move(commit_callback), path, /*create_blob_if_empty=*/true);
         }
 
-        return content_addressed_transaction->writeFile(path, buf_size, mode, enriched_settings);
+        /// The returned buffer (a ContentAddressedWriteBuffer for a content blob, or a
+        /// ContentAddressedInlineWriteBuffer for a non-autocommit mutable per-part file) captures a bare
+        /// `[this]` of `content_addressed_transaction` in its finalize / pin-blob callbacks
+        /// (on_finalized -> recorded[...], on_pin_blob -> recordBlobInSession -> persistSession reading
+        /// `this->session`). These buffers are deferred-finalized: MergedBlockOutputStream's Finalizer
+        /// stores them and calls finish() LATER, possibly from another thread or after the part storage /
+        /// transaction would otherwise be torn down on an async-insert / cancel / exception-unwind path. If
+        /// the buffer outlives the transaction, that `[this]` dangles -> persistSession touches a freed
+        /// session -> heap corruption (the suspected CA-S3 SIGSEGV). Mirror the mutable-file branch above
+        /// (and the verbatim branch below): pin the DiskObjectStorageTransaction via
+        /// `disk_tx = shared_from_this()` for the lifetime of the returned buffer. Because this transaction
+        /// owns `metadata_transaction` (the ContentAddressedTransaction) by shared_ptr, holding `disk_tx`
+        /// keeps that `[this]` valid until the buffer (and so this callback) is destroyed after finalize.
+        /// No cycle: the transaction does not hold the buffer, so releasing the callback releases the
+        /// transaction.
+        auto inner = content_addressed_transaction->writeFile(path, buf_size, mode, enriched_settings);
+        auto keep_alive_callback = [disk_tx = shared_from_this()](size_t) mutable {};
+        return std::make_unique<WriteBufferWithFinalizeCallback>(
+            std::move(inner), std::move(keep_alive_callback), path, /*create_blob_if_empty=*/true);
     }
 
     StoredObject object(metadata_transaction->generateObjectKeyForPath(path).serialize(), path);
