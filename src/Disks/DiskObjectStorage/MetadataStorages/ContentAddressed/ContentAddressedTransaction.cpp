@@ -45,6 +45,27 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
 }
 
+namespace
+{
+    /// A part-DIRECTORY (not a part FILE) reached a moveFile/replaceFile path. Two dir shapes occur:
+    ///   - an ACTIVE part dir `store/<uuid>/<part>` -> parsePartFilePath yields an empty `file`;
+    ///   - a DETACHED part dir `store/<uuid>/detached/<part>` -> part_name is `kDetachedDirName` and `file`
+    ///     is the single-component detached dir name (no '/').
+    /// Both are directory re-keys moveDirectory owns. A real part-FILE never matches: an active file has a
+    /// non-empty `file`, and a detached file is `detached/<part>/<subfile>` so its `file` contains '/'.
+    /// Shared by moveFile (B87) and replaceFile (symmetry / defense-in-depth — no caller passes a part dir to
+    /// replaceFile today, but mirror the guard so a future caller cannot regress into the B87 LOGICAL_ERROR).
+    bool isPartDirPath(const std::optional<ContentAddressed::PartFilePath> & p)
+    {
+        if (!p)
+            return false;
+        if (p->file.empty())
+            return true; /// active part dir: store/<uuid>/<part>
+        return p->part_name == ContentAddressed::kDetachedDirName
+            && p->file.find('/') == std::string::npos; /// detached part dir: store/<uuid>/detached/<part>
+    }
+}
+
 ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_, std::string key_prefix_, std::string local_scratch_path_)
     : metadata_storage(metadata_storage_)
     , key_prefix(std::move(key_prefix_))
@@ -1138,16 +1159,7 @@ void ContentAddressedTransaction::moveFile(const std::string & from, const std::
     /// Both are directory re-keys moveDirectory already owns (incl. the detached<->detached rekeyDetachedPartDir
     /// branch). Delegate instead of throwing LOGICAL_ERROR (B87). A real part-FILE move never matches: an active
     /// file has a non-empty `file`, and a detached file is `detached/<part>/<subfile>` so its `file` contains '/'.
-    auto is_part_dir = [](const std::optional<ContentAddressed::PartFilePath> & p)
-    {
-        if (!p)
-            return false;
-        if (p->file.empty())
-            return true; /// active part dir: store/<uuid>/<part>
-        return p->part_name == ContentAddressed::kDetachedDirName
-            && p->file.find('/') == std::string::npos; /// detached part dir: store/<uuid>/detached/<part>
-    };
-    if (is_part_dir(src) && is_part_dir(dst))
+    if (isPartDirPath(src) && isPartDirPath(dst))
     {
         moveDirectory(from, to);
         return;
@@ -1226,6 +1238,15 @@ void ContentAddressedTransaction::replaceFile(const std::string & from, const st
     /// per-part file, so the result must land in recorded_mutable (the per-ref sidecar), never the manifest.
     auto src = ContentAddressed::parsePartFilePath(from);
     auto dst = ContentAddressed::parsePartFilePath(to);
+    /// A part-DIRECTORY rename reached replaceFile — delegate to moveDirectory exactly as moveFile does (B87
+    /// symmetry / defense-in-depth). No caller passes a part dir to replaceFile today, but mirror the guard so
+    /// a future caller cannot regress: without it an active part dir (empty `file`) would fall into the
+    /// verbatim branch below and moveFile a directory verbatim. Routed before the verbatim branch.
+    if (isPartDirPath(src) && isPartDirPath(dst))
+    {
+        moveDirectory(from, to);
+        return;
+    }
     if (!src || src->file.empty() || !dst || dst->file.empty())
     {
         /// Table-level / generic verbatim path: delegate to moveFile (its non-part branch does a
