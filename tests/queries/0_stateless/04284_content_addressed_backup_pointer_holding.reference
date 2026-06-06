@@ -1,4 +1,5 @@
 before	1000	499500	7
 BACKUP_CREATED
-1
+RESTORED
+after	1000	499500	7
 dropped_ok

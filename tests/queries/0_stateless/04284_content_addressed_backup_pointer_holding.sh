@@ -3,15 +3,16 @@
 # ^ content_addressed is an object-storage metadata type; keep it off the minimal fasttest image.
 
 # B34: BACKUP / RESTORE of a content_addressed table in an Atomic (UUID) database — the default in
-# the stateless suite. Two honest behaviors:
+# the stateless suite. Two behaviors:
 #   1. BACKUP uses the pointer-holding path (make_temporary_hard_links=false): it resolves the
 #      part's objects via getStorageObjects and never calls disk->createHardLink, so it succeeds on
 #      a content_addressed disk. (The temporary-hard-link BACKUP path, used only by the deprecated
 #      Ordinary database engine, is fail-closed with a clear SUPPORT_IS_DISABLED message in
 #      DataPartStorageOnDiskBase::backup — see B34/B16.)
-#   2. RESTORE onto a content_addressed disk writes the part files back through the disk's autocommit
-#      write path, which CA fail-closes (NOT_IMPLEMENTED: a whole-part write contract, B30, is
-#      required). This is a clean error, not corruption — restore-onto-CA is a known M1 gap.
+#   2. RESTORE onto a content_addressed disk now succeeds end-to-end: the part files are written back
+#      through the disk's write path and the restored table reads back identical to the original.
+#      (This used to fail closed with NOT_IMPLEMENTED until the whole-part write contract, B30,
+#      landed; restore-onto-CA is no longer an M1 gap.)
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -39,9 +40,9 @@ EOF
 # (1) Pointer-holding BACKUP of the Atomic-DB content_addressed table succeeds.
 ${CLICKHOUSE_CLIENT} -q "BACKUP TABLE t_cas_backup TO ${backup_name}" | cut -f2
 
-# (2) RESTORE onto a content_addressed disk fails closed with a clean error (not corruption).
-${CLICKHOUSE_CLIENT} -q "RESTORE TABLE t_cas_backup AS t_cas_restored FROM ${backup_name}" 2>&1 \
-    | grep -c -m1 "Autocommit writes are not supported for part files on a content-addressed disk"
+# (2) RESTORE onto a content_addressed disk succeeds and the restored data is identical.
+${CLICKHOUSE_CLIENT} -q "RESTORE TABLE t_cas_backup AS t_cas_restored FROM ${backup_name}" | cut -f2
+${CLICKHOUSE_CLIENT} -q "SELECT 'after', count(), sum(a), uniqExact(s) FROM t_cas_restored"
 
 ${CLICKHOUSE_CLIENT} --multiquery <<EOF
 DROP TABLE IF EXISTS t_cas_restored;
