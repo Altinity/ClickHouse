@@ -32,4 +32,34 @@
     <merge_tree>
         <storage_policy>content_addressed_s3</storage_policy>
     </merge_tree>
+    <!-- B86: system logs must not land on the cacheless CA-S3 disk (their flushes would block on minio and
+         trip "Timeout exceeded (180s) while flushing system log ... to S3"). Pin them to the local default
+         policy; user tables still default to content_addressed_s3 above. -->
+    <query_log><storage_policy>default</storage_policy></query_log>
+    <query_thread_log><storage_policy>default</storage_policy></query_thread_log>
+    <query_views_log><storage_policy>default</storage_policy></query_views_log>
+    <part_log><storage_policy>default</storage_policy></part_log>
+    <trace_log><storage_policy>default</storage_policy></trace_log>
+    <metric_log><storage_policy>default</storage_policy></metric_log>
+    <error_log><storage_policy>default</storage_policy></error_log>
+    <query_metric_log><storage_policy>default</storage_policy></query_metric_log>
+    <asynchronous_metric_log><storage_policy>default</storage_policy></asynchronous_metric_log>
+    <!-- opentelemetry_span_log ships an explicit <engine> in the default config, so a sibling
+         <storage_policy> is rejected (BAD_ARGUMENTS); bake the policy into the engine SETTINGS instead. -->
+    <opentelemetry_span_log>
+        <engine>
+            engine MergeTree
+            partition by toYYYYMM(finish_date)
+            order by (finish_date, finish_time_us)
+            settings storage_policy = 'default'
+        </engine>
+    </opentelemetry_span_log>
+    <crash_log><storage_policy>default</storage_policy></crash_log>
+    <processors_profile_log><storage_policy>default</storage_policy></processors_profile_log>
+    <asynchronous_insert_log><storage_policy>default</storage_policy></asynchronous_insert_log>
+    <backup_log><storage_policy>default</storage_policy></backup_log>
+    <s3queue_log><storage_policy>default</storage_policy></s3queue_log>
+    <blob_storage_log><storage_policy>default</storage_policy></blob_storage_log>
+    <zookeeper_log><storage_policy>default</storage_policy></zookeeper_log>
+    <text_log><storage_policy>default</storage_policy></text_log>
 </clickhouse>
