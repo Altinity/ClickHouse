@@ -364,16 +364,26 @@ std::optional<std::string> ContentAddressedMetadataStorage::readSmallObjectIfExi
 
 ContentAddressed::BlobObjectKey ContentAddressedMetadataStorage::resolveBlobGenKeyForRead(const ContentAddressed::BlobHash & blob_hash) const
 {
-    /// Cache hit: a previous read resolved a resurrected (g>0) generation. Return its key directly — no
-    /// `active` read, no LIST. (The common g=0 content is never cached, so this lookup misses then.)
+    /// Cache hit: a previous read resolved a (possibly resurrected, g>0) generation. Return its key
+    /// directly — no `active` read, no LIST.
     {
         std::lock_guard lock(gen_cache_mutex);
         if (auto it = blob_gen_cache.find(blob_hash); it != blob_gen_cache.end())
             return ContentAddressed::blobGenKey(storage_path_prefix, blob_hash, it->second);
     }
-    /// Cache miss: default to g=0 with NO probe (§12.4 — the steady read is exactly one GET downstream).
-    /// A genuine 404 on this key is repaired by `repairBlobGenOn404`.
-    return ContentAddressed::blobGenKey(storage_path_prefix, blob_hash, 0);
+    /// Cache miss: consult the best-effort `active` hint (§Task-2/Step-1). After dedup-against-resurrected
+    /// content + GC sweeping the old generation, the live bytes can sit at g>0 while a manifest still pins
+    /// the bare H; resolving to g=0 unconditionally would 404. The resurrecting writer best-effort-advances
+    /// `active`→g, so reading it resolves to the live generation. Default to 0 if the hint is absent, empty,
+    /// or unparseable — this preserves the common, never-resurrected g=0 read with one extra small-object
+    /// probe paid once per identity (the result is cached below). A genuine 404 on the resolved key is a
+    /// separate repair path (`repairBlobGenOn404`).
+    const uint64_t gen = readActiveGenHintForRead(ContentAddressed::blobActiveKey(storage_path_prefix, blob_hash));
+    {
+        std::lock_guard lock(gen_cache_mutex);
+        blob_gen_cache[blob_hash] = gen;
+    }
+    return ContentAddressed::blobGenKey(storage_path_prefix, blob_hash, gen);
 }
 
 ContentAddressed::PartObjectKey ContentAddressedMetadataStorage::resolvePartGenKeyForRead(const ContentAddressed::PartId & part_id) const
@@ -383,7 +393,31 @@ ContentAddressed::PartObjectKey ContentAddressedMetadataStorage::resolvePartGenK
         if (auto it = part_gen_cache.find(part_id); it != part_gen_cache.end())
             return ContentAddressed::partGenKey(storage_path_prefix, part_id, it->second);
     }
-    return ContentAddressed::partGenKey(storage_path_prefix, part_id, 0);
+    /// Cache miss: consult the best-effort `active` hint (symmetric to `resolveBlobGenKeyForRead`). Default
+    /// to 0 when the hint is absent/empty/unparseable, preserving the common never-resurrected g=0 read.
+    const uint64_t gen = readActiveGenHintForRead(ContentAddressed::partActiveKey(storage_path_prefix, part_id));
+    {
+        std::lock_guard lock(gen_cache_mutex);
+        part_gen_cache[part_id] = gen;
+    }
+    return ContentAddressed::partGenKey(storage_path_prefix, part_id, gen);
+}
+
+uint64_t ContentAddressedMetadataStorage::readActiveGenHintForRead(const std::string & active_key) const
+{
+    /// Read a best-effort `active` generation hint (default 0 if absent, empty, or unparseable). Matches the
+    /// decimal parse style of `ContentAddressedTransaction::readActiveGenHint`.
+    auto bytes = readSmallObjectIfExists(active_key);
+    if (!bytes || bytes->empty())
+        return 0;
+    uint64_t parsed = 0;
+    for (char c : *bytes)
+    {
+        if (c < '0' || c > '9')
+            return 0;
+        parsed = parsed * 10 + static_cast<uint64_t>(c - '0');
+    }
+    return parsed;
 }
 
 ContentAddressed::BlobObjectKey ContentAddressedMetadataStorage::repairBlobGenOn404(const ContentAddressed::BlobHash & blob_hash) const

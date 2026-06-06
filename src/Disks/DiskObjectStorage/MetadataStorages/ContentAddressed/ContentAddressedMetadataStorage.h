@@ -228,6 +228,10 @@ private:
     ContentAddressed::BlobObjectKey resolveBlobGenKeyForRead(const ContentAddressed::BlobHash & blob_hash) const;
     ContentAddressed::PartObjectKey resolvePartGenKeyForRead(const ContentAddressed::PartId & part_id) const;
 
+    // Read a best-effort decimal `active` generation hint (default 0 if absent/empty/unparseable), matching
+    // ContentAddressedTransaction::readActiveGenHint. Used by the resolvers on a cache miss.
+    uint64_t readActiveGenHintForRead(const std::string & active_key) const;
+
     // The 404 fallback: LIST the H (resp. part_id) generation directory, pick the highest present
     // generation, repair `active` (best-effort), cache it, and return its key. Throws CORRUPTED_DATA if NO
     // present generation exists (a committed ref to content with no surviving blob/manifest — I7b violated).
