@@ -111,7 +111,22 @@ std::set<PartId> listLivePartIds(const ObjectStoragePtr & object_storage, const 
                 continue;
             if (isRefMetaKey(key))
                 continue;
-            live.insert(partIdFromRefPayload(readSmallObject(object_storage, key)));
+            /// A concurrent DROP (`unlinkPartDirRefs`) can remove a ref between this LIST and the per-key read.
+            /// A vanished ref is correctly NOT a live part, so swallow the two codes that signal it
+            /// (`FILE_DOESNT_EXIST`/`CANNOT_OPEN_FILE`) and skip the key — mirroring `tryReadSession` above —
+            /// instead of throwing and aborting the whole GC round under DROP churn. Other errors propagate.
+            std::string raw;
+            try
+            {
+                raw = readSmallObject(object_storage, key);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() == ErrorCodes::CANNOT_OPEN_FILE || e.code() == ErrorCodes::FILE_DOESNT_EXIST)
+                    continue; /// vanished between LIST and READ — see tryReadSession.
+                throw;
+            }
+            live.insert(partIdFromRefPayload(raw));
         }
     };
     scan_root(refsRootPrefix(key_prefix));        /// live active parts (store/.../refs/)
