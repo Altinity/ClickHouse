@@ -167,7 +167,7 @@ ContentAddressedMetadataStorage::relinkPin(const ContentAddressed::PartId & part
     /// touches it). After finalize the cross-mounter pin is durable and the blobs are protected.
     const std::string key = ContentAddressed::sessionKey(storage_path_prefix, pin.session_id);
     const std::string bytes = session.serialize();
-    auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
+    auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     out->write(bytes.data(), bytes.size());
     out->finalize();
 
@@ -247,7 +247,7 @@ void ContentAddressedMetadataStorage::relinkPublishRef(
         {
             const std::string file_key
                 = ContentAddressed::refMutableFileKey(storage_path_prefix, server_id, table_uuid, part_name, file).string();
-            auto file_out = object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite);
+            auto file_out = object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             file_out->write(bytes.data(), bytes.size());
             file_out->finalize();
         }
@@ -257,7 +257,7 @@ void ContentAddressedMetadataStorage::relinkPublishRef(
         sidecar.files = sidecar_values;
         const std::string meta_key = ContentAddressed::refMetaKey(storage_path_prefix, server_id, table_uuid, part_name).string();
         const std::string meta_bytes = sidecar.serialize();
-        auto meta_out = object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+        auto meta_out = object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         meta_out->write(meta_bytes.data(), meta_bytes.size());
         meta_out->finalize();
     }
@@ -267,7 +267,7 @@ void ContentAddressedMetadataStorage::relinkPublishRef(
     /// path and the GC live-set scan resolve it identically (B28).
     const std::string ref_key = ContentAddressed::refKey(storage_path_prefix, server_id, table_uuid, part_name).string();
     const std::string ref_payload = ContentAddressed::serializeRefPayload(part_id);
-    auto ref_out = object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
+    auto ref_out = object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     ref_out->write(ref_payload.data(), ref_payload.size());
     ref_out->finalize();
 }
@@ -483,7 +483,7 @@ ContentAddressed::BlobObjectKey ContentAddressedMetadataStorage::repairBlobGenOn
     {
         const std::string active_key = ContentAddressed::blobActiveKey(storage_path_prefix, blob_hash);
         const std::string bytes = std::to_string(*best);
-        auto out = object_storage->writeObject(StoredObject(active_key), WriteMode::Rewrite);
+        auto out = object_storage->writeObject(StoredObject(active_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         out->write(bytes.data(), bytes.size());
         out->finalize();
     }
@@ -523,7 +523,7 @@ ContentAddressed::PartObjectKey ContentAddressedMetadataStorage::repairPartGenOn
     {
         const std::string active_key = ContentAddressed::partActiveKey(storage_path_prefix, part_id);
         const std::string bytes = std::to_string(*best);
-        auto out = object_storage->writeObject(StoredObject(active_key), WriteMode::Rewrite);
+        auto out = object_storage->writeObject(StoredObject(active_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         out->write(bytes.data(), bytes.size());
         out->finalize();
     }

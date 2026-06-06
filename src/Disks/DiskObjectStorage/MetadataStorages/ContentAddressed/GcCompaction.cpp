@@ -232,7 +232,7 @@ void GcCompaction::writeShardEpoch(ShardId shard, uint64_t epoch)
     /// not a content-addressed object, just a tiny counter).
     const std::string key = gcCurrentEpochKey(key_prefix, shard);
     const std::string bytes = std::to_string(epoch);
-    auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
+    auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     out->write(bytes.data(), bytes.size());
     out->finalize();
 }
@@ -249,7 +249,7 @@ void GcCompaction::writeSnapshot(uint64_t epoch, ShardId shard, const std::map<C
 {
     const GcSnapObjectKey snap_key = gcSnapKey(key_prefix, epoch, shard);
     const std::string bytes = serializeSnapshot(counts);
-    auto out = object_storage->writeObject(StoredObject(snap_key.string()), WriteMode::Rewrite);
+    auto out = object_storage->writeObject(StoredObject(snap_key.string()), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     out->write(bytes.data(), bytes.size());
     out->finalize();
 }

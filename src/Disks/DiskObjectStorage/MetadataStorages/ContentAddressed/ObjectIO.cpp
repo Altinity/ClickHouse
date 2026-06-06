@@ -7,6 +7,12 @@
 namespace DB::ContentAddressed
 {
 
+WriteSettings caControlWriteSettings(WriteSettings base)
+{
+    base.s3_allow_parallel_part_upload = false;
+    return base;
+}
+
 std::string readSmallObject(const ObjectStoragePtr & object_storage, const std::string & key)
 {
     StoredObject object(key);

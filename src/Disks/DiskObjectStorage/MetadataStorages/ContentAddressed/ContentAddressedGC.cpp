@@ -720,7 +720,7 @@ void ContentAddressedGC::resetActiveOffGeneration(bool is_blob, const std::strin
     try
     {
         const std::string bytes = std::to_string(*best);
-        auto out = object_storage->writeObject(StoredObject(active_key), WriteMode::Rewrite);
+        auto out = object_storage->writeObject(StoredObject(active_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         out->write(bytes.data(), bytes.size());
         out->finalize();
     }
@@ -896,7 +896,7 @@ std::set<std::string> ContentAddressedGC::collectReconciliationCandidates(
 void ContentAddressedGC::rewriteSession(const std::string & session_key, const WriteSession & session)
 {
     const std::string bytes = session.serialize();
-    auto out = object_storage->writeObject(StoredObject(session_key), WriteMode::Rewrite);
+    auto out = object_storage->writeObject(StoredObject(session_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     out->write(bytes.data(), bytes.size());
     out->finalize();
 }

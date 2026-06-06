@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffers.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ObjectIO.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
@@ -107,7 +108,7 @@ void ContentAddressedWriteBuffer::uploadBlobAtomically(const std::string & key)
         const std::string temp_key = key + ".tmp." + getRandomASCIIString(16);
         {
             ReadBufferFromFile in(temp_path);
-            auto out = object_storage->writeObject(StoredObject(temp_key), WriteMode::Rewrite);
+            auto out = object_storage->writeObject(StoredObject(temp_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             copyData(in, *out);
             out->finalize();
         }
@@ -127,7 +128,7 @@ void ContentAddressedWriteBuffer::uploadBlobAtomically(const std::string & key)
     }
 
     ReadBufferFromFile in(temp_path);
-    auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
+    auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     copyData(in, *out);
     out->finalize();
 }

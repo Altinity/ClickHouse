@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ObjectIO.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/RefPayload.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcCompaction.h>
@@ -168,7 +169,7 @@ void ContentAddressedTransaction::persistSession()
     {
         try
         {
-            auto out = metadata_storage.object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
+            auto out = metadata_storage.object_storage->writeObject(StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             out->write(bytes.data(), bytes.size());
             out->finalize();
             return;
@@ -364,13 +365,16 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// carry forward.
             std::optional<std::string> existing = metadata_storage.readSmallObjectIfExists(key);
             auto out = metadata_storage.object_storage->writeObject(
-                StoredObject(key, path), WriteMode::Rewrite, /*attributes=*/std::nullopt, buf_size, settings);
+                StoredObject(key, path), WriteMode::Rewrite, /*attributes=*/std::nullopt, buf_size,
+                ContentAddressed::caControlWriteSettings(settings));
             if (existing && !existing->empty())
                 out->write(existing->data(), existing->size());
             return out;
         }
 
-        return metadata_storage.object_storage->writeObject(StoredObject(key, path), mode, /*attributes=*/std::nullopt, buf_size, settings);
+        return metadata_storage.object_storage->writeObject(
+            StoredObject(key, path), mode, /*attributes=*/std::nullopt, buf_size,
+            ContentAddressed::caControlWriteSettings(settings));
     }
 
     rememberTarget(path);
@@ -534,7 +538,7 @@ void ContentAddressedTransaction::republishCommittedPartIntoDetached(
     if (!metadata_storage.object_storage->tryGetObjectMetadata(detached_part_key, /*with_tags=*/false).has_value())
     {
         const std::string bytes = detached_manifest.serialize();
-        auto out = metadata_storage.object_storage->writeObject(StoredObject(detached_part_key), WriteMode::Rewrite);
+        auto out = metadata_storage.object_storage->writeObject(StoredObject(detached_part_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         out->write(bytes.data(), bytes.size());
         out->finalize();
     }
@@ -554,7 +558,7 @@ void ContentAddressedTransaction::republishCommittedPartIntoDetached(
 
             const std::string file_key = ContentAddressed::refMutableFileKey(
                 key_prefix, metadata_storage.server_id, dst_detached.table_uuid, dst_detached.part_name, detached_file).string();
-            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite);
+            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             file_out->write(bytes.data(), bytes.size());
             file_out->finalize();
         }
@@ -562,7 +566,7 @@ void ContentAddressedTransaction::republishCommittedPartIntoDetached(
         const std::string meta_key = ContentAddressed::refMetaKey(
             key_prefix, metadata_storage.server_id, dst_detached.table_uuid, dst_detached.part_name).string();
         const std::string meta_bytes = detached_sidecar.serialize();
-        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         meta_out->write(meta_bytes.data(), meta_bytes.size());
         meta_out->finalize();
     }
@@ -572,7 +576,7 @@ void ContentAddressedTransaction::republishCommittedPartIntoDetached(
     const std::string detached_ref_key = ContentAddressed::refKey(
         key_prefix, metadata_storage.server_id, dst_detached.table_uuid, dst_detached.part_name).string();
     const std::string ref_payload = ContentAddressed::serializeRefPayload(detached_pid);
-    auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(detached_ref_key), WriteMode::Rewrite);
+    auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(detached_ref_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     ref_out->write(ref_payload.data(), ref_payload.size());
     ref_out->finalize();
 
@@ -636,7 +640,7 @@ void ContentAddressedTransaction::rekeyDetachedPartDir(
                 ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_id, detached, file).string());
             const std::string new_key
                 = ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_id, detached, new_file).string();
-            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(new_key), WriteMode::Rewrite);
+            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(new_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             file_out->write(bytes.data(), bytes.size());
             file_out->finalize();
         }
@@ -649,21 +653,21 @@ void ContentAddressedTransaction::rekeyDetachedPartDir(
     if (!metadata_storage.object_storage->tryGetObjectMetadata(new_part_key, /*with_tags=*/false).has_value())
     {
         const std::string bytes = rekeyed.serialize();
-        auto out = metadata_storage.object_storage->writeObject(StoredObject(new_part_key), WriteMode::Rewrite);
+        auto out = metadata_storage.object_storage->writeObject(StoredObject(new_part_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         out->write(bytes.data(), bytes.size());
         out->finalize();
     }
     {
         const std::string meta_key = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_id, detached).string();
         const std::string meta_bytes = rekeyed_sidecar.serialize();
-        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         meta_out->write(meta_bytes.data(), meta_bytes.size());
         meta_out->finalize();
     }
     {
         const std::string ref_key = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_id, detached).string();
         const std::string ref_payload = ContentAddressed::serializeRefPayload(new_pid);
-        auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
+        auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         ref_out->write(ref_payload.data(), ref_payload.size());
         ref_out->finalize();
     }
@@ -722,7 +726,7 @@ void ContentAddressedTransaction::republishDetachedStagingIntoActive(
     if (!metadata_storage.object_storage->tryGetObjectMetadata(active_part_key, /*with_tags=*/false).has_value())
     {
         const std::string bytes = active_manifest.serialize();
-        auto out = metadata_storage.object_storage->writeObject(StoredObject(active_part_key), WriteMode::Rewrite);
+        auto out = metadata_storage.object_storage->writeObject(StoredObject(active_part_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         out->write(bytes.data(), bytes.size());
         out->finalize();
     }
@@ -741,7 +745,7 @@ void ContentAddressedTransaction::republishDetachedStagingIntoActive(
 
             const std::string file_key = ContentAddressed::refMutableFileKey(
                 key_prefix, metadata_storage.server_id, dst_active.table_uuid, dst_active.part_name, bare_file).string();
-            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite);
+            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             file_out->write(bytes.data(), bytes.size());
             file_out->finalize();
         }
@@ -751,7 +755,7 @@ void ContentAddressedTransaction::republishDetachedStagingIntoActive(
             const std::string meta_key = ContentAddressed::refMetaKey(
                 key_prefix, metadata_storage.server_id, dst_active.table_uuid, dst_active.part_name).string();
             const std::string meta_bytes = active_sidecar.serialize();
-            auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+            auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             meta_out->write(meta_bytes.data(), meta_bytes.size());
             meta_out->finalize();
         }
@@ -761,7 +765,7 @@ void ContentAddressedTransaction::republishDetachedStagingIntoActive(
     const std::string active_ref_key = ContentAddressed::refKey(
         key_prefix, metadata_storage.server_id, dst_active.table_uuid, dst_active.part_name).string();
     const std::string active_ref_payload = ContentAddressed::serializeRefPayload(active_pid);
-    auto active_ref_out = metadata_storage.object_storage->writeObject(StoredObject(active_ref_key), WriteMode::Rewrite);
+    auto active_ref_out = metadata_storage.object_storage->writeObject(StoredObject(active_ref_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     active_ref_out->write(active_ref_payload.data(), active_ref_payload.size());
     active_ref_out->finalize();
 
@@ -808,19 +812,19 @@ void ContentAddressedTransaction::republishDetachedStagingIntoActive(
     if (!metadata_storage.object_storage->tryGetObjectMetadata(new_detached_part_key, /*with_tags=*/false).has_value())
     {
         const std::string bytes = detached_manifest.serialize();
-        auto out = metadata_storage.object_storage->writeObject(StoredObject(new_detached_part_key), WriteMode::Rewrite);
+        auto out = metadata_storage.object_storage->writeObject(StoredObject(new_detached_part_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         out->write(bytes.data(), bytes.size());
         out->finalize();
     }
     {
         const std::string meta_bytes = detached_sidecar.serialize();
-        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(detached_meta_key), WriteMode::Rewrite);
+        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(detached_meta_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         meta_out->write(meta_bytes.data(), meta_bytes.size());
         meta_out->finalize();
     }
     {
         const std::string ref_payload = ContentAddressed::serializeRefPayload(new_detached_pid);
-        auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(detached_ref_key), WriteMode::Rewrite);
+        auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(detached_ref_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         ref_out->write(ref_payload.data(), ref_payload.size());
         ref_out->finalize();
     }
@@ -854,7 +858,7 @@ void ContentAddressedTransaction::republishTableRefs(const std::string & src_tab
             if (!bytes)
                 continue; /// raced away; nothing to move
 
-            auto out = metadata_storage.object_storage->writeObject(StoredObject(dst_key), WriteMode::Rewrite);
+            auto out = metadata_storage.object_storage->writeObject(StoredObject(dst_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             out->write(bytes->data(), bytes->size());
             out->finalize();
 
@@ -1465,7 +1469,7 @@ uint64_t ContentAddressedTransaction::resolveAndResurrectGeneration(
         try
         {
             const std::string bytes = std::to_string(next);
-            auto out = object_storage.writeObject(StoredObject(make_active_key()), WriteMode::Rewrite);
+            auto out = object_storage.writeObject(StoredObject(make_active_key()), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             out->write(bytes.data(), bytes.size());
             out->finalize();
         }
@@ -1540,13 +1544,13 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
         {
             sidecar.files[file] = bytes;
             const std::string fk = ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid_, part_name_, file).string();
-            auto out = metadata_storage.object_storage->writeObject(StoredObject(fk), WriteMode::Rewrite);
+            auto out = metadata_storage.object_storage->writeObject(StoredObject(fk), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             out->write(bytes.data(), bytes.size());
             out->finalize();
         }
         const std::string meta_key = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid_, part_name_).string();
         const std::string meta_bytes = sidecar.serialize();
-        auto mo = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+        auto mo = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         mo->write(meta_bytes.data(), meta_bytes.size());
         mo->finalize();
         return;
@@ -1666,7 +1670,7 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
         for (const auto & [file, bytes] : st.recorded_mutable)
         {
             const std::string file_key = mutable_file_key(file);
-            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite);
+            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             file_out->write(bytes.data(), bytes.size());
             file_out->finalize();
         }
@@ -1684,7 +1688,7 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
         for (const auto & [hash, g] : resolved_blob_gen)
             sidecar.pin_generations.emplace(hash.string(), g);
         const std::string meta_bytes = sidecar.serialize();
-        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         meta_out->write(meta_bytes.data(), meta_bytes.size());
         meta_out->finalize();
     }
@@ -1766,7 +1770,7 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
         ? ContentAddressed::shadowRefKey(key_prefix, st.frozen_table_dir, part_name_).string()
         : ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_uuid_, part_name_).string();
     const std::string ref_payload = ContentAddressed::serializeRefPayload(part_id);
-    auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
+    auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     ref_out->write(ref_payload.data(), ref_payload.size());
     ref_out->finalize();
 
@@ -1966,7 +1970,7 @@ bool ContentAddressedTransaction::renameCommittedPartRef(
         {
             const std::string dst_file_key = ContentAddressed::refMutableFileKey(
                 key_prefix, metadata_storage.server_id, dst.table_uuid, dst.part_name, file).string();
-            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(dst_file_key), WriteMode::Rewrite);
+            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(dst_file_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             file_out->write(bytes.data(), bytes.size());
             file_out->finalize();
         }
@@ -1974,7 +1978,7 @@ bool ContentAddressedTransaction::renameCommittedPartRef(
         const std::string dst_meta_key
             = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, dst.table_uuid, dst.part_name).string();
         const std::string meta_bytes = src_sidecar->serialize();
-        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(dst_meta_key), WriteMode::Rewrite);
+        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(dst_meta_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
         meta_out->write(meta_bytes.data(), meta_bytes.size());
         meta_out->finalize();
     }
@@ -1983,7 +1987,7 @@ bool ContentAddressedTransaction::renameCommittedPartRef(
     const std::string dst_ref_key
         = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, dst.table_uuid, dst.part_name).string();
     const std::string ref_payload = ContentAddressed::serializeRefPayload(*src_pid);
-    auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(dst_ref_key), WriteMode::Rewrite);
+    auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(dst_ref_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     ref_out->write(ref_payload.data(), ref_payload.size());
     ref_out->finalize();
 
@@ -2278,19 +2282,19 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         if (!metadata_storage.object_storage->tryGetObjectMetadata(new_part_key, /*with_tags=*/false).has_value())
         {
             const std::string bytes = manifest.serialize();
-            auto out = metadata_storage.object_storage->writeObject(StoredObject(new_part_key), WriteMode::Rewrite);
+            auto out = metadata_storage.object_storage->writeObject(StoredObject(new_part_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             out->write(bytes.data(), bytes.size());
             out->finalize();
         }
         {
             const std::string meta_bytes = sidecar.serialize();
-            auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+            auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             meta_out->write(meta_bytes.data(), meta_bytes.size());
             meta_out->finalize();
         }
         {
             const std::string ref_payload = ContentAddressed::serializeRefPayload(new_pid);
-            auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
+            auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
             ref_out->write(ref_payload.data(), ref_payload.size());
             ref_out->finalize();
         }

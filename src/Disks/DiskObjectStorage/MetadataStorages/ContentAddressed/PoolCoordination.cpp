@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ObjectIO.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
@@ -103,7 +104,8 @@ bool condCreateViaIfNoneMatch(IObjectStorage & object_storage, const std::string
     try
     {
         auto buf = object_storage.writeObject(
-            StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, /*buf_size=*/DBMS_DEFAULT_BUFFER_SIZE, ws);
+            StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, /*buf_size=*/DBMS_DEFAULT_BUFFER_SIZE,
+            ContentAddressed::caControlWriteSettings(ws));
         buf->write(bytes.data(), bytes.size());
         buf->finalize();
         return true;
@@ -213,7 +215,7 @@ std::optional<std::string> readIfExists(IObjectStorage & object_storage, const s
 /// the fence token — not the lock object — is the safety authority, so a non-atomic overwrite is safe.
 void rewriteObject(IObjectStorage & object_storage, const std::string & key, const std::string & bytes)
 {
-    auto buf = object_storage.writeObject(StoredObject(key), WriteMode::Rewrite);
+    auto buf = object_storage.writeObject(StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     buf->write(bytes.data(), bytes.size());
     buf->finalize();
 }

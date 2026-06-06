@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLogWriter.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/GcLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ObjectIO.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
@@ -152,7 +153,7 @@ void GcLogWriter::writePending(const PendingWrite & pending)
 {
     /// Lock-free: the S3 PUT. Two writers targeting the same (shard, epoch, first-event_id) write identical
     /// bytes to the same key (idempotent — the batch is named by the first event_id and re-appends reuse it).
-    auto out = object_storage->writeObject(StoredObject(pending.object_key), WriteMode::Rewrite);
+    auto out = object_storage->writeObject(StoredObject(pending.object_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ContentAddressed::caControlWriteSettings());
     out->write(pending.bytes.data(), pending.bytes.size());
     out->finalize();
     last_batch_size.store(pending.delta_count, std::memory_order_relaxed);
