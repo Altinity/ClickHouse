@@ -214,7 +214,15 @@ std::string shadowRefsPrefix(const std::string & key_prefix, const std::string &
     /// Mirror the physical store tree: the refs live directly under the literal shadow table dir
     /// (shadow/<backup>/store/<uuid[:3]>/<uuid>) so the enumeration's intermediate levels resolve via
     /// the same generic child-derivation as the live table dir.
-    return withPrefix(key_prefix, shadow_table_dir + "/refs/");
+    ///
+    /// `shadow_table_dir` arrives either from `joinTableId` (no trailing slash) or as a free-form directory
+    /// `path` from `existsDirectory`/`listDirectory` (which MAY carry a trailing slash). Strip a trailing
+    /// slash before appending `/refs/` so the join produces exactly one separator — a literal `<uuid>//refs/`
+    /// is normalized by the local POSIX FS but rejected by S3/MinIO (XMinioInvalidObjectName).
+    std::string dir = shadow_table_dir;
+    while (!dir.empty() && dir.back() == '/')
+        dir.pop_back();
+    return withPrefix(key_prefix, dir + "/refs/");
 }
 
 RefObjectKey shadowRefKey(const std::string & key_prefix, const std::string & shadow_table_dir, const std::string & part_name)
