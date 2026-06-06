@@ -427,18 +427,76 @@ void LocalObjectStorage::listObjects(const std::string & path, RelativePathsWith
     if (!fs::exists(path) || !fs::is_directory(path))
         return;
 
-    for (const auto & entry : fs::recursive_directory_iterator(path))
+    /// A real object store snapshots its listing, so a directory or file removed by a concurrent operation
+    /// while the listing is in progress simply does not appear — it never surfaces a raw filesystem error
+    /// to the caller. The throwing `recursive_directory_iterator` does NOT emulate that: when it yields a
+    /// subdirectory and then tries to recurse into it, a concurrent removal of that subdirectory makes its
+    /// `operator++` throw `no_such_file_or_directory` AND end the whole walk (libc++ resets the iterator on
+    /// a failed recursion). On a content-addressed pool this is hit by `unlinkPartDirRefs` listing the
+    /// `refs/` prefix (e.g. for a background MERGE) while another transaction removes a sibling part's
+    /// detached ref dir (e.g. `refs/detached.deleting_<part>`). Walk with an explicit stack of plain
+    /// (non-recursive) `directory_iterator`s using the error_code overloads, so a subdirectory that vanishes
+    /// before we descend into it is simply skipped and the remaining siblings are still enumerated.
+    std::vector<fs::directory_iterator> stack;
     {
-        if (entry.is_directory())
-            continue;
+        std::error_code ec;
+        fs::directory_iterator it(path, ec);
+        if (ec)
+        {
+            if (ec == std::errc::no_such_file_or_directory)
+                return;
+            throw fs::filesystem_error("Got unexpected error while listing directory", path, ec);
+        }
+        stack.push_back(std::move(it));
+    }
 
-        /// An entry yielded by the directory iterator may be removed by a concurrent operation before we
-        /// stat it (TOCTOU). A real object store snapshots its listing, so an object deleted after the
-        /// listing simply does not appear — it never surfaces a stat error to the caller. Emulate that:
-        /// `tryGetObjectMetadata` returns nullopt when the file vanished (no_such_file_or_directory), so
-        /// skip such entries instead of throwing. On a content-addressed pool this race is hit by a
-        /// background MERGE's `unlinkPartDirRefs` listing the `refs/` prefix while another transaction
-        /// removes a sibling part's mutable per-ref sidecar (e.g. `txn_version.txt.tmp.meta`).
+    const fs::directory_iterator end;
+    while (!stack.empty())
+    {
+        if (stack.back() == end)
+        {
+            stack.pop_back();
+            continue;
+        }
+
+        const fs::directory_entry entry = *stack.back();
+
+        /// Advance the current level first; a removal that races our descent below then cannot make us
+        /// revisit or get stuck. Use the error_code overload — a vanished sibling just ends this level.
+        std::error_code ec;
+        stack.back().increment(ec);
+        if (ec)
+        {
+            if (ec == std::errc::no_such_file_or_directory)
+            {
+                stack.pop_back();
+                continue;
+            }
+            throw fs::filesystem_error("Got unexpected error while listing directory", path, ec);
+        }
+
+        std::error_code dir_ec;
+        if (entry.is_directory(dir_ec))
+        {
+            /// Descend. If the directory was removed between enumeration and now, opening its stream fails
+            /// with no_such_file_or_directory — skip it (it is absent from the snapshot) instead of throwing.
+            std::error_code open_ec;
+            fs::directory_iterator child(entry.path(), open_ec);
+            if (open_ec)
+            {
+                if (open_ec == std::errc::no_such_file_or_directory)
+                    continue;
+                throw fs::filesystem_error("Got unexpected error while listing directory", entry.path(), open_ec);
+            }
+            stack.push_back(std::move(child));
+            continue;
+        }
+        if (dir_ec && dir_ec != std::errc::no_such_file_or_directory)
+            throw fs::filesystem_error("Got unexpected error while listing directory", entry.path(), dir_ec);
+
+        /// A file entry may also be removed by a concurrent operation before we stat it (TOCTOU).
+        /// `tryGetObjectMetadata` returns nullopt when the file vanished, so skip such entries instead of
+        /// throwing — mirroring how a real object store omits a concurrently-deleted object from the listing.
         auto object_metadata = tryGetObjectMetadata(entry.path(), false);
         if (!object_metadata)
             continue;

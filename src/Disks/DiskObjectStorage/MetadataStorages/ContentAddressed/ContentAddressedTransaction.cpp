@@ -653,9 +653,17 @@ void ContentAddressedTransaction::republishDetachedStagingIntoActive(
 
     auto detached_pid = metadata_storage.readRefPartId(src_staging.table_uuid, detached);
     if (!detached_pid)
+        /// A concurrent ATTACH of the SAME detached part won the race: it already consumed the shared
+        /// `detached` ref (republished it under a new part id and unlinked the staging keys, below), so our
+        /// staging source no longer exists. On a plain disk the same race surfaces as `FILE_DOESNT_EXIST`
+        /// from `DataPartStorageOnDiskBase::rename` (its `setLastModified`/`moveDirectory` on the vanished
+        /// staging dir), which ATTACH treats as a recoverable failure of this attempt — NOT a logical error.
+        /// Mirror that here instead of aborting the server (the staging+load happen outside `lockParts`, so
+        /// two ATTACH queries can both stage `attaching_X` for the same detached part — see 01164).
         throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressed: moveDirectory of detached/{} into active {}/{}, but the detached ref is absent",
+            ErrorCodes::FILE_DOESNT_EXIST,
+            "ContentAddressed: moveDirectory of detached/{} into active {}/{}, but the detached ref is absent "
+            "(a concurrent ATTACH consumed it)",
             staging_dir, dst_active.table_uuid, dst_active.part_name);
 
     auto detached_manifest = metadata_storage.loadPartManifestOrThrow(*detached_pid);
@@ -670,10 +678,14 @@ void ContentAddressedTransaction::republishDetachedStagingIntoActive(
             active_manifest.blobs[file.substr(staging_pfx.size())] = entry;
     }
     if (active_manifest.blobs.empty())
+        /// As above: a concurrent ATTACH of the same detached part already stripped this staging dir's keys
+        /// from the still-present shared `detached` ref (another detached part keeps the ref alive). Our
+        /// staging source is gone — a recoverable per-attempt failure, mirroring the plain disk's
+        /// `FILE_DOESNT_EXIST`, not a logical error / server abort.
         throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
+            ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: moveDirectory of detached/{} into active {}/{}, but the detached ref has no "
-            "entries under that staging directory",
+            "entries under that staging directory (a concurrent ATTACH consumed it)",
             staging_dir, dst_active.table_uuid, dst_active.part_name);
 
     const ContentAddressed::PartId active_pid = ContentAddressed::computePartId(active_manifest.blobs);
@@ -1118,11 +1130,24 @@ void ContentAddressedTransaction::moveFile(const std::string & from, const std::
     /// Rename of a single in-part file: re-key the recorded blob. No object is moved in storage.
     auto src = ContentAddressed::parsePartFilePath(from);
     auto dst = ContentAddressed::parsePartFilePath(to);
-    /// A part-DIRECTORY rename reached moveFile (PartsTemporaryRename::rollBackAll undoes an attach with
-    /// moveFile(detached/attaching_X -> detached/X), whereas the forward tryRenameAll uses moveDirectory).
-    /// CA re-keys directories; delegate to moveDirectory (it owns the detached<->detached re-key) instead of
-    /// throwing LOGICAL_ERROR (B87).
-    if (src && src->file.empty() && dst && dst->file.empty())
+    /// A part-DIRECTORY rename reached moveFile (PartsTemporaryRename::rollBackAll undoes an attach via
+    /// moveFile, whereas the forward tryRenameAll uses moveDirectory). Two dir shapes occur:
+    ///   - an ACTIVE part dir `store/<uuid>/<part>`  -> parsePartFilePath yields an empty `file`;
+    ///   - a DETACHED part dir `store/<uuid>/detached/<part>` (the attach-rollback case) -> part_name is
+    ///     `kDetachedDirName` and `file` is the single-component detached dir name (no '/').
+    /// Both are directory re-keys moveDirectory already owns (incl. the detached<->detached rekeyDetachedPartDir
+    /// branch). Delegate instead of throwing LOGICAL_ERROR (B87). A real part-FILE move never matches: an active
+    /// file has a non-empty `file`, and a detached file is `detached/<part>/<subfile>` so its `file` contains '/'.
+    auto is_part_dir = [](const std::optional<ContentAddressed::PartFilePath> & p)
+    {
+        if (!p)
+            return false;
+        if (p->file.empty())
+            return true; /// active part dir: store/<uuid>/<part>
+        return p->part_name == ContentAddressed::kDetachedDirName
+            && p->file.find('/') == std::string::npos; /// detached part dir: store/<uuid>/detached/<part>
+    };
+    if (is_part_dir(src) && is_part_dir(dst))
     {
         moveDirectory(from, to);
         return;
