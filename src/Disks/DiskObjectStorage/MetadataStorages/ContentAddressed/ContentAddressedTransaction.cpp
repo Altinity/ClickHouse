@@ -503,9 +503,17 @@ void ContentAddressedTransaction::republishCommittedPartIntoDetached(
 
     auto src_pid = metadata_storage.readRefPartId(src_committed.table_uuid, src_committed.part_name);
     if (!src_pid)
+        /// A concurrent DETACH/DROP/move-partition consumed the source committed ref before this DETACH could
+        /// re-publish it under the shared `detached` ref, so the source ref no longer exists. On a plain disk
+        /// the same race surfaces as `FILE_DOESNT_EXIST` from `DataPartStorageOnDiskBase::rename` (its
+        /// `setLastModified`/`moveDirectory` on the vanished part dir), which the caller treats as a
+        /// recoverable failure of this attempt — NOT a logical error. Mirror that here (and mirror
+        /// republishDetachedStagingIntoActive's concurrent-consume races) instead of aborting the server
+        /// under `abort_on_logical_error`.
         throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressed: moveDirectory of {}/{} into detached, but the source ref is absent",
+            ErrorCodes::FILE_DOESNT_EXIST,
+            "ContentAddressed: moveDirectory of {}/{} into detached, but the source ref is absent "
+            "(a concurrent DETACH/DROP/move consumed it)",
             src_committed.table_uuid, src_committed.part_name);
 
     auto src_manifest = metadata_storage.loadPartManifestOrThrow(*src_pid);
@@ -1507,8 +1515,14 @@ void ContentAddressedTransaction::commitOnePart(const PartKey & key, PartStaging
     {
         auto existing_pid = metadata_storage.readRefPartId(table_uuid_, part_name_);
         if (!existing_pid)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "ContentAddressed: mutable-only commit for {}/{} with no existing ref", table_uuid_, part_name_);
+            /// A concurrent DROP/DETACH/merge-replace unlinked the part's ref mid-commit, so this mutable-only
+            /// txn_version.txt rewrite (MVCC creation-CSN fill-in or removal-TID lock) has nothing to update —
+            /// the part is gone and the write is lost. On a plain disk the same race surfaces as the late
+            /// in-place write to a removed part dir failing with `FILE_DOESNT_EXIST`, which the MVCC layer
+            /// tolerates; surface that here instead of aborting the server under `abort_on_logical_error`.
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                "ContentAddressed: mutable-only commit for {}/{} with no existing ref "
+                "(a concurrent DROP/DETACH/merge unlinked it)", table_uuid_, part_name_);
 
         ContentAddressed::RefSidecar sidecar;
         /// CA GC S3 (#6): carry forward manifest_generation + pin_generations from the prior sidecar so
