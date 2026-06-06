@@ -417,6 +417,21 @@ ContentAddressed::BlobObjectKey ContentAddressedMetadataStorage::resolveBlobGenK
     return repairBlobGenOn404(blob_hash);
 }
 
+ContentAddressed::PartObjectKey ContentAddressedMetadataStorage::resolvePartGenKeyChecked(
+    const ContentAddressed::PartId & part_id) const
+{
+    /// CA read-path safety net (B85), the MANIFEST analogue of resolveBlobGenKeyChecked: the `active` hint /
+    /// on-node cache resolvePartGenKeyForRead trusts can be stale (a best-effort PUT failed, or the GC swept
+    /// the generation after caching), so the resolved manifest key may 404. HEAD it (tryGetObjectMetadata
+    /// returns nullopt on a missing object for BOTH S3 and local, sidestepping the
+    /// S3_ERROR-vs-FILE_DOESNT_EXIST divergence); on a miss, repair (LIST the present generations, pick the
+    /// live one, fix `active`, cache) so a stale-`active` read transparently recovers to the live manifest.
+    auto key = resolvePartGenKeyForRead(part_id);
+    if (object_storage->tryGetObjectMetadata(key.string(), /*with_tags=*/false))
+        return key;
+    return repairPartGenOn404(part_id);
+}
+
 uint64_t ContentAddressedMetadataStorage::readActiveGenHintForRead(const std::string & active_key) const
 {
     /// Read a best-effort `active` generation hint (default 0 if absent, empty, or unparseable). Matches the
@@ -859,7 +874,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto pid = readShadowRefPartId(p->shadow_table_dir, p->part_name);
         if (!pid)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no shadow ref for {}", path);
-        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyForRead(*pid).string(), /*with_tags=*/false);
+        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyChecked(*pid).string(), /*with_tags=*/false);
         return metadata.last_modified;
     }
 
@@ -871,7 +886,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto pid = readRefPartId(p->table_uuid, p->part_name);
         if (!pid)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyForRead(*pid).string(), /*with_tags=*/false);
+        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyChecked(*pid).string(), /*with_tags=*/false);
         return metadata.last_modified;
     }
 
@@ -888,7 +903,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto pid = readRefPartId(p->table_uuid, p->part_name);
         if (!pid)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyForRead(*pid).string(), /*with_tags=*/false);
+        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyChecked(*pid).string(), /*with_tags=*/false);
         return metadata.last_modified;
     }
 
@@ -906,7 +921,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto pid = readRefPartId(p->table_uuid, p->part_name);
         if (!pid)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyForRead(*pid).string(), /*with_tags=*/false);
+        auto metadata = object_storage->getObjectMetadata(resolvePartGenKeyChecked(*pid).string(), /*with_tags=*/false);
         return metadata.last_modified;
     }
 

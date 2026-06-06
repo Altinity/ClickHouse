@@ -234,6 +234,14 @@ private:
     // getStorageObjects before the key reaches the read buffer.
     ContentAddressed::BlobObjectKey resolveBlobGenKeyChecked(const ContentAddressed::BlobHash & blob_hash) const;
 
+    // Read-path 404→repair safety net for the MANIFEST generation (B85, part analogue of
+    // resolveBlobGenKeyChecked): resolve the part generation key, HEAD it, and on a miss repair via
+    // repairPartGenOn404 (LIST present generations, pick the live one, fix `active`, cache) so a
+    // stale-`active`/stale-cache read transparently recovers to the live manifest. Used by getLastModified
+    // on the part-dir branches, where the throwing getObjectMetadata on a stale generation would otherwise
+    // 404 and wedge clearOldTemporaryDirectories/isOldPartDirectory (DROP) or system.detached_parts.
+    ContentAddressed::PartObjectKey resolvePartGenKeyChecked(const ContentAddressed::PartId & part_id) const;
+
     // Read a best-effort decimal `active` generation hint (default 0 if absent/empty/unparseable), matching
     // ContentAddressedTransaction::readActiveGenHint. Used by the resolvers on a cache miss.
     uint64_t readActiveGenHintForRead(const std::string & active_key) const;
