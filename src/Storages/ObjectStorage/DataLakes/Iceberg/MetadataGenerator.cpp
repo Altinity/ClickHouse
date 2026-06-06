@@ -52,6 +52,7 @@ bool checkValidSchemaEvolution(Poco::Dynamic::Var old_type, Poco::Dynamic::Var n
         return true;
     }
 
+    if (!old_type.isString() && !new_type.isString())
     {
         auto old_complex_type = old_type.extract<Poco::JSON::Object::Ptr>();
         auto new_complex_type = new_type.extract<Poco::JSON::Object::Ptr>();

@@ -901,6 +901,8 @@ void StorageObjectStorage::mutate([[maybe_unused]] const MutationCommands & comm
 
 void StorageObjectStorage::checkMutationIsPossible(const MutationCommands & commands, const Settings & /* settings */) const
 {
+    if (configuration->isDataLakeConfiguration())
+        configuration->lazyInitializeIfNeeded(object_storage, Context::getGlobalContextInstance());
     configuration->checkMutationIsPossible(commands);
 }
 
@@ -928,8 +930,9 @@ void StorageObjectStorage::alter(const AlterCommands & params, ContextPtr contex
     setInMemoryMetadata(new_metadata);
 }
 
-void StorageObjectStorage::checkAlterIsPossible(const AlterCommands & commands, ContextPtr /*context*/) const
+void StorageObjectStorage::checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const
 {
+    configuration->lazyInitializeIfNeeded(object_storage, context);
     configuration->checkAlterIsPossible(commands);
 }
 
