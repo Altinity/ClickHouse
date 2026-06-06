@@ -403,6 +403,20 @@ ContentAddressed::PartObjectKey ContentAddressedMetadataStorage::resolvePartGenK
     return ContentAddressed::partGenKey(storage_path_prefix, part_id, gen);
 }
 
+ContentAddressed::BlobObjectKey ContentAddressedMetadataStorage::resolveBlobGenKeyChecked(
+    const ContentAddressed::BlobHash & blob_hash) const
+{
+    /// CA read-path safety net (B85): the `active` hint resolveBlobGenKeyForRead trusts can be stale (a
+    /// best-effort PUT failed, or the GC swept the generation after caching), so the resolved key may 404.
+    /// HEAD it (tryGetObjectMetadata returns nullopt on a missing object for BOTH S3 and local, sidestepping
+    /// the S3_ERROR-vs-FILE_DOESNT_EXIST divergence); on a miss, repair (LIST the present generations, pick
+    /// the live one, fix `active`, cache) so a stale-`active` read transparently recovers to the live blob.
+    auto key = resolveBlobGenKeyForRead(blob_hash);
+    if (object_storage->tryGetObjectMetadata(key.string(), /*with_tags=*/false))
+        return key;
+    return repairBlobGenOn404(blob_hash);
+}
+
 uint64_t ContentAddressedMetadataStorage::readActiveGenHintForRead(const std::string & active_key) const
 {
     /// Read a best-effort `active` generation hint (default 0 if absent, empty, or unparseable). Matches the
@@ -1182,7 +1196,7 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         if (it == manifest.blobs.end())
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in shadow manifest of {}", p->file, path);
         const auto & e = it->second;
-        return {StoredObject(resolveBlobGenKeyForRead(e.key).string(), path, e.size)};
+        return {StoredObject(resolveBlobGenKeyChecked(e.key).string(), path, e.size)};
     }
 
     /// Mutable per-part file: resolve to its OWN per-file sidecar object, whose bytes are EXACTLY this
@@ -1210,8 +1224,9 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     /// storage_path_prefix), so blobs are read from where ContentAddressedWriteBuffer stored them.
     /// e.key is the BARE BlobHash; resolveBlobGenKeyForRead projects it to the full generationed
     /// BlobObjectKey (cache-fronted; g=0 in the common case — one GET downstream), .string() at the
-    /// object-storage boundary. The downstream GET's 404 fallback is repairBlobGenOn404 (§6.1).
-    return {StoredObject(resolveBlobGenKeyForRead(e.key).string(), path, e.size)};
+    /// object-storage boundary. resolveBlobGenKeyChecked HEADs the resolved key and repairs a stale-`active`
+    /// 404 before it reaches the read buffer (B85), the read-path counterpart to repairBlobGenOn404 (§6.1).
+    return {StoredObject(resolveBlobGenKeyChecked(e.key).string(), path, e.size)};
 }
 
 }

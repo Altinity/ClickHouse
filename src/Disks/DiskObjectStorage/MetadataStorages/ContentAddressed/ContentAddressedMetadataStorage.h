@@ -228,6 +228,12 @@ private:
     ContentAddressed::BlobObjectKey resolveBlobGenKeyForRead(const ContentAddressed::BlobHash & blob_hash) const;
     ContentAddressed::PartObjectKey resolvePartGenKeyForRead(const ContentAddressed::PartId & part_id) const;
 
+    // Read-path 404→repair safety net (B85): resolve the blob generation key, HEAD it, and on a miss
+    // repair via repairBlobGenOn404 (LIST present generations, pick the live one, fix `active`, cache) so a
+    // stale-`active` read transparently recovers to the live blob. Used at the content-blob return sites in
+    // getStorageObjects before the key reaches the read buffer.
+    ContentAddressed::BlobObjectKey resolveBlobGenKeyChecked(const ContentAddressed::BlobHash & blob_hash) const;
+
     // Read a best-effort decimal `active` generation hint (default 0 if absent/empty/unparseable), matching
     // ContentAddressedTransaction::readActiveGenHint. Used by the resolvers on a cache miss.
     uint64_t readActiveGenHintForRead(const std::string & active_key) const;
