@@ -1118,6 +1118,15 @@ void ContentAddressedTransaction::moveFile(const std::string & from, const std::
     /// Rename of a single in-part file: re-key the recorded blob. No object is moved in storage.
     auto src = ContentAddressed::parsePartFilePath(from);
     auto dst = ContentAddressed::parsePartFilePath(to);
+    /// A part-DIRECTORY rename reached moveFile (PartsTemporaryRename::rollBackAll undoes an attach with
+    /// moveFile(detached/attaching_X -> detached/X), whereas the forward tryRenameAll uses moveDirectory).
+    /// CA re-keys directories; delegate to moveDirectory (it owns the detached<->detached re-key) instead of
+    /// throwing LOGICAL_ERROR (B87).
+    if (src && src->file.empty() && dst && dst->file.empty())
+    {
+        moveDirectory(from, to);
+        return;
+    }
     if (!src || src->file.empty() || !dst || dst->file.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: moveFile requires two part-file paths: {} -> {}", from, to);
 
