@@ -1335,10 +1335,19 @@ uint64_t ContentAddressedTransaction::resolveAndResurrectGeneration(
     }
 
     /// Bounded re-check + resurrect loop (§6, §7.1 steps 4-5). Each iteration: ensure g exists, re-check its
-    /// tombstone; if SEALED, resurrect to g+1 and retry. The bound caps a pathological hot-content cycle of
-    /// zero-refs→resurrection; in S3 the held gc_lock means a seal essentially never races this, so one or
-    /// two iterations is the norm.
-    constexpr size_t max_iterations = 8;
+    /// tombstone; if SEALED, resurrect to g+1 and retry. The loop is correct and terminating at ANY cap: it
+    /// advances ONLY when it observes a present tombstone (a GC-owned seal), creates an unsealed successor at
+    /// g+1, and settles the moment it reaches a generation with no tombstone. The cap is therefore purely a
+    /// backstop against a pathological UNBOUNDED sealed chain — not a correctness bound.
+    ///
+    /// We size it at 256 (was 8) for headroom against transient GC seal bursts: the GC writes a permanent
+    /// `.tombstone` gravestone per sweep round, so under a fast GC cadence (e.g. the 5s interval the
+    /// content-addressed stateless tests run with) a hot content identity can accrue sealed generations at
+    /// roughly one per round. A short cap turned such a transient burst into a user-visible `CORRUPTED_DATA`
+    /// failure on an otherwise healthy commit; 256 absorbs the burst while still bounding a truly runaway
+    /// chain. (The principled cure — an in-flight manifest pin so a seal cannot race a live commit — is a
+    /// separate backlog item.)
+    constexpr size_t max_iterations = 256;
     for (size_t iter = 0; iter < max_iterations; ++iter)
     {
         const std::string gen_key = make_gen_key(g);
