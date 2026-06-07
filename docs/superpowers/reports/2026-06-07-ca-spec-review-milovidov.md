@@ -47,8 +47,10 @@ the Merkle-DAG core; D5 (trust `checksums.txt`, `cityHash128`) — the keystone 
    metadata files are not in `checksums.txt`. And verify part-load doesn't trip the cold `404→LIST` en masse.
 
 ## Disposition (what the spec did with this) {#disposition}
-- **D6 CUT entirely** (orphans → periodic Retention-guarded sweep). The rejected-intent rationale is recorded in
-  §9; §8 notes the sweep cost.
+- **D6 CUT entirely.** Orphans → a periodic **reconcile that condemns-not-deletes** (§4.5); quiescence is the
+  safety, not a wall clock. Zero hot-path orphan tracking (a later realization closed this: for fresh parts the
+  blob hashes aren't even known up front, so any write-ahead record degrades to `O(files)` — the exact
+  amplification objected to). The rejected-intent rationale is recorded in §9; §8 notes the reconcile cost.
 - **Epoch cache kept** (user's call) but with the **sole-writer rule** made normative (§3.2, §6.2, §9 D1).
 - Framing collapse (two gears, deferred cascade = edge `-`) applied to §4.2.
 - All RISKS 2–6 captured as explicit open items in the new §11; the generation read-cost is noted in §8.

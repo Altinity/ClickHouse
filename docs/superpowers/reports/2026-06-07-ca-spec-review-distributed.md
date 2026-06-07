@@ -44,9 +44,12 @@ late-`+`-into-closed-epoch reappend under a *lagging* epoch source; the post-wip
 atomicity with the orphan path active.
 
 ## Disposition (what the spec did with this) {#disposition}
-- The user **cut D6 entirely** (crash orphans → periodic Retention-guarded full-`LIST` sweep only). This dissolves
-  Findings 1 and 2 (no intents, no rescue, no key). The sweep's age-basis + grace (Finding 4) was folded into §4.4
-  / §7 / §9.
+- The user **cut D6 entirely**; crash orphans are collected by a periodic **reconcile that condemns-not-deletes**
+  (§4.5), with the **quiescence** gate (not a wall clock) as the safety. This dissolves Findings 1 and 2 (no
+  intents, no rescue, no key) and supersedes Finding 4: there is no `Retention`-gated *deletion* at all — the
+  reconcile only nominates candidates into `gc/condemned`, and the normal `safe_epoch > e ∧ in-degree 0 ∧ e+2 ∧
+  fence` gate reclaims them. The age-filter that remains is a pure performance heuristic (avoid disturbing
+  in-flight builds), fail-safe.
 - The Keeper `epoch` cache was **kept**, with the **sole-writer rule** made normative (§3.2, §6.2, §9 D1) —
   Finding 3's condition. The reappend-binding (cache is hint-only) and the `e+2` lag-independence note (Finding 5)
   were added to §6.2.
