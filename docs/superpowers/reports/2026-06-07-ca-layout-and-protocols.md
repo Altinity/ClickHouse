@@ -7,7 +7,7 @@ reclaimed by the **Keeper-only EBR GC** (`2026-06-07-ca-gc-keeper-only-profile.m
 ## 1. State split — `INV-S3-COMPLETE` {#split}
 
 - **S3** holds ALL durable state: the Merkle DAG (blobs, trees, refs) + the GC index (epoch, log, snap,
-  tombstones). Self-describing; the full state is understandable and rebuildable from S3 alone.
+  condemned sets). Self-describing; the full state is understandable and rebuildable from S3 alone.
 - **Keeper** holds ONLY ephemeral coordination, size **O(active writers + contending leaders)** — never
   O(objects). Losing Keeper (even wiping it) loses no durable state: writers self-fence read-only, GC stops,
   and on restore everything resumes from S3.
@@ -100,7 +100,7 @@ folds to 0. Over-count only.
 ```
 GET ref -> {T,g}.  resolveNode(x,g): GET <x>/<g>; on 404, LIST <x>/ and read any present generation.
 Walk the tree's entries; recurse into child trees, GET child blobs. 404 → LIST fallback at each node.
-A present-but-condemned node still reads correctly (the tombstone only blocks new reuse/attach).
+A present-but-condemned node still reads correctly (condemnation only blocks new reuse/attach).
 ```
 
 ## 6. GC round protocol (fenced leader) {#gc}
