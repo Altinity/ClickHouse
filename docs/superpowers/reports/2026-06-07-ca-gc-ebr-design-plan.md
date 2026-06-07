@@ -138,8 +138,10 @@ closed-epoch fold in §5.2.
   margin** — the writer self-fences at `lease_until − Δ_skew` (local clock), the GC drops the writer only at
   `GC_now > lease_until + Δ_skew`, under the assumption `GC_clock − W_clock ≤ Δ_skew`. Renewals count only
   once **read-back-durable** (issue→read-confirm before extending the self-fence), closing the
-  renewal-vs-expiry gap. Renew well inside `T_lease`. **Keeper is the recommended coordinator** (removes the
-  skew assumption entirely); S3-only is the documented weaker mode.
+  renewal-vs-expiry gap. Renew well inside `T_lease`. **DECISION D1: Keeper is REQUIRED** — the S3-only
+  coordination mode (this lease math + the fence counter + strong-read fence) is **dropped** as a documented
+  data-loss-under-skew mode. The S3-mode text below is retained only as rationale for why Keeper is required;
+  the authoritative coordination design is the Keeper-only profile + `2026-06-07-ca-design-decisions.md`.
 - **Leader fence (deleter safety).** `gc.lock` carries a monotone fence (Keeper: ephemeral-sequential / czxid;
   S3: a `create-if-absent` counter). Every DELETE / epoch-advance re-checks the fence (Kleppmann fencing).
   On S3 the fence re-check must be a **strong read**, and a **stealing** leader must **out-wait** the prior

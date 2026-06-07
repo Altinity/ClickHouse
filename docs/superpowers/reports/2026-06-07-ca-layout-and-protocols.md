@@ -14,8 +14,9 @@ reclaimed by the **Keeper-only EBR GC** (`2026-06-07-ca-gc-keeper-only-profile.m
 
 ## 2. S3 layout {#s3}
 
-One pool = one disk root. `<H>`/`<T>` are content hashes; `<g>` is the generation (= the epoch the node was
-(re)created in; `0` is the common case). Generations exist only so a GC delete and a concurrent re-create never
+One pool = one disk root. `<H>`/`<T>` are content hashes; `<g>` is a **per-node resurrection generation** —
+`0` until the GC condemns generation `g` and a writer recreates the content at `g+1` (D2: decoupled from the
+epoch; stays `0` in the common case). Generations exist only so a GC delete and a concurrent re-create never
 collide on the same key (ABA-safety).
 
 ```
@@ -82,13 +83,13 @@ A writer's lease = its ephemeral session; `writers/<S>` publishes its `O_W`. The
 0b. CONDEMNED CACHE: read gc/condemned/<e> for the last ~(e+2) epochs once each (immutable closed-epoch sets),
     cache for this epoch. "condemned?(node,e)" is a membership test against this cache.
 1. Build the part locally. For each file f: Bf := hash(f); putBlob -> createIfAbsent blobs/<Bf>/<g>; upload once.
-   For each subdir: recurse -> child tree hash. DEDUP-REUSE an existing child node (hash,e) iff present AND
-   NOT condemned?(hash,e); else RESURRECT (createIfAbsent at the current epoch).
+   For each subdir: recurse -> child tree hash. DEDUP-REUSE the present generation (hash,g) iff present AND
+   NOT condemned?(hash,g); else RESURRECT (createIfAbsent at gen+1). (No `g >= O_W` rule — D2 decoupled.)
 2. T := canonical-serialize(entries); createIfAbsent trees/<T>/<g>.   (part_id == T)
 3. Append EDGE `+` deltas to gc/log/<O_W>/<shard>:  ref→(T,g)  and  (T,g)→each child(hash,e).
    Make them DURABLE, then (and only then) may O_W advance — FLUSH-`+`-THEN-ADVANCE. After the edge-`+` is
    durable, RE-CHECK condemned?(child) against the refreshed condemned cache; if now condemned, resurrect to
-   the current epoch AND append the `-` for the abandoned edge (the dedup-preserving reuse rule, CE-2).
+   gen+1 AND append the `-` for the abandoned edge (the dedup-preserving reuse rule; CE-2 resolved by D2).
 4. setRef store/.../refs/<name> = RefPayload{T,g,header}.   COMMIT POINT — written LAST; recheck self-fence first.
 5. Drop (later): removeRef FIRST, then append the ref→(T,g) `-` delta.
 ```
@@ -150,6 +151,7 @@ R4 RECLAIM  for each (N,e_a) listed in gc/condemned/<e_a> with
 
 TLC-checked (bounded) for the *single-node* core: `INV_NO_LOSS / NO_DANGLE / NO_ABA` under expiry-gap +
 split-brain + Keeper-wipe. **Not yet modeled:** multi-child commit atomicity (a tree making a SET of nodes
-reachable at once) and the decrement cascade — the #1 next model-checking target. Also open: canonical tree
-serialization + hash choice; the `generation==epoch` vs long-lived-dedup tension (CE-2) at the tree level; the
-folder API (`putBlob/putTree/getBlob/getTree/setRef/removeRef`) and the `IDataPartStorage` adapter.
+reachable at once) and the decrement cascade — the #1 next model-checking target. **Decided** (see
+`2026-06-07-ca-design-decisions.md`): Keeper required (D1), generations decoupled per-node (D2, resolves
+CE-2), flat refs (D3), deferred cascade (D4), hashes = `cityHash128`/`SipHash-128`. Still open: the folder API
+(`putBlob/putTree/getBlob/getTree/setRef/removeRef`) and the `IDataPartStorage` adapter.

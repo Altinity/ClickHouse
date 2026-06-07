@@ -134,15 +134,12 @@ recoverable source of truth. This is the variant to spec and build.
 Keeper's linearizable `O_W` publish; (2) measure round-trips per INSERT; (3) the leader's one-time epoch bump
 on recovery — prove it fences pre-outage in-flight epochs without stranding a just-published ref.
 
-**NEW open question from TLC (CE-2 — `generation==epoch` vs long-lived dedup):** the model proved
-"reuse only a generation `e ≥ O_W`" sufficient for safety, but combined with `generation==epoch` that would
-**break long-lived dedup** — a stable `g=0` blob keeps generation 0 while `O_W` climbs unboundedly (one per GC
-round), so `e ≥ O_W` would forbid de-duplicating against it and force wasteful resurrection. Resolve before
-spec: most likely the dedup-preserving variant **"reuse + make `+` durable + re-check the tombstone; resurrect
-only if now condemned"** (which the model did NOT encode — it used the stricter `e ≥ O_W`), or **decouple
-generation from epoch** (a small per-blob generation counter, advanced only on actual resurrection, instead of
-stamping the global epoch). The safety the model proved is real; the dedup-cost of the *particular* rule it
-used is the thing to re-engineer.
+**RESOLVED — CE-2 (`generation` vs long-lived dedup), decision D2:** generation is **decoupled** from the
+epoch — a small per-node resurrection counter (bumped only when a writer recreates a condemned generation),
+`0` in the common case. The reuse rule is "reuse the present generation iff not condemned; else resurrect to
+`gen+1`" with `flush-+-then-advance` + re-check + `-`-on-resurrect — **no `e ≥ O_W`** rule, so long-lived
+dedup is preserved. See `2026-06-07-ca-design-decisions.md` (D2). (The TLC model used the stricter `e ≥ O_W`
+encoding; re-modeling under the decoupled reuse rule is folded into the next multi-child model pass.)
 
 **TLC status:** the stabilized core (closed-epoch fold + flush-`+`-then-advance + reuse-under-fresh-`O_W` +
 session-alive self-fence + fenced/fail-close leader + `e+2`/`safe_epoch` reclaim + retention backstop) passes

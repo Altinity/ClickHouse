@@ -70,7 +70,8 @@ either `ref → node` (root edge) or `tree → child` (internal edge):
   it appends `-` for each of *its* outgoing edges — a **decrement cascade** down the dead subtree.
 - **Everything else is unchanged:** the sharded snapshot folds per-node in-degree (the sloppy candidate
   filter); the fenced single leader condemns (`<gen>.tombstone`) and reclaims under the `e+2` limbo +
-  `safe_epoch` quiescence; epoch == generation; per-writer time-bounded lease (session-alive self-fence);
+  `safe_epoch` quiescence; epoch (EBR clock) + a decoupled per-node resurrection generation (D2); per-writer
+  time-bounded lease (session-alive self-fence);
   retention-backstop reconcile = full **DAG reachability** from refs, the rebuild authority.
 - **Cascade crash-safety:** a partial decrement cascade (leader crash mid-cascade) is recovered by re-folding
   the log — the `-` edges already written are durable, and a re-fold recomputes in-degrees; missing `-`s only
@@ -78,7 +79,7 @@ either `ref → node` (root edge) or `tree → child` (internal edge):
   re-folds + re-quiesces under its own fence before deleting (as in the profile).
 - **CE-2 generalizes to nodes:** dedup-reusing an existing subtree races a concurrent condemn exactly like a
   blob; the same reuse rule applies uniformly — *reuse → make the edge-`+` durable → re-check the tombstone →
-  resurrect (re-create under the current epoch) only if now condemned*. One rule for blobs and trees.
+  resurrect (re-create at gen+1) only if now condemned*. One rule for blobs and trees.
 
 So the GC we model-checked (`docs/superpowers/models/`) applies; the model's `H`/`(H,e)` becomes a node, and
 its single edge generalizes to the DAG edge set. (Extending the TLA+ model to a *tree referencing a set of
@@ -114,8 +115,9 @@ nodes* — multi-child commit atomicity — is the top untested gap, §6.)
    must keep `INV-NO-LOSS` for the whole set. **This is the #1 thing to add to the TLA+ model** (currently a
    single `H`; needs a node referencing a *set* of children).
 2. **CE-2 reuse rule for trees** — confirm `reuse + durable edge-`+` + re-check-tombstone` resurrects correctly
-   when a *subtree* (not just a blob) is condemned mid-reuse; and reconcile the `generation == epoch` vs
-   long-lived dedup tension (open from the model) at the *tree* level.
+   when a *subtree* (not just a blob) is condemned mid-reuse. (The `generation == epoch` vs long-lived-dedup
+   tension is RESOLVED — D2 decouples generation into a per-node resurrection counter; see
+   `2026-06-07-ca-design-decisions.md`.)
 3. **Tree size / sharding policy** — define when a tree must be sharded into a trie (large-directory corner),
    and the canonical serialization + hash function (collision resistance, length).
 4. **API surface** — the minimal `putBlob/putTree/getBlob/getTree/setRef/removeRef` interface and how
