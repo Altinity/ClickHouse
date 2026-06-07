@@ -54,6 +54,12 @@ garbage collector**: writers and the background GC never share a mutex; a live w
 This replaces zero-copy replication: `blobs/`+`trees/` are a global per-pool content pool, a ref is a pointer,
 and a second server "fetches" a part by publishing a ref to an already-present tree — no byte copy.
 
+**Keeper load is flat in pool size.** The commit hot path is *upload the bytes + two constant CA objects (one
+tree, one ref) + a coalesced edge-delta*, with **no per-object and no data-proportional Keeper traffic** —
+Keeper holds only `O(active-writers)` ephemeral coordination. This is the decisive contrast with zero-copy
+replication, whose per-part/per-blob lock state in Keeper scales with the data and is what melts Keeper on large
+clusters.
+
 ## 2. Data model — the Merkle DAG of immutable folders {#data-model}
 
 Three object kinds; everything is built from them.
@@ -189,10 +195,13 @@ R0 CLOSE    E := GET gc/epoch (S3); fenced PUT gc/epoch = E+1 in S3 (DURABLE FIR
 R1 FOLD     CLOSED epochs only: per shard, streaming merge-sort gc/log/<≤E>/<shard> ⋈ gc/snap/<…>/<shard>
             → gc/snap/<E+1>/<shard>; per-node IN-DEGREE; emit in-degree-0 CANDIDATES.   (O(delta), sharded)
 R2 CONDEMN  write the candidate (node,gen) set to gc/condemned/<e_a> as ONE object (fenced; e_a = folded epoch).
-R3 QUIESCE  safe_epoch := min(O_W) over getChildren(writers/) [sync-ed]; if none → E_cur.
+R3 QUIESCE  safe_epoch := min(O_W) over getChildren(writers/) [SYNC-ED read — required: a stale read could
+            under-count live writers]; if none → E_cur (also via a sync-ed membership read).
 R4 RECLAIM  for each (N,e_a) in gc/condemned/<e_a> with
-              E_cur ≥ e_a+2  ∧  safe_epoch > e_a  ∧  in-degree==0  ∧  still-leader(fence):
-                DELETE the node object;  if N is a TREE, append `-` deltas for ITS child edges
+              E_cur ≥ e_a+2  ∧  safe_epoch > e_a  ∧  in-degree==0 (re-read from the CURRENT fold, not a frozen
+                                                                   snapshot)  ∧  still-leader(fence):
+                read N's child edges FROM the immutable gc/condemned/<e_a> record (or the tree object BEFORE its
+                  DELETE — never after);  DELETE the node object;  if N is a TREE, append the `-` child-edge deltas
                 (DEFERRED CASCADE — children whose in-degree reaches 0 are condemned in a LATER round, D4).
 ```
 **Two gears, not four.** The real no-loss gate is **quiescence** (`safe_epoch > e_a`: every live writer has
@@ -214,31 +223,65 @@ gone the part was dropped and the read fails cleanly (no live ref names it — t
 during:  every writer session drops → READ-ONLY (self-fence); the leader's election znode is gone → GC stops.
          No mutation that could dangle or lose data occurs while Keeper is down.  SAFE PAUSE.
 restore (even empty Keeper):
-         PURGE any backup-restored ghost leader//writers/ znodes;  elect a leader;
-         E := GET gc/epoch (S3);  fenced PUT gc/epoch = E+1  (fence off pre-outage in-flight epochs);  the elected
-         leader — and ONLY it, S3-first — refreshes the Keeper `epoch` cache;  writers reconnect, re-create
-         writers/<S>, observe the new epoch, resume.
+         PURGE any backup-restored ghost znodes — leader/, writers/, AND the `epoch` cache (a restored stale-HIGH
+         epoch would let a writer read O_W > E_cur, i.e. Keeper AHEAD of S3 — the one forbidden direction). No
+         writer may read O_W from the cache until the elected leader has rewritten it S3-first.
+         Elect a leader;  E := GET gc/epoch (S3);  fenced PUT gc/epoch = E+1  (fence off pre-outage in-flight
+         epochs);  the elected leader — and ONLY it, S3-first — writes the Keeper `epoch` cache;  writers
+         reconnect, re-create writers/<S>, observe the new epoch, resume.
          If gc/snap integrity is in doubt → RECONCILE (§4.5): rebuild gc/snap from refs/ reachability and CONDEMN
          (never delete) unreachable debris; the usual quiescence gate reclaims it.  S3 ALONE SUFFICES.
 ```
 
-### 4.5 Reconcile — orphan discovery (condemn, never delete) {#proto-reconcile}
+### 4.5 Reconcile — orphan discovery (emit candidates, never delete) {#proto-reconcile}
 The `O(delta)` fold reclaims referenced-then-dropped nodes but **cannot see never-referenced debris** (objects a
-crashed build PUT before publishing any `+`; see §4.1). A periodic background **reconcile** is the only thing
-that sees them. It is the same full-DAG pass that rebuilds `gc/snap`, and it is safe because it **condemns, never
-deletes**:
+crashed build PUT before publishing any `+`; see §4.1) — such debris carries no edge, so it never appears in the
+fold. A periodic background **reconcile** (rare — e.g. every few days) is the only thing that sees it. Reconcile
+is the GC's **same streaming merge-sort fold, with the full `LIST` as one extra sorted input**; it emits
+corrective markers and stops — it **never deletes and never condemns directly** (the single fold stays the sole
+condemner; the single quiescence gate stays the sole reclaimer).
 ```
-R   LIST blobs/ + trees/; compute REACHABILITY from all roots (refs/, refs/detached, shadow/) — the durable,
-    written-last authority. For each object NOT reachable AND older than the age-filter:  CONDEMN it into the
-    CURRENT epoch's gc/condemned/<E> (fenced). It is now an ordinary condemned node — the R4 path reclaims it
-    under the usual  safe_epoch > E ∧ in-degree==0 ∧ E_cur ≥ E+2 ∧ fence  gate.
+R0  WALK reachability from all roots (refs/, refs/detached, shadow/) — the durable, written-last AUTHORITY (NOT
+    the snapshot, which is only a derived cache) — emitting each reachable (hash,gen) to an external SORTED SPILL.
+    Bounded memory: the spill is sorted on disk, deduped; the walk reads live trees (≪ blobs) once.
+R1  LIST blobs/ + trees/  (paginated, sorted by key = the sharded node-key order)  AFTER the reachability walk
+    began from a refs/ view no older than the LIST  (READ-REFS-relative-to-LIST: a ref published mid-scan is
+    either in the reachability spill, or its `+` is already durable in a foldable epoch — keeps the two safety
+    gates independent).
+R2  STREAMING MERGE  LIST ⋈ reachability-spill, per shard:
+      • in LIST, NOT reachable, older than the age-filter  → emit a ZERO-WEIGHT "seen" marker into gc/log
+        (idempotent: keyed by (hash,gen)+event_id, deduped like every gc/log event; it contributes 0 to
+        in-degree — NEVER additive, so repeated reconciles cannot inflate a phantom positive count);
+      • reachable but absent from LIST → already physically deleted: drop the stale snap entry (housekeeping);
+      • in both / reachable → nothing.
+    (This pass also rebuilds gc/snap from the refs/ authority — the §4.4 / §7 "rebuild on torn snap" use of
+    reconcile — because reachability is computed from refs/, not consumed from the snapshot.)
 ```
-**Quiescence is the safety, not a clock.** A reclaim needs `safe_epoch > E`; a live writer still holding an
-uploaded-but-uncommitted object has not flushed its `+`, so (flush-`+`-then-advance) its `O_W ≤` its upload epoch
-`≤ E`, and it pins `safe_epoch ≤ E` — the reclaim is blocked until that writer commits (→ `in-degree > 0`,
-blocked forever) or dies (→ true orphan, reclaimed). A writer that races to reference the object *after* the
-condemn sees it condemned in its read-window and resurrects to `gen+1` (re-check, step 5), or its `+` lands first
-and `in-degree > 0` blocks the reclaim. No wall clock is consulted on the reclaim path.
+The **next normal GC round** consumes the "seen" markers like any delta: a node carrying a seen-marker whose net
+`in-degree` (re-read from the CURRENT fold, including all durable `+`/`-`) is 0 becomes an ordinary condemn
+candidate, reclaimed under the unchanged `safe_epoch > E ∧ in-degree==0 ∧ E_cur ≥ E+2 ∧ fence` gate.
+
+**Why merge against `refs/`-reachability, not the raw snapshot.** The snapshot is a *sloppy candidate filter*
+that can drift or tear (§5, §7). Merging `LIST` against it would (a) not be equivalent to reachability and (b)
+destroy the snapshot-rebuild property recovery depends on (you cannot rebuild a torn snapshot by consuming it).
+Walking `refs/` (the durable, written-last roots) keeps reconcile authoritative AND rebuilds the snapshot, while
+the external sorted spill keeps it `O(1)`-memory at billions of objects (the only framing that does not OOM).
+
+**Quiescence is the safety, not a clock.** Reconcile only *adds* in-degree-0 candidates; the existing gate is the
+authority. A reclaim needs `safe_epoch > E`; a live writer still holding an uploaded-but-uncommitted object has
+not flushed its `+`, so (flush-`+`-then-advance) its `O_W ≤` its upload epoch `≤ E`, pinning `safe_epoch ≤ E` —
+the reclaim is blocked until that writer commits (→ `in-degree > 0`, blocked forever) or dies (→ true orphan,
+reclaimed). A writer racing to reference the object *after* the seen-marker either sees it condemned and
+resurrects to `gen+1` (re-check, step 5), or its durable `+` co-folds with the seen-marker and out-votes it
+(`in-degree > 0`). No wall clock is consulted on the reclaim path.
+
+**The age-filter is a performance heuristic, fail-safe *toward leak* (never toward loss).** Its only purpose is
+to avoid emitting markers for brand-new in-flight objects, which would make their writers needlessly resurrect to
+`gen+1` and re-upload (wasted work + lost dedup, never lost data). Set it well above max build/upload duration.
+Too small → wasted re-uploads + a transient `g+1` leak; too large → debris leaks longer. Both directions are
+leak, never dangle. Reconcile also tolerates a stale view (over-count only): a missed orphan is caught next pass;
+a wrongly-emitted marker on a referenced object is out-voted by its durable `+`; and because it never deletes, an
+interrupted reconcile is always safe — it just emits fewer markers this pass.
 
 **The age-filter is a performance heuristic, fail-safe.** Its only purpose is to avoid condemning brand-new
 in-flight objects, which would make their writers needlessly resurrect to `gen+1` and re-upload (wasted work +
@@ -263,8 +306,9 @@ pass.
   a *sloppy candidate filter*, not the delete authority; the authority is quiescence + in-degree + fence.
   Upload-crash debris (objects PUT by a build that crashed before publishing its ref, so no `+` edge ever named
   them) is **invisible to the fold** — it carries no edge — and is reclaimed by the periodic **reconcile** (§4.5),
-  which **condemns, never deletes**, so the same quiescence + in-degree + fence gate reclaims it. Deliberate
-  choice (§9): no per-object write-ahead tracking on the hot path, and no wall-clock-gated deletion anywhere.
+  which emits zero-weight "seen" markers (never deletes, never condemns directly), so the same fold + quiescence
+  + in-degree + fence path reclaims it. Deliberate choice (§9): no per-object write-ahead tracking on the hot
+  path, and no wall-clock-gated deletion anywhere.
 - **INV-S3-COMPLETE:** S3 alone determines and rebuilds the full state; Keeper holds only ephemeral coordination
   plus **rebuildable caches** (the `epoch` znode) — never authoritative durable state; total Keeper loss loses
   nothing (the epoch is re-read from the durable S3 `gc/epoch`).
@@ -298,7 +342,7 @@ pass.
 
 | Fault | Outcome |
 |---|---|
-| writer crash mid-build / mid-(100GB)-upload | no ref published; objects already `+`'d (step 5) fold to in-degree 0 and reclaim normally. Objects uploaded but never `+`'d carry no edge → invisible to the fold → reclaimed by the periodic **reconcile** (§4.5): a full `LIST` minus reachability-from-`refs/` that **condemns, never deletes**, so the usual quiescence + in-degree + fence gate reclaims them (the Iceberg `remove_orphan_files` / `git gc` model). Incomplete multipart objects are reclaimed by an S3 lifecycle abort-incomplete rule (infra). Over-count only. |
+| writer crash mid-build / mid-(100GB)-upload | no ref published; objects already `+`'d (step 5) fold to in-degree 0 and reclaim normally. Objects uploaded but never `+`'d carry no edge → invisible to the fold → reclaimed by the periodic **reconcile** (§4.5): a streaming `LIST ⋈ refs/-reachability` that emits zero-weight "seen" markers (never deletes/condemns directly), so the usual fold + quiescence + in-degree + fence path reclaims them (the Iceberg `remove_orphan_files` / `git gc` model). Incomplete multipart objects are reclaimed by an S3 lifecycle abort-incomplete rule (infra). Over-count only. |
 | writer paused (alive lease) | pins `safe_epoch` at `O_W`; reclamation of newer epochs waits. Liveness only. |
 | writer server-expired but still believes Connected | the §6.1 local-deadline self-fence forces read-only *before* expiry. Safe. |
 | GC leader crash mid-round / mid-cascade | idempotent (`create-if-absent` condemned set, monotone epoch PUT, fenced deletes; re-fold recovers a partial cascade); successor takes a higher fence and re-folds. |
@@ -319,8 +363,10 @@ pass.
 - **Read cost**: one `GET` per node in the common `g=0` case; a node ever resurrected (`g>0`) pays
   `GET`-`404`-then-`LIST` on every read until generations are compacted (open item, §11). The part-load path must
   not trip the cold `404→LIST` en masse (§11).
-- **Reconcile cost**: the periodic full-`LIST` reconcile (§4.5) is `O(all objects)` and must be incremental,
-  bounded in memory, and pausable on a very large bucket (open item, §11).
+- **Reconcile cost**: the periodic reconcile (§4.5) is `O(all objects)` but **`O(1)`-memory** — it streams the
+  `LIST` and the `refs/`-reachability spill (both sorted by node key) through the existing merge-sort, never
+  materializing a reachability set. Reading live trees during the walk is bounded by part-count (`≪` blobs).
+  Schedule + per-pass `LIST` budget are an open item (§11).
 
 ## 9. Decisions (D1–D5) and parameters {#decisions}
 
@@ -343,14 +389,15 @@ pass.
   grounds: (1) for a *fresh* part the blob hashes are **not known up front** (`checksums.txt` is computed *as* the
   part is built; only copy/fetch/ATTACH have a source `checksums.txt`), so the record cannot be batched and
   degrades to `O(files)` individual hot-path writes — exactly the data-proportional traffic this design exists to
-  remove; (2) it is unnecessary. The periodic **reconcile** (§4.5) — full `LIST` minus reachability-from-`refs/`
-  — **condemns** the unreachable debris (never deletes it directly), and the *same quiescence + in-degree + fence
-  gate* reclaims it. **Quiescence, not a wall clock, is the safety**: a live writer holding an uncommitted object
-  has not flushed its `+`, so its `O_W` (hence `safe_epoch`) sits below the condemn epoch and blocks the reclaim
-  until it commits or dies. The reconcile's age-filter is a pure **performance** heuristic (avoid disturbing
-  in-flight builds), fail-safe — mis-set → wasted re-uploads, never a dangle. Decision: **no hot-path orphan
-  tracking; reconcile condemns-not-deletes.** Accepted cost: debris (unreferenced, rare) lingers until the next
-  reconcile, and the reconcile is an `O(objects)` pass (§11).
+  remove; (2) it is unnecessary. The periodic **reconcile** (§4.5) — a streaming `LIST ⋈ refs/-reachability` —
+  **emits zero-weight "seen" markers** into `gc/log` for unreachable debris (it never deletes and never condemns
+  directly); the *single existing fold* then condemns the in-degree-0 ones and the *same quiescence + in-degree +
+  fence gate* reclaims them. **Quiescence, not a wall clock, is the safety**: a live writer holding an uncommitted
+  object has not flushed its `+`, so its `O_W` (hence `safe_epoch`) sits below the condemn epoch and blocks the
+  reclaim until it commits or dies. The reconcile's age-filter is a pure **performance** heuristic (avoid
+  disturbing in-flight builds), fail-safe *toward leak* — mis-set → wasted re-uploads, never a dangle. Decision:
+  **no hot-path orphan tracking; reconcile emits candidates, the fold is the sole condemner.** Accepted cost:
+  debris (unreferenced, rare) lingers until the next reconcile, an `O(objects)`-but-`O(1)`-memory pass (§11).
 - **Hashes:** `cityHash128` (blob), `SipHash-128` (canonical tree entries).
 - **Parameters (tuning, conservative defaults):** epoch period ≈ 10 min; `T_session` ≈ 60 s; heartbeat ≈ 15 s;
   limbo = `e+2`; reconcile age-filter = a **performance** heuristic (≥ max build/upload duration, e.g. hours) —
@@ -362,18 +409,24 @@ The TLA+ model (`docs/superpowers/models/`, extended from `CaGcCore.tla`) **must
 interleaving + the failure set (session-expiry gap, split-brain, total Keeper wipe): the single-node core
 (already PASS) **plus the currently-untested** (a) **multi-child commit atomicity** — a tree making a *set* of
 nodes reachable at once; (b) the **deferred decrement cascade** (D4); (c) the **decoupled reuse rule** (D2,
-re-verifying CE-2 under `gen+1` resurrection rather than the old `e ≥ O_W` encoding). Invariants checked:
-`INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA`, and (temporal, if feasible) no-leak-forever.
+re-verifying CE-2 under `gen+1` resurrection rather than the old `e ≥ O_W` encoding); (d) the **reconcile /
+"seen"-marker path** (§4.5): a `Reconcile` action that, for a `Present` node unreachable from `refs` and with
+in-degree 0, emits a zero-weight seen-marker; the next fold condemns it; `GC_Reclaim` reclaims under the gate.
+Properties: an uploaded-but-uncommitted orphan is eventually reclaimed (no leak), and a committed / dedup-reused
+object that gets a seen-marker is **never** reclaimed (its durable `+` out-votes the marker — no loss). Run this
+**with `RetentionEps = 0`** (age-filter off) to model-check the "age-filter is perf-only, not safety" claim
+directly. Invariants checked: `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA`, and (temporal, if feasible)
+no-leak-forever.
 
 **Out of scope of the model (assumed / handled elsewhere):** the fold/snap data-plane internals (signed counts,
-LIST pagination, torn snapshot, `event_id` dedup — implementation correctness, not protocol); multipart-upload
-invisibility + S3 lifecycle abort (infra); the periodic reconcile (§4.5 — a full `LIST` minus reachability-from-
-`refs/` that **condemns, never deletes**; its safety reduces to the modeled quiescence + in-degree + fence gate,
-and its age-filter is a perf heuristic, so reconcile adds no protocol safety surface); the reader path /
-`404→LIST`; the exact canonical serialization bytes and the tree-entry
-`size`/`attrs` (non-safety metadata); the S3-vs-Keeper epoch cache split (modeled as a single `epochCur` — the
-S3-first sole-writer rule means Keeper only ever lags, the already-modeled lagging-writer case); and the S3-only
-coordination mode (dropped per D1, so not modeled).
+LIST pagination, torn snapshot, `event_id` dedup — implementation correctness, not protocol); the reconcile's
+**physical `LIST` + `refs/`-reachability walk** (the *discovery* mechanics — the model abstracts it as the
+`Reconcile` action emitting seen-markers for unreachable-present nodes, since reconcile's protocol effect is
+exactly "add in-degree-0 candidates"); multipart-upload invisibility + S3 lifecycle abort (infra); the reader
+path / `404→LIST`; the exact canonical serialization bytes and the tree-entry `size`/`attrs` (non-safety
+metadata); the S3-vs-Keeper epoch cache split (modeled as a single `epochCur` — the S3-first sole-writer rule
+means Keeper only ever lags, the already-modeled lagging-writer case); and the S3-only coordination mode
+(dropped per D1, so not modeled).
 
 ## 11. Open items and operational concerns {#open-items}
 
@@ -384,21 +437,29 @@ design review.
   current epoch, `safe_epoch`, the oldest pinning writer (and its `O_W`), condemned-set size, reclaim backlog,
   last reconcile time, per-pool reclaimable-bytes estimate. Reclamation is intentionally lazy (limbo +
   quiescence), so this visibility is required, not optional.
-- **Reconcile at scale.** The periodic full-`LIST` reconcile (§4.5) is `O(all objects)`; on a 10⁹–10¹¹-object
-  bucket it must be incremental, bounded in memory (stream/spill the reachability set), pausable/resumable, and
-  rate-limited on `LIST`. Specify its schedule, cost ceiling, and how the reachability set is built without OOM.
-  (It condemns-not-deletes, so a partial/interrupted pass is always safe — it just condemns fewer orphans.)
+- **Reconcile at scale.** The reconcile (§4.5) is `O(all objects)` but `O(1)`-memory by construction (streaming
+  `LIST ⋈ refs/-reachability` spill through the existing merge-sort — never materialize a reachability set). Still
+  to specify before implementation: the **schedule** (e.g. every N days), the **per-pass `LIST` budget / rate
+  limit** (at 10¹¹ objects a full `LIST` is ~10⁸ paginated calls — money and wall-clock), and pausable/resumable
+  checkpointing. Because it only emits seen-markers (never deletes), a partial/interrupted pass is always safe —
+  it just discovers fewer orphans this round.
 - **Generation compaction.** A node resurrected to `g>0` pays `GET`-`404`-then-`LIST` on every read forever; there
   is no path back to `g=0`. Decide whether reconcile compacts live nodes back to `g=0` (rewriting the referencing
-  trees) or whether high-`g` nodes are simply tolerated as a rare read-cost item.
+  trees) or whether high-`g` nodes are tolerated as a rare read-cost item — **and in either case expose a
+  `count of live nodes with g>0` metric** so "rare" can be observed before it stops being rare.
 - **Stuck / flapping writer.** A single live-but-stalled writer pins `safe_epoch` and stalls pool-wide
   reclamation until its lease expires (liveness only, by design); a writer flapping near the session deadline can
   repeatedly pin/release. Surface "oldest pinning writer / reclamation lag" as an alertable metric.
 - **`checksums.txt` coverage (D5).** The set of part files that become blobs must exactly match
   `IMergeTreeDataPart::checksums`. Some files are **not** in `checksums.txt` (e.g. `checksums.txt` itself,
   version-dependent metadata, the `.meta` sidecars) — those are table-level verbatim `files/` or `refs/*.meta`,
-  not content-addressed blobs. The attach-time guard (D5) must verify the blob set round-trips, falling back to
-  re-hash on any mismatch.
+  not content-addressed blobs. The attach-time guard (D5) must verify the blob set round-trips **in both
+  directions** — a *missing* file → `INV-NO-DANGLE` (loud, read fails); an *extra* file (a checksum that is also
+  stored verbatim) → silent double-storage — falling back to re-hash on any mismatch.
+- **Epoch-cache sole-writer assertion.** The "only the fenced leader writes the `epoch` znode, S3-first" rule
+  (§3.2, §6.2, D1) is a human-remembered invariant; the day a second writer is added "to fix a startup race" it
+  silently breaks "Keeper never ahead of S3". Put an **assertion in the code path that writes the znode** ("if I
+  am not the fenced leader, this is a bug"), not just prose.
 - **Part-load read path.** `MergeTreeData::loadDataParts` / attach issue many `exists`/`getMetadata`/`list`
   calls; on the CA disk each becomes a tree walk. Verify a server start loading thousands of parts hits the `g=0`
   `GET` fast path and does not trip the cold `404→LIST` en masse.
@@ -429,6 +490,7 @@ refs       \subseteq (RefName \X Hashes \X Gen)                    \* live root 
 plus       \in [Epoch -> SUBSET Edge]                              \* gc/log +deltas per epoch (Edge = root edge or tree->child edge)
 minus      \in [Epoch -> SUBSET Edge]                              \* gc/log -deltas per epoch
 snap       \in [(Hashes \X Gen) -> Int]                            \* folded in-degree (sloppy filter)
+seen       \subseteq (Hashes \X Gen)                               \* reconcile "seen" markers (gc/log; ZERO-WEIGHT, enumerate-only, idempotent)
 condemned  \in [Epoch -> SUBSET (Hashes \X Gen)]                   \* gc/condemned/<epoch>
 epochCur   \in Epoch                                               \* gc/epoch (authoritative)
 \* ---- Keeper (ephemeral) ----
@@ -442,11 +504,14 @@ wPinDurable\in [Writers -> SUBSET Edge]                            \* this write
 ldrConn    \in [Leaders -> {Connected, Disconnected}]
 ```
 `epochClosed(e) == e < epochCur`. `inDegree(n)` is the leader's fold over CLOSED epochs only (the closed-epoch
-barrier): `snap[n]` plus the closed-epoch `plus`/`minus` net for `n`.
+barrier): `snap[n]` plus the closed-epoch `plus`/`minus` net for `n`. `seen` contributes **0** to `inDegree` — it
+only makes a node *enumerable*. A node is a fold CANDIDATE iff `node[n]=Present ∧ inDegree(n)=0 ∧ enumerated(n)`,
+where `enumerated(n) == (n appears in some folded delta) ∨ (n ∈ seen)`. (`seen` is idempotent: re-adding a
+present marker is a no-op, so repeated reconciles can never inflate `inDegree`.)
 
 ### A.3 Init {#a-init}
-All nodes `Absent`; `refs = {}`; `plus/minus/condemned` empty; `snap = 0`; `epochCur = 0`; no leader; all
-`writerOW = None`; writers `Connected ∧ SessAlive` with empty decided/pin sets.
+All nodes `Absent`; `refs = {}`; `plus/minus/condemned` empty; `snap = 0`; `seen = {}`; `epochCur = 0`; no
+leader; all `writerOW = None`; writers `Connected ∧ SessAlive` with empty decided/pin sets.
 
 ### A.4 Actions (Next = disjunction) {#a-actions}
 Each action: **guard ⇒ effect.** (`Edge` = `(parent, child)` where parent is a ref or a tree node.)
@@ -468,14 +533,19 @@ Each action: **guard ⇒ effect.** (`Edge` = `(parent, child)` where parent is a
 - **GC_Close(L):** guard `IsLeader(L)` (lowest live `leaderSeq`) ∧ `ldrConn[L]=Connected`. effect
   `epochCur := epochCur+1`.
 - **GC_FoldCondemn(L, e):** guard `IsLeader(L) ∧ ldrConn[L]=Connected ∧ epochClosed(e)`. effect fold `plus[≤e]`,
-  `minus[≤e]` into `snap`; `condemned[e] := { n : inDegree(n)=0 }`.
+  `minus[≤e]` into `snap`; `condemned[e] := { n : node[n]=Present ∧ inDegree(n)=0 ∧ enumerated(n) }`.
 - **GC_Reclaim(L, n, e_a):** guard `IsLeader(L) ∧ ldrConn[L]=Connected ∧ n ∈ condemned[e_a] ∧ epochCur ≥ e_a+2 ∧
   (min over live writers of writerOW) > e_a ∧ inDegree(n)=0`. effect `node[n] := Deleted`; if `n` is a tree, for
   each child edge add its `-` to `minus[epochCur]` (deferred cascade, D4).
+- **Reconcile(L):** guard `IsLeader(L) ∧ ldrConn[L]=Connected`. effect: for any `n` with `node[n]=Present ∧ n ∉
+  Reachable(refs)` (with `RetentionEps>0`, also older than the filter): `seen := seen ∪ {n}` (idempotent,
+  zero-weight). Models §4.5: emit a "seen" marker for a `LIST`-present node unreachable from `refs/`; the next
+  `GC_FoldCondemn` enumerates it and condemns it iff its `inDegree` is genuinely 0. `Reachable(refs)` is the DAG
+  closure from the live roots — the durable authority, **not** `snap` (which may drift).
 - **Failures:** `Sess_Expire(w)` (`wSess[w]:=SessExpired ∧ writerOW[w]:=None`, independent of `wConn`);
   `Disconnect(w)`/`Reconnect(w)`; `Ldr_Disconnect(L)`/`Ldr_Steal(L)` (new lowest seq); `Keeper_Wipe` (all
-  `writerOW:=None`, all `leaderSeq:=None`, all writers→read-only); `Recover` (purge, elect, bump epoch,
-  re-register).
+  `writerOW:=None`, all `leaderSeq:=None`, all writers→read-only; **`seen` is NOT cleared — it lives in S3
+  gc/log, not Keeper**); `Recover` (purge `leader/`+`writers/`+`epoch` znodes, elect, bump epoch, re-register).
 
 ### A.5 Invariants {#a-inv}
 ```
@@ -494,6 +564,11 @@ NoLeakForever  == \A n : (eventually-always unreachable(n)) ~> (eventually node[
 ### A.7 Suggested finite bounds for TLC {#a-bounds}
 `Writers = {w1,w2}`, `Leaders = {L1,L2}`, `MaxEpoch = 2`, `MaxGen = 1`, a tree with 2 children (multi-child),
 `RetentionEps = 0`; `StateConstraint` caps `|refs| ≤ 2`, per-writer `wDecided`/`wPinDurable` ≤ 2,
-fence ≤ MaxEpoch+2. Bounded model checking — strong evidence within bounds, not a proof. (Crash-orphan
-reclamation is the periodic reconcile, §4.5 — out of model scope, §10 — so the model carries no intent state;
-reconcile's only effect is to condemn extra candidates, which the modeled `GC_Reclaim` gate already covers.)
+fence ≤ MaxEpoch+2. Bounded model checking — strong evidence within bounds, not a proof.
+**Reconcile / seen-marker scenario (model with `RetentionEps = 0`, age-filter off):** a writer creates a node
+(`W_CreateOrReuseChild`) then `Sess_Expire`s *before* `W_PublishRef` (uploaded, never committed); `Reconcile`
+emits a `seen` marker for it (unreachable from `refs`); `GC_FoldCondemn` enumerates it at `inDegree 0` and
+condemns it; `GC_Reclaim` deletes it → **no leak**. Conversely, a node that *is* referenced (a durable `+`,
+hence `inDegree>0`) but also picks up a `seen` marker (reconcile raced a not-yet-folded `+`) must **never** be
+reclaimed — `GC_Reclaim`'s `inDegree=0` guard refuses → **no loss**. Checking both, at age-filter 0, is what
+substantiates "the age-filter is perf-only, not safety."
