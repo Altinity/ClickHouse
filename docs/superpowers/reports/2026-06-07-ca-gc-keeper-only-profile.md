@@ -38,11 +38,20 @@ them outright:
 |---|---|
 | `create-if-absent` fence **counter** (O(n) scan) | **ephemeral-sequential** znode; the sequence number *is* the monotone fence (free) |
 | writer time-lease + `2·Δ_skew` + read-back-durable renewals (clock-skew-dependent) | **ephemeral session** — Keeper's session timeout is the single arbiter; **no clocks compared**, no skew |
-| strong-read fence + stealing-leader out-wait (split-brain visibility) | leadership = "my ephemeral node is still the lowest seq"; **linearizable**, no visibility race |
-| closed-epoch fold S3 barrier + the `Δ_skew` math | the leader reads a **linearizable snapshot** of `{O_W}` via `getChildren(writers/)`; quiescence is exact |
+| strong-read fence + stealing-leader out-wait (split-brain visibility) | leadership = lowest-seq ephemeral, re-checked with a **`sync`-ed** read before each delete; **fail-close on `Disconnected`** |
+| the `Δ_skew` inter-clock lease math | **gone** — the ephemeral session is the lease; no two clocks are compared |
 
-The one safety hinge reduces to its clean form: **a writer self-fences (goes read-only) the instant its Keeper
-session is lost** — and it *knows*, because its Keeper ops start failing. No clock-skew assumption survives.
+**NOT collapsed (review R3 — `2026-06-07-ca-gc-keeper-only-review.md`):** the **closed-epoch S3 fold barrier
+is RETAINED**, not deleted. `log` lives in S3; Keeper's linearizable `{O_W}` snapshot does **not** create a
+happens-before edge into the writer's S3 `+` durability (no cross-system ordering between a Keeper op and an S3
+op). So the base plan's §5.2 R0/R1 closed-epoch fenced fold + the writer-ordered `flush-+-then-advance` (S3 `+`
+durable *before* the Keeper `O_W` advance) stay exactly as in the EBR plan. Keeper erases **3 of 4** S3 hazards
+(fence counter, `2·Δ_skew` lease, fence-steal out-wait) — not the cross-system fold barrier.
+
+The safety hinge, stated correctly: **a writer self-fences fail-stop on `Disconnected`** (NOT on confirmed
+`Expired`), using a **local-elapsed-time deadline inside `T_session`**, and the leader likewise fail-closes on
+`Disconnected`. This is **not** "no timing assumption" — it is the *session-timeout* assumption (local elapsed
+vs one timeout), which is strictly cleaner and weaker than the S3 mode's inter-clock `Δ_skew`, but not zero.
 
 ## 4. The collapsed protocol {#protocol}
 
@@ -79,8 +88,22 @@ No `Δ_skew`, no fence counter, no strong-read gymnastics, no S3 close-barrier �
    reachability is the authority; `snap`/`log` are only the fast filter. Thus **S3 alone suffices** to
    understand and rebuild the entire state.
 
-The only correctness requirement across the outage is the §3 hinge — writers self-fence on session loss —
-which Keeper makes reliable (failed ops), with **no clock-skew assumption**.
+**Recovery-transient fixes (review R3 — INV-S3-COMPLETE does NOT hold for the live-writer transient without these):**
+- **Retention backstop + reconcile grace (must-fix #4).** After a wipe there are *no* live leases, so a ref
+  published *during* the outage (or a blob whose `+` was in-flight) has no lease/`+` root. Post-restore
+  reconcile must therefore (a) treat a **conservative time-retention window** as a root — never reclaim
+  anything younger than retention — exactly the Iceberg/Delta rule the base plan §10 keeps; and (b) run only
+  *after* the leader's recovery epoch-bump, deriving roots from `refs/` (the durable, written-last authority).
+- **Purge backup-restored ephemerals (must-fix #6).** If Keeper is restored from a *persistent snapshot*
+  rather than coming up empty, ghost `leader`/`writers/<S>` znodes resurrect and break the "ephemeral vanished"
+  assumption. The recovery procedure must delete all `writers/` and election znodes before re-electing.
+- **`sync`-ed reads (must-fix #5).** The `safe_epoch := E_cur` empty-writer branch, and the leader's lowest-seq
+  fence re-check, must use a **`sync`-ed** Keeper read — default reads are sequentially-consistent, not
+  linearizable, so a stale read could under-count live writers or miss a steal.
+
+The cross-outage correctness requirements are therefore the §3 hinge (writers + leader fail-stop on
+`Disconnected`, session-timeout assumption — **not** clock-skew-free) **plus** the retention-backstop reconcile
+and the backup-purge above. With those, S3 alone remains the recoverable source of truth.
 
 ## 6. Scale notes (Milovidov #3) {#scale}
 
@@ -95,9 +118,10 @@ which Keeper makes reliable (failed ops), with **no clock-skew assumption**.
 
 ## 7. Verdict {#verdict}
 
-Keeper-only is both **simpler** (deletes the fence counter, the `2·Δ_skew` lease, the strong-read fence, and
-the closed-epoch S3 barrier — the entire class of S3-eventual-consistency workarounds the reviews flagged) and
-**safer** (no clock-skew dependency; the hinge becomes "session lost ⇒ read-only", which Keeper enforces). It
+Keeper-only is both **simpler** (deletes **3 of 4** S3 workarounds — the fence counter, the `2·Δ_skew` lease,
+and the fence-steal out-wait; the **closed-epoch S3 fold barrier is RETAINED**, since Keeper cannot order S3
+writes — review R3) and **safer** (no inter-clock-skew dependency; the hinge becomes fail-stop on
+`Disconnected` against the session timeout — a cleaner, weaker timing assumption, not its elimination). It
 keeps the **S3-COMPLETE** invariant: Keeper is O(active writers) of throwaway coordination, and S3 alone is the
 recoverable source of truth. This is the variant to spec and build.
 
