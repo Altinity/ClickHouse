@@ -45,6 +45,7 @@ KeyDescription buildIdentityKey(const NamesAndTypesList & comparable_cols, Conte
     return KeyDescription::getKeyFromAST(
         makeIdentityKeyAST(names),
         ColumnsDescription{comparable_cols},
+        VirtualColumnsDescription{},
         context);
 }
 

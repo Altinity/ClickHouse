@@ -4,10 +4,12 @@
 #include <Storages/Distributed/DistributedAsyncInsertDirectoryQueue.h>
 #include <Storages/getStructureOfRemoteTable.h>
 #include <Columns/IColumn.h>
+#include <Common/MultiVersion.h>
 #include <Common/SimpleIncrement.h>
 #include <Common/ActionBlocker.h>
 #include <Interpreters/Cluster.h>
 
+#include <map>
 #include <pcg_random.hpp>
 
 namespace DB
@@ -50,6 +52,26 @@ class StorageDistributed final : public IStorage, WithContext
     friend class StorageSystemDistributionQueue;
 
 public:
+    struct HybridSegment
+    {
+        ASTPtr table_function_ast;
+        ASTPtr predicate_ast;
+        std::optional<StorageID> storage_id;
+
+        HybridSegment(ASTPtr table_function_ast_, ASTPtr predicate_ast_)
+            : table_function_ast(std::move(table_function_ast_))
+            , predicate_ast(std::move(predicate_ast_))
+        {}
+
+        HybridSegment(ASTPtr table_function_ast_, ASTPtr predicate_ast_, StorageID storage_id_)
+            : table_function_ast(std::move(table_function_ast_))
+            , predicate_ast(std::move(predicate_ast_))
+            , storage_id(std::move(storage_id_))
+        {}
+    };
+
+    using WatermarkParams = std::map<String, String>;
+
     StorageDistributed(
         const StorageID & id_,
         const ColumnsDescription & columns_,
@@ -87,6 +109,8 @@ public:
 
     QueryProcessingStage::Enum
     getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
+
+    StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
 
     void read(
         QueryPlan & query_plan,
@@ -311,6 +335,10 @@ private:
     pcg64 rng;
 
     bool is_remote_function;
+
+    MultiVersion<WatermarkParams> hybrid_watermark_params;
+    ASTPtr base_segment_predicate;
+    std::vector<HybridSegment> segments;
 };
 
 }

@@ -7,6 +7,7 @@
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/SelectQueryOptions.h>
 #include <Interpreters/TranslateQualifiedNamesVisitor.h>
+#include <Parsers/ASTFunction.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Planner/Utils.h>
 #include <Processors/QueryPlan/DistributedCreateLocalPlan.h>
@@ -59,7 +60,8 @@ ASTPtr rewriteSelectQuery(
     const ASTPtr & query,
     const std::string & remote_database,
     const std::string & remote_table,
-    ASTPtr table_function_ptr)
+    ASTPtr table_function_ptr,
+    ASTPtr additional_filter)
 {
     auto modified_query_ast = query->clone();
 
@@ -72,6 +74,17 @@ ASTPtr rewriteSelectQuery(
 
     if (!context->getSettingsRef()[Setting::allow_experimental_analyzer])
     {
+        if (additional_filter)
+        {
+            if (select_query.where())
+                select_query.setExpression(
+                    ASTSelectQuery::Expression::WHERE,
+                    makeASTFunction("and", select_query.where(), additional_filter->clone()));
+            else
+                select_query.setExpression(
+                    ASTSelectQuery::Expression::WHERE, additional_filter->clone());
+        }
+
         if (table_function_ptr)
             select_query.addTableFunction(table_function_ptr);
         else

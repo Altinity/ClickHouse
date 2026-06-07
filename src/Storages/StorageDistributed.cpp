@@ -546,8 +546,6 @@ QueryProcessingStage::Enum StorageDistributed::getQueryProcessingStage(
     if (to_stage == QueryProcessingStage::WithMergeableState)
         return QueryProcessingStage::WithMergeableState;
 
-<<<<<<< HEAD
-=======
     // TODO: check logic
     if (!segments.empty())
     {
@@ -558,7 +556,7 @@ QueryProcessingStage::Enum StorageDistributed::getQueryProcessingStage(
         nodes += surviving_segments;
     }
 
->>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
+
     /// If there is only one node, the query can be fully processed by the
     /// shard, initiator will work as a proxy only.
     if (nodes == 1)
@@ -782,8 +780,6 @@ std::optional<QueryProcessingStage::Enum> StorageDistributed::getOptimizedQueryP
     return QueryProcessingStage::Complete;
 }
 
-<<<<<<< HEAD
-=======
 StorageSnapshotPtr StorageDistributed::getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr) const
 {
     /// For Hybrid tables, freeze the watermark snapshot at snapshot acquisition time so
@@ -800,7 +796,7 @@ StorageSnapshotPtr StorageDistributed::getStorageSnapshot(const StorageMetadataP
     return std::make_shared<StorageSnapshot>(*this, metadata_snapshot);
 }
 
->>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
+
 namespace
 {
 
@@ -912,7 +908,8 @@ bool rewriteJoinToGlobalJoinIfNeeded(QueryTreeNodePtr join_tree)
 QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     const StorageSnapshotPtr & distributed_storage_snapshot,
     const StorageID & remote_storage_id,
-    const ASTPtr & remote_table_function)
+    const ASTPtr & remote_table_function,
+    const ASTPtr & additional_filter = nullptr)
 {
     auto & planner_context = query_info.planner_context;
     const auto & query_context = planner_context->getQueryContext();
@@ -979,7 +976,23 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
 
     replacement_table_expression->setAlias(query_info.table_expression->getAlias());
 
+    QueryTreeNodePtr filter;
+    if (additional_filter)
+    {
+        filter = buildQueryTree(additional_filter->clone(), query_context);
+        QueryAnalysisPass(replacement_table_expression).run(filter, query_context);
+    }
+
     auto query_tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, std::move(replacement_table_expression));
+
+    if (filter)
+    {
+        auto & query_node = query_tree_to_modify->as<QueryNode &>();
+        query_node.getWhere() = query_node.hasWhere()
+            ? mergeConditionNodes({query_node.getWhere(), filter}, query_context)
+            : std::move(filter);
+    }
+
     ReplaseAliasColumnsVisitor replace_alias_columns_visitor;
     replace_alias_columns_visitor.visit(query_tree_to_modify);
 
@@ -998,6 +1011,44 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     }
 
     return buildQueryTreeForShard(query_info.planner_context, query_tree_to_modify, /*allow_global_join_for_right_table*/ false);
+}
+
+std::optional<std::pair<String, String>> tryGetParamTypeAndName(const ASTPtr & node)
+{
+    if (auto * func = node->as<ASTFunction>(); func && func->name == "hybridParam")
+    {
+        auto * arg_list = func->arguments ? func->arguments->as<ASTExpressionList>() : nullptr;
+        if (!arg_list || arg_list->children.size() != 2)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "hybridParam() requires exactly 2 arguments: (name, type)");
+
+        auto * name_lit = arg_list->children[0]->as<ASTLiteral>();
+        auto * type_lit = arg_list->children[1]->as<ASTLiteral>();
+        if (!name_lit || name_lit->value.getType() != Field::Types::String)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "hybridParam() first argument (name) must be a string literal");
+        if (!type_lit || type_lit->value.getType() != Field::Types::String)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "hybridParam() second argument (type) must be a string literal");
+
+        const auto & param_name = name_lit->value.safeGet<String>();
+        const auto & type_name = type_lit->value.safeGet<String>();
+        return {{param_name, type_name}};
+    }
+    return std::nullopt;
+}
+
+template <typename ASTPtrType, typename Visitor>
+void visitHybridParams(ASTPtrType & node, Visitor & visitor)
+{
+    if (!node)
+        return;
+
+    if (auto param_type_and_name = tryGetParamTypeAndName(node); param_type_and_name.has_value())
+    {
+        visitor(node, *param_type_and_name);
+        return;
+    }
+
+    for (auto & child : node->children)
+        visitHybridParams(child, visitor);
 }
 
 }
@@ -1108,10 +1159,10 @@ void StorageDistributed::read(
 
     SelectQueryInfo modified_query_info = query_info;
 
+    std::vector<SelectQueryInfo> additional_query_infos;
+
     const auto & settings = local_context->getSettingsRef();
-<<<<<<< HEAD
-=======
-    auto metadata_ptr = getInMemoryMetadataPtr();
+    auto metadata_ptr = getInMemoryMetadataPtr(local_context, false);
 
     auto describe_segment_target = [&](const HybridSegment & segment) -> String
     {
@@ -1158,7 +1209,6 @@ void StorageDistributed::read(
 
     if (pruning_verdict.base_pruned)
         LOG_TRACE(log, "Hybrid segment pruned (target: {})", base_target);
->>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
 
     if (settings[Setting::allow_experimental_analyzer])
     {
@@ -1167,12 +1217,8 @@ void StorageDistributed::read(
         auto query_tree_distributed = buildQueryTreeDistributed(modified_query_info,
             query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
             remote_storage_id,
-<<<<<<< HEAD
-            remote_table_function_ptr);
-=======
             remote_table_function_ptr,
             substituteHybridWatermarks(base_segment_predicate, watermark_snapshot));
->>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
         Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_distributed, local_context, SelectQueryOptions(processed_stage).analyze());
         /** For distributed tables we do not need constants in header, since we don't send them to remote servers.
           * Moreover, constants can break some functions like `hostName` that are constants only for local queries.
@@ -1185,10 +1231,6 @@ void StorageDistributed::read(
 
         modified_query_info.query_tree = std::move(query_tree_distributed);
 
-<<<<<<< HEAD
-        /// Return directly (with correct header) if no shard to query.
-        if (modified_query_info.getCluster()->getShardsInfo().empty())
-=======
         if (!segments.empty())
         {
             for (size_t segment_idx = 0; segment_idx < segments.size(); ++segment_idx)
@@ -1224,7 +1266,6 @@ void StorageDistributed::read(
         /// "all segments pruned" case (base pruned via empty `optimized_cluster`, every
         /// additional pruned via the segments loop above).
         if (modified_query_info.getCluster()->getShardsInfo().empty() && additional_query_infos.empty())
->>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
             return;
     }
     else
@@ -1233,11 +1274,6 @@ void StorageDistributed::read(
 
         modified_query_info.query = ClusterProxy::rewriteSelectQuery(
             local_context, modified_query_info.query,
-<<<<<<< HEAD
-            remote_database, remote_table, remote_table_function_ptr);
-
-        if (modified_query_info.getCluster()->getShardsInfo().empty())
-=======
             remote_database, remote_table, remote_table_function_ptr,
             substituteHybridWatermarks(base_segment_predicate, watermark_snapshot));
         log_rewritten_query(base_target, modified_query_info.query);
@@ -1282,7 +1318,6 @@ void StorageDistributed::read(
         /// "all segments pruned" case (base pruned via empty `optimized_cluster`, every
         /// additional pruned via the segments loop above).
         if (modified_query_info.getCluster()->getShardsInfo().empty() && additional_query_infos.empty())
->>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
         {
             Pipe pipe(std::make_shared<NullSource>(header));
             auto read_from_pipe = std::make_unique<ReadFromPreparedSource>(std::move(pipe));
@@ -1293,10 +1328,6 @@ void StorageDistributed::read(
         }
     }
 
-<<<<<<< HEAD
-    ClusterProxy::SelectStreamFactory select_stream_factory =
-        ClusterProxy::SelectStreamFactory(
-=======
     /// Hybrid case 2: base pruned (cluster empty via `getQueryProcessingStage`'s empty
     /// `optimized_cluster`) and at least one additional segment survives. The all-pruned
     /// subcase is already handled by the existing empty-cluster early-returns above. We
@@ -1349,29 +1380,20 @@ void StorageDistributed::read(
 
         ClusterProxy::executeQuery(
             query_plan,
->>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
             header,
-            storage_snapshot,
-            processed_stage);
-
-    auto shard_filter_generator = ClusterProxy::getShardFilterGeneratorForCustomKey(
-        *modified_query_info.getCluster(), local_context, getInMemoryMetadataPtr(local_context, false)->columns);
-
-    ClusterProxy::executeQuery(
-        query_plan,
-        header,
-        processed_stage,
-        remote_storage,
-        remote_table_function_ptr,
-        select_stream_factory,
-        log,
-        local_context,
-        modified_query_info,
-        sharding_key_expr,
-        sharding_key_column_name,
-        *distributed_settings,
-        shard_filter_generator,
-        is_remote_function);
+            processed_stage,
+            remote_storage,
+            remote_table_function_ptr,
+            select_stream_factory,
+            log,
+            local_context,
+            modified_query_info,
+            sharding_key_expr,
+            sharding_key_column_name,
+            *distributed_settings,
+            shard_filter_generator,
+            is_remote_function);
+    }
 
     /// This is a bug, it is possible only when there is no shards to query, and this is handled earlier.
     if (!query_plan.isInitialized())
