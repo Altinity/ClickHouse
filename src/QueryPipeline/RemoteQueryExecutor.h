@@ -218,13 +218,11 @@ public:
 
     void setUnavailableShardTracker(UnavailableShardTrackerPtr tracker) { unavailable_shard_tracker = std::move(tracker); }
 
-<<<<<<< HEAD
     void setDistributedFanout(size_t total_connections) { distributed_fanout = total_connections; }
-=======
+
     void setRemoteFunction(bool is_remote_function_ = true) { is_remote_function = is_remote_function_; }
 
     void setShardCount(UInt32 shard_count_) { shard_count = shard_count_; }
->>>>>>> d9d3710bd9b (Merge pull request #1646 from Altinity/frontport/antalya-26.3/fix_remote_calls)
 
     const Block & getHeader() const { return *header; }
     const SharedHeader & getSharedHeader() const { return header; }

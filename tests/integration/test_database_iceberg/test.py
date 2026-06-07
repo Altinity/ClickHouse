@@ -964,7 +964,6 @@ def test_gcs(started_cluster):
         assert "Google cloud storage converts to S3" in str(err.value)
 
 
-<<<<<<< HEAD
 def test_invalid_auth_header_format(started_cluster):
     node = started_cluster.instances["node1"]
 
@@ -982,7 +981,8 @@ def test_invalid_auth_header_format(started_cluster):
             """
         )
     assert "Invalid auth header format" in str(err.value)
-=======
+
+
 # TODO - turn on after merge alternative syntax
 def _test_cluster_joins(started_cluster):
     node = started_cluster.instances["node1"]
@@ -1122,4 +1122,3 @@ def _test_cluster_joins(started_cluster):
     )
 
     assert res == "Jack\tBlack\nJack\tSilver\nJohn\tBlack\nJohn\tSilver\n"
->>>>>>> d9d3710bd9b (Merge pull request #1646 from Altinity/frontport/antalya-26.3/fix_remote_calls)
