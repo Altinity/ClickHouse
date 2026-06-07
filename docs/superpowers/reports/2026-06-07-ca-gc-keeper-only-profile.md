@@ -53,6 +53,11 @@ The safety hinge, stated correctly: **a writer self-fences fail-stop on `Disconn
 `Disconnected`. This is **not** "no timing assumption" — it is the *session-timeout* assumption (local elapsed
 vs one timeout), which is strictly cleaner and weaker than the S3 mode's inter-clock `Δ_skew`, but not zero.
 
+> **TLC-verified (CE-4, `docs/superpowers/models/`):** `Disconnected`-detection *alone* is **insufficient** —
+> the model lost data via a server-expired-but-still-`Connected` writer until the **local-deadline self-fence
+> inside `T_session`** was encoded (a consequential op requires `Connected ∧ session-alive-by-local-clock`).
+> The local deadline is load-bearing, not belt-and-suspenders.
+
 ## 4. The collapsed protocol {#protocol}
 
 ```
@@ -128,3 +133,18 @@ recoverable source of truth. This is the variant to spec and build.
 **Open items carried forward:** (1) confirm the §4 flush-`+`-then-advance coupling is expressed cleanly with
 Keeper's linearizable `O_W` publish; (2) measure round-trips per INSERT; (3) the leader's one-time epoch bump
 on recovery — prove it fences pre-outage in-flight epochs without stranding a just-published ref.
+
+**NEW open question from TLC (CE-2 — `generation==epoch` vs long-lived dedup):** the model proved
+"reuse only a generation `e ≥ O_W`" sufficient for safety, but combined with `generation==epoch` that would
+**break long-lived dedup** — a stable `g=0` blob keeps generation 0 while `O_W` climbs unboundedly (one per GC
+round), so `e ≥ O_W` would forbid de-duplicating against it and force wasteful resurrection. Resolve before
+spec: most likely the dedup-preserving variant **"reuse + make `+` durable + re-check the tombstone; resurrect
+only if now condemned"** (which the model did NOT encode — it used the stricter `e ≥ O_W`), or **decouple
+generation from epoch** (a small per-blob generation counter, advanced only on actual resurrection, instead of
+stamping the global epoch). The safety the model proved is real; the dedup-cost of the *particular* rule it
+used is the thing to re-engineer.
+
+**TLC status:** the stabilized core (closed-epoch fold + flush-`+`-then-advance + reuse-under-fresh-`O_W` +
+session-alive self-fence + fenced/fail-close leader + `e+2`/`safe_epoch` reclaim + retention backstop) passes
+exhaustive bounded model-checking (`INV_NO_LOSS/NO_DANGLE/NO_ABA`, 135M states, expiry+split-brain+wipe) —
+see `docs/superpowers/models/RESULTS.md` for bounds and the residual untested surface.
