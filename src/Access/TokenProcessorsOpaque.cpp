@@ -281,7 +281,6 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            UInt64 jwks_cache_lifetime_)
         : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
           expected_issuer(expected_issuer_), expected_audience(expected_audience_),
-          allow_no_expiration(allow_no_expiration_),
           userinfo_endpoint(userinfo_endpoint_), token_introspection_endpoint(token_introspection_endpoint_)
 {
     if (!jwks_uri_.empty())
@@ -312,8 +311,7 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            UInt64 verifier_leeway_,
                                            UInt64 jwks_cache_lifetime_)
     : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
-      expected_issuer(expected_issuer_), expected_audience(expected_audience_),
-      allow_no_expiration(allow_no_expiration_)
+      expected_issuer(expected_issuer_), expected_audience(expected_audience_)
 {
     const picojson::object openid_config = getObjectFromURI(Poco::URI(openid_config_endpoint_));
 

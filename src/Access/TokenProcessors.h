@@ -215,7 +215,6 @@ public:
 private:
     const String expected_issuer;
     const String expected_audience;
-    const bool allow_no_expiration;
     Poco::URI userinfo_endpoint;
     Poco::URI token_introspection_endpoint;
 
