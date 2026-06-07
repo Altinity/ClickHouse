@@ -2054,9 +2054,6 @@ void TCPHandler::receiveHello()
     }
 #endif
 
-<<<<<<< HEAD
-    session->authenticate(user, password, getClientAddress(client_info), socket().peerAddress());
-=======
     if (is_jwt_based_auth)
     {
         const auto & access_control = server.context()->getAccessControl();
@@ -2070,12 +2067,11 @@ void TCPHandler::receiveHello()
         if (!external_authenticators.checkTokenCredentials(credentials))
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Token is invalid");
 
-        session->authenticate(credentials, getClientAddress(client_info));
+        session->authenticate(credentials, getClientAddress(client_info), socket().peerAddress());
         return;
     }
 
-    session->authenticate(user, password, getClientAddress(client_info));
->>>>>>> 58b404dc6a5 (Merge pull request #1078 from Altinity/oauth-antalya-25.8)
+    session->authenticate(user, password, getClientAddress(client_info), socket().peerAddress());
 }
 
 

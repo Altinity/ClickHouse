@@ -28,18 +28,16 @@
 #     include <bcrypt.h>
 #endif
 
-<<<<<<< HEAD
+#if USE_JWT_CPP
+#include <picojson/picojson.h>
+#endif
+
 namespace CurrentMetrics
 {
     extern const Metric BcryptCacheBytes;
     extern const Metric BcryptCacheSize;
 }
 
-=======
-#if USE_JWT_CPP
-#include <picojson/picojson.h>
-#endif
->>>>>>> 58b404dc6a5 (Merge pull request #1078 from Altinity/oauth-antalya-25.8)
 
 namespace DB
 {

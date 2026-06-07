@@ -34,11 +34,8 @@ namespace ErrorCodes
     extern const int ACCESS_ENTITY_NOT_FOUND;
     extern const int ACCESS_STORAGE_READONLY;
     extern const int ACCESS_STORAGE_DOESNT_ALLOW_BACKUP;
-<<<<<<< HEAD
     extern const int REQUIRED_SECOND_FACTOR;
-=======
     extern const int AUTHENTICATION_FAILED;
->>>>>>> 58b404dc6a5 (Merge pull request #1078 from Altinity/oauth-antalya-25.8)
     extern const int WRONG_PASSWORD;
     extern const int IP_ADDRESS_NOT_ALLOWED;
     extern const int LOGICAL_ERROR;

@@ -653,12 +653,9 @@ JoinStrictness
 Jpan
 JumpConsistentHash
 Jupyter
-<<<<<<< HEAD
 Jurc
-=======
 jwks
 JWKS
->>>>>>> 58b404dc6a5 (Merge pull request #1078 from Altinity/oauth-antalya-25.8)
 KDevelop
 KafkaAssignedPartitions
 KafkaBackgroundReads
@@ -3809,11 +3806,8 @@ uuid
 uuids
 uuidv
 vCPU
-<<<<<<< HEAD
-vLLM
-=======
 validators
->>>>>>> 58b404dc6a5 (Merge pull request #1078 from Altinity/oauth-antalya-25.8)
+vLLM
 varPop
 varPopStable
 varSamp
