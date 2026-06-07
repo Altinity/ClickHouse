@@ -28,13 +28,8 @@ private:
     ObjectInfoPtr getMatchingFileFromIterator(size_t number_of_current_replica);
     ObjectInfoPtr getAnyUnprocessedFile(size_t number_of_current_replica);
 
-<<<<<<< HEAD
-=======
-    void saveLastNodeActivity(size_t number_of_current_replica);
-
     String getFileIdentifier(ObjectInfoPtr file_object, bool write_to_log = false) const;
 
->>>>>>> 58b280f1f26 (Merge pull request #1748 from Altinity/feature/antalya-26.3/pr-1493)
     const std::shared_ptr<IObjectIterator> iterator;
     const bool send_over_whole_archive;
 
