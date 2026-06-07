@@ -4,15 +4,12 @@
 #include <Common/Base64.h>
 #include <Common/logger_useful.h>
 #include <Poco/String.h>
-<<<<<<< HEAD
-=======
 #include <openssl/bio.h>
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
 #include <openssl/param_build.h>
 #include <openssl/pem.h>
 #include <cstring>
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 
 namespace DB {
 
@@ -165,8 +162,6 @@ bool check_claims(const String & claims, const picojson::value::object & payload
     return check_claims(json.get<picojson::value::object>(), payload, "");
 }
 
-<<<<<<< HEAD
-=======
 std::string create_public_key_from_ec_components(const std::string & x, const std::string & y, int curve_nid)
 {
     auto decode_base64url = [](const std::string & value)
@@ -238,7 +233,6 @@ std::string create_public_key_from_ec_components(const std::string & x, const st
     return std::string(data, len);
 }
 
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 }
 
 namespace
@@ -368,20 +362,12 @@ bool checkUserClaims(const TokenCredentials & credentials, const String & claims
 }
 }
 
-<<<<<<< HEAD
-bool StaticKeyJwtProcessor::checkClaims(const TokenCredentials & credentials, const String & claims_to_check)
-=======
 bool StaticKeyJwtProcessor::checkClaims(const TokenCredentials & credentials, const String & claims_to_check) const
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 {
     return checkUserClaims(credentials, claims_to_check);
 }
 
-<<<<<<< HEAD
-bool JwksJwtProcessor::checkClaims(const TokenCredentials & credentials, const String & claims_to_check)
-=======
 bool JwksJwtProcessor::checkClaims(const TokenCredentials & credentials, const String & claims_to_check) const
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 {
     return checkUserClaims(credentials, claims_to_check);
 }
@@ -483,14 +469,6 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
 
     if (public_key.empty())
     {
-<<<<<<< HEAD
-        if (!(jwk.has_jwk_claim("n") && jwk.has_jwk_claim("e")))
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK: 'n' or 'e' not found", processor_name);
-        LOG_TRACE(getLogger("TokenAuthentication"), "{}: `issuer` or `x5c` not present, verifying {} with RSA components", processor_name, username);
-        const auto modulus = jwk.get_jwk_claim("n").as_string();
-        const auto exponent = jwk.get_jwk_claim("e").as_string();
-        public_key = jwt::helper::create_public_key_from_rsa_components(modulus, exponent);
-=======
         const auto key_type = jwk.get_key_type();
         if (key_type == "EC")
         {
@@ -541,7 +519,6 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
         }
         else
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK key type '{}'", processor_name, key_type);
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
     }
 
     if (jwk.has_algorithm() && Poco::toLower(jwk.get_algorithm()) != algo)
@@ -553,15 +530,12 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
         verifier = verifier.allow_algorithm(jwt::algorithm::rs384(public_key, "", "", ""));
     else if (algo == "rs512")
         verifier = verifier.allow_algorithm(jwt::algorithm::rs512(public_key, "", "", ""));
-<<<<<<< HEAD
-=======
     else if (algo == "es256")
         verifier = verifier.allow_algorithm(jwt::algorithm::es256(public_key, "", "", ""));
     else if (algo == "es384")
         verifier = verifier.allow_algorithm(jwt::algorithm::es384(public_key, "", "", ""));
     else if (algo == "es512")
         verifier = verifier.allow_algorithm(jwt::algorithm::es512(public_key, "", "", ""));
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
     else
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: unknown algorithm {}", algo);
 

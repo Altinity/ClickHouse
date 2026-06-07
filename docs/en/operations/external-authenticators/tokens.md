@@ -102,11 +102,7 @@ Only one of `static_jwks` or `static_jwks_file` keys must be present in one veri
 :::
 
 :::note
-<<<<<<< HEAD
-Only RS* family algorithms are supported!
-=======
 For JWKS-based validators (`jwt_static_jwks` and `jwt_dynamic_jwks`), RS* and ES* family algorithms are supported.
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 :::
 
 ### JWT with remote JWKS
@@ -216,11 +212,7 @@ Example (goes into `users.xml`):
 Here, the JWT payload must contain `["view-profile"]` on path `resource_access.account.roles`, otherwise authentication will not succeed even with a valid JWT.
 
 :::note
-<<<<<<< HEAD
-If `claims` is defined, this user will not be able to authenticate using opaque tokens, so, only JWT-based authentication will be available.
-=======
 Per-user `claims` are enforced only when the token is a JWT (validated by a JWT processor such as `jwt_static_key` or `jwt_dynamic_jwks`). When the user authenticates with an opaque (access) token (e.g. via Azure, OpenID, or Google token processors), claims are not checked and authentication succeeds if the token is otherwise valid.
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 :::
 
 ```

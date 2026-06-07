@@ -7,12 +7,6 @@
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 
-<<<<<<< HEAD
-#include <cmath>
-#include <limits>
-
-=======
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 namespace DB {
 
 namespace ErrorCodes
@@ -120,23 +114,7 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 
     auto token_info = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo"), token);
     if (token_info.contains("exp"))
-<<<<<<< HEAD
-    {
-        /// picojson stores all numerics as double; we need to validate the
-        /// value is a finite, positive Unix timestamp that fits in time_t
-        /// before casting.
-        const double exp = getValueByKey<double>(token_info, "exp").value();
-        if (!std::isfinite(exp) || exp <= 0.0
-            || exp > static_cast<double>(std::numeric_limits<time_t>::max()))
-            throw Exception(
-                ErrorCodes::AUTHENTICATION_FAILED,
-                "{}: tokeninfo response contains an out-of-range 'exp' value: {}",
-                processor_name, exp);
-        credentials.setExpiresAt(std::chrono::system_clock::from_time_t(static_cast<time_t>(exp)));
-    }
-=======
         credentials.setExpiresAt(std::chrono::system_clock::from_time_t(static_cast<time_t>(getValueByKey<int64_t>(token_info, "exp").value())));
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 
     /// Groups info can only be retrieved if user email is known.
     /// If no email found in user info, we skip this step and there are no external roles for the user.
@@ -287,10 +265,6 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            const String & jwks_uri_,
                                            UInt64 jwks_cache_lifetime_)
         : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
-<<<<<<< HEAD
-          expected_issuer(expected_issuer_), expected_audience(expected_audience_),
-=======
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
           userinfo_endpoint(userinfo_endpoint_), token_introspection_endpoint(token_introspection_endpoint_)
 {
     if (!jwks_uri_.empty())
@@ -320,24 +294,16 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            const String & openid_config_endpoint_,
                                            UInt64 verifier_leeway_,
                                            UInt64 jwks_cache_lifetime_)
-<<<<<<< HEAD
-    : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
-      expected_issuer(expected_issuer_), expected_audience(expected_audience_)
-=======
     : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_)
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 {
     const picojson::object openid_config = getObjectFromURI(Poco::URI(openid_config_endpoint_));
 
     if (!openid_config.contains("userinfo_endpoint") || !openid_config.contains("introspection_endpoint"))
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: Cannot extract userinfo_endpoint or introspection_endpoint from OIDC configuration, consider manual configuration.", processor_name);
 
-<<<<<<< HEAD
-=======
     userinfo_endpoint = Poco::URI(getValueByKey(openid_config, "userinfo_endpoint").value());
     token_introspection_endpoint = Poco::URI(getValueByKey(openid_config, "introspection_endpoint").value());
 
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
     if (openid_config.contains("jwks_uri"))
     {
         LOG_TRACE(getLogger("TokenAuthentication"), "{}: JWKS URI set, local JWT processing will be attempted", processor_name_);

@@ -583,11 +583,7 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     }
 
     if (id)
-<<<<<<< HEAD
-        return AuthResult{ .user_id = *id, .authentication_data = AuthenticationData(AuthenticationType::JWT), .user_name = credentials.getUserName() };
-=======
         return AuthResult{ .user_id = *id, .authentication_data = AuthenticationData(AuthenticationType::JWT), .user_name = user->getName() };
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
     return std::nullopt;
 }
 

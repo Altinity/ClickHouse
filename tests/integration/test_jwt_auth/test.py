@@ -80,8 +80,6 @@ def test_jwks_server(started_cluster):
         ]
     )
     assert res == "jwt_user\n"
-<<<<<<< HEAD
-=======
 
 
 def test_jwks_server_ec_es384(started_cluster):
@@ -99,4 +97,3 @@ def test_jwks_server_ec_es384(started_cluster):
         ]
     )
     assert res == "jwt_user\n"
->>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
