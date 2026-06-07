@@ -762,19 +762,12 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
         return processor.checkClaims(credentials, jwt_claims);
     };
 
-<<<<<<< HEAD
-
-    /// lookup token in local cache if not expired.
-    auto cached_entry_iter = access_token_to_username_cache.find(credentials.getToken());
-    if (cached_entry_iter != access_token_to_username_cache.end())
-=======
     /// Snapshot the processor set under the mutex, then run the expensive
     /// crypto verify WITHOUT the mutex (M-20). `shared_ptr` keeps each
     /// processor alive even if a config reload swaps `token_processors` in
     /// the middle of validation. Cache lookup stays under the mutex.
     std::map<String, std::shared_ptr<ITokenProcessor>> processors_snapshot;
 
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
     {
         std::lock_guard lock{mutex};
 
