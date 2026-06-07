@@ -103,7 +103,7 @@ std::unique_ptr<S3::Client> getClient(
     std::optional<std::function<std::shared_ptr<DataLake::IStorageCredentials>()>> refresh_credentials_callback)
 
 {
-    auto url = S3::URI(endpoint, false, true, settings.auth_settings[S3AuthSetting::uri_style]);
+    auto url = S3::URI(endpoint, false, true, true, settings.auth_settings[S3AuthSetting::uri_style]);
     if (!url.key.ends_with('/'))
         url.key.push_back('/');
     return getClient(url, settings, context, for_disk_s3, opt_disk_name, refresh_credentials_callback);

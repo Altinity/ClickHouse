@@ -1,11 +1,8 @@
 #pragma once
 
-<<<<<<< HEAD
-=======
 #include <optional>
 #include <Interpreters/Context_fwd.h>
 #include "config.h"
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 #include <string>
 #include <string_view>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/FileNamesGenerator.h>

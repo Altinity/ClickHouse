@@ -41,11 +41,8 @@
 #include <Common/SipHash.h>
 #include <Common/parseGlobs.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
-<<<<<<< HEAD
-=======
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 #if ENABLE_DISTRIBUTED_CACHE
 #include <DistributedCache/DistributedCacheRegistry.h>
 #include <Disks/IO/ReadBufferFromDistributedCache.h>
@@ -426,12 +423,8 @@ Chunk StorageObjectStorageSource::generate()
                 chunk,
                 read_from_format_info.requested_virtual_columns,
                 {
-<<<<<<< HEAD
-                    .path = path,
-                    .storage_id = storage_snapshot->storage.getStorageID(),
-=======
                     .path = path_for_virtual_column,
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
+                    .storage_id = storage_snapshot->storage.getStorageID(),
                     .size = object_info->isArchive() ? object_info->fileSizeInArchive() : object_metadata->size_bytes,
                     .filename = &filename,
                     .last_modified = object_metadata->last_modified,
@@ -671,17 +664,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         }
         else
         {
-<<<<<<< HEAD
             compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->compression_method);
-            read_buf = createReadBuffer(object_info->relative_path_with_metadata, object_storage, context_, log);
-=======
-            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->getCompressionMethod());
             read_buf = createReadBuffer(
                 object_info->relative_path_with_metadata,
                 getResolvedStorageFromObjectInfo(object_info, object_storage),
                 context_,
                 log);
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
         }
 
         Block initial_header = read_from_format_info.format_header;
@@ -1397,19 +1385,8 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
     ObjectInfoPtr object_info;
     if (current_index >= buffer.size())
     {
-<<<<<<< HEAD
-        auto task = callback();
-        if (!task || task->isEmpty())
-=======
-        if (!getContext()->isSwarmModeEnabled())
-        {
-            LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
-            return nullptr;
-        }
-
         auto raw = callback();
         if (!raw || raw->isEmpty())
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
             return nullptr;
 
         object_info = raw->getObjectInfo();
