@@ -184,24 +184,39 @@ authoritative durable state, so a Keeper wipe stays non-destructive (`INV-S3-COM
    `floor(hash)` (≥ `gen+1`). (No write-ahead orphan tracking on this path — see §9; crash debris is collected by
    the periodic reconcile, §4.5.)
 4. **Tree.** `T := SipHash-128(canonical entries)`; `createIfAbsent trees/<T>/<g>`. (`part_id ≡ T`.)
-5. **Edge `+`.** Append edge `+` deltas to `gc/log/<O_W>/<shard>`: `ref→(T,g)` and `(T,g)→each child(h,g)`.
-   **Sealed-epoch check (concrete reappend protocol):** if `gc/sealed/<O_W>` exists, the epoch closed under me —
-   refresh `O_W` from S3 `gc/epoch` and **reappend** the still-needed `+` into the now-open epoch (this is also
-   the writer's event-invalidation of its epoch cache). Make the `+` **durable**, and only **then** may `O_W`
-   advance — **flush-`+`-then-advance** (TLC CE-1). After the `+` is durable, **re-check** `floor` for reused
-   children; if any reused `(h,g)` now has `g < floor(h)`, **resurrect to `floor(h)` and append a `-` for the
-   abandoned edge** (dedup-preserving reuse; resolves CE-2 under D2).
+5. **Edge `+`.** Append edge `+` deltas to `gc/log/<O_W>/<shard>`: `ref→(T,g)` and `(T,g)→each child(h,g)`, each
+   with a **stable `event_id`** (globally deduped by the fold — so re-appending the same edge counts once).
+   **Sealed-epoch protocol (P1-2, normative — closes the check-then-append TOCTOU):** make the `+` durable, then
+   **re-read `gc/sealed/<O_W>`**; if `O_W` is now sealed, the leader may have folded it without this `+`, so
+   **reappend** the same `event_id`'d `+` into the current open epoch (from S3 `gc/epoch`) and re-read again —
+   loop until the `+` is durable in an epoch that was **unsealed at the moment of that append**. (Global
+   `event_id` dedup makes any double-appearance a no-op.) Only an edge so confirmed is "flushed".
+   **Floor re-check + ANCESTOR REBUILD (P1-3, normative).** After flushing, re-check `floor` for every reused
+   child. If any reused `(h,g)` now has `g < floor(h)`, the child must resurrect to `floor(h)` — **but tree
+   identity includes `child_gen` (§2), so the parent tree's hash changes, and so does every ancestor up to the
+   ref.** Therefore: **abort the whole tentative chain above `h`** (append `-` for its already-flushed edges),
+   **rebuild** the tree chain `h → … → T` with the new gens (new hashes), **flush** the complete new edge set
+   (sealed-epoch protocol again), and re-check. A floor move invalidates the tentative DAG above the node — never
+   patch a single child in place.
 6. **Commit.** `setRef roots/<server_id>/store/.../refs/<name> = RefPayload{T,g,header}` — the commit point,
-   **written last** (re-check the self-fence immediately before). The `ref→(T,g)` `+` was logged in step 5
-   *before* this `setRef`: a crash here biases to **over-count (leak), never loss** (see below).
-7. **Drop.** `removeRef` **first**, then append the `ref→(T,g)` `-` delta. (`removeRef`-before-`-` again biases to
-   over-count on a crash, never loss.)
+   **written last** (re-check the self-fence immediately before).
+   **Advance gate (P1-1, normative — flush-COMMIT/ABORT-then-advance).** `O_W` may advance **only after a durable
+   OUTCOME** for this build: either (commit) `setRef` is durable, or (explicit abort) a `-` for every tentative
+   edge — including the root `ref→(T,g)` — is durable. Advancing on a durable `+` alone is **forbidden**: it would
+   release the writer's quiescence pin on epoch `O_W` while the tentative root `+` is unmatched by a real ref,
+   letting reconcile (which sees no ref) zero the node and GC reclaim it before `setRef`. A crash with neither
+   outcome is covered by session expiry (the lease drops → epoch quiesces → reconcile cleans the tentative `+`).
+7. **Drop.** `removeRef` **first**, then append the `ref→(T,g)` `-` delta. (`removeRef`-before-`-` biases a crash
+   to over-count, never loss.)
 
-A crash before step 6 leaves the part not-live. Both crash windows around the root edge — `+`-logged-but-no-ref
-(step 5↛6) and ref-removed-but-no-`-` (step 7) — leave a **stale positive** that makes the fold *over-count* (the
-node lingers = leak), **never under-count** (a live node is never seen as in-degree 0 → never wrongly deleted).
-Such stale positives are cancelled by the periodic reconcile (§4.5), which authoritatively rebuilds in-degree
-from the real `refs/`. Nodes uploaded but *never* `+`'d (a crash between step 3 and step 5) carry no edge — they
+A crash before step 6 leaves the part not-live; because **O_W is pinned at the build epoch until the durable
+outcome** (step 6 gate), the writer's quiescence protects the tentative node until it commits or its lease drops.
+Both crash windows around the root edge — `+`-logged-but-no-ref (5↛6) and ref-removed-but-no-`-` (step 7) — leave
+a **stale positive** that makes the fold *over-count* (the node lingers = leak), **never under-count** (a live
+node is never seen as in-degree 0). Such stale positives are cancelled by the periodic reconcile (§4.5), which
+authoritatively rebuilds in-degree from the real `refs/` — but **only over the quiesced epoch prefix** (§4.5), so
+it never touches a live writer's still-pinned epoch. Nodes uploaded but *never* `+`'d (a crash between step 3 and
+step 5) carry no edge — they
 are invisible to the `O(delta)` fold and are likewise collected by reconcile (which `LIST`s physical objects).
 Over-count only in every case — the accepted cost is that such debris lingers until the next reconcile.
 
@@ -264,33 +279,46 @@ fold *over-count* (a leak). A periodic background **reconcile** (rare — e.g. e
 the **authoritative rebuild** of the in-degree snapshot from the durable roots — *not* an additive marker pass
 (a zero-weight marker could never cancel a stale positive). It is `O(1)`-memory via streaming sorted merges.
 ```
+QP  QUIESCED-PREFIX WATERMARK (P1-1 refinement 2, normative).  Choose Q with  Q < safe_epoch  — i.e. EVERY live
+    writer (including a lagging-O_W one, whose low published O_W *lowers* safe_epoch) has advanced strictly past Q.
+    Reconcile rebuilds / discards logs ONLY for epochs ≤ Q. It MUST NOT use "current E" or "sealed epoch" as the
+    watermark: a live writer's tentative `+` sits in its epoch ≥ safe_epoch > Q, so it is in [Q+1, E_cur] and is
+    NEVER rebuilt away — its pin survives. (This is the fix for "reconcile erasing a live pre-commit pin".)
 R0  WALK reachability from all roots (refs/, refs/detached, shadow/) — the durable, written-last AUTHORITY (NOT
     gc/snap, which may have drifted) — spilling each reachable (hash,gen) and the internal-edge structure to an
     external SORTED stream. Reads live trees (≪ blobs) once. Read refs/ no older than the LIST (R1).
 R1  LIST blobs/ + trees/  (paginated, sorted by key = the sharded node-key order).
-R2  STREAMING MERGE  LIST ⋈ reachability-stream, per shard → REBUILD gc/snap/<E> with the TRUE in-degree of every
-    physically-present node (root edges counted from real refs/, internal edges from the reachable tree
-    structure). This OVERWRITES any drift: a stale-positive node recomputes to its real in-degree (0 if
-    unreferenced); never-referenced debris appears at in-degree 0. Write gc/snap/<E> as AUTHORITATIVE-THROUGH-E
-    (high-watermark) and DISCARD logs ≤ E (they are now superseded — this is what lets a stale `+` finally die).
-R3  The next normal GC round folds only logs > E onto snap/<E>; any node at in-degree 0 is condemned and reclaimed
-    under the UNCHANGED gate (safe_epoch > e_a ∧ in-degree==0 ∧ E_cur ≥ e_a+2 ∧ fence). Reconcile itself never
-    deletes; it only makes the snapshot truthful.
+R2  STREAMING MERGE  LIST ⋈ reachability-stream, per shard → REBUILD gc/snap/<Q> with the TRUE in-degree
+    CONTRIBUTED BY epochs ≤ Q of every physically-present node. OVERWRITES drift within the quiesced prefix: a
+    stale-positive whose `+` was in a now-quiesced epoch recomputes to its real value; never-referenced debris
+    appears at in-degree 0. Write gc/snap/<Q> AUTHORITATIVE-THROUGH-Q and DISCARD logs ≤ Q.
+R3  The next normal GC round folds logs in (Q, E_cur] onto snap/<Q> (so a live writer's tentative `+` in [Q+1,..]
+    still counts); any node at in-degree 0 is condemned and reclaimed under the UNCHANGED gate
+    (safe_epoch > e_a ∧ in-degree==0 ∧ E_cur ≥ e_a+2 ∧ fence). Reconcile itself never deletes.
 ```
 **Why authoritative rebuild, not additive markers.** Stale positives (crashed commit/drop) and torn snapshots
 both require *recomputing* in-degree from the durable roots, which a zero-weight marker cannot do. Walking
-`refs/` (the written-last authority) and counting real edges gives the true in-degree; the high-watermark then
-retires the superseded logs so the stale `+` cannot re-appear. This single pass therefore does debris discovery,
-stale-positive cancellation, AND the torn-snap rebuild (§4.4, §7) — one mechanism.
+`refs/` (the written-last authority) and counting real edges gives the true in-degree over the quiesced prefix;
+the high-watermark then retires those superseded logs so the stale `+` cannot re-appear. One pass does debris
+discovery, stale-positive cancellation, AND the torn-snap rebuild (§4.4, §7).
+
+**Why only the quiesced prefix (`Q < safe_epoch`).** A live writer's tentative root `+` (logged in step 5,
+not yet matched by a `setRef`) looks "stale" to a `refs/` walk — it is NOT, the ref is coming. Rebuilding its
+epoch would zero the node and (since the writer may have a lagging `O_W`) let GC reclaim it before commit — the
+exact P1-1 loss. Restricting the rebuild to `Q < safe_epoch` guarantees no live writer is still in a rebuilt
+epoch, so only *dead* writers' tentative `+`s (whose epochs have quiesced) are cancelled. Combined with the
+step-6 advance gate (O_W pinned until commit/abort durable), an epoch falls below `Q` only after its writers
+have committed (→ reachable, kept) or died (→ orphan, zeroed).
 
 **`O(1)`-memory.** The `LIST` stream and the reachability spill are both sorted by node key and merged in a
 stream; no reachability *set* is materialized. The expensive part is reading every live tree once (bounded by
 part-count `≪` blobs) and the full `LIST` (the open item in §11).
 
 **Quiescence is the safety, not a clock.** Reconcile only makes nodes *candidates* (in-degree 0 in the rebuilt
-snapshot); the unchanged gate decides deletion. A live writer holding an uploaded-but-uncommitted object has not
-flushed its `+`, so (flush-`+`-then-advance) its `O_W ≤` its upload epoch, pinning `safe_epoch` below the condemn
-epoch — reclaim is blocked until it commits (→ in-degree > 0) or dies (→ true orphan). A writer racing to
+snapshot); the unchanged gate decides deletion. A live writer holding a tentative build has **O_W pinned at its
+build epoch until a durable commit/abort outcome** (step 6 gate), pinning `safe_epoch` at-or-below that epoch —
+so reclaim is blocked until it commits (→ in-degree > 0, or reachable after the next reconcile) or dies (→ true
+orphan). A writer racing to
 reference a candidate after the rebuild either bumps its in-degree (durable `+` folds in → spared) or sees the
 floor moved and resurrects to `floor` (re-check, §4.1 step 5). No wall clock on the reclaim path.
 
@@ -334,16 +362,19 @@ for an unreached shard stays valid).
    `T_session`. This is a session-timeout assumption (no inter-clock skew, because Keeper's session is the
    single arbiter). The leader likewise fail-closes on `Disconnected`, with a `sync`-ed lowest-seq fence
    re-check before every delete.
-2. **`flush-+-then-advance` + sealed-epoch fold**: a writer makes an edge-`+` durable in S3 before advancing
-   `O_W`. The leader folds only **sealed** (closed) epochs (`gc/sealed/<e>`); a writer whose target epoch is
-   sealed (it checks the seal at append, §4.1 step 5) reappends the still-needed `+` into the open epoch. The
-   writer's epoch source is **S3 `gc/epoch`, process-cached with a short TTL** — a hint for the hot read of `O_W`
-   only, never the authority for "is my `+`'s epoch still foldable-open" (the seal is). A stale (process-)cache
-   can only *lag*, never lead (it reads S3, never writes it), so a `+` is never silently dropped — worst case it
-   lands in a just-sealed epoch and is reappended (the proven CE-1 path). The `e+2` limbo is sufficient
-   **independent of cache lag**: a writer lagging by `k` epochs publishes `writers/<S> = E_cur−k`, lowering
-   `safe_epoch` to match, so the `R4` `safe_epoch > e_a` gate self-adjusts — safety comes from quiescence, not
-   from `+2`, and not from any clock.
+2. **`flush-COMMIT/ABORT-then-advance` + sealed-epoch fold + quiesced-prefix reconcile** (the P1-1/P1-2 hinge):
+   (i) A writer advances `O_W` only after a **durable outcome** for its build — `setRef` (commit) *or* a durable
+   `-` for every tentative edge (explicit abort); never on a durable `+` alone (§4.1 step 6). So while a part is
+   in flight, `O_W` is pinned at the build epoch and quiescence protects the tentative node. (ii) The leader
+   folds only **sealed** epochs (`gc/sealed/<e>`); a writer makes its `+` durable, re-reads the seal, and
+   reappends (same `event_id`, globally deduped) into the open epoch if its epoch was sealed — closing the
+   check-then-append race (§4.1 step 5). The epoch source is **S3 `gc/epoch`, process-cached with a short TTL** —
+   a hint only; a stale cache can only *lag* (it reads S3, never writes it), so a `+` is never silently dropped.
+   (iii) **Reconcile rebuilds only the quiesced prefix `Q < safe_epoch`** (§4.5), so it can never zero a live
+   writer's tentative root `+` (which sits in an epoch ≥ safe_epoch > Q), even with a lagging `O_W`. The `e+2`
+   limbo is sufficient independent of cache lag: a writer lagging by `k` publishes `writers/<S> = E_cur−k`,
+   lowering `safe_epoch` to match, so the gates self-adjust — safety comes from quiescence, not from `+2`, not
+   from any clock.
 3. **Fenced single deleter**: only the lowest-seq leader deletes; every delete/epoch-advance is fence-gated.
 4. **Decoupled generations + durable floor** (D2/#3): a re-create routes to `≥ floor(H)` (the durable per-hash
    generation floor), making the unconditional delete ABA-safe with only `create-if-absent` — and the floor is
@@ -406,9 +437,11 @@ for an unreached shard stays valid).
   blob hashes are **not known up front** (`checksums.txt` is computed *as* the part is built), so the record
   degrades to `O(files)` hot-path writes — the data-proportional traffic this design exists to remove; and it
   cannot cancel a stale positive anyway. Instead the periodic **reconcile** (§4.5) **authoritatively rebuilds**
-  in-degree from the real `refs/` reachability + the physical `LIST`, with a **high-watermark** (`snap/<E>`
-  authoritative-through-E; discard logs ≤ E). This recomputes every node's true in-degree — debris and stale
-  positives both end at in-degree 0 — and the *same quiescence + in-degree + fence gate* reclaims them.
+  in-degree from the real `refs/` reachability + the physical `LIST`, with a **high-watermark over the quiesced
+  prefix** (`snap/<Q>` authoritative-through-`Q`, `Q < safe_epoch`; discard logs ≤ `Q`). This recomputes the true
+  in-degree of every node whose support is quiesced — a *dead* writer's debris and stale positives end at
+  in-degree 0 — while a *live* writer's tentative `+` (epoch ≥ safe_epoch > Q) is left untouched; the *same
+  quiescence + in-degree + fence gate* reclaims what it finds.
   **Quiescence, not a wall clock, is the safety.** The reconcile age-filter is a pure **performance** heuristic,
   fail-safe *toward leak*. Decision: **no hot-path orphan tracking; reconcile is the authoritative truth-maker,
   the fold is the fast incremental path between reconciles.** Accepted cost: debris / stale positives linger
@@ -473,10 +506,10 @@ design review.
   not content-addressed blobs. The attach-time guard (D5) must verify the blob set round-trips **in both
   directions** — a *missing* file → `INV-NO-DANGLE` (loud, read fails); an *extra* file (a checksum that is also
   stored verbatim) → silent double-storage — falling back to re-hash on any mismatch.
-- **Epoch seal + reappend correctness.** The sealed-epoch check (§4.1 step 5) and the seal write (§4.2 R0) are
-  the concrete reappend protocol replacing the old hand-wave. Verify the append→seal-check→reappend sequence has
-  no window where a `+` is counted in a sealed epoch *after* its fold (conditional append / re-read the seal
-  after append), and that the seal write is fenced.
+- **Seal + reappend implementation.** The append→durable→re-read-seal→reappend protocol (§4.1 step 5) is now
+  normative; what remains is implementation: the global `event_id` dedup must span epochs (a `+` reappended into
+  `E+1` must not double-count if the `E` fold also caught it), and the seal write (§4.2 R0) must be fenced and
+  ordered after the `gc/epoch` bump. (This is no longer a protocol gap — it is the P1-2 fix — only a build task.)
 - **Floor storage / hot-path cost.** `floors/<H>` is sparse (only condemned hashes) and cached; confirm the reuse
   path's floor lookup stays off the critical latency path (cache + only consult on the rare resurrect/dedup-of-
   condemned case), and bound the floor object count.
@@ -521,37 +554,47 @@ writerOW   \in [Writers -> Epoch \cup {None}]                      \* writers/<S
 wConn      \in [Writers -> {Connected, Disconnected}]              \* writer's belief
 wSess      \in [Writers -> {SessAlive, SessExpired}]               \* server-side session truth (may differ from wConn)
 wDecided   \in [Writers -> SUBSET (Hashes \X Gen)]                 \* deps decided but not yet +durable
-wPinDurable\in [Writers -> SUBSET Edge]                            \* this writer's durable +edges (flush-then-advance)
+wPinDurable\in [Writers -> SUBSET Edge]                            \* this writer's durable +edges (tentative until commit/abort)
+wPending   \in [Writers -> BOOLEAN]                                \* an uncommitted tentative build is in flight (gates O_W advance, P1-1)
 ldrConn    \in [Leaders -> {Connected, Disconnected}]
 ```
-`epochSealed(e) == e \in sealed` (⇒ `e < epochCur`). `inDegree(n)` is the leader's fold over SEALED epochs only
-(the closed-epoch barrier): `snap[n]` plus the sealed `plus`/`minus` net for `n`. A fold CANDIDATE is
-`node[n]=Present ∧ inDegree(n)=0`. **Reconcile authoritatively overwrites `snap[n]`** with the in-degree derived
-from `Reachable(refs)` (a present node unreachable from `refs` → 0, regardless of any stale logged `+`), and
-discards superseded sealed logs — this is what lets a stale positive die and a torn `snap` be rebuilt. The reuse
-authority is the durable `floors`, not a recent window: `reusable(H,g) == g \geq floors[H]`.
+`epochSealed(e) == e \in sealed` (⇒ `e < epochCur`). `safeEpoch == Min({writerOW[w] : w live}) (or epochCur if
+none)`; the quiesced-prefix watermark `Q < safeEpoch`. `inDegree(n)` is the leader's fold over SEALED epochs:
+`snap[n]` plus the sealed `plus`/`minus` net for `n`. A fold CANDIDATE is `node[n]=Present ∧ inDegree(n)=0`.
+**Reconcile authoritatively overwrites `snap[n]`** with the in-degree derived from `Reachable(refs)` **but only
+for the contribution of the quiesced prefix (epochs ≤ Q)** — a present node unreachable from `refs` whose
+support is all ≤ Q → 0 (stale positive dies); a live writer's tentative `+` sits in an epoch `≥ safeEpoch > Q`
+so it is NOT in the rebuilt prefix and survives. The reuse authority is the durable `floors`, not a recent
+window: `reusable(H,g) == g \geq floors[H]`. A writer with `wPending[w]=TRUE` has an uncommitted tentative
+build; `W_AdvanceOW` is disabled until it commits or aborts (flush-COMMIT/ABORT-then-advance).
 
 ### A.3 Init {#a-init}
 All nodes `Absent`; `refs = {}`; `plus/minus/condemned` empty; `snap = 0`; `sealed = {}`; `floors = [h ↦ 0]`;
-`epochCur = 0`; no leader; all `writerOW = None`; writers `Connected ∧ SessAlive` with empty decided/pin sets.
+`epochCur = 0`; no leader; all `writerOW = None`; all `wPending = FALSE`; writers `Connected ∧ SessAlive` with
+empty decided/pin sets.
 
 ### A.4 Actions (Next = disjunction) {#a-actions}
 Each action: **guard ⇒ effect.** (`Edge` = `(parent, child)` where parent is a ref or a tree node.)
 
 - **W_RegisterLease(w):** guard `writerOW[w]=None ∧ wConn[w]=Connected ∧ wSess[w]=SessAlive`.
   effect `writerOW[w] := epochCur`.
-- **W_CreateOrReuseChild(w, c):** guard writer may-act (`wConn=Connected ∧ wSess=SessAlive`). effect: let `g` be
-  the present gen of `c`; if `node[c,g]=Present ∧ g ≥ floors[c]` → reuse (add `(c,g)` to `wDecided[w]`); else
-  `node[c, floors[c]] := Present` and add `(c, floors[c])` to `wDecided[w]` (resurrect to the durable floor, D2/#3).
-- **W_FlushPlus(w, edge):** guard `edge`'s child `∈ wDecided[w]`. effect: **if `writerOW[w] ∈ sealed`** (epoch
-  closed under me) refresh `writerOW[w] := epochCur` (reappend to the open epoch) FIRST; then add `edge` to
-  `plus[writerOW[w]]` and to `wPinDurable[w]` (durable). **Only after this may O_W advance.**
-- **W_AdvanceOW(w):** guard `wConn=Connected ∧ wSess=SessAlive ∧ writerOW[w] < epochCur ∧ wDecided[w] ⊆
-  {children with their +edge ∈ wPinDurable[w]}`  (flush-+-then-advance, CE-1/CE-2). effect
-  `writerOW[w] := writerOW[w]+1`; re-check: any decided child `(c,g)` now with `g < floors[c]` → resurrect to
-  `floors[c]`, add a `-` for the abandoned edge to `minus`.
-- **W_PublishRef(w, name, (T,g)):** guard may-act ∧ `(T,g)`'s `+` edges `∈ wPinDurable[w]`. effect add
-  `(name,T,g)` to `refs` (commit point; the `ref→(T,g)` `+` was logged earlier — bias-to-leak ordering).
+- **W_CreateOrReuseChild(w, c):** guard writer may-act (`wConn=Connected ∧ wSess=SessAlive`). effect:
+  `wPending[w] := TRUE`; let `g` be the present gen of `c`; if `node[c,g]=Present ∧ g ≥ floors[c]` → reuse (add
+  `(c,g)` to `wDecided[w]`); else `node[c, floors[c]] := Present`, add `(c, floors[c])` to `wDecided[w]`
+  (resurrect to the durable floor, D2/#3).
+- **W_FlushPlus(w, edge):** guard `edge`'s child `∈ wDecided[w]`. effect: **if `writerOW[w] ∈ sealed`** refresh
+  `writerOW[w] := epochCur` (reappend to the open epoch) FIRST; then add `edge` (with its stable `event_id`,
+  globally deduped) to `plus[writerOW[w]]` and to `wPinDurable[w]` (durable).
+- **W_PublishRef(w, name, (T,g)):** guard may-act ∧ `(T,g)`'s `+` edges `∈ wPinDurable[w]` ∧ **every decided
+  child `(c,g_c)` still has `g_c ≥ floors[c]`** (floor re-check, P1-3 — a moved floor disables commit and forces
+  `W_Abort`+rebuild, since the tree hash depends on `child_gen`). effect add `(name,T,g)` to `refs` (commit
+  point); `wPending[w] := FALSE`; clear `wDecided[w]`, `wPinDurable[w]`.
+- **W_Abort(w):** guard `wPending[w]=TRUE`. effect (explicit abort, P1-1): add a `-` to `minus` for every edge in
+  `wPinDurable[w]` (incl. the tentative root `ref→(T,g)`); `wPending[w] := FALSE`; clear `wDecided`/`wPinDurable`.
+  (A writer that crashes instead just expires; its tentative `+`s become a stale positive cleaned by reconcile.)
+- **W_AdvanceOW(w):** guard `wConn=Connected ∧ wSess=SessAlive ∧ writerOW[w] < epochCur ∧ ¬wPending[w]`
+  (**flush-COMMIT/ABORT-then-advance, P1-1**: never advance with an uncommitted tentative build). effect
+  `writerOW[w] := writerOW[w]+1`.
 - **W_Drop(w, name):** guard may-act. effect remove the ref from `refs`, then add the `ref→(T,g)` `-` to `minus`.
 - **GC_Close(L):** guard `IsLeader(L)` (lowest live `leaderSeq`) ∧ `ldrConn[L]=Connected`. effect
   `sealed := sealed ∪ {epochCur}`; `epochCur := epochCur+1`.   (durable seal, then bump)
@@ -562,16 +605,20 @@ Each action: **guard ⇒ effect.** (`Edge` = `(parent, child)` where parent is a
   (min over live writers of writerOW) > e_a ∧ inDegree(n)=0`. effect: if `n` is a tree, FIRST for each child edge
   (read from the `condemned[e_a]` record) add its `-` to `minus[epochCur]` (deferred cascade, D4), THEN
   `node[n] := Deleted`.
-- **Reconcile(L):** guard `IsLeader(L) ∧ ldrConn[L]=Connected`. effect (authoritative rebuild): for every present
-  `n`, `snap[n] := authoritativeInDegree(n)` where that is the count of edges into `n` from `Reachable(refs)`
-  (so `n ∉ Reachable(refs) ⇒ snap[n]=0`, cancelling any stale positive); discard superseded sealed `plus`/`minus`
-  (high-watermark). `Reachable(refs)` is the DAG closure from the live roots — the durable authority, **not** the
-  pre-existing `snap`. The next `GC_FoldCondemn`/`GC_Reclaim` then condemn+reclaim the in-degree-0 nodes under the
-  unchanged gate. (With `RetentionEps>0`, skip rebuilding entries younger than the filter — perf only.)
-- **Failures:** `Sess_Expire(w)` (`wSess[w]:=SessExpired ∧ writerOW[w]:=None`, independent of `wConn`);
+- **Reconcile(L):** guard `IsLeader(L) ∧ ldrConn[L]=Connected`. effect (authoritative rebuild over the QUIESCED
+  PREFIX, P1-1 refinement 2): pick `Q < safeEpoch`; for every present `n`, `snap[n] :=` the count of edges into
+  `n` from `Reachable(refs)` whose support is in epochs `≤ Q` (so a node unreachable-from-`refs` with all-quiesced
+  support → 0, cancelling a *dead* writer's stale positive); **discard `plus`/`minus` for epochs ≤ Q**; deltas in
+  `(Q, E_cur]` are LEFT for the incremental fold (so a live writer's tentative `+`, in an epoch `≥ safeEpoch > Q`,
+  is never rebuilt away). `Reachable(refs)` is the DAG closure from the live roots — the durable authority, NOT
+  the pre-existing `snap`. The next `GC_FoldCondemn`/`GC_Reclaim` condemn+reclaim in-degree-0 nodes under the
+  unchanged gate. (With `RetentionEps>0`, skip rebuilding entries younger than the age-filter — perf only.)
+- **Failures:** `Sess_Expire(w)` (`wSess[w]:=SessExpired ∧ writerOW[w]:=None ∧ wPending[w]:=FALSE` — the build is
+  abandoned by death; its tentative `+`s remain as a stale positive cleaned by reconcile, NOT explicitly `-`'d);
   `Disconnect(w)`/`Reconnect(w)`; `Ldr_Disconnect(L)`/`Ldr_Steal(L)` (new lowest seq); `Keeper_Wipe` (all
-  `writerOW:=None`, all `leaderSeq:=None`, all writers→read-only; **`sealed`/`floors`/`snap` are S3, NOT cleared**);
-  `Recover` (purge `leader/`+`writers/` only — **no epoch znode to purge**; elect, bump epoch + seal, re-register).
+  `writerOW:=None ∧ wPending:=FALSE`, all `leaderSeq:=None`, all writers→read-only; **`sealed`/`floors`/`snap`
+  are S3, NOT cleared**); `Recover` (purge `leader/`+`writers/` only — **no epoch znode to purge**; elect, bump
+  epoch + seal, re-register).
 
 ### A.5 Invariants {#a-inv}
 ```
@@ -598,7 +645,14 @@ unreachable, #5b), fence ≤ MaxEpoch+2. Bounded model checking — strong evide
   committed) → `Reconcile` sets its `snap`=0 (unreachable) → condemned → `GC_Reclaim` deletes it.
 - **No-leak (stale positive):** a `ref→(T,g)` `+` is logged (step 5) but the writer dies before `W_PublishRef`
   (no ref) → fold over-counts `T` → `Reconcile` recomputes `snap[T]=0` (T ∉ Reachable(refs)) → T reclaimed.
-- **No-loss:** a reachable node (committed / dedup-reused, in `Reachable(refs)`) is **never** `Deleted`, even
-  after `Reconcile` ran and even if a stale marker existed — its authoritative `snap ≥ 1` ⇒ the gate refuses.
+- **No-loss (P1-1, the headline):** a LIVE writer logs `ref→(T,g)` `+`, has NOT published the ref, and
+  `Reconcile` runs (possibly with the writer on a lagging `O_W`). `T` must **never** be `Deleted` before the
+  writer commits or aborts: the `W_AdvanceOW` gate keeps `O_W` (hence `safeEpoch`) at the build epoch, and
+  `Reconcile`'s `Q < safeEpoch` watermark leaves `T`'s epoch un-rebuilt. Drive every interleaving of
+  `W_AdvanceOW`/`Reconcile`/`GC_Reclaim` against an uncommitted live build — this is the case that was broken.
+- **No-loss (reachable):** a reachable node (committed / dedup-reused) is never `Deleted`, even after `Reconcile`.
 - **No-ABA-when-reclaim-lags (floor):** condemn `(H,0)` (bumps `floors[H]=1`), delay its reclaim past the
   recent window, then a new writer wants `H` → it must resurrect to `floors[H]` (=1), never reuse `(H,0)`.
+- **Floor-move-before-commit (P1-3):** a reused child's `floor` moves after its parent tree was flushed →
+  `W_PublishRef` is disabled (re-check fails) → the writer must `W_Abort` (rebuild) → no ref ever names a
+  below-floor child.
