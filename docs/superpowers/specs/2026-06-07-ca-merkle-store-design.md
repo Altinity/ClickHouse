@@ -27,6 +27,7 @@ This is the TARGET design. Migration from the current implementation is out of s
 - [8. Scale and performance](#scale)
 - [9. Decisions (D1–D5) and parameters](#decisions)
 - [10. Verification scope](#verification)
+- [11. Open items and operational concerns](#open-items)
 - [Appendix A. Formal model (TLA+-convertible)](#appendix)
 
 ---
@@ -137,23 +138,17 @@ that rare cold `LIST`. Condemnation gates *reuse/attachment*, never *reads*.
 ### 3.2 Keeper (ephemeral coordination only, `O(active writers)`) {#layout-keeper}
 ```
 /clickhouse/ca/<pool>/
-  epoch                 current epoch E_cur — a DERIVED CACHE of the durable S3 gc/epoch (the leader writes S3 FIRST,
-                        then refreshes this; writers READ their O_W from here, avoiding a per-commit S3 GET)
+  epoch                 current epoch E_cur — a DERIVED CACHE of the durable S3 gc/epoch. ONLY the fenced leader
+                        writes it, S3 FIRST then this znode (R0); no other path ever writes it. Writers READ their
+                        O_W from here, avoiding a per-commit S3 GET.
   leader/lock-<seq>     EPHEMERAL-SEQUENTIAL; lowest live seq = GC leader; <seq> IS the monotone fence token
   writers/<session_id>  EPHEMERAL; data = that writer's observed epoch O_W (one integer)
-  leases/<epoch>/<key>  PERSISTENT write-ahead intent (data = owner session id), CREATED BEFORE the S3 object PUT and
-                        DELETED by the writer on commit; lets the GC enumerate crash orphans without a full LIST (D6).
-                        PERSISTENT (not ephemeral) on purpose — it must SURVIVE the writer's death to be useful. A
-                        leftover intent of a DEAD owner is simply CONDEMNED (tombstone → generation rolls), then
-                        reclaimed by the normal path — no rescue.
 ```
-The `epoch` znode is a **rebuildable cache** of the S3 `gc/epoch` (S3 stays the authority); because the leader
-writes S3 before refreshing it, Keeper is never *ahead* of S3 — at worst equal-or-behind, the safe direction (a
-writer can only *lag* the epoch, already covered by quiescence + closed-epoch reappend). Losing it loses nothing:
-recovery re-reads `gc/epoch` from S3. The `leases/` intents scale only with `O(in-flight build objects)` and are
-self-cleaning; losing them on a Keeper wipe loses nothing either — orphans then fall back to the periodic
-full-`LIST` sweep. Neither is authoritative durable state, so a Keeper wipe stays non-destructive
-(`INV-S3-COMPLETE`).
+The `epoch` znode is a **rebuildable cache** of the S3 `gc/epoch` (S3 stays the authority). Because **only the
+fenced leader writes it, and always S3-first** (R0 — the sole-writer rule is load-bearing, see §6.2), Keeper is
+never *ahead* of S3, only equal-or-behind: a writer can only *lag* the epoch, the safe direction already covered
+by quiescence + closed-epoch reappend. Losing it loses nothing — recovery re-reads `gc/epoch` from S3. So a
+Keeper wipe stays non-destructive; nothing in Keeper is authoritative durable state (`INV-S3-COMPLETE`).
 
 ## 4. Protocols {#protocols}
 
@@ -164,28 +159,25 @@ full-`LIST` sweep. Neither is authoritative durable state, so a Keeper wipe stay
    (`Disconnected`-detection alone is insufficient — TLC CE-4.)
 2. **Condemned cache.** Read `gc/condemned/<e>` for the last ~`e+2` epochs once each (immutable closed-epoch
    sets); cache. `condemned?(node,g)` is a membership test against this cache.
-3. **Build locally.** **Write-ahead intent (D6):** *before* creating any new object, record its planned key in a
-   **persistent** Keeper intent `leases/<O_W>/<key>` (data = session `S`). For part-trees every key is known up
-   front from `checksums.txt` (D5), so this is **one batched Keeper multi-create** per build — not per-PUT S3
-   churn. *Then* upload: for each file `f`, `Bf := cityHash128(f)` (D5); `createIfAbsent blobs/<Bf>/<g>`, upload
-   once if absent. For each subdir: recurse → child tree. **Reuse** the present generation `(hash,g)` iff present
-   ∧ `¬condemned?(hash,g)`; else **resurrect**: `createIfAbsent` at `gen+1`. Because the intent is durable in
-   Keeper *before* the PUT, a crash at any point leaves every uploaded object enumerable to the GC via its
-   leftover intent — **no S3 log churn and no batch-at-commit window** (recording the pin in the S3 log would be
-   write amplification per-PUT, or reopen the crash gap if batched at commit).
+3. **Build locally.** For each file `f`: `Bf := cityHash128(f)` (D5: from `checksums.txt` for part files);
+   `createIfAbsent blobs/<Bf>/<g>`; upload once if absent. For each subdir: recurse → child tree. **Reuse** the
+   present generation `(hash,g)` iff present ∧ `¬condemned?(hash,g)`; else **resurrect**: `createIfAbsent` at
+   `gen+1`. (No write-ahead orphan tracking on this path — see §9; crash debris is collected by the periodic
+   sweep.)
 4. **Tree.** `T := SipHash-128(canonical entries)`; `createIfAbsent trees/<T>/<g>`. (`part_id ≡ T`.)
 5. **Edge `+`.** Append edge `+` deltas to `gc/log/<O_W>/<shard>`: `ref→(T,g)` and `(T,g)→each child(h,g)`.
    Make them **durable**, and only **then** may `O_W` advance — **flush-`+`-then-advance** (TLC CE-1). After the
    `+` is durable, **re-check** `condemned?` for reused children; if any is now condemned, **resurrect to
    `gen+1` and append a `-` for the abandoned edge** (dedup-preserving reuse; resolves CE-2 under D2).
 6. **Commit.** `setRef roots/<server_id>/store/.../refs/<name> = RefPayload{T,g,header}` — the commit point,
-   **written last** (re-check the self-fence immediately before). Once published, the durable tree edges hold
-   every node, so **delete this build's `leases/<O_W>/*` intents** (D6) — only a crashed (uncommitted) build
-   leaves intents behind.
+   **written last** (re-check the self-fence immediately before).
 7. **Drop.** `removeRef` **first**, then append the `ref→(T,g)` `-` delta.
 
-A crash before step 6 leaves the part not-live; its nodes age out once the writer's lease is gone and their
-in-degree folds to 0 (over-count only).
+A crash before step 6 leaves the part not-live. Nodes whose `+` edge was made durable (step 5) fold to in-degree
+0 (the ref is never published) and reclaim by the normal path. Nodes uploaded but *never* `+`'d (a crash between
+step 3 and step 5) carry no edge and are **invisible to the `O(delta)` fold**; they are reclaimed only by the
+periodic Retention-guarded orphan-sweep (§7, §4.4). Over-count only either way — the accepted cost is that pure
+upload-crash debris lingers until the next sweep.
 
 ### 4.2 GC leader — one round (fenced single deleter) {#proto-gc}
 Guard every step: I am the lowest-seq child of `leader/` (a **`sync`-ed** read) ∧ `Connected`; else **fail-close
@@ -197,26 +189,25 @@ R0 CLOSE    E := GET gc/epoch (S3); fenced PUT gc/epoch = E+1 in S3 (DURABLE FIR
 R1 FOLD     CLOSED epochs only: per shard, streaming merge-sort gc/log/<≤E>/<shard> ⋈ gc/snap/<…>/<shard>
             → gc/snap/<E+1>/<shard>; per-node IN-DEGREE; emit in-degree-0 CANDIDATES.   (O(delta), sharded)
 R2 CONDEMN  write the candidate (node,gen) set to gc/condemned/<e_a> as ONE object (fenced; e_a = folded epoch).
-            ALSO fold in CRASH ORPHANS (D6): for each intent leases/<*>/<key> whose owner session is GONE
-            (∉ getChildren(writers/), sync-ed), add its (key,gen) to THIS round's set gc/condemned/<e_a> (a
-            tombstone, into the CURRENT epoch so every live writer re-reads it before reclaim) and DELETE the
-            intent. A live-owner intent is left untouched (its build may still commit). NO rescue: the orphan is
-            now a normal condemned node — generation rolls, and R4's in-degree==0 guard alone keeps a dedup-reused
-            / committed copy alive.
 R3 QUIESCE  safe_epoch := min(O_W) over getChildren(writers/) [sync-ed]; if none → E_cur.
 R4 RECLAIM  for each (N,e_a) in gc/condemned/<e_a> with
               E_cur ≥ e_a+2  ∧  safe_epoch > e_a  ∧  in-degree==0  ∧  still-leader(fence):
                 DELETE the node object;  if N is a TREE, append `-` deltas for ITS child edges
                 (DEFERRED CASCADE — children whose in-degree reaches 0 are condemned in a LATER round, D4).
 ```
-`E_cur ≥ e_a+2` = Crossbeam 3-epoch limbo; `safe_epoch > e_a` = EBR/QSBR quiescence; the fence gates every
-DELETE. `Retention` is **not** on this fast path (quiescence covers it) — it is a backstop only for reconcile
-(§7).
+**Two gears, not four.** The real no-loss gate is **quiescence** (`safe_epoch > e_a`: every live writer has
+observed past `e_a`, so none can newly reference the node). `E_cur ≥ e_a+2` (Crossbeam 3-epoch limbo) is only the
+conservative *slack* that lets quiescence be sampled lazily across rounds rather than synchronously. The
+**deferred cascade** (D4) is not a separate mechanism — a tree-delete's child decrements are just `-` edges
+folded next round. The fence gates every DELETE. `Retention` is **not** on this fast path (quiescence covers it)
+— it is a backstop only for the periodic orphan-sweep / reconcile (§7).
 
 ### 4.3 Reader {#proto-read}
 `GET ref → (T,g)`; `resolveNode(x,g)`: `GET <x>/<g>`, on `404` `LIST <x>/` and read any present generation;
 walk tree entries, recurse into child trees, `GET` child blobs (`404 → LIST` at each node). A present-but-
-condemned node still reads correctly (condemnation blocks only new reuse/attach).
+condemned node still reads correctly (condemnation blocks only new reuse/attach). If both the `GET` **and** the
+`LIST` are empty, the node was reclaimed under a dropped ref: **re-resolve from the ref**; if the ref itself is
+gone the part was dropped and the read fails cleanly (no live ref names it — this is not a dangle).
 
 ### 4.4 Recovery — total Keeper loss {#proto-recovery}
 ```
@@ -224,10 +215,14 @@ during:  every writer session drops → READ-ONLY (self-fence); the leader's ele
          No mutation that could dangle or lose data occurs while Keeper is down.  SAFE PAUSE.
 restore (even empty Keeper):
          PURGE any backup-restored ghost leader//writers/ znodes;  elect a leader;
-         E := GET gc/epoch (S3);  fenced PUT gc/epoch = E+1  (fence off pre-outage in-flight epochs);  refresh
-         the Keeper `epoch` cache;  writers reconnect, re-create writers/<S>, observe the new epoch, resume.
+         E := GET gc/epoch (S3);  fenced PUT gc/epoch = E+1  (fence off pre-outage in-flight epochs);  the elected
+         leader — and ONLY it, S3-first — refreshes the Keeper `epoch` cache;  writers reconnect, re-create
+         writers/<S>, observe the new epoch, resume.
          If gc/snap integrity is in doubt → RECONCILE: full DAG reachability from refs/ (durable, written-last
-         authority) rebuilds gc/snap; reconcile NEVER reclaims anything younger than Retention.  S3 ALONE SUFFICES.
+         authority) rebuilds gc/snap.  Reconcile and the periodic orphan-sweep NEVER reclaim an S3 object younger
+         than Retention (age by the object's last-modified / multipart-completion time), and Retention > max
+         in-flight op duration — so a pre-wipe upload that completes after the wipe is never swept from under an
+         about-to-be-published ref.  S3 ALONE SUFFICES.
 ```
 
 ## 5. Invariants and the safety argument {#invariants}
@@ -241,13 +236,12 @@ restore (even empty Keeper):
 - **INV-NO-ABA:** a node once deleted is never returned to present at the **same** key — a re-create uses
   `gen+1` (D2), a different key; only `create-if-absent` is needed.
 - **INV-OVER-COUNT-ONLY:** every failure mode (lost/dup/reordered `+`/`-`, crash, partial cascade) biases to
-  over-count (a node kept longer → a leak, reconciled later), never to under-count (loss). The reverse index is
+  over-count (a node kept longer → a leak, reclaimed later), never to under-count (loss). The reverse index is
   a *sloppy candidate filter*, not the delete authority; the authority is quiescence + in-degree + fence.
-  Upload-crash orphans (a blob PUT whose tree was never committed) are enumerated by the writer's write-ahead
-  Keeper intent (`leases/<e>/<key>`, written *before* the PUT); when the owning session dies the GC simply
-  **condemns** that `(key,gen)` and lets the normal generation-roll + reclaim path delete it (D6, no rescue —
-  `R4`'s `in-degree 0` guard protects a dedup-reused / committed copy). A periodic Retention-guarded full-`LIST`
-  orphan-sweep (§7) is the backstop if the intents themselves are lost (Keeper wipe).
+  Upload-crash debris (objects PUT by a build that crashed before publishing its ref, so no `+` edge ever named
+  them) is **invisible to the fold** — it carries no edge — and is reclaimed by the periodic Retention-guarded
+  full-`LIST` orphan-sweep (§7), the only mechanism that sees never-referenced objects. This is a deliberate
+  choice (§9): no per-object / per-build write-ahead tracking on the hot path.
 - **INV-S3-COMPLETE:** S3 alone determines and rebuilds the full state; Keeper holds only ephemeral coordination
   plus **rebuildable caches** (the `epoch` znode) — never authoritative durable state; total Keeper loss loses
   nothing (the epoch is re-read from the durable S3 `gc/epoch`).
@@ -263,10 +257,16 @@ restore (even empty Keeper):
    single arbiter). The leader likewise fail-closes on `Disconnected`, with a `sync`-ed lowest-seq fence
    re-check before every delete.
 2. **`flush-+-then-advance`**: a writer makes an edge-`+` durable in S3 before advancing `O_W` in Keeper
-   (Keeper linearizability does **not** extend to S3). The leader folds only **closed** epochs; writers reappend
-   in-flight `+` into the open epoch. Symmetrically, the leader writes the durable S3 `gc/epoch` **before**
-   refreshing the Keeper `epoch` cache, so the cache is never *ahead* of the durable epoch — a writer can only
-   *lag*, the safe direction already covered by quiescence + closed-epoch reappend.
+   (Keeper linearizability does **not** extend to S3). The leader folds only **closed** epochs; a writer that
+   learns its epoch was closed reappends the still-needed in-flight `+` into the open epoch. The Keeper `epoch`
+   cache is a **hint for the hot read of `O_W` only** — never the authority for "is my `+`'s epoch still
+   foldable-open" (that is detected against the leader's close), so a *lagging* cache cannot let a `+` be silently
+   dropped: worst case it lands in a just-closed epoch and is reappended (the proven CE-1 path). Symmetrically,
+   **only the fenced leader writes the `epoch` znode, always S3-first** (sole-writer rule), so the cache is never
+   *ahead* of the durable S3 epoch — a writer can only *lag*, the safe direction already covered by quiescence +
+   reappend. The `e+2` limbo is sufficient **independent of cache lag**: a writer lagging by `k` epochs publishes
+   `writers/<S> = E_cur−k`, which lowers `safe_epoch` to match, so the `R4` `safe_epoch > e_a` gate self-adjusts
+   to any lag — safety comes from quiescence, not from `+2`.
 3. **Fenced single deleter**: only the lowest-seq leader deletes; every delete/epoch-advance is fence-gated.
 4. **Decoupled generations** (D2): re-create routes to `gen+1`, making the unconditional delete ABA-safe with
    only `create-if-absent`.
@@ -275,8 +275,7 @@ restore (even empty Keeper):
 
 | Fault | Outcome |
 |---|---|
-| writer crash mid-build / mid-(100GB)-upload | no ref published; every uploaded object has a **write-ahead Keeper intent** (`leases/<e>/<key>`, written *before* the PUT — D6); once the owning session is gone the GC **condemns** each leftover intent's `(key,gen)`, and the normal generation-roll + reclaim path deletes it (no full `LIST`, no rescue). Incomplete multipart objects are reclaimed by an S3 lifecycle abort-incomplete rule (infra). Over-count only. |
-| stray orphan whose intent was lost (Keeper wipe / torn intent) | reclaimed by the periodic **orphan-sweep**: a Retention-guarded full `LIST` of `blobs/`+`trees/` minus the fold/reachability set (the Iceberg `remove_orphan_files` / `git gc` model); rare, off-hot-path; never deletes anything younger than `Retention`. |
+| writer crash mid-build / mid-(100GB)-upload | no ref published; objects already `+`'d (step 5) fold to in-degree 0 and reclaim normally. Objects uploaded but never `+`'d carry no edge → invisible to the fold → reclaimed by the periodic **orphan-sweep**: a Retention-guarded full `LIST` of `blobs/`+`trees/` minus the reachability-from-`refs/` set (the Iceberg `remove_orphan_files` / `git gc` model; = reconcile on a schedule), rare and off-hot-path, never deleting an object younger than `Retention` (by last-modified / completion time). Incomplete multipart objects are reclaimed by an S3 lifecycle abort-incomplete rule (infra). Over-count only. |
 | writer paused (alive lease) | pins `safe_epoch` at `O_W`; reclamation of newer epochs waits. Liveness only. |
 | writer server-expired but still believes Connected | the §6.1 local-deadline self-fence forces read-only *before* expiry. Safe. |
 | GC leader crash mid-round / mid-cascade | idempotent (`create-if-absent` condemned set, monotone epoch PUT, fenced deletes; re-fold recovers a partial cascade); successor takes a higher fence and re-folds. |
@@ -293,13 +292,18 @@ restore (even empty Keeper):
 - **Keeper load**: `O(active writers)` tiny znodes + heartbeats; independent of pool size.
 - **Big folders**: parts are small trees. A table keeps **flat refs** (D3), not one giant tree; if a single
   huge directory is ever required, shard it into a trie of trees by name-prefix.
+- **Read cost**: one `GET` per node in the common `g=0` case; a node ever resurrected (`g>0`) pays
+  `GET`-`404`-then-`LIST` on every read until generations are compacted (open item, §11). The part-load path must
+  not trip the cold `404→LIST` en masse (§11).
+- **Orphan-sweep cost**: the periodic full-`LIST` sweep is `O(all objects)` and must be incremental, bounded in
+  memory, and pausable on a very large bucket (open item, §11).
 
 ## 9. Decisions (D1–D5) and parameters {#decisions}
 
 - **D1 — Keeper required** for coordination; the S3-only coordination mode is dropped (it had clock-skew and
   fence-steal data-loss modes). S3 remains the sole durable truth. Keeper additionally caches the current epoch
-  as a derived, rebuildable znode so writers avoid a per-commit S3 `GET` (written S3-first, so never ahead of
-  the durable epoch).
+  as a derived, rebuildable znode so writers avoid a per-commit S3 `GET`; **only the fenced leader writes that
+  znode, always S3-first** (sole-writer rule), so it is never ahead of the durable epoch.
 - **D2 — generations decoupled** from epochs (per-node resurrection counter, usually 0); reuse = present-gen
   if not condemned else resurrect to `gen+1`; no `g ≥ O_W` rule; long-lived dedup preserved.
 - **D3 — flat refs** per part for the table active set (no giant table tree; revisit a trie only if atomic
@@ -308,25 +312,15 @@ restore (even empty Keeper):
   crash-safe).
 - **D5 — trust `checksums.txt`** for part-trees: blob hash = `cityHash128` so copy/fetch/ATTACH build the
   part-tree and dedup from `checksums.txt` with no re-read/re-hash; fail-safe re-hash on mismatch.
-- **D6 — write-ahead Keeper intents, reclaimed by condemnation (no rescue).** The `O(delta)` fold (over the S3
-  log) cannot see a never-referenced object, so an upload that crashes before its tree is committed would
-  otherwise be invisible. Recording the pin in the S3 log is wrong twice over: per-PUT it is write amplification;
-  batched at commit it reopens the same crash window. Instead, **before** creating any object the writer writes a
-  **persistent** Keeper intent `leases/<O_W>/<key>` (owner = session `S`) — created before the S3 PUT, deleted by
-  the writer on commit. When the GC finds a leftover intent whose **owner session is dead**, it simply
-  **condemns** that `(key,gen)` (folds it into the current round's `gc/condemned/<e_a>` tombstone set) and deletes
-  the intent. From there the orphan is **identical to any condemned node**: the generation rolls (a future writer
-  wanting the content resurrects to `gen+1`) and the standard reclaim deletes it once quiesced + `e+2` +
-  `in-degree 0` + fence. **No rescue logic:** the normal `in-degree 0` reclaim guard alone keeps a still-referenced
-  copy alive (a writer that dedup-reused the same content, or that committed then died before deleting its intent)
-  — at the cost only of an unnecessary generation roll (a little lost dedup in that rare crash window), never
-  correctness. Condemning into the *current* epoch (not the writer's original one) keeps the tombstone inside
-  every live writer's condemned-read window, so `safe_epoch > e_a` guarantees they all roll past it before any
-  reclaim. The intent is **persistent (not ephemeral)** so it survives the writer's death. Footprint
-  `O(in-flight build objects)`, self-cleaning; for part-trees the keys are known up front from `checksums.txt`
-  (D5), so one batched multi-create covers a whole part. A periodic Retention-guarded full-`LIST` orphan-sweep
-  (the Iceberg `remove_orphan_files` / `git gc` model) is the backstop if the intents themselves are lost (Keeper
-  wipe). `INV-S3-COMPLETE` holds: the intents are a rebuildable accelerator, not durable truth.
+- **Crash-orphan reclamation = the periodic sweep (write-ahead intents *rejected*).** The `O(delta)` fold cannot
+  see a never-referenced object, so a build that crashes before publishing its ref leaves debris invisible to the
+  GC. We considered a write-ahead record (first an S3-log pin, then a per-object / per-build Keeper intent) so the
+  GC could enumerate and condemn that debris without a full `LIST` — and **rejected it**: per-object intents are
+  `O(files)` persistent Keeper writes on *every* commit (write amplification that re-introduces exactly the
+  data-proportional Keeper traffic this design exists to remove), and the cheaper backstop — a periodic
+  Retention-guarded full-`LIST` orphan-sweep (Iceberg `remove_orphan_files` / `git gc`) — is needed anyway.
+  Decision: **no hot-path orphan tracking**; crash debris is collected by the periodic sweep. Accepted cost: such
+  debris (unreferenced, rare) lingers until the next sweep.
 - **Hashes:** `cityHash128` (blob), `SipHash-128` (canonical tree entries).
 - **Parameters (tuning, conservative defaults):** epoch period ≈ 10 min; `T_session` ≈ 60 s; heartbeat ≈ 15 s;
   limbo = `e+2`; `Retention` = reconcile backstop (e.g. hours/days, ≥ max op duration).
@@ -337,18 +331,44 @@ The TLA+ model (`docs/superpowers/models/`, extended from `CaGcCore.tla`) **must
 interleaving + the failure set (session-expiry gap, split-brain, total Keeper wipe): the single-node core
 (already PASS) **plus the currently-untested** (a) **multi-child commit atomicity** — a tree making a *set* of
 nodes reachable at once; (b) the **deferred decrement cascade** (D4); (c) the **decoupled reuse rule** (D2,
-re-verifying CE-2 under `gen+1` resurrection rather than the old `e ≥ O_W` encoding); (d) the **write-ahead Keeper
-intent → condemnation** path (D6) — a dead intent condemns its `(key,gen)`; an uploaded-but-uncommitted object
-must end up reclaimed (not leaked), while an object that another writer committed / dedup-reused must survive
-because `R4`'s `in-degree 0` guard refuses to delete it (not lost) even though it was condemned. Invariants
-checked: `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA`, and (temporal, if feasible) no-leak-forever.
+re-verifying CE-2 under `gen+1` resurrection rather than the old `e ≥ O_W` encoding). Invariants checked:
+`INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA`, and (temporal, if feasible) no-leak-forever.
 
 **Out of scope of the model (assumed / handled elsewhere):** the fold/snap data-plane internals (signed counts,
 LIST pagination, torn snapshot, `event_id` dedup — implementation correctness, not protocol); multipart-upload
-invisibility + S3 lifecycle abort (infra); the reader path / `404→LIST`; the exact canonical serialization
-bytes and the tree-entry `size`/`attrs` (non-safety metadata); the S3-vs-Keeper epoch cache split (modeled as a
-single `epochCur` — the S3-first write order means Keeper only ever lags, which is the already-modeled
-lagging-writer case); and the S3-only coordination mode (dropped per D1, so not modeled).
+invisibility + S3 lifecycle abort (infra); the periodic orphan-sweep (a full `LIST` minus reachability-from-
+`refs/`, Retention-guarded — off-protocol maintenance whose only safety obligation is "never delete younger than
+Retention"); the reader path / `404→LIST`; the exact canonical serialization bytes and the tree-entry
+`size`/`attrs` (non-safety metadata); the S3-vs-Keeper epoch cache split (modeled as a single `epochCur` — the
+S3-first sole-writer rule means Keeper only ever lags, the already-modeled lagging-writer case); and the S3-only
+coordination mode (dropped per D1, so not modeled).
+
+## 11. Open items and operational concerns {#open-items}
+
+These do not change the protocol's safety argument but must be addressed before/within implementation; raised by
+design review.
+
+- **Observability.** Expose `system.*` so an operator can answer "I dropped a table, why didn't S3 shrink?":
+  current epoch, `safe_epoch`, the oldest pinning writer (and its `O_W`), condemned-set size, reclaim backlog,
+  last orphan-sweep time, per-pool reclaimable-bytes estimate. Reclamation is intentionally lazy (limbo +
+  quiescence), so this visibility is required, not optional.
+- **Orphan-sweep at scale.** The periodic full-`LIST` sweep is `O(all objects)`; on a 10⁹–10¹¹-object bucket it
+  must be incremental, bounded in memory (stream/spill the reachability set), pausable/resumable, and rate-limited
+  on `LIST`. Specify its schedule, cost ceiling, and how the reachability set is built without OOM.
+- **Generation compaction.** A node resurrected to `g>0` pays `GET`-`404`-then-`LIST` on every read forever; there
+  is no path back to `g=0`. Decide whether reconcile compacts live nodes back to `g=0` (rewriting the referencing
+  trees) or whether high-`g` nodes are simply tolerated as a rare read-cost item.
+- **Stuck / flapping writer.** A single live-but-stalled writer pins `safe_epoch` and stalls pool-wide
+  reclamation until its lease expires (liveness only, by design); a writer flapping near the session deadline can
+  repeatedly pin/release. Surface "oldest pinning writer / reclamation lag" as an alertable metric.
+- **`checksums.txt` coverage (D5).** The set of part files that become blobs must exactly match
+  `IMergeTreeDataPart::checksums`. Some files are **not** in `checksums.txt` (e.g. `checksums.txt` itself,
+  version-dependent metadata, the `.meta` sidecars) — those are table-level verbatim `files/` or `refs/*.meta`,
+  not content-addressed blobs. The attach-time guard (D5) must verify the blob set round-trips, falling back to
+  re-hash on any mismatch.
+- **Part-load read path.** `MergeTreeData::loadDataParts` / attach issue many `exists`/`getMetadata`/`list`
+  calls; on the CA disk each becomes a tree walk. Verify a server start loading thousands of parts hits the `g=0`
+  `GET` fast path and does not trip the cold `404→LIST` en masse.
 
 ---
 
@@ -381,7 +401,6 @@ epochCur   \in Epoch                                               \* gc/epoch (
 \* ---- Keeper (ephemeral) ----
 leaderSeq  \in [Leaders -> Nat \cup {None}]                        \* leader/lock-<seq>; lowest live = leader; seq = fence
 writerOW   \in [Writers -> Epoch \cup {None}]                      \* writers/<S> observed epoch; None = no live session
-leaseIntents \subseteq (Epoch \X Hashes \X Gen \X Writers)         \* PERSISTENT Keeper write-ahead intents (epoch,obj,owner); D6
 \* ---- per-actor local ----
 wConn      \in [Writers -> {Connected, Disconnected}]              \* writer's belief
 wSess      \in [Writers -> {SessAlive, SessExpired}]               \* server-side session truth (may differ from wConn)
@@ -390,23 +409,20 @@ wPinDurable\in [Writers -> SUBSET Edge]                            \* this write
 ldrConn    \in [Leaders -> {Connected, Disconnected}]
 ```
 `epochClosed(e) == e < epochCur`. `inDegree(n)` is the leader's fold over CLOSED epochs only (the closed-epoch
-barrier): `snap[n]` plus the closed-epoch `plus`/`minus` net for `n`. (Write-ahead Keeper intents — D6 — are
-**not** part of in-degree; they are a separate orphan-enumeration set, and an intent's object is reclaimed only
-when its owner is dead **and** its `inDegree` is 0.)
+barrier): `snap[n]` plus the closed-epoch `plus`/`minus` net for `n`.
 
 ### A.3 Init {#a-init}
 All nodes `Absent`; `refs = {}`; `plus/minus/condemned` empty; `snap = 0`; `epochCur = 0`; no leader; all
-`writerOW = None`; `leaseIntents = {}`; writers `Connected ∧ SessAlive` with empty decided/pin sets.
+`writerOW = None`; writers `Connected ∧ SessAlive` with empty decided/pin sets.
 
 ### A.4 Actions (Next = disjunction) {#a-actions}
 Each action: **guard ⇒ effect.** (`Edge` = `(parent, child)` where parent is a ref or a tree node.)
 
 - **W_RegisterLease(w):** guard `writerOW[w]=None ∧ wConn[w]=Connected ∧ wSess[w]=SessAlive`.
   effect `writerOW[w] := epochCur`.
-- **W_CreateOrReuseChild(w, c):** guard writer may-act (`wConn=Connected ∧ wSess=SessAlive`). effect: pick the
-  target gen `g'` (present `g` if `node[c,g]=Present ∧ (c,g) ∉ UNION condemned[..]`, else `g+1`); **write-ahead:**
-  `leaseIntents := leaseIntents ∪ {(writerOW[w], c, g', w)}` (intent recorded *before* existence, D6); then
-  `node[c,g'] := Present` (no-op if reusing) and add `(c,g')` to `wDecided[w]`.
+- **W_CreateOrReuseChild(w, c):** guard writer may-act (`wConn=Connected ∧ wSess=SessAlive`). effect: if
+  `node[c,g]=Present ∧ (c,g) ∉ UNION condemned[..]` for the present `g` → reuse (add `(c,g)` to `wDecided[w]`);
+  else `node[c, g+1] := Present` and add `(c,g+1)` to `wDecided[w]` (resurrect, D2).
 - **W_FlushPlus(w, edge):** guard `edge`'s child `∈ wDecided[w]`. effect add `edge` to `plus[writerOW[w]]` and to
   `wPinDurable[w]` (durable). **Only after this may O_W advance.**
 - **W_AdvanceOW(w):** guard `wConn=Connected ∧ wSess=SessAlive ∧ writerOW[w] < epochCur ∧ wDecided[w] ⊆
@@ -414,26 +430,19 @@ Each action: **guard ⇒ effect.** (`Edge` = `(parent, child)` where parent is a
   `writerOW[w] := writerOW[w]+1`; re-check: any decided child now in `condemned` → resurrect to `g+1`, add its
   `-` to `minus`.
 - **W_PublishRef(w, name, (T,g)):** guard may-act ∧ `(T,g)`'s `+` edges `∈ wPinDurable[w]`. effect add
-  `(name,T,g)` to `refs` (commit point); delete this writer's intents
-  `leaseIntents := leaseIntents \ {i ∈ leaseIntents : i.owner = w}` (durable tree edges now hold every node, D6).
+  `(name,T,g)` to `refs` (commit point).
 - **W_Drop(w, name):** guard may-act. effect remove the ref from `refs`, then add the `ref→(T,g)` `-` to `minus`.
 - **GC_Close(L):** guard `IsLeader(L)` (lowest live `leaderSeq`) ∧ `ldrConn[L]=Connected`. effect
   `epochCur := epochCur+1`.
 - **GC_FoldCondemn(L, e):** guard `IsLeader(L) ∧ ldrConn[L]=Connected ∧ epochClosed(e)`. effect fold `plus[≤e]`,
-  `minus[≤e]` into `snap`; `condemned[e] := { n : inDegree(n)=0 } ∪ { (i.h,i.g) : i ∈ leaseIntents ∧
-  writerOW[i.owner]=None }` (dead-owner crash-orphan intents tombstoned into THIS epoch's set — into the current
-  closed epoch `e`, inside live writers' read window — D6); and `leaseIntents := leaseIntents \ { i : writerOW[i.owner]=None }`
-  (drop the condemned intents). No node delete and no in-degree check here — the orphan is now a normal condemned
-  node handled by `GC_Reclaim`.
+  `minus[≤e]` into `snap`; `condemned[e] := { n : inDegree(n)=0 }`.
 - **GC_Reclaim(L, n, e_a):** guard `IsLeader(L) ∧ ldrConn[L]=Connected ∧ n ∈ condemned[e_a] ∧ epochCur ≥ e_a+2 ∧
   (min over live writers of writerOW) > e_a ∧ inDegree(n)=0`. effect `node[n] := Deleted`; if `n` is a tree, for
-  each child edge add its `-` to `minus[epochCur]` (deferred cascade, D4). The `inDegree(n)=0` guard alone keeps a
-  dedup-reused / committed-then-died orphan alive — no rescue (D6).
-- **Failures:** `Sess_Expire(w)` (`wSess[w]:=SessExpired ∧ writerOW[w]:=None`, independent of `wConn`;
-  **`leaseIntents` is left intact — persistent, the whole point of D6: the intent must survive the writer's
-  death**); `Disconnect(w)`/`Reconnect(w)`; `Ldr_Disconnect(L)`/`Ldr_Steal(L)` (new lowest seq); `Keeper_Wipe`
-  (all `writerOW:=None`, `leaseIntents:={}` [lost → orphans fall to the full sweep], all `leaderSeq:=None`, all
-  writers→read-only); `Recover` (purge, elect, bump epoch, re-register).
+  each child edge add its `-` to `minus[epochCur]` (deferred cascade, D4).
+- **Failures:** `Sess_Expire(w)` (`wSess[w]:=SessExpired ∧ writerOW[w]:=None`, independent of `wConn`);
+  `Disconnect(w)`/`Reconnect(w)`; `Ldr_Disconnect(L)`/`Ldr_Steal(L)` (new lowest seq); `Keeper_Wipe` (all
+  `writerOW:=None`, all `leaderSeq:=None`, all writers→read-only); `Recover` (purge, elect, bump epoch,
+  re-register).
 
 ### A.5 Invariants {#a-inv}
 ```
@@ -452,9 +461,5 @@ NoLeakForever  == \A n : (eventually-always unreachable(n)) ~> (eventually node[
 ### A.7 Suggested finite bounds for TLC {#a-bounds}
 `Writers = {w1,w2}`, `Leaders = {L1,L2}`, `MaxEpoch = 2`, `MaxGen = 1`, a tree with 2 children (multi-child),
 `RetentionEps = 0`; `StateConstraint` caps `|refs| ≤ 2`, per-writer `wDecided`/`wPinDurable` ≤ 2,
-`|leaseIntents| ≤ 4`, fence ≤ MaxEpoch+2. The D6 orphan case is exercised by `W_CreateOrReuseChild` then
-`Sess_Expire` *before* `W_PublishRef` (uploaded, intent recorded, never committed) — the intent **persists** past
-the expiry; `GC_FoldCondemn` tombstones `(key,gen)` into `condemned[e]` and drops the intent, then `GC_Reclaim`
-deletes the node (no leak). A *committed* or *dedup-reused* object condemned the same way must **not** be deleted
-— `GC_Reclaim`'s `inDegree=0` guard refuses (no loss). Bounded model checking — strong evidence within bounds,
-not a proof.
+fence ≤ MaxEpoch+2. Bounded model checking — strong evidence within bounds, not a proof. (Crash-orphan
+reclamation is the periodic full-`LIST` sweep — out of model scope, §10 — so the model carries no intent state.)
