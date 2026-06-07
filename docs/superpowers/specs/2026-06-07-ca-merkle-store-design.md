@@ -83,11 +83,10 @@ needs its children's hashes to exist first), so **per-node reference counting is
 means genuinely unreachable; no cycle collector is ever needed.
 
 **Generations (D2).** A node key carries a generation `g`: a **small per-node resurrection counter**, `0` until
-the GC condemns generation `g` and a writer needs that content again and recreates it above the **durable
-per-hash floor** `floors/<H>` (= 1 + max-condemned-gen; #3). `g` is **decoupled from the epoch**; it exists only
+the GC retires generation `g` and a writer needs that content again and recreates it above the **durable per-hash floor** derived from `gc/retired` (= 1 + max retired gen; #3). `g` is **decoupled from the epoch**; it exists only
 so a GC delete of `(N,g)` and a concurrent re-create can never collide on a key (the re-create goes to a gen
 `≥ floor`, a different key — G2/ABA). The floor is durable so this holds even when a reclaim is delayed far past
-the recent-condemned window.
+the recent-retired window.
 
 **Canonical serialization.** Trees use a fixed encoding: entries sorted by `name`, fixed field layout, explicit
 `kind`, no nondeterministic fields (no timestamps/uids). Identical folders therefore hash identically — this is
@@ -141,23 +140,24 @@ One pool = one disk root.
                                               ((T,g,name),(child,g)). op_id = hash(build_id, edge, sign): retry within the SAME pinned
                                               epoch reuses the key → idempotent. No cross-epoch reappend ⇒ no cross-epoch dedup. Sharded.
   gc/snap/<epoch>/<shard>                    per-node IN-DEGREE authoritative THROUGH <epoch>; sorted by node key, sharded. Rebuildable.
-  floors/<H>                                 DURABLE per-hash barrier { floor_gen, retire_epoch } (SPARSE — only retired hashes have one):
-                                              floor_gen = 1 + max retired gen (REUSE barrier — new builds use g ≥ floor_gen); retire_epoch =
-                                              open_epoch at the last floor raise (DELETE-grace barrier — a gen < floor_gen may be physically
-                                              deleted only once safe_epoch > retire_epoch). THE durable authority for reclaim (§4.2). D2/#3.
-  gc/reclaiming/<…>                          OPTIONAL disposable work/retry list (zero-in-degree candidates, tree child-edge cascades) —
-                                              NOT authority; if lost/torn it only delays reclaim (the fold re-derives the same candidates).
-                                              It is the GC's internal TODO, NOT a signal to writers: a writer learns "this gen is being
-                                              reclaimed" ONLY from floors/<H>.floor_gen, which RETIRE raises durably BEFORE any delete. So
-                                              losing this list cannot race a writer — the floor (raised first) is the writer-facing barrier.
+  gc/retired/<retire_epoch>/<shard>          THE single durable barrier: a per-round manifest { retire_epoch, entries:[{(hash,gen), kind,
+                                              child_edges if tree}] }, sharded by hash. ONE source of truth with three jobs:
+                                                (1) REUSE BARRIER — (H,g') ∈ retired with g' ≥ g ⇒ a writer must not commit references to (H,g);
+                                                (2) DELETE-GRACE reference — retire_epoch (open_epoch at retire) gates physical delete (§4.2);
+                                                (3) DELETE-RECOVERY — the tree child_edges let a successor finish a crashed cascade.
+                                              An entry is kept until its object is physically deleted, then dropped — so the manifest is
+                                              bounded by the pending-reclaim backlog, NOT by all-ever-deleted (no per-object tombstone bloat).
+                                              (A FloorIndex — a compacted index "max retired gen per hash" — is an OPTIONAL implementation
+                                              cache OVER gc/retired for O(1) reuse-check; rebuildable; must fail-closed / refresh if stale.)
   _pool_meta                                pool identity / format version
 ```
 Notes: all mutable roots live under `roots/<server_id>/` and **mirror the real ClickHouse path** (`store/<uuid>`
 for live tables, `shadow/<backup_id>/store/<uuid>` for frozen backups) so the metadata layer maps onto it
-directly. There is **no per-object tombstone** — condemnation is the per-epoch `gc/condemned/<e>` record. There is
+directly. There is **no per-object tombstone** and **no separate `floors`/`candidates`/`reclaiming` namespaces** —
+the single `gc/retired` manifest (one per round, entries dropped after delete) is the whole barrier. There is
 **no `active` hint**: a node's present generation is resolved by a `GET <hash>/g=0` first (the **>90% case** —
 `g` stays `0`), and only on `404` a `LIST <hash>/` (a `LIST` costs ≈10× a `GET`, so this is a **cold** path, not
-the hot path). Condemnation gates *reuse/attachment*, never *reads*. Root edges (`ref→T`) ARE logged (so the
+the hot path). Retirement gates *reuse/attachment*, never *reads*. Root edges (`ref→T`) ARE logged (so the
 routine fold needs no `LIST` of `refs/`); a crash biases to **over-count (leak), never under-count (loss)**, and
 reconcile (§4.5) authoritatively cancels any stale positive over the quiesced prefix. **There is intentionally
 no `gc/sealed`** — the live-pin invariant (GC never folds an epoch `≥ safe_epoch`) makes a seal unnecessary, so
@@ -189,9 +189,10 @@ Keeper wipe stays non-destructive (`INV-S3-COMPLETE`).
    `gc/log/<pin_epoch>`, and the pin stays published until a durable outcome (step 6). **Self-fence (D1 hinge):**
    a consequential op may proceed only while `Connected ∧ local_elapsed_since_renew < T_session − margin`; else
    the writer goes **read-only**. (`Disconnected`-detection alone is insufficient — TLC CE-4.)
-2. **Floor.** Reuse-safety authority is the durable per-hash `floors/<H>.floor_gen` (D2, §3.1): cache it lazily;
-   reusable iff `g ≥ floor_gen(H)`. (It is the *durable* authority, so safety holds even when reclaim lags far
-   past any recent window.)
+2. **Reuse barrier.** The durable authority is `gc/retired` (§3.1): `(H,g)` is reusable iff no retired `(H,g')`
+   with `g' ≥ g` — equivalently `g ≥ floor_gen(H)` where `floor_gen(H) := 1 + max retired gen for H`, a value
+   *derived* from `gc/retired` (cached via the optional FloorIndex; the cache must refresh/fail-closed before a
+   commit). It is durable, so safety holds even when reclaim lags far past any recent window.
 3. **Build locally.** For each file `f`: `Bf := cityHash128(f)` (D5: from `checksums.txt` for part files); reuse
    present `(Bf,g)` iff `g ≥ floor_gen(Bf)`, else `createIfAbsent blobs/<Bf>/<floor_gen(Bf)>` with `birth_epoch :=
    pin_epoch` (immutable; a `createIfAbsent` that finds an existing object keeps its original `birth_epoch`).
@@ -239,31 +240,35 @@ R1 SAFE     safe_epoch := min(pin epoch) over getChildren(writers/) [SYNC-ED rea
 R2 FOLD     choose Q with  folded_through < Q ≤ open_epoch−1  ∧  Q < safe_epoch.  Streaming merge-sort
             gc/log/(folded_through, Q]/<shard> onto gc/snap/<folded_through> → gc/snap/<Q>; IN-DEGREE = count of
             DISTINCT present edges per node (idempotent edge-set). After durable, set folded_through := Q (fenced);
-            logs ≤ Q may then be deleted. Stream the in-degree-0 nodes to RETIRE (R3) — optionally via the
-            disposable gc/reclaiming work-list, which is NOT authority (lost → only delays reclaim).
-R3 RETIRE   for each in-degree-0 node (H,g): durably **raise floors/<H> := { floor_gen: max(floor_gen, g+1),
-            retire_epoch: open_epoch }**. This is the durable reclaim authority: floor_gen blocks NEW reuse of
-            (H,g); retire_epoch (= open_epoch now) is the delete-grace barrier. (NOT "condemned" = "dead" — the
-            object may still be reused/reachable until the grace + final recheck below.)
-R4 DELETE   delete (H,g) only when ALL hold (else leave it; retry later):
-              safe_epoch > floors/<H>.retire_epoch   (GRACE — every writer that could have passed its floor-recheck
-                                                       BEFORE the raise had pin ≤ retire_epoch, so it has now
-                                                       committed/aborted/died; this is the fix for the floor-recheck-
-                                                       vs-floor-bump race — NOT `safe_epoch > Q`)
-              ∧ FINAL RECHECK: current in-degree (folded through some Q' ≥ retire_epoch) == 0 AND not reachable
-                from any live ref   (a writer that committed during the grace is now folded → in-degree > 0 → spared;
-                                     floor stays raised, old gen kept alive by that ref, new reuse goes to floor_gen)
+            logs ≤ Q may then be deleted. The in-degree-0 nodes are streamed straight to RETIRE (R3) — no separate
+            durable candidate/work-list (a transient in-memory queue is fine; lost → re-derived by the next fold).
+R3 RETIRE   for each in-degree-0 node (H,g): durably append it to **gc/retired/<retire_epoch>** (retire_epoch =
+            open_epoch now), with kind + (for trees) child_edges. This single manifest IS the reclaim authority:
+            it is the writer-facing REUSE barrier (`(H,g') with g'≥g` ⇒ no new commit references (H,g)) AND the
+            delete-grace reference. (Retired ≠ dead — the object may still be reused/reachable until the grace +
+            final recheck below.)
+R4 DELETE   delete (H,g) ∈ gc/retired/<r> only when ALL hold (else leave it; retry later):
+              safe_epoch > r   (GRACE — a writer that passed its reuse-check BEFORE this entry was written had its
+                                pin ≤ r, so by safe_epoch > r it has committed/aborted/died; a writer that started
+                                AFTER sees (H,g) in gc/retired and won't reuse it. This is the fix for the
+                                reuse-check-vs-retire race — the barrier is `safe_epoch > r`, NOT `safe_epoch > Q`)
+              ∧ FINAL RECHECK: current in-degree (folded through some Q' ≥ r) == 0 AND not reachable from any live
+                ref   (a writer that committed during the grace is now folded → in-degree > 0 → spared; the retired
+                       entry stays, old gen kept alive by that ref, new reuse goes above it)
               ∧ still-leader(fence).
-            If (H,g) is a TREE: FIRST durably append the `-` child-edge deltas read **from the tree object itself**
-            (it still exists — crash before delete just re-reads it), THEN delete the object. (DEFERRED CASCADE,
-            D4 — children reach in-degree 0 and retire in later rounds.)
+            If (H,g) is a TREE: FIRST durably append the `-` child-edge deltas (read from the tree object itself —
+            still present, so a crash before delete just re-reads it; the gc/retired child_edges are an
+            optimization for that recovery), THEN delete the object. AFTER the object is deleted, the gc/retired
+            entry MAY be dropped (its barrier is moot — `GET g0→404→LIST` now finds the live gen). DEFERRED
+            CASCADE (D4): children reach in-degree 0 and retire in later rounds.
 ```
-**Quiescence is the gate, but against `retire_epoch`, not `Q`.** `Q` is when in-degree was *measured*; a live
-writer in an epoch `> Q` can still **reuse** an old `(H,g)` that was in-degree-0 through `Q` and reference it in
-an unfolded epoch. So the delete barrier is `safe_epoch > retire_epoch` (the epoch at which the floor was raised,
-≥ any reusing writer's frozen pin) **plus a final in-degree/reachability recheck**. There is **no separate `+2`
-limbo and no condemned-set authority** — `floors/<H> = {floor_gen, retire_epoch}` is the single durable barrier;
-`gc/reclaiming` and any candidate list are disposable work-lists. No wall clock is consulted on the reclaim path.
+**One durable barrier; physical delete is a later retryable consequence.** `gc/retired` is the single source of
+truth — the writer-facing reuse barrier *and* the delete-grace reference. The delete gate is `safe_epoch > r`
+(the retire round, ≥ any reusing writer's frozen pin) **plus a final in-degree/reachability recheck** — NOT
+`safe_epoch > Q` (`Q` is only when in-degree was measured; a live writer past `Q` can still reuse an old `(H,g)`
+and reference it in an unfolded epoch). There is **no `+2` limbo, no separate `floors`/`candidates`/`reclaiming`
+state** — a FloorIndex, if used for fast reuse-lookup, is a rebuildable cache over `gc/retired`, not a second
+authority. No wall clock is consulted on the reclaim path.
 
 ### 4.3 Reader {#proto-read}
 `GET ref → (T,g)`; `resolveNode(x,g)`: `GET <x>/<g>`; walk tree entries, recurse into child trees, `GET` child
@@ -272,7 +277,7 @@ names: a live ref naming a deleted generation is an invariant violation, not som
 `LIST <x>/` only to **confirm** that exact generation is absent; if it is, **re-read the ref** — if the ref is
 gone the part was dropped (read fails cleanly, no live ref names it — not a dangle); if the ref **still names the
 missing `(hash,gen)`**, report a **storage exception** (it surfaces a real `INV-NO-DANGLE` violation rather than
-hiding it). A present-but-condemned node still reads correctly (condemnation blocks reuse, not reads).
+hiding it). A present-but-retired node still reads correctly (retirement blocks reuse, not reads).
 
 ### 4.4 Recovery — total Keeper loss {#proto-recovery}
 ```
@@ -306,9 +311,9 @@ R2  STREAMING MERGE  LIST ⋈ reachability-stream, per shard → REBUILD gc/snap
     Q. Objects with birth_epoch ≤ Q are rebuilt: unreachable ⇒ in-degree 0 (stale positives die, debris
     surfaces). Objects with birth_epoch > Q are EXCLUDED — a live writer's fresh upload with no edge yet is
     protected by its epoch, not misread as old debris. DISCARD logs ≤ Q only after the rebuilt shards are durable.
-R3  Reconcile feeds its in-degree-0 nodes into the SAME RETIRE/DELETE path as the fold (§4.2 R3/R4): raise
-    floors/<H> = {floor_gen, retire_epoch=open_epoch}, then delete only when safe_epoch > retire_epoch with a
-    final recheck. Reconcile itself never deletes; it only makes the snapshot authoritative + raises floors.
+R3  Reconcile feeds its in-degree-0 nodes into the SAME RETIRE/DELETE path as the fold (§4.2 R3/R4): append them
+    to gc/retired/<retire_epoch=open_epoch>, then delete only when safe_epoch > that round with a final recheck.
+    Reconcile itself never deletes; it only makes the snapshot authoritative + appends to gc/retired.
 ```
 **Two explicit timestamps make the prefix rebuild computable.** Without `commit_epoch`/`birth_epoch`, a `refs/`
 walk + `LIST` cannot tell which roots/objects belong to epochs ≤ Q — it would either count a post-Q ref into
@@ -334,7 +339,7 @@ discarding that shard's logs. An interrupted reconcile is always safe — un-reb
   writer had its pin frozen `≤ retire_epoch` (it passed the recheck before the floor raise), so `safe_epoch >
   retire_epoch` ⇒ it has committed (→ folded, the final recheck spares `(N,g)`) or died (→ truly unreferenced).
   This is the floor-recheck-vs-floor-raise race fix.
-- **INV-NO-LIVE-WRITER-DELETION:** nothing — fold, condemn, reclaim, reconcile, or log discard — ever processes
+- **INV-NO-LIVE-WRITER-DELETION:** nothing — fold, retire, delete, reconcile, or log discard — ever processes
   an epoch `≥ safe_epoch`. A live writer's pinned epoch is therefore never touched; and a physical object with
   `birth_epoch > Q` (a fresh, possibly edge-less upload) is excluded from the reconcile rebuild. So neither a
   tentative committed-or-not node nor a brand-new upload of a live writer can be deleted.
@@ -359,7 +364,7 @@ discarding that shard's logs. An interrupted reconcile is always safe — un-reb
 - **INV-S3-COMPLETE:** S3 alone determines and rebuilds the full state; Keeper holds **only ephemeral
   coordination** (leader election + per-writer lease) — no durable state, no caches; total Keeper loss loses
   nothing (the epoch lives in S3 `gc/epoch_state`; writers re-read it on restore).
-- **Liveness (no-leak-forever):** every genuinely unreachable node is eventually condemned (in-degree 0 fold)
+- **Liveness (no-leak-forever):** every genuinely unreachable node is eventually retired (in-degree 0 fold)
   and, after the limbo + quiescence, reclaimed; deferred cascades drain dead subtrees over successive rounds; a
   stuck writer cannot stall reclamation forever (its lease expires → it is dropped from `safe_epoch`).
 
@@ -397,7 +402,7 @@ discarding that shard's logs. An interrupted reconcile is always safe — un-reb
 | writer crash mid-build / mid-(100GB)-upload | no ref published. A stale root `+` (logged before `setRef`) or never-`+`'d debris both bias to **over-count (leak), never loss** (§4.1 orderings) → corrected by the periodic **reconcile** (§4.5), which authoritatively rebuilds in-degree from real `refs/` (stale positive recomputes to 0; debris discovered by the `LIST`) → the usual quiescence + in-degree + fence gate reclaims. Incomplete multipart objects are reclaimed by an S3 lifecycle abort-incomplete rule (infra). Over-count only. |
 | writer paused (alive lease) | its frozen pin epoch holds `safe_epoch` down; reclamation of newer epochs waits. Liveness only. |
 | writer server-expired but still believes Connected | the §6.1 local-deadline self-fence forces read-only *before* expiry. Safe. |
-| GC leader crash mid-round / mid-cascade | idempotent (`create-if-absent` condemned set, monotone epoch PUT, fenced deletes; re-fold recovers a partial cascade); successor takes a higher fence and re-folds. |
+| GC leader crash mid-round / mid-cascade | idempotent (`gc/retired` is append/drop-keyed, monotone epoch PUT, fenced deletes; re-fold recovers a partial cascade); successor takes a higher fence and re-folds. |
 | split-brain leaders | only the lowest-seq leader's `sync`-ed fence passes; the stale leader fails-close. |
 | total Keeper loss / restore | §4.4: safe pause → S3-only authoritative rebuild via reconcile (§4.5). No ghost-epoch hazard (epoch not in Keeper). INV-S3-COMPLETE. |
 | lost/torn `gc/snap` | authoritatively rebuilt by reconcile (§4.5) from real `refs/` reachability over the quiesced prefix — `snap/<Q>` becomes the new truth; over-protective. |
@@ -436,19 +441,22 @@ discarding that shard's logs. An interrupted reconcile is always safe — un-reb
   dedup: a writer logs to its single pin epoch and the GC never folds an epoch `≥ safe_epoch`, so a live pin's
   epoch is inherently safe to append to. Keeper holds only the writer's **pin** (`writers/<S>`, the quiescence
   arbiter, frozen until commit/abort) and leader election.
-- **D2 — generations decoupled** from epochs, with a **durable per-hash barrier** `floors/<H> = {floor_gen,
-  retire_epoch}` (#3): reuse iff `g ≥ floor_gen(H)`, else resurrect to `floor_gen(H)`. `floor_gen` (= 1 + max
-  retired gen, raised before any delete) is the **durable** reuse authority that outlives any recent window.
-  `retire_epoch` (open_epoch at the raise) is the **delete-grace** barrier: a gen `< floor_gen` is physically
-  deleted only once `safe_epoch > retire_epoch` (+ a final recheck) — raising the floor does NOT make the old gen
-  instantly deletable, because a writer that passed its floor-recheck before the raise may still commit a
-  reference. No `g ≥ O_W` rule; long-lived dedup preserved (a never-retired hash has no floor object → floor 0).
+- **D2 — generations decoupled** from epochs; the durable barrier is the **single `gc/retired` manifest** (D6),
+  **not** a separate per-hash `floors` namespace. `floor_gen(H) := 1 + max retired gen for H` is *derived* from
+  `gc/retired` (cached via the optional rebuildable FloorIndex): reuse iff `g ≥ floor_gen(H)`, else resurrect to
+  `floor_gen(H)`. Because a retired entry is kept until its object is deleted, the manifest is the durable reuse
+  authority that outlives any recent window — and the retire round `r` is the **delete-grace** reference: a
+  retired `(H,g)` is physically deleted only once `safe_epoch > r` (+ a final recheck), because a writer that
+  passed its reuse-check before the entry was written may still be committing a reference. No `g ≥ O_W` rule;
+  long-lived dedup preserved (a never-retired hash has no entry → floor 0). The earlier "separate durable
+  `floors/<H>`" framing was wrong — it re-introduced per-object tombstones; the barrier is the one consolidated
+  manifest.
 - **D3 — flat refs** per part for the table active set (no giant table tree; revisit a trie only if atomic
   table snapshots become required).
 - **D4 — deferred decrement cascade** on tree delete (children reclaimed over later rounds; idempotent). The
   child-edge `-` deltas are read **from the tree object itself** and written durably *before* the object is
-  deleted — so a crash before delete just re-reads the still-present tree (crash-safe); the `gc/reclaiming`
-  work-list is an optimization/retry aid, **not** the authority.
+  deleted — so a crash before delete just re-reads the still-present tree (crash-safe); the `child_edges` carried
+  in the `gc/retired` entry are an optimization/retry aid, **not** the authority.
 - **D5 — trust `checksums.txt`** for part-trees: blob hash = `cityHash128` so copy/fetch/ATTACH build the
   part-tree and dedup from `checksums.txt` with no re-read/re-hash; fail-safe re-hash on mismatch.
 - **D6 — orphan / drift reclamation = the periodic reconcile, authoritative-rebuild (write-ahead intents
@@ -483,7 +491,7 @@ nodes reachable at once; (b) the **deferred decrement cascade** (D4); (c) the **
 re-verifying CE-2 under `floor`-resurrection rather than the old `e ≥ O_W` encoding); (d) the **reconcile
 quiesced-prefix rebuild** (§4.5): a `Reconcile` action that recomputes in-degree from `refs/`-reachability over
 `commit_epoch ≤ Q` roots and `birth_epoch ≤ Q` objects — debris and stale positives end at in-degree 0, are
-condemned by the next fold, and reclaimed; an object with `birth_epoch > Q` is excluded. Properties: an
+retired by the next fold, and deleted; an object with `birth_epoch > Q` is excluded. Properties: an
 uploaded-but-uncommitted orphan **and** a node with a stale root `+` are eventually reclaimed (no leak); a
 committed / dedup-reused / reachable object is **never** reclaimed even if reconcile ran (no loss); (e) the
 **durable floor + retire-grace** (#3): a writer reuses `(H,0)` (floor-recheck sees `floor_gen=0`); the GC then
@@ -511,7 +519,7 @@ These do not change the protocol's safety argument but must be addressed before/
 design review.
 
 - **Observability.** Expose `system.*` so an operator can answer "I dropped a table, why didn't S3 shrink?":
-  `open_epoch`, `folded_through`, `safe_epoch`, the oldest pinning writer (and its pin epoch), condemned-set
+  `open_epoch`, `folded_through`, `safe_epoch`, the oldest pinning writer (and its pin epoch), gc/retired-set
   size, reclaim backlog, last reconcile time, per-pool reclaimable-bytes estimate. Reclamation is intentionally
   lazy (limbo + quiescence), so this visibility is required, not optional.
 - **Reconcile at scale.** The prefix-rebuild reconcile (§4.5) is `O(all objects)` but `O(1)`-memory (streaming
@@ -542,9 +550,11 @@ design review.
   can read it during the scan without a `HEAD` per object if possible. These two timestamps are what make the
   quiesced-prefix reconcile computable (count refs with `commit_epoch ≤ Q`, rebuild objects with
   `birth_epoch ≤ Q`); without them reconcile cannot tell a live writer's fresh upload from old debris.
-- **Floor storage / hot-path cost.** `floors/<H>` is sparse (only condemned hashes) and cached; confirm the reuse
-  path's floor lookup stays off the critical latency path (cache + only consult on the rare resurrect/dedup-of-
-  condemned case), and bound the floor object count.
+- **FloorIndex (reuse-lookup cache).** The reuse-barrier is `gc/retired`; for an O(1) hot-path check, materialize
+  an optional **FloorIndex** ("max retired gen per hash") as a rebuildable cache over `gc/retired` — it is a
+  cache, not a second authority (rebuild from `gc/retired`; refresh / fail-closed before commit if stale). Confirm
+  the lookup stays off the critical latency path (only consulted on reuse/resurrect), and that `gc/retired` stays
+  bounded by the pending-reclaim backlog (entries dropped after their object is deleted).
 - **Part-load read path.** `MergeTreeData::loadDataParts` / attach issue many `exists`/`getMetadata`/`list`
   calls; on the CA disk each becomes a tree walk. Verify a server start loading thousands of parts hits the `g=0`
   `GET` fast path and does not trip the cold `404→LIST` en masse.
@@ -575,9 +585,9 @@ birthEpoch \in [(Hashes \X Gen) -> Epoch \cup {None}]             \* immutable o
 refs       \subseteq (RefName \X Hashes \X Gen \X Epoch)           \* live root edges; 4th field = commit_epoch (pin epoch of the root +)
 edgeLog    \in [Epoch -> SUBSET (Edge \X {Add, Rem})]             \* gc/log: per-epoch ADD/REM of edges keyed by (parent,child); IDEMPOTENT (op_id)
 snap       \in [(Hashes \X Gen) -> Int]                            \* folded in-degree (distinct present edges) through folded_through; rebuilt ≤Q
-floors     \in [Hashes -> [floor_gen: Gen, retire_epoch: Epoch \cup {None}]]  \* DURABLE barrier; default {0, None}; D2/#3
-                                                                  \* floor_gen = reuse barrier; retire_epoch = delete-grace barrier
-\* (no `condemned` authority — `gc/reclaiming` is an optional disposable work-list, not modeled as state)
+retired    \subseteq (Hashes \X Gen \X Epoch)                      \* gc/retired: (hash, gen, retire_round) — THE single durable barrier
+                                                                  \* (reuse barrier + delete-grace ref); entry dropped after its object is deleted
+\* floor_gen(H) == 1 + Max({g : <<H,g,_>> \in retired}) (0 if none) — DERIVED, not a separate variable (FloorIndex is a cache)
 epochState \in [open_epoch: Epoch, folded_through: Epoch \cup {None}, leader_fence: Nat]  \* gc/epoch_state — ONE object; SOLE epoch authority (NOT in Keeper)
 \* ---- Keeper (ephemeral) ----
 leaderSeq  \in [Leaders -> Nat \cup {None}]                        \* leader/lock-<seq>; lowest live = leader; seq = fence
@@ -598,12 +608,12 @@ through `folded_through`. A fold CANDIDATE is `node[n]=Present ∧ inDegree(n)=0
 `safeEpoch == Min({pinEpoch[w] : w live}) (or open_epoch if none)`; watermark `Q` with `folded_through < Q <
 safeEpoch ∧ Q ≤ open_epoch−1`. **Reconcile rebuilds `snap` from `Reachable(refs)` over the prefix `≤ Q`**, using
 `commit_epoch` (count a ref iff its `commit_epoch ≤ Q`) and `birthEpoch` (rebuild an object iff `birthEpoch ≤
-Q`, exclude `> Q`). Reuse authority is the durable `floors`: `reusable(H,g) == g ≥ floors[H]`. While `wPending[w]`,
-`pinEpoch[w]` is FROZEN; `W_AdvancePin` is disabled until commit/abort.
+Q`, exclude `> Q`). Reuse authority is the durable `retired` set: `reusable(H,g) == g ≥ floor_gen(H)` (derived).
+While `wPending[w]`, `pinEpoch[w]` is FROZEN; `W_AdvancePin` is disabled until commit/abort.
 
 ### A.3 Init {#a-init}
 All nodes `Absent`; `birthEpoch = None`; `refs = {}`; `edgeLog` empty; `snap = 0`;
-`floors = [h ↦ {floor_gen ↦ 0, retire_epoch ↦ None}]`;
+`retired = {}`;
 `epochState = [open_epoch ↦ 0, folded_through ↦ None, leader_fence ↦ 0]`; no leader; all `pinEpoch = None`;
 all `wPending = FALSE`; writers `Connected ∧ SessAlive` with empty decided/tentative sets.
 
@@ -613,14 +623,14 @@ Each action: **guard ⇒ effect.** (`Edge` = `(parent, child)` where parent is a
 - **W_RegisterLease(w):** guard `pinEpoch[w]=None ∧ wConn[w]=Connected ∧ wSess[w]=SessAlive`.
   effect `pinEpoch[w] := epochState.open_epoch` (read fresh — never below `folded_through`).
 - **W_CreateOrReuseChild(w, c):** guard writer may-act (`wConn=Connected ∧ wSess=SessAlive`). let `fg :=
-  floors[c].floor_gen`. effect: `wPending[w] := TRUE`; let `g` be the present gen of `c`; if `node[c,g]=Present
+  floor_gen(c)` (derived from `retired`). effect: `wPending[w] := TRUE`; let `g` be the present gen of `c`; if `node[c,g]=Present
   ∧ g ≥ fg` → reuse (add `(c,g)` to `wDecided[w]`); else `node[c, fg] := Present`, `birthEpoch[(c,fg)] :=
   pinEpoch[w]`, add `(c, fg)` to `wDecided[w]` (resurrect to the durable floor_gen, D2/#3).
 - **W_FlushEdge(w, edge):** guard `edge`'s child `∈ wDecided[w]`. effect add `(edge, Add)` to
   `edgeLog[pinEpoch[w]]` (always the pin epoch — **no seal check, no re-target**; idempotent by edge key) and to
   `wTentEdges[w]`.
 - **W_PublishRef(w, name, (T,g)):** guard may-act ∧ `(T,g)`'s edges `∈ wTentEdges[w]` ∧ **every decided child
-  `(c,g_c)` still has `g_c ≥ floors[c].floor_gen`** (floor re-check, P1-3 — a moved floor disables commit and
+  `(c,g_c)` still has `g_c ≥ floor_gen(c)`** (re-check vs `retired`, P1-3 — a moved floor disables commit and
   forces `W_Abort`+rebuild). effect add `(name, T, g, pinEpoch[w])` to `refs` (record `commit_epoch = pinEpoch[w]`);
   `wPending[w] := FALSE`; clear `wDecided[w]`, `wTentEdges[w]`.   (durable OUTCOME — `W_AdvancePin` now enabled)
 - **W_Abort(w):** guard `wPending[w]=TRUE`. effect (explicit abort, P1-1): for every edge ∈ `wTentEdges[w]`
@@ -639,27 +649,27 @@ Each action: **guard ⇒ effect.** (`Edge` = `(parent, child)` where parent is a
   `epochState.folded_through := Q` (fenced); logs `≤ Q` may be discarded. (The in-degree-0 nodes are the input to
   `GC_Retire`; materializing them is an optional disposable work-list, not state.)
 - **GC_Retire(L, n=(H,g)):** guard `IsLeader(L) ∧ ldrConn[L]=Connected ∧ node[n]=Present ∧ inDegree(n)=0`. effect
-  **durably raise** `floors[H] := { floor_gen ↦ Max(floors[H].floor_gen, g+1), retire_epoch ↦ epochState.open_epoch }`.
-  (Blocks NEW reuse of `(H,g)` and records the delete-grace epoch. NOT a delete — the object may still be reused/
-  reachable until the grace + final recheck.)
-- **GC_Delete(L, n=(H,g)):** guard `IsLeader(L) ∧ ldrConn[L]=Connected ∧ floors[H].floor_gen > g ∧
-  floors[H].retire_epoch # None ∧ safeEpoch > floors[H].retire_epoch  (GRACE) ∧ inDegree(n)=0 (final recheck on
-  the CURRENT fold) ∧ n ∉ Reachable(refs)`. effect: if `n` is a tree, FIRST for each child edge (read from the
-  STILL-PRESENT tree object) add `(edge, Rem)` to `edgeLog[open_epoch]` (deferred cascade, D4), THEN
-  `node[n] := Deleted`. (No `condemned`-set authority and no `+2` limbo — `safeEpoch > retire_epoch` + recheck is
-  the whole barrier.)
+  **durably add** `<<H, g, epochState.open_epoch>>` to `retired` (the single barrier — blocks NEW reuse of `(H,g)`
+  via `floor_gen`, and records the retire round `r = open_epoch` as the delete-grace ref). NOT a delete — the
+  object may still be reused/reachable until the grace + final recheck.
+- **GC_Delete(L, n=(H,g)):** guard `IsLeader(L) ∧ ldrConn[L]=Connected ∧ <<H,g,r>> \in retired ∧
+  safeEpoch > r  (GRACE) ∧ inDegree(n)=0 (final recheck on the CURRENT fold) ∧ n ∉ Reachable(refs)`. effect: if
+  `n` is a tree, FIRST for each child edge (read from the STILL-PRESENT tree object) add `(edge, Rem)` to
+  `edgeLog[open_epoch]` (deferred cascade, D4), THEN `node[n] := Deleted`; the `retired` entry MAY then be dropped
+  (its barrier is moot post-delete). (No separate floors/candidates state, no `+2` limbo — `safeEpoch > r` +
+  recheck is the whole barrier.)
 - **Reconcile(L):** guard `IsLeader(L) ∧ ldrConn[L]=Connected`. effect (prefix rebuild): pick `Q` with
   `folded_through < Q < safeEpoch ∧ Q ≤ open_epoch−1`; rebuild `snap` for every present `n` as the count of
   distinct edges `(_,n)` from `Reachable({r ∈ refs : r.commit_epoch ≤ Q})`, **counted only for `n` with
   `birthEpoch[n] ≤ Q`** (objects with `birthEpoch > Q` are EXCLUDED — a live writer's fresh upload is not misread
   as debris); drop `edgeLog[≤Q]`; `folded_through := Q`. The resulting in-degree-0 nodes feed the SAME `GC_Retire`
-  → `GC_Delete` path (raise `floors`, then grace + recheck). Reconcile never deletes. `Reachable` is the DAG
+  → `GC_Delete` path (add to `retired`, then grace + recheck). Reconcile never deletes. `Reachable` is the DAG
   closure from the live roots — the durable authority, NOT `snap`.
 - **Failures:** `Sess_Expire(w)` (`wSess[w]:=SessExpired ∧ pinEpoch[w]:=None ∧ wPending[w]:=FALSE` — build
   abandoned by death; tentative edges remain a stale positive cleaned by reconcile, fresh uploads stay protected
   by `birthEpoch` until that epoch quiesces); `Disconnect(w)`/`Reconnect(w)`; `Ldr_Disconnect(L)`/`Ldr_Steal(L)`;
   `Keeper_Wipe` (all `pinEpoch:=None ∧ wPending:=FALSE`, all `leaderSeq:=None`, writers→read-only;
-  **`edgeLog`/`floors`/`snap`/`epochState`/`birthEpoch`/`refs` are S3, NOT cleared**); `Recover` (purge
+  **`edgeLog`/`retired`/`snap`/`epochState`/`birthEpoch`/`refs` are S3, NOT cleared**); `Recover` (purge
   `leader/`+`writers/` only — no epoch znode; elect, `epochState.open_epoch += 1`, re-register).
 
 ### A.5 Invariants {#a-inv}
@@ -696,13 +706,13 @@ NoLeakForever  == \A n : (eventually-always unreachable(n)) ~> (eventually node[
   `GC_Delete` against an uncommitted live build.
 - **No-loss (fresh edge-less upload, the birth_epoch case):** `W_CreateOrReuseChild` creates a node with
   `birthEpoch = pinEpoch` but the writer logs **no edge yet** and stays live. `Reconcile` must EXCLUDE it
-  (`birthEpoch > Q`) and never condemn/reclaim it.
+  (`birthEpoch > Q`) and never retire/delete it.
 - **No-loss (reachable):** a reachable node (committed / dedup-reused) is never `Deleted`, even after `Reconcile`.
 - **Retire-grace race (the new headline):** a live writer reuses `(H,0)` (floor-recheck saw `floor_gen=0`); GC
   `GC_Retire`s `(H,0)` (raises `floor_gen=1`, `retire_epoch`). `GC_Delete` must be blocked until
   `safe_epoch > retire_epoch` ∧ final recheck — so the still-building writer (pin ≤ retire_epoch) is waited out;
   if it commits, the recheck sees reachability and spares `(H,0)`; if it dies, `(H,0)` is deleted. No loss.
 - **No-ABA-when-reclaim-lags (floor):** retire `(H,0)` (raises `floor_gen=1`), delay reclaim past the recent
-  window, then a new writer wanting `H` must resurrect to `floors[H]` (=1), never reuse `(H,0)`.
+  window, then a new writer wanting `H` must resurrect to `floor_gen(H)` (=1, derived from `retired`), never reuse `(H,0)`.
 - **Floor-move-before-commit (P1-3):** a reused child's `floor` moves after its parent tree was flushed →
   `W_PublishRef` disabled (re-check fails) → `W_Abort` + rebuild → no ref ever names a below-floor child.
