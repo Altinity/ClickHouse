@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <thread>
 #include <Interpreters/Context.h>
+#include <Interpreters/ExpressionActions.h>
 
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
