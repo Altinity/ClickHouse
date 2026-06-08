@@ -202,31 +202,31 @@ namespace ErrorCodes
     bytes) with some gap to avoid filesystem errors.
     )", 0) \
     DECLARE(UInt64, min_bytes_for_full_part_storage, 0, R"(
-    Only available in ClickHouse Cloud. Minimal uncompressed size in bytes to
+    Minimal uncompressed size in bytes to
     use full type of storage for data part instead of packed
     )", 0) \
     DECLARE(UInt64, min_rows_for_full_part_storage, 0, R"(
-    Only available in ClickHouse Cloud. Minimal number of rows to use full type
+    Minimal number of rows to use full type
     of storage for data part instead of packed
     )", 0) \
     DECLARE(UInt64, compact_parts_max_bytes_to_buffer, 128 * 1024 * 1024, R"(
-    Only available in ClickHouse Cloud. Maximal number of bytes to write in a
+    Maximal number of bytes to write in a
     single stripe in compact parts
     )", 0) \
     DECLARE(UInt64, compact_parts_max_granules_to_buffer, 128, R"(
-    Only available in ClickHouse Cloud. Maximal number of granules to write in a
+    Maximal number of granules to write in a
     single stripe in compact parts
     )", 0) \
     DECLARE(UInt64, compact_parts_merge_max_bytes_to_prefetch_part, 16 * 1024 * 1024, R"(
-    Only available in ClickHouse Cloud. Maximal size of compact part to read it
+    Maximal size of compact part to read it
     in a whole to memory during merge.
     )", 0) \
     DECLARE(UInt64, merge_max_bytes_to_prewarm_cache, 1ULL * 1024 * 1024 * 1024, R"(
-    Only available in ClickHouse Cloud. Maximal size of part (compact or packed)
+    Maximal size of part (compact or packed)
     to prewarm cache during merge.
     )", 0) \
     DECLARE(UInt64, merge_total_max_bytes_to_prewarm_cache, 15ULL * 1024 * 1024 * 1024, R"(
-    Only available in ClickHouse Cloud. Maximal size of parts in total to prewarm
+    Maximal size of parts in total to prewarm
     cache during merge.
     )", 0) \
     DECLARE(Bool, load_existing_rows_count_for_old_parts, false, R"(
@@ -896,7 +896,7 @@ namespace ErrorCodes
     `simultaneous_parts_removal_limit` set to `0` means unlimited.
     )", 0) \
     DECLARE(UInt64, reduce_blocking_parts_sleep_ms, 5000, R"(
-    Only available in ClickHouse Cloud. Minimum time to wait before trying to
+    Minimum time to wait before trying to
     reduce blocking parts again after no ranges were dropped/replaced. A lower
     setting will trigger tasks in background_schedule_pool frequently which
     results in large amount of requests to zookeeper in large-scale clusters
@@ -1072,7 +1072,7 @@ namespace ErrorCodes
     - true, false
     )", 0) \
     DECLARE(UInt64, number_of_partitions_to_consider_for_merge, 10, R"(
-    Only available in ClickHouse Cloud. Up to top N partitions which we will
+    Up to top N partitions which we will
     consider for merge. Partitions picked in a random weighted way where weight
     is amount of data parts which can be merged in this partition.
     )", 0) \
@@ -1219,104 +1219,93 @@ namespace ErrorCodes
     For testing. Do not change it.
     )", 0) \
     DECLARE(Bool, shared_merge_tree_disable_merges_and_mutations_assignment, false, R"(
-    Stop merges assignment for shared merge tree. Only available in ClickHouse
-    Cloud
+    Stop merges assignment for shared merge tree
     )", 0) \
     DECLARE(Bool, shared_merge_tree_enable_outdated_parts_check, true, R"(
-    Enable outdated parts check. Only available in ClickHouse Cloud
+    Enable outdated parts check.
     )", 0) \
     DECLARE(Float, shared_merge_tree_partitions_hint_ratio_to_reload_merge_pred_for_mutations, 0.5, R"(
     Will reload merge predicate in merge/mutate selecting task when `<candidate
     partitions for mutations only (partitions that cannot be merged)>/<candidate
-    partitions for mutations>` ratio is higher than the setting. Only available
-    in ClickHouse Cloud
+    partitions for mutations>` ratio is higher than the setting
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_parts_load_batch_size, 32, R"(
-    Amount of fetch parts metadata jobs to schedule at once. Only available in
-    ClickHouse Cloud
+    Amount of fetch parts metadata jobs to schedule at once
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_max_parts_update_leaders_in_total, 6, R"(
-    Maximum number of parts update leaders. Only available in ClickHouse Cloud
+    Maximum number of parts update leaders.
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_max_parts_update_leaders_per_az, 2, R"(
-    Maximum number of parts update leaders. Only available in ClickHouse Cloud
+    Maximum number of parts update leaders.
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_leader_update_period_seconds, 30, R"(
-    Maximum period to recheck leadership for parts update. Only available in
-    ClickHouse Cloud
+    Maximum period to recheck leadership for parts update
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_leader_update_period_random_add_seconds, 10, R"(
     Add uniformly distributed value from 0 to x seconds to
     shared_merge_tree_leader_update_period to avoid thundering
-    herd effect. Only available in ClickHouse Cloud
+    herd effect.
     )", 0) \
     DECLARE(Bool, shared_merge_tree_read_virtual_parts_from_leader, true, R"(
-    Read virtual parts from leader when possible. Only available in ClickHouse
-    Cloud
+    Read virtual parts from leader when possible
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_initial_parts_update_backoff_ms, 50, R"(
-    Initial backoff for parts update. Only available in ClickHouse Cloud
+    Initial backoff for parts update.
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_max_parts_update_backoff_ms, 5000, R"(
-    Max backoff for parts update. Only available in ClickHouse Cloud
+    Max backoff for parts update.
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_interserver_http_connection_timeout_ms, 100, R"(
-    Timeouts for interserver HTTP connection. Only available in ClickHouse Cloud
+    Timeouts for interserver HTTP connection.
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_interserver_http_timeout_ms, 10000, R"(
-    Timeouts for interserver HTTP communication. Only available in ClickHouse
-    Cloud
+    Timeouts for interserver HTTP communication
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_max_replicas_for_parts_deletion, 10, R"(
-    Max replicas which will participate in parts deletion (killer thread). Only
-    available in ClickHouse Cloud
+    Max replicas which will participate in parts deletion (killer thread).
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_max_replicas_to_merge_parts_for_each_parts_range, 5, R"(
     Max replicas which will try to assign potentially conflicting merges (allow
-    to avoid redundant conflicts in merges assignment). 0 means disabled. Only
-    available in ClickHouse Cloud
+    to avoid redundant conflicts in merges assignment). 0 means disabled.
     )", 0) \
     DECLARE(Bool, shared_merge_tree_use_outdated_parts_compact_format, false, R"(
     Use compact format for outdated parts: reduces load to Keeper, improves
-    outdated parts processing. Only available in ClickHouse Cloud
+    outdated parts processing.
     )", 0) \
     DECLARE(Int64, shared_merge_tree_memo_ids_remove_timeout_seconds, 1800, R"(
     How long we store insert memoization ids to avoid wrong actions during
-    insert retries. Only available in ClickHouse Cloud
+    insert retries.
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_idle_parts_update_seconds, 3600, R"(
     Interval in seconds for parts update without being triggered by ZooKeeper
-    watch in the shared merge tree. Only available in ClickHouse Cloud
+    watch in the shared merge tree.
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_max_outdated_parts_to_process_at_once, 1000, R"(
     Maximum amount of outdated parts leader will try to confirm for removal at
-    one HTTP request. Only available in ClickHouse Cloud.
+    one HTTP request.
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_postpone_next_merge_for_locally_merged_parts_rows_threshold, 1000000, R"(
     Minimum size of part (in rows) to postpone assigning a next merge just after
-    merging it locally. Only available in ClickHouse Cloud.
+    merging it locally.
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_postpone_next_merge_for_locally_merged_parts_ms, 0, R"(
     Time to keep a locally merged part without starting a new merge containing
     this part. Gives other replicas a chance fetch the part and start this merge.
-    Only available in ClickHouse Cloud.
     )", 0) \
     DECLARE(UInt64, shared_merge_tree_range_for_merge_window_size, 10, R"(
     Time to keep a locally merged part without starting a new merge containing
     this part. Gives other replicas a chance fetch the part and start this merge.
-    Only available in ClickHouse Cloud
     )", 0) \
     DECLARE(Bool, shared_merge_tree_use_too_many_parts_count_from_virtual_parts, 0, R"(
     If enabled too many parts counter will rely on shared data in Keeper, not on
-    local replica state. Only available in ClickHouse Cloud
+    local replica state.
     )", 0) \
     DECLARE(Bool, shared_merge_tree_create_per_replica_metadata_nodes, true, R"(
     Enables creation of per-replica /metadata and /columns nodes in ZooKeeper.
-    Only available in ClickHouse Cloud
     )", 0) \
     DECLARE(Bool, shared_merge_tree_use_metadata_hints_cache, true, R"(
     Enables requesting FS cache hints from in-memory
-    cache on other replicas. Only available in ClickHouse Cloud
+    cache on other replicas.
     )", 0) \
     DECLARE(Bool, shared_merge_tree_try_fetch_part_in_memory_data_from_replicas, false, R"(
     If enabled all the replicas try to fetch part in memory data (like primary
@@ -1327,7 +1316,6 @@ namespace ErrorCodes
     )", 0) \
     DECLARE(Bool, allow_reduce_blocking_parts_task, true, R"(
     Background task which reduces blocking parts for shared merge tree tables.
-    Only in ClickHouse Cloud
     )", 0) \
     DECLARE(Seconds, refresh_parts_interval, 0, R"(
     If it is greater than zero - refresh the list of data parts from the underlying filesystem to check if the data was updated under the hood.
@@ -1670,10 +1658,6 @@ namespace ErrorCodes
     Force read-through filesystem cache for merges
     )", EXPERIMENTAL) \
     DECLARE(Bool, cache_populated_by_fetch, false, R"(
-    :::note
-    This setting applies only to ClickHouse Cloud.
-    :::
-
     When `cache_populated_by_fetch` is disabled (the default setting), new data
     parts are loaded into the cache only when a query is run that requires those
     parts.
@@ -1689,10 +1673,6 @@ namespace ErrorCodes
     - [cache_warmer_threads](/operations/settings/settings#cache_warmer_threads)
     )", 0) \
     DECLARE(String, cache_populated_by_fetch_filename_regexp, "", R"(
-    :::note
-    This setting applies only to ClickHouse Cloud.
-    :::
-
     If not empty, only files that match this regex will be prewarmed into the cache after fetch (if `cache_populated_by_fetch` is enabled).
     )", 0) \
     DECLARE(Bool, allow_experimental_replacing_merge_with_cleanup, false, R"(
@@ -1747,7 +1727,7 @@ namespace ErrorCodes
     **Default Value:** false
     )", EXPERIMENTAL) \
     DECLARE(Bool, notify_newest_block_number, false, R"(
-    Notify newest block number to SharedJoin or SharedSet. Only in ClickHouse Cloud.
+    Notify newest block number to SharedJoin or SharedSet.
     )", EXPERIMENTAL) \
     DECLARE(Bool, shared_merge_tree_enable_keeper_parts_extra_data, false, R"(
     Enables writing attributes into virtual parts and committing blocks in keeper
