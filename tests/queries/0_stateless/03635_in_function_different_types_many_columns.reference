@@ -4,53 +4,41 @@ CreatingSets
       ReadFromMergeTree
       Indexes:
         PrimaryKey
-          Keys:
-            id
+          Keys: 
             value
-          Condition: ((id, value) in 5-element set)
+          Condition: (value in 5-element set)
           Parts: 1/1
           Granules: 1/1
-          Search Algorithm: generic exclusion search
-        Ranges: 1
 CreatingSets
   Expression
     Filter
       ReadFromMergeTree
       Indexes:
         PrimaryKey
-          Keys:
-            id
+          Keys: 
             value
-          Condition: ((id, value) in 0-element set)
+          Condition: (value in 0-element set)
           Parts: 0/1
           Granules: 0/1
-          Search Algorithm: generic exclusion search
-        Ranges: 0
 CreatingSets
   Expression
     Filter
       ReadFromMergeTree
       Indexes:
         PrimaryKey
-          Keys:
-            id
+          Keys: 
             value
-          Condition: ((id, value) in 5-element set)
+          Condition: (value in 6-element set)
           Parts: 1/1
           Granules: 1/1
-          Search Algorithm: generic exclusion search
-        Ranges: 1
 CreatingSets
   Expression
     Filter
       ReadFromMergeTree
       Indexes:
         PrimaryKey
-          Keys:
-            id
+          Keys: 
             value
-          Condition: ((id, value) in 0-element set)
+          Condition: (value in 1-element set)
           Parts: 0/1
           Granules: 0/1
-          Search Algorithm: generic exclusion search
-        Ranges: 0
