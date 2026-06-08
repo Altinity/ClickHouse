@@ -42,6 +42,7 @@
 - [ ] <!---ci_regression_clickhouse_keeper--> ClickHouse Keeper (1h)
 - [x] <!---ci_regression_iceberg--> Iceberg (2h)
 - [ ] <!---ci_regression_ldap--> LDAP (1h)
+- [x] <!---ci_regression_oauth--> OAuth (5m)
 - [x] <!---ci_regression_parquet--> Parquet (1.5h)
 - [ ] <!---ci_regression_rbac--> RBAC (1.5h)
 - [ ] <!---ci_regression_ssl_server--> SSL Server (1h)

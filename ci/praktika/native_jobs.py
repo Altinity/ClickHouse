@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import platform
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -495,7 +496,7 @@ def _config_workflow(workflow: Workflow.Config, job_name) -> Result:
                 if "aarch64" not in workflow_config.custom_data.get(
                     "ci_exclude_tags", []
                 ):
-                    all_required_artifacts.update(['CH_ARM_BINARY'])
+                    all_required_artifacts.update(['CH_ARM_BIN'])
             print(f"Including artifacts for custom jobs [{all_required_artifacts}]")
 
             for job in workflow.jobs:
