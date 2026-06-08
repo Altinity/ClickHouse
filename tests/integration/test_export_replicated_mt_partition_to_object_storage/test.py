@@ -228,18 +228,15 @@ def test_restart_nodes_during_export(cluster):
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2021") != f'0\n', "Export of partition 2021 did not resume after crash"
 
 
-@pytest.mark.parametrize(
-    "system_table_prefer_remote_information", ['0', '1']
-)
-def test_kill_export(cluster, system_table_prefer_remote_information):
+def test_kill_export(cluster):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
     node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"kill_export_mt_table_{system_table_prefer_remote_information}_{postfix}"
-    s3_table = f"kill_export_s3_table_{system_table_prefer_remote_information}_{postfix}"
+    mt_table = f"kill_export_mt_table_{postfix}"
+    s3_table = f"kill_export_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
     create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
@@ -316,8 +313,8 @@ def test_kill_export(cluster, system_table_prefer_remote_information):
     assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2021_*', format=LineAsString)") != f'0\n', "Partition 2021 was not written to S3, but it should have been"
 
     # check system.replicated_partition_exports for the export, status should be KILLED
-    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}' SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = {system_table_prefer_remote_information}") == 'KILLED\n', "Partition 2020 was not killed as expected"
-    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2021' and source_table = '{mt_table}' and destination_table = '{s3_table}' SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = {system_table_prefer_remote_information}") == 'COMPLETED\n', "Partition 2021 was not completed, this is unexpected"
+    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'KILLED\n', "Partition 2020 was not killed as expected"
+    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2021' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'COMPLETED\n', "Partition 2021 was not completed, this is unexpected"
 
     # check the data did not land on s3
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '0\n', "Partition 2020 was written to S3, it was not killed as expected"
@@ -376,14 +373,12 @@ def test_kill_export_resilient_to_status_handling_failure(cluster):
     # Wait up to 15 s (5 s retry delay + margin) for the kill to propagate.
     wait_for_export_status(node, mt_table, s3_table, "2020", "KILLED", timeout=15)
 
-    # query the local status export_merge_tree_partition_system_table_prefer_remote_information=0
     assert (
         node.query(
             f"SELECT status FROM system.replicated_partition_exports"
             f" WHERE partition_id = '2020'"
             f"   AND source_table = '{mt_table}'"
             f"   AND destination_table = '{s3_table}'"
-            f" SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = 0"
         ).strip() == "KILLED"
     ), "Export was not killed — status change was lost after the injected failure"
 
@@ -537,7 +532,6 @@ def test_failure_is_logged_in_system_table(cluster):
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
-          SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = 1
         """
     )
 
@@ -549,7 +543,6 @@ def test_failure_is_logged_in_system_table(cluster):
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
-          SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = 1
         """
     )
     assert int(exception_count.strip()) > 0, "Expected non-zero exception_count in system.replicated_partition_exports"
@@ -600,8 +593,11 @@ def test_inject_short_living_failures(cluster):
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_max_retries=100;"
         )
 
-        # wait for at least one exception to occur, but not enough to finish the export
-        wait_for_exception_count(node, mt_table, s3_table, "2020", min_exception_count=1, timeout=30)
+        # wait for at least one exception to occur, but not enough to finish the export.
+        # Use the helper default (>= one manifest-updater poll cycle): system.replicated_partition_exports
+        # is served from the in-memory mirror, and while the task stays PENDING the mirror only
+        # picks up new exception leaves on the next poll tick (~30s) — see helper docstring.
+        wait_for_exception_count(node, mt_table, s3_table, "2020", min_exception_count=1)
 
     # wait for the export to finish
     wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
@@ -626,7 +622,6 @@ def test_inject_short_living_failures(cluster):
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
-          SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = 1
         """
     )
     assert int(exception_count.strip()) >= 1, "Expected at least one exception"
@@ -1506,3 +1501,100 @@ def test_export_partition_resumes_after_stop_moves_during_export(cluster):
 
     row_count = int(node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020").strip())
     assert row_count == 3, f"Expected 3 rows in S3 after export completed, got {row_count}"
+
+
+def test_export_partition_all(cluster):
+    """Happy path for `ALTER TABLE ... EXPORT PARTITION ALL TO TABLE ...`.
+
+    Schedules one export task per active partition in a single ALTER, then
+    verifies every partition lands in the destination S3 table.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"export_all_mt_{uid}"
+    s3_table = f"export_all_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY year ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2021), (3, 2022)")
+    create_s3_table(node, s3_table)
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+
+    for partition_id in ("2020", "2021", "2022"):
+        wait_for_export_status(node, mt_table, s3_table, partition_id, "COMPLETED", timeout=60)
+
+    row_count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert row_count == 3, f"Expected 3 rows in S3 after EXPORT PARTITION ALL, got {row_count}"
+
+
+def test_export_partition_all_failure_modes(cluster):
+    """Cover the three values of `export_merge_tree_partition_all_on_error`.
+
+    Set up an already-fully-exported source table, then re-run EXPORT PARTITION ALL
+    with each failure mode and assert the documented behavior.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"export_all_modes_mt_{uid}"
+    s3_table = f"export_all_modes_s3_{uid}"
+    empty_mt = f"export_all_empty_mt_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY year ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2021), (3, 2022)")
+    create_s3_table(node, s3_table)
+
+    # First run: schedule + wait for all partitions to complete.
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+    for partition_id in ("2020", "2021", "2022"):
+        wait_for_export_status(node, mt_table, s3_table, partition_id, "COMPLETED", timeout=60)
+
+    # Empty table: throws BAD_ARGUMENTS (no active partitions).
+    node.query(
+        f"CREATE TABLE {empty_mt} (id UInt64, year UInt16)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{empty_mt}', 'replica1')"
+        f" PARTITION BY year ORDER BY tuple()"
+    )
+    error = node.query_and_get_error(
+        f"ALTER TABLE {empty_mt} EXPORT PARTITION ALL TO TABLE {s3_table}"
+    )
+    assert "no active partitions to export" in error, (
+        f"Expected 'no active partitions' error, got: {error}"
+    )
+
+    # throw_first (default): re-run aborts on the first conflicting partition.
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
+        f" SETTINGS export_merge_tree_partition_all_on_error = 'throw_first'"
+    )
+    assert "EXPORT_PARTITION_ALREADY_EXPORTED" in error, (
+        f"Expected EXPORT_PARTITION_ALREADY_EXPORTED in error, got: {error}"
+    )
+
+    # collect: aggregated PARTITION_EXPORT_FAILED message lists every conflicting partition.
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
+        f" SETTINGS export_merge_tree_partition_all_on_error = 'collect'"
+    )
+    assert "PARTITION_EXPORT_FAILED" in error, (
+        f"Expected PARTITION_EXPORT_FAILED in error, got: {error}"
+    )
+    for partition_id in ("2020", "2021", "2022"):
+        assert partition_id in error, (
+            f"Expected aggregated error to mention partition {partition_id}, got: {error}"
+        )
+
+    # skip_conflicts: succeeds silently because every partition conflicts and is skipped.
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
+        f" SETTINGS export_merge_tree_partition_all_on_error = 'skip_conflicts'"
+    )

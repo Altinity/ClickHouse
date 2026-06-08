@@ -5,6 +5,8 @@
 #include <Common/logger_useful.h>
 #include <Common/quoteString.h>
 #include <Poco/StreamCopier.h>
+#include <Poco/URI.h>
+#include <Poco/Net/HTTPBasicCredentials.h>
 #include <Poco/Net/HTTPSClientSession.h>
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
@@ -61,45 +63,26 @@ namespace
         return value.get<ValueType>();
     }
 
-    /// Bound every IdP-bound HTTP call (OIDC discovery, userinfo, introspection)
-    /// to a known limit. Without this, Poco's default `HTTPSession` timeout of
-    /// 60 seconds applies, and because `ExternalAuthenticators::mutex` is held
-    /// for the entire duration of `checkTokenCredentials` -- including the
-    /// outbound call this function makes -- a single slow or hung IdP would
-    /// stall the whole auth subsystem (LDAP, Kerberos, HTTP basic, every other
-    /// token auth) for up to a full minute per request.
-    ///
-    /// 10 seconds is a deliberately conservative cap: well above any healthy
-    /// IdP latency, well below the default. Operators who need a different
-    /// value would have to expose this via per-processor config; for now it
-    /// is hard-coded so deployments inherit the bounded behavior automatically.
-    constexpr int kIdpHttpTimeoutSeconds = 10;
-
-    void applyIdpSessionTimeouts(Poco::Net::HTTPClientSession & session)
-    {
-        const Poco::Timespan timeout(kIdpHttpTimeoutSeconds, 0);
-        session.setTimeout(timeout, timeout, timeout);
-    }
-
-    picojson::object getObjectFromURI(const Poco::URI & uri, const String & token = "")
+    picojson::object getObjectFromURI(const Poco::URI & uri, const ConnectionTimeouts & timeouts, const String & token = "")
     {
         Poco::Net::HTTPResponse response;
         std::ostringstream responseString;
 
         Poco::Net::HTTPRequest request{Poco::Net::HTTPRequest::HTTP_GET, uri.getPathAndQuery()};
+        request.add("Accept", "application/json");
         if (!token.empty())
             request.add("Authorization", "Bearer " + token);
 
         if (uri.getScheme() == "https") {
             Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort());
-            applyIdpSessionTimeouts(session);
+            setTimeouts(session, timeouts);
             session.sendRequest(request);
             Poco::StreamCopier::copyStream(session.receiveResponse(response), responseString);
         }
         else
         {
             Poco::Net::HTTPClientSession session(uri.getHost(), uri.getPort());
-            applyIdpSessionTimeouts(session);
+            setTimeouts(session, timeouts);
             session.sendRequest(request);
             Poco::StreamCopier::copyStream(session.receiveResponse(response), responseString);
         }
@@ -118,15 +101,86 @@ namespace
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to parse server response: {}", e.what());
         }
     }
+
+    /// RFC 7662 form-POST with `client_secret_basic` auth. Returns parsed JSON;
+    /// non-200 throws so callers can distinguish "inactive" (200+active:false)
+    /// from "client auth or transport failure".
+    picojson::object postFormToURI(const Poco::URI & uri,
+                                   const std::vector<std::pair<String, String>> & form,
+                                   const String & basic_user,
+                                   const String & basic_password,
+                                   const ConnectionTimeouts & timeouts)
+    {
+        Poco::Net::HTTPResponse response;
+        std::ostringstream responseString;
+
+        String body;
+        for (const auto & [key, value] : form)
+        {
+            if (!body.empty())
+                body += '&';
+            String encoded_key;
+            String encoded_value;
+            Poco::URI::encode(key, "", encoded_key);
+            Poco::URI::encode(value, "", encoded_value);
+            body += encoded_key + "=" + encoded_value;
+        }
+
+        Poco::Net::HTTPRequest request{Poco::Net::HTTPRequest::HTTP_POST, uri.getPathAndQuery(),
+                                       Poco::Net::HTTPMessage::HTTP_1_1};
+        request.setContentType("application/x-www-form-urlencoded");
+        request.setContentLength(body.size());
+        request.add("Accept", "application/json");
+        if (!basic_user.empty())
+        {
+            Poco::Net::HTTPBasicCredentials creds(basic_user, basic_password);
+            creds.authenticate(request);
+        }
+
+        auto send_and_receive = [&](Poco::Net::HTTPClientSession & session)
+        {
+            setTimeouts(session, timeouts);
+            session.sendRequest(request) << body;
+            Poco::StreamCopier::copyStream(session.receiveResponse(response), responseString);
+        };
+
+        if (uri.getScheme() == "https")
+        {
+            Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort());
+            send_and_receive(session);
+        }
+        else
+        {
+            Poco::Net::HTTPClientSession session(uri.getHost(), uri.getPort());
+            send_and_receive(session);
+        }
+
+        if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK)
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
+                            "POST to '{}' returned HTTP {} ({})",
+                            uri.toString(), static_cast<int>(response.getStatus()), response.getReason());
+
+        try
+        {
+            return parseJSON(responseString.str());
+        }
+        catch (const std::runtime_error & e)
+        {
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
+                            "Failed to parse JSON response from '{}': {}", uri.toString(), e.what());
+        }
+    }
 }
 
 GoogleTokenProcessor::GoogleTokenProcessor(const String & processor_name_,
                                            UInt64 token_cache_lifetime_,
                                            const String & username_claim_,
                                            const String & groups_claim_,
-                                           const String & expected_audience_)
+                                           const String & expected_audience_,
+                                           const ConnectionTimeouts & timeouts_)
     : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_)
     , expected_audience(expected_audience_)
+    , timeouts(timeouts_)
 {
     /// Without an audience pin, this processor accepts any Google access token
     /// that authenticates the user against Google -- including tokens minted for
@@ -147,7 +201,7 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
     const String & token = credentials.getToken();
 
     std::unordered_map<String, String> user_info;
-    picojson::object user_info_json = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/userinfo"), token);
+    picojson::object user_info_json = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/userinfo"), timeouts, token);
 
     if (!user_info_json.contains("email"))
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
@@ -159,7 +213,7 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 
     String user_name = user_info[username_claim];
 
-    auto token_info = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo"), token);
+    auto token_info = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo"), timeouts, token);
 
     /// Audience binding (H-10): the Google /tokeninfo endpoint authoritatively
     /// reports the OAuth client_id the access token was issued for in its 'aud'
@@ -218,7 +272,7 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 
         try
         {
-            auto groups_response = getObjectFromURI(get_groups_uri, token);
+            auto groups_response = getObjectFromURI(get_groups_uri, timeouts, token);
 
             if (!groups_response.contains("memberships") || !groups_response["memberships"].is<picojson::array>())
             {
@@ -289,50 +343,20 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            const String & groups_claim_,
                                            const String & expected_issuer_,
                                            const String & expected_audience_,
-                                           bool allow_no_expiration_,
                                            const String & userinfo_endpoint_,
                                            const String & token_introspection_endpoint_,
-                                           UInt64 verifier_leeway_,
-                                           const String & jwks_uri_,
-                                           UInt64 jwks_cache_lifetime_)
+                                           const String & introspection_client_id_,
+                                           const String & introspection_client_secret_,
+                                           const ConnectionTimeouts & timeouts_)
         : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
-          userinfo_endpoint(userinfo_endpoint_), token_introspection_endpoint(token_introspection_endpoint_)
+          userinfo_endpoint(userinfo_endpoint_),
+          token_introspection_endpoint(token_introspection_endpoint_),
+          expected_issuer(expected_issuer_),
+          expected_audience(expected_audience_),
+          introspection_client_id(introspection_client_id_),
+          introspection_client_secret(introspection_client_secret_),
+          timeouts(timeouts_)
 {
-    /// Without `jwks_uri`, no `jwt_validator` is created and so `expected_issuer`
-    /// / `expected_audience` cannot be enforced anywhere on the validation path
-    /// -- the runtime falls straight to the userinfo endpoint, which only
-    /// answers "the IdP describes this user", not "the token's `iss`/`aud`
-    /// match what this deployment pinned". Refuse to load with that combination
-    /// rather than silently dropping the operator's bindings.
-    if (jwks_uri_.empty() && (!expected_issuer_.empty() || !expected_audience_.empty()))
-        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
-                        "{}: 'expected_issuer' / 'expected_audience' are configured but no 'jwks_uri' is provided. "
-                        "These bindings can only be enforced via local JWT validation against a JWKS; the userinfo "
-                        "fallback alone cannot enforce them. Configure 'jwks_uri' (or, if you intentionally want "
-                        "userinfo-only validation, clear 'expected_issuer'/'expected_audience').",
-                        processor_name);
-
-    if (!jwks_uri_.empty())
-    {
-        LOG_TRACE(getLogger("TokenAuthentication"), "{}: JWKS URI set, local JWT processing will be attempted", processor_name_);
-        /// `expected_typ` is left empty here: OpenID's JWT-fastpath inherits no
-        /// `typ` enforcement from the operator config (the parser doesn't surface
-        /// `expected_typ` for the `openid` processor type yet). Operators who
-        /// want strict `typ` enforcement should use `jwt_static_jwks` /
-        /// `jwt_dynamic_jwks` directly instead of `openid`.
-        jwt_validator.emplace(processor_name_ + "jwks_val",
-                              token_cache_lifetime_,
-                              username_claim_,
-                              groups_claim_,
-                              expected_issuer_,
-                              expected_audience_,
-                              /*expected_typ=*/"",
-                              allow_no_expiration_,
-                              "",
-                              verifier_leeway_,
-                              jwks_uri_,
-                              jwks_cache_lifetime_);
-    }
 }
 
 OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
@@ -345,9 +369,17 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            const String & openid_config_endpoint_,
                                            UInt64 verifier_leeway_,
                                            UInt64 jwks_cache_lifetime_,
+                                           const String & introspection_client_id_,
+                                           const String & introspection_client_secret_,
                                            const RemoteHostFilter & remote_host_filter_,
-                                           bool allow_http_discovery_urls_)
-    : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_)
+                                           bool allow_http_discovery_urls_,
+                                           const ConnectionTimeouts & timeouts_)
+    : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
+      expected_issuer(expected_issuer_),
+      expected_audience(expected_audience_),
+      introspection_client_id(introspection_client_id_),
+      introspection_client_secret(introspection_client_secret_),
+      timeouts(timeouts_)
 {
     /// Defense in depth: the discovery endpoint itself was already validated by
     /// the parser, but re-check here in case this constructor is reached via a
@@ -363,13 +395,8 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                         processor_name, openid_config_endpoint_, e.message());
     }
 
-    const picojson::object openid_config = getObjectFromURI(Poco::URI(openid_config_endpoint_));
+    const picojson::object openid_config = getObjectFromURI(Poco::URI(openid_config_endpoint_), timeouts);
 
-    /// Only `userinfo_endpoint` is mandatory: it backs the runtime userinfo
-    /// fallback (and is the sole user-info source when no JWKS is configured).
-    /// `introspection_endpoint` is currently unused at runtime -- it's plumbed
-    /// for a future RFC 7662 introspection feature -- so a discovery document
-    /// that omits it should not block processor construction.
     if (!openid_config.contains("userinfo_endpoint"))
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
                         "{}: Cannot extract userinfo_endpoint from OIDC configuration at '{}'; consider manual configuration.",
@@ -484,16 +511,24 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
     if (openid_config.contains("introspection_endpoint"))
         token_introspection_endpoint = Poco::URI(getValueByKey(openid_config, "introspection_endpoint").value());
 
-    /// See manual-constructor comment: `expected_issuer` / `expected_audience`
-    /// can only be enforced via local JWT validation. If the discovery document
-    /// does not advertise a `jwks_uri`, no `jwt_validator` will be created and
-    /// the userinfo fallback alone cannot enforce these bindings. Refuse the
-    /// configuration rather than silently dropping them.
-    if (!openid_config.contains("jwks_uri") && (!expected_issuer_.empty() || !expected_audience_.empty()))
+    const bool can_enforce_via_jwks = openid_config.contains("jwks_uri");
+    const bool can_enforce_via_introspection =
+        openid_config.contains("introspection_endpoint") && !introspection_client_id_.empty();
+
+    /// Catch creds configured for a discovery doc that does not advertise an
+    /// introspection endpoint -- otherwise the credentials would be silently
+    /// ignored at runtime.
+    if (!introspection_client_id_.empty() && !openid_config.contains("introspection_endpoint"))
         throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
-                        "{}: OIDC discovery at '{}' did not advertise a 'jwks_uri', but 'expected_issuer' / "
-                        "'expected_audience' are configured. These bindings can only be enforced via local JWT "
-                        "validation against a JWKS; userinfo cannot enforce them. Refusing to load.",
+                        "{}: 'introspection_client_id' / 'introspection_client_secret' are set but the OIDC "
+                        "discovery at '{}' does not advertise an 'introspection_endpoint'.",
+                        processor_name, openid_config_endpoint_);
+
+    if (!can_enforce_via_jwks && !can_enforce_via_introspection
+        && (!expected_issuer_.empty() || !expected_audience_.empty()))
+        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                        "{}: 'expected_issuer' / 'expected_audience' need either a 'jwks_uri' or an "
+                        "'introspection_endpoint' (with operator credentials) in the discovery doc at '{}'.",
                         processor_name, openid_config_endpoint_);
 
     if (openid_config.contains("jwks_uri"))
@@ -511,8 +546,97 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                               "",
                               verifier_leeway_,
                               getValueByKey(openid_config, "jwks_uri").value(),
-                              jwks_cache_lifetime_);
+                              jwks_cache_lifetime_,
+                              timeouts);
     }
+}
+
+bool OpenIdTokenProcessor::runIntrospection(const String & token,
+                                            std::chrono::system_clock::time_point & expires_at) const
+{
+    expires_at = {};
+
+    picojson::object response;
+    try
+    {
+        response = postFormToURI(token_introspection_endpoint,
+                                 {{"token", token}, {"token_type_hint", "access_token"}},
+                                 introspection_client_id,
+                                 introspection_client_secret,
+                                 timeouts);
+    }
+    catch (const Exception & e)
+    {
+        /// LOG_WARNING (not TRACE): a non-200 from the introspection endpoint
+        /// almost always means the operator's `introspection_client_*` is
+        /// wrong or the IdP is unreachable -- worth surfacing by default.
+        LOG_WARNING(getLogger("TokenAuthentication"),
+                    "{}: Token introspection request failed: {}", processor_name, e.message());
+        return false;
+    }
+
+    /// active=true is authoritative per RFC 7662 §2.2.
+    const auto active_opt = getValueByKey<bool, false>(response, "active");
+    if (!active_opt.has_value() || !active_opt.value())
+    {
+        LOG_TRACE(getLogger("TokenAuthentication"),
+                  "{}: Token introspection reported active=false (or missing); rejecting", processor_name);
+        return false;
+    }
+
+    if (!expected_issuer.empty())
+    {
+        const auto iss = getValueByKey<std::string, false>(response, "iss").value_or("");
+        if (iss != expected_issuer)
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"),
+                      "{}: Token introspection 'iss' '{}' does not match expected_issuer '{}'; rejecting",
+                      processor_name, iss, expected_issuer);
+            return false;
+        }
+    }
+
+    /// `aud` may be a string or an array (RFC 7519 §4.1.3).
+    if (!expected_audience.empty())
+    {
+        auto aud_it = response.find("aud");
+        bool ok = false;
+        if (aud_it != response.end())
+        {
+            const picojson::value & aud_val = aud_it->second;
+            if (aud_val.is<std::string>())
+                ok = (aud_val.get<std::string>() == expected_audience);
+            else if (aud_val.is<picojson::array>())
+                for (const auto & v : aud_val.get<picojson::array>())
+                    if (v.is<std::string>() && v.get<std::string>() == expected_audience)
+                        ok = true;
+        }
+        if (!ok)
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"),
+                      "{}: Token introspection 'aud' does not contain expected_audience '{}'; rejecting",
+                      processor_name, expected_audience);
+            return false;
+        }
+    }
+
+    if (response.contains("exp"))
+    {
+        const auto exp_opt = getValueByKey<double, false>(response, "exp");
+        const double exp = exp_opt.value_or(0.0);
+        if (exp_opt.has_value() && std::isfinite(exp) && exp > 0.0
+            && exp <= static_cast<double>(std::numeric_limits<time_t>::max()))
+            expires_at = std::chrono::system_clock::from_time_t(static_cast<time_t>(exp));
+        else
+            /// IdP advertised an `exp` we cannot use. Authentication still
+            /// succeeds (the token IS active), but the cache loses its tighter
+            /// upper bound; surface so operators see IdP drift.
+            LOG_WARNING(getLogger("TokenAuthentication"),
+                        "{}: Token introspection returned malformed 'exp'; cache TTL falls back to token_cache_lifetime",
+                        processor_name);
+    }
+
+    return true;
 }
 
 bool OpenIdTokenProcessor::resolveAndValidate(TokenCredentials & credentials) const
@@ -555,7 +679,6 @@ bool OpenIdTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
             user_info_json = decoded_token.get_payload_json();
             username = getValueByKey(user_info_json, username_claim).value();
 
-            /// TODO: Now we work only with Keycloak -- and it provides expires_at in token itself. Need to add actual token introspection logic for other OIDC providers.
             if (decoded_token.has_expires_at())
                 credentials.setExpiresAt(decoded_token.get_expires_at());
         }
@@ -580,18 +703,23 @@ bool OpenIdTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
         }
     }
 
-    /// Userinfo path: only reachable when no `jwt_validator` is configured
-    /// (the constructor guarantees that combination is incompatible with any
-    /// `expected_issuer` / `expected_audience` pin), or when local JWT validation
-    /// passed but extracting the username/payload from the decoded token failed
-    /// for an unrelated reason -- in which case the bindings have already been
-    /// enforced by `jwt_validator` and userinfo is just being asked for the user
-    /// identity.
+    /// Run introspection whenever the operator configured it -- the JWT
+    /// fast-path validates signature/exp but cannot detect server-side
+    /// revocation, which is the whole reason to add introspection.
+    if (!token_introspection_endpoint.empty() && !introspection_client_id.empty())
+    {
+        std::chrono::system_clock::time_point introspection_expires_at;
+        if (!runIntrospection(token, introspection_expires_at))
+            return false;
+        if (introspection_expires_at != std::chrono::system_clock::time_point{})
+            credentials.setExpiresAt(introspection_expires_at);
+    }
+
     if (username.empty() || user_info_json.empty())
     {
         try
         {
-            user_info_json = getObjectFromURI(userinfo_endpoint, token);
+            user_info_json = getObjectFromURI(userinfo_endpoint, timeouts, token);
             username = getValueByKey(user_info_json, username_claim).value();
         }
         catch (...)

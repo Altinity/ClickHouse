@@ -3,9 +3,11 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Common/Exception.h>
+#include <Common/MemoryTracker.h>
 #include <Common/ZooKeeper/Types.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ProfileEvents.h>
+#include <Common/formatReadable.h>
 #include "Storages/MergeTree/ExportPartitionUtils.h"
 #include "Storages/MergeTree/MergeTreePartExportManifest.h"
 #include "Formats/FormatFactory.h"
@@ -20,6 +22,7 @@ namespace ProfileEvents
     extern const Event ExportPartitionZooKeeperSet;
     extern const Event ExportPartitionZooKeeperRemove;
     extern const Event ExportPartitionZooKeeperMulti;
+    extern const Event ExportPartsRejectedByMemoryLimit;
 }
 
 
@@ -50,6 +53,20 @@ void ExportPartitionTaskScheduler::run()
     if (available_move_executors == 0)
     {
         LOG_INFO(storage.log, "ExportPartition scheduler task: No available move executors, skipping");
+        return;
+    }
+
+    /// Respect the background memory soft-limit: refuse to schedule new export-part tasks when
+    /// background tasks are already pressing the limit. The task is rescheduled by the parent
+    /// background pool a few seconds later, so this just defers work without losing it.
+    if (!canEnqueueBackgroundTask())
+    {
+        ProfileEvents::increment(ProfileEvents::ExportPartsRejectedByMemoryLimit);
+        LOG_TRACE(storage.log,
+            "ExportPartition scheduler task: Reached memory limit for the background tasks ({}), "
+            "so won't select new parts to export. Current background tasks memory usage: {}.",
+            formatReadableSizeWithBinarySuffix(background_memory_tracker.getSoftLimit()),
+            formatReadableSizeWithBinarySuffix(background_memory_tracker.get()));
         return;
     }
 
@@ -280,7 +297,7 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
     try
     {
         auto context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), manifest);
-        ExportPartitionUtils::commit(manifest, destination_storage, zk, storage.log.load(), export_path, context, storage);
+        ExportPartitionUtils::commit(manifest, destination_storage, zk, storage.log.load(), export_path, context, storage, storage.replica_name);
     }
     catch (const Exception & e)
     {
@@ -289,10 +306,14 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
         /// Bump commit-attempts counter; transition to FAILED once the budget is exhausted.
         /// Prevents the task from remaining stuck in PENDING if commit() fails persistently
         /// (e.g. schema/spec mismatch, prolonged destination outage).
+        /// The exception is recorded in <export_path>/last_exception via appendExceptionOps
+        /// inside the same multi as the commit_attempts bump and the (possible) FAILED set.
         const bool became_failed = ExportPartitionUtils::handleCommitFailure(
             zk,
             export_path,
             manifest.max_retries,
+            storage.replica_name,
+            e.message(),
             storage.log.load());
 
         if (became_failed)

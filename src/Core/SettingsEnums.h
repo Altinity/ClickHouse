@@ -441,6 +441,7 @@ enum class DatabaseDataLakeCatalogType : uint8_t
     ICEBERG_ONELAKE,
     ICEBERG_BIGLAKE,
     PAIMON_REST,
+    S3_TABLES,
 };
 
 DECLARE_SETTING_ENUM(DatabaseDataLakeCatalogType)
@@ -573,5 +574,13 @@ enum class MergeTreePartExportFileAlreadyExistsPolicy : uint8_t
 
 DECLARE_SETTING_ENUM(MergeTreePartExportFileAlreadyExistsPolicy)
 
+enum class ExportPartitionAllOnError : uint8_t
+{
+    throw_first,
+    collect,
+    skip_conflicts,
+};
+
+DECLARE_SETTING_ENUM(ExportPartitionAllOnError)
 
 }

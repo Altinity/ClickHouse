@@ -347,7 +347,8 @@ IMPLEMENT_SETTING_ENUM(
      {"hive", DatabaseDataLakeCatalogType::ICEBERG_HIVE},
      {"onelake", DatabaseDataLakeCatalogType::ICEBERG_ONELAKE},
      {"biglake", DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE},
-     {"paimon_rest", DatabaseDataLakeCatalogType::PAIMON_REST}})
+     {"paimon_rest", DatabaseDataLakeCatalogType::PAIMON_REST},
+     {"s3tables", DatabaseDataLakeCatalogType::S3_TABLES}})
 
 IMPLEMENT_SETTING_ENUM(
     FileCachePolicy,
@@ -481,5 +482,7 @@ IMPLEMENT_SETTING_ENUM(JemallocProfileFormat, ErrorCodes::BAD_ARGUMENTS,
      {"collapsed", JemallocProfileFormat::Collapsed}})
 
 IMPLEMENT_SETTING_AUTO_ENUM(MergeTreePartExportFileAlreadyExistsPolicy, ErrorCodes::BAD_ARGUMENTS);
+
+IMPLEMENT_SETTING_AUTO_ENUM(ExportPartitionAllOnError, ErrorCodes::BAD_ARGUMENTS);
 
 }
