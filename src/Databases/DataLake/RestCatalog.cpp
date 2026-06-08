@@ -276,7 +276,10 @@ Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
         {
             Poco::JSON::Object::Ptr set_current_schema = new Poco::JSON::Object;
             set_current_schema->set("action", "set-current-schema");
-            set_current_schema->set("schema-id", new_schema_id);
+            // Iceberg REST spec: schema-id == -1 means "the last added schema".
+            // The catalog assigns schema ids itself and may reuse an existing id when
+            // the new schema is identical, so we must not assume our locally computed id.
+            set_current_schema->set("schema-id", -1);
             updates->add(set_current_schema);
         }
         if (sortOrderIncompatibleWithSchema(new_snapshot, new_schema_obj))
