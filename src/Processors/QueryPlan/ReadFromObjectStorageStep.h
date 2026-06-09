@@ -39,6 +39,7 @@ public:
 
     void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
     QueryPlanStepPtr clone() const override;
+    bool isSerializable() const override { return true; }
 
     bool requestReadingInOrder() const;
 
