@@ -79,8 +79,14 @@ Three object kinds; everything is built from them.
 
 **Node** = a blob or a tree. **Edge** = a reference from a ref to a node (`ref → (T,g)`) or from a tree to a
 child (`(T,g) → (child,g)`). The store is therefore a **Merkle DAG, acyclic by construction** (a parent's hash
-needs its children's hashes to exist first), so **per-node reference counting is complete** — `in-degree == 0`
-means genuinely unreachable; no cycle collector is ever needed.
+needs its children's hashes to exist first), so **per-node reference counting is complete** — a node with no
+incoming edge is genuinely unreachable; no cycle collector is ever needed.
+
+> **Terminology — `in-degree` = refcount.** Throughout this doc, a node's **in-degree** is the number of edges
+> pointing *into* it — i.e. its **reference count** (`in-degree == 0` ⇔ refcount 0 ⇔ unreferenced ⇔ collectable).
+> The one nuance vs a classic `refcount`: it is **not a stored integer mutated in place** — it is *computed* by
+> folding the edge-delta log (`gc/log`) and rebuilt by reconcile. So "in-degree" emphasises "derived from edges,"
+> but mentally you may read it as "refcount" everywhere.
 
 **Generations (D2).** A node key carries a generation `g`: a **small per-node resurrection counter**, `0` until
 the GC retires generation `g` and a writer needs that content again and recreates it above the **durable per-hash floor** derived from `gc/retired` (= 1 + max retired gen; #3). `g` is **decoupled from the epoch**; it exists only

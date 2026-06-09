@@ -63,6 +63,12 @@ Layering note: the Phase-1 library lives in `src/Disks/ObjectStorages/ContentAdd
 
 Ported from the PoC (`poc/cas_mergetree/cas.h`/`cas.cpp`), trimmed to the pure, layering-clean parts. All four tasks are TDD with the `src/Disks/tests/` gtest harness; no object storage, no server.
 
+> **Build-wiring correction (verified against the tree; supersedes paths in the tasks below):**
+> - Real directory is `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/` (there is **no** `src/Disks/ObjectStorages/`). In every code block change `#include <Disks/ObjectStorages/ContentAddressed/X.h>` → `#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/X.h>`.
+> - A **new** source directory is not auto-globbed: add one line to `src/CMakeLists.txt` after line 128 (the `MetadataStorages/Web` entry): `add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/ContentAddressed)`.
+> - The gtest `src/Disks/tests/gtest_content_addressed.cpp` **is** auto-globbed (`grep_gtest_sources` → `file(GLOB_RECURSE … CONFIGURE_DEPENDS "gtest*.cpp")`). **No `src/Disks/tests/CMakeLists.txt` edit** (it doesn't exist). `CONFIGURE_DEPENDS` makes ninja re-glob on the next build.
+> - Build dir is `build/` (configured; `unit_tests_dbms` already built but ~3 weeks stale → first incremental build is heavy). Per CLAUDE.md, redirect to a log and have a subagent summarize: `cmake --build build --target unit_tests_dbms > build/cas_build.log 2>&1`. Run: `build/src/unit_tests_dbms --gtest_filter='ContentAddressed*'`.
+
 > Build/run a single gtest (replace `<build>` with your build dir, e.g. `build` or `build_debug`):
 > `cmake --build <build> --target unit_tests_dbms 2>&1 | tail -5`
 > `<build>/src/unit_tests_dbms --gtest_filter='ContentAddressed*'`
