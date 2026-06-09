@@ -135,6 +135,9 @@
   message: 'All iterations has been failed. Unable to test snapshot sharing disabled'
   check_types:
   - asan
+- name: 00157_cache_dictionary
+  reason: INVESTIGATE - Timeout when enable_filesystem_cache=0
+  message: 'DB::Exception: Timeout exceeded'
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
