@@ -148,6 +148,21 @@ WReuse(w, h) ==
                     everEdged, pendCasc, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
                     fgCut, fgRefs, fgSeen >>
 
+\* Anonymous environment churn: an unconditional same-content re-PUT by anyone, any time (spec §12:
+\* safety must not rest on PUT conditions). No dependency recorded — writer-intent overwrites are
+\* WResurrect (condemned) / WReuse (adopt). Per the deadTok MODEL RULE, the in-place overwrite makes
+\* the OLD token stop being current, so it MUST join deadTok (else a stale token-bearing dep on it
+\* dangles — the bug WResurrect fixed). creator gated on EnableDebris (keeps earlier stages inert).
+WOverwrite(w, h) ==
+    /\ EnableOverwrite /\ present[h] /\ nextTok[h] <= MaxToken
+    /\ tokOf'   = [tokOf   EXCEPT ![h] = nextTok[h]]
+    /\ nextTok' = [nextTok EXCEPT ![h] = @ + 1]
+    /\ deadTok' = [deadTok EXCEPT ![h] = @ \cup {tokOf[h]}]
+    /\ creator' = IF EnableDebris THEN [creator EXCEPT ![h] = w] ELSE creator
+    /\ UNCHANGED << present, man, retired, inflight, gcRound, gcPhase, roundOf, fencedSet,
+                    fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged, pendCasc,
+                    wDeps, wView, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut, fgRefs, fgSeen >>
+
 \* Resurrect a condemned current incarnation: overwrite in place with a FRESH token (W-FRESH-TAG).
 \* The overwrite is an in-place replacement of the single physical slot, so the OLD token is gone for
 \* good — record it in deadTok exactly as a physical delete would (INV-NO-RETURN: the overwritten token
@@ -296,7 +311,8 @@ GFenceShard(l, s) ==
     /\ Len(man[s].log) < MaxLog
     /\ IF SabotageNoFence
        THEN man' = man /\ fencePos' = fencePos
-       ELSE /\ man' = [man EXCEPT ![s].fence = roundOf[l],
+            \* fence is monotone (CAS-modelled): a stale leader's lower round is absorbed, never lowers it (INV-MONOTONE-GC under split-brain).
+       ELSE /\ man' = [man EXCEPT ![s].fence = IF roundOf[l] > man[s].fence THEN roundOf[l] ELSE man[s].fence,
                                   ![s].log   = Append(@, [op |-> "fence"])]
             /\ fencePos' = [fencePos EXCEPT ![s] = Len(man[s].log) + 1]
     /\ fencedSet' = [fencedSet EXCEPT ![l] = @ \cup {s}]
@@ -472,6 +488,7 @@ FGCommit ==
 \* ---------------------------------------------------------------- next / spec
 Next ==
     \/ \E w \in Writers, h \in Hashes : WCreate(w, h) \/ WReuse(w, h)
+    \/ \E w \in Writers, h \in Hashes : WOverwrite(w, h)
     \/ \E w \in Writers, h \in Hashes : WResurrect(w, h) \/ WEvidence(w, h) \/ WResolveEvidence(w, h)
     \/ \E w \in Writers : WRefreshView(w) \/ WAbandon(w)
     \/ \E w \in Writers, s \in Shards, h \in Hashes : WPublish(w, s, h)
