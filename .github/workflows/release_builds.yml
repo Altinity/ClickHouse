@@ -983,7 +983,7 @@ jobs:
   finish_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [build_amd_asan, build_amd_binary, build_amd_debug, build_amd_msan, build_amd_release, build_amd_tsan, build_amd_ubsan, build_arm_asan, build_arm_binary, build_arm_release, config_workflow, docker_keeper_image, docker_server_image, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, install_packages_amd_release, install_packages_arm_release, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ always() }}
+    if: ${{ always() && needs.config_workflow.outputs.pipeline_status != '' }}
     name: "Finish Workflow"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1073,7 +1073,7 @@ jobs:
       data: ${{ needs.config_workflow.outputs.data }}
 
   FinishCIReport:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.config_workflow.outputs.pipeline_status != '' }}
     needs:
       - config_workflow
       - dockers_build_amd
@@ -1115,7 +1115,7 @@ jobs:
 
   SourceUpload:
     needs: [config_workflow, build_amd_release]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !cancelled() && needs.config_workflow.outputs.pipeline_status != '' && !contains(needs.*.outputs.pipeline_status, 'failure') }}
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     env:
         COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
