@@ -70,7 +70,11 @@ vars == << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gc
            pendCasc, wDeps, wView >>
 
 \* ---------------------------------------------------------------- helpers
-CondemnedAtView(h, t, v) == \E e \in retired : e.h = h /\ e.t = t /\ e.r <= v
+\* A token-bearing dependency is condemned in a view if a retire entry for that exact token is
+\* visible at the view, OR the token is already physically dead (INV_NO_RETURN: that exact token
+\* can never again be a valid dependency, even after the retire entry was consumed by its landing).
+CondemnedAtView(h, t, v) == \/ \E e \in retired : e.h = h /\ e.t = t /\ e.r <= v
+                            \/ t \in deadTok[h]
 HashHitAtView(h, v)      == \E e \in retired : e.h = h /\ e.r <= v
 InDeg(h) == Cardinality({e \in rootEdges : e[2] = h}) + Cardinality({e \in treeEdges : e[2] = h})
 Reach(r)      == {r} \cup (IF r \in TreeHashes THEN Children[r] ELSE {})
