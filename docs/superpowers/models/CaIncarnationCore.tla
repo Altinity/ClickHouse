@@ -316,6 +316,10 @@ INV_NO_LOSS   == \A h \in ReachableSet : present[h]
 \* sab_noretireview counterexample — it is NOT a state invariant (an unpublished writer may hold
 \* a dependency on a token that GC legitimately deletes; the gate catches it at publish).
 INV_NO_RETURN == \A h \in Hashes : present[h] => tokOf[h] \notin deadTok[h]
+\* This is the ORDERING half only of the spec's INV-JOURNAL-COVERAGE: trim never advances past the
+\* durable folded cursor.  The coverage half (the journal retains every folded-but-untrimmed record)
+\* holds BY CONSTRUCTION in this model — Trim only advances a watermark below cursor and never pops
+\* journal records — so this invariant cannot, by itself, catch a coverage bug.
 INV_JOURNAL_COVERAGE == \A s \in Shards : trimBase[s] <= cursor[s]
 
 \* Monotonicity of GC state — checked as an action property (PROPERTY in configs).
