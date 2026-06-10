@@ -11,7 +11,10 @@
 **Key modeling abstractions (state these in the README task; they are deliberate):**
 - Tokens are naturals allocated per key by `nextTok` — `W-FRESH-TAG` and backend token-distinctness hold *by construction*; `SabotageReusedTag` breaks exactly that to prove `INV_NO_RETURN` has teeth.
 - A successful publish CAS = one atomic action guarded on the *current* manifest (CAS linearization); a writer with a stale retire view simply has the guard false until `WRefreshView` — the retry loop needs no explicit encoding.
-- `Children` is derived (`every tree's children = all non-tree hashes`), not a constant — avoids TLC config function syntax.
+- `Children` is derived, not a constant — TLC configs cannot express tuple/function literals. With one tree it
+  maps to all non-tree hashes; with two trees the derivation is asymmetric (one full tree, one single-child
+  tree via `CHOOSE`), so stage 3 covers both shared-child survival and selective cascade. Nested subtrees are
+  NOT modeled (one-level closure) — a stated residual.
 - Retire entries are checked against the live `retired` set; dropped entries are safe to miss (deleted/absent ⇒ reuse becomes a fresh create; replaced/spared ⇒ current token is not condemned) — mirrors the spec's entry-lifecycle argument.
 - The cascade is atomic with `Land` (the round-pipeline rule); `SabotageCascadeRace` turns it into a deferred record applied at an arbitrary later time — the exact race the spec's pipeline ordering closes.
 - `INV-JOURNAL-COVERAGE` is modeled with an explicit `Trim` action gated on the folded cursor.
@@ -36,6 +39,10 @@ Expected: TLC version banner (`TLC2 Version 2.19` or similar), no exception.
 # Run one TLC config against CaIncarnationCore.tla. Usage: ./run_tlc.sh <cfg-file> [extra TLC args]
 # Output goes to ../../../tmp/tlc_<cfg-basename>.log; last lines + result echoed.
 set -uo pipefail
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <cfg-file> [extra TLC args]" >&2
+  exit 2
+fi
 cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
 CFG="$1"; shift || true
@@ -91,7 +98,17 @@ CONSTANTS
 ASSUME TreeHashes \subseteq Hashes
 
 NonTree  == Hashes \ TreeHashes
-Children == [t \in TreeHashes |-> NonTree]      \* derived: every tree's children = all non-tree hashes
+\* Children is DERIVED (TLC configs cannot express function/tuple constants). Asymmetric by design:
+\* one tree (FullTree) references every non-tree hash; any further tree references exactly one.
+\* With TreeHashes = {t1}: t1 -> NonTree (stages where one tree suffices).
+\* With TreeHashes = {t1, t2}: full tree + single-child tree — covers BOTH shared-child survival
+\* (a child outliving one of two referencing trees) AND selective cascade (deleting the full tree
+\* must not touch the other tree's child).  Nested subtrees are NOT modeled (one-level closure).
+\* FullTree/Children are evaluated lazily by TLC — only ever applied to members of TreeHashes,
+\* so the CHOOSE is never evaluated when TreeHashes = {} (stages 1, 2, 5_small).
+FullTree  == CHOOSE t \in TreeHashes : TRUE
+OneChild  == CHOOSE h \in NonTree : TRUE
+Children  == [t \in TreeHashes |-> IF t = FullTree THEN NonTree ELSE {OneChild}]
 Ev       == MaxToken + 1                        \* dependency form: tokenless live-root evidence
 Toks     == 1..MaxToken
 
@@ -361,12 +378,24 @@ TypeOK ==
                          /\ man[s].log \in Seq(Rec)
     /\ gcRound \in 0..MaxRound
 
+\* Roots hold LOGICAL hashes only; the publish-time token dependency is transient by design (the
+\* real publish_dependency_set is writer-local).  Hence NO_DANGLE/NO_LOSS are about logical
+\* presence — any current incarnation satisfies a reader — exactly the spec's reader contract.
 INV_NO_DANGLE == \A s \in Shards : \A h \in man[s].refs : present[h]
 INV_NO_LOSS   == \A h \in ReachableSet : present[h]
+\* INV_NO_RETURN models the LATE-DELETE-SAFETY facet of the spec's invariant (a deleted token is
+\* never current again).  The publish-gate facet ("a condemned token is never a valid dependency
+\* of a publish") is enforced by the W-PUBLISH-GATE guard and proven load-bearing by the
+\* sab_noretireview counterexample — it is NOT a state invariant (an unpublished writer may hold
+\* a dependency on a token that GC legitimately deletes; the gate catches it at publish).
 INV_NO_RETURN == \A h \in Hashes : present[h] => tokOf[h] \notin deadTok[h]
 INV_JOURNAL_COVERAGE == \A s \in Shards : trimBase[s] <= cursor[s]
 
 \* Monotonicity of GC state — checked as an action property (PROPERTY in configs).
+\* NOTE on form: [][A]_vars is the standard TLC action property; the _vars subscript exempts
+\* stuttering steps, so this does NOT over-constrain.  The Len(log)-monotone clause is valid
+\* only because Trim advances trimBase without physically shrinking the log — if real log
+\* compaction is ever modeled, revise this clause together with the Trim action.
 MonotoneGC == [][ /\ gcRound' >= gcRound
                   /\ \A s \in Shards : /\ cursor'[s]   >= cursor[s]
                                        /\ trimBase'[s] >= trimBase[s]
@@ -457,21 +486,21 @@ Each config flips exactly one `Sabotage*` flag on the stage-1 base and MUST prod
 - Create: `docs/superpowers/models/CaIncarnationCore_sab_nofence.cfg`
 - Create: `docs/superpowers/models/CaIncarnationCore_sab_norecheckfold.cfg`
 - Create: `docs/superpowers/models/CaIncarnationCore_sab_noretireview.cfg`
-- Create: `docs/superpowers/models/CaIncarnationCore_sab_unconddelete.cfg`
 
-- [ ] **Step 1: Write the four configs.** Each is a copy of `CaIncarnationCore_stage1.cfg` with exactly one line changed and the header comment replaced; for `sab_unconddelete` also set `EnableResurrect = TRUE` (the victim is the resurrected incarnation — requires Task 4's `WResurrect` action; write the file now, run it in Task 4):
+(`sab_unconddelete` needs Task 4's `WResurrect` action — it is created AND run in Task 4, not here.)
+
+- [ ] **Step 1: Write the three configs.** Each is a copy of `CaIncarnationCore_stage1.cfg` with exactly one line changed and the header comment replaced:
 
 | File | Changed line | Header comment |
 |---|---|---|
 | `..._sab_nofence.cfg` | `SabotageNoFence = TRUE` | `\* SABOTAGE: fence does not touch manifests — post-fence writers never blocked. EXPECT violation.` |
 | `..._sab_norecheckfold.cfg` | `SabotageNoRecheckFold = TRUE` | `\* SABOTAGE: recheck does not require fold-through-fence — pre-fence publishes missed. EXPECT violation.` |
 | `..._sab_noretireview.cfg` | `SabotageNoRetireView = TRUE` | `\* SABOTAGE: publish gate removed — writers reuse condemned tokens. EXPECT violation.` |
-| `..._sab_unconddelete.cfg` | `SabotageUncondDelete = TRUE` and `EnableResurrect = TRUE` | `\* SABOTAGE: delete ignores the token — zombie delete kills the resurrected incarnation. EXPECT violation.` |
 
-- [ ] **Step 2: Run the first three, expect counterexamples**
+- [ ] **Step 2: Run all three, expect counterexamples**
 
 Run (each): `docs/superpowers/models/run_tlc.sh CaIncarnationCore_sab_nofence.cfg` (and `_sab_norecheckfold`, `_sab_noretireview`)
-Expected: `Error: Invariant INV_NO_LOSS is violated.` (or `INV_NO_DANGLE`) and nonzero exit. Save each trace's action sequence (TLC prints the state trace) — they go into the RESULTS file as CE-1..CE-3 analogs proving horn 1, horn 2, and the retire-view gate are each load-bearing.
+Expected: `Error: Invariant INV_NO_LOSS is violated.` (or `INV_NO_DANGLE`) and nonzero exit. **Validity rule:** a negative control is valid only if the log shows an invariant violation with a state trace — a parse or type error is NOT a counterexample; a sabotage run that PASSES is a model failure to be analyzed, never shipped. Save each trace's action sequence (TLC prints the state trace) — they go into the RESULTS file as CE-1..CE-3 analogs proving horn 1, horn 2, and the retire-view gate are each load-bearing.
 If one PASSES: the corresponding rule did not bite within bounds — first try raising `MaxRound = 3` or `MaxLog = 8` in that sabotage config only; if it still passes, stop and analyze before continuing.
 
 - [ ] **Step 3: Commit**
@@ -542,15 +571,16 @@ Expected: `No error has been found.` This stage's state space covers the design'
 - [ ] **Step 5: Run the two stage-2 sabotages, expect counterexamples**
 
 Create `CaIncarnationCore_sab_reusedtag.cfg` (stage-2 base + `SabotageReusedTag = TRUE`, header `\* SABOTAGE: resurrect reuses the condemned token — token recurrence. EXPECT INV_NO_RETURN violation.`).
+Create `CaIncarnationCore_sab_unconddelete.cfg` (stage-2 base + `SabotageUncondDelete = TRUE`, header `\* SABOTAGE: delete ignores the token — zombie delete kills the resurrected incarnation. EXPECT violation.`).
 Run: `docs/superpowers/models/run_tlc.sh CaIncarnationCore_sab_reusedtag.cfg`
 Expected: `Error: Invariant INV_NO_RETURN is violated.` (or `INV_NO_LOSS` — record which).
-Run: `docs/superpowers/models/run_tlc.sh CaIncarnationCore_sab_unconddelete.cfg` (written in Task 3)
+Run: `docs/superpowers/models/run_tlc.sh CaIncarnationCore_sab_unconddelete.cfg`
 Expected: `Error: Invariant INV_NO_LOSS is violated.` — the zombie-delete-kills-resurrected trace.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add docs/superpowers/models/CaIncarnationCore.tla docs/superpowers/models/CaIncarnationCore_stage2.cfg docs/superpowers/models/CaIncarnationCore_sab_reusedtag.cfg
+git add docs/superpowers/models/CaIncarnationCore.tla docs/superpowers/models/CaIncarnationCore_stage2.cfg docs/superpowers/models/CaIncarnationCore_sab_reusedtag.cfg docs/superpowers/models/CaIncarnationCore_sab_unconddelete.cfg
 git commit -m "CA model: stage 2 — resurrect/evidence/resolve actions, retired-old-vs-newer-current PASS, reused-tag + uncond-delete counterexamples"
 ```
 
@@ -567,19 +597,20 @@ No new actions needed — `GFold` expansion, `Land` cascade, and `ApplyPendCasca
 - [ ] **Step 1: Write `CaIncarnationCore_stage3.cfg`** — copy of stage 2 with:
 
 ```text
-    Hashes = {t1, h1, h2}
-    TreeHashes = {t1}
+    Hashes = {t1, t2, h1, h2}
+    TreeHashes = {t1, t2}
     EnableTrees = TRUE
-    MaxLog = 8
+    MaxLog = 7
 ```
 
-Header: `\* Stage 3: + a 2-child tree — expansion markers, deferred cascade, drop/re-attach replay, cascade-vs-recreate.`
+Header: `\* Stage 3: + trees — one full tree, one single-child tree (asymmetric derived Children): expansion markers, atomic cascade, shared-child survival, selective cascade, drop/re-attach replay.`
+If the two-tree state space exceeds ~30 minutes, fall back to `Hashes = {t1, h1, h2}` / `TreeHashes = {t1}` / `MaxLog = 8` (the single-tree variant) and record in RESULTS that selective-cascade coverage was bound-limited.
 (`EnableTrees` gates nothing in the module — trees activate via non-empty `TreeHashes`; the flag is kept for config self-documentation.)
 
 - [ ] **Step 2: Run stage 3, expect PASS**
 
 Run: `docs/superpowers/models/run_tlc.sh CaIncarnationCore_stage3.cfg`
-Expected: `No error has been found.` Covers: publish ref→`t1` (expansion adds `(t1,h1)`,`(t1,h2)` edges exactly once), drop + re-publish same tree (edge-set replay), tree retire/delete with atomic cascade, children surviving while any tree incarnation is present.
+Expected: `No error has been found.` Covers: publish ref→tree (expansion adds child edges exactly once), drop + re-publish same tree (edge-set replay), tree retire/delete with atomic cascade, children surviving while any referencing tree is present (shared-child survival: the single-child tree keeps its child alive when the full tree dies), and selective cascade (deleting the full tree never strips the other tree's edges).
 
 - [ ] **Step 3: Write `CaIncarnationCore_sab_cascade.cfg`** — stage-3 base + `SabotageCascadeRace = TRUE`, header `\* SABOTAGE: cascade deferred as a free-floating record applied at an arbitrary later time — the re-create/re-expand interleave strips a LIVE tree's child edges. EXPECT violation.`
 
@@ -709,6 +740,9 @@ FGRead(s) ==
 \* SabotageCutOverclaim: cursors jump to CURRENT log length while edges come from the cut.
 FGCommit ==
     /\ EnableDebris /\ fgPhase = "read"
+    \* Under the sabotage, only commit when a publish actually landed in the read-commit gap —
+    \* focuses TLC on the intended counterexample instead of vacuous overclaims.
+    /\ (~SabotageCutOverclaim) \/ (\E s \in Shards : Len(man[s].log) > fgCut[s])
     /\ IF \A s \in Shards : cursor[s] <= fgCut[s]
        THEN /\ rootEdges' = { <<s, h>> : s \in Shards, h \in fgRefs[s] }
             /\ LET trees == { h \in UNION {fgRefs[s] : s \in Shards} : h \in TreeHashes } IN
@@ -746,6 +780,19 @@ Also extend `TypeOK` with the new variables' domains, mirroring the declarations
 
 Header: `\* Stage 4: + debris/heartbeats (wedged-writer publish) + full-GC exact-cut walk over two shards.`
 
+Also write the fallback `CaIncarnationCore_stage4_small.cfg` now (same flags, smaller bounds — used only if the full stage-4 run exceeds ~45 minutes; record in RESULTS which one ran):
+
+```text
+    Writers = {w1}
+    Leaders = {L1}
+    Shards = {s1, s2}
+    Hashes = {t1, h1}
+    TreeHashes = {t1}
+    MaxToken = 3
+    MaxRound = 2
+    MaxLog = 5
+```
+
 - [ ] **Step 6: Run stage 4, expect PASS**
 
 Run: `docs/superpowers/models/run_tlc.sh CaIncarnationCore_stage4.cfg`
@@ -772,9 +819,11 @@ git commit -m "CA model: stage 4 — heartbeat-gated debris, wedged-writer publi
 - Modify: `docs/superpowers/models/CaIncarnationCore.tla` (one action)
 - Create: `docs/superpowers/models/CaIncarnationCore_stage5.cfg`
 
-- [ ] **Step 1: Add the overwrite action** (after `WReuse`; models a racing writer's unconditional re-PUT — same logical content by construction, fresh token; spec §12 requires safety not to rest on PUT conditions):
+- [ ] **Step 1: Add the overwrite action** (after `WReuse`). This is **anonymous environment churn** — a raced, duplicated, or retried unconditional PUT landing at any time; same logical content by construction, fresh token; spec §12 requires safety not to rest on PUT conditions. It deliberately adds **no dependency**: a writer that wants to depend on the fresh incarnation performs `WReuse` afterward (observing the new token), and the writer-overwrite-then-publish path is already `WResurrect`'s job:
 
 ```tla
+\* Anonymous environment churn: an unconditional same-content re-PUT by anyone, any time.
+\* No dependency recorded — writer-intent overwrites are WResurrect (condemned) / WReuse (adopt).
 WOverwrite(w, h) ==
     /\ EnableOverwrite /\ present[h] /\ nextTok[h] <= MaxToken
     /\ tokOf'   = [tokOf   EXCEPT ![h] = nextTok[h]]
@@ -798,6 +847,19 @@ Extend `Next`: `\/ \E w \in Writers, h \in Hashes : WOverwrite(w, h)`.
 
 Header: `\* Stage 5: + split-brain leaders (two concurrent GC round machines) + unconditional overwrite.`
 (`EnableSplit` gates nothing — split-brain is simply `|Leaders| = 2`, since every GC action is already guard-based on shared durable state with per-leader phase machines; the flag documents intent.)
+
+Also write the fallback `CaIncarnationCore_stage5_small.cfg` (used only if the full run exceeds ~45 minutes; record which ran):
+
+```text
+    Writers = {w1}
+    Leaders = {L1, L2}
+    Shards = {s1}
+    Hashes = {h1, h2}
+    TreeHashes = {}
+    MaxToken = 3
+    MaxRound = 2
+    MaxLog = 5
+```
 
 - [ ] **Step 3: Run stage 5, expect PASS**
 
@@ -869,7 +931,18 @@ git commit -m "CA model: liveness — no-leak-forever under fairness (explorator
 > `CaIncarnationCore_README.md`. Kept, with `RESULTS.md`, as the record of the EBR-era checking.
 ```
 
-- [ ] **Step 2: Write `CaIncarnationCore_README.md`** — same shape as the old README: source spec pointer (`2026-06-10-ca-incarnation-store-design.md` §12 + Appendix A), what is modeled (the bullet list from this plan's "Key modeling abstractions" plus the variables/actions overview), what is deliberately NOT modeled (pack byte ranges; manifest size bounds; the `O(delta)` fold data plane internals; GCS/Azure token bindings — token distinctness is a parameter; reader path; provenance), the run table:
+- [ ] **Step 2: Write `CaIncarnationCore_README.md`** — same shape as the old README: source spec pointer (`2026-06-10-ca-incarnation-store-design.md` §12 + Appendix A), what is modeled (the bullet list from this plan's "Key modeling abstractions" plus the variables/actions overview), what is deliberately NOT modeled (pack byte ranges; manifest size bounds; the `O(delta)` fold data plane internals; GCS/Azure token bindings — token distinctness is a parameter; reader path; provenance; **nested subtrees — tree closure is one-level**), a flags table making the documentation-only constants explicit:
+
+```markdown
+| Constant | Effect |
+|---|---|
+| EnableResurrect, EnableDebris, EnableOverwrite | gate actions |
+| EnableTrees  | documentation only — non-empty TreeHashes activates trees |
+| EnableSplit  | documentation only — |Leaders| = 2 activates split-brain |
+| Sabotage*    | negative controls; exactly one TRUE per sabotage config |
+```
+
+then the run table:
 
 ```markdown
 ## How to run
@@ -909,6 +982,8 @@ TLC (v2.19, OpenJDK 21) on `CaIncarnationCore.tla`. Bounded model checking, not 
 | liveness (stage-2 bounds) | … | … | … | … |
 
 ## Negative controls (each MUST produce a counterexample)
+A negative-control PASS is a model failure — analyze before shipping. A run failing on a
+parse/type error is NOT a valid counterexample; only an invariant violation with a trace counts.
 | Sabotage | Rule it removes | Violated invariant | Trace summary (3-6 lines) |
 |---|---|---|---|
 | nofence | fence blocks post-fence writers (horn 2) | … | … |
@@ -924,7 +999,8 @@ Same format as the old RESULTS.md: CE-n, what happened, design constraint vs mod
 
 ## Residual untested surface
 (enumerate honestly — at minimum: pack range addressing, manifest bounds/trim data plane,
-token-distinctness assumed as parameter, single pool, bounds themselves)
+token-distinctness assumed as parameter, one-level tree closure (no nested subtrees), single pool,
+bounds themselves, and which fallback small configs were used instead of the full ones)
 ```
 
 - [ ] **Step 4: Commit**
@@ -939,7 +1015,7 @@ git commit -m "CA model: README + RESULTS for the incarnation-token model; banne
 ## Task 10: Spec cross-check and closeout
 
 - [ ] **Step 1: Check the spec's must-check list against the model.** Open `docs/superpowers/specs/2026-06-10-ca-incarnation-store-design.md` §12. For each must-check scenario, name the stage/sabotage that covers it:
-fence horns → stage 1 + `sab_nofence`/`sab_norecheckfold`; retired-old-vs-newer-current → stage 2; zombie-after-resurrect → stage 2 + `sab_unconddelete`; spared-entry-then-stale-delete → stage 1 (Land of a spared entry's message); cascade-vs-recreate → stage 3 + `sab_cascade`; full-GC cut-vs-cursor → stage 4 + `sab_cutoverclaim`; wedged-heartbeat publish → stage 4; drop/re-attach replay → stage 3; `INV_JOURNAL_COVERAGE` → `Trim` in all stages; `MonotoneGC` → all stages. If anything in §12 has no covering stage, add a scenario or record it in RESULTS' residual list — do not skip silently.
+fence horns → stage 1 + `sab_nofence`/`sab_norecheckfold`; retired-old-vs-newer-current → stage 2; zombie-after-resurrect → stage 2 + `sab_unconddelete`; spared-entry-then-stale-delete → stage 1 (Land of a spared entry's message); cascade-vs-recreate → stage 3 + `sab_cascade`; full-GC cut-vs-cursor → stage 4 + `sab_cutoverclaim`; wedged-heartbeat publish → stage 4; drop/re-attach replay → stage 3; `INV_JOURNAL_COVERAGE` → `Trim` in all stages; `MonotoneGC` → all stages; **debris retire fences ALL root shards, never only the creator's** → by construction in stage 4 (`GRecheckDelete` requires the round's `fencedSet` to cover `Shards` via the `"fenced"` phase) — verify this stays true if the phase machine is ever refactored. If anything in §12 has no covering stage, add a scenario or record it in RESULTS' residual list — do not skip silently.
 
 - [ ] **Step 2: Update the spec's §12 with a pointer.** Add one line at the top of §12: `The model lives in docs/superpowers/models/CaIncarnationCore.tla (see CaIncarnationCore_README.md; results in CaIncarnationCore_RESULTS.md).` — keeping the anchor and formatting rules of the file.
 
