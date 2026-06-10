@@ -178,8 +178,11 @@ DepOK(w) ==
         IF d[2] = Ev THEN ~HashHitAtView(d[1], wView[w])
                      ELSE ~CondemnedAtView(d[1], d[2], wView[w])
 \* A published tree's children must be present AND live (not condemned in the writer's view) at
-\* publish time. Models the bottom-up build (children uploaded before the tree ref is published)
-\* and the dependency-set gate covering the tree's children — without this a writer can publish a
+\* publish time. Models the bottom-up build (children uploaded before the tree ref is published).
+\* This models the CHILD half of the dependency-set gate as a publish-time LIVE re-read of each
+\* child's current token (it does NOT carry separate per-child wDeps entries) — sound because all
+\* incarnations are payload-identical (W-SAME-CONTENT) and trees reference children by hash, so
+\* validating the current token matches the reader contract. Without this a writer can publish a
 \* tree over an absent/condemned child and dangle (INV_NO_LOSS). One-level: stage-3 trees are flat
 \* (Children[t] subset of NonTree); nested subtrees are a documented residual.
 TreeDepsOK(w, h) == h \in TreeHashes =>
