@@ -272,7 +272,7 @@ jobs:
   finish_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [build_arm_binary, config_workflow, dockers_build_amd, dockers_build_arm, keeper_stress_no_faults]
-    if: ${{ always() }}
+    if: ${{ always() && needs.config_workflow.outputs.pipeline_status != '' }}
     name: "Finish Workflow"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
