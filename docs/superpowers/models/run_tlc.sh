@@ -11,7 +11,7 @@ JAR=../../../tmp/tla2tools.jar
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
 CFG="$1"; shift || true
 LOG="../../../tmp/tlc_$(basename "$CFG" .cfg).log"
-/usr/bin/java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -config "$CFG" "$@" CaIncarnationCore.tla >"$LOG" 2>&1
+/usr/bin/java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -metadir ../../../tmp/tlc-meta -workers auto -config "$CFG" "$@" CaIncarnationCore.tla >"$LOG" 2>&1
 RC=$?
 grep -E "Model checking completed|Error:|violated|states generated|distinct states|Finished in" "$LOG" | tail -8
 echo "exit=$RC log=$LOG"

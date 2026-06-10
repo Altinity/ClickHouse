@@ -119,6 +119,46 @@ WReuse(w, h) ==
                     roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
                     everEdged, pendCasc, wView >>
 
+\* Resurrect a condemned current incarnation: overwrite in place with a FRESH token (W-FRESH-TAG).
+\* The overwrite is an in-place replacement of the single physical slot, so the OLD token is gone for
+\* good — record it in deadTok exactly as a physical delete would (INV-NO-RETURN: the overwritten token
+\* can never again be a valid dependency, even though its retire entry is later consumed by a landing).
+\* Without this, a writer holding a stale token-bearing dependency on the overwritten incarnation could
+\* pass the publish gate after that incarnation's retire entry drops, then a delete of the NEW token
+\* leaves the logical hash absent under a live root (INV_NO_DANGLE / INV_NO_LOSS).
+\* SabotageReusedTag re-issues the condemned token itself — token recurrence, must break INV_NO_RETURN.
+WResurrect(w, h) ==
+    /\ EnableResurrect
+    /\ present[h] /\ CondemnedAtView(h, tokOf[h], wView[w])
+    /\ nextTok[h] <= MaxToken
+    /\ LET newt == IF SabotageReusedTag THEN tokOf[h] ELSE nextTok[h] IN
+       /\ tokOf'   = [tokOf   EXCEPT ![h] = newt]
+       /\ nextTok' = [nextTok EXCEPT ![h] = @ + 1]
+       /\ deadTok' = [deadTok EXCEPT ![h] = @ \cup {tokOf[h]}]
+       /\ wDeps'   = [wDeps   EXCEPT ![w] = @ \cup {<<h, newt>>}]
+    /\ UNCHANGED << present, man, retired, inflight, gcRound, gcPhase, roundOf, fencedSet,
+                    fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged, pendCasc,
+                    wView >>
+
+\* Carry-forward / fetch-by-reference: tokenless live-root-evidence dependency (no request made).
+WEvidence(w, h) ==
+    /\ EnableResurrect /\ present[h]
+    /\ wDeps' = [wDeps EXCEPT ![w] = @ \cup {<<h, Ev>>}]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
+                    everEdged, pendCasc, wView >>
+
+\* W-EVIDENCE escalation: a retire-view hit on the hash forces resolution to a token-bearing entry
+\* (adopt the current token iff it is not condemned; a condemned current token goes via WResurrect).
+WResolveEvidence(w, h) ==
+    /\ EnableResurrect
+    /\ <<h, Ev>> \in wDeps[w] /\ present[h]
+    /\ ~CondemnedAtView(h, tokOf[h], wView[w])
+    /\ wDeps' = [wDeps EXCEPT ![w] = (@ \ {<<h, Ev>>}) \cup {<<h, tokOf[h]>>}]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
+                    everEdged, pendCasc, wView >>
+
 WRefreshView(w) ==
     /\ wView' = [wView EXCEPT ![w] = gcRound]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
@@ -282,6 +322,7 @@ Trim(s) ==
 \* ---------------------------------------------------------------- next / spec
 Next ==
     \/ \E w \in Writers, h \in Hashes : WCreate(w, h) \/ WReuse(w, h)
+    \/ \E w \in Writers, h \in Hashes : WResurrect(w, h) \/ WEvidence(w, h) \/ WResolveEvidence(w, h)
     \/ \E w \in Writers : WRefreshView(w) \/ WAbandon(w)
     \/ \E w \in Writers, s \in Shards, h \in Hashes : WPublish(w, s, h)
     \/ \E s \in Shards, h \in Hashes : WDrop(s, h)
