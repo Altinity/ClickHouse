@@ -83,10 +83,14 @@ Core rule: GC may delete only (logical_key, observed_incarnation_token).
 ```
 
 The protocol term is the **token**, never a specific backend mechanism. v1 operates in **current-object mode**:
-one live object per key, bucket versioning **Disabled or Suspended** on the CA prefix (probed — an `If-Match`
-delete on a versioning-enabled bucket "succeeds" by laying a delete marker and the bytes leak invisibly).
-A **versioned mode** (token = `versionId`/generation, delete by version) is a future, explicitly separate
-feature requiring its own modeling of delete markers, noncurrent retention, and lifecycle interplay.
+one live object per key, and bucket versioning **never enabled** on the CA prefix. Suspended buckets are
+rejected too: in a versioning-suspended bucket a delete inserts a null delete marker (and noncurrent versions
+from a previously-enabled period linger invisibly), which breaks the one-live-object model just as a
+versioning-enabled bucket does (there an `If-Match` delete "succeeds" by laying a delete marker while the bytes
+leak invisibly). The probe checks this functionally and prefix-scoped — create and delete a probe key, fail
+closed if the delete response reports a delete marker (`x-amz-delete-marker`) — so no bucket-level permissions
+are required. A **versioned mode** (token = `versionId`/generation, delete by version) is a future, explicitly
+separate feature requiring its own modeling of delete markers, noncurrent retention, and lifecycle interplay.
 
 | Backend | Token | Binding | v1 status |
 |---|---|---|---|
@@ -101,7 +105,7 @@ feature requiring its own modeling of delete markers, noncurrent retention, and 
 atomic whole-object PUT; **exact-token conditional delete, enforced** — a delete carrying a wrong token MUST
 fail (this catches backends that silently ignore the header); a failed conditional write leaves the object
 unmodified; CAS (`If-Match`) on the root-manifest objects; strong read-after-write and list-after-write;
-versioning off on the CA prefix; and the **token-distinctness obligation**: the proof must establish that an
+versioning never enabled on the CA prefix (delete-marker probe above); and the **token-distinctness obligation**: the proof must establish that an
 exact-token delete for an old incarnation cannot affect a newer current incarnation (the in-body
 `incarnation_tag` plus body-sensitive tokens provide this on `ETag` backends; `generation` provides it natively).
 
@@ -198,7 +202,11 @@ One pool = one disk root; one bucket/prefix = one pool.
   gc/outcomes/<round>.<fence_seq>/<shard>  retire outcomes {deleted|absent|replaced|spared}; trimmed after
                                            checkpoint inclusion
   gc/checkpoint/<n>                        full-GC checkpoints: reachable-set summary + cut_version[shard]
-  builds/<server_id>/<build_id>            build heartbeat: {build_id, heartbeat_seq (monotone), provenance}
+  builds/<build_id[:2]>/<build_id>         build heartbeat: {server_id, heartbeat_seq (monotone), provenance};
+                                           keyed by build_id ALONE (a random u128, globally unique) so full GC
+                                           resolves a debris candidate's heartbeat from the core header in one
+                                           GET — heartbeat identity is protocol-visible, PROVENANCE stays
+                                           diagnostic
   _pool_meta                               pool identity, format version, capability proof
 ```
 
@@ -214,11 +222,16 @@ manifest = { shard_version,                     // monotone, CAS-carried
 
 A publish is **one conditional PUT** updating `refs` and appending the journal record atomically. Detached parts
 and `FREEZE`/`BACKUP` ref-sets are refs in their own namespaces under `roots/` (additional reachability roots,
-table-lifetime-independent), exactly as in the superseded design. `DROP TABLE` rewrites each shard to a
+table-lifetime-independent), exactly as in the superseded design.
+
+**Ownership.** Each root namespace has exactly one logical owner for ordinary publishes. Any transfer, attach
+adoption, replica adoption, backup/freeze writer, or FUSE snapshot client either writes a **distinct** `roots/`
+namespace of its own or performs an explicit CAS ownership handoff. Cross-owner concurrent publishes to the
+same root shard are outside the v1 protocol except through that handoff. `DROP TABLE` rewrites each shard to a
 tombstone (`refs:{}`, journal of `-` records); GC deletes the manifest object itself only after
 `folded_cursor[shard]` reaches its final `shard_version` **and** a durable checkpoint records it. Bounds are
-explicit: max manifest size (size guard + alert), journal trimmed only below the folded cursor, `N` sized so the
-refs map stays small (online resharding is out of v1).
+explicit: max manifest size (size guard + alert), journal trimmed only under `INV-JOURNAL-COVERAGE` (§9), `N`
+sized so the refs map stays small (online resharding is out of v1).
 
 **Keeper (optional, when configured):** leader election via ephemeral-sequential node instead of lease polling;
 per-build ephemerals instead of heartbeat objects. `O(active writers)`, nothing durable, zero protocol
@@ -237,6 +250,10 @@ W-FRESH-TAG     every non-retry upload attempt uses a fresh random incarnation_t
 W-HEARTBEAT     the build heartbeat is durable before the first object PUT and renewed in background.
 W-DEP-SET       the writer maintains publish_dependency_set = {(kind, hash, token | live-root-evidence)}
                 covering EVERY object the publish makes reachable — own uploads and trees included.
+W-EVIDENCE      a tokenless (live-root-evidence) member is publishable iff its hash has NO entry in the
+                writer's retire view. Any hit forces resolution to a token-bearing entry: HEAD the key,
+                then adopt the current token if it is not condemned, else resurrect. An unresolved
+                tokenless member whose hash matches any condemned entry may not be published.
 W-PUBLISH-GATE  the publish CAS is valid only if: retire_view_round ≥ manifest.fence_round, AND no
                 dependency-set member is condemned in that view, AND the writer's own heartbeat renewal is
                 recent by its own clock (local sanity bound — liveness, never the safety argument).
@@ -245,8 +262,8 @@ W-MANIFEST-CAS  root-manifest writes are always CAS (refs+journal are not idempo
 
 Publishing a part `name`:
 
-1. **Heartbeat** durable (`builds/<server_id>/<build_id>`, `heartbeat_seq` monotone), then build locally;
-   hashes from `checksums.txt` (D5).
+1. **Heartbeat** durable (`builds/<build_id>`, `heartbeat_seq` monotone, `server_id` in the body), then build
+   locally; hashes from `checksums.txt` (D5).
 2. **Upload by placement** (inline → tree payload; middle band → per-part packs; large → standalone blobs),
    recording a dependency-set entry per object:
    - **New content:** `PUT If-None-Match:*` directly (default), or HEAD-first for large blobs where a rejected
@@ -386,7 +403,9 @@ LIST `roots/` + read manifests (the authority) → stream tree reachability → 
 - **present-but-unreferenced** → debris candidates.
 
 **Debris classification — no writer clocks, ever.** Per candidate (rare): range-GET `[0, header_len)` →
-`build_id` (+ `INTENDED_REF` forensics). The build is **alive** iff its heartbeat object exists and its
+`build_id` (+ `INTENDED_REF` forensics) → one GET of `builds/<build_id>` (heartbeats are keyed by `build_id`
+alone, §4 — the core header is sufficient, no diagnostic TLV is consulted). The build is **alive** iff its
+heartbeat object exists and its
 monotone `heartbeat_seq` (and token) changed across the GC's *own* observation window — GC-observed staleness,
 single clock, never `mtime`. Alive ⇒ skip. Unreadable/ambiguous/backend error ⇒ skip, fail closed. Dead ⇒ the
 candidates enter **the same retire → fence → recheck → exact-token-delete tail as regular GC** — no second
@@ -413,6 +432,10 @@ lease-polling and heartbeat objects — latency/cost only.
   is an accelerator. Total Keeper loss loses nothing and blocks nothing.
 - **`INV-MONOTONE-GC`** — cursors, `fence_round`, snap/checkpoint generations only increase; fence versions and
   cut vectors are immutable once recorded; retire/outcome logs are append-by-unique-path.
+- **`INV-JOURNAL-COVERAGE`** — for every shard, the manifest journal contains every record in
+  `(folded_cursor, shard_version]`, or a durable checkpoint/snapshot generation included by `gc/state` proves
+  those records already incorporated. A manifest CAS may trim records only after the corresponding folded-cursor
+  advance is durable. ("Compact the manifest for size" is never a reason to trim.)
 - **`W-SAME-CONTENT` / `W-FRESH-TAG`** — writer-side invariants making unconditional overwrite benign and token
   recurrence impossible (§5).
 
@@ -461,7 +484,7 @@ mutable-files, observability, probe scope — the probe scope is *extended*, §2
 4. *Retire-marker cleanup rules* → **superseded** by token-exactness: entries drop on
    deleted/absent/replaced/spared; outcomes logged until checkpoint inclusion.
 5. *Environmental assumptions* → **extended**: exact-token conditional delete (enforced) and
-   versioning-off-on-prefix are required; conditional PUT is demoted to hygiene.
+   versioning-never-enabled-on-prefix (delete-marker probe) are required; conditional PUT is demoted to hygiene.
 6. *Build-root expiry/fencing baseline (heartbeat + GC expiry)* → retained in spirit; the mechanism is the
    monotone `heartbeat_seq` judged by GC-observed windows.
 7. *Old D1 (Keeper required)* → **reversed**: Keeper optional; S3-only is the fully-supported baseline.
@@ -470,7 +493,9 @@ mutable-files, observability, probe scope — the probe scope is *extended*, §2
 
 ## 11. Scale and cost {#scale}
 
-Per the S3 ops cost model (write-tier ≈ 12.5× read-tier; `DELETE` free):
+Per the S3 ops cost model (write-tier ≈ 12.5× read-tier; `DELETE` treated as free **in this reference cost
+model** — a backend that charges deletes or prices `LIST` differently must restate the budget, as the
+requirements contract already demands):
 
 - **Commit:** `F` blob/pack PUTs (the unavoidable bytes) + 1 tree PUT + **1 manifest CAS PUT** — the journal
   rides inside it; no separate delta-log write, no per-object metadata ops, no Keeper ops.
@@ -576,6 +601,9 @@ W_Put(w, h)         body must verify logical_hash = h (W-SAME-CONTENT); fresh to
                     obj[h] := [present ↦ TRUE, token ↦ newTok(h)]; add (h, tok) to wDeps[w].
                     Modeled both as conditional (guarded absent/If-Match) AND unconditional overwrite.
 W_Resurrect(w, h)   obj[h].present ∧ condemned(h, obj[h].token, wRetireView[w]) ⇒ same as W_Put (new token).
+W_ResolveEvidence(w, h)  (h, RootEvidence) ∈ wDeps[w] ∧ retireViewHits(h, wRetireView[w]) ⇒ replace it with
+                    (h, obj[h].token) if not condemned, else W_Resurrect — models W-EVIDENCE; the publish
+                    guard rejects an unresolved RootEvidence member whose hash hits the retire view.
 W_Publish(w, s, n)  GUARD: heartbeat[w].present ∧ wRetireView[w] ≥ manifest[s].fenceRound
                     ∧ ∀ d ∈ wDeps[w]: ¬condemnedInView(d, wRetireView[w])
                     EFFECT (CAS): manifest[s].ver++; refs += (n, T); journal ⊕ [Add, n, T, ver].
@@ -592,7 +620,8 @@ Land(d ∈ inflight)  obj[d.h].token = d.tok ⇒ obj[d.h].present := FALSE; dele
                     obj[d.h].token ≠ d.tok ⇒ no-op (412).
 FullGC(L)           per-shard cut := manifest[s].ver at read; rebuild snap exactly through cuts;
                     checkpoint CAS fails if any cursor > cut; debris: ¬journalKnown(h) ∧ heartbeat of
-                    creator not advancing across GC-observed window ⇒ feed GC_Retire.
+                    buildOf(h) not advancing across GC-observed window ⇒ feed GC_Retire.
+                    buildOf(h) = the core-header build_id (protocol-visible; never a diagnostic TLV).
 ```
 
 ### A.4 Invariants {#a-inv}
