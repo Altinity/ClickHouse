@@ -9,7 +9,13 @@ doc_type: 'guide'
 
 # Content-Addressed MergeTree Storage — Design Specification {#ca-merkle-store-design}
 
-**Status:** authoritative, single-source. Supersedes the exploration docs in `docs/superpowers/reports/`
+**Status:** SUPERSEDED by `2026-06-10-ca-incarnation-store-design.md` (the incarnation-token core: one key per
+hash, backend-native exact-token deletes, CAS root manifests with embedded journal, Keeper optional). Kept for
+the historical record of the EBR/epoch/generation design and its review trail. Decisions D1–D6 below are no
+longer in force where the new spec amends them (notably D1 Keeper-required is reversed and D2 generations are
+replaced by incarnation tokens).
+
+Original status: authoritative, single-source. Supersedes the exploration docs in `docs/superpowers/reports/`
 (moved to `reports/obsolete/`). Decisions D1–D6 are settled (§9). This document is written to be converted to a
 TLA+ model and model-checked (the formal appendix, §A); a separate, later effort plans the phased refactoring
 of the current implementation onto this design.
