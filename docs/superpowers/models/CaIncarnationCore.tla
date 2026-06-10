@@ -44,7 +44,11 @@ VARIABLES
     present,   \* [Hashes -> BOOLEAN]
     tokOf,     \* [Hashes -> 0..MaxToken]          current incarnation token (0 = never created)
     nextTok,   \* [Hashes -> 1..MaxToken+1]        fresh-token allocator (W-FRESH-TAG by construction)
-    deadTok,   \* [Hashes -> SUBSET Toks]          physically deleted tokens (history; INV_NO_RETURN)
+    deadTok,   \* [Hashes -> SUBSET Toks]          tokens that have stopped being current (history; INV_NO_RETURN).
+               \* MODEL RULE: any action that makes a token stop being current — in-place overwrite (WResurrect,
+               \* and the future WOverwrite in stage 5) OR physical delete (Land) — MUST add that token here.
+               \* CondemnedAtView consults deadTok, so this is what rejects a stale token-bearing dependency.
+               \* Omitting the deadTok update in any such action silently reintroduces a dangling-ref bug.
     \* ---- S3 durable: roots + GC ----
     man,       \* [Shards -> [fence: 0..MaxRound, refs: SUBSET Hashes, log: Seq(Rec)]]
     retired,   \* SUBSET [h: Hashes, t: Toks, r: 1..MaxRound]
@@ -122,7 +126,8 @@ WReuse(w, h) ==
 \* Resurrect a condemned current incarnation: overwrite in place with a FRESH token (W-FRESH-TAG).
 \* The overwrite is an in-place replacement of the single physical slot, so the OLD token is gone for
 \* good — record it in deadTok exactly as a physical delete would (INV-NO-RETURN: the overwritten token
-\* can never again be a valid dependency, even though its retire entry is later consumed by a landing).
+\* can never again be a valid dependency, even though its retire entry is later consumed by a landing
+\* or dropped as spared at the recheck).
 \* Without this, a writer holding a stale token-bearing dependency on the overwritten incarnation could
 \* pass the publish gate after that incarnation's retire entry drops, then a delete of the NEW token
 \* leaves the logical hash absent under a live root (INV_NO_DANGLE / INV_NO_LOSS).
