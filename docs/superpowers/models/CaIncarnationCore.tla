@@ -107,6 +107,7 @@ Init ==
 \* the model's key IS the content). Dependency recorded with the created token.
 WCreate(w, h) ==
     /\ present[h] = FALSE /\ nextTok[h] <= MaxToken
+    /\ (h \in TreeHashes => \A c \in Children[h] : present[c])
     /\ present' = [present EXCEPT ![h] = TRUE]
     /\ tokOf'   = [tokOf   EXCEPT ![h] = nextTok[h]]
     /\ nextTok' = [nextTok EXCEPT ![h] = @ + 1]
@@ -176,11 +177,19 @@ DepOK(w) ==
     \A d \in wDeps[w] :
         IF d[2] = Ev THEN ~HashHitAtView(d[1], wView[w])
                      ELSE ~CondemnedAtView(d[1], d[2], wView[w])
+\* A published tree's children must be present AND live (not condemned in the writer's view) at
+\* publish time. Models the bottom-up build (children uploaded before the tree ref is published)
+\* and the dependency-set gate covering the tree's children — without this a writer can publish a
+\* tree over an absent/condemned child and dangle (INV_NO_LOSS). One-level: stage-3 trees are flat
+\* (Children[t] subset of NonTree); nested subtrees are a documented residual.
+TreeDepsOK(w, h) == h \in TreeHashes =>
+                      \A c \in Children[h] : present[c] /\ ~CondemnedAtView(c, tokOf[c], wView[w])
 WPublish(w, s, h) ==
     /\ \E t \in Toks : <<h, t>> \in wDeps[w]          \* the root itself was created/reused
     /\ h \notin man[s].refs
     /\ Len(man[s].log) < MaxLog
     /\ SabotageNoRetireView \/ (wView[w] >= man[s].fence /\ DepOK(w))
+    /\ TreeDepsOK(w, h)
     /\ man'   = [man EXCEPT ![s].refs = @ \cup {h},
                             ![s].log  = Append(@, [op |-> "add", h |-> h])]
     /\ wDeps' = [wDeps EXCEPT ![w] = {}]
