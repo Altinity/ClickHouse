@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Run one TLC config against CaIncarnationCore.tla. Usage: ./run_tlc.sh <cfg-file> [extra TLC args]
+# Output goes to ../../../tmp/tlc_<cfg-basename>.log; last lines + result echoed.
+set -uo pipefail
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <cfg-file> [extra TLC args]" >&2
+  exit 2
+fi
+cd "$(dirname "$0")"
+JAR=../../../tmp/tla2tools.jar
+CFG="$1"; shift || true
+LOG="../../../tmp/tlc_$(basename "$CFG" .cfg).log"
+/usr/bin/java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -config "$CFG" "$@" CaIncarnationCore.tla >"$LOG" 2>&1
+RC=$?
+grep -E "Model checking completed|Error:|violated|states generated|distinct states|Finished in" "$LOG" | tail -8
+echo "exit=$RC log=$LOG"
+exit $RC
