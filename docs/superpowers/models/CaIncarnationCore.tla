@@ -3,7 +3,7 @@
    One key per hash; tokens = naturals per key; deletes exact-token via in-flight messages that may
    land arbitrarily late; CAS root manifests with embedded journal; GC = fold -> retire -> fence ->
    recheck -> delete.  Sabotage* flags break one load-bearing rule each and MUST yield counterexamples. *)
-EXTENDS Naturals, Sequences, FiniteSets
+EXTENDS Integers, Sequences, FiniteSets
 
 CONSTANTS
     Writers,            \* e.g. {w1, w2}
@@ -67,11 +67,22 @@ VARIABLES
     pendCasc,  \* SUBSET TreeHashes                deferred cascades (SabotageCascadeRace only)
     \* ---- writer local ----
     wDeps,     \* [Writers -> SUBSET (Hashes \X (1..MaxToken+1))]   (h, tok) or (h, Ev)
-    wView      \* [Writers -> 0..MaxRound]         highest retire round refreshed
+    wView,     \* [Writers -> 0..MaxRound]         highest retire round refreshed
+    \* ---- stage 4: heartbeats + debris + full-GC cut ----
+    creator,   \* [Hashes -> Writers \cup {"none"}]  who last (re)created the object
+    hbAlive,   \* [Writers -> BOOLEAN]               heartbeat object present
+    hbSeq,     \* [Writers -> Nat]                   monotone renewal counter
+    wedged,    \* [Writers -> BOOLEAN]               renewal thread stuck (writer still acts!)
+    hbObs,     \* [Writers -> Nat \cup {-1}]         GC's first observation (-1 = none yet)
+    fgPhase,   \* {"idle", "reading", "read"}        full-GC walk program counter
+    fgCut,     \* [Shards -> Nat]                    log length actually read per shard
+    fgRefs,    \* [Shards -> SUBSET Hashes]          refs snapshot actually read per shard
+    fgSeen     \* SUBSET Shards                      shards read so far this walk
 
 vars == << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase, roundOf,
            fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged,
-           pendCasc, wDeps, wView >>
+           pendCasc, wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut,
+           fgRefs, fgSeen >>
 
 \* ---------------------------------------------------------------- helpers
 \* A token-bearing dependency is condemned in a view if a retire entry for that exact token is
@@ -101,6 +112,15 @@ Init ==
     /\ rootEdges = {} /\ treeEdges = {} /\ marker = {} /\ everEdged = {} /\ pendCasc = {}
     /\ wDeps    = [w \in Writers |-> {}]
     /\ wView    = [w \in Writers |-> 0]
+    /\ creator  = [h \in Hashes |-> "none"]
+    /\ hbAlive  = [w \in Writers |-> FALSE]
+    /\ hbSeq    = [w \in Writers |-> 0]
+    /\ wedged   = [w \in Writers |-> FALSE]
+    /\ hbObs    = [w \in Writers |-> -1]
+    /\ fgPhase  = "idle"
+    /\ fgCut    = [s \in Shards |-> 0]
+    /\ fgRefs   = [s \in Shards |-> {}]
+    /\ fgSeen   = {}
 
 \* ---------------------------------------------------------------- writer actions
 \* Create a missing object: fresh token from the allocator (W-SAME-CONTENT is by construction:
@@ -108,13 +128,16 @@ Init ==
 WCreate(w, h) ==
     /\ present[h] = FALSE /\ nextTok[h] <= MaxToken
     /\ (h \in TreeHashes => \A c \in Children[h] : present[c])
+    /\ (~EnableDebris) \/ hbAlive[w]          \* W-HEARTBEAT: durable before the first object PUT
     /\ present' = [present EXCEPT ![h] = TRUE]
     /\ tokOf'   = [tokOf   EXCEPT ![h] = nextTok[h]]
     /\ nextTok' = [nextTok EXCEPT ![h] = @ + 1]
+    /\ creator' = IF EnableDebris THEN [creator EXCEPT ![h] = w] ELSE creator
     /\ wDeps'   = [wDeps   EXCEPT ![w] = @ \cup {<<h, nextTok[h]>>}]
     /\ UNCHANGED << deadTok, man, retired, inflight, gcRound, gcPhase, roundOf, fencedSet,
                     fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged,
-                    pendCasc, wView >>
+                    pendCasc, wView, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut, fgRefs,
+                    fgSeen >>
 
 \* Cold reuse: the existence check observes the current token (token-bearing dependency).
 WReuse(w, h) ==
@@ -122,7 +145,8 @@ WReuse(w, h) ==
     /\ wDeps' = [wDeps EXCEPT ![w] = @ \cup {<<h, tokOf[h]>>}]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
                     roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
-                    everEdged, pendCasc, wView >>
+                    everEdged, pendCasc, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
 
 \* Resurrect a condemned current incarnation: overwrite in place with a FRESH token (W-FRESH-TAG).
 \* The overwrite is an in-place replacement of the single physical slot, so the OLD token is gone for
@@ -137,14 +161,16 @@ WResurrect(w, h) ==
     /\ EnableResurrect
     /\ present[h] /\ CondemnedAtView(h, tokOf[h], wView[w])
     /\ nextTok[h] <= MaxToken
+    /\ (~EnableDebris) \/ hbAlive[w]          \* W-HEARTBEAT: durable before the first object PUT
     /\ LET newt == IF SabotageReusedTag THEN tokOf[h] ELSE nextTok[h] IN
        /\ tokOf'   = [tokOf   EXCEPT ![h] = newt]
        /\ nextTok' = [nextTok EXCEPT ![h] = @ + 1]
        /\ deadTok' = [deadTok EXCEPT ![h] = @ \cup {tokOf[h]}]
        /\ wDeps'   = [wDeps   EXCEPT ![w] = @ \cup {<<h, newt>>}]
+    /\ creator' = IF EnableDebris THEN [creator EXCEPT ![h] = w] ELSE creator
     /\ UNCHANGED << present, man, retired, inflight, gcRound, gcPhase, roundOf, fencedSet,
                     fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged, pendCasc,
-                    wView >>
+                    wView, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut, fgRefs, fgSeen >>
 
 \* Carry-forward / fetch-by-reference: tokenless live-root-evidence dependency (no request made).
 WEvidence(w, h) ==
@@ -152,7 +178,8 @@ WEvidence(w, h) ==
     /\ wDeps' = [wDeps EXCEPT ![w] = @ \cup {<<h, Ev>>}]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
                     roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
-                    everEdged, pendCasc, wView >>
+                    everEdged, pendCasc, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
 
 \* W-EVIDENCE escalation: a retire-view hit on the hash forces resolution to a token-bearing entry
 \* (adopt the current token iff it is not condemned; a condemned current token goes via WResurrect).
@@ -163,13 +190,15 @@ WResolveEvidence(w, h) ==
     /\ wDeps' = [wDeps EXCEPT ![w] = (@ \ {<<h, Ev>>}) \cup {<<h, tokOf[h]>>}]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
                     roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
-                    everEdged, pendCasc, wView >>
+                    everEdged, pendCasc, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
 
 WRefreshView(w) ==
     /\ wView' = [wView EXCEPT ![w] = gcRound]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
                     roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
-                    everEdged, pendCasc, wDeps >>
+                    everEdged, pendCasc, wDeps, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
 
 \* Publish: one atomic successful CAS — guard reads the CURRENT manifest (CAS linearization).
 \* W-PUBLISH-GATE + W-EVIDENCE.  SabotageNoRetireView removes the gate.
@@ -198,7 +227,8 @@ WPublish(w, s, h) ==
     /\ wDeps' = [wDeps EXCEPT ![w] = {}]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, retired, inflight, gcRound, gcPhase, roundOf,
                     fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged,
-                    pendCasc, wView >>
+                    pendCasc, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut,
+                    fgRefs, fgSeen >>
 
 WDrop(s, h) ==
     /\ h \in man[s].refs
@@ -207,14 +237,16 @@ WDrop(s, h) ==
                           ![s].log  = Append(@, [op |-> "rem", h |-> h])]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, retired, inflight, gcRound, gcPhase, roundOf,
                     fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged,
-                    pendCasc, wDeps, wView >>
+                    pendCasc, wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
 
 WAbandon(w) ==      \* crash/abort before publish: deps lost; uploads remain (debris in stage 4)
     /\ wDeps[w] # {}
     /\ wDeps' = [wDeps EXCEPT ![w] = {}]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
                     roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
-                    everEdged, pendCasc, wView >>
+                    everEdged, pendCasc, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
 
 \* ---------------------------------------------------------------- GC actions (per leader)
 GStartRound(l) ==
@@ -224,7 +256,8 @@ GStartRound(l) ==
     /\ gcPhase'  = [gcPhase  EXCEPT ![l] = "retiring"]
     /\ fencedSet'= [fencedSet EXCEPT ![l] = {}]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, fencePos, cursor,
-                    trimBase, rootEdges, treeEdges, marker, everEdged, pendCasc, wDeps, wView >>
+                    trimBase, rootEdges, treeEdges, marker, everEdged, pendCasc, wDeps, wView,
+                    creator, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut, fgRefs, fgSeen >>
 
 \* Fold one journal record into the snap (edge-set semantics; expansion marker rule).
 GFold(s) ==
@@ -241,7 +274,8 @@ GFold(s) ==
                /\ everEdged' = IF rec.op = "add" THEN everEdged \cup {rec.h} ELSE everEdged
     /\ cursor' = [cursor EXCEPT ![s] = @ + 1]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
-                    roundOf, fencedSet, fencePos, trimBase, pendCasc, wDeps, wView >>
+                    roundOf, fencedSet, fencePos, trimBase, pendCasc, wDeps, wView, creator,
+                    hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut, fgRefs, fgSeen >>
 
 \* Retire a journal-known, present, in-degree-0 candidate at its CURRENT token (the HEAD).
 GRetire(l, h) ==
@@ -251,7 +285,8 @@ GRetire(l, h) ==
     /\ retired' = retired \cup { [h |-> h, t |-> tokOf[h], r |-> roundOf[l]] }
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, inflight, gcRound, gcPhase, roundOf,
                     fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged,
-                    pendCasc, wDeps, wView >>
+                    pendCasc, wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
 
 \* Fence one shard: bump fence_round in the manifest (a CAS — appends a fence record).
 \* SabotageNoFence: the fence does NOT touch the manifest (writers never blocked, horn 2 open).
@@ -268,7 +303,8 @@ GFenceShard(l, s) ==
     /\ gcPhase'   = [gcPhase   EXCEPT ![l] = IF fencedSet[l] \cup {s} = Shards
                                              THEN "fenced" ELSE "fencing"]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, retired, inflight, gcRound, roundOf, cursor,
-                    trimBase, rootEdges, treeEdges, marker, everEdged, pendCasc, wDeps, wView >>
+                    trimBase, rootEdges, treeEdges, marker, everEdged, pendCasc, wDeps, wView,
+                    creator, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut, fgRefs, fgSeen >>
 
 \* Recheck + issue delete. The recheck requires the fold to have provably reached every fence
 \* position (SabotageNoRecheckFold drops that — horn 1 open).  Spared entries drop at the recheck;
@@ -285,7 +321,8 @@ GRecheckDelete(l, e) ==
             /\ inflight' = inflight \cup { [h |-> e.h, t |-> e.t] }
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, gcRound, gcPhase, roundOf, fencedSet,
                     fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged, pendCasc,
-                    wDeps, wView >>
+                    wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut, fgRefs,
+                    fgSeen >>
 
 GEndRound(l) ==
     /\ gcPhase[l] = "fenced"
@@ -293,7 +330,8 @@ GEndRound(l) ==
     /\ gcPhase' = [gcPhase EXCEPT ![l] = "idle"]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, roundOf,
                     fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged,
-                    pendCasc, wDeps, wView >>
+                    pendCasc, wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
 
 \* A delete message lands: exact-token (412 = no-op).  SabotageUncondDelete ignores the token.
 \* The landing is the confirmed outcome: the matching retired entry drops HERE (deleted/absent/
@@ -316,7 +354,8 @@ Land(d) ==
                ELSE UNCHANGED << treeEdges, marker, pendCasc >>
        ELSE /\ UNCHANGED << present, deadTok, treeEdges, marker, pendCasc >>   \* 412 / absent
     /\ UNCHANGED << tokOf, nextTok, man, gcRound, gcPhase, roundOf, fencedSet, fencePos,
-                    cursor, trimBase, rootEdges, everEdged, wDeps, wView >>
+                    cursor, trimBase, rootEdges, everEdged, wDeps, wView, creator, hbAlive,
+                    hbSeq, wedged, hbObs, fgPhase, fgCut, fgRefs, fgSeen >>
 
 \* Deferred cascade application (exists ONLY under SabotageCascadeRace; this is the race).
 ApplyPendCascade(t) ==
@@ -326,7 +365,8 @@ ApplyPendCascade(t) ==
     /\ pendCasc'  = pendCasc \ {t}
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
                     roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, everEdged,
-                    wDeps, wView >>
+                    wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut,
+                    fgRefs, fgSeen >>
 
 \* Journal trim: INV_JOURNAL_COVERAGE — only below the durable folded cursor.
 Trim(s) ==
@@ -334,7 +374,100 @@ Trim(s) ==
     /\ trimBase' = [trimBase EXCEPT ![s] = @ + 1]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
                     roundOf, fencedSet, fencePos, cursor, rootEdges, treeEdges, marker, everEdged,
-                    pendCasc, wDeps, wView >>
+                    pendCasc, wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
+
+\* ---------------------------------------------------------------- stage 4: heartbeats + debris + full-GC cut
+WHbStart(w) ==
+    /\ EnableDebris /\ ~hbAlive[w]
+    /\ hbAlive' = [hbAlive EXCEPT ![w] = TRUE]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
+                    everEdged, pendCasc, wDeps, wView, creator, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
+
+WHbRenew(w) ==
+    /\ EnableDebris /\ hbAlive[w] /\ ~wedged[w] /\ hbSeq[w] < MaxRound + 2
+    /\ hbSeq' = [hbSeq EXCEPT ![w] = @ + 1]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
+                    everEdged, pendCasc, wDeps, wView, creator, hbAlive, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
+
+Wedge(w) ==        \* environment: renewal thread stuck; the writer can still publish
+    /\ EnableDebris /\ ~wedged[w]
+    /\ wedged' = [wedged EXCEPT ![w] = TRUE]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
+                    everEdged, pendCasc, wDeps, wView, creator, hbAlive, hbSeq, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
+
+WCrash(w) ==       \* process death: heartbeat gone, build state lost; uploads stay as debris
+    /\ EnableDebris /\ hbAlive[w]
+    /\ hbAlive' = [hbAlive EXCEPT ![w] = FALSE]
+    /\ wDeps'   = [wDeps   EXCEPT ![w] = {}]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
+                    everEdged, pendCasc, wView, creator, hbSeq, wedged, hbObs, fgPhase, fgCut,
+                    fgRefs, fgSeen >>
+
+GObserveHb(w) ==   \* first read of the GC observation window
+    /\ EnableDebris
+    /\ hbObs' = [hbObs EXCEPT ![w] = IF hbAlive[w] THEN hbSeq[w] ELSE -1]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
+                    everEdged, pendCasc, wDeps, wView, creator, hbAlive, hbSeq, wedged, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
+
+\* Debris classification: present, never journal-known, creator's heartbeat absent OR unchanged
+\* since the earlier observation (the second read happens in this guard). Same retire tail.
+GDebrisRetire(l, h) ==
+    /\ EnableDebris /\ gcPhase[l] = "retiring"
+    /\ present[h] /\ h \notin everEdged /\ creator[h] \in Writers
+    /\ LET c == creator[h] IN
+       \/ ~hbAlive[c]
+       \/ (hbObs[c] >= 0 /\ hbObs[c] = hbSeq[c])
+    /\ ~\E e \in retired : e.h = h /\ e.t = tokOf[h]
+    /\ retired' = retired \cup { [h |-> h, t |-> tokOf[h], r |-> roundOf[l]] }
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, inflight, gcRound, gcPhase, roundOf,
+                    fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged,
+                    pendCasc, wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut,
+                    fgRefs, fgSeen >>
+
+\* ---- full-GC walk: per-shard atomic reads recording the EXACT cut; commit CAS-guarded ----
+FGRead(s) ==
+    /\ EnableDebris /\ fgPhase \in {"idle", "reading"} /\ s \notin fgSeen
+    /\ fgCut'   = [fgCut  EXCEPT ![s] = Len(man[s].log)]
+    /\ fgRefs'  = [fgRefs EXCEPT ![s] = man[s].refs]
+    /\ fgSeen'  = fgSeen \cup {s}
+    /\ fgPhase' = IF fgSeen \cup {s} = Shards THEN "read" ELSE "reading"
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
+                    everEdged, pendCasc, wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs >>
+
+\* Rebuild authority EXACTLY through the cut: refs snapshot -> root edges; reachable trees ->
+\* expansion; cursors := the versions actually read.  Claimed authority == incorporated state.
+\* The commit FAILS (walk aborts to idle) if any cursor already advanced past its cut.
+\* SabotageCutOverclaim: cursors jump to CURRENT log length while edges come from the cut.
+FGCommit ==
+    /\ EnableDebris /\ fgPhase = "read"
+    \* Under the sabotage, only commit when a publish actually landed in the read-commit gap —
+    \* focuses TLC on the intended counterexample instead of vacuous overclaims.
+    /\ (~SabotageCutOverclaim) \/ (\E s \in Shards : Len(man[s].log) > fgCut[s])
+    /\ IF \A s \in Shards : cursor[s] <= fgCut[s]
+       THEN /\ rootEdges' = UNION { { <<s, h>> : h \in fgRefs[s] } : s \in Shards }
+            /\ LET trees == { h \in UNION {fgRefs[s] : s \in Shards} : h \in TreeHashes } IN
+               /\ treeEdges' = UNION { { <<t, c>> : c \in Children[t] } : t \in trees }
+               /\ marker'    = trees
+               /\ everEdged' = UNION { Reach(r) : r \in UNION {fgRefs[s] : s \in Shards} }
+            /\ cursor' = IF SabotageCutOverclaim
+                         THEN [s \in Shards |-> Len(man[s].log)]
+                         ELSE [s \in Shards |-> fgCut[s]]
+       ELSE UNCHANGED << rootEdges, treeEdges, marker, everEdged, cursor >>
+    /\ fgPhase' = "idle" /\ fgSeen' = {}
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, trimBase, pendCasc, wDeps, wView, creator,
+                    hbAlive, hbSeq, wedged, hbObs, fgCut, fgRefs >>
 
 \* ---------------------------------------------------------------- next / spec
 Next ==
@@ -350,6 +483,10 @@ Next ==
     \/ \E l \in Leaders, e \in retired : GRecheckDelete(l, e)
     \/ \E d \in inflight : Land(d)
     \/ \E t \in TreeHashes : ApplyPendCascade(t)
+    \/ \E w \in Writers : WHbStart(w) \/ WHbRenew(w) \/ Wedge(w) \/ WCrash(w) \/ GObserveHb(w)
+    \/ \E l \in Leaders, h \in Hashes : GDebrisRetire(l, h)
+    \/ \E s \in Shards : FGRead(s)
+    \/ FGCommit
 
 Spec == Init /\ [][Next]_vars
 
@@ -362,6 +499,15 @@ TypeOK ==
     /\ \A s \in Shards : man[s].fence \in 0..MaxRound /\ man[s].refs \subseteq Hashes
                          /\ man[s].log \in Seq(Rec)
     /\ gcRound \in 0..MaxRound
+    /\ creator \in [Hashes -> Writers \cup {"none"}]
+    /\ hbAlive \in [Writers -> BOOLEAN]
+    /\ hbSeq   \in [Writers -> 0..(MaxRound + 2)]
+    /\ wedged  \in [Writers -> BOOLEAN]
+    /\ hbObs   \in [Writers -> {-1} \cup (0..(MaxRound + 2))]
+    /\ fgPhase \in {"idle", "reading", "read"}
+    /\ fgCut   \in [Shards -> 0..MaxLog]
+    /\ fgRefs  \in [Shards -> SUBSET Hashes]
+    /\ fgSeen  \subseteq Shards
 
 \* Roots hold LOGICAL hashes only; the publish-time token dependency is transient by design (the
 \* real publish_dependency_set is writer-local).  Hence NO_DANGLE/NO_LOSS are about logical
