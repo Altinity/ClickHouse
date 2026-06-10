@@ -48,7 +48,7 @@ namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int INVALID_SETTING_VALUE;
-    extern const int BAD_ARGUMENT;
+    extern const int BAD_ARGUMENTS;
 }
 
 String StorageObjectStorageCluster::getPathSample(ContextPtr context)
