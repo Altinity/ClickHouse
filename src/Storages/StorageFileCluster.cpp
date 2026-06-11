@@ -68,16 +68,23 @@ StorageFileCluster::StorageFileCluster(
 
     auto & storage_columns = storage_metadata.columns;
 
+    const auto sample_path = paths.empty() ? "" : paths.front();
+
     /// Not grabbing the file_columns because it is not necessary to do it here.
     std::tie(hive_partition_columns_to_read_from_file_path, std::ignore) = HivePartitioningUtils::setupHivePartitioningForFileURLLikeStorage(
         storage_columns,
-        paths.empty() ? "" : paths.front(),
+        sample_path,
         columns_.empty(),
         std::nullopt,
         context);
 
     storage_metadata.setConstraints(constraints_);
-    setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(storage_metadata.columns, context));
+    setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
+        storage_metadata.columns,
+        context,
+        std::nullopt,
+        PartitionStrategyFactory::StrategyType::NONE,
+        sample_path));
     setInMemoryMetadata(storage_metadata);
 }
 
@@ -139,7 +146,7 @@ RemoteQueryExecutor::Extension StorageFileCluster::getTaskIteratorExtension(
         std::nullopt,
         predicate,
         getVirtualsList(),
-        hive_partition_columns_to_read_from_file_path,
+        getHivePartitionColumnsWithoutVirtuals(),
         context
     );
     return RemoteQueryExecutor::Extension{.task_iterator = std::move(callback)};
