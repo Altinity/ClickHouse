@@ -3,6 +3,10 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 
+#include <Common/Exception.h>
+
+#include <gtest/gtest.h>
+
 #include <atomic>
 #include <filesystem>
 #include <memory>
@@ -11,6 +15,23 @@
 
 namespace DB::Cas::tests
 {
+
+/// Run `fn`, expect a DB::Exception with EXACTLY `expected_code` (CORRUPTED_DATA-vs-NOT_IMPLEMENTED
+/// is part of the fail-closed contract: an unknown future format must be NOT_IMPLEMENTED, never
+/// misreported as corruption).
+template <typename F>
+void expectThrowsCode(int expected_code, F && fn)
+{
+    try
+    {
+        fn();
+        FAIL() << "expected DB::Exception";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), expected_code);
+    }
+}
 
 /// Build a `LocalObjectStorage` rooted at a fresh, unique temporary directory (one per call).
 ///

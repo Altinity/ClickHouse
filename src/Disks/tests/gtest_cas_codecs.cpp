@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
 namespace DB::ErrorCodes
@@ -8,28 +9,7 @@ extern const int NOT_IMPLEMENTED;
 }
 
 using namespace DB::Cas;
-
-namespace
-{
-
-/// Run `fn`, expect a DB::Exception with EXACTLY `expected_code` (CORRUPTED_DATA-vs-NOT_IMPLEMENTED
-/// is part of the fail-closed contract: an unknown future format must be NOT_IMPLEMENTED, never
-/// misreported as corruption).
-template <typename F>
-void expectThrowsCode(F && fn, int expected_code)
-{
-    try
-    {
-        fn();
-        FAIL() << "expected DB::Exception";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), expected_code);
-    }
-}
-
-}
+using DB::Cas::tests::expectThrowsCode;
 
 namespace
 {
@@ -172,8 +152,8 @@ TEST(CasEnvelope, FutureVersionThrows)
     String bytes = encodeEnvelopeHeader(h);
     bytes[4] = 2;  /// format_version = 2 (version is validated before the crc, so the code is pinned)
     expectThrowsCode(
-        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); },
-        DB::ErrorCodes::NOT_IMPLEMENTED);
+        DB::ErrorCodes::NOT_IMPLEMENTED,
+        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
 }
 
 TEST(CasEnvelope, WrongKindThrows)
@@ -230,8 +210,8 @@ TEST(CasEnvelope, CriticalUnknownExtensionThrows)
     h.unknown_critical_tlv = true;  /// emit an unknown TLV type with the critical flag set
     String bytes = encodeEnvelopeHeader(h);
     expectThrowsCode(
-        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); },
-        DB::ErrorCodes::NOT_IMPLEMENTED);
+        DB::ErrorCodes::NOT_IMPLEMENTED,
+        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
 }
 
 /// ===================================================================================
