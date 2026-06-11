@@ -353,36 +353,23 @@ StateShape ==
 
 \* ---------------------------------------------------------------- invariants / IndInv v1 (Task 4)
 \* The candidate inductive invariant. Each named conjunct is a fact argued informally in the
-\* spec/model work; the CTI loop (Task 5) strengthens. All are TLC-pre-filtered against reachable
-\* states before any SMT effort.
+\* spec/model work; the CTI loop (Task 5) strengthens. Every conjunct is TLC-pre-filtered against
+\* reachable states before any SMT effort.
 \*
-\* TASK 5 STATUS: CHECKPOINT (NOT yet fully inductive). The Apalache one-step induction recipe is
-\* working (StateShape assigns, IndInv constrains; see StateShape). Four CTI-derived facts were
-\* added and TLC-prefiltered green at the documented single-hash bounds (694,265 states, depth 30):
-\* InflightAllocated, PhaseRoundActive, AbsentObsolete, RootEdgesTyped. ONE CTI class remains open.
+\* PRE-FILTER POLICY: per-hash facts are pre-filtered EXHAUSTIVELY at the single-hash TLC bounds
+\* (694,265 distinct states, depth 30, complete). INTER-HASH facts (anything coupling inflight/
+\* retired on one hash with edges/journal records of another) cannot be witnessed non-vacuously at
+\* Hashes={h1} — a candidate fact `tokOf[d.h]=d.t => InDeg(d.h)=0` passed single-hash TLC vacuously
+\* yet was FALSE at two hashes, broken by GFold of a stale add (CTI #6). For those, the pre-filter
+\* is (a) the exhaustive single-hash run (must stay green) PLUS (b) a BOUNDED two-hash TLC run
+\* matching CInit — no violation required, exhaustion NOT required. This is sound because induction
+\* soundness does not rest on the pre-filter: a false lemma necessarily fails the Apalache base or
+\* step check (Init => IndInv, plus the step, pin IndInv on all reachable states) — the pre-filter
+\* is an efficiency/diagnosis device, not a soundness gate. The CTI #6 trap wasted SMT cycles; it
+\* could not have certified a false invariant.
 \*
-\* OPEN CTI (InflightHeld, GRecheckDelete spared branch): the step admits a state where a delete
-\* [h,t] is in flight AND a retired entry [h,r,t] exists AND tokOf[h]=t (current) AND InDeg(h)>0,
-\* then GRecheckDelete's SPARED branch drops the retired entry, ORPHANING the in-flight delete on a
-\* still-current token (InflightHeld's first disjunct fails, and tokOf[h]#t is false). This CTI is
-\* UNREACHABLE (a missing-fact, not a real bug): the two-hash TLC model — which matches CInit —
-\* explored >17M distinct states to depth 15 and >495M states overall with NO InflightHeld
-\* violation. Unreachability proof sketch: inflight[h,t] is created only by the GRecheckDelete
-\* CONDEMNED branch, which requires InDeg(h)=0 AND FoldedThroughFence (cursor through fencePos, so
-\* all pre-fence records already folded). For InDeg(h) to rise back to >0 a GFold must fold a
-\* post-cursor `add h`; that add is necessarily POST-fence (pre-fence ones were folded), and a
-\* post-fence `WPublish` of h at the current token t is BLOCKED by the gate's RetiredHit(h,t,wView)
-\* (wView >= man[s].fence >= gcRound = r, and [h,r,t] is retired). Hence InDeg(h) cannot rise while
-\* [h,t] is in flight and tokOf[h]=t — the orphan never arises. The INDUCTIVE fact that encodes
-\* this is the fence/cursor/snap-lag coupling lemma family (hint list: phase=fenced ⇒ fencePos ≤
-\* Len(log)+1 with a fence record at fencePos; FoldedThroughFence for any condemned-this-round
-\* entry; retired e.r ≤ gcRound and man.fence covers e.r when fenced; snap = refs modulo the
-\* unfolded tail). Stating + TWO-HASH-validating that multi-conjunct lemma is the remaining work;
-\* single-hash TLC is an INADEQUATE pre-filter for it (an in-flight delete on h2 cannot even be
-\* witnessed at Hashes={h1} — a candidate fact `tokOf[d.h]=d.t => InDeg(d.h)=0` passed single-hash
-\* TLC vacuously yet was FALSE at two hashes, broken by GFold of a stale add: CTI #6). This is the
-\* honest checkpoint boundary (plan Task 5: prefer to stop and report when the structural lemma is
-\* the bottleneck). IndInv = the original 9 + the 4 added below.
+\* CTI-loop history (Task 5): see the per-conjunct comments below; the journal lives in the commit
+\* messages and CaIncarnationCore_RESULTS.md (Task 7).
 TypeBounds ==   \* domains the types don't carry (Apalache types are unbounded Int/Seq)
     /\ \A h \in Hashes : /\ nextTok[h] \in 1..(MaxToken+1)
                          /\ tokOf[h] \in 0..MaxToken /\ tokOf[h] < nextTok[h]
@@ -404,6 +391,96 @@ TypeBounds ==   \* domains the types don't carry (Apalache types are unbounded I
 
 NoDangle  == \A s \in Shards : \A h \in man[s].refs : present[h]              \* TARGET
 NoReturn  == \A h \in Hashes : present[h] => tokOf[h] \notin obsoleteTok[h]   \* TARGET
+
+FenceCoverage ==       \* CTI #7 (Apalache step, 2026-06-11): a fenced shard's manifest fence covers
+                       \* the active round, and the "fenced" phase means every shard is fenced.
+                       \* Without it the step admits gcPhase="fenced" with man.fence=0 < gcRound: a
+                       \* low-view writer's post-fence add then escapes the gate's RetiredHit (view
+                       \* >= man.fence is vacuous), the snap lags it, and GRecheckDelete condemns a
+                       \* still-referenced current token off the stale snap, violating
+                       \* InflightVsRefs. Inductive: GFenceShard adds s to fencedSet and bumps its
+                       \* fence to >= gcRound in the same step, and flips to "fenced" exactly when
+                       \* fencedSet covers Shards; GStartRound resets fencedSet to {} as it bumps
+                       \* gcRound; fences never decrease. HASH-FREE fact: the exhaustive single-hash
+                       \* TLC pre-filter is complete for it (no two-hash vacuity concern).
+    /\ \A s \in fencedSet : man[s].fence >= gcRound
+    /\ (gcPhase = "fenced" => fencedSet = Shards)
+
+RetiredCoveredNoPostFenceAdd ==
+                       \* CTI #10 (Apalache step, 2026-06-11): the retired-entry analogue of
+                       \* InflightCurrentUnreferenced — for a retired entry e whose token is still
+                       \* current and whose round is covered by a shard's fence, that shard's log
+                       \* has NO add of e.h after its latest fence record. Records after fencePos
+                       \* were published with the CURRENT man.fence (a newer fence would have
+                       \* advanced fencePos), so the gate had wView >= man.fence >= e.r and
+                       \* re-observation forced the dep token to tokOf[e.h] = e.t — RetiredHit(e)
+                       \* fires and blocks the publish; a resurrect/overwrite instead falsifies
+                       \* tokOf = e.t (tokens never return). Without this fact the step parks
+                       \* unfolded post-fence adds of e.h, the snap stays stale through
+                       \* FoldedThroughFence, and GRecheckDelete condemns a still-referenced
+                       \* current token (CTI #7/#8/#9's pattern, final layer). Preserved:
+                       \* GFenceShard advances fencePos past all old records (the post-fence set
+                       \* empties); WPublish of e.h is gate-blocked as above; GRetire's new entry
+                       \* has e.r = gcRound and fences lag the round during "retiring".
+    \A e \in retired : \A s \in Shards :
+        (tokOf[e.h] = e.t /\ man[s].fence >= e.r) =>
+            \A i \in DOMAIN man[s].log :
+                (i > fencePos[s]) => ~(man[s].log[i].op = "add" /\ e.h \in man[s].log[i].hs)
+
+RetiringFenceBelow ==  \* CTI #11 (Apalache step, 2026-06-11): during "retiring" every shard's
+                       \* fence is strictly below the active round. GStartRound enters "retiring"
+                       \* bumping gcRound past every fence (FenceLeRound bounds them by the OLD
+                       \* round), and GFenceShard — the only fence writer — exits "retiring" in the
+                       \* same step. Without it the step lets GRetire stamp a new retired entry
+                       \* whose round is already "covered" (fence = gcRound) while an old unfolded
+                       \* add of the retiree sits past fencePos, breaking
+                       \* RetiredCoveredNoPostFenceAdd at its creation point.
+    gcPhase = "retiring" => \A s \in Shards : man[s].fence < gcRound
+
+FenceLeRound ==        \* CTI #9 (Apalache step, 2026-06-11): no shard's fence is ahead of the
+                       \* active round (man[s].fence <= gcRound). GFenceShard sets the fence to at
+                       \* most gcRound and nothing else writes it; gcRound only increases. Without
+                       \* it the step admits a fence "from the future" (fence=2 at gcRound=1) that
+                       \* satisfies FenceCoverage while an ungated unfolded post-fence add keeps the
+                       \* snap stale, and GRecheckDelete condemns a still-referenced current token
+                       \* (CTI #7's pattern again). Inductive: GFenceShard writes max(gcRound,fence);
+                       \* GStartRound increases gcRound.
+    \A s \in Shards : man[s].fence <= gcRound
+
+FencePosRecord ==      \* CTI #8 (Apalache step, 2026-06-11): a fenced shard's fencePos points at an
+                       \* actual fence record in its log. Without it the step admits fencedSet={s}
+                       \* with fencePos=0 and NO fence record: FoldedThroughFence is trivially true
+                       \* at cursor=0, every add is "post-fence" yet ungated, and GRecheckDelete
+                       \* condemns a still-referenced current token off the empty snap (CTI #7's
+                       \* pattern one layer deeper). Inductive: GFenceShard appends the fence record
+                       \* and sets fencePos to exactly its position (Len(old log)+1) in the same
+                       \* step; the journal is append-only (no trim in the proof core), so the
+                       \* record at fencePos stays a fence; GStartRound resets fencedSet to {}.
+    \A s \in fencedSet : /\ fencePos[s] >= 1
+                         /\ fencePos[s] <= Len(man[s].log)
+                         /\ man[s].log[fencePos[s]].op = "fence"
+
+InflightCurrentUnreferenced ==
+                       \* CTI #5/#7 (Apalache step, 2026-06-11): an in-flight delete on a
+                       \* STILL-CURRENT token has no reference anywhere: no folded root edge, and no
+                       \* unfolded add in any journal suffix beyond the cursor. This is what makes
+                       \* the spared-branch orphan impossible while the token is current (CTI #5's
+                       \* state). Established at send (GRecheckDelete condemned branch): InDeg=0
+                       \* covers the folded half; for the unfolded half, any add beyond the cursor
+                       \* sits beyond the fence record (FoldedThroughFence), its publish was
+                       \* post-fence, and a post-fence publish of token d.t is blocked by the gate's
+                       \* RetiredHit (entry held at send; SendImpliesFenced gives man.fence >= e.r;
+                       \* gate needs view >= man.fence), while a post-fence publish of t' # d.t
+                       \* implies an intervening resurrect, i.e. tokOf # d.t (antecedent false).
+                       \* Preserved: WPublish of d.h@d.t is blocked the same way, of t' requires
+                       \* tokOf = t' (re-observation); WResurrect/WOverwrite falsify the antecedent;
+                       \* GFold folds an add at a position <= the new cursor, which the unfolded
+                       \* half says is not d.h; Land removes d; the spared drop touches neither half.
+    \A d \in inflight : tokOf[d.h] = d.t =>
+        /\ \A s \in Shards : <<s, d.h>> \notin rootEdges
+        /\ \A s \in Shards : \A i \in DOMAIN man[s].log :   \* i > cursor[s]: the unfolded suffix
+               \* (Apalache rejects the non-constant range (cursor[s]+1)..Len(log) — known issue)
+               (i > cursor[s]) => ~(man[s].log[i].op = "add" /\ d.h \in man[s].log[i].hs)
 
 RootEdgesTyped ==      \* CTI #4 (Apalache step, 2026-06-11): every root edge is over a real shard
                        \* and hash (rootEdges \subseteq Shards \X Hashes). The type Set(<<SHARD,HASH>>)
@@ -497,6 +574,8 @@ SnapFromPrefix ==      \* the snap is exactly the cursor-prefix fold
 IndInv == TypeBounds /\ NoDangle /\ NoReturn /\ InflightHeld /\ RetiredCurrentOrDead
           /\ InflightVsRefs /\ SendImpliesFenced /\ RefsFromLog /\ SnapFromPrefix
           /\ InflightAllocated /\ PhaseRoundActive /\ AbsentObsolete /\ RootEdgesTyped
+          /\ InflightCurrentUnreferenced /\ FenceCoverage /\ FencePosRecord /\ FenceLeRound
+          /\ RetiredCoveredNoPostFenceAdd /\ RetiringFenceBelow
 
 \* Inductive-step init: assign (StateShape) then constrain (IndInv). See StateShape comment.
 IndInvInit == StateShape /\ IndInv
