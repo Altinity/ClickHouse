@@ -54,6 +54,13 @@ std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
 /// A `404 NoSuchKey` on an `If-Match` PUT (the key was deleted out from under us) is treated identically:
 /// protocol callers handle 'mismatch' and 'gone' the same way (re-validate), so both collapse onto
 /// `PreconditionFailed`.
+///
+/// The detection matches error-name substrings only (`PreconditionFailed`, `NoSuchKey`) — never bare
+/// status digits, since the formatted message embeds the object key and free digits could match
+/// spuriously. The substring match itself is fail-safe in direction (a misread transient error becomes
+/// a retryable PreconditionFailed/Conflict, never a false success). FOLLOW-UP (pre-integration): have
+/// `WriteBufferFromS3` surface the precondition loss as a typed signal so this matches the SDK error
+/// type instead of free text, mirroring `S3ObjectStorage::removeObjectIfTokenMatches`.
 PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, Token * out_token)
 {
     try
@@ -67,8 +74,7 @@ PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const 
     {
         if (e.code() == ErrorCodes::S3_ERROR
             && (e.message().find("PreconditionFailed") != std::string::npos
-                || e.message().find("NoSuchKey") != std::string::npos
-                || e.message().find("404") != std::string::npos))
+                || e.message().find("NoSuchKey") != std::string::npos))
             return PutOutcome::PreconditionFailed;
         throw;
     }
