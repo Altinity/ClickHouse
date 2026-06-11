@@ -558,4 +558,19 @@ StateConstraint ==
     /\ \A s \in Shards : Len(man[s].log) <= MaxLog
     /\ Cardinality(inflight) <= 2
     /\ \A w \in Writers : Cardinality(wDeps[w]) <= 3
+
+\* Liveness (checked only on the small stage-2 bounds): a permanently-unreachable journal-known
+\* object is eventually deleted.  Fairness on the GC pipeline + delete landing.
+FairSpec == Spec /\ WF_vars(\E s \in Shards : GFold(s))
+                 /\ WF_vars(\E l \in Leaders : GStartRound(l))
+                 /\ WF_vars(\E l \in Leaders, h \in Hashes : GRetire(l, h))
+                 /\ WF_vars(\E l \in Leaders, s \in Shards : GFenceShard(l, s))
+                 /\ WF_vars(\E l \in Leaders, e \in retired : GRecheckDelete(l, e))
+                 /\ WF_vars(\E l \in Leaders : GEndRound(l))
+                 /\ WF_vars(\E d \in inflight : Land(d))
+
+NoLeakForever ==
+    \A h \in Hashes :
+        [](( present[h] /\ h \in everEdged /\ h \notin ReachableSet )
+           => <>( ~present[h] \/ h \in ReachableSet ))
 =======================================================================================
