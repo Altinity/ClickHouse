@@ -166,6 +166,21 @@ RootShard decodeRootShard(std::string_view data)
             rec.ref_name = requireString(*rec_obj, "ref", "root shard journal");
             rec.tree_id = requireHash(*rec_obj, "tree", "root shard journal");
             rec.at_version = requireU64(*rec_obj, "at_version", "root shard journal");
+
+            /// The GC fold replays the journal in order under a cursor bound: an out-of-order
+            /// at_version would fold silently in vector order (a corruption-induced UNDER-count =
+            /// a wrong delete later), and a record beyond shard_version would be silently skipped
+            /// by the cursor window. Both are corruption - fail closed. NON-DECREASING, not
+            /// strict: dropNamespace legally appends N Removes at the same committed version.
+            if (rec.at_version > root.shard_version)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS root shard: journal at_version {} exceeds shard_version {}",
+                    rec.at_version, root.shard_version);
+            if (!root.journal.empty() && rec.at_version < root.journal.back().at_version)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS root shard: journal at_version {} after {} - the journal must be non-decreasing",
+                    rec.at_version, root.journal.back().at_version);
+
             root.journal.push_back(std::move(rec));
         }
 

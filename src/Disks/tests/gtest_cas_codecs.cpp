@@ -557,6 +557,37 @@ TEST(CasRootShardCodec, StrictJsonRefAndJournalValidation)
     });
 }
 
+TEST(CasRootShardCodec, JournalAtVersionMonotonicityIsEnforced)
+{
+    /// The GC fold replays the journal in order under a cursor bound; an out-of-order at_version
+    /// would fold silently in vector order (corruption-induced UNDER-count = a wrong delete later)
+    /// and a record claiming a version beyond shard_version would be silently skipped by the
+    /// cursor window. Both are corruption - fail closed at decode.
+
+    /// Descending at_version.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
+    {
+        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":5,"fence_round":0,"refs":{},)"
+            R"("journal":[{"op":"add","ref":"r","tree":"000102030405060708090a0b0c0d0e0f","at_version":3},)"
+            R"({"op":"add","ref":"r","tree":"000102030405060708090a0b0c0d0e0f","at_version":2}]})");
+    });
+    /// at_version beyond shard_version.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
+    {
+        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":1,"fence_round":0,"refs":{},)"
+            R"("journal":[{"op":"add","ref":"r","tree":"000102030405060708090a0b0c0d0e0f","at_version":2}]})");
+    });
+    /// EQUAL at_versions are legal (non-decreasing, not strict): dropNamespace appends N Removes
+    /// at the same committed version.
+    const RootShard d = decodeRootShard(
+        R"({"format":"cas_root_shard","version":1,"shard_version":2,"fence_round":0,"refs":{},)"
+        R"("journal":[{"op":"remove","ref":"a","tree":"000102030405060708090a0b0c0d0e0f","at_version":2},)"
+        R"({"op":"remove","ref":"b","tree":"000102030405060708090a0b0c0d0e0f","at_version":2}]})");
+    ASSERT_EQ(d.journal.size(), 2u);
+    EXPECT_EQ(d.journal[0].at_version, 2u);
+    EXPECT_EQ(d.journal[1].at_version, 2u);
+}
+
 /// ---------- envelope fixed-length header padding (pad_to_header_len) ----------
 
 TEST(CasEnvelope, EnvelopeHeaderPaddingReachesTargetLen)

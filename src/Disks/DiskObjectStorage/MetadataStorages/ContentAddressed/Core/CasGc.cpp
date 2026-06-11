@@ -9,6 +9,8 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
+    extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -56,6 +58,16 @@ RoundReport Gc::runRegularRound()
 
 Gc::FoldResult Gc::fold(GcState & state, const Token & state_token)
 {
+    /// M-C3 limitation, fail closed: last-op-wins displacement is INTRA-shard only (addRootEdge
+    /// re-points the edge inside ONE GcSnap). With the displaced and displacing trees in DIFFERENT
+    /// snap shards, a republish would leave the old root edge behind forever - a permanent leak
+    /// (over-count-safe, but silently broken sharding). Raising the constant needs a design first:
+    /// per-ref displacement records, or root edges sharded by REF identity rather than target hash.
+    if (state.snap_shards != 1)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "CAS gc fold: snap_shards = {} - cross-shard last-op-wins displacement is undesigned; "
+            "snap_shards must be 1 in M-C3", state.snap_shards);
+
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
     FoldResult result;
@@ -138,27 +150,31 @@ Gc::FoldResult Gc::fold(GcState & state, const Token & state_token)
                     {
                         if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
                             throw;
-                        /// DECISION (Task 6): a journal Add implies the tree was published, but the
-                        /// object may legitimately be gone NOW - a later Remove for the same ref
-                        /// plus an already COMPLETED prior round can have deleted it (in-order
-                        /// folding visits the Add anyway). Lookahead: a Remove for the same
-                        /// ref_name at a later at_version in THIS shard's remaining journal =>
-                        /// skip the expansion (the edges would be stripped anyway; the marker
-                        /// stays unset; no edges were added for a gone tree, so over-count-only
-                        /// is preserved). No later Remove => the manifest claims a LIVE ref to a
-                        /// missing tree => INV-NO-DANGLE surfaced; fail closed (propagate).
-                        bool later_remove = false;
+                        /// DECISION (Task 6, refined by review): a journal Add implies the tree was
+                        /// published, but the object may legitimately be gone NOW - this record's
+                        /// edge was DISPLACED later in the journal and an already COMPLETED
+                        /// competing round deleted the displaced tree (in-order folding still
+                        /// visits the Add). Displacement proof is a later record for the SAME
+                        /// ref_name: a Remove drops the edge, and a later Add re-points it
+                        /// (last-op-wins republish - the COMMON mutation path). Either => skip the
+                        /// expansion (the edges would be stripped/displaced anyway; the marker
+                        /// stays unset; no edges were added for a gone tree, so over-count-only is
+                        /// preserved). No later record for the ref => the manifest claims a LIVE
+                        /// ref to a missing tree => INV-NO-DANGLE surfaced; fail closed
+                        /// (propagate). The op check stays EXPLICIT: a future journal op (e.g. the
+                        /// model's fence records) must NOT count as displacement.
+                        bool displaced_later = false;
                         for (size_t ahead = record_idx + 1; ahead < root.journal.size(); ++ahead)
                         {
                             const JournalRecord & next = root.journal[ahead];
-                            if (next.op == JournalRecord::Op::Remove && next.ref_name == record.ref_name
-                                && next.at_version > record.at_version)
+                            if ((next.op == JournalRecord::Op::Remove || next.op == JournalRecord::Op::Add)
+                                && next.ref_name == record.ref_name && next.at_version > record.at_version)
                             {
-                                later_remove = true;
+                                displaced_later = true;
                                 break;
                             }
                         }
-                        if (!later_remove)
+                        if (!displaced_later)
                             throw;
                         tree_present = false;
                     }
@@ -190,6 +206,10 @@ Gc::FoldResult Gc::fold(GcState & state, const Token & state_token)
             {
                 /// The model's GFold rem only removes the root edge - the cascade strip of the
                 /// tree's child edges belongs to the recheck/delete pipeline (Task 10).
+                /// LOAD-BEARING routing: the Remove routes via the journal record's DROP-TIME
+                /// tree_id, which by in-order folding is exactly the shard where the live
+                /// (root_shard, part_name) edge resides - any earlier displacing Add already
+                /// re-pointed the edge when ITS record folded (intra-shard while snap_shards == 1).
                 auto cands = shard_for(record.tree_id).removeRootEdge(cursor_key, record.ref_name);
                 result.transitioned.insert(result.transitioned.end(), cands.begin(), cands.end());
             }
@@ -200,30 +220,54 @@ Gc::FoldResult Gc::fold(GcState & state, const Token & state_token)
 
     /// 4. Persist, durable-before-cursor: the new-generation snap objects go durable FIRST; only
     /// then does the gc/state CAS advance snap_generation + folded_cursor. A crash between the two
-    /// loses nothing - the old generation stays authoritative and the next round re-folds the same
-    /// records into a byte-identical generation object (idempotent replay).
-    const uint64_t new_generation = state.snap_generation + 1;
-    for (auto & [snap_shard, snap] : result.snap)
+    /// loses nothing - the old generation stays authoritative.
+    ///
+    /// THE WRITE GENERATION PROBES UPWARD. Generation objects are write-once, and a generation key
+    /// occupied by DIFFERENT bytes can never be reused: a fold that wrote its snaps but lost the
+    /// gc/state CAS leaves an orphan at snap_generation+1, and once ANY new journal record arrives
+    /// every later fold covers a larger range - its bytes can never match the orphan again, so a
+    /// FIXED write generation would abort forever (a permanent GC wedge). Per probed generation:
+    /// every shard Done or byte-equal => adopt it (byte-equality keeps crash-replay adoption: the
+    /// orphan of OUR identical earlier attempt is reused, not abandoned); ANY shard divergent =>
+    /// abandon the generation (partially written objects there are orphans - harmless, write-once,
+    /// never referenced by any cursor; full-GC reclaims them in M-F) and retry one higher. The
+    /// adopted generation is > the snap_generation we read and the gc/state CAS below guards the
+    /// advance, so INV-MONOTONE-GC holds; generations need NOT be dense - the gc/state pointer is
+    /// authoritative, a reader never enumerates generations.
+    constexpr uint64_t max_generation_probes = 1000;   /// runaway brake, never a legitimate bound
+    uint64_t adopted_generation = 0;
+    for (uint64_t generation = state.snap_generation + 1; ; ++generation)
     {
-        snap.generation = new_generation;
-        const String snap_key = layout.gcSnapKey(new_generation, snap_shard);
-        const String body = encodeGcSnap(snap);
-        if (backend.putIfAbsent(snap_key, body) == PutOutcome::PreconditionFailed)
+        if (generation > state.snap_generation + max_generation_probes)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS gc fold: no adoptable snap generation within {} probes above {} (runaway divergence)",
+                max_generation_probes, state.snap_generation);
+
+        bool diverged = false;
+        for (auto & [snap_shard, snap] : result.snap)
         {
-            /// Generation objects are write-once. An existing object is either OUR replay (a prior
-            /// attempt wrote the snap, then crashed or lost the cursor CAS) or a competing leader's
-            /// fold. Byte-equality proves the same fold => proceed. Different bytes => the
-            /// competing fold saw different journals => abort THIS round gracefully (split-brain
-            /// duplicate work must be benign; the next round re-derives from the
-            /// then-authoritative gc/state).
-            const auto existing = backend.get(snap_key);
-            if (!existing || existing->bytes != body)
-                throw Exception(ErrorCodes::ABORTED,
-                    "CAS gc fold: concurrent fold diverged at {}; retry next round", snap_key);
+            snap.generation = generation;
+            const String snap_key = layout.gcSnapKey(generation, snap_shard);
+            const String body = encodeGcSnap(snap);
+            if (backend.putIfAbsent(snap_key, body) == PutOutcome::PreconditionFailed)
+            {
+                const auto existing = backend.get(snap_key);
+                if (!existing || existing->bytes != body)
+                {
+                    diverged = true;
+                    break;
+                }
+                /// byte-equal: OUR replay (a prior attempt crashed or lost the cursor CAS) - adopt.
+            }
+        }
+        if (!diverged)
+        {
+            adopted_generation = generation;
+            break;
         }
     }
 
-    state.snap_generation = new_generation;
+    state.snap_generation = adopted_generation;
     if (backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token) != CasOutcome::Committed)
         /// Another leader advanced gc/state under us. The new-generation snap we just wrote is
         /// orphaned garbage - harmless (write-once, never referenced by any cursor); full-GC

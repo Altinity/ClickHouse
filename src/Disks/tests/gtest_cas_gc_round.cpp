@@ -13,6 +13,7 @@ extern const int ABORTED;
 extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
 extern const int FILE_DOESNT_EXIST;
+extern const int NOT_IMPLEMENTED;
 }
 
 using namespace DB::Cas;
@@ -495,19 +496,70 @@ TEST(CasGcFold, DurableSnapBeforeCursorAdvance)
     EXPECT_FALSE(st2.folded_cursor.empty());
 }
 
-TEST(CasGcFold, ConcurrentDivergentSnapAborts)
+TEST(CasGcFold, ForeignDivergentGenerationIsProbedPast)
 {
-    /// Write-once generations: if the gen-1 object already exists with DIFFERENT bytes, a competing
-    /// fold saw different journals - this round must abort gracefully (ABORTED) leaving the OLD
-    /// generation authoritative; the next round re-derives from the then-authoritative state.
+    /// Write-once generations: a generation key occupied by DIFFERENT bytes (a diverged competing
+    /// fold's leftover) can never be reused, so aborting on it forever would wedge GC. The fold
+    /// probes UPWARD: abandon gen 1, land at gen 2. The gc/state pointer is authoritative -
+    /// generations need not be dense.
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
-    publishPart(s, "srv1/tbl", "part_1", "payload");
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     ASSERT_EQ(b->putIfAbsent(s->layout().gcSnapKey(1, 0), "not-our-fold"), PutOutcome::Done);
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep = gc.runRegularRound();
+    EXPECT_TRUE(rep.acquired_lease);
+    EXPECT_EQ(rep.candidates, 0u);
+    EXPECT_EQ(readState(*b, *s).snap_generation, 2u);            /// gen 1 abandoned, gen 2 ours
+    const GcSnap snap = readSnap(*b, *s, 2, 0);
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, hexToU128(tree.string())), 1u);
+}
+
+TEST(CasGcFold, GenerationProbeRecoversAfterLostCursorCas)
+{
+    /// The wedge horn: a fold writes the gen-1 snaps but loses the gc/state CAS; a NEW journal
+    /// record then arrives. Every later fold covers a LARGER range, so its gen-1 bytes can never
+    /// match the orphan again - a fixed write generation of snap_generation+1 would ABORT forever
+    /// (regular GC permanently dead; the folded range only grows). The probe-upward persist must
+    /// land at gen 2 instead.
+    auto b = std::make_shared<FailNthCasPutBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId t1 = publishPart(s, "srv1/tbl", "part_1", "one");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    b->failNthCasPut(s->layout().gcStateKey(), 2);               /// the fold's cursor CAS loses
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc.runRegularRound(); });
-    EXPECT_EQ(readState(*b, *s).snap_generation, 0u);            /// old generation stays authoritative
+    ASSERT_TRUE(b->get(s->layout().gcSnapKey(1, 0)).has_value());    /// the gen-1 orphan
+
+    const TreeId t2 = publishPart(s, "srv1/tbl", "part_2", "two");   /// the folded range grows
+
+    const RoundReport rep = gc.runRegularRound();                /// must NOT wedge on gen 1
+    EXPECT_TRUE(rep.acquired_lease);
+    EXPECT_EQ(rep.candidates, 0u);
+    const GcState st = readState(*b, *s);
+    EXPECT_EQ(st.snap_generation, 2u);
+    EXPECT_FALSE(st.folded_cursor.empty());
+    const GcSnap snap = readSnap(*b, *s, 2, 0);
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, hexToU128(t1.string())), 1u);
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, hexToU128(t2.string())), 1u);
+}
+
+TEST(CasGcFold, SnapShardsOtherThanOneIsNotImplemented)
+{
+    /// Last-op-wins displacement is INTRA-shard only: with the displaced and displacing trees in
+    /// different snap shards a republish would leak the old root edge forever. Until cross-shard
+    /// displacement is designed, a pool whose gc/state carries snap_shards != 1 must be refused
+    /// (NOT_IMPLEMENTED, fail closed), never silently mis-folded.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    GcState injected;
+    injected.snap_shards = 2;
+    ASSERT_EQ(b->putIfAbsent(s->layout().gcStateKey(), encodeGcState(injected)), PutOutcome::Done);
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    EXPECT_FALSE(gc.runRegularRound().acquired_lease);           /// first sight of the never-held lease
+    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { gc.runRegularRound(); });   /// steal, then refuse
 }
 
 TEST(CasGcFold, AbsentTreeWithLaterRemoveSkipsExpansion)
@@ -533,6 +585,32 @@ TEST(CasGcFold, AbsentTreeWithLaterRemoveSkipsExpansion)
     EXPECT_FALSE(snap.isExpanded(tree_hash));                    /// expansion skipped
     EXPECT_FALSE(snap.isKnown(ObjectKind::Blob, u128Of("payload")));  /// no child edges added
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, tree_hash), 0u);
+}
+
+TEST(CasGcFold, AbsentTreeWithLaterDisplacingAddSkipsExpansion)
+{
+    /// readTree-absent DECISION, displacing-Add branch: a republish (last-op-wins, the COMMON
+    /// mutation path) displaces the old tree WITHOUT a Remove - journal [Add(p1->T1), Add(p1->T2)].
+    /// Another leader can legally have deleted the displaced T1 before a stale leader folds the
+    /// first Add, so the lookahead must accept a later Add for the same ref as displacement proof
+    /// too; only a Remove would make this a false corruption-shaped alarm for a legal race.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const TreeId t1 = publishPart(s, "srv1/tbl", "part_1", "one");
+    const TreeId t2 = publishPart(s, "srv1/tbl", "part_1", "two");   /// displacing republish
+    rawDeleteTree(*b, *s, t1);                                   /// as a completed competing round could
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep = gc.runRegularRound();                /// must NOT throw
+    EXPECT_TRUE(rep.acquired_lease);
+    EXPECT_EQ(rep.candidates, 1u);                               /// the displaced T1
+
+    const GcSnap snap = readSnap(*b, *s, 1, 0);
+    EXPECT_FALSE(snap.isExpanded(hexToU128(t1.string())));       /// expansion skipped
+    EXPECT_FALSE(snap.isKnown(ObjectKind::Blob, u128Of("one"))); /// no child edges for the gone tree
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, hexToU128(t1.string())), 0u);
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, hexToU128(t2.string())), 1u);   /// alive
+    EXPECT_TRUE(snap.isExpanded(hexToU128(t2.string())));
 }
 
 TEST(CasGcFold, AbsentTreeWithoutLaterRemoveFailsClosed)

@@ -95,13 +95,18 @@ private:
     /// cascade strip belongs to the delete pipeline, Task 10). Fresh uploads are invisible by
     /// construction (no journal record until publish).
     ///
-    /// DURABLE-BEFORE-CURSOR: the updated snap is written at generation+1 FIRST (ALL shards, even
-    /// unchanged ones - simplest correct v1; skipping byte-identical shards is a possible later
+    /// DURABLE-BEFORE-CURSOR: the updated snap goes durable FIRST (ALL shards, even unchanged
+    /// ones - simplest correct v1; skipping byte-identical shards is a possible later
     /// optimization), only then does ONE gc/state CAS advance snap_generation + folded_cursor
-    /// against `state_token`. Generation objects are write-once (putIfAbsent): an existing
-    /// byte-equal object is OUR replay (proceed); a different one is a diverged concurrent fold
-    /// and the gc/state CAS conflicting means another leader advanced state - both throw ABORTED
-    /// (the orphaned new-generation snap is harmless garbage; full-GC cleans it in M-F).
+    /// against `state_token`. Generation objects are write-once (putIfAbsent) and the write
+    /// generation PROBES UPWARD from snap_generation+1: per generation, every shard Done or
+    /// byte-equal (our own crash-replay) => adopt; any shard divergent => abandon that generation
+    /// and try one higher - a FIXED generation would wedge GC forever once an orphan plus new
+    /// journal records make the bytes unmatchable. Abandoned partials are harmless orphans
+    /// (full-GC cleans them in M-F); generations need not be dense - the gc/state pointer is
+    /// authoritative. A gc/state CAS Conflict means another leader advanced state - throw ABORTED
+    /// (retry next round). snap_shards != 1 is refused (NOT_IMPLEMENTED): cross-shard last-op-wins
+    /// displacement is undesigned in M-C3.
     ///
     /// On success `state` carries the committed snap_generation/folded_cursor.
     FoldResult fold(GcState & state, const Token & state_token);
