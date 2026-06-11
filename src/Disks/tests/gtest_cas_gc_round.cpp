@@ -579,7 +579,7 @@ TEST(CasGcFold, AbsentTreeWithLaterRemoveSkipsExpansion)
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     const RoundReport rep = gc.runRegularRound();                /// must NOT throw
     EXPECT_TRUE(rep.acquired_lease);
-    EXPECT_EQ(rep.candidates, 1u);                               /// T zeroed by the Remove
+    EXPECT_EQ(rep.candidates, 0u);                               /// T zeroed but is ABSENT => retire skips it
 
     const GcSnap snap = readSnap(*b, *s, 1, 0);
     EXPECT_FALSE(snap.isExpanded(tree_hash));                    /// expansion skipped
@@ -603,7 +603,7 @@ TEST(CasGcFold, AbsentTreeWithLaterDisplacingAddSkipsExpansion)
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     const RoundReport rep = gc.runRegularRound();                /// must NOT throw
     EXPECT_TRUE(rep.acquired_lease);
-    EXPECT_EQ(rep.candidates, 1u);                               /// the displaced T1
+    EXPECT_EQ(rep.candidates, 0u);                               /// the displaced T1 is ABSENT => retire skips it
 
     const GcSnap snap = readSnap(*b, *s, 1, 0);
     EXPECT_FALSE(snap.isExpanded(hexToU128(t1.string())));       /// expansion skipped
@@ -630,4 +630,175 @@ TEST(CasGcFold, AbsentTreeWithoutLaterRemoveFailsClosed)
     EXPECT_EQ(st.snap_generation, 0u);
     EXPECT_TRUE(st.folded_cursor.empty());
     EXPECT_FALSE(b->get(s->layout().gcSnapKey(1, 0)).has_value());   /// nothing durable was written
+}
+
+/// ---- R2 RETIRE (Task 7) ----
+///
+/// RETIRE observes each candidate's CURRENT incarnation token with one HEAD and writes the round's
+/// retire sets to gc/retired/<round>.<fence_seq>/<snap_shard> (append-by-unique-path: one object
+/// per path, written once), then CASes gc/state.round = round. The sets are durable BEFORE the
+/// round number advances (INV-MONOTONE-GC: a writer whose RetireView refreshes at the new round is
+/// guaranteed to see the entries); the round CAS is the durable "retire phase complete" marker.
+/// Candidates are derived STATELESSLY from the durable snap (zeroInDegreeKnown - the model's
+/// GRetire guard `present /\ everEdged /\ InDeg = 0`). Retired != dead: the entries are the
+/// writer-facing "resurrect, don't reuse" barrier (spec section 7 R2).
+
+TEST(CasGcRetire, ObservesCurrentTokenAndAppends)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload-1");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep = gc.runRegularRound();
+    EXPECT_TRUE(rep.acquired_lease);
+    EXPECT_GE(rep.candidates, 1u);            /// the tree zeroed (the blob stays pinned by the tree edge)
+
+    const GcState st = readState(*b, *s);
+    EXPECT_EQ(st.round, 1u);                  /// the durable "retire phase complete" marker
+
+    const auto retired_obj = b->get(s->layout().retiredKey(1, st.fence_seq, 0));
+    ASSERT_TRUE(retired_obj.has_value());
+    const RetiredSet set = decodeRetiredSet(retired_obj->bytes);
+    ASSERT_EQ(set.entries.size(), 1u);
+    EXPECT_EQ(set.entries[0].kind, ObjectKind::Tree);
+    EXPECT_EQ(set.entries[0].hash, hexToU128(tree.string()));
+    /// the condemned token is the live object's CURRENT token - observed, never fabricated:
+    const HeadResult tree_head = b->head(s->layout().treeKey(tree));
+    ASSERT_TRUE(tree_head.exists);
+    EXPECT_EQ(set.entries[0].token, tree_head.token);
+    EXPECT_EQ(set.entries[0].size, tree_head.size);            /// trees account whole-object
+
+    /// the writer-facing barrier is LIVE: a fresh Store's RetireView condemns the incarnation
+    auto s2 = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    EXPECT_TRUE(s2->retireView().isCondemnedToken(ObjectKind::Tree, set.entries[0].hash, set.entries[0].token));
+    EXPECT_EQ(s2->retireView().round(), 1u);
+}
+
+TEST(CasGcRetire, AbsentCandidateIsSkippedNotFabricated)
+{
+    /// The candidate's object is already gone (a completed prior round's delete - staged here by
+    /// removing the tree out-of-band): retire records NOTHING for it. There is no token to condemn
+    /// and fabricating one would be a fail-open delete ticket. The round still advances (an
+    /// all-skipped round completed its retire phase; the recheck has nothing to do for an absent
+    /// candidate) and no empty retired object is written.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    rawDeleteTree(*b, *s, tree);
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep = gc.runRegularRound();             /// must NOT throw
+    EXPECT_TRUE(rep.acquired_lease);
+    EXPECT_EQ(rep.candidates, 0u);                            /// no entry written
+
+    const GcState st = readState(*b, *s);
+    EXPECT_EQ(st.round, 1u);                                  /// the round still completed
+    EXPECT_FALSE(b->get(s->layout().retiredKey(1, st.fence_seq, 0)).has_value());   /// no empty objects
+}
+
+TEST(CasGcRetire, IdempotentReplaySameRound)
+{
+    /// Cross-round duplicate-entry property: with no new journal activity, round 2 re-derives the
+    /// same candidate from the durable snap (still known + zero in-degree + present until Task 9's
+    /// delete lands) and re-retires it at the SAME observed token under a NEW unique path. Benign
+    /// by construction: RetireView unions all present sets (one more copy of the same condemned
+    /// token) and the eventual delete is exact-token idempotent. (TRUE same-round crash replay -
+    /// sets durable, round CAS lost - is pinned by RetireSetsDurableBeforeRoundCas below.)
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const RoundReport rep2 = gc.runRegularRound();            /// no new journal activity in between
+    EXPECT_TRUE(rep2.acquired_lease);
+    EXPECT_EQ(rep2.candidates, 1u);                           /// re-derived, re-retired
+
+    const GcState st = readState(*b, *s);
+    EXPECT_EQ(st.round, 2u);
+
+    const auto round1 = b->get(s->layout().retiredKey(1, st.fence_seq, 0));
+    const auto round2 = b->get(s->layout().retiredKey(2, st.fence_seq, 0));
+    ASSERT_TRUE(round1.has_value());
+    ASSERT_TRUE(round2.has_value());
+    const RetiredSet set1 = decodeRetiredSet(round1->bytes);
+    const RetiredSet set2 = decodeRetiredSet(round2->bytes);
+    ASSERT_EQ(set1.entries.size(), 1u);
+    ASSERT_EQ(set2.entries.size(), 1u);
+    EXPECT_EQ(set2.entries[0].hash, set1.entries[0].hash);
+    EXPECT_EQ(set2.entries[0].token, set1.entries[0].token);  /// same incarnation, same exact token
+
+    auto s2 = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    EXPECT_TRUE(s2->retireView().isCondemnedToken(ObjectKind::Tree, hexToU128(tree.string()), set2.entries[0].token));
+}
+
+TEST(CasGcRetire, RetireSetsDurableBeforeRoundCas)
+{
+    /// The ordering seam (INV-MONOTONE-GC): the retire sets go durable FIRST; only then does the
+    /// gc/state CAS advance .round. Inject a Conflict on exactly the retire CAS (3rd casPut to
+    /// gcStateKey: lease create = 1st, fold cursor CAS = 2nd): the round throws ABORTED with the
+    /// retired set already durable but .round NOT advanced - a crash here leaves only re-derivable
+    /// durable state. The rerun is the TRUE same-round replay: it re-derives the same set,
+    /// putIfAbsent hits PreconditionFailed, byte-equality proves the set is OURS (adopt, not
+    /// abort), and the round CAS lands.
+    auto b = std::make_shared<FailNthCasPutBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    b->failNthCasPut(s->layout().gcStateKey(), 3);
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc.runRegularRound(); });
+
+    GcState st = readState(*b, *s);
+    EXPECT_EQ(st.round, 0u);                                  /// the marker did NOT advance...
+    const auto retired_obj = b->get(s->layout().retiredKey(1, st.fence_seq, 0));
+    ASSERT_TRUE(retired_obj.has_value());                     /// ...but the set is already durable
+
+    const RoundReport rep = gc.runRegularRound();             /// replay: adopts the set, lands
+    EXPECT_TRUE(rep.acquired_lease);
+    EXPECT_EQ(rep.candidates, 1u);
+    st = readState(*b, *s);
+    EXPECT_EQ(st.round, 1u);
+    const RetiredSet set = decodeRetiredSet(b->get(s->layout().retiredKey(1, st.fence_seq, 0))->bytes);
+    ASSERT_EQ(set.entries.size(), 1u);
+    EXPECT_EQ(set.entries[0].hash, hexToU128(tree.string()));
+}
+
+TEST(CasGcRetire, DivergedRetiredSetFailsClosed)
+{
+    /// A retired-set key occupied by DIFFERENT bytes is a diverged competing retire at the same
+    /// (round, fence_seq) - two leaders derived different sets for the same path. fence_seq
+    /// isolation makes this near-impossible (a lease steal bumps fence_seq, changing every path)
+    /// except a duplicate-gc_id misconfiguration; the loser must fail closed (ABORTED), never
+    /// overwrite or adopt, and the round marker must not advance.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    /// fresh pool: the executed round is 1, fence_seq 0
+    ASSERT_EQ(b->putIfAbsent(s->layout().retiredKey(1, 0, 0), "not-our-retire"), PutOutcome::Done);
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc.runRegularRound(); });
+    EXPECT_EQ(readState(*b, *s).round, 0u);                   /// the marker never advanced
+}
+
+TEST(CasGcRetire, BlobHeaderUnderflowFailsClosed)
+{
+    /// retiredLogicalSize unit rows: blobs subtract the pool's fixed blob_header_len (the size in a
+    /// retire entry is GC bookkeeping over PAYLOAD bytes); a blob OBJECT smaller than the fixed
+    /// header is corrupt => CORRUPTED_DATA (fail closed, never a wrapped-around size); trees/packs
+    /// account whole-object. Direct unit rows because a BLOB candidate cannot be constructed
+    /// through a real round before Task 9 lands: a blob stays pinned by its parent tree's edge
+    /// until the cascade strips it.
+    EXPECT_EQ(retiredLogicalSize(ObjectKind::Blob, 300, 256), 44u);
+    EXPECT_EQ(retiredLogicalSize(ObjectKind::Blob, 256, 256), 0u);     /// empty payload is legal
+    EXPECT_EQ(retiredLogicalSize(ObjectKind::Tree, 100, 256), 100u);   /// whole-object
+    EXPECT_EQ(retiredLogicalSize(ObjectKind::Pack, 100, 256), 100u);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { retiredLogicalSize(ObjectKind::Blob, 100, 256); });
 }

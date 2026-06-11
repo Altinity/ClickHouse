@@ -341,17 +341,7 @@ TreeId Build::putTree(std::vector<TreeEntry> entries)
 
 String Build::keyFor(ObjectKind kind, const UInt128 & hash) const
 {
-    const String id = u128ToHex(hash);
-    switch (kind)
-    {
-        case ObjectKind::Blob:
-            return store->layout().blobKey(BlobId(id));
-        case ObjectKind::Tree:
-            return store->layout().treeKey(TreeId(id));
-        case ObjectKind::Pack:
-            return store->layout().packKey(PackId(id));
-    }
-    throw Exception(ErrorCodes::LOGICAL_ERROR, "keyFor: unknown ObjectKind {}", static_cast<int>(kind));
+    return objectKey(store->layout(), kind, hash);
 }
 
 void Build::gateCheckDeps()

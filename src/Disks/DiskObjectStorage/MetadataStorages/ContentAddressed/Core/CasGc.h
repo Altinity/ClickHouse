@@ -10,12 +10,18 @@
 namespace DB::Cas
 {
 
+/// The logical (GC-bookkeeping) size of a retired object: blobs subtract the pool's fixed
+/// blob_header_len (a blob OBJECT smaller than the fixed header is corrupt — CORRUPTED_DATA,
+/// fail closed, never a wrapped-around size); trees/packs account whole-object. Sizes feed
+/// cost/health accounting only — no protocol decision ever reads them.
+uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len);
+
 /// What one runRegularRound did (counters are health metrics, not protocol state).
 struct RoundReport
 {
     bool acquired_lease = false;  /// false => another leader is alive; nothing else was done
     uint64_t round = 0;
-    uint64_t candidates = 0;
+    uint64_t candidates = 0;      /// retired entries WRITTEN this round (absent candidates are skipped)
     uint64_t deleted = 0;
     uint64_t absent = 0;
     uint64_t replaced = 0;        /// 412-saves - a health metric (spec §7)
@@ -110,6 +116,22 @@ private:
     ///
     /// On success `state` carries the committed snap_generation/folded_cursor.
     FoldResult fold(GcState & state, const Token & state_token);
+
+    /// R2 (spec §7; the model's GRetire): the round being executed is state.round + 1 (state.round
+    /// = "highest round whose retire sets are durable"). Per candidate — derived STATELESSLY from
+    /// the durable snap via GcSnap::zeroInDegreeKnown, the model guard `present ∧ everEdged ∧
+    /// InDeg = 0` — ONE HEAD observes the object's CURRENT token; an absent object is SKIPPED
+    /// (no token to condemn — never fabricate; a crashed prior round's landed delete or debris).
+    /// The per-shard retire sets are written by unique path (gc/retired/<round>.<fence_seq>/<shard>,
+    /// putIfAbsent; a byte-equal occupant is OUR crash-replay — adopt; a divergent one is a
+    /// competing retire — ABORTED, fail closed). The sets go durable BEFORE one gc/state CAS
+    /// advances .round — the durable "retire phase complete" marker (INV-MONOTONE-GC ordering:
+    /// a writer whose RetireView refreshes at the new round is guaranteed to see the entries).
+    /// On success `state`/`state_token` carry the committed round. Returns the retired entries
+    /// grouped by snap shard (the input to R4 recheck). Retired ≠ dead: the entries are the
+    /// writer-facing "resurrect, don't reuse" barrier.
+    std::map<uint64_t, RetiredSet> retire(GcState & state, Token & state_token,
+                                          const std::map<uint64_t, GcSnap> & snap);
 
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);

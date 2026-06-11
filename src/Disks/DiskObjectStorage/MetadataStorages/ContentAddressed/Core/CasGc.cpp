@@ -17,6 +17,17 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len)
+{
+    if (kind != ObjectKind::Blob)
+        return object_size;   /// trees/packs account whole-object (sizes are GC bookkeeping)
+    if (object_size < blob_header_len)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS gc retire: blob object of {} bytes is smaller than the pool's fixed blob header ({} bytes)",
+            object_size, blob_header_len);
+    return object_size - blob_header_len;
+}
+
 Gc::Gc(StorePtr store_, UInt128 gc_id_)
     : store(std::move(store_))
     , gc_id(gc_id_)
@@ -37,23 +48,120 @@ RoundReport Gc::runRegularRound()
     if (!report.acquired_lease)
         return report;
 
-    report.round = state.round;
-
     /// R1: fold the journals into a new durable snap generation (cursors advance only after).
     const FoldResult folded = fold(state, state_token);
 
-    /// Candidates for R2 are derived STATELESSLY from the durable snap (the model GRetire guard
+    /// R2 operates on a FRESH read of gc/state: the fold's CAS committed a new state
+    /// (snap_generation/folded_cursor) but does not return its post-CAS token, so re-read - the
+    /// retire round CAS is conditioned on THIS token. gc/state vanishing here is the same
+    /// out-of-model deletion the lease fails closed on.
+    const auto reread = store->backend().get(store->layout().gcStateKey());
+    if (!reread)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state vanished after the fold committed");
+    state = decodeGcState(reread->bytes);
+    state_token = reread->token;
+
+    /// R2: HEAD-observe each candidate's current token, write the round's retire sets, advance
+    /// .round. Candidates are derived STATELESSLY from the durable snap (the model GRetire guard
     /// `present ∧ everEdged ∧ InDeg = 0` over zeroInDegreeKnown) - never from the in-memory fold
     /// transitions, so a crash-replayed round re-derives the same set. `folded.transitioned` is
     /// only a health cross-check; the counts can differ legitimately (e.g. a node zeroed by an
     /// EARLIER round's fold is in zeroInDegreeKnown but did not transition in THIS fold).
-    uint64_t candidates = 0;
-    for (const auto & [snap_shard, snap] : folded.snap)
-        candidates += snap.zeroInDegreeKnown().size();
-    report.candidates = candidates;
+    const std::map<uint64_t, RetiredSet> retired = retire(state, state_token, folded.snap);
+    report.round = state.round;
+    for (const auto & [snap_shard, set] : retired)
+        report.candidates += set.entries.size();
 
-    /// Tasks 7-12: retire / fence / recheck / cascade / trim
+    /// Tasks 8-12: fence / recheck / cascade / trim
     return report;
+}
+
+std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
+                                          const std::map<uint64_t, GcSnap> & snap)
+{
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+
+    /// state.round = "highest round whose retire sets are durable" => THIS round is the next one.
+    const uint64_t round = state.round + 1;
+
+    /// 1. Observe. One HEAD per candidate captures the CURRENT incarnation token - the only token
+    /// the eventual delete may carry (exact-token delete, spec §7).
+    ///
+    /// Cross-round duplicates are possible and benign: a prior round may have retired the same
+    /// (hash, token) and crashed before its recheck/outcomes - this round re-derives the candidate
+    /// (still known + zero + present) and writes ANOTHER entry under its own unique path. The
+    /// RetireView unions all present sets (the same condemned token twice), the delete is
+    /// exact-token idempotent, and a stale round's set is cleaned by ITS round's replay (or M-F) -
+    /// so no cross-round dedup is attempted here. Within one round a candidate appears once by
+    /// construction (zeroInDegreeKnown yields unique nodes; a node lives in exactly one shard).
+    std::map<uint64_t, RetiredSet> retired;
+    for (const auto & [snap_shard, shard_snap] : snap)
+    {
+        for (const Candidate & candidate : shard_snap.zeroInDegreeKnown())
+        {
+            const HeadResult observed = backend.head(objectKey(layout, candidate.kind, candidate.hash));
+            if (!observed.exists)
+                /// No token to condemn - never fabricate one (fail closed). The object is already
+                /// gone: a crashed prior round's landed delete, or debris; the recheck has nothing
+                /// to do for it and the writer-facing barrier has nothing to bar.
+                continue;
+
+            RetiredEntry entry;
+            entry.kind = candidate.kind;
+            entry.hash = candidate.hash;
+            entry.token = observed.token;
+            entry.size = retiredLogicalSize(candidate.kind, observed.size, store->poolMeta().blob_header_len);
+            retired[hashPrefixShard(candidate.hash, state.snap_shards)].entries.push_back(std::move(entry));
+        }
+    }
+
+    /// 2. Write each shard's set - append-by-unique-path: the path is unique per
+    /// (round, fence_seq, shard) and written ONCE. An EMPTY shard writes nothing (no empty
+    /// objects; RetireView handles absent keys), and an all-empty round still advances .round
+    /// below - the round RAN; the common idle case, with a trivially empty recheck. A key already
+    /// occupied by byte-identical content is OUR crash-replay (the same round re-derived the same
+    /// set from the same durable snap) - adopt it; DIVERGENT content is a competing retire at the
+    /// same (round, fence_seq) - two leaders saw different snaps, which fence_seq isolation makes
+    /// near-impossible (a lease steal bumps fence_seq, changing every path) except a duplicate-
+    /// gc_id misconfiguration - fail closed, never overwrite, never adopt.
+    for (const auto & [snap_shard, set] : retired)
+    {
+        const String key = layout.retiredKey(round, state.fence_seq, snap_shard);
+        const String body = encodeRetiredSet(set);
+        if (backend.putIfAbsent(key, body) == PutOutcome::PreconditionFailed)
+        {
+            const auto existing = backend.get(key);
+            if (!existing || existing->bytes != body)
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS gc retire: concurrent retire diverged at {} (duplicate gc_id?)", key);
+        }
+    }
+
+    /// 3. The durable "retire phase complete" marker: ONE gc/state CAS advances .round, strictly
+    /// AFTER the sets are durable (INV-MONOTONE-GC ordering: a writer whose RetireView refreshes
+    /// at the new round is guaranteed to see the entries). A crash between step 2 and here leaves
+    /// only re-derivable durable state - the replay adopts the byte-equal sets and re-runs this CAS.
+    GcState next = state;
+    next.round = round;
+    Token committed_token;
+    if (backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token, &committed_token)
+        != CasOutcome::Committed)
+    {
+        /// Another leader moved gc/state under us. Bounded and fail-closed: this leader's round
+        /// attempt ends here (the lease makes contention rare); the re-read only sharpens the
+        /// message - a round already at/past ours means a competitor COMPLETED this retire
+        /// (duplicate work detected), anything else is a plain interleaving.
+        const auto current = backend.get(layout.gcStateKey());
+        if (current && decodeGcState(current->bytes).round >= round)
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS gc retire: another leader already completed retire round {}; retry next round", round);
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS gc retire: gc/state moved during retire (another leader advanced it); retry next round");
+    }
+    state = std::move(next);
+    state_token = committed_token;
+    return retired;
 }
 
 Gc::FoldResult Gc::fold(GcState & state, const Token & state_token)

@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Common/Exception.h>
 #include <base/types.h>
@@ -11,6 +12,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -225,5 +227,23 @@ private:
         return prefix + "/" + ns + "/" + id.substr(0, 2) + "/" + id;
     }
 };
+
+/// The object key for a (kind, hash) — the single kind→key-shape mapping (blobs/trees/packs).
+/// Shared by `Build` (the publish gate's observe/resurrect) and `Gc` (the retire HEAD and the
+/// exact-token delete): both sides MUST address the same object the same way.
+inline String objectKey(const Layout & layout, ObjectKind kind, const UInt128 & hash)
+{
+    const String id = u128ToHex(hash);
+    switch (kind)
+    {
+        case ObjectKind::Blob:
+            return layout.blobKey(BlobId(id));
+        case ObjectKind::Tree:
+            return layout.treeKey(TreeId(id));
+        case ObjectKind::Pack:
+            return layout.packKey(PackId(id));
+    }
+    throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "objectKey: unknown ObjectKind {}", static_cast<uint8_t>(kind));
+}
 
 }
