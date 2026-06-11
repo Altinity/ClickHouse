@@ -146,6 +146,8 @@ String getLocationSchemeForTableCreation(const std::shared_ptr<DataLake::ICatalo
             return "abfss"; /// Azure-only
         case DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE:
             return "s3"; /// GCS via S3 API
+        case DatabaseDataLakeCatalogType::S3_TABLES:
+            return "s3"; /// S3-only
         case DatabaseDataLakeCatalogType::ICEBERG_REST:
         case DatabaseDataLakeCatalogType::ICEBERG_HIVE:
         case DatabaseDataLakeCatalogType::GLUE:
@@ -843,11 +845,10 @@ void DatabaseDataLake::createTable(
     if (create.storage)
     {
         if (create.storage->primary_key || create.storage->sample_by
-            || create.storage->ttl_table || create.storage->unique_key
-            || create.storage->settings)
+            || create.storage->ttl_table || create.storage->settings)
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "DataLakeCatalog CREATE TABLE supports only PARTITION BY and ORDER BY; "
-                "PRIMARY KEY, SAMPLE BY, TTL, UNIQUE KEY, and engine SETTINGS are not supported");
+                "PRIMARY KEY, SAMPLE BY, TTL, and engine SETTINGS are not supported");
 
         if (create.storage->partition_by)
             partition_by = create.storage->partition_by->clone();
