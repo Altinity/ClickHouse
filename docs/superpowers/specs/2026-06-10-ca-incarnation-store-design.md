@@ -540,6 +540,37 @@ Invariants: `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_OVER_COUNT_ONL
 no-leak-forever under fairness. The model states its environment assumptions explicitly (atomic conditional
 ops, token distinctness as a parameter) and must not assume more than §2 requires.
 
+### Model status and findings {#model-status}
+
+The model is implemented and model-checked: `docs/superpowers/models/CaIncarnationCore.tla` (run guide
+`CaIncarnationCore_README.md`; per-stage results, bounds, and residuals `CaIncarnationCore_RESULTS.md`). Every
+must-check above is covered by a staged config, and each load-bearing rule has a **sabotage negative control**
+that must — and does — produce a counterexample (`sab_nofence`, `sab_norecheckfold`, `sab_noretireview`,
+`sab_unconddelete`, `sab_reusedtag`, `sab_cascade`, `sab_cutoverclaim`). Bounds are reduced per stage to fit the
+state space (stage 2 one hash; stage 3 single writer; stage 4 split into a `MaxLog=2` debris + two-shard-cut
+config and a `MaxLog=3` journaled-delete + full-GC-tree config; stage 5 `MaxLog=4`); the reductions and what each
+drops are recorded in `RESULTS`.
+
+**Checked invariants:** `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_JOURNAL_COVERAGE`, and
+`MonotoneGC` (= `INV-MONOTONE-GC`, an action property). `INV-OVER-COUNT-ONLY` is **not** a separate checked state
+invariant — it holds by construction (edge-set fold; "may overcount, never undercount"), and its only unsafe
+consequence (undercount → premature delete) is caught by `INV_NO_LOSS`. The temporal `no-leak-forever` is
+**bound-limited by the round cap** (an honest artifact — `GStartRound` is disabled at `MaxRound`, so a last-round
+unreachable object is never collected; not a clean pass — see `RESULTS`).
+
+**Two refinements the model surfaced (to fold into §5/§6/§7):**
+- **F1 — the publish gate must re-validate dependencies' CURRENT physical state, not only the originally observed
+  token.** An observed token can go stale between observation and publish — by delete-then-retire-entry-drop, or
+  by another writer's same-content overwrite — so a gate keyed on the stale token misses the condemnation and a
+  published ref can dangle. The model proves this load-bearing (the `sab_noretireview`/`sab_unconddelete`
+  counterexamples) and captures it conservatively: a token that stops being current (overwrite or delete) joins a
+  durable dead-token set the gate consults. §5's `W-DEP-SET` / `W-PUBLISH-GATE` and §7's no-return argument should
+  state the re-validation explicitly.
+- **F2 — tree publish requires an explicit bottom-up build discipline.** A tree ref may be published only when
+  every child it references is present and live (not condemned). `W-DEP-SET` implies it, but the spec should make
+  it explicit for trees — and the model leaves the transitive/nested-subtree case as a one-level residual, which
+  the spec should also pin.
+
 ## 13. Open items and integration deltas {#open-items}
 
 **Integration deltas vs the current branch (M1–M9 PoC):**
