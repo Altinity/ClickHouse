@@ -1,12 +1,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Common/Exception.h>
+#include <limits>
 
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
 }
@@ -89,6 +91,11 @@ String encodeRetiredSet(const RetiredSet & set)
         writeU8(out, static_cast<uint8_t>(entry.kind));
         writeU128LE(out, entry.hash);
         writeU8(out, static_cast<uint8_t>(entry.token.type));
+        /// token_len is u16 on disk; a longer token would silently truncate the length while the
+        /// full value is appended below — writer-side silent corruption. Guard before writing.
+        if (entry.token.value.size() > std::numeric_limits<uint16_t>::max())
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
+                "CAS retired set: token length {} exceeds the u16 on-disk limit", entry.token.value.size());
         writeLE16(out, static_cast<uint16_t>(entry.token.value.size()));
         out += entry.token.value;
         writeLE64(out, entry.size);

@@ -7,6 +7,7 @@
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
+extern const int LOGICAL_ERROR;
 extern const int NOT_IMPLEMENTED;
 }
 
@@ -122,6 +123,15 @@ TEST(CasGcFormats, MoreValidation)
         auto bytes = encodeGcState(GcState{});
         bytes[5] = 1;
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
+    }
+
+    /// Encoding a token longer than the u16 token_len field must fail closed (exception),
+    /// never silently truncate the length while appending the full token value.
+    {
+        RetiredSet rs;
+        rs.entries.push_back({ObjectKind::Blob, hexToU128("000102030405060708090a0b0c0d0e0f"),
+                              Token{String(70000, 't'), TokenType::ETag}, 1});
+        expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRetiredSet(rs); });
     }
 
     /// Truncated and trailing-garbage gc/state.
