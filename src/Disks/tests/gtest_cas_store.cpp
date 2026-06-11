@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
@@ -169,4 +170,52 @@ TEST(CasPoolMeta, CasConflictReReadsWinner)
     EXPECT_EQ(result.pool_id, winner);
     EXPECT_EQ(result.root_shards, 8u);
     EXPECT_EQ(result.blob_header_len, 256u);
+}
+
+TEST(CasStore, OpenFailsClosedOnNonEnforcingBackend)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    b->setEnforceTokens(false);
+    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
+        [&] { Store::open(b, PoolConfig{.pool_prefix = "p"}); });   /// the probe error contract
+}
+
+TEST(CasStore, OpenCreatesPoolMetaAndReopens)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s1 = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s2 = Store::open(b, PoolConfig{.pool_prefix = "p", .root_shards = 4});
+    EXPECT_EQ(s2->poolMeta().root_shards, 8u);                      /// pool authoritative
+    EXPECT_EQ(s1->poolMeta().pool_id, s2->poolMeta().pool_id);
+}
+
+TEST(CasStore, OpenWithExplicitConstantsCreatesThem)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .root_shards = 4, .blob_header_len = 512});
+    EXPECT_EQ(s->poolMeta().root_shards, 4u);                       /// config applies at creation
+    EXPECT_EQ(s->poolMeta().blob_header_len, 512u);
+}
+
+TEST(CasStore, VerbatimFilesLifecycle)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    RootNamespace ns{"srv1/tbl"};
+    s->putNamespaceFile(ns, "format_version.txt", "1\n");
+    s->putNamespaceFile(ns, "uuid.txt", "abc");
+    EXPECT_EQ(s->getNamespaceFile(ns, "format_version.txt"), String("1\n"));
+    EXPECT_FALSE(s->getNamespaceFile(ns, "absent").has_value());
+    auto names = s->listNamespaceFiles(ns);
+    EXPECT_EQ(names, (std::vector<String>{"format_version.txt", "uuid.txt"}));
+    s->putNamespaceFile(ns, "uuid.txt", "def");                     /// overwrite allowed (head + putOverwrite)
+    EXPECT_EQ(s->getNamespaceFile(ns, "uuid.txt"), String("def"));
+}
+
+TEST(CasStore, ListNamespaceFilesEmpty)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    RootNamespace ns{"srv1/tbl"};
+    EXPECT_TRUE(s->listNamespaceFiles(ns).empty());
 }
