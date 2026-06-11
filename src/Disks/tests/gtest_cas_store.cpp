@@ -12,6 +12,7 @@ extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
 extern const int NOT_IMPLEMENTED;
 extern const int FILE_DOESNT_EXIST;
+extern const int LOGICAL_ERROR;
 }
 
 using namespace DB::Cas;
@@ -391,4 +392,165 @@ TEST(CasStore, ReadTreeFailsClosed)
         b->putIfAbsent(layout.treeKey(tree_key), head + payload);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readTree(tree_key); });
     }
+}
+
+/// ---------- ref lifecycle: dropRef / updateRefPayload / dropNamespace ----------
+
+TEST(CasStore, DropRefAppendsJournalAtomically)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    Layout layout("p");
+    RootNamespace ns{"srv1/tbl"};
+    const uint64_t shards = s->poolMeta().root_shards;
+    const uint64_t shard = shardOfForTest("part_1", shards);
+    const UInt128 tree_id = u128Of("tree-part_1");
+
+    RootShard root;
+    root.shard_version = 1;
+    root.refs["part_1"] = RefPayload{.tree_id = tree_id, .tree_size = 7, .mutable_files = {}};
+    publishRaw(*b, layout, ns, shard, root);
+
+    s->dropRef(ns, "part_1");
+
+    auto after = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
+    EXPECT_TRUE(after.refs.empty());
+    EXPECT_EQ(after.shard_version, 2u);                 /// +1 from the published value
+    ASSERT_FALSE(after.journal.empty());
+    const JournalRecord & last = after.journal.back();
+    EXPECT_EQ(last.op, JournalRecord::Op::Remove);
+    EXPECT_EQ(last.ref_name, "part_1");
+    EXPECT_EQ(last.tree_id, tree_id);
+    EXPECT_EQ(last.at_version, after.shard_version);    /// at_version == the committed shard_version
+
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+
+    /// Dropping a missing ref is fail-closed, never a silent no-op.
+    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->dropRef(ns, "no_such_ref"); });
+}
+
+TEST(CasStore, UpdateRefPayloadMutatesWithoutJournal)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    Layout layout("p");
+    RootNamespace ns{"srv1/tbl"};
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    const UInt128 tree_id = u128Of("tree-part_1");
+
+    RootShard root;
+    root.shard_version = 3;
+    root.refs["part_1"] = RefPayload{
+        .tree_id = tree_id, .tree_size = 11, .mutable_files = {{"txn_version.txt", "1"}}};
+    publishRaw(*b, layout, ns, shard, root);
+
+    const size_t journal_before = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes).journal.size();
+
+    s->updateRefPayload(ns, "part_1", [](RefPayload & p) { p.mutable_files["txn_version.txt"] = "7"; });
+
+    auto after = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
+    EXPECT_EQ(after.refs.at("part_1").mutable_files.at("txn_version.txt"), "7");
+    EXPECT_EQ(after.refs.at("part_1").tree_id, tree_id);
+    EXPECT_EQ(after.refs.at("part_1").tree_size, 11u);
+    EXPECT_EQ(after.shard_version, 4u);                 /// +1 from the published value
+    EXPECT_EQ(after.journal.size(), journal_before);    /// no reachability change ⇒ no journal record
+
+    /// A mutator that changes tree_id is rejected, and the manifest is left UNTOUCHED.
+    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
+    {
+        s->updateRefPayload(ns, "part_1", [](RefPayload & p) { p.tree_id = u128Of("other"); });
+    });
+    auto unchanged = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
+    EXPECT_EQ(unchanged.shard_version, 4u);             /// throw aborted before casPut
+    EXPECT_EQ(unchanged.refs.at("part_1").tree_id, tree_id);
+    EXPECT_EQ(unchanged.refs.at("part_1").mutable_files.at("txn_version.txt"), "7");
+
+    /// Likewise, a mutator that changes tree_size is rejected.
+    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
+    {
+        s->updateRefPayload(ns, "part_1", [](RefPayload & p) { p.tree_size = 99; });
+    });
+}
+
+TEST(CasStore, DropRefSurvivesCasConflict)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    Layout layout("p");
+    RootNamespace ns{"srv1/tbl"};
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    const UInt128 tree_id = u128Of("tree-part_1");
+
+    RootShard root;
+    root.shard_version = 1;
+    root.refs["part_1"] = RefPayload{.tree_id = tree_id, .tree_size = 7, .mutable_files = {}};
+    publishRaw(*b, layout, ns, shard, root);
+
+    /// Inject one artificial Conflict: the loop must re-read the (unchanged) manifest and re-apply.
+    b->failNextCasPut(layout.rootShardKey(ns, shard));
+    s->dropRef(ns, "part_1");
+
+    auto after = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
+    EXPECT_TRUE(after.refs.empty());
+    EXPECT_GT(after.shard_version, 1u);                 /// advanced (exact delta depends on the fake)
+    ASSERT_FALSE(after.journal.empty());
+    /// Exactly one Remove for part_1 — the mutate must not double-append across the retry.
+    size_t removes = 0;
+    for (const JournalRecord & rec : after.journal)
+        if (rec.op == JournalRecord::Op::Remove && rec.ref_name == "part_1")
+            ++removes;
+    EXPECT_EQ(removes, 1u);
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+}
+
+TEST(CasStore, DropNamespaceTombstonesAndRemovesFiles)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    Layout layout("p");
+    RootNamespace ns{"srv1/tbl"};
+    const uint64_t shards = s->poolMeta().root_shards;
+
+    /// Three refs, one per manifest (their shards may collide; each touched shard holds its refs).
+    const std::vector<String> ref_names{"alpha", "bravo", "charlie"};
+    std::map<uint64_t, RootShard> by_shard;
+    for (const String & name : ref_names)
+    {
+        const uint64_t shard = shardOfForTest(name, shards);
+        by_shard[shard].shard_version = 1;
+        by_shard[shard].refs[name] = RefPayload{
+            .tree_id = u128Of("tree-" + name), .tree_size = 3, .mutable_files = {}};
+    }
+    for (const auto & [shard, root] : by_shard)
+        publishRaw(*b, layout, ns, shard, root);
+
+    /// Two verbatim files.
+    s->putNamespaceFile(ns, "format_version.txt", "1\n");
+    s->putNamespaceFile(ns, "uuid.txt", "abc");
+
+    s->dropNamespace(ns);
+
+    /// Every TOUCHED shard manifest still EXISTS, with empty refs and a Remove journal record.
+    for (const auto & [shard, root] : by_shard)
+    {
+        auto obj = b->get(layout.rootShardKey(ns, shard));
+        ASSERT_TRUE(obj.has_value());
+        auto after = decodeRootShard(obj->bytes);
+        EXPECT_TRUE(after.refs.empty());
+        bool has_remove = false;
+        for (const JournalRecord & rec : after.journal)
+            if (rec.op == JournalRecord::Op::Remove)
+                has_remove = true;
+        EXPECT_TRUE(has_remove);
+    }
+
+    /// UNTOUCHED shards (no manifest) remain absent — no tombstone manifest minted.
+    for (uint64_t shard = 0; shard < shards; ++shard)
+        if (!by_shard.count(shard))
+            EXPECT_FALSE(b->get(layout.rootShardKey(ns, shard)).has_value());
+
+    /// Verbatim files gone; listRefs empty.
+    EXPECT_FALSE(s->getNamespaceFile(ns, "format_version.txt").has_value());
+    EXPECT_FALSE(s->getNamespaceFile(ns, "uuid.txt").has_value());
+    EXPECT_TRUE(s->listRefs(ns).empty());
 }

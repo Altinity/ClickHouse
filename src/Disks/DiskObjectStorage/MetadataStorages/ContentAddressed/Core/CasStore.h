@@ -93,6 +93,15 @@ private:
     /// Read shard manifest (absent ⇒ empty RootShard with no token); used by resolve/list/drop.
     std::pair<RootShard, std::optional<Token>> readShard(const RootNamespace & ns, uint64_t shard);
 
+    /// Read-modify-CAS one shard manifest under the manifest size guard. `mutate` edits the in-memory
+    /// RootShard (which carries the freshly-read shard_version); the helper bumps shard_version, encodes,
+    /// applies the manifest size guard (soft ⇒ LOG_WARNING, hard ⇒ LIMIT_EXCEEDED), and casPut against the
+    /// observed token (nullopt when the shard was absent — create-if-absent). On Conflict it re-reads and
+    /// retries the WHOLE mutate, bounded (100) then ABORTED ("manifest CAS contention on {}"). Single-writer
+    /// shards make a real storm impossible; the bound is a runaway brake. `mutate` runs on the FRESHLY READ
+    /// root each attempt, so a journal append is never double-applied across retries.
+    void mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate);
+
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;

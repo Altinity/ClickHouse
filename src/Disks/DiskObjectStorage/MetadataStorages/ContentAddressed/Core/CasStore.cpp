@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
 #include <city.h>
 #include <algorithm>
 
@@ -14,6 +15,8 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
+    extern const int LIMIT_EXCEEDED;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -199,19 +202,133 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
     return result;
 }
 
-void Store::dropRef(const RootNamespace &, const String &)
+void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Store::dropRef: M-C2 Task 10");
+    const String key = pool_layout.rootShardKey(ns, shard);
+    for (size_t attempt = 0; attempt < 100; ++attempt)
+    {
+        /// Re-read inside the loop so `mutate` always edits the FRESH manifest: on a Conflict retry the
+        /// previous attempt's edits are discarded and re-applied to the winner's state, so a journal
+        /// append is never double-appended.
+        auto [root, token] = readShard(ns, shard);
+        mutate(root);
+        ++root.shard_version;
+        String body = encodeRootShard(root);
+
+        /// Manifest size guard (spec §4): soft ⇒ warn (still commit), hard ⇒ refuse the write.
+        if (body.size() >= config.manifest_hard_limit)
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                "manifest {} size {} reached hard limit {}", key, body.size(), config.manifest_hard_limit);
+        if (body.size() >= config.manifest_soft_limit)
+            LOG_WARNING(getLogger("CasStore"),
+                "manifest {} size {} crossed soft limit {}", key, body.size(), config.manifest_soft_limit);
+
+        if (pool_backend->casPut(key, body, token) == CasOutcome::Committed)
+            return;
+        /// Conflict ⇒ someone committed under us; re-read and re-apply the whole mutate.
+    }
+    throw Exception(ErrorCodes::ABORTED, "manifest CAS contention on {}", key);
 }
 
-void Store::updateRefPayload(const RootNamespace &, const String &, std::function<void(RefPayload &)>)
+void Store::dropRef(const RootNamespace & ns, const String & ref_name)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Store::updateRefPayload: M-C2 Task 10");
+    /// Drop = the same CAS shape as publish (spec §5 step 6): remove refs[name], append {-, name, T}.
+    mutateShard(ns, shardOf(ref_name), [&](RootShard & root)
+    {
+        auto it = root.refs.find(ref_name);
+        if (it == root.refs.end())
+            /// Fail-closed (no silent no-op): the throw propagates out of mutateShard and aborts the drop.
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                "dropRef: no such ref {} in namespace {}", ref_name, ns.string());
+
+        const UInt128 tree_id = it->second.tree_id;
+        root.refs.erase(it);
+        /// The at_version is the NEW shard_version this attempt commits — the helper bumps AFTER mutate,
+        /// so here the post-commit version is root.shard_version + 1.
+        root.journal.push_back(JournalRecord{
+            .op = JournalRecord::Op::Remove, .ref_name = ref_name, .tree_id = tree_id,
+            .at_version = root.shard_version + 1});
+    });
 }
 
-void Store::dropNamespace(const RootNamespace &)
+void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
+                             std::function<void(RefPayload &)> mutator)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Store::dropNamespace: M-C2 Task 10");
+    /// Mutable-fields-only update (design §3): no reachability change ⇒ NO journal record.
+    mutateShard(ns, shardOf(ref_name), [&](RootShard & root)
+    {
+        auto it = root.refs.find(ref_name);
+        if (it == root.refs.end())
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                "updateRefPayload: no such ref {} in namespace {}", ref_name, ns.string());
+
+        const UInt128 old_tree_id = it->second.tree_id;
+        const uint64_t old_tree_size = it->second.tree_size;
+
+        RefPayload payload = it->second;
+        mutator(payload);
+
+        /// A reachability change is not allowed on this path: it would need a journal record (use
+        /// publish/drop instead). Throwing here aborts before casPut — the manifest stays untouched.
+        if (payload.tree_id != old_tree_id || payload.tree_size != old_tree_size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "updateRefPayload must not change tree_id/tree_size; use publish/drop");
+
+        it->second = std::move(payload);
+    });
+}
+
+void Store::dropNamespace(const RootNamespace & ns)
+{
+    /// Tombstone every TOUCHED shard, then delete the verbatim files. GC removes the manifest OBJECTS
+    /// themselves later (M-C3); here we only clear refs + journal the removals (spec §4: untouched
+    /// shards stay absent — we never mint a manifest just to hold a tombstone).
+    for (uint64_t shard = 0; shard < meta.root_shards; ++shard)
+    {
+        const auto [root, token] = readShard(ns, shard);
+        if (!token)
+            continue;                       /// absent shard: stays absent, no manifest minted
+        if (root.refs.empty())
+            continue;                       /// already a tombstone (no live refs): nothing to remove
+
+        mutateShard(ns, shard, [](RootShard & shard_root)
+        {
+            /// Append one Remove per former ref (iterate before clearing), then clear all refs.
+            for (const auto & [ref_name, payload] : shard_root.refs)
+                shard_root.journal.push_back(JournalRecord{
+                    .op = JournalRecord::Op::Remove, .ref_name = ref_name, .tree_id = payload.tree_id,
+                    .at_version = shard_root.shard_version + 1});
+            shard_root.refs.clear();
+        });
+    }
+
+    /// Delete the verbatim files: list → head for the token → deleteExact (single-owner, bounded retry).
+    const String prefix = pool_layout.namespaceFilesPrefix(ns);
+    String cursor;
+    while (true)
+    {
+        ListPage page = pool_backend->list(prefix, cursor, /*limit*/ 1000);
+        for (const ListedKey & listed : page.keys)
+        {
+            for (size_t attempt = 0; attempt < 100; ++attempt)
+            {
+                HeadResult head = pool_backend->head(listed.key);
+                if (!head.exists)
+                    break;                  /// NotFound ⇒ already gone (idempotent)
+                DeleteOutcome outcome = pool_backend->deleteExact(listed.key, head.token);
+                if (outcome.kind == DeleteOutcome::Kind::Deleted
+                    || outcome.kind == DeleteOutcome::Kind::NotFound)
+                    break;
+                /// TokenMismatch ⇒ the object changed under us; re-head and retry.
+                if (attempt + 1 == 100)
+                    throw Exception(ErrorCodes::ABORTED,
+                        "verbatim file delete contention on {}", listed.key);
+            }
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
 }
 
 std::pair<RootShard, std::optional<Token>> Store::readShard(const RootNamespace & ns, uint64_t shard)
