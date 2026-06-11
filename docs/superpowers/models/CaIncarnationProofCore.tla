@@ -320,10 +320,69 @@ StateConstraint ==
     /\ Cardinality(inflight) <= 2
     /\ \A w \in Writers : Cardinality(wDeps[w]) <= 3
 
+\* ---------------------------------------------------------------- inductive-step initializer
+\* Apalache's --init must ASSIGN every variable. IndInv (a conjunction of element-wise bounds and
+\* facts) carries no top-level assignment, so --init=IndInv fails with "v' is used before it is
+\* assigned". The documented idiom (EWD840's InvAndTypeOK) is to combine a most-permissive shape
+\* (every variable a bounded nondeterministic value of its type, via Apalache's Gen) with the
+\* invariant: StateShape ASSIGNS, IndInv CONSTRAINS. StateShape weakens nothing — Gen ranges over
+\* all values of the type; TypeBounds does the pinning. Gen widths cover MaxLog=4 and the small
+\* identity sets with room to spare. Used only for the step check (--init=IndInvInit); the base
+\* case uses --init=Init.
+\* Function-typed variables get an explicit DOMAIN (the index set) so reads under \A h \in Hashes
+\* etc. land on defined entries — a bare Gen produces a function over an arbitrary (FRESH) domain,
+\* making TypeBounds reads junk. Codomains are wide (TypeBounds pins the tight bounds). The Seq-
+\* bearing man and the set-typed variables use Gen (Seq is not finitely enumerable); man's domain
+\* is pinned to Shards by building the function explicitly and Gen-ing only each record value.
+StateShape ==
+    /\ present     \in [Hashes -> BOOLEAN]
+    /\ tokOf       \in [Hashes -> 0..(MaxToken+1)]
+    /\ nextTok     \in [Hashes -> 0..(MaxToken+1)]
+    /\ obsoleteTok \in [Hashes -> SUBSET (0..(MaxToken+1))]
+    /\ man         = [s \in Shards |-> Gen(6)]
+    /\ retired     = Gen(6)
+    /\ inflight    = Gen(6)
+    /\ gcRound     = Gen(1)
+    /\ gcPhase     = Gen(1)
+    /\ fencedSet   \in SUBSET Shards
+    /\ fencePos    \in [Shards -> 0..(MaxLog+2)]
+    /\ cursor      \in [Shards -> 0..(MaxLog+2)]
+    /\ rootEdges   = Gen(6)
+    /\ wDeps       \in [Writers -> SUBSET (Hashes \X (0..(MaxToken+1)))]
+    /\ wView       \in [Writers -> 0..(MaxRound+1)]
+
 \* ---------------------------------------------------------------- invariants / IndInv v1 (Task 4)
 \* The candidate inductive invariant. Each named conjunct is a fact argued informally in the
-\* spec/model work; the CTI loop (Task 5) strengthens. All nine are TLC-pre-filtered against
-\* reachable states before any SMT effort.
+\* spec/model work; the CTI loop (Task 5) strengthens. All are TLC-pre-filtered against reachable
+\* states before any SMT effort.
+\*
+\* TASK 5 STATUS: CHECKPOINT (NOT yet fully inductive). The Apalache one-step induction recipe is
+\* working (StateShape assigns, IndInv constrains; see StateShape). Four CTI-derived facts were
+\* added and TLC-prefiltered green at the documented single-hash bounds (694,265 states, depth 30):
+\* InflightAllocated, PhaseRoundActive, AbsentObsolete, RootEdgesTyped. ONE CTI class remains open.
+\*
+\* OPEN CTI (InflightHeld, GRecheckDelete spared branch): the step admits a state where a delete
+\* [h,t] is in flight AND a retired entry [h,r,t] exists AND tokOf[h]=t (current) AND InDeg(h)>0,
+\* then GRecheckDelete's SPARED branch drops the retired entry, ORPHANING the in-flight delete on a
+\* still-current token (InflightHeld's first disjunct fails, and tokOf[h]#t is false). This CTI is
+\* UNREACHABLE (a missing-fact, not a real bug): the two-hash TLC model — which matches CInit —
+\* explored >17M distinct states to depth 15 and >495M states overall with NO InflightHeld
+\* violation. Unreachability proof sketch: inflight[h,t] is created only by the GRecheckDelete
+\* CONDEMNED branch, which requires InDeg(h)=0 AND FoldedThroughFence (cursor through fencePos, so
+\* all pre-fence records already folded). For InDeg(h) to rise back to >0 a GFold must fold a
+\* post-cursor `add h`; that add is necessarily POST-fence (pre-fence ones were folded), and a
+\* post-fence `WPublish` of h at the current token t is BLOCKED by the gate's RetiredHit(h,t,wView)
+\* (wView >= man[s].fence >= gcRound = r, and [h,r,t] is retired). Hence InDeg(h) cannot rise while
+\* [h,t] is in flight and tokOf[h]=t — the orphan never arises. The INDUCTIVE fact that encodes
+\* this is the fence/cursor/snap-lag coupling lemma family (hint list: phase=fenced ⇒ fencePos ≤
+\* Len(log)+1 with a fence record at fencePos; FoldedThroughFence for any condemned-this-round
+\* entry; retired e.r ≤ gcRound and man.fence covers e.r when fenced; snap = refs modulo the
+\* unfolded tail). Stating + TWO-HASH-validating that multi-conjunct lemma is the remaining work;
+\* single-hash TLC is an INADEQUATE pre-filter for it (an in-flight delete on h2 cannot even be
+\* witnessed at Hashes={h1} — a candidate fact `tokOf[d.h]=d.t => InDeg(d.h)=0` passed single-hash
+\* TLC vacuously yet was FALSE at two hashes, broken by GFold of a stale add: CTI #6). This is the
+\* honest checkpoint boundary (plan Task 5: prefer to stop and report when the structural lemma is
+\* the bottleneck). IndInv = the original 9 + the 4 added below.
 TypeBounds ==   \* domains the types don't carry (Apalache types are unbounded Int/Seq)
     /\ \A h \in Hashes : /\ nextTok[h] \in 1..(MaxToken+1)
                          /\ tokOf[h] \in 0..MaxToken /\ tokOf[h] < nextTok[h]
@@ -345,6 +404,45 @@ TypeBounds ==   \* domains the types don't carry (Apalache types are unbounded I
 
 NoDangle  == \A s \in Shards : \A h \in man[s].refs : present[h]              \* TARGET
 NoReturn  == \A h \in Hashes : present[h] => tokOf[h] \notin obsoleteTok[h]   \* TARGET
+
+RootEdgesTyped ==      \* CTI #4 (Apalache step, 2026-06-11): every root edge is over a real shard
+                       \* and hash (rootEdges \subseteq Shards \X Hashes). The type Set(<<SHARD,HASH>>)
+                       \* does NOT restrict the shard to Shards, so the step admits a junk edge
+                       \* <<fresh_shard, h>> that inflates InDeg(h); GRecheckDelete then takes the
+                       \* SPARED branch (InDeg>0) and drops a retired entry while leaving its delete
+                       \* in flight on a still-current token, violating InflightHeld. Inductive:
+                       \* GFold is the only action adding to rootEdges and it adds <<s,h>> with
+                       \* s \in Shards (the GFold binder) and h \in rec.hs \subseteq Hashes.
+    rootEdges \subseteq (Shards \X Hashes)
+
+AbsentObsolete ==      \* CTI #3 (Apalache step, 2026-06-11): an ABSENT object's last current token
+                       \* is obsolete (or it was never created, tokOf=0). The only action clearing
+                       \* present[h] is Land (real delete), which adds tokOf[h] to obsoleteTok[h] in
+                       \* the same step. Without it the step allows present[h]=FALSE with a stale
+                       \* nonzero tokOf[h] not in obsoleteTok, plus retired entries at that token;
+                       \* WCreate then advances tokOf, orphaning those retired entries and violating
+                       \* RetiredCurrentOrDead. Inductive: Land is the only present->FALSE step and it
+                       \* obsoletes tokOf; tokOf changes only while present=TRUE; obsoleteTok grows.
+    \A h \in Hashes : present[h] \/ tokOf[h] = 0 \/ tokOf[h] \in obsoleteTok[h]
+
+PhaseRoundActive ==    \* CTI #2 (Apalache step, 2026-06-11): an active GC phase implies a started
+                       \* round (gcRound >= 1). GStartRound is the only action entering "retiring",
+                       \* and it sets gcRound := gcRound+1 (>= 1) in the same step; the later phases
+                       \* keep the round. Without it the step lets gcPhase="retiring" sit at
+                       \* gcRound=0, then GRetire stamps a retired entry with r=0, violating
+                       \* TypeBounds' e.r \in 1..MaxRound. Inductive: only GStartRound sets an active
+                       \* phase and it forces gcRound >= 1; no action decreases gcRound.
+    gcPhase \in {"retiring", "fencing", "fenced"} => gcRound >= 1
+
+InflightAllocated ==   \* CTI #1 (Apalache step, 2026-06-11): an in-flight delete's token was
+                       \* actually allocated (d.t < nextTok[d.h]). TypeBounds carries the analogous
+                       \* fact for retired entries but NOT for inflight; without it the step lets a
+                       \* phantom inflight [h, nextTok[h]] sit with no retired entry, then WOverwrite
+                       \* bumps tokOf to that very (unallocated) value, making it current and
+                       \* falsifying InflightHeld. Inductive: inflight grows only via GRecheckDelete
+                       \* from a retired entry e (TypeBounds: e.t < nextTok[e.h]), and nextTok never
+                       \* decreases.
+    \A d \in inflight : d.t < nextTok[d.h]
 
 InflightHeld ==        \* THE lemma (CORRECTED by TLC pre-filter — see below): a delete can be in
                        \* flight only for an entry that is EITHER still held in retired OR whose
@@ -398,4 +496,8 @@ SnapFromPrefix ==      \* the snap is exactly the cursor-prefix fold
 
 IndInv == TypeBounds /\ NoDangle /\ NoReturn /\ InflightHeld /\ RetiredCurrentOrDead
           /\ InflightVsRefs /\ SendImpliesFenced /\ RefsFromLog /\ SnapFromPrefix
+          /\ InflightAllocated /\ PhaseRoundActive /\ AbsentObsolete /\ RootEdgesTyped
+
+\* Inductive-step init: assign (StateShape) then constrain (IndInv). See StateShape comment.
+IndInvInit == StateShape /\ IndInv
 =======================================================================================
