@@ -200,14 +200,29 @@ One pool = one disk root; one bucket/prefix = one pool.
   trees/<T[:2]>/<T>                        CHCA envelope, kind=tree
   packs/<P[:2]>/<P>                        CHCA envelope, kind=pack
   roots/<server_id>/<table_uuid>/<shard>   ROOT MANIFEST (mutable, CAS): the only commit point
-  gc/state                                 CAS: lease{owner,seq}, round, folded_cursor[shard],
-                                           fence_version[round][shard], snap_generation, checkpoint_generation
-  gc/snap/<gen>/<shard>                    in-degree snapshot: present-edge sets + tree expansion markers;
-                                           generation-numbered, monotone, streaming-folded
-  gc/retired/<round>.<fence_seq>/<shard>   retire set: {kind, hash, observed_token, token_type, size};
-                                           append-by-unique-path (two leaders never overwrite each other)
-  gc/outcomes/<round>.<fence_seq>/<shard>  retire outcomes {deleted|absent|replaced|spared}; trimmed after
-                                           checkpoint inclusion
+  gc/state                                 CAS: lease{owner,seq}, round, snap_shards (GC constant),
+                                           folded_cursor[root_shard], fence_version[round][root_shard],
+                                           snap_generation, checkpoint_generation. (folded_cursor and
+                                           fence_version are indexed by ROOT shard — they track per-root
+                                           journal-fold progress and fence points; the snap/retired/outcome
+                                           objects are indexed by target-hash-prefix snap_shard. Two distinct
+                                           sharding axes: roots are the journal sources, snap shards the
+                                           in-degree targets.)
+  gc/snap/<gen>/<snap_shard>               in-degree snapshot: present-edge sets + tree expansion markers;
+                                           generation-numbered, monotone, streaming-folded. SHARDED BY THE
+                                           TARGET CONTENT-HASH PREFIX (snap_shard = hash_prefix(node_hash) %
+                                           snap_shards; snap_shards a GC constant, default 1): every edge
+                                           targeting a node lands in the NODE's own snap shard, so a node's
+                                           in-degree is always INTRA-SHARD — no cross-shard aggregation, no
+                                           intersection between shards. (decision 2026-06-11. NOT the root
+                                           shard: root in-degree of a content object is global across roots
+                                           and parent trees, which only a target-hash-prefix sharding keeps
+                                           collision-free.)
+  gc/retired/<round>.<fence_seq>/<snap_shard>  retire set: {kind, hash, observed_token, token_type, size};
+                                           append-by-unique-path (two leaders never overwrite each other);
+                                           sharded by the same target-hash prefix as the snap
+  gc/outcomes/<round>.<fence_seq>/<snap_shard>  retire outcomes {deleted|absent|replaced|spared}; trimmed
+                                           after checkpoint inclusion; same target-hash-prefix sharding
   gc/checkpoint/<n>                        full-GC checkpoints: reachable-set summary + cut_version[shard]
   builds/<build_id[:2]>/<build_id>         build heartbeat: {server_id, heartbeat_seq (monotone), provenance};
                                            keyed by build_id ALONE (a random u128, globally unique) so full GC
