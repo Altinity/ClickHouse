@@ -72,6 +72,12 @@ DROP (out of proof-core scope, each a recorded residual): trees (`treeEdges, mar
 - [ ] **Step 2: Actions kept (16), with these exact changes.**
 
 Writers: `WCreate, WReuse, WResurrect, WReobserve, WRefreshView, WAbandon, WPublish, WDrop, WOverwrite` — `WResurrect`'s condemned-guard and `WPublish`'s gate use **`RetiredHit` only** (no `deadTok` consult anywhere in guards — the faithful re-observation world; `deadTok` remains write-only history for `NoReturn`); `WPublish`'s gate = `\A <<h,t>> \in wDeps[w] : ~RetiredHit(h,t,wView[w]) /\ present[h] /\ tokOf[h] = t` plus `wView[w] >= man[s].fence`; drop `TreeDepsOK` and the `WCreate` child guard (no trees). `WOverwrite` and `WResurrect` keep the `deadTok'` update (the model rule).
+
+> **Why the proof-core gate needs no `deadTok` (state this as a module comment too):** this differs from
+> the main model's stage-1 oracle fix *intentionally*. The re-observation conjunct `present[h] /\
+> tokOf[h] = t` blocks a stale dependency on a deleted token (`present = FALSE`) and on a
+> displaced/overwritten token (`tokOf # t`) directly — `deadTok` is needed only as the `NoReturn`
+> history variable, never as a gate input. This is exactly the spec's `W-REVALIDATE` claim.
 GC (single leader, guards minus the `Leaders` quantifier): `GStartRound, GFold, GRetire, GFenceShard, GRecheckDelete, GEndRound, Land` — semantics identical (entry kept until landing; spared drops; cascade branch removed since no trees).
 
 - [ ] **Step 3: Journal record type (the one Apalache-forced deviation).** Apalache rejects heterogeneous record unions, so the main model's `AddRec ∪ FenceRec` becomes a uniform record:
@@ -132,15 +138,20 @@ VARIABLES
     wView
 ```
 
-- [ ] **Step 5: Constant initializer** (Apalache has no TLC model values):
+- [ ] **Step 5: Constant initializer** (Apalache has no TLC model values). DEFAULT to the boring,
+tool-friendly literal form — uninterpreted-type literals are **distinct by construction**:
 
 ```tla
 CInit ==
-    /\ Writers = Gen(2) /\ Shards = Gen(1) /\ Hashes = Gen(2)   \* see note
+    /\ Writers = { "w1_OF_WRITER", "w2_OF_WRITER" }
+    /\ Shards  = { "s1_OF_SHARD" }
+    /\ Hashes  = { "h1_OF_HASH", "h2_OF_HASH" }
     /\ MaxToken = 3 /\ MaxRound = 2 /\ MaxLog = 4
 ```
 
-Note: if `Gen` for constant sets is awkward in the installed version, the fallback is concrete uninterpreted constants via `--cinit` with `Writers = {"w1_OF_WRITER","w2_OF_WRITER"}`-style literals (Apalache's uninterpreted-literal syntax) — use whichever the installed version's manual prescribes; record the choice.
+(Do NOT use declared `CONSTANTS w1, w2, ...` of uninterpreted type as the identity values — declared
+uninterpreted constants are *not* automatically distinct in Apalache; the literal syntax is. `Gen(n)`
+is the alternative if the installed version's manual prefers it — record whichever is used.)
 
 - [ ] **Step 6: Fold operators** (needed by the structural lemmas; Apalache forbids unbounded recursion — use its folds):
 
@@ -156,6 +167,11 @@ FoldRefs(log) == ApaFoldSeqLeft(ApplyRec, {}, log)
 \* @type: (Seq({ op: Str, hs: Set(HASH) }), Int) => Set(HASH);
 FoldPrefix(log, n) == ApaFoldSeqLeft(ApplyRec, {}, SubSeq(log, 1, n))
 ```
+
+These folds are the most likely SMT bottleneck. Known escape hatch (pre-authorized, detailed in
+Task 5): if the step check spends its time in `FoldRefs`/`FoldPrefix`, replace the `Seq` journal
+with an abstract per-shard published/folded counter pair + an unfolded-adds set — try the sequence
+version first, do not spend days optimizing it.
 
 - [ ] **Step 7: SANY-parse** (`tla2sany.SANY`) — must be clean. Commit: `CA model: proof core module for Apalache induction (single-leader token core, W-REVALIDATE gate)` + trailer.
 
@@ -218,6 +234,7 @@ TypeBounds ==   \* domains the types don't carry (Apalache types are unbounded I
                          /\ \A i \in DOMAIN man[s].log : /\ man[s].log[i].op \in {"add","rem","fence"}
                                                          /\ man[s].log[i].hs \subseteq Hashes
     /\ \A e \in retired : e.h \in Hashes /\ e.t \in 1..MaxToken /\ e.r \in 1..MaxRound
+                          /\ e.t < nextTok[e.h]      \* a retired token was allocated
     /\ \A d \in inflight : d.h \in Hashes /\ d.t \in 1..MaxToken
     /\ \A w \in Writers : wView[w] \in 0..MaxRound
                           /\ \A p \in wDeps[w] : p[1] \in Hashes /\ p[2] \in 1..MaxToken
@@ -225,10 +242,18 @@ TypeBounds ==   \* domains the types don't carry (Apalache types are unbounded I
 NoDangle  == \A s \in Shards : \A h \in man[s].refs : present[h]          \* TARGET
 NoReturn  == \A h \in Hashes : present[h] => tokOf[h] \notin deadTok[h]   \* TARGET
 
-InflightHeld ==        \* THE lemma: a delete can be in flight only for a held entry
+InflightHeld ==        \* THE lemma: a delete can be in flight only for a held entry.
+                       \* NOTE: this depends on the modeling choice that outcome consumption is
+                       \* ATOMIC with the delete-message landing (Land drops the matching retired
+                       \* entry in the same step). A later refactor to separate outcome logs
+                       \* breaks this conjunct's inductiveness — revisit it together.
     \A d \in inflight : \E e \in retired : e.h = d.h /\ e.t = d.t
 
-RetiredCurrentOrDead ==   \* a retired token is still current or already displaced/dead
+RetiredCurrentOrDead ==   \* a retired token is still current, or it STOPPED BEING CURRENT and is
+                          \* therefore in deadTok. Read deadTok as "displaced-or-deleted history",
+                          \* NOT "physically deleted": WResurrect/WOverwrite add the displaced old
+                          \* token to deadTok atomically (the model rule, MR-2) — which is exactly
+                          \* why the resurrect-displacement state does not falsify this lemma.
     \A e \in retired : e.t = tokOf[e.h] \/ e.t \in deadTok[e.h]
 
 InflightVsRefs ==      \* the heart: an in-flight-deletable token is never a referenced current token
@@ -238,7 +263,11 @@ SendImpliesFenced ==   \* a delete is sent only after every shard's fence covers
     \A d \in inflight : \E e \in retired :
         e.h = d.h /\ e.t = d.t /\ \A s \in Shards : man[s].fence >= e.r
 
-RefsFromLog ==         \* manifest CAS keeps refs and journal atomic — refs IS the full-log fold
+RefsFromLog ==         \* manifest CAS keeps refs and journal atomic — refs IS the full-log fold.
+                       \* SCOPE: this is the LOGICAL / pre-compaction manifest (the proof core has
+                       \* no Trim). Production manifests trim folded tails: there, refs = fold of
+                       \* (checkpoint base + tail). Physical trimming is covered by the TLC model
+                       \* (INV_JOURNAL_COVERAGE), not by this proof core — a recorded residual.
     \A s \in Shards : man[s].refs = FoldRefs(man[s].log)
 
 SnapFromPrefix ==      \* the snap is exactly the cursor-prefix fold
@@ -272,7 +301,7 @@ Three outcomes, each with a fixed response:
 - **PASS** → IndInv is inductive. Go to Task 6.
 - **Counterexample (a CTI)**: a state satisfying IndInv whose successor violates it. Read `tmp/apa_step.log` + the generated counterexample files (Apalache writes `_apalache-out/.../violation.tla`). Classify:
   1. **Missing fact** (the CTI state is unreachable but IndInv doesn't exclude it — by far the most common): identify the fact that excludes it, ADD a named conjunct, TLC-pre-filter the new conjunct (Task 4 Step 2 — mandatory before re-running SMT), re-run the step check.
-  2. **Real bug** (the CTI state IS reachable — confirm by TLC-checking the violated conjunct as an invariant; if TLC also violates it, you mis-transcribed a lemma — case 1 in disguise; if the violated conjunct is `NoDangle`/`NoReturn` AND TLC at proof-core bounds passes them, the CTI is unreachable — case 1): a genuine reachable safety violation would already have been TLC-caught; treat any apparent "real bug" with extreme suspicion and escalate with the trace rather than patching.
+  2. **Real bug** (the CTI state IS reachable — confirm by TLC-checking the violated conjunct as an invariant; if TLC also violates it, you mis-transcribed a lemma — case 1 in disguise; if the violated conjunct is `NoDangle`/`NoReturn` AND TLC at proof-core bounds passes them, the CTI is unreachable — case 1): a genuine reachable safety violation should usually have been reproduced by TLC within the proof-core bounds — but only if the TLC config exercises the same actions and bounds as `CInit`; compare the two configs before classifying. Treat any apparent "real bug" with extreme suspicion and escalate with the trace rather than patching.
   3. **Abstraction artifact / SMT timeout**: if the step check times out (30 min), first try `--smt-encoding=funArrays`, then shrink `MaxLog = 3` in `CInit`; if the journal folds are the bottleneck, the PRE-AUTHORIZED fallback is to replace the `Seq` journal with an abstract per-shard counter pair (published-count / folded-count) + an unfolded-adds set, re-deriving `RefsFromLog`/`SnapFromPrefix` over it — record the abstraction and re-run Task 2's TLC cross-validation on the abstracted module first.
 - **Budget**: up to ~15 CTI iterations or ~3 working hours of SMT. If not inductive by then, STOP and checkpoint: commit the current IndInv state, write up the remaining CTI class honestly (a partially-strengthened invariant + the open CTI is still a deliverable — it documents exactly what a TLAPS effort would face).
 
@@ -301,6 +330,24 @@ docs/superpowers/models/run_apalache.sh ctlrefs check --cinit=CInit --init=IndIn
 ```
 
 EACH must FAIL the step check (a CTI appears) — proving the removed lemma is load-bearing for the induction, not decorative. If one still passes, either the remaining conjuncts imply it (fine — document the implication) or the invariant is over-strong somewhere (investigate before accepting).
+
+- [ ] **Step 2b: Gate negative control (the F1 bug class, the most important control).** Define in the module a weakened publish action and next-relation — flag-free, selected via Apalache's `--next`:
+
+```tla
+\* NEGATIVE CONTROL ONLY: WPublish without the re-observation conjunct (the F1 bug class).
+WPublishNoReval(w, s, h) ==
+    <copy of WPublish with the per-dep conjunct reduced to ~RetiredHit(h, t, wView[w]) —
+     the present[h] /\ tokOf[h] = t conjunct REMOVED; everything else identical>
+NextNoReval == <copy of Next with WPublish replaced by WPublishNoReval>
+```
+
+(Write both out in full in the module — they are mechanical copies with one conjunct removed; mark them with a comment banner so nobody mistakes them for the real protocol.) Then:
+
+```bash
+docs/superpowers/models/run_apalache.sh ctlreval check --cinit=CInit --init=IndInv --next=NextNoReval --inv=IndInv --length=1 CaIncarnationProofCore.tla
+```
+
+MUST FAIL with a CTI — expected shape: a stale token-bearing dependency (object deleted or displaced after observation) passes the weakened gate and publishes, violating `NoDangle`/`InflightVsRefs`. This is the direct machine-checked witness that the `W-REVALIDATE` re-observation conjunct is what carries F1 in the inductive argument.
 - [ ] **Step 3: Sanity that Init is satisfiable** (a contradictory IndInv passes everything vacuously): `--init=IndInv --inv=FalseInv --length=0` with `FalseInv == FALSE` MUST produce a counterexample (= an IndInv state exists). 
 - [ ] **Step 4: Commit**: `CA model: induction negative controls — InflightHeld/InflightVsRefs load-bearing; IndInv satisfiable`.
 
