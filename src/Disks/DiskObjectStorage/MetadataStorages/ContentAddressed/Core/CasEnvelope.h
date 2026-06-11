@@ -44,7 +44,10 @@ struct EnvelopeHeader
 {
     ObjectKind kind = ObjectKind::Blob;
     uint8_t hash_algo = 1;             /// 1 = cityHash128
-    uint64_t logical_size = 0;         /// bytes covered by logical_hash = [header_len + index_len, EOF)
+    /// Bytes covered by logical_hash = [header_len, EOF) = object_size - header_len, UNIFORMLY for
+    /// all kinds (spec §3.1). For packs this INCLUDES the index:
+    /// logical_size = index_len + payload_region_size, and logical_hash covers index ‖ payload region.
+    uint64_t logical_size = 0;
     UInt128 logical_hash{};
     UInt128 domain_id{};
     UInt128 incarnation_tag{};
@@ -70,7 +73,9 @@ String encodeEnvelopeHeader(EnvelopeHeader & header);
 ///   index_len rule violation / size arithmetic mismatch / crc mismatch      -> CORRUPTED_DATA
 EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object_size, ObjectKind expected_kind);
 
-/// Payload starts after header and (packs only) the index.
+/// Payload starts after header and (packs only) the index. Note: for packs this points INTO the
+/// hashed+sized region — the payload region is a sub-range of [header_len, EOF), which logical_size
+/// and logical_hash cover in full (index included); payloadOffset is NOT the start of the hashed area.
 inline uint64_t payloadOffset(const EnvelopeHeader & header)
 {
     return static_cast<uint64_t>(header.header_len) + header.index_len;

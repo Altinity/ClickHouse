@@ -223,12 +223,17 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
                 "CHCA envelope: header_crc32c mismatch (computed {:08x}, stored {:08x})", computed, stored_crc);
     }
 
-    /// Size arithmetic: header_len + index_len + logical_size == object_size.
-    const uint64_t expected_object_size = static_cast<uint64_t>(header_len) + h.index_len + h.logical_size;
+    /// Size arithmetic (uniform for ALL kinds, spec §3.1): header_len + logical_size == object_size.
+    /// logical_size covers [header_len, EOF); for packs that INCLUDES the index
+    /// (logical_size = index_len + payload_region_size).
+    const uint64_t expected_object_size = static_cast<uint64_t>(header_len) + h.logical_size;
     if (expected_object_size != object_size)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-            "CHCA envelope: size mismatch (header_len {} + index_len {} + logical_size {} = {}, object_size {})",
-            header_len, h.index_len, h.logical_size, expected_object_size, object_size);
+            "CHCA envelope: size mismatch (header_len {} + logical_size {} = {}, object_size {})",
+            header_len, h.logical_size, expected_object_size, object_size);
+    if (h.index_len > h.logical_size)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "CHCA envelope: index_len {} exceeds logical_size {}", h.index_len, h.logical_size);
 
     /// [96, header_len) TLV extensions. Encode pads the area to 8-alignment with zero bytes; a valid
     /// TLV type is never 0, so a zero type marks the start of alignment padding (which must be all

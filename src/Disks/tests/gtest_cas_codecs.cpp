@@ -90,9 +90,43 @@ TEST(CasEnvelope, PayloadOffsetHelper)
     EnvelopeHeader h = makeBlobHeader();
     h.kind = ObjectKind::Pack;
     h.index_len = 32;
+    h.logical_size = 32 + 968;   /// logical_size covers [header_len, EOF): index (32) + payload (968)
     String bytes = encodeEnvelopeHeader(h);
-    EnvelopeHeader d = decodeEnvelopeHeader(bytes, h.header_len + h.index_len + h.logical_size, ObjectKind::Pack);
+    EnvelopeHeader d = decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Pack);
     EXPECT_EQ(payloadOffset(d), static_cast<uint64_t>(d.header_len) + d.index_len);
+}
+
+TEST(CasEnvelope, PackSizeArithmeticPerFrozenSpec)
+{
+    /// Pins the frozen-spec pack arithmetic (spec §3.1): logical_size = object_size - header_len
+    /// UNIFORMLY — for a pack with an I-byte index and a P-byte payload region,
+    /// logical_size = I + P and object_size = header_len + I + P (NO extra index_len term).
+    constexpr uint64_t I = 64;
+    constexpr uint64_t P = 5000;
+
+    EnvelopeHeader h = makeBlobHeader();
+    h.kind = ObjectKind::Pack;
+    h.index_len = I;
+    h.logical_size = I + P;
+    String bytes = encodeEnvelopeHeader(h);
+
+    /// The correct object size decodes...
+    EnvelopeHeader d = decodeEnvelopeHeader(bytes, h.header_len + I + P, ObjectKind::Pack);
+    EXPECT_EQ(d.logical_size, I + P);
+    EXPECT_EQ(d.index_len, I);
+    EXPECT_EQ(payloadOffset(d), static_cast<uint64_t>(d.header_len) + I);
+
+    /// ... while the rejected reading (object_size = header_len + index_len + logical_size,
+    /// i.e. logical_size excluding the index) must throw.
+    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + I + h.logical_size, ObjectKind::Pack), DB::Exception);
+
+    /// index_len larger than logical_size is structurally impossible and must throw.
+    EnvelopeHeader bad = makeBlobHeader();
+    bad.kind = ObjectKind::Pack;
+    bad.index_len = 100;
+    bad.logical_size = 50;
+    String bad_bytes = encodeEnvelopeHeader(bad);
+    EXPECT_THROW(decodeEnvelopeHeader(bad_bytes, bad.header_len + bad.logical_size, ObjectKind::Pack), DB::Exception);
 }
 
 /// ---------- validation throw-paths ----------
