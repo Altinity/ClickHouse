@@ -199,6 +199,18 @@ One pool = one disk root; one bucket/prefix = one pool.
   blobs/<H[:2]>/<H>                        CHCA envelope, kind=blob
   trees/<T[:2]>/<T>                        CHCA envelope, kind=tree
   packs/<P[:2]>/<P>                        CHCA envelope, kind=pack
+  roots/_registry                          NAMESPACE REGISTRY (mutable, CAS): {registry_version,
+                                           fence_round, namespaces[]}. The authoritative namespace
+                                           universe (decision 2026-06-12). A writer's FIRST publish
+                                           into a namespace CAS-appends it here BEFORE creating any
+                                           shard manifest; GC discovers namespaces FROM the registry
+                                           (never LIST) and fences it like a shard. This orders
+                                           namespace CREATION against the fence — without it, a
+                                           first-publish-to-a-new-namespace is invisible to both
+                                           fence horns and a stale-view writer could republish a
+                                           condemned hash past the recheck (a dangle). Namespaces
+                                           stay registered until full GC removes them with their
+                                           final manifests (M-F).
   roots/<server_id>/<table_uuid>/<shard>   ROOT MANIFEST (mutable, CAS): the only commit point
   gc/state                                 CAS: lease{owner,seq}, round, snap_shards (GC constant),
                                            folded_cursor[root_shard], fence_version[round][root_shard],
@@ -309,6 +321,14 @@ W-TREE-BUILD    bottom-up build discipline, at every level (F2, model-discovered
                 explicitly for trees. The model checks the one-level case; the transitive nested-subtree
                 case is a recorded residual.
 W-MANIFEST-CAS  root-manifest writes are always CAS (refs+journal are not idempotent content).
+W-REGISTER      before the FIRST publish into a root namespace, the writer CAS-appends the namespace
+                to roots/_registry; the registry's fence_round acts as a gate floor for that publish
+                (view round < registry fence_round ⇒ refresh + W-REVALIDATE before proceeding), and
+                the manifest gate then uses max(manifest.fence_round, registry fence at registration).
+                Already-registered namespaces skip this (the per-shard fence carries the ordering:
+                R3 fences ALL root_shards shards of every registered namespace each round, minting
+                fence-only manifests for absent shards — the create-if-absent race against a first
+                shard publish is the required total order). (decision 2026-06-12)
 ```
 
 Publishing a part `name`:
@@ -396,8 +416,12 @@ R1 FOLD     per root shard: stream-merge journal records in (folded_cursor, shar
 R2 RETIRE   per candidate: one HEAD observes the current token; append {kind, hash, observed_token,
             token_type, size} durably to gc/retired/<R>.<fence_seq>/<shard>. Retired ≠ dead: it is the
             writer-facing "resurrect, don't reuse" barrier.
-R3 FENCE    CAS every root shard: fence_round := R; record fence_version[R][shard] in gc/state.
-            One fence covers the whole round's candidate set.
+R3 FENCE    CAS the namespace registry (fence_round := R, monotone), then CAS EVERY root shard of
+            EVERY registered namespace: fence_round := R (monotone max), MINTING a fence-only
+            manifest (create-if-absent CAS) for absent shards — the create race against a first
+            publish is the required total order; record fence_version[R][shard] (and the registry's
+            version) in gc/state. One fence covers the whole round's candidate set. Discovery (R1)
+            reads the registry, never LIST. (amended 2026-06-12)
 R4 RECHECK  fold every shard through ≥ its recorded fence version (provable, not asserted). Per entry:
    +DELETE    in-degree > 0            → outcome=spared, drop entry
               else DELETE If-Match tok → 2xx: outcome=deleted (trees: cascade step below), drop entry
