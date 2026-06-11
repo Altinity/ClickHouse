@@ -1,0 +1,186 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+
+namespace DB::Cas
+{
+
+Token InMemoryBackend::mintToken()
+{
+    Token t;
+    t.value = std::to_string(++token_seq_);
+    t.type = TokenType::Emulated;
+    return t;
+}
+
+std::optional<GetResult> InMemoryBackend::get(const String & key, Range range)
+{
+    std::lock_guard lock(mutex_);
+    auto it = store_.find(key);
+    if (it == store_.end())
+        return std::nullopt;
+
+    const String & data = it->second.bytes;
+    String result;
+    size_t offset = static_cast<size_t>(range.offset);
+    if (offset >= data.size())
+    {
+        result = "";
+    }
+    else if (range.length.has_value())
+    {
+        size_t len = static_cast<size_t>(*range.length);
+        result = data.substr(offset, len);
+    }
+    else
+    {
+        result = data.substr(offset);
+    }
+
+    GetResult gr;
+    gr.bytes = std::move(result);
+    gr.token = it->second.token;
+    return gr;
+}
+
+HeadResult InMemoryBackend::head(const String & key)
+{
+    std::lock_guard lock(mutex_);
+    auto it = store_.find(key);
+    if (it == store_.end())
+        return HeadResult{};
+
+    HeadResult hr;
+    hr.exists = true;
+    hr.size = static_cast<uint64_t>(it->second.bytes.size());
+    hr.token = it->second.token;
+    return hr;
+}
+
+PutOutcome InMemoryBackend::putIfAbsent(const String & key, const String & bytes, Token * out_token)
+{
+    std::lock_guard lock(mutex_);
+    if (store_.count(key))
+        return PutOutcome::PreconditionFailed;
+
+    Token t = mintToken();
+    Object obj;
+    obj.bytes = bytes;
+    obj.token = t;
+    store_[key] = std::move(obj);
+    if (out_token)
+        *out_token = t;
+    return PutOutcome::Done;
+}
+
+PutOutcome InMemoryBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token)
+{
+    std::lock_guard lock(mutex_);
+    auto it = store_.find(key);
+    if (it == store_.end())
+        return PutOutcome::PreconditionFailed;
+
+    if (it->second.token != expected)
+        return PutOutcome::PreconditionFailed;
+
+    Token t = mintToken();
+    it->second.bytes = bytes;
+    it->second.token = t;
+    if (out_token)
+        *out_token = t;
+    return PutOutcome::Done;
+}
+
+CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token)
+{
+    std::lock_guard lock(mutex_);
+
+    auto it = store_.find(key);
+    bool exists = (it != store_.end());
+
+    if (!expected.has_value())
+    {
+        // create-if-absent CAS
+        if (exists)
+            return CasOutcome::Conflict;
+        Token t = mintToken();
+        Object obj;
+        obj.bytes = bytes;
+        obj.token = t;
+        store_[key] = std::move(obj);
+        if (out_token)
+            *out_token = t;
+        return CasOutcome::Committed;
+    }
+    else
+    {
+        // swap-if-current CAS
+        if (!exists)
+            return CasOutcome::Conflict;
+        if (it->second.token != *expected)
+            return CasOutcome::Conflict;
+        Token t = mintToken();
+        it->second.bytes = bytes;
+        it->second.token = t;
+        if (out_token)
+            *out_token = t;
+        return CasOutcome::Committed;
+    }
+}
+
+DeleteOutcome InMemoryBackend::deleteExact(const String & key, const Token & token)
+{
+    std::lock_guard lock(mutex_);
+
+    auto it = store_.find(key);
+    if (it == store_.end())
+    {
+        DeleteOutcome d;
+        d.kind = DeleteOutcome::Kind::NotFound;
+        return d;
+    }
+
+    if (it->second.token != token)
+    {
+        DeleteOutcome d;
+        d.kind = DeleteOutcome::Kind::TokenMismatch;
+        return d;
+    }
+
+    store_.erase(it);
+    DeleteOutcome d;
+    d.kind = DeleteOutcome::Kind::Deleted;
+    d.created_delete_marker = false;
+    return d;
+}
+
+ListPage InMemoryBackend::list(const String & prefix, const String & cursor, size_t limit)
+{
+    std::lock_guard lock(mutex_);
+    ListPage page;
+
+    // Start from max(prefix, cursor) — whichever sorts later
+    const String & start = (cursor > prefix) ? cursor : prefix;
+
+    auto it = store_.lower_bound(start);
+
+    size_t count = 0;
+    while (it != store_.end() && count < limit)
+    {
+        if (it->first.substr(0, prefix.size()) != prefix)
+            break;
+
+        ListedKey lk;
+        lk.key = it->first;
+        lk.size = static_cast<uint64_t>(it->second.bytes.size());
+        page.keys.push_back(std::move(lk));
+        ++count;
+        ++it;
+    }
+
+    // Set next_cursor if there are more keys in this prefix
+    if (it != store_.end() && it->first.substr(0, prefix.size()) == prefix)
+        page.next_cursor = it->first;
+
+    return page;
+}
+
+}
