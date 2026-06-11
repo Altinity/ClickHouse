@@ -51,6 +51,8 @@ VARIABLES
                \* and the future WOverwrite in stage 5) OR physical delete (Land) — MUST add that token here.
                \* CondemnedAtView consults deadTok, so this is what rejects a stale token-bearing dependency.
                \* Omitting the deadTok update in any such action silently reintroduces a dangling-ref bug.
+               \* NAMING: "dead as a publish dependency" (displaced by resurrect/overwrite OR deleted),
+               \* NOT "physically deleted". The Apalache proof core names this obsoleteTok for clarity.
     \* ---- S3 durable: roots + GC ----
     man,       \* [Shards -> [fence: 0..MaxRound, refs: SUBSET Hashes, log: Seq(Rec)]]
     retired,   \* SUBSET [h: Hashes, t: Toks, r: 1..MaxRound]

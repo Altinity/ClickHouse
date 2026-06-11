@@ -66,18 +66,30 @@ Derive it from `CaIncarnationCore.tla` by EXACT surgery — single leader, `W-RE
 
 - [ ] **Step 1: Variables kept (14) / dropped.**
 
-KEEP (semantics identical to the main model): `present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase, fencePos, cursor, rootEdges, wDeps, wView` — with `gcPhase` a plain string (single leader) and `fencedSet` a plain `Set(SHARD)` (add it: 15th variable, single-leader form).
+KEEP (semantics identical to the main model): `present, tokOf, nextTok, obsoleteTok, man, retired, inflight, gcRound, gcPhase, fencePos, cursor, rootEdges, wDeps, wView` — with `gcPhase` a plain string (single leader) and `fencedSet` a plain `Set(SHARD)` (add it: 15th variable, single-leader form).
+
+> **RENAME (proof core only):** the main model's `deadTok` is named **`obsoleteTok`** here — "tokens
+> that stopped being current as a dependency" (by delete, resurrect, OR overwrite), NOT "physically
+> deleted". Two reviewers independently misread the old name; the semantics are identical (MR-2).
+> Everywhere the main model's docs say `deadTok`, the proof core reads `obsoleteTok`.
+
+> **MR-2 completeness checklist (verify after writing the module):** every action that changes
+> `tokOf[h]` or clears `present[h]` obeys the rule — `WResurrect` adds the displaced old token;
+> `WOverwrite` adds the displaced old token; `Land` (real delete) adds the deleted current token;
+> `WCreate` has no prior token (0 → t, nothing to add). No action may ever add `0` to the history —
+> guaranteed because every displacing/deleting action guards on `present[h]` (⇒ `tokOf[h] >= 1`) and
+> `TypeBounds` pins `obsoleteTok[h] \subseteq 1..(nextTok[h]-1)`.
 DROP (out of proof-core scope, each a recorded residual): trees (`treeEdges, marker, pendCasc, TreeHashes`), debris/heartbeats (`creator, hbAlive, hbSeq, wedged, hbObs`), full-GC walk (`fgPhase, fgCut, fgRefs, fgSeen`), `trimBase` (+ `Trim`, `INV_JOURNAL_COVERAGE`), `roundOf` (single leader: `gcRound` is the active round), all `Enable*`/`Sabotage*` flags (proof core is flag-free; negative controls are invariant-side, Task 6), `Ev`/evidence deps (`wDeps` is token-only: `Set(<<HASH, Int>>)`).
 
 - [ ] **Step 2: Actions kept (16), with these exact changes.**
 
-Writers: `WCreate, WReuse, WResurrect, WReobserve, WRefreshView, WAbandon, WPublish, WDrop, WOverwrite` — `WResurrect`'s condemned-guard and `WPublish`'s gate use **`RetiredHit` only** (no `deadTok` consult anywhere in guards — the faithful re-observation world; `deadTok` remains write-only history for `NoReturn`); `WPublish`'s gate = `\A <<h,t>> \in wDeps[w] : ~RetiredHit(h,t,wView[w]) /\ present[h] /\ tokOf[h] = t` plus `wView[w] >= man[s].fence`; drop `TreeDepsOK` and the `WCreate` child guard (no trees). `WOverwrite` and `WResurrect` keep the `deadTok'` update (the model rule).
+Writers: `WCreate, WReuse, WResurrect, WReobserve, WRefreshView, WAbandon, WPublish, WDrop, WOverwrite` — `WResurrect`'s condemned-guard and `WPublish`'s gate use **`RetiredHit` only** (no obsolete-token consult anywhere in guards — the faithful re-observation world; `obsoleteTok` remains write-only history for `NoReturn`); `WPublish`'s gate = `\A <<h,t>> \in wDeps[w] : ~RetiredHit(h,t,wView[w]) /\ present[h] /\ tokOf[h] = t` plus `wView[w] >= man[s].fence`; drop `TreeDepsOK` and the `WCreate` child guard (no trees). `WOverwrite` and `WResurrect` keep the `obsoleteTok'` update (the model rule).
 
-> **Why the proof-core gate needs no `deadTok` (state this as a module comment too):** this differs from
-> the main model's stage-1 oracle fix *intentionally*. The re-observation conjunct `present[h] /\
-> tokOf[h] = t` blocks a stale dependency on a deleted token (`present = FALSE`) and on a
-> displaced/overwritten token (`tokOf # t`) directly — `deadTok` is needed only as the `NoReturn`
-> history variable, never as a gate input. This is exactly the spec's `W-REVALIDATE` claim.
+> **Why the proof-core gate needs no obsolete-token oracle (state this as a module comment too):**
+> this differs from the main model's stage-1 oracle fix *intentionally*. The re-observation conjunct
+> `present[h] /\ tokOf[h] = t` blocks a stale dependency on a deleted token (`present = FALSE`) and
+> on a displaced/overwritten token (`tokOf # t`) directly — `obsoleteTok` is needed only as the
+> `NoReturn` history variable, never as a gate input. This is exactly the spec's `W-REVALIDATE` claim.
 GC (single leader, guards minus the `Leaders` quantifier): `GStartRound, GFold, GRetire, GFenceShard, GRecheckDelete, GEndRound, Land` — semantics identical (entry kept until landing; spared drops; cascade branch removed since no trees).
 
 - [ ] **Step 3: Journal record type (the one Apalache-forced deviation).** Apalache rejects heterogeneous record unions, so the main model's `AddRec ∪ FenceRec` becomes a uniform record:
@@ -113,7 +125,7 @@ VARIABLES
     \* @type: HASH -> Int;
     nextTok,
     \* @type: HASH -> Set(Int);
-    deadTok,
+    obsoleteTok,   \* main model's deadTok: tokens that stopped being current (delete/resurrect/overwrite)
     \* @type: SHARD -> { fence: Int, refs: Set(HASH), log: Seq({ op: Str, hs: Set(HASH) }) };
     man,
     \* @type: Set({ h: HASH, t: Int, r: Int });
@@ -184,7 +196,7 @@ The proof core must agree with the main model before any SMT effort. TLC is also
 **Files:**
 - Create: `docs/superpowers/models/CaIncarnationProofCore_tlc.cfg`
 
-- [ ] **Step 1: Config** — stage-2-equivalent bounds, TLC model values: `Writers={w1,w2}, Shards={s1}, Hashes={h1}, MaxToken=3, MaxRound=2, MaxLog=4`; `CONSTRAINT StateConstraint` (add the same `Len(log) <= MaxLog` constraint operator to the module); INVARIANTs: `TypeBounds, NoDangle, NoReturn` (defined in Task 4 — for this task, temporary minimal versions: `NoDangle == \A s \in Shards : \A h \in man[s].refs : present[h]`, `NoReturn == \A h \in Hashes : present[h] => tokOf[h] \notin deadTok[h]`).
+- [ ] **Step 1: Config** — stage-2-equivalent bounds, TLC model values: `Writers={w1,w2}, Shards={s1}, Hashes={h1}, MaxToken=3, MaxRound=2, MaxLog=4`; `CONSTRAINT StateConstraint` (add the same `Len(log) <= MaxLog` constraint operator to the module); INVARIANTs: `TypeBounds, NoDangle, NoReturn` (defined in Task 4 — for this task, temporary minimal versions: `NoDangle == \A s \in Shards : \A h \in man[s].refs : present[h]`, `NoReturn == \A h \in Hashes : present[h] => tokOf[h] \notin obsoleteTok[h]`).
 - [ ] **Step 2: Run** `timeout 360 docs/superpowers/models/run_tlc.sh ...` — wait: the runner hardcodes `CaIncarnationCore.tla`. Run TLC directly for the proof core:
 
 ```bash
@@ -223,7 +235,7 @@ Expected: no counterexample (TLC already verified far deeper). A counterexample 
 TypeBounds ==   \* domains the types don't carry (Apalache types are unbounded Int/Seq)
     /\ \A h \in Hashes : /\ nextTok[h] \in 1..(MaxToken+1)
                          /\ tokOf[h] \in 0..MaxToken /\ tokOf[h] < nextTok[h]
-                         /\ deadTok[h] \subseteq 1..(nextTok[h]-1)
+                         /\ obsoleteTok[h] \subseteq 1..(nextTok[h]-1)
                          /\ (present[h] => tokOf[h] >= 1)
     /\ gcRound \in 0..MaxRound /\ gcPhase \in {"idle","retiring","fencing","fenced"}
     /\ fencedSet \subseteq Shards
@@ -239,8 +251,8 @@ TypeBounds ==   \* domains the types don't carry (Apalache types are unbounded I
     /\ \A w \in Writers : wView[w] \in 0..MaxRound
                           /\ \A p \in wDeps[w] : p[1] \in Hashes /\ p[2] \in 1..MaxToken
 
-NoDangle  == \A s \in Shards : \A h \in man[s].refs : present[h]          \* TARGET
-NoReturn  == \A h \in Hashes : present[h] => tokOf[h] \notin deadTok[h]   \* TARGET
+NoDangle  == \A s \in Shards : \A h \in man[s].refs : present[h]              \* TARGET
+NoReturn  == \A h \in Hashes : present[h] => tokOf[h] \notin obsoleteTok[h]   \* TARGET
 
 InflightHeld ==        \* THE lemma: a delete can be in flight only for a held entry.
                        \* NOTE: this depends on the modeling choice that outcome consumption is
@@ -250,11 +262,11 @@ InflightHeld ==        \* THE lemma: a delete can be in flight only for a held e
     \A d \in inflight : \E e \in retired : e.h = d.h /\ e.t = d.t
 
 RetiredCurrentOrDead ==   \* a retired token is still current, or it STOPPED BEING CURRENT and is
-                          \* therefore in deadTok. Read deadTok as "displaced-or-deleted history",
-                          \* NOT "physically deleted": WResurrect/WOverwrite add the displaced old
-                          \* token to deadTok atomically (the model rule, MR-2) — which is exactly
-                          \* why the resurrect-displacement state does not falsify this lemma.
-    \A e \in retired : e.t = tokOf[e.h] \/ e.t \in deadTok[e.h]
+                          \* therefore in obsoleteTok (displaced-or-deleted history — the name says
+                          \* what it means: obsolete as a dependency, not necessarily deleted).
+                          \* WResurrect/WOverwrite add the displaced old token atomically (MR-2) —
+                          \* exactly why the resurrect-displacement state does not falsify this.
+    \A e \in retired : e.t = tokOf[e.h] \/ e.t \in obsoleteTok[e.h]
 
 InflightVsRefs ==      \* the heart: an in-flight-deletable token is never a referenced current token
     \A d \in inflight : \A s \in Shards : d.h \in man[s].refs => tokOf[d.h] # d.t
