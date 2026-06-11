@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
+#include <charconv>
 
 namespace DB
 {
@@ -18,8 +19,36 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint64_t GC_STATE_VERSION = 1;
+constexpr uint64_t GC_STATE_VERSION = 2;
 constexpr uint64_t RETIRED_SET_VERSION = 1;
+
+/// Writes a `{"key":u64,...}` object from a string-keyed map (folded_cursor and the inner
+/// fence_version objects). The keys are "ns/shard" strings — data, so they go through the
+/// escaping writer.
+void writeU64MapObject(WriteBuffer & out, const std::map<String, uint64_t> & map)
+{
+    writeChar('{', out);
+    bool first = true;
+    for (const auto & [key, value] : map)
+    {
+        if (!first)
+            writeChar(',', out);
+        first = false;
+        writeJsonKey(out, key);
+        writeIntText(value, out);
+    }
+    writeChar('}', out);
+}
+
+/// Reads a `{"key":u64,...}` object into a map; every value must be a strict u64 (the same
+/// rejection set as requireU64).
+std::map<String, uint64_t> u64MapFromObject(const Poco::JSON::Object & obj, std::string_view what)
+{
+    std::map<String, uint64_t> result;
+    for (const auto & [key, value] : obj)
+        result[key] = requireU64Var(value, key, what);
+    return result;
+}
 
 /// `ObjectKind` <-> string. Unknown string on decode is corruption (fail closed).
 std::string_view objectKindToString(ObjectKind kind)
@@ -84,6 +113,37 @@ String encodeGcState(const GcState & state)
     writeChar(',', out);
     writeJsonKey(out, "fence_seq");
     writeIntText(state.fence_seq, out);
+    writeChar(',', out);
+    writeJsonKey(out, "snap_shards");
+    writeIntText(state.snap_shards, out);
+    writeChar(',', out);
+    writeJsonKey(out, "snap_generation");
+    writeIntText(state.snap_generation, out);
+    writeChar(',', out);
+    writeJsonKey(out, "lease");
+    writeChar('{', out);
+    writeJsonKey(out, "owner");
+    writeJsonString(u128ToHex(state.lease.owner), out);
+    writeChar(',', out);
+    writeJsonKey(out, "seq");
+    writeIntText(state.lease.seq, out);
+    writeChar('}', out);
+    writeChar(',', out);
+    writeJsonKey(out, "folded_cursor");
+    writeU64MapObject(out, state.folded_cursor);
+    writeChar(',', out);
+    writeJsonKey(out, "fence_version");
+    writeChar('{', out);
+    bool first = true;
+    for (const auto & [round, inner] : state.fence_version)
+    {
+        if (!first)
+            writeChar(',', out);
+        first = false;
+        writeJsonKey(out, std::to_string(round));
+        writeU64MapObject(out, inner);
+    }
+    writeChar('}', out);
     writeChar('}', out);
     return std::move(out.str());
 }
@@ -93,11 +153,39 @@ GcState decodeGcState(std::string_view data)
     return decodeJsonGuarded("gc/state", [&]
     {
         auto obj = parseJsonDocument(data, "cas_gc_state", GC_STATE_VERSION, "gc/state");
-        checkNoUnknownKeys(*obj, {"format", "version", "round", "fence_seq"}, "gc/state");
+        checkNoUnknownKeys(*obj,
+            {"format", "version", "round", "fence_seq", "snap_shards", "snap_generation",
+             "lease", "folded_cursor", "fence_version"}, "gc/state");
 
         GcState state;
         state.round = requireU64(*obj, "round", "gc/state");
         state.fence_seq = requireU64(*obj, "fence_seq", "gc/state");
+        state.snap_shards = requireU64(*obj, "snap_shards", "gc/state");
+        if (state.snap_shards == 0)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: snap_shards must be >= 1");
+        state.snap_generation = requireU64(*obj, "snap_generation", "gc/state");
+
+        auto lease = requireObject(*obj, "lease", "gc/state");
+        checkNoUnknownKeys(*lease, {"owner", "seq"}, "gc/state lease");
+        state.lease.owner = requireHash(*lease, "owner", "gc/state lease");
+        state.lease.seq = requireU64(*lease, "seq", "gc/state lease");
+
+        state.folded_cursor = u64MapFromObject(*requireObject(*obj, "folded_cursor", "gc/state"), "gc/state folded_cursor");
+
+        auto fences = requireObject(*obj, "fence_version", "gc/state");
+        for (const auto & [round_str, inner_var] : *fences)
+        {
+            uint64_t round = 0;
+            const auto [end, ec] = std::from_chars(round_str.data(), round_str.data() + round_str.size(), round);
+            if (ec != std::errc() || end != round_str.data() + round_str.size() || round_str.empty())
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS gc/state: non-numeric fence_version round key '{}'", round_str);
+            if (inner_var.type() != typeid(Poco::JSON::Object::Ptr))
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS gc/state: fence_version value for round '{}' must be an object", round_str);
+            state.fence_version[round]
+                = u64MapFromObject(*inner_var.extract<Poco::JSON::Object::Ptr>(), "gc/state fence_version");
+        }
         return state;
     });
 }

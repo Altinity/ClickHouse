@@ -143,6 +143,8 @@ public:
         const std::string_view last_ns_segment = prev_slash == std::string_view::npos ? ns : ns.substr(prev_slash + 1);
         if (last_ns_segment == "_files")
             return std::nullopt;
+        if (last_ns_segment.empty())
+            return std::nullopt;                       /// empty ns segment ("a//7", "//7") — Layout never writes these
 
         return std::make_pair(RootNamespace{String(ns)}, shard);
     }

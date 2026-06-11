@@ -65,6 +65,8 @@ TEST(CasLayout, TryParseRootShardKey)
     EXPECT_FALSE(l.tryParseRootShardKey("p/blobs/aa/aabb").has_value());
     EXPECT_FALSE(l.tryParseRootShardKey("p/roots/7").has_value());          /// no namespace segment
     EXPECT_FALSE(l.tryParseRootShardKey("p/roots/").has_value());
+    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/a//7").has_value());       /// empty last ns segment ("a/")
+    EXPECT_FALSE(l.tryParseRootShardKey("p/roots//7").has_value());         /// empty namespace ("/")
 }
 
 TEST(CasLayout, ShortIdThrows)

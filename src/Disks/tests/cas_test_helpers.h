@@ -145,6 +145,16 @@ inline void publishRaw(
     backend.casPut(layout.rootShardKey(ns, shard), DB::Cas::encodeRootShard(root), /*expected*/ std::nullopt);
 }
 
+/// Encode a CAGS document carrying only {round, fence_seq} — everything else defaulted. The
+/// retire-view tests and `injectRetire` only care about these two fields.
+inline String encodeMinimalGcState(uint64_t round, uint64_t fence_seq)
+{
+    DB::Cas::GcState state;
+    state.round = round;
+    state.fence_seq = fence_seq;
+    return DB::Cas::encodeGcState(state);
+}
+
 /// Inject GC state so a fresh `Store::open` over the same backend sees the given incarnations as
 /// condemned. Writes `gc/state` ({round, fence_seq}) and one retired-set object at
 /// `retiredKey(round, fence_seq, shard)`. The Store refreshes its `retireView` only at open, so the
@@ -153,7 +163,7 @@ inline void injectRetire(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     uint64_t round, uint64_t fence_seq, uint64_t shard, std::vector<DB::Cas::RetiredEntry> entries)
 {
-    const String state = DB::Cas::encodeGcState(DB::Cas::GcState{.round = round, .fence_seq = fence_seq});
+    const String state = encodeMinimalGcState(round, fence_seq);
     const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
     if (!head.exists)
         backend.putIfAbsent(layout.gcStateKey(), state);

@@ -161,18 +161,24 @@ inline String requireString(const Poco::JSON::Object & obj, std::string_view key
     return var.extract<String>();
 }
 
-/// Strict unsigned integer: rejects strings, booleans, floats and negatives. Poco parses JSON
+/// Strict unsigned integer from an already-extracted value (map iteration, where the keys are
+/// data, not codec literals): rejects strings, booleans, floats and negatives. Poco parses JSON
 /// integers as Int64, so values above INT64_MAX are out of scope BY DESIGN — every counter/size in
 /// these formats stays far below 2^53 (the JSON-number interop bound) anyway.
-inline uint64_t requireU64(const Poco::JSON::Object & obj, std::string_view key, std::string_view what)
+inline uint64_t requireU64Var(const Poco::Dynamic::Var & var, std::string_view key, std::string_view what)
 {
-    const auto var = requireKey(obj, key, what);
     if (var.isBoolean() || !var.isInteger())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: key '{}' must be a non-negative integer", what, key);
     const Int64 value = var.convert<Int64>();
     if (value < 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: key '{}' must be a non-negative integer", what, key);
     return static_cast<uint64_t>(value);
+}
+
+/// Strict unsigned integer at a known key.
+inline uint64_t requireU64(const Poco::JSON::Object & obj, std::string_view key, std::string_view what)
+{
+    return requireU64Var(requireKey(obj, key, what), key, what);
 }
 
 inline Poco::JSON::Object::Ptr requireObject(const Poco::JSON::Object & obj, std::string_view key, std::string_view what)

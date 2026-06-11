@@ -4,6 +4,7 @@
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
+#include <map>
 #include <string_view>
 #include <vector>
 
@@ -13,22 +14,42 @@ namespace DB::Cas
 /// GC-surface formats — the part of the GC state the WRITER consumes (the publish gate reads
 /// gc/state and the retired sets to decide whether a reused object is condemned, spec §4).
 ///
-/// OWNERSHIP: these codecs are owned by GC (milestone M-C3), which will extend them — CAGS v2
-/// adds cursors, the lease, and fence versions. M-C2 defines only the minimal v1 the writer
-/// needs; keep writer-side code forward-compatible by treating a future version as
-/// NOT_IMPLEMENTED (fail closed), never as corruption.
+/// OWNERSHIP: these codecs are owned by GC (milestone M-C3). CAGS v2 carries the full GC
+/// controller state: the lease, the snap config, the fold cursors, and the fence versions.
+/// Keep writer-side code forward-compatible by treating a future version as NOT_IMPLEMENTED
+/// (fail closed), never as corruption. The format is unreleased, so v1 (the M-C2 minimal CAGS)
+/// is NOT accepted — no compat shims.
 ///
 /// Both formats are non-hashed metadata objects => STRICT JSON (spec §4 encoding split,
 /// decision 2026-06-11): a top-level object with `format` + `version`, fail-closed decode
 /// (wrong format / unknown key / missing key / wrong type / bad enum string / bad hash hex /
 /// malformed document => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
 
-/// gc/state ("cas_gc_state" v1):
-///   {"format":"cas_gc_state","version":1,"round":7,"fence_seq":3}
+/// gc/state ("cas_gc_state" v2):
+///   {"format":"cas_gc_state","version":2,
+///    "round":7,"fence_seq":3,"snap_shards":1,"snap_generation":12,
+///    "lease":{"owner":"<32hex>","seq":5},
+///    "folded_cursor":{"<ns>/<root_shard>":4},
+///    "fence_version":{"<round>":{"<ns>/<root_shard>":4}}}
+/// folded_cursor / fence_version are indexed by ROOT shard ("ns/shard" strings — the journal
+/// sources); the snap / retired / outcome OBJECTS are indexed by target-hash-prefix snap shard.
+/// Two distinct sharding axes (spec §4). fence_version outer keys are the round as a decimal
+/// string (JSON object keys are strings).
+struct GcLease
+{
+    UInt128 owner{};          /// gc leader id (random u128); 0 = never held
+    uint64_t seq = 0;         /// renewal counter; a steal observes a stalled (owner, seq)
+};
+
 struct GcState
 {
-    uint64_t round = 0;       /// the highest GC round whose retire sets are durable
-    uint64_t fence_seq = 0;   /// leadership-epoch component of retired-set paths (spec §4)
+    uint64_t round = 0;            /// the highest GC round whose retire sets are durable
+    uint64_t fence_seq = 0;        /// leadership-epoch component of retired/outcome paths (spec §4)
+    uint64_t snap_shards = 1;      /// GC constant (target-hash-prefix sharding); set once, immutable
+    uint64_t snap_generation = 0;  /// monotone; the authoritative snap objects' generation
+    GcLease lease;
+    std::map<String, uint64_t> folded_cursor;                       /// "ns/shard" -> folded shard_version
+    std::map<uint64_t, std::map<String, uint64_t>> fence_version;   /// round -> ("ns/shard" -> version)
 };
 
 /// One condemned object inside a retired set.

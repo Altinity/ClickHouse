@@ -16,13 +16,59 @@ using DB::Cas::tests::expectThrowsCode;
 
 /// ---------- round trips ----------
 
-TEST(CasGcFormats, GcStateRoundTrip)
+TEST(CasGcFormats, GcStateV2RoundTrip)
 {
-    GcState s{.round = 7, .fence_seq = 3};
-    auto bytes = encodeGcState(s);
-    auto d = decodeGcState(bytes);
+    GcState s;
+    s.round = 7;
+    s.fence_seq = 3;
+    s.snap_shards = 1;
+    s.snap_generation = 12;
+    s.lease.owner = hexToU128("00000000000000000000000000000005");
+    s.lease.seq = 5;
+    s.folded_cursor["srv1/tbl/0"] = 4;
+    s.folded_cursor["srv1/tbl/1"] = 9;
+    s.fence_version[7]["srv1/tbl/0"] = 4;
+    s.fence_version[7]["srv1/tbl/1"] = 9;
+    auto d = decodeGcState(encodeGcState(s));
     EXPECT_EQ(d.round, 7u);
     EXPECT_EQ(d.fence_seq, 3u);
+    EXPECT_EQ(d.snap_shards, 1u);
+    EXPECT_EQ(d.snap_generation, 12u);
+    EXPECT_EQ(d.lease.owner, hexToU128("00000000000000000000000000000005"));
+    EXPECT_EQ(d.lease.seq, 5u);
+    EXPECT_EQ(d.folded_cursor.at("srv1/tbl/1"), 9u);
+    EXPECT_EQ(d.fence_version.at(7).at("srv1/tbl/0"), 4u);
+}
+
+TEST(CasGcFormats, GcStateV2DefaultsAndReadability)
+{
+    GcState s;
+    EXPECT_EQ(s.snap_shards, 1u);                /// default 1 (the GC constant)
+    auto bytes = encodeGcState(s);
+    EXPECT_NE(bytes.find("\"format\":\"cas_gc_state\""), String::npos);
+    EXPECT_NE(bytes.find("\"version\":2"), String::npos);
+    auto d = decodeGcState(bytes);
+    EXPECT_EQ(d.round, 0u);
+    EXPECT_TRUE(d.folded_cursor.empty());
+    EXPECT_TRUE(d.fence_version.empty());
+    EXPECT_EQ(d.lease.owner, DB::UInt128{});
+}
+
+TEST(CasGcFormats, GcStateV2Validation)
+{
+    /// future version => NOT_IMPLEMENTED; v1 (old minimal CAGS) => CORRUPTED_DATA (unreleased, no compat);
+    /// unknown top-level key, unknown lease key, non-numeric fence_version round key => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":3,"round":0,"fence_seq":0,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{}})"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":1,"round":1,"fence_seq":1})"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":2,"round":0,"fence_seq":0,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0,"extra":1},"folded_cursor":{},"fence_version":{}})"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":2,"round":0,"fence_seq":0,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{"notanumber":{}}})"); });
+    /// snap_shards == 0 is an invariant violation => CORRUPTED_DATA
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":2,"round":0,"fence_seq":0,"snap_shards":0,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{}})"); });
 }
 
 TEST(CasGcFormats, RetiredSetRoundTrip)
@@ -75,47 +121,54 @@ namespace
 /// non-hashed metadata object, so each codec's validation test just supplies the decode function and
 /// a known-good document to mutate.
 template <typename Decode>
-void expectStrictJsonContract(Decode && decode, const String & expected_format)
+void expectStrictJsonContract(Decode && decode, const String & expected_format, uint64_t current_version = 1)
 {
+    const String version_str = std::to_string(current_version);
     /// Malformed JSON.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(String("{not json")); });
     /// Trailing junk after an otherwise-valid document (the JSON analogue of the binary codecs'
     /// requireNoTrailingBytes guard — a half-written / spliced object must not silently decode).
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decode(R"({"format":")" + expected_format + R"(","version":1}trailing)"); });
+        [&] { decode(R"({"format":")" + expected_format + R"(","version":)" + version_str + "}trailing"); });
     /// Top-level value not an object.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(String("[]")); });
     /// Wrong format value.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decode(R"({"format":"cas_wrong","version":1})"); });
+        [&] { decode(R"({"format":"cas_wrong","version":)" + version_str + "}"); });
     /// Missing the format key entirely.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(R"({"version":1})"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(R"({"version":)" + version_str + "}"); });
     /// version as a string (wrong type).
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decode(R"({"format":")" + expected_format + R"(","version":"1"})"); });
+        [&] { decode(R"({"format":")" + expected_format + R"(","version":")" + version_str + R"("})"); });
     /// Future version => NOT_IMPLEMENTED (fail closed on the future, never corruption).
     expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
-        [&] { decode(R"({"format":")" + expected_format + R"(","version":2})"); });
+        [&] { decode(R"({"format":")" + expected_format + R"(","version":)" + std::to_string(current_version + 1) + "}"); });
 }
 
 }
 
 TEST(CasGcFormats, GcStateValidation)
 {
-    expectStrictJsonContract([](const String & s) { return decodeGcState(s); }, "cas_gc_state");
+    expectStrictJsonContract([](const String & s) { return decodeGcState(s); }, "cas_gc_state", /*current_version*/ 2);
 
     /// Readability pin: the encoded document carries the compact format marker.
     EXPECT_TRUE(encodeGcState(GcState{}).contains(R"("format":"cas_gc_state")"));
 
-    /// Missing a required field.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeGcState(R"({"format":"cas_gc_state","version":1,"round":7})"); });
+    /// Missing a required field (no snap_generation).
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":2,"round":7,"fence_seq":3,"snap_shards":1,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{}})"); });
     /// Wrong type for a numeric field.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeGcState(R"({"format":"cas_gc_state","version":1,"round":"7","fence_seq":3})"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":2,"round":"7","fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{}})"); });
+    /// Wrong type for a cursor value (string inside folded_cursor).
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":2,"round":7,"fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{"ns/0":"4"},"fence_version":{}})"); });
+    /// fence_version round value not an object.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":2,"round":7,"fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{"7":4}})"); });
     /// Unknown extra key.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeGcState(R"({"format":"cas_gc_state","version":1,"round":7,"fence_seq":3,"x":1})"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":2,"round":7,"fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{},"x":1})"); });
 }
 
 TEST(CasGcFormats, RetiredSetValidation)

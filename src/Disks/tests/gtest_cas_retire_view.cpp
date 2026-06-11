@@ -5,6 +5,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRetireView.h>
 
+#include <Disks/tests/cas_test_helpers.h>
+
 #include <algorithm>
 
 using namespace DB::Cas;
@@ -27,7 +29,7 @@ TEST(CasRetireView, SeesInjectedRetirements)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    b->putIfAbsent(layout.gcStateKey(), encodeGcState({.round = 2, .fence_seq = 1}));
+    b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(2, 1));
     RetiredSet rs;
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
     rs.entries.push_back({ObjectKind::Blob, h, Token{"3", TokenType::Emulated}, 10});
@@ -46,7 +48,7 @@ TEST(CasRetireView, RefreshDropsRewrittenEntries)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    b->putIfAbsent(layout.gcStateKey(), encodeGcState({.round = 2, .fence_seq = 1}));
+    b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(2, 1));
     RetiredSet rs;
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
     rs.entries.push_back({ObjectKind::Blob, h, Token{"3", TokenType::Emulated}, 10});
@@ -68,7 +70,7 @@ TEST(CasRetireView, RefreshDropsRewrittenEntries)
     {
         auto head = b->head(layout.gcStateKey());
         ASSERT_TRUE(head.exists);
-        ASSERT_EQ(b->putOverwrite(layout.gcStateKey(), encodeGcState({.round = 3, .fence_seq = 1}), head.token),
+        ASSERT_EQ(b->putOverwrite(layout.gcStateKey(), tests::encodeMinimalGcState(3, 1), head.token),
                   PutOutcome::Done);
     }
 
@@ -81,7 +83,7 @@ TEST(CasRetireView, MultipleRoundsUnion)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    b->putIfAbsent(layout.gcStateKey(), encodeGcState({.round = 2, .fence_seq = 1}));
+    b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(2, 1));
 
     /// Two retired objects at different (round, fence_seq, shard) keys condemn DIFFERENT tokens
     /// of the SAME (kind, hash) — the view is the UNION over all present retired objects.
@@ -130,7 +132,7 @@ TEST(CasRetireView, PaginationCoversManyObjects)
 
     auto b = std::make_shared<TinyPageBackend>();
     Layout layout("p");
-    b->putIfAbsent(layout.gcStateKey(), encodeGcState({.round = 5, .fence_seq = 1}));
+    b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(5, 1));
 
     /// Five retired objects under gc/retired/, each condemning a distinct hash. The view must
     /// union ALL of them; with the clamped page size the union completes only if the cursor loop
@@ -161,7 +163,7 @@ TEST(CasRetireView, IsCondemnedTokenIdentity)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    b->putIfAbsent(layout.gcStateKey(), encodeGcState({.round = 1, .fence_seq = 1}));
+    b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(1, 1));
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
     RetiredSet rs;
     rs.entries.push_back({ObjectKind::Blob, h, Token{"3", TokenType::Emulated}, 10});
