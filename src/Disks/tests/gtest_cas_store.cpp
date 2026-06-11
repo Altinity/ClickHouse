@@ -124,3 +124,49 @@ TEST(CasPoolMeta, ConcurrentCreateRace)
     EXPECT_EQ(result.root_shards, 8u);     /// the foreign pool's constants win
     EXPECT_EQ(result.blob_header_len, 256u);
 }
+
+TEST(CasPoolMeta, CasConflictReReadsWinner)
+{
+    /// The subtlest branch: the initial GET sees ABSENT, so createOrValidate proceeds to the
+    /// create-if-absent casPut — and loses, because a racing creator committed in between. The loser
+    /// must then re-read and return the WINNER's pool identity, not LOGICAL_ERROR. A single-threaded
+    /// `failNextCasPut` alone cannot exercise this: it returns Conflict without leaving the object
+    /// readable, so the re-read would fire the LOGICAL_ERROR guard. We model the real interleaving
+    /// with a backend whose casPut commits the winner's object (via the public putIfAbsent) and THEN
+    /// reports Conflict — exactly what the loser observes.
+    class RacingBackend : public InMemoryBackend
+    {
+    public:
+        String winner_bytes;
+        CasOutcome casPut(const String & key, const String & bytes,
+            const std::optional<Token> & expected, Token * out_token) override
+        {
+            if (!winner_committed)
+            {
+                winner_committed = true;
+                /// The winner lands first; our create-if-absent now necessarily conflicts.
+                putIfAbsent(key, winner_bytes);
+                return CasOutcome::Conflict;
+            }
+            return InMemoryBackend::casPut(key, bytes, expected, out_token);
+        }
+    private:
+        bool winner_committed = false;
+    };
+
+    const UInt128 winner = hexToU128("0123456789abcdeffedcba9876543210");
+    PoolMeta winner_pm;
+    winner_pm.pool_id = winner;
+    winner_pm.root_shards = 8;
+    winner_pm.blob_header_len = 256;
+
+    auto b = std::make_shared<RacingBackend>();
+    b->winner_bytes = encodePoolMeta(winner_pm);
+    Layout layout("p");
+
+    /// Our config (4 / 512) is what we WOULD have minted, but we lose the race and inherit the winner.
+    PoolMeta result = PoolMeta::createOrValidate(*b, layout, /*root_shards*/ 4, /*blob_header_len*/ 512);
+    EXPECT_EQ(result.pool_id, winner);
+    EXPECT_EQ(result.root_shards, 8u);
+    EXPECT_EQ(result.blob_header_len, 256u);
+}
