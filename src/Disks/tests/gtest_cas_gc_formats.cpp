@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
@@ -52,6 +53,18 @@ TEST(CasGcFormats, EmptyRetiredSetRoundTrips)
     auto bytes = encodeRetiredSet(RetiredSet{});
     auto d = decodeRetiredSet(bytes);
     EXPECT_TRUE(d.entries.empty());
+}
+
+TEST(CasGcFormats, HeartbeatRoundTrip)
+{
+    Heartbeat hb{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
+                 .heartbeat_seq = 42,
+                 .created_at_ms = 1234567890123};
+    auto bytes = encodeHeartbeat(hb);
+    auto d = decodeHeartbeat(bytes);
+    EXPECT_EQ(d.server_id, hexToU128("000102030405060708090a0b0c0d0e0f"));
+    EXPECT_EQ(d.heartbeat_seq, 42u);
+    EXPECT_EQ(d.created_at_ms, 1234567890123u);
 }
 
 /// ---------- validation throw-paths ----------
@@ -144,5 +157,51 @@ TEST(CasGcFormats, MoreValidation)
         auto bytes = encodeGcState(GcState{.round = 1, .fence_seq = 2});
         bytes.push_back('\0');
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
+    }
+}
+
+TEST(CasGcFormats, HeartbeatValidation)
+{
+    /// Layout: "CAHB"(0-3) version(4) reserved(5-7) server_id(8-23) seq(24-31) created_at_ms(32-39).
+    const auto makeHeartbeat = []
+    {
+        return encodeHeartbeat({.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
+                                .heartbeat_seq = 7,
+                                .created_at_ms = 9});
+    };
+
+    /// Bad magic.
+    {
+        auto bytes = makeHeartbeat();
+        bytes[0] = 'X';
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
+    }
+
+    /// Future version — NOT_IMPLEMENTED, never misreported as corruption.
+    {
+        auto bytes = makeHeartbeat();
+        bytes[4] = 2;
+        expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { decodeHeartbeat(bytes); });
+    }
+
+    /// Nonzero reserved byte.
+    {
+        auto bytes = makeHeartbeat();
+        bytes[6] = 1;
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
+    }
+
+    /// Truncation.
+    {
+        auto bytes = makeHeartbeat();
+        bytes.pop_back();
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
+    }
+
+    /// Trailing garbage.
+    {
+        auto bytes = makeHeartbeat();
+        bytes.push_back('\0');
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
     }
 }

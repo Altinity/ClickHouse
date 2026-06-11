@@ -23,45 +23,6 @@ namespace
 
 constexpr uint8_t GC_STATE_VERSION = 1;
 constexpr uint8_t RETIRED_SET_VERSION = 1;
-constexpr size_t RESERVED_BYTES = 3;
-
-void writeHeader(WriteBuffer & out, std::string_view magic, uint8_t version)
-{
-    writeString(magic, out);
-    writeBinaryLittleEndian(version, out);
-    for (size_t i = 0; i < RESERVED_BYTES; ++i)
-        writeBinaryLittleEndian(static_cast<uint8_t>(0), out);
-}
-
-/// Reads and validates magic + version + reserved. Future version => NOT_IMPLEMENTED (checked
-/// before the reserved bytes — a v2 header may repurpose them); everything else => CORRUPTED_DATA.
-void readHeader(ReadBuffer & in, std::string_view magic, uint8_t current_version, std::string_view what)
-{
-    if (readFixedBytes(in, magic.size()) != magic)
-        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS {}: bad magic", what);
-
-    uint8_t version = 0;
-    readBinaryLittleEndian(version, in);
-    if (version > current_version)
-        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "CAS {}: unsupported version {}", what, version);
-    if (version != current_version)
-        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid version {}", what, version);
-
-    for (size_t i = 0; i < RESERVED_BYTES; ++i)
-    {
-        uint8_t reserved = 0;
-        readBinaryLittleEndian(reserved, in);
-        if (reserved != 0)
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS {}: nonzero reserved byte", what);
-    }
-}
-
-void requireNoTrailingBytes(ReadBuffer & in, std::string_view what)
-{
-    if (!in.eof())
-        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-            "CAS {}: {} trailing bytes after the end of the encoded data", what, in.available());
-}
 
 }
 
