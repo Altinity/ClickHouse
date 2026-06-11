@@ -218,7 +218,9 @@ ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfiguratio
     };
 }
 
-void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name) const
+/// S3Tables manages the underlying data itself, so the data is always purged on drop
+/// regardless of the `purge` flag.
+void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name, bool /*purge*/) const
 {
     if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,

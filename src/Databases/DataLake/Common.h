@@ -19,4 +19,10 @@ DB::DataTypePtr getType(const String & type_name, bool nullable, DB::ContextPtr 
 /// `E` is a table name.
 std::pair<std::string, std::string> parseTableName(const std::string & name);
 
+String constructTableLocation(
+    const String & location_scheme,
+    const String & storage_endpoint,
+    const String & namespace_name,
+    const String & table_name);
+
 }
