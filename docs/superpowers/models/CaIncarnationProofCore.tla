@@ -579,4 +579,82 @@ IndInv == TypeBounds /\ NoDangle /\ NoReturn /\ InflightHeld /\ RetiredCurrentOr
 
 \* Inductive-step init: assign (StateShape) then constrain (IndInv). See StateShape comment.
 IndInvInit == StateShape /\ IndInv
+
+\* ============================================================ NEGATIVE CONTROLS (Task 6) ==========
+\* The definitions below are CONTROLS for the induction proof, NOT part of the protocol. They are
+\* inert for TLC (not referenced from the .cfg) and are exercised only by explicit Apalache runs.
+\* Their job is to prove IndInv "has teeth": that load-bearing conjuncts are load-bearing (drop-a-
+\* lemma), that the W-REVALIDATE re-observation conjunct is what carries F1 (gate control), and that
+\* IndInv is satisfiable (not vacuously true). See the plan, Task 6.
+
+\* --------------------------------------------- drop-a-lemma controls (Step 2, extended per Task 5)
+\* Each is IndInv with EXACTLY ONE conjunct removed, plus its own StateShape-based --init. The
+\* step check on each MUST FAIL with a CTI — i.e. the removed conjunct is load-bearing for the
+\* induction (not implied by the rest). If one PASSES, the remaining conjuncts imply the dropped
+\* one (an acceptable, documentable implication) or IndInv is over-strong somewhere.
+
+\* minus InflightHeld
+IndInv_NoHeld == TypeBounds /\ NoDangle /\ NoReturn /\ RetiredCurrentOrDead
+          /\ InflightVsRefs /\ SendImpliesFenced /\ RefsFromLog /\ SnapFromPrefix
+          /\ InflightAllocated /\ PhaseRoundActive /\ AbsentObsolete /\ RootEdgesTyped
+          /\ InflightCurrentUnreferenced /\ FenceCoverage /\ FencePosRecord /\ FenceLeRound
+          /\ RetiredCoveredNoPostFenceAdd /\ RetiringFenceBelow
+IndInv_NoHeldInit == StateShape /\ IndInv_NoHeld
+
+\* minus InflightVsRefs
+IndInv_NoRefs == TypeBounds /\ NoDangle /\ NoReturn /\ InflightHeld /\ RetiredCurrentOrDead
+          /\ SendImpliesFenced /\ RefsFromLog /\ SnapFromPrefix
+          /\ InflightAllocated /\ PhaseRoundActive /\ AbsentObsolete /\ RootEdgesTyped
+          /\ InflightCurrentUnreferenced /\ FenceCoverage /\ FencePosRecord /\ FenceLeRound
+          /\ RetiredCoveredNoPostFenceAdd /\ RetiringFenceBelow
+IndInv_NoRefsInit == StateShape /\ IndInv_NoRefs
+
+\* minus InflightCurrentUnreferenced (the most load-bearing Task-5 addition — CTI #5/#7)
+IndInv_NoICU == TypeBounds /\ NoDangle /\ NoReturn /\ InflightHeld /\ RetiredCurrentOrDead
+          /\ InflightVsRefs /\ SendImpliesFenced /\ RefsFromLog /\ SnapFromPrefix
+          /\ InflightAllocated /\ PhaseRoundActive /\ AbsentObsolete /\ RootEdgesTyped
+          /\ FenceCoverage /\ FencePosRecord /\ FenceLeRound
+          /\ RetiredCoveredNoPostFenceAdd /\ RetiringFenceBelow
+IndInv_NoICUInit == StateShape /\ IndInv_NoICU
+
+\* --------------------------------------------- gate negative control (Step 2b — the F1 witness)
+\* WPublishNoReval is a mechanical copy of WPublish with the per-dep RE-OBSERVATION conjunct
+\* (present[d[1]] /\ tokOf[d[1]] = d[2]) REMOVED — only ~RetiredHit and the fence check remain.
+\* This is the F1 bug class: a stale token-bearing dependency (object deleted or displaced after
+\* observation) passes the weakened gate and publishes. NextNoReval swaps WPublish -> WPublishNoReval.
+\* NEGATIVE CONTROL ONLY — NOT the protocol. Selected via Apalache's --next=NextNoReval.
+\* @type: (WRITER) => Bool;
+DepOKNoReval(w) == \A d \in wDeps[w] : ~RetiredHit(d[1], d[2], wView[w])
+WPublishNoReval(w, s, h) ==
+    /\ \E t \in Toks : <<h, t>> \in wDeps[w]
+    /\ h \notin man[s].refs
+    /\ Len(man[s].log) < MaxLog
+    /\ wView[w] >= man[s].fence /\ DepOKNoReval(w)
+    /\ man'   = [man EXCEPT ![s].refs = @ \cup {h},
+                            ![s].log  = Append(@, [op |-> "add", hs |-> {h}])]
+    /\ wDeps' = [wDeps EXCEPT ![w] = {}]
+    /\ UNCHANGED << present, tokOf, nextTok, obsoleteTok, retired, inflight, gcRound, gcPhase,
+                    fencedSet, fencePos, cursor, rootEdges, wView >>
+
+\* NEGATIVE CONTROL ONLY: Next with WPublish replaced by WPublishNoReval (everything else identical).
+NextNoReval ==
+    \/ \E w \in Writers, h \in Hashes : WCreate(w, h) \/ WReuse(w, h)
+    \/ \E w \in Writers, h \in Hashes : WOverwrite(w, h)
+    \/ \E w \in Writers, h \in Hashes : WResurrect(w, h)
+    \/ \E w \in Writers, h \in Hashes : WReobserve(w, h)
+    \/ \E w \in Writers : WRefreshView(w) \/ WAbandon(w)
+    \/ \E w \in Writers, s \in Shards, h \in Hashes : WPublishNoReval(w, s, h)
+    \/ \E s \in Shards, h \in Hashes : WDrop(s, h)
+    \/ GStartRound \/ GEndRound
+    \/ \E s \in Shards : GFold(s)
+    \/ \E h \in Hashes : GRetire(h)
+    \/ \E s \in Shards : GFenceShard(s)
+    \/ \E e \in retired : GRecheckDelete(e)
+    \/ \E d \in inflight : Land(d)
+
+\* --------------------------------------------- satisfiability control (Step 3)
+\* FalseInv == FALSE: --init=IndInvInit --inv=FalseInv --length=0 MUST produce a counterexample,
+\* i.e. an IndInv state exists (guards against a contradictory IndInv that would pass everything
+\* vacuously). The base case (Init => IndInv, already green) also implies satisfiability.
+FalseInv == FALSE
 =======================================================================================
