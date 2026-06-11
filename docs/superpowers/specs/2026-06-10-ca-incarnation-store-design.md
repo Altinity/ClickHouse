@@ -163,6 +163,10 @@ Every blob, tree, and pack object is `header ‖ [pack index] ‖ payload`:
    0x0001 PROVENANCE (fixed): u64 created_at_ms, u128 creator_server_id, u32 ch_version,
                               u8 op{insert,merge,mutation,attach,repack,...}
    0x0002 INTENDED_REF (utf8, optional): "server/<table_uuid>/<part_name>"   — debris forensics
+   padding: RAW ZERO BYTES from the end of the last TLV to header_len (NOT a length-prefixed
+            type-0 TLV). The decoder stops TLV parsing at a zero type word and requires the
+            remainder of […, header_len) to be all zero. header_len (and any fixed target it is
+            padded to, e.g. the pool's blob header length) is 8-aligned.
 [header_len, header_len+index_len)   pack index (deterministic encoding; packs only)
 [header_len+index_len, EOF)          payload
 ```
