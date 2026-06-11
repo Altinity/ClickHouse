@@ -5,8 +5,10 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
+    extern const int FILE_DOESNT_EXIST;
 }
 }
 
@@ -34,8 +36,202 @@ RoundReport Gc::runRegularRound()
         return report;
 
     report.round = state.round;
-    /// Tasks 6-12: fold / retire / fence / recheck / cascade / trim
+
+    /// R1: fold the journals into a new durable snap generation (cursors advance only after).
+    const FoldResult folded = fold(state, state_token);
+
+    /// Candidates for R2 are derived STATELESSLY from the durable snap (the model GRetire guard
+    /// `present ∧ everEdged ∧ InDeg = 0` over zeroInDegreeKnown) - never from the in-memory fold
+    /// transitions, so a crash-replayed round re-derives the same set. `folded.transitioned` is
+    /// only a health cross-check; the counts can differ legitimately (e.g. a node zeroed by an
+    /// EARLIER round's fold is in zeroInDegreeKnown but did not transition in THIS fold).
+    uint64_t candidates = 0;
+    for (const auto & [snap_shard, snap] : folded.snap)
+        candidates += snap.zeroInDegreeKnown().size();
+    report.candidates = candidates;
+
+    /// Tasks 7-12: retire / fence / recheck / cascade / trim
     return report;
+}
+
+Gc::FoldResult Gc::fold(GcState & state, const Token & state_token)
+{
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+    FoldResult result;
+
+    /// 1. Discover root-shard manifests: paginate roots/; the classifier skips verbatim files
+    /// (`_files/...`) and any non-numeric tail.
+    {
+        String cursor;
+        while (true)
+        {
+            const ListPage page = backend.list(layout.rootsPrefix(), cursor, /*limit*/ 1000);
+            for (const ListedKey & listed : page.keys)
+                if (auto parsed = layout.tryParseRootShardKey(listed.key))
+                    result.root_shards.push_back(std::move(*parsed));
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+    }
+
+    /// 2. Load the authoritative snap generation. An absent shard object is an EMPTY snap, not an
+    /// error: generation 0 of a fresh pool has no objects at all (and the very first fold of a new
+    /// pool legitimately starts from nothing).
+    for (uint64_t snap_shard = 0; snap_shard < state.snap_shards; ++snap_shard)
+    {
+        if (const auto got = backend.get(layout.gcSnapKey(state.snap_generation, snap_shard)))
+            result.snap.emplace(snap_shard, decodeGcSnap(got->bytes));
+        else
+        {
+            GcSnap empty;
+            empty.snap_shard = snap_shard;
+            empty.generation = state.snap_generation;
+            result.snap.emplace(snap_shard, std::move(empty));
+        }
+    }
+
+    /// Edges live in the TARGET's snap shard (in-degree is intra-shard); the expansion marker
+    /// lives in the TREE's own home shard. std::map node references are stable across inserts.
+    const auto shard_for = [&](const UInt128 & hash) -> GcSnap &
+    {
+        return result.snap.at(hashPrefixShard(hash, state.snap_shards));
+    };
+
+    /// 3. Fold each discovered root shard's journal records in (folded_cursor, shard_version],
+    /// in journal (= insertion) order.
+    for (const auto & [ns, root_shard] : result.root_shards)
+    {
+        const auto [root, manifest_token] = store->readShard(ns, root_shard);
+        const String cursor_key = ns.string() + "/" + std::to_string(root_shard);
+        const auto cursor_it = state.folded_cursor.find(cursor_key);
+        const uint64_t cursor = cursor_it != state.folded_cursor.end() ? cursor_it->second : 0;
+
+        for (size_t record_idx = 0; record_idx < root.journal.size(); ++record_idx)
+        {
+            const JournalRecord & record = root.journal[record_idx];
+            if (record.at_version <= cursor || record.at_version > root.shard_version)
+                continue;
+
+            if (record.op == JournalRecord::Op::Add)
+            {
+                /// Last-op-wins root edge (spec §7): a republish of an existing ref produces
+                /// consecutive Adds for the same (root_shard, part_name) with DIFFERENT trees and
+                /// no Remove between - addRootEdge re-points the edge and returns the displaced
+                /// old target if it zeroed.
+                auto displaced = shard_for(record.tree_id).addRootEdge(cursor_key, record.ref_name, record.tree_id);
+                result.transitioned.insert(result.transitioned.end(), displaced.begin(), displaced.end());
+
+                /// Once-per-tree expansion: the FIRST '+' to a tree with no marker reads the tree
+                /// once and adds its child-edge set (each edge into the CHILD's shard).
+                GcSnap & tree_home = shard_for(record.tree_id);
+                if (!tree_home.isExpanded(record.tree_id))
+                {
+                    std::vector<TreeEntry> entries;
+                    bool tree_present = true;
+                    try
+                    {
+                        entries = store->readTree(TreeId(u128ToHex(record.tree_id)));
+                    }
+                    catch (const Exception & e)
+                    {
+                        if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
+                            throw;
+                        /// DECISION (Task 6): a journal Add implies the tree was published, but the
+                        /// object may legitimately be gone NOW - a later Remove for the same ref
+                        /// plus an already COMPLETED prior round can have deleted it (in-order
+                        /// folding visits the Add anyway). Lookahead: a Remove for the same
+                        /// ref_name at a later at_version in THIS shard's remaining journal =>
+                        /// skip the expansion (the edges would be stripped anyway; the marker
+                        /// stays unset; no edges were added for a gone tree, so over-count-only
+                        /// is preserved). No later Remove => the manifest claims a LIVE ref to a
+                        /// missing tree => INV-NO-DANGLE surfaced; fail closed (propagate).
+                        bool later_remove = false;
+                        for (size_t ahead = record_idx + 1; ahead < root.journal.size(); ++ahead)
+                        {
+                            const JournalRecord & next = root.journal[ahead];
+                            if (next.op == JournalRecord::Op::Remove && next.ref_name == record.ref_name
+                                && next.at_version > record.at_version)
+                            {
+                                later_remove = true;
+                                break;
+                            }
+                        }
+                        if (!later_remove)
+                            throw;
+                        tree_present = false;
+                    }
+
+                    if (tree_present)
+                    {
+                        for (const TreeEntry & entry : entries)
+                        {
+                            switch (entry.placement)
+                            {
+                                case Placement::Blob:
+                                    shard_for(entry.file_hash).addTreeEdge(record.tree_id, ObjectKind::Blob, entry.file_hash);
+                                    break;
+                                case Placement::Subtree:
+                                    shard_for(entry.file_hash).addTreeEdge(record.tree_id, ObjectKind::Tree, entry.file_hash);
+                                    break;
+                                case Placement::PackSlice:
+                                    shard_for(entry.pack_hash).addPackEdge(record.tree_id, entry.pack_hash);
+                                    break;
+                                case Placement::Inline:
+                                    break;   /// embedded bytes - no separate object, no edge
+                            }
+                        }
+                        tree_home.markExpanded(record.tree_id);
+                    }
+                }
+            }
+            else
+            {
+                /// The model's GFold rem only removes the root edge - the cascade strip of the
+                /// tree's child edges belongs to the recheck/delete pipeline (Task 10).
+                auto cands = shard_for(record.tree_id).removeRootEdge(cursor_key, record.ref_name);
+                result.transitioned.insert(result.transitioned.end(), cands.begin(), cands.end());
+            }
+        }
+
+        state.folded_cursor[cursor_key] = root.shard_version;
+    }
+
+    /// 4. Persist, durable-before-cursor: the new-generation snap objects go durable FIRST; only
+    /// then does the gc/state CAS advance snap_generation + folded_cursor. A crash between the two
+    /// loses nothing - the old generation stays authoritative and the next round re-folds the same
+    /// records into a byte-identical generation object (idempotent replay).
+    const uint64_t new_generation = state.snap_generation + 1;
+    for (auto & [snap_shard, snap] : result.snap)
+    {
+        snap.generation = new_generation;
+        const String snap_key = layout.gcSnapKey(new_generation, snap_shard);
+        const String body = encodeGcSnap(snap);
+        if (backend.putIfAbsent(snap_key, body) == PutOutcome::PreconditionFailed)
+        {
+            /// Generation objects are write-once. An existing object is either OUR replay (a prior
+            /// attempt wrote the snap, then crashed or lost the cursor CAS) or a competing leader's
+            /// fold. Byte-equality proves the same fold => proceed. Different bytes => the
+            /// competing fold saw different journals => abort THIS round gracefully (split-brain
+            /// duplicate work must be benign; the next round re-derives from the
+            /// then-authoritative gc/state).
+            const auto existing = backend.get(snap_key);
+            if (!existing || existing->bytes != body)
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS gc fold: concurrent fold diverged at {}; retry next round", snap_key);
+        }
+    }
+
+    state.snap_generation = new_generation;
+    if (backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token) != CasOutcome::Committed)
+        /// Another leader advanced gc/state under us. The new-generation snap we just wrote is
+        /// orphaned garbage - harmless (write-once, never referenced by any cursor); full-GC
+        /// reclaims it in M-F.
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS gc fold: gc/state moved during the fold (another leader advanced it); retry next round");
+
+    return result;
 }
 
 void Gc::rememberObservation(const GcLease & lease)

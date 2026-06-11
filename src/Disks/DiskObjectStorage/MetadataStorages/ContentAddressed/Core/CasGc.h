@@ -3,6 +3,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcSnap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <map>
+#include <utility>
+#include <vector>
 
 namespace DB::Cas
 {
@@ -72,6 +75,36 @@ private:
     /// Lease acquire/renew/steal per the documented observation protocol. On success `state` holds
     /// the committed gc/state (with our lease) and `state_token` its backend token.
     bool acquireOrRenewLease(GcState & state, Token & state_token);
+
+    /// What one R1 fold produced (all derived from durable state; `transitioned` is the only
+    /// in-memory-transition artifact and it is REPORT/CROSS-CHECK ONLY - retire (Task 7) derives
+    /// its candidates STATELESSLY from the durable snap via GcSnap::zeroInDegreeKnown, so a
+    /// crash-replayed round sees the same candidates as the round that folded).
+    struct FoldResult
+    {
+        std::map<uint64_t, GcSnap> snap;                              /// snap_shard -> loaded+updated shard
+        std::vector<Candidate> transitioned;                          /// nodes that zeroed during THIS fold
+        std::vector<std::pair<RootNamespace, uint64_t>> root_shards;  /// discovered present manifests
+    };
+
+    /// R1 (spec §7; the model's GFold): per root shard, stream-merge the journal records in
+    /// (folded_cursor, shard_version] into the snap shards. Add => last-op-wins root edge (the
+    /// displaced old target is collected into `transitioned` - the Task-3 republish carryover) +
+    /// once-per-tree expansion (read the tree ONCE, add its child edges into each CHILD's snap
+    /// shard, set the marker in the TREE's home shard); Remove => drop the root edge only (the
+    /// cascade strip belongs to the delete pipeline, Task 10). Fresh uploads are invisible by
+    /// construction (no journal record until publish).
+    ///
+    /// DURABLE-BEFORE-CURSOR: the updated snap is written at generation+1 FIRST (ALL shards, even
+    /// unchanged ones - simplest correct v1; skipping byte-identical shards is a possible later
+    /// optimization), only then does ONE gc/state CAS advance snap_generation + folded_cursor
+    /// against `state_token`. Generation objects are write-once (putIfAbsent): an existing
+    /// byte-equal object is OUR replay (proceed); a different one is a diverged concurrent fold
+    /// and the gc/state CAS conflicting means another leader advanced state - both throw ABORTED
+    /// (the orphaned new-generation snap is harmless garbage; full-GC cleans it in M-F).
+    ///
+    /// On success `state` carries the committed snap_generation/folded_cursor.
+    FoldResult fold(GcState & state, const Token & state_token);
 
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
