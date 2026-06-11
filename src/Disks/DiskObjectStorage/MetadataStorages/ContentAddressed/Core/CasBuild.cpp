@@ -253,6 +253,13 @@ void Build::adoptTree(const TreeId & id)
     requireAlive();
     /// Whole-tree tokenless evidence on the tree root; the publish gate + fence/recheck handshake
     /// covers the closure (spec §5).
+    /// FOLLOW-UP(M-W): size 0 here flows into `RefPayload.tree_size` at publish for adopt-published
+    /// parts (FREEZE / detached re-attach / replication relink). Harmless in M-C2 (no read path
+    /// consumes tree_size — `readTree` GETs the whole object, `locate` uses per-entry file_size), but
+    /// `Resolved.tree_size` is reader-facing precisely so the M-W wiring can build StoredObjects
+    /// without a HEAD (spec §6). Recover the real size on the adopt path before M-W relies on it
+    /// (the subtree case in `adoptFromTree` already carries entry.file_size); add a round-trip test
+    /// asserting tree_size survives adopt-republish.
     deps[{static_cast<uint8_t>(ObjectKind::Tree), hexToU128(id.string())}] =
         DepEntry{ObjectKind::Tree, std::nullopt, store->retireView().round(), 0};
 }
