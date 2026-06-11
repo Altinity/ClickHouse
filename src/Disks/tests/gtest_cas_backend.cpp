@@ -165,3 +165,55 @@ TEST(CasInMemory, RangeGetAndHeadAndList)
     EXPECT_EQ(page2.keys[0].key, "p/b");
 }
 
+// =====================================================================
+// Task 4: CasInMemoryBackend — fault injection and probe-test modes
+// =====================================================================
+
+TEST(CasInMemoryFaults, HeldDeleteLandsLater)
+{
+    InMemoryBackend b;
+    Token t1;
+    b.putIfAbsent("k", "v1", &t1);
+    b.setHoldDeletes(true);
+    auto d = b.deleteExact("k", t1);                  // message "sent", not landed
+    EXPECT_EQ(d.kind, DeleteOutcome::Kind::Deleted);  // caller sees the send accepted
+    EXPECT_TRUE(b.get("k").has_value());              // ... but nothing landed yet
+    ASSERT_EQ(b.pendingDeletes(), 1u);
+    // the object is resurrected before the zombie lands:
+    Token t2;
+    b.putOverwrite("k", "v1'", t1, &t2);
+    auto landed = b.landPendingDelete(0);             // the zombie lands NOW
+    EXPECT_EQ(landed.kind, DeleteOutcome::Kind::TokenMismatch);   // 412 — INV-NO-RETURN in miniature
+    EXPECT_EQ(b.get("k")->bytes, "v1'");
+}
+
+TEST(CasInMemoryFaults, InjectedCasConflictFiresOnce)
+{
+    InMemoryBackend b;
+    Token t1;
+    b.casPut("m", "s1", std::nullopt, &t1);
+    b.failNextCasPut("m");
+    EXPECT_EQ(b.casPut("m", "s2", t1), CasOutcome::Conflict);     // injected
+    EXPECT_EQ(b.get("m")->bytes, "s1");
+    EXPECT_EQ(b.casPut("m", "s2", t1), CasOutcome::Committed);    // next attempt is real
+}
+
+TEST(CasInMemoryFaults, NonEnforcingModeMimicsBadBackend)
+{
+    InMemoryBackend b;
+    b.setEnforceTokens(false);                        // MinIO-OSS-shaped backend
+    Token t1;
+    b.putIfAbsent("k", "v1", &t1);
+    auto d = b.deleteExact("k", Token{"totally-wrong", TokenType::Emulated});
+    EXPECT_EQ(d.kind, DeleteOutcome::Kind::Deleted);  // silently deletes anyway — the dangerous behavior
+    EXPECT_FALSE(b.get("k").has_value());
+}
+
+TEST(CasInMemoryFaults, VersioningMarkerMode)
+{
+    InMemoryBackend b;
+    b.setSimulateDeleteMarkers(true);
+    Token t1;
+    b.putIfAbsent("k", "v1", &t1);
+    EXPECT_TRUE(b.deleteExact("k", t1).created_delete_marker);    // probe must reject this pool
+}

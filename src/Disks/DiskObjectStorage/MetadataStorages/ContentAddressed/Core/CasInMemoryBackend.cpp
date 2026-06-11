@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <algorithm>
 
 namespace DB::Cas
 {
@@ -78,7 +79,7 @@ PutOutcome InMemoryBackend::putOverwrite(const String & key, const String & byte
     if (it == store_.end())
         return PutOutcome::PreconditionFailed;
 
-    if (it->second.token != expected)
+    if (enforce_tokens_ && it->second.token != expected)
         return PutOutcome::PreconditionFailed;
 
     Token t = mintToken();
@@ -92,6 +93,14 @@ PutOutcome InMemoryBackend::putOverwrite(const String & key, const String & byte
 CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token)
 {
     std::lock_guard lock(mutex_);
+
+    // One-shot injected conflict
+    auto fail_it = fail_next_cas_.find(key);
+    if (fail_it != fail_next_cas_.end())
+    {
+        fail_next_cas_.erase(fail_it);
+        return CasOutcome::Conflict;
+    }
 
     auto it = store_.find(key);
     bool exists = (it != store_.end());
@@ -115,7 +124,7 @@ CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, con
         // swap-if-current CAS
         if (!exists)
             return CasOutcome::Conflict;
-        if (it->second.token != *expected)
+        if (enforce_tokens_ && it->second.token != *expected)
             return CasOutcome::Conflict;
         Token t = mintToken();
         it->second.bytes = bytes;
@@ -126,10 +135,9 @@ CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, con
     }
 }
 
-DeleteOutcome InMemoryBackend::deleteExact(const String & key, const Token & token)
+DeleteOutcome InMemoryBackend::applyDelete(const String & key, const Token & token)
 {
-    std::lock_guard lock(mutex_);
-
+    // Caller holds the mutex.
     auto it = store_.find(key);
     if (it == store_.end())
     {
@@ -138,7 +146,7 @@ DeleteOutcome InMemoryBackend::deleteExact(const String & key, const Token & tok
         return d;
     }
 
-    if (it->second.token != token)
+    if (enforce_tokens_ && it->second.token != token)
     {
         DeleteOutcome d;
         d.kind = DeleteOutcome::Kind::TokenMismatch;
@@ -148,8 +156,42 @@ DeleteOutcome InMemoryBackend::deleteExact(const String & key, const Token & tok
     store_.erase(it);
     DeleteOutcome d;
     d.kind = DeleteOutcome::Kind::Deleted;
-    d.created_delete_marker = false;
+    d.created_delete_marker = simulate_delete_markers_;
     return d;
+}
+
+DeleteOutcome InMemoryBackend::deleteExact(const String & key, const Token & token)
+{
+    std::lock_guard lock(mutex_);
+
+    if (hold_deletes_)
+    {
+        // Validate the key exists (and token matches if enforcing) before queuing,
+        // but don't remove yet — just enqueue.
+        auto it = store_.find(key);
+        if (it == store_.end())
+        {
+            DeleteOutcome d;
+            d.kind = DeleteOutcome::Kind::NotFound;
+            return d;
+        }
+        if (enforce_tokens_ && it->second.token != token)
+        {
+            DeleteOutcome d;
+            d.kind = DeleteOutcome::Kind::TokenMismatch;
+            return d;
+        }
+        PendingDelete pd;
+        pd.key = key;
+        pd.token = token;
+        pending_deletes_.push_back(std::move(pd));
+        DeleteOutcome d;
+        d.kind = DeleteOutcome::Kind::Deleted;
+        d.created_delete_marker = simulate_delete_markers_;
+        return d;
+    }
+
+    return applyDelete(key, token);
 }
 
 ListPage InMemoryBackend::list(const String & prefix, const String & cursor, size_t limit)
@@ -181,6 +223,53 @@ ListPage InMemoryBackend::list(const String & prefix, const String & cursor, siz
         page.next_cursor = it->first;
 
     return page;
+}
+
+void InMemoryBackend::setHoldDeletes(bool hold)
+{
+    std::lock_guard lock(mutex_);
+    hold_deletes_ = hold;
+}
+
+size_t InMemoryBackend::pendingDeletes() const
+{
+    std::lock_guard lock(mutex_);
+    return pending_deletes_.size();
+}
+
+DeleteOutcome InMemoryBackend::landPendingDelete(size_t i)
+{
+    std::lock_guard lock(mutex_);
+    if (i >= pending_deletes_.size())
+    {
+        DeleteOutcome d;
+        d.kind = DeleteOutcome::Kind::NotFound;
+        return d;
+    }
+
+    PendingDelete pd = pending_deletes_[i];
+    pending_deletes_.erase(pending_deletes_.begin() + static_cast<ptrdiff_t>(i));
+
+    // Apply the token check at LAND time — the object may have been modified since the delete was enqueued.
+    return applyDelete(pd.key, pd.token);
+}
+
+void InMemoryBackend::failNextCasPut(const String & key)
+{
+    std::lock_guard lock(mutex_);
+    fail_next_cas_.insert(key);
+}
+
+void InMemoryBackend::setEnforceTokens(bool enforce)
+{
+    std::lock_guard lock(mutex_);
+    enforce_tokens_ = enforce;
+}
+
+void InMemoryBackend::setSimulateDeleteMarkers(bool simulate)
+{
+    std::lock_guard lock(mutex_);
+    simulate_delete_markers_ = simulate;
 }
 
 }
