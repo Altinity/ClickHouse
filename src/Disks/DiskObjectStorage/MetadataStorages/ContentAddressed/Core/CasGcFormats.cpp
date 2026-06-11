@@ -1,17 +1,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
-#include <IO/ReadBufferFromMemory.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
-#include <limits>
 
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
-    extern const int LOGICAL_ERROR;
-    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -21,32 +18,86 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint8_t GC_STATE_VERSION = 1;
-constexpr uint8_t RETIRED_SET_VERSION = 1;
+constexpr uint64_t GC_STATE_VERSION = 1;
+constexpr uint64_t RETIRED_SET_VERSION = 1;
+
+/// `ObjectKind` <-> string. Unknown string on decode is corruption (fail closed).
+std::string_view objectKindToString(ObjectKind kind)
+{
+    switch (kind)
+    {
+        case ObjectKind::Blob: return "blob";
+        case ObjectKind::Tree: return "tree";
+        case ObjectKind::Pack: return "pack";
+    }
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS retired set: invalid object kind {}", static_cast<int>(kind));
+}
+
+ObjectKind objectKindFromString(std::string_view s, std::string_view what)
+{
+    if (s == "blob")
+        return ObjectKind::Blob;
+    if (s == "tree")
+        return ObjectKind::Tree;
+    if (s == "pack")
+        return ObjectKind::Pack;
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid object kind '{}'", what, s);
+}
+
+/// `TokenType` <-> string. Unknown string on decode is corruption (fail closed).
+std::string_view tokenTypeToString(TokenType type)
+{
+    switch (type)
+    {
+        case TokenType::ETag: return "etag";
+        case TokenType::Generation: return "generation";
+        case TokenType::Emulated: return "emulated";
+    }
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS retired set: invalid token type {}", static_cast<int>(type));
+}
+
+TokenType tokenTypeFromString(std::string_view s, std::string_view what)
+{
+    if (s == "etag")
+        return TokenType::ETag;
+    if (s == "generation")
+        return TokenType::Generation;
+    if (s == "emulated")
+        return TokenType::Emulated;
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid token type '{}'", what, s);
+}
 
 }
 
 String encodeGcState(const GcState & state)
 {
     WriteBufferFromOwnString out;
-    writeHeader(out, "CAGS", GC_STATE_VERSION);
-    writeBinaryLittleEndian(state.round, out);
-    writeBinaryLittleEndian(state.fence_seq, out);
+    writeCString("{", out);
+    writeJsonKey(out, "format");
+    writeJsonString("cas_gc_state", out);
+    writeChar(',', out);
+    writeJsonKey(out, "version");
+    writeIntText(GC_STATE_VERSION, out);
+    writeChar(',', out);
+    writeJsonKey(out, "round");
+    writeIntText(state.round, out);
+    writeChar(',', out);
+    writeJsonKey(out, "fence_seq");
+    writeIntText(state.fence_seq, out);
+    writeChar('}', out);
     return std::move(out.str());
 }
 
 GcState decodeGcState(std::string_view data)
 {
-    return decodeGuarded("gc/state", [&]
+    return decodeJsonGuarded("gc/state", [&]
     {
-        ReadBufferFromMemory in(data.data(), data.size());
-        readHeader(in, "CAGS", GC_STATE_VERSION, "gc/state");
+        auto obj = parseJsonDocument(data, "cas_gc_state", GC_STATE_VERSION, "gc/state");
+        checkNoUnknownKeys(*obj, {"format", "version", "round", "fence_seq"}, "gc/state");
 
         GcState state;
-        readBinaryLittleEndian(state.round, in);
-        readBinaryLittleEndian(state.fence_seq, in);
-
-        requireNoTrailingBytes(in, "gc/state");
+        state.round = requireU64(*obj, "round", "gc/state");
+        state.fence_seq = requireU64(*obj, "fence_seq", "gc/state");
         return state;
     });
 }
@@ -54,63 +105,67 @@ GcState decodeGcState(std::string_view data)
 String encodeRetiredSet(const RetiredSet & set)
 {
     WriteBufferFromOwnString out;
-    writeHeader(out, "CART", RETIRED_SET_VERSION);
-    writeBinaryLittleEndian(static_cast<uint64_t>(set.entries.size()), out);
+    writeCString("{", out);
+    writeJsonKey(out, "format");
+    writeJsonString("cas_retired_set", out);
+    writeChar(',', out);
+    writeJsonKey(out, "version");
+    writeIntText(RETIRED_SET_VERSION, out);
+    writeChar(',', out);
+    writeJsonKey(out, "entries");
+    writeChar('[', out);
+    bool first = true;
     for (const auto & entry : set.entries)
     {
-        writeBinaryLittleEndian(static_cast<uint8_t>(entry.kind), out);
-        writeBinaryLittleEndian(entry.hash, out);
-        writeBinaryLittleEndian(static_cast<uint8_t>(entry.token.type), out);
-        /// token_len is u16 on disk; a longer token would silently truncate the length while the
-        /// full value is appended below — writer-side silent corruption. Guard before writing.
-        if (entry.token.value.size() > std::numeric_limits<uint16_t>::max())
-            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
-                "CAS retired set: token length {} exceeds the u16 on-disk limit", entry.token.value.size());
-        writeBinaryLittleEndian(static_cast<uint16_t>(entry.token.value.size()), out);
-        writeString(entry.token.value, out);
-        writeBinaryLittleEndian(entry.size, out);
+        if (!first)
+            writeChar(',', out);
+        first = false;
+
+        writeChar('{', out);
+        writeJsonKey(out, "kind");
+        writeJsonString(objectKindToString(entry.kind), out);
+        writeChar(',', out);
+        writeJsonKey(out, "hash");
+        writeJsonString(u128ToHex(entry.hash), out);
+        writeChar(',', out);
+        writeJsonKey(out, "token");
+        writeJsonString(entry.token.value, out);
+        writeChar(',', out);
+        writeJsonKey(out, "token_type");
+        writeJsonString(tokenTypeToString(entry.token.type), out);
+        writeChar(',', out);
+        writeJsonKey(out, "size");
+        writeIntText(entry.size, out);
+        writeChar('}', out);
     }
+    writeChar(']', out);
+    writeChar('}', out);
     return std::move(out.str());
 }
 
 RetiredSet decodeRetiredSet(std::string_view data)
 {
-    return decodeGuarded("retired set", [&]
+    return decodeJsonGuarded("retired set", [&]
     {
-        ReadBufferFromMemory in(data.data(), data.size());
-        readHeader(in, "CART", RETIRED_SET_VERSION, "retired set");
+        auto obj = parseJsonDocument(data, "cas_retired_set", RETIRED_SET_VERSION, "retired set");
+        checkNoUnknownKeys(*obj, {"format", "version", "entries"}, "retired set");
+
+        auto entries = requireArray(*obj, "entries", "retired set");
 
         RetiredSet set;
-        uint64_t entry_count = 0;
-        readBinaryLittleEndian(entry_count, in);
-        for (uint64_t i = 0; i < entry_count; ++i)
+        for (size_t i = 0; i < entries->size(); ++i)
         {
+            auto entry_obj = requireObjectAt(*entries, i, "retired set");
+            checkNoUnknownKeys(*entry_obj, {"kind", "hash", "token", "token_type", "size"}, "retired set entry");
+
             RetiredEntry entry;
-
-            uint8_t kind = 0;
-            readBinaryLittleEndian(kind, in);
-            if (kind < static_cast<uint8_t>(ObjectKind::Blob) || kind > static_cast<uint8_t>(ObjectKind::Pack))
-                throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS retired set: invalid object kind {}", kind);
-            entry.kind = static_cast<ObjectKind>(kind);
-
-            readBinaryLittleEndian(entry.hash, in);
-
-            uint8_t token_type = 0;
-            readBinaryLittleEndian(token_type, in);
-            if (token_type < static_cast<uint8_t>(TokenType::ETag) || token_type > static_cast<uint8_t>(TokenType::Emulated))
-                throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS retired set: invalid token type {}", token_type);
-            entry.token.type = static_cast<TokenType>(token_type);
-
-            uint16_t token_len = 0;
-            readBinaryLittleEndian(token_len, in);
-            entry.token.value = readFixedBytes(in, token_len);
-
-            readBinaryLittleEndian(entry.size, in);
-
+            entry.kind = objectKindFromString(requireString(*entry_obj, "kind", "retired set"), "retired set");
+            entry.hash = requireHash(*entry_obj, "hash", "retired set");
+            entry.token.value = requireString(*entry_obj, "token", "retired set");
+            entry.token.type = tokenTypeFromString(requireString(*entry_obj, "token_type", "retired set"), "retired set");
+            entry.size = requireU64(*entry_obj, "size", "retired set");
             set.entries.push_back(std::move(entry));
         }
-
-        requireNoTrailingBytes(in, "retired set");
         return set;
     });
 }

@@ -8,7 +8,6 @@
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
-extern const int LOGICAL_ERROR;
 extern const int NOT_IMPLEMENTED;
 }
 
@@ -67,141 +66,123 @@ TEST(CasGcFormats, HeartbeatRoundTrip)
     EXPECT_EQ(d.created_at_ms, 1234567890123u);
 }
 
-/// ---------- validation throw-paths ----------
+/// ---------- validation throw-paths (strict JSON) ----------
 
-TEST(CasGcFormats, Validation)
+namespace
 {
-    auto bytes = encodeGcState(GcState{});
-    bytes[0] = 'X';
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
-    auto good = encodeGcState(GcState{});
-    good[4] = 2;   /// future version
-    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { decodeGcState(good); });
-    auto rs = encodeRetiredSet(RetiredSet{});
-    rs.push_back('\0');   /// trailing garbage
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRetiredSet(rs); });
+
+/// Shared corruption matrix for a JSON codec: the same fail-closed contract applies to every
+/// non-hashed metadata object, so each codec's validation test just supplies the decode function and
+/// a known-good document to mutate.
+template <typename Decode>
+void expectStrictJsonContract(Decode && decode, const String & expected_format)
+{
+    /// Malformed JSON.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(String("{not json")); });
+    /// Trailing junk after an otherwise-valid document (the JSON analogue of the binary codecs'
+    /// requireNoTrailingBytes guard — a half-written / spliced object must not silently decode).
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decode(R"({"format":")" + expected_format + R"(","version":1}trailing)"); });
+    /// Top-level value not an object.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(String("[]")); });
+    /// Wrong format value.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decode(R"({"format":"cas_wrong","version":1})"); });
+    /// Missing the format key entirely.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(R"({"version":1})"); });
+    /// version as a string (wrong type).
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decode(R"({"format":")" + expected_format + R"(","version":"1"})"); });
+    /// Future version => NOT_IMPLEMENTED (fail closed on the future, never corruption).
+    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
+        [&] { decode(R"({"format":")" + expected_format + R"(","version":2})"); });
 }
 
-TEST(CasGcFormats, MoreValidation)
+}
+
+TEST(CasGcFormats, GcStateValidation)
 {
-    /// One-entry retired set used as the base for the corruption rows below.
-    const auto makeOneEntrySet = []
-    {
-        RetiredSet rs;
-        rs.entries.push_back({ObjectKind::Pack, hexToU128("000102030405060708090a0b0c0d0e0f"),
-                              Token{"e", TokenType::ETag}, 1});
-        return encodeRetiredSet(rs);
-    };
+    expectStrictJsonContract([](const String & s) { return decodeGcState(s); }, "cas_gc_state");
 
-    /// Truncated retired set (chop the last byte of a non-empty encode).
-    {
-        auto bytes = makeOneEntrySet();
-        bytes.pop_back();
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRetiredSet(bytes); });
-    }
+    /// Readability pin: the encoded document carries the compact format marker.
+    EXPECT_TRUE(encodeGcState(GcState{}).contains(R"("format":"cas_gc_state")"));
 
-    /// Invalid kind byte. Layout: "CART"(4) version(1) reserved(3) entry_count(8) -> kind at 16.
-    {
-        auto bytes = makeOneEntrySet();
-        bytes[16] = 99;
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRetiredSet(bytes); });
-    }
+    /// Missing a required field.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeGcState(R"({"format":"cas_gc_state","version":1,"round":7})"); });
+    /// Wrong type for a numeric field.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeGcState(R"({"format":"cas_gc_state","version":1,"round":"7","fence_seq":3})"); });
+    /// Unknown extra key.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeGcState(R"({"format":"cas_gc_state","version":1,"round":7,"fence_seq":3,"x":1})"); });
+}
 
-    /// Invalid token_type byte: kind(1) + hash(16) after offset 16 -> token_type at 33.
-    {
-        auto bytes = makeOneEntrySet();
-        bytes[33] = 0;
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRetiredSet(bytes); });
-    }
+TEST(CasGcFormats, RetiredSetValidation)
+{
+    expectStrictJsonContract([](const String & s) { return decodeRetiredSet(s); }, "cas_retired_set");
 
-    /// Bad magic / future version on the retired set.
-    {
-        auto bytes = makeOneEntrySet();
-        bytes[0] = 'X';
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRetiredSet(bytes); });
-    }
-    {
-        auto bytes = makeOneEntrySet();
-        bytes[4] = 2;
-        expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { decodeRetiredSet(bytes); });
-    }
+    EXPECT_TRUE(encodeRetiredSet(RetiredSet{}).contains(R"("format":"cas_retired_set")"));
 
-    /// Nonzero reserved bytes (offset 5..7 in both headers).
-    {
-        auto bytes = makeOneEntrySet();
-        bytes[6] = 1;
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRetiredSet(bytes); });
-    }
-    {
-        auto bytes = encodeGcState(GcState{});
-        bytes[5] = 1;
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
-    }
+    const String entry = R"({"kind":"blob","hash":"000102030405060708090a0b0c0d0e0f","token":"e","token_type":"etag","size":1})";
 
-    /// Encoding a token longer than the u16 token_len field must fail closed (exception),
-    /// never silently truncate the length while appending the full token value.
+    /// Missing a required field inside an entry.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[{"kind":"blob"}]})"); });
+    /// Unknown extra key inside an entry.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        RetiredSet rs;
-        rs.entries.push_back({ObjectKind::Blob, hexToU128("000102030405060708090a0b0c0d0e0f"),
-                              Token{String(70000, 't'), TokenType::ETag}, 1});
-        expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRetiredSet(rs); });
-    }
+        decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)"
+            + String(R"({"kind":"blob","hash":"000102030405060708090a0b0c0d0e0f","token":"e","token_type":"etag","size":1,"x":1})") + "]}");
+    });
+    /// Wrong type: size as a string.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)"
+            + String(R"({"kind":"blob","hash":"000102030405060708090a0b0c0d0e0f","token":"e","token_type":"etag","size":"1"})") + "]}");
+    });
+    /// Bad enum: unknown kind.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)"
+            + String(R"({"kind":"banana","hash":"000102030405060708090a0b0c0d0e0f","token":"e","token_type":"etag","size":1})") + "]}");
+    });
+    /// Bad enum: unknown token_type.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)"
+            + String(R"({"kind":"blob","hash":"000102030405060708090a0b0c0d0e0f","token":"e","token_type":"weird","size":1})") + "]}");
+    });
+    /// Bad hash hex.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)"
+            + String(R"({"kind":"blob","hash":"nothex","token":"e","token_type":"etag","size":1})") + "]}");
+    });
+    /// Unknown extra key at the top level.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[],"x":1})"); });
 
-    /// Truncated and trailing-garbage gc/state.
-    {
-        auto bytes = encodeGcState(GcState{.round = 1, .fence_seq = 2});
-        bytes.pop_back();
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
-    }
-    {
-        auto bytes = encodeGcState(GcState{.round = 1, .fence_seq = 2});
-        bytes.push_back('\0');
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
-    }
+    /// Sanity: the canonical entry round-trips through decode without throwing.
+    EXPECT_NO_THROW(decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)" + entry + "]}"));
 }
 
 TEST(CasGcFormats, HeartbeatValidation)
 {
-    /// Layout: "CAHB"(0-3) version(4) reserved(5-7) server_id(8-23) seq(24-31) created_at_ms(32-39).
-    const auto makeHeartbeat = []
-    {
-        return encodeHeartbeat({.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                                .heartbeat_seq = 7,
-                                .created_at_ms = 9});
-    };
+    expectStrictJsonContract([](const String & s) { return decodeHeartbeat(s); }, "cas_heartbeat");
 
-    /// Bad magic.
-    {
-        auto bytes = makeHeartbeat();
-        bytes[0] = 'X';
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
-    }
+    EXPECT_TRUE(encodeHeartbeat(Heartbeat{}).contains(R"("format":"cas_heartbeat")"));
 
-    /// Future version — NOT_IMPLEMENTED, never misreported as corruption.
-    {
-        auto bytes = makeHeartbeat();
-        bytes[4] = 2;
-        expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { decodeHeartbeat(bytes); });
-    }
-
-    /// Nonzero reserved byte.
-    {
-        auto bytes = makeHeartbeat();
-        bytes[6] = 1;
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
-    }
-
-    /// Truncation.
-    {
-        auto bytes = makeHeartbeat();
-        bytes.pop_back();
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
-    }
-
-    /// Trailing garbage.
-    {
-        auto bytes = makeHeartbeat();
-        bytes.push_back('\0');
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
-    }
+    /// Missing a required field.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeHeartbeat(R"({"format":"cas_heartbeat","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","heartbeat_seq":7})"); });
+    /// Wrong type for a numeric field.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeHeartbeat(R"({"format":"cas_heartbeat","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","heartbeat_seq":"7","created_at_ms":9})"); });
+    /// Bad hash hex for server_id.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeHeartbeat(R"({"format":"cas_heartbeat","version":1,"server_id":"nothex","heartbeat_seq":7,"created_at_ms":9})"); });
+    /// Unknown extra key.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeHeartbeat(R"({"format":"cas_heartbeat","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","heartbeat_seq":7,"created_at_ms":9,"x":1})"); });
 }

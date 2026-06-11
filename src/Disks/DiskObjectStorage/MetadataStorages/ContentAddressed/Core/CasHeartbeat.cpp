@@ -1,7 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
-#include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -20,33 +19,43 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint8_t HEARTBEAT_VERSION = 1;
+constexpr uint64_t HEARTBEAT_VERSION = 1;
 
 }
 
 String encodeHeartbeat(const Heartbeat & heartbeat)
 {
     WriteBufferFromOwnString out;
-    writeHeader(out, "CAHB", HEARTBEAT_VERSION);
-    writeBinaryLittleEndian(heartbeat.server_id, out);
-    writeBinaryLittleEndian(heartbeat.heartbeat_seq, out);
-    writeBinaryLittleEndian(heartbeat.created_at_ms, out);
+    writeCString("{", out);
+    writeJsonKey(out, "format");
+    writeJsonString("cas_heartbeat", out);
+    writeChar(',', out);
+    writeJsonKey(out, "version");
+    writeIntText(HEARTBEAT_VERSION, out);
+    writeChar(',', out);
+    writeJsonKey(out, "server_id");
+    writeJsonString(u128ToHex(heartbeat.server_id), out);
+    writeChar(',', out);
+    writeJsonKey(out, "heartbeat_seq");
+    writeIntText(heartbeat.heartbeat_seq, out);
+    writeChar(',', out);
+    writeJsonKey(out, "created_at_ms");
+    writeIntText(heartbeat.created_at_ms, out);
+    writeChar('}', out);
     return std::move(out.str());
 }
 
 Heartbeat decodeHeartbeat(std::string_view data)
 {
-    return decodeGuarded("heartbeat", [&]
+    return decodeJsonGuarded("heartbeat", [&]
     {
-        ReadBufferFromMemory in(data.data(), data.size());
-        readHeader(in, "CAHB", HEARTBEAT_VERSION, "heartbeat");
+        auto obj = parseJsonDocument(data, "cas_heartbeat", HEARTBEAT_VERSION, "heartbeat");
+        checkNoUnknownKeys(*obj, {"format", "version", "server_id", "heartbeat_seq", "created_at_ms"}, "heartbeat");
 
         Heartbeat heartbeat;
-        readBinaryLittleEndian(heartbeat.server_id, in);
-        readBinaryLittleEndian(heartbeat.heartbeat_seq, in);
-        readBinaryLittleEndian(heartbeat.created_at_ms, in);
-
-        requireNoTrailingBytes(in, "heartbeat");
+        heartbeat.server_id = requireHash(*obj, "server_id", "heartbeat");
+        heartbeat.heartbeat_seq = requireU64(*obj, "heartbeat_seq", "heartbeat");
+        heartbeat.created_at_ms = requireU64(*obj, "created_at_ms", "heartbeat");
         return heartbeat;
     });
 }

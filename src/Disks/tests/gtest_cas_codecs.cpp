@@ -488,44 +488,62 @@ TEST(CasRootShardCodec, RefsCanonicalOrderRegardlessOfInsertion)
     EXPECT_EQ(encodeRootShard(a), encodeRootShard(b));
 }
 
-TEST(CasRootShardCodec, BadMagicThrows)
+/// ---------- CasRootShardCodec strict-JSON validation ----------
+
+TEST(CasRootShardCodec, StrictJsonValidation)
 {
-    RootShard rs;
-    String encoded = encodeRootShard(rs);
-    encoded[0] = 'X';
-    EXPECT_THROW(decodeRootShard(encoded), DB::Exception);
+    /// Readability pin: the encoded document carries the compact format marker.
+    EXPECT_TRUE(encodeRootShard(RootShard{}).contains(R"("format":"cas_root_shard")"));
+
+    /// Malformed JSON.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("{not json")); });
+    /// Wrong format value.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeRootShard(R"({"format":"cas_wrong","version":1,"shard_version":0,"fence_round":0,"refs":{},"journal":[]})"); });
+    /// Missing a required top-level key (refs).
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"journal":[]})"); });
+    /// Wrong type: shard_version as a string.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":"0","fence_round":0,"refs":{},"journal":[]})"); });
+    /// Unknown extra key at the top level.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"refs":{},"journal":[],"x":1})"); });
+    /// Future version => NOT_IMPLEMENTED (fail closed on the future, never corruption).
+    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
+        [] { decodeRootShard(R"({"format":"cas_root_shard","version":2,"shard_version":0,"fence_round":0,"refs":{},"journal":[]})"); });
 }
 
-TEST(CasRootShardCodec, FutureVersionThrows)
+TEST(CasRootShardCodec, StrictJsonRefAndJournalValidation)
 {
-    RootShard rs;
-    String encoded = encodeRootShard(rs);
-    encoded[4] = 2;  /// version byte right after the 4-char magic
-    EXPECT_THROW(decodeRootShard(encoded), DB::Exception);
-}
-
-TEST(CasRootShardCodec, TruncationThrows)
-{
-    RootShard rs;
-    rs.refs["x"] = RefPayload{UInt128(0x1), 1, {}};
-    String encoded = encodeRootShard(rs);
-    encoded.resize(encoded.size() - 4);
-    EXPECT_THROW(decodeRootShard(encoded), DB::Exception);
-}
-
-TEST(CasRootShardCodec, BadJournalOpThrows)
-{
-    RootShard rs;
-    rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(0x1), 1});
-    String encoded = encodeRootShard(rs);
-    /// Patch the op byte of the single journal record to an out-of-range value (3).
-    /// We cannot easily compute its offset robustly, so re-encode with a forged op via decode-then-check
-    /// is not possible; instead corrupt by scanning for the known ref name "r".
-    auto found = encoded.rfind('r');
-    ASSERT_NE(found, String::npos);
-    /// The op byte precedes "u16 name_len + name"; name_len(2 bytes) sits just before the name. The op
-    /// byte is the byte before those 2 length bytes.
-    ASSERT_GE(found, 3u);
-    encoded[found - 3] = 3;  /// op = 3 (out of {1,2})
-    EXPECT_THROW(decodeRootShard(encoded), DB::Exception);
+    /// Bad hash hex in a ref's tree.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
+    {
+        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,)"
+            R"("refs":{"r":{"tree":"nothex","tree_size":1,"mutable_files":{}}},"journal":[]})");
+    });
+    /// Unknown extra key inside a ref payload.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
+    {
+        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,)"
+            R"("refs":{"r":{"tree":"000102030405060708090a0b0c0d0e0f","tree_size":1,"mutable_files":{},"x":1}},"journal":[]})");
+    });
+    /// Wrong type: a mutable_files value that is not a string.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
+    {
+        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,)"
+            R"("refs":{"r":{"tree":"000102030405060708090a0b0c0d0e0f","tree_size":1,"mutable_files":{"k":1}}},"journal":[]})");
+    });
+    /// Bad enum: unknown journal op.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
+    {
+        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"refs":{},)"
+            R"("journal":[{"op":"toggle","ref":"r","tree":"000102030405060708090a0b0c0d0e0f","at_version":1}]})");
+    });
+    /// Missing a required key inside a journal record.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
+    {
+        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"refs":{},)"
+            R"("journal":[{"op":"add","ref":"r","tree":"000102030405060708090a0b0c0d0e0f"}]})");
+    });
 }

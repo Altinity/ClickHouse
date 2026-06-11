@@ -19,9 +19,12 @@ namespace DB::Cas
 /// Heartbeats gate only DEBRIS reclamation by full GC (M-F): a wedged heartbeat delays cleanup,
 /// never correctness — the publish GATE, not the heartbeat, is the safety mechanism (spec §5).
 ///
-/// Format ("CAHB" v1, little-endian):
-///   char[4]="CAHB"  u8 version=1  u8[3] reserved=0
-///   u128 server_id   u64 heartbeat_seq   u64 created_at_ms
+/// Non-hashed metadata object => STRICT JSON ("cas_heartbeat" v1, spec §4 encoding split,
+/// decision 2026-06-11):
+///   {"format":"cas_heartbeat","version":1,"server_id":"<32 lowercase hex>",
+///    "heartbeat_seq":3,"created_at_ms":1765459200000}
+/// Fail-closed decode (wrong format / unknown key / missing key / wrong type / bad hash hex /
+/// malformed document => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
 struct Heartbeat
 {
     UInt128 server_id{};

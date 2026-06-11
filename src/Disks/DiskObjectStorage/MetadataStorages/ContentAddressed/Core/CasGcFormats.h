@@ -18,11 +18,13 @@ namespace DB::Cas
 /// needs; keep writer-side code forward-compatible by treating a future version as
 /// NOT_IMPLEMENTED (fail closed), never as corruption.
 ///
-/// Both formats follow the M-C1 codec conventions: little-endian, magic + version + reserved
-/// header, strict decode (bad magic / truncation / trailing bytes / nonzero reserved / invalid
-/// enum values => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
+/// Both formats are non-hashed metadata objects => STRICT JSON (spec §4 encoding split,
+/// decision 2026-06-11): a top-level object with `format` + `version`, fail-closed decode
+/// (wrong format / unknown key / missing key / wrong type / bad enum string / bad hash hex /
+/// malformed document => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
 
-/// gc/state ("CAGS" v1): char[4]="CAGS" u8 version=1 u8[3] reserved=0 u64 round u64 fence_seq.
+/// gc/state ("cas_gc_state" v1):
+///   {"format":"cas_gc_state","version":1,"round":7,"fence_seq":3}
 struct GcState
 {
     uint64_t round = 0;       /// the highest GC round whose retire sets are durable
@@ -38,10 +40,11 @@ struct RetiredEntry
     uint64_t size = 0;
 };
 
-/// Retired set ("CART" v1), one object per gc/retired/<round>.<fence_seq>/<shard>:
-/// char[4]="CART" u8 version=1 u8[3] reserved=0 u64 entry_count, then per entry:
-/// u8 kind{1=blob,2=tree,3=pack} u128 hash u8 token_type{1=etag,2=generation,3=emulated}
-/// u16 token_len, token_len bytes (token value), u64 size.
+/// Retired set ("cas_retired_set" v1), one object per gc/retired/<round>.<fence_seq>/<shard>:
+///   {"format":"cas_retired_set","version":1,
+///    "entries":[{"kind":"blob","hash":"<32 lowercase hex>","token":"etag-1",
+///                "token_type":"etag","size":1234}]}
+/// kind: "blob" | "tree" | "pack"; token_type: "etag" | "generation" | "emulated".
 struct RetiredSet
 {
     std::vector<RetiredEntry> entries;

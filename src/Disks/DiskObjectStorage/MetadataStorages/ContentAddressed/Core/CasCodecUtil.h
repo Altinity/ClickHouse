@@ -1,8 +1,17 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Formats/FormatSettings.h>
 #include <IO/ReadBuffer.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
+#include <Poco/Dynamic/Var.h>
+#include <Poco/JSON/Array.h>
+#include <Poco/JSON/Object.h>
+#include <Poco/JSON/Parser.h>
+#include <algorithm>
+#include <initializer_list>
+#include <map>
 #include <string_view>
 
 namespace DB
@@ -19,12 +28,16 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-/// The CAS on-disk codecs use the standard IO helpers — `writeBinaryLittleEndian` /
-/// `readBinaryLittleEndian` over `WriteBuffer` / `ReadBuffer` — for every field. The on-disk format
-/// is byte-exact (it IS pool format v2): every multi-byte field is little-endian; `UInt128` is its
-/// 16 little-endian bytes (low 64 bits first) — exactly what the helpers produce on any host
-/// (`transformEndianness` handles wide integers). String lengths ride separately as explicit
-/// fixed-width LE fields, so the codecs do not use the varint-prefixed `writeStringBinary` family.
+/// Encoding split (spec §4, decision 2026-06-11). Objects whose bytes are identity (the CHCA
+/// envelope, the canonical tree payload, blob/pack payloads) are BINARY: the codecs use the
+/// standard IO helpers — `writeBinaryLittleEndian` / `readBinaryLittleEndian` over `WriteBuffer` /
+/// `ReadBuffer` — for every field; little-endian, byte-exact (it IS pool format v2). Every
+/// NON-HASHED metadata object (root manifests, gc/state, retired sets, heartbeats, _pool_meta,
+/// checkpoints, outcomes) is STRICT JSON: a top-level object carrying `format` + `version`,
+/// fail-closed parsing (wrong format / unknown key / missing key / wrong type / malformed document
+/// => CORRUPTED_DATA; newer version => NOT_IMPLEMENTED) via the helpers in the second half of this
+/// file. These objects are the operational surface a human inspects with plain S3 tools during an
+/// incident; they are never hashed, so canonical byte stability is not required.
 
 /// Read exactly `n` raw bytes. The bounds check MUST precede the allocation: `n` typically comes
 /// from a length field just read off the wire, so on corrupted input it can be huge (a u32 field
@@ -41,47 +54,6 @@ inline String readFixedBytes(ReadBuffer & in, size_t n)
     String s(n, '\0');
     in.readStrict(s.data(), n);
     return s;
-}
-
-/// The shared object header: char[4] magic, u8 version, u8[3] reserved=0.
-constexpr size_t CODEC_RESERVED_BYTES = 3;
-
-inline void writeHeader(WriteBuffer & out, std::string_view magic, uint8_t version)
-{
-    writeString(magic, out);
-    writeBinaryLittleEndian(version, out);
-    for (size_t i = 0; i < CODEC_RESERVED_BYTES; ++i)
-        writeBinaryLittleEndian(static_cast<uint8_t>(0), out);
-}
-
-/// Reads and validates magic + version + reserved. Future version => NOT_IMPLEMENTED (checked
-/// before the reserved bytes — a v2 header may repurpose them); everything else => CORRUPTED_DATA.
-inline void readHeader(ReadBuffer & in, std::string_view magic, uint8_t current_version, std::string_view what)
-{
-    if (readFixedBytes(in, magic.size()) != magic)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: bad magic", what);
-
-    uint8_t version = 0;
-    readBinaryLittleEndian(version, in);
-    if (version > current_version)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "CAS {}: unsupported version {}", what, version);
-    if (version != current_version)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid version {}", what, version);
-
-    for (size_t i = 0; i < CODEC_RESERVED_BYTES; ++i)
-    {
-        uint8_t reserved = 0;
-        readBinaryLittleEndian(reserved, in);
-        if (reserved != 0)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: nonzero reserved byte", what);
-    }
-}
-
-inline void requireNoTrailingBytes(ReadBuffer & in, std::string_view what)
-{
-    if (!in.eof())
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS {}: {} trailing bytes after the end of the encoded data", what, in.available());
 }
 
 /// Decode-boundary guard. The codecs parse fully materialized objects, so running out of bytes is
@@ -102,6 +74,192 @@ auto decodeGuarded(std::string_view what, F && f)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: truncated encoded data ({})", what, e.message());
         throw;
     }
+}
+
+/// ---------------------------------------------------------------------------------------------
+/// Strict JSON helpers for the non-hashed metadata codecs (see the encoding-split note above).
+/// Encode is hand-written (deterministic key order = insertion order, compact); decode goes
+/// through `Poco::JSON::Parser` with the fail-closed extraction helpers below.
+/// ---------------------------------------------------------------------------------------------
+
+/// JSON string writer for the metadata codecs: standard JSON escaping, forward slashes kept
+/// verbatim (part names and tokens stay grep-able in an incident).
+inline void writeJsonString(std::string_view s, WriteBuffer & out)
+{
+    static const FormatSettings settings = []
+    {
+        FormatSettings fs;
+        fs.json.escape_forward_slashes = false;
+        return fs;
+    }();
+    writeJSONString(s, out, settings);
+}
+
+/// Writes `"key":` — the key is a literal from the codec, never attacker-controlled.
+inline void writeJsonKey(WriteBuffer & out, std::string_view key)
+{
+    writeJsonString(key, out);
+    writeChar(':', out);
+}
+
+/// Decode-boundary guard for the JSON codecs: translates `Poco::Exception` (parser errors) and any
+/// bad-cast/conversion error into CORRUPTED_DATA. Already-classified `DB::Exception`s
+/// (CORRUPTED_DATA / NOT_IMPLEMENTED from the helpers below) pass through unchanged.
+template <typename F>
+auto decodeJsonGuarded(std::string_view what, F && f)
+{
+    try
+    {
+        return f();
+    }
+    catch (const Exception &)
+    {
+        throw;
+    }
+    catch (const Poco::Exception & e)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: malformed JSON ({})", what, e.displayText());
+    }
+    catch (const std::exception & e)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: malformed JSON ({})", what, e.what());
+    }
+}
+
+/// Parses `data` and requires the top-level value to be a JSON object.
+inline Poco::JSON::Object::Ptr requireObject(std::string_view data, std::string_view what)
+{
+    Poco::Dynamic::Var parsed;
+    try
+    {
+        Poco::JSON::Parser parser;
+        parsed = parser.parse(String(data));
+    }
+    catch (const Poco::Exception & e)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: malformed JSON ({})", what, e.displayText());
+    }
+    if (parsed.type() != typeid(Poco::JSON::Object::Ptr))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: top-level JSON value is not an object", what);
+    return parsed.extract<Poco::JSON::Object::Ptr>();
+}
+
+/// Fail-closed key lookup: a missing key is corruption.
+inline Poco::Dynamic::Var requireKey(const Poco::JSON::Object & obj, std::string_view key, std::string_view what)
+{
+    const String key_str(key);
+    if (!obj.has(key_str))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: missing key '{}'", what, key);
+    return obj.get(key_str);
+}
+
+inline String requireString(const Poco::JSON::Object & obj, std::string_view key, std::string_view what)
+{
+    const auto var = requireKey(obj, key, what);
+    if (var.type() != typeid(String))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: key '{}' must be a string", what, key);
+    return var.extract<String>();
+}
+
+/// Strict unsigned integer: rejects strings, booleans, floats and negatives. Poco parses JSON
+/// integers as Int64, so values above INT64_MAX are out of scope BY DESIGN — every counter/size in
+/// these formats stays far below 2^53 (the JSON-number interop bound) anyway.
+inline uint64_t requireU64(const Poco::JSON::Object & obj, std::string_view key, std::string_view what)
+{
+    const auto var = requireKey(obj, key, what);
+    if (var.isBoolean() || !var.isInteger())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: key '{}' must be a non-negative integer", what, key);
+    const Int64 value = var.convert<Int64>();
+    if (value < 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: key '{}' must be a non-negative integer", what, key);
+    return static_cast<uint64_t>(value);
+}
+
+inline Poco::JSON::Object::Ptr requireObject(const Poco::JSON::Object & obj, std::string_view key, std::string_view what)
+{
+    const auto var = requireKey(obj, key, what);
+    if (var.type() != typeid(Poco::JSON::Object::Ptr))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: key '{}' must be an object", what, key);
+    return var.extract<Poco::JSON::Object::Ptr>();
+}
+
+inline Poco::JSON::Array::Ptr requireArray(const Poco::JSON::Object & obj, std::string_view key, std::string_view what)
+{
+    const auto var = requireKey(obj, key, what);
+    if (var.type() != typeid(Poco::JSON::Array::Ptr))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: key '{}' must be an array", what, key);
+    return var.extract<Poco::JSON::Array::Ptr>();
+}
+
+/// Array element that must be an object (journal records, retired entries).
+inline Poco::JSON::Object::Ptr requireObjectAt(const Poco::JSON::Array & arr, size_t i, std::string_view what)
+{
+    const auto var = arr.get(static_cast<unsigned int>(i));
+    if (var.type() != typeid(Poco::JSON::Object::Ptr))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: array element {} must be an object", what, i);
+    return var.extract<Poco::JSON::Object::Ptr>();
+}
+
+/// A nested object whose values are all strings (e.g. a ref's `mutable_files`).
+inline std::map<String, String> requireStringMap(const Poco::JSON::Object & obj, std::string_view key, std::string_view what)
+{
+    const auto nested = requireObject(obj, key, what);
+    std::map<String, String> result;
+    for (const auto & [k, v] : *nested)
+    {
+        if (v.type() != typeid(String))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: value of '{}' inside '{}' must be a string", what, k, key);
+        result[k] = v.extract<String>();
+    }
+    return result;
+}
+
+/// A 32-lowercase-hex-char hash string; `hexToU128`'s BAD_ARGUMENTS is translated to the pinned
+/// CORRUPTED_DATA here (junk hex inside a persisted object is corruption, not a caller mistake).
+inline UInt128 requireHash(const Poco::JSON::Object & obj, std::string_view key, std::string_view what)
+{
+    const String hex = requireString(obj, key, what);
+    try
+    {
+        return hexToU128(hex);
+    }
+    catch (const Exception & e)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS {}: key '{}' is not a valid hash ({})", what, key, e.message());
+    }
+}
+
+/// Fail-closed: any key outside `allowed` is corruption.
+inline void checkNoUnknownKeys(
+    const Poco::JSON::Object & obj, std::initializer_list<std::string_view> allowed, std::string_view what)
+{
+    for (const auto & [key, value] : obj)
+    {
+        if (std::find(allowed.begin(), allowed.end(), key) == allowed.end())
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown key '{}'", what, key);
+    }
+}
+
+/// Common decode prologue for every non-hashed metadata object: parse the document (malformed =>
+/// CORRUPTED_DATA), require `format` == expected (else CORRUPTED_DATA), require an integer
+/// `version`; a version above `current_version` => NOT_IMPLEMENTED (fail closed on the future,
+/// never misreported as corruption), any other unexpected version => CORRUPTED_DATA.
+inline Poco::JSON::Object::Ptr parseJsonDocument(
+    std::string_view data, std::string_view expected_format, uint64_t current_version, std::string_view what)
+{
+    auto obj = requireObject(data, what);
+    const String format = requireString(*obj, "format", what);
+    if (format != expected_format)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS {}: unexpected format '{}' (expected '{}')", what, format, expected_format);
+    const uint64_t version = requireU64(*obj, "version", what);
+    if (version > current_version)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "CAS {}: unsupported version {}", what, version);
+    if (version != current_version)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid version {}", what, version);
+    return obj;
 }
 
 }
