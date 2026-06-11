@@ -156,3 +156,21 @@ are not in `retired` at the writer's view." The model covers one-level trees; th
    1, 2, and 5 on smaller models.
 8. **Liveness is round-cap limited** — `NoLeakForever` found a bound-artifact lasso at `MaxRound=2`
    (and at `MaxRound=3`); a genuine non-round-cap lasso was not confirmed absent.
+
+## Large-bound counterexample hunt (W-REVALIDATE mode) {#hunt}
+
+Run 2026-06-11 after the `W-REVALIDATE` mode landed (the faithful F1 re-observation gate, no
+dead-token oracle — `EnableReval = TRUE` in both hunt configs). Both phases are **bug hunts, not
+proofs**: "no violation found" below means exactly that — a clean search of the stated scope —
+and is never recorded as a PASS.
+
+| Phase | Config | Scope searched | Violations | Termination |
+|---|---|---|---|---|
+| BFS cross-product | `CaIncarnationCore_hunt_cross.cfg` | **4,978,632,765 states generated / 781,714,146 distinct** (trees × debris × split-brain × overwrite × 2 writers × 2 shards — the cross-product no staged config co-checks; all 5 invariants + `MonotoneGC`) | **0** | killed at ~28 min by **disk exhaustion** (`StatePoolWriter: No space left on device` — the breadth-first queue at 637M pending states filled the ~100 GB free; 43 GB heap was not the limit). Infra failure, not a model error; re-runnable with more disk or smaller bounds. |
+| Random simulation, depth 200 | `CaIncarnationCore_hunt_sim.cfg` | **8,307,265,639 state visits** along random depth-200 traces at bounds BFS cannot enumerate (2 trees + 2 blobs, `MaxToken=4`, `MaxRound=4`, `MaxLog=8`; 5 invariants — action properties not checked in simulation) | **0** | full 58-minute budget (timeout, by design) |
+
+Interpretation: ~782M distinct states breadth-first across the full feature cross-product plus
+8.3B deep random visits at enlarged bounds, all clean, in the gate mode the implementation will
+actually use. Strong negative evidence; the explored-prefix caveat stands (the BFS queue still
+held 637M unexplored states at the cutoff). Logs: `tmp/tlc_CaIncarnationCore_hunt_cross.log`,
+`tmp/tlc_CaIncarnationCore_hunt_sim.log`.
