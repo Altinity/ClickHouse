@@ -32,7 +32,8 @@ TEST(CasGcSnap, InDegreeSetSemanticsAndCandidates)
     EXPECT_EQ(snap.inDegree(ObjectKind::Blob, B), 1u);
     EXPECT_TRUE(snap.isKnown(ObjectKind::Tree, T));
     EXPECT_TRUE(snap.isKnown(ObjectKind::Blob, B));
-    snap.addRootEdge("srv1/tbl/0", "part_1", T);              /// duplicate add: no double count
+    /// same-target duplicate add: no double count, no displaced candidate
+    EXPECT_TRUE(snap.addRootEdge("srv1/tbl/0", "part_1", T).empty());
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, T), 2u);
     EXPECT_TRUE(snap.removeRootEdge("srv1/tbl/0", "part_1").empty());
     auto cands = snap.removeRootEdge("srv1/tbl/1", "part_2");
@@ -112,6 +113,45 @@ TEST(CasGcSnap, RootEdgeRepointIsRemoveThenAdd)
     snap.addRootEdge("s/0", "p1", T2);
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, T2), 1u);
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, T1), 0u);
+}
+
+TEST(CasGcSnap, RootEdgeAddOverAddIsLastOpWins)
+{
+    /// Spec §7: root edges are last-op-wins. `Build::publish` legally re-publishes an existing
+    /// ref with a NEW tree (consecutive journal Adds, no Remove between); the LIVE tree (T2)
+    /// must end up counted and the displaced OLD tree (T1) becomes the zero-in-degree candidate.
+    GcSnap snap;
+    const UInt128 T1 = hexToU128("aa00000000000000000000000000000a");
+    const UInt128 T2 = hexToU128("ab00000000000000000000000000000a");
+    EXPECT_TRUE(snap.addRootEdge("s/0", "p1", T1).empty());
+    auto cands = snap.addRootEdge("s/0", "p1", T2);
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, T2), 1u);
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, T1), 0u);
+    ASSERT_EQ(cands.size(), 1u);                               /// displaced old target zeroed
+    EXPECT_EQ(cands[0].kind, ObjectKind::Tree);
+    EXPECT_EQ(cands[0].hash, T1);
+    auto zs = snap.zeroInDegreeKnown();
+    ASSERT_EQ(zs.size(), 1u);                                  /// T1 is a candidate; T2 is NOT
+    EXPECT_EQ(zs[0].hash, T1);
+    /// a freshly decoded snap agrees (the durable document carries the re-pointed edge):
+    auto d = decodeGcSnap(encodeGcSnap(snap));
+    EXPECT_EQ(d.inDegree(ObjectKind::Tree, T2), 1u);
+    EXPECT_EQ(d.inDegree(ObjectKind::Tree, T1), 0u);
+    auto zs2 = d.zeroInDegreeKnown();
+    ASSERT_EQ(zs2.size(), 1u);
+    EXPECT_EQ(zs2[0].hash, T1);
+}
+
+TEST(CasGcSnap, DecodeRejectsDuplicateEdgeIds)
+{
+    /// The canonical encoder iterates a map keyed by edge id, so it can never emit a duplicate;
+    /// any duplicate edge id in a persisted document is corruption (and silently deduplicating a
+    /// root-edge duplicate would pick an arbitrary target).
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcSnap(
+        R"({"format":"cas_gc_snap","version":1,"snap_shard":0,"generation":0,"edges":[)"
+        R"({"edge_kind":"root","root_shard":"s/0","part_name":"p1","target_kind":"tree","target_hash":"aa00000000000000000000000000000a"},)"
+        R"({"edge_kind":"root","root_shard":"s/0","part_name":"p1","target_kind":"tree","target_hash":"ab00000000000000000000000000000a"})"
+        R"(],"expanded":[],"known":[]})"); });
 }
 
 TEST(CasGcSnap, CodecRoundTripDeterministicAndStrict)

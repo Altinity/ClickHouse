@@ -10,6 +10,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -101,7 +102,8 @@ String GcSnap::edgeIdFor(const EdgeRec & rec)
     {
         case EdgeKind::Root:
             /// The root id deliberately omits the target: a (root_shard, part_name) names exactly
-            /// one tree at a time, so a re-point is removeRootEdge + addRootEdge.
+            /// one tree at a time. Re-pointing is removeRootEdge + addRootEdge OR a direct
+            /// add-over-add (last-op-wins, handled in addRootEdge).
             return rootEdgeId(rec.root_shard, rec.part_name);
         case EdgeKind::Tree:
             return "T|" + u128ToHex(rec.parent_tree) + "|" + std::to_string(static_cast<int>(rec.target_kind))
@@ -115,26 +117,49 @@ String GcSnap::edgeIdFor(const EdgeRec & rec)
 
 void GcSnap::addEdge(EdgeRec rec)
 {
+    /// Set-semantics insert for edges whose canonical id INCLUDES the target (Tree/Pack): a
+    /// duplicate id always carries the SAME target, so a different-target duplicate is impossible
+    /// by construction and a duplicate add is a pure no-op. Root edges (target NOT in the id)
+    /// have last-op-wins semantics per spec §7 and are handled in addRootEdge, not here.
     const String id = edgeIdFor(rec);
     const NodeKey target{static_cast<uint8_t>(rec.target_kind), rec.target_hash};
     const auto [it, inserted] = edges.try_emplace(id, std::move(rec));
     known.insert(target);                                        /// known even on duplicate add
     if (inserted)
         ++indeg[target];
-    /// NOTE (root edges): a duplicate (root_shard, part_name) id with a DIFFERENT target is a
-    /// journal anomaly (a '+' without the intervening '-'); set semantics keep the FIRST record.
-    /// Over-count direction is safe (INV-OVER-COUNT-ONLY); the recheck fold re-derives anyway.
 }
 
-void GcSnap::addRootEdge(const String & root_shard, const String & part_name, const UInt128 & tree)
+std::vector<Candidate> GcSnap::addRootEdge(const String & root_shard, const String & part_name, const UInt128 & tree)
 {
+    /// Last-op-wins (spec §7): `Build::publish` legally re-publishes an existing ref with a NEW
+    /// tree (consecutive journal `Add`s for the same ref, no `Remove` between). Keeping the FIRST
+    /// record would leave the LIVE tree with in-degree 0 — an under-count that zeroInDegreeKnown
+    /// would surface as a retire candidate (INV-NO-LOSS violation). So an add over an existing
+    /// (root_shard, part_name) edge with a different target re-points it: the old target drops
+    /// one in-degree (and may become a candidate), the new target gains one.
+    std::vector<Candidate> result;
+    const NodeKey target{static_cast<uint8_t>(ObjectKind::Tree), tree};
+    known.insert(target);                                        /// known even on duplicate add
+    const auto it = edges.find(rootEdgeId(root_shard, part_name));
+    if (it != edges.end())
+    {
+        if (it->second.target_hash == tree)
+            return result;                                       /// same-target duplicate: no-op
+        if (const auto candidate = dropEdgeTarget(it->second))
+            result.push_back(*candidate);
+        it->second.target_hash = tree;
+        ++indeg[target];
+        return result;
+    }
     EdgeRec rec;
     rec.edge_kind = EdgeKind::Root;
     rec.target_kind = ObjectKind::Tree;
     rec.target_hash = tree;
     rec.root_shard = root_shard;
     rec.part_name = part_name;
-    addEdge(std::move(rec));
+    edges.emplace(rootEdgeId(root_shard, part_name), std::move(rec));
+    ++indeg[target];
+    return result;
 }
 
 void GcSnap::addTreeEdge(const UInt128 & parent_tree, ObjectKind child_kind, const UInt128 & child_hash)
@@ -161,7 +186,12 @@ std::optional<Candidate> GcSnap::dropEdgeTarget(const EdgeRec & rec)
 {
     const NodeKey target{static_cast<uint8_t>(rec.target_kind), rec.target_hash};
     const auto it = indeg.find(target);
-    chassert(it != indeg.end() && it->second > 0);               /// edges and indeg are kept in sync
+    /// edges and indeg are kept in sync; this guards a delete decision, so a desync must fail
+    /// loud in release builds too — never proceed on inconsistent GC state (fail closed).
+    if (it == indeg.end() || it->second == 0)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS gc/snap: in-degree desync for edge target {} (kind {})",
+            u128ToHex(rec.target_hash), static_cast<int>(rec.target_kind));
     if (--it->second > 0)
         return std::nullopt;
     indeg.erase(it);                                             /// indeg never stores a zero count
@@ -369,6 +399,12 @@ GcSnap decodeGcSnap(std::string_view data)
                     "CAS gc/snap: pack edge target_kind must be 'pack', got '{}'",
                     objectKindToString(rec.target_kind));
 
+            /// The canonical encoder iterates the edge map, so it can never emit two edges with
+            /// the same canonical id — ANY duplicate in a persisted document is corruption (and
+            /// silently deduplicating a root-edge duplicate would pick an arbitrary target).
+            const String id = GcSnap::edgeIdFor(rec);
+            if (snap.edges.contains(id))
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: duplicate edge id '{}'", id);
             snap.addEdge(std::move(rec));                        /// rebuilds indeg (and seeds known)
         }
 

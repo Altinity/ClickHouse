@@ -18,7 +18,8 @@ namespace DB::Cas
 /// known ↔ everEdged, inDegree ↔ InDeg, zeroInDegreeKnown ↔ the GRetire guard's candidate set
 /// (STATELESS: derived from durable state, never from in-memory fold transitions — crash-replay).
 /// Set semantics throughout: duplicate adds and missing removes are no-ops (idempotent replay;
-/// GC state may over-count, must never under-count — INV-OVER-COUNT-ONLY).
+/// GC state may over-count, must never under-count — INV-OVER-COUNT-ONLY). Root edges are
+/// last-op-wins (spec §7): an add over an existing (root_shard, part_name) edge re-points it.
 
 enum class EdgeKind : uint8_t
 {
@@ -42,7 +43,12 @@ public:
     uint64_t snap_shard = 0;
     uint64_t generation = 0;
 
-    void addRootEdge(const String & root_shard, const String & part_name, const UInt128 & tree);
+    /// Last-op-wins (spec §7): the canonical root-edge id is (root_shard, part_name) — the target
+    /// is NOT part of the id — and `Build::publish` may legally re-publish an existing ref with a
+    /// NEW tree (consecutive journal `Add`s, no `Remove` between). Adding over an existing edge
+    /// with a different target re-points it; returns the displaced OLD target as a candidate if
+    /// its in-degree transitioned to 0. A same-target duplicate add is a no-op (empty result).
+    std::vector<Candidate> addRootEdge(const String & root_shard, const String & part_name, const UInt128 & tree);
     void addTreeEdge(const UInt128 & parent_tree, ObjectKind child_kind, const UInt128 & child_hash);
     void addPackEdge(const UInt128 & parent_tree, const UInt128 & pack_hash);
 
