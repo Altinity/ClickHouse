@@ -5,6 +5,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRetireView.h>
 
+#include <algorithm>
+
 using namespace DB::Cas;
 
 /// RetireView tests inject GC state by writing the gc/state and gc/retired/ objects directly:
@@ -114,13 +116,25 @@ TEST(CasRetireView, MultipleRoundsUnion)
 
 TEST(CasRetireView, PaginationCoversManyObjects)
 {
-    auto b = std::make_shared<InMemoryBackend>();
+    /// RetireView::refresh lists with an internal page limit of 1000, so five objects would come
+    /// back in ONE page and the cursor-continuation loop would never run. Clamp the backend's page
+    /// size to 2 so refresh MUST follow next_cursor across multiple pages to see all five.
+    class TinyPageBackend : public InMemoryBackend
+    {
+    public:
+        ListPage list(const String & prefix, const String & cursor, size_t limit) override
+        {
+            return InMemoryBackend::list(prefix, cursor, std::min<size_t>(limit, 2));
+        }
+    };
+
+    auto b = std::make_shared<TinyPageBackend>();
     Layout layout("p");
     b->putIfAbsent(layout.gcStateKey(), encodeGcState({.round = 5, .fence_seq = 1}));
 
     /// Five retired objects under gc/retired/, each condemning a distinct hash. The view must
-    /// union ALL of them regardless of how Backend::list pages the keys (InMemoryBackend honors
-    /// the limit; the implementation pages with a cursor loop).
+    /// union ALL of them; with the clamped page size the union completes only if the cursor loop
+    /// is correct.
     std::vector<UInt128> hashes;
     for (uint64_t i = 0; i < 5; ++i)
     {

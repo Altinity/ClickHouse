@@ -18,7 +18,10 @@ namespace DB::Cas
 ///   - failNextCasPut:                     inject a one-shot conflict
 ///   - setEnforceTokens(false):            mimic a "dumb" backend that ignores token checks
 ///   - setSimulateDeleteMarkers:           mimic S3 versioning-enabled buckets
-class InMemoryBackend final : public Backend
+///
+/// Not `final`: tests subclass it to distort single behaviors (e.g. clamp list page size to force
+/// pagination) while delegating everything else to this base.
+class InMemoryBackend : public Backend
 {
 public:
     InMemoryBackend() = default;

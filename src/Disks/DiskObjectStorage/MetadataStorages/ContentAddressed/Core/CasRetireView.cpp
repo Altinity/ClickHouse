@@ -32,6 +32,10 @@ void RetireView::refresh()
     /// handled by the gate's re-observation under W-REVALIDATE, and entries ADDED for round R+1
     /// are a bonus (strictly more conservative). Reading gc/state last could claim a NEWER round
     /// over entries observed BEFORE it — overstating how current the view is.
+    ///
+    /// Two racing refreshes may install views out of round order — each installed view is
+    /// internally coherent and honestly labeled with the round it observed, and a gate needing a
+    /// newer round simply refreshes again; there is deliberately no monotonicity guard.
     uint64_t new_round = 0;
     if (auto state_object = backend->get(layout.gcStateKey()))
         new_round = decodeGcState(state_object->bytes).round;
