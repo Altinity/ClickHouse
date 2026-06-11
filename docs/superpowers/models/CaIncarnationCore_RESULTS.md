@@ -174,3 +174,128 @@ Interpretation: ~782M distinct states breadth-first across the full feature cros
 actually use. Strong negative evidence; the explored-prefix caveat stands (the BFS queue still
 held 637M unexplored states at the cutoff). Logs: `tmp/tlc_CaIncarnationCore_hunt_cross.log`,
 `tmp/tlc_CaIncarnationCore_hunt_sim.log`.
+
+## Apalache induction results {#apalache-induction-results}
+
+Tool: **Apalache 0.58.0** (build `711dce6`, Z3 bundled), proof core `CaIncarnationProofCore.tla`.
+Induction bounds: `|Writers|=2`, `|Shards|=1`, `|Hashes|=2`, `MaxToken=3`, `MaxRound=2`,
+`MaxLog=4` (the `CInit` constant initializer). Harness: `StateShape`/`IndInvInit` idiom —
+function-domain-pinned `Gen` assignments so `TypeBounds` reads land on defined entries; `IndInvInit
+== StateShape /\ IndInv`.
+
+### Summary {#apalache-summary}
+
+| Check | Command | Outcome | Wall time |
+|---|---|---|---|
+| Base case (`Init => IndInv`) | `--init=Init --inv=IndInv --length=0` | **NoError** | 1s |
+| Step check (`IndInv => IndInv'`) | `--init=IndInvInit --inv=IndInv --length=1` | **NoError** | 45s |
+| Step check (reproduced) | same | **NoError** | 72s |
+
+`IndInv` (19 conjuncts) is **INDUCTIVE** at the stated bounds after 12 CTI iterations.
+Soundness rests on the base+step pair, not on the TLC pre-filter.
+
+### Final IndInv — 19 conjuncts {#indinv-conjuncts}
+
+The conjuncts are grouped by origin; each is a named operator in `CaIncarnationProofCore.tla`.
+
+**9 v1 candidates (Task 4 — TLC-prefiltered before any SMT; 2 needed correction):**
+
+| Conjunct | One-line meaning | TLC pre-filter note |
+|---|---|---|
+| `TypeBounds` | domains the unbounded Apalache Int/Seq types don't carry | green |
+| `NoDangle` | every manifest ref points to a `present` object — TARGET | green |
+| `NoReturn` | a present object's token is never in `obsoleteTok` — TARGET | green |
+| `InflightHeld` | in-flight `(h,t)` implies entry held OR `t` displaced (`tokOf[h] # t`) | **corrected**: v1 had no disjunct; TLC pre-filter found the spared-branch orphan case (spec refinement `8eda0a5ba76` — the IN-FLIGHT DISJUNCTION) |
+| `RetiredCurrentOrDead` | a retired token is still current or is in `obsoleteTok` | green |
+| `InflightVsRefs` | an in-flight-deletable token is never a referenced current token | green |
+| `SendImpliesFenced` | a delete is sent only after every shard's fence covers its entry's round, OR the token is displaced | **corrected**: same disjunctive form for the same orphan case |
+| `RefsFromLog` | manifest refs = full-log fold (logical pre-compaction manifest) | green |
+| `SnapFromPrefix` | snap edge-set = cursor-prefix fold | green |
+
+**4 early CTI facts (CTIs #1–4, before the orphan detour):**
+
+| Conjunct | One-line meaning | CTI # |
+|---|---|---|
+| `InflightAllocated` | `d.t < nextTok[d.h]` — in-flight token was allocated | #1 |
+| `PhaseRoundActive` | active GC phase implies `gcRound >= 1` | #2 |
+| `AbsentObsolete` | absent key has `tokOf=0` or `tokOf ∈ obsoleteTok` | #3 |
+| `RootEdgesTyped` | `rootEdges ⊆ Shards × Hashes` (type doesn't restrict domain) | #4 |
+
+**`InflightCurrentUnreferenced` — the irredundant heart conjunct (CTIs #5–6 detour):**
+
+| Conjunct | One-line meaning |
+|---|---|
+| `InflightCurrentUnreferenced` | an in-flight delete on a STILL-CURRENT token has no folded root edge and no unfolded add in any journal suffix beyond the cursor |
+
+CTI #6 was a vacuity trap: a candidate fact (`tokOf[d.h]=d.t => InDeg(d.h)=0`) passed the
+single-hash TLC pre-filter vacuously because `GFold` of a stale add can re-snap `h2` — impossible
+at `Hashes={h1}` but reachable at `Hashes={h1,h2}`. Pre-filter policy adjusted: inter-hash facts
+additionally require a bounded two-hash TLC run (see below).
+
+**5 fence-discipline conjuncts (CTIs #7–11, pulled in by `InflightCurrentUnreferenced`'s preservation):**
+
+| Conjunct | One-line meaning | CTI # |
+|---|---|---|
+| `FenceCoverage` | `fencedSet` shards have `man[s].fence >= gcRound`; `"fenced"` phase iff all shards fenced | #7 |
+| `FencePosRecord` | `fencePos[s] > 0` implies the record at that position is a fence entry | #8 |
+| `FenceLeRound` | no shard's fence is strictly ahead of the active GC round | #9 |
+| `RetiredCoveredNoPostFenceAdd` | for a retired-current entry covered by a shard's fence, that shard has no add of the entry's key after its latest fence record | #10 |
+| `RetiringFenceBelow` | during `"retiring"` phase every shard's fence is strictly below the active round | #11 |
+
+### Full CTI journal {#cti-journal}
+
+| # | Violated conjunct | CTI summary | Fact added |
+|---|---|---|---|
+| 1 | `InflightHeld` | phantom `inflight [h, nextTok[h]]`; `WOverwrite` makes it current | `InflightAllocated` |
+| 2 | `TypeBounds` (`e.r` range) | `gcPhase="retiring"` at `gcRound=0`; `GRetire` stamps `r=0` | `PhaseRoundActive` |
+| 3 | `RetiredCurrentOrDead` | absent `h` with stale nonzero `tokOf` not in `obsoleteTok`; `WCreate` advances | `AbsentObsolete` |
+| 4 | `InflightHeld` | junk fresh-shard `rootEdge` inflates in-degree; spared-branch orphan | `RootEdgesTyped` |
+| 5 | `InflightHeld` | spared branch drops retired entry whose `[h,t]` is in flight and still current | `InflightCurrentUnreferenced` (after #6 detour) |
+| 6 | (rejected candidate) | `GFold` of stale add re-snaps `h2`; single-hash TLC passed a FALSE fact vacuously | candidate reverted; pre-filter policy adjusted |
+| 7 | `InflightVsRefs` | fenced with `fence=0 < gcRound`; ungated post-fence add; stale-snap condemn | `FenceCoverage` |
+| 8 | `InflightVsRefs` | `fencedSet={s}` with `fencePos=0`, NO fence record; trivial `FoldedThroughFence` | `FencePosRecord` |
+| 9 | `InflightVsRefs` | future fence (`fence=2` at `gcRound=1`) satisfies coverage; stale snap | `FenceLeRound` |
+| 10 | `InflightVsRefs` | unfolded POST-fence adds of retired-current `h2`; condemned off stale snap | `RetiredCoveredNoPostFenceAdd` |
+| 11 | `RetiredCoveredNoPostFenceAdd` | `GRetire` in `"retiring"` with `fence=gcRound`: new entry born covered | `RetiringFenceBelow` |
+| 12 | — | **PASS** | — |
+
+### Negative controls {#apalache-negative-controls}
+
+| Control | What was tested | Outcome | Finding |
+|---|---|---|---|
+| `IndInv => NoDangle` | implication (length=0) | **NoError** | `NoDangle` is a conjunct — trivially implied |
+| `IndInv => NoReturn` | implication (length=0) | **NoError** | `NoReturn` is a conjunct — trivially implied |
+| drop `InflightCurrentUnreferenced` (`IndInv_NoICU`) | step check on weakened invariant | **Error** (CTI) | irredundant — the spared-branch orphan pattern breaks `InflightHeld`; ICU is the heart conjunct |
+| drop `InflightHeld` (`IndInv_NoHeld`) | step check on weakened invariant | **NoError** | documented redundancy: `IndInv_NoHeld => InflightHeld` confirmed by implication check; after strengthening, `InflightHeld` is a corollary of `InflightCurrentUnreferenced` + the fence-discipline family |
+| drop `InflightVsRefs` (`IndInv_NoRefs`) | step check on weakened invariant | **NoError** | documented redundancy: `IndInv_NoRefs => InflightVsRefs` confirmed by implication check; same reason |
+| gate control `WPublishNoReval` via `--next=NextNoReval` | step check with re-observation conjunct removed from `WPublish` | **Error** (CTI breaking `NoDangle`) | machine-checked F1 witness: stale dep on deleted object (`present=FALSE`, `tokOf=0` vs dep token 2) passes the weakened gate and publishes `h1` into `man.refs`; `W-REVALIDATE` is what carries F1 in the inductive argument |
+| `FalseInv` satisfiability | `--init=IndInv --inv=FalseInv --length=0` | **Error** (counterexample produced) | `IndInv` is satisfiable — the induction is not vacuously true |
+
+### Pre-filter policy and state counts {#prefilter-policy}
+
+Every conjunct was TLC-pre-filtered before any Apalache SMT run.
+
+| Run | Scope | Distinct states | Result |
+|---|---|---|---|
+| Single-hash TLC exhaustive (`Hashes={h1}`) | complete BFS, depth 30 | **694,265** | green throughout all 12 iterations |
+| Two-hash bounded TLC (`CaIncarnationProofCore_tlc2h.cfg`, `Hashes={h1,h2}`) | BFS through level 23, 600s cap | **254.8M** | 0 violations at cap |
+
+Policy: per-hash facts are exhaustively pre-filtered at `Hashes={h1}`. Inter-hash facts (anything
+coupling `inflight`/`retired` on one hash with edges/journal records of another hash) additionally
+require the bounded two-hash run. Induction soundness does NOT rest on the pre-filter — a false
+lemma necessarily fails the Apalache base or step check; the pre-filter is an efficiency and
+diagnosis device.
+
+### Honest scope {#honest-scope}
+
+The induction quantifies over ALL states satisfying `IndInv` at FIXED constants (`|Writers|=2`,
+`|Shards|=1`, `|Hashes|=2`, `MaxToken=3`, `MaxRound=2`, `MaxLog=4`) — unbounded depth, bounded
+constants. This is the middle rung: stronger than `TLC` bounded-checking (no depth limit) but
+weaker than a parametric proof (constants are not symbolic). Constant-parametric generality is
+TLAPS territory; `IndInv` and the CTI journal above are the prepared input for that effort.
+
+Proof-core residuals (recorded scope exclusions): single leader (split-brain covered by the TLC
+main model), no trees/debris/evidence, logical pre-compaction manifest (`RefsFromLog` — physical
+trimming covered by `INV_JOURNAL_COVERAGE` in the TLC model), uniform journal record encoding
+(the main model's heterogeneous `AddRec ∪ FenceRec` is a uniform `{op: Str, hs: Set(HASH)}` in
+the proof core).

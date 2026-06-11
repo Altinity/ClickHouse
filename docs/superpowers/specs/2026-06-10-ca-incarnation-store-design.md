@@ -603,6 +603,21 @@ unreachable object is never collected; not a clean pass — see `RESULTS`).
   after its children exist; a tree ref only when the new tree's transitive closure is present and uncondemned.
   The model checks the one-level case; the transitive nested-subtree case remains a recorded residual.
 
+**Inductive-invariant rung (Apalache) — complete.** The trimmed proof core
+`CaIncarnationProofCore.tla` (single leader, `W-REVALIDATE` gate only, token-only dependencies) was
+driven through Apalache 0.58.0 one-step induction to yield a 19-conjunct `IndInv` that is
+**INDUCTIVE** at `|Writers|=2`, `|Shards|=1`, `|Hashes|=2`, `MaxToken=3`, `MaxRound=2`, `MaxLog=4`
+(base PASS, step PASS — 45s/72s wall, reproduced; 12 CTI iterations). Full conjunct list, CTI
+journal, and negative-control outcomes are in `CaIncarnationCore_RESULTS.md` (§ "Apalache induction
+results"). Key findings: `InflightCurrentUnreferenced` is the irredundant heart conjunct — without
+it the spared-branch orphan breaks the induction, and the original `InflightHeld`/`InflightVsRefs`
+lemmas become corollaries of `InflightCurrentUnreferenced` + the fence-discipline family after
+strengthening. The gate negative control (`WPublishNoReval` via `--next`) fails on `NoDangle` — a
+machine-checked F1 witness: removing the `W-REVALIDATE` re-observation conjunct from `WPublish`
+allows a stale dep on a deleted object to pass the gate and publish. The induction covers all states
+at fixed constants (unbounded depth, bounded constants); constant-parametric generality is TLAPS
+territory, for which `IndInv` and the CTI journal are the prepared input.
+
 ## 13. Open items and integration deltas {#open-items}
 
 **Integration deltas vs the current branch (M1–M9 PoC):**

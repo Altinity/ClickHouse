@@ -162,3 +162,75 @@ The model abstracts aggressively. These are out of scope and remain untested:
 See `CaIncarnationCore_RESULTS.md` for per-stage state counts, wall times, and the seven
 negative-control counterexample traces. See also the model-refinement findings that `TLC` surfaced
 during development (each was a real encoding gap, fixed spec-faithfully).
+
+## Apalache induction (proof core) {#apalache-induction}
+
+A trimmed, fully type-annotated proof module `CaIncarnationProofCore.tla` (single leader,
+`W-REVALIDATE` gate only, token-only dependencies — no trees, no debris, no split-brain, no
+evidence) was driven through Apalache's one-step induction recipe to find a strengthened
+**inductive invariant** `IndInv`.
+
+**What induction buys (state honestly):** the step check quantifies over ALL states satisfying
+`IndInv` — not just reachable ones — so a green induction is evidence for every execution at the
+fixed constant sizes (`|Writers|=2`, `|Shards|=1`, `|Hashes|=2`, `MaxToken=3`, `MaxRound=2`,
+`MaxLog=4`), regardless of trace depth. Constants remain finite; parametric generality requires
+TLAPS, for which `IndInv` and the CTI journal are the prepared input. This is the middle rung
+between TLC bounded-checking and full parametric proof.
+
+### Install Apalache {#install-apalache}
+
+```bash
+mkdir -p <repo>/tmp/apalache
+cd <repo>/tmp/apalache
+curl -fL -o apalache.tgz https://github.com/apalache-mc/apalache/releases/latest/download/apalache.tgz
+tar xzf apalache.tgz --strip-components=1
+bin/apalache-mc version   # must print 0.58.0 or newer
+```
+
+Java 21 (`/usr/bin/java`) is required. All runs use `docs/superpowers/models/run_apalache.sh`
+(wrapper that logs to `tmp/apa_<label>.log` and prints a summary tail).
+
+### Running the induction checks {#running-induction}
+
+All commands run from `docs/superpowers/models/`.
+
+```bash
+# Typecheck (Snowcat): must be clean before any SMT run
+./run_apalache.sh typecheck typecheck CaIncarnationProofCore.tla
+
+# Base case: Init satisfies IndInv
+./run_apalache.sh base check --cinit=CInit --init=Init --inv=IndInv --length=0 CaIncarnationProofCore.tla
+
+# Step check: IndInv is inductive (the main result)
+./run_apalache.sh step check --cinit=CInit --init=IndInvInit --inv=IndInv --length=1 CaIncarnationProofCore.tla
+```
+
+Expected: typecheck exit 0; base `NoError`; step `NoError` (45–73s wall).
+`IndInvInit == StateShape /\ IndInv` — the `StateShape` initializer assigns every variable via
+function spaces and `Gen`, then `IndInv` constrains; needed because Apalache's assignment-finder
+requires a top-level assignment and `IndInv` alone carries only element-wise bounds.
+
+### Negative controls {#negative-controls-apalache}
+
+```bash
+# Implication: IndInv => NoDangle and IndInv => NoReturn (both must be NoError)
+./run_apalache.sh impl1 check --cinit=CInit --init=IndInv --inv=NoDangle --length=0 CaIncarnationProofCore.tla
+./run_apalache.sh impl2 check --cinit=CInit --init=IndInv --inv=NoReturn  --length=0 CaIncarnationProofCore.tla
+
+# Drop InflightCurrentUnreferenced: MUST FAIL (the irredundant heart conjunct)
+./run_apalache.sh ctlicu check --cinit=CInit --init=IndInv_NoICUInit --inv=IndInv_NoICU --length=1 CaIncarnationProofCore.tla
+
+# Drop InflightHeld / InflightVsRefs: each PASSES (implied by remaining conjuncts — documented redundancy)
+./run_apalache.sh ctlheld check --cinit=CInit --init=IndInv_NoHeldInit --inv=IndInv_NoHeld --length=1 CaIncarnationProofCore.tla
+./run_apalache.sh ctlrefs check --cinit=CInit --init=IndInv_NoRefsInit --inv=IndInv_NoRefs --length=1 CaIncarnationProofCore.tla
+
+# Gate control: WPublish without re-observation conjunct — MUST FAIL on NoDangle (F1 witness)
+./run_apalache.sh ctlreval check --cinit=CInit --init=IndInv --next=NextNoReval --inv=IndInv --length=1 CaIncarnationProofCore.tla
+
+# Satisfiability: an IndInv state exists (FalseInv control must produce a counterexample)
+./run_apalache.sh sat check --cinit=CInit --init=IndInv --inv=FalseInv --length=0 CaIncarnationProofCore.tla
+```
+
+`IndInv_NoHeld`, `IndInv_NoRefs`, `IndInv_NoICU`, `WPublishNoReval`, `NextNoReval`, and `FalseInv`
+are defined in the proof core as inert negative-control annotations (not referenced from the TLC
+config). Full results and the CTI journal are in `CaIncarnationCore_RESULTS.md`.
