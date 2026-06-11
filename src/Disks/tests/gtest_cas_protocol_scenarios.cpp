@@ -159,14 +159,75 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     assertPartReads(b, s, ns, "part_1", tree, "payload-X");
     EXPECT_EQ(b->head(blob_key).token, t1);
 
-    /// Black-box proof the dep now rides t1, not the stale t0: a SECOND injected retire of the OLD t0
-    /// + fence to round 2 + re-publish into a different ref must NOT resurrect (t0 isn't our token any
-    /// more — the gate finds no condemned entry at our current token t1). The object stays at t1.
-    injectRetire(*b, s->layout(), /*round*/ 2, /*fence_seq*/ 0, /*shard*/ 1,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
-    fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 2);
-    build->publish(ns, "part_2", tree, RefPayload{});
+    /// Black-box proof the dep now rides t1 (not the stale t0): re-publish the same tree into a SECOND
+    /// namespace with NO new GC injection — no fence advance, so no refresh and no gate displacement.
+    /// The dep is already token-bearing at t1; nothing is re-uploaded and the object stays at t1.
+    /// (Condemning hashX at ANY token now forces a resurrect on a fence-advanced publish — view hits
+    /// are by HASH, not by our exact token — so the dep's token cannot be probed via a hash-condemn.)
+    build->publish(RootNamespace{"srv1/tbl/copy"}, "part_2", tree, RefPayload{});
     EXPECT_EQ(b->head(blob_key).token, t1);
+    assertPartReads(b, s, RootNamespace{"srv1/tbl/copy"}, "part_2", tree, "payload-X");
+}
+
+TEST(CasProtocol, RevalidateResurrectsWhenCurrentTokenCondemnedAtDifferentToken)
+{
+    /// The spared-orphan window (spec §5 step 5 — "members with a view hit ⇒ resurrect", where a view
+    /// hit is BY HASH, not by our exact observed token; §8 R4). A token-bearing dep observed at t0 whose
+    /// HASH has a view entry at a DIFFERENT token must resurrect, not be kept blindly. The protocol's
+    /// fully-dangerous instance (the object PHYSICALLY lives at a condemned current token while our dep
+    /// rides a displaced older token, non-stale) requires a GC-vs-publish interleaving that this
+    /// single-Store, single-thread harness cannot express: every view refresh here is paired with a fence
+    /// advance that makes the dep stale, which routes the buggy code through the re-observe → observeAndAdmit
+    /// path (which itself re-checks the CURRENT token and resurrects) — self-healing, so it would NOT
+    /// expose the bug. That exact interleaving is the model's `WReobserve`-then-`WResurrect` and is left to
+    /// the model.
+    ///
+    /// What IS single-thread expressible — and what distinguishes the fix from the bug — is the
+    /// behavioral contract directly: a NON-STALE token-bearing dep (observed at the current view round)
+    /// whose hash has a view hit at a token ≠ our observed token. The buggy code (token-exact check in
+    /// both gateCheckDeps and revalidateDeps) KEEPS it; the fix RESURRECTS on the hit-by-hash. We construct
+    /// this with a condemned entry for hashX at a token distinct from the live current token, observed at
+    /// the same round the dep is recorded (so neither the stale re-observe horn nor a fence advance fires).
+    auto b = std::make_shared<InMemoryBackend>();
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// X pre-exists at its current token t0; another incarnation token t_other is condemned by hash at
+    /// round 1 (a different incarnation's entry — the GC surface only needs the (hash, token) pair).
+    DB::Cas::Layout layout("p");
+    {
+        auto s0 = Store::open(b, PoolConfig{.pool_prefix = "p"});
+        writeBlobRaw(*b, s0->layout(), "payload-X", s0->poolMeta().blob_header_len, s0->poolMeta().pool_id);
+    }
+    const String blob_key = layout.blobKey(idOf("payload-X"));
+    const Token t0 = b->head(blob_key).token;
+    const Token t_other{"emulated-phantom", DB::Cas::TokenType::Emulated};
+    ASSERT_NE(t_other, t0);
+
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t_other, .size = 9}});
+    /// Fence to round 1 BEFORE opening the store, so the store's open-time refresh lands the view at
+    /// round 1 already populated — and the build's dep is then recorded at round 1 (non-stale).
+    fenceNamespace(*b, layout, ns, /*n_shards*/ 8, /*round*/ 1);
+
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});   /// open-time refresh ⇒ view round 1
+    auto build = s->startBuild({});
+    /// reuseBlob ⇒ observeAndAdmit: current t0 is NOT in the condemned set {t_other} ⇒ ADOPT t0, dep
+    /// recorded at observed_view_round = 1 (the current view round) ⇒ NON-STALE at publish time.
+    build->reuseBlob(idOf("payload-X"));
+    const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
+
+    /// publish: view round 1 == fence_round 1 ⇒ NO fence advance ⇒ revalidateDeps does NOT run; only
+    /// gateCheckDeps gates. The fix's gateCheckDeps resurrects on the hit-by-hash; the buggy code kept t0.
+    build->publish(ns, "part_1", tree, RefPayload{});
+
+    assertPartReads(b, s, ns, "part_1", tree, "payload-X");
+
+    /// The fix displaced the object to a FRESH token ≠ t0 (resurrect on the hit). The buggy code would
+    /// have left it at t0 — this assertion is the discriminator (it FAILS without the fix).
+    const Token t_after = b->head(blob_key).token;
+    EXPECT_NE(t_after, t0);
+    /// INV-NO-RETURN: the old t0 can never be current again.
+    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
 }
 
 TEST(CasProtocol, RevalidateAbsentBlobDepAbortsRetryable)

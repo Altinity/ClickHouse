@@ -3,7 +3,6 @@
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
-#include <algorithm>
 #include <chrono>
 
 namespace DB
@@ -359,9 +358,21 @@ void Build::gateCheckDeps()
 
         if (dep.token.has_value())
         {
-            /// Token-bearing: condemned at exactly this token ⇒ resurrect (mints a fresh token, records it).
-            if (store->retireView().isCondemnedToken(kind, hash, *dep.token))
-                resurrect(kind, hash, keyFor(kind, hash));
+            /// Token-bearing: ANY view hit BY HASH ⇒ resurrect/recreate (spec §5 step 5: "members with a
+            /// view hit ⇒ resurrect" — a view hit is by HASH, not by our exact observed token). The
+            /// current incarnation may have been displaced to a DIFFERENT token t' that GC then condemned;
+            /// keeping our stale token while the object lives at the condemned t' would let an in-flight
+            /// DELETE If-Match:t' (zombie/duplicate GC delete) hit the live object ⇒ dangling ref. The §8
+            /// R4 spared-orphan is safe only because the orphan's token was DISPLACED by a resurrect first;
+            /// resurrect/recreate on any hit performs exactly that displacement (a fresh tag never reuses
+            /// an old token, INV-NO-RETURN), closing the window.
+            if (store->retireView().findCondemned(kind, hash).has_value())
+            {
+                if (kind == ObjectKind::Tree && retained_trees.contains(hash))
+                    recreateTree(hash);
+                else
+                    resurrect(kind, hash, keyFor(kind, hash));
+            }
         }
         else
         {
@@ -439,22 +450,25 @@ void Build::revalidateDeps()
         const String k = keyFor(kind, hash);
         const std::optional<std::vector<Token>> hits = store->retireView().findCondemned(kind, hash);
 
-        if (hits.has_value() && std::find(hits->begin(), hits->end(), *dep.token) != hits->end())
+        if (hits.has_value())
         {
-            /// Condemned at our EXACT observed token in the refreshed view ⇒ resurrect (blob) or
-            /// re-create from the retained payload (tree). This is the spec §7 step-4 "held entry ⇒
-            /// the dependency-set gate finds it ⇒ resurrect" horn, surfaced early so the keep-branch
-            /// below only ever sees genuinely-uncondemned members.
+            /// ANY view hit BY HASH ⇒ resurrect (blob) or re-create from the retained payload (tree).
+            /// Spec §5 step 5: "members with a view hit ⇒ resurrect" — a view hit is by HASH, NOT by our
+            /// exact observed token. The current incarnation may be condemned at its CURRENT token (a
+            /// prior writer displaced t → t', GC then condemned t'); displacing it (a fresh tag) makes any
+            /// in-flight DELETE If-Match:<current> 412, closing the §8 R4 spared-orphan window. Resurrect
+            /// on any hit is the conservative, model-faithful (WResurrect) choice (INV-NO-RETURN: a fresh
+            /// tag never reuses an old token), and it covers the §7 step-4 "held entry ⇒ resurrect" horn.
             if (kind == ObjectKind::Tree && retained_trees.contains(hash))
                 recreateTree(hash);
             else
                 resurrect(kind, hash, k);
         }
-        else if (!hits.has_value() && dep.observed_view_round < store->retireView().round())
+        else if (dep.observed_view_round < store->retireView().round())
         {
-            /// STALE-OBSERVED, no entry in the refreshed view ⇒ the W-REVALIDATE single re-observation
-            /// (one HEAD). We re-observe ONLY members observed under an older round; a member already
-            /// observed at this round needs nothing (handled by the else-keep below).
+            /// No entry for the hash (the `if` above consumed every view hit) AND stale-observed ⇒ the
+            /// W-REVALIDATE single re-observation (one HEAD). We re-observe ONLY members observed under an
+            /// older round; a member already observed at this round needs nothing (the else-keep below).
             const HeadResult hr = store->backend().head(k);
             if (!hr.exists)
             {
