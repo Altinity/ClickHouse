@@ -21,6 +21,7 @@ using namespace DB::Cas;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
+using DB::Cas::tests::shardOfForTest;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::writeTreeRaw;
 
@@ -244,4 +245,206 @@ TEST(CasBuild, AbandonDropsHeartbeatAndDisables)
     expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { build->putTree({entry}); });
     expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
         [&] { build->publish(RootNamespace("ns"), "ref", tree, RefPayload{}); });
+}
+
+TEST(CasBuild, PublishHappyPathRoundTrip)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    auto build = s->startBuild({});
+    auto blob = build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
+    EXPECT_EQ(blob.size, 11u);
+
+    std::vector<TreeEntry> entries;
+    TreeEntry e;
+    e.name = "data.bin";
+    e.placement = Placement::Blob;
+    e.file_hash = u128Of("hello world");
+    e.file_size = 11;
+    entries.push_back(e);
+    auto tree = build->putTree(entries);
+
+    RefPayload payload;
+    payload.mutable_files["txn_version.txt"] = "1";
+    build->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, payload);
+
+    auto r = s->resolveRef(RootNamespace{"srv1/tbl"}, "part_1");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->tree_id, tree);
+    EXPECT_EQ(r->mutable_files.at("txn_version.txt"), "1");
+
+    auto read = s->readTree(tree);
+    ASSERT_EQ(read.size(), 1u);
+    auto loc = s->locate(read[0]);
+    auto got = b->get(loc.key, Range{loc.offset, loc.length});
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "hello world");
+
+    /// journal: read the shard manifest raw, assert journal.back() == {Add, "part_1", tree, at_version}
+    /// with at_version == shard_version.
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    auto manifest = b->get(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard));
+    ASSERT_TRUE(manifest.has_value());
+    const RootShard root = decodeRootShard(manifest->bytes);
+    ASSERT_FALSE(root.journal.empty());
+    const JournalRecord & last = root.journal.back();
+    EXPECT_EQ(last.op, JournalRecord::Op::Add);
+    EXPECT_EQ(last.ref_name, "part_1");
+    EXPECT_EQ(u128ToHex(last.tree_id), tree.string());
+    EXPECT_EQ(last.at_version, root.shard_version);
+}
+
+TEST(CasBuild, PublishRequiresTreeInDepSet)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    auto build = s->startBuild({});
+
+    /// A TreeId this build never built or adopted → LOGICAL_ERROR (root not in the W-DEP-SET).
+    const TreeId stranger{u128ToHex(u128Of("nope"))};
+    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { build->publish(RootNamespace{"srv1/tbl"}, "part_1", stranger, RefPayload{}); });
+}
+
+TEST(CasBuild, PublishOwnThreadConflictRetries)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    auto build = s->startBuild({});
+
+    build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
+    TreeEntry e;
+    e.name = "data.bin";
+    e.placement = Placement::Blob;
+    e.file_hash = u128Of("hello world");
+    e.file_size = 11;
+    auto tree = build->putTree({e});
+
+    /// One artificial Conflict on the shard's first casPut (no fence advance; the view is untouched).
+    /// mutateShard re-reads + re-runs the lambda and lands on the retry.
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    b->failNextCasPut(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard));
+
+    build->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{});
+
+    auto r = s->resolveRef(RootNamespace{"srv1/tbl"}, "part_1");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->tree_id, tree);
+}
+
+TEST(CasBuild, PublishIntoSecondNamespaceSameTree)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    auto build = s->startBuild({});
+
+    auto blob = build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
+    TreeEntry e;
+    e.name = "data.bin";
+    e.placement = Placement::Blob;
+    e.file_hash = u128Of("hello world");
+    e.file_size = 11;
+    auto tree = build->putTree({e});
+
+    const String blob_key = s->layout().blobKey(blob.id);
+    const String tree_key = s->layout().treeKey(tree);
+    const Token blob_token = b->head(blob_key).token;
+    const Token tree_token = b->head(tree_key).token;
+
+    /// The SAME tree published as "part_1" in two namespaces — the second publish must NOT re-upload
+    /// (the tree dep is already present); both refs resolve to the same tree, a single object set.
+    build->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{});
+    build->publish(RootNamespace{"srv1/tbl/detached"}, "part_1", tree, RefPayload{});
+
+    auto r1 = s->resolveRef(RootNamespace{"srv1/tbl"}, "part_1");
+    auto r2 = s->resolveRef(RootNamespace{"srv1/tbl/detached"}, "part_1");
+    ASSERT_TRUE(r1.has_value());
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r1->tree_id, tree);
+    EXPECT_EQ(r2->tree_id, tree);
+
+    /// The blob/tree objects were uploaded once: their tokens are unchanged after both publishes.
+    EXPECT_EQ(b->head(blob_key).token, blob_token);
+    EXPECT_EQ(b->head(tree_key).token, tree_token);
+}
+
+TEST(CasBuild, TwoBuildsPublishToSameShardSerialize)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const uint64_t root_shards = s->poolMeta().root_shards;
+
+    /// Find two distinct ref names that map to the SAME shard.
+    String ref1;
+    String ref2;
+    {
+        std::map<uint64_t, String> seen;
+        for (char c = 'a'; c <= 'z' && ref2.empty(); ++c)
+        {
+            const String name(1, c);
+            const uint64_t sh = shardOfForTest(name, root_shards);
+            auto it = seen.find(sh);
+            if (it != seen.end())
+            {
+                ref1 = it->second;
+                ref2 = name;
+            }
+            else
+            {
+                seen.emplace(sh, name);
+            }
+        }
+    }
+    ASSERT_FALSE(ref1.empty());
+    ASSERT_FALSE(ref2.empty());
+    ASSERT_EQ(shardOfForTest(ref1, root_shards), shardOfForTest(ref2, root_shards));
+
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// Build A publishes ref1.
+    auto build_a = s->startBuild({});
+    build_a->putBlob(idOf("content-a"), BlobSource::fromString("content-a"));
+    TreeEntry ea;
+    ea.name = "data.bin";
+    ea.placement = Placement::Blob;
+    ea.file_hash = u128Of("content-a");
+    ea.file_size = 9;
+    auto tree_a = build_a->putTree({ea});
+    build_a->publish(ns, ref1, tree_a, RefPayload{});
+
+    /// Build B publishes ref2 into the same shard: its mutateShard sees A's manifest (shard_version
+    /// advanced past 0), re-reads, and lands. The single artificial conflict forces B to genuinely
+    /// re-read after the first attempt.
+    auto build_b = s->startBuild({});
+    build_b->putBlob(idOf("content-b"), BlobSource::fromString("content-b"));
+    TreeEntry eb;
+    eb.name = "data.bin";
+    eb.placement = Placement::Blob;
+    eb.file_hash = u128Of("content-b");
+    eb.file_size = 9;
+    auto tree_b = build_b->putTree({eb});
+
+    const uint64_t shard = shardOfForTest(ref2, root_shards);
+    b->failNextCasPut(s->layout().rootShardKey(ns, shard));
+    build_b->publish(ns, ref2, tree_b, RefPayload{});
+
+    /// Both refs resolve.
+    auto r1 = s->resolveRef(ns, ref1);
+    auto r2 = s->resolveRef(ns, ref2);
+    ASSERT_TRUE(r1.has_value());
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r1->tree_id, tree_a);
+    EXPECT_EQ(r2->tree_id, tree_b);
+
+    /// The shared manifest holds both refs and both Add journal records.
+    auto manifest = b->get(s->layout().rootShardKey(ns, shard));
+    ASSERT_TRUE(manifest.has_value());
+    const RootShard root = decodeRootShard(manifest->bytes);
+    EXPECT_TRUE(root.refs.contains(ref1));
+    EXPECT_TRUE(root.refs.contains(ref2));
+    size_t adds = 0;
+    for (const JournalRecord & rec : root.journal)
+        if (rec.op == JournalRecord::Op::Add)
+            ++adds;
+    EXPECT_EQ(adds, 2u);
 }

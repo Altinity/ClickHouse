@@ -82,6 +82,16 @@ private:
     /// and all other TLVs, putOverwrite(If-Match observed token). Records the new token as the dep.
     void resurrect(ObjectKind kind, const UInt128 & hash, const String & key);
 
+    /// The publish gate's W-EVIDENCE + condemned-token scan (spec §5). For each dependency: a
+    /// token-bearing dep condemned at its token ⇒ resurrect; a tokenless (W-EVIDENCE) dep whose
+    /// (kind, hash) has any condemned token ⇒ observeAndAdmit (adopt-or-resurrect the HEAD). With an
+    /// empty retire view this is a no-op. Runs INSIDE the publish mutate lambda, so it re-runs on
+    /// every CAS retry — idempotent (re-observe). Task 13 extends it with revalidateDeps.
+    void gateCheckDeps();
+
+    /// Map (kind, hash) to its object key per kind (blob/tree/pack).
+    String keyFor(ObjectKind kind, const UInt128 & hash) const;
+
     void requireAlive() const;                            /// throws LOGICAL_ERROR after abandon
 
     StorePtr store;

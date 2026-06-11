@@ -56,6 +56,11 @@ using StorePtr = std::shared_ptr<Store>;
 /// failure refuses the pool (design §6). The read side has no GC awareness and no tokens (spec §6).
 class Store : public std::enable_shared_from_this<Store>
 {
+    /// Build drives the manifest publish CAS through the private mutateShard/shardOf: the gate logic
+    /// (W-PUBLISH-GATE) is Build's responsibility (it owns deps/retireView access), but the CAS loop
+    /// itself is the verified Store loop — reused, never duplicated.
+    friend class Build;
+
 public:
     static StorePtr open(BackendPtr backend, PoolConfig config);
 

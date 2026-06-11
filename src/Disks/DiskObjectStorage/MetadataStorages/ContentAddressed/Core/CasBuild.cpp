@@ -330,10 +330,99 @@ TreeId Build::putTree(std::vector<TreeEntry> entries)
     return id;
 }
 
-void Build::publish(const RootNamespace &, const String &, const TreeId &, RefPayload)
+String Build::keyFor(ObjectKind kind, const UInt128 & hash) const
+{
+    const String id = u128ToHex(hash);
+    switch (kind)
+    {
+        case ObjectKind::Blob:
+            return store->layout().blobKey(BlobId(id));
+        case ObjectKind::Tree:
+            return store->layout().treeKey(TreeId(id));
+        case ObjectKind::Pack:
+            return store->layout().packKey(PackId(id));
+    }
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "keyFor: unknown ObjectKind {}", static_cast<int>(kind));
+}
+
+void Build::gateCheckDeps()
+{
+    /// Iterating `deps` while resurrect/observeAndAdmit MUTATE deps is safe: both OVERWRITE the SAME
+    /// (kind, hash) entry (deps[thatkey].token), never insert a new key, so the iterator we hold and
+    /// the map structure stay valid. (We resolve via the loop's own key.)
+    for (auto & [key, dep] : deps)
+    {
+        const ObjectKind kind = dep.kind;
+        const UInt128 & hash = key.second;
+
+        if (dep.token.has_value())
+        {
+            /// Token-bearing: condemned at exactly this token ⇒ resurrect (mints a fresh token, records it).
+            if (store->retireView().isCondemnedToken(kind, hash, *dep.token))
+                resurrect(kind, hash, keyFor(kind, hash));
+        }
+        else
+        {
+            /// Tokenless evidence (W-EVIDENCE): any condemned token for (kind, hash) ⇒ resolve the HEAD
+            /// via observeAndAdmit (adopt the live incarnation, or resurrect if it too is condemned).
+            /// This turns the dep token-bearing.
+            if (store->retireView().findCondemned(kind, hash).has_value())
+                observeAndAdmit(kind, hash, keyFor(kind, hash));
+        }
+    }
+}
+
+void Build::publish(const RootNamespace & ns, const String & ref_name, const TreeId & tree, RefPayload payload)
 {
     requireAlive();   /// abandon disables publish too (the test asserts LOGICAL_ERROR after abandon)
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Build::publish: M-C2 Task 12");
+
+    /// The published root MUST be in the W-DEP-SET — built or adopted by this Build (spec §5).
+    const UInt128 tree_hash = hexToU128(tree.string());
+    auto dep_it = deps.find({static_cast<uint8_t>(ObjectKind::Tree), tree_hash});
+    if (dep_it == deps.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "publish: tree {} was not built/adopted by this Build", tree.string());
+
+    /// Fill the tree fields of the caller's payload (mutable_files is caller input, preserved).
+    payload.tree_id = tree_hash;
+    auto retained_it = retained_trees.find(tree_hash);
+    /// tree_size: for a tree we built we have the encoded payload size; for an adopted tree we may only
+    /// have 0 (the dep size) — acceptable GC bookkeeping in M-C2.
+    payload.tree_size = retained_it != retained_trees.end() ? retained_it->second.size() : dep_it->second.size;
+
+    /// Heartbeat local-sanity (LIVENESS, never safety): if our heartbeat is stale by the local clock,
+    /// renew it once. With background_heartbeats=false and a fresh build the elapsed time is ~0, so this
+    /// never fires in tests — keep it non-flaky (no test depends on timing).
+    if (heartbeat)
+    {
+        const auto elapsed = std::chrono::steady_clock::now() - heartbeat->lastRenewTime();
+        if (elapsed > 3 * store->poolConfig().heartbeat_period)
+            heartbeat->renewOnce();
+    }
+
+    /// Publish = ONE CAS (spec §5 step 4): set refs[name], append {+, name, T}, shard_version++.
+    /// We REUSE Store::mutateShard (the verified Task-10 loop: re-read-inside-loop, size-guard,
+    /// casPut, bounded retry). The gate-aware mutate lambda owns the gate; because mutateShard
+    /// re-reads + re-invokes the lambda each attempt, a fence-advanced conflict naturally re-runs the
+    /// gate on the fresh fence_round (spec §5 step 5).
+    store->mutateShard(ns, store->shardOf(ref_name), [&](RootShard & root)
+    {
+        /// Fence vs view: if the manifest's fence_round is ahead of our view, GC advanced — refresh.
+        if (store->retireView().round() < root.fence_round)
+        {
+            store->retireView().refresh();
+            /// Task 13: revalidateDeps()
+        }
+
+        gateCheckDeps();
+
+        root.refs[ref_name] = payload;
+        /// at_version == the committed shard_version: mutateShard bumps AFTER the lambda, so inside it
+        /// the post-commit version is root.shard_version + 1 (matches dropRef).
+        root.journal.push_back(JournalRecord{
+            .op = JournalRecord::Op::Add, .ref_name = ref_name, .tree_id = payload.tree_id,
+            .at_version = root.shard_version + 1});
+    });
 }
 
 void Build::abandon()
