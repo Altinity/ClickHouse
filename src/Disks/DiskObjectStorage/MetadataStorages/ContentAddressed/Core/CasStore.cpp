@@ -1,8 +1,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <Common/thread_local_rng.h>
 #include <city.h>
 #include <algorithm>
 
@@ -110,9 +113,22 @@ std::vector<String> Store::listNamespaceFiles(const RootNamespace & ns)
     return names;
 }
 
-BuildPtr Store::startBuild(BuildInfo)
+BuildPtr Store::startBuild(BuildInfo info)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Store::startBuild: M-C2 Task 11");
+    /// Mint a globally-unique build id from two thread_local_rng draws (random u128).
+    const UInt64 hi = thread_local_rng();
+    const UInt64 lo = thread_local_rng();
+    const UInt128 build_id = (static_cast<UInt128>(hi) << 64) | lo;
+
+    /// W-HEARTBEAT: the heartbeat must be durable BEFORE the build returns (and thus before any object
+    /// PUT). start does the durable-first putIfAbsent; background renewal is opt-in (tests drive
+    /// renewOnce explicitly).
+    auto keeper = std::make_unique<HeartbeatKeeper>(pool_backend, pool_layout, build_id, config.server_id);
+    keeper->start();
+    if (config.background_heartbeats)
+        keeper->startBackground(config.heartbeat_period);
+
+    return std::make_shared<Build>(shared_from_this(), std::move(keeper), build_id, std::move(info));
 }
 
 std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String & ref_name)

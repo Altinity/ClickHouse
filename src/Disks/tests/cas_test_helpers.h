@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
@@ -141,6 +142,25 @@ inline void publishRaw(
     const DB::Cas::RootNamespace & ns, uint64_t shard, const DB::Cas::RootShard & root)
 {
     backend.casPut(layout.rootShardKey(ns, shard), DB::Cas::encodeRootShard(root), /*expected*/ std::nullopt);
+}
+
+/// Inject GC state so a fresh `Store::open` over the same backend sees the given incarnations as
+/// condemned. Writes `gc/state` ({round, fence_seq}) and one retired-set object at
+/// `retiredKey(round, fence_seq, shard)`. The Store refreshes its `retireView` only at open, so the
+/// caller injects BEFORE opening the Store whose Build will consult the view.
+inline void injectRetire(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+    uint64_t round, uint64_t fence_seq, uint64_t shard, std::vector<DB::Cas::RetiredEntry> entries)
+{
+    const String state = DB::Cas::encodeGcState(DB::Cas::GcState{.round = round, .fence_seq = fence_seq});
+    const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
+    if (!head.exists)
+        backend.putIfAbsent(layout.gcStateKey(), state);
+    else
+        backend.putOverwrite(layout.gcStateKey(), state, head.token);
+
+    backend.putIfAbsent(layout.retiredKey(round, fence_seq, shard),
+        DB::Cas::encodeRetiredSet(DB::Cas::RetiredSet{.entries = std::move(entries)}));
 }
 
 /// Duplicate of `Store::shardOf` (CityHash64(ref) % root_shards) for placing manifests in tests, since

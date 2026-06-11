@@ -1,0 +1,347 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <IO/WriteHelpers.h>
+#include <Common/Exception.h>
+#include <Common/thread_local_rng.h>
+#include <chrono>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+    extern const int BAD_ARGUMENTS;
+    extern const int FILE_DOESNT_EXIST;
+    extern const int NOT_IMPLEMENTED;
+}
+}
+
+namespace DB::Cas
+{
+
+namespace
+{
+
+/// Two thread_local_rng draws composed into a UInt128. Used both to mint build ids and, per upload
+/// AND per resurrect, a FRESH incarnation_tag (W-FRESH-TAG).
+UInt128 mintU128()
+{
+    const UInt64 hi = thread_local_rng();
+    const UInt64 lo = thread_local_rng();
+    return (static_cast<UInt128>(hi) << 64) | lo;
+}
+
+uint64_t nowMs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+}
+
+BlobSource BlobSource::fromString(String bytes)
+{
+    BlobSource source;
+    source.size = bytes.size();
+    source.write_payload = [b = std::move(bytes)](WriteBuffer & out) { writeString(b, out); };
+    return source;
+}
+
+Build::Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt128 build_id_, BuildInfo info_)
+    : store(std::move(store_))
+    , heartbeat(std::move(heartbeat_))
+    , build_id(build_id_)
+    , info(std::move(info_))
+{
+}
+
+Build::~Build()
+{
+    /// Crash semantics: the Build dtor takes no special action. If the build was not abandoned, the
+    /// heartbeat keeper's own dtor stops its background thread WITHOUT discarding the key, so the
+    /// uploads become debris that full GC reclaims under the heartbeat rules (spec §5). abandon() is
+    /// the only path that proactively discards.
+}
+
+void Build::requireAlive() const
+{
+    if (!alive)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Build has been abandoned; no further operations allowed");
+}
+
+void Build::renewHeartbeat()
+{
+    requireAlive();
+    heartbeat->renewOnce();
+}
+
+BlobRef Build::putBlob(const BlobId & id, BlobSource source)
+{
+    requireAlive();
+
+    const UInt128 logical_hash = hexToU128(id.string());
+    const String key = store->layout().blobKey(id);
+    const PoolMeta & meta = store->poolMeta();
+    const PoolConfig & cfg = store->poolConfig();
+
+    /// W-FRESH-TAG: a fresh incarnation_tag for this upload attempt.
+    EnvelopeHeader header;
+    header.kind = ObjectKind::Blob;
+    header.hash_algo = 1;
+    header.logical_size = source.size;
+    header.logical_hash = logical_hash;
+    header.domain_id = meta.pool_id;
+    header.incarnation_tag = mintU128();
+    header.build_id = build_id;
+    header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
+    header.intended_ref = info.intended_ref;
+    header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
+
+    String head_bytes;
+    try
+    {
+        head_bytes = encodeEnvelopeHeader(header);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::BAD_ARGUMENTS)
+            throw;
+        /// intended_ref is diagnostic-only: when it makes the natural header exceed the pool's fixed
+        /// blob_header_len, drop it (never grow the fixed blob header) and re-encode.
+        header.intended_ref.reset();
+        head_bytes = encodeEnvelopeHeader(header);
+    }
+
+    WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
+    writeString(head_bytes, sink->buffer());
+    const size_t before = sink->buffer().count();
+    source.write_payload(sink->buffer());
+    const size_t written = sink->buffer().count() - before;
+    if (written != source.size)
+    {
+        /// Fail-closed: the envelope's logical_size would lie. Cancel the stream — the key is never
+        /// created by a cancelled sink — and never publish a truncation-undetectable object.
+        sink->cancel();
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "putBlob: source wrote {} bytes, declared {}", written, source.size);
+    }
+
+    Token tok;
+    const PutOutcome outcome = sink->finalize(&tok);
+    if (outcome == PutOutcome::Done)
+    {
+        deps[{static_cast<uint8_t>(ObjectKind::Blob), logical_hash}] =
+            DepEntry{ObjectKind::Blob, tok, store->retireView().round(), source.size};
+        return BlobRef{id, source.size};
+    }
+
+    /// PreconditionFailed ⇒ the key already exists (another writer's incarnation). The body shipped is
+    /// harmless: the dedup saving is the skipped INCARNATION, not the bytes. Apply the cold-reuse rule.
+    const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key);
+    return BlobRef{id, admitted};
+}
+
+BlobRef Build::reuseBlob(const BlobId & id)
+{
+    requireAlive();
+    const UInt128 logical_hash = hexToU128(id.string());
+    const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, store->layout().blobKey(id));
+    return BlobRef{id, admitted};
+}
+
+uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key)
+{
+    const HeadResult hr = store->backend().head(key);
+    if (!hr.exists)
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+            "Build: object {} absent — cannot reuse (caller must upload it)", key);
+
+    if (store->retireView().isCondemnedToken(kind, hash, hr.token))
+    {
+        resurrect(kind, hash, key);
+        /// resurrect recorded the dep with the new token; the admitted logical size is bookkeeping for
+        /// GC (M-C3) and not load-bearing in M-C2 — report the logical size where cheap (Blob only).
+        return kind == ObjectKind::Blob ? hr.size - store->poolMeta().blob_header_len : 0;
+    }
+
+    /// Adopt the current incarnation — free, no bytes moved.
+    deps[{static_cast<uint8_t>(kind), hash}] =
+        DepEntry{kind, hr.token, store->retireView().round(),
+            /// dep.size is GC bookkeeping (M-C3), populated only where free: a blob's logical size is
+            /// the object size minus the pool's fixed header; trees would require a decode, so 0.
+            kind == ObjectKind::Blob ? hr.size - store->poolMeta().blob_header_len : 0};
+    return kind == ObjectKind::Blob ? hr.size - store->poolMeta().blob_header_len : 0;
+}
+
+void Build::resurrect(ObjectKind kind, const UInt128 & hash, const String & key)
+{
+    const std::optional<GetResult> got = store->backend().get(key);
+    if (!got)
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+            "Build::resurrect: object {} vanished between HEAD and GET", key);
+
+    EnvelopeHeader header = decodeEnvelopeHeader(got->bytes, got->bytes.size(), kind);
+
+    /// FOLLOW-UP(M-F): for huge blobs, server-side multipart copy-to-self (spec §5 step 2) instead of
+    /// GET+PUT — copy preserving the bytes, rewriting only the incarnation header.
+    /// W-FRESH-TAG on resurrect: a fresh incarnation_tag forces a distinct body so the condemned
+    /// incarnation can never be re-derived; everything else (header_len, provenance, ...) is preserved.
+    header.incarnation_tag = mintU128();
+    header.pad_to_header_len = header.header_len;   /// preserve the exact header length on re-encode
+    const String new_head = encodeEnvelopeHeader(header);
+    const String body = new_head + got->bytes.substr(header.header_len);
+
+    Token new_tok;
+    const PutOutcome oc = store->backend().putOverwrite(key, body, got->token, &new_tok);
+    if (oc == PutOutcome::PreconditionFailed)
+    {
+        /// A racing writer displaced the incarnation we read (their resurrect won). Re-observe: their
+        /// fresh incarnation is adoptable unless it too is condemned. observeAndAdmit records the dep.
+        observeAndAdmit(kind, hash, key);
+        return;
+    }
+
+    deps[{static_cast<uint8_t>(kind), hash}] =
+        DepEntry{kind, new_tok, store->retireView().round(),
+            kind == ObjectKind::Blob ? got->bytes.size() - store->poolMeta().blob_header_len : 0};
+}
+
+TreeEntry Build::adoptFromTree(const TreeId & source, const String & name)
+{
+    requireAlive();
+
+    auto it = source_tree_cache.find(source);
+    if (it == source_tree_cache.end())
+        it = source_tree_cache.emplace(source, store->readTree(source)).first;
+
+    for (const TreeEntry & entry : it->second)
+    {
+        if (entry.name != name)
+            continue;
+
+        /// W-EVIDENCE: record a TOKENLESS dependency — liveness evidence is the live source root, not a
+        /// token. Inline entries reference no standalone object, so they record nothing.
+        const uint64_t view_round = store->retireView().round();
+        switch (entry.placement)
+        {
+            case Placement::Blob:
+                deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}] =
+                    DepEntry{ObjectKind::Blob, std::nullopt, view_round, entry.file_size};
+                break;
+            case Placement::Subtree:
+                deps[{static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}] =
+                    DepEntry{ObjectKind::Tree, std::nullopt, view_round, entry.file_size};
+                break;
+            case Placement::PackSlice:
+                deps[{static_cast<uint8_t>(ObjectKind::Pack), entry.pack_hash}] =
+                    DepEntry{ObjectKind::Pack, std::nullopt, view_round, entry.pack_length};
+                break;
+            case Placement::Inline:
+                break;   /// no standalone object — nothing to depend on
+        }
+        return entry;
+    }
+
+    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+        "adoptFromTree: no entry named '{}' in source tree {}", name, source.string());
+}
+
+void Build::adoptTree(const TreeId & id)
+{
+    requireAlive();
+    /// Whole-tree tokenless evidence on the tree root; the publish gate + fence/recheck handshake
+    /// covers the closure (spec §5).
+    deps[{static_cast<uint8_t>(ObjectKind::Tree), hexToU128(id.string())}] =
+        DepEntry{ObjectKind::Tree, std::nullopt, store->retireView().round(), 0};
+}
+
+TreeId Build::putTree(std::vector<TreeEntry> entries)
+{
+    requireAlive();
+
+    /// W-TREE-BUILD: bottom-up discipline — every referenced child must already be a dependency.
+    for (const TreeEntry & entry : entries)
+    {
+        switch (entry.placement)
+        {
+            case Placement::Blob:
+                if (!deps.contains({static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}))
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "putTree: child blob {} not in dependency set (W-TREE-BUILD)",
+                        u128ToHex(entry.file_hash));
+                break;
+            case Placement::Subtree:
+                if (!deps.contains({static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}))
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "putTree: child tree {} not in dependency set (W-TREE-BUILD)",
+                        u128ToHex(entry.file_hash));
+                break;
+            case Placement::PackSlice:
+                if (!deps.contains({static_cast<uint8_t>(ObjectKind::Pack), entry.pack_hash}))
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "putTree: child pack {} not in dependency set (W-TREE-BUILD)",
+                        u128ToHex(entry.pack_hash));
+                break;
+            case Placement::Inline:
+                break;   /// inline bytes need no dependency
+        }
+    }
+
+    const String encoded = encodeTree(std::move(entries));   /// canonical sort + duplicate-name check
+    const TreeId id = treeIdFor(encoded);
+    const UInt128 logical_hash = hexToU128(id.string());
+    const String key = store->layout().treeKey(id);
+    const PoolMeta & meta = store->poolMeta();
+    const PoolConfig & cfg = store->poolConfig();
+
+    /// Tree envelope: NATURAL header length (no pad). W-FRESH-TAG: fresh incarnation_tag.
+    EnvelopeHeader header;
+    header.kind = ObjectKind::Tree;
+    header.hash_algo = 1;
+    header.logical_size = encoded.size();
+    header.logical_hash = logical_hash;
+    header.domain_id = meta.pool_id;
+    header.incarnation_tag = mintU128();
+    header.build_id = build_id;
+    header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
+    /// intended_ref deliberately omitted from tree envelopes (forensics live on the published blob set).
+    const String head_bytes = encodeEnvelopeHeader(header);
+
+    WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
+    writeString(head_bytes, sink->buffer());
+    writeString(encoded, sink->buffer());
+    Token tok;
+    const PutOutcome outcome = sink->finalize(&tok);
+    if (outcome == PutOutcome::Done)
+    {
+        deps[{static_cast<uint8_t>(ObjectKind::Tree), logical_hash}] =
+            DepEntry{ObjectKind::Tree, tok, store->retireView().round(), encoded.size()};
+    }
+    else
+    {
+        /// The identical tree already exists (a just-dropped identical tree may be condemned): apply
+        /// the cold-reuse rule, which adopts or resurrects and records the Tree dep.
+        observeAndAdmit(ObjectKind::Tree, logical_hash, key);
+    }
+
+    /// RETAIN the encoded payload: trees are always re-creatable during the gate's W-REVALIDATE
+    /// (Task 13), unlike blob payloads which are not retained.
+    retained_trees[logical_hash] = encoded;
+    return id;
+}
+
+void Build::publish(const RootNamespace &, const String &, const TreeId &, RefPayload)
+{
+    requireAlive();   /// abandon disables publish too (the test asserts LOGICAL_ERROR after abandon)
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Build::publish: M-C2 Task 12");
+}
+
+void Build::abandon()
+{
+    requireAlive();
+    heartbeat->stopBackground();
+    heartbeat->discard();
+    alive = false;
+}
+
+}
