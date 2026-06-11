@@ -163,6 +163,9 @@ TEST(CasGcFormats, GcStateValidation)
     /// Wrong type for a cursor value (string inside folded_cursor).
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
         R"({"format":"cas_gc_state","version":2,"round":7,"fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{"ns/0":"4"},"fence_version":{}})"); });
+    /// Non-canonical fence_version round key ("07" parses to 7 but re-encodes as "7" — aliasing).
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
+        R"({"format":"cas_gc_state","version":2,"round":7,"fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{"07":{}}})"); });
     /// fence_version round value not an object.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
         R"({"format":"cas_gc_state","version":2,"round":7,"fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{"7":4}})"); });

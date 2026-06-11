@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
+#include <base/defines.h>
 #include <charconv>
 
 namespace DB
@@ -100,6 +101,7 @@ TokenType tokenTypeFromString(std::string_view s, std::string_view what)
 
 String encodeGcState(const GcState & state)
 {
+    chassert(state.snap_shards >= 1);   /// catch a zeroed GC constant at the write site
     WriteBufferFromOwnString out;
     writeCString("{", out);
     writeJsonKey(out, "format");
@@ -180,6 +182,11 @@ GcState decodeGcState(std::string_view data)
             if (ec != std::errc() || end != round_str.data() + round_str.size() || round_str.empty())
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS gc/state: non-numeric fence_version round key '{}'", round_str);
+            /// Canonical-form check: "07" parses to 7 but would re-encode as "7" — two keys aliasing
+            /// one round inside a persisted object is corruption, not a tolerable spelling.
+            if (std::to_string(round) != round_str)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS gc/state: non-canonical fence_version round key '{}'", round_str);
             if (inner_var.type() != typeid(Poco::JSON::Object::Ptr))
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS gc/state: fence_version value for round '{}' must be an object", round_str);
