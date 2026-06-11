@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include <functional>
 #include <memory>
 
@@ -11,8 +13,6 @@ using namespace DB::Cas;
 /// Fault-injection-only features are excluded — those are InMemory-specific tests.
 class CasBackendContract : public ::testing::TestWithParam<std::function<BackendPtr()>>
 {
-protected:
-    BackendPtr make() { return GetParam()(); }
 };
 
 TEST_P(CasBackendContract, PutIfAbsentAndGet)
@@ -130,5 +130,31 @@ TEST_P(CasBackendContract, ReadAfterWrite)
     EXPECT_EQ(h.token, t1);
 }
 
+/// After an object is created then deleted (key absent again), BOTH conditional updates against a stale
+/// token must be rejected with the object still absent — a token-conditional update can never resurrect a
+/// missing key. For the Native S3 adapter this pins the 404-on-If-Match -> PreconditionFailed/Conflict
+/// mapping; for every backend it pins that absence is not a write opportunity for a stale token.
+TEST_P(CasBackendContract, OverwriteAndCasOnMissingKey)
+{
+    auto b = GetParam()();
+    Token t1;
+    b->putIfAbsent("k", "v1", &t1);
+    EXPECT_EQ(b->deleteExact("k", t1).kind, DeleteOutcome::Kind::Deleted);
+    ASSERT_FALSE(b->get("k").has_value());                     // key is absent
+
+    EXPECT_EQ(b->putOverwrite("k", "v2", t1), PutOutcome::PreconditionFailed);
+    EXPECT_FALSE(b->get("k").has_value());                     // still absent
+
+    EXPECT_EQ(b->casPut("k", "v2", t1), CasOutcome::Conflict);
+    EXPECT_FALSE(b->get("k").has_value());                     // still absent
+}
+
 INSTANTIATE_TEST_SUITE_P(InMemory, CasBackendContract,
     ::testing::Values(+[]() -> BackendPtr { return std::make_shared<InMemoryBackend>(); }));
+
+INSTANTIATE_TEST_SUITE_P(Local, CasBackendContract,
+    ::testing::Values(+[]() -> BackendPtr
+    {
+        return std::make_shared<ObjectStorageBackend>(
+            DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    }));
