@@ -5,6 +5,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int CORRUPTED_DATA;
 extern const int NOT_IMPLEMENTED;
 }
 
@@ -370,6 +371,35 @@ TEST(CasTreeCodec, TruncatedBufferThrows)
     String encoded = encodeTree(entries);
     encoded.resize(encoded.size() - 3);
     EXPECT_THROW(decodeTree(encoded), DB::Exception);
+}
+
+TEST(CasTreeCodec, HugeInlineLengthThrowsCorruptedData)
+{
+    /// A corrupted u32 inline-bytes length field must be rejected by the bounds check in
+    /// `readFixedBytes` BEFORE any allocation: without that check, a single flipped length field
+    /// would transiently allocate up to 4 GiB, surfacing as MEMORY_LIMIT_EXCEEDED under a memory
+    /// tracker instead of the pinned CORRUPTED_DATA (and this test would take noticeably longer).
+    std::vector<TreeEntry> entries = {inlineEntry("f", "hello")};
+    String encoded = encodeTree(entries);
+
+    /// CATR layout (see `encodeTree`): magic(4) ver(1) count(4) = 9 bytes of header, then for the
+    /// single entry: name_len(2) name(1, "f") placement(1) file_hash(16) file_size(8); the u32
+    /// little-endian inline_bytes length therefore sits at offset 9 + 2 + 1 + 1 + 16 + 8 = 37.
+    constexpr size_t len_offset = 9 + 2 + 1 + 1 + 16 + 8;
+    ASSERT_LE(len_offset + 4, encoded.size());
+    /// Sanity: the bytes at the computed offset hold the known length of "hello" (5, LE).
+    ASSERT_EQ(static_cast<unsigned char>(encoded[len_offset]), 5u);
+    ASSERT_EQ(static_cast<unsigned char>(encoded[len_offset + 1]), 0u);
+    ASSERT_EQ(static_cast<unsigned char>(encoded[len_offset + 2]), 0u);
+    ASSERT_EQ(static_cast<unsigned char>(encoded[len_offset + 3]), 0u);
+
+    /// Patch the length to ~4 GiB (0xFFFFFFF0 little-endian).
+    encoded[len_offset] = static_cast<char>(0xF0);
+    encoded[len_offset + 1] = static_cast<char>(0xFF);
+    encoded[len_offset + 2] = static_cast<char>(0xFF);
+    encoded[len_offset + 3] = static_cast<char>(0xFF);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeTree(encoded); });
 }
 
 TEST(CasTreeCodec, BadMagicThrows)

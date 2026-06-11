@@ -25,9 +25,18 @@ namespace DB::Cas
 /// (`transformEndianness` handles wide integers). String lengths ride separately as explicit
 /// fixed-width LE fields, so the codecs do not use the varint-prefixed `writeStringBinary` family.
 
-/// Read exactly `n` raw bytes.
+/// Read exactly `n` raw bytes. The bounds check MUST precede the allocation: `n` typically comes
+/// from a length field just read off the wire, so on corrupted input it can be huge (a u32 field
+/// admits 4 GiB) — allocating first would mean a multi-GiB transient allocation, which under a
+/// memory tracker surfaces as MEMORY_LIMIT_EXCEEDED instead of the pinned CORRUPTED_DATA.
+/// Comparing against `available` as the exact remainder is valid because all CAS codec decoding
+/// reads from `ReadBufferFromMemory`: the whole object is in memory, so `available` is exactly
+/// the number of bytes left.
 inline String readFixedBytes(ReadBuffer & in, size_t n)
 {
+    if (n > in.available())
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS codec: truncated encoded data: need {} bytes, {} available", n, in.available());
     String s(n, '\0');
     in.readStrict(s.data(), n);
     return s;
@@ -45,8 +54,10 @@ auto decodeGuarded(std::string_view what, F && f)
     }
     catch (const Exception & e)
     {
+        /// This translation is only safe because the guarded lambdas read exclusively from in-memory
+        /// buffers — no real IO inside, so these codes cannot mean a transient read failure.
         if (e.code() == ErrorCodes::CANNOT_READ_ALL_DATA || e.code() == ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: truncated encoded data", what);
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: truncated encoded data ({})", what, e.message());
         throw;
     }
 }
