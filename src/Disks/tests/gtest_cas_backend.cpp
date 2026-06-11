@@ -1,6 +1,13 @@
 #include <gtest/gtest.h>
+
+#include "config.h"
+
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+
+#if USE_AWS_S3
+#include <IO/S3Common.h>
+#endif
 
 using namespace DB::Cas;
 
@@ -222,3 +229,23 @@ TEST(CasInMemoryFaults, VersioningMarkerMode)
     b.putIfAbsent("k", "v1", &t1);
     EXPECT_TRUE(b.deleteExact("k", t1).created_delete_marker);    // probe must reject this pool
 }
+
+// =====================================================================
+// M-C2 Task 2: typed S3 precondition signal
+// =====================================================================
+
+#if USE_AWS_S3
+
+/// The Native conditional-PUT path discriminates a lost precondition by the canonical S3 error code
+/// string ("PreconditionFailed", "NoSuchKey", ...) that `S3Exception` carries from the response XML
+/// `<Code>` — a 412 is UNMODELED for the AWS SDK (the enum value is UNKNOWN), so the name is the only
+/// machine-readable signal.
+TEST(CasS3Signal, S3ExceptionCarriesCanonicalErrorName)
+{
+    DB::S3Exception e("412 from backend", Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed");
+    EXPECT_EQ(e.getExceptionName(), "PreconditionFailed");
+    DB::S3Exception bare("no name attached", Aws::S3::S3Errors::UNKNOWN);
+    EXPECT_TRUE(bare.getExceptionName().empty());
+}
+
+#endif

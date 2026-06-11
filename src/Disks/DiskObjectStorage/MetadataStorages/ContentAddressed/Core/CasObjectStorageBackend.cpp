@@ -6,19 +6,20 @@
 #include <Core/Defines.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadSettings.h>
+#include <IO/WriteBufferFromString.h>
 #include <IO/WriteSettings.h>
 
 #include <Common/Exception.h>
 
-#include <algorithm>
+#include <base/defines.h>
 
-namespace DB
-{
-namespace ErrorCodes
-{
-    extern const int S3_ERROR;
-}
-}
+#include "config.h"
+
+#if USE_AWS_S3
+#include <IO/S3Common.h>
+#endif
+
+#include <algorithm>
 
 namespace DB::Cas
 {
@@ -47,37 +48,52 @@ std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
     return hr;
 }
 
-/// Issue a conditional PUT (the condition rides on `ws`) and map a precondition loss.
+/// Finalize a conditional write (the condition rode on the buffer's WriteSettings) and map a
+/// precondition loss to an OUTCOME — anything else propagates.
 ///
-/// A backend reports a lost condition as an `S3Exception` (code `S3_ERROR`) whose message carries
-/// `PreconditionFailed` — the exact signal `PoolCoordination.cpp`'s `condCreateViaIfNoneMatch` detects.
-/// A `404 NoSuchKey` on an `If-Match` PUT (the key was deleted out from under us) is treated identically:
-/// protocol callers handle 'mismatch' and 'gone' the same way (re-validate), so both collapse onto
-/// `PreconditionFailed`.
+/// A backend reports a lost condition as an `S3Exception` carrying the canonical S3 error code string
+/// from the response XML `<Code>` (`S3Exception::getExceptionName`); a conditional-write 412 is
+/// UNMODELED for the AWS SDK (its enum value is UNKNOWN), so the name — matched EXACTLY, never as a
+/// substring of free text — is the typed signal. A `404 NoSuchKey` on an `If-Match` PUT (the key was
+/// deleted out from under us) is treated identically: protocol callers handle 'mismatch' and 'gone'
+/// the same way (re-validate), so both collapse onto `PreconditionFailed`. `NoSuchKey` IS modeled by
+/// the SDK, and `WriteBufferFromS3` retries it internally surfacing the exhaustion with the typed enum
+/// code (and no name), so the enum is matched as well as the name. The mapping is fail-safe in
+/// direction: a misread error becomes a retryable PreconditionFailed/Conflict, never a false success.
 ///
-/// The detection matches error-name substrings only (`PreconditionFailed`, `NoSuchKey`) — never bare
-/// status digits, since the formatted message embeds the object key and free digits could match
-/// spuriously. The substring match itself is fail-safe in direction (a misread transient error becomes
-/// a retryable PreconditionFailed/Conflict, never a false success). FOLLOW-UP (pre-integration): have
-/// `WriteBufferFromS3` surface the precondition loss as a typed signal so this matches the SDK error
-/// type instead of free text, mirroring `S3ObjectStorage::removeObjectIfTokenMatches`.
-PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, Token * out_token)
+/// HONEST NOTE: the Native conditional-write paths are exercised end-to-end only at M-W against
+/// RustFS; unit coverage is the Emulated mode plus the typed-catch compile path.
+static PutOutcome finalizeConditionalWrite(WriteBuffer & buf)
 {
+#if USE_AWS_S3
     try
     {
-        auto buf = object_storage->writeObject(
-            StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ws);
-        buf->write(bytes.data(), bytes.size());
-        buf->finalize();
+        buf.finalize();
     }
-    catch (const Exception & e)
+    catch (const S3Exception & e)
     {
-        if (e.code() == ErrorCodes::S3_ERROR
-            && (e.message().find("PreconditionFailed") != std::string::npos
-                || e.message().find("NoSuchKey") != std::string::npos))
+        if (e.getExceptionName() == "PreconditionFailed"
+            || e.getExceptionName() == "NoSuchKey"
+            || e.getS3ErrorCode() == Aws::S3::S3Errors::NO_SUCH_KEY)
             return PutOutcome::PreconditionFailed;
         throw;
     }
+#else
+    buf.finalize();
+#endif
+    return PutOutcome::Done;
+}
+
+/// Issue a conditional PUT (the condition rides on `ws`) and map a precondition loss — see
+/// finalizeConditionalWrite. The condition is checked by the backend when the object is completed,
+/// so the precondition loss always surfaces from the buffer's finalize, never from write.
+PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, Token * out_token)
+{
+    auto buf = object_storage->writeObject(
+        StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ws);
+    buf->write(bytes.data(), bytes.size());
+    if (finalizeConditionalWrite(*buf) == PutOutcome::PreconditionFailed)
+        return PutOutcome::PreconditionFailed;
 
     if (out_token)
     {
@@ -85,6 +101,104 @@ PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const 
         *out_token = hr ? hr->token : Token{};
     }
     return PutOutcome::Done;
+}
+
+namespace
+{
+
+/// True-streaming WriteSink for Native mode: the underlying object-storage write buffer was opened
+/// with `If-None-Match: *` riding on its WriteSettings, so bytes stream through it directly and the
+/// condition is checked when finalize completes the object — see finalizeConditionalWrite for the
+/// outcome mapping. Nothing is ever published on cancel/destruction.
+class NativeStreamingSink final : public WriteSink
+{
+public:
+    NativeStreamingSink(Backend & backend_, String key_, std::unique_ptr<WriteBufferFromFileBase> write_buf_)
+        : backend(backend_)
+        , key(std::move(key_))
+        , write_buf(std::move(write_buf_))
+    {
+    }
+
+    WriteBuffer & buffer() override { return *write_buf; }
+
+    PutOutcome finalize(Token * out_token) override
+    {
+        chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
+        done = true;
+        if (finalizeConditionalWrite(*write_buf) == PutOutcome::PreconditionFailed)
+            return PutOutcome::PreconditionFailed;
+
+        if (out_token)
+        {
+            /// Observe the token of the incarnation we just created — same head-after-put strategy
+            /// as nativeConditionalPut (the conditional-write plumbing does not return the ETag).
+            auto hr = backend.head(key);
+            *out_token = hr.exists ? hr.token : Token{};
+        }
+        return PutOutcome::Done;
+    }
+
+    void cancel() noexcept override
+    {
+        done = true;
+        write_buf->cancel();
+    }
+
+    ~NativeStreamingSink() override
+    {
+        if (!done)
+            cancel();
+    }
+
+private:
+    Backend & backend;
+    const String key;
+    std::unique_ptr<WriteBufferFromFileBase> write_buf;
+    bool done = false;
+};
+
+/// Memory-buffered WriteSink for EmulatedSingleProcess mode (unit tests only — buffering the whole
+/// body is acceptable and documented): accumulates into a WriteBufferFromOwnString and delegates the
+/// conditional publish to putIfAbsent at finalize, which provides atomicity under emu_mutex. Nothing
+/// is ever published on cancel/destruction.
+class EmulatedBufferedSink final : public WriteSink
+{
+public:
+    EmulatedBufferedSink(Backend & backend_, String key_)
+        : backend(backend_)
+        , key(std::move(key_))
+    {
+    }
+
+    WriteBuffer & buffer() override { return buf; }
+
+    PutOutcome finalize(Token * out_token) override
+    {
+        chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
+        done = true;
+        return backend.putIfAbsent(key, buf.str(), out_token);
+    }
+
+    void cancel() noexcept override
+    {
+        done = true;
+        buf.cancel();
+    }
+
+    ~EmulatedBufferedSink() override
+    {
+        if (!done)
+            cancel();
+    }
+
+private:
+    Backend & backend;
+    const String key;
+    WriteBufferFromOwnString buf;
+    bool done = false;
+};
+
 }
 
 /// Read the whole object at `path` and honor `range` by substr. Objects on this path are small (root
@@ -217,6 +331,22 @@ PutOutcome ObjectStorageBackend::putIfAbsent(const String & key, const String & 
     if (out_token)
         *out_token = Token{std::to_string(seq), TokenType::Emulated};
     return PutOutcome::Done;
+}
+
+WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key)
+{
+    if (mode == Mode::Native)
+    {
+        /// Same WriteSettings construction as putIfAbsent — the condition rides on the write buffer
+        /// and is checked when finalize completes the object.
+        WriteSettings ws;
+        ws.object_storage_write_if_none_match = "*";
+        auto buf = object_storage->writeObject(
+            StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ws);
+        return std::make_unique<NativeStreamingSink>(*this, key, std::move(buf));
+    }
+
+    return std::make_unique<EmulatedBufferedSink>(*this, key);
 }
 
 PutOutcome ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token)

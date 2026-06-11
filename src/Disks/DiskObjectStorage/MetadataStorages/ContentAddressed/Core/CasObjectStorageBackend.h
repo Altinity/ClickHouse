@@ -1,8 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
-#include <IO/WriteBufferFromString.h>
-#include <base/defines.h>
 #include <map>
 #include <mutex>
 
@@ -31,43 +29,10 @@ public:
     HeadResult head(const String & key) override;
     PutOutcome putIfAbsent(const String & key, const String & bytes, Token * out_token) override;
 
-    /// TEMPORARY (Task 1): memory-buffered delegation; Task 2 replaces with true streaming for Native mode.
-    WriteSinkPtr putIfAbsentStream(const String & key) override
-    {
-        class BufferedSink final : public WriteSink
-        {
-        public:
-            BufferedSink(Backend & backend_, String key_) : backend(backend_), key(std::move(key_)) {}
-
-            WriteBuffer & buffer() override { return buf; }
-
-            PutOutcome finalize(Token * out_token) override
-            {
-                chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
-                done = true;
-                return backend.putIfAbsent(key, buf.str(), out_token);
-            }
-
-            void cancel() noexcept override
-            {
-                done = true;
-                buf.cancel();
-            }
-
-            ~BufferedSink() override
-            {
-                if (!done)
-                    cancel();
-            }
-
-        private:
-            Backend & backend;
-            String key;
-            WriteBufferFromOwnString buf;
-            bool done = false;
-        };
-        return std::make_unique<BufferedSink>(*this, key);
-    }
+    /// Native mode: true streaming — bytes flow straight into the object storage's write buffer with
+    /// `If-None-Match: *` riding on the request. EmulatedSingleProcess mode: memory-buffered delegation
+    /// to putIfAbsent (acceptable: this mode exists for unit tests only).
+    WriteSinkPtr putIfAbsentStream(const String & key) override;
     PutOutcome putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token) override;
     CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token) override;
     DeleteOutcome deleteExact(const String & key, const Token & token) override;

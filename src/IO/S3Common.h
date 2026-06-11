@@ -37,14 +37,24 @@ public:
     {
     }
 
-    S3Exception(const std::string & msg, Aws::S3::S3Errors code_)
+    S3Exception(const std::string & msg, Aws::S3::S3Errors code_, String exception_name_ = {})
         : Exception(msg, ErrorCodes::S3_ERROR)
         , code(code_)
+        , exception_name(std::move(exception_name_))
     {}
 
     Aws::S3::S3Errors getS3ErrorCode() const
     {
         return code;
+    }
+
+    /// The canonical S3 error code string from the response XML `<Code>` (e.g. "PreconditionFailed",
+    /// "NoSuchKey") as reported by `Aws::Client::AWSError::GetExceptionName`. Errors unmodeled by the
+    /// SDK (a conditional-PUT 412 is one) have `getS3ErrorCode` == UNKNOWN, so this name is the only
+    /// machine-readable discriminator. Empty when the throw site did not attach it.
+    const String & getExceptionName() const
+    {
+        return exception_name;
     }
 
     bool isRetryableError() const;
@@ -55,6 +65,7 @@ public:
 
 private:
     Aws::S3::S3Errors code;
+    String exception_name;
 };
 }
 

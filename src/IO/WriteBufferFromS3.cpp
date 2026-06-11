@@ -693,10 +693,13 @@ void WriteBufferFromS3::completeMultipartUpload()
         }
         else
         {
+            /// Pass the canonical S3 error name: a conditional-write 412 is UNMODELED for the SDK
+            /// (the error type is UNKNOWN), so the name is the caller's only typed signal.
             throw S3Exception(
+                fmt::format("Message: {}, Key: {}, Bucket: {}, Tags: {}",
+                    outcome.GetError().GetMessage(), key, bucket, fmt::join(multipart_tags.begin(), multipart_tags.end(), " ")),
                 outcome.GetError().GetErrorType(),
-                "Message: {}, Key: {}, Bucket: {}, Tags: {}",
-                outcome.GetError().GetMessage(), key, bucket, fmt::join(multipart_tags.begin(), multipart_tags.end(), " "));
+                outcome.GetError().GetExceptionName());
         }
     }
 
@@ -793,10 +796,13 @@ void WriteBufferFromS3::makeSinglepartUpload(WriteBufferFromS3::PartData && data
                 else
                     LOG_ERROR(log, "S3Exception name {}, Message: {}, bucket {}, key {}, object size {}",
                               outcome.GetError().GetExceptionName(), outcome.GetError().GetMessage(), bucket, key, content_length);
+                /// Pass the canonical S3 error name: a conditional-write 412 is UNMODELED for the SDK
+                /// (the error type is UNKNOWN), so the name is the caller's only typed signal.
                 throw S3Exception(
+                    fmt::format("Message: {}, bucket {}, key {}, object size {}",
+                        outcome.GetError().GetMessage(), bucket, key, content_length),
                     outcome.GetError().GetErrorType(),
-                    "Message: {}, bucket {}, key {}, object size {}",
-                    outcome.GetError().GetMessage(), bucket, key, content_length);
+                    outcome.GetError().GetExceptionName());
             }
         }
 
