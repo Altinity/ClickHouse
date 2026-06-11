@@ -89,6 +89,23 @@ private:
     /// every CAS retry — idempotent (re-observe). Task 13 extends it with revalidateDeps.
     void gateCheckDeps();
 
+    /// W-REVALIDATE (the model's `WPublishReval`). Called once, immediately after a fence-advanced
+    /// `retireView().refresh` in the publish lambda and BEFORE gateCheckDeps. A token observation is
+    /// valid only relative to the retire view at which it was made (finding F1): retire entries drop
+    /// on confirmed outcomes, so the refreshed view alone cannot condemn a STALE observation — the
+    /// durable witness is the object itself. For every token-bearing member whose hash has NO entry
+    /// in the refreshed view yet was observed under an older round, this re-observes (one HEAD) and
+    /// keeps / adopts / re-creates per the rule. See spec §7 step 4 (the no-return argument's
+    /// publish-after-fence branch).
+    void revalidateDeps();
+
+    /// W-REVALIDATE re-create branch for trees: re-upload retained_trees[hash] as a FRESH Tree
+    /// incarnation (fresh incarnation_tag, putIfAbsentStream If-None-Match), then record the new
+    /// token + observed_view_round. On PreconditionFailed (someone re-created it concurrently) ⇒
+    /// observeAndAdmit. Trees are ALWAYS re-creatable because their encoded payload is retained;
+    /// blob payloads are not retained (hence the ABORTED branch in revalidateDeps for a lost blob).
+    void recreateTree(const UInt128 & hash);
+
     /// Map (kind, hash) to its object key per kind (blob/tree/pack).
     String keyFor(ObjectKind kind, const UInt128 & hash) const;
 

@@ -3,6 +3,7 @@
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
+#include <algorithm>
 #include <chrono>
 
 namespace DB
@@ -13,6 +14,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int FILE_DOESNT_EXIST;
     extern const int NOT_IMPLEMENTED;
+    extern const int ABORTED;
 }
 }
 
@@ -372,6 +374,124 @@ void Build::gateCheckDeps()
     }
 }
 
+void Build::recreateTree(const UInt128 & hash)
+{
+    /// W-REVALIDATE re-create branch. The encoded payload was RETAINED at putTree, so a tree is always
+    /// re-creatable: re-upload it as a FRESH incarnation. W-FRESH-TAG: a fresh incarnation_tag.
+    const auto retained_it = retained_trees.find(hash);
+    if (retained_it == retained_trees.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Build::recreateTree: no retained payload for tree {} (only built trees are re-creatable)",
+            u128ToHex(hash));
+
+    const String & encoded = retained_it->second;
+    const TreeId id{u128ToHex(hash)};
+    const String key = store->layout().treeKey(id);
+    const PoolMeta & meta = store->poolMeta();
+    const PoolConfig & cfg = store->poolConfig();
+
+    EnvelopeHeader header;
+    header.kind = ObjectKind::Tree;
+    header.hash_algo = 1;
+    header.logical_size = encoded.size();
+    header.logical_hash = hash;
+    header.domain_id = meta.pool_id;
+    header.incarnation_tag = mintU128();
+    header.build_id = build_id;
+    header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
+    const String head_bytes = encodeEnvelopeHeader(header);
+
+    WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
+    writeString(head_bytes, sink->buffer());
+    writeString(encoded, sink->buffer());
+    Token tok;
+    const PutOutcome outcome = sink->finalize(&tok);
+    if (outcome == PutOutcome::Done)
+    {
+        deps[{static_cast<uint8_t>(ObjectKind::Tree), hash}] =
+            DepEntry{ObjectKind::Tree, tok, store->retireView().round(), encoded.size()};
+        return;
+    }
+
+    /// PreconditionFailed ⇒ a concurrent writer re-created it first. Apply the cold-reuse rule against
+    /// the current incarnation (adopt it, or resurrect if it too is condemned). observeAndAdmit records
+    /// the dep with the current round.
+    observeAndAdmit(ObjectKind::Tree, hash, key);
+}
+
+void Build::revalidateDeps()
+{
+    /// W-REVALIDATE (the model's `WPublishReval`). Iterating `deps` while resurrect / observeAndAdmit /
+    /// recreateTree MUTATE deps is safe for the same reason as gateCheckDeps: re-create keeps the SAME
+    /// (kind, hash) — a tree's hash commits to its content, so its re-uploaded incarnation lives at the
+    /// identical key — and resurrect/observeAndAdmit OVERWRITE deps[k], never insert a new key. So the
+    /// iterator and the map structure stay valid.
+    for (auto & [key, dep] : deps)
+    {
+        const ObjectKind kind = dep.kind;
+        const UInt128 & hash = key.second;
+
+        /// Tokenless evidence (W-EVIDENCE) is NOT re-observed here: it carries no observed token to be
+        /// stale. gateCheckDeps resolves it (a view hit ⇒ observeAndAdmit).
+        if (!dep.token.has_value())
+            continue;
+
+        const String k = keyFor(kind, hash);
+        const std::optional<std::vector<Token>> hits = store->retireView().findCondemned(kind, hash);
+
+        if (hits.has_value() && std::find(hits->begin(), hits->end(), *dep.token) != hits->end())
+        {
+            /// Condemned at our EXACT observed token in the refreshed view ⇒ resurrect (blob) or
+            /// re-create from the retained payload (tree). This is the spec §7 step-4 "held entry ⇒
+            /// the dependency-set gate finds it ⇒ resurrect" horn, surfaced early so the keep-branch
+            /// below only ever sees genuinely-uncondemned members.
+            if (kind == ObjectKind::Tree && retained_trees.contains(hash))
+                recreateTree(hash);
+            else
+                resurrect(kind, hash, k);
+        }
+        else if (!hits.has_value() && dep.observed_view_round < store->retireView().round())
+        {
+            /// STALE-OBSERVED, no entry in the refreshed view ⇒ the W-REVALIDATE single re-observation
+            /// (one HEAD). We re-observe ONLY members observed under an older round; a member already
+            /// observed at this round needs nothing (handled by the else-keep below).
+            const HeadResult hr = store->backend().head(k);
+            if (!hr.exists)
+            {
+                /// deleted / absent in the refreshed reality.
+                if (kind == ObjectKind::Tree && retained_trees.contains(hash))
+                    recreateTree(hash);   /// spec §7 step 4: deleted/absent ⇒ re-create
+                else
+                    /// A blob payload is not retained — fail closed and retryable. Do NOT fabricate a
+                    /// dangling reference (INV-NO-DANGLE); the caller re-runs the operation, which
+                    /// re-uploads the blob bytes from source.
+                    throw Exception(ErrorCodes::ABORTED,
+                        "publish dependency {} lost and not re-creatable; retry the operation",
+                        u128ToHex(hash));
+            }
+            else if (hr.token == *dep.token)
+            {
+                /// current == observed ⇒ KEEP — safe by the IN-FLIGHT DISJUNCTION (model-checked): a
+                /// delete in flight for (hash, t) implies its retire entry is still HELD, or t was
+                /// already DISPLACED (current ≠ t, forced through a gate-mandated resurrect). A delete
+                /// for the CURRENT token therefore implies a held entry — which would be a VIEW HIT, and
+                /// we are in the no-hit branch. So no-hit + current==observed is publishable. We only
+                /// re-stamp observed_view_round so a later same-publish recheck treats it as fresh.
+                dep.observed_view_round = store->retireView().round();
+            }
+            else
+            {
+                /// current token differs ⇒ treat as a FRESH cold reuse of the current token (spec §7
+                /// step 4: replaced ⇒ adopt the newer token, or resurrect if it too is condemned).
+                observeAndAdmit(kind, hash, k);
+            }
+        }
+        /// else: already valid at this view round — either observed_view_round >= round (re-observed /
+        /// uploaded under the current view), or condemned-but-not-at-our-token (a different incarnation's
+        /// entry, irrelevant to us). KEEP.
+    }
+}
+
 void Build::publish(const RootNamespace & ns, const String & ref_name, const TreeId & tree, RefPayload payload)
 {
     requireAlive();   /// abandon disables publish too (the test asserts LOGICAL_ERROR after abandon)
@@ -411,7 +531,9 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
         if (store->retireView().round() < root.fence_round)
         {
             store->retireView().refresh();
-            /// Task 13: revalidateDeps()
+            /// W-REVALIDATE: a fence-advanced refresh invalidates every stale token observation; re-validate
+            /// the whole dependency set BEFORE the gate scan (spec §5 step 5, §7 step 4).
+            revalidateDeps();
         }
 
         gateCheckDeps();

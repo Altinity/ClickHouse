@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <memory>
@@ -161,6 +162,59 @@ inline void injectRetire(
 
     backend.putIfAbsent(layout.retiredKey(round, fence_seq, shard),
         DB::Cas::encodeRetiredSet(DB::Cas::RetiredSet{.entries = std::move(entries)}));
+}
+
+/// Raise the `fence_round` of every shard of a namespace to at least `round`, exactly as a GC leader's
+/// fence step (R3) does. For each shard 0..n_shards-1: read the manifest raw (decodeRootShard) if
+/// present, `fence_round = max(fence_round, round)`, re-encode, and `casPut` it back against the
+/// observed token. An ABSENT shard is created fresh holding only `fence_round = round` (mirrors GC
+/// fencing a never-published shard) via `casPut(expected = nullopt)`.
+inline void fenceNamespace(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+    const DB::Cas::RootNamespace & ns, uint64_t n_shards, uint64_t round)
+{
+    for (uint64_t shard = 0; shard < n_shards; ++shard)
+    {
+        const String key = layout.rootShardKey(ns, shard);
+        const auto got = backend.get(key);
+        if (got)
+        {
+            DB::Cas::RootShard root = DB::Cas::decodeRootShard(got->bytes);
+            root.fence_round = std::max(root.fence_round, round);
+            backend.casPut(key, DB::Cas::encodeRootShard(root), got->token);
+        }
+        else
+        {
+            DB::Cas::RootShard root;
+            root.fence_round = round;
+            backend.casPut(key, DB::Cas::encodeRootShard(root), /*expected*/ std::nullopt);
+        }
+    }
+}
+
+/// Displace a blob's incarnation out-of-band (as a racing writer would): GET it, mint a fresh
+/// incarnation_tag in its envelope header (preserving header_len + payload), putOverwrite against the
+/// current token, and return the NEW token. Used to drive the W-REVALIDATE adopt branch (current token
+/// differs from the writer's stale observation).
+inline DB::Cas::Token displaceBlobToken(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::BlobId & id)
+{
+    const String key = layout.blobKey(id);
+    const auto got = backend.get(key);
+    if (!got)
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "displaceBlobToken: blob {} absent", key);
+
+    DB::Cas::EnvelopeHeader header =
+        DB::Cas::decodeEnvelopeHeader(got->bytes, got->bytes.size(), DB::Cas::ObjectKind::Blob);
+    /// A fresh, distinct incarnation_tag forces a distinct body so the displaced token differs.
+    header.incarnation_tag = header.incarnation_tag + DB::UInt128(1);
+    header.pad_to_header_len = header.header_len;   /// preserve the exact header length on re-encode
+    const String new_head = DB::Cas::encodeEnvelopeHeader(header);
+    const String body = new_head + got->bytes.substr(header.header_len);
+
+    DB::Cas::Token new_tok;
+    backend.putOverwrite(key, body, got->token, &new_tok);
+    return new_tok;
 }
 
 /// Duplicate of `Store::shardOf` (CityHash64(ref) % root_shards) for placing manifests in tests, since
