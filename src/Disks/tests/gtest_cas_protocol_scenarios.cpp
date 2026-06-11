@@ -167,6 +167,11 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     build->publish(RootNamespace{"srv1/tbl/copy"}, "part_2", tree, RefPayload{});
     EXPECT_EQ(b->head(blob_key).token, t1);
     assertPartReads(b, s, RootNamespace{"srv1/tbl/copy"}, "part_2", tree, "payload-X");
+
+    /// Independent discriminator that the dep rides t1, not the stale t0: t0 is DEAD. A deleteExact
+    /// against t0 must TokenMismatch (INV-NO-RETURN — t0 was displaced and can never be current
+    /// again), proving the adoption was to t1 and did not silently retain t0.
+    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
 }
 
 TEST(CasProtocol, RevalidateResurrectsWhenCurrentTokenCondemnedAtDifferentToken)

@@ -143,6 +143,11 @@ void HeartbeatKeeper::discard()
 
 void HeartbeatKeeper::startBackground(std::chrono::milliseconds period)
 {
+    /// After a thread-side renewal failure the loop returns (see backgroundLoop) but the thread
+    /// handle stays joinable, so a subsequent startBackground throws "already running" until
+    /// stopBackground is called. This is intentional fail-closed: the publish gate observes the
+    /// frozen lastRenewTime and refuses to proceed — the gate, not the thread, is the safety
+    /// mechanism (spec §5). We never silently re-arm renewal after it has failed.
     std::lock_guard lock(background_mutex);
     if (thread.joinable())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: background renewal is already running for key '{}'", key);

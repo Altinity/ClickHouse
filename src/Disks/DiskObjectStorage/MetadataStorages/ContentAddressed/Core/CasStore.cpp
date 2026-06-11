@@ -26,6 +26,11 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+/// Runaway brake on CAS/conditional-write retry loops. These keys are single-owner (one writer per
+/// namespace by construction), so a contention storm is impossible — the bound only catches a
+/// pathological live-lock and never a legitimate steady state.
+static constexpr size_t MAX_CAS_ATTEMPTS = 100;
+
 Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     : pool_backend(std::move(backend_))
     , config(std::move(config_))
@@ -63,7 +68,7 @@ void Store::putNamespaceFile(const RootNamespace & ns, const String & name, cons
     /// retry on contention. These keys have a single owner, so a contention storm is impossible — the
     /// bound is purely a runaway brake.
     const String key = pool_layout.namespaceFileKey(ns, name);
-    for (size_t attempt = 0; attempt < 100; ++attempt)
+    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
     {
         HeadResult head = pool_backend->head(key);
         if (!head.exists)
@@ -221,7 +226,7 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
 void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate)
 {
     const String key = pool_layout.rootShardKey(ns, shard);
-    for (size_t attempt = 0; attempt < 100; ++attempt)
+    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
     {
         /// Re-read inside the loop so `mutate` always edits the FRESH manifest: on a Conflict retry the
         /// previous attempt's edits are discarded and re-applied to the winner's state, so a journal
@@ -305,7 +310,10 @@ void Store::dropNamespace(const RootNamespace & ns)
         if (!token)
             continue;                       /// absent shard: stays absent, no manifest minted
         if (root.refs.empty())
-            continue;                       /// already a tombstone (no live refs): nothing to remove
+            /// OPTIMIZATION, not a correctness guard: skip an empty snapshot to avoid a no-op CAS.
+            /// Single-writer-per-namespace makes this snapshot safe to trust; even if it were racy,
+            /// mutateShard re-reads the manifest inside its loop, so correctness never rests here.
+            continue;
 
         mutateShard(ns, shard, [](RootShard & shard_root)
         {
@@ -326,7 +334,7 @@ void Store::dropNamespace(const RootNamespace & ns)
         ListPage page = pool_backend->list(prefix, cursor, /*limit*/ 1000);
         for (const ListedKey & listed : page.keys)
         {
-            for (size_t attempt = 0; attempt < 100; ++attempt)
+            for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
             {
                 HeadResult head = pool_backend->head(listed.key);
                 if (!head.exists)
@@ -336,7 +344,7 @@ void Store::dropNamespace(const RootNamespace & ns)
                     || outcome.kind == DeleteOutcome::Kind::NotFound)
                     break;
                 /// TokenMismatch ⇒ the object changed under us; re-head and retry.
-                if (attempt + 1 == 100)
+                if (attempt + 1 == MAX_CAS_ATTEMPTS)
                     throw Exception(ErrorCodes::ABORTED,
                         "verbatim file delete contention on {}", listed.key);
             }

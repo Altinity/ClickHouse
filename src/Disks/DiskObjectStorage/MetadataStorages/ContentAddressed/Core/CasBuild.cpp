@@ -3,6 +3,7 @@
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
+#include <base/defines.h>
 #include <chrono>
 
 namespace DB
@@ -353,6 +354,11 @@ void Build::gateCheckDeps()
     /// the map structure stay valid. (We resolve via the loop's own key.)
     for (auto & [key, dep] : deps)
     {
+        /// Iteration-safety invariant, made self-enforcing: the DepKey's kind byte (key.first) matches
+        /// dep.kind, so deps[{kind, hash}] inside resurrect/observeAndAdmit overwrites the SAME entry
+        /// being iterated — never inserts a new key that would invalidate the loop.
+        chassert(static_cast<uint8_t>(dep.kind) == key.first);
+
         const ObjectKind kind = dep.kind;
         const UInt128 & hash = key.second;
 

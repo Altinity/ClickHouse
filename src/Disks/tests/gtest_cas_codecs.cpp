@@ -515,6 +515,14 @@ TEST(CasRootShardCodec, StrictJsonValidation)
         [] { decodeRootShard(R"({"format":"cas_root_shard","version":2,"shard_version":0,"fence_round":0,"refs":{},"journal":[]})"); });
 }
 
+TEST(CasRootShardCodec, TrailingJunkThrows)
+{
+    /// Symmetry with the CAGS/CART/CAHB trailing-junk rows: a valid encoding plus a stray byte is
+    /// CORRUPTED_DATA (Poco rejects trailing content after the top-level JSON object).
+    const String encoded = encodeRootShard(RootShard{});
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(encoded + "x"); });
+}
+
 TEST(CasRootShardCodec, StrictJsonRefAndJournalValidation)
 {
     /// Bad hash hex in a ref's tree.

@@ -36,6 +36,13 @@ TEST(CasLayout, RootNamespaceValidation)
     EXPECT_THROW(l.rootShardKey(RootNamespace{"/lead"}, 0), DB::Exception);
     EXPECT_THROW(l.rootShardKey(RootNamespace{"trail/"}, 0), DB::Exception);
     EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/b"), DB::Exception);   /// file names are flat
+
+    /// A middle empty segment ("a//b") is rejected (doubled '/').
+    EXPECT_THROW(l.rootShardKey(RootNamespace{"a//b"}, 0), DB::Exception);
+    /// A segment exactly equal to the reserved "_files" is rejected.
+    EXPECT_THROW(l.rootShardKey(RootNamespace{"srv1/_files/x"}, 0), DB::Exception);
+    /// But a segment that merely CONTAINS "_files" as a substring is legal (no false positive).
+    EXPECT_NO_THROW(l.rootShardKey(RootNamespace{"my_files/tbl"}, 0));
 }
 
 TEST(CasLayout, ShortIdThrows)
