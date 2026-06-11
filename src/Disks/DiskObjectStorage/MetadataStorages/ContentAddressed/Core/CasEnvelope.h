@@ -57,6 +57,13 @@ struct EnvelopeHeader
     uint32_t index_len = 0;            /// nonzero only for packs
     uint32_t header_len = 0;           /// filled by encode; reported by decode
 
+    /// When set, encode pads the header with a single zero-type TLV so the returned bytes are EXACTLY
+    /// this many bytes (and header_len == this). Used for fixed-length blob headers, so the payload of
+    /// every blob in a pool starts at a constant offset (blob_header_len) and locate is a constant
+    /// shift, no per-object header read. Must be >= the natural header length, <= 16 KiB, and 8-aligned
+    /// (else BAD_ARGUMENTS). The pad is in [96, header_len) and is NOT covered by header_hash.
+    std::optional<uint32_t> pad_to_header_len;
+
     /// Test-only knobs to drive the critical-extension fail-closed path. When
     /// unknown_critical_tlv is set, encode emits an unknown TLV type and sets the critical flag bit;
     /// decode of such a header must fail closed (NOT_IMPLEMENTED).

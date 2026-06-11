@@ -5,6 +5,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
 extern const int NOT_IMPLEMENTED;
 }
@@ -545,5 +546,41 @@ TEST(CasRootShardCodec, StrictJsonRefAndJournalValidation)
     {
         decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"refs":{},)"
             R"("journal":[{"op":"add","ref":"r","tree":"000102030405060708090a0b0c0d0e0f"}]})");
+    });
+}
+
+/// ---------- envelope fixed-length header padding (pad_to_header_len) ----------
+
+TEST(CasEnvelope, EnvelopeHeaderPaddingReachesTargetLen)
+{
+    EnvelopeHeader h = makeBlobHeader();
+    h.pad_to_header_len = 256;
+
+    String bytes = encodeEnvelopeHeader(h);
+    EXPECT_EQ(h.header_len, 256u);
+    EXPECT_EQ(bytes.size(), 256u);
+
+    /// The padded header round-trips: the decoder skips the zero-type pad TLV and validates the size
+    /// arithmetic header_len + logical_size == object_size.
+    const uint64_t object_size = 256 + h.logical_size;
+    EnvelopeHeader d = decodeEnvelopeHeader(bytes, object_size, ObjectKind::Blob);
+    EXPECT_EQ(d.header_len, 256u);
+    EXPECT_EQ(d.logical_hash, h.logical_hash);
+    EXPECT_EQ(d.logical_size, h.logical_size);
+
+    /// Not 8-aligned ⇒ BAD_ARGUMENTS.
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, []
+    {
+        EnvelopeHeader bad = makeBlobHeader();
+        bad.pad_to_header_len = 100;
+        encodeEnvelopeHeader(bad);
+    });
+
+    /// Below the natural header length (96) ⇒ BAD_ARGUMENTS.
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, []
+    {
+        EnvelopeHeader bad = makeBlobHeader();
+        bad.pad_to_header_len = 64;
+        encodeEnvelopeHeader(bad);
     });
 }

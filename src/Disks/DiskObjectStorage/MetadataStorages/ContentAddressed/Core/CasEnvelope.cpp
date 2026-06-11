@@ -12,6 +12,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int NOT_IMPLEMENTED;
 }
@@ -98,6 +99,37 @@ String encodeEnvelopeHeader(EnvelopeHeader & header)
         ext.push_back('\0');
         ++header_len;
     }
+
+    /// Optional fixed-length headers: pad with a single zero-type TLV up to the requested length, so the
+    /// payload starts at a constant offset for every object in the pool (constant-shift locate). The pad
+    /// is appended AFTER the 8-alignment above, and pad_to_header_len is itself 8-aligned, so the gap is
+    /// a non-negative multiple of 8 — either 0 or at least 8 (always room for the 4-byte TLV header).
+    if (header.pad_to_header_len)
+    {
+        const uint32_t target = *header.pad_to_header_len;
+        if (target < header_len)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "CHCA envelope: pad_to_header_len {} is below the natural header length {}", target, header_len);
+        if (target > MAX_HEADER_LEN)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "CHCA envelope: pad_to_header_len {} exceeds the maximum header length {}", target, MAX_HEADER_LEN);
+        if ((target % 8) != 0)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "CHCA envelope: pad_to_header_len {} must be 8-aligned", target);
+
+        const uint32_t gap = target - header_len;
+        /// The decoder treats a zero type word as the start of all-zero alignment padding (a valid TLV
+        /// type is never 0), so the pad is simply `gap` zero bytes — NOT a length-prefixed TLV. With both
+        /// sides 8-aligned the gap is a multiple of 8, so it is 0 or >= 8: the 2-byte zero type marker
+        /// always fits. (A 1-3 byte gap can't carry the marker; 8-alignment rules it out, but we surface
+        /// it rather than silently mis-size.)
+        if (gap == 1 || gap == 2 || gap == 3)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "CHCA envelope: cannot pad to header_len {} from {}", target, header_len);
+        ext.append(gap, '\0');
+        header_len = target;
+    }
+
     header.header_len = header_len;
 
     String out;
