@@ -343,3 +343,122 @@ TEST(CasTreeCodec, EmptyTreeRoundTrips)
     EXPECT_TRUE(decoded.empty());
 }
 
+/// ===================================================================================
+/// CasRootShardCodec
+/// ===================================================================================
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+
+TEST(CasRootShardCodec, RoundTripRefsAndJournal)
+{
+    RootShard rs;
+    rs.shard_version = 42;
+    rs.fence_round = 7;
+
+    RefPayload all_1;
+    all_1.tree_id = (UInt128(0x11) << 64) | UInt128(0x22);
+    all_1.tree_size = 4096;
+    all_1.mutable_files["txn_version.txt"] = "100";
+    all_1.mutable_files["metadata_version.txt"] = "3";
+    rs.refs["all_1_1_0"] = all_1;
+
+    RefPayload all_2;
+    all_2.tree_id = (UInt128(0x33) << 64) | UInt128(0x44);
+    all_2.tree_size = 8192;
+    rs.refs["all_2_2_0"] = all_2;
+
+    rs.journal.push_back({JournalRecord::Op::Add, "all_1_1_0", all_1.tree_id, 40});
+    rs.journal.push_back({JournalRecord::Op::Add, "all_2_2_0", all_2.tree_id, 41});
+    rs.journal.push_back({JournalRecord::Op::Remove, "all_0_0_0", (UInt128(0x99) << 64), 42});
+
+    const String encoded = encodeRootShard(rs);
+    const RootShard d = decodeRootShard(encoded);
+
+    EXPECT_EQ(d.shard_version, 42u);
+    EXPECT_EQ(d.fence_round, 7u);
+
+    ASSERT_EQ(d.refs.size(), 2u);
+    ASSERT_TRUE(d.refs.count("all_1_1_0"));
+    EXPECT_EQ(d.refs.at("all_1_1_0").tree_id, all_1.tree_id);
+    EXPECT_EQ(d.refs.at("all_1_1_0").tree_size, 4096u);
+    EXPECT_EQ(d.refs.at("all_1_1_0").mutable_files.size(), 2u);
+    EXPECT_EQ(d.refs.at("all_1_1_0").mutable_files.at("txn_version.txt"), "100");
+    EXPECT_EQ(d.refs.at("all_1_1_0").mutable_files.at("metadata_version.txt"), "3");
+    EXPECT_EQ(d.refs.at("all_2_2_0").mutable_files.size(), 0u);
+
+    ASSERT_EQ(d.journal.size(), 3u);
+    EXPECT_EQ(d.journal[0].op, JournalRecord::Op::Add);
+    EXPECT_EQ(d.journal[0].ref_name, "all_1_1_0");
+    EXPECT_EQ(d.journal[0].at_version, 40u);
+    EXPECT_EQ(d.journal[2].op, JournalRecord::Op::Remove);
+    EXPECT_EQ(d.journal[2].ref_name, "all_0_0_0");
+    EXPECT_EQ(d.journal[2].at_version, 42u);
+}
+
+TEST(CasRootShardCodec, EmptyManifestRoundTrips)
+{
+    RootShard rs;  /// {0,0,{},{}}
+    const String encoded = encodeRootShard(rs);
+    const RootShard d = decodeRootShard(encoded);
+    EXPECT_EQ(d.shard_version, 0u);
+    EXPECT_EQ(d.fence_round, 0u);
+    EXPECT_TRUE(d.refs.empty());
+    EXPECT_TRUE(d.journal.empty());
+}
+
+TEST(CasRootShardCodec, RefsCanonicalOrderRegardlessOfInsertion)
+{
+    /// std::map already keeps refs name-sorted, but verify two manifests built in different insertion
+    /// order encode byte-identically.
+    RootShard a;
+    a.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}};
+    a.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
+
+    RootShard b;
+    b.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
+    b.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}};
+
+    EXPECT_EQ(encodeRootShard(a), encodeRootShard(b));
+}
+
+TEST(CasRootShardCodec, BadMagicThrows)
+{
+    RootShard rs;
+    String encoded = encodeRootShard(rs);
+    encoded[0] = 'X';
+    EXPECT_THROW(decodeRootShard(encoded), DB::Exception);
+}
+
+TEST(CasRootShardCodec, FutureVersionThrows)
+{
+    RootShard rs;
+    String encoded = encodeRootShard(rs);
+    encoded[4] = 2;  /// version byte right after the 4-char magic
+    EXPECT_THROW(decodeRootShard(encoded), DB::Exception);
+}
+
+TEST(CasRootShardCodec, TruncationThrows)
+{
+    RootShard rs;
+    rs.refs["x"] = RefPayload{UInt128(0x1), 1, {}};
+    String encoded = encodeRootShard(rs);
+    encoded.resize(encoded.size() - 4);
+    EXPECT_THROW(decodeRootShard(encoded), DB::Exception);
+}
+
+TEST(CasRootShardCodec, BadJournalOpThrows)
+{
+    RootShard rs;
+    rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(0x1), 1});
+    String encoded = encodeRootShard(rs);
+    /// Patch the op byte of the single journal record to an out-of-range value (3).
+    /// We cannot easily compute its offset robustly, so re-encode with a forged op via decode-then-check
+    /// is not possible; instead corrupt by scanning for the known ref name "r".
+    auto found = encoded.rfind('r');
+    ASSERT_NE(found, String::npos);
+    /// The op byte precedes "u16 name_len + name"; name_len(2 bytes) sits just before the name. The op
+    /// byte is the byte before those 2 length bytes.
+    ASSERT_GE(found, 3u);
+    encoded[found - 3] = 3;  /// op = 3 (out of {1,2})
+    EXPECT_THROW(decodeRootShard(encoded), DB::Exception);
+}
