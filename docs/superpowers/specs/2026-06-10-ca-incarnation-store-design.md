@@ -98,7 +98,7 @@ separate feature requiring its own modeling of delete markers, noncurrent retent
 | GCS | `generation` | `x-goog-if-generation-match` headers injected via the existing `SetAdditionalCustomHeaderValue` hook; generation read from response headers | binding specified, implementation deferred; fail-closed until probed |
 | Azure Blob | `ETag` (write-sensitive) | `AccessConditions` on put/delete (SDK support in-tree); versioning/soft-delete must be off in v1 | supported, probe-gated |
 | MinIO AIStor | `ETag` | documents `DeleteObject If-Match` | CI candidate, probe decides |
-| MinIO OSS (archived 2026-02) | — | conditional PUT only, no conditional delete | fail-closed for v1 GC |
+| MinIO OSS (archived 2026-02) | — | conditional PUT only; `If-Match` on DELETE is **silently ignored and the object is deleted anyway** (empirically confirmed 2026-06-11 on RELEASE.2024-09-13 and the final RELEASE.2025-09-07 — exactly the failure mode the enforced probe exists to catch) | fail-closed for v1 GC |
 | Ceph RGW | — | no conditional delete documented | fail-closed for v1 GC |
 
 **Safety-critical primitives** (capability probe, extending the existing fail-closed `PoolCoordination` probe):
