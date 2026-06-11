@@ -1,3 +1,8 @@
+> **HISTORICAL.** This model (`CaGcCore.tla`) checks the SUPERSEDED EBR/epoch/generation design
+> (`2026-06-07-ca-merkle-store-design.md`). The current model is `CaIncarnationCore.tla` — see
+> `CaIncarnationCore_README.md` (results in `CaIncarnationCore_RESULTS.md`). This file and `RESULTS.md`
+> are kept as the record of the EBR-era checking.
+
 # CA GC core — TLA+ model + TLC runbook
 
 A TLA+ specification (`CaGcCore.tla`) of the **stabilized core** of the content-addressed (CA)
