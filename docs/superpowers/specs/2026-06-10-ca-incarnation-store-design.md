@@ -158,7 +158,7 @@ Every blob, tree, and pack object is `header ‖ [pack index] ‖ payload`:
    u128 logical_hash      = hash over [header_len, EOF):
                             blob: raw file bytes · tree: canonical entries · pack: index ‖ payload region
    u128 domain_id         u128 incarnation_tag         u128 build_id
-   u32 header_crc32c (header bytes only, field zeroed)   u32 reserved0=0
+   u64 header_hash (CityHash64 over the 96 core-header bytes with this field zeroed)
 [96, header_len)         TLV extensions {u16 type, u16 len, bytes}; unknown non-critical types skipped:
    0x0001 PROVENANCE (fixed): u64 created_at_ms, u128 creator_server_id, u32 ch_version,
                               u8 op{insert,merge,mutation,attach,repack,...}
@@ -175,10 +175,12 @@ of the same logical object; identity is everything below it. Key = hex(`logical_
 hot read path performs **no** CA-level payload verification — ClickHouse compressed blocks carry their own
 per-block checksums verified on decompression. Payload-vs-hash verification exists only as the D5 attach-time
 fallback and an explicit deep-scrub mode. Routine validation is the free structural set: magic, supported
-version, kind ↔ key-prefix, key ↔ `logical_hash` (string compare), size arithmetic, `reserved0 == 0`,
-`header_crc32c` (over the 96 core-header bytes with the field zeroed — one hardware instruction, covers the
-header only, never content). Unknown critical
-extension (flag bit) ⇒ fail closed.
+version, kind ↔ key-prefix, key ↔ `logical_hash` (string compare), size arithmetic, `header_hash`
+(`CityHash64` over the 96 core-header bytes with the field zeroed — the same hash family the rest of
+ClickHouse uses for checksums; covers the header only, never content. The header is the one region
+`logical_hash` does not cover; every load-bearing field is independently re-verified, so this is a
+diagnostics-quality check, not a safety dependency — decision 2026-06-11, replacing the earlier CRC-32C).
+Unknown critical extension (flag bit) ⇒ fail closed.
 
 **Provenance is diagnostic only.** No protocol decision — retire, delete, debris classification, heartbeat
 staleness — ever reads `created_at_ms` or any writer clock. Provenance serves humans, forensics, and the FUSE
@@ -224,6 +226,16 @@ manifest = { shard_version,                     // monotone, CAS-carried
 A publish is **one conditional PUT** updating `refs` and appending the journal record atomically. Detached parts
 and `FREEZE`/`BACKUP` ref-sets are refs in their own namespaces under `roots/` (additional reachability roots,
 table-lifetime-independent), exactly as in the superseded design.
+
+**Encoding split (decision 2026-06-11).** Objects whose **bytes are identity** (hashed) are binary: the CHCA
+envelope and the canonical tree payload (plus blob/pack payloads, trivially). Every **non-hashed metadata
+object** — root manifests, `gc/state`, retired sets, build heartbeats, `_pool_meta`, checkpoints, outcome
+logs — is **strict JSON**: a top-level object carrying `format` and `version` fields; parsing is fail-closed
+(wrong `format`, unknown key, missing key, wrong type, malformed document ⇒ corruption error; newer `version`
+⇒ not-implemented error). These objects are exactly the operational surface a human inspects with plain S3
+tools during an incident; they are never hashed, so canonical byte stability is not required. Hashes and
+tokens are JSON strings (lowercase hex / verbatim); counters and sizes are JSON numbers (bounded far below
+2^53 in practice).
 
 **Ownership.** Each root namespace has exactly one logical owner for ordinary publishes. Any transfer, attach
 adoption, replica adoption, backup/freeze writer, or FUSE snapshot client either writes a **distinct** `roots/`
