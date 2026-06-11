@@ -10,7 +10,6 @@ TEST(CasLayout, KeyShapes)
     EXPECT_EQ(l.treeKey(TreeId{"ffee01"}), "p/trees/ff/ffee01");
     EXPECT_EQ(l.packKey(PackId{"0102aa"}), "p/packs/01/0102aa");
     EXPECT_EQ(l.gcStateKey(), "p/gc/state");
-    EXPECT_EQ(l.gcSnapKey(7, 2), "p/gc/snap/7/2");
     EXPECT_EQ(l.retiredKey(4, 9, 1), "p/gc/retired/4.9/1");
     EXPECT_EQ(l.outcomesKey(4, 9, 1), "p/gc/outcomes/4.9/1");
     EXPECT_EQ(l.checkpointKey(12), "p/gc/checkpoint/12");
@@ -43,6 +42,29 @@ TEST(CasLayout, RootNamespaceValidation)
     EXPECT_THROW(l.rootShardKey(RootNamespace{"srv1/_files/x"}, 0), DB::Exception);
     /// But a segment that merely CONTAINS "_files" as a substring is legal (no false positive).
     EXPECT_NO_THROW(l.rootShardKey(RootNamespace{"my_files/tbl"}, 0));
+}
+
+TEST(CasLayout, GcSnapAndRootsKeys)
+{
+    Layout l("p");
+    EXPECT_EQ(l.gcSnapKey(/*generation*/ 12, /*snap_shard*/ 3), "p/gc/snap/12/3");
+    EXPECT_EQ(l.gcSnapShardPrefix(12), "p/gc/snap/12/");
+    EXPECT_EQ(l.rootsPrefix(), "p/roots/");
+}
+
+TEST(CasLayout, TryParseRootShardKey)
+{
+    Layout l("p");
+    auto a = l.tryParseRootShardKey("p/roots/srv1/3f2e-uuid/7");
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->first, RootNamespace{"srv1/3f2e-uuid"});
+    EXPECT_EQ(a->second, 7u);
+    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/srv1/tbl/_files/format_version.txt").has_value());
+    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/srv1/tbl/_files/123").has_value());
+    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/srv1/tbl/notashard").has_value());
+    EXPECT_FALSE(l.tryParseRootShardKey("p/blobs/aa/aabb").has_value());
+    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/7").has_value());          /// no namespace segment
+    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/").has_value());
 }
 
 TEST(CasLayout, ShortIdThrows)

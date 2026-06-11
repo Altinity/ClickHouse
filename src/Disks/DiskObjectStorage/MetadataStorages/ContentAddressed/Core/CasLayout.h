@@ -2,6 +2,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Common/Exception.h>
 #include <base/types.h>
+#include <charconv>
+#include <optional>
+#include <string_view>
 
 namespace DB
 {
@@ -22,7 +25,8 @@ namespace DB::Cas
 ///   - pack objects:     POOL/packs/S/ID
 ///   - root manifests:   POOL/roots/NAMESPACE/SHARD_NUMBER
 ///   - verbatim files:   POOL/roots/NAMESPACE/_files/FILE_NAME
-///   - GC state:         POOL/gc/...
+///   - GC snapshots:     POOL/gc/snap/GENERATION/SNAP_SHARD
+///   - other GC state:   POOL/gc/...
 ///   - build heartbeats: POOL/builds/S/BUILD_ID
 ///   - pool metadata:    POOL/_pool_meta
 ///
@@ -93,10 +97,54 @@ public:
         return prefix + "/gc/state";
     }
 
-    /// Snapshot key: <prefix>/gc/snap/<round>/<fence_seq>
-    String gcSnapKey(uint64_t round, uint64_t fence_seq) const
+    /// In-degree snapshot object: <prefix>/gc/snap/<generation>/<snap_shard>.
+    /// Sharded by the TARGET content-hash prefix (spec §4, decision 2026-06-11): every edge
+    /// targeting a node lands in the node's own snap shard, so in-degree is intra-shard.
+    String gcSnapKey(uint64_t generation, uint64_t snap_shard) const
     {
-        return prefix + "/gc/snap/" + std::to_string(round) + "/" + std::to_string(fence_seq);
+        return prefix + "/gc/snap/" + std::to_string(generation) + "/" + std::to_string(snap_shard);
+    }
+
+    /// Prefix that covers all snap shards of one generation (for list).
+    String gcSnapShardPrefix(uint64_t generation) const
+    {
+        return prefix + "/gc/snap/" + std::to_string(generation) + "/";
+    }
+
+    /// Prefix that covers every root-shard manifest and namespace file (GC round discovery).
+    String rootsPrefix() const
+    {
+        return prefix + "/roots/";
+    }
+
+    /// Classifies a LISTed key as a root-shard manifest: <prefix>/roots/<namespace...>/<shard_number>.
+    /// Returns nullopt for verbatim files (a `_files` segment), non-numeric tails, or foreign keys.
+    /// A classifier over list output, not a validator — never throws.
+    std::optional<std::pair<RootNamespace, uint64_t>> tryParseRootShardKey(const String & key) const
+    {
+        const String roots = rootsPrefix();
+        if (!key.starts_with(roots))
+            return std::nullopt;
+        const std::string_view rest(key.data() + roots.size(), key.size() - roots.size());
+
+        const size_t last_slash = rest.rfind('/');
+        if (last_slash == std::string_view::npos || last_slash == 0 || last_slash + 1 == rest.size())
+            return std::nullopt;                       /// need "<ns>/<tail>" with both parts non-empty
+
+        const std::string_view tail = rest.substr(last_slash + 1);
+        uint64_t shard = 0;
+        const auto [end, ec] = std::from_chars(tail.data(), tail.data() + tail.size(), shard);
+        if (ec != std::errc() || end != tail.data() + tail.size())
+            return std::nullopt;                       /// non-numeric (or overflow) tail is not a shard
+
+        const std::string_view ns = rest.substr(0, last_slash);
+        /// the segment immediately before the tail must not be the reserved verbatim-file area
+        const size_t prev_slash = ns.rfind('/');
+        const std::string_view last_ns_segment = prev_slash == std::string_view::npos ? ns : ns.substr(prev_slash + 1);
+        if (last_ns_segment == "_files")
+            return std::nullopt;
+
+        return std::make_pair(RootNamespace{String(ns)}, shard);
     }
 
     /// Retired-set key: <prefix>/gc/retired/<round>.<fence_seq>/<shard>
