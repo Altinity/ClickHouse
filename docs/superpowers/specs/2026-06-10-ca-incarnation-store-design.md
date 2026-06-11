@@ -257,6 +257,22 @@ W-EVIDENCE      a tokenless (live-root-evidence) member is publishable iff its h
 W-PUBLISH-GATE  the publish CAS is valid only if: retire_view_round ≥ manifest.fence_round, AND no
                 dependency-set member is condemned in that view, AND the writer's own heartbeat renewal is
                 recent by its own clock (local sanity bound — liveness, never the safety argument).
+W-REVALIDATE    a token observation is valid only relative to the retire view at which it was made (F1,
+                model-discovered). Retire entries drop on confirmed outcomes, so the retire view alone
+                cannot condemn a stale observation — the durable witness is the object itself. Whenever
+                the writer refreshes its retire view (a fence-advanced CAS conflict), every token-bearing
+                member whose hash has NO entry in the refreshed view must be RE-OBSERVED (one HEAD):
+                current token == observed ⇒ keep (safe — a delete message can be in flight only for a
+                token whose retire entry is still HELD, and held entries are view hits); current token
+                differs ⇒ treat as a fresh cold reuse of the current token (adopt or resurrect); key
+                absent ⇒ re-create. Cost: HEADs only on fence-conflicted retries, only for stale-observed
+                members — rare by construction.
+W-TREE-BUILD    bottom-up build discipline, at every level (F2, model-discovered): a tree object is
+                created only after all of its children exist (its hash commits to them), and a tree ref
+                may be published only when every object in the new tree's transitive closure is present
+                and not condemned in the writer's view — W-DEP-SET applied to the closure, stated
+                explicitly for trees. The model checks the one-level case; the transitive nested-subtree
+                case is a recorded residual.
 W-MANIFEST-CAS  root-manifest writes are always CAS (refs+journal are not idempotent content).
 ```
 
@@ -282,8 +298,10 @@ Publishing a part `name`:
 3. **Trees** bottom-up; reused trees are dependency-set entries like any cold reuse (a just-dropped identical
    part's tree can genuinely be condemned mid-build).
 4. **Publish = one CAS** under `W-PUBLISH-GATE`: set `refs[name]`, append `{+, name, T}`, `shard_version++`.
-5. **On CAS conflict:** re-read. `fence_round` advanced ⇒ refresh the retire view to ≥ that round, re-validate
-   the **whole** dependency set, resurrect what got condemned, retry. Own-thread race ⇒ plain retry.
+5. **On CAS conflict:** re-read. `fence_round` advanced ⇒ refresh the retire view to ≥ that round and
+   re-validate the **whole** dependency set under `W-REVALIDATE`: members with a view hit ⇒ resurrect; members
+   whose hash has no entry but whose token was observed under the old view ⇒ re-observe (HEAD) and keep / adopt
+   / re-create per the rule; then retry. Own-thread race ⇒ plain retry.
 6. **Drop** = the same CAS shape: remove `refs[name]`, append `{-, name, T}` — ref removal and delta record
    atomic by construction.
 7. **Crash anywhere before publish** ⇒ uploaded objects are debris (attributed by `build_id`/`INTENDED_REF`),
@@ -350,7 +368,10 @@ R4 RECHECK  fold every shard through ≥ its recorded fence version (provable, n
               else DELETE If-Match tok → 2xx: outcome=deleted (trees: cascade step below), drop entry
                                        → 404: outcome=absent (trees: ensure cascade ran), drop entry
                                        → 412: outcome=replaced (a resurrection won — count the save), drop
-            Dropping entries is safe in every case: token-exact deletes cannot affect later incarnations.
+            Dropping entries is safe for the DELETE side in every case: token-exact deletes cannot affect
+            later incarnations, and a delete message can be in flight only for a token whose entry is
+            still HELD (entries drop only on confirmed outcomes). The PUBLISH side does not rest on entry
+            retention: a stale token observation is made safe by W-REVALIDATE (§5), not by finding an entry.
 ```
 
 **Cascade is a pipeline step, not a foldable record** (this closes the cascade-vs-recreate race): round R's
@@ -371,9 +392,12 @@ for the child list cannot diverge from the retired one.
 2. Any publish making `hash` reachable is a manifest CAS, totally ordered against the fence CAS on its shard.
 3. Publish **before** fence ⇒ its journal record sits below the fence version ⇒ the recheck folds it ⇒
    in-degree > 0 ⇒ spared, no delete.
-4. Publish **after** fence ⇒ the writer saw `fence_round ≥ R` ⇒ its retire view includes round R ⇒ the
-   dependency-set gate finds the condemned token ⇒ it resurrects (new token, `W-FRESH-TAG`) or aborts ⇒
-   nothing ever again depends on the condemned incarnation.
+4. Publish **after** fence ⇒ the writer saw `fence_round ≥ R` ⇒ its retire view includes round R ⇒ if the
+   condemned token's entry is still held, the dependency-set gate finds it ⇒ resurrect (new token,
+   `W-FRESH-TAG`) or abort. If the entry already dropped on a confirmed outcome, `W-REVALIDATE` re-observes:
+   deleted/absent ⇒ re-create; replaced ⇒ adopt the newer token or resurrect; spared ⇒ the object is live and
+   uncondemned at its current token (publishable — no delete can be in flight for it, since in-flight deletes
+   imply a held entry). In every branch, nothing ever again depends on the retired incarnation.
 5. Token distinctness (probed capability + `W-FRESH-TAG`) ⇒ the deleted incarnation can never again be
    current ⇒ any delayed, duplicated, or zombie-leader delete is forever harmless — it 412s or hits exactly
    the already-condemned incarnation.
@@ -558,18 +582,19 @@ consequence (undercount → premature delete) is caught by `INV_NO_LOSS`. The te
 **bound-limited by the round cap** (an honest artifact — `GStartRound` is disabled at `MaxRound`, so a last-round
 unreachable object is never collected; not a clean pass — see `RESULTS`).
 
-**Two refinements the model surfaced (to fold into §5/§6/§7):**
+**Two refinements the model surfaced — now folded into §5 as `W-REVALIDATE` and `W-TREE-BUILD`:**
 - **F1 — the publish gate must re-validate dependencies' CURRENT physical state, not only the originally observed
   token.** An observed token can go stale between observation and publish — by delete-then-retire-entry-drop, or
   by another writer's same-content overwrite — so a gate keyed on the stale token misses the condemnation and a
   published ref can dangle. The model proves this load-bearing (the `sab_noretireview`/`sab_unconddelete`
-  counterexamples) and captures it conservatively: a token that stops being current (overwrite or delete) joins a
-  durable dead-token set the gate consults. §5's `W-DEP-SET` / `W-PUBLISH-GATE` and §7's no-return argument should
-  state the re-validation explicitly.
-- **F2 — tree publish requires an explicit bottom-up build discipline.** A tree ref may be published only when
-  every child it references is present and live (not condemned). `W-DEP-SET` implies it, but the spec should make
-  it explicit for trees — and the model leaves the transitive/nested-subtree case as a one-level residual, which
-  the spec should also pin.
+  counterexamples) and captures it conservatively via a durable dead-token history; the **real protocol cannot
+  keep such a registry** (retire entries drop by design), so the spec mechanism is **re-observation**
+  (`W-REVALIDATE`, §5): stale-observed members are re-HEADed on retire-view refresh, keyed by the lemma that a
+  delete can be in flight only for a token whose entry is still held. §7 R4 and the no-return argument step 4
+  carry the matching amendments.
+- **F2 — tree publish requires an explicit bottom-up build discipline** (`W-TREE-BUILD`, §5): a tree object only
+  after its children exist; a tree ref only when the new tree's transitive closure is present and uncondemned.
+  The model checks the one-level case; the transitive nested-subtree case remains a recorded residual.
 
 ## 13. Open items and integration deltas {#open-items}
 
