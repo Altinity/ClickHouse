@@ -1584,3 +1584,38 @@ def test_object_storage_remote_initiator_aggregation(started_cluster):
     # Cluster contains two nodes, each returns up to two rows, at least two rows totaly.
     result_rows = int(result_rows[0])
     assert result_rows >= 2 and result_rows <= 4
+
+
+def test_hive_partitioning_with_where_condition(started_cluster):
+    node = started_cluster.instances["s0_0_0"]
+    test_id = uuid.uuid4().hex[:8]
+
+    for i in range(1, 5):
+        node.query(
+            f"""
+            INSERT INTO FUNCTION s3('http://minio1:9001/root/hive/{test_id}/date=2000-01-0{i}/data.csv',
+                'minio','{minio_secret_key}','CSVWithNames','d UInt64')
+            SELECT number FROM numbers(10)
+            SETTINGS s3_truncate_on_insert=1
+            """)
+
+    # Direct query
+    result = node.query(
+        f"""
+        SELECT count() FROM s3('http://minio1:9001/root/hive/{test_id}/date=*/data.csv',
+            'minio','{minio_secret_key}','CSVWithNames','d UInt64')
+        WHERE date='2000-01-02'
+        SETTINGS use_hive_partitioning=1
+        """
+    )
+    assert result.strip() == "10"
+
+    result = node.query(
+        f"""
+        SELECT count() FROM s3Cluster('cluster_simple', 'http://minio1:9001/root/hive/{test_id}/date=*/data.csv',
+            'minio','{minio_secret_key}','CSVWithNames','d UInt64')
+        WHERE date='2000-01-02'
+        SETTINGS use_hive_partitioning=1
+        """
+    )
+    assert result.strip() == "10"
