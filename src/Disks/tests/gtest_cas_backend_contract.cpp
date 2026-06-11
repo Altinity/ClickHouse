@@ -200,6 +200,48 @@ TEST_P(CasBackendContract, StreamPutDestructionWithoutFinalizeLeavesNothing)
     EXPECT_FALSE(b->head("k/stream4").exists);
 }
 
+TEST_P(CasBackendContract, StreamPutEmptyBody)
+{
+    auto b = GetParam()();
+    auto sink = b->putIfAbsentStream("k/stream_empty");
+    Token tok;
+    ASSERT_EQ(sink->finalize(&tok), PutOutcome::Done);
+    ASSERT_FALSE(tok.empty());
+    auto got = b->get("k/stream_empty");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_TRUE(got->bytes.empty());
+    EXPECT_EQ(got->token, tok);
+    auto h = b->head("k/stream_empty");
+    EXPECT_TRUE(h.exists);
+    EXPECT_EQ(h.size, 0u);
+}
+
+/// ~1 MB written in chunks: exercises buffer growth in the memory-buffered sinks and, for the
+/// future Native sink, the real streaming path.
+TEST_P(CasBackendContract, StreamPutLargeBody)
+{
+    auto b = GetParam()();
+    String chunk(4096, '\0');
+    for (size_t i = 0; i < chunk.size(); ++i)
+        chunk[i] = static_cast<char>('a' + i % 26);
+
+    String expected;
+    auto sink = b->putIfAbsentStream("k/stream_large");
+    for (size_t written = 0; written < (1 << 20); written += chunk.size())
+    {
+        sink->buffer().write(chunk.data(), chunk.size());
+        expected += chunk;
+    }
+    Token tok;
+    ASSERT_EQ(sink->finalize(&tok), PutOutcome::Done);
+
+    auto got = b->get("k/stream_large");
+    ASSERT_TRUE(got.has_value());
+    ASSERT_EQ(got->bytes.size(), expected.size());
+    EXPECT_EQ(got->bytes, expected);
+    EXPECT_EQ(got->token, tok);
+}
+
 INSTANTIATE_TEST_SUITE_P(InMemory, CasBackendContract,
     ::testing::Values(+[]() -> BackendPtr { return std::make_shared<InMemoryBackend>(); }));
 

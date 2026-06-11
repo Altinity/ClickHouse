@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <IO/WriteBufferFromString.h>
+#include <base/defines.h>
 #include <algorithm>
 
 namespace DB::Cas
@@ -24,6 +25,7 @@ public:
 
     PutOutcome finalize(Token * out_token) override
     {
+        chassert(!done_);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
         done_ = true;
         return backend_.putIfAbsent(key_, buf_.str(), out_token);
     }

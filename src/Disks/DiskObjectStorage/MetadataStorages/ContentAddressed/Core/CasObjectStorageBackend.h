@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <IO/WriteBufferFromString.h>
+#include <base/defines.h>
 #include <map>
 #include <mutex>
 
@@ -42,6 +43,7 @@ public:
 
             PutOutcome finalize(Token * out_token) override
             {
+                chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
                 done = true;
                 return backend.putIfAbsent(key, buf.str(), out_token);
             }

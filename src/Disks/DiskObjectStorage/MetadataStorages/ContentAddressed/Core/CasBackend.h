@@ -56,24 +56,18 @@ struct ListPage
     String next_cursor;       /// empty => no more pages
 };
 
-/// The ~8-op token-aware storage seam (design §3). TOKEN SEMANTICS ARE THE CONTRACT:
-///   - every present key has exactly one current incarnation identified by an opaque Token;
-///   - putOverwrite/casPut succeed only against the expected current token (or expected absence);
-///   - deleteExact removes ONLY the incarnation whose token matches — wrong token MUST be a
-///     TokenMismatch with the object untouched (backends that silently ignore the condition are
-///     rejected by Cas::Probe);
-///   - conditional PUTs are protocol hygiene; casPut and deleteExact are SAFETY-critical.
-///
-/// Most ops take/return whole `String` bodies — sufficient for manifests, trees, and probe/GC
-/// objects. LARGE content blobs stream through `putIfAbsentStream` (see `WriteSink`); reads stay
-/// String-based because blob payload reads go through the wiring's read stack, not this seam.
-
 /// Streaming conditional create (If-None-Match:* semantics). The caller writes the FULL object body
-/// (envelope header + payload) into buffer(), then calls finalize() exactly once:
+/// (envelope header + payload) into buffer, then calls finalize exactly once:
 ///   - Done                ⇒ the object is durable; out_token (if requested) is the new incarnation's token
 ///   - PreconditionFailed  ⇒ the key already existed — NOTHING was changed (same contract as putIfAbsent)
-/// finalize() may throw on storage errors; PreconditionFailed is an OUTCOME, never an exception.
-/// cancel() (or destruction before finalize) abandons the upload: the key is never created by it.
+/// finalize may throw on storage errors; PreconditionFailed is an OUTCOME, never an exception.
+/// cancel (or destruction before finalize) abandons the upload: the key is never created by it.
+///
+/// MISUSE/LIFETIME CONTRACT: after finalize or cancel the sink is DEAD — any further finalize,
+/// cancel, or write into buffer is a programming error (finalize asserts on it in debug builds).
+/// The caller must not call the underlying buffer's own finalize/cancel directly — only through
+/// the sink. A sink is single-caller: it is NOT thread-safe (only Backend itself is), and it must
+/// not outlive the Backend that created it.
 class WriteSink
 {
 public:
@@ -85,6 +79,17 @@ public:
 
 using WriteSinkPtr = std::unique_ptr<WriteSink>;
 
+/// The ~8-op token-aware storage seam (design §3). TOKEN SEMANTICS ARE THE CONTRACT:
+///   - every present key has exactly one current incarnation identified by an opaque Token;
+///   - putOverwrite/casPut succeed only against the expected current token (or expected absence);
+///   - deleteExact removes ONLY the incarnation whose token matches — wrong token MUST be a
+///     TokenMismatch with the object untouched (backends that silently ignore the condition are
+///     rejected by Cas::Probe);
+///   - conditional PUTs are protocol hygiene; casPut and deleteExact are SAFETY-critical.
+///
+/// Most ops take/return whole `String` bodies — sufficient for manifests, trees, and probe/GC
+/// objects. LARGE content blobs stream through `putIfAbsentStream` (see `WriteSink`); reads stay
+/// String-based because blob payload reads go through the wiring's read stack, not this seam.
 class Backend
 {
 public:
