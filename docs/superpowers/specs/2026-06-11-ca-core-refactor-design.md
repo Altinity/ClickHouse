@@ -205,9 +205,12 @@ Three tiers, each at its own seam:
 **Empirical backend finding (2026-06-11, recorded in the protocol spec's backend table):** MinIO OSS — both
 the CI image (`RELEASE.2024-09-13`) and the final pre-archive release (`RELEASE.2025-09-07`) — **silently
 ignores `If-Match` on DELETE and deletes anyway** (probed live: wrong token → 204 → object gone). This is
-exactly the failure mode the enforced probe catches. Consequence: GC-delete e2e needs MinIO AIStor or Ceph
-(infra item); everything below e2e runs on the in-memory/Local backends, which enforce token semantics
-natively.
+exactly the failure mode the enforced probe catches. **Counter-finding (same day, same method): RustFS
+1.0.0-beta.8 passes the complete safety-critical battery** — DELETE `If-Match` enforced (wrong token → 412,
+object survives), `If-None-Match:*` create enforced, `If-Match` CAS PUT enforced — making it the leading
+open-source CI candidate for the GC-e2e lane (caveats: beta; strictly requires quoted ETags in conditional
+headers, rustfs#1458 — the binding sends tokens exactly as observed). AIStor and Ceph remain alternates.
+Everything below e2e runs on the in-memory/Local backends, which enforce token semantics natively.
 
 ## 8. Milestones {#milestones}
 
@@ -226,7 +229,8 @@ Each lands green before the next starts (D3); each gets its own implementation p
 
 ## 9. Open items {#open-items}
 
-- AIStor licensing/image choice for the CI GC-e2e lane (or Ceph demo container) — infra, M-F.
+- CI GC-e2e lane backend: RustFS (empirically verified, open-source, leading candidate) vs AIStor
+  (licensing question) vs Ceph (heavyweight) — infra, M-F.
 - Sub-shard count `N` default per namespace and the manifest size guard (spec §4) — constants chosen in M-C2
   with a recorded rationale.
 - GCS token binding implementation (header injection) — deferred with the probe failing closed, per the spec.
