@@ -6,6 +6,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int CORRUPTED_DATA;
 }
 }
 
@@ -57,6 +58,15 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
 
         if (!got)
         {
+            /// gc/state is NEVER legally deleted once created — absent AFTER we observed a lease on
+            /// it proves an out-of-model deletion (operator/tooling wipe). Fail closed: recreating a
+            /// default state would silently reset round/fence_seq/snap_generation/cursors and could
+            /// let already-condemned incarnations be reused as live.
+            if (has_observation)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS gc/state vanished after being observed (owner {}, seq {})",
+                    u128ToHex(last_seen_owner), last_seen_seq);
+
             /// Step 1: fresh pool — create gc/state holding our lease (create-if-absent CAS).
             GcState fresh;
             fresh.lease = GcLease{gc_id, 1};
@@ -132,8 +142,9 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
         /// we read BEFORE its write, so it lost. Re-read, record what is there now, back off.
         if (const auto reread = store->backend().get(key))
             rememberObservation(decodeGcState(reread->bytes).lease);
-        else
-            has_observation = false;   /// gc/state vanished (never expected — it is never deleted)
+        /// else: gc/state vanished (never legal — it is never deleted). KEEP the stale observation,
+        /// so the next round's absent-after-observed check above fails closed (CORRUPTED_DATA)
+        /// instead of recreating a default state.
         return false;
     }
 

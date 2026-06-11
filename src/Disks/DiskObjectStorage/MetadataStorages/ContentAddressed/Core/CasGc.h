@@ -55,6 +55,9 @@ struct RoundReport
 /// the incumbent failed to renew for one full scheduler period - wall-clock enters ONLY through
 /// the caller's pacing, never through this class (so unit tests drive the window by simply
 /// calling runRegularRound, with no sleeps and no clock).
+///
+/// NOT thread-safe: one pacing thread drives a Gc instance. gc_id uniqueness across instances
+/// (a random u128) is a CALLER obligation - duplicate ids make two leaders indistinguishable.
 class Gc
 {
 public:

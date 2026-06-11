@@ -1,9 +1,22 @@
 #include <gtest/gtest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
 
+namespace DB::ErrorCodes
+{
+extern const int ABORTED;
+extern const int BAD_ARGUMENTS;
+extern const int CORRUPTED_DATA;
+extern const int FILE_DOESNT_EXIST;
+}
+
 using namespace DB::Cas;
+using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::idOf;
+using DB::Cas::tests::shardOfForTest;
+using DB::Cas::tests::u128Of;
 
 /// Per-step regular-round tests (M-C3). This file starts with the LEASE (Task 5); the
 /// fold/retire/fence/recheck/cascade/trim step tests land here in Tasks 6-12.
@@ -147,4 +160,52 @@ TEST(CasGcLease, CreateConflictReReadsWithinTheBound)
     const GcState st = readState(*b, *s);
     EXPECT_EQ(st.lease.owner, hexToU128("0000000000000000000000000000000c"));
     EXPECT_EQ(st.lease.seq, 1u);
+}
+
+TEST(CasGcLease, CtorFailsClosedOnBadArguments)
+{
+    /// Guards: a null store and gc_id == 0 (reserved for "lease never held") are caller bugs.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS,
+        [&] { Gc(nullptr, hexToU128("00000000000000000000000000000001")); });
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&] { Gc(s, DB::UInt128(0)); });
+}
+
+TEST(CasGcLease, IncumbentRenewConflictRetriesOnceAndAcquires)
+{
+    /// The incumbent's own renew CAS conflicts (one-shot injection). The documented behavior:
+    /// re-read sees our own ownership => the renew is retried ONCE within the bounded (2) CAS
+    /// attempts => acquired. The invariant under test: never acquired=true without a Committed
+    /// CAS - the state on storage must carry the seq the SECOND (committed) attempt wrote.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    Gc gc(s, hexToU128("0000000000000000000000000000000d"));
+
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);            /// create: seq 1
+    b->failNextCasPut(s->layout().gcStateKey());                 /// inject: the renew CAS conflicts
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);            /// re-read (still us) => retried once
+    const GcState st = readState(*b, *s);
+    EXPECT_EQ(st.lease.owner, hexToU128("0000000000000000000000000000000d"));
+    EXPECT_EQ(st.lease.seq, 2u);                                 /// the committed retry's seq
+}
+
+TEST(CasGcLease, VanishedStateAfterObservationFailsClosed)
+{
+    /// gc/state is never legally deleted - absent AFTER a recorded observation proves an
+    /// out-of-model deletion. Recreating a default state would reset round/fence_seq/cursors;
+    /// the lease protocol must fail closed (CORRUPTED_DATA) instead.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    Gc gc1(s, hexToU128("0000000000000000000000000000000a"));
+    Gc gc2(s, hexToU128("0000000000000000000000000000000b"));
+
+    ASSERT_TRUE(gc1.runRegularRound().acquired_lease);
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);          /// gc2 records an observation
+
+    const auto head = b->head(s->layout().gcStateKey());         /// out-of-model wipe (raw delete)
+    ASSERT_TRUE(head.exists);
+    ASSERT_EQ(b->deleteExact(s->layout().gcStateKey(), head.token).kind, DeleteOutcome::Kind::Deleted);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc2.runRegularRound(); });
 }
