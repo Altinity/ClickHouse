@@ -10,7 +10,7 @@ namespace DB::Cas
 {
 
 /// Retire outcomes (spec §7 R4) — what the recheck decided per retired entry. One JSON object per
-/// gc/outcomes/<round>.<fence_seq>/<snap_shard>; written once (putIfAbsent — idempotent replay reads
+/// gc/outcomes/<round>.<fence_seq>/<snap_shard>; written once (`putIfAbsent` — idempotent replay reads
 /// and verifies). Non-hashed metadata => strict JSON. 412-saves (replaced) are a health metric.
 enum class OutcomeKind : uint8_t
 {

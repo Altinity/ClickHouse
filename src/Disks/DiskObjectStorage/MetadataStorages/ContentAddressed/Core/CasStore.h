@@ -49,6 +49,7 @@ struct BuildInfo
 
 class Build;
 using BuildPtr = std::shared_ptr<Build>;
+class Gc;
 class Store;
 using StorePtr = std::shared_ptr<Store>;
 
@@ -60,6 +61,9 @@ class Store : public std::enable_shared_from_this<Store>
     /// (W-PUBLISH-GATE) is Build's responsibility (it owns deps/retireView access), but the CAS loop
     /// itself is the verified Store loop — reused, never duplicated.
     friend class Build;
+    /// Gc drives the manifest fence CAS (R3) through the same private mutateShard loop — reused,
+    /// never duplicated (the lease itself only needs the public accessors).
+    friend class Gc;
 
 public:
     static StorePtr open(BackendPtr backend, PoolConfig config);

@@ -16,10 +16,12 @@ namespace DB::Cas
 {
 
 /// Shared enum <-> string mappings for the strict-JSON GC codecs (retired sets, gc/snap,
-/// gc/outcomes). One mapping for all consumers: file-local copies were duplicated while there
-/// were only two users (see the old note in `CasGcSnap.cpp`); a third user made divergence a
-/// real hazard, so the mapping now lives here. Unknown string on decode is corruption (fail
-/// closed); an out-of-range enum value at the write site is likewise reported as corruption.
+/// gc/outcomes). One mapping for all consumers: the `ObjectKind` mapping used to live as
+/// file-local copies in `CasGcFormats.cpp` and `CasGcSnap.cpp`, and the `TokenType` mapping
+/// lived solely in `CasGcFormats.cpp` until the outcomes codec became its second consumer —
+/// at three codecs, divergence became a real hazard, so the mappings now live here. Unknown
+/// string on decode is corruption (fail closed); an out-of-range enum value at the write site
+/// is likewise reported as corruption.
 
 inline std::string_view objectKindToString(ObjectKind kind)
 {
