@@ -108,6 +108,9 @@ public:
     /// `DeleteObjectsRequest` does not exist on GCS, see https://issuetracker.google.com/issues/162653700 .
     void removeObjectsIfExist(const StoredObjects & objects) override;
 
+    /// Uses `DeleteObjectRequest` with `If-Match` (token-exact removal for content-addressed disks).
+    ConditionalRemoveResult removeObjectIfTokenMatches(const StoredObject & object, const std::string & etag) override;
+
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 
     ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;

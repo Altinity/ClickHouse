@@ -17,6 +17,7 @@
 #include <IO/WriteBufferFromS3.h>
 #include <IO/ReadBufferFromS3.h>
 #include <IO/S3/getObjectInfo.h>
+#include <IO/S3/Requests.h>
 #include <IO/S3/copyS3File.h>
 #include <IO/S3/deleteFileFromS3.h>
 #include <Interpreters/Context.h>
@@ -71,6 +72,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
+    extern const int S3_ERROR;
 }
 
 namespace
@@ -425,6 +427,39 @@ void S3ObjectStorage::removeObjectIfExists(const StoredObject & object)
 void S3ObjectStorage::removeObjectsIfExist(const StoredObjects & objects)
 {
     removeObjectsImpl(objects, true);
+}
+
+ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatches(const StoredObject & object, const std::string & etag)
+{
+    S3::DeleteObjectRequest request;
+    request.SetBucket(uri.bucket);
+    request.SetKey(object.remote_path);
+    request.SetIfMatch(etag);
+
+    ProfileEvents::increment(ProfileEvents::DiskS3DeleteObjects);
+
+    auto outcome = client.get()->DeleteObject(request);
+
+    if (outcome.IsSuccess())
+        return {ConditionalRemoveOutcome::Removed, outcome.GetResult().GetDeleteMarker()};
+
+    const auto & err = outcome.GetError();
+
+    /// The token did not match the current incarnation: the conditional delete is rejected with
+    /// HTTP 412 PreconditionFailed. The AWS SDK does not map this to a dedicated S3Errors enum value,
+    /// so detect it the same way the PoC's `condCreateViaIfNoneMatch` detects an `If-None-Match` loss:
+    /// by the `PreconditionFailed` token in the error name/message.
+    if (err.GetExceptionName() == "PreconditionFailed"
+        || err.GetMessage().find("PreconditionFailed") != std::string::npos)
+        return {ConditionalRemoveOutcome::TokenMismatch, false};
+
+    /// The object no longer exists (404). Protocol callers treat 'mismatch' and 'gone' alike (re-validate).
+    if (S3::isNotFoundError(err.GetErrorType()))
+        return {ConditionalRemoveOutcome::NotFound, false};
+
+    throw S3Exception(err.GetErrorType(),
+        "{} (Code: {}, S3 exception: '{}') while conditionally removing object with path {} from S3",
+        err.GetMessage(), static_cast<size_t>(err.GetErrorType()), err.GetExceptionName(), object.remote_path);
 }
 
 static void putObjectsTagOnS3(

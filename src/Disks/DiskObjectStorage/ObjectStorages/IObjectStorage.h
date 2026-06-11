@@ -161,6 +161,14 @@ using ObjectKeysWithMetadata = std::vector<ObjectKeyWithMetadata>;
 class IObjectStorageIterator;
 using ObjectStorageIteratorPtr = std::shared_ptr<IObjectStorageIterator>;
 
+/// Outcome of a token-conditional single-object removal (content-addressed disks).
+enum class ConditionalRemoveOutcome : uint8_t { Removed, TokenMismatch, NotFound };
+struct ConditionalRemoveResult
+{
+    ConditionalRemoveOutcome outcome = ConditionalRemoveOutcome::NotFound;
+    bool created_delete_marker = false;   /// backend reported a versioning delete marker
+};
+
 /// Base class for all object storages which implement some subset of ordinary filesystem operations.
 ///
 /// Examples of object storages are S3, Azure Blob Storage, HDFS.
@@ -266,6 +274,15 @@ public:
 
     /// Remove objects on path if exists
     virtual void removeObjectsIfExist(const StoredObjects & object) = 0;
+
+    /// Remove `object` ONLY if its current entity tag equals `etag`. Backends without enforced
+    /// conditional removal MUST NOT override this: the content-addressed capability probe relies on the
+    /// default to fail closed. Supported: S3 (DeleteObject If-Match, GA 2025-09).
+    virtual ConditionalRemoveResult removeObjectIfTokenMatches(const StoredObject & /*object*/, const std::string & /*etag*/)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Conditional (token-exact) object removal is not implemented for {} object storage", getName());
+    }
 
     /// Copy object with different attributes if required
     virtual void copyObject( /// NOLINT
