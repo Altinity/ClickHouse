@@ -1,5 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 #include <base/hex.h>
 #include <city.h>
@@ -37,94 +39,101 @@ String encodeTree(std::vector<TreeEntry> entries)
                 "CAS tree: duplicate entry name '{}'", entries[i].name);
     }
 
-    String out;
-    out += "CATR";
-    writeU8(out, TREE_VERSION);
-    writeLE32(out, static_cast<uint32_t>(entries.size()));
+    WriteBufferFromOwnString out;
+    writeString("CATR", out);
+    writeBinaryLittleEndian(TREE_VERSION, out);
+    writeBinaryLittleEndian(static_cast<uint32_t>(entries.size()), out);
 
     for (const auto & e : entries)
     {
-        writeLE16(out, static_cast<uint16_t>(e.name.size()));
-        out += e.name;
-        writeU8(out, static_cast<uint8_t>(e.placement));
-        writeU128LE(out, e.file_hash);
-        writeLE64(out, e.file_size);
+        writeBinaryLittleEndian(static_cast<uint16_t>(e.name.size()), out);
+        writeString(e.name, out);
+        writeBinaryLittleEndian(static_cast<uint8_t>(e.placement), out);
+        writeBinaryLittleEndian(e.file_hash, out);
+        writeBinaryLittleEndian(e.file_size, out);
 
         switch (e.placement)
         {
             case Placement::Inline:
-                writeLE32(out, static_cast<uint32_t>(e.inline_bytes.size()));
-                out += e.inline_bytes;
+                writeBinaryLittleEndian(static_cast<uint32_t>(e.inline_bytes.size()), out);
+                writeString(e.inline_bytes, out);
                 break;
             case Placement::Blob:
                 break;
             case Placement::PackSlice:
-                writeU128LE(out, e.pack_hash);
-                writeLE64(out, e.pack_offset);
-                writeLE64(out, e.pack_length);
+                writeBinaryLittleEndian(e.pack_hash, out);
+                writeBinaryLittleEndian(e.pack_offset, out);
+                writeBinaryLittleEndian(e.pack_length, out);
                 break;
             case Placement::Subtree:
                 break;
         }
     }
 
-    return out;
+    return std::move(out.str());
 }
 
 std::vector<TreeEntry> decodeTree(std::string_view data)
 {
-    ByteReader r(data);
-
-    const String magic = r.readBytes(4);
-    if (magic != "CATR")
-        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS tree: bad magic");
-
-    const uint8_t version = r.readU8();
-    if (version > TREE_VERSION)
-        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "CAS tree: unsupported version {}", version);
-
-    const uint32_t count = r.readLE32();
-
-    std::vector<TreeEntry> entries;
-    entries.reserve(count);
-
-    for (uint32_t i = 0; i < count; ++i)
+    return decodeGuarded("tree", [&]
     {
-        TreeEntry e;
-        const uint16_t name_len = r.readLE16();
-        e.name = r.readBytes(name_len);
+        ReadBufferFromMemory in(data.data(), data.size());
 
-        const uint8_t placement = r.readU8();
-        if (placement < 1 || placement > 4)
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS tree: unknown placement {}", placement);
-        e.placement = static_cast<Placement>(placement);
+        if (readFixedBytes(in, 4) != "CATR")
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS tree: bad magic");
 
-        e.file_hash = r.readU128LE();
-        e.file_size = r.readLE64();
+        uint8_t version = 0;
+        readBinaryLittleEndian(version, in);
+        if (version > TREE_VERSION)
+            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "CAS tree: unsupported version {}", version);
 
-        switch (e.placement)
+        uint32_t count = 0;
+        readBinaryLittleEndian(count, in);
+
+        std::vector<TreeEntry> entries;
+        entries.reserve(count);
+
+        for (uint32_t i = 0; i < count; ++i)
         {
-            case Placement::Inline:
+            TreeEntry e;
+            uint16_t name_len = 0;
+            readBinaryLittleEndian(name_len, in);
+            e.name = readFixedBytes(in, name_len);
+
+            uint8_t placement = 0;
+            readBinaryLittleEndian(placement, in);
+            if (placement < 1 || placement > 4)
+                throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS tree: unknown placement {}", placement);
+            e.placement = static_cast<Placement>(placement);
+
+            readBinaryLittleEndian(e.file_hash, in);
+            readBinaryLittleEndian(e.file_size, in);
+
+            switch (e.placement)
             {
-                const uint32_t len = r.readLE32();
-                e.inline_bytes = r.readBytes(len);
-                break;
+                case Placement::Inline:
+                {
+                    uint32_t len = 0;
+                    readBinaryLittleEndian(len, in);
+                    e.inline_bytes = readFixedBytes(in, len);
+                    break;
+                }
+                case Placement::Blob:
+                    break;
+                case Placement::PackSlice:
+                    readBinaryLittleEndian(e.pack_hash, in);
+                    readBinaryLittleEndian(e.pack_offset, in);
+                    readBinaryLittleEndian(e.pack_length, in);
+                    break;
+                case Placement::Subtree:
+                    break;
             }
-            case Placement::Blob:
-                break;
-            case Placement::PackSlice:
-                e.pack_hash = r.readU128LE();
-                e.pack_offset = r.readLE64();
-                e.pack_length = r.readLE64();
-                break;
-            case Placement::Subtree:
-                break;
+
+            entries.push_back(std::move(e));
         }
 
-        entries.push_back(std::move(e));
-    }
-
-    return entries;
+        return entries;
+    });
 }
 
 TreeId treeIdFor(const String & encoded)

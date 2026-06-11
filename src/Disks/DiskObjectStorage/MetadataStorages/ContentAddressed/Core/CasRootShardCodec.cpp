@@ -1,5 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 
 namespace DB
@@ -19,37 +21,51 @@ namespace
 
 constexpr uint8_t ROOT_VERSION = 1;
 
-void writeString16(String & out, const String & s)
+void writeString16(WriteBuffer & out, const String & s)
 {
-    writeLE16(out, static_cast<uint16_t>(s.size()));
-    out += s;
+    writeBinaryLittleEndian(static_cast<uint16_t>(s.size()), out);
+    writeString(s, out);
 }
 
-void writeString32(String & out, const String & s)
+void writeString32(WriteBuffer & out, const String & s)
 {
-    writeLE32(out, static_cast<uint32_t>(s.size()));
-    out += s;
+    writeBinaryLittleEndian(static_cast<uint32_t>(s.size()), out);
+    writeString(s, out);
+}
+
+String readString16(ReadBuffer & in)
+{
+    uint16_t len = 0;
+    readBinaryLittleEndian(len, in);
+    return readFixedBytes(in, len);
+}
+
+String readString32(ReadBuffer & in)
+{
+    uint32_t len = 0;
+    readBinaryLittleEndian(len, in);
+    return readFixedBytes(in, len);
 }
 
 }
 
 String encodeRootShard(const RootShard & root)
 {
-    String out;
-    out += "CARS";
-    writeU8(out, ROOT_VERSION);
+    WriteBufferFromOwnString out;
+    writeString("CARS", out);
+    writeBinaryLittleEndian(ROOT_VERSION, out);
 
-    writeLE64(out, root.shard_version);
-    writeLE64(out, root.fence_round);
+    writeBinaryLittleEndian(root.shard_version, out);
+    writeBinaryLittleEndian(root.fence_round, out);
 
-    writeLE32(out, static_cast<uint32_t>(root.refs.size()));
+    writeBinaryLittleEndian(static_cast<uint32_t>(root.refs.size()), out);
     for (const auto & [name, payload] : root.refs)
     {
         writeString16(out, name);
-        writeU128LE(out, payload.tree_id);
-        writeLE64(out, payload.tree_size);
+        writeBinaryLittleEndian(payload.tree_id, out);
+        writeBinaryLittleEndian(payload.tree_size, out);
 
-        writeLE16(out, static_cast<uint16_t>(payload.mutable_files.size()));
+        writeBinaryLittleEndian(static_cast<uint16_t>(payload.mutable_files.size()), out);
         for (const auto & [k, v] : payload.mutable_files)
         {
             writeString16(out, k);
@@ -57,76 +73,78 @@ String encodeRootShard(const RootShard & root)
         }
     }
 
-    writeLE32(out, static_cast<uint32_t>(root.journal.size()));
+    writeBinaryLittleEndian(static_cast<uint32_t>(root.journal.size()), out);
     for (const auto & rec : root.journal)
     {
-        writeU8(out, static_cast<uint8_t>(rec.op));
+        writeBinaryLittleEndian(static_cast<uint8_t>(rec.op), out);
         writeString16(out, rec.ref_name);
-        writeU128LE(out, rec.tree_id);
-        writeLE64(out, rec.at_version);
+        writeBinaryLittleEndian(rec.tree_id, out);
+        writeBinaryLittleEndian(rec.at_version, out);
     }
 
-    return out;
+    return std::move(out.str());
 }
 
 RootShard decodeRootShard(std::string_view data)
 {
-    ByteReader r(data);
-
-    const String magic = r.readBytes(4);
-    if (magic != "CARS")
-        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS root shard: bad magic");
-
-    const uint8_t version = r.readU8();
-    if (version > ROOT_VERSION)
-        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "CAS root shard: unsupported version {}", version);
-
-    RootShard root;
-    root.shard_version = r.readLE64();
-    root.fence_round = r.readLE64();
-
-    const uint32_t ref_count = r.readLE32();
-    for (uint32_t i = 0; i < ref_count; ++i)
+    return decodeGuarded("root shard", [&]
     {
-        const uint16_t name_len = r.readLE16();
-        const String name = r.readBytes(name_len);
+        ReadBufferFromMemory in(data.data(), data.size());
 
-        RefPayload payload;
-        payload.tree_id = r.readU128LE();
-        payload.tree_size = r.readLE64();
+        if (readFixedBytes(in, 4) != "CARS")
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS root shard: bad magic");
 
-        const uint16_t mutable_count = r.readLE16();
-        for (uint16_t j = 0; j < mutable_count; ++j)
+        uint8_t version = 0;
+        readBinaryLittleEndian(version, in);
+        if (version > ROOT_VERSION)
+            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "CAS root shard: unsupported version {}", version);
+
+        RootShard root;
+        readBinaryLittleEndian(root.shard_version, in);
+        readBinaryLittleEndian(root.fence_round, in);
+
+        uint32_t ref_count = 0;
+        readBinaryLittleEndian(ref_count, in);
+        for (uint32_t i = 0; i < ref_count; ++i)
         {
-            const uint16_t klen = r.readLE16();
-            const String k = r.readBytes(klen);
-            const uint32_t vlen = r.readLE32();
-            const String v = r.readBytes(vlen);
-            payload.mutable_files[k] = v;
+            String name = readString16(in);
+
+            RefPayload payload;
+            readBinaryLittleEndian(payload.tree_id, in);
+            readBinaryLittleEndian(payload.tree_size, in);
+
+            uint16_t mutable_count = 0;
+            readBinaryLittleEndian(mutable_count, in);
+            for (uint16_t j = 0; j < mutable_count; ++j)
+            {
+                String k = readString16(in);
+                payload.mutable_files[k] = readString32(in);
+            }
+
+            root.refs[name] = std::move(payload);
         }
 
-        root.refs[name] = std::move(payload);
-    }
+        uint32_t journal_count = 0;
+        readBinaryLittleEndian(journal_count, in);
+        for (uint32_t i = 0; i < journal_count; ++i)
+        {
+            JournalRecord rec;
+            uint8_t op = 0;
+            readBinaryLittleEndian(op, in);
+            if (op != static_cast<uint8_t>(JournalRecord::Op::Add)
+                && op != static_cast<uint8_t>(JournalRecord::Op::Remove))
+                throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS root shard: invalid journal op {}", op);
+            rec.op = static_cast<JournalRecord::Op>(op);
 
-    const uint32_t journal_count = r.readLE32();
-    for (uint32_t i = 0; i < journal_count; ++i)
-    {
-        JournalRecord rec;
-        const uint8_t op = r.readU8();
-        if (op != static_cast<uint8_t>(JournalRecord::Op::Add)
-            && op != static_cast<uint8_t>(JournalRecord::Op::Remove))
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS root shard: invalid journal op {}", op);
-        rec.op = static_cast<JournalRecord::Op>(op);
+            rec.ref_name = readString16(in);
+            readBinaryLittleEndian(rec.tree_id, in);
+            readBinaryLittleEndian(rec.at_version, in);
 
-        const uint16_t name_len = r.readLE16();
-        rec.ref_name = r.readBytes(name_len);
-        rec.tree_id = r.readU128LE();
-        rec.at_version = r.readLE64();
+            root.journal.push_back(std::move(rec));
+        }
 
-        root.journal.push_back(std::move(rec));
-    }
-
-    return root;
+        return root;
+    });
 }
 
 }

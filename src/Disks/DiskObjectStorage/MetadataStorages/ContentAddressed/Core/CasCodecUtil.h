@@ -1,16 +1,16 @@
 #pragma once
-#include <base/types.h>
-#include <base/extended_types.h>
+#include <IO/ReadBuffer.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
-#include <cstdint>
-#include <cstring>
-#include <string>
 #include <string_view>
 
 namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int ATTEMPT_TO_READ_AFTER_EOF;
+    extern const int CANNOT_READ_ALL_DATA;
     extern const int CORRUPTED_DATA;
 }
 }
@@ -18,116 +18,37 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-/// Shared little-endian byte writers/readers for the three on-disk codecs.
-///
-/// The on-disk format is byte-exact (it IS pool format v2), so we never rely on struct layout or
-/// memcpy of whole structs: every multi-byte field is written and read one byte at a time in
-/// little-endian order. UInt128 is serialized as its 16 little-endian bytes.
+/// The CAS on-disk codecs use the standard IO helpers — `writeBinaryLittleEndian` /
+/// `readBinaryLittleEndian` over `WriteBuffer` / `ReadBuffer` — for every field. The on-disk format
+/// is byte-exact (it IS pool format v2): every multi-byte field is little-endian; `UInt128` is its
+/// 16 little-endian bytes (low 64 bits first) — exactly what the helpers produce on any host
+/// (`transformEndianness` handles wide integers). String lengths ride separately as explicit
+/// fixed-width LE fields, so the codecs do not use the varint-prefixed `writeStringBinary` family.
 
-inline void writeU8(String & out, uint8_t v)
+/// Read exactly `n` raw bytes.
+inline String readFixedBytes(ReadBuffer & in, size_t n)
 {
-    out.push_back(static_cast<char>(v));
+    String s(n, '\0');
+    in.readStrict(s.data(), n);
+    return s;
 }
 
-inline void writeLE16(String & out, uint16_t v)
+/// Decode-boundary guard. The codecs parse fully materialized objects, so running out of bytes is
+/// data corruption, not an IO condition: translate the standard reading errors into CORRUPTED_DATA —
+/// the code the protocol layers and tests pin for truncated persisted objects.
+template <typename F>
+auto decodeGuarded(std::string_view what, F && f)
 {
-    out.push_back(static_cast<char>(v & 0xff));
-    out.push_back(static_cast<char>((v >> 8) & 0xff));
+    try
+    {
+        return f();
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() == ErrorCodes::CANNOT_READ_ALL_DATA || e.code() == ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: truncated encoded data", what);
+        throw;
+    }
 }
-
-inline void writeLE32(String & out, uint32_t v)
-{
-    for (int i = 0; i < 4; ++i)
-        out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
-}
-
-inline void writeLE64(String & out, uint64_t v)
-{
-    for (int i = 0; i < 8; ++i)
-        out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
-}
-
-inline void writeU128LE(String & out, const UInt128 & v)
-{
-    /// wide::integer stores 64-bit limbs; extract low and high 64 bits explicitly so we never
-    /// depend on the in-memory limb order. Low 64 bits first (little-endian overall).
-    const uint64_t low = static_cast<uint64_t>(v);
-    const uint64_t high = static_cast<uint64_t>(v >> 64);
-    writeLE64(out, low);
-    writeLE64(out, high);
-}
-
-/// Sequential reader over a byte buffer; every out-of-bounds read throws CORRUPTED_DATA.
-class ByteReader
-{
-public:
-    explicit ByteReader(std::string_view data_) : data(data_) {}
-
-    size_t position() const { return pos; }
-    size_t remaining() const { return data.size() - pos; }
-    bool eof() const { return pos >= data.size(); }
-
-    void require(size_t n) const
-    {
-        if (pos + n > data.size())
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                "CAS codec: truncated buffer (need {} bytes at offset {}, have {})", n, pos, data.size());
-    }
-
-    uint8_t readU8()
-    {
-        require(1);
-        return static_cast<uint8_t>(data[pos++]);
-    }
-
-    uint16_t readLE16()
-    {
-        require(2);
-        const uint16_t v = static_cast<uint16_t>(
-            static_cast<uint16_t>(static_cast<uint8_t>(data[pos]))
-            | (static_cast<uint16_t>(static_cast<uint8_t>(data[pos + 1])) << 8));
-        pos += 2;
-        return v;
-    }
-
-    uint32_t readLE32()
-    {
-        require(4);
-        uint32_t v = 0;
-        for (int i = 0; i < 4; ++i)
-            v |= static_cast<uint32_t>(static_cast<uint8_t>(data[pos + i])) << (8 * i);
-        pos += 4;
-        return v;
-    }
-
-    uint64_t readLE64()
-    {
-        require(8);
-        uint64_t v = 0;
-        for (int i = 0; i < 8; ++i)
-            v |= static_cast<uint64_t>(static_cast<uint8_t>(data[pos + i])) << (8 * i);
-        pos += 8;
-        return v;
-    }
-
-    UInt128 readU128LE()
-    {
-        const uint64_t low = readLE64();
-        const uint64_t high = readLE64();
-        return (UInt128(high) << 64) | UInt128(low);
-    }
-
-    String readBytes(size_t n)
-    {
-        require(n);
-        String s(data.substr(pos, n));
-        pos += n;
-        return s;
-    }
-
-private:
-    std::string_view data;
-    size_t pos = 0;
-};
 
 }

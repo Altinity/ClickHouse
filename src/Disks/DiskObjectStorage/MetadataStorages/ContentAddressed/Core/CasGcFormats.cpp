@@ -1,5 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 #include <limits>
 
@@ -23,119 +25,133 @@ constexpr uint8_t GC_STATE_VERSION = 1;
 constexpr uint8_t RETIRED_SET_VERSION = 1;
 constexpr size_t RESERVED_BYTES = 3;
 
-void writeHeader(String & out, std::string_view magic, uint8_t version)
+void writeHeader(WriteBuffer & out, std::string_view magic, uint8_t version)
 {
-    out += magic;
-    writeU8(out, version);
+    writeString(magic, out);
+    writeBinaryLittleEndian(version, out);
     for (size_t i = 0; i < RESERVED_BYTES; ++i)
-        writeU8(out, 0);
+        writeBinaryLittleEndian(static_cast<uint8_t>(0), out);
 }
 
 /// Reads and validates magic + version + reserved. Future version => NOT_IMPLEMENTED (checked
 /// before the reserved bytes — a v2 header may repurpose them); everything else => CORRUPTED_DATA.
-void readHeader(ByteReader & r, std::string_view magic, uint8_t current_version, std::string_view what)
+void readHeader(ReadBuffer & in, std::string_view magic, uint8_t current_version, std::string_view what)
 {
-    const String found = r.readBytes(magic.size());
-    if (found != magic)
+    if (readFixedBytes(in, magic.size()) != magic)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS {}: bad magic", what);
 
-    const uint8_t version = r.readU8();
+    uint8_t version = 0;
+    readBinaryLittleEndian(version, in);
     if (version > current_version)
         throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "CAS {}: unsupported version {}", what, version);
     if (version != current_version)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid version {}", what, version);
 
     for (size_t i = 0; i < RESERVED_BYTES; ++i)
-        if (r.readU8() != 0)
+    {
+        uint8_t reserved = 0;
+        readBinaryLittleEndian(reserved, in);
+        if (reserved != 0)
             throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS {}: nonzero reserved byte", what);
+    }
 }
 
-void requireNoTrailingBytes(const ByteReader & r, std::string_view what)
+void requireNoTrailingBytes(ReadBuffer & in, std::string_view what)
 {
-    if (!r.eof())
+    if (!in.eof())
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-            "CAS {}: {} trailing bytes after the end of the encoded data", what, r.remaining());
+            "CAS {}: {} trailing bytes after the end of the encoded data", what, in.available());
 }
 
 }
 
 String encodeGcState(const GcState & state)
 {
-    String out;
+    WriteBufferFromOwnString out;
     writeHeader(out, "CAGS", GC_STATE_VERSION);
-    writeLE64(out, state.round);
-    writeLE64(out, state.fence_seq);
-    return out;
+    writeBinaryLittleEndian(state.round, out);
+    writeBinaryLittleEndian(state.fence_seq, out);
+    return std::move(out.str());
 }
 
 GcState decodeGcState(std::string_view data)
 {
-    ByteReader r(data);
-    readHeader(r, "CAGS", GC_STATE_VERSION, "gc/state");
+    return decodeGuarded("gc/state", [&]
+    {
+        ReadBufferFromMemory in(data.data(), data.size());
+        readHeader(in, "CAGS", GC_STATE_VERSION, "gc/state");
 
-    GcState state;
-    state.round = r.readLE64();
-    state.fence_seq = r.readLE64();
+        GcState state;
+        readBinaryLittleEndian(state.round, in);
+        readBinaryLittleEndian(state.fence_seq, in);
 
-    requireNoTrailingBytes(r, "gc/state");
-    return state;
+        requireNoTrailingBytes(in, "gc/state");
+        return state;
+    });
 }
 
 String encodeRetiredSet(const RetiredSet & set)
 {
-    String out;
+    WriteBufferFromOwnString out;
     writeHeader(out, "CART", RETIRED_SET_VERSION);
-    writeLE64(out, set.entries.size());
+    writeBinaryLittleEndian(static_cast<uint64_t>(set.entries.size()), out);
     for (const auto & entry : set.entries)
     {
-        writeU8(out, static_cast<uint8_t>(entry.kind));
-        writeU128LE(out, entry.hash);
-        writeU8(out, static_cast<uint8_t>(entry.token.type));
+        writeBinaryLittleEndian(static_cast<uint8_t>(entry.kind), out);
+        writeBinaryLittleEndian(entry.hash, out);
+        writeBinaryLittleEndian(static_cast<uint8_t>(entry.token.type), out);
         /// token_len is u16 on disk; a longer token would silently truncate the length while the
         /// full value is appended below — writer-side silent corruption. Guard before writing.
         if (entry.token.value.size() > std::numeric_limits<uint16_t>::max())
             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
                 "CAS retired set: token length {} exceeds the u16 on-disk limit", entry.token.value.size());
-        writeLE16(out, static_cast<uint16_t>(entry.token.value.size()));
-        out += entry.token.value;
-        writeLE64(out, entry.size);
+        writeBinaryLittleEndian(static_cast<uint16_t>(entry.token.value.size()), out);
+        writeString(entry.token.value, out);
+        writeBinaryLittleEndian(entry.size, out);
     }
-    return out;
+    return std::move(out.str());
 }
 
 RetiredSet decodeRetiredSet(std::string_view data)
 {
-    ByteReader r(data);
-    readHeader(r, "CART", RETIRED_SET_VERSION, "retired set");
-
-    RetiredSet set;
-    const uint64_t entry_count = r.readLE64();
-    for (uint64_t i = 0; i < entry_count; ++i)
+    return decodeGuarded("retired set", [&]
     {
-        RetiredEntry entry;
+        ReadBufferFromMemory in(data.data(), data.size());
+        readHeader(in, "CART", RETIRED_SET_VERSION, "retired set");
 
-        const uint8_t kind = r.readU8();
-        if (kind < static_cast<uint8_t>(ObjectKind::Blob) || kind > static_cast<uint8_t>(ObjectKind::Pack))
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS retired set: invalid object kind {}", kind);
-        entry.kind = static_cast<ObjectKind>(kind);
+        RetiredSet set;
+        uint64_t entry_count = 0;
+        readBinaryLittleEndian(entry_count, in);
+        for (uint64_t i = 0; i < entry_count; ++i)
+        {
+            RetiredEntry entry;
 
-        entry.hash = r.readU128LE();
+            uint8_t kind = 0;
+            readBinaryLittleEndian(kind, in);
+            if (kind < static_cast<uint8_t>(ObjectKind::Blob) || kind > static_cast<uint8_t>(ObjectKind::Pack))
+                throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS retired set: invalid object kind {}", kind);
+            entry.kind = static_cast<ObjectKind>(kind);
 
-        const uint8_t token_type = r.readU8();
-        if (token_type < static_cast<uint8_t>(TokenType::ETag) || token_type > static_cast<uint8_t>(TokenType::Emulated))
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS retired set: invalid token type {}", token_type);
-        entry.token.type = static_cast<TokenType>(token_type);
+            readBinaryLittleEndian(entry.hash, in);
 
-        const uint16_t token_len = r.readLE16();
-        entry.token.value = r.readBytes(token_len);
+            uint8_t token_type = 0;
+            readBinaryLittleEndian(token_type, in);
+            if (token_type < static_cast<uint8_t>(TokenType::ETag) || token_type > static_cast<uint8_t>(TokenType::Emulated))
+                throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS retired set: invalid token type {}", token_type);
+            entry.token.type = static_cast<TokenType>(token_type);
 
-        entry.size = r.readLE64();
+            uint16_t token_len = 0;
+            readBinaryLittleEndian(token_len, in);
+            entry.token.value = readFixedBytes(in, token_len);
 
-        set.entries.push_back(std::move(entry));
-    }
+            readBinaryLittleEndian(entry.size, in);
 
-    requireNoTrailingBytes(r, "retired set");
-    return set;
+            set.entries.push_back(std::move(entry));
+        }
+
+        requireNoTrailingBytes(in, "retired set");
+        return set;
+    });
 }
 
 }
