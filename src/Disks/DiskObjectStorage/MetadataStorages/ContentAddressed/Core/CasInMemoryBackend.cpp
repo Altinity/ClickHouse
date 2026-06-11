@@ -1,8 +1,53 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <IO/WriteBufferFromString.h>
 #include <algorithm>
 
 namespace DB::Cas
 {
+
+namespace
+{
+
+/// Memory-buffered WriteSink: accumulates the body in a WriteBufferFromOwnString and delegates the
+/// conditional publish to InMemoryBackend::putIfAbsent at finalize — the single mutex acquisition
+/// inside putIfAbsent gives atomicity for free. Nothing is ever published on cancel/destruction.
+class InMemoryWriteSink final : public WriteSink
+{
+public:
+    InMemoryWriteSink(InMemoryBackend & backend, String key)
+        : backend_(backend)
+        , key_(std::move(key))
+    {
+    }
+
+    WriteBuffer & buffer() override { return buf_; }
+
+    PutOutcome finalize(Token * out_token) override
+    {
+        done_ = true;
+        return backend_.putIfAbsent(key_, buf_.str(), out_token);
+    }
+
+    void cancel() noexcept override
+    {
+        done_ = true;
+        buf_.cancel();
+    }
+
+    ~InMemoryWriteSink() override
+    {
+        if (!done_)
+            cancel();
+    }
+
+private:
+    InMemoryBackend & backend_;
+    String key_;
+    WriteBufferFromOwnString buf_;
+    bool done_ = false;
+};
+
+}
 
 Token InMemoryBackend::mintToken()
 {
@@ -70,6 +115,11 @@ PutOutcome InMemoryBackend::putIfAbsent(const String & key, const String & bytes
     if (out_token)
         *out_token = t;
     return PutOutcome::Done;
+}
+
+WriteSinkPtr InMemoryBackend::putIfAbsentStream(const String & key)
+{
+    return std::make_unique<InMemoryWriteSink>(*this, key);
 }
 
 PutOutcome InMemoryBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token)

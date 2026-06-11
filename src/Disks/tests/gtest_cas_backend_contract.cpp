@@ -149,6 +149,57 @@ TEST_P(CasBackendContract, OverwriteAndCasOnMissingKey)
     EXPECT_FALSE(b->get("k").has_value());                     // still absent
 }
 
+TEST_P(CasBackendContract, StreamPutRoundTrip)
+{
+    auto b = GetParam()();
+    auto sink = b->putIfAbsentStream("k/stream1");
+    sink->buffer().write("hello ", 6);
+    sink->buffer().write("world", 5);
+    Token tok;
+    ASSERT_EQ(sink->finalize(&tok), PutOutcome::Done);
+    ASSERT_FALSE(tok.empty());
+    auto got = b->get("k/stream1");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "hello world");
+    EXPECT_EQ(got->token, tok);
+}
+
+TEST_P(CasBackendContract, StreamPutPreconditionAtFinalize)
+{
+    auto b = GetParam()();
+    Token first;
+    ASSERT_EQ(b->putIfAbsent("k/stream2", "original", &first), PutOutcome::Done);
+    auto sink = b->putIfAbsentStream("k/stream2");
+    sink->buffer().write("loser", 5);
+    ASSERT_EQ(sink->finalize(nullptr), PutOutcome::PreconditionFailed);
+    auto got = b->get("k/stream2");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "original");    /// the failed conditional write left the object unmodified
+    EXPECT_EQ(got->token, first);
+}
+
+TEST_P(CasBackendContract, StreamPutCancelLeavesNothing)
+{
+    auto b = GetParam()();
+    {
+        auto sink = b->putIfAbsentStream("k/stream3");
+        sink->buffer().write("partial", 7);
+        sink->cancel();
+    }
+    EXPECT_FALSE(b->head("k/stream3").exists);
+}
+
+TEST_P(CasBackendContract, StreamPutDestructionWithoutFinalizeLeavesNothing)
+{
+    auto b = GetParam()();
+    {
+        auto sink = b->putIfAbsentStream("k/stream4");
+        sink->buffer().write("partial", 7);
+        /// no finalize, no cancel — destructor must behave as cancel (never publish)
+    }
+    EXPECT_FALSE(b->head("k/stream4").exists);
+}
+
 INSTANTIATE_TEST_SUITE_P(InMemory, CasBackendContract,
     ::testing::Values(+[]() -> BackendPtr { return std::make_shared<InMemoryBackend>(); }));
 

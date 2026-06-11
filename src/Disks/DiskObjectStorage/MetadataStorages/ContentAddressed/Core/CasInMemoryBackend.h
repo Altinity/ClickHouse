@@ -28,6 +28,7 @@ public:
     std::optional<GetResult> get(const String & key, Range range = {}) override;
     HeadResult head(const String & key) override;
     PutOutcome putIfAbsent(const String & key, const String & bytes, Token * out_token = nullptr) override;
+    WriteSinkPtr putIfAbsentStream(const String & key) override;
     PutOutcome putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token = nullptr) override;
     CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token = nullptr) override;
     DeleteOutcome deleteExact(const String & key, const Token & token) override;

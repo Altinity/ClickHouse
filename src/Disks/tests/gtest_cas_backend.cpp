@@ -23,6 +23,11 @@ struct NullBackend final : Backend
         return PutOutcome::Done;
     }
 
+    WriteSinkPtr putIfAbsentStream(const String & /*key*/) override
+    {
+        return nullptr;   /// trivial default — streaming behavior is pinned by the CasBackendContract suite
+    }
+
     PutOutcome putOverwrite(const String & /*key*/, const String & /*bytes*/, const Token & /*expected*/, Token * /*out_token*/) override
     {
         return PutOutcome::PreconditionFailed;
