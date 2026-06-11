@@ -9,8 +9,6 @@ TEST(CasLayout, KeyShapes)
     EXPECT_EQ(l.blobKey(BlobId{"00aabb"}), "p/blobs/00/00aabb");
     EXPECT_EQ(l.treeKey(TreeId{"ffee01"}), "p/trees/ff/ffee01");
     EXPECT_EQ(l.packKey(PackId{"0102aa"}), "p/packs/01/0102aa");
-    EXPECT_EQ(l.rootShardKey("srv1", "tbl-uuid", 3), "p/roots/srv1/tbl-uuid/3");
-    EXPECT_EQ(l.rootNamespacePrefix("srv1", "tbl-uuid"), "p/roots/srv1/tbl-uuid/");
     EXPECT_EQ(l.gcStateKey(), "p/gc/state");
     EXPECT_EQ(l.gcSnapKey(7, 2), "p/gc/snap/7/2");
     EXPECT_EQ(l.retiredKey(4, 9, 1), "p/gc/retired/4.9/1");
@@ -18,6 +16,26 @@ TEST(CasLayout, KeyShapes)
     EXPECT_EQ(l.checkpointKey(12), "p/gc/checkpoint/12");
     EXPECT_EQ(l.buildHeartbeatKey("deadbeef00"), "p/builds/de/deadbeef00");
     EXPECT_EQ(l.poolMetaKey(), "p/_pool_meta");
+}
+
+TEST(CasLayout, RootNamespaceKeys)
+{
+    Layout l("p");
+    RootNamespace ns{"srv1/3f2e-uuid"};
+    EXPECT_EQ(l.rootShardKey(ns, 3), "p/roots/srv1/3f2e-uuid/3");
+    EXPECT_EQ(l.rootNamespacePrefix(ns), "p/roots/srv1/3f2e-uuid/");
+    EXPECT_EQ(l.namespaceFileKey(ns, "format_version.txt"), "p/roots/srv1/3f2e-uuid/_files/format_version.txt");
+    EXPECT_EQ(l.namespaceFilesPrefix(ns), "p/roots/srv1/3f2e-uuid/_files/");
+    EXPECT_EQ(l.gcRetiredPrefix(), "p/gc/retired/");
+}
+
+TEST(CasLayout, RootNamespaceValidation)
+{
+    Layout l("p");
+    EXPECT_THROW(l.rootShardKey(RootNamespace{""}, 0), DB::Exception);
+    EXPECT_THROW(l.rootShardKey(RootNamespace{"/lead"}, 0), DB::Exception);
+    EXPECT_THROW(l.rootShardKey(RootNamespace{"trail/"}, 0), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/b"), DB::Exception);   /// file names are flat
 }
 
 TEST(CasLayout, ShortIdThrows)

@@ -28,7 +28,7 @@ namespace DB::Cas
 /// implicit conversion to String, and the underlying string is reached only through the explicit
 /// string accessor — at the object-storage boundary.
 ///
-/// All three expose operator<=> and operator== (so they live in std::set / std::map) and a
+/// All of them expose operator<=> and operator== (so they live in std::set / std::map) and a
 /// std::hash specialization (so they live in std::unordered_* containers).
 
 #define CAS_STRONG_STRING(NAME) \
@@ -48,6 +48,12 @@ namespace DB::Cas
 CAS_STRONG_STRING(BlobId)
 CAS_STRONG_STRING(TreeId)
 CAS_STRONG_STRING(PackId)
+
+/// Opaque namespace under which root manifests live. The core never interprets its contents:
+/// the wiring composes strings like "srv1/<table_uuid>" or "shadow/<backup>/<table_uuid>".
+/// Layout only validates its shape (non-empty, no leading/trailing or empty segments,
+/// no segment equal to the reserved "_files").
+CAS_STRONG_STRING(RootNamespace)
 
 #undef CAS_STRONG_STRING
 
@@ -91,5 +97,6 @@ inline UInt128 hexToU128(const String & hex)
 CAS_STRONG_STRING_HASH(BlobId)
 CAS_STRONG_STRING_HASH(TreeId)
 CAS_STRONG_STRING_HASH(PackId)
+CAS_STRONG_STRING_HASH(RootNamespace)
 
 #undef CAS_STRONG_STRING_HASH

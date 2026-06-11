@@ -20,10 +20,16 @@ namespace DB::Cas
 ///   - content objects:  POOL/blobs/S/ID
 ///   - tree objects:     POOL/trees/S/ID
 ///   - pack objects:     POOL/packs/S/ID
-///   - root manifests:   POOL/roots/SERVER_ID/TABLE_UUID/SHARD_NUMBER
+///   - root manifests:   POOL/roots/NAMESPACE/SHARD_NUMBER
+///   - verbatim files:   POOL/roots/NAMESPACE/_files/FILE_NAME
 ///   - GC state:         POOL/gc/...
 ///   - build heartbeats: POOL/builds/S/BUILD_ID
 ///   - pool metadata:    POOL/_pool_meta
+///
+/// NAMESPACE is opaque to the core: the wiring composes strings like "srv1/<table_uuid>" or
+/// "shadow/<backup>/<table_uuid>". The reserved "_files" segment cannot collide with root shard
+/// keys because shard names are numeric, and checkNamespace rejects "_files" as a namespace
+/// segment.
 ///
 /// The 2-char shard is always the first two characters of the id string.
 /// This matches the protocol spec §4 layout exactly.
@@ -48,16 +54,37 @@ public:
         return shardedKey("packs", id.string());
     }
 
-    /// Root manifest for a given server + table UUID + shard number.
-    String rootShardKey(const String & server_id, const String & table_uuid, uint64_t shard) const
+    /// Root manifest for a given namespace + shard number.
+    String rootShardKey(const RootNamespace & ns, uint64_t shard) const
     {
-        return prefix + "/roots/" + server_id + "/" + table_uuid + "/" + std::to_string(shard);
+        checkNamespace(ns);
+        return prefix + "/roots/" + ns.string() + "/" + std::to_string(shard);
     }
 
-    /// Prefix that covers all root manifest shards for a given server + table UUID (for list).
-    String rootNamespacePrefix(const String & server_id, const String & table_uuid) const
+    /// Prefix that covers all root manifest shards of a namespace (for list).
+    /// Note: also covers the "_files/" sub-prefix; listers must skip it.
+    String rootNamespacePrefix(const RootNamespace & ns) const
     {
-        return prefix + "/roots/" + server_id + "/" + table_uuid + "/";
+        checkNamespace(ns);
+        return prefix + "/roots/" + ns.string() + "/";
+    }
+
+    /// Verbatim (non-content-addressed) file stored under a namespace.
+    /// File names are flat: no '/' allowed.
+    String namespaceFileKey(const RootNamespace & ns, const String & file_name) const
+    {
+        checkNamespace(ns);
+        if (file_name.empty() || file_name.find('/') != String::npos)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "CasLayout: namespace file name must be non-empty and flat (no '/'), got '{}'", file_name);
+        return prefix + "/roots/" + ns.string() + "/_files/" + file_name;
+    }
+
+    /// Prefix that covers all verbatim files of a namespace (for list).
+    String namespaceFilesPrefix(const RootNamespace & ns) const
+    {
+        checkNamespace(ns);
+        return prefix + "/roots/" + ns.string() + "/_files/";
     }
 
     /// GC keys.
@@ -77,6 +104,12 @@ public:
     {
         return prefix + "/gc/retired/" + std::to_string(round) + "." + std::to_string(fence_seq)
                + "/" + std::to_string(shard);
+    }
+
+    /// Prefix that covers all retired-set objects (for list).
+    String gcRetiredPrefix() const
+    {
+        return prefix + "/gc/retired/";
     }
 
     /// Outcomes key: <prefix>/gc/outcomes/<round>.<fence_seq>/<shard>
@@ -106,6 +139,31 @@ public:
 
 private:
     String prefix;
+
+    /// A namespace must be non-empty, with no leading/trailing '/', no empty segment ("//"),
+    /// and no segment equal to the reserved "_files".
+    void checkNamespace(const RootNamespace & ns) const
+    {
+        const String & s = ns.string();
+        if (s.empty())
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "CasLayout: namespace must be non-empty");
+
+        size_t start = 0;
+        while (true)
+        {
+            size_t end = s.find('/', start);
+            const String segment = s.substr(start, end == String::npos ? String::npos : end - start);
+            if (segment.empty())
+                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                    "CasLayout: namespace '{}' has an empty segment (leading/trailing or doubled '/')", s);
+            if (segment == "_files")
+                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                    "CasLayout: namespace '{}' uses the reserved segment '_files'", s);
+            if (end == String::npos)
+                break;
+            start = end + 1;
+        }
+    }
 
     /// Build <prefix>/<namespace>/<first2chars>/<id>.
     /// Throws BAD_ARGUMENTS if id is shorter than 2 characters.
