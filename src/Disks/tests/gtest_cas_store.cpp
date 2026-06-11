@@ -11,10 +11,17 @@ namespace DB::ErrorCodes
 extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
 extern const int NOT_IMPLEMENTED;
+extern const int FILE_DOESNT_EXIST;
 }
 
 using namespace DB::Cas;
 using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::idOf;
+using DB::Cas::tests::publishRaw;
+using DB::Cas::tests::shardOfForTest;
+using DB::Cas::tests::u128Of;
+using DB::Cas::tests::writeBlobRaw;
+using DB::Cas::tests::writeTreeRaw;
 
 TEST(CasPoolMeta, CreateThenReopen)
 {
@@ -218,4 +225,170 @@ TEST(CasStore, ListNamespaceFilesEmpty)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     RootNamespace ns{"srv1/tbl"};
     EXPECT_TRUE(s->listNamespaceFiles(ns).empty());
+}
+
+/// ---------- read side (spec §6): resolveRef / readTree / locate / listRefs ----------
+
+TEST(CasStore, ResolveReadLocateRoundTrip)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const UInt128 dom = s->poolMeta().pool_id;
+    Layout layout("p");
+
+    /// blob "hello world" written with the pool's fixed header length.
+    auto blob = writeBlobRaw(*b, layout, "hello world", s->poolMeta().blob_header_len, dom);
+
+    /// tree: {"data.bin" → Blob hash("hello world"), 11} and {"small.txt" → Inline "tiny\n", 5}.
+    std::vector<TreeEntry> entries;
+    entries.push_back(TreeEntry{
+        .name = "data.bin", .placement = Placement::Blob, .file_hash = u128Of("hello world"),
+        .file_size = 11, .inline_bytes = "", .pack_hash = {}, .pack_offset = 0, .pack_length = 0});
+    entries.push_back(TreeEntry{
+        .name = "small.txt", .placement = Placement::Inline, .file_hash = {},
+        .file_size = 5, .inline_bytes = "tiny\n", .pack_hash = {}, .pack_offset = 0, .pack_length = 0});
+    auto tree = writeTreeRaw(*b, layout, entries, dom);
+
+    RootShard root;
+    root.shard_version = 1;
+    root.refs["part_1"] = RefPayload{
+        .tree_id = hexToU128(tree.string()), .tree_size = 0, .mutable_files = {{"txn_version.txt", "42"}}};
+    /// Place the manifest in the shard the Store will look in for "part_1".
+    publishRaw(*b, layout, RootNamespace{"srv1/tbl"},
+        shardOfForTest("part_1", s->poolMeta().root_shards), root);
+
+    auto r = s->resolveRef(RootNamespace{"srv1/tbl"}, "part_1");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->tree_id, tree);
+    EXPECT_EQ(r->mutable_files.at("txn_version.txt"), "42");
+
+    auto read = s->readTree(r->tree_id);
+    ASSERT_EQ(read.size(), 2u);
+
+    auto loc = s->locate(read[0]);                  /// "data.bin" sorts before "small.txt"
+    EXPECT_EQ(loc.offset, s->poolMeta().blob_header_len);
+    EXPECT_EQ(loc.length, 11u);
+
+    auto bytes = b->get(loc.key, Range{loc.offset, loc.length});
+    ASSERT_TRUE(bytes.has_value());
+    EXPECT_EQ(bytes->bytes, "hello world");         /// ranged read, no header touch
+
+    EXPECT_THROW(s->locate(read[1]), DB::Exception); /// Inline has no location
+    (void)blob;
+}
+
+TEST(CasStore, ResolveAbsentRefAndAbsentNamespace)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    RootNamespace ns{"srv1/tbl"};
+
+    /// A freshly-opened pool has no shard manifests: an absent shard is an empty manifest, so resolve
+    /// yields nullopt and listRefs is empty (NOT an error).
+    EXPECT_FALSE(s->resolveRef(ns, "anything").has_value());
+    EXPECT_TRUE(s->listRefs(ns).empty());
+}
+
+TEST(CasStore, ListRefsMergesAllShards)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const UInt128 dom = s->poolMeta().pool_id;
+    Layout layout("p");
+    RootNamespace ns{"srv1/tbl"};
+    const uint64_t shards = s->poolMeta().root_shards;
+
+    /// Publish refs "a".."h", each in its own shard's manifest; refs colliding into one shard share it.
+    std::map<uint64_t, RootShard> by_shard;
+    for (char c = 'a'; c <= 'h'; ++c)
+    {
+        const String ref(1, c);
+        const UInt128 tree_id = u128Of("tree-" + ref);
+        by_shard[shardOfForTest(ref, shards)].refs[ref] =
+            RefPayload{.tree_id = tree_id, .tree_size = 0, .mutable_files = {}};
+    }
+    for (auto & [shard, root] : by_shard)
+    {
+        root.shard_version = 1;
+        publishRaw(*b, layout, ns, shard, root);
+    }
+
+    auto refs = s->listRefs(ns);
+    ASSERT_EQ(refs.size(), 8u);
+    for (char c = 'a'; c <= 'h'; ++c)
+    {
+        const String ref(1, c);
+        ASSERT_TRUE(refs.count(ref));
+        EXPECT_EQ(refs.at(ref).tree_id, TreeId(u128ToHex(u128Of("tree-" + ref))));
+    }
+    (void)dom;
+}
+
+TEST(CasStore, ReadTreeFailsClosed)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const UInt128 dom = s->poolMeta().pool_id;
+    Layout layout("p");
+
+    /// (1) A tree object stored at the WRONG key (key != hex(logical_hash)) ⇒ CORRUPTED_DATA.
+    {
+        std::vector<TreeEntry> entries;
+        entries.push_back(TreeEntry{
+            .name = "f", .placement = Placement::Inline, .file_hash = {},
+            .file_size = 3, .inline_bytes = "abc", .pack_hash = {}, .pack_offset = 0, .pack_length = 0});
+        const String encoded = encodeTree(entries);
+        const TreeId real_id = treeIdFor(encoded);
+
+        EnvelopeHeader header;
+        header.kind = ObjectKind::Tree;
+        header.hash_algo = 1;
+        header.logical_size = encoded.size();
+        header.logical_hash = hexToU128(real_id.string());   /// honest hash of THIS tree
+        header.domain_id = dom;
+        header.incarnation_tag = UInt128(0x1);
+        header.build_id = UInt128(0x1);
+        const String head = encodeEnvelopeHeader(header);
+
+        /// ... but stored under a DIFFERENT id's key.
+        const TreeId wrong_id{"00000000000000000000000000000001"};
+        b->putIfAbsent(layout.treeKey(wrong_id), head + encoded);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readTree(wrong_id); });
+    }
+
+    /// (2) A ref naming a tree id with NO object present ⇒ resolveRef SUCCEEDS (refs are manifest
+    /// state) but readTree throws FILE_DOESNT_EXIST carrying the tree id (INV-NO-DANGLE surfaced).
+    {
+        RootNamespace ns{"srv1/dangle"};
+        const UInt128 missing_tree = u128Of("missing");
+        RootShard root;
+        root.shard_version = 1;
+        root.refs["part_x"] = RefPayload{.tree_id = missing_tree, .tree_size = 0, .mutable_files = {}};
+        publishRaw(*b, layout, ns, shardOfForTest("part_x", s->poolMeta().root_shards), root);
+
+        auto r = s->resolveRef(ns, "part_x");
+        ASSERT_TRUE(r.has_value());
+        expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->readTree(r->tree_id); });
+    }
+
+    /// (3) A Blob-kind envelope stored at a tree key ⇒ CORRUPTED_DATA (expected_kind=Tree mismatch).
+    {
+        /// Build a blob whose content id we then (ab)use as a tree key.
+        const String payload = "not a tree";
+        const BlobId blob_id = idOf(payload);
+        const TreeId tree_key{blob_id.string()};   /// reuse the hex as a tree id
+
+        EnvelopeHeader header;
+        header.kind = ObjectKind::Blob;            /// WRONG kind for a tree key
+        header.hash_algo = 1;
+        header.logical_size = payload.size();
+        header.logical_hash = u128Of(payload);
+        header.domain_id = dom;
+        header.incarnation_tag = UInt128(0x1);
+        header.build_id = UInt128(0x1);
+        const String head = encodeEnvelopeHeader(header);
+
+        b->putIfAbsent(layout.treeKey(tree_key), head + payload);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readTree(tree_key); });
+    }
 }

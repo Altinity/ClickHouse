@@ -2,8 +2,17 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 
 #include <Common/Exception.h>
+
+#include <base/hex.h>
+#include <city.h>
 
 #include <gtest/gtest.h>
 
@@ -12,6 +21,7 @@
 #include <memory>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 namespace DB::Cas::tests
 {
@@ -52,6 +62,93 @@ inline DB::ObjectStoragePtr makeLocalObjectStorageForTest()
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
     return std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+}
+
+/// ---- on-storage write fixtures (shared by the Store read/lifecycle/build tests, Tasks 9-13) ----
+///
+/// These produce objects through the SAME codecs the Store reads — the documented on-storage
+/// interface, not white-box pokes — so a test asserts a real round trip across the format boundary.
+
+/// CityHash128 of bytes, composed into the canonical lowercase-hex id (identical composition to
+/// `Cas::treeIdFor`, via `getHexUIntLowercase` over the cityhash `uint128`).
+inline String hexOf(const String & bytes)
+{
+    return getHexUIntLowercase(CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size()));
+}
+
+/// The content id of `bytes` as a UInt128 — definitionally consistent with `idOf` (parses the same hex).
+inline DB::UInt128 u128Of(const String & bytes)
+{
+    return DB::Cas::hexToU128(hexOf(bytes));
+}
+
+/// The content id of `bytes` as a strong BlobId.
+inline DB::Cas::BlobId idOf(const String & bytes)
+{
+    return DB::Cas::BlobId(hexOf(bytes));
+}
+
+/// Write a Blob object: a fixed-length (pad_to_header_len = blob_header_len) envelope followed by the
+/// raw payload, keyed by content. Mirrors what Build::putBlob will emit (Task 11).
+inline DB::Cas::BlobId writeBlobRaw(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & payload,
+    uint64_t blob_header_len, const DB::UInt128 & domain_id)
+{
+    const DB::Cas::BlobId id = idOf(payload);
+
+    DB::Cas::EnvelopeHeader header;
+    header.kind = DB::Cas::ObjectKind::Blob;
+    header.hash_algo = 1;
+    header.logical_size = payload.size();
+    header.logical_hash = u128Of(payload);
+    header.domain_id = domain_id;
+    header.incarnation_tag = DB::UInt128(0x1234);
+    header.build_id = DB::UInt128(0x5678);
+    header.pad_to_header_len = static_cast<uint32_t>(blob_header_len);
+
+    const String head = DB::Cas::encodeEnvelopeHeader(header);
+    backend.putIfAbsent(layout.blobKey(id), head + payload);
+    return id;
+}
+
+/// Write a Tree object: a NATURAL-length (no pad) Tree envelope followed by the canonical tree payload,
+/// keyed by the tree id. Mirrors what Build::putTree will emit (Task 11).
+inline DB::Cas::TreeId writeTreeRaw(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+    std::vector<DB::Cas::TreeEntry> entries, const DB::UInt128 & domain_id)
+{
+    const String encoded = DB::Cas::encodeTree(std::move(entries));
+    const DB::Cas::TreeId id = DB::Cas::treeIdFor(encoded);
+
+    DB::Cas::EnvelopeHeader header;
+    header.kind = DB::Cas::ObjectKind::Tree;
+    header.hash_algo = 1;
+    header.logical_size = encoded.size();
+    header.logical_hash = DB::Cas::hexToU128(id.string());
+    header.domain_id = domain_id;
+    header.incarnation_tag = DB::UInt128(0x1234);
+    header.build_id = DB::UInt128(0x5678);
+
+    const String head = DB::Cas::encodeEnvelopeHeader(header);
+    backend.putIfAbsent(layout.treeKey(id), head + encoded);
+    return id;
+}
+
+/// Publish a root-shard manifest fresh (create-if-absent CAS). One fresh publish per shard suffices for
+/// the read-side tests; lifecycle tests that layer go through the Store CAS loop instead.
+inline void publishRaw(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+    const DB::Cas::RootNamespace & ns, uint64_t shard, const DB::Cas::RootShard & root)
+{
+    backend.casPut(layout.rootShardKey(ns, shard), DB::Cas::encodeRootShard(root), /*expected*/ std::nullopt);
+}
+
+/// Duplicate of `Store::shardOf` (CityHash64(ref) % root_shards) for placing manifests in tests, since
+/// shardOf is private and the Store API must not be widened for tests.
+/// MUST match Store::shardOf exactly.
+inline uint64_t shardOfForTest(const String & ref_name, uint64_t root_shards)
+{
+    return CityHash_v1_0_2::CityHash64(ref_name.data(), ref_name.size()) % root_shards;
 }
 
 }
