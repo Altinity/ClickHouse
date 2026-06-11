@@ -124,7 +124,7 @@ files (`txn_version.txt`, `metadata_version.txt`) live in the manifest's `RefPay
 objects.
 
 **Identity.** Blob hash `H` = `cityHash128` of the raw file bytes — taken from `checksums.txt` (D5 retained: no
-re-read, no re-hash; fail-safe re-hash on attach-time mismatch). Tree hash `T` = SipHash-128 of the canonical
+re-read, no re-hash; fail-safe re-hash on attach-time mismatch). Tree hash `T` = `cityHash128` of the canonical
 entries. Pack hash `P` = `cityHash128` over the pack index plus payload region. The hash algorithm is per-pool
 policy (`hash_algo` in the envelope); single-trust-domain pools use `cityHash128`, adversarial/multi-tenant
 pools use a collision-resistant hash per the requirements contract §11.

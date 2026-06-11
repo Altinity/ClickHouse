@@ -2,7 +2,34 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Common/Exception.h>
 
+namespace DB::ErrorCodes
+{
+extern const int NOT_IMPLEMENTED;
+}
+
 using namespace DB::Cas;
+
+namespace
+{
+
+/// Run `fn`, expect a DB::Exception with EXACTLY `expected_code` (CORRUPTED_DATA-vs-NOT_IMPLEMENTED
+/// is part of the fail-closed contract: an unknown future format must be NOT_IMPLEMENTED, never
+/// misreported as corruption).
+template <typename F>
+void expectThrowsCode(F && fn, int expected_code)
+{
+    try
+    {
+        fn();
+        FAIL() << "expected DB::Exception";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), expected_code);
+    }
+}
+
+}
 
 namespace
 {
@@ -143,8 +170,10 @@ TEST(CasEnvelope, FutureVersionThrows)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    bytes[4] = 2;  /// format_version = 2
-    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
+    bytes[4] = 2;  /// format_version = 2 (version is validated before the crc, so the code is pinned)
+    expectThrowsCode(
+        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); },
+        DB::ErrorCodes::NOT_IMPLEMENTED);
 }
 
 TEST(CasEnvelope, WrongKindThrows)
@@ -200,7 +229,9 @@ TEST(CasEnvelope, CriticalUnknownExtensionThrows)
     h.flags_has_critical_extension = true;
     h.unknown_critical_tlv = true;  /// emit an unknown TLV type with the critical flag set
     String bytes = encodeEnvelopeHeader(h);
-    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
+    expectThrowsCode(
+        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); },
+        DB::ErrorCodes::NOT_IMPLEMENTED);
 }
 
 /// ===================================================================================
