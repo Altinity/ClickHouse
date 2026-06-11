@@ -223,7 +223,8 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
     return result;
 }
 
-void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate)
+void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
+                        uint64_t * out_committed_version)
 {
     const String key = pool_layout.rootShardKey(ns, shard);
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
@@ -245,7 +246,11 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
                 "manifest {} size {} crossed soft limit {}", key, body.size(), config.manifest_soft_limit);
 
         if (pool_backend->casPut(key, body, token) == CasOutcome::Committed)
+        {
+            if (out_committed_version)
+                *out_committed_version = root.shard_version;
             return;
+        }
         /// Conflict ⇒ someone committed under us; re-read and re-apply the whole mutate.
     }
     throw Exception(ErrorCodes::ABORTED, "manifest CAS contention on {}", key);

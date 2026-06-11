@@ -109,7 +109,10 @@ private:
     /// retries the WHOLE mutate, bounded (100) then ABORTED ("manifest CAS contention on {}"). Single-writer
     /// shards make a real storm impossible; the bound is a runaway brake. `mutate` runs on the FRESHLY READ
     /// root each attempt, so a journal append is never double-applied across retries.
-    void mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate);
+    /// `out_committed_version` (optional) receives the shard_version the successful casPut committed —
+    /// the GC fence (R3) records it as the durable per-shard fence position (the model's fencePos[s]).
+    void mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
+                     uint64_t * out_committed_version = nullptr);
 
     BackendPtr pool_backend;
     PoolConfig config;

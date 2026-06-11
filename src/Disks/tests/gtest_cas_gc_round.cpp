@@ -825,6 +825,154 @@ TEST(CasGcRetire, RetireUsesFoldCommittedStateWithoutReread)
     EXPECT_EQ(readState(*b, *s).round, 1u);                   /// the round still completed
 }
 
+/// ---- R3 FENCE (Task 8) ----
+///
+/// The FENCE writes fence_round := max(fence_round, round) into every PRESENT root-shard manifest
+/// through the verified mutateShard CAS loop, and records each shard's committed shard_version in
+/// gc/state.fence_version[round] (spec section 7 R3; the model's GFenceShard). The fence is
+/// MONOTONE - a stale leader's lower round is absorbed by the max, never lowers it
+/// (INV-MONOTONE-GC) - and the recorded committed version is the C++ equivalent of the model's
+/// fencePos[s]: the manifest CAS totally orders the fence against publishes on that shard, which
+/// is exactly what the no-return argument rests on.
+
+TEST(CasGcFence, SetsFenceRoundOnPresentShardsAndRecordsVersions)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");
+    publishPart(s, "srv1/tbl", "part_2", "payload-2");           /// likely a different root shard
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const GcState st = readState(*b, *s);
+    EXPECT_EQ(st.round, 1u);
+    ASSERT_TRUE(st.fence_version.contains(1));
+
+    /// every discovered (present) shard is fenced at round 1 with the recorded committed version:
+    for (const auto & [key, ver] : st.fence_version.at(1))
+    {
+        /// parse "ns/shard" back (split at the last '/'), read the manifest raw:
+        const size_t slash = key.rfind('/');
+        ASSERT_NE(slash, String::npos);
+        const RootNamespace ns{key.substr(0, slash)};
+        const uint64_t shard = std::stoull(key.substr(slash + 1));
+        const auto manifest = b->get(s->layout().rootShardKey(ns, shard));
+        ASSERT_TRUE(manifest.has_value()) << "fenced shard has no manifest: " << key;
+        const RootShard root = decodeRootShard(manifest->bytes);
+        EXPECT_EQ(root.fence_round, 1u);
+        EXPECT_EQ(root.shard_version, ver);                      /// the fence's own commit
+    }
+
+    /// shards with no manifest stay absent (no fence minted a manifest); a never-published shard
+    /// contributes no edges and needs no fence:
+    uint64_t present = 0;
+    for (uint64_t shard = 0; shard < s->poolMeta().root_shards; ++shard)
+        present += b->get(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard)).has_value() ? 1 : 0;
+    EXPECT_EQ(present, st.fence_version.at(1).size());
+}
+
+TEST(CasGcFence, MonotoneNeverLowers)
+{
+    /// The model's monotone fence (GFenceShard / INV-MONOTONE-GC): a manifest already fenced at a
+    /// HIGHER round (as a newer leader would leave behind) must never be lowered by a stale
+    /// leader's lower round - the max absorbs it. A later round above it raises it again.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    publishPart(s, "srv1/tbl", "part_1", "payload");
+
+    /// hand-set the manifest's fence_round to 5 via a raw CAS (read, edit, casPut back):
+    const String shard_key = s->layout().rootShardKey(
+        RootNamespace{"srv1/tbl"}, shardOfForTest("part_1", s->poolMeta().root_shards));
+    const auto got = b->get(shard_key);
+    ASSERT_TRUE(got.has_value());
+    RootShard staged = decodeRootShard(got->bytes);
+    staged.fence_round = 5;
+    ++staged.shard_version;
+    ASSERT_EQ(b->casPut(shard_key, encodeRootShard(staged), got->token), CasOutcome::Committed);
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);            /// round 1 < 5
+
+    const RootShard after1 = decodeRootShard(b->get(shard_key)->bytes);
+    EXPECT_EQ(after1.fence_round, 5u);                           /// NOT lowered to 1
+    /// the recorded fence_version still records the commit (the version bump happened):
+    const GcState st1 = readState(*b, *s);
+    const String key = "srv1/tbl/" + std::to_string(shardOfForTest("part_1", s->poolMeta().root_shards));
+    ASSERT_TRUE(st1.fence_version.contains(1));
+    EXPECT_EQ(st1.fence_version.at(1).at(key), after1.shard_version);
+
+    /// rounds 2..5 keep absorbing into 5; round 6 raises it:
+    for (int i = 0; i < 5; ++i)
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_EQ(readState(*b, *s).round, 6u);
+    EXPECT_EQ(decodeRootShard(b->get(shard_key)->bytes).fence_round, 6u);
+}
+
+TEST(CasGcFence, FenceBumpAppendsNoJournalRecord)
+{
+    /// The fence is a version bump with NO journal record - a fold no-op (the fold reads records,
+    /// not versions) and harmless to INV-JOURNAL-COVERAGE (trim is gated on at_version <= cursor;
+    /// a fence bump above the cursor leaves no record to trim). Pin: after a round, each fenced
+    /// manifest carries ONLY the publish/drop records, its shard_version advanced by exactly 1
+    /// over the pre-fence version (the fence's own CAS), and every journal at_version still sits
+    /// at or below the PRE-fence shard_version.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    /// pre-round (= pre-fence) snapshot of every present manifest:
+    std::map<uint64_t, RootShard> pre;
+    for (uint64_t shard = 0; shard < s->poolMeta().root_shards; ++shard)
+        if (const auto m = b->get(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard)))
+            pre.emplace(shard, decodeRootShard(m->bytes));
+    ASSERT_FALSE(pre.empty());
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    for (const auto & [shard, before] : pre)
+    {
+        const RootShard after = decodeRootShard(
+            b->get(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard))->bytes);
+        EXPECT_EQ(after.fence_round, 1u);
+        EXPECT_EQ(after.shard_version, before.shard_version + 1);    /// exactly the fence's bump
+        ASSERT_EQ(after.journal.size(), before.journal.size());      /// no fence record appended
+        for (const JournalRecord & record : after.journal)
+            EXPECT_LE(record.at_version, before.shard_version);      /// trim math unaffected
+    }
+}
+
+TEST(CasGcFence, FenceCasConflictRetriesAndRecordsFinalCommit)
+{
+    /// Horn 1 retry semantics, pinned mechanically: an injected one-shot Conflict on the fence's
+    /// manifest CAS forces mutateShard's re-read + retry on the FRESH manifest; the fence still
+    /// lands and the recorded fence_version reflects the FINAL commit. (The TRUE interleaved horn -
+    /// a real publish committing between the fence's read and CAS, whose journal record must land
+    /// at a version BELOW the fence's committed version - needs interleaving and is Task 13's
+    /// fault-injection battery.)
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");
+
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    const String shard_key = s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard);
+    b->failNextCasPut(shard_key);                                /// the fence CAS conflicts once
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const RootShard root = decodeRootShard(b->get(shard_key)->bytes);
+    EXPECT_EQ(root.fence_round, 1u);                             /// the fence landed despite the conflict
+    EXPECT_EQ(root.shard_version, 2u);                           /// publish = 1; the conflicted attempt
+                                                                 /// committed nothing; the retry = 2
+    const GcState st = readState(*b, *s);
+    ASSERT_TRUE(st.fence_version.contains(1));
+    EXPECT_EQ(st.fence_version.at(1).at("srv1/tbl/" + std::to_string(shard)), 2u);   /// the FINAL commit
+}
+
 TEST(CasGcRetire, RetireReplayAdoptsOwnCrashedAttempt)
 {
     /// H2 (review of ce7df279563): crash after the sets are durable but before the round CAS, then

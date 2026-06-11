@@ -70,8 +70,94 @@ RoundReport Gc::runRegularRound()
     for (const auto & [snap_shard, set] : retired)
         report.candidates += set.entries.size();
 
-    /// Tasks 8-12: fence / recheck / cascade / trim
+    /// R3: CAS the monotone fence into every PRESENT root shard and persist the recorded fence
+    /// versions - the durable point the recheck (Task 9) folds through. `state.round` was advanced
+    /// by retire's CAS; `state`/`state_token` are current after it.
+    fence(state, state_token, folded.root_shards);
+
+    /// Tasks 9-12: recheck / cascade / trim
     return report;
+}
+
+void Gc::fence(GcState & state, Token & state_token,
+               const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards)
+{
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+
+    /// Same no-re-read contract as retire: the state we fence under is the one OUR lease committed.
+    chassert(state.lease.owner == gc_id);
+
+    /// The round being executed: retire's CAS already advanced state.round to it.
+    const uint64_t round = state.round;
+
+    /// 1. CAS fence_round := max(fence_round, round) into every PRESENT root shard (the fold's
+    /// discovery - a never-published shard contributes no edges and needs no fence; the M-F
+    /// full-GC walk owns the authoritative universe). The mutate lambda runs on the FRESHLY READ
+    /// manifest on every CAS attempt (mutateShard re-reads inside its loop), and the max makes a
+    /// stale leader's lower round get ABSORBED, never lower the fence - the model's monotone
+    /// fence (GFenceShard, INV-MONOTONE-GC).
+    ///
+    /// THE TWO HORNS of the no-return argument (spec section 7, steps 2-4) both rest on the
+    /// manifest CAS totally ordering this fence against publishes on the shard:
+    ///   horn 1 - a publish racing the fence conflicts one of the two CASes; if the publish wins,
+    ///     mutateShard re-reads and retries, so the publish's journal record lands at a version
+    ///     strictly BELOW the fence's committed version => the recheck (which folds through the
+    ///     recorded version) SEES it and spares the resurrected object;
+    ///   horn 2 - a publish AFTER the fence reads a manifest carrying fence_round = round => the
+    ///     writer gate (Build::publish, W-PUBLISH-GATE) refreshes its RetireView and revalidates
+    ///     against the new round's retired entries before committing.
+    /// Either way no publish can slip a reference past both the fence and the recheck.
+    ///
+    /// The fence bumps shard_version but appends NO journal record: a version bump with no record
+    /// is a fold no-op (the fold reads records, not versions), and INV-JOURNAL-COVERAGE is
+    /// untouched - trim (Task 11) is gated on at_version <= folded_cursor, and a fence bump above
+    /// the cursor leaves no record to trim.
+    for (const auto & [ns, shard] : root_shards)
+    {
+        uint64_t committed = 0;
+        store->mutateShard(ns, shard, [&](RootShard & root)
+        {
+            root.fence_round = std::max(root.fence_round, round);
+        }, &committed);
+
+        /// RE-FENCING ON REPLAY (a crashed round resumed, Task 12): the manifest CAS re-applies
+        /// the max (a no-op on fence_round if already fenced at this round) but still BUMPS
+        /// shard_version, so the recorded version DIFFERS from the first attempt's - it is HIGHER.
+        /// Safe in the provable-coverage direction: the recheck must fold THROUGH at least the
+        /// recorded version, and recording the higher replayed version is MORE conservative
+        /// (folds more, never less).
+        state.fence_version[round][ns.string() + "/" + std::to_string(shard)] = committed;
+    }
+
+    /// 2. ONE gc/state CAS persists the whole fence_version[round] vector (everything else in
+    /// `state` preserved - it is the retire-committed state mutated in place).
+    Token committed_token;
+    if (backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token, &committed_token)
+        == CasOutcome::Committed)
+    {
+        state_token = committed_token;
+        return;
+    }
+
+    /// Conflict: gc/state moved under us between retire's CAS and this one. Re-read ONCE to
+    /// sharpen the message, then fail closed (ABORTED) - bounded, never a blind retry.
+    const auto current = backend.get(layout.gcStateKey());
+    if (!current)
+        /// gc/state is never legally deleted once created (see acquireOrRenewLease).
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc fence: gc/state vanished during the fence");
+    const GcState observed = decodeGcState(current->bytes);
+    if (observed.lease.owner != gc_id)
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS gc fence: lease lost during fence (stolen by {}); retry next round",
+            u128ToHex(observed.lease.owner));
+    /// Lease still ours yet the token moved: a racing fold of our own is impossible (one pacing
+    /// thread per Gc instance) - this is a split-brain zombie of OURSELVES (another process with
+    /// our gc_id, a caller-obligation violation) or out-of-model tooling. Fail closed; the
+    /// manifest fences already written are monotone and idempotent - the next round re-fences
+    /// and re-records (the higher replayed versions are the MORE conservative coverage).
+    throw Exception(ErrorCodes::ABORTED,
+        "CAS gc fence: gc/state moved during the fence while the lease is still ours; retry next round");
 }
 
 std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,

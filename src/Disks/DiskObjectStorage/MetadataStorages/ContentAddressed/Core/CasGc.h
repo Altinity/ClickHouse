@@ -137,6 +137,19 @@ private:
     std::map<uint64_t, RetiredSet> retire(GcState & state, Token & state_token,
                                           const std::map<uint64_t, GcSnap> & snap);
 
+    /// R3 (spec §7; the model's GFenceShard): CAS fence_round := round (monotone max) into every
+    /// PRESENT root shard via the verified mutateShard loop; record each shard's committed
+    /// shard_version in gc/state.fence_version[round] — the durable fence position the recheck
+    /// folds through (provable coverage; the model's fencePos[s]). The manifest CAS totally
+    /// orders the fence against publishes on that shard — exactly the ordering the spec's
+    /// no-return argument rests on. One fence covers the whole round's candidate set; one
+    /// gc/state CAS persists the whole vector. `root_shards` is the fold's discovery (present
+    /// manifests only) — a never-published shard contributes no edges and needs no fence; the
+    /// M-F full-GC walk owns the authoritative universe. On success `state`/`state_token` carry
+    /// the committed fence_version[round].
+    void fence(GcState & state, Token & state_token,
+               const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards);
+
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
 
