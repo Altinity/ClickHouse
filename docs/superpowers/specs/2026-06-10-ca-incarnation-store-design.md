@@ -262,11 +262,14 @@ W-REVALIDATE    a token observation is valid only relative to the retire view at
                 cannot condemn a stale observation — the durable witness is the object itself. Whenever
                 the writer refreshes its retire view (a fence-advanced CAS conflict), every token-bearing
                 member whose hash has NO entry in the refreshed view must be RE-OBSERVED (one HEAD):
-                current token == observed ⇒ keep (safe — a delete message can be in flight only for a
-                token whose retire entry is still HELD, and held entries are view hits); current token
-                differs ⇒ treat as a fresh cold reuse of the current token (adopt or resurrect); key
-                absent ⇒ re-create. Cost: HEADs only on fence-conflicted retries, only for stale-observed
-                members — rare by construction.
+                current token == observed ⇒ keep — safe by the IN-FLIGHT DISJUNCTION (model-checked): a
+                delete in flight for (h, t) implies its retire entry is still held OR t was already
+                displaced (current ≠ t, forced through a gate-mandated resurrect). A delete for the
+                CURRENT token therefore implies a held entry (displacement is excluded), which would be
+                a view hit — so no-hit + current==observed is publishable. Current token differs ⇒ treat
+                as a fresh cold reuse of the current token (adopt or resurrect); key absent ⇒ re-create.
+                Cost: HEADs only on fence-conflicted retries, only for stale-observed members — rare by
+                construction.
 W-TREE-BUILD    bottom-up build discipline, at every level (F2, model-discovered): a tree object is
                 created only after all of its children exist (its hash commits to them), and a tree ref
                 may be published only when every object in the new tree's transitive closure is present
@@ -369,8 +372,11 @@ R4 RECHECK  fold every shard through ≥ its recorded fence version (provable, n
                                        → 404: outcome=absent (trees: ensure cascade ran), drop entry
                                        → 412: outcome=replaced (a resurrection won — count the save), drop
             Dropping entries is safe for the DELETE side in every case: token-exact deletes cannot affect
-            later incarnations, and a delete message can be in flight only for a token whose entry is
-            still HELD (entries drop only on confirmed outcomes). The PUBLISH side does not rest on entry
+            later incarnations. Note the spared branch CAN orphan an in-flight delete (send, then a
+            gate-forced resurrect + publish raises in-degree, then the recheck spares and drops the
+            entry) — safe, because the orphan's token was displaced by that resurrect first. The precise,
+            model-checked guarantee is the IN-FLIGHT DISJUNCTION: a delete in flight implies its entry is
+            held OR its token is already displaced (≠ current). The PUBLISH side does not rest on entry
             retention: a stale token observation is made safe by W-REVALIDATE (§5), not by finding an entry.
 ```
 
@@ -396,8 +402,9 @@ for the child list cannot diverge from the retired one.
    condemned token's entry is still held, the dependency-set gate finds it ⇒ resurrect (new token,
    `W-FRESH-TAG`) or abort. If the entry already dropped on a confirmed outcome, `W-REVALIDATE` re-observes:
    deleted/absent ⇒ re-create; replaced ⇒ adopt the newer token or resurrect; spared ⇒ the object is live and
-   uncondemned at its current token (publishable — no delete can be in flight for it, since in-flight deletes
-   imply a held entry). In every branch, nothing ever again depends on the retired incarnation.
+   uncondemned at its current token (publishable — a delete in flight for the CURRENT token would require a
+   held entry by the IN-FLIGHT DISJUNCTION, since displacement is excluded for the current token; a held
+   entry would be a view hit). In every branch, nothing ever again depends on the retired incarnation.
 5. Token distinctness (probed capability + `W-FRESH-TAG`) ⇒ the deleted incarnation can never again be
    current ⇒ any delayed, duplicated, or zombie-leader delete is forever harmless — it 412s or hits exactly
    the already-condemned incarnation.
