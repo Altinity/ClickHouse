@@ -320,7 +320,82 @@ StateConstraint ==
     /\ Cardinality(inflight) <= 2
     /\ \A w \in Writers : Cardinality(wDeps[w]) <= 3
 
-\* ---------------------------------------------------------------- invariants (Task 2 minimal)
-NoDangle == \A s \in Shards : \A h \in man[s].refs : present[h]
-NoReturn == \A h \in Hashes : present[h] => tokOf[h] \notin obsoleteTok[h]
+\* ---------------------------------------------------------------- invariants / IndInv v1 (Task 4)
+\* The candidate inductive invariant. Each named conjunct is a fact argued informally in the
+\* spec/model work; the CTI loop (Task 5) strengthens. All nine are TLC-pre-filtered against
+\* reachable states before any SMT effort.
+TypeBounds ==   \* domains the types don't carry (Apalache types are unbounded Int/Seq)
+    /\ \A h \in Hashes : /\ nextTok[h] \in 1..(MaxToken+1)
+                         /\ tokOf[h] \in 0..MaxToken /\ tokOf[h] < nextTok[h]
+                         /\ obsoleteTok[h] \subseteq 1..(nextTok[h]-1)
+                         /\ (present[h] => tokOf[h] >= 1)
+    /\ gcRound \in 0..MaxRound /\ gcPhase \in {"idle","retiring","fencing","fenced"}
+    /\ fencedSet \subseteq Shards
+    /\ \A s \in Shards : /\ Len(man[s].log) <= MaxLog
+                         /\ cursor[s] \in 0..Len(man[s].log)
+                         /\ fencePos[s] \in 0..(Len(man[s].log) + 1)
+                         /\ man[s].fence \in 0..MaxRound /\ man[s].refs \subseteq Hashes
+                         /\ \A i \in DOMAIN man[s].log : /\ man[s].log[i].op \in {"add","rem","fence"}
+                                                         /\ man[s].log[i].hs \subseteq Hashes
+    /\ \A e \in retired : e.h \in Hashes /\ e.t \in 1..MaxToken /\ e.r \in 1..MaxRound
+                          /\ e.t < nextTok[e.h]      \* a retired token was allocated
+    /\ \A d \in inflight : d.h \in Hashes /\ d.t \in 1..MaxToken
+    /\ \A w \in Writers : wView[w] \in 0..MaxRound
+                          /\ \A p \in wDeps[w] : p[1] \in Hashes /\ p[2] \in 1..MaxToken
+
+NoDangle  == \A s \in Shards : \A h \in man[s].refs : present[h]              \* TARGET
+NoReturn  == \A h \in Hashes : present[h] => tokOf[h] \notin obsoleteTok[h]   \* TARGET
+
+InflightHeld ==        \* THE lemma (CORRECTED by TLC pre-filter — see below): a delete can be in
+                       \* flight only for an entry that is EITHER still held in retired OR whose
+                       \* token has already stopped being current (tokOf[h] # t), making the
+                       \* eventual Land a harmless 412 no-op.
+                       \*
+                       \* CORRECTION (TLC trace, 2026-06-11): the original form
+                       \*   \A d \in inflight : \E e \in retired : e.h = d.h /\ e.t = d.t
+                       \* is FALSE in this model. GRecheckDelete may put [h,t] in flight while
+                       \* InDeg(h)=0; a later GFold raises InDeg(h)>0; GRecheckDelete on the SAME
+                       \* retired entry then takes the SPARED branch and drops the retired entry,
+                       \* leaving [h,t] in flight with no matching retired entry. In that orphan
+                       \* state the token is no longer current (it was resurrected/overwritten),
+                       \* so tokOf[h] # t holds — the corrected disjunct. The actions are frozen;
+                       \* the lemma is weakened to match the model's actual truth.
+                       \* NOTE: still depends on outcome consumption being ATOMIC with the
+                       \* delete-message landing (Land drops the matching retired entry in the
+                       \* same step). A later refactor to separate outcome logs revisits this.
+    \A d \in inflight : (\E e \in retired : e.h = d.h /\ e.t = d.t) \/ tokOf[d.h] # d.t
+
+RetiredCurrentOrDead ==   \* a retired token is still current, or it STOPPED BEING CURRENT and is
+                          \* therefore in obsoleteTok (displaced-or-deleted history — the name says
+                          \* what it means: obsolete as a dependency, not necessarily deleted).
+                          \* WResurrect/WOverwrite add the displaced old token atomically (MR-2) —
+                          \* exactly why the resurrect-displacement state does not falsify this.
+    \A e \in retired : e.t = tokOf[e.h] \/ e.t \in obsoleteTok[e.h]
+
+InflightVsRefs ==      \* the heart: an in-flight-deletable token is never a referenced current token
+    \A d \in inflight : \A s \in Shards : d.h \in man[s].refs => tokOf[d.h] # d.t
+
+SendImpliesFenced ==   \* a delete is sent only after every shard's fence covers its entry's round.
+                       \* CORRECTED in parallel with InflightHeld (TLC pre-filter, 2026-06-11): a
+                       \* delete may outlive its retired entry (the orphan case, see InflightHeld),
+                       \* at which point there is no entry to read e.r from — but then the token is
+                       \* no longer current (tokOf[h] # t). So: EITHER a matching retired entry
+                       \* exists and every shard's fence covers its round, OR the token has stopped
+                       \* being current.
+    \A d \in inflight : (\E e \in retired :
+                            e.h = d.h /\ e.t = d.t /\ \A s \in Shards : man[s].fence >= e.r)
+                        \/ tokOf[d.h] # d.t
+
+RefsFromLog ==         \* manifest CAS keeps refs and journal atomic — refs IS the full-log fold.
+                       \* SCOPE: this is the LOGICAL / pre-compaction manifest (the proof core has
+                       \* no Trim). Production manifests trim folded tails: there, refs = fold of
+                       \* (checkpoint base + tail). Physical trimming is covered by the TLC model
+                       \* (INV_JOURNAL_COVERAGE), not by this proof core — a recorded residual.
+    \A s \in Shards : man[s].refs = FoldRefs(man[s].log)
+
+SnapFromPrefix ==      \* the snap is exactly the cursor-prefix fold
+    \A s \in Shards : { h \in Hashes : <<s, h>> \in rootEdges } = FoldPrefix(man[s].log, cursor[s])
+
+IndInv == TypeBounds /\ NoDangle /\ NoReturn /\ InflightHeld /\ RetiredCurrentOrDead
+          /\ InflightVsRefs /\ SendImpliesFenced /\ RefsFromLog /\ SnapFromPrefix
 =======================================================================================
