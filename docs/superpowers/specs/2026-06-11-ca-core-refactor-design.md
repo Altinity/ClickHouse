@@ -224,14 +224,18 @@ Each lands green before the next starts (D3); each gets its own implementation p
 - **M-C3 — GC regular tail**: `Gc::runRegularRound` (fold/retire/fence/recheck/deleteExact + outcomes),
   retire-set plumbing into the `Build` gate. Green: the full model-scenario battery incl. fault injection.
 - **M-W — the cutover**: wiring rewrite onto the core, relink retarget, `DataPartsExchange` façade,
-  deletions of §5. Green: wiring tests + the SQL-level acceptance suites.
-- **M-F — follow-ups (separately planned)**: full-GC walk + debris reclaim, packs (+ repack), AIStor/Ceph CI
-  lane for GC e2e, observability surfacing (`system.*` views over `RoundReport`/retire backlog).
+  deletions of §5, **and the RustFS test-environment wiring** — the stateless CA-default job (and the CA
+  integration fixtures) switch from MinIO to RustFS so the GC delete tail is exercisable e2e (decision
+  2026-06-11; MinIO OSS silently ignores conditional deletes and is archived). Green: wiring tests + the
+  SQL-level acceptance suites running against RustFS.
+- **M-F — follow-ups (separately planned)**: full-GC walk + debris reclaim, packs (+ repack), observability
+  surfacing (`system.*` views over `RoundReport`/retire backlog).
 
 ## 9. Open items {#open-items}
 
-- CI GC-e2e lane backend: RustFS (empirically verified, open-source, leading candidate) vs AIStor
-  (licensing question) vs Ceph (heavyweight) — infra, M-F.
+- RustFS test-environment wiring details (which stateless/integration fixtures switch, image pinning,
+  credentials/compose shape) — scoped into M-W per user decision; AIStor/Ceph remain fallbacks if RustFS
+  beta issues surface.
 - Sub-shard count `N` default per namespace and the manifest size guard (spec §4) — constants chosen in M-C2
   with a recorded rationale.
 - GCS token binding implementation (header injection) — deferred with the probe failing closed, per the spec.
