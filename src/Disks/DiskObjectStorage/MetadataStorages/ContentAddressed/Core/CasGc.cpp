@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Common/Exception.h>
+#include <base/defines.h>
 
 namespace DB
 {
@@ -51,16 +52,13 @@ RoundReport Gc::runRegularRound()
     /// R1: fold the journals into a new durable snap generation (cursors advance only after).
     const FoldResult folded = fold(state, state_token);
 
-    /// R2 operates on a FRESH read of gc/state: the fold's CAS committed a new state
-    /// (snap_generation/folded_cursor) but does not return its post-CAS token, so re-read - the
-    /// retire round CAS is conditioned on THIS token. gc/state vanishing here is the same
-    /// out-of-model deletion the lease fails closed on.
-    const auto reread = store->backend().get(store->layout().gcStateKey());
-    if (!reread)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state vanished after the fold committed");
-    state = decodeGcState(reread->bytes);
-    state_token = reread->token;
-
+    /// R2 consumes the EXACT (state, token) the fold's CAS committed - THREADED through, never
+    /// re-read. A post-fold re-read would open a zombie window: a lease steal landing between the
+    /// fold CAS and the re-read hands this (now stale) leader the thief's state with its bumped
+    /// fence_seq, letting stale-snap retire sets land inside the thief's epoch paths - and the
+    /// round CAS would ride the post-steal token. With the committed token threaded, any
+    /// intervening steal makes the retire round CAS Conflict => ABORTED (fail closed).
+    ///
     /// R2: HEAD-observe each candidate's current token, write the round's retire sets, advance
     /// .round. Candidates are derived STATELESSLY from the durable snap (the model GRetire guard
     /// `present ∧ everEdged ∧ InDeg = 0` over zeroInDegreeKnown) - never from the in-memory fold
@@ -82,6 +80,11 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
 
+    /// Belt-and-braces for the no-re-read contract: the state retire runs under must be the one
+    /// OUR lease committed (the caller threads the fold-committed state; a thief's state would
+    /// carry a foreign owner).
+    chassert(state.lease.owner == gc_id);
+
     /// state.round = "highest round whose retire sets are durable" => THIS round is the next one.
     const uint64_t round = state.round + 1;
 
@@ -92,7 +95,8 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     /// (hash, token) and crashed before its recheck/outcomes - this round re-derives the candidate
     /// (still known + zero + present) and writes ANOTHER entry under its own unique path. The
     /// RetireView unions all present sets (the same condemned token twice), the delete is
-    /// exact-token idempotent, and a stale round's set is cleaned by ITS round's replay (or M-F) -
+    /// exact-token idempotent, and stale sets are cleaned by Task 9: a round's retired-set objects
+    /// are deleted after its outcome log is durable -
     /// so no cross-round dedup is attempted here. Within one round a candidate appears once by
     /// construction (zeroInDegreeKnown yields unique nodes; a node lives in exactly one shard).
     std::map<uint64_t, RetiredSet> retired;
@@ -117,24 +121,47 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     }
 
     /// 2. Write each shard's set - append-by-unique-path: the path is unique per
-    /// (round, fence_seq, shard) and written ONCE. An EMPTY shard writes nothing (no empty
-    /// objects; RetireView handles absent keys), and an all-empty round still advances .round
-    /// below - the round RAN; the common idle case, with a trivially empty recheck. A key already
-    /// occupied by byte-identical content is OUR crash-replay (the same round re-derived the same
-    /// set from the same durable snap) - adopt it; DIVERGENT content is a competing retire at the
-    /// same (round, fence_seq) - two leaders saw different snaps, which fence_seq isolation makes
-    /// near-impossible (a lease steal bumps fence_seq, changing every path) except a duplicate-
-    /// gc_id misconfiguration - fail closed, never overwrite, never adopt.
-    for (const auto & [snap_shard, set] : retired)
+    /// (round, fence_seq, shard) and written ONCE (write-once, never rewritten). An EMPTY shard
+    /// writes nothing (no empty objects; RetireView handles absent keys), and an all-empty round
+    /// still advances .round below - the round RAN; the common idle case, with a trivially empty
+    /// recheck.
+    ///
+    /// AN OCCUPIED PATH IS OUR OWN CRASHED PRIOR ATTEMPT. With the fold-committed state threaded
+    /// (no re-read window) and fence_seq isolation (a lease steal bumps fence_seq, changing every
+    /// path), nobody but THIS leader in THIS epoch ever writes this key. Byte-identical content is
+    /// the exact replay - proceed. DIVERGENT content is the same round derived from an OLDER snap:
+    /// the crash window admitted new journal activity or token displacement before this replay -
+    /// ADOPT the occupant as this round's set (never rewrite). Safety: the occupant's entries were
+    /// derived from an older durable snap of the same pool and are conservative - retired != dead,
+    /// the recheck re-validates in-degree through the fence before any delete, and a stale
+    /// observed token just makes the delete 412 => outcome replaced. Candidates the occupant lacks
+    /// are NOT lost: zeroInDegreeKnown is stateless, the next round re-derives and retires them.
+    /// Aborting here instead would WEDGE this leader forever - renewal never bumps fence_seq, so
+    /// every later round would re-hit the same occupied path (the same problem class the fold's
+    /// generation probe-upward solves). Fail closed (ABORTED) only when the occupant cannot be
+    /// decoded - corrupt state must never be adopted as a delete input.
+    for (auto & [snap_shard, set] : retired)
     {
         const String key = layout.retiredKey(round, state.fence_seq, snap_shard);
         const String body = encodeRetiredSet(set);
         if (backend.putIfAbsent(key, body) == PutOutcome::PreconditionFailed)
         {
             const auto existing = backend.get(key);
-            if (!existing || existing->bytes != body)
+            if (!existing)
                 throw Exception(ErrorCodes::ABORTED,
-                    "CAS gc retire: concurrent retire diverged at {} (duplicate gc_id?)", key);
+                    "CAS gc retire: retired set at {} vanished between putIfAbsent and read", key);
+            if (existing->bytes != body)
+            {
+                try
+                {
+                    set = decodeRetiredSet(existing->bytes);
+                }
+                catch (const Exception & e)
+                {
+                    throw Exception(ErrorCodes::ABORTED,
+                        "CAS gc retire: undecodable occupant at {} cannot be adopted: {}", key, e.message());
+                }
+            }
         }
     }
 
@@ -164,7 +191,7 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     return retired;
 }
 
-Gc::FoldResult Gc::fold(GcState & state, const Token & state_token)
+Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 {
     /// M-C3 limitation, fail closed: last-op-wins displacement is INTRA-shard only (addRootEdge
     /// re-points the edge inside ONE GcSnap). With the displaced and displacing trees in DIFFERENT
@@ -376,13 +403,18 @@ Gc::FoldResult Gc::fold(GcState & state, const Token & state_token)
     }
 
     state.snap_generation = adopted_generation;
-    if (backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token) != CasOutcome::Committed)
+    Token committed_token;
+    if (backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token, &committed_token)
+        != CasOutcome::Committed)
         /// Another leader advanced gc/state under us. The new-generation snap we just wrote is
         /// orphaned garbage - harmless (write-once, never referenced by any cursor); full-GC
         /// reclaims it in M-F.
         throw Exception(ErrorCodes::ABORTED,
             "CAS gc fold: gc/state moved during the fold (another leader advanced it); retry next round");
 
+    /// The committed token is threaded to retire - the round CAS rides exactly this incarnation,
+    /// so any intervening lease steal Conflicts there (no re-read window, see runRegularRound).
+    state_token = committed_token;
     return result;
 }
 

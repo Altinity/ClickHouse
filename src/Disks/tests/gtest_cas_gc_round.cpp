@@ -771,11 +771,11 @@ TEST(CasGcRetire, RetireSetsDurableBeforeRoundCas)
 
 TEST(CasGcRetire, DivergedRetiredSetFailsClosed)
 {
-    /// A retired-set key occupied by DIFFERENT bytes is a diverged competing retire at the same
-    /// (round, fence_seq) - two leaders derived different sets for the same path. fence_seq
-    /// isolation makes this near-impossible (a lease steal bumps fence_seq, changing every path)
-    /// except a duplicate-gc_id misconfiguration; the loser must fail closed (ABORTED), never
-    /// overwrite or adopt, and the round marker must not advance.
+    /// A retired-set key occupied by content that does not DECODE as a retired set: a decodable
+    /// divergent occupant at our (round, fence_seq) is our own crashed prior attempt and is
+    /// ADOPTED (RetireReplayAdoptsOwnCrashedAttempt below), but corrupt bytes must never be
+    /// adopted as a delete input - fail closed (ABORTED), never overwrite, and the round marker
+    /// must not advance.
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
     publishPart(s, "srv1/tbl", "part_1", "payload");
@@ -801,4 +801,72 @@ TEST(CasGcRetire, BlobHeaderUnderflowFailsClosed)
     EXPECT_EQ(retiredLogicalSize(ObjectKind::Tree, 100, 256), 100u);   /// whole-object
     EXPECT_EQ(retiredLogicalSize(ObjectKind::Pack, 100, 256), 100u);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { retiredLogicalSize(ObjectKind::Blob, 100, 256); });
+}
+
+TEST(CasGcRetire, RetireUsesFoldCommittedStateWithoutReread)
+{
+    /// H1 (review of ce7df279563): retire must operate on the EXACT (state, token) the fold's CAS
+    /// committed - threaded through, never re-read. A post-fold re-read opens a zombie window: a
+    /// lease steal landing between the fold CAS and the re-read hands the stale leader the THIEF's
+    /// state (bumped fence_seq), letting it write stale-snap retire sets into the thief's epoch
+    /// paths - defeating fence_seq isolation. Pin the contract by counting gc/state GETs across
+    /// one full round: exactly ONE (the lease-acquire read), no post-fold re-read.
+    auto b = std::make_shared<CountingGetBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    b->resetCounts();
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep = gc.runRegularRound();
+    EXPECT_TRUE(rep.acquired_lease);
+    EXPECT_EQ(rep.candidates, 1u);
+    EXPECT_EQ(b->getCount(s->layout().gcStateKey()), 1u);     /// the lease-acquire read ONLY
+    EXPECT_EQ(readState(*b, *s).round, 1u);                   /// the round still completed
+}
+
+TEST(CasGcRetire, RetireReplayAdoptsOwnCrashedAttempt)
+{
+    /// H2 (review of ce7df279563): crash after the sets are durable but before the round CAS, then
+    /// NEW journal activity before the replay => the replayed round derives DIFFERENT bytes for the
+    /// SAME retiredKey(round, fence_seq, shard). With the fold-committed state threaded (H1) and
+    /// fence_seq isolation, a divergent occupant at OUR path can only be OUR OWN crashed prior
+    /// attempt: it must be ADOPTED (write-once preserved), never aborted - renewal never bumps
+    /// fence_seq, so aborting would re-hit the same occupied path on EVERY later round of this
+    /// leader (a permanent wedge). The candidate the occupant lacks is NOT lost: zeroInDegreeKnown
+    /// is stateless, the following round re-derives and retires it.
+    auto b = std::make_shared<FailNthCasPutBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId t1 = publishPart(s, "srv1/tbl", "part_1", "one");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    b->failNthCasPut(s->layout().gcStateKey(), 3);            /// lease=1, fold=2, retire=3
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc.runRegularRound(); });
+    ASSERT_TRUE(b->get(s->layout().retiredKey(1, 0, 0)).has_value());   /// the crashed attempt's set
+
+    /// new journal activity changes the would-be round-1 set (T2 also zeroes):
+    const TreeId t2 = publishPart(s, "srv1/tbl", "part_2", "two");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_2");
+
+    const RoundReport rep = gc.runRegularRound();             /// must NOT wedge
+    EXPECT_TRUE(rep.acquired_lease);
+    GcState st = readState(*b, *s);
+    EXPECT_EQ(st.round, 1u);                                  /// the round landed
+    /// round 1 carries the ADOPTED occupant - T1 only, write-once preserved:
+    const RetiredSet round1 = decodeRetiredSet(b->get(s->layout().retiredKey(1, st.fence_seq, 0))->bytes);
+    ASSERT_EQ(round1.entries.size(), 1u);
+    EXPECT_EQ(round1.entries[0].hash, hexToU128(t1.string()));
+    EXPECT_EQ(rep.candidates, 1u);                            /// reports the ADOPTED durable truth
+
+    /// T2 is not lost - the FOLLOWING round re-derives and retires it:
+    const RoundReport rep2 = gc.runRegularRound();
+    EXPECT_TRUE(rep2.acquired_lease);
+    st = readState(*b, *s);
+    EXPECT_EQ(st.round, 2u);
+    const RetiredSet round2 = decodeRetiredSet(b->get(s->layout().retiredKey(2, st.fence_seq, 0))->bytes);
+    bool has_t2 = false;
+    for (const RetiredEntry & entry : round2.entries)
+        has_t2 |= entry.hash == hexToU128(t2.string());
+    EXPECT_TRUE(has_t2);
 }

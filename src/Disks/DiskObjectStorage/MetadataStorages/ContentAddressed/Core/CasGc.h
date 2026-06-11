@@ -114,8 +114,12 @@ private:
     /// (retry next round). snap_shards != 1 is refused (NOT_IMPLEMENTED): cross-shard last-op-wins
     /// displacement is undesigned in M-C3.
     ///
-    /// On success `state` carries the committed snap_generation/folded_cursor.
-    FoldResult fold(GcState & state, const Token & state_token);
+    /// On success `state` carries the committed snap_generation/folded_cursor and `state_token`
+    /// the committed gc/state token. The committed pair is THREADED into retire, never re-read:
+    /// a post-fold re-read would open a zombie window - a lease steal landing between the fold
+    /// CAS and the re-read hands this (now stale) leader the thief's state with its bumped
+    /// fence_seq, letting stale-snap retire sets land inside the thief's epoch paths.
+    FoldResult fold(GcState & state, Token & state_token);
 
     /// R2 (spec §7; the model's GRetire): the round being executed is state.round + 1 (state.round
     /// = "highest round whose retire sets are durable"). Per candidate — derived STATELESSLY from
@@ -123,8 +127,8 @@ private:
     /// InDeg = 0` — ONE HEAD observes the object's CURRENT token; an absent object is SKIPPED
     /// (no token to condemn — never fabricate; a crashed prior round's landed delete or debris).
     /// The per-shard retire sets are written by unique path (gc/retired/<round>.<fence_seq>/<shard>,
-    /// putIfAbsent; a byte-equal occupant is OUR crash-replay — adopt; a divergent one is a
-    /// competing retire — ABORTED, fail closed). The sets go durable BEFORE one gc/state CAS
+    /// putIfAbsent; ANY decodable occupant at our path is OUR OWN crashed prior attempt — adopted,
+    /// write-once preserved; an undecodable occupant is ABORTED). The sets go durable BEFORE one gc/state CAS
     /// advances .round — the durable "retire phase complete" marker (INV-MONOTONE-GC ordering:
     /// a writer whose RetireView refreshes at the new round is guaranteed to see the entries).
     /// On success `state`/`state_token` carry the committed round. Returns the retired entries
