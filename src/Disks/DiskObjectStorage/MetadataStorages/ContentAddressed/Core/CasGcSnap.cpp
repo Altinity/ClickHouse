@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcSnap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnumStrings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
@@ -43,30 +44,6 @@ EdgeKind edgeKindFromString(std::string_view s, std::string_view what)
     if (s == "pack")
         return EdgeKind::Pack;
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid edge kind '{}'", what, s);
-}
-
-/// `ObjectKind` <-> string. Mirrors the file-static helper in `CasGcFormats.cpp` (deliberately
-/// duplicated — a 6-line mapping is cheaper than widening a header for two codecs).
-std::string_view objectKindToString(ObjectKind kind)
-{
-    switch (kind)
-    {
-        case ObjectKind::Blob: return "blob";
-        case ObjectKind::Tree: return "tree";
-        case ObjectKind::Pack: return "pack";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: invalid object kind {}", static_cast<int>(kind));
-}
-
-ObjectKind objectKindFromString(std::string_view s, std::string_view what)
-{
-    if (s == "blob")
-        return ObjectKind::Blob;
-    if (s == "tree")
-        return ObjectKind::Tree;
-    if (s == "pack")
-        return ObjectKind::Pack;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid object kind '{}'", what, s);
 }
 
 /// A 32-hex hash from an already-extracted string (array elements, where requireHash's

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -112,6 +113,40 @@ TEST(CasGcFormats, HeartbeatRoundTrip)
     EXPECT_EQ(d.created_at_ms, 1234567890123u);
 }
 
+TEST(CasGcFormats, OutcomeLogRoundTrip)
+{
+    OutcomeLog log;
+    log.entries.push_back({ObjectKind::Tree, hexToU128("aa00000000000000000000000000000a"),
+                           Token{"etag-1", TokenType::ETag}, OutcomeKind::Deleted});
+    log.entries.push_back({ObjectKind::Blob, hexToU128("bb00000000000000000000000000000b"),
+                           Token{"7", TokenType::Emulated}, OutcomeKind::Spared});
+    log.entries.push_back({ObjectKind::Blob, hexToU128("cc00000000000000000000000000000c"),
+                           Token{"8", TokenType::Emulated}, OutcomeKind::Replaced});
+    log.entries.push_back({ObjectKind::Pack, hexToU128("dd00000000000000000000000000000d"),
+                           Token{"9", TokenType::Emulated}, OutcomeKind::Absent});
+    auto bytes = encodeOutcomeLog(log);
+    EXPECT_NE(bytes.find("\"format\":\"cas_gc_outcomes\""), String::npos);
+    auto d = decodeOutcomeLog(bytes);
+    ASSERT_EQ(d.entries.size(), 4u);
+    EXPECT_EQ(d.entries[0].kind, ObjectKind::Tree);
+    EXPECT_EQ(d.entries[0].hash, hexToU128("aa00000000000000000000000000000a"));
+    EXPECT_EQ(d.entries[0].outcome, OutcomeKind::Deleted);
+    EXPECT_EQ(d.entries[1].outcome, OutcomeKind::Spared);
+    EXPECT_EQ(d.entries[2].outcome, OutcomeKind::Replaced);
+    EXPECT_EQ(d.entries[3].outcome, OutcomeKind::Absent);
+    EXPECT_EQ(d.entries[0].token.value, "etag-1");
+    EXPECT_EQ(d.entries[0].token.type, TokenType::ETag);
+    EXPECT_EQ(d.entries[3].token.value, "9");
+    EXPECT_EQ(encodeOutcomeLog(d), bytes);                       /// byte-stable
+}
+
+TEST(CasGcFormats, EmptyOutcomeLogRoundTrips)
+{
+    auto bytes = encodeOutcomeLog(OutcomeLog{});
+    auto d = decodeOutcomeLog(bytes);
+    EXPECT_TRUE(d.entries.empty());
+}
+
 /// ---------- validation throw-paths (strict JSON) ----------
 
 namespace
@@ -221,6 +256,40 @@ TEST(CasGcFormats, RetiredSetValidation)
 
     /// Sanity: the canonical entry round-trips through decode without throwing.
     EXPECT_NO_THROW(decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)" + entry + "]}"));
+}
+
+TEST(CasGcFormats, OutcomeLogValidation)
+{
+    expectStrictJsonContract([](const String & s) { return decodeOutcomeLog(s); }, "cas_gc_outcomes");
+
+    EXPECT_TRUE(encodeOutcomeLog(OutcomeLog{}).contains(R"("format":"cas_gc_outcomes")"));
+
+    const String entry = R"({"kind":"tree","hash":"aa00000000000000000000000000000a","token":"etag-1","token_type":"etag","outcome":"deleted"})";
+
+    /// Bad enum: unknown outcome.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
+        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"x","token_type":"etag","outcome":"bogus"}]})"); });
+    /// Bad enum: unknown kind.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
+        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"banana","hash":"aa00000000000000000000000000000a","token":"x","token_type":"etag","outcome":"deleted"}]})"); });
+    /// Bad enum: unknown token_type.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
+        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"x","token_type":"weird","outcome":"deleted"}]})"); });
+    /// Unknown extra key inside an entry.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
+        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"x","token_type":"etag","outcome":"deleted","x":1}]})"); });
+    /// Missing a required field inside an entry (no token_type).
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
+        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"x","outcome":"deleted"}]})"); });
+    /// Bad hash hex.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
+        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"nothex","token":"x","token_type":"etag","outcome":"deleted"}]})"); });
+    /// Unknown extra key at the top level.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeOutcomeLog(R"({"format":"cas_gc_outcomes","version":1,"entries":[],"x":1})"); });
+
+    /// Sanity: the canonical entry round-trips through decode without throwing.
+    EXPECT_NO_THROW(decodeOutcomeLog(R"({"format":"cas_gc_outcomes","version":1,"entries":[)" + entry + "]}"));
 }
 
 TEST(CasGcFormats, HeartbeatValidation)

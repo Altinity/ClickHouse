@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnumStrings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
@@ -49,52 +50,6 @@ std::map<String, uint64_t> u64MapFromObject(const Poco::JSON::Object & obj, std:
     for (const auto & [key, value] : obj)
         result[key] = requireU64Var(value, key, what);
     return result;
-}
-
-/// `ObjectKind` <-> string. Unknown string on decode is corruption (fail closed).
-std::string_view objectKindToString(ObjectKind kind)
-{
-    switch (kind)
-    {
-        case ObjectKind::Blob: return "blob";
-        case ObjectKind::Tree: return "tree";
-        case ObjectKind::Pack: return "pack";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS retired set: invalid object kind {}", static_cast<int>(kind));
-}
-
-ObjectKind objectKindFromString(std::string_view s, std::string_view what)
-{
-    if (s == "blob")
-        return ObjectKind::Blob;
-    if (s == "tree")
-        return ObjectKind::Tree;
-    if (s == "pack")
-        return ObjectKind::Pack;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid object kind '{}'", what, s);
-}
-
-/// `TokenType` <-> string. Unknown string on decode is corruption (fail closed).
-std::string_view tokenTypeToString(TokenType type)
-{
-    switch (type)
-    {
-        case TokenType::ETag: return "etag";
-        case TokenType::Generation: return "generation";
-        case TokenType::Emulated: return "emulated";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS retired set: invalid token type {}", static_cast<int>(type));
-}
-
-TokenType tokenTypeFromString(std::string_view s, std::string_view what)
-{
-    if (s == "etag")
-        return TokenType::ETag;
-    if (s == "generation")
-        return TokenType::Generation;
-    if (s == "emulated")
-        return TokenType::Emulated;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid token type '{}'", what, s);
 }
 
 }
