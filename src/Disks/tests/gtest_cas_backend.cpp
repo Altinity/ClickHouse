@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 
 #if USE_AWS_S3
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
 #include <IO/S3Common.h>
 #endif
 
@@ -246,6 +247,58 @@ TEST(CasS3Signal, S3ExceptionCarriesCanonicalErrorName)
     EXPECT_EQ(e.getExceptionName(), "PreconditionFailed");
     DB::S3Exception bare("no name attached", Aws::S3::S3Errors::UNKNOWN);
     EXPECT_TRUE(bare.getExceptionName().empty());
+}
+
+namespace
+{
+
+/// WriteBuffer stub whose finalize throws a configured S3Exception — drives the classifier directly.
+class ThrowOnFinalizeBuffer final : public DB::WriteBuffer
+{
+public:
+    ThrowOnFinalizeBuffer() : DB::WriteBuffer(nullptr, 0) {}
+
+    explicit ThrowOnFinalizeBuffer(DB::S3Exception e) : DB::WriteBuffer(nullptr, 0), to_throw(std::move(e)) {}
+
+private:
+    void nextImpl() override {}
+
+    void finalizeImpl() override
+    {
+        if (to_throw)
+            throw *to_throw;
+    }
+
+    std::optional<DB::S3Exception> to_throw;
+};
+
+}
+
+/// detail::finalizeConditionalWrite maps a lost precondition to an OUTCOME by exact-matching the
+/// canonical S3 error name (plus the modeled NO_SUCH_KEY enum, which WriteBufferFromS3 surfaces
+/// nameless on retry exhaustion) and rethrows anything else.
+TEST(CasS3Signal, FinalizeClassifierMapsPreconditionLossExactly)
+{
+    using DB::Cas::detail::finalizeConditionalWrite;
+
+    auto classify = [](DB::S3Exception e)
+    {
+        ThrowOnFinalizeBuffer buf(std::move(e));
+        return finalizeConditionalWrite(buf);
+    };
+
+    EXPECT_EQ(classify(DB::S3Exception("412", Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed")),
+              PutOutcome::PreconditionFailed);
+    EXPECT_EQ(classify(DB::S3Exception("404 gone under If-Match", Aws::S3::S3Errors::UNKNOWN, "NoSuchKey")),
+              PutOutcome::PreconditionFailed);
+    EXPECT_EQ(classify(DB::S3Exception("retries exhausted, no name attached", Aws::S3::S3Errors::NO_SUCH_KEY)),
+              PutOutcome::PreconditionFailed);
+
+    ThrowOnFinalizeBuffer unrelated(DB::S3Exception("503", Aws::S3::S3Errors::UNKNOWN, "SlowDown"));
+    EXPECT_THROW(finalizeConditionalWrite(unrelated), DB::S3Exception);
+
+    ThrowOnFinalizeBuffer clean;
+    EXPECT_EQ(finalizeConditionalWrite(clean), PutOutcome::Done);
 }
 
 #endif

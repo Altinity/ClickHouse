@@ -43,6 +43,14 @@ public:
         , exception_name(std::move(exception_name_))
     {}
 
+    /// Preserves the static format string (system.text_log / system.errors grouping) while also
+    /// carrying the canonical S3 error name — build msg with PreformattedMessage::create.
+    S3Exception(PreformattedMessage && msg, Aws::S3::S3Errors code_, String exception_name_)
+        : Exception(std::move(msg), ErrorCodes::S3_ERROR)
+        , code(code_)
+        , exception_name(std::move(exception_name_))
+    {}
+
     Aws::S3::S3Errors getS3ErrorCode() const
     {
         return code;
@@ -52,6 +60,7 @@ public:
     /// "NoSuchKey") as reported by `Aws::Client::AWSError::GetExceptionName`. Errors unmodeled by the
     /// SDK (a conditional-PUT 412 is one) have `getS3ErrorCode` == UNKNOWN, so this name is the only
     /// machine-readable discriminator. Empty when the throw site did not attach it.
+    /// Not `Exception::name`; this is the AWS `<Code>` string.
     const String & getExceptionName() const
     {
         return exception_name;

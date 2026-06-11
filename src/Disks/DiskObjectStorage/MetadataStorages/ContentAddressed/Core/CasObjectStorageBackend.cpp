@@ -62,10 +62,11 @@ std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
 /// direction: a misread error becomes a retryable PreconditionFailed/Conflict, never a false success.
 ///
 /// HONEST NOTE: the Native conditional-write paths are exercised end-to-end only at M-W against
-/// RustFS; unit coverage is the Emulated mode plus the typed-catch compile path.
-static PutOutcome finalizeConditionalWrite(WriteBuffer & buf)
-{
+/// RustFS; unit coverage is the Emulated mode, the typed-catch compile path, and the classifier
+/// itself (CasS3Signal in gtest_cas_backend.cpp — hence the detail:: exposure in the header).
 #if USE_AWS_S3
+PutOutcome detail::finalizeConditionalWrite(WriteBuffer & buf)
+{
     try
     {
         buf.finalize();
@@ -78,10 +79,20 @@ static PutOutcome finalizeConditionalWrite(WriteBuffer & buf)
             return PutOutcome::PreconditionFailed;
         throw;
     }
+    return PutOutcome::Done;
+}
+#endif
+
+/// Build-dispatching shim for the write paths below: without the AWS SDK there is no S3Exception
+/// to classify, so the errors of finalize simply propagate.
+static PutOutcome finalizeConditionalWrite(WriteBuffer & buf)
+{
+#if USE_AWS_S3
+    return detail::finalizeConditionalWrite(buf);
 #else
     buf.finalize();
-#endif
     return PutOutcome::Done;
+#endif
 }
 
 /// Issue a conditional PUT (the condition rides on `ws`) and map a precondition loss — see

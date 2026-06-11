@@ -4,8 +4,21 @@
 #include <map>
 #include <mutex>
 
+#include "config.h"
+
 namespace DB::Cas
 {
+
+#if USE_AWS_S3
+namespace detail
+{
+/// Finalize a conditional write (the condition rode on the buffer's WriteSettings) and map a
+/// precondition loss to an OUTCOME — anything else propagates. This is the classifier for the
+/// typed `S3Exception` signal; exposed here for unit tests only — production callers go through
+/// `ObjectStorageBackend`. See the definition for the exact matching rules.
+PutOutcome finalizeConditionalWrite(WriteBuffer & buf);
+}
+#endif
 
 /// Production Backend over IObjectStorage.
 ///
