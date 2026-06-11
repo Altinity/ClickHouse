@@ -30,18 +30,6 @@ EnvelopeHeader makeBlobHeader()
 
 }
 
-/// ---------- CRC32C ----------
-
-TEST(CasEnvelopeCrc, KnownVector)
-{
-    EXPECT_EQ(crc32c("123456789", 9), 0xE3069283u);
-}
-
-TEST(CasEnvelopeCrc, EmptyIsZero)
-{
-    EXPECT_EQ(crc32c("", 0), 0u);
-}
-
 /// ---------- round trip ----------
 
 TEST(CasEnvelope, RoundTripWithProvenanceAndIntendedRef)
@@ -151,7 +139,7 @@ TEST(CasEnvelope, FutureVersionThrows)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    bytes[4] = 2;  /// format_version = 2 (version is validated before the crc, so the code is pinned)
+    bytes[4] = 2;  /// format_version = 2 (version is validated before the header hash, so the code is pinned)
     expectThrowsCode(
         DB::ErrorCodes::NOT_IMPLEMENTED,
         [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
@@ -168,7 +156,7 @@ TEST(CasEnvelope, BadHeaderLenThrows)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    /// header_len = 90 (< 96) at offset 8; recompute crc would mismatch too, but range check fires first.
+    /// header_len = 90 (< 96) at offset 8; the header hash would mismatch too, but range check fires first.
     bytes[8] = 90;
     EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
 }
@@ -188,20 +176,24 @@ TEST(CasEnvelope, SizeMismatchThrows)
     EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size + 1, ObjectKind::Blob), DB::Exception);
 }
 
-TEST(CasEnvelope, CorruptedCrcThrows)
+TEST(CasEnvelope, CorruptedHeaderFieldFailsHeaderHash)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    bytes[24] ^= 0xff;  /// flip a byte inside logical_hash -> crc mismatch
-    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
+    bytes[24] ^= 0xff;  /// flip a byte inside logical_hash -> header hash mismatch
+    expectThrowsCode(
+        DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
 }
 
-TEST(CasEnvelope, NonzeroReservedThrows)
+TEST(CasEnvelope, CorruptedStoredHeaderHashThrows)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    bytes[92] = 1;  /// reserved0 nonzero
-    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
+    bytes[92] ^= 0xff;  /// flip a byte inside the stored header_hash itself ([88,96))
+    expectThrowsCode(
+        DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
 }
 
 TEST(CasEnvelope, CriticalUnknownExtensionThrows)

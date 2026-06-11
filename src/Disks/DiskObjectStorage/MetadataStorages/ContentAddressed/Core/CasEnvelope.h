@@ -64,13 +64,14 @@ struct EnvelopeHeader
     bool unknown_critical_tlv = false;
 };
 
-/// Computes header_len + header_crc32c and returns the [0, header_len) header bytes (no payload).
+/// Computes header_len + header_hash and returns the [0, header_len) header bytes (no payload).
 String encodeEnvelopeHeader(EnvelopeHeader & header);
 
 /// Validates and decodes the header. Every validation row of the spec table is one throw-path:
-///   bad magic / nonzero reserved0 / wrong kind / bad header_len             -> CORRUPTED_DATA
-///   future format_version / unknown critical extension                      -> NOT_IMPLEMENTED
-///   index_len rule violation / size arithmetic mismatch / crc mismatch      -> CORRUPTED_DATA
+///   bad magic / wrong kind / bad header_len                                  -> CORRUPTED_DATA
+///   future format_version / unknown critical extension                       -> NOT_IMPLEMENTED
+///   index_len rule violation / size arithmetic mismatch / header_hash
+///   mismatch (CityHash64 over the 96 core-header bytes, field zeroed)        -> CORRUPTED_DATA
 EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object_size, ObjectKind expected_kind);
 
 /// Payload starts after header and (packs only) the index. Note: for packs this points INTO the
@@ -80,9 +81,5 @@ inline uint64_t payloadOffset(const EnvelopeHeader & header)
 {
     return static_cast<uint64_t>(header.header_len) + header.index_len;
 }
-
-/// Self-contained table-based CRC-32C (Castagnoli, reflected polynomial 0x82F63B78).
-/// crc32c("123456789", 9) == 0xE3069283.
-uint32_t crc32c(const char * data, size_t size);
 
 }

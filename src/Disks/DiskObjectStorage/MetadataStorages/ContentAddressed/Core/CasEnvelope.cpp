@@ -4,6 +4,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 #include <base/unaligned.h>
+#include <city.h>
 #include <array>
 #include <cstring>
 
@@ -25,7 +26,8 @@ namespace
 constexpr uint8_t FORMAT_VERSION = 1;
 constexpr uint32_t CORE_HEADER_LEN = 96;
 constexpr uint32_t MAX_HEADER_LEN = 16384;
-constexpr size_t CRC_OFFSET = 88;
+constexpr size_t HEADER_HASH_OFFSET = 88;
+constexpr size_t HEADER_HASH_LEN = 8;
 
 constexpr uint8_t FLAG_HAS_CRITICAL_EXTENSION = 0x01;
 
@@ -34,36 +36,14 @@ constexpr uint16_t TLV_INTENDED_REF = 0x0002;
 /// An arbitrary unknown type used (test-only) to exercise the critical fail-closed path.
 constexpr uint16_t TLV_UNKNOWN_CRITICAL = 0x7f01;
 
-/// CRC-32C (Castagnoli) lookup table, reflected polynomial 0x82F63B78. Built once at startup.
-struct Crc32cTable
+/// header_hash = CityHash64 over the 96 core-header bytes with the [88, 96) field itself zeroed —
+/// the hash family the rest of ClickHouse uses for checksums. A diagnostics-quality check, not a
+/// safety dependency: every load-bearing header field is independently re-verified (spec §3.1).
+uint64_t computeHeaderHash(const char * core_header_with_hash_zeroed)
 {
-    std::array<uint32_t, 256> table;
-
-    Crc32cTable()
-    {
-        for (uint32_t i = 0; i < 256; ++i)
-        {
-            uint32_t crc = i;
-            for (int k = 0; k < 8; ++k)
-                crc = (crc & 1) ? (crc >> 1) ^ 0x82F63B78u : (crc >> 1);
-            table[i] = crc;
-        }
-    }
-};
-
-const Crc32cTable crc32c_table;
-
+    return CityHash_v1_0_2::CityHash64(core_header_with_hash_zeroed, CORE_HEADER_LEN);
 }
 
-uint32_t crc32c(const char * data, size_t size)
-{
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < size; ++i)
-    {
-        const uint8_t byte = static_cast<uint8_t>(data[i]);
-        crc = crc32c_table.table[(crc ^ byte) & 0xff] ^ (crc >> 8);
-    }
-    return crc ^ 0xFFFFFFFFu;
 }
 
 String encodeEnvelopeHeader(EnvelopeHeader & header)
@@ -137,16 +117,15 @@ String encodeEnvelopeHeader(EnvelopeHeader & header)
         writeBinaryLittleEndian(header.domain_id, out_buf);                 /// [40,56)
         writeBinaryLittleEndian(header.incarnation_tag, out_buf);           /// [56,72)
         writeBinaryLittleEndian(header.build_id, out_buf);                  /// [72,88)
-        writeBinaryLittleEndian(static_cast<uint32_t>(0), out_buf);         /// [88,92) crc32c placeholder (zeroed)
-        writeBinaryLittleEndian(static_cast<uint32_t>(0), out_buf);         /// [92,96) reserved0
+        writeBinaryLittleEndian(static_cast<uint64_t>(0), out_buf);         /// [88,96) header_hash placeholder (zeroed)
 
         writeString(ext, out_buf);                                          /// [96, header_len) TLV extensions
         out_buf.finalize();
     }
 
-    /// Compute crc over [0,96) with the crc field zeroed (it already is), then patch it in.
-    const uint32_t crc = crc32c(out.data(), CORE_HEADER_LEN);
-    unalignedStoreLittleEndian<uint32_t>(out.data() + CRC_OFFSET, crc);
+    /// Compute the hash over [0,96) with the header_hash field zeroed (it already is), then patch it in.
+    const uint64_t header_hash = computeHeaderHash(out.data());
+    unalignedStoreLittleEndian<uint64_t>(out.data() + HEADER_HASH_OFFSET, header_hash);
 
     return out;
 }
@@ -221,27 +200,20 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
         readBinaryLittleEndian(h.incarnation_tag, in);
         readBinaryLittleEndian(h.build_id, in);
 
-        /// [88,92) crc32c
-        uint32_t stored_crc = 0;
-        readBinaryLittleEndian(stored_crc, in);
-        /// [92,96) reserved0
-        uint32_t reserved0 = 0;
-        readBinaryLittleEndian(reserved0, in);
-        if (reserved0 != 0)
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CHCA envelope: reserved0 must be 0");
+        /// [88,96) header_hash
+        uint64_t stored_header_hash = 0;
+        readBinaryLittleEndian(stored_header_hash, in);
 
-        /// Verify crc over [0,96) with the crc field zeroed.
+        /// Verify the hash over [0,96) with the header_hash field zeroed.
         {
             std::array<char, CORE_HEADER_LEN> core{};
             std::memcpy(core.data(), head_bytes.data(), CORE_HEADER_LEN);
-            core[CRC_OFFSET + 0] = 0;
-            core[CRC_OFFSET + 1] = 0;
-            core[CRC_OFFSET + 2] = 0;
-            core[CRC_OFFSET + 3] = 0;
-            const uint32_t computed = crc32c(core.data(), CORE_HEADER_LEN);
-            if (computed != stored_crc)
+            std::memset(core.data() + HEADER_HASH_OFFSET, 0, HEADER_HASH_LEN);
+            const uint64_t computed = computeHeaderHash(core.data());
+            if (computed != stored_header_hash)
                 throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                    "CHCA envelope: header_crc32c mismatch (computed {:08x}, stored {:08x})", computed, stored_crc);
+                    "CHCA envelope: header hash mismatch (computed {:016x}, stored {:016x})",
+                    computed, stored_header_hash);
         }
 
         /// Size arithmetic (uniform for ALL kinds, spec §3.1): header_len + logical_size == object_size.
