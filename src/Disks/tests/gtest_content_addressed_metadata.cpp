@@ -1730,7 +1730,7 @@ TEST_F(ContentAddressedMetaTest, DiskTransactionRoutesContentAddressedWrite)
     auto write_part = [&](const std::string & part, const std::map<std::string, std::string> & files)
     {
         auto disk_tx = std::make_shared<DB::DiskObjectStorageTransaction>(
-            cluster, ms, router, /*blob_killer=*/nullptr, /*wait_blob_removal=*/false,
+            cluster, ms, router, /*blob_killer=*/nullptr, /*copy_object_pool=*/nullptr, /*wait_blob_removal=*/false,
             /*read_resource_name=*/"", /*write_resource_name=*/"");
         for (const auto & [name, bytes] : files)
         {
@@ -1778,7 +1778,7 @@ TEST_F(ContentAddressedMetaTest, DiskTransactionCarryForwardThroughCreateHardLin
     auto new_disk_tx = [&]
     {
         return std::make_shared<DB::DiskObjectStorageTransaction>(
-            cluster, ms, router, /*blob_killer=*/nullptr, /*wait_blob_removal=*/false,
+            cluster, ms, router, /*blob_killer=*/nullptr, /*copy_object_pool=*/nullptr, /*wait_blob_removal=*/false,
             /*read_resource_name=*/"", /*write_resource_name=*/"");
     };
 
