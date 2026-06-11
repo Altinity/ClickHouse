@@ -100,7 +100,7 @@ separate feature requiring its own modeling of delete markers, noncurrent retent
 | MinIO AIStor | `ETag` | documents `DeleteObject If-Match` | CI candidate, probe decides |
 | MinIO OSS (archived 2026-02) | — | conditional PUT only; `If-Match` on DELETE is **silently ignored and the object is deleted anyway** (empirically confirmed 2026-06-11 on RELEASE.2024-09-13 and the final RELEASE.2025-09-07 — exactly the failure mode the enforced probe exists to catch) | fail-closed for v1 GC |
 | Ceph RGW | — | no conditional delete documented | fail-closed for v1 GC |
-| RustFS (1.0.0-beta.8) | `ETag` | **full conditional set empirically verified 2026-06-11**: DELETE `If-Match` enforced (wrong token → 412, object survives), `If-None-Match:*` create enforced, `If-Match` CAS PUT enforced. Caveat: requires QUOTED ETags in conditional headers (rustfs#1458) — send tokens exactly as observed; beta software | leading open-source CI candidate for GC e2e, probe-gated |
+| RustFS (1.0.0-beta.8) | `ETag` | **full conditional set empirically verified 2026-06-11**: DELETE `If-Match` enforced (wrong token → 412, object survives), `If-None-Match:*` create enforced, `If-Match` CAS PUT enforced — with both quoted AND unquoted ETags (the historical unquoted-strictness rustfs#1458 is closed and verified fixed in this image). Practice regardless: send tokens exactly as observed. Caveat: beta software | leading open-source CI candidate for GC e2e, probe-gated |
 
 **Safety-critical primitives** (capability probe, extending the existing fail-closed `PoolCoordination` probe):
 atomic whole-object PUT; **exact-token conditional delete, enforced** — a delete carrying a wrong token MUST
