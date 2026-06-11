@@ -15,8 +15,10 @@ CONSTANTS
     MaxRound,           \* GC round bound
     MaxLog,             \* journal length bound per shard (state constraint)
     EnableResurrect, EnableTrees, EnableDebris, EnableSplit, EnableOverwrite,
+    EnableReval,
     SabotageNoFence, SabotageNoRecheckFold, SabotageNoRetireView,
-    SabotageUncondDelete, SabotageReusedTag, SabotageCascadeRace, SabotageCutOverclaim
+    SabotageUncondDelete, SabotageReusedTag, SabotageCascadeRace, SabotageCutOverclaim,
+    SabotageNoReobserve
 
 ASSUME TreeHashes \subseteq Hashes
 
@@ -88,8 +90,8 @@ vars == << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gc
 \* A token-bearing dependency is condemned in a view if a retire entry for that exact token is
 \* visible at the view, OR the token is already physically dead (INV_NO_RETURN: that exact token
 \* can never again be a valid dependency, even after the retire entry was consumed by its landing).
-CondemnedAtView(h, t, v) == \/ \E e \in retired : e.h = h /\ e.t = t /\ e.r <= v
-                            \/ t \in deadTok[h]
+RetiredHit(h, t, v) == \E e \in retired : e.h = h /\ e.t = t /\ e.r <= v
+CondemnedAtView(h, t, v) == RetiredHit(h, t, v) \/ t \in deadTok[h]
 HashHitAtView(h, v)      == \E e \in retired : e.h = h /\ e.r <= v
 InDeg(h) == Cardinality({e \in rootEdges : e[2] = h}) + Cardinality({e \in treeEdges : e[2] = h})
 Reach(r)      == {r} \cup (IF r \in TreeHashes THEN Children[r] ELSE {})
@@ -208,6 +210,19 @@ WResolveEvidence(w, h) ==
                     everEdged, pendCasc, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
                     fgCut, fgRefs, fgSeen >>
 
+\* W-REVALIDATE HEAD (EnableReval): on a retire-view refresh the writer re-observes every
+\* token-bearing dependency on h — refresh to the CURRENT token if the key is present, or drop the
+\* dependency if the key is absent (re-create handled elsewhere). Ev members are untouched.
+WReobserve(w, h) ==
+    /\ EnableReval
+    /\ \E t \in Toks : <<h, t>> \in wDeps[w]
+    /\ LET keep == { d \in wDeps[w] : d[1] # h \/ d[2] = Ev }
+       IN wDeps' = [wDeps EXCEPT ![w] = IF present[h] THEN keep \cup {<<h, tokOf[h]>>} ELSE keep]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
+                    everEdged, pendCasc, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase,
+                    fgCut, fgRefs, fgSeen >>
+
 WRefreshView(w) ==
     /\ wView' = [wView EXCEPT ![w] = gcRound]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
@@ -217,10 +232,19 @@ WRefreshView(w) ==
 
 \* Publish: one atomic successful CAS — guard reads the CURRENT manifest (CAS linearization).
 \* W-PUBLISH-GATE + W-EVIDENCE.  SabotageNoRetireView removes the gate.
+\* W-REVALIDATE mode (EnableReval): the gate has NO dead-token oracle — entries drop on outcomes,
+\* so a stale observation is validated by RE-OBSERVATION: the dep's token must be the CURRENT one
+\* (present /\ tokOf = t), atomically with the publish CAS (the fence closes the HEAD->CAS window
+\* on the GC side; overwrites without a fence are harmless — the ref names the hash).
+\* SabotageNoReobserve drops the re-observation conjunct: the gate degrades to retired-only and the
+\* stage-1 stale-dependency dangle MUST return (the F1 negative control).
 DepOK(w) ==
     \A d \in wDeps[w] :
         IF d[2] = Ev THEN ~HashHitAtView(d[1], wView[w])
-                     ELSE ~CondemnedAtView(d[1], d[2], wView[w])
+        ELSE IF EnableReval
+             THEN /\ ~RetiredHit(d[1], d[2], wView[w])
+                  /\ SabotageNoReobserve \/ (present[d[1]] /\ tokOf[d[1]] = d[2])
+             ELSE ~CondemnedAtView(d[1], d[2], wView[w])
 \* A published tree's children must be present AND live (not condemned in the writer's view) at
 \* publish time. Models the bottom-up build (children uploaded before the tree ref is published).
 \* This models the CHILD half of the dependency-set gate as a publish-time LIVE re-read of each
@@ -230,7 +254,10 @@ DepOK(w) ==
 \* tree over an absent/condemned child and dangle (INV_NO_LOSS). One-level: stage-3 trees are flat
 \* (Children[t] subset of NonTree); nested subtrees are a documented residual.
 TreeDepsOK(w, h) == h \in TreeHashes =>
-                      \A c \in Children[h] : present[c] /\ ~CondemnedAtView(c, tokOf[c], wView[w])
+                      \A c \in Children[h] :
+                          /\ present[c]
+                          /\ IF EnableReval THEN ~RetiredHit(c, tokOf[c], wView[w])
+                                            ELSE ~CondemnedAtView(c, tokOf[c], wView[w])
 WPublish(w, s, h) ==
     /\ \E t \in Toks : <<h, t>> \in wDeps[w]          \* the root itself was created/reused
     /\ h \notin man[s].refs
@@ -490,6 +517,7 @@ Next ==
     \/ \E w \in Writers, h \in Hashes : WCreate(w, h) \/ WReuse(w, h)
     \/ \E w \in Writers, h \in Hashes : WOverwrite(w, h)
     \/ \E w \in Writers, h \in Hashes : WResurrect(w, h) \/ WEvidence(w, h) \/ WResolveEvidence(w, h)
+    \/ \E w \in Writers, h \in Hashes : WReobserve(w, h)
     \/ \E w \in Writers : WRefreshView(w) \/ WAbandon(w)
     \/ \E w \in Writers, s \in Shards, h \in Hashes : WPublish(w, s, h)
     \/ \E s \in Shards, h \in Hashes : WDrop(s, h)
