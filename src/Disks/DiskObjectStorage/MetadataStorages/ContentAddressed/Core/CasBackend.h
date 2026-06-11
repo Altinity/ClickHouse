@@ -62,6 +62,10 @@ struct ListPage
 ///     TokenMismatch with the object untouched (backends that silently ignore the condition are
 ///     rejected by Cas::Probe);
 ///   - conditional PUTs are protocol hygiene; casPut and deleteExact are SAFETY-critical.
+///
+/// KNOWN M-C1 DEFERRAL: all ops take/return whole `String` bodies — sufficient for manifests,
+/// trees, and probe/test blobs. M-C2's `Build::putBlob` for LARGE content blobs needs a streaming
+/// write (and `get` a streaming read) seam added here; plan it there, do not bolt it on ad hoc.
 class Backend
 {
 public:
