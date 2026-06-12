@@ -63,6 +63,7 @@ namespace Setting
 
 namespace S3RequestSetting
 {
+    extern const S3RequestSettingsBool check_objects_after_upload;
     extern const S3RequestSettingsUInt64 list_object_keys_size;
     extern const S3RequestSettingsUInt64 objects_chunk_size_to_delete;
 }
@@ -297,6 +298,9 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         const auto & settings = query_context->getSettingsRef();
         request_settings.updateFromSettings(settings, /* if_changed */ true, settings[Setting::s3_validate_request_settings]);
     }
+
+    if (write_settings.s3_skip_check_objects_after_upload)
+        request_settings[S3RequestSetting::check_objects_after_upload] = false;
 
     ThreadPoolCallbackRunnerUnsafe<void> scheduler;
     if (write_settings.s3_allow_parallel_part_upload)

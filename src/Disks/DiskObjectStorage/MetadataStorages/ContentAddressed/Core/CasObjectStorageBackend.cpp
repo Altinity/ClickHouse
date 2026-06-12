@@ -323,11 +323,25 @@ HeadResult ObjectStorageBackend::head(const String & key)
     return hr;
 }
 
+/// Base WriteSettings for every Native conditional write. The post-upload existence/size HEAD
+/// (check_objects_after_upload) is SKIPPED: CAS-mutable keys (shard manifests, gc/state, the
+/// registry) are legitimately replaced by a concurrent conditional PUT between our upload and the
+/// check's HEAD - the size comparison false-positives as "a bug in S3" under perfectly normal
+/// contention (observed live against RustFS: a publish's manifest CAS raced the GC fence and the
+/// mismatch TERMINATED the server from the upload worker, M-W T13). Integrity for these keys is
+/// the conditional PUT outcome + the observed token - a recheck adds nothing and races by design.
+static WriteSettings casWriteSettings()
+{
+    WriteSettings ws;
+    ws.s3_skip_check_objects_after_upload = true;
+    return ws;
+}
+
 PutOutcome ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, Token * out_token)
 {
     if (mode == Mode::Native)
     {
-        WriteSettings ws;
+        WriteSettings ws = casWriteSettings();
         ws.object_storage_write_if_none_match = "*";
         return nativeConditionalPut(key, bytes, ws, out_token);
     }
@@ -350,7 +364,7 @@ WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key)
     {
         /// Same WriteSettings construction as putIfAbsent — the condition rides on the write buffer
         /// and is checked when finalize completes the object.
-        WriteSettings ws;
+        WriteSettings ws = casWriteSettings();
         ws.object_storage_write_if_none_match = "*";
         auto buf = object_storage->writeObject(
             StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ws);
@@ -364,7 +378,7 @@ PutOutcome ObjectStorageBackend::putOverwrite(const String & key, const String &
 {
     if (mode == Mode::Native)
     {
-        WriteSettings ws;
+        WriteSettings ws = casWriteSettings();
         ws.object_storage_write_if_match = expected.value;
         return nativeConditionalPut(key, bytes, ws, out_token);
     }
@@ -387,7 +401,7 @@ CasOutcome ObjectStorageBackend::casPut(const String & key, const String & bytes
 {
     if (mode == Mode::Native)
     {
-        WriteSettings ws;
+        WriteSettings ws = casWriteSettings();
         if (expected.has_value())
             ws.object_storage_write_if_match = expected->value;
         else
