@@ -109,13 +109,15 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
 
 void ContentAddressedMetadataStorage::runOneGcRoundForTest()
 {
-    if (gc_scheduler)
-    {
-        gc_scheduler->runOneRoundNow();
-        return;
-    }
-    ContentAddressed::CasGcScheduler one_shot(store(), gc_interval, "ContentAddressedGC");
-    one_shot.runOneRoundNow();
+    /// The pacing scheduler must be STABLE across calls: the lease's observation-window steal
+    /// protocol compares consecutive observations of the SAME observer (gc_id), so an ad-hoc
+    /// scheduler per call would acquire the lease on the first call and then back off forever
+    /// ("incumbent alive" - its own previous incarnation). Found by the M-W retro: the original
+    /// per-call one-shot made every round after the first a silent no-op.
+    if (!gc_scheduler)
+        gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
+            store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full));
+    gc_scheduler->runOneRoundNow();
 }
 
 void ContentAddressedMetadataStorage::startup()

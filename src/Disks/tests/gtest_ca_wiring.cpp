@@ -711,21 +711,30 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
     writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "reclaim-me");
     tx->commit(DB::NoCommitOptions{});
 
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    const auto tree_id = exchange->getPartTreeId("uui/uuid-1/all_1_1_0");
+    ASSERT_TRUE(tree_id.has_value());
     const auto blob_key = storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path;
 
     auto tx2 = storage->createTransaction();
     tx2->removeDirectory("uui/uuid-1/all_1_1_0");   /// dropRef - the part is unreachable now
 
-    /// Round 1 folds the drop and retires+deletes the tree; the blob is freed by the cascade and
-    /// reclaimed in a following round (next-round reclamation, M-C3).
+    /// Round 1 folds the drop and retires+deletes the TREE; the cascade frees the blob, which a
+    /// FOLLOWING round retires+deletes (next-round reclamation, M-C3). The steal needs one extra
+    /// observation window between rounds (the pacing scheduler is stable across these calls -
+    /// each call after the first re-acquires via renewal).
     storage->runOneGcRoundForTest();
     storage->runOneGcRoundForTest();
     storage->runOneGcRoundForTest();
 
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    /// The blob object is gone from the backend (read attempts would 404; assert through the
-    /// in-flight-free read path: the part is unreachable, so just verify a fresh identical write
-    /// re-uploads rather than dedups - the old object no longer exists).
+    /// The DELETION WITNESS: adopting the old tree id must fail (the tree object is GONE) - the
+    /// same probe the relink race uses. (Key equality of a re-written identical part would be
+    /// vacuous: content addressing reproduces the key whether or not the old object survived.)
+    EXPECT_FALSE(exchange->adoptPart("uuid-1", "tmp-fetch_back", *tree_id, {}));
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp-fetch_back"));
+
+    /// A fresh identical write re-CREATES the content at the same key and reads back fine.
     auto tx3 = storage->createTransaction();
     writeThroughTransaction(*tx3, "uui/uuid-1/all_9_9_0/data.bin", "reclaim-me");
     tx3->commit(DB::NoCommitOptions{});
