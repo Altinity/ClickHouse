@@ -699,7 +699,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     /// CAS replication 2b — fetch-by-relink (spec §4). The sender chose to relink: it sent only the
     /// part's content id + metadata_version, no file bytes. Build the part by publishing this server's
     /// own ref to the blobs already in the shared pool (pin -> revalidate -> publish -> release inside
-    /// relinkExistingPart). If the relink is not possible (manifest/blob missing — a transient or a
+    /// adoptPart). If the relink is not possible (manifest/blob missing — a transient or a
     /// genuinely-different pool the cheap pre-filter let through), fall back to a normal byte fetch by
     /// re-requesting WITHOUT the relink capability.
     String ca_relink = parse<String>(in->getResponseCookie(CA_RELINK_COOKIE, ""));
