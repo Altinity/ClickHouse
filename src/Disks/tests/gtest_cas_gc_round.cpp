@@ -1531,3 +1531,102 @@ TEST(CasGcResume, AdoptsOutcomesAfterCrashBeforeCascadePersist)
     EXPECT_EQ(next.deleted, 1u);
     EXPECT_FALSE(b->head(s->layout().blobKey(idOf("payload"))).exists);
 }
+
+TEST(CasGcScenario, ZombieDeleteAfterResurrectIs412)
+{
+    /// THE IN-FLIGHT DISJUNCTION + INV-NO-RETURN, with a genuinely held (in-flight) delete: the
+    /// recheck SENDS the delete (the backend accepts but defers it - the model's inflight set);
+    /// a writer then resurrects and republishes the same content; the zombie delete LANDS later
+    /// carrying the OLD observed token and MUST 412 against the new incarnation. "A delete in
+    /// flight implies its entry is held OR its token already displaced" - here the resurrect
+    /// displaced it first, so the landing is forever harmless.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    const String tree_key = s->layout().treeKey(tree);
+    const Token t0 = b->head(tree_key).token;
+
+    b->setHoldDeletes(true);                                  /// every deleteExact is now in-flight
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep = gc.runRegularRound();
+    EXPECT_EQ(rep.deleted, 1u);                               /// the SEND was accepted...
+    EXPECT_TRUE(b->head(tree_key).exists);                    /// ...but nothing landed yet
+    EXPECT_GT(b->pendingDeletes(), 0u);
+
+    /// The writer republishes the same part. The held retired-set drop means the set is STILL
+    /// listed, so the gate's fence-advanced refresh (manifest fence_round 1 > view round 0) sees T
+    /// condemned at t0 and RESURRECTS (fresh tag => t1) before publishing - exactly the
+    /// displacement the disjunction requires. (Reuse the original Store: a fresh open would run
+    /// the capability probe, which CORRECTLY fails the pool while deletes are held.)
+    auto build = s->startBuild({});
+    build->putBlob(idOf("payload"), BlobSource::fromString("payload"));
+    TreeEntry e; e.name = "f"; e.placement = Placement::Blob; e.file_hash = u128Of("payload"); e.file_size = 7;
+    const TreeId again = build->putTree({e});
+    ASSERT_EQ(again, tree);
+    build->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{});
+    const Token t1 = b->head(tree_key).token;
+    EXPECT_NE(t1, t0);                                        /// the gate-forced resurrect displaced t0
+
+    /// Now every in-flight delete lands - token re-evaluated at LAND time:
+    bool tree_delete_was_412 = false;
+    while (b->pendingDeletes() > 0)
+    {
+        const DeleteOutcome landed = b->landPendingDelete(0);
+        if (landed.kind == DeleteOutcome::Kind::TokenMismatch)
+            tree_delete_was_412 = true;
+    }
+    EXPECT_TRUE(tree_delete_was_412);                         /// the zombie hit the displaced token
+    EXPECT_TRUE(b->head(tree_key).exists);                    /// the LIVE incarnation survived
+    EXPECT_EQ(b->head(tree_key).token, t1);
+
+    /// INV-NO-DANGLE end-to-end:
+    b->setHoldDeletes(false);
+    auto resolved = s->resolveRef(RootNamespace{"srv1/tbl"}, "part_1");
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(s->readTree(resolved->tree_id).size(), 1u);
+}
+
+TEST(CasGcScenario, SplitBrainLeadersOnlyDuplicateWork)
+{
+    /// A stalled leader's epoch is abandoned, never corrupted: gc1 crashes mid-round (after retire,
+    /// before the fence persists); gc2 observes the stall twice and STEALS (fence_seq bumps - a new
+    /// epoch whose retire/outcome paths never collide with gc1's). gc2's resume does NOT see gc1's
+    /// orphan sets (different fence_seq - the documented epoch-orphan, conservative: it only
+    /// condemns until M-F cleans it) and runs its own rounds; the dropped part's objects are
+    /// deleted exactly once, by gc2. The revived gc1 backs off (foreign owner). No double delete,
+    /// no loss, monotone state throughout.
+    auto b = std::make_shared<FailNthCasPutBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    Gc gc1(s, hexToU128("0000000000000000000000000000000a"));
+    Gc gc2(s, hexToU128("0000000000000000000000000000000b"));
+
+    b->failNthCasPut(s->layout().gcStateKey(), 4);            /// gc1 dies at the fence persist
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc1.runRegularRound(); });
+    GcState st = readState(*b, *s);
+    ASSERT_EQ(st.round, 1u);
+    ASSERT_EQ(st.fence_seq, 0u);
+    ASSERT_TRUE(b->get(s->layout().retiredKey(1, 0, 0)).has_value());   /// gc1's epoch-0 set
+
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);       /// observe #1 (gc1 now silent)
+    const RoundReport stolen = gc2.runRegularRound();         /// observe #2 => steal => epoch 1
+    EXPECT_TRUE(stolen.acquired_lease);
+    st = readState(*b, *s);
+    EXPECT_EQ(st.fence_seq, 1u);
+
+    /// gc2's rounds collect the dropped part in ITS epoch (T still zero in the durable snap):
+    RoundReport rep = stolen;
+    for (int i = 0; rep.deleted == 0 && i < 3; ++i)
+        rep = gc2.runRegularRound();
+    EXPECT_EQ(rep.deleted, 1u);
+    EXPECT_FALSE(b->head(s->layout().treeKey(tree)).exists);
+
+    /// gc1 revives: foreign owner => back off; its orphan set still lingers (epoch isolation):
+    EXPECT_FALSE(gc1.runRegularRound().acquired_lease);
+    EXPECT_TRUE(b->get(s->layout().retiredKey(1, 0, 0)).has_value());
+    /// and the lingering entry is CONSERVATIVE - it condemns t0, an incarnation that no longer
+    /// exists; a delete for it would 412 or 404. No path ever deletes a live object twice.
+}
