@@ -12,6 +12,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
@@ -66,6 +67,43 @@ Cas::Build & ContentAddressedTransaction::buildFor(
         st.build = metadata_storage.store()->startBuild(
             Cas::BuildInfo{.intended_ref = r.ns.string() + "/" + r.ref, .op = Cas::ProvenanceOp::Insert});
     return *st.build;
+}
+
+bool ContentAddressedTransaction::republishRef(
+    const Cas::RootNamespace & src_ns, const std::string & src_ref,
+    const Cas::RootNamespace & dst_ns, const std::string & dst_ref)
+{
+    /// Move a COMMITTED ref: content addressing has no rename, so publish the SAME tree under the
+    /// destination (adoptTree observes the tree and the publish gate carries the GC-race safety)
+    /// and drop the source ref. Returns false (nothing written) when the source ref is absent.
+    auto resolved = metadata_storage.store()->resolveRef(src_ns, src_ref);
+    if (!resolved)
+        return false;
+    auto build = metadata_storage.store()->startBuild(
+        Cas::BuildInfo{.intended_ref = dst_ns.string() + "/" + dst_ref, .op = Cas::ProvenanceOp::Other});
+    build->adoptTree(resolved->tree_id);
+    Cas::RefPayload payload;
+    payload.tree_size = resolved->tree_size;
+    payload.mutable_files = resolved->mutable_files;   /// the .ca_mtime stamp carries over (a rename is not a new part)
+    build->publish(dst_ns, dst_ref, resolved->tree_id, std::move(payload));
+    metadata_storage.store()->dropRef(src_ns, src_ref);
+    return true;
+}
+
+ContentAddressedTransaction::PartStaging * ContentAddressedTransaction::findStaging(
+    const ContentAddressedMetadataStorage::Route & r)
+{
+    auto it = parts.find({r.ns.string(), r.ref});
+    return it == parts.end() ? nullptr : &it->second;
+}
+
+std::optional<ContentAddressedMetadataStorage::Route>
+ContentAddressedTransaction::routeOf(const std::string & path) const
+{
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (!p)
+        return std::nullopt;
+    return metadata_storage.route(*p);
 }
 
 void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &)
@@ -251,19 +289,150 @@ void ContentAddressedTransaction::createDirectoryRecursive(const std::string &)
 {
 }
 
-void ContentAddressedTransaction::removeDirectory(const std::string &)
+void ContentAddressedTransaction::removeDirectory(const std::string & path)
 {
-    notYet("removeDirectory");
+    /// The MergeTree fast-removal path unlinks a part's files one by one (no-ops here) and then
+    /// calls removeDirectory(<part>) - the SINGLE authoritative point at which the part's ref must
+    /// be unlinked (the PoC's B45). Part dirs route to dropRef; anything else is a no-op (object
+    /// storage has no real directories; tables/detached/shadow are removed via removeRecursive).
+    if (auto r = routeOf(path); r && !r->ref.empty() && r->file.empty())
+    {
+        if (metadata_storage.store()->resolveRef(r->ns, r->ref))
+            metadata_storage.store()->dropRef(r->ns, r->ref);
+        return;
+    }
 }
 
-void ContentAddressedTransaction::removeRecursive(const std::string &, const ShouldRemoveObjectsPredicate &)
+void ContentAddressedTransaction::removeRecursive(const std::string & path, const ShouldRemoveObjectsPredicate & /*should_remove_objects*/)
 {
-    notYet("removeRecursive");
+    /// Removal = pointer-unlink + deferred GC: only refs and verbatim files go; the shared
+    /// blobs/trees are reclaimed by Cas::Gc once unreachable. The predicate gates backing-object
+    /// deletion, which CA always defers - intentionally ignored (PoC contract).
+
+    /// FREEZE shadow shapes first (a shadow table dir also satisfies parseTableUuid).
+    if (ContentAddressed::isShadowPath(path))
+    {
+        if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
+        {
+            const auto ns = ContentAddressedMetadataStorage::shadowNamespace(p->shadow_table_dir);
+            if (metadata_storage.store()->resolveRef(ns, p->part_name))
+                metadata_storage.store()->dropRef(ns, p->part_name);
+            return;
+        }
+        if (ContentAddressed::endsWithTableUuidPair(path))
+        {
+            metadata_storage.store()->dropNamespace(ContentAddressedMetadataStorage::shadowNamespace(path));
+            return;
+        }
+        /// Backup root / intermediate dir (SYSTEM UNFREEZE WITH NAME): drop every shadow
+        /// namespace under it.
+        for (const auto & ns : metadata_storage.store()->listNamespaces(path + "/"))
+            metadata_storage.store()->dropNamespace(Cas::RootNamespace{ns});
+        return;
+    }
+
+    /// Table dir: the live namespace, its detached namespace, and every verbatim file go.
+    if (auto uuid = ContentAddressed::parseTableUuid(path))
+    {
+        metadata_storage.store()->dropNamespace(metadata_storage.liveNamespace(*uuid));
+        metadata_storage.store()->dropNamespace(metadata_storage.detachedNamespace(*uuid));
+        return;
+    }
+
+    if (auto p = ContentAddressed::parsePartFilePath(path))
+    {
+        auto r = metadata_storage.route(*p);
+        /// The detached CONTAINER dir: drop the whole detached namespace.
+        if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
+        {
+            metadata_storage.store()->dropNamespace(r->ns);
+            return;
+        }
+        /// A single part dir (live or detached): drop its ref.
+        if (r && !r->ref.empty() && r->file.empty())
+        {
+            if (metadata_storage.store()->resolveRef(r->ns, r->ref))
+                metadata_storage.store()->dropRef(r->ns, r->ref);
+            return;
+        }
+        /// A projection subdir: virtual (nested in the parent tree) - removal is a no-op; the
+        /// blobs go when the part's ref does (the PoC's B60 contract).
+        if (r && !r->ref.empty())
+            return;
+    }
+
+    /// Table-level SUBDIRECTORY (deduplication_logs/): remove every verbatim file under it.
+    if (auto tf = ContentAddressed::parseTableFilePath(path))
+    {
+        const auto ns = metadata_storage.liveNamespace(tf->table_uuid);
+        const std::string prefix = tf->tail + "/";
+        for (const auto & name : metadata_storage.store()->listNamespaceFiles(ns))
+            if (name.starts_with(prefix))
+                metadata_storage.store()->removeNamespaceFile(ns, name);
+        return;
+    }
 }
 
-void ContentAddressedTransaction::createHardLink(const std::string &, const std::string &)
+void ContentAddressedTransaction::createHardLink(const std::string & path_from, const std::string & path_to)
 {
-    notYet("createHardLink");
+    auto src = routeOf(path_from);
+    auto dst = routeOf(path_to);
+    if (!src || src->file.empty() || !dst || dst->file.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressed: createHardLink requires two part-file paths: {} -> {}", path_from, path_to);
+
+    auto & dst_st = stagingFor(*dst);
+
+    /// A MUTABLE per-part file carries forward by VALUE (its private bytes), never by reference
+    /// (the mutable decision is made on the SOURCE file — B62's clone shapes route cleanly now).
+    if (ContentAddressed::isMutablePerPartFile(src->file))
+    {
+        if (auto * src_st = findStaging(*src))
+            if (auto it = src_st->mutable_files.find(src->file); it != src_st->mutable_files.end())
+            {
+                dst_st.mutable_files[dst->file] = it->second;
+                return;
+            }
+        auto resolved = metadata_storage.store()->resolveRef(src->ns, src->ref);
+        if (!resolved || !resolved->mutable_files.contains(src->file))
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                "ContentAddressed: createHardLink source mutable file missing: {}", path_from);
+        dst_st.mutable_files[dst->file] = resolved->mutable_files.at(src->file);
+        return;
+    }
+
+    /// Content file. Prefer an entry staged earlier in THIS transaction (the destination Build
+    /// re-observes the blob via cold reuse — its own dependency); else carry forward from the
+    /// COMMITTED source part (adoptFromTree: tokenless evidence pinned by the witnessed live
+    /// source tree, W-EVIDENCE).
+    Cas::TreeEntry entry;
+    if (auto * src_st = findStaging(*src))
+    {
+        auto it = std::find_if(src_st->entries.begin(), src_st->entries.end(),
+            [&](const Cas::TreeEntry & e) { return e.name == src->file; });
+        if (it != src_st->entries.end())
+        {
+            entry = *it;
+            if (entry.placement == Cas::Placement::Blob)
+                buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)));
+            else if (entry.placement != Cas::Placement::Inline)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "ContentAddressed: staged hardlink of unsupported placement for {}", path_from);
+            entry.name = dst->file;
+            std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+            dst_st.entries.push_back(std::move(entry));
+            return;
+        }
+    }
+
+    auto resolved = metadata_storage.store()->resolveRef(src->ns, src->ref);
+    if (!resolved)
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+            "ContentAddressed: createHardLink source part missing: {}", path_from);
+    entry = buildFor(*dst, dst_st).adoptFromTree(resolved->tree_id, src->file);
+    entry.name = dst->file;
+    std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+    dst_st.entries.push_back(std::move(entry));
 }
 
 void ContentAddressedTransaction::setLastModified(const std::string &, const Poco::Timestamp &)
@@ -282,29 +451,253 @@ void ContentAddressedTransaction::setReadOnly(const std::string &)
     /// Read-only flags have no content-addressed representation — accept and ignore (PoC behavior).
 }
 
-void ContentAddressedTransaction::moveDirectory(const std::string &, const std::string &)
+void ContentAddressedTransaction::moveDirectory(const std::string & path_from, const std::string & path_to)
 {
-    notYet("moveDirectory");
+    auto src_p = ContentAddressed::parsePartFilePath(path_from);
+    auto dst_p = ContentAddressed::parsePartFilePath(path_to);
+    auto src = src_p ? metadata_storage.route(*src_p) : std::nullopt;
+    auto dst = dst_p ? metadata_storage.route(*dst_p) : std::nullopt;
+
+    /// RENAME TABLE / cross-engine move: both endpoints are TABLE dirs. Republish every live and
+    /// detached ref plus every verbatim file under the new table identity, then drop the old
+    /// namespaces (the blobs/trees are content-addressed and untouched).
+    if (auto src_table = ContentAddressed::parseTableUuid(path_from))
+    {
+        if (auto dst_table = ContentAddressed::parseTableUuid(path_to))
+        {
+            auto move_namespace = [&](const Cas::RootNamespace & from_ns, const Cas::RootNamespace & to_ns)
+            {
+                auto refs = metadata_storage.store()->listRefs(from_ns);
+                for (const auto & [ref, _] : refs)
+                    republishRef(from_ns, ref, to_ns, ref);
+                for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_ns))
+                    if (auto bytes = metadata_storage.store()->getNamespaceFile(from_ns, name))
+                        metadata_storage.store()->putNamespaceFile(to_ns, name, *bytes);
+                metadata_storage.store()->dropNamespace(from_ns);
+            };
+            move_namespace(metadata_storage.liveNamespace(*src_table), metadata_storage.liveNamespace(*dst_table));
+            move_namespace(metadata_storage.detachedNamespace(*src_table), metadata_storage.detachedNamespace(*dst_table));
+            return;
+        }
+    }
+
+    if (!src || !dst)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressed: moveDirectory cannot classify {} -> {}", path_from, path_to);
+
+    /// Projection MATERIALIZE/merge renames the staged <proj>_<n>.tmp_proj subdir to <proj>.proj
+    /// inside the SAME staged part: re-key the staged entry-name prefixes so the published tree
+    /// carries the final keys.
+    if (!src->file.empty() && !dst->file.empty()
+        && src->ns.string() == dst->ns.string() && src->ref == dst->ref
+        && src->file.ends_with(".tmp_proj") && dst->file.ends_with(".proj"))
+    {
+        if (auto * st = findStaging(*src))
+        {
+            const std::string old_prefix = src->file + "/";
+            const std::string new_prefix = dst->file + "/";
+            for (auto & entry : st->entries)
+                if (entry.name.starts_with(old_prefix))
+                    entry.name = new_prefix + entry.name.substr(old_prefix.size());
+            for (auto it = st->mutable_files.begin(); it != st->mutable_files.end();)
+            {
+                if (it->first.starts_with(old_prefix))
+                {
+                    st->mutable_files[new_prefix + it->first.substr(old_prefix.size())] = std::move(it->second);
+                    it = st->mutable_files.erase(it);
+                }
+                else
+                    ++it;
+            }
+            return;
+        }
+    }
+
+    /// Every remaining shape is a PART-DIR move: (ns, ref) -> (ns', ref') with empty files. This
+    /// uniformly covers tmp->final (staged), committed renames (delete_tmp_, merge results),
+    /// DETACH (live -> detached ns), detached renames (attaching_/deleting_), and ATTACH
+    /// (detached -> live ns) - in the new layout they are all the same two moves: re-key any
+    /// staging, then move any committed ref.
+    if (!src->ref.empty() && src->file.empty() && !dst->ref.empty() && dst->file.empty())
+    {
+        const std::pair<std::string, std::string> src_key{src->ns.string(), src->ref};
+        const std::pair<std::string, std::string> dst_key{dst->ns.string(), dst->ref};
+        if (src_key == dst_key)
+            return;
+
+        /// Re-key a STAGED source into the destination (B67: merge stagings; on a mutable-file
+        /// collision PREFER the existing destination bytes - the newer MVCC state).
+        if (auto src_it = parts.find(src_key); src_it != parts.end())
+        {
+            PartStaging & dst_st = parts[dst_key];
+            PartStaging & src_st = src_it->second;
+            for (auto & entry : src_st.entries)
+            {
+                std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+                dst_st.entries.push_back(std::move(entry));
+            }
+            for (auto & [file, bytes] : src_st.mutable_files)
+                dst_st.mutable_files.emplace(file, std::move(bytes));   /// dest bytes win on collision
+            for (const auto & file : src_st.mutable_removed)
+                dst_st.mutable_removed.insert(file);
+            if (!src_st.build)
+            {
+            }
+            else if (!dst_st.build)
+            {
+                dst_st.build = std::move(src_st.build);
+            }
+            else
+            {
+                /// Two Builds for one destination part: keep the destination's; the source build's
+                /// deps ride the staged entries (re-observed by the destination build at adopt
+                /// time is unnecessary - entries staged via putBlob/adopt carry deps in the SOURCE
+                /// build... merge conservatively by abandoning nothing and re-observing):
+                for (const auto & entry : dst_st.entries)
+                    if (entry.placement == Cas::Placement::Blob)
+                        dst_st.build->reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)));
+                src_st.build->abandon();
+            }
+            parts.erase(src_it);
+        }
+
+        /// Move any COMMITTED source ref (a merge/mutation result rename, DETACH, ATTACH, a
+        /// delete_tmp_ rename, an early-committed child ref being renamed away). Absent = a pure
+        /// staged/tmp move - nothing durable to touch.
+        republishRef(src->ns, src->ref, dst->ns, dst->ref);
+        return;
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "ContentAddressed: moveDirectory from {} to {} has an unsupported shape", path_from, path_to);
 }
 
-void ContentAddressedTransaction::moveFile(const std::string &, const std::string &)
+void ContentAddressedTransaction::moveFile(const std::string & path_from, const std::string & path_to)
 {
-    notYet("moveFile");
+    /// Verbatim table-level / generic files: physically move the namespace file (the mutation
+    /// entry tmp_mutation_N.txt -> mutation_N.txt rename; already durable from its finalize).
+    if (!ContentAddressed::isPartFilePath(path_from) && !ContentAddressed::isPartFilePath(path_to))
+    {
+        auto locate_verbatim = [&](const std::string & path) -> std::pair<Cas::RootNamespace, std::string>
+        {
+            if (auto tf = ContentAddressed::parseTableFilePath(path))
+                return {metadata_storage.liveNamespace(tf->table_uuid), tf->tail};
+            return {metadata_storage.genericNamespace(), path};
+        };
+        auto [src_ns, src_name] = locate_verbatim(path_from);
+        auto [dst_ns, dst_name] = locate_verbatim(path_to);
+        if (src_ns.string() == dst_ns.string() && src_name == dst_name)
+            return;
+        auto bytes = metadata_storage.store()->getNamespaceFile(src_ns, src_name);
+        if (!bytes)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: moveFile source missing: {}", path_from);
+        metadata_storage.store()->putNamespaceFile(dst_ns, dst_name, *bytes);
+        metadata_storage.store()->removeNamespaceFile(src_ns, src_name);
+        return;
+    }
+
+    auto src = routeOf(path_from);
+    auto dst = routeOf(path_to);
+    /// A part-DIRECTORY rename reaching moveFile (PartsTemporaryRename::rollBackAll undoes an
+    /// attach via moveFile - B87): delegate to moveDirectory, which owns directory shapes.
+    if (src && dst && !src->ref.empty() && src->file.empty() && !dst->ref.empty() && dst->file.empty())
+    {
+        moveDirectory(path_from, path_to);
+        return;
+    }
+    if (!src || src->file.empty() || !dst || dst->file.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressed: moveFile requires two part-file paths: {} -> {}", path_from, path_to);
+
+    auto & src_st = stagingFor(*src);
+    auto & dst_st = stagingFor(*dst);
+
+    /// Staged mutable bytes re-key in place.
+    if (auto mit = src_st.mutable_files.find(src->file); mit != src_st.mutable_files.end())
+    {
+        auto bytes = std::move(mit->second);
+        src_st.mutable_files.erase(mit);
+        dst_st.mutable_files[dst->file] = std::move(bytes);
+        return;
+    }
+    /// Staged content entry re-keys in place (cross-part included; deps follow the entries).
+    auto it = std::find_if(src_st.entries.begin(), src_st.entries.end(),
+        [&](const Cas::TreeEntry & e) { return e.name == src->file; });
+    if (it != src_st.entries.end())
+    {
+        auto entry = std::move(*it);
+        src_st.entries.erase(it);
+        entry.name = dst->file;
+        if (&src_st != &dst_st && entry.placement == Cas::Placement::Blob)
+            buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)));
+        std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+        dst_st.entries.push_back(std::move(entry));
+        return;
+    }
+    /// Source not staged in THIS transaction: a standalone one-shot rename of a COMMITTED mutable
+    /// file (the MVCC txn_version.txt.tmp -> txn_version.txt move). Re-stage the committed bytes
+    /// under the destination and mark the source removed; commit publishes via updateRefPayload.
+    if (ContentAddressed::isMutablePerPartFile(dst->file))
+    {
+        auto resolved = metadata_storage.store()->resolveRef(src->ns, src->ref);
+        if (!resolved || !resolved->mutable_files.contains(src->file))
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                "ContentAddressed: moveFile source mutable file missing: {}", path_from);
+        dst_st.mutable_files[dst->file] = resolved->mutable_files.at(src->file);
+        src_st.mutable_removed.insert(src->file);
+        return;
+    }
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: moveFile source not staged: {}", path_from);
 }
 
-void ContentAddressedTransaction::replaceFile(const std::string &, const std::string &)
+void ContentAddressedTransaction::replaceFile(const std::string & path_from, const std::string & path_to)
 {
-    notYet("replaceFile");
+    /// replaceFile = moveFile that overwrites the destination. Drop any staged destination state
+    /// first, then delegate (the verbatim branch's putNamespaceFile already overwrites).
+    if (auto dst = routeOf(path_to); dst && !dst->file.empty())
+    {
+        auto & dst_st = stagingFor(*dst);
+        std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == dst->file; });
+        dst_st.mutable_files.erase(dst->file);
+        dst_st.mutable_removed.erase(dst->file);
+    }
+    moveFile(path_from, path_to);
 }
 
-void ContentAddressedTransaction::unlinkFile(const std::string &, bool, bool)
+void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if_exists*/, bool /*should_remove_objects*/)
 {
-    notYet("unlinkFile");
+    /// Part file: drop the staged state so it never reaches the published tree. A mutable file
+    /// that exists only in the COMMITTED payload is staged for removal (commit publishes the
+    /// deletion via updateRefPayload - the MVCC removeTmpMetadataFile shape). Committed CONTENT
+    /// files are never unlinked one-by-one on CA (the part's ref-drop is the removal unit) - the
+    /// per-file unlinks of the MergeTree fast-removal path are no-ops here.
+    if (auto r = routeOf(path); r && !r->file.empty())
+    {
+        auto & st = stagingFor(*r);
+        const bool staged_here = st.mutable_files.contains(r->file)
+            || std::any_of(st.entries.begin(), st.entries.end(),
+                           [&](const Cas::TreeEntry & e) { return e.name == r->file; });
+        std::erase_if(st.entries, [&](const Cas::TreeEntry & e) { return e.name == r->file; });
+        st.mutable_files.erase(r->file);
+        if (!staged_here && ContentAddressed::isMutablePerPartFile(r->file))
+            st.mutable_removed.insert(r->file);
+        return;
+    }
+
+    /// Verbatim table-level / generic file: reclaim the object NOW (the GC never scans them; a
+    /// pruned mutation entry would otherwise leak until DROP - the PoC's B50).
+    if (auto tf = ContentAddressed::parseTableFilePath(path))
+    {
+        metadata_storage.store()->removeNamespaceFile(metadata_storage.liveNamespace(tf->table_uuid), tf->tail);
+        return;
+    }
+    metadata_storage.store()->removeNamespaceFile(metadata_storage.genericNamespace(), path);
 }
 
 void ContentAddressedTransaction::truncateFile(const std::string &, size_t)
 {
-    notYet("truncateFile");
+    /// No-op: content-addressed blobs are immutable; committed part files are never truncated
+    /// (whole-file rewrites replace the staged entry instead). PoC behavior, kept.
 }
 
 }

@@ -89,7 +89,12 @@ private:
     bool committed = false;
 
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
+    PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);
     Cas::Build & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
+    std::optional<ContentAddressedMetadataStorage::Route> routeOf(const std::string & path) const;
+    /// Move a COMMITTED ref by republish (adoptTree + publish same tree + dropRef). false = absent source.
+    bool republishRef(const Cas::RootNamespace & src_ns, const std::string & src_ref,
+                      const Cas::RootNamespace & dst_ns, const std::string & dst_ref);
 };
 
 }

@@ -305,6 +305,23 @@ void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
     });
 }
 
+void Store::removeNamespaceFile(const RootNamespace & ns, const String & name)
+{
+    const String key = pool_layout.namespaceFileKey(ns, name);
+    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
+    {
+        const HeadResult head = pool_backend->head(key);
+        if (!head.exists)
+            return;
+        const DeleteOutcome outcome = pool_backend->deleteExact(key, head.token);
+        if (outcome.kind == DeleteOutcome::Kind::Deleted || outcome.kind == DeleteOutcome::Kind::NotFound)
+            return;
+        /// TokenMismatch: a concurrent rewrite - re-head and retry (single-owner keys, runaway brake).
+    }
+    throw Exception(ErrorCodes::ABORTED,
+        "CAS removeNamespaceFile contention on {} (runaway live-lock brake)", key);
+}
+
 void Store::dropNamespace(const RootNamespace & ns)
 {
     /// Tombstone every TOUCHED shard, then delete the verbatim files. GC removes the manifest OBJECTS

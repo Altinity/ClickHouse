@@ -92,6 +92,10 @@ public:
     void putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes);
     std::optional<String> getNamespaceFile(const RootNamespace & ns, const String & name);
     std::vector<String> listNamespaceFiles(const RootNamespace & ns);
+    /// Exact-token delete of one verbatim file (no-op when absent). Verbatim files are never
+    /// content-addressed, so a mid-life delete (a pruned mutation entry, a stale tmp) must reclaim
+    /// the object NOW - the reachability GC never scans them.
+    void removeNamespaceFile(const RootNamespace & ns, const String & name);
 
     /// Internal surface for Build (same TU family; not for the wiring):
     const PoolConfig & poolConfig() const { return config; }

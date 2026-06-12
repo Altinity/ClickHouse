@@ -442,3 +442,216 @@ TEST(CaWiringWrite, VerbatimFilesDurableOnFinalizeAndAppendable)
     EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/mutation_5.txt"),
               std::optional<String>("commands\ncsn 42\n"));
 }
+
+/// ==== M-W Tasks 5-7: carry-forward, renames, removals, detached/ATTACH/FREEZE ====
+
+TEST(CaWiringOps, HardLinkCarriesForwardWithoutReupload)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "shared-payload");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/uuid.txt", "u-1");
+    tx->commit(DB::NoCommitOptions{});
+
+    /// A mutation/merge carries unchanged files into the new part by hardlink.
+    auto tx2 = storage->createTransaction();
+    tx2->createHardLink("uui/uuid-1/all_1_1_0/data.bin", "uui/uuid-1/all_1_1_5/data.bin");
+    tx2->createHardLink("uui/uuid-1/all_1_1_0/uuid.txt", "uui/uuid-1/all_1_1_5/uuid.txt");
+    tx2->commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_5/data.bin"));
+    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path,
+              storage->getStorageObjects("uui/uuid-1/all_1_1_5/data.bin")[0].remote_path);
+    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_5/uuid.txt"), std::optional<String>("u-1"));
+}
+
+TEST(CaWiringOps, TmpToFinalRenamePublishesUnderFinalName)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/tmp_insert_all_1_1_0/data.bin", "fresh");
+    tx->moveDirectory("uui/uuid-1/tmp_insert_all_1_1_0", "uui/uuid-1/all_1_1_0");
+    tx->commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp_insert_all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
+}
+
+TEST(CaWiringOps, CommittedPartRenameMovesTheRef)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "bytes");
+    tx->commit(DB::NoCommitOptions{});
+
+    /// MergeTree renames a part to delete_tmp_<part> before removing it.
+    auto tx2 = storage->createTransaction();
+    tx2->moveDirectory("uui/uuid-1/all_1_1_0", "uui/uuid-1/delete_tmp_all_1_1_0");
+    tx2->commit(DB::NoCommitOptions{});
+
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/delete_tmp_all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/delete_tmp_all_1_1_0/data.bin"));
+}
+
+TEST(CaWiringOps, ProjectionTmpRenameRekeysStagedEntries)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "main");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/p_1.tmp_proj/data.bin", "proj");
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    ca_tx.moveDirectory("uui/uuid-1/all_1_1_0/p_1.tmp_proj", "uui/uuid-1/all_1_1_0/p.proj");
+    tx->commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/p.proj/data.bin"));
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/p_1.tmp_proj/data.bin"));
+    EXPECT_EQ(storage->listDirectory("uui/uuid-1/all_1_1_0/p.proj"), (std::vector<std::string>{"data.bin"}));
+}
+
+TEST(CaWiringOps, DetachAttachRoundTrip)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "detachable");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/metadata_version.txt", "3");
+    tx->commit(DB::NoCommitOptions{});
+
+    /// DETACH: a committed part moves into the detached namespace - pure ref ops.
+    auto tx2 = storage->createTransaction();
+    tx2->moveDirectory("uui/uuid-1/all_1_1_0", "uui/uuid-1/detached/all_1_1_0");
+    tx2->commit(DB::NoCommitOptions{});
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/detached/all_1_1_0"));
+    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/detached/all_1_1_0/metadata_version.txt"),
+              std::optional<String>("3"));
+
+    /// ATTACH: stage-rename within detached, then publish back into the live namespace.
+    auto tx3 = storage->createTransaction();
+    tx3->moveDirectory("uui/uuid-1/detached/all_1_1_0", "uui/uuid-1/detached/attaching_all_1_1_0");
+    tx3->commit(DB::NoCommitOptions{});
+    auto tx4 = storage->createTransaction();
+    tx4->moveDirectory("uui/uuid-1/detached/attaching_all_1_1_0", "uui/uuid-1/all_2_2_0");
+    tx4->commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_2_2_0/data.bin"));
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/detached/attaching_all_1_1_0"));
+    EXPECT_EQ(storage->listDirectory("uui/uuid-1/detached"), (std::vector<std::string>{}));
+}
+
+TEST(CaWiringOps, RemovalsDropRefsAndNamespaces)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "gone-soon");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_2_2_0/data.bin", "stays");
+    tx->commit(DB::NoCommitOptions{});
+    storage->store()->putNamespaceFile(storage->liveNamespace("uuid-1"), "format_version.txt", "1\n");
+
+    /// The fast-removal path: per-file unlinks are no-ops; removeDirectory(<part>) drops the ref.
+    auto tx2 = storage->createTransaction();
+    tx2->unlinkFile("uui/uuid-1/all_1_1_0/data.bin", false, false);
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));   /// still committed
+    tx2->removeDirectory("uui/uuid-1/all_1_1_0");
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
+
+    /// DROP TABLE: removeRecursive on the table dir drops the live + detached namespaces.
+    tx2->removeRecursive("uui/uuid-1", {});
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1"));
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/format_version.txt"));
+}
+
+TEST(CaWiringOps, MutableTmpMoveOnCommittedPart)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "x");
+    tx->commit(DB::NoCommitOptions{});
+
+    /// VersionMetadataOnDisk's atomic write: autocommit txn_version.txt.tmp, then a standalone
+    /// one-shot moveFile(.tmp -> txn_version.txt).
+    auto tx2 = storage->createTransaction();
+    writeThroughTransaction(*tx2, "uui/uuid-1/all_1_1_0/txn_version.txt.tmp", "tid-7");
+    tx2->commit(DB::NoCommitOptions{});
+    auto tx3 = storage->createTransaction();
+    tx3->moveFile("uui/uuid-1/all_1_1_0/txn_version.txt.tmp", "uui/uuid-1/all_1_1_0/txn_version.txt");
+    tx3->commit(DB::NoCommitOptions{});
+
+    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/txn_version.txt"), std::optional<String>("tid-7"));
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/txn_version.txt.tmp"));
+
+    /// removeTmpMetadataFile: unlink of a committed mutable file publishes its deletion.
+    auto tx4 = storage->createTransaction();
+    tx4->unlinkFile("uui/uuid-1/all_1_1_0/txn_version.txt", false, false);
+    tx4->commit(DB::NoCommitOptions{});
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/txn_version.txt"));
+}
+
+TEST(CaWiringOps, VerbatimMoveAndUnlink)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/tmp_mutation_5.txt", "cmds");
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    ca_tx.moveFile("uui/uuid-1/tmp_mutation_5.txt", "uui/uuid-1/mutation_5.txt");
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/mutation_5.txt"));
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/tmp_mutation_5.txt"));
+    ca_tx.unlinkFile("uui/uuid-1/mutation_5.txt", false, false);
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/mutation_5.txt"));
+}
+
+TEST(CaWiringOps, TableRenameMovesRefsFilesAndDetached)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "live");
+    tx->commit(DB::NoCommitOptions{});
+    auto tx2 = storage->createTransaction();
+    tx2->moveDirectory("uui/uuid-1/all_1_1_0", "uui/uuid-1/detached/all_1_1_0");   /// one detached part
+    tx2->commit(DB::NoCommitOptions{});
+    auto tx3 = storage->createTransaction();
+    writeThroughTransaction(*tx3, "uui/uuid-1/all_2_2_0/data.bin", "live2");
+    tx3->commit(DB::NoCommitOptions{});
+    storage->store()->putNamespaceFile(storage->liveNamespace("uuid-1"), "format_version.txt", "1\n");
+
+    auto tx4 = storage->createTransaction();
+    tx4->moveDirectory("uui/uuid-1", "uui/uuid-2");
+    tx4->commit(DB::NoCommitOptions{});
+
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1"));
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-2"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-2/all_2_2_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-2/format_version.txt"));
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-2/detached/all_1_1_0"));
+}
+
+TEST(CaWiringOps, FreezeViaHardLinksIntoShadow)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "frozen-bytes");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/metadata_version.txt", "7");
+    tx->commit(DB::NoCommitOptions{});
+
+    /// FREEZE clones a committed part file-by-file into the shadow tree via hardlinks; the staged
+    /// shadow part publishes at commit (pool-global - any replica reads the backup).
+    auto tx2 = storage->createTransaction();
+    tx2->createHardLink("uui/uuid-1/all_1_1_0/data.bin", "shadow/bk1/store/uui/uuid-1/all_1_1_0/data.bin");
+    tx2->createHardLink("uui/uuid-1/all_1_1_0/metadata_version.txt",
+                        "shadow/bk1/store/uui/uuid-1/all_1_1_0/metadata_version.txt");
+    tx2->commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(storage->existsDirectory("shadow/bk1/store/uui/uuid-1/all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("shadow/bk1/store/uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_EQ(storage->tryGetInManifestBytes("shadow/bk1/store/uui/uuid-1/all_1_1_0/metadata_version.txt"),
+              std::optional<String>("7"));
+
+    /// UNFREEZE: removeRecursive of the backup root drops every shadow namespace under it.
+    auto tx3 = storage->createTransaction();
+    tx3->removeRecursive("shadow/bk1", {});
+    EXPECT_FALSE(storage->existsDirectory("shadow/bk1/store/uui/uuid-1/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("shadow/bk1"));
+}

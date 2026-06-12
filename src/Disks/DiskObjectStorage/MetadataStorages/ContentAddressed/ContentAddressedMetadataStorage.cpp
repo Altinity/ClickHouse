@@ -248,10 +248,11 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
         if (ContentAddressed::endsWithTableUuidPair(path))
             return !store()->listRefs(shadowNamespace(path)).empty();
         /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff some shadow
-        /// namespace (= a literal shadow table dir) lives under it.
+        /// namespace (= a literal shadow table dir) under it still has refs. Registration alone is
+        /// not existence - dropped namespaces linger registered until full GC (visible-but-empty).
         const std::string prefix = path + "/";
         for (const auto & ns : store()->listNamespaces("shadow/"))
-            if (ns.starts_with(prefix))
+            if (ns.starts_with(prefix) && !store()->listRefs(Cas::RootNamespace{ns}).empty())
                 return true;
         return false;
     }
@@ -386,11 +387,12 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
                 result.push_back(ref);
             return result;
         }
-        /// Shadow INTERMEDIATE dir: derive children from the registered shadow namespaces.
+        /// Shadow INTERMEDIATE dir: derive children from the registered shadow namespaces that
+        /// still have refs (dropped ones linger registered until full GC - never list them).
         const std::string prefix = path.empty() ? "shadow" : path;
         std::unordered_set<std::string> result;
         for (const auto & ns : store()->listNamespaces("shadow/"))
-            if (ns.starts_with(prefix + "/"))
+            if (ns.starts_with(prefix + "/") && !store()->listRefs(Cas::RootNamespace{ns}).empty())
                 addFirstComponent(result, ns.substr(prefix.size() + 1));
         return toVector(std::move(result));
     }
