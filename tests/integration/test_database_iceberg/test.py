@@ -20,6 +20,7 @@ from pyiceberg.table.sorting import SortField, SortOrder
 from pyiceberg.transforms import DayTransform, IdentityTransform
 from pyiceberg.types import (
     DoubleType,
+    IntegerType,
     LongType,
     FloatType,
     NestedField,
@@ -1139,6 +1140,71 @@ def test_alter_drop_column_without_reload(started_cluster):
     assert "`y`" not in node.query(
         f"SHOW CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}`"
     )
+
+
+def test_alter_modify_column_rest_catalog(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_alter_modify_column_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    schema = Schema(
+        NestedField(field_id=1, name="id", field_type=IntegerType(), required=False),
+        NestedField(field_id=2, name="value", field_type=StringType(), required=False),
+    )
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_name}` VALUES (1, 'hello'), (2, 'world');",
+        settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+    )
+    assert (
+        node.query(f"SELECT id, value FROM {CATALOG_NAME}.`{root_namespace}.{table_name}` ORDER BY id")
+        == "1\thello\n2\tworld\n"
+    )
+
+    node.query(
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}` ADD COLUMN newCol Nullable(Int64);",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+
+    # No-op modify: column is already Nullable(Int64). Without the fix this fails catalog commit
+    # with "Cannot set current schema to unknown schema".
+    node.query(
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}` MODIFY COLUMN newCol Nullable(Int64);",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+
+    node.query(
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}` MODIFY COLUMN id Nullable(Int64);",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+
+    assert (
+        node.query(f"SELECT id, value FROM {CATALOG_NAME}.`{root_namespace}.{table_name}` ORDER BY id")
+        == "1\thello\n2\tworld\n"
+    )
+
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_name}` VALUES (3000000000, 'foo', NULL);",
+        settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+    )
+    assert (
+        node.query(
+            f"SELECT id, value, newCol FROM {CATALOG_NAME}.`{root_namespace}.{table_name}` ORDER BY id"
+        )
+        == "1\thello\t\\N\n2\tworld\t\\N\n3000000000\tfoo\t\\N\n"
+    )
+
+    iceberg_table = catalog.load_table(f"{root_namespace}.{table_name}")
+    current_schema = iceberg_table.schema()
+    assert isinstance(current_schema.find_field("id").field_type, LongType)
+    assert isinstance(current_schema.find_field("newCol").field_type, LongType)
 
 
 def test_alter_orphan_metadata_cleanup_on_catalog_failure(started_cluster):
