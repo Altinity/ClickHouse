@@ -91,14 +91,29 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     String storage_path_prefix_,
     String server_id_,
     String local_scratch_path_,
-    ContextPtr context_)
+    ContextPtr context_,
+    bool gc_enabled_,
+    std::chrono::seconds gc_interval_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
     , server_id(std::move(server_id_))
     , local_scratch_path(std::move(local_scratch_path_))
     , context(context_)
+    , gc_enabled(gc_enabled_)
+    , gc_interval(gc_interval_)
 {
+}
+
+void ContentAddressedMetadataStorage::runOneGcRoundForTest()
+{
+    if (gc_scheduler)
+    {
+        gc_scheduler->runOneRoundNow();
+        return;
+    }
+    ContentAddressed::CasGcScheduler one_shot(store(), gc_interval, "ContentAddressedGC");
+    one_shot.runOneRoundNow();
 }
 
 void ContentAddressedMetadataStorage::startup()
@@ -139,11 +154,24 @@ void ContentAddressedMetadataStorage::startup()
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
 
-    /// The background GC scheduler lands in M-W T10 (context-gated).
+    /// The background GC scheduler runs only on the disk-factory path (context non-null) and when
+    /// enabled - the lease makes concurrent schedulers across mounters safe (work dedup), so no
+    /// further gating is needed (D-W5).
+    if (context && gc_enabled)
+    {
+        gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
+            cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full));
+        gc_scheduler->start();
+    }
 }
 
 void ContentAddressedMetadataStorage::shutdown()
 {
+    if (gc_scheduler)
+    {
+        gc_scheduler->stop();
+        gc_scheduler.reset();
+    }
     cas_store.reset();
 }
 

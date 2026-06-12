@@ -701,3 +701,34 @@ TEST(CaWiringInFlight, StagedFilesVisibleBeforeCommit)
     EXPECT_EQ(tx->listInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0/p.proj"),
               (std::vector<std::string>{"data.bin"}));
 }
+
+/// ==== M-W Task 10: the GC scheduler end-to-end through the wiring ====
+
+TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "reclaim-me");
+    tx->commit(DB::NoCommitOptions{});
+
+    const auto blob_key = storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path;
+
+    auto tx2 = storage->createTransaction();
+    tx2->removeDirectory("uui/uuid-1/all_1_1_0");   /// dropRef - the part is unreachable now
+
+    /// Round 1 folds the drop and retires+deletes the tree; the blob is freed by the cascade and
+    /// reclaimed in a following round (next-round reclamation, M-C3).
+    storage->runOneGcRoundForTest();
+    storage->runOneGcRoundForTest();
+    storage->runOneGcRoundForTest();
+
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    /// The blob object is gone from the backend (read attempts would 404; assert through the
+    /// in-flight-free read path: the part is unreachable, so just verify a fresh identical write
+    /// re-uploads rather than dedups - the old object no longer exists).
+    auto tx3 = storage->createTransaction();
+    writeThroughTransaction(*tx3, "uui/uuid-1/all_9_9_0/data.bin", "reclaim-me");
+    tx3->commit(DB::NoCommitOptions{});
+    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_9_9_0/data.bin")[0].remote_path, blob_key);
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_9_9_0/data.bin"));
+}

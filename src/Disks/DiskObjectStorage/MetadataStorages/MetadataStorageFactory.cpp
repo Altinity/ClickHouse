@@ -233,12 +233,12 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// fence/recheck handshake make shared pools safe, and the GC lease dedups leaders — the old
         /// single-owner claim and its allow_shared_pool opt-in are gone (M-W D-W5/D-W6).
         auto global_context = Context::getGlobalContextInstance();
+        const bool gc_enabled = config.getBool(config_prefix + ".content_addressed_gc_enabled", true);
+        const auto gc_interval = std::chrono::seconds(
+            config.getUInt64(config_prefix + ".content_addressed_gc_interval_sec", 60));
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path,
-            global_context);
-
-        /// GC scheduler knobs (content_addressed_gc_enabled / content_addressed_gc_interval_sec) are
-        /// read by the scheduler when it lands (M-W T10).
+            global_context, gc_enabled, gc_interval);
 
         return metadata_storage;
     });

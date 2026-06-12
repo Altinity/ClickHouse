@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Interpreters/Context_fwd.h>
 #include <memory>
@@ -42,7 +43,12 @@ public:
         String storage_path_prefix_,
         String server_id_,
         String local_scratch_path_,
-        ContextPtr context_ = nullptr);
+        ContextPtr context_ = nullptr,
+        bool gc_enabled_ = true,
+        std::chrono::seconds gc_interval_ = std::chrono::seconds(60));
+
+    /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
+    void runOneGcRoundForTest();
 
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
     const std::string & getPath() const override { return storage_path_full; }
@@ -129,9 +135,13 @@ private:
     const std::string local_scratch_path;
     const ContextPtr context;
 
+    const bool gc_enabled;
+    const std::chrono::seconds gc_interval;
+
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;
     String pool_uuid;
+    std::unique_ptr<ContentAddressed::CasGcScheduler> gc_scheduler;
     /// Joined in front of core keys for DIRECT object_storage reads. The Emulated (Local) backend
     /// maps bare pool keys under getCommonKeyPrefix; Native passes keys through - this member
     /// mirrors that rule so readBlobPayload reads exactly where the backend wrote ("" for Native).
