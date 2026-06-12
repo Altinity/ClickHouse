@@ -21,6 +21,7 @@
 namespace DB::ErrorCodes
 {
 extern const int ABORTED;
+extern const int FILE_DOESNT_EXIST;
 extern const int LOGICAL_ERROR;
 }
 
@@ -518,7 +519,8 @@ TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
     const String tree_key = s->layout().treeKey(tree);
     const Token t0 = b->head(tree_key).token;
 
-    /// 2. build B adopts T while the view is still at round 0 (a tokenless evidence dep).
+    /// 2. build B adopts T while the view is still at round 0 (a token-bearing cold-reuse dep
+    /// since 2026-06-12 - observed at adopt time, stamped with view round 0).
     auto build_b = s->startBuild({});
     build_b->adoptTree(tree);
 
@@ -533,9 +535,9 @@ TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
     EXPECT_FALSE(b->head(tree_key).exists);
 
     /// 4. build B publishes T into a BRAND-NEW namespace: ensureRegistered returns the registry's
-    /// fence_round (1) > view round (0) => the gate refreshes => B's STALE TOKENLESS EVIDENCE on T
-    /// (recorded at view round 0 < 1, no view hit - the entry dropped) is RE-OBSERVED (one HEAD,
-    /// the amended W-EVIDENCE): T is ABSENT and adoptTree retains no payload => the publish ABORTS
+    /// fence_round (1) > view round (0) => the gate refreshes => B's STALE dep on T (observed at
+    /// view round 0 < 1, no view hit - the entry dropped) is RE-OBSERVED (one HEAD,
+    /// W-REVALIDATE): T is ABSENT and adoptTree retains no payload => the publish ABORTS
     /// retryably. It must NEVER land - landing would write a manifest naming a deleted tree (the
     /// dangle this whole ordering machinery exists to prevent).
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
@@ -550,4 +552,43 @@ TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
     /// WITHOUT the registry gate floor the publish LANDS on the stale round-0 view (no refresh, no
     /// re-observation) and resolveRef would return a ref whose readTree throws - the dangle made
     /// concrete. (Verified red with the floor disabled.)
+}
+
+TEST(CasProtocol, AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime)
+{
+    /// The SAME-ROUND companion of the scenario above (found refreshing the TLA+ model, B91,
+    /// 2026-06-12): adoptTree must OBSERVE the object (cold-reuse semantics, one HEAD), never
+    /// record blind tokenless evidence. A detached tree reclaimed by a COMPLETED round has no
+    /// view hit (entries drop on confirmed outcomes), and a view already refreshed AT the current
+    /// round skips both the publish-time re-observation (the observed_view_round >= round keep
+    /// branch) AND the fence-advanced refresh (view round == fence round). With a blind adopt
+    /// nothing is left to catch it and the publish lands a manifest naming a deleted tree - the
+    /// dangle. The live-source argument that justifies tokenless evidence for adoptFromTree
+    /// children does not apply here: a detached tree is exactly NOT pinned by anything.
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+
+    auto build_a = s->startBuild({});
+    build_a->putBlob(idOf("wr-payload"), BlobSource::fromString("wr-payload"));
+    auto tree = build_a->putTree({blobEntry("data.bin", "wr-payload")});
+    build_a->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{});
+
+    /// Detach, then a FULL GC round: T deleted at its observed token, entry dropped on the
+    /// confirmed outcome, namespace fenced at round 1.
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_FALSE(b->head(s->layout().treeKey(tree)).exists);
+
+    /// The process view refreshes AFTER the round completed (any unrelated publish does this in
+    /// production): round 1, NO entry for T - the view alone can never condemn it again.
+    s->retireView().refresh();
+
+    /// Re-attach attempt: the adopt itself must fail closed at observation time - by the time of
+    /// the publish gate there is nothing left to catch it (no hit, fresh round, no refresh).
+    auto build_b = s->startBuild({});
+    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { build_b->adoptTree(tree); });
+
+    /// NOTHING may name the deleted tree.
+    EXPECT_FALSE(s->resolveRef(RootNamespace{"srv1/tbl"}, "part_2").has_value());
 }

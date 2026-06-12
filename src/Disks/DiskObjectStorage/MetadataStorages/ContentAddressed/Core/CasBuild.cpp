@@ -252,8 +252,18 @@ TreeEntry Build::adoptFromTree(const TreeId & source, const String & name)
 void Build::adoptTree(const TreeId & id)
 {
     requireAlive();
-    /// Whole-tree tokenless evidence on the tree root; the publish gate + fence/recheck handshake
-    /// covers the closure (spec §5).
+    /// Whole-tree adoption is a COLD REUSE, not blind evidence (amended 2026-06-12, found
+    /// refreshing the TLA+ model): the object is OBSERVED at adopt time (one HEAD inside
+    /// observeAndAdmit) and the dependency recorded TOKEN-BEARING, so the full W-REVALIDATE
+    /// machinery covers it. A blind tokenless dep here was a dangle: a detached tree already
+    /// reclaimed by a COMPLETED round has no view hit (entries drop on confirmed outcomes), and a
+    /// view already refreshed AT the current round skips both the publish-time re-observation
+    /// (the observed_view_round >= round keep branch) and the fence-advanced refresh (view round
+    /// == fence round) - the publish would land a manifest naming a deleted tree. The live-source
+    /// argument that justifies tokenless evidence for adoptFromTree CHILDREN does not apply to
+    /// the root being adopted: a detached/frozen tree is exactly NOT pinned by anything. Absent
+    /// => FILE_DOESNT_EXIST (fail closed; the caller re-creates from source or aborts the
+    /// re-attach); condemned => resurrect (the cold-reuse rule, same as reuseBlob).
     /// FOLLOW-UP(M-W): size 0 here flows into `RefPayload.tree_size` at publish for adopt-published
     /// parts (FREEZE / detached re-attach / replication relink). Harmless in M-C2 (no read path
     /// consumes tree_size — `readTree` GETs the whole object, `locate` uses per-entry file_size), but
@@ -261,8 +271,8 @@ void Build::adoptTree(const TreeId & id)
     /// without a HEAD (spec §6). Recover the real size on the adopt path before M-W relies on it
     /// (the subtree case in `adoptFromTree` already carries entry.file_size); add a round-trip test
     /// asserting tree_size survives adopt-republish.
-    deps[{static_cast<uint8_t>(ObjectKind::Tree), hexToU128(id.string())}] =
-        DepEntry{ObjectKind::Tree, std::nullopt, store->retireView().round(), 0};
+    const UInt128 hash = hexToU128(id.string());
+    observeAndAdmit(ObjectKind::Tree, hash, keyFor(ObjectKind::Tree, hash));
 }
 
 TreeId Build::putTree(std::vector<TreeEntry> entries)
