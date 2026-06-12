@@ -5,9 +5,9 @@
 #include <Disks/IO/createReadBufferFromFileBase.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/createVolume.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
 #include <Storages/MergeTree/MergeTreeDataPartBuilder.h>
 #include <Formats/NativeWriter.h>
 #include <IO/HTTPCommon.h>
@@ -101,13 +101,15 @@ constexpr auto CA_POOL_UUID_PARAM = "content_addressed_pool_uuid";
 /// (part_id + metadata_version) instead of the byte stream.
 constexpr auto CA_RELINK_COOKIE = "content_addressed_relink";
 
-/// Resolve a disk to its content-addressed metadata storage, or nullptr if the disk is not CA. Used by
-/// both the relink sender (the part's disk) and the relink receiver (the target disk).
-ContentAddressedMetadataStorage * tryGetContentAddressedMetadataStorage(const DiskPtr & disk)
+/// Resolve a disk to the content-addressed exchange facade, or nullptr if the disk is not CA. The
+/// cast targets the purpose-built INTERFACE (IContentAddressedExchange), never the concrete
+/// metadata-storage class (M-W design section 4). Used by both the relink sender (the part's
+/// disk) and the relink receiver (the target disk).
+IContentAddressedExchange * tryGetContentAddressedExchange(const DiskPtr & disk)
 {
     if (!disk || !disk->isContentAddressed())
         return nullptr;
-    return dynamic_cast<ContentAddressedMetadataStorage *>(disk->getMetadataStorage().get());
+    return dynamic_cast<IContentAddressedExchange *>(disk->getMetadataStorage().get());
 }
 
 /// Simple functor for tracking fetch progress in system.replicated_fetches table.
@@ -237,24 +239,25 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
         {
             const String receiver_pool_uuid = parse<String>(params.get(CA_POOL_UUID_PARAM, ""));
             DiskPtr part_disk = data.getStoragePolicy()->tryGetDiskByName(part->getDataPartStorage().getDiskName());
-            auto * ca_meta = tryGetContentAddressedMetadataStorage(part_disk);
+            auto * ca_meta = tryGetContentAddressedExchange(part_disk);
             if (ca_meta && !receiver_pool_uuid.empty() && receiver_pool_uuid == ca_meta->getPoolUUID())
             {
-                auto part_id = ca_meta->getPartId(part->getDataPartStorage().getRelativePath());
-                if (part_id)
+                auto tree_id = ca_meta->getPartTreeId(part->getDataPartStorage().getRelativePath());
+                if (tree_id)
                 {
-                    LOG_DEBUG(log, "Sending part {} by relink (content-addressed, shared pool {}), part_id {}",
-                        part_name, receiver_pool_uuid, part_id->string());
+                    LOG_DEBUG(log, "Sending part {} by relink (content-addressed, shared pool {}), tree id {}",
+                        part_name, receiver_pool_uuid, *tree_id);
                     response.addCookie({CA_RELINK_COOKIE, "1"});
-                    /// The relink payload: the authoritative content id (the receiver reads the manifest
-                    /// from the shared pool itself) + the mutable per-part header the manifest does not
-                    /// carry (metadata_version; the UUID is already in the protocol >= 5 header field).
-                    writeStringBinary(part_id->string(), out);
+                    /// The relink payload (D-W4): the authoritative tree id (the receiver adopts the
+                    /// tree from the shared pool itself; the legacy part_id wire field carries it) +
+                    /// the mutable per-part header the tree does not carry (metadata_version; the
+                    /// UUID is already in the protocol >= 5 header field).
+                    writeStringBinary(*tree_id, out);
                     writeBinary(static_cast<Int32>(part->getMetadataVersion()), out);
                     data.addLastSentPart(part->info);
                     return;
                 }
-                /// part_id absent (no ref for this part on this server) — fall through to the byte path.
+                /// no tree id (no committed ref for this part here) — fall through to the byte path.
             }
         }
 
@@ -522,7 +525,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     /// `detached/` namespace. Relink-into-detached is a deferred optimization (see backlog).
     if (try_zero_copy && !to_detached)
     {
-        if (auto * ca_meta = tryGetContentAddressedMetadataStorage(disk))
+        if (auto * ca_meta = tryGetContentAddressedExchange(disk))
         {
             uri.addQueryParameter(CA_POOL_UUID_PARAM, ca_meta->getPoolUUID());
         }
@@ -530,7 +533,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
         {
             for (const auto & data_disk : data.getDisks())
             {
-                if (auto * ca_disk_meta = tryGetContentAddressedMetadataStorage(data_disk))
+                if (auto * ca_disk_meta = tryGetContentAddressedExchange(data_disk))
                 {
                     uri.addQueryParameter(CA_POOL_UUID_PARAM, ca_disk_meta->getPoolUUID());
                     break;
@@ -708,7 +711,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
         readBinary(metadata_version, *in);
         assertEOF(*in);
 
-        auto * ca_meta = tryGetContentAddressedMetadataStorage(disk);
+        auto * ca_meta = tryGetContentAddressedExchange(disk);
         if (!ca_meta)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "Got '{}' cookie but the target disk {} is not content-addressed", CA_RELINK_COOKIE, disk->getName());
@@ -1060,7 +1063,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     UUID part_uuid,
     Int32 metadata_version)
 {
-    auto * ca_meta = tryGetContentAddressedMetadataStorage(disk);
+    auto * ca_meta = tryGetContentAddressedExchange(disk);
     if (!ca_meta)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "relinkPartToDisk called for a non-content-addressed disk {}", disk->getName());
@@ -1094,11 +1097,11 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     LOG_DEBUG(log, "Relinking part {} (staged as {}) onto content-addressed disk {} from shared part_id {}.",
         part_name, part_dir, disk->getName(), sender_part_id);
 
-    /// PIN -> RE-VALIDATE -> PUBLISH -> RELEASE (the data-loss-safe relink, spec §4). Returns false if the
-    /// part_id is not resolvable in this pool (manifest/blob missing) — relink not possible, caller falls
-    /// back to a byte fetch; in that case nothing was published (no dangling ref).
-    const bool published = ca_meta->relinkExistingPart(
-        *table_uuid, part_dir, ContentAddressed::PartId(sender_part_id), sidecar_values);
+    /// Adopt-by-tree-id + publish (M-W D-W4): Build::adoptTree OBSERVES the tree (cold reuse) and
+    /// the publish gate provides the GC-race safety the old 4-step pin protocol carried. Returns
+    /// false if the tree is not adoptable in this pool (reclaimed) — relink not possible, the
+    /// caller falls back to a byte fetch; nothing was published (no dangling ref).
+    const bool published = ca_meta->adoptPart(*table_uuid, part_dir, sender_part_id, sidecar_values);
     if (!published)
         return nullptr;
 

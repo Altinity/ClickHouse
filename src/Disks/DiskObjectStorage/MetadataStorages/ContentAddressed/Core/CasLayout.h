@@ -85,14 +85,19 @@ public:
         return prefix + "/roots/" + ns.string() + "/";
     }
 
-    /// Verbatim (non-content-addressed) file stored under a namespace.
-    /// File names are flat: no '/' allowed.
+    /// Verbatim (non-content-addressed) file stored under a namespace. Names may be NESTED
+    /// (relative sub-paths — the wiring stores table-level subdirectory files such as
+    /// deduplication_logs/deduplication_log_1.txt verbatim, M-W T2); empty segments, leading or
+    /// trailing '/', and '..' segments are rejected (no escaping the namespace's files prefix).
     String namespaceFileKey(const RootNamespace & ns, const String & file_name) const
     {
         checkNamespace(ns);
-        if (file_name.empty() || file_name.find('/') != String::npos)
+        const bool bad_shape = file_name.empty() || file_name.front() == '/' || file_name.back() == '/'
+            || file_name.find("//") != String::npos || file_name == ".." || file_name.starts_with("../")
+            || file_name.ends_with("/..") || file_name.find("/../") != String::npos;
+        if (bad_shape)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "CasLayout: namespace file name must be non-empty and flat (no '/'), got '{}'", file_name);
+                "CasLayout: namespace file name must be a clean relative path, got '{}'", file_name);
         return prefix + "/roots/" + ns.string() + "/_files/" + file_name;
     }
 

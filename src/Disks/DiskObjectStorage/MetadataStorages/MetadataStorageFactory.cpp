@@ -229,24 +229,16 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
                                                     fs::path(Context::getGlobalContextInstance()->getPath()) / "disks" / name / "cas_scratch" / "");
         fs::create_directories(local_scratch_path);
 
-        /// Operator opt-in to share one content-addressed pool across mounters (M8). Default false: the
-        /// `_pool_meta` self-check fails closed on a second/concurrent mounter (single-owner). When set,
-        /// a second distinct-owner mounter REGISTERS in the mounter registry and proceeds — the M8
-        /// coordination (write-session pins + the fenced GC-leader lock) makes a shared pool safe: the
-        /// background sweep deletes ONLY while it holds the per-pool GC-leader lock and is fenced, so at
-        /// most one mounter ever deletes at a time and a paused leader cannot delete after a successor
-        /// took a higher fence.
-        const bool allow_shared_pool = config.getBool(config_prefix + ".content_addressed_allow_shared_pool", false);
-
+        /// The incarnation-token pool is multi-writer by design (spec section 2): the publish gate +
+        /// fence/recheck handshake make shared pools safe, and the GC lease dedups leaders — the old
+        /// single-owner claim and its allow_shared_pool opt-in are gone (M-W D-W5/D-W6).
         auto global_context = Context::getGlobalContextInstance();
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path,
-            global_context, allow_shared_pool);
+            global_context);
 
-        /// Pass GC tuning (interval/grace) so the stateless GC test can request a short grace. The
-        /// thread reads content_addressed_gc_interval_sec / content_addressed_gc_grace_sec atomics.
-        if (const auto & gc_thread = metadata_storage->gcThreadForTest())
-            gc_thread->applyNewSettings(config, config_prefix);
+        /// GC scheduler knobs (content_addressed_gc_enabled / content_addressed_gc_interval_sec) are
+        /// read by the scheduler when it lands (M-W T10).
 
         return metadata_storage;
     });

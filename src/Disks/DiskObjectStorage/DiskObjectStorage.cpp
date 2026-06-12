@@ -13,6 +13,7 @@
 #include <Common/CurrentMetrics.h>
 #include <IO/CachedInMemoryReadBufferFromFile.h>
 #include <IO/ReadPipeline.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Cached/CachedObjectStorage.h>
 #include <Interpreters/FileCache/FileCache.h>
 #include <Disks/IO/ReadBufferFromRemoteFSGather.h>
@@ -810,6 +811,15 @@ void DiskObjectStorage::prepareRead(
     std::optional<size_t> read_hint,
     ReadPipeline & pipeline) const
 {
+    /// Content-addressed reads have their own plan (in-manifest bytes from memory; blob payloads
+    /// through an envelope-skipping view) — see ContentAddressedMetadataStorage::prepareReadPipeline.
+    if (metadata_storage->isContentAddressed())
+    {
+        auto * ca = dynamic_cast<const ContentAddressedMetadataStorage *>(metadata_storage.get());
+        if (ca && ca->prepareReadPipeline(path, settings, pipeline))
+            return;
+    }
+
     const auto storage_objects = metadata_storage->getStorageObjects(path);
 
     auto read_settings = updateIOSchedulingSettings(settings, getReadResourceName(), getWriteResourceName());

@@ -34,7 +34,15 @@ TEST(CasLayout, RootNamespaceValidation)
     EXPECT_THROW(l.rootShardKey(RootNamespace{""}, 0), DB::Exception);
     EXPECT_THROW(l.rootShardKey(RootNamespace{"/lead"}, 0), DB::Exception);
     EXPECT_THROW(l.rootShardKey(RootNamespace{"trail/"}, 0), DB::Exception);
-    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/b"), DB::Exception);   /// file names are flat
+    /// File names may be NESTED relative paths (M-W T2: deduplication_logs/...); only unclean
+    /// shapes are rejected (empty, leading/trailing '/', empty segments, '..' escapes).
+    EXPECT_NO_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/b"));
+    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, ""), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "/lead"), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "trail/"), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a//b"), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "../up"), DB::Exception);
+    EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/../b"), DB::Exception);
 
     /// A middle empty segment ("a//b") is rejected (doubled '/').
     EXPECT_THROW(l.rootShardKey(RootNamespace{"a//b"}, 0), DB::Exception);
