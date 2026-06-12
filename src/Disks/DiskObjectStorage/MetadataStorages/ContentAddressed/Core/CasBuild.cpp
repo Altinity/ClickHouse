@@ -446,13 +446,43 @@ void Build::revalidateDeps()
         const ObjectKind kind = dep.kind;
         const UInt128 & hash = key.second;
 
-        /// Tokenless evidence (W-EVIDENCE) is NOT re-observed here: it carries no observed token to be
-        /// stale. gateCheckDeps resolves it (a view hit ⇒ observeAndAdmit).
-        if (!dep.token.has_value())
-            continue;
-
         const String k = keyFor(kind, hash);
         const std::optional<std::vector<Token>> hits = store->retireView().findCondemned(kind, hash);
+
+        /// Tokenless evidence (W-EVIDENCE) with a view HIT is resolved by gateCheckDeps. But a
+        /// stale evidence member with NO hit must be RE-OBSERVED here, exactly like a stale token:
+        /// retire entries DROP on confirmed outcomes (F1), so "no entry" can mean "the object was
+        /// condemned, deleted, and its entry dropped" - the durable witness is the OBJECT, not the
+        /// view. Evidence staleness = the view round advanced past the round the evidence was
+        /// recorded at (the live-source-root argument only covers the fence/recheck handshake of
+        /// the SAME round window; a full round boundary in between invalidates it - the source may
+        /// have dropped and the object been reclaimed). Discovered by the Task-9 integration test:
+        /// without this, an evidence dep on a deleted tree sails through a refreshed gate and the
+        /// publish DANGLES (the model's DepOK requires present[h] for evidence deps too).
+        if (!dep.token.has_value())
+        {
+            if (hits.has_value())
+                continue;   /// gateCheckDeps resolves the hit (W-EVIDENCE)
+            if (dep.observed_view_round >= store->retireView().round())
+                continue;   /// evidence as fresh as the view - the handshake covers it
+            const HeadResult hr = store->backend().head(k);
+            if (!hr.exists)
+            {
+                if (kind == ObjectKind::Tree && retained_trees.contains(hash))
+                    recreateTree(hash);
+                else
+                    throw Exception(ErrorCodes::ABORTED,
+                        "publish evidence dependency {} lost and not re-creatable; retry the operation",
+                        u128ToHex(hash));
+            }
+            else
+            {
+                /// Present: resolve the stale evidence to a TOKEN-BEARING entry observed at the
+                /// current round (adopt the current token, or resurrect if it is condemned).
+                observeAndAdmit(kind, hash, k);
+            }
+            continue;
+        }
 
         if (hits.has_value())
         {

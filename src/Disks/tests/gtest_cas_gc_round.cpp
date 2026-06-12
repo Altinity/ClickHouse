@@ -17,6 +17,7 @@ extern const int NOT_IMPLEMENTED;
 }
 
 using namespace DB::Cas;
+using DB::Cas::tests::displaceObjectToken;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::shardOfForTest;
@@ -643,37 +644,49 @@ TEST(CasGcFold, AbsentTreeWithoutLaterRemoveFailsClosed)
 /// GRetire guard `present /\ everEdged /\ InDeg = 0`). Retired != dead: the entries are the
 /// writer-facing "resurrect, don't reuse" barrier (spec section 7 R2).
 
-TEST(CasGcRetire, ObservesCurrentTokenAndAppends)
+TEST(CasGcRetire, ObservesCurrentTokenDeletesExactAndDropsEntries)
 {
+    /// The full R2->R4 chain for a truly-unreachable tree: retire observes the CURRENT token, the
+    /// recheck's single delete site removes exactly that incarnation, the outcome log records it,
+    /// and the retired set DROPS on the confirmed outcome (the writer-facing barrier ends with the
+    /// round - a deleted incarnation cannot return, INV-NO-RETURN).
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload-1");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
 
+    const Token pre_round_token = b->head(s->layout().treeKey(tree)).token;
+
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     const RoundReport rep = gc.runRegularRound();
     EXPECT_TRUE(rep.acquired_lease);
     EXPECT_GE(rep.candidates, 1u);            /// the tree zeroed (the blob stays pinned by the tree edge)
+    EXPECT_EQ(rep.deleted, 1u);
+    EXPECT_EQ(rep.spared + rep.absent + rep.replaced, 0u);
 
     const GcState st = readState(*b, *s);
-    EXPECT_EQ(st.round, 1u);                  /// the durable "retire phase complete" marker
+    EXPECT_EQ(st.round, 1u);
 
-    const auto retired_obj = b->get(s->layout().retiredKey(1, st.fence_seq, 0));
-    ASSERT_TRUE(retired_obj.has_value());
-    const RetiredSet set = decodeRetiredSet(retired_obj->bytes);
-    ASSERT_EQ(set.entries.size(), 1u);
-    EXPECT_EQ(set.entries[0].kind, ObjectKind::Tree);
-    EXPECT_EQ(set.entries[0].hash, hexToU128(tree.string()));
-    /// the condemned token is the live object's CURRENT token - observed, never fabricated:
-    const HeadResult tree_head = b->head(s->layout().treeKey(tree));
-    ASSERT_TRUE(tree_head.exists);
-    EXPECT_EQ(set.entries[0].token, tree_head.token);
-    EXPECT_EQ(set.entries[0].size, tree_head.size);            /// trees account whole-object
+    /// the tree object is GONE - deleted at exactly the observed token;
+    EXPECT_FALSE(b->head(s->layout().treeKey(tree)).exists);
 
-    /// the writer-facing barrier is LIVE: a fresh Store's RetireView condemns the incarnation
+    /// the outcome log is the durable confirmation, carrying the observed token:
+    const auto outcome_obj = b->get(s->layout().outcomesKey(1, st.fence_seq, 0));
+    ASSERT_TRUE(outcome_obj.has_value());
+    const OutcomeLog log = decodeOutcomeLog(outcome_obj->bytes);
+    ASSERT_EQ(log.entries.size(), 1u);
+    EXPECT_EQ(log.entries[0].kind, ObjectKind::Tree);
+    EXPECT_EQ(log.entries[0].hash, hexToU128(tree.string()));
+    EXPECT_EQ(log.entries[0].token, pre_round_token);          /// observed, never fabricated
+    EXPECT_EQ(log.entries[0].outcome, OutcomeKind::Deleted);
+
+    /// the retired set dropped on the confirmed outcome (entries drop on outcomes, spec section 7):
+    EXPECT_FALSE(b->get(s->layout().retiredKey(1, st.fence_seq, 0)).has_value());
     auto s2 = Store::open(b, PoolConfig{.pool_prefix = "p"});
-    EXPECT_TRUE(s2->retireView().isCondemnedToken(ObjectKind::Tree, set.entries[0].hash, set.entries[0].token));
-    EXPECT_EQ(s2->retireView().round(), 1u);
+    EXPECT_FALSE(s2->retireView().isCondemnedToken(ObjectKind::Tree, hexToU128(tree.string()), pre_round_token));
+
+    /// fence_version[1] served its recheck and was erased (gc/state must not grow forever):
+    EXPECT_FALSE(st.fence_version.contains(1));
 }
 
 TEST(CasGcRetire, AbsentCandidateIsSkippedNotFabricated)
@@ -699,41 +712,33 @@ TEST(CasGcRetire, AbsentCandidateIsSkippedNotFabricated)
     EXPECT_FALSE(b->get(s->layout().retiredKey(1, st.fence_seq, 0)).has_value());   /// no empty objects
 }
 
-TEST(CasGcRetire, IdempotentReplaySameRound)
+TEST(CasGcRetire, DeletedCandidateDoesNotReappear)
 {
-    /// Cross-round duplicate-entry property: with no new journal activity, round 2 re-derives the
-    /// same candidate from the durable snap (still known + zero in-degree + present until Task 9's
-    /// delete lands) and re-retires it at the SAME observed token under a NEW unique path. Benign
-    /// by construction: RetireView unions all present sets (one more copy of the same condemned
-    /// token) and the eventual delete is exact-token idempotent. (TRUE same-round crash replay -
-    /// sets durable, round CAS lost - is pinned by RetireSetsDurableBeforeRoundCas below.)
+    /// A round is terminal for its candidates: round 1 deletes the unreachable tree (entries drop
+    /// on confirmed outcomes), so round 2 - with no new journal activity - re-derives the same
+    /// zero-in-degree known node from the durable snap but SKIPS it at retire (HEAD-absent: no
+    /// token to condemn). No retired object, no outcomes, no error; the round still advances.
+    /// (The model's no-dup guard `¬∃ retired (h, tokOf)` is realized by the synchronous
+    /// drop-on-outcome: the entry is gone the moment its outcome confirmed.)
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
-    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const RoundReport rep1 = gc.runRegularRound();
+    EXPECT_EQ(rep1.deleted, 1u);
+    EXPECT_FALSE(b->head(s->layout().treeKey(tree)).exists);
+
     const RoundReport rep2 = gc.runRegularRound();            /// no new journal activity in between
     EXPECT_TRUE(rep2.acquired_lease);
-    EXPECT_EQ(rep2.candidates, 1u);                           /// re-derived, re-retired
+    EXPECT_EQ(rep2.candidates, 0u);                           /// absent at HEAD => skipped
+    EXPECT_EQ(rep2.deleted + rep2.absent + rep2.replaced + rep2.spared, 0u);
 
     const GcState st = readState(*b, *s);
     EXPECT_EQ(st.round, 2u);
-
-    const auto round1 = b->get(s->layout().retiredKey(1, st.fence_seq, 0));
-    const auto round2 = b->get(s->layout().retiredKey(2, st.fence_seq, 0));
-    ASSERT_TRUE(round1.has_value());
-    ASSERT_TRUE(round2.has_value());
-    const RetiredSet set1 = decodeRetiredSet(round1->bytes);
-    const RetiredSet set2 = decodeRetiredSet(round2->bytes);
-    ASSERT_EQ(set1.entries.size(), 1u);
-    ASSERT_EQ(set2.entries.size(), 1u);
-    EXPECT_EQ(set2.entries[0].hash, set1.entries[0].hash);
-    EXPECT_EQ(set2.entries[0].token, set1.entries[0].token);  /// same incarnation, same exact token
-
-    auto s2 = Store::open(b, PoolConfig{.pool_prefix = "p"});
-    EXPECT_TRUE(s2->retireView().isCondemnedToken(ObjectKind::Tree, hexToU128(tree.string()), set2.entries[0].token));
+    EXPECT_FALSE(b->get(s->layout().retiredKey(2, st.fence_seq, 0)).has_value());
+    EXPECT_FALSE(b->get(s->layout().outcomesKey(2, st.fence_seq, 0)).has_value());
 }
 
 TEST(CasGcRetire, RetireSetsDurableBeforeRoundCas)
@@ -759,14 +764,143 @@ TEST(CasGcRetire, RetireSetsDurableBeforeRoundCas)
     const auto retired_obj = b->get(s->layout().retiredKey(1, st.fence_seq, 0));
     ASSERT_TRUE(retired_obj.has_value());                     /// ...but the set is already durable
 
-    const RoundReport rep = gc.runRegularRound();             /// replay: adopts the set, lands
+    const RoundReport rep = gc.runRegularRound();             /// replay: adopts the set, completes
     EXPECT_TRUE(rep.acquired_lease);
-    EXPECT_EQ(rep.candidates, 1u);
+    EXPECT_EQ(rep.candidates, 1u);                            /// the adopted durable set's entry
+    EXPECT_EQ(rep.deleted, 1u);                               /// ...and the round ran to the delete
     st = readState(*b, *s);
     EXPECT_EQ(st.round, 1u);
-    const RetiredSet set = decodeRetiredSet(b->get(s->layout().retiredKey(1, st.fence_seq, 0))->bytes);
-    ASSERT_EQ(set.entries.size(), 1u);
-    EXPECT_EQ(set.entries[0].hash, hexToU128(tree.string()));
+    /// the replayed round completed: tree gone, retired set dropped, outcome log durable
+    EXPECT_FALSE(b->head(s->layout().treeKey(tree)).exists);
+    EXPECT_FALSE(b->get(s->layout().retiredKey(1, st.fence_seq, 0)).has_value());
+    const OutcomeLog log = decodeOutcomeLog(b->get(s->layout().outcomesKey(1, st.fence_seq, 0))->bytes);
+    ASSERT_EQ(log.entries.size(), 1u);
+    EXPECT_EQ(log.entries[0].hash, hexToU128(tree.string()));
+    EXPECT_EQ(log.entries[0].outcome, OutcomeKind::Deleted);
+}
+
+/// Fires a one-shot hook just BEFORE the first fence CAS lands on the target shard key (the body
+/// carries a "fence_round" the manifest did not yet have - we trigger on any casPut to the key
+/// once armed). The hook runs raw backend ops only (base-class methods), simulating an interleaved
+/// actor in the fence window: a racing publish (horn 1), a resurrect (412 horn), or a zombie
+/// delete landing (absent horn).
+class OnFenceHookBackend : public InMemoryBackend
+{
+public:
+    CasOutcome casPut(const String & key, const String & bytes,
+                      const std::optional<Token> & expected, Token * out_token = nullptr) override
+    {
+        if (!fired && key == armed_key)
+        {
+            fired = true;
+            hook();
+        }
+        return InMemoryBackend::casPut(key, bytes, expected, out_token);
+    }
+
+    void armOnCasPut(String key, std::function<void()> hook_)
+    {
+        armed_key = std::move(key);
+        hook = std::move(hook_);
+        fired = false;
+    }
+
+private:
+    String armed_key;
+    std::function<void()> hook;
+    bool fired = true;
+};
+
+TEST(CasGcRecheck, SparedWhenPublishRacesTheFence)
+{
+    /// HORN 1 of the no-return argument, mechanically: a publish committing in the fence window
+    /// lands its journal record at or below the fence's committed version (the fence CAS conflicts
+    /// and retries on the fresh manifest), so the RECHECK's fold-through-fence sees it, in-degree
+    /// returns above zero, and the entry is SPARED - no delete, the object survives.
+    auto b = std::make_shared<OnFenceHookBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    const String shard_key = s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard);
+    b->armOnCasPut(shard_key, [&]
+    {
+        /// the racing publish, raw (exactly the manifest CAS a writer's publish performs):
+        const auto got = b->InMemoryBackend::get(shard_key);
+        ASSERT_TRUE(got.has_value());
+        RootShard root = decodeRootShard(got->bytes);
+        ++root.shard_version;
+        root.refs["part_1"] = RefPayload{.tree_id = hexToU128(tree.string()), .tree_size = 0, .mutable_files = {}};
+        root.journal.push_back(JournalRecord{
+            .op = JournalRecord::Op::Add, .ref_name = "part_1",
+            .tree_id = hexToU128(tree.string()), .at_version = root.shard_version});
+        ASSERT_EQ(b->InMemoryBackend::casPut(shard_key, encodeRootShard(root), got->token, nullptr),
+                  CasOutcome::Committed);
+    });
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep = gc.runRegularRound();
+    EXPECT_TRUE(rep.acquired_lease);
+    EXPECT_EQ(rep.spared, 1u);
+    EXPECT_EQ(rep.deleted, 0u);
+    EXPECT_TRUE(b->head(s->layout().treeKey(tree)).exists);   /// the object SURVIVED
+    /// resolvable again - the racing publish re-pinned it:
+    EXPECT_TRUE(s->resolveRef(RootNamespace{"srv1/tbl"}, "part_1").has_value());
+}
+
+TEST(CasGcRecheck, ReplacedWhenResurrectionWins)
+{
+    /// The 412 horn: a writer resurrects the condemned incarnation (fresh tag, new token) in the
+    /// fence window. The delete carries the OLD observed token, hits TokenMismatch, and the
+    /// outcome is REPLACED - the 412-save health metric; no data loss, the new incarnation lives.
+    auto b = std::make_shared<OnFenceHookBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    const String tree_key = s->layout().treeKey(tree);
+    const Token t0 = b->head(tree_key).token;
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    Token t1;
+    b->armOnCasPut(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard), [&]
+    {
+        t1 = displaceObjectToken(*b, tree_key, ObjectKind::Tree);   /// the racing resurrect
+    });
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep = gc.runRegularRound();
+    EXPECT_EQ(rep.replaced, 1u);
+    EXPECT_EQ(rep.deleted, 0u);
+    EXPECT_TRUE(b->head(tree_key).exists);                    /// the NEW incarnation survived
+    EXPECT_EQ(b->head(tree_key).token, t1);
+    EXPECT_NE(t1, t0);
+}
+
+TEST(CasGcRecheck, AbsentWhenAlreadyGone)
+{
+    /// A prior crashed round's delete landed (staged: a zombie delete fires in the fence window).
+    /// The recheck's delete sees NotFound => outcome ABSENT - no error, the round completes.
+    auto b = std::make_shared<OnFenceHookBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    const String tree_key = s->layout().treeKey(tree);
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    b->armOnCasPut(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard), [&]
+    {
+        const Token current = b->InMemoryBackend::head(tree_key).token;
+        ASSERT_EQ(b->InMemoryBackend::deleteExact(tree_key, current).kind, DeleteOutcome::Kind::Deleted);
+    });
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep = gc.runRegularRound();
+    EXPECT_EQ(rep.absent, 1u);
+    EXPECT_EQ(rep.deleted, 0u);
+    const GcState st = readState(*b, *s);
+    EXPECT_EQ(st.round, 1u);                                  /// the round completed normally
+    EXPECT_FALSE(b->get(s->layout().retiredKey(1, st.fence_seq, 0)).has_value());
 }
 
 TEST(CasGcRetire, DivergedRetiredSetFailsClosed)
@@ -835,6 +969,38 @@ TEST(CasGcRetire, RetireUsesFoldCommittedStateWithoutReread)
 /// fencePos[s]: the manifest CAS totally orders the fence against publishes on that shard, which
 /// is exactly what the no-return argument rests on.
 
+/// Captures the durable gc/state bytes just BEFORE the nth casPut to a key lands. Used to observe
+/// fence_version[round] at the recheck's pre-erase point: the recheck erases fence_version[<=round]
+/// in the round's FINAL gc/state CAS (per-round casPut order on gc/state: lease, fold, retire,
+/// fence, recheck-erase), so post-round state no longer carries the vector the recheck used.
+class CaptureStateBackend : public InMemoryBackend
+{
+public:
+    CasOutcome casPut(const String & key, const String & bytes,
+                      const std::optional<Token> & expected, Token * out_token = nullptr) override
+    {
+        if (key == capture_key && ++count == capture_nth)
+            if (const auto got = InMemoryBackend::get(key))
+                captured = got->bytes;
+        return InMemoryBackend::casPut(key, bytes, expected, out_token);
+    }
+
+    void armCapture(String key, size_t nth)
+    {
+        capture_key = std::move(key);
+        capture_nth = nth;
+        count = 0;
+        captured.reset();
+    }
+
+    std::optional<String> captured;
+
+private:
+    String capture_key;
+    size_t capture_nth = 0;
+    size_t count = 0;
+};
+
 TEST(CasGcFence, FencesAllShardsMintingAbsentOnes)
 {
     /// R3 fences EVERY root shard of every registered namespace - present or ABSENT (spec section 7
@@ -842,17 +1008,19 @@ TEST(CasGcFence, FencesAllShardsMintingAbsentOnes)
     /// manifest: the create race against a first publish into that shard is the required total
     /// order. Fencing only present shards would leave a first publish into an absent shard
     /// unordered against the fence (the absent-shard hole).
-    std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto b = std::make_shared<CaptureStateBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     publishPart(s, "srv1/tbl", "part_1", "payload-1");
     publishPart(s, "srv1/tbl", "part_2", "payload-2");           /// likely a different root shard
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    b->armCapture(s->layout().gcStateKey(), 5);                  /// pre-erase point (the recheck CAS)
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
-    const GcState st = readState(*b, *s);
-    EXPECT_EQ(st.round, 1u);
+    EXPECT_EQ(readState(*b, *s).round, 1u);
+    ASSERT_TRUE(b->captured.has_value());
+    const GcState st = decodeGcState(*b->captured);              /// gc/state as the recheck saw it
     ASSERT_TRUE(st.fence_version.contains(1));
 
     /// ALL root_shards manifests now exist, each fenced at round 1 with its committed version
@@ -884,11 +1052,12 @@ TEST(CasGcFence, RegistryFencedAndRecorded)
     /// The namespace registry is fenced FIRST (the ordering point for namespace creation): after a
     /// round its fence_round equals the round and the committed registry_version is recorded under
     /// the reserved "_registry" key.
-    std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto b = std::make_shared<CaptureStateBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     publishPart(s, "srv1/tbl", "part_1", "payload-1");
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    b->armCapture(s->layout().gcStateKey(), 5);                  /// pre-erase point (the recheck CAS)
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
     const auto got = b->get(s->layout().rootsRegistryKey());
@@ -897,7 +1066,8 @@ TEST(CasGcFence, RegistryFencedAndRecorded)
     EXPECT_EQ(registry.fence_round, 1u);
     EXPECT_TRUE(registry.namespaces.contains("srv1/tbl"));
 
-    const GcState st = readState(*b, *s);
+    ASSERT_TRUE(b->captured.has_value());
+    const GcState st = decodeGcState(*b->captured);
     ASSERT_TRUE(st.fence_version.contains(1));
     EXPECT_EQ(st.fence_version.at(1).at("_registry"), registry.registry_version);
 }
@@ -937,8 +1107,8 @@ TEST(CasGcFence, MonotoneNeverLowers)
     /// The model's monotone fence (GFenceShard / INV-MONOTONE-GC): a manifest already fenced at a
     /// HIGHER round (as a newer leader would leave behind) must never be lowered by a stale
     /// leader's lower round - the max absorbs it. A later round above it raises it again.
-    std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto b = std::make_shared<CaptureStateBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     publishPart(s, "srv1/tbl", "part_1", "payload");
 
     /// hand-set the manifest's fence_round to 5 via a raw CAS (read, edit, casPut back):
@@ -952,12 +1122,14 @@ TEST(CasGcFence, MonotoneNeverLowers)
     ASSERT_EQ(b->casPut(shard_key, encodeRootShard(staged), got->token), CasOutcome::Committed);
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    b->armCapture(s->layout().gcStateKey(), 5);                  /// pre-erase point (the recheck CAS)
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);            /// round 1 < 5
 
     const RootShard after1 = decodeRootShard(b->get(shard_key)->bytes);
     EXPECT_EQ(after1.fence_round, 5u);                           /// NOT lowered to 1
     /// the recorded fence_version still records the commit (the version bump happened):
-    const GcState st1 = readState(*b, *s);
+    ASSERT_TRUE(b->captured.has_value());
+    const GcState st1 = decodeGcState(*b->captured);
     const String key = "srv1/tbl/" + std::to_string(shardOfForTest("part_1", s->poolMeta().root_shards));
     ASSERT_TRUE(st1.fence_version.contains(1));
     EXPECT_EQ(st1.fence_version.at(1).at(key), after1.shard_version);
@@ -1012,8 +1184,8 @@ TEST(CasGcFence, FenceCasConflictRetriesAndRecordsFinalCommit)
     /// a real publish committing between the fence's read and CAS, whose journal record must land
     /// at a version BELOW the fence's committed version - needs interleaving and is Task 13's
     /// fault-injection battery.)
-    std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto b = std::make_shared<CaptureStateBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     publishPart(s, "srv1/tbl", "part_1", "payload-1");
 
     const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
@@ -1021,13 +1193,15 @@ TEST(CasGcFence, FenceCasConflictRetriesAndRecordsFinalCommit)
     b->failNextCasPut(shard_key);                                /// the fence CAS conflicts once
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    b->armCapture(s->layout().gcStateKey(), 5);                  /// pre-erase point (the recheck CAS)
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
     const RootShard root = decodeRootShard(b->get(shard_key)->bytes);
     EXPECT_EQ(root.fence_round, 1u);                             /// the fence landed despite the conflict
     EXPECT_EQ(root.shard_version, 2u);                           /// publish = 1; the conflicted attempt
                                                                  /// committed nothing; the retry = 2
-    const GcState st = readState(*b, *s);
+    ASSERT_TRUE(b->captured.has_value());
+    const GcState st = decodeGcState(*b->captured);
     ASSERT_TRUE(st.fence_version.contains(1));
     EXPECT_EQ(st.fence_version.at(1).at("srv1/tbl/" + std::to_string(shard)), 2u);   /// the FINAL commit
 }
@@ -1060,20 +1234,27 @@ TEST(CasGcRetire, RetireReplayAdoptsOwnCrashedAttempt)
     EXPECT_TRUE(rep.acquired_lease);
     GcState st = readState(*b, *s);
     EXPECT_EQ(st.round, 1u);                                  /// the round landed
-    /// round 1 carries the ADOPTED occupant - T1 only, write-once preserved:
-    const RetiredSet round1 = decodeRetiredSet(b->get(s->layout().retiredKey(1, st.fence_seq, 0))->bytes);
-    ASSERT_EQ(round1.entries.size(), 1u);
-    EXPECT_EQ(round1.entries[0].hash, hexToU128(t1.string()));
     EXPECT_EQ(rep.candidates, 1u);                            /// reports the ADOPTED durable truth
+    /// ADOPTION PROOF: T2 had already zeroed before the rerun, so a non-adopting rerun would have
+    /// processed TWO entries; the round-1 outcome log carrying exactly ONE (T1) proves the
+    /// occupant set was adopted, write-once preserved. The round then COMPLETED: T1 deleted,
+    /// retired set dropped on the confirmed outcome.
+    const OutcomeLog log1 = decodeOutcomeLog(b->get(s->layout().outcomesKey(1, st.fence_seq, 0))->bytes);
+    ASSERT_EQ(log1.entries.size(), 1u);
+    EXPECT_EQ(log1.entries[0].hash, hexToU128(t1.string()));
+    EXPECT_EQ(log1.entries[0].outcome, OutcomeKind::Deleted);
+    EXPECT_FALSE(b->head(s->layout().treeKey(t1)).exists);
+    EXPECT_FALSE(b->get(s->layout().retiredKey(1, st.fence_seq, 0)).has_value());
 
-    /// T2 is not lost - the FOLLOWING round re-derives and retires it:
+    /// T2 is not lost - the FOLLOWING round re-derives, retires, and deletes it:
     const RoundReport rep2 = gc.runRegularRound();
     EXPECT_TRUE(rep2.acquired_lease);
     st = readState(*b, *s);
     EXPECT_EQ(st.round, 2u);
-    const RetiredSet round2 = decodeRetiredSet(b->get(s->layout().retiredKey(2, st.fence_seq, 0))->bytes);
-    bool has_t2 = false;
-    for (const RetiredEntry & entry : round2.entries)
-        has_t2 |= entry.hash == hexToU128(t2.string());
-    EXPECT_TRUE(has_t2);
+    const OutcomeLog log2 = decodeOutcomeLog(b->get(s->layout().outcomesKey(2, st.fence_seq, 0))->bytes);
+    bool t2_deleted = false;
+    for (const OutcomeEntry & entry : log2.entries)
+        t2_deleted |= entry.hash == hexToU128(t2.string()) && entry.outcome == OutcomeKind::Deleted;
+    EXPECT_TRUE(t2_deleted);
+    EXPECT_FALSE(b->head(s->layout().treeKey(t2)).exists);
 }

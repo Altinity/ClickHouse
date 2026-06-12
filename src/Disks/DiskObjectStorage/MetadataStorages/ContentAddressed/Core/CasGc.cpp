@@ -3,6 +3,7 @@
 #include <Common/Exception.h>
 #include <base/defines.h>
 #include <algorithm>
+#include <charconv>
 
 namespace DB
 {
@@ -52,7 +53,7 @@ RoundReport Gc::runRegularRound()
         return report;
 
     /// R1: fold the journals into a new durable snap generation (cursors advance only after).
-    const FoldResult folded = fold(state, state_token);
+    FoldResult folded = fold(state, state_token);   /// non-const: the recheck folds through the fence into the same snap
 
     /// R2 consumes the EXACT (state, token) the fold's CAS committed - THREADED through, never
     /// re-read. A post-fold re-read would open a zombie window: a lease steal landing between the
@@ -74,12 +75,221 @@ RoundReport Gc::runRegularRound()
 
     /// R3: CAS the monotone fence into the registry and EVERY root shard of every registered
     /// namespace (minting fence-only manifests for absent shards) and persist the recorded fence
-    /// versions - the durable point the recheck (Task 9) folds through. `state.round` was advanced
+    /// versions - the durable point the recheck folds through. `state.round` was advanced
     /// by retire's CAS; `state`/`state_token` are current after it.
     fence(state, state_token, folded.root_shards);
 
-    /// Tasks 9-12: recheck / cascade / trim
+    /// R4: fold-through-fence recheck + the single content-delete site + outcomes + retired-set
+    /// cleanup. The deleted trees feed the cascade (Task 10).
+    [[maybe_unused]] const RecheckResult rechecked = recheck(state, state_token, folded.snap, retired, report);   /// Task 10 consumes deleted_trees
+
+    /// Tasks 10-12: cascade / trim
     return report;
+}
+
+Gc::RecheckResult Gc::recheck(GcState & state, Token & state_token, std::map<uint64_t, GcSnap> & snap,
+                              const std::map<uint64_t, RetiredSet> & retired, RoundReport & report)
+{
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+    chassert(state.lease.owner == gc_id);
+
+    const uint64_t round = state.round;
+
+    /// A delete for round R requires R's fence vector: without the recorded fence positions the
+    /// fold-through-fence coverage below is unprovable and NO delete may fire (fail closed). In
+    /// the sequential round this is structurally guaranteed (fence ran just before); the guard
+    /// protects future resume paths (Task 12) and out-of-model state.
+    const auto fence_it = state.fence_version.find(round);
+    if (fence_it == state.fence_version.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS gc recheck: no fence_version recorded for round {} - refusing to delete", round);
+
+    /// 1. FOLD-THROUGH-FENCE (the model's FoldedThroughFence guard): re-read every fenced shard
+    /// and fold the records in (folded_cursor, fence_version] - exactly the publishes that raced
+    /// the fence (horn 1 of the no-return argument: a pre-fence publish's record sits at or below
+    /// the fence's committed version, so it is folded HERE and re-pins its targets => Spared).
+    /// This in-memory delta is NOT persisted: the next round's durable fold re-derives it
+    /// idempotently (set semantics); persisting would advance cursors past records the durable
+    /// snap generation does not contain.
+    for (const auto & [cursor_key, fence_version] : fence_it->second)
+    {
+        if (cursor_key == "_registry")
+            continue;   /// the registry fence orders namespace creation; it carries no journal
+        const size_t slash = cursor_key.rfind('/');
+        chassert(slash != String::npos);
+        const RootNamespace ns{cursor_key.substr(0, slash)};
+        uint64_t shard = 0;
+        [[maybe_unused]] const auto parse =
+            std::from_chars(cursor_key.data() + slash + 1, cursor_key.data() + cursor_key.size(), shard);
+        chassert(parse.ec == std::errc());
+
+        const auto [root, manifest_token] = store->readShard(ns, shard);
+        const auto cursor_it = state.folded_cursor.find(cursor_key);
+        const uint64_t cursor = cursor_it != state.folded_cursor.end() ? cursor_it->second : 0;
+        if (fence_version > cursor)
+            foldShardRecords(snap, state, cursor_key, root, cursor, fence_version);
+    }
+
+    /// 2. Per retired entry: spare or delete. The retired sets passed in are the DURABLE sets the
+    /// retire step wrote or adopted (a crashed prior attempt's set is the authoritative round
+    /// input - the Task-7 contract).
+    RecheckResult result;
+    std::map<uint64_t, OutcomeLog> computed;
+    for (const auto & [snap_shard, set] : retired)
+    {
+        for (const RetiredEntry & entry : set.entries)
+        {
+            OutcomeEntry outcome;
+            outcome.kind = entry.kind;
+            outcome.hash = entry.hash;
+            outcome.token = entry.token;
+
+            if (snap.at(hashPrefixShard(entry.hash, state.snap_shards)).inDegree(entry.kind, entry.hash) > 0)
+            {
+                /// A publish at or below the fence re-pinned it (folded above) - never delete.
+                outcome.outcome = OutcomeKind::Spared;
+            }
+            else
+            {
+                /// ==================== THE SINGLE CONTENT-DELETE SITE ====================
+                /// The ONLY place Cas::Gc ever deletes a content object (blob/tree/pack), and the
+                /// only reachability delete in the whole core. All four gates of INV-NO-LOSS hold
+                /// here, in order:
+                ///   1. the retire entry is DURABLE (written/adopted by R2 before .round advanced);
+                ///   2. EVERY root shard of every registered namespace is fenced at versions
+                ///      recorded in gc/state.fence_version[round] (R3; the registry fence orders
+                ///      namespace creation itself);
+                ///   3. the fold-through-fence above re-derived in-degree THROUGH those recorded
+                ///      versions and found 0 (no journal record at or below any fence names it);
+                ///   4. the delete carries the EXACT token R2 observed - a post-retire publish
+                ///      either resurrected (new token => TokenMismatch => Replaced, no loss) or was
+                ///      folded above (=> Spared). INV-NO-RETURN: the deleted incarnation's token
+                ///      can never be current again (W-FRESH-TAG), so a duplicated/zombie replay of
+                ///      this very call is forever harmless.
+                const DeleteOutcome deleted =
+                    backend.deleteExact(objectKey(layout, entry.kind, entry.hash), entry.token);
+                /// ========================================================================
+                if (deleted.created_delete_marker)
+                    /// Versioning-enabled bucket: the probe exists to reject this pool shape; a
+                    /// marker here means the pool is mis-provisioned - fail loud, never continue
+                    /// (the "deleted" bytes silently linger as a noncurrent version).
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "CAS gc recheck: delete of {} created a delete marker - versioning is "
+                        "enabled on the pool (mis-provisioned; the capability probe must reject this)",
+                        u128ToHex(entry.hash));
+                switch (deleted.kind)
+                {
+                    case DeleteOutcome::Kind::Deleted:
+                        outcome.outcome = OutcomeKind::Deleted;
+                        break;
+                    case DeleteOutcome::Kind::NotFound:
+                        outcome.outcome = OutcomeKind::Absent;
+                        break;
+                    case DeleteOutcome::Kind::TokenMismatch:
+                        outcome.outcome = OutcomeKind::Replaced;
+                        break;
+                }
+            }
+            computed[snap_shard].entries.push_back(std::move(outcome));
+        }
+    }
+
+    /// 3. Outcome logs - append-by-unique-path with crashed-attempt adoption (the retire-set
+    /// pattern): an occupant log is the durable truth of what a PRIOR attempt's deletes actually
+    /// did (e.g. it recorded Deleted where our idempotent replay just saw Absent) - adopt it and
+    /// discard this attempt's tallies for that shard. Undecodable occupant => ABORTED (corrupt
+    /// state never becomes a cascade input).
+    for (auto & [snap_shard, log] : computed)
+    {
+        const String key = layout.outcomesKey(round, state.fence_seq, snap_shard);
+        const String body = encodeOutcomeLog(log);
+        if (backend.putIfAbsent(key, body) == PutOutcome::PreconditionFailed)
+        {
+            const auto existing = backend.get(key);
+            if (!existing)
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS gc recheck: outcome log at {} vanished between putIfAbsent and read", key);
+            if (existing->bytes != body)
+            {
+                try
+                {
+                    log = decodeOutcomeLog(existing->bytes);
+                }
+                catch (const Exception & e)
+                {
+                    throw Exception(ErrorCodes::ABORTED,
+                        "CAS gc recheck: undecodable outcome log at {} cannot be adopted: {}", key, e.message());
+                }
+            }
+        }
+        result.outcomes.emplace(snap_shard, log);
+    }
+
+    /// 4. Tallies + the cascade input, derived from the FINAL (written-or-adopted) logs so a
+    /// crash-replayed recheck reports and cascades identically. An ABSENT tree cascades too: its
+    /// entry is HELD (we are processing it), so the 404 proves OUR OWN crashed delete landed
+    /// (spec §7 cascade rule); a Replaced tree NEVER cascades - the new incarnation pins its
+    /// children, its own lifecycle handles them.
+    for (const auto & [snap_shard, log] : result.outcomes)
+    {
+        for (const OutcomeEntry & outcome : log.entries)
+        {
+            switch (outcome.outcome)
+            {
+                case OutcomeKind::Deleted:
+                    ++report.deleted;
+                    if (outcome.kind == ObjectKind::Tree)
+                        result.deleted_trees.push_back(outcome.hash);
+                    break;
+                case OutcomeKind::Absent:
+                    ++report.absent;
+                    if (outcome.kind == ObjectKind::Tree)
+                        result.deleted_trees.push_back(outcome.hash);
+                    break;
+                case OutcomeKind::Replaced:
+                    ++report.replaced;
+                    break;
+                case OutcomeKind::Spared:
+                    ++report.spared;
+                    break;
+            }
+        }
+    }
+
+    /// 5. The entries "drop on confirmed outcomes": with the outcome logs durable, the round's
+    /// retired-set objects are deleted (a GC-METADATA delete, not the content-delete site above -
+    /// these are gc/retired/ bookkeeping objects GC itself wrote). RetireView tolerates a
+    /// list-then-get disappearance, and from this moment the writer-facing barrier for these
+    /// incarnations is gone - which is correct: every entry has a confirmed outcome (deleted/
+    /// absent incarnations cannot return, INV-NO-RETURN; replaced/spared ones are alive at a
+    /// NEWER token that was never condemned).
+    for (const auto & [snap_shard, set] : retired)
+    {
+        const String key = layout.retiredKey(round, state.fence_seq, snap_shard);
+        if (const auto got = backend.get(key))
+        {
+            const DeleteOutcome dropped = backend.deleteExact(key, got->token);
+            if (dropped.kind == DeleteOutcome::Kind::TokenMismatch)
+                /// Nobody else legally writes this path (fence_seq epoch isolation) - fail loud.
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "CAS gc recheck: retired set at {} changed under us (token mismatch on drop)", key);
+        }
+    }
+
+    /// 6. fence_version[<= round] served its recheck - erase it (gc/state must not grow a
+    /// per-round vector forever). ONE gc/state CAS, same fail-closed contract as the other steps.
+    GcState next = state;
+    std::erase_if(next.fence_version, [&](const auto & kv) { return kv.first <= round; });
+    Token committed_token;
+    if (backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token, &committed_token)
+        != CasOutcome::Committed)
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS gc recheck: gc/state moved during the recheck (another leader advanced it); retry next round");
+    state = std::move(next);
+    state_token = committed_token;
+
+    return result;
 }
 
 void Gc::fence(GcState & state, Token & state_token,
@@ -319,6 +529,117 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     return retired;
 }
 
+std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, const GcState & state,
+                                            const String & cursor_key, const RootShard & root,
+                                            uint64_t lo_exclusive, uint64_t hi_inclusive)
+{
+    std::vector<Candidate> transitioned;
+
+    /// Edges live in the TARGET's snap shard (in-degree is intra-shard); the expansion marker
+    /// lives in the TREE's own home shard. std::map node references are stable across inserts.
+    const auto shard_for = [&](const UInt128 & hash) -> GcSnap &
+    {
+        return snap.at(hashPrefixShard(hash, state.snap_shards));
+    };
+
+    for (size_t record_idx = 0; record_idx < root.journal.size(); ++record_idx)
+    {
+        const JournalRecord & record = root.journal[record_idx];
+        if (record.at_version <= lo_exclusive || record.at_version > hi_inclusive)
+            continue;
+
+        if (record.op == JournalRecord::Op::Add)
+        {
+            /// Last-op-wins root edge (spec §7): a republish of an existing ref produces
+            /// consecutive Adds for the same (root_shard, part_name) with DIFFERENT trees and
+            /// no Remove between - addRootEdge re-points the edge and returns the displaced
+            /// old target if it zeroed.
+            auto displaced = shard_for(record.tree_id).addRootEdge(cursor_key, record.ref_name, record.tree_id);
+            transitioned.insert(transitioned.end(), displaced.begin(), displaced.end());
+
+            /// Once-per-tree expansion: the FIRST '+' to a tree with no marker reads the tree
+            /// once and adds its child-edge set (each edge into the CHILD's shard).
+            GcSnap & tree_home = shard_for(record.tree_id);
+            if (!tree_home.isExpanded(record.tree_id))
+            {
+                std::vector<TreeEntry> entries;
+                bool tree_present = true;
+                try
+                {
+                    entries = store->readTree(TreeId(u128ToHex(record.tree_id)));
+                }
+                catch (const Exception & e)
+                {
+                    if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
+                        throw;
+                    /// DECISION (Task 6, refined by review): a journal Add implies the tree was
+                    /// published, but the object may legitimately be gone NOW - this record's
+                    /// edge was DISPLACED later in the journal and an already COMPLETED
+                    /// competing round deleted the displaced tree (in-order folding still
+                    /// visits the Add). Displacement proof is a later record for the SAME
+                    /// ref_name: a Remove drops the edge, and a later Add re-points it
+                    /// (last-op-wins republish - the COMMON mutation path). Either => skip the
+                    /// expansion (the edges would be stripped/displaced anyway; the marker
+                    /// stays unset; no edges were added for a gone tree, so over-count-only is
+                    /// preserved). No later record for the ref => the manifest claims a LIVE
+                    /// ref to a missing tree => INV-NO-DANGLE surfaced; fail closed
+                    /// (propagate). The op check stays EXPLICIT: a future journal op (e.g. the
+                    /// model's fence records) must NOT count as displacement.
+                    bool displaced_later = false;
+                    for (size_t ahead = record_idx + 1; ahead < root.journal.size(); ++ahead)
+                    {
+                        const JournalRecord & next = root.journal[ahead];
+                        if ((next.op == JournalRecord::Op::Remove || next.op == JournalRecord::Op::Add)
+                            && next.ref_name == record.ref_name && next.at_version > record.at_version)
+                        {
+                            displaced_later = true;
+                            break;
+                        }
+                    }
+                    if (!displaced_later)
+                        throw;
+                    tree_present = false;
+                }
+
+                if (tree_present)
+                {
+                    for (const TreeEntry & entry : entries)
+                    {
+                        switch (entry.placement)
+                        {
+                            case Placement::Blob:
+                                shard_for(entry.file_hash).addTreeEdge(record.tree_id, ObjectKind::Blob, entry.file_hash);
+                                break;
+                            case Placement::Subtree:
+                                shard_for(entry.file_hash).addTreeEdge(record.tree_id, ObjectKind::Tree, entry.file_hash);
+                                break;
+                            case Placement::PackSlice:
+                                shard_for(entry.pack_hash).addPackEdge(record.tree_id, entry.pack_hash);
+                                break;
+                            case Placement::Inline:
+                                break;   /// embedded bytes - no separate object, no edge
+                        }
+                    }
+                    tree_home.markExpanded(record.tree_id);
+                }
+            }
+        }
+        else
+        {
+            /// The model's GFold rem only removes the root edge - the cascade strip of the
+            /// tree's child edges belongs to the recheck/delete pipeline (Task 10).
+            /// LOAD-BEARING routing: the Remove routes via the journal record's DROP-TIME
+            /// tree_id, which by in-order folding is exactly the shard where the live
+            /// (root_shard, part_name) edge resides - any earlier displacing Add already
+            /// re-pointed the edge when ITS record folded (intra-shard while snap_shards == 1).
+            auto cands = shard_for(record.tree_id).removeRootEdge(cursor_key, record.ref_name);
+            transitioned.insert(transitioned.end(), cands.begin(), cands.end());
+        }
+    }
+
+    return transitioned;
+}
+
 Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 {
     /// M-C3 limitation, fail closed: last-op-wins displacement is INTRA-shard only (addRootEdge
@@ -369,15 +690,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
         }
     }
 
-    /// Edges live in the TARGET's snap shard (in-degree is intra-shard); the expansion marker
-    /// lives in the TREE's own home shard. std::map node references are stable across inserts.
-    const auto shard_for = [&](const UInt128 & hash) -> GcSnap &
-    {
-        return result.snap.at(hashPrefixShard(hash, state.snap_shards));
-    };
-
     /// 3. Fold each discovered root shard's journal records in (folded_cursor, shard_version],
-    /// in journal (= insertion) order.
+    /// in journal (= insertion) order (the shared R1/R4 record semantics — foldShardRecords).
     for (const auto & [ns, root_shard] : result.root_shards)
     {
         const auto [root, manifest_token] = store->readShard(ns, root_shard);
@@ -385,100 +699,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
         const auto cursor_it = state.folded_cursor.find(cursor_key);
         const uint64_t cursor = cursor_it != state.folded_cursor.end() ? cursor_it->second : 0;
 
-        for (size_t record_idx = 0; record_idx < root.journal.size(); ++record_idx)
-        {
-            const JournalRecord & record = root.journal[record_idx];
-            if (record.at_version <= cursor || record.at_version > root.shard_version)
-                continue;
-
-            if (record.op == JournalRecord::Op::Add)
-            {
-                /// Last-op-wins root edge (spec §7): a republish of an existing ref produces
-                /// consecutive Adds for the same (root_shard, part_name) with DIFFERENT trees and
-                /// no Remove between - addRootEdge re-points the edge and returns the displaced
-                /// old target if it zeroed.
-                auto displaced = shard_for(record.tree_id).addRootEdge(cursor_key, record.ref_name, record.tree_id);
-                result.transitioned.insert(result.transitioned.end(), displaced.begin(), displaced.end());
-
-                /// Once-per-tree expansion: the FIRST '+' to a tree with no marker reads the tree
-                /// once and adds its child-edge set (each edge into the CHILD's shard).
-                GcSnap & tree_home = shard_for(record.tree_id);
-                if (!tree_home.isExpanded(record.tree_id))
-                {
-                    std::vector<TreeEntry> entries;
-                    bool tree_present = true;
-                    try
-                    {
-                        entries = store->readTree(TreeId(u128ToHex(record.tree_id)));
-                    }
-                    catch (const Exception & e)
-                    {
-                        if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
-                            throw;
-                        /// DECISION (Task 6, refined by review): a journal Add implies the tree was
-                        /// published, but the object may legitimately be gone NOW - this record's
-                        /// edge was DISPLACED later in the journal and an already COMPLETED
-                        /// competing round deleted the displaced tree (in-order folding still
-                        /// visits the Add). Displacement proof is a later record for the SAME
-                        /// ref_name: a Remove drops the edge, and a later Add re-points it
-                        /// (last-op-wins republish - the COMMON mutation path). Either => skip the
-                        /// expansion (the edges would be stripped/displaced anyway; the marker
-                        /// stays unset; no edges were added for a gone tree, so over-count-only is
-                        /// preserved). No later record for the ref => the manifest claims a LIVE
-                        /// ref to a missing tree => INV-NO-DANGLE surfaced; fail closed
-                        /// (propagate). The op check stays EXPLICIT: a future journal op (e.g. the
-                        /// model's fence records) must NOT count as displacement.
-                        bool displaced_later = false;
-                        for (size_t ahead = record_idx + 1; ahead < root.journal.size(); ++ahead)
-                        {
-                            const JournalRecord & next = root.journal[ahead];
-                            if ((next.op == JournalRecord::Op::Remove || next.op == JournalRecord::Op::Add)
-                                && next.ref_name == record.ref_name && next.at_version > record.at_version)
-                            {
-                                displaced_later = true;
-                                break;
-                            }
-                        }
-                        if (!displaced_later)
-                            throw;
-                        tree_present = false;
-                    }
-
-                    if (tree_present)
-                    {
-                        for (const TreeEntry & entry : entries)
-                        {
-                            switch (entry.placement)
-                            {
-                                case Placement::Blob:
-                                    shard_for(entry.file_hash).addTreeEdge(record.tree_id, ObjectKind::Blob, entry.file_hash);
-                                    break;
-                                case Placement::Subtree:
-                                    shard_for(entry.file_hash).addTreeEdge(record.tree_id, ObjectKind::Tree, entry.file_hash);
-                                    break;
-                                case Placement::PackSlice:
-                                    shard_for(entry.pack_hash).addPackEdge(record.tree_id, entry.pack_hash);
-                                    break;
-                                case Placement::Inline:
-                                    break;   /// embedded bytes - no separate object, no edge
-                            }
-                        }
-                        tree_home.markExpanded(record.tree_id);
-                    }
-                }
-            }
-            else
-            {
-                /// The model's GFold rem only removes the root edge - the cascade strip of the
-                /// tree's child edges belongs to the recheck/delete pipeline (Task 10).
-                /// LOAD-BEARING routing: the Remove routes via the journal record's DROP-TIME
-                /// tree_id, which by in-order folding is exactly the shard where the live
-                /// (root_shard, part_name) edge resides - any earlier displacing Add already
-                /// re-pointed the edge when ITS record folded (intra-shard while snap_shards == 1).
-                auto cands = shard_for(record.tree_id).removeRootEdge(cursor_key, record.ref_name);
-                result.transitioned.insert(result.transitioned.end(), cands.begin(), cands.end());
-            }
-        }
+        auto transitioned = foldShardRecords(result.snap, state, cursor_key, root, cursor, root.shard_version);
+        result.transitioned.insert(result.transitioned.end(), transitioned.begin(), transitioned.end());
 
         /// Don't mint zero cursor entries for absent shards (the registry universe includes every
         /// shard of every namespace; an absent shard has nothing folded and nothing to remember).

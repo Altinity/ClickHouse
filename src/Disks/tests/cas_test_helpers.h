@@ -234,16 +234,15 @@ inline void fenceNamespace(
 /// incarnation_tag in its envelope header (preserving header_len + payload), putOverwrite against the
 /// current token, and return the NEW token. Used to drive the W-REVALIDATE adopt branch (current token
 /// differs from the writer's stale observation).
-inline DB::Cas::Token displaceBlobToken(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::BlobId & id)
+inline DB::Cas::Token displaceObjectToken(
+    DB::Cas::Backend & backend, const String & key, DB::Cas::ObjectKind kind)
 {
-    const String key = layout.blobKey(id);
     const auto got = backend.get(key);
     if (!got)
-        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "displaceBlobToken: blob {} absent", key);
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "displaceObjectToken: object {} absent", key);
 
     DB::Cas::EnvelopeHeader header =
-        DB::Cas::decodeEnvelopeHeader(got->bytes, got->bytes.size(), DB::Cas::ObjectKind::Blob);
+        DB::Cas::decodeEnvelopeHeader(got->bytes, got->bytes.size(), kind);
     /// A fresh, distinct incarnation_tag forces a distinct body so the displaced token differs.
     header.incarnation_tag = header.incarnation_tag + DB::UInt128(1);
     header.pad_to_header_len = header.header_len;   /// preserve the exact header length on re-encode
@@ -253,6 +252,12 @@ inline DB::Cas::Token displaceBlobToken(
     DB::Cas::Token new_tok;
     backend.putOverwrite(key, body, got->token, &new_tok);
     return new_tok;
+}
+
+inline DB::Cas::Token displaceBlobToken(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::BlobId & id)
+{
+    return displaceObjectToken(backend, layout.blobKey(id), DB::Cas::ObjectKind::Blob);
 }
 
 /// Duplicate of `Store::shardOf` (CityHash64(ref) % root_shards) for placing manifests in tests, since

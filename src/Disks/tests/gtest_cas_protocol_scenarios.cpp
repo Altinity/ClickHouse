@@ -528,17 +528,26 @@ TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
+    /// The full round COMPLETED: T (unreachable) was deleted at t0 and its retired entry dropped
+    /// on the confirmed outcome - the view alone can no longer condemn it.
+    EXPECT_FALSE(b->head(tree_key).exists);
+
     /// 4. build B publishes T into a BRAND-NEW namespace: ensureRegistered returns the registry's
-    /// fence_round (1) > view round (0) => the gate refreshes => T's hash is condemned at t0 =>
-    /// resurrect => publish lands on a fresh incarnation.
-    build_b->publish(RootNamespace{"srv2/new"}, "part_x", tree, RefPayload{});
+    /// fence_round (1) > view round (0) => the gate refreshes => B's STALE TOKENLESS EVIDENCE on T
+    /// (recorded at view round 0 < 1, no view hit - the entry dropped) is RE-OBSERVED (one HEAD,
+    /// the amended W-EVIDENCE): T is ABSENT and adoptTree retains no payload => the publish ABORTS
+    /// retryably. It must NEVER land - landing would write a manifest naming a deleted tree (the
+    /// dangle this whole ordering machinery exists to prevent).
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
+    {
+        build_b->publish(RootNamespace{"srv2/new"}, "part_x", tree, RefPayload{});
+    });
 
-    auto resolved = s->resolveRef(RootNamespace{"srv2/new"}, "part_x");
-    ASSERT_TRUE(resolved.has_value());
-    EXPECT_EQ(resolved->tree_id, tree);
+    /// NO DANGLE: nothing in the new namespace names the deleted tree.
+    EXPECT_FALSE(s->resolveRef(RootNamespace{"srv2/new"}, "part_x").has_value());
+    EXPECT_EQ(b->deleteExact(tree_key, t0).kind, DeleteOutcome::Kind::NotFound);   /// long gone
 
-    /// The would-be dangle is dead: T was displaced off the condemned token.
-    const Token t1 = b->head(tree_key).token;
-    EXPECT_NE(t1, t0);
-    EXPECT_EQ(b->deleteExact(tree_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
+    /// WITHOUT the registry gate floor the publish LANDS on the stale round-0 view (no refresh, no
+    /// re-observation) and resolveRef would return a ref whose readTree throws - the dangle made
+    /// concrete. (Verified red with the floor disabled.)
 }

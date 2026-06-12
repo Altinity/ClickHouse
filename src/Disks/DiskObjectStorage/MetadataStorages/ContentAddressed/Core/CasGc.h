@@ -137,18 +137,59 @@ private:
     std::map<uint64_t, RetiredSet> retire(GcState & state, Token & state_token,
                                           const std::map<uint64_t, GcSnap> & snap);
 
-    /// R3 (spec §7; the model's GFenceShard): CAS fence_round := round (monotone max) into every
-    /// PRESENT root shard via the verified mutateShard loop; record each shard's committed
-    /// shard_version in gc/state.fence_version[round] — the durable fence position the recheck
-    /// folds through (provable coverage; the model's fencePos[s]). The manifest CAS totally
-    /// orders the fence against publishes on that shard — exactly the ordering the spec's
-    /// no-return argument rests on. One fence covers the whole round's candidate set; one
-    /// gc/state CAS persists the whole vector. `root_shards` is the fold's discovery (present
-    /// manifests only) — a never-published shard contributes no edges and needs no fence; the
-    /// M-F full-GC walk owns the authoritative universe. On success `state`/`state_token` carry
-    /// the committed fence_version[round].
+    /// R3 (spec §7 as amended 2026-06-12; the model's GFenceShard): CAS the NAMESPACE REGISTRY's
+    /// fence_round first (the ordering point for namespace creation — W-REGISTER's gate floor),
+    /// then CAS fence_round := round (monotone max) into EVERY root shard of every registered
+    /// namespace via the verified mutateShard loop — present or ABSENT (the create-if-absent CAS
+    /// MINTS a fence-only manifest for an absent shard; the create race against a first publish
+    /// into that shard is the required total order). Record each shard's committed shard_version
+    /// (and the registry's committed version under the reserved "_registry" key) in
+    /// gc/state.fence_version[round] — the durable fence positions the recheck folds through
+    /// (provable coverage; the model's fencePos[s]). The manifest CAS totally orders the fence
+    /// against publishes on that shard — exactly the ordering the spec's no-return argument rests
+    /// on. One fence covers the whole round's candidate set; one gc/state CAS persists the whole
+    /// vector. `root_shards` is the fold's registry-derived universe. On success
+    /// `state`/`state_token` carry the committed fence_version[round].
     void fence(GcState & state, Token & state_token,
                const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards);
+
+    /// What one R4 recheck decided. `deleted_trees` are the trees whose entries confirmed Deleted
+    /// or Absent-while-held (our own crashed delete provably landed) — the cascade's input
+    /// (Task 10). Derived from the FINAL (written-or-adopted) outcome logs, never from this
+    /// attempt's in-memory tallies, so a crash-replayed recheck cascades the same trees.
+    struct RecheckResult
+    {
+        std::map<uint64_t, OutcomeLog> outcomes;   /// snap_shard -> the durable outcome log
+        std::vector<UInt128> deleted_trees;
+    };
+
+    /// R4 (spec §7; the model's GRecheckDelete + the synchronous half of Land): re-fold every
+    /// fenced shard's journal THROUGH its recorded fence version (records in
+    /// (folded_cursor, fence_version] — exactly the publishes that raced the fence; provable
+    /// coverage, the FoldedThroughFence guard) into the in-memory snap, then per retired entry:
+    ///   in-degree > 0      => outcome Spared (a pre-fence publish re-pinned it — horn 1);
+    ///   else deleteExact   => THE SINGLE CONTENT-DELETE SITE (exact observed token):
+    ///       Deleted        => outcome Deleted (trees: cascade input);
+    ///       NotFound       => outcome Absent (a prior crashed delete landed; held trees cascade);
+    ///       TokenMismatch  => outcome Replaced (a resurrection won — the 412-save health metric).
+    /// deleteExact is synchronous: its return IS the model's Land (the confirmed outcome), so
+    /// entries "drop on confirmed outcomes" collapses to: write the outcome logs
+    /// (append-by-unique-path with crashed-attempt adoption like retire — an occupant log is the
+    /// durable truth of what a prior attempt's deletes DID and replaces this attempt's tallies),
+    /// then DELETE the round's retired-set objects (RetireView tolerates list-then-get
+    /// disappearance), then one gc/state CAS erases fence_version for rounds <= round (it served
+    /// its recheck; gc/state must not grow a per-round vector forever). The in-memory recheck fold
+    /// is NOT persisted — the next round's durable fold re-derives it idempotently (set semantics).
+    RecheckResult recheck(GcState & state, Token & state_token, std::map<uint64_t, GcSnap> & snap,
+                          const std::map<uint64_t, RetiredSet> & retired, RoundReport & report);
+
+    /// Fold one root shard's journal records with at_version in (lo, hi] into `snap` — the shared
+    /// R1/R4 record semantics: last-op-wins root edges, once-per-tree expansion with the
+    /// displaced-later lookahead, Remove drops the root edge. Returns the nodes that transitioned
+    /// to zero in-degree (report/cross-check only; decisions read the snap statelessly).
+    std::vector<Candidate> foldShardRecords(std::map<uint64_t, GcSnap> & snap, const GcState & state,
+                                            const String & cursor_key, const RootShard & root,
+                                            uint64_t lo_exclusive, uint64_t hi_inclusive);
 
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);

@@ -295,9 +295,17 @@ W-HEARTBEAT     the build heartbeat is durable before the first object PUT and r
 W-DEP-SET       the writer maintains publish_dependency_set = {(kind, hash, token | live-root-evidence)}
                 covering EVERY object the publish makes reachable — own uploads and trees included.
 W-EVIDENCE      a tokenless (live-root-evidence) member is publishable iff its hash has NO entry in the
-                writer's retire view. Any hit forces resolution to a token-bearing entry: HEAD the key,
+                writer's retire view AND the evidence is as fresh as the view (recorded at a view round
+                >= the current one). Any hit forces resolution to a token-bearing entry: HEAD the key,
                 then adopt the current token if it is not condemned, else resurrect. An unresolved
                 tokenless member whose hash matches any condemned entry may not be published.
+                STALE evidence with NO hit (amended 2026-06-12, implementation-discovered): because
+                retire entries drop on confirmed outcomes (F1), "no entry" can mean
+                condemned-deleted-and-dropped — the durable witness is the OBJECT. On a view refresh,
+                every tokenless member recorded under an older view round is RE-OBSERVED (one HEAD):
+                present ⇒ resolve to the current token (adopt or resurrect); absent ⇒ re-create or
+                abort retryably — never publish a dangling reference. The "no source-root
+                revalidation" economy holds only within one fence/recheck round window.
 W-PUBLISH-GATE  the publish CAS is valid only if: retire_view_round ≥ manifest.fence_round, AND no
                 dependency-set member is condemned in that view, AND the writer's own heartbeat renewal is
                 recent by its own clock (local sanity bound — liveness, never the safety argument).
