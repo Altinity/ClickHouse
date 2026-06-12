@@ -56,6 +56,7 @@ void CasGcScheduler::loop()
     /// REQUIRES a stable observer (it compares the lease across consecutive runRegularRound calls
     /// of the same instance).
     Cas::Gc gc(store, gc_id);
+    size_t consecutive_backoffs = 0;
     while (true)
     {
         {
@@ -67,9 +68,25 @@ void CasGcScheduler::loop()
         {
             const Cas::RoundReport report = gc.runRegularRound();
             if (report.acquired_lease)
+            {
+                consecutive_backoffs = 0;
                 LOG_DEBUG(log, "CA GC round {}: candidates={} deleted={} absent={} replaced={} spared={} cascaded={}",
                     report.round, report.candidates, report.deleted, report.absent,
                     report.replaced, report.spared, report.cascaded);
+            }
+            else
+            {
+                /// NEVER silent: a follower backing off is the normal multi-mounter state, but a
+                /// pool where THIS scheduler never leads must be observable (the lease layer is
+                /// outside the TLA+ model's liveness - a misuse that starves rounds, like the
+                /// retro's fresh-gc_id-per-call test-hook bug, would otherwise log nothing).
+                ++consecutive_backoffs;
+                if (consecutive_backoffs % 10 == 0)
+                    LOG_INFO(log, "CA GC: lease held by another mounter for {} consecutive ticks "
+                        "(normal for a follower; investigate if no mounter is reclaiming)", consecutive_backoffs);
+                else
+                    LOG_TRACE(log, "CA GC: lease held by another mounter (tick {})", consecutive_backoffs);
+            }
         }
         catch (...)
         {
