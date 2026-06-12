@@ -78,6 +78,9 @@ public:
     std::vector<TreeEntry> readTree(const TreeId & id);           /// validates envelope, kind, key↔hash
     BlobLocation locate(const TreeEntry & entry) const;           /// Blob/PackSlice placements only
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
+    /// Registered namespaces with the given prefix (one registry GET; opaque strings, sorted).
+    /// Dropped namespaces linger registered until full GC (M-F) — visible-but-empty, never wrong.
+    std::vector<String> listNamespaces(const String & prefix);
 
     /// ---- ref lifecycle (CAS loops on the owning shard) ----
     void dropRef(const RootNamespace & ns, const String & ref_name);            /// refs−− + '-' journal, atomic

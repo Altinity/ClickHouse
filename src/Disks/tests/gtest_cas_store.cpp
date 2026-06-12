@@ -554,3 +554,25 @@ TEST(CasStore, DropNamespaceTombstonesAndRemovesFiles)
     EXPECT_FALSE(s->getNamespaceFile(ns, "uuid.txt").has_value());
     EXPECT_TRUE(s->listRefs(ns).empty());
 }
+
+TEST(CasStore, ListNamespacesFromRegistry)
+{
+    /// listNamespaces = one registry GET filtered by prefix (the W-REGISTER universe, never LIST).
+    /// The wiring uses it for directory-style enumeration of opaque namespace strings (M-W).
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+
+    EXPECT_TRUE(s->listNamespaces("").empty());   /// fresh pool: no registry yet
+
+    DB::Cas::tests::registerNamespaceRaw(*b, s->layout(), RootNamespace{"srv1/tbl"});
+    DB::Cas::tests::registerNamespaceRaw(*b, s->layout(), RootNamespace{"shadow/bk1/tbl"});
+    DB::Cas::tests::registerNamespaceRaw(*b, s->layout(), RootNamespace{"shadow/bk2/tbl"});
+
+    const auto all = s->listNamespaces("");
+    EXPECT_EQ(all.size(), 3u);
+    const auto shadows = s->listNamespaces("shadow/");
+    ASSERT_EQ(shadows.size(), 2u);                /// sorted (registry holds a std::set)
+    EXPECT_EQ(shadows[0], "shadow/bk1/tbl");
+    EXPECT_EQ(shadows[1], "shadow/bk2/tbl");
+    EXPECT_TRUE(s->listNamespaces("nope/").empty());
+}

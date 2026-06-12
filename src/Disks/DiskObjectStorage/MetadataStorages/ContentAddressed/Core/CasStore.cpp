@@ -424,4 +424,22 @@ uint64_t Store::ensureRegistered(const RootNamespace & ns)
         "CAS namespace registration contention on {} (runaway live-lock brake)", key);
 }
 
+std::vector<String> Store::listNamespaces(const String & prefix)
+{
+    /// One registry GET — the authoritative namespace universe (W-REGISTER: every published
+    /// namespace is here; never LIST). Absent registry = fresh pool = no namespaces. The wiring
+    /// uses this for directory-style enumeration of opaque namespace strings (e.g. the FREEZE
+    /// shadow tree); registrations of dropped namespaces linger until full GC (M-F) — callers
+    /// resolve refs per namespace, so a lingering empty namespace is visible-but-empty, not wrong.
+    std::vector<String> result;
+    if (const std::optional<GetResult> got = pool_backend->get(pool_layout.rootsRegistryKey()))
+    {
+        const RootsRegistry registry = decodeRootsRegistry(got->bytes);
+        for (const String & ns : registry.namespaces)
+            if (ns.starts_with(prefix))
+                result.push_back(ns);
+    }
+    return result;
+}
+
 }
