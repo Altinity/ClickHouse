@@ -337,6 +337,7 @@ TEST(CaWiringRead, VerbatimNamespaceFiles)
 /// ==== M-W Task 3: the write path through IMetadataTransaction ====
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <IO/ReadHelpers.h>
 
 namespace
 {
@@ -654,4 +655,49 @@ TEST(CaWiringOps, FreezeViaHardLinksIntoShadow)
     tx3->removeRecursive("shadow/bk1", {});
     EXPECT_FALSE(storage->existsDirectory("shadow/bk1/store/uui/uuid-1/all_1_1_0"));
     EXPECT_FALSE(storage->existsDirectory("shadow/bk1"));
+}
+
+/// ==== M-W Task 8: in-flight read-your-writes (B59) ====
+
+TEST(CaWiringInFlight, StagedFilesVisibleBeforeCommit)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/tmp_mut_all_1_1_0/p.proj/data.bin", "proj-bytes");
+    writeThroughTransaction(*tx, "uui/uuid-1/tmp_mut_all_1_1_0/uuid.txt", "u-9");
+
+    /// The file trio.
+    auto objects = tx->tryGetInFlightStorageObjects("uui/uuid-1/tmp_mut_all_1_1_0/p.proj/data.bin");
+    ASSERT_TRUE(objects.has_value());
+    ASSERT_EQ(objects->size(), 1u);
+    EXPECT_FALSE((*objects)[0].remote_path.empty());
+    EXPECT_EQ((*objects)[0].bytes_size, 10u);
+    EXPECT_EQ(tx->tryGetInFlightFileSize("uui/uuid-1/tmp_mut_all_1_1_0/p.proj/data.bin"), std::optional<uint64_t>(10));
+    EXPECT_EQ(tx->tryGetInFlightFileSize("uui/uuid-1/tmp_mut_all_1_1_0/uuid.txt"), std::optional<uint64_t>(3));
+    EXPECT_FALSE(tx->tryGetInFlightFileSize("uui/uuid-1/tmp_mut_all_1_1_0/missing.bin").has_value());
+
+    /// Bytes read back: a staged blob through the payload view; staged mutable bytes from memory.
+    {
+        auto buf = tx->tryReadFileInFlight("uui/uuid-1/tmp_mut_all_1_1_0/p.proj/data.bin", {}, std::nullopt);
+        ASSERT_TRUE(buf);
+        String read;
+        readStringUntilEOF(read, *buf);
+        EXPECT_EQ(read, "proj-bytes");
+    }
+    {
+        auto buf = tx->tryReadFileInFlight("uui/uuid-1/tmp_mut_all_1_1_0/uuid.txt", {}, std::nullopt);
+        ASSERT_TRUE(buf);
+        String read;
+        readStringUntilEOF(read, *buf);
+        EXPECT_EQ(read, "u-9");
+    }
+
+    /// The directory overlay.
+    EXPECT_TRUE(tx->hasInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0"));
+    EXPECT_TRUE(tx->hasInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0/p.proj"));
+    EXPECT_FALSE(tx->hasInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0/q.proj"));
+    auto top = tx->listInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0");
+    EXPECT_EQ(top, (std::vector<std::string>{"p.proj", "uuid.txt"}));
+    EXPECT_EQ(tx->listInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0/p.proj"),
+              (std::vector<std::string>{"data.bin"}));
 }

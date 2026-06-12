@@ -99,6 +99,11 @@ public:
     /// pipeline cache stages — the CA disk runs cacheless, as the PoC did (B86).
     bool prepareReadPipeline(const std::string & path, const ReadSettings & settings, ReadPipeline & pipeline) const;
 
+    /// A seekable reader over ONE blob payload (the object minus its envelope header) - shared by
+    /// prepareReadPipeline and the transaction's in-flight read-your-writes (B59).
+    std::unique_ptr<ReadBufferFromFileBase> readBlobPayload(
+        const Cas::BlobLocation & location, const std::string & path, const ReadSettings & settings) const;
+
     /// D-W1 namespace mapping (shared with the transaction — ONE definition).
     Cas::RootNamespace liveNamespace(const std::string & table_uuid) const;
     Cas::RootNamespace detachedNamespace(const std::string & table_uuid) const;
@@ -127,6 +132,19 @@ private:
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;
     String pool_uuid;
+    /// Joined in front of core keys for DIRECT object_storage reads. The Emulated (Local) backend
+    /// maps bare pool keys under getCommonKeyPrefix; Native passes keys through - this member
+    /// mirrors that rule so readBlobPayload reads exactly where the backend wrote ("" for Native).
+    String physical_key_prefix;
+
+    String physicalKey(const String & key) const
+    {
+        if (physical_key_prefix.empty())
+            return key;
+        if (physical_key_prefix.back() == '/')
+            return physical_key_prefix + key;
+        return physical_key_prefix + "/" + key;
+    }
 
     /// resolveRef + readTree for a routed path; nullopt when the ref is absent. Throws on a
     /// present-but-corrupt tree (fail closed, INV-NO-DANGLE surfaced).

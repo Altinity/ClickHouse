@@ -113,8 +113,27 @@ void ContentAddressedMetadataStorage::startup()
         : Cas::ObjectStorageBackend::Mode::Native;
     auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode);
 
+    /// Key spaces per mode: the Emulated (Local) backend maps bare pool keys under
+    /// getCommonKeyPrefix (the disk root dir), so the POOL prefix must be bucket-relative - strip
+    /// the common prefix when the configured prefix carries it (the local factory passes the root
+    /// path). Native passes keys through, so the configured prefix is used as-is (for S3 it
+    /// already embeds the endpoint sub-path).
+    String pool_prefix = storage_path_prefix;
+    if (mode == Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess)
+    {
+        physical_key_prefix = object_storage->getCommonKeyPrefix();
+        if (!physical_key_prefix.empty() && pool_prefix.starts_with(physical_key_prefix))
+        {
+            pool_prefix = pool_prefix.substr(physical_key_prefix.size());
+            while (!pool_prefix.empty() && pool_prefix.front() == '/')
+                pool_prefix.erase(pool_prefix.begin());
+        }
+        if (pool_prefix.empty())
+            pool_prefix = "ca";
+    }
+
     Cas::PoolConfig pool_config;
-    pool_config.pool_prefix = storage_path_prefix;
+    pool_config.pool_prefix = pool_prefix;
     pool_config.server_id = serverIdToU128(server_id);
     pool_config.background_heartbeats = context != nullptr;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
@@ -607,18 +626,24 @@ bool ContentAddressedMetadataStorage::prepareReadPipeline(
         if (entry.name != r->file)
             continue;
         const auto location = store()->locate(entry);
-        auto creator = [storage = object_storage, location, path](
+        auto creator = [this, location, path](
             const StoredObject &, const ReadSettings & creator_settings, bool, bool) -> std::unique_ptr<ReadBufferFromFileBase>
         {
-            auto impl = storage->readObject(
-                StoredObject(location.key, path, location.offset + location.length), creator_settings);
-            return std::make_unique<ReadBufferFromFileView>(
-                std::move(impl), path, location.offset, location.offset + location.length);
+            return readBlobPayload(location, path, creator_settings);
         };
         pipeline.setSource(std::move(creator), {StoredObject(location.key, path, location.length)}, settings);
         return true;
     }
     return false;
+}
+
+std::unique_ptr<ReadBufferFromFileBase> ContentAddressedMetadataStorage::readBlobPayload(
+    const Cas::BlobLocation & location, const std::string & path, const ReadSettings & settings) const
+{
+    auto impl = object_storage->readObject(
+        StoredObject(physicalKey(location.key), path, location.offset + location.length), settings);
+    return std::make_unique<ReadBufferFromFileView>(
+        std::move(impl), path, location.offset, location.offset + location.length);
 }
 
 /// ==== IContentAddressedExchange (relink lands in M-W T11; SAFE DEGRADATION until then) ====

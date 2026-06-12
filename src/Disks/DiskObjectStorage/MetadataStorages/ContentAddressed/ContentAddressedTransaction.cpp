@@ -3,7 +3,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <IO/ReadBufferFromFile.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/copyData.h>
+#include <algorithm>
 #include <Common/Exception.h>
 #include <ctime>
 
@@ -168,30 +170,121 @@ StoredObjects ContentAddressedTransaction::getSubmittedForRemovalBlobs()
     return {};
 }
 
-std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageObjects(const std::string &) const
+const Cas::TreeEntry * ContentAddressedTransaction::findStagedEntry(
+    const ContentAddressedMetadataStorage::Route & r) const
 {
+    auto it = parts.find({r.ns.string(), r.ref});
+    if (it == parts.end())
+        return nullptr;
+    auto eit = std::find_if(it->second.entries.begin(), it->second.entries.end(),
+        [&](const Cas::TreeEntry & e) { return e.name == r.file; });
+    return eit == it->second.entries.end() ? nullptr : &*eit;
+}
+
+std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageObjects(const std::string & path) const
+{
+    /// B59 read-your-writes: a projection spill-and-merge reads back its own temp blocks before
+    /// the parent part's single commit. Staged content blobs are already uploaded - locate them.
+    auto r = const_cast<ContentAddressedTransaction *>(this)->routeOf(path);
+    if (!r || r->file.empty())
+        return {};
+    if (const auto * entry = findStagedEntry(*r))
+    {
+        if (entry->placement == Cas::Placement::Blob)
+        {
+            const auto location = metadata_storage.store()->locate(*entry);
+            return StoredObjects{StoredObject(location.key, path, location.length)};
+        }
+        return StoredObjects{StoredObject("", path, entry->file_size)};
+    }
     return {};
 }
 
 std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFileInFlight(
-    const std::string &, const ReadSettings &, std::optional<size_t>) const
+    const std::string & path, const ReadSettings & settings, std::optional<size_t> /*read_hint*/) const
 {
+    auto r = const_cast<ContentAddressedTransaction *>(this)->routeOf(path);
+    if (!r || r->file.empty())
+        return nullptr;
+    auto it = parts.find({r->ns.string(), r->ref});
+    if (it == parts.end())
+        return nullptr;
+    /// Staged mutable bytes serve from memory; staged blobs read through the payload view.
+    if (auto mit = it->second.mutable_files.find(r->file); mit != it->second.mutable_files.end())
+        return std::make_unique<ReadBufferFromOwnMemoryFile>(path, mit->second);
+    if (const auto * entry = findStagedEntry(*r))
+    {
+        if (entry->placement == Cas::Placement::Inline)
+            return std::make_unique<ReadBufferFromOwnMemoryFile>(path, entry->inline_bytes);
+        if (entry->placement == Cas::Placement::Blob)
+            return metadata_storage.readBlobPayload(metadata_storage.store()->locate(*entry), path, settings);
+    }
     return nullptr;
 }
 
-std::optional<uint64_t> ContentAddressedTransaction::tryGetInFlightFileSize(const std::string &) const
+std::optional<uint64_t> ContentAddressedTransaction::tryGetInFlightFileSize(const std::string & path) const
 {
+    auto r = const_cast<ContentAddressedTransaction *>(this)->routeOf(path);
+    if (!r || r->file.empty())
+        return {};
+    auto it = parts.find({r->ns.string(), r->ref});
+    if (it == parts.end())
+        return {};
+    if (auto mit = it->second.mutable_files.find(r->file); mit != it->second.mutable_files.end())
+        return mit->second.size();
+    if (const auto * entry = findStagedEntry(*r))
+        return entry->file_size;
     return {};
 }
 
-bool ContentAddressedTransaction::hasInFlightDirectory(const std::string &) const
+bool ContentAddressedTransaction::hasInFlightDirectory(const std::string & path) const
 {
+    /// Directory overlay (B59): true iff at least one staged file lives under `path` for `path`'s
+    /// part - what makes a carried-forward projection dir visible to loadProjections.
+    auto r = const_cast<ContentAddressedTransaction *>(this)->routeOf(path);
+    if (!r || r->ref.empty())
+        return false;
+    auto it = parts.find({r->ns.string(), r->ref});
+    if (it == parts.end())
+        return false;
+    if (r->file.empty())
+        return !it->second.entries.empty() || !it->second.mutable_files.empty();
+    const std::string prefix = r->file + "/";
+    for (const auto & entry : it->second.entries)
+        if (entry.name.starts_with(prefix))
+            return true;
+    for (const auto & [name, _] : it->second.mutable_files)
+        if (name.starts_with(prefix))
+            return true;
     return false;
 }
 
-std::vector<std::string> ContentAddressedTransaction::listInFlightDirectory(const std::string &) const
+std::vector<std::string> ContentAddressedTransaction::listInFlightDirectory(const std::string & path) const
 {
-    return {};
+    /// Immediate-child names staged directly under `path` (one level) - loadProjections'
+    /// withPartFormatFromDisk iterates a staged projection dir to find its mark file.
+    auto r = const_cast<ContentAddressedTransaction *>(this)->routeOf(path);
+    std::vector<std::string> result;
+    if (!r || r->ref.empty())
+        return result;
+    auto it = parts.find({r->ns.string(), r->ref});
+    if (it == parts.end())
+        return result;
+    const std::string prefix = r->file.empty() ? "" : r->file + "/";
+    std::set<std::string> names;
+    auto add = [&](const std::string & name)
+    {
+        if (!name.starts_with(prefix) || name.size() <= prefix.size())
+            return;
+        const auto rest = name.substr(prefix.size());
+        const auto slash = rest.find('/');
+        names.insert(slash == std::string::npos ? rest : rest.substr(0, slash));
+    };
+    for (const auto & entry : it->second.entries)
+        add(entry.name);
+    for (const auto & [name, _] : it->second.mutable_files)
+        add(name);
+    return {names.begin(), names.end()};
 }
 
 void ContentAddressedTransaction::createMetadataFile(const std::string &, const StoredObjects &)

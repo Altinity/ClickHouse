@@ -90,6 +90,7 @@ private:
 
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
     PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);
+    const Cas::TreeEntry * findStagedEntry(const ContentAddressedMetadataStorage::Route & r) const;
     Cas::Build & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
     std::optional<ContentAddressedMetadataStorage::Route> routeOf(const std::string & path) const;
     /// Move a COMMITTED ref by republish (adoptTree + publish same tree + dropRef). false = absent source.
