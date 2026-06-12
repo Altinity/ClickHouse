@@ -176,7 +176,18 @@ class ClickHouseProc:
             return False
         data_dir = f"{temp_dir}/rustfs_data"
         Shell.check(f"rm -rf {data_dir} && mkdir -p {data_dir}", verbose=True)
+        # Disable the background data-scanner and auto-heal manager (B93). On a single-disk
+        # ephemeral test pool they do no useful work (no parity to heal from; data-usage/bitrot
+        # accounting on throwaway data is pointless) but their cost is NOT free: the scanner walks
+        # the whole object tree (CPU grows with object count - observed ~120% sustained after the
+        # pool reached ~177k objects in a full lane) and the heal manager's 10s auto-disk-scan
+        # takes namespace locks, producing periodic multi-minute bursts of 503 ServiceUnavailable
+        # (NamespaceLockQuorumUnavailable) that stalled client I/O and caused ~50 test timeouts.
+        # Client GET/PUT/LIST/DELETE do not depend on either service, so disabling them is safe.
+        # Env names: RUSTFS_SCANNER_ENABLED/RUSTFS_HEAL_ENABLED (the RUSTFS_ENABLE_* forms are
+        # deprecated in 1.0.0-beta.8).
         command = (
+            f"RUSTFS_SCANNER_ENABLED=false RUSTFS_HEAL_ENABLED=false "
             f"{rustfs_bin} server --address 0.0.0.0:11121 "
             f"--access-key clickhouse --secret-key clickhouse {data_dir}"
         )
