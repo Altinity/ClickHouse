@@ -448,3 +448,36 @@ TEST(CasBuild, TwoBuildsPublishToSameShardSerialize)
             ++adds;
     EXPECT_EQ(adds, 2u);
 }
+
+TEST(CasBuild, FirstPublishRegistersNamespace)
+{
+    /// W-REGISTER (spec section 5, decision 2026-06-12): the first publish into a namespace
+    /// CAS-appends it to roots/_registry BEFORE the manifest exists; later publishes into the same
+    /// namespace hit the Store's monotone cache and leave the registry untouched.
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto build = s->startBuild({});
+    auto blob = build->putBlob(idOf("reg-payload"), BlobSource::fromString("reg-payload"));
+    std::vector<TreeEntry> entries;
+    TreeEntry e;
+    e.name = "f";
+    e.placement = Placement::Blob;
+    e.file_hash = u128Of("reg-payload");
+    e.file_size = 11;
+    entries.push_back(e);
+    auto tree = build->putTree(entries);
+
+    EXPECT_FALSE(b->get(s->layout().rootsRegistryKey()).has_value());
+    build->publish(RootNamespace{"srv9/fresh"}, "part_1", tree, RefPayload{});
+
+    const auto got = b->get(s->layout().rootsRegistryKey());
+    ASSERT_TRUE(got.has_value());
+    const RootsRegistry registry = decodeRootsRegistry(got->bytes);
+    EXPECT_TRUE(registry.namespaces.contains("srv9/fresh"));
+    const uint64_t version_after_first = registry.registry_version;
+
+    /// second publish into the same namespace: cache hit, registry untouched
+    build->publish(RootNamespace{"srv9/fresh"}, "part_2", tree, RefPayload{});
+    const RootsRegistry again = decodeRootsRegistry(b->get(s->layout().rootsRegistryKey())->bytes);
+    EXPECT_EQ(again.registry_version, version_after_first);
+}

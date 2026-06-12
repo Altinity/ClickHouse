@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
@@ -491,4 +492,53 @@ TEST(CasProtocol, ResurrectLosesRaceReObserves)
     EXPECT_NE(t2, t1);
     /// INV-NO-RETURN: the condemned t0 can never be current again.
     EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
+}
+
+TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
+{
+    /// THE ABSENT-SHARD ORDERING HOLE's regression test (spec section 5 W-REGISTER, decision
+    /// 2026-06-12). A publish into a BRAND-NEW namespace creates its manifest with fence_round 0,
+    /// so the manifest alone can never trigger the gate's fence-advanced refresh - without the
+    /// registry fence floor a stale-view writer would republish a condemned hash invisibly to the
+    /// recheck, and the exact-token delete would then dangle a live ref. With W-REGISTER, the
+    /// registration observes the registry's fence_round (raised by the GC round) and the gate
+    /// refreshes + revalidates BEFORE the first publish commits.
+    ///
+    /// Discriminating asserts: WITHOUT the floor (max(root.fence_round /*0*/, 0)) the stale view
+    /// has no entry for T, no resurrect happens, and deleteExact(T, t0) would return Deleted -
+    /// the dangle made concrete. With the floor it returns TokenMismatch.
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+
+    /// 1. part_1 -> tree T in namespace A, through the real Build (registers A).
+    auto build_a = s->startBuild({});
+    build_a->putBlob(idOf("floor-payload"), BlobSource::fromString("floor-payload"));
+    auto tree = build_a->putTree({blobEntry("data.bin", "floor-payload")});
+    build_a->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{});
+    const String tree_key = s->layout().treeKey(tree);
+    const Token t0 = b->head(tree_key).token;
+
+    /// 2. build B adopts T while the view is still at round 0 (a tokenless evidence dep).
+    auto build_b = s->startBuild({});
+    build_b->adoptTree(tree);
+
+    /// 3. the last ref to T drops; a REAL GC round retires T at t0 and fences the registry
+    /// (fence_round 1). No delete exists yet in this milestone - the retire set is the barrier.
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    /// 4. build B publishes T into a BRAND-NEW namespace: ensureRegistered returns the registry's
+    /// fence_round (1) > view round (0) => the gate refreshes => T's hash is condemned at t0 =>
+    /// resurrect => publish lands on a fresh incarnation.
+    build_b->publish(RootNamespace{"srv2/new"}, "part_x", tree, RefPayload{});
+
+    auto resolved = s->resolveRef(RootNamespace{"srv2/new"}, "part_x");
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->tree_id, tree);
+
+    /// The would-be dangle is dead: T was displaced off the condemned token.
+    const Token t1 = b->head(tree_key).token;
+    EXPECT_NE(t1, t0);
+    EXPECT_EQ(b->deleteExact(tree_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
 }

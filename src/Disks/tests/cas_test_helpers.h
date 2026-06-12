@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 
 #include <Common/Exception.h>
@@ -136,12 +137,38 @@ inline DB::Cas::TreeId writeTreeRaw(
     return id;
 }
 
+/// Register a namespace in roots/_registry exactly as a writer's W-REGISTER does (read-modify-CAS
+/// append; no-op if already present). Raw-manifest fixtures MUST register: GC discovers namespaces
+/// from the registry, never LIST — an unregistered namespace's manifests are invisible to it.
+inline void registerNamespaceRaw(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns)
+{
+    while (true)
+    {
+        const auto got = backend.get(layout.rootsRegistryKey());
+        DB::Cas::RootsRegistry registry;
+        if (got)
+            registry = DB::Cas::decodeRootsRegistry(got->bytes);
+        if (registry.namespaces.contains(ns.string()))
+            return;
+        registry.namespaces.insert(ns.string());
+        ++registry.registry_version;
+        const auto outcome = got
+            ? backend.casPut(layout.rootsRegistryKey(), DB::Cas::encodeRootsRegistry(registry), got->token)
+            : backend.casPut(layout.rootsRegistryKey(), DB::Cas::encodeRootsRegistry(registry), std::nullopt);
+        if (outcome == DB::Cas::CasOutcome::Committed)
+            return;
+    }
+}
+
 /// Publish a root-shard manifest fresh (create-if-absent CAS). One fresh publish per shard suffices for
 /// the read-side tests; lifecycle tests that layer go through the Store CAS loop instead.
+/// Registers the namespace first (W-REGISTER) so GC discovery sees it.
 inline void publishRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     const DB::Cas::RootNamespace & ns, uint64_t shard, const DB::Cas::RootShard & root)
 {
+    registerNamespaceRaw(backend, layout, ns);
     backend.casPut(layout.rootShardKey(ns, shard), DB::Cas::encodeRootShard(root), /*expected*/ std::nullopt);
 }
 
@@ -183,6 +210,7 @@ inline void fenceNamespace(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     const DB::Cas::RootNamespace & ns, uint64_t n_shards, uint64_t round)
 {
+    registerNamespaceRaw(backend, layout, ns);
     for (uint64_t shard = 0; shard < n_shards; ++shard)
     {
         const String key = layout.rootShardKey(ns, shard);

@@ -835,8 +835,13 @@ TEST(CasGcRetire, RetireUsesFoldCommittedStateWithoutReread)
 /// fencePos[s]: the manifest CAS totally orders the fence against publishes on that shard, which
 /// is exactly what the no-return argument rests on.
 
-TEST(CasGcFence, SetsFenceRoundOnPresentShardsAndRecordsVersions)
+TEST(CasGcFence, FencesAllShardsMintingAbsentOnes)
 {
+    /// R3 fences EVERY root shard of every registered namespace - present or ABSENT (spec section 7
+    /// R3, decision 2026-06-12). For an absent shard the create-if-absent CAS MINTS a fence-only
+    /// manifest: the create race against a first publish into that shard is the required total
+    /// order. Fencing only present shards would leave a first publish into an absent shard
+    /// unordered against the fence (the absent-shard hole).
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
     publishPart(s, "srv1/tbl", "part_1", "payload-1");
@@ -850,27 +855,81 @@ TEST(CasGcFence, SetsFenceRoundOnPresentShardsAndRecordsVersions)
     EXPECT_EQ(st.round, 1u);
     ASSERT_TRUE(st.fence_version.contains(1));
 
-    /// every discovered (present) shard is fenced at round 1 with the recorded committed version:
-    for (const auto & [key, ver] : st.fence_version.at(1))
+    /// ALL root_shards manifests now exist, each fenced at round 1 with its committed version
+    /// recorded; the minted (previously absent) ones carry empty refs and an empty journal:
+    for (uint64_t shard = 0; shard < s->poolMeta().root_shards; ++shard)
     {
-        /// parse "ns/shard" back (split at the last '/'), read the manifest raw:
-        const size_t slash = key.rfind('/');
-        ASSERT_NE(slash, String::npos);
-        const RootNamespace ns{key.substr(0, slash)};
-        const uint64_t shard = std::stoull(key.substr(slash + 1));
-        const auto manifest = b->get(s->layout().rootShardKey(ns, shard));
-        ASSERT_TRUE(manifest.has_value()) << "fenced shard has no manifest: " << key;
+        const auto manifest = b->get(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard));
+        ASSERT_TRUE(manifest.has_value()) << "shard " << shard << " was not minted by the fence";
         const RootShard root = decodeRootShard(manifest->bytes);
         EXPECT_EQ(root.fence_round, 1u);
-        EXPECT_EQ(root.shard_version, ver);                      /// the fence's own commit
+        const String key = "srv1/tbl/" + std::to_string(shard);
+        ASSERT_TRUE(st.fence_version.at(1).contains(key)) << key;
+        EXPECT_EQ(root.shard_version, st.fence_version.at(1).at(key));   /// the fence's own commit
+        /// a MINTED manifest (the fence's create was its first commit) is fence-only:
+        if (root.shard_version == 1)
+        {
+            EXPECT_TRUE(root.refs.empty());
+            EXPECT_TRUE(root.journal.empty());
+        }
     }
 
-    /// shards with no manifest stay absent (no fence minted a manifest); a never-published shard
-    /// contributes no edges and needs no fence:
-    uint64_t present = 0;
-    for (uint64_t shard = 0; shard < s->poolMeta().root_shards; ++shard)
-        present += b->get(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard)).has_value() ? 1 : 0;
-    EXPECT_EQ(present, st.fence_version.at(1).size());
+    /// the vector covers all shards + the registry entry:
+    EXPECT_EQ(st.fence_version.at(1).size(), s->poolMeta().root_shards + 1);
+    EXPECT_TRUE(st.fence_version.at(1).contains("_registry"));
+}
+
+TEST(CasGcFence, RegistryFencedAndRecorded)
+{
+    /// The namespace registry is fenced FIRST (the ordering point for namespace creation): after a
+    /// round its fence_round equals the round and the committed registry_version is recorded under
+    /// the reserved "_registry" key.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const auto got = b->get(s->layout().rootsRegistryKey());
+    ASSERT_TRUE(got.has_value());
+    const RootsRegistry registry = decodeRootsRegistry(got->bytes);
+    EXPECT_EQ(registry.fence_round, 1u);
+    EXPECT_TRUE(registry.namespaces.contains("srv1/tbl"));
+
+    const GcState st = readState(*b, *s);
+    ASSERT_TRUE(st.fence_version.contains(1));
+    EXPECT_EQ(st.fence_version.at(1).at("_registry"), registry.registry_version);
+}
+
+TEST(CasGcDiscovery, UsesRegistryNotList)
+{
+    /// GC discovers namespaces FROM the registry, never LIST: a manifest written for an
+    /// UNREGISTERED namespace (an out-of-model fixture artifact - production writers always
+    /// register via W-REGISTER) is invisible to the round - not folded, not fenced.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");           /// registered via Build::publish
+
+    /// bypass registerNamespaceRaw deliberately: a manifest for a ghost namespace
+    RootShard ghost;
+    ghost.shard_version = 1;
+    ghost.refs["ghost_part"] = RefPayload{.tree_id = u128Of("ghost-tree"), .tree_size = 0, .mutable_files = {}};
+    ghost.journal.push_back(JournalRecord{
+        .op = JournalRecord::Op::Add, .ref_name = "ghost_part", .tree_id = u128Of("ghost-tree"), .at_version = 1});
+    b->casPut(s->layout().rootShardKey(RootNamespace{"ghost/ns"}, 0), encodeRootShard(ghost), std::nullopt);
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    /// not folded: no edge targeting the ghost tree in the snap
+    const GcState st = readState(*b, *s);
+    const auto snap = decodeGcSnap(b->get(s->layout().gcSnapKey(st.snap_generation, 0))->bytes);
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, u128Of("ghost-tree")), 0u);
+    EXPECT_FALSE(snap.isKnown(ObjectKind::Tree, u128Of("ghost-tree")));
+    /// not fenced: the ghost manifest still carries fence_round 0
+    const RootShard after = decodeRootShard(b->get(s->layout().rootShardKey(RootNamespace{"ghost/ns"}, 0))->bytes);
+    EXPECT_EQ(after.fence_round, 0u);
 }
 
 TEST(CasGcFence, MonotoneNeverLowers)

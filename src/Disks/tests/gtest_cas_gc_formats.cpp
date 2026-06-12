@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
@@ -310,4 +311,33 @@ TEST(CasGcFormats, HeartbeatValidation)
     /// Unknown extra key.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [] { decodeHeartbeat(R"({"format":"cas_heartbeat","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","heartbeat_seq":7,"created_at_ms":9,"x":1})"); });
+}
+
+TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
+{
+    /// The namespace registry (spec section 4, decision 2026-06-12): the authoritative namespace
+    /// universe, CAS-appended by W-REGISTER and fenced by GC like a shard.
+    RootsRegistry registry;
+    registry.registry_version = 3;
+    registry.fence_round = 2;
+    registry.namespaces = {"srv1/tbl", "srv2/tbl2"};
+    const String bytes = encodeRootsRegistry(registry);
+    EXPECT_NE(bytes.find("\"format\":\"cas_roots_registry\""), String::npos);
+    const RootsRegistry d = decodeRootsRegistry(bytes);
+    EXPECT_EQ(d.registry_version, 3u);
+    EXPECT_EQ(d.fence_round, 2u);
+    EXPECT_EQ(d.namespaces, registry.namespaces);
+    EXPECT_EQ(encodeRootsRegistry(d), bytes);                    /// byte-stable re-encode
+
+    expectStrictJsonContract([](const String & s) { return decodeRootsRegistry(s); }, "cas_roots_registry");
+
+    /// codec-specific rows: non-string / empty / duplicate namespace entries fail closed
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(
+        R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":[7]})"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(
+        R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":[""]})"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(
+        R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":["a","a"]})"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(
+        R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":["a"],"extra":1})"); });
 }

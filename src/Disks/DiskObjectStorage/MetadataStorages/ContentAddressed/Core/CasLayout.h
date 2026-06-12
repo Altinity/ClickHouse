@@ -60,6 +60,16 @@ public:
         return shardedKey("packs", id.string());
     }
 
+    /// The namespace registry (spec §4, decision 2026-06-12): the authoritative namespace
+    /// universe, CAS-appended by a writer's first publish into a namespace (W-REGISTER), fenced by
+    /// GC like a shard, and the source of GC discovery (never LIST). The `_registry` tail is
+    /// non-numeric, so tryParseRootShardKey never classifies it as a shard manifest, and
+    /// checkNamespace reserves the segment so no namespace can collide under it.
+    String rootsRegistryKey() const
+    {
+        return prefix + "/roots/_registry";
+    }
+
     /// Root manifest for a given namespace + shard number.
     String rootShardKey(const RootNamespace & ns, uint64_t shard) const
     {
@@ -211,6 +221,11 @@ private:
             if (segment == "_files")
                 throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
                     "CasLayout: namespace '{}' uses the reserved segment '_files'", s);
+            /// Reserved for the namespace registry object (roots/_registry); a namespace starting
+            /// with it would nest shard manifests under the registry's own key.
+            if (segment == "_registry")
+                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                    "CasLayout: namespace '{}' uses the reserved segment '_registry'", s);
             if (end == String::npos)
                 break;
             start = end + 1;

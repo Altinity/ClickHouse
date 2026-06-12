@@ -4,6 +4,7 @@
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
 #include <base/defines.h>
+#include <algorithm>
 #include <chrono>
 
 namespace DB
@@ -537,6 +538,15 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
             heartbeat->renewOnce();
     }
 
+    /// W-REGISTER (spec §5, decision 2026-06-12): a namespace must be in roots/_registry BEFORE its
+    /// first manifest exists — that is what orders namespace CREATION against the GC fence. The
+    /// returned registry fence_round is the GATE FLOOR for this publish: a brand-new namespace's
+    /// shard manifest carries fence_round 0 and could never trigger the refresh below on its own,
+    /// so a stale-view writer would slip a condemned hash past the recheck (the absent-shard
+    /// ordering hole). Already-registered namespaces return floor 0 (cache hit) — R3 fences all
+    /// their shards each round, so the per-shard fence carries the ordering.
+    const uint64_t registry_fence = store->ensureRegistered(ns);
+
     /// Publish = ONE CAS (spec §5 step 4): set refs[name], append {+, name, T}, shard_version++.
     /// We REUSE Store::mutateShard (the verified Task-10 loop: re-read-inside-loop, size-guard,
     /// casPut, bounded retry). The gate-aware mutate lambda owns the gate; because mutateShard
@@ -544,8 +554,9 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
     /// gate on the fresh fence_round (spec §5 step 5).
     store->mutateShard(ns, store->shardOf(ref_name), [&](RootShard & root)
     {
-        /// Fence vs view: if the manifest's fence_round is ahead of our view, GC advanced — refresh.
-        if (store->retireView().round() < root.fence_round)
+        /// Fence vs view: if the manifest's fence_round (floored by the registry fence at
+        /// registration, W-REGISTER) is ahead of our view, GC advanced — refresh.
+        if (store->retireView().round() < std::max(root.fence_round, registry_fence))
         {
             store->retireView().refresh();
             /// W-REVALIDATE: a fence-advanced refresh invalidates every stale token observation; re-validate

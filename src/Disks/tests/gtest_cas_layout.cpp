@@ -76,3 +76,15 @@ TEST(CasLayout, ShortIdThrows)
     EXPECT_THROW(l.treeKey(TreeId{""}), DB::Exception);      // empty
     EXPECT_NO_THROW(l.blobKey(BlobId{"ab"}));                // exactly 2 chars is OK
 }
+
+TEST(CasLayout, RegistryKeyAndReservedSegment)
+{
+    Layout l("p");
+    EXPECT_EQ(l.rootsRegistryKey(), "p/roots/_registry");
+    /// the registry key is never classified as a shard manifest (non-numeric tail):
+    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/_registry").has_value());
+    /// the segment is reserved: no namespace may nest shard manifests under the registry's key
+    EXPECT_THROW(l.rootShardKey(RootNamespace{"_registry"}, 0), DB::Exception);
+    EXPECT_THROW(l.rootShardKey(RootNamespace{"_registry/x"}, 0), DB::Exception);
+    EXPECT_THROW(l.rootShardKey(RootNamespace{"a/_registry"}, 0), DB::Exception);
+}

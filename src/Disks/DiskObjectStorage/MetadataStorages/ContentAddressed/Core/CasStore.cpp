@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
@@ -368,6 +369,59 @@ std::pair<RootShard, std::optional<Token>> Store::readShard(const RootNamespace 
     if (!object)
         return {RootShard{}, std::nullopt};
     return {decodeRootShard(object->bytes), object->token};
+}
+
+uint64_t Store::ensureRegistered(const RootNamespace & ns)
+{
+    pool_layout.rootShardKey(ns, 0);   /// validate the namespace string early (checkNamespace)
+
+    {
+        std::lock_guard lock(registered_mutex);
+        if (registered_cache.contains(ns.string()))
+            /// Already registered: no gate floor needed — R3 fences ALL shards of every registered
+            /// namespace each round (minting fence-only manifests for absent ones), so the per-shard
+            /// fence carries the publish ordering from here on.
+            return 0;
+    }
+
+    const String key = pool_layout.rootsRegistryKey();
+    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
+    {
+        const std::optional<GetResult> got = pool_backend->get(key);
+        RootsRegistry registry;
+        if (got)
+            registry = decodeRootsRegistry(got->bytes);
+
+        if (registry.namespaces.contains(ns.string()))
+        {
+            /// Another writer (or our own crashed attempt) registered it. Return the observed
+            /// fence_round anyway — for a FIRST publish of THIS Store the floor is cheap and
+            /// strictly conservative (the round-R fence may not have minted this namespace's
+            /// shards yet if registration landed after R3 began).
+            std::lock_guard lock(registered_mutex);
+            registered_cache.insert(ns.string());
+            return registry.fence_round;
+        }
+
+        registry.namespaces.insert(ns.string());
+        ++registry.registry_version;
+        const CasOutcome outcome = got
+            ? pool_backend->casPut(key, encodeRootsRegistry(registry), got->token)
+            : pool_backend->casPut(key, encodeRootsRegistry(registry), std::nullopt);
+        if (outcome == CasOutcome::Committed)
+        {
+            std::lock_guard lock(registered_mutex);
+            registered_cache.insert(ns.string());
+            /// W-REGISTER gate floor: the fence_round READ in the committed attempt. An append that
+            /// lands BELOW a round's registry fence is folded into that round's discovery; an
+            /// append AFTER it observed fence_round >= round here — the caller's publish gate must
+            /// refresh its retire view to at least this round before committing (spec §5).
+            return registry.fence_round;
+        }
+        /// Conflict: a racing registration or the GC fence moved the registry — re-read and retry.
+    }
+    throw Exception(ErrorCodes::ABORTED,
+        "CAS namespace registration contention on {} (runaway live-lock brake)", key);
 }
 
 }

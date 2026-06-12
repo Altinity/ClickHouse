@@ -1,6 +1,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
+#include <algorithm>
 
 namespace DB
 {
@@ -70,7 +72,8 @@ RoundReport Gc::runRegularRound()
     for (const auto & [snap_shard, set] : retired)
         report.candidates += set.entries.size();
 
-    /// R3: CAS the monotone fence into every PRESENT root shard and persist the recorded fence
+    /// R3: CAS the monotone fence into the registry and EVERY root shard of every registered
+    /// namespace (minting fence-only manifests for absent shards) and persist the recorded fence
     /// versions - the durable point the recheck (Task 9) folds through. `state.round` was advanced
     /// by retire's CAS; `state`/`state_token` are current after it.
     fence(state, state_token, folded.root_shards);
@@ -91,12 +94,51 @@ void Gc::fence(GcState & state, Token & state_token,
     /// The round being executed: retire's CAS already advanced state.round to it.
     const uint64_t round = state.round;
 
-    /// 1. CAS fence_round := max(fence_round, round) into every PRESENT root shard (the fold's
-    /// discovery - a never-published shard contributes no edges and needs no fence; the M-F
-    /// full-GC walk owns the authoritative universe). The mutate lambda runs on the FRESHLY READ
-    /// manifest on every CAS attempt (mutateShard re-reads inside its loop), and the max makes a
-    /// stale leader's lower round get ABSORBED, never lower the fence - the model's monotone
-    /// fence (GFenceShard, INV-MONOTONE-GC).
+    /// 0. CAS the NAMESPACE REGISTRY's fence_round first (spec §7 R3, decision 2026-06-12). This
+    /// is the ordering point for namespace CREATION: a writer registering a namespace BELOW this
+    /// fence is in this round's discovery (its shards are fenced below); one registering AFTER it
+    /// observes fence_round >= round and must refresh its retire view before its first publish
+    /// (W-REGISTER gate floor) - the two-horn argument at namespace granularity. The committed
+    /// registry_version is recorded under the reserved "_registry" key (checkNamespace forbids it
+    /// as a namespace segment, so it can never collide with an "ns/shard" entry).
+    {
+        const String registry_key = layout.rootsRegistryKey();
+        bool registry_fenced = false;
+        for (size_t attempt = 0; attempt < 100 && !registry_fenced; ++attempt)
+        {
+            const auto got = backend.get(registry_key);
+            RootsRegistry registry;
+            if (got)
+                registry = decodeRootsRegistry(got->bytes);
+            registry.fence_round = std::max(registry.fence_round, round);
+            ++registry.registry_version;
+            const CasOutcome outcome = got
+                ? backend.casPut(registry_key, encodeRootsRegistry(registry), got->token)
+                : backend.casPut(registry_key, encodeRootsRegistry(registry), std::nullopt);
+            if (outcome == CasOutcome::Committed)
+            {
+                state.fence_version[round]["_registry"] = registry.registry_version;
+                registry_fenced = true;
+            }
+            /// Conflict: a racing namespace registration - re-read and retry (their append is then
+            /// either below our fence commit, i.e. in the universe the NEXT round discovers, or
+            /// they observed our fence_round and took the gate floor).
+        }
+        if (!registry_fenced)
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS gc fence: registry CAS contention (runaway live-lock brake)");
+    }
+
+    /// 1. CAS fence_round := max(fence_round, round) into EVERY root shard of EVERY registered
+    /// namespace - present or ABSENT (the fold's discovery is the registry universe x all shards).
+    /// For an absent shard, mutateShard's create-if-absent CAS MINTS a fence-only manifest
+    /// (fence_round = round, empty refs/journal): the create race against a first publish into
+    /// that shard is exactly the required total order (whoever loses the CAS re-reads - the
+    /// publisher then sees fence_round = round and its gate refreshes). Fencing only PRESENT
+    /// shards would leave that first publish unordered against the fence - the absent-shard hole.
+    /// The mutate lambda runs on the FRESHLY READ manifest on every CAS attempt (mutateShard
+    /// re-reads inside its loop), and the max makes a stale leader's lower round get ABSORBED,
+    /// never lower the fence - the model's monotone fence (GFenceShard, INV-MONOTONE-GC).
     ///
     /// THE TWO HORNS of the no-return argument (spec section 7, steps 2-4) both rest on the
     /// manifest CAS totally ordering this fence against publishes on the shard:
@@ -293,20 +335,22 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     Backend & backend = store->backend();
     FoldResult result;
 
-    /// 1. Discover root-shard manifests: paginate roots/; the classifier skips verbatim files
-    /// (`_files/...`) and any non-numeric tail.
+    /// 1. Discover the namespace universe FROM THE REGISTRY (spec §4/§7 R1, decision 2026-06-12) —
+    /// never LIST. The registry is the authoritative universe: writers CAS-append a namespace
+    /// before its first manifest exists (W-REGISTER), so every manifest GC must order against is
+    /// reachable from here. The universe is namespaces × ALL root_shards shards (present or
+    /// absent) — the fence (R3) needs the absent ones too (it mints fence-only manifests there;
+    /// fencing only present shards leaves a first publish into an absent shard totally unordered).
+    /// A manifest existing for an UNREGISTERED namespace is out-of-model (production writers always
+    /// register; a test fixture must call registerNamespaceRaw) and is invisible to GC by contract.
+    /// An absent registry is the fresh-pool case: empty universe.
+    if (const auto got = backend.get(layout.rootsRegistryKey()))
     {
-        String cursor;
-        while (true)
-        {
-            const ListPage page = backend.list(layout.rootsPrefix(), cursor, /*limit*/ 1000);
-            for (const ListedKey & listed : page.keys)
-                if (auto parsed = layout.tryParseRootShardKey(listed.key))
-                    result.root_shards.push_back(std::move(*parsed));
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
-        }
+        const RootsRegistry registry = decodeRootsRegistry(got->bytes);
+        const uint64_t root_shards_per_ns = store->poolMeta().root_shards;
+        for (const String & ns : registry.namespaces)
+            for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
+                result.root_shards.emplace_back(RootNamespace{ns}, shard);
     }
 
     /// 2. Load the authoritative snap generation. An absent shard object is an EMPTY snap, not an
@@ -436,7 +480,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
             }
         }
 
-        state.folded_cursor[cursor_key] = root.shard_version;
+        /// Don't mint zero cursor entries for absent shards (the registry universe includes every
+        /// shard of every namespace; an absent shard has nothing folded and nothing to remember).
+        if (root.shard_version > 0 || cursor > 0)
+            state.folded_cursor[cursor_key] = root.shard_version;
     }
 
     /// 4. Persist, durable-before-cursor: the new-generation snap objects go durable FIRST; only
