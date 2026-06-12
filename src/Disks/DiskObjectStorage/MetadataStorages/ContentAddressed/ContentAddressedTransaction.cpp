@@ -421,8 +421,11 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
             return;
         }
         /// Backup root / intermediate dir (SYSTEM UNFREEZE WITH NAME): drop every shadow
-        /// namespace under it.
-        for (const auto & ns : metadata_storage.store()->listNamespaces(path + "/"))
+        /// namespace under it. Canonicalize: callers hand trailing-slash dirs (T13).
+        std::string prefix = path;
+        while (!prefix.empty() && prefix.back() == '/')
+            prefix.pop_back();
+        for (const auto & ns : metadata_storage.store()->listNamespaces(prefix + "/"))
             metadata_storage.store()->dropNamespace(Cas::RootNamespace{ns});
         return;
     }

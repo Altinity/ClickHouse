@@ -49,6 +49,33 @@ std::optional<std::string> projectionDirPrefix(const std::string & file)
     return std::nullopt;
 }
 
+/// Canonical disk-relative path: components joined by single '/', no leading/trailing slashes.
+/// Callers hand paths in both shapes (the Unfreezer walks shadow dirs WITH a trailing slash);
+/// namespace strings and prefix matching need the canonical form.
+std::string canonicalDiskPath(const std::string & path)
+{
+    std::string result;
+    std::string component;
+    auto flush = [&]
+    {
+        if (component.empty())
+            return;
+        if (!result.empty())
+            result += '/';
+        result += component;
+        component.clear();
+    };
+    for (char c : path)
+    {
+        if (c == '/')
+            flush();
+        else
+            component.push_back(c);
+    }
+    flush();
+    return result;
+}
+
 /// "<first>/<rest...>" -> {first, rest} ({whole, ""} when there is no '/').
 std::pair<std::string, std::string> splitFirstComponent(const std::string & s)
 {
@@ -209,7 +236,8 @@ Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::s
     /// The LITERAL shadow table dir (shadow/<backup>/store/<u3>/<uuid> or .../data/<db>/<tbl>):
     /// bijective with the disk path for both layouts, pool-global (backups are read by any
     /// replica), and the shadow tree enumerates from Store::listNamespaces("shadow/").
-    return Cas::RootNamespace{shadow_table_dir};
+    /// CANONICALIZED: the Unfreezer hands the dir with a trailing slash (T13 finding).
+    return Cas::RootNamespace{canonicalDiskPath(shadow_table_dir)};
 }
 
 Cas::RootNamespace ContentAddressedMetadataStorage::genericNamespace() const
@@ -301,7 +329,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
         /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff some shadow
         /// namespace (= a literal shadow table dir) under it still has refs. Registration alone is
         /// not existence - dropped namespaces linger registered until full GC (visible-but-empty).
-        const std::string prefix = path + "/";
+        const std::string prefix = canonicalDiskPath(path) + "/";
         for (const auto & ns : store()->listNamespaces("shadow/"))
             if (ns.starts_with(prefix) && !store()->listRefs(Cas::RootNamespace{ns}).empty())
                 return true;
@@ -440,7 +468,8 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         }
         /// Shadow INTERMEDIATE dir: derive children from the registered shadow namespaces that
         /// still have refs (dropped ones linger registered until full GC - never list them).
-        const std::string prefix = path.empty() ? "shadow" : path;
+        const std::string canonical = canonicalDiskPath(path);
+        const std::string prefix = canonical.empty() ? "shadow" : canonical;
         std::unordered_set<std::string> result;
         for (const auto & ns : store()->listNamespaces("shadow/"))
             if (ns.starts_with(prefix + "/") && !store()->listRefs(Cas::RootNamespace{ns}).empty())
