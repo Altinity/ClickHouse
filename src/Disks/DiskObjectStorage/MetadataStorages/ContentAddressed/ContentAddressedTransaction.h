@@ -4,8 +4,12 @@
 #include <Disks/WriteMode.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteSettings.h>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace DB
 {
@@ -13,10 +17,12 @@ namespace DB
 /// The M-W write-path wiring: accumulates ClickHouse operations and maps them to ONE Cas::Build
 /// per written part at commit (design 2026-06-11 section 4; plan D-W2).
 ///
-/// T2 SKELETON: every mutating operation throws NOT_IMPLEMENTED. The operations land task by task
-/// (T3 content blobs, T4 mutable files, T5 carry-forward/renames, T6 removals, T7
-/// detached/ATTACH/FREEZE, T8 read-your-writes, T9 disk-seam glue) — each with wiring tests; the
-/// SQL suites gate the completed milestone (T13).
+/// T3 state: writeFile (content blobs through a spill+hash buffer into Build::putBlob; mutable
+/// per-part bytes staged; verbatim namespace files durable on finalize) + commit (one
+/// putTree+publish per staged part, with the reserved .ca_mtime publish stamp) + destructor
+/// abandon. Remaining operations land task by task (T5 carry-forward/renames, T6 removals, T7
+/// detached/ATTACH/FREEZE, T8 read-your-writes) — each with wiring tests; the SQL suites gate the
+/// completed milestone (T13).
 class ContentAddressedTransaction : public IMetadataTransaction
 {
 public:
@@ -60,8 +66,30 @@ public:
     void unlinkFile(const std::string & path, bool if_exists, bool should_remove_objects) override;
     void truncateFile(const std::string & path, size_t size) override;
 
+    ~ContentAddressedTransaction() override;
+
 protected:
     ContentAddressedMetadataStorage & metadata_storage;
+
+private:
+    /// One part being assembled by this transaction (D-W2: ONE Cas::Build per written part,
+    /// opened lazily at the FIRST staged write — W-HEARTBEAT requires the heartbeat durable
+    /// before the first PUT, and buffer finalize uploads immediately).
+    struct PartStaging
+    {
+        Cas::BuildPtr build;                       /// nullptr until the first content upload
+        std::vector<Cas::TreeEntry> entries;       /// staged tree entries (uploads + adoptions)
+        std::map<std::string, std::string> mutable_files;
+        std::set<std::string> mutable_removed;     /// staged deletions for a COMMITTED part's payload
+    };
+
+    /// Keyed by (namespace string, ref name) — the routed identity, so live/detached/shadow
+    /// stagings never collide.
+    std::map<std::pair<std::string, std::string>, PartStaging> parts;
+    bool committed = false;
+
+    PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
+    Cas::Build & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
 };
 
 }

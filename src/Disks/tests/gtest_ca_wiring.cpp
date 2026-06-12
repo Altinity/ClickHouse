@@ -333,3 +333,112 @@ TEST(CaWiringRead, VerbatimNamespaceFiles)
     EXPECT_EQ(storage->tryGetInManifestBytes("clickhouse_access_check_xyz"), std::optional<String>("ok"));
     EXPECT_FALSE(storage->existsFile("clickhouse_access_check_other"));
 }
+
+/// ==== M-W Task 3: the write path through IMetadataTransaction ====
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+
+namespace
+{
+
+void writeThroughTransaction(DB::IMetadataTransaction & tx, const String & path, const String & bytes)
+{
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(tx);
+    auto buf = ca_tx.writeFile(path, 65536, DB::WriteMode::Rewrite, {});
+    buf->write(bytes.data(), bytes.size());
+    buf->finalize();
+}
+
+}
+
+TEST(CaWiringWrite, ContentRoundTripThroughTransaction)
+{
+    auto storage = openWiringStorage();
+
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "content-A");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/checksums.txt", "sums");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/uuid.txt", "u-42");
+    /// Nothing visible before commit.
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    tx->commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 9u);
+    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/uuid.txt"), std::optional<String>("u-42"));
+    auto names = storage->listDirectory("uui/uuid-1/all_1_1_0");
+    std::sort(names.begin(), names.end());
+    EXPECT_EQ(names, (std::vector<std::string>{"checksums.txt", "data.bin", "uuid.txt"}));
+    /// The publish stamp was added automatically and is filtered from listings.
+    EXPECT_GT(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 1700000000);
+}
+
+TEST(CaWiringWrite, IdenticalContentDedupsToOneBlob)
+{
+    auto storage = openWiringStorage();
+
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "same-bytes");
+    tx->commit(DB::NoCommitOptions{});
+    auto tx2 = storage->createTransaction();
+    writeThroughTransaction(*tx2, "uui/uuid-1/all_2_2_0/data.bin", "same-bytes");
+    tx2->commit(DB::NoCommitOptions{});
+
+    /// Identical content => the SAME blob object (the key is the content hash).
+    auto a = storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin");
+    auto b = storage->getStorageObjects("uui/uuid-1/all_2_2_0/data.bin");
+    ASSERT_EQ(a.size(), 1u);
+    ASSERT_EQ(b.size(), 1u);
+    EXPECT_EQ(a[0].remote_path, b[0].remote_path);
+}
+
+TEST(CaWiringWrite, UncommittedTransactionPublishesNothing)
+{
+    auto storage = openWiringStorage();
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "doomed");
+        /// destroyed without commit => Build abandoned (uploads are heartbeat-gated debris)
+    }
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
+}
+
+TEST(CaWiringWrite, MutableOnlyUpdateOnCommittedPart)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "content-A");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/txn_version.txt", "v1");
+    tx->commit(DB::NoCommitOptions{});
+
+    /// The MVCC autocommit one-shot shape: a fresh transaction rewriting ONLY a mutable file of a
+    /// COMMITTED part goes through updateRefPayload (no tree rebuild, no journal record).
+    auto tx2 = storage->createTransaction();
+    writeThroughTransaction(*tx2, "uui/uuid-1/all_1_1_0/txn_version.txt", "v2");
+    tx2->commit(DB::NoCommitOptions{});
+
+    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/txn_version.txt"), std::optional<String>("v2"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));   /// the tree is untouched
+}
+
+TEST(CaWiringWrite, VerbatimFilesDurableOnFinalizeAndAppendable)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    /// Verbatim files are durable on FINALIZE, with no commit (the disk layer's autocommit
+    /// contract for table-level files).
+    writeThroughTransaction(*tx, "uui/uuid-1/mutation_5.txt", "commands\n");
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/mutation_5.txt"));
+
+    /// Append = read-modify-rewrite (the MVCC mutation-entry CSN append).
+    {
+        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+        auto buf = ca_tx.writeFile("uui/uuid-1/mutation_5.txt", 65536, DB::WriteMode::Append, {});
+        buf->write("csn 42\n", 7);
+        buf->finalize();
+    }
+    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/mutation_5.txt"),
+              std::optional<String>("commands\ncsn 42\n"));
+}
