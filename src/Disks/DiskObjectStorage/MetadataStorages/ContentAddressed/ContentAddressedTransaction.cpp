@@ -242,13 +242,16 @@ bool ContentAddressedTransaction::hasInFlightDirectory(const std::string & path)
     /// Directory overlay (B59): true iff at least one staged file lives under `path` for `path`'s
     /// part - what makes a carried-forward projection dir visible to loadProjections.
     auto r = const_cast<ContentAddressedTransaction *>(this)->routeOf(path);
-    if (!r || r->ref.empty())
+    /// INNER directories only (the PoC contract): the overlay exists for staged projection dirs
+    /// (B58/B63 - loadProjections during finalize). The PART DIR ITSELF answers FALSE - a
+    /// dedup-rejected temporary part still holds its uncommitted transaction at destruction, and
+    /// an overlay "exists" for the bare part dir sends removeIfNeeded into remove(), whose
+    /// bare-disk check then logs the "part to remove doesn't exist" warning (T13 finding).
+    if (!r || r->ref.empty() || r->file.empty())
         return false;
     auto it = parts.find({r->ns.string(), r->ref});
     if (it == parts.end())
         return false;
-    if (r->file.empty())
-        return !it->second.entries.empty() || !it->second.mutable_files.empty();
     const std::string prefix = r->file + "/";
     for (const auto & entry : it->second.entries)
         if (entry.name.starts_with(prefix))

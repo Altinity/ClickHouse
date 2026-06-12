@@ -23,8 +23,8 @@ mkdir -p "${POOL_DIR}"
 
 count_pool_objects() {
     local n_blobs n_parts
-    n_blobs=$(find "${POOL_DIR}/blobs" -type f 2>/dev/null | wc -l)
-    n_parts=$(find "${POOL_DIR}/parts" -type f 2>/dev/null | wc -l)
+    n_blobs=$(find "${POOL_DIR}/ca/blobs" "${POOL_DIR}/ca/packs" -type f 2>/dev/null | wc -l)
+    n_parts=$(find "${POOL_DIR}/ca/trees" -type f 2>/dev/null | wc -l)
     echo $(( n_blobs + n_parts ))
 }
 
@@ -35,7 +35,6 @@ DISK_DEF="disk(
     name = '04295_content_addressed_mut',
     path = '${POOL_DIR}/',
     content_addressed_gc_enabled = 1,
-    content_addressed_gc_grace_sec = 2,
     content_addressed_gc_interval_sec = 1)"
 
 $CLICKHOUSE_CLIENT --query "DROP TABLE IF EXISTS t_cas_mut_leftovers SYNC"
@@ -97,10 +96,10 @@ if [ "$FINAL" -eq 0 ]; then
 else
     echo "no_leftovers 0 (baseline=${BASELINE} after_insert=${AFTER_INSERT} final=${FINAL})"
     echo "--- remaining objects ---"
-    find "${POOL_DIR}/blobs" "${POOL_DIR}/parts" -type f 2>/dev/null | head
+    find "${POOL_DIR}/ca/blobs" "${POOL_DIR}/ca/trees" "${POOL_DIR}/ca/packs" -type f 2>/dev/null | head
 fi
 
-if [ -f "${POOL_DIR}/_pool_meta" ]; then
+if [ -f "${POOL_DIR}/ca/_pool_meta" ]; then
     echo "pool_meta_present 1"
 else
     echo "pool_meta_present 0"

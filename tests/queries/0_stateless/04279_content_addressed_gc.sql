@@ -3,7 +3,6 @@
 
 -- Correctness-under-active-GC oracle. The `content_addressed` disk below opts in to the background
 -- reachability GC (`content_addressed_gc_enabled=1`, default OFF) and runs it aggressively
--- (`content_addressed_gc_grace_sec=1`, `content_addressed_gc_interval_sec=1`),
 -- and `old_parts_lifetime=1` drops the merged-away source parts quickly so their footers/blobs become
 -- unreferenced and turn into genuine GC fodder *during* the test. We assert the CA table stays
 -- byte-for-byte identical to a normal MergeTree table on the same data: if a concurrent sweep ever
@@ -23,7 +22,6 @@ SETTINGS disk = disk(
     name = '04279_content_addressed_gc',
     path = '04279_content_addressed_gc_pool/',
     content_addressed_gc_enabled = 1,
-    content_addressed_gc_grace_sec = 1,
     content_addressed_gc_interval_sec = 1),
     old_parts_lifetime = 1;
 

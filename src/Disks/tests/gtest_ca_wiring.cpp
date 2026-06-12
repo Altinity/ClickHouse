@@ -692,8 +692,9 @@ TEST(CaWiringInFlight, StagedFilesVisibleBeforeCommit)
         EXPECT_EQ(read, "u-9");
     }
 
-    /// The directory overlay.
-    EXPECT_TRUE(tx->hasInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0"));
+    /// The directory overlay answers for INNER dirs only (the PoC contract): the part dir itself
+    /// is FALSE so a rejected temporary part's removeIfNeeded takes the clean early-return path.
+    EXPECT_FALSE(tx->hasInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0"));
     EXPECT_TRUE(tx->hasInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0/p.proj"));
     EXPECT_FALSE(tx->hasInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0/q.proj"));
     auto top = tx->listInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0");
