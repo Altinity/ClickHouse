@@ -195,6 +195,30 @@ private:
                            const RecheckResult & rechecked,
                            const std::map<uint64_t, RetiredSet> & retired, RoundReport & report);
 
+    /// Discover the namespace universe from the registry (namespaces x ALL root_shards shards);
+    /// shared by the fold and the resume's re-fence. Absent registry => empty (fresh pool).
+    std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverse();
+
+    /// Load the durable snap generation (absent shard objects => empty snaps; the fresh-pool case).
+    std::map<uint64_t, GcSnap> loadSnap(const GcState & state);
+
+    /// CRASH-RESUME (the model: "replay of a crashed round re-runs both steps from the durable
+    /// outcome log over set semantics - no-ops"). An INCOMPLETE round is detectable from durable
+    /// state alone: retired sets still present at (state.round, fence_seq) - they drop only at the
+    /// very end of a completed round. The resume re-runs the round TAIL from what is durable:
+    ///   - fence_version[state.round] missing => the crash hit between retire and the fence's
+    ///     gc/state CAS (or after the cascade erased it but before the sets dropped) => RE-FENCE -
+    ///     monotone max re-application; the re-recorded (higher) versions are MORE conservative
+    ///     coverage, and re-folding the larger window can only spare more;
+    ///   - recheck: deletes are exact-token idempotent (NotFound => Absent), and an existing
+    ///     outcome log is ADOPTED as the durable truth of what the crashed attempt's deletes DID;
+    ///   - cascade: strips from the FINAL logs over set semantics (no-ops when already applied);
+    ///   - the sets drop, the round completes, the report carries the resumed round.
+    /// Returns true if a resume ran (the caller returns its report; the next call runs round+1).
+    /// Lingering sets from an OLDER LEADERSHIP EPOCH (a thief never probes the old fence_seq) stay
+    /// until full GC (M-F) - conservative: they only condemn, forcing resurrects, never deleting.
+    bool tryResumeIncompleteRound(GcState & state, Token & state_token, RoundReport & report);
+
     /// Journal trim (INV-JOURNAL-COVERAGE): drop journal records with at_version <= the DURABLE
     /// folded_cursor (the cascade CAS advanced it to the fence versions before this runs). A
     /// manifest CAS may trim records ONLY after the corresponding cursor advance is durable -

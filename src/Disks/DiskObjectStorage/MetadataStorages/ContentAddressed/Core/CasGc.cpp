@@ -52,6 +52,12 @@ RoundReport Gc::runRegularRound()
     if (!report.acquired_lease)
         return report;
 
+    /// CRASH-RESUME first: an incomplete prior round (its retired sets still present) is finished
+    /// from durable state before any new round starts - the model's idempotent replay ("re-runs
+    /// both steps from the durable outcome log over set semantics - no-ops").
+    if (tryResumeIncompleteRound(state, state_token, report))
+        return report;
+
     /// R1: fold the journals into a new durable snap generation (cursors advance only after).
     FoldResult folded = fold(state, state_token);   /// non-const: the recheck folds through the fence into the same snap
 
@@ -789,6 +795,87 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
     return transitioned;
 }
 
+std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
+{
+    /// FROM THE REGISTRY - never LIST. The registry is the authoritative universe: writers
+    /// CAS-append a namespace before its first manifest exists (W-REGISTER), so every manifest GC
+    /// must order against is reachable from here. The universe is namespaces x ALL root_shards
+    /// shards (present or absent) - the fence needs the absent ones too (it mints fence-only
+    /// manifests there; fencing only present shards leaves a first publish into an absent shard
+    /// totally unordered). A manifest of an UNREGISTERED namespace is out-of-model (production
+    /// writers always register; fixtures call registerNamespaceRaw) and invisible by contract.
+    /// An absent registry is the fresh-pool case: empty universe.
+    std::vector<std::pair<RootNamespace, uint64_t>> universe;
+    if (const auto got = store->backend().get(store->layout().rootsRegistryKey()))
+    {
+        const RootsRegistry registry = decodeRootsRegistry(got->bytes);
+        const uint64_t root_shards_per_ns = store->poolMeta().root_shards;
+        for (const String & ns : registry.namespaces)
+            for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
+                universe.emplace_back(RootNamespace{ns}, shard);
+    }
+    return universe;
+}
+
+std::map<uint64_t, GcSnap> Gc::loadSnap(const GcState & state)
+{
+    /// An absent shard object is an EMPTY snap, not an error: generation 0 of a fresh pool has no
+    /// objects at all (and the very first fold legitimately starts from nothing).
+    std::map<uint64_t, GcSnap> snap;
+    for (uint64_t snap_shard = 0; snap_shard < state.snap_shards; ++snap_shard)
+    {
+        if (const auto got = store->backend().get(store->layout().gcSnapKey(state.snap_generation, snap_shard)))
+            snap.emplace(snap_shard, decodeGcSnap(got->bytes));
+        else
+        {
+            GcSnap empty;
+            empty.snap_shard = snap_shard;
+            empty.generation = state.snap_generation;
+            snap.emplace(snap_shard, std::move(empty));
+        }
+    }
+    return snap;
+}
+
+bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundReport & report)
+{
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+
+    const uint64_t round = state.round;
+    if (round == 0)
+        return false;
+
+    /// Detect: retired sets still present at (round, fence_seq) - they drop only at the end of a
+    /// COMPLETED round, so their presence is the durable incompleteness signal.
+    std::map<uint64_t, RetiredSet> retired;
+    for (uint64_t snap_shard = 0; snap_shard < state.snap_shards; ++snap_shard)
+        if (const auto got = backend.get(layout.retiredKey(round, state.fence_seq, snap_shard)))
+            retired.emplace(snap_shard, decodeRetiredSet(got->bytes));
+    if (retired.empty())
+        return false;
+
+    report.round = round;
+    for (const auto & [snap_shard, set] : retired)
+        report.candidates += set.entries.size();
+
+    /// The round's fold already committed (retire's CAS advanced .round AFTER the fold's CAS);
+    /// the candidates come from the durable sets - no re-fold, just load the durable snap.
+    std::map<uint64_t, GcSnap> snap = loadSnap(state);
+
+    /// Re-fence when the durable state lacks the round's vector (a crash between retire and the
+    /// fence's gc/state CAS, or after the cascade erased it but before the sets dropped). The
+    /// monotone max makes re-fencing idempotent; the re-recorded HIGHER versions are MORE
+    /// conservative coverage (the recheck folds a larger window and can only spare more).
+    if (!state.fence_version.contains(round))
+        fence(state, state_token, discoverUniverse());
+
+    const RecheckResult rechecked = recheck(state, snap, retired, report);
+    cascadeAndPersist(state, state_token, snap, rechecked, retired, report);
+    trim(state, discoverUniverse());
+    return true;
+}
+
 Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 {
     /// M-C3 limitation, fail closed: last-op-wins displacement is INTRA-shard only (addRootEdge
@@ -805,39 +892,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     Backend & backend = store->backend();
     FoldResult result;
 
-    /// 1. Discover the namespace universe FROM THE REGISTRY (spec §4/§7 R1, decision 2026-06-12) —
-    /// never LIST. The registry is the authoritative universe: writers CAS-append a namespace
-    /// before its first manifest exists (W-REGISTER), so every manifest GC must order against is
-    /// reachable from here. The universe is namespaces × ALL root_shards shards (present or
-    /// absent) — the fence (R3) needs the absent ones too (it mints fence-only manifests there;
-    /// fencing only present shards leaves a first publish into an absent shard totally unordered).
-    /// A manifest existing for an UNREGISTERED namespace is out-of-model (production writers always
-    /// register; a test fixture must call registerNamespaceRaw) and is invisible to GC by contract.
-    /// An absent registry is the fresh-pool case: empty universe.
-    if (const auto got = backend.get(layout.rootsRegistryKey()))
-    {
-        const RootsRegistry registry = decodeRootsRegistry(got->bytes);
-        const uint64_t root_shards_per_ns = store->poolMeta().root_shards;
-        for (const String & ns : registry.namespaces)
-            for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
-                result.root_shards.emplace_back(RootNamespace{ns}, shard);
-    }
+    /// 1. Discover the namespace universe FROM THE REGISTRY (spec section 4/7 R1).
+    result.root_shards = discoverUniverse();
 
-    /// 2. Load the authoritative snap generation. An absent shard object is an EMPTY snap, not an
-    /// error: generation 0 of a fresh pool has no objects at all (and the very first fold of a new
-    /// pool legitimately starts from nothing).
-    for (uint64_t snap_shard = 0; snap_shard < state.snap_shards; ++snap_shard)
-    {
-        if (const auto got = backend.get(layout.gcSnapKey(state.snap_generation, snap_shard)))
-            result.snap.emplace(snap_shard, decodeGcSnap(got->bytes));
-        else
-        {
-            GcSnap empty;
-            empty.snap_shard = snap_shard;
-            empty.generation = state.snap_generation;
-            result.snap.emplace(snap_shard, std::move(empty));
-        }
-    }
+    /// 2. Load the authoritative snap generation.
+    result.snap = loadSnap(state);
 
     /// 3. Fold each discovered root shard's journal records in (folded_cursor, shard_version],
     /// in journal (= insertion) order (the shared R1/R4 record semantics — foldShardRecords).

@@ -1461,3 +1461,73 @@ TEST(CasGcTrim, RecordAboveTheCursorSurvives)
     EXPECT_EQ(after.journal[0].ref_name, "late_part");        /// ...the uncovered one SURVIVED
     EXPECT_TRUE(after.refs.contains("late_part"));
 }
+
+TEST(CasGcResume, CompletesRoundAfterCrashBeforeFencePersist)
+{
+    /// Crash window: retire's round CAS landed (.round = 1, sets durable) but the fence's gc/state
+    /// CAS lost (fence_version[1] never persisted). The next call RESUMES round 1 from durable
+    /// state: sets present => incomplete; fence_version missing => re-fence (monotone max,
+    /// idempotent); recheck deletes; cascade persists; sets drop. Only then does a fresh round run.
+    auto b = std::make_shared<FailNthCasPutBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    b->failNthCasPut(s->layout().gcStateKey(), 4);            /// lease=1, fold=2, retire=3, FENCE=4
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc.runRegularRound(); });
+
+    GcState st = readState(*b, *s);
+    ASSERT_EQ(st.round, 1u);                                  /// retire completed...
+    ASSERT_FALSE(st.fence_version.contains(1));               /// ...the fence vector did not
+    ASSERT_TRUE(b->get(s->layout().retiredKey(1, st.fence_seq, 0)).has_value());
+
+    const RoundReport resumed = gc.runRegularRound();         /// the RESUME
+    EXPECT_TRUE(resumed.acquired_lease);
+    EXPECT_EQ(resumed.round, 1u);                             /// the resumed round, not a new one
+    EXPECT_EQ(resumed.deleted, 1u);
+    EXPECT_FALSE(b->head(s->layout().treeKey(tree)).exists);
+    st = readState(*b, *s);
+    EXPECT_FALSE(b->get(s->layout().retiredKey(1, st.fence_seq, 0)).has_value());   /// sets dropped
+
+    const RoundReport next = gc.runRegularRound();            /// a fresh round follows
+    EXPECT_EQ(next.round, 2u);
+}
+
+TEST(CasGcResume, AdoptsOutcomesAfterCrashBeforeCascadePersist)
+{
+    /// Crash window: the deletes LANDED and the outcome logs are durable, but the cascade's
+    /// gc/state CAS lost - sets still present, strips unpersisted. The resume re-runs the recheck
+    /// (the re-delete sees NotFound) and ADOPTS the existing outcome log as the durable truth
+    /// (Deleted, not Absent), strips from it, persists, and drops the sets. The freed child is
+    /// then reclaimed by the NEXT round - the cascade survives the crash.
+    auto b = std::make_shared<FailNthCasPutBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    b->failNthCasPut(s->layout().gcStateKey(), 5);            /// the CASCADE persist CAS
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc.runRegularRound(); });
+
+    GcState st = readState(*b, *s);
+    ASSERT_EQ(st.round, 1u);
+    ASSERT_TRUE(st.fence_version.contains(1));                /// fence persisted...
+    ASSERT_FALSE(b->head(s->layout().treeKey(tree)).exists);  /// ...and the delete LANDED
+    ASSERT_TRUE(b->get(s->layout().outcomesKey(1, st.fence_seq, 0)).has_value());
+    ASSERT_TRUE(b->get(s->layout().retiredKey(1, st.fence_seq, 0)).has_value());   /// sets linger
+
+    const RoundReport resumed = gc.runRegularRound();
+    EXPECT_EQ(resumed.round, 1u);
+    EXPECT_EQ(resumed.deleted, 1u);                           /// ADOPTED from the durable log
+    EXPECT_EQ(resumed.absent, 0u);                            /// NOT re-tallied as Absent
+    st = readState(*b, *s);
+    EXPECT_FALSE(b->get(s->layout().retiredKey(1, st.fence_seq, 0)).has_value());
+    EXPECT_FALSE(st.fence_version.contains(1));
+
+    /// the strip survived the crash: the freed child goes next round (LIVE-RECLAIM):
+    const RoundReport next = gc.runRegularRound();
+    EXPECT_EQ(next.round, 2u);
+    EXPECT_EQ(next.deleted, 1u);
+    EXPECT_FALSE(b->head(s->layout().blobKey(idOf("payload"))).exists);
+}
