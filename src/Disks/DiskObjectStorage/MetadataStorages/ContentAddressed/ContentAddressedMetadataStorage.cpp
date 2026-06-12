@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
@@ -9,6 +10,7 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <filesystem>
+#include <ctime>
 #include <unordered_set>
 
 namespace fs = std::filesystem;
@@ -674,20 +676,56 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedMetadataStorage::readBlo
         std::move(impl), path, location.offset, location.offset + location.length);
 }
 
-/// ==== IContentAddressedExchange (relink lands in M-W T11; SAFE DEGRADATION until then) ====
+/// ==== IContentAddressedExchange (M-W T11; D-W4) ====
 
-std::optional<String> ContentAddressedMetadataStorage::getPartTreeId(const String & /*part_path*/) const
+std::optional<String> ContentAddressedMetadataStorage::getPartTreeId(const String & part_path) const
 {
-    /// T2 degradation: no relink offer => the sender streams bytes (correct, just slower).
-    return std::nullopt;
+    /// Sender side: the tree id THIS server's ref names for the part - the relink offer. No ref
+    /// (or an unroutable path) means no offer; the sender streams bytes.
+    if (!cas_store)
+        return std::nullopt;
+    auto p = ContentAddressed::parsePartFilePath(part_path);
+    if (!p)
+        return std::nullopt;
+    auto r = route(*p);
+    if (!r || r->ref.empty() || !r->file.empty())
+        return std::nullopt;
+    auto resolved = store()->resolveRef(r->ns, r->ref);
+    if (!resolved)
+        return std::nullopt;
+    return resolved->tree_id.string();
 }
 
 bool ContentAddressedMetadataStorage::adoptPart(
-    const String & /*table_uuid*/, const String & /*part_name*/,
-    const String & /*tree_id_hex*/, const std::map<String, String> & /*mutable_files*/)
+    const String & table_uuid, const String & part_name,
+    const String & tree_id_hex, const std::map<String, String> & mutable_files)
 {
-    /// T2 degradation: adoption "not possible" => the receiver falls back to a byte fetch.
-    return false;
+    /// Receiver side: adopt-by-tree-id + publish this server's own ref. adoptTree OBSERVES the
+    /// tree (cold reuse, 2026-06-12) - a tree reclaimed since the sender's offer surfaces as
+    /// FILE_DOESNT_EXIST and the caller falls back to the byte fetch, exactly where the old
+    /// 4-step pin protocol fell back. Publish-gate ABORTED propagates (a retryable fetch error).
+    const Cas::TreeId tree{tree_id_hex};
+    const auto ns = liveNamespace(table_uuid);
+    auto build = store()->startBuild(
+        Cas::BuildInfo{.intended_ref = ns.string() + "/" + part_name, .op = Cas::ProvenanceOp::Other});
+    try
+    {
+        build->adoptTree(tree);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
+            throw;
+        build->abandon();
+        return false;
+    }
+    Cas::RefPayload payload;
+    payload.mutable_files = mutable_files;
+    payload.mutable_files[".ca_mtime"] = std::to_string(static_cast<uint64_t>(::time(nullptr)));
+    /// tree_size is not carried on the wire (B92: the adopt path publishes 0 until the size is
+    /// recovered; no read path consumes it yet).
+    build->publish(ns, part_name, tree, std::move(payload));
+    return true;
 }
 
 }

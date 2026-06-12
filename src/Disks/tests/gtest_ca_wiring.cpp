@@ -732,3 +732,54 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
     EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_9_9_0/data.bin")[0].remote_path, blob_key);
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_9_9_0/data.bin"));
 }
+
+/// ==== M-W Task 11: the DataPartsExchange facade (relink) ====
+
+TEST(CaWiringExchange, AdoptPartPublishesOwnRef)
+{
+    /// Sender and receiver share one pool: model both as two metadata storages over the SAME
+    /// backend is not constructible here (Local storages differ), so use one storage as both ends
+    /// - the facade only touches pool state.
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "replicate-me");
+    tx->commit(DB::NoCommitOptions{});
+
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    ASSERT_NE(exchange, nullptr);
+    EXPECT_FALSE(exchange->getPoolUUID().empty());
+
+    auto tree_id = exchange->getPartTreeId("uui/uuid-1/all_1_1_0");
+    ASSERT_TRUE(tree_id.has_value());
+    EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_9_9_9").has_value());
+
+    /// The receiver's adoption: a new ref to the SAME tree under the fetched part name, carrying
+    /// the transferred mutable header.
+    ASSERT_TRUE(exchange->adoptPart("uuid-1", "tmp-fetch_all_1_1_0", *tree_id, {{"metadata_version.txt", "4"}}));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/tmp-fetch_all_1_1_0/data.bin"));
+    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/tmp-fetch_all_1_1_0/metadata_version.txt"),
+              std::optional<String>("4"));
+    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path,
+              storage->getStorageObjects("uui/uuid-1/tmp-fetch_all_1_1_0/data.bin")[0].remote_path);
+}
+
+TEST(CaWiringExchange, AdoptOfReclaimedTreeFallsBack)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "soon-gone");
+    tx->commit(DB::NoCommitOptions{});
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    auto tree_id = exchange->getPartTreeId("uui/uuid-1/all_1_1_0");
+    ASSERT_TRUE(tree_id.has_value());
+
+    /// The part is dropped and reclaimed before the receiver adopts (the relink race).
+    auto tx2 = storage->createTransaction();
+    tx2->removeDirectory("uui/uuid-1/all_1_1_0");
+    storage->runOneGcRoundForTest();
+    storage->runOneGcRoundForTest();
+
+    /// adoptPart returns false (byte-fetch fallback) and publishes NOTHING.
+    EXPECT_FALSE(exchange->adoptPart("uuid-1", "tmp-fetch_all_1_1_0", *tree_id, {}));
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp-fetch_all_1_1_0"));
+}
