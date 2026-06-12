@@ -730,15 +730,26 @@ TEST(CasGcRetire, DeletedCandidateDoesNotReappear)
     EXPECT_EQ(rep1.deleted, 1u);
     EXPECT_FALSE(b->head(s->layout().treeKey(tree)).exists);
 
+    /// Round 2: the CASCADE freed the tree's child blob in round 1 (strip), so round 2 retires and
+    /// deletes IT - the LIVE-RECLAIM bound made concrete (a dropped part's tree goes in round 1,
+    /// its exclusively-owned blobs in round 2). The deleted TREE itself never reappears (HEAD-
+    /// absent => skipped; the model's no-dup guard realized by the synchronous drop-on-outcome).
     const RoundReport rep2 = gc.runRegularRound();            /// no new journal activity in between
     EXPECT_TRUE(rep2.acquired_lease);
-    EXPECT_EQ(rep2.candidates, 0u);                           /// absent at HEAD => skipped
-    EXPECT_EQ(rep2.deleted + rep2.absent + rep2.replaced + rep2.spared, 0u);
+    EXPECT_EQ(rep2.candidates, 1u);                           /// the cascade-freed blob
+    EXPECT_EQ(rep2.deleted, 1u);
+    EXPECT_FALSE(b->head(s->layout().blobKey(BlobId{u128ToHex(u128Of("payload"))})).exists);
+
+    /// Round 3: nothing left - the dead subgraph is fully reclaimed and nothing reappears.
+    const RoundReport rep3 = gc.runRegularRound();
+    EXPECT_TRUE(rep3.acquired_lease);
+    EXPECT_EQ(rep3.candidates, 0u);
+    EXPECT_EQ(rep3.deleted + rep3.absent + rep3.replaced + rep3.spared, 0u);
 
     const GcState st = readState(*b, *s);
-    EXPECT_EQ(st.round, 2u);
-    EXPECT_FALSE(b->get(s->layout().retiredKey(2, st.fence_seq, 0)).has_value());
-    EXPECT_FALSE(b->get(s->layout().outcomesKey(2, st.fence_seq, 0)).has_value());
+    EXPECT_EQ(st.round, 3u);
+    EXPECT_FALSE(b->get(s->layout().retiredKey(3, st.fence_seq, 0)).has_value());
+    EXPECT_FALSE(b->get(s->layout().outcomesKey(3, st.fence_seq, 0)).has_value());
 }
 
 TEST(CasGcRetire, RetireSetsDurableBeforeRoundCas)
@@ -1257,4 +1268,113 @@ TEST(CasGcRetire, RetireReplayAdoptsOwnCrashedAttempt)
         t2_deleted |= entry.hash == hexToU128(t2.string()) && entry.outcome == OutcomeKind::Deleted;
     EXPECT_TRUE(t2_deleted);
     EXPECT_FALSE(b->head(s->layout().treeKey(t2)).exists);
+}
+
+TEST(CasGcCascade, SharedChildSurvivesOneParentDeletion)
+{
+    /// B is referenced by TWO live trees; dropping one part deletes its tree, but the strip leaves
+    /// B's in-degree at 1 (the other tree's edge) - B is never a candidate while any parent lives.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    /// two parts, different trees (different entry names), SAME blob payload => shared B:
+    auto build = s->startBuild({});
+    build->putBlob(idOf("shared"), BlobSource::fromString("shared"));
+    TreeEntry e1; e1.name = "a.bin"; e1.placement = Placement::Blob; e1.file_hash = u128Of("shared"); e1.file_size = 6;
+    TreeEntry e2; e2.name = "b.bin"; e2.placement = Placement::Blob; e2.file_hash = u128Of("shared"); e2.file_size = 6;
+    const TreeId t1 = build->putTree({e1});
+    const TreeId t2 = build->putTree({e2});
+    build->publish(RootNamespace{"srv1/tbl"}, "part_1", t1, RefPayload{});
+    build->publish(RootNamespace{"srv1/tbl"}, "part_2", t2, RefPayload{});
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep1 = gc.runRegularRound();
+    EXPECT_EQ(rep1.deleted, 1u);                              /// t1 only
+    EXPECT_FALSE(b->head(s->layout().treeKey(t1)).exists);
+    EXPECT_TRUE(b->head(s->layout().treeKey(t2)).exists);
+
+    const RoundReport rep2 = gc.runRegularRound();
+    EXPECT_EQ(rep2.candidates, 0u);                           /// B still pinned by t2
+    EXPECT_TRUE(b->head(s->layout().blobKey(idOf("shared"))).exists);
+    /// part_2 still reads end-to-end (INV-NO-DANGLE):
+    auto resolved = s->resolveRef(RootNamespace{"srv1/tbl"}, "part_2");
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(s->readTree(resolved->tree_id).size(), 1u);
+}
+
+TEST(CasGcCascade, NeverCascadesOnReplaced)
+{
+    /// A resurrection winning the race (412 => Replaced) must NOT cascade: the new incarnation is
+    /// payload-identical and pins its children; its own lifecycle handles them (spec section 7).
+    auto b = std::make_shared<OnFenceHookBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    const String tree_key = s->layout().treeKey(tree);
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    b->armOnCasPut(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard), [&]
+    {
+        displaceObjectToken(*b, tree_key, ObjectKind::Tree);  /// the racing resurrect
+    });
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep1 = gc.runRegularRound();
+    EXPECT_EQ(rep1.replaced, 1u);
+    EXPECT_EQ(rep1.cascaded, 0u);                             /// THE claim: no strip on Replaced
+    /// the new incarnation and its still-edge-pinned child both survive the 412 round:
+    EXPECT_TRUE(b->head(tree_key).exists);
+    EXPECT_TRUE(b->head(s->layout().blobKey(idOf("payload"))).exists);
+
+    /// A bare resurrect with NO republish leaves the new incarnation just as unreachable: the next
+    /// round legitimately retires it at its NEW token and deletes it (the 412-save matters when
+    /// the resurrect is part of a publish - the gate's resurrect-then-publish raises in-degree and
+    /// the recheck spares; here nobody published). The strip then runs on the CONFIRMED delete.
+    const RoundReport rep2 = gc.runRegularRound();
+    EXPECT_EQ(rep2.deleted, 1u);
+    EXPECT_EQ(rep2.cascaded, 1u);
+    EXPECT_FALSE(b->head(tree_key).exists);
+
+    /// and the freed child goes one round later (LIVE-RECLAIM):
+    const RoundReport rep3 = gc.runRegularRound();
+    EXPECT_EQ(rep3.deleted, 1u);
+    EXPECT_FALSE(b->head(s->layout().blobKey(idOf("payload"))).exists);
+}
+
+TEST(CasGcCascade, RecreateAfterDeletionRefoldsAfterStrip)
+{
+    /// The cascade-vs-recreate race (spec section 7; the model's SabotageCascadeRace negative
+    /// control breaks exactly this): a re-create-and-publish of the SAME tree content lands at a
+    /// shard_version ABOVE the deleting round's fence version, so its Add folds in the NEXT round
+    /// on a snap whose marker the strip already CLEARED - the re-expansion re-pins the children.
+    /// (Persisting the strip lazily, or folding the Add against a still-set marker, would leave
+    /// the recreated live tree's children edge-less => a later wrong delete.)
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep1 = gc.runRegularRound();            /// deletes T, strips, frees B
+    EXPECT_EQ(rep1.deleted, 1u);
+    EXPECT_EQ(rep1.cascaded, 1u);
+
+    /// the recreate: same content => same hashes; both objects re-uploaded fresh; the publish
+    /// lands above round 1's fence version on the shard.
+    const TreeId recreated = publishPart(s, "srv1/tbl", "part_1", "payload");
+    ASSERT_EQ(recreated, tree);                               /// content-addressed identity
+
+    const RoundReport rep2 = gc.runRegularRound();            /// folds the Add post-strip
+    EXPECT_EQ(rep2.candidates, 0u);                           /// B re-pinned by the re-expansion
+    EXPECT_EQ(rep2.deleted, 0u);
+
+    /// the part reads end-to-end; nothing was wrongly deleted:
+    auto resolved = s->resolveRef(RootNamespace{"srv1/tbl"}, "part_1");
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_TRUE(b->head(s->layout().blobKey(idOf("payload"))).exists);
+    EXPECT_TRUE(b->head(s->layout().treeKey(tree)).exists);
+
+    /// and a further idle round stays empty (the dead-then-recreated subgraph is stable):
+    const RoundReport rep3 = gc.runRegularRound();
+    EXPECT_EQ(rep3.candidates + rep3.deleted, 0u);
 }

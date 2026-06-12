@@ -161,6 +161,7 @@ private:
     {
         std::map<uint64_t, OutcomeLog> outcomes;   /// snap_shard -> the durable outcome log
         std::vector<UInt128> deleted_trees;
+        bool fence_window_records_folded = false;  /// the recheck's fold-through-fence saw records
     };
 
     /// R4 (spec §7; the model's GRecheckDelete + the synchronous half of Land): re-fold every
@@ -172,16 +173,27 @@ private:
     ///       Deleted        => outcome Deleted (trees: cascade input);
     ///       NotFound       => outcome Absent (a prior crashed delete landed; held trees cascade);
     ///       TokenMismatch  => outcome Replaced (a resurrection won — the 412-save health metric).
-    /// deleteExact is synchronous: its return IS the model's Land (the confirmed outcome), so
-    /// entries "drop on confirmed outcomes" collapses to: write the outcome logs
-    /// (append-by-unique-path with crashed-attempt adoption like retire — an occupant log is the
-    /// durable truth of what a prior attempt's deletes DID and replaces this attempt's tallies),
-    /// then DELETE the round's retired-set objects (RetireView tolerates list-then-get
-    /// disappearance), then one gc/state CAS erases fence_version for rounds <= round (it served
-    /// its recheck; gc/state must not grow a per-round vector forever). The in-memory recheck fold
-    /// is NOT persisted — the next round's durable fold re-derives it idempotently (set semantics).
-    RecheckResult recheck(GcState & state, Token & state_token, std::map<uint64_t, GcSnap> & snap,
+    /// deleteExact is synchronous: its return IS the model's Land (the confirmed outcome). The
+    /// outcome logs are written here (append-by-unique-path with crashed-attempt adoption like
+    /// retire — an occupant log is the durable truth of what a prior attempt's deletes DID and
+    /// replaces this attempt's tallies); the entry drop / strip / persist tail belongs to
+    /// cascadeAndPersist.
+    RecheckResult recheck(const GcState & state, std::map<uint64_t, GcSnap> & snap,
                           const std::map<uint64_t, RetiredSet> & retired, RoundReport & report);
+
+    /// The CASCADE pipeline step (spec §7; the model's Land does the strip atomically with the
+    /// landing): strip every confirmed-deleted (or absent-while-held) tree's child edges + clear
+    /// its marker; PERSIST the post-strip snap (including the recheck's fence-window fold) at a
+    /// probe-upward generation; ONE gc/state CAS advances snap_generation + folded_cursor to the
+    /// recorded fence versions and erases fence_version[<= round] — the ordering that closes the
+    /// cascade-vs-recreate race (a recreate lands ABOVE the fence version, so the next round folds
+    /// its Add on a snap whose marker the strip already cleared ⇒ re-expansion re-pins the
+    /// children); THEN drop the round's retired-set objects on their confirmed outcomes. The
+    /// freed children become zero-in-degree known nodes — the NEXT round's stateless candidate
+    /// scan retires and deletes them (LIVE-RECLAIM: ~2 regular rounds).
+    void cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64_t, GcSnap> & snap,
+                           const RecheckResult & rechecked,
+                           const std::map<uint64_t, RetiredSet> & retired, RoundReport & report);
 
     /// Fold one root shard's journal records with at_version in (lo, hi] into `snap` — the shared
     /// R1/R4 record semantics: last-op-wins root edges, once-per-tree expansion with the

@@ -79,15 +79,19 @@ RoundReport Gc::runRegularRound()
     /// by retire's CAS; `state`/`state_token` are current after it.
     fence(state, state_token, folded.root_shards);
 
-    /// R4: fold-through-fence recheck + the single content-delete site + outcomes + retired-set
-    /// cleanup. The deleted trees feed the cascade (Task 10).
-    [[maybe_unused]] const RecheckResult rechecked = recheck(state, state_token, folded.snap, retired, report);   /// Task 10 consumes deleted_trees
+    /// R4: fold-through-fence recheck + the single content-delete site + outcomes.
+    const RecheckResult rechecked = recheck(state, folded.snap, retired, report);
 
-    /// Tasks 10-12: cascade / trim
+    /// CASCADE (the pipeline step): strip deleted trees, persist the post-strip snap with cursors
+    /// advanced to the fence versions (the cascade-vs-recreate ordering), then drop the round's
+    /// retired sets on their confirmed outcomes.
+    cascadeAndPersist(state, state_token, folded.snap, rechecked, retired, report);
+
+    /// Tasks 11-12: trim / resume
     return report;
 }
 
-Gc::RecheckResult Gc::recheck(GcState & state, Token & state_token, std::map<uint64_t, GcSnap> & snap,
+Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> & snap,
                               const std::map<uint64_t, RetiredSet> & retired, RoundReport & report)
 {
     const Layout & layout = store->layout();
@@ -104,6 +108,8 @@ Gc::RecheckResult Gc::recheck(GcState & state, Token & state_token, std::map<uin
     if (fence_it == state.fence_version.end())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS gc recheck: no fence_version recorded for round {} - refusing to delete", round);
+
+    bool fence_window_records_folded = false;
 
     /// 1. FOLD-THROUGH-FENCE (the model's FoldedThroughFence guard): re-read every fenced shard
     /// and fold the records in (folded_cursor, fence_version] - exactly the publishes that raced
@@ -128,13 +134,24 @@ Gc::RecheckResult Gc::recheck(GcState & state, Token & state_token, std::map<uin
         const auto cursor_it = state.folded_cursor.find(cursor_key);
         const uint64_t cursor = cursor_it != state.folded_cursor.end() ? cursor_it->second : 0;
         if (fence_version > cursor)
+        {
+            /// Did any RECORD actually sit in the window? (The fence's own bump is recordless, so
+            /// the common idle case folds nothing - the cascade can then skip its snap persist.)
+            for (const JournalRecord & record : root.journal)
+                if (record.at_version > cursor && record.at_version <= fence_version)
+                {
+                    fence_window_records_folded = true;
+                    break;
+                }
             foldShardRecords(snap, state, cursor_key, root, cursor, fence_version);
+        }
     }
 
     /// 2. Per retired entry: spare or delete. The retired sets passed in are the DURABLE sets the
     /// retire step wrote or adopted (a crashed prior attempt's set is the authoritative round
     /// input - the Task-7 contract).
     RecheckResult result;
+    result.fence_window_records_folded = fence_window_records_folded;
     std::map<uint64_t, OutcomeLog> computed;
     for (const auto & [snap_shard, set] : retired)
     {
@@ -257,13 +274,119 @@ Gc::RecheckResult Gc::recheck(GcState & state, Token & state_token, std::map<uin
         }
     }
 
-    /// 5. The entries "drop on confirmed outcomes": with the outcome logs durable, the round's
-    /// retired-set objects are deleted (a GC-METADATA delete, not the content-delete site above -
-    /// these are gc/retired/ bookkeeping objects GC itself wrote). RetireView tolerates a
-    /// list-then-get disappearance, and from this moment the writer-facing barrier for these
-    /// incarnations is gone - which is correct: every entry has a confirmed outcome (deleted/
-    /// absent incarnations cannot return, INV-NO-RETURN; replaced/spared ones are alive at a
-    /// NEWER token that was never condemned).
+    /// Steps 5-7 of the round tail (the strip, the persist, the entry drop) belong to the CASCADE
+    /// pipeline step - see cascadeAndPersist, which the orchestration runs right after this.
+    return result;
+}
+
+void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64_t, GcSnap> & snap,
+                           const RecheckResult & rechecked,
+                           const std::map<uint64_t, RetiredSet> & retired, RoundReport & report)
+{
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+    chassert(state.lease.owner == gc_id);
+
+    const uint64_t round = state.round;
+    const auto fence_it = state.fence_version.find(round);
+    chassert(fence_it != state.fence_version.end());   /// recheck guarded this; same round state
+
+    /// 1. THE CASCADE STRIP (spec §7 "cascade is a pipeline step, not a foldable record"; the
+    /// model's Land does the strip atomically with the landing). For every round-R tree whose
+    /// outcome confirmed Deleted - or Absent while its entry was HELD, proving our own crashed
+    /// delete landed - strip its child edges and clear its marker. The freed children become
+    /// zero-in-degree KNOWN nodes in the durable snap: the NEXT round's stateless candidate scan
+    /// retires and deletes them (the model's GRetire runs in the next retiring phase; the spec's
+    /// LIVE-RECLAIM bound is "~2 regular rounds"). Replaced trees are NOT in deleted_trees and
+    /// NEVER cascade - the new incarnation pins its children. The strip needs no tree read: the
+    /// snap recorded the child edges at expansion (all incarnations are payload-identical), and a
+    /// never-expanded tree strips as a no-op (it contributed no edges).
+    for (const UInt128 & tree : rechecked.deleted_trees)
+    {
+        const auto freed = snap.at(hashPrefixShard(tree, state.snap_shards)).stripTree(tree);
+        report.cascaded += freed.size();
+    }
+
+    /// 2. PERSIST the post-strip snap - WITH the recheck's fence-window fold included - and
+    /// advance folded_cursor to the recorded fence versions in the SAME gc/state CAS. This is the
+    /// pipeline ORDERING rule that closes the cascade-vs-recreate race: a re-create-and-publish
+    /// racing the deletion necessarily lands at a shard_version ABOVE this round's fence version,
+    /// so the next round folds its Add on a snap whose marker was already CLEARED by the strip -
+    /// the re-expansion re-pins the children. Persisting the strip lazily (or not advancing the
+    /// cursors with it) would let that Add fold against a still-set marker, skip the re-expansion,
+    /// and leave the recreated live tree's children edge-less - an under-count, a wrong delete.
+    /// Same write-once probe-upward discipline as the fold's persist. SKIPPED when the snap is
+    /// semantically unchanged since the fold's persist (no strips, no fence-window records - the
+    /// common idle case): persisting a byte-equivalent-except-generation snap every round would
+    /// mint an orphan object per round forever for nothing. The closing gc/state CAS below still
+    /// runs unconditionally (cursors advance to the fence versions - vacuous coverage when the
+    /// window held no records - and fence_version[<= round] is erased).
+    const bool snap_changed = !rechecked.deleted_trees.empty() || rechecked.fence_window_records_folded;
+    constexpr uint64_t max_generation_probes = 1000;
+    uint64_t adopted_generation = state.snap_generation;
+    if (snap_changed)
+    for (uint64_t generation = state.snap_generation + 1; ; ++generation)
+    {
+        if (generation > state.snap_generation + max_generation_probes)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS gc cascade: no adoptable snap generation within {} probes above {} (runaway divergence)",
+                max_generation_probes, state.snap_generation);
+        bool diverged = false;
+        for (auto & [snap_shard, shard_snap] : snap)
+        {
+            shard_snap.generation = generation;
+            const String snap_key = layout.gcSnapKey(generation, snap_shard);
+            const String body = encodeGcSnap(shard_snap);
+            if (backend.putIfAbsent(snap_key, body) == PutOutcome::PreconditionFailed)
+            {
+                const auto existing = backend.get(snap_key);
+                if (!existing || existing->bytes != body)
+                {
+                    diverged = true;
+                    break;
+                }
+            }
+        }
+        if (!diverged)
+        {
+            adopted_generation = generation;
+            break;
+        }
+    }
+
+    GcState next = state;
+    next.snap_generation = adopted_generation;   /// unchanged when the persist was skipped
+    for (const auto & [cursor_key, fence_version] : fence_it->second)
+    {
+        if (cursor_key == "_registry")
+            continue;
+        auto it = next.folded_cursor.find(cursor_key);
+        if (it != next.folded_cursor.end())
+            it->second = std::max(it->second, fence_version);
+        else
+            next.folded_cursor[cursor_key] = fence_version;
+    }
+    /// fence_version[<= round] served its recheck - erase it (gc/state must not grow forever).
+    std::erase_if(next.fence_version, [&](const auto & kv) { return kv.first <= round; });
+    Token committed_token;
+    if (backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token, &committed_token)
+        != CasOutcome::Committed)
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS gc cascade: gc/state moved during the cascade persist (another leader advanced it); "
+            "retry next round");
+    state = std::move(next);
+    state_token = committed_token;
+
+    /// 3. The entries "drop on confirmed outcomes": with the outcomes durable AND the cascade
+    /// persisted, the round's retired-set objects are deleted (a GC-METADATA delete, not the
+    /// content-delete site - these are gc/retired/ bookkeeping objects GC itself wrote).
+    /// RetireView tolerates a list-then-get disappearance, and from this moment the writer-facing
+    /// barrier for these incarnations is gone - correct: every entry has a confirmed outcome
+    /// (deleted/absent incarnations cannot return, INV-NO-RETURN; replaced/spared ones are alive
+    /// at a NEWER token that was never condemned). A crash BEFORE this loop leaves the sets
+    /// lingering with their outcomes durable - the resume rule (Task 12) detects exactly that
+    /// (retired sets at rounds <= state.round whose outcome logs exist), re-applies the idempotent
+    /// strip from the logs, and drops the sets.
     for (const auto & [snap_shard, set] : retired)
     {
         const String key = layout.retiredKey(round, state.fence_seq, snap_shard);
@@ -273,23 +396,9 @@ Gc::RecheckResult Gc::recheck(GcState & state, Token & state_token, std::map<uin
             if (dropped.kind == DeleteOutcome::Kind::TokenMismatch)
                 /// Nobody else legally writes this path (fence_seq epoch isolation) - fail loud.
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "CAS gc recheck: retired set at {} changed under us (token mismatch on drop)", key);
+                    "CAS gc cascade: retired set at {} changed under us (token mismatch on drop)", key);
         }
     }
-
-    /// 6. fence_version[<= round] served its recheck - erase it (gc/state must not grow a
-    /// per-round vector forever). ONE gc/state CAS, same fail-closed contract as the other steps.
-    GcState next = state;
-    std::erase_if(next.fence_version, [&](const auto & kv) { return kv.first <= round; });
-    Token committed_token;
-    if (backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token, &committed_token)
-        != CasOutcome::Committed)
-        throw Exception(ErrorCodes::ABORTED,
-            "CAS gc recheck: gc/state moved during the recheck (another leader advanced it); retry next round");
-    state = std::move(next);
-    state_token = committed_token;
-
-    return result;
 }
 
 void Gc::fence(GcState & state, Token & state_token,
