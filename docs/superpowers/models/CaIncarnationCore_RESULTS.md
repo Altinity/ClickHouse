@@ -60,8 +60,9 @@ landed):
 | `stage4_journaltree` | **PASS** | 35,576,464 | 1min 49s |
 | `stage5_small` | **PASS** | 64,359,811 | 3min 29s |
 | `reval_stage2` | **PASS** | 155,142 | 1s |
-| `stage6_registry` (new) | **PASS** (incl. `INV_MAN_EXISTS`) | 3,700,390 | 12s |
+| `stage6_registry` (new) | **PASS** (incl. `INV_MAN_EXISTS`, `MonotoneRegistry`) | 3,700,390 | 12s |
 | `stage6_evstale` (new) | **PASS** | 10,143,569 | 36s |
+| `stage6_cross_smoke` (new, review follow-up) | **PASS** (incl. `INV_MAN_EXISTS`, `MonotoneRegistry`) | 439,696 | 2s |
 | `stage2_live` | bound-artifact lasso (expected, unchanged class) | 78,761 | 3s |
 | `sab_nofence` | counterexample `INV_NO_DANGLE` ✓ | 32,014 | 1s |
 | `sab_norecheckfold` | counterexample `INV_NO_DANGLE` ✓ | 57,108 | 1s |
@@ -81,11 +82,23 @@ views (a refresh during a round's retiring no longer claims that round). The
 `GStartRound`'s (sabotaged) universe capture and `GFenceRegistry`; the late namespace's publish is
 never fenced or recheck-folded and the exact-token delete dangles its ref.
 
-**B91 residuals:** registry × split-brain and registry × evidence combined configs not run (state
-space); one model shard = one namespace (per-namespace `root_shards > 1` not modeled); the model's
-hit checks read the live `retired` set, weaker than the implementation's frozen LIST snapshot
-(conservative direction); `CaIncarnationProofCore.tla` (Apalache induction) predates the
-amendments and is STALE until re-derived.
+**External review follow-ups (2026-06-12, accepted with the refresh):** `MonotoneRegistry` action
+property added and checked in registry-enabled configs (append-only `reg.ns`, monotone
+`reg.fence`/`reg.man`, immutable registration floors; `reg.univ`/`reg.done` are per-round work
+state, deliberately not monotone); the three mixed `/\`-`\/` guards parenthesized for
+reviewability (`EvOK` freshness, `WAbandon` enabling condition, `WPublish` W-REGISTER line —
+semantics unchanged, stage1 reproduces 20,931,058 states exactly); `stage6_cross_smoke` added
+(registry × evidence small-bounds interaction check — not a proof of the combined space). The
+reviewer's `ViewableRound`-under-split-leaders nuance (global `gcRound` vs per-leader/durable
+round) is folded into the B104 registry × split-brain residual.
+
+**B91 residuals:** registry × split-brain and registry × evidence at FULL bounds not run (state
+space; `stage6_cross_smoke` covers the small-bounds interaction); one model shard = one namespace
+(per-namespace `root_shards > 1` not modeled); the model's hit checks read the live `retired`
+set, weaker than the implementation's frozen LIST snapshot (conservative direction);
+`CaIncarnationProofCore.tla` (Apalache induction) predates the amendments and is STALE until
+re-derived — the amendments add proof obligations (permanent registration floors, fence-time
+universe, view-round coverage, evidence freshness/re-observation, dep-covered tree children).
 
 ## PASS stages {#pass-stages}
 

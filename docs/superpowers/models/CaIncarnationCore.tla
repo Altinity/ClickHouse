@@ -134,7 +134,7 @@ PubFloor(s) == Max2(man[s].fence, reg.floor[s])
 \* SabotageNoEvReobserve admits stale evidence: the dangle MUST return.
 EvOK(w) == \A d \in wEv[w] :
               /\ ~HashHitAtView(d[1], wView[w])
-              /\ SabotageNoEvReobserve \/ d[2] >= wView[w]
+              /\ (SabotageNoEvReobserve \/ d[2] >= wView[w])
 Reach(r)      == {r} \cup (IF r \in TreeHashes THEN Children[r] ELSE {})
 ReachableSet  == UNION { Reach(r) : r \in UNION { man[s].refs : s \in Shards } }
 FoldedThroughFence == \A s \in Shards : cursor[s] >= fencePos[s]
@@ -365,7 +365,7 @@ TreeDepsOK(w, h) == h \in TreeHashes =>
                                                  ELSE ~CondemnedAtView(c, tokOf[c], wView[w])
 WPublish(w, s, h) ==
     /\ \E t \in Toks : <<h, t>> \in wDeps[w]          \* the root itself was created/reused
-    /\ SabotageNoRegistry \/ s \in reg.ns             \* W-REGISTER: register before any publish
+    /\ (SabotageNoRegistry \/ s \in reg.ns)           \* W-REGISTER: register before any publish
     /\ h \notin man[s].refs
     /\ Len(man[s].log) < MaxLog
     /\ SabotageNoRetireView \/ (wView[w] >= PubFloor(s) /\ DepOK(w) /\ EvOK(w))
@@ -391,7 +391,7 @@ WDrop(s, h) ==
                     fgCut, fgRefs, fgSeen, reg, wEv >>
 
 WAbandon(w) ==      \* crash/abort before publish: deps lost; uploads remain (debris in stage 4)
-    /\ wDeps[w] # {} \/ wEv[w] # {}
+    /\ (wDeps[w] # {} \/ wEv[w] # {})
     /\ wDeps' = [wDeps EXCEPT ![w] = {}]
     /\ wEv'   = [wEv   EXCEPT ![w] = {}]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
@@ -744,6 +744,16 @@ MonotoneGC == [][ /\ gcRound' >= gcRound
                                        /\ trimBase'[s] >= trimBase[s]
                                        /\ man'[s].fence >= man[s].fence
                                        /\ Len(man'[s].log) >= Len(man[s].log) ]_vars
+
+\* Registry monotonicity (B91 review follow-up; checked as PROPERTY in registry-enabled configs):
+\* the registered set is append-only, the registry fence never lowers, an existing manifest never
+\* becomes "absent", and a namespace's registration floor is immutable once written (it is set
+\* exactly once, by WRegister, when the namespace ENTERS reg.ns). reg.univ and reg.done are
+\* per-round work state and deliberately NOT monotone.
+MonotoneRegistry == [][ /\ reg.ns \subseteq reg'.ns
+                        /\ reg'.fence >= reg.fence
+                        /\ \A s \in Shards : /\ (reg.man[s] => reg'.man[s])
+                                             /\ (s \in reg.ns => reg'.floor[s] = reg.floor[s]) ]_vars
 
 StateConstraint ==
     /\ \A s \in Shards : Len(man[s].log) <= MaxLog

@@ -91,7 +91,7 @@ spec's `W-FRESH-TAG` and backend token-distinctness hold **by construction** in 
 | `EnableTrees` | documentation only — non-empty `TreeHashes` activates tree machinery |
 | `EnableSplit` | documentation only — `\|Leaders\| = 2` activates split-brain leader competition |
 | `EnableReval` | W-REVALIDATE gate mode: no dead-token oracle; re-observation conjunct |
-| `EnableRegistry` | B91: namespace registry + manifest creation (`WRegister`, `GFenceRegistry`, minting) |
+| `EnableRegistry` | B91: namespace registry + manifest creation (`WRegister`, `GFenceRegistry`, minting); registry-enabled configs also check the `MonotoneRegistry` action property (append-only `reg.ns`, monotone `reg.fence`/`reg.man`, immutable registration floors) |
 | `EnableEvStale` | B91: evidence staleness + dep-set tree-child validation (`wEv`, `WEvObserve`, `EvOK`) |
 | `Sabotage*` | negative controls; exactly one `TRUE` per sabotage config |
 
@@ -131,6 +131,7 @@ residual section below.
 | 5 split/overwrite | `CaIncarnationCore_stage5_small.cfg` | split-brain two-leader competition + `WOverwrite` (anonymous churn) | 1 writer, 2 leaders, 2 hashes, `MaxLog=4` (debris OFF to isolate split×overwrite) | PASS |
 | 6a registry | `CaIncarnationCore_stage6_registry.cfg` | namespace registry + manifest creation (B91): `WRegister`, `GFenceRegistry` (fence-time universe), minting, registration floors; reval mode | 1 writer, 2 shards (= 2 namespaces), 1 hash, `MaxToken=3`, `MaxRound=2`, `MaxLog=4` | PASS |
 | 6b evidence staleness | `CaIncarnationCore_stage6_evstale.cfg` | amended `W-EVIDENCE` (B91): recorded-round evidence, `WEvObserve`, dep-set tree-child validation (no global presence oracle); reval mode | 1 writer, 1 shard, 3 hashes (`t1` tree), `MaxToken=2`, `MaxRound=2`, `MaxLog=5` | PASS |
+| 6c cross smoke | `CaIncarnationCore_stage6_cross_smoke.cfg` | registry × evidence-staleness interaction smoke (NOT a proof of the combined space — B104 residual): `PubFloor` + `EvOK` in one gate, minting under a tree publish riding evidence deps | 1 writer, 1 shard, 2 hashes (`t1` tree), `MaxToken=2`, `MaxRound=2`, `MaxLog=4` | PASS |
 | liveness | `CaIncarnationCore_stage2_live.cfg` | `NoLeakForever` under `FairSpec` | stage-2 bounds, `MaxRound=2` | bound-artifact lasso (see RESULTS) |
 
 ### Sabotage configs (all MUST fail) {#sabotage-configs}
