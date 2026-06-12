@@ -34,6 +34,18 @@ spec's `W-FRESH-TAG` and backend token-distinctness hold **by construction** in 
   this is the model RULE: *any action that makes a token stop being current adds it to `deadTok`*.
 - **`WEvidence` / `WResolveEvidence`** — tokenless live-root evidence dependency (carry-forward /
   fetch-by-reference); escalates to a token-bearing dependency when the retire-view is clean.
+  Under `EnableEvStale` (B91, 2026-06-12) the evidence carries the view round it was RECORDED at
+  (the amended `W-EVIDENCE` staleness input), requires the object to be REACHABLE when observed
+  (live-root is literal — the implementation witnesses it by reading the live source tree), and
+  the publish gate (`EvOK`) admits it only fresh (`r ≥ wView`) with no hash hit; stale members
+  must be re-observed via **`WEvObserve`** (present ⇒ token-bearing dep, absent ⇒ dropped).
+- **`WRegister` / `GFenceRegistry`** — under `EnableRegistry` (B91, 2026-06-12): a namespace must
+  be CAS-appended to the registry before any publish (`W-REGISTER`); the registering read takes
+  the current registry fence as the namespace's publish-gate floor (`reg.floor`). The GC fences
+  the registry FIRST (`GFenceRegistry`, ending the round's retiring — the view-coverage ordering)
+  and derives the shard-fence universe from the COMMITTED registry (fence-time, never fold-time);
+  `GFenceShard` MINTS absent manifests. `ViewableRound` gives view rounds the COVERAGE PROPERTY
+  (a refresh claims round R only after R's retiring ended — `gc/state.round` semantics).
 - **`WOverwrite`** — anonymous environment churn (unconditional same-content re-PUT by anyone);
   same RULE: the displaced token joins `deadTok`. No dependency recorded.
 - **`WPublish`** — one atomic successful CAS guarded on the CURRENT manifest (CAS linearization).
@@ -78,6 +90,9 @@ spec's `W-FRESH-TAG` and backend token-distinctness hold **by construction** in 
 | `EnableResurrect`, `EnableDebris`, `EnableOverwrite` | gate actions (stage 2 / 4 / 5 resp.) |
 | `EnableTrees` | documentation only — non-empty `TreeHashes` activates tree machinery |
 | `EnableSplit` | documentation only — `\|Leaders\| = 2` activates split-brain leader competition |
+| `EnableReval` | W-REVALIDATE gate mode: no dead-token oracle; re-observation conjunct |
+| `EnableRegistry` | B91: namespace registry + manifest creation (`WRegister`, `GFenceRegistry`, minting) |
+| `EnableEvStale` | B91: evidence staleness + dep-set tree-child validation (`wEv`, `WEvObserve`, `EvOK`) |
 | `Sabotage*` | negative controls; exactly one `TRUE` per sabotage config |
 
 ## How to run {#how-to-run}
@@ -91,8 +106,12 @@ spec's `W-FRESH-TAG` and backend token-distinctness hold **by construction** in 
 ./run_tlc.sh CaIncarnationCore_stage4_journaltree.cfg
 ./run_tlc.sh CaIncarnationCore_stage5_small.cfg
 ./run_tlc.sh CaIncarnationCore_stage2_live.cfg     # temporal: bound-limited (see RESULTS)
+# B91 stages (2026-06-12 amendments):
+./run_tlc.sh CaIncarnationCore_stage6_registry.cfg
+./run_tlc.sh CaIncarnationCore_stage6_evstale.cfg
 # negative controls — these MUST fail with an invariant violation:
-for c in nofence norecheckfold noretireview unconddelete reusedtag cascade cutoverclaim; do
+for c in nofence norecheckfold noretireview unconddelete reusedtag cascade cutoverclaim \
+         noreobserve noregistry foldtimeuniverse noevreobserve; do
   ./run_tlc.sh CaIncarnationCore_sab_$c.cfg && echo "UNEXPECTED PASS: $c"
 done
 ```
@@ -110,6 +129,8 @@ residual section below.
 | 4a debris/full-GC cut | `CaIncarnationCore_stage4_small.cfg` | heartbeat-gated debris, wedged-writer publish, two-shard full-GC exact-cut walk | 1 writer, 1 hash (no trees), `MaxToken=2`, `MaxRound=1`, `MaxLog=2`, 2 shards | PASS |
 | 4b journaled-delete + tree rebuild | `CaIncarnationCore_stage4_journaltree.cfg` | full GC + `MaxLog=3` (covers journaled retire→fence→recheck→delete tail) + tree-reachability rebuild in `FGCommit` | 1 writer, 1 shard, 2 hashes (`t1` tree), `MaxLog=3` | PASS |
 | 5 split/overwrite | `CaIncarnationCore_stage5_small.cfg` | split-brain two-leader competition + `WOverwrite` (anonymous churn) | 1 writer, 2 leaders, 2 hashes, `MaxLog=4` (debris OFF to isolate split×overwrite) | PASS |
+| 6a registry | `CaIncarnationCore_stage6_registry.cfg` | namespace registry + manifest creation (B91): `WRegister`, `GFenceRegistry` (fence-time universe), minting, registration floors; reval mode | 1 writer, 2 shards (= 2 namespaces), 1 hash, `MaxToken=3`, `MaxRound=2`, `MaxLog=4` | PASS |
+| 6b evidence staleness | `CaIncarnationCore_stage6_evstale.cfg` | amended `W-EVIDENCE` (B91): recorded-round evidence, `WEvObserve`, dep-set tree-child validation (no global presence oracle); reval mode | 1 writer, 1 shard, 3 hashes (`t1` tree), `MaxToken=2`, `MaxRound=2`, `MaxLog=5` | PASS |
 | liveness | `CaIncarnationCore_stage2_live.cfg` | `NoLeakForever` under `FairSpec` | stage-2 bounds, `MaxRound=2` | bound-artifact lasso (see RESULTS) |
 
 ### Sabotage configs (all MUST fail) {#sabotage-configs}
@@ -123,6 +144,10 @@ residual section below.
 | `CaIncarnationCore_sab_reusedtag.cfg` | W-FRESH-TAG / token distinctness | `INV_NO_RETURN` |
 | `CaIncarnationCore_sab_cascade.cfg` | cascade-as-pipeline-step ordering | `INV_NO_LOSS` |
 | `CaIncarnationCore_sab_cutoverclaim.cfg` | full-GC claimed-authority = incorporated-state | `INV_NO_DANGLE` |
+| `CaIncarnationCore_sab_noreobserve.cfg` | W-REVALIDATE re-observation conjunct (reval mode) | `INV_NO_DANGLE` |
+| `CaIncarnationCore_sab_noregistry.cfg` | W-REGISTER skipped: publish into unregistered namespaces, no floor (B91) | `INV_NO_DANGLE` |
+| `CaIncarnationCore_sab_foldtimeuniverse.cfg` | GC fences the FOLD-TIME universe — the C++ hole fixed 2026-06-12 (B91) | `INV_NO_DANGLE` |
+| `CaIncarnationCore_sab_noevreobserve.cfg` | gate admits STALE evidence without re-observation (B91) | `INV_NO_LOSS` |
 
 ## What is deliberately NOT modeled {#not-modeled}
 
@@ -156,6 +181,12 @@ The model abstracts aggressively. These are out of scope and remain untested:
 8. **Liveness is bound-limited.** `NoLeakForever` is checked on stage-2 bounds with `MaxRound=2`.
    The temporal-property counterexample is a round-cap lasso (GC exhausted its round budget before
    reclaiming the candidate), not a genuine leak; see `CaIncarnationCore_RESULTS.md`.
+9. **B91 stage-6 reductions.** One model shard = one namespace (`root_shards > 1` per namespace is
+   not modeled — the implementation fences namespaces × all shards uniformly). Registry × split-brain
+   and registry × evidence-staleness combined configs are not run (state space); each amendment is
+   checked against the full single-leader round machinery. The retire view's hit check reads the
+   LIVE `retired` set, weaker than the implementation's frozen LIST snapshot (the model explores
+   MORE writer-hostile states — conservative direction).
 
 ## Results {#results}
 

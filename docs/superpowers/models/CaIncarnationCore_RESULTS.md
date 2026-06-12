@@ -14,6 +14,79 @@ This is **bounded model checking**: `TLC` exhaustively explored every interleavi
 bounds per stage. A clean run is strong evidence of safety within those bounds, **not** a proof for
 unbounded tokens/writers/shards/rounds.
 
+## B91 refresh (2026-06-12) — amended protocol, full re-run {#b91-refresh}
+
+The model was refreshed onto the 2026-06-12 protocol amendments (namespace registry + manifest
+creation; evidence staleness) and the ENTIRE suite re-run. The historical tables below record the
+original runs; this section is authoritative for the current model.
+
+**Semantic changes** (all flag-gated; old configs keep identical reachable behavior — stage-1's
+pre-edit re-run reproduced its 24,744,564 distinct states bit-for-bit before `ViewableRound`
+landed):
+
+- `EnableRegistry`: `reg` bundle (registered set, manifest-exists flags, registry fence,
+  REGISTRATION-TIME floors, per-leader fence universe), `WRegister`, `GFenceRegistry` (ends the
+  round's retiring; captures the FENCE-TIME universe), `GFenceShard` minting + universe-bound,
+  `WPublish` floor `PubFloor = max(man.fence, reg.floor)`, `INV_MAN_EXISTS`.
+- `EnableEvStale`: `wEv` evidence with recorded view round, `WEvObserve` re-observation, `EvOK`
+  gate (no hash hit + fresh), dep-set `TreeDepsOK` (no global presence oracle), `WEvidence`
+  requires reachability (live-root is literal).
+- `ViewableRound` (unconditional): a view refresh claims round R only after R's retiring ended —
+  the implementation's `gc/state.round` coverage property. Shrinks all stage state counts.
+
+**Three fixes machine-derived during the refresh:**
+
+1. **C++ fence-universe hole** (commit `724eb5363ff`): `Gc::fence` fenced the FOLD-TIME registry
+   universe; a namespace registered between the fold's registry read and the registry-fence CAS
+   fell between both horns. Fixed to the committed registry-fence universe;
+   `sab_foldtimeuniverse` is this exact hole as a permanent negative control.
+2. **Model ordering, implementation-faithful**: the registry fence must END the round's retiring
+   (R2 strictly before R3 step 0) and view rounds must carry the coverage property
+   (`ViewableRound`) — both found as TLC counterexamples against the first model draft, both
+   already true of the C++ (sequential round; `gc/state.round` advances at R2's CAS).
+3. **C++ blind `adoptTree`** (commit `a247e29c125`): whole-root adoption recorded tokenless
+   evidence without observing the object — a reclaimed detached tree could be re-attached as a
+   dangling ref past every gate. Fixed to cold-reuse (`observeAndAdmit`); spec `W-EVIDENCE` SCOPE
+   amended.
+
+**Re-run ledger (2026-06-12, all queues exhausted on PASS):**
+
+| Config | Result | Distinct states | Wall |
+|---|---|---|---|
+| `stage1` | **PASS** | 20,931,058 | 1min 08s |
+| `stage2` | **PASS** | 155,142 | 2s |
+| `stage3` | **PASS** | 52,770,710 | 3min 41s |
+| `stage4_small` | **PASS** | 16,844,184 | 55s |
+| `stage4_journaltree` | **PASS** | 35,576,464 | 1min 49s |
+| `stage5_small` | **PASS** | 64,359,811 | 3min 29s |
+| `reval_stage2` | **PASS** | 155,142 | 1s |
+| `stage6_registry` (new) | **PASS** (incl. `INV_MAN_EXISTS`) | 3,700,390 | 12s |
+| `stage6_evstale` (new) | **PASS** | 10,143,569 | 36s |
+| `stage2_live` | bound-artifact lasso (expected, unchanged class) | 78,761 | 3s |
+| `sab_nofence` | counterexample `INV_NO_DANGLE` ✓ | 32,014 | 1s |
+| `sab_norecheckfold` | counterexample `INV_NO_DANGLE` ✓ | 57,108 | 1s |
+| `sab_noretireview` | counterexample `INV_NO_DANGLE` ✓ | 159,414 | 1s |
+| `sab_unconddelete` | counterexample `INV_NO_DANGLE` ✓ | 28,957 | 1s |
+| `sab_reusedtag` | counterexample `INV_NO_RETURN` ✓ | 5,997 | 0s |
+| `sab_cascade` | counterexample `INV_NO_LOSS` ✓ | 38,719,755 | 2min 22s |
+| `sab_cutoverclaim` | counterexample `INV_NO_DANGLE` ✓ | 793,197 | 2s |
+| `sab_noreobserve` | counterexample `INV_NO_DANGLE` ✓ | 28,777 | 0s |
+| `sab_noregistry` (new) | counterexample `INV_NO_DANGLE` ✓ | 36,347 | 0s |
+| `sab_foldtimeuniverse` (new) | counterexample `INV_NO_DANGLE` ✓ | 29,911 | 0s |
+| `sab_noevreobserve` (new) | counterexample `INV_NO_LOSS` ✓ | 626,806 | 2s |
+
+State counts shrink vs the historical tables because `ViewableRound` prunes unimplementable early
+views (a refresh during a round's retiring no longer claims that round). The
+`sab_foldtimeuniverse` trace reproduces the C++ hole shape exactly: `WRegister` lands between
+`GStartRound`'s (sabotaged) universe capture and `GFenceRegistry`; the late namespace's publish is
+never fenced or recheck-folded and the exact-token delete dangles its ref.
+
+**B91 residuals:** registry × split-brain and registry × evidence combined configs not run (state
+space); one model shard = one namespace (per-namespace `root_shards > 1` not modeled); the model's
+hit checks read the live `retired` set, weaker than the implementation's frozen LIST snapshot
+(conservative direction); `CaIncarnationProofCore.tla` (Apalache induction) predates the
+amendments and is STALE until re-derived.
+
 ## PASS stages {#pass-stages}
 
 Stage 4 was split into two companion configs (the full `stage4.cfg` exceeds the time budget at any

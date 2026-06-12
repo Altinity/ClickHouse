@@ -306,6 +306,16 @@ W-EVIDENCE      a tokenless (live-root-evidence) member is publishable iff its h
                 present ⇒ resolve to the current token (adopt or resurrect); absent ⇒ re-create or
                 abort retryably — never publish a dangling reference. The "no source-root
                 revalidation" economy holds only within one fence/recheck round window.
+                SCOPE (amended 2026-06-12, model-discovered): tokenless evidence is permitted ONLY
+                for members the writer WITNESSED as pinned — children carried forward from a source
+                tree the writer actually read via a live root (the read is the observation; the live
+                source pins them for the round window). Whole-object adoption of a root that nothing
+                is known to pin (FREEZE, detached re-attach, replication relink) is a COLD REUSE,
+                never blind evidence: one HEAD at adopt time, recording a token-bearing member
+                (absent ⇒ fail closed; condemned ⇒ resurrect). Blind root evidence is a dangle: a
+                detached tree reclaimed by a COMPLETED round has no view hit (entries dropped on
+                outcomes), and a view already at the current round triggers neither the re-observation
+                above nor a fence refresh — nothing would catch the dead reference.
 W-PUBLISH-GATE  the publish CAS is valid only if: retire_view_round ≥ manifest.fence_round, AND no
                 dependency-set member is condemned in that view, AND the writer's own heartbeat renewal is
                 recent by its own clock (local sanity bound — liveness, never the safety argument).
@@ -425,8 +435,14 @@ R2 RETIRE   per candidate: one HEAD observes the current token; append {kind, ha
             token_type, size} durably to gc/retired/<R>.<fence_seq>/<shard>. Retired ≠ dead: it is the
             writer-facing "resurrect, don't reuse" barrier.
 R3 FENCE    CAS the namespace registry (fence_round := R, monotone), then CAS EVERY root shard of
-            EVERY registered namespace: fence_round := R (monotone max), MINTING a fence-only
-            manifest (create-if-absent CAS) for absent shards — the create race against a first
+            EVERY namespace in the registry AS DECODED BY THE COMMITTED REGISTRY-FENCE CAS — the
+            FENCE-TIME universe, never the fold-time one. The registry is CAS-append-only, so
+            fence-time ⊇ fold-time; a namespace registered between the fold's registry read and
+            the registry-fence CAS would otherwise fall between the two horns (below the registry
+            fence ⇒ its writer observes no floor; absent from the fold-time universe ⇒ its shards
+            never fenced or recheck-folded — a dangle window; found and fixed 2026-06-12). Per
+            shard: fence_round := R (monotone max), MINTING a fence-only manifest
+            (create-if-absent CAS) for absent shards — the create race against a first
             publish is the required total order; record fence_version[R][shard] (and the registry's
             version) in gc/state. One fence covers the whole round's candidate set. Discovery (R1)
             reads the registry, never LIST. (amended 2026-06-12)
@@ -681,6 +697,25 @@ machine-checked F1 witness: removing the `W-REVALIDATE` re-observation conjunct 
 allows a stale dep on a deleted object to pass the gate and publish. The induction covers all states
 at fixed constants (unbounded depth, bounded constants); constant-parametric generality is TLAPS
 territory, for which `IndInv` and the CTI journal are the prepared input.
+
+**B91 refresh (2026-06-12) — the model brought onto the amended protocol.** Two new flag-gated
+stages: `EnableRegistry` (namespace registry + manifest creation: `W-REGISTER`, the R3 registry
+fence ending the round's retiring, FENCE-TIME shard universe, absent-manifest minting,
+registration-time gate floors) and `EnableEvStale` (evidence staleness: tokenless evidence carries
+its recording view round; stale members must be re-observed; tree children validated through the
+writer's OWN dependency set instead of a global presence oracle). Three new negative controls, all
+counterexample-confirmed: `sab_noregistry` (skip `W-REGISTER` ⇒ dangle), `sab_foldtimeuniverse`
+(fence the fold-time universe — the exact C++ hole fixed 2026-06-12 ⇒ dangle), `sab_noevreobserve`
+(admit stale evidence ⇒ the Task-9 dangle). The refresh machine-derived THREE fixes: (1) the C++
+fence-universe hole (`Gc::fence` iterated the fold-time registry; fixed to the committed
+registry-fence universe); (2) the view-round COVERAGE PROPERTY — a view "at round R" must see ALL
+round-R retire entries, which holds in the implementation (`gc/state.round` advances at R2
+completion) and is now modeled (`ViewableRound`), and which forces the registry fence to END the
+round's retiring; (3) blind `adoptTree` evidence was a dangle (whole-root adoption is now a COLD
+REUSE — see `W-EVIDENCE` SCOPE above). All prior stages re-run green under the refreshed semantics
+(state counts shrink — `ViewableRound` prunes unimplementable early views); all 12 sabotage
+controls fire. Residuals: registry × split-brain and registry × evidence combined configs are not
+run (state space); `CaIncarnationProofCore.tla` (Apalache) predates the amendments and is stale.
 
 ## 13. Open items and integration deltas {#open-items}
 
