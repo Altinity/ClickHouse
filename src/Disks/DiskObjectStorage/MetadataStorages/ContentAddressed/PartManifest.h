@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
 #include <array>
 #include <cstdint>
 #include <map>
@@ -10,46 +11,6 @@
 namespace DB::ContentAddressed
 {
 
-/// The canonical set of MUTABLE per-part files: files whose bytes differ between two parts that are
-/// otherwise byte-identical in their column data (so they MUST NOT contribute to the part identity,
-/// and MUST NOT be shared through the content-addressed manifest). This is the single source of
-/// truth: computePartId excludes exactly this set from the part_id, and ContentAddressedTransaction
-/// stores exactly this set in the per-ref sidecar instead of the manifest. Keeping one constant here
-/// makes "excluded from identity" and "stored per-ref" the same concept by construction (B23).
-inline constexpr std::array<std::string_view, 3> kMutablePerPartFiles{
-    "uuid.txt", "txn_version.txt", "metadata_version.txt"};
-
-/// The canonical mutable-per-part-file set (see kMutablePerPartFiles).
-constexpr const std::array<std::string_view, 3> & mutablePerPartFiles()
-{
-    return kMutablePerPartFiles;
-}
-
-/// True iff file is a mutable per-part file (see kMutablePerPartFiles). The ONE predicate shared by
-/// computePartId (exclude from identity) and the transaction/read path (route to the per-ref sidecar).
-///
-/// The match is on the LAST path component (basename), not the whole string: a part-relative file is
-/// usually a bare name (e.g. `metadata_version.txt`), but a DETACHED part carries its files under a
-/// `<detached_part>/` prefix inside the shared `detached` ref (e.g. `attaching_all_0_0_0/metadata_version.txt`,
-/// B36/B46). Both must route to the per-ref sidecar; matching only the bare string left the prefixed
-/// detached form unrecognized, so loading the detached part's `metadata_version.txt` (the on-fly RENAME
-/// COLUMN reconciliation on ATTACH) fell back to the table's current version and skipped the rename (B62).
-constexpr bool isMutablePerPartFile(std::string_view file)
-{
-    const auto slash = file.rfind('/');
-    const std::string_view basename = (slash == std::string_view::npos) ? file : file.substr(slash + 1);
-    /// The atomic write of a mutable per-part file goes via a sibling tmp (e.g. txn_version.txt.tmp,
-    /// VersionMetadataOnDisk). Treat that tmp as mutable too, so it stages inline in the per-ref sidecar
-    /// instead of content-addressing into the manifest — otherwise a standalone autocommit write of the
-    /// tmp on an already-committed part would republish the part with a one-file manifest (data loss).
-    std::string_view stem = basename;
-    if (stem.ends_with(".tmp"))
-        stem = stem.substr(0, stem.size() - 4);
-    for (const auto & name : kMutablePerPartFiles)
-        if (basename == name || stem == name)
-            return true;
-    return false;
-}
 
 struct BlobEntry
 {

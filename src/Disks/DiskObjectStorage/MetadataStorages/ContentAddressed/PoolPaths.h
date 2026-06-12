@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -139,15 +140,7 @@ RefObjectKey shadowRefKey(const std::string & key_prefix, const std::string & sh
 RefMetaObjectKey shadowRefMetaKey(const std::string & key_prefix, const std::string & shadow_table_dir, const std::string & part_name);
 RefMetaObjectKey shadowRefMutableFileKey(const std::string & key_prefix, const std::string & shadow_table_dir, const std::string & part_name, const std::string & file);
 
-// The literal first path component reserved for FREEZE snapshots (mirrors kDetachedDirName).
-inline constexpr std::string_view kShadowDirName = "shadow";
 
-// True iff the disk-relative path's FIRST component is the reserved FREEZE shadow root (kShadowDirName),
-// i.e. the path lives in the shadow snapshot namespace (shadow/<backup>/store/<uuid[:3]>/<uuid>/…). Used
-// to route shadow reads/lists/existence/removal to the shadow ref-set BEFORE the live-table-dir branch
-// (a shadow table dir also satisfies parseTableUuid and would otherwise be mis-routed to the live refs
-// prefix). Leading slashes are ignored.
-bool isShadowPath(const std::string & path);
 
 // The suffix that distinguishes a per-ref sidecar object from a ref object under the SAME refs/
 // prefix. Every enumerator that treats a key under refsPrefix as a ref (the table-dir listing,
@@ -155,20 +148,7 @@ bool isShadowPath(const std::string & path);
 // is not a ref and its payload is a RefSidecar, not a part id.
 inline constexpr std::string_view kRefMetaSuffix = ".meta";
 
-// The MergeTree detached-parts namespace. A part-dir component equal to this name is not a real part
-// but a container of detached part directories (detached/<detached_part>/<file>); the listing must
-// yield the detached part directory names, not the files inside (B36). Mirrors
-// MergeTreeData::DETACHED_DIR_NAME (kept here to avoid a Storages dependency from the disk layer).
-inline constexpr std::string_view kDetachedDirName = "detached";
 
-// The non-replicated deduplication-log namespace. A MergeTree with non_replicated_deduplication_window
-// writes an on-disk log at <table>/deduplication_logs/deduplication_log_N.txt. In the Atomic layout the
-// path <uuid>/deduplication_logs/<file> is structurally indistinguishable from a part file
-// <uuid>/<part>/<file>, so this directory name is RESERVED: a component equal to it (directly under the
-// table dir) is never a part dir — its contents are table-level verbatim files under the files/
-// namespace. ClickHouse part names never take this form (they end in numeric min_max_level groups), so
-// reserving the name cannot shadow a real part. Mirrors how kDetachedDirName reserves "detached".
-inline constexpr std::string_view kDeduplicationLogsDirName = "deduplication_logs";
 
 // True iff key (a key under some refsPrefix) is a per-ref sidecar rather than a ref object.
 bool isRefMetaKey(const std::string & key);
@@ -232,54 +212,5 @@ std::string gcLockKey(const std::string & key_prefix);
 // addressing, no ref, no manifest) using the same empty-prefix-safe join as every other key builder.
 std::string diskFileKey(const std::string & key_prefix, const std::string & path);
 
-struct PartFilePath
-{
-    std::string table_uuid;
-    std::string part_name;
-    std::string file; /// empty when the path is a part directory
-    /// Set to the backup name when the path is a FREEZE target shadow/<backup_name>/…/<part>[/<file>].
-    /// Empty for a normal live-part path. The frozen ref then lives in the shadow/ namespace
-    /// (shadowRefKey) rather than the live store/.../refs/ location, so a freeze never clobbers the
-    /// live part's ref (the shadow ref is also an independent GC root).
-    std::string backup_name;
-    /// Set (alongside backup_name) when the path is a FREEZE target: the LITERAL shadow table dir under
-    /// the disk root excluding the part and file, i.e. the joined components [0 .. part_idx-1]
-    /// (shadow/<backup>/store/<uuid[:3]>/<uuid>). The shadow ref-family keys mirror the physical store
-    /// tree under this dir (shadowRefsPrefix), so the enumeration's intermediate levels resolve via the
-    /// same generic child-derivation as the live table dir. Empty for a normal live-part path.
-    std::string shadow_table_dir;
-};
-
-// Parse a disk-relative ClickHouse path <uuid[:3]>/<uuid>/<part>[/<file>].
-// Returns nullopt if the path is the table dir or shallower (fewer than 3 components).
-std::optional<PartFilePath> parsePartFilePath(const std::string & path);
-
-// Returns the table_uuid iff path is exactly the table dir <uuid[:3]>/<uuid>[/] (2 components).
-std::optional<std::string> parseTableUuid(const std::string & path);
-
-// True iff the path's LAST two components form an Atomic-style <uuid[:3]>/<uuid> pair (the 3-char
-// prefix component immediately followed by the matching uuid, with nothing after it). Unlike
-// parseTableUuid this does NOT accept the non-Atomic fallback (any 2+-component dir): it is the strict
-// "this dir IS a uuid-anchored table dir" predicate the shadow router uses to tell a shadow TABLE dir
-// (shadow/<backup>/store/<uuid[:3]>/<uuid>) apart from a shadow INTERMEDIATE dir (shadow/<backup>,
-// shadow/<backup>/store, shadow/<backup>/store/<uuid[:3]>), which parseTableUuid would mis-accept.
-bool endsWithTableUuidPair(const std::string & path);
-
-// True iff the path addresses a file inside a part dir, i.e. <uuid[:3]>/<uuid>/<part>/<file>
-// (4+ components, non-empty file). These are content-addressed (ref + manifest + blob). Everything
-// else handled by writeFile / file reads (e.g. <uuid[:3]>/<uuid>/format_version.txt, 3 components)
-// is a non-part / table-level file handled by plain passthrough.
-bool isPartFilePath(const std::string & path);
-
-struct TableFilePath
-{
-    std::string table_uuid;
-    std::string tail; /// path beyond the table dir <uuid[:3]>/<uuid>/
-};
-
-// Parse a non-part / table-level file path: <uuid[:3]>/<uuid>/<tail...> where <tail...> is not a
-// single part-dir-shaped component path. Returns nullopt if the path is shallower than the table
-// dir, or if it is a part-file path (use isPartFilePath / parsePartFilePath for those).
-std::optional<TableFilePath> parseTableFilePath(const std::string & path);
 
 }

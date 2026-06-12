@@ -221,9 +221,9 @@ TEST(ContentAddressedMutablePerPartFile, PredicateMatchesPartIdExclusion)
 
     // The set is derived from one shared constant: assert the predicate agrees with the part-id
     // exclusion for every name in the canonical list (single source of truth).
-    for (const auto & name : mutablePerPartFiles())
+    for (const auto & name : kMutablePerPartFiles)
         EXPECT_TRUE(isMutablePerPartFile(name)) << name;
-    EXPECT_EQ(mutablePerPartFiles().size(), 3u);
+    EXPECT_EQ(kMutablePerPartFiles.size(), 3u);
 }
 
 // B23 Task 1: the per-ref sidecar is a tiny versioned {filename -> bytes} blob. Round-trip preserves
