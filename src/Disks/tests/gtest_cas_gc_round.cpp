@@ -1212,9 +1212,8 @@ TEST(CasGcFence, FenceCasConflictRetriesAndRecordsFinalCommit)
     /// Horn 1 retry semantics, pinned mechanically: an injected one-shot Conflict on the fence's
     /// manifest CAS forces mutateShard's re-read + retry on the FRESH manifest; the fence still
     /// lands and the recorded fence_version reflects the FINAL commit. (The TRUE interleaved horn -
-    /// a real publish committing between the fence's read and CAS, whose journal record must land
-    /// at a version BELOW the fence's committed version - needs interleaving and is Task 13's
-    /// fault-injection battery.)
+    /// a real publish committing in the fence window, folded by the recheck and SPARED - is pinned
+    /// mechanically by CasGcRecheck.SparedWhenPublishRacesTheFence via the on-fence hook.)
     auto b = std::make_shared<CaptureStateBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     publishPart(s, "srv1/tbl", "part_1", "payload-1");
