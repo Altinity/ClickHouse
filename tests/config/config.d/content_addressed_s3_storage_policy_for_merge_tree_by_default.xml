@@ -5,8 +5,12 @@
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
                 <metadata_type>content_addressed</metadata_type>
-                <!-- minio: port 11111, bucket `test`, a dedicated key prefix for this disk. -->
-                <endpoint>http://localhost:11111/test/content_addressed_s3/</endpoint>
+                <!-- RustFS (M-W D-W8): the CA pool needs ENFORCED conditional ops (exact-token
+                     DELETE must 412 on mismatch) - MinIO OSS silently ignores If-Match on DELETE
+                     and the fail-closed capability probe rejects it. RustFS runs on a dedicated
+                     port (11121); MinIO keeps serving the non-CA s3 disks. Bucket `test`, a
+                     dedicated key prefix for this disk. -->
+                <endpoint>http://localhost:11121/test/content_addressed_s3/</endpoint>
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
                 <!-- Real server-local scratch dir for the write-buffer spill. -->

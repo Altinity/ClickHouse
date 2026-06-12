@@ -165,14 +165,26 @@ void ContentAddressedMetadataStorage::startup()
     /// path). Native passes keys through, so the configured prefix is used as-is (for S3 it
     /// already embeds the endpoint sub-path).
     String pool_prefix = storage_path_prefix;
+    /// The configured prefix is an endpoint sub-path and usually carries a TRAILING slash
+    /// ("content_addressed_s3/"); Cas::Layout joins components with '/', and a doubled slash in
+    /// keys is backend-hostile (RustFS rejects "p//_probe" LIST prefixes with InvalidArgument -
+    /// T13 finding; MinIO and the emulation merely tolerated it).
+    while (!pool_prefix.empty() && pool_prefix.back() == '/')
+        pool_prefix.pop_back();
     if (mode == Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess)
     {
         physical_key_prefix = object_storage->getCommonKeyPrefix();
-        if (!physical_key_prefix.empty() && pool_prefix.starts_with(physical_key_prefix))
+        /// Slash-tolerant strip: the common prefix usually ends with '/', the pool prefix was
+        /// just trimmed of trailing slashes - compare canonical forms.
+        String common_trimmed = physical_key_prefix;
+        while (!common_trimmed.empty() && common_trimmed.back() == '/')
+            common_trimmed.pop_back();
+        if (!common_trimmed.empty())
         {
-            pool_prefix = pool_prefix.substr(physical_key_prefix.size());
-            while (!pool_prefix.empty() && pool_prefix.front() == '/')
-                pool_prefix.erase(pool_prefix.begin());
+            if (pool_prefix == common_trimmed)
+                pool_prefix.clear();
+            else if (pool_prefix.starts_with(common_trimmed + "/"))
+                pool_prefix = pool_prefix.substr(common_trimmed.size() + 1);
         }
         if (pool_prefix.empty())
             pool_prefix = "ca";

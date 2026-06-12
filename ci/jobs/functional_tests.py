@@ -566,19 +566,13 @@ def main():
         def start():
             res = CH.start_minio(test_type="stateless") and CH.start_azurite()
             if res and is_content_addressed_s3:
-                # The content-addressed-over-S3 pool (incl. its _pool_meta ownership
-                # marker) persists in the minio bucket at test/content_addressed_s3/.
-                # ServerUUID is regenerated each run, so a stale-owned pool would lock
-                # the fresh server out (`claimPoolOwnership` -> Code: 344 "already owned
-                # by another mounter"). Local-CA never hits this because its pool lives
-                # under the per-run server store that is wiped each run; the bucket-prefix
-                # wipe below is the S3 analogue. Done AFTER minio is up and the bucket
-                # exists (start_minio returned True) and BEFORE the server starts.
-                print("Resetting content_addressed_s3 pool prefix in minio bucket")
-                Shell.check(
-                    "/mc rm --recursive --force clickminio/test/content_addressed_s3/ 2>/dev/null ||:",
-                    verbose=True,
-                )
+                # The CA-over-S3 pool lives on RustFS (M-W D-W8): the incarnation pool
+                # needs ENFORCED conditional deletes, which MinIO OSS lacks (the
+                # fail-closed capability probe rejects it). start_rustfs wipes its data
+                # dir per run, so no pool state bleeds between runs (the local-CA
+                # analogue is the per-run server-store wipe). MinIO keeps the non-CA
+                # s3 disks.
+                res = CH.start_rustfs()
             res = res and CH.start()
             res = res and CH.wait_ready()
             if res:

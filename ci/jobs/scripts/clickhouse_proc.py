@@ -163,6 +163,45 @@ class ClickHouseProc:
         print("Failed to start minio")
         return False
 
+    def start_rustfs(self):
+        # RustFS backs the content-addressed-over-S3 pool (M-W D-W8): the incarnation pool needs
+        # ENFORCED conditional operations (a wrong-token DELETE must fail with 412), which MinIO
+        # OSS lacks - the CA disk's fail-closed capability probe rejects it. The static binary
+        # lives at ci/tmp/rustfs (extracted from rustfs/rustfs:1.0.0-beta.8); the data dir is
+        # wiped per run so no pool state bleeds between runs. MinIO keeps serving the non-CA s3
+        # disks on its own port.
+        rustfs_bin = f"{temp_dir}/rustfs"
+        if not Path(rustfs_bin).is_file():
+            print(f"rustfs binary not found at {rustfs_bin}")
+            return False
+        data_dir = f"{temp_dir}/rustfs_data"
+        Shell.check(f"rm -rf {data_dir} && mkdir -p {data_dir}", verbose=True)
+        command = (
+            f"{rustfs_bin} server --address 0.0.0.0:11121 "
+            f"--access-key clickhouse --secret-key clickhouse {data_dir}"
+        )
+        with open(f"{temp_dir}/rustfs.log", "w") as log_file:
+            self.rustfs_proc = subprocess.Popen(
+                command, stdout=log_file, stderr=subprocess.STDOUT, shell=True
+            )
+        print(f"Started rustfs asynchronously with PID {self.rustfs_proc.pid}")
+
+        if not Shell.check(
+            "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:11121/ | grep -qE '403|200'",
+            verbose=False,
+            retries=6,
+        ):
+            print("Failed to start rustfs")
+            return False
+        # The `test` bucket the storage policy expects.
+        res = Shell.check(
+            "/mc alias set carustfs http://localhost:11121 clickhouse clickhouse && /mc mb --ignore-existing carustfs/test",
+            verbose=True,
+        )
+        if not res:
+            print("Failed to create rustfs test bucket")
+        return res
+
     def start_azurite(self):
         # Raise the open files limit before launching azurite-rs.
         # Each concurrent test query opens a TCP connection plus an in-memory
