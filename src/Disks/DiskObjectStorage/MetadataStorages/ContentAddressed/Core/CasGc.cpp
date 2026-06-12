@@ -87,8 +87,48 @@ RoundReport Gc::runRegularRound()
     /// retired sets on their confirmed outcomes.
     cascadeAndPersist(state, state_token, folded.snap, rechecked, retired, report);
 
-    /// Tasks 11-12: trim / resume
+    /// Journal trim - the round's maintenance tail (cursors are durable; INV-JOURNAL-COVERAGE).
+    trim(state, folded.root_shards);
+
+    /// Task 12: resume
     return report;
+}
+
+void Gc::trim(const GcState & state,
+              const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards)
+{
+    for (const auto & [ns, shard] : root_shards)
+    {
+        const String cursor_key = ns.string() + "/" + std::to_string(shard);
+        const auto cursor_it = state.folded_cursor.find(cursor_key);
+        if (cursor_it == state.folded_cursor.end())
+            continue;
+        const uint64_t cursor = cursor_it->second;
+
+        /// Touch the manifest only when there is something to trim (a peek first - the CAS loop
+        /// re-reads anyway, but a per-round no-op version bump on every shard would be noise).
+        const auto [root, manifest_token] = store->readShard(ns, shard);
+        bool has_trimmable = false;
+        for (const JournalRecord & record : root.journal)
+            if (record.at_version <= cursor)
+            {
+                has_trimmable = true;
+                break;
+            }
+        if (!has_trimmable)
+            continue;
+
+        store->mutateShard(ns, shard, [&](RootShard & fresh)
+        {
+            /// INV-JOURNAL-COVERAGE: only records at or below the DURABLE cursor may go - they are
+            /// provably incorporated into the durable snap generation. Records above the cursor
+            /// (a publish racing this very trim included - mutateShard re-reads per attempt) stay.
+            std::erase_if(fresh.journal, [&](const JournalRecord & record)
+            {
+                return record.at_version <= cursor;
+            });
+        });
+    }
 }
 
 Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> & snap,

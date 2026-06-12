@@ -195,6 +195,15 @@ private:
                            const RecheckResult & rechecked,
                            const std::map<uint64_t, RetiredSet> & retired, RoundReport & report);
 
+    /// Journal trim (INV-JOURNAL-COVERAGE): drop journal records with at_version <= the DURABLE
+    /// folded_cursor (the cascade CAS advanced it to the fence versions before this runs). A
+    /// manifest CAS may trim records ONLY after the corresponding cursor advance is durable -
+    /// "compact the manifest for size" is never a reason to trim. Shards with nothing to trim are
+    /// not touched (no pointless version bumps). The trim's own CAS bumps shard_version with no
+    /// journal record - vacuously covered, same argument as the fence bump.
+    void trim(const GcState & state,
+              const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards);
+
     /// Fold one root shard's journal records with at_version in (lo, hi] into `snap` — the shared
     /// R1/R4 record semantics: last-op-wins root edges, once-per-tree expansion with the
     /// displaced-later lookahead, Remove drops the root edge. Returns the nodes that transitioned

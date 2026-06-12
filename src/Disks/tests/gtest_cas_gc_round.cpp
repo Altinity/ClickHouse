@@ -801,7 +801,7 @@ public:
     CasOutcome casPut(const String & key, const String & bytes,
                       const std::optional<Token> & expected, Token * out_token = nullptr) override
     {
-        if (!fired && key == armed_key)
+        if (!fired && key == armed_key && ++count == fire_at)
         {
             fired = true;
             hook();
@@ -811,14 +811,25 @@ public:
 
     void armOnCasPut(String key, std::function<void()> hook_)
     {
+        armOnNthCasPut(std::move(key), 1, std::move(hook_));
+    }
+
+    /// Fire just before the nth casPut to the key lands (per-round casPut order on a shard key:
+    /// fence = 1st, trim = 2nd when the shard has trimmable records).
+    void armOnNthCasPut(String key, size_t nth, std::function<void()> hook_)
+    {
         armed_key = std::move(key);
         hook = std::move(hook_);
+        fire_at = nth;
+        count = 0;
         fired = false;
     }
 
 private:
     String armed_key;
     std::function<void()> hook;
+    size_t fire_at = 1;
+    size_t count = 0;
     bool fired = true;
 };
 
@@ -1044,7 +1055,10 @@ TEST(CasGcFence, FencesAllShardsMintingAbsentOnes)
         EXPECT_EQ(root.fence_round, 1u);
         const String key = "srv1/tbl/" + std::to_string(shard);
         ASSERT_TRUE(st.fence_version.at(1).contains(key)) << key;
-        EXPECT_EQ(root.shard_version, st.fence_version.at(1).at(key));   /// the fence's own commit
+        /// post-round version >= the fence commit (the trim may bump once more on shards that had
+        /// journal records); the captured fence_version is the recheck's fold-through point.
+        EXPECT_GE(root.shard_version, st.fence_version.at(1).at(key));
+        EXPECT_LE(root.shard_version, st.fence_version.at(1).at(key) + 1);
         /// a MINTED manifest (the fence's create was its first commit) is fence-only:
         if (root.shard_version == 1)
         {
@@ -1143,7 +1157,10 @@ TEST(CasGcFence, MonotoneNeverLowers)
     const GcState st1 = decodeGcState(*b->captured);
     const String key = "srv1/tbl/" + std::to_string(shardOfForTest("part_1", s->poolMeta().root_shards));
     ASSERT_TRUE(st1.fence_version.contains(1));
-    EXPECT_EQ(st1.fence_version.at(1).at(key), after1.shard_version);
+    /// the recorded version is the fence's own commit; the post-round manifest may be one above it
+    /// (the trim's bump on a shard that had journal records).
+    EXPECT_GE(after1.shard_version, st1.fence_version.at(1).at(key));
+    EXPECT_LE(after1.shard_version, st1.fence_version.at(1).at(key) + 1);
 
     /// rounds 2..5 keep absorbing into 5; round 6 raises it:
     for (int i = 0; i < 5; ++i)
@@ -1180,10 +1197,13 @@ TEST(CasGcFence, FenceBumpAppendsNoJournalRecord)
         const RootShard after = decodeRootShard(
             b->get(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard))->bytes);
         EXPECT_EQ(after.fence_round, 1u);
-        EXPECT_EQ(after.shard_version, before.shard_version + 1);    /// exactly the fence's bump
-        ASSERT_EQ(after.journal.size(), before.journal.size());      /// no fence record appended
+        /// fence bump (+1) and, on shards that had records, the trim's bump (+1) - and NEITHER
+        /// appended a journal record: every surviving record predates the round (none here - the
+        /// trim dropped all records at or below the durable cursor).
+        EXPECT_EQ(after.shard_version, before.shard_version + 2);
+        EXPECT_TRUE(after.journal.empty());
         for (const JournalRecord & record : after.journal)
-            EXPECT_LE(record.at_version, before.shard_version);      /// trim math unaffected
+            EXPECT_LE(record.at_version, before.shard_version);      /// no round-minted records
     }
 }
 
@@ -1209,8 +1229,9 @@ TEST(CasGcFence, FenceCasConflictRetriesAndRecordsFinalCommit)
 
     const RootShard root = decodeRootShard(b->get(shard_key)->bytes);
     EXPECT_EQ(root.fence_round, 1u);                             /// the fence landed despite the conflict
-    EXPECT_EQ(root.shard_version, 2u);                           /// publish = 1; the conflicted attempt
-                                                                 /// committed nothing; the retry = 2
+    EXPECT_EQ(root.shard_version, 3u);                           /// publish = 1; the conflicted attempt
+                                                                 /// committed nothing; the fence retry
+                                                                 /// = 2; the trim = 3
     ASSERT_TRUE(b->captured.has_value());
     const GcState st = decodeGcState(*b->captured);
     ASSERT_TRUE(st.fence_version.contains(1));
@@ -1377,4 +1398,66 @@ TEST(CasGcCascade, RecreateAfterDeletionRefoldsAfterStrip)
     /// and a further idle round stays empty (the dead-then-recreated subgraph is stable):
     const RoundReport rep3 = gc.runRegularRound();
     EXPECT_EQ(rep3.candidates + rep3.deleted, 0u);
+}
+
+TEST(CasGcTrim, DropsRecordsAtOrBelowTheDurableCursor)
+{
+    /// INV-JOURNAL-COVERAGE end-to-end: after a round, every record the durable cursor covers is
+    /// gone from the manifest journal; refs are untouched; only the GC's recordless version bumps
+    /// remain on top.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");        /// Add at v1
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");          /// Remove at v2
+    publishPart(s, "srv1/tbl", "part_keep", "payload-2");     /// Add at v1 of ITS shard
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    for (uint64_t shard = 0; shard < s->poolMeta().root_shards; ++shard)
+    {
+        const RootShard root = decodeRootShard(
+            b->get(s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard))->bytes);
+        EXPECT_TRUE(root.journal.empty()) << "shard " << shard;   /// every record was folded => trimmed
+    }
+    /// refs untouched by the trim:
+    EXPECT_TRUE(s->resolveRef(RootNamespace{"srv1/tbl"}, "part_keep").has_value());
+    EXPECT_FALSE(s->resolveRef(RootNamespace{"srv1/tbl"}, "part_1").has_value());
+}
+
+TEST(CasGcTrim, RecordAboveTheCursorSurvives)
+{
+    /// THE BOUNDARY, mechanically: a publish landing between the cascade's cursor CAS and the trim
+    /// puts a record ABOVE the durable cursor - the trim's own CAS conflicts, re-reads, and must
+    /// retain exactly that record while dropping the covered ones. (Trimming it would violate
+    /// INV-JOURNAL-COVERAGE: the durable snap does not incorporate it yet.)
+    auto b = std::make_shared<OnFenceHookBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    const String shard_key = s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard);
+    /// fire before the TRIM's casPut (the 2nd to this shard: fence = 1st):
+    b->armOnNthCasPut(shard_key, 2, [&]
+    {
+        const auto got = b->InMemoryBackend::get(shard_key);
+        ASSERT_TRUE(got.has_value());
+        RootShard root = decodeRootShard(got->bytes);
+        ++root.shard_version;
+        root.refs["late_part"] = RefPayload{.tree_id = u128Of("late-tree"), .tree_size = 0, .mutable_files = {}};
+        root.journal.push_back(JournalRecord{
+            .op = JournalRecord::Op::Add, .ref_name = "late_part",
+            .tree_id = u128Of("late-tree"), .at_version = root.shard_version});
+        ASSERT_EQ(b->InMemoryBackend::casPut(shard_key, encodeRootShard(root), got->token, nullptr),
+                  CasOutcome::Committed);
+    });
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const RootShard after = decodeRootShard(b->get(shard_key)->bytes);
+    ASSERT_EQ(after.journal.size(), 1u);                      /// the covered records dropped...
+    EXPECT_EQ(after.journal[0].ref_name, "late_part");        /// ...the uncovered one SURVIVED
+    EXPECT_TRUE(after.refs.contains("late_part"));
 }
