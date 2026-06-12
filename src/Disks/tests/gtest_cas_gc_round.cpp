@@ -1097,6 +1097,91 @@ TEST(CasGcFence, RegistryFencedAndRecorded)
     EXPECT_EQ(st.fence_version.at(1).at("_registry"), registry.registry_version);
 }
 
+/// CaptureStateBackend that additionally runs a one-shot hook just before the first casPut to the
+/// armed key (after arming) - the fence's registry CAS attempt. Used to land a namespace
+/// registration INSIDE the fence's registry-CAS window.
+class HookOnCasCaptureBackend : public CaptureStateBackend
+{
+public:
+    CasOutcome casPut(const String & key, const String & bytes,
+                      const std::optional<Token> & expected, Token * out_token = nullptr) override
+    {
+        if (!fired && key == hook_key)
+        {
+            fired = true;   /// before the hook - its own casPut on the same key must not re-fire
+            hook();
+        }
+        return CaptureStateBackend::casPut(key, bytes, expected, out_token);
+    }
+
+    void armHookOnCasPut(String key, std::function<void()> hook_)
+    {
+        hook_key = std::move(key);
+        hook = std::move(hook_);
+        fired = false;
+    }
+
+private:
+    String hook_key;
+    std::function<void()> hook;
+    bool fired = true;
+};
+
+TEST(CasGcFence, FenceUniverseIsFenceTimeRegistryNotFoldTime)
+{
+    /// THE FENCE-UNIVERSE HOLE (found designing the model's registry encoding, fixed 2026-06-12):
+    /// the shard-fence universe must come from the registry decoded in the COMMITTED registry-fence
+    /// attempt, never from the fold-time universe. A namespace registered in the window between the
+    /// fold's registry read and the registry-fence CAS falls between the two horns otherwise:
+    /// registered BELOW the registry fence, so its writer never observes a fence_round floor
+    /// (horn 2 misses), yet absent from the fold-time universe, so its shards are never minted or
+    /// fenced and the recheck never folds their journals (horn 1 misses) - a stale-view publish
+    /// into it could re-reference a condemned hash past the recheck and the exact-token delete
+    /// would dangle a live ref.
+    ///
+    /// Stage the registration exactly in that window: the hook fires just before the fence's
+    /// registry CAS attempt (the fold already read the registry), registers "late/ns" raw, and the
+    /// fence's CAS then conflicts, re-reads (now seeing "late/ns"), and commits - the committed
+    /// registry MUST be the universe the shard loop fences.
+    auto b = std::make_shared<HookOnCasCaptureBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    b->armCapture(s->layout().gcStateKey(), 5);                  /// pre-erase point (the recheck CAS)
+    b->armHookOnCasPut(s->layout().rootsRegistryKey(), [&]
+    {
+        DB::Cas::tests::registerNamespaceRaw(*b, s->layout(), RootNamespace{"late/ns"});
+    });
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    /// the committed registry carries both namespaces and the round's fence:
+    const auto got = b->get(s->layout().rootsRegistryKey());
+    ASSERT_TRUE(got.has_value());
+    const RootsRegistry registry = decodeRootsRegistry(got->bytes);
+    EXPECT_EQ(registry.fence_round, 1u);
+    EXPECT_TRUE(registry.namespaces.contains("late/ns"));
+
+    ASSERT_TRUE(b->captured.has_value());
+    const GcState st = decodeGcState(*b->captured);              /// gc/state as the recheck saw it
+    ASSERT_TRUE(st.fence_version.contains(1));
+
+    /// EVERY shard of the late namespace was minted fence-only at THIS round and its committed
+    /// version recorded - so the recheck's fold-through-fence covers it and a later writer's gate
+    /// sees the floor:
+    for (uint64_t shard = 0; shard < s->poolMeta().root_shards; ++shard)
+    {
+        const auto manifest = b->get(s->layout().rootShardKey(RootNamespace{"late/ns"}, shard));
+        ASSERT_TRUE(manifest.has_value()) << "late/ns shard " << shard << " was not minted by the fence";
+        const RootShard root = decodeRootShard(manifest->bytes);
+        EXPECT_EQ(root.fence_round, 1u);
+        EXPECT_TRUE(root.refs.empty());
+        EXPECT_TRUE(root.journal.empty());
+        EXPECT_TRUE(st.fence_version.at(1).contains("late/ns/" + std::to_string(shard)))
+            << "late/ns shard " << shard << " missing from fence_version[1]";
+    }
+}
+
 TEST(CasGcDiscovery, UsesRegistryNotList)
 {
     /// GC discovers namespaces FROM the registry, never LIST: a manifest written for an

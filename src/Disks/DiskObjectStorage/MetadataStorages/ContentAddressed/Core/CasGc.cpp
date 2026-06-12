@@ -79,11 +79,11 @@ RoundReport Gc::runRegularRound()
     for (const auto & [snap_shard, set] : retired)
         report.candidates += set.entries.size();
 
-    /// R3: CAS the monotone fence into the registry and EVERY root shard of every registered
-    /// namespace (minting fence-only manifests for absent shards) and persist the recorded fence
-    /// versions - the durable point the recheck folds through. `state.round` was advanced
-    /// by retire's CAS; `state`/`state_token` are current after it.
-    fence(state, state_token, folded.root_shards);
+    /// R3: CAS the monotone fence into the registry and EVERY root shard of every namespace in
+    /// the FENCE-TIME registry (minting fence-only manifests for absent shards) and persist the
+    /// recorded fence versions - the durable point the recheck folds through. `state.round` was
+    /// advanced by retire's CAS; `state`/`state_token` are current after it.
+    fence(state, state_token);
 
     /// R4: fold-through-fence recheck + the single content-delete site + outcomes.
     const RecheckResult rechecked = recheck(state, folded.snap, retired, report);
@@ -447,8 +447,7 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
     }
 }
 
-void Gc::fence(GcState & state, Token & state_token,
-               const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards)
+void Gc::fence(GcState & state, Token & state_token)
 {
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
@@ -466,6 +465,17 @@ void Gc::fence(GcState & state, Token & state_token,
     /// (W-REGISTER gate floor) - the two-horn argument at namespace granularity. The committed
     /// registry_version is recorded under the reserved "_registry" key (checkNamespace forbids it
     /// as a namespace segment, so it can never collide with an "ns/shard" entry).
+    ///
+    /// The registry decoded in the COMMITTED attempt is ALSO the shard-fence universe below. It
+    /// must be: the fold's registry read is STALE by fence time, and a namespace registered in
+    /// the window between them would fall into the hole BETWEEN the horns - registered below this
+    /// registry fence (so its writer never observes a fence_round floor, horn 2 misses) yet
+    /// absent from the fold-time universe (so its shards are never minted/fenced and the recheck
+    /// never folds their journals, horn 1 misses). A stale-view publish into such a namespace
+    /// could then re-reference a condemned hash past the recheck => the exact-token delete
+    /// dangles a live ref. The registry is CAS-append-only, so the committed-attempt universe is
+    /// a superset of the fold-time one - fencing MORE shards only folds more and spares more.
+    RootsRegistry fence_universe;
     {
         const String registry_key = layout.rootsRegistryKey();
         bool registry_fenced = false;
@@ -483,6 +493,7 @@ void Gc::fence(GcState & state, Token & state_token,
             if (outcome == CasOutcome::Committed)
             {
                 state.fence_version[round]["_registry"] = registry.registry_version;
+                fence_universe = std::move(registry);
                 registry_fenced = true;
             }
             /// Conflict: a racing namespace registration - re-read and retry (their append is then
@@ -494,8 +505,9 @@ void Gc::fence(GcState & state, Token & state_token,
                 "CAS gc fence: registry CAS contention (runaway live-lock brake)");
     }
 
-    /// 1. CAS fence_round := max(fence_round, round) into EVERY root shard of EVERY registered
-    /// namespace - present or ABSENT (the fold's discovery is the registry universe x all shards).
+    /// 1. CAS fence_round := max(fence_round, round) into EVERY root shard of EVERY namespace in
+    /// the FENCE-TIME registry (the committed attempt above - NOT the fold-time universe; see the
+    /// hole described there) - present or ABSENT shards alike.
     /// For an absent shard, mutateShard's create-if-absent CAS MINTS a fence-only manifest
     /// (fence_round = round, empty refs/journal): the create race against a first publish into
     /// that shard is exactly the required total order (whoever loses the CAS re-reads - the
@@ -520,21 +532,26 @@ void Gc::fence(GcState & state, Token & state_token,
     /// is a fold no-op (the fold reads records, not versions), and INV-JOURNAL-COVERAGE is
     /// untouched - trim (Task 11) is gated on at_version <= folded_cursor, and a fence bump above
     /// the cursor leaves no record to trim.
-    for (const auto & [ns, shard] : root_shards)
+    const uint64_t root_shards_per_ns = store->poolMeta().root_shards;
+    for (const String & ns_name : fence_universe.namespaces)
     {
-        uint64_t committed = 0;
-        store->mutateShard(ns, shard, [&](RootShard & root)
+        const RootNamespace ns{ns_name};
+        for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
         {
-            root.fence_round = std::max(root.fence_round, round);
-        }, &committed);
+            uint64_t committed = 0;
+            store->mutateShard(ns, shard, [&](RootShard & root)
+            {
+                root.fence_round = std::max(root.fence_round, round);
+            }, &committed);
 
-        /// RE-FENCING ON REPLAY (a crashed round resumed, Task 12): the manifest CAS re-applies
-        /// the max (a no-op on fence_round if already fenced at this round) but still BUMPS
-        /// shard_version, so the recorded version DIFFERS from the first attempt's - it is HIGHER.
-        /// Safe in the provable-coverage direction: the recheck must fold THROUGH at least the
-        /// recorded version, and recording the higher replayed version is MORE conservative
-        /// (folds more, never less).
-        state.fence_version[round][ns.string() + "/" + std::to_string(shard)] = committed;
+            /// RE-FENCING ON REPLAY (a crashed round resumed, Task 12): the manifest CAS re-applies
+            /// the max (a no-op on fence_round if already fenced at this round) but still BUMPS
+            /// shard_version, so the recorded version DIFFERS from the first attempt's - it is HIGHER.
+            /// Safe in the provable-coverage direction: the recheck must fold THROUGH at least the
+            /// recorded version, and recording the higher replayed version is MORE conservative
+            /// (folds more, never less).
+            state.fence_version[round][ns.string() + "/" + std::to_string(shard)] = committed;
+        }
     }
 
     /// 2. ONE gc/state CAS persists the whole fence_version[round] vector (everything else in
@@ -868,7 +885,7 @@ bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundRep
     /// monotone max makes re-fencing idempotent; the re-recorded HIGHER versions are MORE
     /// conservative coverage (the recheck folds a larger window and can only spare more).
     if (!state.fence_version.contains(round))
-        fence(state, state_token, discoverUniverse());
+        fence(state, state_token);
 
     const RecheckResult rechecked = recheck(state, snap, retired, report);
     cascadeAndPersist(state, state_token, snap, rechecked, retired, report);

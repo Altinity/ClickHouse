@@ -146,19 +146,22 @@ private:
 
     /// R3 (spec §7 as amended 2026-06-12; the model's GFenceShard): CAS the NAMESPACE REGISTRY's
     /// fence_round first (the ordering point for namespace creation — W-REGISTER's gate floor),
-    /// then CAS fence_round := round (monotone max) into EVERY root shard of every registered
-    /// namespace via the verified mutateShard loop — present or ABSENT (the create-if-absent CAS
-    /// MINTS a fence-only manifest for an absent shard; the create race against a first publish
-    /// into that shard is the required total order). Record each shard's committed shard_version
-    /// (and the registry's committed version under the reserved "_registry" key) in
-    /// gc/state.fence_version[round] — the durable fence positions the recheck folds through
-    /// (provable coverage; the model's fencePos[s]). The manifest CAS totally orders the fence
-    /// against publishes on that shard — exactly the ordering the spec's no-return argument rests
-    /// on. One fence covers the whole round's candidate set; one gc/state CAS persists the whole
-    /// vector. `root_shards` is the fold's registry-derived universe. On success
+    /// then CAS fence_round := round (monotone max) into EVERY root shard of every namespace in
+    /// the FENCE-TIME registry — the registry decoded in the COMMITTED registry-fence attempt,
+    /// never the fold-time universe (a namespace registered between the fold's registry read and
+    /// the registry-fence CAS would otherwise fall between the two horns: below the registry
+    /// fence, so its writer observes no floor, yet absent from the fold-time universe, so its
+    /// shards are never fenced or rechecked — a dangle window). Shards are fenced present or
+    /// ABSENT via the verified mutateShard loop (the create-if-absent CAS MINTS a fence-only
+    /// manifest for an absent shard; the create race against a first publish into that shard is
+    /// the required total order). Record each shard's committed shard_version (and the registry's
+    /// committed version under the reserved "_registry" key) in gc/state.fence_version[round] —
+    /// the durable fence positions the recheck folds through (provable coverage; the model's
+    /// fencePos[s]). The manifest CAS totally orders the fence against publishes on that shard —
+    /// exactly the ordering the spec's no-return argument rests on. One fence covers the whole
+    /// round's candidate set; one gc/state CAS persists the whole vector. On success
     /// `state`/`state_token` carry the committed fence_version[round].
-    void fence(GcState & state, Token & state_token,
-               const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards);
+    void fence(GcState & state, Token & state_token);
 
     /// What one R4 recheck decided. `deleted_trees` are the trees whose entries confirmed Deleted
     /// or Absent-while-held (our own crashed delete provably landed) — the cascade's input
