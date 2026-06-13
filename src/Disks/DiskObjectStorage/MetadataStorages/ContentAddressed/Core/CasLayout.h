@@ -134,6 +134,11 @@ public:
         return prefix + "/roots/";
     }
 
+    /// Prefixes that cover every content object of one kind (raw object listing for fsck).
+    String blobsPrefix() const { return prefix + "/blobs/"; }
+    String treesPrefix() const { return prefix + "/trees/"; }
+    String packsPrefix() const { return prefix + "/packs/"; }
+
     /// Classifies a LISTed key as a root-shard manifest: <prefix>/roots/<namespace...>/<shard_number>.
     /// Returns nullopt for verbatim files (a `_files` segment), non-numeric tails, or foreign keys.
     /// A classifier over list output, not a validator — never throws.
