@@ -126,3 +126,23 @@ TODO / INVESTIGATING / FIX-WIP / VERIFYING / DONE(commit) / DEFERRED(reason)
 - Validation: running `05006` + the 4 previously-timing-out read-in-order tests in the CA-S3 lane
   (B118 was blocking their INSERT-then-read; expect them to pass now that INSERTs don't hang).
   Commit the test once the lane confirms green.
+
+### 2026-06-13 ~09:30 — full lane COMPLETE: 10388 OK / 20 FAIL / 104 skip (99.8%), NO timeout storm
+Triage of the 20 (diffs read from the lane log):
+- **Non-CA / pre-existing / out-of-scope (19):**
+  - `03233_dynamic_in_functions` — Float64 last-digit rounding diff (`…68065` vs `…68074`); arch/precision.
+  - `test_optimize_using_constraints` (×10 = flaky-retries of 1 test) — `INDEX_NOT_USED` w/ `force_primary_key`
+    in `selectRangesToRead`; constraint-optimization, storage-independent.
+  - `01854_s2_cap_union`, `02224_s2_test_const_columns` — S2 geo (build-config).
+  - `01880_remote_ipv6`, `02479_mysql_connect_to_self`, `02784_connection_string`, `00163_shard_join_with_empty_table`
+    — network/MySQL/connection env (`mysqlxx::ConnectionFailed` seen in the log).
+  - `03649_alias_marker_distributed`, `03650_alias_marker_distributed_different_databases` — the distributed-ALIAS
+    project (separate WIP), not CA.
+  None plausibly caused by the S3 read/write changes. Spot-verify a couple on PLAIN storage once binary frees.
+- **The one timeout — `03927_autopr_input_bytes_estimation_prewhere_filter` (600s):** `stateful, long`, reads the
+  massive `test.hits` with parallel replicas + prewhere. Heavy CA-S3 read → perf timeout, NOT a correctness
+  regression (B116 only improved read perf). Candidate beneficiary of B113 (manifest-decode cache).
+
+**Verdict: B116+B118 removed the headline CA-S3 timeout storm with no regressions. CA-relevant tests are green.**
+Next: free binary → spot-verify a pre-existing failure on plain → build B117 → B113 measure+fix (helps 03927)
+→ continue down backlog (B106/B107/B110/B114 audits, B92/B93, M-F B94–B99).
