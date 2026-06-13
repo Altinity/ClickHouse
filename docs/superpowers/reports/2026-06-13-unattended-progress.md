@@ -213,3 +213,24 @@ chained final-lane launch never fired. Stopped it (TaskStop) and launch the fina
 log-content monitor instead. LESSON: never pgrep a string that appears in the monitor's own command.
 
 ### Final full CA-S3 lane (all fixes incl. review) — RUNNING (`build/test_final_lane.log`).
+
+### 2026-06-13 ~14:00 — FINAL full CA-S3 lane (all fixes incl. review): 10386 OK / 22 FAIL / 104 skip (99.79%)
+Same result as the first full lane → review fixes (Finding 5/6) introduced NO regressions.
+Failure triage (ZERO CA-correctness regressions):
+- ~15 non-CA / pre-existing: `test_optimize_using_constraints` (×10, constraint-opt), `01854_s2`/`02224_s2`
+  (geo), `02479_mysql`/`02784_connection_string` (env), `03233_dynamic` (float precision),
+  `03649`/`03650_alias_marker` (distributed-ALIAS project), `01171_mv_..._isolation_long` (flaky/long).
+- ~4 CA-S3 stateful heavy-read timeouts (B121): `00091_prewhere_two_conditions`, `03582_pr_read_in_order_hits`,
+  `03634_autopr...`, `03800_autopr...` — all `stateful,long` reads of `test.hits`. The SET shuffles
+  run-to-run (run 1 timed out `03927`, which PASSED here) → marginal/flaky near 600s, host-load-sensitive,
+  NOT a regression. Recorded as B121 (perf: per-blob GET overhead on huge tables; fix = coalescing/packing).
+
+## SESSION OUTCOME
+Core mandate ACHIEVED: the CA-S3 lane went from a ~50-test timeout storm to 99.79% green with ZERO
+CA-correctness regressions. The remaining failures are non-CA (env/geo/other-projects) or marginal
+stateful-read perf timeouts (B121, a future read-coalescing/packing item).
+Shipped + verified + reviewed: B116, B118 (+test), B117, B113 (×2), review Findings 5/6.
+Backlog fully triaged: every open item is FIXED, AUDITED, DEFERRED-with-reason, or a recorded future
+feature/milestone (M-F GC, B25 needs a decision, B17/B1/B26/B31 features). Persistent memory updated.
+Did NOT rush the high-stakes GC delete path (M-C3/M-F) unattended — it needs the planned adversarial
+review + fault-injection harness.
