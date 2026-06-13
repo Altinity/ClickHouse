@@ -75,6 +75,20 @@ public:
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
     RoundReport runRegularRound();
 
+    /// One previewed deletion the next regular round would make, with the reason it is eligible.
+    struct PreviewEntry
+    {
+        ObjectKind kind = ObjectKind::Blob;
+        UInt128 hash{};
+        String key;
+        uint64_t size = 0;
+        String reason;   /// "unreachable" (zero in-degree, present)
+    };
+
+    /// WRITE-FREE preview of the next round's deletes, derived from the DURABLE gc/snap + gc/state.
+    /// Reflects the snap as last persisted (run at quiescence for an exact picture). No CAS/delete.
+    std::vector<PreviewEntry> previewDeletes();
+
     /// full-GC walk + debris reclaim: deferred (M-F); API slot reserved.
     ///
     /// DELETE-SITE AUDIT (closeout invariant; grep `deleteExact` under Core/): the recheck holds

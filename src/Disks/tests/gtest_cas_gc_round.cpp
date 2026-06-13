@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
 
 #include <map>
 #include <mutex>
+#include <set>
 
 namespace DB::ErrorCodes
 {
@@ -1713,4 +1715,58 @@ TEST(CasGcScenario, SplitBrainLeadersOnlyDuplicateWork)
     EXPECT_TRUE(b->get(s->layout().retiredKey(1, 0, 0)).has_value());
     /// and the lingering entry is CONSERVATIVE - it condemns t0, an incarnation that no longer
     /// exists; a delete for it would 412 or 404. No path ever deletes a live object twice.
+}
+
+TEST(CasGcRound, PreviewDeletesIsWriteFreeAndSubsetOfUnreachable)
+{
+    using namespace DB::Cas;
+    using DB::Cas::tests::idOf;
+    using DB::Cas::tests::u128Of;
+
+    auto backend = std::make_shared<InMemoryBackend>();
+    PoolConfig cfg;
+    cfg.pool_prefix = "pool";
+    cfg.server_id = DB::UInt128(7);
+    auto store = Store::open(backend, cfg);
+
+    /// Publish one part, then drop it (ref gone; tree+blob await GC).
+    {
+        auto build = store->startBuild({});
+        build->putBlob(idOf("ghost"), BlobSource::fromString("ghost"));
+        TreeEntry e; e.name = "data.bin"; e.placement = Placement::Blob;
+        e.file_hash = u128Of("ghost"); e.file_size = 5;
+        auto tree = build->putTree({e});
+        build->publish(RootNamespace{"uui/uuid-1"}, "all_1_1_0", tree, {});
+    }
+    store->dropRef(RootNamespace{"uui/uuid-1"}, "all_1_1_0");
+
+    /// One real round folds the drop and persists the snap/state previewDeletes reads.
+    Gc gc(store, DB::UInt128(123));
+    gc.runRegularRound();
+
+    auto countObjects = [&]() -> size_t
+    {
+        size_t n = 0; String cursor;
+        while (true)
+        {
+            auto page = backend->list("pool", cursor, 1000);
+            n += page.keys.size();
+            if (page.next_cursor.empty()) break;
+            cursor = page.next_cursor;
+        }
+        return n;
+    };
+
+    const size_t before = countObjects();
+    const auto preview = gc.previewDeletes();
+    EXPECT_EQ(countObjects(), before);   /// write-free
+
+    /// Every previewed delete key must be unreachable per the independent fsck (the safety subset).
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    std::set<String> unreachable;
+    for (const auto & o : report.objects)
+        if (o.cls == FsckClass::Unreachable)
+            unreachable.insert(o.key);
+    for (const auto & p : preview)
+        EXPECT_TRUE(unreachable.contains(p.key)) << "preview delete not unreachable: " << p.key;
 }

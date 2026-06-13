@@ -854,6 +854,38 @@ std::map<uint64_t, GcSnap> Gc::loadSnap(const GcState & state)
     return snap;
 }
 
+std::vector<Gc::PreviewEntry> Gc::previewDeletes()
+{
+    std::vector<PreviewEntry> out;
+
+    const auto state_bytes = store->backend().get(store->layout().gcStateKey());
+    if (!state_bytes)
+        return out;   /// no GC state yet => nothing retired
+    const GcState state = decodeGcState(state_bytes->bytes);
+
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+    std::map<uint64_t, GcSnap> snap = loadSnap(state);
+
+    for (const auto & [snap_shard, shard_snap] : snap)
+    {
+        for (const Candidate & candidate : shard_snap.zeroInDegreeKnown())
+        {
+            const HeadResult observed = backend.head(objectKey(layout, candidate.kind, candidate.hash));
+            if (!observed.exists)
+                continue;   /// absent => already reclaimed; nothing to preview
+            PreviewEntry e;
+            e.kind = candidate.kind;
+            e.hash = candidate.hash;
+            e.key = objectKey(layout, candidate.kind, candidate.hash);
+            e.size = observed.size;
+            e.reason = "unreachable";
+            out.push_back(std::move(e));
+        }
+    }
+    return out;
+}
+
 bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundReport & report)
 {
     const Layout & layout = store->layout();
