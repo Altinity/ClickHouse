@@ -300,3 +300,18 @@ the container :9001) — BEFORE the clickhouse node / CA code ran. Generic local
 NOT CA-specific, NOT a regression. Plus: these tests use minio, which CA's probe rejects → stale,
 need RustFS (recorded B125, parallel to B93). CA-over-S3 remains validated by the stateless lane
 (RustFS, 3× green) + 224 gtests + live GC-delete validation + 2 reviews.
+
+### 2026-06-13 ~11:20 UTC — non-CA regression checks (s3-minio) + arm/amd clarification
+- CLARIFICATION (raised by operator): host is **x86_64 (AMD)**, binary is **x86-64**. All test runs
+  used OUR x86 binary — the lane symlinks `ci/tmp/clickhouse -> build/programs/clickhouse`. The
+  praktika label `arm_binary` is just the **plain-release-binary test profile** (the only non-sanitizer
+  stateless profile in ci/defs; all `amd_*` stateless variants are ASan/TSan/MSan/debug/coverage). It
+  selects the test config + the CI artifact to require (ignored locally); it does NOT run an ARM binary.
+  So prior green runs are valid on our AMD binary.
+- To run the NORMAL (non-CA) s3-minio stateless lane on our plain x86 binary, added a parametrization
+  `arm_binary, s3 storage, parallel` in ci/defs/job_configs.py (plain-binary profile + normal-s3-minio;
+  minio started locally by the lane's setup_minio.sh — NOT the integration docker-compose minio that
+  failed). Smoke (4 tests) green. Full lane RUNNING (`build/test_s3minio_full.log`) — confirms the
+  shared S3-client changes (Expect:100-continue, ReadBufferFromS3 cancellation) don't regress non-CA.
+  (NB: normal MergeTree-on-s3 doesn't set conditional headers, so Expect doesn't fire there; the
+  non-CA Expect surface is Iceberg — to be covered via integration.)
