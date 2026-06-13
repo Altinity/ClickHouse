@@ -9,8 +9,16 @@ ch2 :8124 by default; configurable via constructor or env) plus a `docker_exec` 
 
 import os
 import subprocess
+import time
 import urllib.error
 import urllib.request
+
+# ClickHouse error code ABORTED (Common/ErrorCodes.cpp). The publish-time resurrect-vs-GC race
+# (B137) now throws this as a RETRYABLE transient ("retry the operation") instead of a hard
+# FILE_DOESNT_EXIST. No server layer retries it on the async-insert flush path, so the writer
+# (this harness) must retry the INSERT. A retried identical INSERT is idempotent thanks to
+# ReplicatedMergeTree block-dedup, and the model has already applied the op exactly once.
+ABORTED_CODE = 236
 
 
 class QueryError(RuntimeError):
@@ -24,6 +32,13 @@ class QueryError(RuntimeError):
         snippet = sql if len(sql) <= 200 else sql[:200] + "...(%d more chars)" % (len(sql) - 200)
         super().__init__(f"{node} HTTP {code}: {body.strip()} | sql={snippet}")
 
+    @property
+    def is_aborted(self) -> bool:
+        """True if the server-side exception is the retryable ABORTED transient (code 236).
+        Detected by parsing the exception body the server returns in the HTTP response."""
+        b = self.body or ""
+        return ("Code: %d" % ABORTED_CODE) in b or "ABORTED" in b
+
 _DEFAULTS = {
     "node1_host": "localhost", "node1_port": 8123, "node1_container": "ca-soak-ch1-1",
     "node2_host": "localhost", "node2_port": 8124, "node2_container": "ca-soak-ch2-1",
@@ -32,7 +47,12 @@ _DEFAULTS = {
 
 
 class Node:
-    def __init__(self, host: str, port: int, container: str | None = None, timeout: float = 60.0):
+    # Default socket timeout is deliberately generous: an INSERT's async-insert flush
+    # (`WaitForAsyncInsert`) can block well beyond a minute while the publish path retries through the
+    # resurrect-vs-GC race (B137), and OPTIMIZE under merge churn is similarly slow. A tight timeout
+    # turns a slow-but-progressing op into a spurious socket TimeoutError. The overall run is still
+    # bounded by the `timeout` wrapping `run_phase1.sh`, so this is transient tolerance, not a hang mask.
+    def __init__(self, host: str, port: int, container: str | None = None, timeout: float = 300.0):
         self.host = host
         self.port = port
         self.container = container
@@ -42,12 +62,14 @@ class Node:
     def url(self) -> str:
         return f"http://{self.host}:{self.port}/"
 
-    def query(self, sql: str) -> str:
-        """POST `sql` and return the raw response body (TabSeparated text), trailing newline stripped."""
+    def query(self, sql: str, timeout: float | None = None) -> str:
+        """POST `sql` and return the raw response body (TabSeparated text), trailing newline stripped.
+        `timeout` overrides the default socket timeout for this call (used for intentionally-blocking
+        admin ops such as `SYSTEM SYNC REPLICA`, whose server-side wait can exceed the default)."""
         data = sql.encode("utf-8")
         req = urllib.request.Request(self.url, data=data, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 return resp.read().decode("utf-8").rstrip("\n")
         except urllib.error.HTTPError as e:
             body = ""
@@ -57,9 +79,9 @@ class Node:
                 pass
             raise QueryError(self, e.code, body, sql) from e
 
-    def command(self, sql: str) -> None:
+    def command(self, sql: str, timeout: float | None = None) -> None:
         """Execute a statement expected to return no rows (DDL/DML)."""
-        self.query(sql)
+        self.query(sql, timeout=timeout)
 
     def scalar(self, sql: str) -> str:
         """Execute a query expected to return a single value; return it as a string."""
@@ -67,6 +89,29 @@ class Node:
 
     def __repr__(self) -> str:
         return f"Node({self.host}:{self.port})"
+
+
+def retry_on_aborted(fn, *, attempts: int = 6, backoff_s: float = 0.05, on_retry=None):
+    """Call `fn` (a no-arg callable performing one INSERT) and retry it on a retryable ABORTED
+    (code 236) QueryError, up to `attempts` total tries with a tiny linear backoff. A persistent
+    ABORTED after exhausting the budget is re-raised as a real failure. Any non-ABORTED QueryError
+    (or other exception) is raised immediately without retry.
+
+    Scope: INSERTs only. The retried INSERT is idempotent (ReplicatedMergeTree block-dedup), so a
+    transient resurrect-vs-GC race converges without double-applying rows."""
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except QueryError as e:
+            if not e.is_aborted:
+                raise
+            last = e
+            if attempt < attempts:
+                if on_retry is not None:
+                    on_retry(attempt, e)
+                time.sleep(backoff_s * attempt)
+    raise last
 
 
 class Cluster:

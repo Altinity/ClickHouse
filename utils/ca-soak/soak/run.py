@@ -30,7 +30,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
 
-from soak.cluster import Cluster, QueryError
+from soak.cluster import Cluster, QueryError, retry_on_aborted
 from soak.ledger import generate_ledger, Op, OpType
 from soak.model import Model
 from soak.workload import insert_values_sql, update_sql, delete_sql, truncate_sql
@@ -104,6 +104,8 @@ class Driver:
         self.executor = ThreadPoolExecutor(max_workers=workers)
         self.inflight = []          # futures for in-flight concurrent (INSERT/OPTIMIZE) ops
         self.last_op = None         # last op executed (for failure.json)
+        self.aborted_retries = 0    # count of ABORTED-retried INSERT attempts (B137 race evidence)
+        self._aborted_lock = threading.Lock()
 
     # -- concurrent (non-barrier) op execution ------------------------------------------------
     def _submit_insert(self, op):
@@ -114,8 +116,17 @@ class Driver:
             self.model.apply(op)
         sql = insert_values_sql(self.seed, op.op_id, n, TABLE, self.base_time)
         node = node_for(self.cluster, op.target)
-        fut = self.executor.submit(node.command, sql)
+        fut = self.executor.submit(self._insert_with_retry, node, sql, op.op_id)
         self.inflight.append(fut)
+
+    def _insert_with_retry(self, node, sql, op_id):
+        """Execute one INSERT, retrying ONLY on the retryable ABORTED transient (B137). Scoped to
+        INSERTs: mutations/DDL are NOT routed here (they have different idempotency)."""
+        def on_retry(attempt, err):
+            with self._aborted_lock:
+                self.aborted_retries += 1
+            log(f"INSERT op_id={op_id} hit retryable ABORTED (attempt {attempt}); retrying. {err}")
+        retry_on_aborted(lambda: node.command(sql), on_retry=on_retry)
 
     def _submit_optimize(self, op):
         # OPTIMIZE has no model effect; run it concurrently as a cluster-only op.
@@ -292,12 +303,19 @@ def main(argv=None):
             log(f"final checkpoint OK: now={now} count={exp['count']} "
                 f"unreachable={f.get('unreachable')} dangling={f.get('dangling')}")
 
-    except (CheckpointFailure, QueryError) as e:
+    except (CheckpointFailure, QueryError, OSError) as e:
         # CheckpointFailure -> a model/replica divergence or a dirty CA pool at a quiesced checkpoint.
-        # QueryError -> a worker-side cluster error during op execution (e.g. a write-path race). Either
-        # way, record a structured failure with the reproducer (seed, base_time, op_id, error) instead
-        # of dumping a raw traceback, so the failure can be replayed and triaged.
-        kind = "CHECKPOINT FAILURE" if isinstance(e, CheckpointFailure) else "WORKLOAD FAILURE"
+        # QueryError -> a worker-side cluster error during op execution (e.g. a write-path race).
+        # OSError (incl. socket TimeoutError) -> a transport-level failure talking to a replica (e.g. a
+        # blocking admin op exceeding its socket timeout). In every case record a structured failure with
+        # the reproducer (seed, base_time, op_id, error) instead of dumping a raw traceback, so the
+        # failure can be replayed and triaged.
+        if isinstance(e, CheckpointFailure):
+            kind = "CHECKPOINT FAILURE"
+        elif isinstance(e, QueryError):
+            kind = "WORKLOAD FAILURE"
+        else:
+            kind = "TRANSPORT FAILURE"
         driver.drain_silent()
         # Best-effort: capture the current cluster + fsck state for the report.
         try:
@@ -326,6 +344,7 @@ def main(argv=None):
     finally:
         driver.executor.shutdown(wait=True)
 
+    log(f"ABORTED-retried INSERT attempts (B137 race fired and was handled): {driver.aborted_retries}")
     print("PHASE1 OK")
     return 0
 

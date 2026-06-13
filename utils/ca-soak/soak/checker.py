@@ -32,8 +32,12 @@ def quiesce(cluster, table: str, timeout_s: int = 300):
     loud failure on timeout), force OPTIMIZE FINAL + MATERIALIZE TTL, re-drain, then return the server
     now() captured AFTER convergence."""
     deadline = time.time() + timeout_s
+    # SYSTEM SYNC REPLICA blocks server-side until the replica drains its fetch queue; under a
+    # replication backlog this legitimately exceeds the default per-call socket timeout, so give the
+    # blocking admin ops a socket timeout aligned with our own quiesce budget rather than letting a
+    # raw socket TimeoutError escape.
     for node in cluster.nodes():
-        node.command(f"SYSTEM SYNC REPLICA {table}")
+        node.command(f"SYSTEM SYNC REPLICA {table}", timeout=timeout_s)
 
     def drained():
         for node in cluster.nodes():
@@ -50,8 +54,8 @@ def quiesce(cluster, table: str, timeout_s: int = 300):
             raise CheckpointFailure("quiescence timeout: queues/mutations/merges did not drain")
         time.sleep(1)
     for node in cluster.nodes():
-        node.command(f"OPTIMIZE TABLE {table} FINAL")
-        node.command(f"ALTER TABLE {table} MATERIALIZE TTL")
+        node.command(f"OPTIMIZE TABLE {table} FINAL", timeout=timeout_s)
+        node.command(f"ALTER TABLE {table} MATERIALIZE TTL", timeout=timeout_s)
     while not drained():
         if time.time() > deadline:
             raise CheckpointFailure("quiescence timeout after OPTIMIZE/MATERIALIZE TTL")
