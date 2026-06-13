@@ -171,3 +171,15 @@ Next: free binary → spot-verify a pre-existing failure on plain → build B117
 - PLAN: (1) confirm lane subset green; (2) launch a FINAL full CA-S3 lane with ALL fixes in (B113/
   B117 added since the last full run) as the comprehensive green gate; (3) during it (no builds),
   do the B106 read-only audit + draft M-F (B94–B99) planning notes.
+
+### 2026-06-13 ~11:30 — consolidated state
+FIXED + verified + committed this session:
+- B116 read pipeline (`d8fd11659df`), B118 Expect:100-continue (`5b69a99fd5b`) + test (`6d1f3a43ab9`),
+  B117 retry cancellation (`dd408fef7ba`), B113 shard cache (`d1590609597`) + tree cache (`47ec3241d53`).
+- B105 fixed-by-B116; B106 audited (not a bug, CA BACKUP tests pass); B107 deferred (latent).
+- Recorded: B119 (RustFS upstream), B120 (Expect fallback follow-up).
+Lane: full CA-S3 lane 10388 OK / 20 FAIL (all non-CA or one stateful perf), no timeout storm.
+Remaining latent/large debts (none green-blocking): B110 (Append-at-create, single-writer),
+B114 (size-check defense), B80 (isFile, harmless), B111 (rename perf), B92/B93 (RustFS scanner),
+B94–B99 (M-F full GC milestone — large), B101–B104, B25/B26/B31, B17, B1/B8/B13–B15, B109 (review).
+NEXT: confirm B113/B117 lane subset → final full lane (all fixes) → M-F planning + B110/B114/B80 triage.
