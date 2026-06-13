@@ -234,3 +234,25 @@ Backlog fully triaged: every open item is FIXED, AUDITED, DEFERRED-with-reason, 
 feature/milestone (M-F GC, B25 needs a decision, B17/B1/B26/B31 features). Persistent memory updated.
 Did NOT rush the high-stakes GC delete path (M-C3/M-F) unattended — it needs the planned adversarial
 review + fault-injection harness.
+
+### 2026-06-13 ~14:30 — live validation of the GC delete path (M-C3) from the final lane
+The final lane ran with GC enabled (5s interval). Server-log evidence over its full run:
+- **~1132 `runRegularRound` rounds**, deleting TENS OF THOUSANDS of objects via exact-token deletes
+  (e.g. round 52: candidates=28025 deleted=28023; round 51: 18303→18298, replaced=2;
+  round 50: 26064 candidates, deleted=24692, **replaced=716**, spared>0).
+- **ZERO GC-path safety alarms**: no LOGICAL_ERROR / FATAL / terminate / INV-* violation / TokenMismatch
+  in any GC / incarnation / retire / fence / recheck / deleteExact context.
+- The non-zero `spared`/`replaced` with `deleted < candidates` shows fence/recheck/retire correctly
+  DECLINED to delete resurrected/in-flight objects (the model's "zombie delete after resurrect" /
+  "spared-entry orphan" dangers) — and no error surfaced from those decisions.
+This is strong real-world evidence the M-C3 GC delete path is solid under heavy DROP/mutation churn,
+complementing the model-scenario gtest battery. (Does NOT cover M-F full-GC walk / debris / packs —
+still unimplemented + unplanned.)
+
+### Remaining work is now all LARGE/PLANNED or needs a decision — NOT safe to rush unattended:
+- M-F (B94–B99 full GC walk, debris reclaim, **packs** — also B121's fix): unplanned milestone; needs
+  design→plan→adversarial-review per the established M-C* discipline. Touches storage layout + GC.
+- B25 (server-root ownership): needs an operator decision (shared-pool semantics) — recorded.
+- B17 (encryption-at-rest), B1 (Replicated*MergeTree), B26/B31: feature milestones needing design.
+Stopping point for SAFE unattended work reached: green-tests goal met, all well-scoped debts fixed/
+triaged, high-stakes paths (read + GC delete) validated, changes independently reviewed.
