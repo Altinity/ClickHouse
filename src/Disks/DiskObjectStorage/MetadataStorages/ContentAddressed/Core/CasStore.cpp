@@ -175,6 +175,10 @@ std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & n
     auto decoded = std::make_shared<const RootShard>(decodeRootShard(object->bytes));
     {
         std::lock_guard lock(shard_decode_cache_mutex);
+        /// Bound memory on a long-lived server: a wholesale clear is fine — entries re-populate on
+        /// demand (a stale entry would be re-validated by the head token check anyway).
+        if (shard_decode_cache.size() >= SHARD_DECODE_CACHE_MAX_ENTRIES)
+            shard_decode_cache.clear();
         shard_decode_cache[key] = {object->token, decoded};
     }
     return decoded;
@@ -437,6 +441,14 @@ void Store::dropNamespace(const RootNamespace & ns)
         if (page.next_cursor.empty())
             break;
         cursor = page.next_cursor;
+    }
+
+    /// Evict this namespace's shard entries from the read-path decode cache: the namespace is gone,
+    /// so they would never be re-read (and thus never revalidated/replaced) — a slow leak otherwise.
+    {
+        std::lock_guard lock(shard_decode_cache_mutex);
+        for (uint64_t shard = 0; shard < meta.root_shards; ++shard)
+            shard_decode_cache.erase(pool_layout.rootShardKey(ns, shard));
     }
 }
 

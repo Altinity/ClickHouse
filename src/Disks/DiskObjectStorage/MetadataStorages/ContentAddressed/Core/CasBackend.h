@@ -87,6 +87,16 @@ using WriteSinkPtr = std::unique_ptr<WriteSink>;
 ///     rejected by Cas::Probe);
 ///   - conditional PUTs are protocol hygiene; casPut and deleteExact are SAFETY-critical.
 ///
+/// TOKEN ⟹ CONTENT PRECONDITION (read-path caches depend on this): a token must uniquely identify
+/// the byte-content of the incarnation it labels — i.e. `head(k).token == prior get(k).token` MUST
+/// imply the bytes are unchanged. The protocol's SAFETY only needs the contrapositive (changed
+/// bytes ⟹ a new token, so a stale CAS/delete is rejected), but `Cas::Store`'s read-path decode
+/// cache (`readShardDecoded`) skips a re-`get`+decode on a token match, so a backend whose token
+/// could REPEAT across different content would make it serve stale manifests (wrong results). Holds
+/// for every backend in use: S3 ETag is content-derived; the emulated/in-memory backends mint a
+/// strictly-monotonic sequence that is never reused. A backend with a weak/recycled token must NOT
+/// be used as a Cas pool (and Probe should grow a check for this — tracked in the backlog).
+///
 /// Most ops take/return whole `String` bodies — sufficient for manifests, trees, and probe/GC
 /// objects. LARGE content blobs stream through `putIfAbsentStream` (see `WriteSink`); reads stay
 /// String-based because blob payload reads go through the wiring's read stack, not this seam.

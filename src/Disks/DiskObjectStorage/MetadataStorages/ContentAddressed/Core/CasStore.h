@@ -159,6 +159,10 @@ private:
     /// B113 read-path decode cache: rootShardKey -> (token of the cached bytes, decoded immutable
     /// manifest). Guarded by its own mutex. A token mismatch (any write to the shard) forces a fresh
     /// get + decode; cache entries are otherwise reused across reads within and across queries.
+    /// Bounded (wholesale clear on overflow, like the tree cache) so a long-lived server that touches
+    /// many tables/backups/detached dirs cannot grow it without limit; `dropNamespace` also evicts a
+    /// dropped namespace's shard entries explicitly (they would otherwise never be re-read — leak).
+    static constexpr size_t SHARD_DECODE_CACHE_MAX_ENTRIES = 16384;
     std::mutex shard_decode_cache_mutex;
     std::unordered_map<String, std::pair<Token, std::shared_ptr<const RootShard>>> shard_decode_cache;
 
