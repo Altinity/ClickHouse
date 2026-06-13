@@ -156,3 +156,18 @@ Next: free binary → spot-verify a pre-existing failure on plain → build B117
   224/224. MEASURED CA-local read-heavy: **2.66× → 1.70×** vs plain (−29% read time).
 - **B113 part 2** (tree decode cache, content-addressed/immutable, no invalidation, bounded 16384)
   building now; will re-measure + run CA battery + a CA-S3 lane subset to confirm green.
+
+### 2026-06-13 ~11:00 — B113 done, remaining-debt triage
+- **B113 part 2** committed `47ec3241d53` (tree decode cache). Combined 2.66×→1.51× (read time
+  −44%), CA battery 224/224. Backlog: B105/B113/B117 → FIXED. Validating on a CA-S3 lane subset.
+- **B107** (verbatim-file mtime = epoch 0): assessed — the age-gated cleanup
+  (`isOldPartDirectory`/`clearOldTemporaryDirectories`) targets tmp PART dirs, which DO carry the
+  `.ca_mtime` stamp; only table-level verbatim files report epoch 0, and the full lane passed. So
+  it's a latent/cosmetic debt, NOT green-blocking. DEFERRED (already in backlog) rather than
+  speculatively add per-object mtime storage for little benefit.
+- Remaining CA debts are mostly latent edge-cases (B106 audit, B110 Append-at-create single-writer,
+  B114 size-check defense, B80 isFile) or large features (M-F full GC B94–B99). None are causing
+  lane failures.
+- PLAN: (1) confirm lane subset green; (2) launch a FINAL full CA-S3 lane with ALL fixes in (B113/
+  B117 added since the last full run) as the comprehensive green gate; (3) during it (no builds),
+  do the B106 read-only audit + draft M-F (B94–B99) planning notes.
