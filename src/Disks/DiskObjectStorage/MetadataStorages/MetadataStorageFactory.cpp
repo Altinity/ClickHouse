@@ -227,6 +227,12 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// a remote object storage such as s3 is a remote key prefix and not a usable local path).
         auto local_scratch_path = config.getString(config_prefix + ".cas_scratch_path",
                                                     fs::path(Context::getGlobalContextInstance()->getPath()) / "disks" / name / "cas_scratch" / "");
+        /// A configured RELATIVE scratch path must be anchored to the server data path, NOT the
+        /// process CWD (which varies by launch method) — otherwise the write-buffer spill lands in an
+        /// unpredictable directory and orphans across restarts (review #1). The default is already
+        /// absolute; only an explicit relative override needs anchoring.
+        if (fs::path(local_scratch_path).is_relative())
+            local_scratch_path = fs::path(Context::getGlobalContextInstance()->getPath()) / local_scratch_path;
         fs::create_directories(local_scratch_path);
 
         /// The incarnation-token pool is multi-writer by design (spec section 2): the publish gate +

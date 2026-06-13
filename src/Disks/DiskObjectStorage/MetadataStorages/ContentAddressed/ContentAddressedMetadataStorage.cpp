@@ -159,6 +159,19 @@ void ContentAddressedMetadataStorage::startup()
         : Cas::ObjectStorageBackend::Mode::Native;
     auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode);
 
+    /// EmulatedSingleProcess emulates the conditional-op / exact-token semantics in-process (local
+    /// object storage has none). That emulation is per-process: two servers pointed at the SAME local
+    /// pool (e.g. an NFS/shared mount) each keep independent token state and would silently violate
+    /// the CAS invariants — the capability probe cannot detect this (each process passes it alone).
+    /// Warn loudly so a shared-pool misconfiguration is visible (review #1 / B25).
+    if (mode == Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess)
+        LOG_WARNING(
+            getLogger("ContentAddressedMetadataStorage"),
+            "Content-addressed disk over LOCAL object storage uses emulated in-process conditional "
+            "operations — safe ONLY for a single server. Do NOT share this pool path between multiple "
+            "ClickHouse servers (e.g. a shared/NFS mount): the CAS/GC invariants would break silently. "
+            "Use an S3-backed pool for multi-server / shared deployments.");
+
     /// Key spaces per mode: the Emulated (Local) backend maps bare pool keys under
     /// getCommonKeyPrefix (the disk root dir), so the POOL prefix must be bucket-relative - strip
     /// the common prefix when the configured prefix carries it (the local factory passes the root
