@@ -617,17 +617,34 @@ void PocoHTTPClient::makeRequestInternalImpl(
 
             Stopwatch watch;
 
-            /// Conditional writes (`If-None-Match` / `If-Match`, used by the content-addressed
-            /// backend) can carry a large body that the server will reject on a precondition loss.
-            /// Ask the server to evaluate the precondition BEFORE we stream the body via
-            /// `Expect: 100-continue`: on a final early response (e.g. 412) we skip the doomed
-            /// upload entirely. Without this, streaming a multi-MB body into a request the server
-            /// has already decided to reject makes some stores (e.g. RustFS) close mid-upload or
-            /// answer 500, which the SDK then RETRIES up to `s3_retry_attempts` (500) times — a
-            /// ~40-min stall that hangs CA INSERTs (see B118) and the CA-S3 test lane.
+            /// A conditional write (`If-None-Match` / `If-Match`) that loses its precondition can
+            /// waste a LARGE body: streaming multi-MB into a request the server has already decided
+            /// to reject makes some stores (e.g. RustFS) close mid-upload or answer 500, which the
+            /// SDK then RETRIES up to `s3_retry_attempts` (500) times — a ~40-min stall that hangs
+            /// CA INSERTs (see B118). `Expect: 100-continue` lets the server reject (e.g. 412) BEFORE
+            /// the body, so we skip the doomed upload.
+            ///
+            /// Gate this on a LARGE body, not merely on the conditional header: only large bodies can
+            /// trigger the mid-upload rejection storm, and `Expect` only pays off when there is a big
+            /// body to avoid sending. This deliberately excludes small conditional writes — CA
+            /// manifests and, notably, Iceberg's conditional metadata commits (which also set
+            /// `If-None-Match`) — so the optimization stays scoped to the case that needs it and does
+            /// not change the wire behaviour of small conditional PUTs on any store.
+            size_t content_body_size = 0;
+            if (const auto & content_body = request.GetContentBody())
+            {
+                content_body->clear();
+                content_body->seekg(0, std::ios_base::end);
+                const auto end_pos = content_body->tellg();
+                content_body->clear();
+                content_body->seekg(0, std::ios_base::beg);
+                if (end_pos > 0)
+                    content_body_size = static_cast<size_t>(end_pos);
+            }
+            static constexpr size_t min_body_size_for_expect_continue = 1024 * 1024;
             const bool conditional_write
                 = method == Poco::Net::HTTPRequest::HTTP_PUT
-                && request.GetContentBody()
+                && content_body_size >= min_body_size_for_expect_continue
                 && (poco_request.has("if-none-match") || poco_request.has("if-match"));
             if (conditional_write)
                 poco_request.setExpectContinue(true);
