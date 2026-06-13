@@ -875,3 +875,98 @@ TEST(CaWiringExchange, AdoptOfReclaimedTreeFallsBack)
     EXPECT_FALSE(exchange->adoptPart("uuid-1", "tmp-fetch_all_1_1_0", *tree_id, {}));
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp-fetch_all_1_1_0"));
 }
+
+/// ==== Commit atomicity (B122): a publish failing mid-loop must not leave a PARTIAL commit ====
+
+#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Common/Exception.h>
+#include <algorithm>
+
+namespace DB::ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
+namespace
+{
+
+/// A LocalObjectStorage whose writeObject can be armed to throw — the single seam needed to drive a
+/// backend write failure at a chosen point. The hook runs BEFORE the write is created; throwing from
+/// it fails the put exactly as a real backend error would. Everything else delegates to the base.
+class FaultyLocalObjectStorage : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    std::function<void(const std::string &)> on_write;
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object,
+        DB::WriteMode mode,
+        std::optional<DB::ObjectAttributes> attributes,
+        size_t buf_size,
+        const DB::WriteSettings & write_settings) override
+    {
+        if (on_write)
+            on_write(object.remote_path);
+        return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+};
+
+/// True for a root-shard manifest key (<...>/roots/<namespace...>/<shard_number>) — the object a
+/// single publish CASes. Tree blobs (blobs/ prefix), the registry (roots/_registry) and verbatim
+/// files (roots/<ns>/_files/...) are excluded, so counting these isolates publishes one-for-one.
+bool isShardManifestPath(const std::string & path)
+{
+    if (path.find("/roots/") == std::string::npos)
+        return false;
+    const auto slash = path.rfind('/');
+    if (slash == std::string::npos || slash + 1 >= path.size())
+        return false;
+    const std::string last = path.substr(slash + 1);
+    return std::all_of(last.begin(), last.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+}
+
+std::shared_ptr<FaultyLocalObjectStorage> makeFaultyStorageForTest()
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("ca_b122_" + unique)).string();
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+    return std::make_shared<FaultyLocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+}
+
+}
+
+TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
+{
+    auto faulty = makeFaultyStorageForTest();
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        faulty, "pool", "srv1", std::filesystem::temp_directory_path() / "ca_b122_scratch", nullptr);
+    storage->startup();
+
+    /// Two parts in ONE transaction. The staging map is keyed by (ns, ref), so all_1_1_0 publishes
+    /// before all_2_2_0 — the blob uploads happen now (before the fault is armed).
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "content-A");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_2_2_0/data.bin", "content-B");
+
+    /// Fail the SECOND shard-manifest publish (part all_2_2_0) — all_1_1_0 has already published by
+    /// then. A pre-fix commit() leaves all_1_1_0 durably visible: a partial commit.
+    int manifest_writes = 0;
+    faulty->on_write = [&](const std::string & path)
+    {
+        if (isShardManifestPath(path) && ++manifest_writes == 2)
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "injected publish failure (B122)");
+    };
+
+    EXPECT_THROW(tx->commit(DB::NoCommitOptions{}), DB::Exception);
+
+    /// All-or-nothing: the part that DID publish must have been rolled back. Disarm first so the
+    /// rollback's own (3rd) manifest write and these read-back assertions run clean.
+    faulty->on_write = nullptr;
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
+}

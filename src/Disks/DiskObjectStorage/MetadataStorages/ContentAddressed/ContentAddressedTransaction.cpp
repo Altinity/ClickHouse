@@ -112,39 +112,77 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
 {
     /// One putTree + publish per staged part (D-W2); a staging with NO new uploads on an EXISTING
     /// ref is a mutable-payload update (updateRefPayload — no journal record, no tree rebuild).
-    for (auto & [key, st] : parts)
+    ///
+    /// Commit atomicity (B122): there is no multi-ref atomic publish, so a publish that throws after
+    /// earlier parts already published would leave a PARTIAL commit — some refs durably visible while
+    /// the transaction reports failure, diverging the durable pool from the disk layer's all-or-nothing
+    /// expectation. Track the refs THIS commit creates and, on any exception, best-effort unpublish
+    /// them before rethrowing. A partial commit is NOT a protocol violation (each publish/dropRef is
+    /// individually gate-checked and journalled; the leftover uploads are GC-reclaimable debris) — this
+    /// restores the wiring-layer transaction contract, not a CAS invariant.
+    ///
+    /// Fail-closed (CLAUDE.md): only refs that were ABSENT before we published them are rolled back. A
+    /// ref that already existed is pre-existing data this commit must never destroy on its error path.
+    /// Publishing over a live ref does not occur in the MergeTree write path (unique part names), but
+    /// the rollback must not assume it. updateRefPayload mutations (autocommit one-shots on a COMMITTED
+    /// part) are individually durable by design and are deliberately NOT rolled back.
+    std::vector<std::pair<Cas::RootNamespace, std::string>> created_refs;
+    try
     {
-        const Cas::RootNamespace ns{key.first};
-        const std::string & ref = key.second;
-
-        if (!st.build && st.entries.empty())
+        for (auto & [key, st] : parts)
         {
-            /// Mutable-only staging: the MVCC layer's autocommit one-shots (txn_version.txt
-            /// fill-in/rewrite) and metadata_version bumps on a COMMITTED part.
-            if (!st.mutable_files.empty() || !st.mutable_removed.empty())
+            const Cas::RootNamespace ns{key.first};
+            const std::string & ref = key.second;
+
+            if (!st.build && st.entries.empty())
             {
-                metadata_storage.store()->updateRefPayload(ns, ref, [&](Cas::RefPayload & payload)
+                /// Mutable-only staging: the MVCC layer's autocommit one-shots (txn_version.txt
+                /// fill-in/rewrite) and metadata_version bumps on a COMMITTED part.
+                if (!st.mutable_files.empty() || !st.mutable_removed.empty())
                 {
-                    for (const auto & [name, bytes] : st.mutable_files)
-                        payload.mutable_files[name] = bytes;
-                    for (const auto & name : st.mutable_removed)
-                        payload.mutable_files.erase(name);
-                });
+                    metadata_storage.store()->updateRefPayload(ns, ref, [&](Cas::RefPayload & payload)
+                    {
+                        for (const auto & [name, bytes] : st.mutable_files)
+                            payload.mutable_files[name] = bytes;
+                        for (const auto & name : st.mutable_removed)
+                            payload.mutable_files.erase(name);
+                    });
+                }
+                continue;
             }
-            continue;
+
+            if (!st.build)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "ContentAddressedTransaction: staged entries for {}/{} without a Build", key.first, ref);
+
+            auto tree = st.build->putTree(st.entries);
+            Cas::RefPayload payload;
+            payload.mutable_files = st.mutable_files;
+            /// The publish wall-clock stamp backing getLastModified (reserved name, filtered from
+            /// every listing by the read side).
+            payload.mutable_files[".ca_mtime"] = std::to_string(static_cast<uint64_t>(::time(nullptr)));
+
+            const bool ref_existed = metadata_storage.store()->resolveRef(ns, ref).has_value();
+            st.build->publish(ns, ref, tree, std::move(payload));
+            if (!ref_existed)
+                created_refs.emplace_back(ns, ref);
         }
-
-        if (!st.build)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "ContentAddressedTransaction: staged entries for {}/{} without a Build", key.first, ref);
-
-        auto tree = st.build->putTree(st.entries);
-        Cas::RefPayload payload;
-        payload.mutable_files = st.mutable_files;
-        /// The publish wall-clock stamp backing getLastModified (reserved name, filtered from
-        /// every listing by the read side).
-        payload.mutable_files[".ca_mtime"] = std::to_string(static_cast<uint64_t>(::time(nullptr)));
-        st.build->publish(ns, ref, tree, std::move(payload));
+    }
+    catch (...)
+    {
+        /// Compensating rollback. Best-effort: a ref we cannot unpublish becomes unreferenced debris
+        /// (GC-reclaimed); never mask the original failure with a rollback failure.
+        for (const auto & [ns, ref] : created_refs)
+        {
+            try
+            {
+                metadata_storage.store()->dropRef(ns, ref);
+            }
+            catch (...) // NOLINT(bugprone-empty-catch)
+            {
+            }
+        }
+        throw;
     }
     committed = true;
 }
