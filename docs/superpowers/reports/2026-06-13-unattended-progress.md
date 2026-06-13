@@ -291,3 +291,12 @@ consistent with the M-C* adversarial-review discipline; not rushed unattended.
   integration tests). CAVEAT: these use minio, which CA's probe rejects (the B93 reason RustFS replaced
   it in the stateless lane); they predate the probe enforcement, so a probe-fail at startup would be a
   PRE-EXISTING integration-needs-RustFS gap (parallel to B93), not a regression. Triaging on result.
+
+### 2026-06-13 ~11:05 UTC — integration result
+CA integration tests (`test_content_addressed_s3`, `test_content_addressed_gc_s3`): 3 ERRORS, ALL at
+the SHARED minio bring-up fixture (`cluster.py` 'Trying to connect to Minio' → Connection refused at
+the container :9001) — BEFORE the clickhouse node / CA code ran. Generic local integration-env issue
+(minio unreachable in the local harness — TLS/cert/networking), affects all minio integration tests,
+NOT CA-specific, NOT a regression. Plus: these tests use minio, which CA's probe rejects → stale,
+need RustFS (recorded B125, parallel to B93). CA-over-S3 remains validated by the stateless lane
+(RustFS, 3× green) + 224 gtests + live GC-delete validation + 2 reviews.
