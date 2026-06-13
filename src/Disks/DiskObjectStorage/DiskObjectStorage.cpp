@@ -811,16 +811,26 @@ void DiskObjectStorage::prepareRead(
     std::optional<size_t> read_hint,
     ReadPipeline & pipeline) const
 {
-    /// Content-addressed reads have their own plan (in-manifest bytes from memory; blob payloads
-    /// through an envelope-skipping view) — see ContentAddressedMetadataStorage::prepareReadPipeline.
+    /// Content-addressed reads: in-manifest bytes come from memory (no object exists); a
+    /// blob-backed part file translates to its physical blob object + a payload window, which
+    /// rides the STANDARD pipeline below (gather/caches/async prefetch — same chain as plain
+    /// object-storage disks, so right-mark bounds reach the object reader and its range requests
+    /// stay drainable, B116) and is bounded by the FileView stage at the end.
+    std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ca_blob_view;
     if (metadata_storage->isContentAddressed())
     {
         auto * ca = dynamic_cast<const ContentAddressedMetadataStorage *>(metadata_storage.get());
-        if (ca && ca->prepareReadPipeline(path, settings, pipeline))
-            return;
+        if (ca)
+        {
+            if (ca->prepareInManifestRead(path, settings, pipeline))
+                return;
+            ca_blob_view = ca->getBlobViewPlan(path);
+        }
     }
 
-    const auto storage_objects = metadata_storage->getStorageObjects(path);
+    const auto storage_objects = ca_blob_view
+        ? StoredObjects{ca_blob_view->object}
+        : metadata_storage->getStorageObjects(path);
 
     auto read_settings = updateIOSchedulingSettings(settings, getReadResourceName(), getWriteResourceName());
     auto global_context = Context::getGlobalContextInstance();
@@ -900,6 +910,11 @@ void DiskObjectStorage::prepareRead(
             global_context->getAsyncReadCounters(),
             global_context->getFilesystemReadPrefetchesLog());
     }
+
+    /// A content-addressed blob-backed file is a payload window inside its blob: bound the
+    /// chain to it (and skip the CHCA envelope header in front).
+    if (ca_blob_view)
+        pipeline.needFileView(path, ca_blob_view->payload_offset, ca_blob_view->payload_end);
 }
 
 std::unique_ptr<ReadBufferFromFileBase> DiskObjectStorage::readFileIfExists(

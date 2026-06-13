@@ -96,17 +96,30 @@ public:
     /// namespace file. nullopt = the path is blob-backed (a real storage object).
     std::optional<String> tryGetInManifestBytes(const std::string & path) const;
 
-    /// The CA read entry, called by DiskObjectStorage::prepareRead BEFORE the generic
-    /// storage-objects path: serves in-manifest bytes from memory, and blob-backed part files
-    /// through a payload VIEW over the object (the CHCA envelope header is skipped via
-    /// ReadBufferFromFileView — StoredObject carries no range, the recorded upstream delta).
-    /// Returns false when the path has no CA-specific read plan (caller falls through; absent
-    /// paths then fail in getStorageObjects exactly as before). NOTE: this path bypasses the
-    /// pipeline cache stages — the CA disk runs cacheless, as the PoC did (B86).
-    bool prepareReadPipeline(const std::string & path, const ReadSettings & settings, ReadPipeline & pipeline) const;
+    /// The CA read entry, part 1 of 2, called by DiskObjectStorage::prepareRead BEFORE the generic
+    /// storage-objects path: serves in-manifest bytes (mutable per-part files, inline entries,
+    /// verbatim namespace files) from memory. Returns false when the path is not in-manifest.
+    bool prepareInManifestRead(const std::string & path, const ReadSettings & settings, ReadPipeline & pipeline) const;
 
-    /// A seekable reader over ONE blob payload (the object minus its envelope header) - shared by
-    /// prepareReadPipeline and the transaction's in-flight read-your-writes (B59).
+    /// The CA read entry, part 2 of 2: a blob-backed part file translates to the physical blob
+    /// object plus the payload WINDOW inside it (the CHCA envelope header occupies
+    /// [0, payload_offset)). DiskObjectStorage::prepareRead composes the STANDARD object-storage
+    /// pipeline over `object` (gather/caches/async prefetch — the same chain plain s3 disks get,
+    /// so `MergeTreeReaderStream` right-mark bounds reach the object reader and its range
+    /// requests stay drainable, B116) and bounds it with the pipeline's FileView stage.
+    /// nullopt = the path is not a blob-backed part file (caller falls through; absent paths
+    /// then fail in getStorageObjects exactly as before).
+    struct BlobViewPlan
+    {
+        StoredObject object;        /// physical blob key; logical path; readable extent (envelope + payload)
+        size_t payload_offset = 0;  /// view left bound inside the blob
+        size_t payload_end = 0;     /// view right bound (payload_offset + payload length)
+    };
+    std::optional<BlobViewPlan> getBlobViewPlan(const std::string & path) const;
+
+    /// A seekable reader over ONE blob payload (the object minus its envelope header) - the
+    /// transaction's in-flight read-your-writes (B59). The committed read path goes through
+    /// getBlobViewPlan + the pipeline instead.
     std::unique_ptr<ReadBufferFromFileBase> readBlobPayload(
         const Cas::BlobLocation & location, const std::string & path, const ReadSettings & settings) const;
 

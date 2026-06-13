@@ -46,7 +46,8 @@ using FilesystemReadPrefetchesLogPtr = std::shared_ptr<FilesystemReadPrefetchesL
 ///   4. DistributedCache   -- ReadBufferFromDistributedCache (with fallback to Gather)
 ///   5. MemoryCache        -- CachedInMemoryReadBufferFromFile
 ///   6. AsyncPrefetch      -- AsynchronousBoundedReadBuffer
-///   7. Encryption         -- ReadBufferFromEncryptedFile (may have multiple layers)
+///   7. FileView           -- ReadBufferFromFileView (a byte window over the chain)
+///   8. Encryption         -- ReadBufferFromEncryptedFile (may have multiple layers)
 class ReadPipeline
 {
 public:
@@ -160,6 +161,15 @@ public:
     /// read from the encryption header. It must return the decryption key.
     void needDecryption(String path, size_t buffer_size, KeyFinderFunc key_finder);
 
+    /// -- File view stage --
+    /// Exposes ONLY the byte window [left_bound, right_bound) of the underlying chain as a
+    /// standalone file named `file_name` (ReadBufferFromFileView). Used by content-addressed
+    /// blob reads, where a logical file is a payload window inside a shared blob (the blob's
+    /// envelope header occupies [0, left_bound)). Sits outside async prefetch — the window's
+    /// seeks and right bounds are translated and forwarded down the standard chain — but
+    /// inside decryption, which operates on logical-file bytes.
+    void needFileView(String file_name, size_t left_bound, size_t right_bound);
+
     /// -- Build the final ReadBuffer chain --
     /// Uses the ReadSettings stored in the source stage.
     std::unique_ptr<ReadBufferFromFileBase> build() const;
@@ -214,6 +224,13 @@ private:
         KeyFinderFunc key_finder;
     };
 
+    struct FileViewStage
+    {
+        String file_name;
+        size_t left_bound = 0;
+        size_t right_bound = 0;
+    };
+
 
     struct DistributedCacheStage
     {
@@ -227,6 +244,7 @@ private:
     std::optional<DistributedCacheStage> distributed_cache;
     std::optional<AsyncPrefetchStage> async_prefetch;
     VectorWithMemoryTracking<DecryptionStage> decryption_stages;
+    std::optional<FileViewStage> file_view;
 
     /// build() helpers: one per logical stage group.
     /// Each helper reads private state and returns the (partial) impl buffer.
@@ -235,6 +253,7 @@ private:
     std::unique_ptr<ReadBufferFromFileBase> buildSingleObjectStage(const std::string & query_id) const;
     std::unique_ptr<ReadBufferFromFileBase> wrapMemoryCache(std::unique_ptr<ReadBufferFromFileBase> impl) const;
     std::unique_ptr<ReadBufferFromFileBase> wrapAsyncPrefetch(std::unique_ptr<ReadBufferFromFileBase> impl) const;
+    std::unique_ptr<ReadBufferFromFileBase> wrapFileView(std::unique_ptr<ReadBufferFromFileBase> impl) const;
     std::unique_ptr<ReadBufferFromFileBase> wrapDecryption(std::unique_ptr<ReadBufferFromFileBase> impl) const;
 };
 

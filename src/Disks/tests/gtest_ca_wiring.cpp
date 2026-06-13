@@ -157,6 +157,8 @@ TEST(CaPartPathParser, MutablePerPartFiles)
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <IO/ReadHelpers.h>
+#include <IO/ReadPipeline.h>
 
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
@@ -239,11 +241,91 @@ TEST(CaWiringRead, ResolvesPublishedPart)
     EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/uuid.txt"), std::optional<String>("u-123"));
     auto mobj = storage->getStorageObjects("uui/uuid-1/all_1_1_0/uuid.txt");
     ASSERT_EQ(mobj.size(), 1u);
-    EXPECT_TRUE(mobj[0].remote_path.empty());   /// sized placeholder; bytes ride prepareReadPipeline
+    EXPECT_TRUE(mobj[0].remote_path.empty());   /// sized placeholder; bytes ride prepareInManifestRead
 
     /// The publish stamp (.ca_mtime) backs getLastModified for the part dir and its files.
     EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 1700000000);
     EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0/data.bin").epochTime(), 1700000000);
+}
+
+TEST(CaWiringRead, BlobViewPlanRidesTheStandardPipeline)
+{
+    /// The committed read path (B116): an in-manifest file is served from memory via
+    /// prepareInManifestRead; a blob-backed file translates to its physical blob object +
+    /// payload window (getBlobViewPlan) and rides the STANDARD object-storage pipeline,
+    /// bounded by the FileView stage — composed here the way DiskObjectStorage::prepareRead
+    /// composes it.
+    auto object_storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        object_storage, "pool", "srv1",
+        std::filesystem::temp_directory_path() / "ca_wiring_scratch", nullptr);
+    storage->startup();
+    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
+
+    /// In-manifest file: memory source, no blob plan.
+    DB::ReadPipeline manifest_pipeline;
+    ASSERT_TRUE(storage->prepareInManifestRead("uui/uuid-1/all_1_1_0/uuid.txt", DB::ReadSettings{}, manifest_pipeline));
+    String manifest_bytes;
+    {
+        auto buf = manifest_pipeline.build();
+        DB::readStringUntilEOF(manifest_bytes, *buf);
+    }
+    EXPECT_EQ(manifest_bytes, "u-123");
+    EXPECT_FALSE(storage->getBlobViewPlan("uui/uuid-1/all_1_1_0/uuid.txt").has_value());
+
+    /// Blob-backed file: a real physical key and a payload-sized window whose extent equals
+    /// the object's readable size (a right-bounded read never overshoots the window).
+    const std::string path = "uui/uuid-1/all_1_1_0/data.bin";
+    auto plan = storage->getBlobViewPlan(path);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_FALSE(plan->object.remote_path.empty());
+    EXPECT_EQ(plan->object.local_path, path);
+    EXPECT_EQ(plan->payload_end - plan->payload_offset, 9u);
+    EXPECT_EQ(plan->object.bytes_size, plan->payload_end);
+    EXPECT_FALSE(storage->prepareInManifestRead(path, DB::ReadSettings{}, manifest_pipeline = {}));
+
+    auto make_pipeline = [&]
+    {
+        DB::ReadPipeline pipeline;
+        pipeline.setSource(object_storage, {plan->object}, DB::ReadSettings{});
+        pipeline.needGather();
+        pipeline.needFileView(path, plan->payload_offset, plan->payload_end);
+        return pipeline;
+    };
+    EXPECT_EQ(make_pipeline().describe(), "Source(ObjectStorage) -> Gather -> FileView");
+
+    {
+        auto buf = make_pipeline().build();
+        EXPECT_EQ(buf->getFileName(), path);
+        EXPECT_EQ(buf->tryGetFileSize(), std::optional<size_t>(9));
+        String bytes;
+        DB::readStringUntilEOF(bytes, *buf);
+        EXPECT_EQ(bytes, "payload-A");
+    }
+
+    /// Right-bounded read through the view (the MergeTreeReaderStream::adjustRightMark shape):
+    /// the bound is window-relative and forwarded down the chain.
+    {
+        auto buf = make_pipeline().build();
+        buf->setReadUntilPosition(7);
+        String head(7, '\0');
+        buf->readStrict(head.data(), 7);
+        EXPECT_EQ(head, "payload");
+        EXPECT_TRUE(buf->eof());
+        buf->setReadUntilEnd();
+        String tail;
+        DB::readStringUntilEOF(tail, *buf);
+        EXPECT_EQ(tail, "-A");
+    }
+
+    /// Seek inside the window.
+    {
+        auto buf = make_pipeline().build();
+        buf->seek(8, SEEK_SET);
+        String last;
+        DB::readStringUntilEOF(last, *buf);
+        EXPECT_EQ(last, "A");
+    }
 }
 
 TEST(CaWiringRead, ProjectionDirectory)

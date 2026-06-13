@@ -619,7 +619,7 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         const auto location = store()->locate(entry);
         /// StoredObject carries no range (the recorded upstream delta) — the PAYLOAD length is the
         /// size (what every size consumer wants); the header offset is applied by
-        /// prepareReadPipeline's view, the only byte-reading path.
+        /// getBlobViewPlan's view window, the only byte-reading path.
         return {StoredObject(location.key, path, location.length)};
     }
     throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in tree of {}", r->file, path);
@@ -664,50 +664,55 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     return std::nullopt;
 }
 
-bool ContentAddressedMetadataStorage::prepareReadPipeline(
+bool ContentAddressedMetadataStorage::prepareInManifestRead(
     const std::string & path, const ReadSettings & settings, ReadPipeline & pipeline) const
 {
     /// In-manifest bytes (mutable per-part files, inline entries, verbatim namespace files):
     /// served from memory — there is no object to read.
-    if (auto bytes = tryGetInManifestBytes(path))
-    {
-        const auto size = bytes->size();
-        auto creator = [path, data = std::move(*bytes)](
-            const StoredObject &, const ReadSettings &, bool, bool) -> std::unique_ptr<ReadBufferFromFileBase>
-        {
-            return std::make_unique<ReadBufferFromOwnMemoryFile>(path, data);
-        };
-        pipeline.setSource(std::move(creator), {StoredObject("", path, size)}, settings);
-        return true;
-    }
-
-    /// Blob-backed part file: read the object and expose ONLY the payload through a view (the
-    /// CHCA envelope header is `location.offset` bytes at the front).
-    if (!ContentAddressed::isPartFilePath(path))
+    auto bytes = tryGetInManifestBytes(path);
+    if (!bytes)
         return false;
+
+    const auto size = bytes->size();
+    auto creator = [path, data = std::move(*bytes)](
+        const StoredObject &, const ReadSettings &, bool, bool) -> std::unique_ptr<ReadBufferFromFileBase>
+    {
+        return std::make_unique<ReadBufferFromOwnMemoryFile>(path, data);
+    };
+    pipeline.setSource(std::move(creator), {StoredObject("", path, size)}, settings);
+    return true;
+}
+
+std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMetadataStorage::getBlobViewPlan(
+    const std::string & path) const
+{
+    if (!ContentAddressed::isPartFilePath(path))
+        return std::nullopt;
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
-        return false;
+        return std::nullopt;
     auto r = route(*p);
     if (!r || r->file.empty())
-        return false;
+        return std::nullopt;
     auto rt = resolveRouted(*r);
     if (!rt)
-        return false;
+        return std::nullopt;
     for (const auto & entry : rt->second)
     {
         if (entry.name != r->file)
             continue;
         const auto location = store()->locate(entry);
-        auto creator = [this, location, path](
-            const StoredObject &, const ReadSettings & creator_settings, bool, bool) -> std::unique_ptr<ReadBufferFromFileBase>
-        {
-            return readBlobPayload(location, path, creator_settings);
-        };
-        pipeline.setSource(std::move(creator), {StoredObject(location.key, path, location.length)}, settings);
-        return true;
+        BlobViewPlan plan;
+        /// bytes_size is the readable extent of THIS file's window, NOT the whole blob: a
+        /// right-bounded read stops at payload_end, and a packed blob's bytes beyond it belong
+        /// to other files. The caches key on the physical blob key, so payload ranges are
+        /// shared between every part that references the same blob.
+        plan.object = StoredObject(physicalKey(location.key), path, location.offset + location.length);
+        plan.payload_offset = location.offset;
+        plan.payload_end = location.offset + location.length;
+        return plan;
     }
-    return false;
+    return std::nullopt;
 }
 
 std::unique_ptr<ReadBufferFromFileBase> ContentAddressedMetadataStorage::readBlobPayload(
