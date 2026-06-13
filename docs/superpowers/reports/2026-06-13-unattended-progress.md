@@ -325,3 +325,19 @@ path (which the CA-only changes don't touch), this is DEFINITIVE: the shared S3-
 (Expect:100-continue, ReadBufferFromS3 cancellation) do NOT regress the non-CA / s3-minio path.
 Integration tests (2 CA + test_merge_tree_s3 non-CA) re-run with minio — pending (also reveals whether
 this minio version enforces conditional ops, i.e. whether CA works on it at all).
+
+### 2026-06-13 ~12:00 UTC — integration with minio: NO non-CA regression; CA fail-closes on minio (by design)
+2nd integration run (minio connectivity worked this time — earlier failure was transient): **22 passed,
+3 skipped, 3 errors**. The 3 errors are ALL the CA tests, erroring at CA-disk load with
+`CasProbe: deleteExact with a wrong token was not TokenMismatch — backend does not enforce conditional
+deletes (NOT_IMPLEMENTED)` (CasProbe.cpp:146 → Store::open). I.e. CA's safety probe CORRECTLY rejects
+minio (which honors a mismatched-token DELETE — unsafe for the incarnation protocol). Fail-closed,
+by design, pre-existing (B125 — CA integration tests need RustFS), NOT a regression.
+The non-CA `test_merge_tree_s3` (+ 21 others) PASSED → no regression on non-CA s3 integration.
+
+## OVERALL no-regression verdict (per operator request)
+- non-CA s3-minio STATELESS: 10269 passed, only the same pre-existing non-CA failures as every lane.
+- non-CA s3 INTEGRATION (test_merge_tree_s3 + 21): passed.
+- CA-S3 STATELESS (RustFS): 99.8%, 3× stable, zero CA-correctness regressions.
+=> The shared S3-client changes do NOT regress the non-CA / minio paths. The only CA "failures" are
+the CA integration tests fail-closing on minio (correct safety behavior; they need RustFS = B125).
