@@ -183,3 +183,12 @@ Remaining latent/large debts (none green-blocking): B110 (Append-at-create, sing
 B114 (size-check defense), B80 (isFile, harmless), B111 (rename perf), B92/B93 (RustFS scanner),
 B94–B99 (M-F full GC milestone — large), B101–B104, B25/B26/B31, B17, B1/B8/B13–B15, B109 (review).
 NEXT: confirm B113/B117 lane subset → final full lane (all fixes) → M-F planning + B110/B114/B80 triage.
+
+### 2026-06-13 ~12:00 — B113/B117 validated; review dispatched
+- B113/B117 CA-S3 lane subset: Failed: 0, Passed: 7 (incl. 03257 B115-regression + 00163 column-oriented).
+- B110/B114/B80 triaged as latent/deferred (not green-blocking).
+- Dispatched an independent adversarial REVIEW subagent on the session's high-stakes changes
+  (B113 cache, B116 pipeline, B117 cancel, B118 Expect:100-continue) — addresses the B109 review debt.
+  Will NOT edit those files until it reports.
+- NEXT: launch final full CA-S3 lane (all fixes in) once praktika frees the container; M-F (B94–B99)
+  planning (read-only) during the run; address any review findings.
