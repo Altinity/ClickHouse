@@ -200,6 +200,15 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
 
 std::vector<TreeEntry> Store::readTree(const TreeId & id)
 {
+    /// B113: trees are content-addressed (immutable), so a cached decode is always valid — no token,
+    /// no invalidation. The read path resolves `route` per file, hitting the same tree repeatedly.
+    {
+        std::lock_guard lock(tree_cache_mutex);
+        auto it = tree_cache.find(id.string());
+        if (it != tree_cache.end())
+            return *it->second;
+    }
+
     /// A live ref naming a missing tree object is a storage invariant violation (INV-NO-DANGLE): surface
     /// it, never substitute an empty tree or any default. Readers have no condemnation awareness — a
     /// present-but-condemned object reads fine here.
@@ -216,7 +225,17 @@ std::vector<TreeEntry> Store::readTree(const TreeId & id)
             "CAS tree key/hash mismatch: object at tree key {} carries logical_hash {}",
             id.string(), u128ToHex(header.logical_hash));
 
-    return decodeTree(std::string_view(object->bytes).substr(payloadOffset(header)));
+    auto decoded = std::make_shared<const std::vector<TreeEntry>>(
+        decodeTree(std::string_view(object->bytes).substr(payloadOffset(header))));
+    {
+        std::lock_guard lock(tree_cache_mutex);
+        /// Bound memory: a wholesale clear on overflow is fine — the entries are pure decode caches
+        /// that re-populate on demand (immutable content, no correctness dependence on residency).
+        if (tree_cache.size() >= TREE_CACHE_MAX_ENTRIES)
+            tree_cache.clear();
+        tree_cache[id.string()] = decoded;
+    }
+    return *decoded;
 }
 
 BlobLocation Store::locate(const TreeEntry & entry) const

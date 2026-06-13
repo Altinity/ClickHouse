@@ -162,6 +162,15 @@ private:
     std::mutex shard_decode_cache_mutex;
     std::unordered_map<String, std::pair<Token, std::shared_ptr<const RootShard>>> shard_decode_cache;
 
+    /// B113 (part 2) tree decode cache: tree_id_hex -> decoded immutable tree. Trees are
+    /// content-addressed (the key IS the content hash), so entries never go stale — no invalidation.
+    /// `route` resolves per FILE op, so the same part's tree was decoded O(files) times per read;
+    /// caching makes it O(1). Bounded (cleared wholesale on overflow) to cap memory on a server that
+    /// reads very many distinct parts.
+    static constexpr size_t TREE_CACHE_MAX_ENTRIES = 16384;
+    std::mutex tree_cache_mutex;
+    std::unordered_map<String, std::shared_ptr<const std::vector<TreeEntry>>> tree_cache;
+
     /// NOTE (M-C2): the manifest journal is never trimmed here — trimming needs folded_cursor
     /// (INV-JOURNAL-COVERAGE), which is GC state landing in M-C3; the manifest size guard
     /// (soft warn / hard throw, in the publish/drop CAS loop) bounds growth meanwhile.
