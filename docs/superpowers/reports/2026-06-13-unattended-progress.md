@@ -265,3 +265,19 @@ Dispatched a second adversarial review focused on the CA WRITE/COMMIT path
 (`ContentAddressedTransaction`: commit atomicity, staging↔publish, autocommit finalize/cancel,
 createHardLink carry-forward, move/rename, Append lost-update, error propagation) — the highest-stakes
 un-reviewed code (data-writing correctness), addressing the rest of B109. Will fix any real findings.
+
+### 2026-06-13 ~15:30 — write/commit-path review done (B109 advanced)
+Second adversarial review (CA write/commit path). VALIDATED as solid: autocommit one-shots
+(content blobs can't autocommit; finalize-once; cancel-never-publishes; truncated-blob guard),
+createHardLink carry-forward (publish gate re-validates → no wrong-bytes / no re-upload),
+same-name rewrite (clean replace), no-throw destructor. Findings recorded (NOT rushed — commit path
+is high-stakes, fixes need attended design):
+- **B122 (HIGH, latent):** no cross-ref commit atomicity — a `publish` throw mid multi-ref commit
+  leaves earlier refs visible (RENAME TABLE same gap). Latent (publish doesn't throw in the lane;
+  `parts` keyed by {ns,ref} so multi-ref IS reachable for partition ops). End-to-end harm depends on
+  MergeTree recovery. Fix = stage-all-then-publish-with-compensation / recovery journal / one-ref-per-txn.
+- **B123 (LOW/MED):** unguarded verbatim RMW (`moveFile` no CAS; `unlinkFile` fail-open no-op).
+- **B124 (MED):** `moveDirectory` (dest-wins) vs `moveFile` (source-wins) opposite collision policies.
+- B110 updated: append branch covers any non-part Append, not just mutation entries.
+These are latent robustness gaps in the high-stakes commit path — recorded for ATTENDED design+fix,
+consistent with the M-C* adversarial-review discipline; not rushed unattended.
