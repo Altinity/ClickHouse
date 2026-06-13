@@ -11,13 +11,13 @@ as seconds and yields a stored instant whose `toUnixTimestamp` round-trips to th
 value (BASE_TIME + (op_id % TS_WINDOW)). The smoke verifies this round-trip before trusting the rest.
 """
 
-from soak.rowgen import row_for_rid, insert_rids
+from soak.rowgen import row_for_rid, insert_rids, BASE_TIME
 
 _COLS = ["op_id", "writer", "bucket", "k", "ts", "version", "v", "payload", "row_fp"]
 
 
-def insert_values_sql(seed: int, op_id: int, n: int, table: str) -> str:
-    rows = [row_for_rid(seed, rid) for rid in insert_rids(op_id, n)]
+def insert_values_sql(seed: int, op_id: int, n: int, table: str, base_time: int = BASE_TIME) -> str:
+    rows = [row_for_rid(seed, rid, base_time) for rid in insert_rids(op_id, n)]
     tuples = []
     for r in rows:
         # ts is emitted via toDateTime64(<seconds>,3) so the stored instant equals the rowgen

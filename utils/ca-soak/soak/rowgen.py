@@ -22,7 +22,7 @@ def insert_rids(op_id: int, n: int):
     assert n <= MAX_BLOCK
     return [op_id * MAX_BLOCK + j for j in range(n)]
 
-def row_for_rid(seed: int, rid: int) -> dict:
+def row_for_rid(seed: int, rid: int, base_time: int = BASE_TIME) -> dict:
     op_id = rid // MAX_BLOCK
     bucket = rid % NBUCKETS
     k = splitmix64(rid) % KSPACE
@@ -33,7 +33,7 @@ def row_for_rid(seed: int, rid: int) -> dict:
         "writer": op_id % 4,
         "bucket": bucket,
         "k": k,
-        "ts": BASE_TIME + (op_id % TS_WINDOW),
+        "ts": base_time + (op_id % TS_WINDOW),
         "version": 1,
         "v": v0,
         "payload": det_blob(seed, bucket, slot),
