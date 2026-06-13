@@ -192,3 +192,24 @@ NEXT: confirm B113/B117 lane subset → final full lane (all fixes) → M-F plan
   Will NOT edit those files until it reports.
 - NEXT: launch final full CA-S3 lane (all fixes in) once praktika frees the container; M-F (B94–B99)
   planning (read-only) during the run; address any review findings.
+
+### 2026-06-13 ~13:00 — independent review done + findings addressed
+Dispatched an adversarial review subagent on B113/B116/B117/B118. 15 findings; 12 verified SAFE
+(connection-reuse on 412, cache thread-safety/staleness self-correcting, tree-cache no-UAF,
+cancellation no-data-loss, FileView bound translation + double-nesting). 3 actionable:
+- **Finding 6 (memory leak)** FIXED `c1a26be818b`: shard_decode_cache now bounded (16384, clear on
+  overflow) + evicted on dropNamespace. 224 gtests green.
+- **Finding 5 (contract)** FIXED `c1a26be818b`: documented the same-token⟹same-bytes Backend
+  precondition the decode cache relies on (holds for all backends in use). Probe-check noted.
+- **Finding 1 (HIGH, Expect:100-continue fallback)** DEFERRED to B120: the clean poll-then-peek
+  fallback is infeasible via the public Poco API (no socket() accessor; peekResponse closes on
+  timeout); the proper fix is a cross-layer probe-gate / per-disk config flag — an attended change.
+  Expect stays ON (required for B118; all CA stores in use honor it).
+Verdict was FIX-BEFORE-SHIP on Findings 1+6; 6 fixed, 1 recorded with design for attended follow-up.
+
+Caught + worked around a tooling bug: a Monitor whose command contained the literal "praktika run"
+made `pgrep -f "praktika run"` match the monitor's own shell → false "still running" forever, so the
+chained final-lane launch never fired. Stopped it (TaskStop) and launch the final lane with a
+log-content monitor instead. LESSON: never pgrep a string that appears in the monitor's own command.
+
+### Final full CA-S3 lane (all fixes incl. review) — RUNNING (`build/test_final_lane.log`).
