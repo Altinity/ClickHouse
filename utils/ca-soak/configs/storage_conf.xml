@@ -1,0 +1,50 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- Writable content-addressed disk over the shared RustFS pool. Both ch1 and ch2 load
+                 this same config, so they mount the SAME pool (one bucket path = single source of
+                 truth). RustFS is required (not MinIO) because the CA capability probe demands a
+                 store that ENFORCES conditional ops (wrong-token DELETE must fail with 412). -->
+            <ca>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>content_addressed</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <!-- Two servers mounting one pool: mandatory acknowledgement, else the second
+                     mounter refuses to attach (PoolMeta ownership check). -->
+                <content_addressed_allow_shared_pool>1</content_addressed_allow_shared_pool>
+                <!-- Background reachability GC enabled on both servers, running aggressively. -->
+                <content_addressed_gc_enabled>1</content_addressed_gc_enabled>
+                <content_addressed_gc_grace_sec>5</content_addressed_gc_grace_sec>
+                <content_addressed_gc_interval_sec>2</content_addressed_gc_interval_sec>
+            </ca>
+
+            <!-- Read-only fsck view over the SAME endpoint. <readonly>true</readonly> is parsed by
+                 S3Settings into S3RequestSetting::read_only, which makes S3ObjectStorage::isReadOnly
+                 return true (sub-project A's read-only-mode trigger). GC must stay disabled here so
+                 the read-only mount never attempts a reclaim. -->
+            <ca_ro>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>content_addressed</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <content_addressed_allow_shared_pool>1</content_addressed_allow_shared_pool>
+                <content_addressed_gc_enabled>0</content_addressed_gc_enabled>
+                <readonly>true</readonly>
+            </ca_ro>
+        </disks>
+        <policies>
+            <ca>
+                <volumes>
+                    <main>
+                        <disk>ca</disk>
+                    </main>
+                </volumes>
+            </ca>
+        </policies>
+    </storage_configuration>
+</clickhouse>

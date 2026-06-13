@@ -1,0 +1,10 @@
+<clickhouse>
+    <!-- Both ch1 and ch2 point their ZooKeeper/Keeper client at the single Keeper node so that
+         ReplicatedMergeTree coordination works. -->
+    <zookeeper>
+        <node>
+            <host>keeper1</host>
+            <port>9181</port>
+        </node>
+    </zookeeper>
+</clickhouse>
