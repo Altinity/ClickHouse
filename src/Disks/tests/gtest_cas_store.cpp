@@ -278,6 +278,34 @@ TEST(CasStore, ResolveReadLocateRoundTrip)
     (void)blob;
 }
 
+TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
+{
+    /// B113: resolveRef uses a token-validated shard-manifest decode cache. A write to the shard
+    /// mints a new token, so a subsequent resolve must observe the change (cache must NOT serve a
+    /// stale decoded manifest). Without token invalidation this would still see the dropped ref.
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    Layout layout("p");
+    RootNamespace ns{"srv1/tbl"};
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+
+    RootShard root;
+    root.shard_version = 1;
+    root.refs["part_1"] = RefPayload{.tree_id = u128Of("tree-part_1"), .tree_size = 7, .mutable_files = {}};
+    publishRaw(*b, layout, ns, shard, root);
+
+    /// First resolve decodes + caches; second is a cache hit — both must see part_1.
+    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
+    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
+
+    /// Write through the Store (mutateShard => new shard token), removing part_1.
+    s->dropRef(ns, "part_1");
+
+    /// The cache must invalidate on the token change: resolve now reflects the drop.
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+    EXPECT_TRUE(s->listRefs(ns).empty());
+}
+
 TEST(CasStore, ResolveAbsentRefAndAbsentNamespace)
 {
     auto b = std::make_shared<InMemoryBackend>();

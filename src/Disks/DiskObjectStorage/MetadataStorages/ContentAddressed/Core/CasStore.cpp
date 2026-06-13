@@ -137,14 +137,57 @@ BuildPtr Store::startBuild(BuildInfo info)
     return std::make_shared<Build>(shared_from_this(), std::move(keeper), build_id, std::move(info));
 }
 
+std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & ns, uint64_t shard)
+{
+    const String key = pool_layout.rootShardKey(ns, shard);
+
+    /// Empty-manifest sentinel for the absent case — shared so callers can treat absent and present
+    /// uniformly (no refs). Never mutated.
+    static const std::shared_ptr<const RootShard> empty_shard = std::make_shared<const RootShard>();
+
+    /// A `head` gets the current token without transferring/decoding the manifest body.
+    const HeadResult h = pool_backend->head(key);
+    if (!h.exists)
+    {
+        std::lock_guard lock(shard_decode_cache_mutex);
+        shard_decode_cache.erase(key);
+        return empty_shard;
+    }
+
+    {
+        std::lock_guard lock(shard_decode_cache_mutex);
+        auto it = shard_decode_cache.find(key);
+        if (it != shard_decode_cache.end() && it->second.first == h.token)
+            return it->second.second;
+    }
+
+    /// Miss (or the shard was written since we last decoded it): fetch + decode once, then cache by
+    /// the token the bytes actually came from (NOT the head token — a write could have landed in
+    /// between; we cache what we decoded, which is self-consistent).
+    std::optional<GetResult> object = pool_backend->get(key);
+    if (!object)
+    {
+        /// Raced a deletion between head and get — treat as absent.
+        std::lock_guard lock(shard_decode_cache_mutex);
+        shard_decode_cache.erase(key);
+        return empty_shard;
+    }
+    auto decoded = std::make_shared<const RootShard>(decodeRootShard(object->bytes));
+    {
+        std::lock_guard lock(shard_decode_cache_mutex);
+        shard_decode_cache[key] = {object->token, decoded};
+    }
+    return decoded;
+}
+
 std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String & ref_name)
 {
     /// Read side (spec §6): no GC awareness, no tokens. The ref is pure manifest state — resolving it
     /// only reads the owning shard manifest; whether the named tree object is still present is checked
     /// later by readTree (INV-NO-DANGLE surfaces there).
-    const auto [root, _] = readShard(ns, shardOf(ref_name));
-    auto it = root.refs.find(ref_name);
-    if (it == root.refs.end())
+    const auto root = readShardDecoded(ns, shardOf(ref_name));
+    auto it = root->refs.find(ref_name);
+    if (it == root->refs.end())
         return std::nullopt;
 
     const RefPayload & payload = it->second;
@@ -211,8 +254,8 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
     std::map<String, Resolved> result;
     for (uint64_t shard = 0; shard < meta.root_shards; ++shard)
     {
-        const auto [root, _] = readShard(ns, shard);
-        for (const auto & [ref_name, payload] : root.refs)
+        const auto root = readShardDecoded(ns, shard);
+        for (const auto & [ref_name, payload] : root->refs)
         {
             result.emplace(ref_name, Resolved{
                 .tree_id = TreeId(u128ToHex(payload.tree_id)),

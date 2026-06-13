@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <unordered_map>
 
 namespace DB::Cas
 {
@@ -118,8 +119,18 @@ private:
     Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
 
     uint64_t shardOf(const String & ref_name) const;             /// CityHash64(ref_name) % root_shards
-    /// Read shard manifest (absent ⇒ empty RootShard with no token); used by resolve/list/drop.
+    /// Read shard manifest (absent ⇒ empty RootShard with no token); used by mutateShard (writes,
+    /// which need the token for the CAS) and as the uncached primitive under readShardDecoded.
     std::pair<RootShard, std::optional<Token>> readShard(const RootNamespace & ns, uint64_t shard);
+
+    /// Read-path shard read with a token-validated DECODE CACHE (B113): a `head` fetches the current
+    /// token cheaply; on a token match the already-decoded, IMMUTABLE manifest is returned without a
+    /// `get` or a re-decode (the dominant read-heavy cost — the whole shard manifest holds many refs).
+    /// The cached object is `const` and shared, so it is never mutated; writers use `readShard`
+    /// (always fresh) so a publish/drop never reads stale state. Correctness rests on the token
+    /// uniquely identifying the incarnation's bytes (every write mints a new token), so a matching
+    /// token guarantees identical content. Used by resolveRef/listRefs only.
+    std::shared_ptr<const RootShard> readShardDecoded(const RootNamespace & ns, uint64_t shard);
 
     /// Read-modify-CAS one shard manifest under the manifest size guard. `mutate` edits the in-memory
     /// RootShard (which carries the freshly-read shard_version); the helper bumps shard_version, encodes,
@@ -144,6 +155,12 @@ private:
     /// in M-C3; full GC removes a namespace with its final manifests in M-F).
     std::mutex registered_mutex;
     std::set<String> registered_cache;
+
+    /// B113 read-path decode cache: rootShardKey -> (token of the cached bytes, decoded immutable
+    /// manifest). Guarded by its own mutex. A token mismatch (any write to the shard) forces a fresh
+    /// get + decode; cache entries are otherwise reused across reads within and across queries.
+    std::mutex shard_decode_cache_mutex;
+    std::unordered_map<String, std::pair<Token, std::shared_ptr<const RootShard>>> shard_decode_cache;
 
     /// NOTE (M-C2): the manifest journal is never trimmed here — trimming needs folded_cursor
     /// (INV-JOURNAL-COVERAGE), which is GC state landing in M-C3; the manifest size guard
