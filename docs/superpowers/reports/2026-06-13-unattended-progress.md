@@ -396,3 +396,17 @@ Remaining latent write-path items B123 (verbatim RMW)/B124 (move collision)/B126
 single-writer-mitigated and need attended design decisions — documented, not changed unattended.
 
 All CA changes are isolated to the CA subsystem; `Cas*`/`Ca*` gtest battery green at 226 throughout.
+
+## 2026-06-13 (evening) — Soak-test sub-project A COMPLETE: CA read-only disk mode + clickhouse-disks fsck
+Brainstormed → spec (`specs/2026-06-13-ca-fsck-readonly-design.md`) → plan (`plans/2026-06-13-ca-fsck-readonly.md`)
+→ executed via subagent-driven-development (impl + spec/quality/adversarial review per task). All on `cas-mergetree-poc`.
+
+Commits: T1 `1fbcce52513` (PoolConfig.read_only, Store::open skips probe) · T2 `a3c097e9522` (CAMS read-only/observe
+mode; fail-closed writes; WORM substrate) · T3 `fc883069715` + fix `fdb439ca813` (Cas::runFsck reachability classify;
+PackSlice fix from review) · T4 `c1e8c300f3e` + doc `c1e9d464806` (Gc::previewDeletes, write-free; adversarial review
+clean) · T5 `54bf5f952cd` + exit-code fix `ee80535672d` (clickhouse-disks fsck; --query now exits nonzero on failure)
+· T6 `1a502903177` (ca-gc-dryrun) · T7 `5526564184` (verified list/read on CA disks — no fix needed; storage read API
+gtested). 232 Cas*/Ca* gtests green. fsck exit code verified (dangling/guard → nonzero, success → 0).
+
+Deferred follow-ups recorded as B132/B133/B134. Sub-projects B (workload+oracle), C (chaos/orchestration),
+D (assertion/metrics loop + 24h schedule) remain — each its own spec. B126 (RENAME-TABLE atomicity) still queued.
