@@ -885,6 +885,7 @@ TEST(CaWiringExchange, AdoptOfReclaimedTreeFallsBack)
 namespace DB::ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int CORRUPTED_DATA;
 }
 
 namespace
@@ -969,4 +970,20 @@ TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
     faulty->on_write = nullptr;
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
+}
+
+TEST(CaWiringRead, CorruptCaMtimeStampFailsClosed)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "x");
+    tx->commit(DB::NoCommitOptions{});
+
+    /// Corrupt the reserved publish stamp. getLastModified must surface a typed CORRUPTED_DATA rather
+    /// than leaking a bare std::invalid_argument/out_of_range out of the underlying integer parse.
+    storage->store()->updateRefPayload(storage->liveNamespace("uuid-1"), "all_1_1_0",
+        [](DB::Cas::RefPayload & payload) { payload.mutable_files[".ca_mtime"] = "not-a-number"; });
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { storage->getLastModified("uui/uuid-1/all_1_1_0"); });
 }

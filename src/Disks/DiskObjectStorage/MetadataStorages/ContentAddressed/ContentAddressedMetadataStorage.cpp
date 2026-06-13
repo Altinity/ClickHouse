@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
 #include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <IO/ReadHelpers.h>
 #include <IO/ReadPipeline.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -22,6 +23,7 @@ namespace ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
+    extern const int CORRUPTED_DATA;
 }
 
 namespace
@@ -450,7 +452,14 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto it = resolved->mutable_files.find(".ca_mtime");
         if (it == resolved->mutable_files.end())
             return Poco::Timestamp(0);
-        return Poco::Timestamp::fromEpochTime(static_cast<time_t>(std::stoull(it->second)));
+        /// `.ca_mtime` is our own decimal-seconds stamp; a value that is not parseable as such is
+        /// payload corruption. std::stoull would throw a bare std::exception (uncategorized) — surface
+        /// it as a typed, well-described CORRUPTED_DATA instead of masking it or leaking std::out_of_range.
+        UInt64 epoch_seconds = 0;
+        if (!tryParse<UInt64>(epoch_seconds, it->second))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "ContentAddressed: .ca_mtime stamp for {} is not a valid epoch-seconds value: '{}'", path, it->second);
+        return Poco::Timestamp::fromEpochTime(static_cast<time_t>(epoch_seconds));
     };
 
     if (auto p = ContentAddressed::parsePartFilePath(path))

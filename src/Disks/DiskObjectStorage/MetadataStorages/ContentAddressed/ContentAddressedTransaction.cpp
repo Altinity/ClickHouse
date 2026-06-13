@@ -92,6 +92,25 @@ bool ContentAddressedTransaction::republishRef(
     return true;
 }
 
+void ContentAddressedTransaction::dropRefIfPresent(const Cas::RootNamespace & ns, const std::string & ref)
+{
+    /// resolveRef gates the common case (a tmp ref that was never committed is a no-op, not an error);
+    /// dropRef re-reads the shard inside its own CAS loop, so a concurrent drop can land in the window
+    /// between our resolve and that re-read — surfacing as FILE_DOESNT_EXIST. Removal is replay-safe,
+    /// so a ref that is already gone is success, not failure; any other error still propagates.
+    if (!metadata_storage.store()->resolveRef(ns, ref))
+        return;
+    try
+    {
+        metadata_storage.store()->dropRef(ns, ref);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
+            throw;
+    }
+}
+
 ContentAddressedTransaction::PartStaging * ContentAddressedTransaction::findStaging(
     const ContentAddressedMetadataStorage::Route & r)
 {
@@ -431,8 +450,7 @@ void ContentAddressedTransaction::removeDirectory(const std::string & path)
     /// storage has no real directories; tables/detached/shadow are removed via removeRecursive).
     if (auto r = routeOf(path); r && !r->ref.empty() && r->file.empty())
     {
-        if (metadata_storage.store()->resolveRef(r->ns, r->ref))
-            metadata_storage.store()->dropRef(r->ns, r->ref);
+        dropRefIfPresent(r->ns, r->ref);
         return;
     }
 }
@@ -449,8 +467,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
         {
             const auto ns = ContentAddressedMetadataStorage::shadowNamespace(p->shadow_table_dir);
-            if (metadata_storage.store()->resolveRef(ns, p->part_name))
-                metadata_storage.store()->dropRef(ns, p->part_name);
+            dropRefIfPresent(ns, p->part_name);
             return;
         }
         if (ContentAddressed::endsWithTableUuidPair(path))
@@ -488,8 +505,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         /// A single part dir (live or detached): drop its ref.
         if (r && !r->ref.empty() && r->file.empty())
         {
-            if (metadata_storage.store()->resolveRef(r->ns, r->ref))
-                metadata_storage.store()->dropRef(r->ns, r->ref);
+            dropRefIfPresent(r->ns, r->ref);
             return;
         }
         /// A projection subdir: virtual (nested in the parent tree) - removal is a no-op; the

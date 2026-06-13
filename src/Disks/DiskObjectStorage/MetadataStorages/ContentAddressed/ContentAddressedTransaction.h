@@ -96,6 +96,10 @@ private:
     /// Move a COMMITTED ref by republish (adoptTree + publish same tree + dropRef). false = absent source.
     bool republishRef(const Cas::RootNamespace & src_ns, const std::string & src_ref,
                       const Cas::RootNamespace & dst_ns, const std::string & dst_ref);
+
+    /// Idempotent ref removal: drop `ref` if it resolves, tolerating a concurrent drop that races
+    /// between the resolve and the drop (the removal unit is meant to be replay-safe).
+    void dropRefIfPresent(const Cas::RootNamespace & ns, const std::string & ref);
 };
 
 }
