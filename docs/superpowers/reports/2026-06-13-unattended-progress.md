@@ -281,3 +281,13 @@ is high-stakes, fixes need attended design):
 - B110 updated: append branch covers any non-part Append, not just mutation entries.
 These are latent robustness gaps in the high-stakes commit path — recorded for ATTENDED design+fix,
 consistent with the M-C* adversarial-review discipline; not rushed unattended.
+
+### 2026-06-13 ~10:30 UTC — re-run all tests (+ integration), per request
+- **Stateless CA-S3 lane (3rd full run)**: Failed: 21, Passed: 10387, Skipped: 104 (99.8%) — stable,
+  same categories (test_optimize_using_constraints ×10, s2 geo, mysql/connection, alias project,
+  03233 float, + B121 stateful-read flaky timeouts 00091/03800/03927). Zero CA-correctness regressions
+  across THREE full runs.
+- **Integration**: launched `test_content_addressed_s3` + `test_content_addressed_gc_s3` (the CA
+  integration tests). CAVEAT: these use minio, which CA's probe rejects (the B93 reason RustFS replaced
+  it in the stateless lane); they predate the probe enforcement, so a probe-fail at startup would be a
+  PRE-EXISTING integration-needs-RustFS gap (parallel to B93), not a regression. Triaging on result.
