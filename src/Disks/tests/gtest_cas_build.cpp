@@ -33,6 +33,43 @@ StorePtr openStore(const std::shared_ptr<InMemoryBackend> & b)
     return Store::open(b, PoolConfig{.pool_prefix = "p"});
 }
 
+/// A one-shot backend hook (mirrors the WriteCountingBackend delegation pattern in gtest_cas_store.cpp):
+/// it delegates every op to a wrapped Backend, but the FIRST time head(target_key) is called it fires a
+/// deleteExact(target_key, condemned_token) AFTER computing the (present) HEAD result and BEFORE returning
+/// it — simulating GC's exact-token content delete landing in the writer's HEAD->GET window (B136).
+class HeadThenDeleteOnceBackend final : public DB::Cas::Backend
+{
+public:
+    HeadThenDeleteOnceBackend(BackendPtr inner_, String target_key_, DB::Cas::Token condemned_)
+        : inner(std::move(inner_)), target_key(std::move(target_key_)), condemned(condemned_) {}
+
+    DB::Cas::HeadResult head(const String & k) override
+    {
+        const DB::Cas::HeadResult hr = inner->head(k);
+        if (k == target_key && !fired)
+        {
+            fired = true;
+            /// GC's single content-delete site, landing in the HEAD->GET window.
+            inner->deleteExact(target_key, condemned);
+        }
+        return hr;
+    }
+
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
+    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+    DB::Cas::PutOutcome putIfAbsent(const String & k, const String & b, DB::Cas::Token * t = nullptr) override { return inner->putIfAbsent(k, b, t); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k) override { return inner->putIfAbsentStream(k); }
+    DB::Cas::PutOutcome putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, DB::Cas::Token * t = nullptr) override { return inner->putOverwrite(k, b, e, t); }
+    DB::Cas::CasOutcome casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, DB::Cas::Token * t = nullptr) override { return inner->casPut(k, b, e, t); }
+    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
+
+private:
+    BackendPtr inner;
+    String target_key;
+    DB::Cas::Token condemned;
+    bool fired = false;
+};
+
 }
 
 TEST(CasBuild, StartBuildHeartbeatDurableFirst)
@@ -140,6 +177,56 @@ TEST(CasBuild, ReuseBlobCondemnedResurrects)
 
     /// INV-NO-RETURN: the condemned incarnation is unreachable by its old token.
     EXPECT_EQ(b->deleteExact(s->layout().blobKey(id), t0).kind, DeleteOutcome::Kind::TokenMismatch);
+}
+
+TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// 1. Write payload-X via a throwaway build to create the blob; capture its token t0.
+    BlobId id;
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        auto build0 = s0->startBuild({});
+        id = build0->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X")).id;
+        t0 = b->head(s0->layout().blobKey(id)).token;
+    }
+
+    /// 2. Condemn (Blob, hash(X), t0) in the retire view.
+    DB::Cas::Layout layout("p");
+    const String blob_key = layout.blobKey(id);
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
+
+    /// 3. Wrap the backend so the NEXT head(blob_key) returns the (present) result and THEN fires
+    ///    deleteExact(blob_key, t0) exactly once — GC's delete in the HEAD->GET window. Open a FRESH
+    ///    Store over the hook so its retire view (refreshed at open) sees the condemnation.
+    auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
+    auto s = Store::open(hook, PoolConfig{.pool_prefix = "p"});
+    auto build = s->startBuild({});
+
+    /// 4. putBlob with a re-invokable body.
+    ///    BEFORE fix: putIfAbsent -> PreconditionFailed -> observeAndAdmit HEAD (present, condemned)
+    ///                -> resurrect GET (vanished, deleted in the window) -> throws FILE_DOESNT_EXIST.
+    ///    AFTER fix:  the FILE_DOESNT_EXIST is caught; putBlob re-runs the fresh-upload path with the
+    ///                still-held body; the object is recreated under a FRESH token.
+    auto ref = build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
+    EXPECT_EQ(ref.id, id);
+
+    /// 5. The blob is present again under a FRESH token, with the same payload; and the condemned token
+    ///    never returns (INV-NO-RETURN).
+    const HeadResult hr = b->head(blob_key);
+    ASSERT_TRUE(hr.exists);
+    EXPECT_NE(hr.token, t0);
+
+    auto raw = b->get(blob_key);
+    ASSERT_TRUE(raw.has_value());
+    auto h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
+    EXPECT_EQ(h.header_len, s->poolMeta().blob_header_len);
+    EXPECT_EQ(raw->bytes.substr(h.header_len), "payload-X");
+
+    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
 }
 
 TEST(CasBuild, PutTreeEnforcesBottomUp)

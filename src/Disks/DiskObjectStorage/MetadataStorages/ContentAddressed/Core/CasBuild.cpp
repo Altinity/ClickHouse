@@ -88,61 +88,92 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
     const PoolMeta & meta = store->poolMeta();
     const PoolConfig & cfg = store->poolConfig();
 
-    /// W-FRESH-TAG: a fresh incarnation_tag for this upload attempt.
-    EnvelopeHeader header;
-    header.kind = ObjectKind::Blob;
-    header.hash_algo = 1;
-    header.logical_size = source.size;
-    header.logical_hash = logical_hash;
-    header.domain_id = meta.pool_id;
-    header.incarnation_tag = mintU128();
-    header.build_id = build_id;
-    header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
-    header.intended_ref = info.intended_ref;
-    header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
-
-    String head_bytes;
-    try
+    /// B136: bounded retry loop. The happy paths (fresh upload ⇒ Done; existing live incarnation ⇒
+    /// adopt) execute exactly once. The loop only re-iterates on the dedup GC race: when our
+    /// conditional upload hit PreconditionFailed (the content key already exists as a prior
+    /// incarnation), observeAndAdmit ⇒ resurrect HEADs then GETs the key, and GC's exact-token
+    /// content delete can land in that HEAD→GET window so the GET returns nothing and resurrect throws
+    /// FILE_DOESNT_EXIST. We STILL HOLD the body (the BlobSource is re-invokable), so this is the
+    /// spec's "bytes in hand ⇒ re-PUT" resurrect arm: re-run the fresh-upload path. The object is now
+    /// absent ⇒ putIfAbsent creates it fresh under a new incarnation; or a racing writer re-created it
+    /// ⇒ PreconditionFailed again ⇒ observeAndAdmit, which now succeeds. Bounded so pathological churn
+    /// cannot spin forever; on exhaustion the last error propagates. Each attempt mints a FRESH
+    /// incarnation_tag (W-FRESH-TAG) — never reusing the condemned token, so INV-NO-RETURN holds.
+    constexpr int max_attempts = 8;
+    for (int attempt = 0; attempt < max_attempts; ++attempt)
     {
-        head_bytes = encodeEnvelopeHeader(header);
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() != ErrorCodes::BAD_ARGUMENTS)
-            throw;
-        /// intended_ref is diagnostic-only: when it makes the natural header exceed the pool's fixed
-        /// blob_header_len, drop it (never grow the fixed blob header) and re-encode.
-        header.intended_ref.reset();
-        head_bytes = encodeEnvelopeHeader(header);
+        /// W-FRESH-TAG: a fresh incarnation_tag for this upload attempt.
+        EnvelopeHeader header;
+        header.kind = ObjectKind::Blob;
+        header.hash_algo = 1;
+        header.logical_size = source.size;
+        header.logical_hash = logical_hash;
+        header.domain_id = meta.pool_id;
+        header.incarnation_tag = mintU128();
+        header.build_id = build_id;
+        header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
+        header.intended_ref = info.intended_ref;
+        header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
+
+        String head_bytes;
+        try
+        {
+            head_bytes = encodeEnvelopeHeader(header);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() != ErrorCodes::BAD_ARGUMENTS)
+                throw;
+            /// intended_ref is diagnostic-only: when it makes the natural header exceed the pool's fixed
+            /// blob_header_len, drop it (never grow the fixed blob header) and re-encode.
+            header.intended_ref.reset();
+            head_bytes = encodeEnvelopeHeader(header);
+        }
+
+        WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
+        writeString(head_bytes, sink->buffer());
+        const size_t before = sink->buffer().count();
+        source.write_payload(sink->buffer());
+        const size_t written = sink->buffer().count() - before;
+        if (written != source.size)
+        {
+            /// Fail-closed: the envelope's logical_size would lie. Cancel the stream — the key is never
+            /// created by a cancelled sink — and never publish a truncation-undetectable object.
+            sink->cancel();
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "putBlob: source wrote {} bytes, declared {}", written, source.size);
+        }
+
+        Token tok;
+        const PutOutcome outcome = sink->finalize(&tok);
+        if (outcome == PutOutcome::Done)
+        {
+            deps[{static_cast<uint8_t>(ObjectKind::Blob), logical_hash}] =
+                DepEntry{ObjectKind::Blob, tok, store->retireView().round(), source.size};
+            return BlobRef{id, source.size};
+        }
+
+        /// PreconditionFailed ⇒ the key already exists (another writer's incarnation). The body shipped is
+        /// harmless: the dedup saving is the skipped INCARNATION, not the bytes. Apply the cold-reuse rule.
+        try
+        {
+            const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key);
+            return BlobRef{id, admitted};
+        }
+        catch (const Exception & e)
+        {
+            /// B136: the condemned incarnation vanished mid-dedup (GC's exact-token delete in the
+            /// HEAD→GET window). We hold the body — re-run the fresh-upload path instead of failing.
+            /// Only this writer-with-a-body site may recover; the shared resurrect stays fail-closed for
+            /// bodyless callers (revalidateDeps / gateCheckDeps). Any other error propagates; on the last
+            /// attempt rethrow so pathological churn surfaces rather than spinning silently.
+            if (e.code() != ErrorCodes::FILE_DOESNT_EXIST || attempt + 1 == max_attempts)
+                throw;
+        }
     }
 
-    WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
-    writeString(head_bytes, sink->buffer());
-    const size_t before = sink->buffer().count();
-    source.write_payload(sink->buffer());
-    const size_t written = sink->buffer().count() - before;
-    if (written != source.size)
-    {
-        /// Fail-closed: the envelope's logical_size would lie. Cancel the stream — the key is never
-        /// created by a cancelled sink — and never publish a truncation-undetectable object.
-        sink->cancel();
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "putBlob: source wrote {} bytes, declared {}", written, source.size);
-    }
-
-    Token tok;
-    const PutOutcome outcome = sink->finalize(&tok);
-    if (outcome == PutOutcome::Done)
-    {
-        deps[{static_cast<uint8_t>(ObjectKind::Blob), logical_hash}] =
-            DepEntry{ObjectKind::Blob, tok, store->retireView().round(), source.size};
-        return BlobRef{id, source.size};
-    }
-
-    /// PreconditionFailed ⇒ the key already exists (another writer's incarnation). The body shipped is
-    /// harmless: the dedup saving is the skipped INCARNATION, not the bytes. Apply the cold-reuse rule.
-    const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key);
-    return BlobRef{id, admitted};
+    /// Unreachable: the loop either returns or rethrows on the final attempt.
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "putBlob: exhausted retries for {}", key);
 }
 
 BlobRef Build::reuseBlob(const BlobId & id)
