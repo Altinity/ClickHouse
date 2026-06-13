@@ -131,7 +131,6 @@ off_t ReadBufferFromFileView::seek(off_t off, int whence)
     file_offset_of_buffer_end = impl_buffer_end;
     resizeWorkingBuffer();
 
-
     return result - left_bound;
 }
 
@@ -143,7 +142,20 @@ void ReadBufferFromFileView::executeWithOriginalBuffer(Op && op)
 
     /// Set working buffer and other internal into impl.
     swap(*impl);
-    op();
+    try
+    {
+        op();
+    }
+    catch (...)
+    {
+        /// The swap MUST be undone even if `op` throws — otherwise `this` and `impl` are left holding
+        /// each other's working buffers (and a stale `original_working_buffer`), so any subsequent
+        /// read or seek over-reads / serves wrong bytes. `op` can throw (e.g. setReadUntilPosition /
+        /// seek bound checks), so restore-on-exception is required for the view to stay consistent.
+        swap(*impl);
+        original_working_buffer = working_buffer;
+        throw;
+    }
     swap(*impl);
 
     original_working_buffer = working_buffer;

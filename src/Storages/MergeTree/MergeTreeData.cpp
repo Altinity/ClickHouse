@@ -6556,7 +6556,6 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                         PartitionCommand::ATTACH_PARTITION,
                         PartitionCommand::MOVE_PARTITION,
                         PartitionCommand::REPLACE_PARTITION,
-                        PartitionCommand::MOVE_PARTITION,
                     };
 
                     can_execute_alter_on_disk = std::ranges::contains(supported_commands, command.type);

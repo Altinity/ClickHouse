@@ -16,6 +16,7 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int NOT_IMPLEMENTED;
     extern const int ABORTED;
+    extern const int CORRUPTED_DATA;
 }
 }
 
@@ -159,21 +160,32 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "Build: object {} absent — cannot reuse (caller must upload it)", key);
 
+    /// Logical (payload) size = object size minus the pool's fixed blob header; trees would need a
+    /// decode, so report 0. GUARD against unsigned underflow: a truncated/corrupt blob whose object
+    /// size is below the header length must surface as CORRUPTED_DATA, never wrap to a huge value
+    /// (the result is the caller-visible BlobRef::size). Mirrors the GC path's `retiredLogicalSize`.
+    uint64_t logical_size = 0;
+    if (kind == ObjectKind::Blob)
+    {
+        const uint64_t header_len = store->poolMeta().blob_header_len;
+        if (hr.size < header_len)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "Build: blob {} object size {} is below the pool blob header length {}", key, hr.size, header_len);
+        logical_size = hr.size - header_len;
+    }
+
     if (store->retireView().isCondemnedToken(kind, hash, hr.token))
     {
         resurrect(kind, hash, key);
         /// resurrect recorded the dep with the new token; the admitted logical size is bookkeeping for
         /// GC (M-C3) and not load-bearing in M-C2 — report the logical size where cheap (Blob only).
-        return kind == ObjectKind::Blob ? hr.size - store->poolMeta().blob_header_len : 0;
+        return logical_size;
     }
 
     /// Adopt the current incarnation — free, no bytes moved.
     deps[{static_cast<uint8_t>(kind), hash}] =
-        DepEntry{kind, hr.token, store->retireView().round(),
-            /// dep.size is GC bookkeeping (M-C3), populated only where free: a blob's logical size is
-            /// the object size minus the pool's fixed header; trees would require a decode, so 0.
-            kind == ObjectKind::Blob ? hr.size - store->poolMeta().blob_header_len : 0};
-    return kind == ObjectKind::Blob ? hr.size - store->poolMeta().blob_header_len : 0;
+        DepEntry{kind, hr.token, store->retireView().round(), logical_size};
+    return logical_size;
 }
 
 void Build::resurrect(ObjectKind kind, const UInt128 & hash, const String & key)
