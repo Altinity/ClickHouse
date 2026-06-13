@@ -52,6 +52,15 @@ Then work down: B106/B107/B110/B114 correctness audits, B92/B93, M-F (B94–B99)
 
 The full lane (`build/test_full_lane.log`) is the ground-truth "green tests" signal; awaiting it.
 
+### 2026-06-13 ~09:00 — full lane mid-run signal (STRONG)
+- At 1189 tests done: **1184 OK / 5 FAIL**, fast — NO timeout storm. B116+B118 fixed the headline
+  lane failure (read-in-order/INSERT tests that 600s-timed-out now pass in seconds).
+- Early failures (to triage when lane completes — likely pre-existing/non-CA, NOT timeouts):
+  `test_optimize_using_constraints` (×3), `02784_connection_string`,
+  `03650_alias_marker_distributed_different_databases` (the latter is the distributed-ALIAS project,
+  unrelated to CA). Triage plan: repro each on CA-S3 vs plain to classify CA-bug / pre-existing /
+  flaky; only CA-caused regressions are in scope here.
+
 ## Status legend
 TODO / INVESTIGATING / FIX-WIP / VERIFYING / DONE(commit) / DEFERRED(reason)
 
