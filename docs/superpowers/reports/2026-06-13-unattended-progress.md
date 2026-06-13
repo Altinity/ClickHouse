@@ -341,3 +341,34 @@ The non-CA `test_merge_tree_s3` (+ 21 others) PASSED → no regression on non-CA
 - CA-S3 STATELESS (RustFS): 99.8%, 3× stable, zero CA-correctness regressions.
 => The shared S3-client changes do NOT regress the non-CA / minio paths. The only CA "failures" are
 the CA integration tests fail-closing on minio (correct safety behavior; they need RustFS = B125).
+
+## 2026-06-13 ~13:35 UTC — acting on umbrella-review findings (unattended; skipping #2 docs-cleanup)
+Plan (verified batches): (A) observeAndAdmit underflow guard + ReadBufferFromFileView exception-safety
++ trivial nits; (B) narrow Expect:100-continue to a CA-only signal; (C) operability (scratch-path
+resolve, emulated-mode shared-FS warning, getLastModified epoch-0 fallback) + small hardening; (D) B122
+commit atomicity (compensating rollback) + gtest; (E) assess B125 RustFS multi-node integration.
+
+## 2026-06-13 ~13:50 UTC — batches A–D landed
+- **Batch A** (`c9eae8fc7d1`): `observeAndAdmit` blob-underflow guard (CORRUPTED_DATA if object < header_len);
+  `ReadBufferFromFileView::executeWithOriginalBuffer` exception-safety (restore swap on throw);
+  removed duplicate `MOVE_PARTITION` from the PlainRewritable supported-commands list.
+- **Batch B** (`55b4b3e580f`): narrowed `Expect:100-continue` to LARGE conditional writes (≥1 MiB body
+  AND `if-none-match`/`if-match`) — excludes Iceberg metadata + small CA manifest writes. (B120 follow-up
+  still open: graceful fallback for a store that ignores Expect.)
+- **Batch C** (`ac0d5453210`): anchor a RELATIVE `cas_scratch_path` to the server data path (not CWD);
+  `LOG_WARNING` in startup() when the backend runs EmulatedSingleProcess (local pool) — a shared/NFS
+  pool between servers would break CAS invariants silently and the probe can't detect it. (review #1/B25)
+- **Batch D** (`08add5c0d4f`): **B122 commit atomicity FIXED.** `commit()` now tracks the refs it creates
+  and best-effort `dropRef`s them on any mid-loop exception (all-or-nothing); fail-closed (never drops a
+  pre-existing ref; updateRefPayload one-shots not rolled back). TDD via `FaultyLocalObjectStorage` that
+  fails the 2nd shard-manifest publish — confirmed failing pre-fix, passing post-fix. Full Cas*/Ca*
+  battery green (225). **Operator Q (TLA+):** answered — partial commit is NOT a protocol-invariant
+  violation (publish/dropRef each gate-checked + journalled; debris GC-reclaimable; §9 invariants hold),
+  it's a wiring-layer atomicity gap ABOVE the model's abstraction line, so the fix needs a wiring-layer
+  fault-injection gtest, NOT a TLA+ extension. RENAME TABLE's multi-namespace move has the same shape but
+  a different (longer) fix → split out as **B126**.
+
+Remaining review action items to work next (unattended): TOCTOU resolveRef→dropRef catch
+FILE_DOESNT_EXIST; resurrect recursion bound; `.ca_mtime` std::stoull wrap guard; TLV/MAX_HEADER_LEN
+guards; NativeStreamingSink empty-token assert; `tryGetInFlightStorageObjects` physicalKey; unbounded
+registry guard (#4). Larger/deferred: #2 dynamic_cast-to-concrete→virtual dispatch, docs cleanup.
