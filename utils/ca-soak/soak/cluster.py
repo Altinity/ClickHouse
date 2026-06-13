@@ -9,7 +9,20 @@ ch2 :8124 by default; configurable via constructor or env) plus a `docker_exec` 
 
 import os
 import subprocess
+import urllib.error
 import urllib.request
+
+
+class QueryError(RuntimeError):
+    """A ClickHouse HTTP query failed; carries the server-side exception text from the response body
+    (ClickHouse returns its full exception message in the body of a non-2xx HTTP response)."""
+
+    def __init__(self, node, code, body, sql):
+        self.code = code
+        self.body = body
+        self.sql = sql
+        snippet = sql if len(sql) <= 200 else sql[:200] + "...(%d more chars)" % (len(sql) - 200)
+        super().__init__(f"{node} HTTP {code}: {body.strip()} | sql={snippet}")
 
 _DEFAULTS = {
     "node1_host": "localhost", "node1_port": 8123, "node1_container": "ca-soak-ch1-1",
@@ -33,8 +46,16 @@ class Node:
         """POST `sql` and return the raw response body (TabSeparated text), trailing newline stripped."""
         data = sql.encode("utf-8")
         req = urllib.request.Request(self.url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            return resp.read().decode("utf-8").rstrip("\n")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return resp.read().decode("utf-8").rstrip("\n")
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                pass
+            raise QueryError(self, e.code, body, sql) from e
 
     def command(self, sql: str) -> None:
         """Execute a statement expected to return no rows (DDL/DML)."""
