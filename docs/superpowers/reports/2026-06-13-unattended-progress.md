@@ -256,3 +256,12 @@ still unimplemented + unplanned.)
 - B17 (encryption-at-rest), B1 (Replicated*MergeTree), B26/B31: feature milestones needing design.
 Stopping point for SAFE unattended work reached: green-tests goal met, all well-scoped debts fixed/
 triaged, high-stakes paths (read + GC delete) validated, changes independently reviewed.
+
+### 2026-06-13 ~15:00 — second focused review dispatched (B109 write-path)
+Found a blast-radius correction first: the Expect:100-continue gate (if-none-match/if-match) also
+covers **Iceberg** conditional metadata writes (`DataLakes/Iceberg/Utils.cpp`), not just CA — safe
+(same 412 outcome, beneficial on S3/MinIO), recorded in B120; corrects review Finding 3.
+Dispatched a second adversarial review focused on the CA WRITE/COMMIT path
+(`ContentAddressedTransaction`: commit atomicity, staging↔publish, autocommit finalize/cancel,
+createHardLink carry-forward, move/rename, Append lost-update, error propagation) — the highest-stakes
+un-reviewed code (data-writing correctness), addressing the rest of B109. Will fix any real findings.
