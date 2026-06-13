@@ -1009,3 +1009,18 @@ git commit -m "CA fsck T7: verify clickhouse-disks list/read on CA disks (+ fixe
 ## Final review
 
 After Task 7, dispatch a final code reviewer over the whole `cas-fsck` change set (Tasks 1-7) — focus: the read-only fail-closed surface is complete (no mutating path reachable in read-only mode), `runFsck` reachability matches the protocol's reachability definition, `previewDeletes` is write-free and subset-safe, and the commands reject non-CA / writable disks cleanly. Then update the backlog (`docs/superpowers/deferred_backlog/cas-mergetree-integration.md`): mark sub-project A done, and record any deferred follow-ups (force-read-only at clickhouse-disks disk-build time so fsck works without reconfig; precise dedup-byte accounting; the `ca-gc-dryrun` in-grace/leaked `reason` split).
+
+---
+
+## Task 7 outcome
+
+Verified the generic `clickhouse-disks list` and `read` commands against a content-addressed disk. **No change needed** — the commands are sound on CA; only this note was added.
+
+What was checked:
+
+- `CommandList` (`programs/disks/CommandList.cpp`) lists via `DiskWithPath::listAllFilesByPath` → `IDisk::listFiles` → `iterateDirectory` → CA `listDirectory`. `listFiles` iterates and pushes `it->name`, which `StaticDirectoryIterator::name` returns as the basename. The recursive walk reconstructs each child as `parent/name` and recurses on `isDirectory` (→ `existsDirectory`). It never assumes real on-disk directories, never calls `getFileSize` on a directory, and the part-dir/projection-dir/`isDirectoryEmpty` virtual-file semantics (B45/B60) are not on the `list` path. The dotfile filter (hide names starting with `.` unless `--all`) is generic CLI behavior layered on top of CA's own `.ca_*` reserved-name filtering — not a CA bug.
+- `CommandRead` (`programs/disks/CommandRead.cpp`) resolves with `getRelativeFromRoot` and calls `IDisk::readFile` → `DiskObjectStorage::prepareRead`, which serves in-manifest bytes from memory (`prepareInManifestRead`) and blob-backed files through the standard object-storage pipeline bounded by the `FileView` stage (`getBlobViewPlan`). No CA-incompatible assumption.
+
+Both commands ride the exact storage-level read API already covered green by `src/Disks/tests/gtest_ca_wiring.cpp` (`CaWiring*`, 28 tests, all passing): `listDirectory` of a part dir (mutable files surface, `.ca_mtime` filtered), `listDirectory` of a table dir (part names + verbatim subdirs), recursive/nested listing (projection `p.proj`, detached, and the multi-level `shadow/bk1/store/uui/uuid-1/all_1_1_0` descent — the same list-then-`existsDirectory`-then-recurse shape `list --recursive` performs), and `readFile`/blob-backed round-trip (`BlobViewPlanRidesTheStandardPipeline`). The recursive-walk shape is genuinely already covered (the shadow-tree test is a literal multi-level descent), so no redundant gtest was added.
+
+Deferred: a live `clickhouse-disks` ls/cat smoke against a populated read-only pool is deferred to the soak-test harness (sub-project D). Opening a FRESH/empty CA pool read-only correctly fails closed at mount (`PoolMeta::createOrValidate` cannot write the absent pool-meta on a read-only backend), and a populated pool normally comes from a running server — so a CLI-only smoke cannot stand up a populated pool without the harness. CLI caveat found: none.
