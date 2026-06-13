@@ -372,3 +372,27 @@ Remaining review action items to work next (unattended): TOCTOU resolveRef→dro
 FILE_DOESNT_EXIST; resurrect recursion bound; `.ca_mtime` std::stoull wrap guard; TLV/MAX_HEADER_LEN
 guards; NativeStreamingSink empty-token assert; `tryGetInFlightStorageObjects` physicalKey; unbounded
 registry guard (#4). Larger/deferred: #2 dynamic_cast-to-concrete→virtual dispatch, docs cleanup.
+
+## 2026-06-13 ~14:10 UTC — batch E (review triage) + umbrella-review action phase COMPLETE
+- **Batch E** (`8fc6d3d1015`): `dropRefIfPresent` helper makes the three resolve-then-drop removal
+  sites idempotent (tolerate a concurrent-drop `FILE_DOESNT_EXIST` race; replay-safe removal);
+  `getLastModified` `.ca_mtime` now parses via `tryParse<UInt64>` → typed `CORRUPTED_DATA` instead of a
+  bare `std::stoull` exception. TDD: `CaWiringRead.CorruptCaMtimeStampFailsClosed`. Battery green (226).
+- **Review triage (subagent, read-only) of the remaining items:** envelope TLV/`MAX_HEADER_LEN` bounds
+  ALREADY guarded; `resurrect` NOT recursive (no stack-blow). Three genuine-but-deferred:
+  - **B127** empty-token-on-Done — NOT fixed unattended: a fail-closed throw on head-after-put would
+    contradict the documented "CAS keys race by design, don't post-HEAD-check" decision and risks the
+    green CA-S3 lane (the exact class of check that destabilised it pre-B116/B118).
+  - **B128** in-flight `physicalKey` — Emulated-only (identity in Native/production); double-prefix risk.
+  - **B129** unbounded roots registry — size guard is safe-additive, pruning is fence-protocol-sensitive.
+
+### Umbrella-review action items — status
+DONE (safe, unattended): observeAndAdmit underflow (A), ReadBufferFromFileView exception-safety (A),
+dup MOVE_PARTITION (A), Expect narrowing (B), scratch-path anchor + emulated shared-pool warning (C),
+**B122 commit atomicity — the top blocker (D)**, TOCTOU idempotent drop + `.ca_mtime` fail-closed (E).
+DEFERRED w/ rationale: #2 docs-cleanup (operator: skip), #2 dynamic_cast→virtual dispatch (larger
+refactor), getLastModified epoch-0 (cosmetic), B127/B128/B129 (lane-risk / Emulated-only / fence-gated).
+Remaining latent write-path items B123 (verbatim RMW)/B124 (move collision)/B126 (RENAME atomicity) are
+single-writer-mitigated and need attended design decisions — documented, not changed unattended.
+
+All CA changes are isolated to the CA subsystem; `Cas*`/`Ca*` gtest battery green at 226 throughout.
