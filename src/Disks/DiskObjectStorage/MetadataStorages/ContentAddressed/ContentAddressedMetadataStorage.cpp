@@ -24,6 +24,7 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
     extern const int CORRUPTED_DATA;
+    extern const int READONLY;
 }
 
 namespace
@@ -154,6 +155,10 @@ void ContentAddressedMetadataStorage::startup()
     if (cas_store)
         return;
 
+    /// Observe-only mode (the disk's <readonly> config): skip the probe (a probe write would fail on
+    /// a read-only backend), run no heartbeats, start no GC, and fail the mutating surface closed.
+    read_only = object_storage->isReadOnly();
+
     /// Native mode rides real conditional ops (probed fail-closed by Store::open); Local object
     /// storage has none, so the backend emulates exact token semantics in-process (single server).
     const auto mode = object_storage->getType() == ObjectStorageType::Local
@@ -208,14 +213,15 @@ void ContentAddressedMetadataStorage::startup()
     Cas::PoolConfig pool_config;
     pool_config.pool_prefix = pool_prefix;
     pool_config.server_id = serverIdToU128(server_id);
-    pool_config.background_heartbeats = context != nullptr;
+    pool_config.background_heartbeats = (context != nullptr) && !read_only;
+    pool_config.read_only = read_only;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
 
     /// The background GC scheduler runs only on the disk-factory path (context non-null) and when
     /// enabled - the lease makes concurrent schedulers across mounters safe (work dedup), so no
     /// further gating is needed (D-W5).
-    if (context && gc_enabled)
+    if (context && gc_enabled && !read_only)
     {
         gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
             cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full));
@@ -243,6 +249,8 @@ const Cas::StorePtr & ContentAddressedMetadataStorage::store() const
 
 MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 {
+    if (read_only)
+        throw Exception(ErrorCodes::READONLY, "Content-addressed disk is opened read-only: writes are rejected");
     return std::make_shared<ContentAddressedTransaction>(*this);
 }
 
@@ -770,6 +778,9 @@ bool ContentAddressedMetadataStorage::adoptPart(
     const String & table_uuid, const String & part_name,
     const String & tree_id_hex, const std::map<String, String> & mutable_files)
 {
+    if (read_only)
+        throw Exception(ErrorCodes::READONLY, "Content-addressed disk is opened read-only: adoptPart is rejected");
+
     /// Receiver side: adopt-by-tree-id + publish this server's own ref. adoptTree OBSERVES the
     /// tree (cold reuse, 2026-06-12) - a tree reclaimed since the sender's offer surfaces as
     /// FILE_DOESNT_EXIST and the caller falls back to the byte fetch, exactly where the old

@@ -886,6 +886,7 @@ namespace DB::ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int CORRUPTED_DATA;
+    extern const int READONLY;
 }
 
 namespace
@@ -970,6 +971,43 @@ TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
     faulty->on_write = nullptr;
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
+}
+
+TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
+{
+    /// 1. Writable storage publishes a part into a fixed root.
+    const auto root = (std::filesystem::temp_directory_path()
+                       / ("ca_ro_" + std::to_string(::getpid()))).string();
+    std::error_code ec; std::filesystem::remove_all(root, ec); std::filesystem::create_directories(root, ec);
+    auto writable_os = std::make_shared<DB::LocalObjectStorage>(
+        DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    {
+        auto w = std::make_shared<DB::ContentAddressedMetadataStorage>(
+            writable_os, "pool", "srv1", std::filesystem::temp_directory_path() / "ca_ro_scratch", nullptr);
+        w->startup();
+        auto tx = w->createTransaction();
+        writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "ro-bytes");
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    /// 2. Read-only object storage over the SAME root => observe-only metadata storage.
+    auto ro_os = std::make_shared<DB::LocalObjectStorage>(
+        DB::LocalObjectStorageSettings("test", root, /*read_only_=*/true));
+    /// Same server_id as the writer: live namespaces are server-scoped (liveNamespace prepends
+    /// server_id), so an observe-only mount reads the same server's data — the WORM scenario.
+    auto ro = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        ro_os, "pool", "srv1", std::filesystem::temp_directory_path() / "ca_ro_scratch2", nullptr);
+    ro->startup();   /// must NOT throw (probe skipped — a probe write would fail on a read-only os)
+
+    EXPECT_TRUE(ro->isReadOnly());
+    /// Reads work:
+    EXPECT_TRUE(ro->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_EQ(ro->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 8u);
+    /// Writes fail closed:
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::READONLY,
+        [&] { ro->createTransaction(); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::READONLY,
+        [&] { ro->adoptPart("uuid-1", "tmp-fetch", std::string(32, '0'), {}); });
 }
 
 TEST(CaWiringRead, CorruptCaMtimeStampFailsClosed)

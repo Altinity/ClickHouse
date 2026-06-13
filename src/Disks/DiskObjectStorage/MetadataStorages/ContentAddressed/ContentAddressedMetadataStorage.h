@@ -54,7 +54,7 @@ public:
     const std::string & getPath() const override { return storage_path_full; }
     bool supportsChmod() const override { return false; }
     bool supportsStat() const override { return false; }
-    bool isReadOnly() const override { return false; }
+    bool isReadOnly() const override { return read_only; }
     bool isContentAddressed() const override { return true; }
     bool supportsTransactionalMutableFiles() const override { return true; }
     bool areBlobPathsRandom() const override { return false; }
@@ -155,6 +155,9 @@ private:
     Cas::StorePtr cas_store;
     String pool_uuid;
     std::unique_ptr<ContentAddressed::CasGcScheduler> gc_scheduler;
+    /// Derived from object_storage->isReadOnly() at startup (the disk's <readonly> config). When set:
+    /// the probe is skipped, no heartbeats, no GC scheduler, and the mutating surface fails closed.
+    bool read_only = false;
     /// Joined in front of core keys for DIRECT object_storage reads. The Emulated (Local) backend
     /// maps bare pool keys under getCommonKeyPrefix; Native passes keys through - this member
     /// mirrors that rule so readBlobPayload reads exactly where the backend wrote ("" for Native).
