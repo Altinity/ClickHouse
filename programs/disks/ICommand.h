@@ -132,6 +132,7 @@ DB::CommandPtr makeCommandGetCurrentDiskAndPath();
 DB::CommandPtr makeCommandHelp(const DisksApp & disks_app);
 DB::CommandPtr makeCommandTouch();
 DB::CommandPtr makeCommandFsck();
+DB::CommandPtr makeCommandCaGcDryRun();
 #if CLICKHOUSE_CLOUD
 DB::CommandPtr makeCommandPackedIO();
 #endif

@@ -16,6 +16,7 @@ set (CLICKHOUSE_DISKS_SOURCES
     CommandHelp.cpp
     CommandTouch.cpp
     CommandFsck.cpp
+    CommandCaGcDryRun.cpp
     CommandGetCurrentDiskAndPath.cpp
     Utils.cpp)
 
