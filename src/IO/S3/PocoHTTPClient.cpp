@@ -617,6 +617,21 @@ void PocoHTTPClient::makeRequestInternalImpl(
 
             Stopwatch watch;
 
+            /// Conditional writes (`If-None-Match` / `If-Match`, used by the content-addressed
+            /// backend) can carry a large body that the server will reject on a precondition loss.
+            /// Ask the server to evaluate the precondition BEFORE we stream the body via
+            /// `Expect: 100-continue`: on a final early response (e.g. 412) we skip the doomed
+            /// upload entirely. Without this, streaming a multi-MB body into a request the server
+            /// has already decided to reject makes some stores (e.g. RustFS) close mid-upload or
+            /// answer 500, which the SDK then RETRIES up to `s3_retry_attempts` (500) times — a
+            /// ~40-min stall that hangs CA INSERTs (see B118) and the CA-S3 test lane.
+            const bool conditional_write
+                = method == Poco::Net::HTTPRequest::HTTP_PUT
+                && request.GetContentBody()
+                && (poco_request.has("if-none-match") || poco_request.has("if-match"));
+            if (conditional_write)
+                poco_request.setExpectContinue(true);
+
             auto & request_body_stream = session->sendRequest(poco_request, &connect_time, &first_byte_time);
             /// We record connect time here and not earlier, so that if an exception occurs while sending a request,
             /// we won't record the same latency twice.
@@ -624,7 +639,20 @@ void PocoHTTPClient::makeRequestInternalImpl(
             observeLatency(request, first_byte_latency_type, static_cast<HistogramMetrics::Value>(first_byte_time));
             latency_recorded = true;
 
-            if (request.GetContentBody())
+            /// With `Expect: 100-continue`, peek the interim response after the headers. `true` means
+            /// the server sent `100 Continue` (proceed with the body); `false` means it already sent a
+            /// FINAL response (now in `poco_response`) and the body must NOT be sent. `receiveResponse`
+            /// below is still called in both cases (Poco contract) and skips re-reading the headers.
+            bool skip_body = false;
+            if (conditional_write)
+            {
+                setTimeouts(*session, getTimeouts(method, first_attempt, /*first_byte*/ true));
+                skip_body = !session->peekResponse(poco_response);
+                if (enable_s3_requests_logging)
+                    LOG_TEST(log, "Expect: 100-continue peek -> {}", skip_body ? "final response, skipping body" : "100 Continue");
+            }
+
+            if (request.GetContentBody() && !skip_body)
             {
                 if (enable_s3_requests_logging)
                     LOG_TEST(log, "Writing request body.");
