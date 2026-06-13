@@ -315,3 +315,13 @@ need RustFS (recorded B125, parallel to B93). CA-over-S3 remains validated by th
   shared S3-client changes (Expect:100-continue, ReadBufferFromS3 cancellation) don't regress non-CA.
   (NB: normal MergeTree-on-s3 doesn't set conditional headers, so Expect doesn't fire there; the
   non-CA Expect surface is Iceberg — to be covered via integration.)
+
+### 2026-06-13 ~11:40 UTC — full s3-minio (non-CA) lane: NO REGRESSIONS
+Result: Failed: 19, Passed: 10269, Skipped: 224. The 19 failures are the EXACT SAME non-CA categories
+as the CA-S3 lane — test_optimize_using_constraints ×10 (constraint-opt), S2 geo (01854/02224),
+env/network (00163/01880/02479/02784), float precision (03233), distributed-ALIAS project (03649/03650).
+NO new failures, NO timeouts, NO s3-specific breakage. Since they fail IDENTICALLY on the normal s3
+path (which the CA-only changes don't touch), this is DEFINITIVE: the shared S3-client changes
+(Expect:100-continue, ReadBufferFromS3 cancellation) do NOT regress the non-CA / s3-minio path.
+Integration tests (2 CA + test_merge_tree_s3 non-CA) re-run with minio — pending (also reveals whether
+this minio version enforces conditional ops, i.e. whether CA works on it at all).
