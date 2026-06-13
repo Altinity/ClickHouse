@@ -146,3 +146,13 @@ Triage of the 20 (diffs read from the lane log):
 **Verdict: B116+B118 removed the headline CA-S3 timeout storm with no regressions. CA-relevant tests are green.**
 Next: free binary → spot-verify a pre-existing failure on plain → build B117 → B113 measure+fix (helps 03927)
 → continue down backlog (B106/B107/B110/B114 audits, B92/B93, M-F B94–B99).
+
+### 2026-06-13 ~10:30 — B117 + B113 progress
+- **B117** committed `dd408fef7ba` (cancellation check in `processException`; needed
+  `#include <Common/ThreadStatus.h>` — first build failed on incomplete type, fixed). Smoke-verified.
+- **B113 part 1** committed `d1590609597` — token-validated shard-manifest decode cache
+  (`Store::readShardDecoded`, head-validated, immutable shared_ptr; resolveRef/listRefs use it;
+  writers stay on uncached `readShard`). New gtest `ResolveDecodeCacheInvalidatesOnWrite`; CA battery
+  224/224. MEASURED CA-local read-heavy: **2.66× → 1.70×** vs plain (−29% read time).
+- **B113 part 2** (tree decode cache, content-addressed/immutable, no invalidation, bounded 16384)
+  building now; will re-measure + run CA battery + a CA-S3 lane subset to confirm green.
