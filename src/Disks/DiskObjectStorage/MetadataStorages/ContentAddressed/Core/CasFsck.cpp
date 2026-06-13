@@ -59,10 +59,23 @@ FsckReport runFsck(Store & store, bool detail)
                 ++report.total_blob_refs;
                 report.referenced_logical_bytes += e.file_size;
             }
+            else if (e.placement == Placement::PackSlice)
+            {
+                /// Packs are M-F (not produced yet); the producing-path regression test lands with
+                /// them. A slice's liveness keeps the whole pack object reachable, keyed by pack_hash.
+                const String pkey = layout.packKey(PackId(u128ToHex(e.pack_hash)));
+                if (detail)
+                    reachable[pkey].push_back(label);
+                else
+                    reachable.try_emplace(pkey);
+                ++report.total_blob_refs;
+                report.referenced_logical_bytes += e.file_size;
+            }
             else if (e.placement == Placement::Subtree)
             {
                 walk(TreeId(u128ToHex(e.file_hash)), label, seen);
             }
+            /// Placement::Inline carries its bytes in the tree payload — no separate object.
         }
     };
 
