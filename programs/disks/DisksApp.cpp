@@ -42,6 +42,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
+    extern const int STD_EXCEPTION;
 };
 
 LineReader::Patterns DisksApp::query_extenders = {"\\"};
@@ -210,6 +211,8 @@ bool DisksApp::processQueryText(const String & text)
         return false;
     CommandPtr command;
 
+    last_command_exit_code = 0;
+
     auto subqueries = splitOnUnquotedSemicolons(text);
     for (const auto & subquery : subqueries)
     {
@@ -228,6 +231,7 @@ bool DisksApp::processQueryText(const String & text)
         {
             int code = err.code();
             error_string = getExceptionMessageForLogging(err, true, false);
+            last_command_exit_code = code;
             if (code == ErrorCodes::BAD_ARGUMENTS)
             {
                 if (command.get())
@@ -244,10 +248,12 @@ bool DisksApp::processQueryText(const String & text)
         catch (std::exception & err)
         {
             error_string = err.what();
+            last_command_exit_code = ErrorCodes::STD_EXCEPTION;
         }
         catch (...) // Ok: report unknown exception
         {
             error_string = "Unknown exception";
+            last_command_exit_code = ErrorCodes::STD_EXCEPTION;
         }
         if (error_string.has_value())
         {
@@ -584,6 +590,10 @@ int DisksApp::main(const std::vector<String> & /*args*/)
     if (log_file)
         log_file->close();
 
+    /// Non-interactive runs surface a failing command as a nonzero process exit (CI/cron gating,
+    /// e.g. `fsck` reporting dangling objects). Interactive sessions are unaffected.
+    if (query.has_value() && last_command_exit_code != 0)
+        return last_command_exit_code;
     return Application::EXIT_OK;
 }
 
