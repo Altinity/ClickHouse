@@ -86,7 +86,11 @@ public:
     };
 
     /// WRITE-FREE preview of the next round's deletes, derived from the DURABLE gc/snap + gc/state.
-    /// Reflects the snap as last persisted (run at quiescence for an exact picture). No CAS/delete.
+    /// Diagnostic / cross-check ONLY — its output must never feed a real delete. It reads the durable
+    /// snap WITHOUT folding new journal records, so at NON-QUIESCENCE it can OVER-REPORT a node that a
+    /// since-landed publish re-referenced (the real round folds first and would spare it). The
+    /// {preview} ⊆ {genuinely-unreachable} guarantee therefore holds ONLY at quiescence (no journal
+    /// records past the folded cursor); run it then for an exact picture. No CAS/delete on any path.
     std::vector<PreviewEntry> previewDeletes();
 
     /// full-GC walk + debris reclaim: deferred (M-F); API slot reserved.
