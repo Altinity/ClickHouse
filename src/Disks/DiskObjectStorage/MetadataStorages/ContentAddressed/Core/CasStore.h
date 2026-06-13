@@ -28,6 +28,7 @@ struct PoolConfig
     uint64_t manifest_hard_limit = 64ULL << 20;
     std::chrono::milliseconds heartbeat_period{5000};
     bool background_heartbeats = false;       /// tests drive renewOnce explicitly
+    bool read_only = false;                   /// observe-only open: skip the mutating capability probe; reads only
 };
 
 struct Resolved

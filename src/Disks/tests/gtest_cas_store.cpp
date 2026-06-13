@@ -24,6 +24,47 @@ using DB::Cas::tests::u128Of;
 using DB::Cas::tests::writeBlobRaw;
 using DB::Cas::tests::writeTreeRaw;
 
+namespace
+{
+/// Counts mutating backend calls so a test can assert an open path is write-free.
+class WriteCountingBackend final : public DB::Cas::Backend
+{
+public:
+    explicit WriteCountingBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
+    size_t writes = 0;
+
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
+    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
+    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+    DB::Cas::PutOutcome putIfAbsent(const String & k, const String & b, DB::Cas::Token * t = nullptr) override { ++writes; return inner->putIfAbsent(k, b, t); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k) override { ++writes; return inner->putIfAbsentStream(k); }
+    DB::Cas::PutOutcome putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, DB::Cas::Token * t = nullptr) override { ++writes; return inner->putOverwrite(k, b, e, t); }
+    DB::Cas::CasOutcome casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, DB::Cas::Token * t = nullptr) override { ++writes; return inner->casPut(k, b, e, t); }
+    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { ++writes; return inner->deleteExact(k, t); }
+private:
+    std::shared_ptr<DB::Cas::Backend> inner;
+};
+}
+
+TEST(CasStore, ReadOnlyOpenSkipsProbe)
+{
+    auto shared = std::make_shared<DB::Cas::InMemoryBackend>();
+
+    DB::Cas::PoolConfig cfg;
+    cfg.pool_prefix = "pool";
+    cfg.server_id = DB::UInt128(1);
+    /// Writable open: creates _pool_meta and runs the probe (which writes+cleans up).
+    DB::Cas::Store::open(std::make_shared<WriteCountingBackend>(shared), cfg);
+
+    /// Read-only re-open over the SAME data must perform ZERO writes (no probe, meta already present).
+    auto counter = std::make_shared<WriteCountingBackend>(shared);
+    DB::Cas::PoolConfig ro = cfg;
+    ro.read_only = true;
+    auto store = DB::Cas::Store::open(counter, ro);
+    EXPECT_EQ(counter->writes, 0u);
+    ASSERT_NE(store, nullptr);
+}
+
 TEST(CasPoolMeta, CreateThenReopen)
 {
     auto b = std::make_shared<InMemoryBackend>();

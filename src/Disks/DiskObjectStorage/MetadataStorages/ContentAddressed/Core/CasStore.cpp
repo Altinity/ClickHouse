@@ -46,7 +46,11 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
     /// FAIL-CLOSED (design §6): the capability probe throws NOT_IMPLEMENTED on any failed check, and
     /// PoolMeta::createOrValidate is pool-authoritative — the config constants apply only at creation.
     Layout layout(config.pool_prefix);
-    runCapabilityProbe(*backend, config.pool_prefix + "/_probe");
+    /// The probe writes and deletes throwaway keys to verify conditional-op enforcement. A read-only
+    /// open must never mutate the pool it inspects; fsck only reads, so skip it. (Pool meta below is
+    /// read-only when the pool already exists; a missing pool meta on a read-only backend fails closed.)
+    if (!config.read_only)
+        runCapabilityProbe(*backend, config.pool_prefix + "/_probe");
     PoolMeta meta = PoolMeta::createOrValidate(*backend, layout, config.root_shards, config.blob_header_len);
 
     /// Private ctor: make_shared cannot reach it.
