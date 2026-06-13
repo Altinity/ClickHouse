@@ -15,6 +15,7 @@ extern const int BAD_ARGUMENTS;
 extern const int FILE_DOESNT_EXIST;
 extern const int LOGICAL_ERROR;
 extern const int NOT_IMPLEMENTED;
+extern const int ABORTED;
 }
 
 using namespace DB::Cas;
@@ -227,6 +228,62 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
     EXPECT_EQ(raw->bytes.substr(h.header_len), "payload-X");
 
     EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
+}
+
+TEST(CasBuild, PublishResurrectVanishedThrowsAbortedRetryable)
+{
+    /// B137: the resurrect HEAD->GET window also races GC's exact-token delete on the BODYLESS publish
+    /// path (gateCheckDeps -> observeAndAdmit -> resurrect), where no writer holds the body to re-upload.
+    /// That vanish must surface as ABORTED ("retry the operation") — a retryable transient, matching the
+    /// sibling lost-dependency branches — NOT a hard FILE_DOESNT_EXIST (which became an HTTP-500 INSERT
+    /// failure).
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// 1. Write payload-X via a throwaway build to create the blob object; capture its token t0.
+    BlobId id;
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        auto build0 = s0->startBuild({});
+        id = build0->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X")).id;
+        t0 = b->head(s0->layout().blobKey(id)).token;
+    }
+
+    /// 2. A source tree referencing blob hash(X) by name. adoptFromTree records a TOKENLESS (evidence)
+    ///    Blob dep on hash(X) WITHOUT holding the body — exactly the bodyless dependency B137 is about.
+    DB::Cas::Layout layout("p");
+    const String blob_key = layout.blobKey(id);
+    TreeEntry src_entry;
+    src_entry.name = "data.bin";
+    src_entry.placement = Placement::Blob;
+    src_entry.file_hash = u128Of("payload-X");
+    src_entry.file_size = 9;
+    const TreeId source = writeTreeRaw(*b, layout, {src_entry}, openStore(b)->poolMeta().pool_id);
+
+    /// 3. Condemn (Blob, hash(X), t0) in the retire view, so the publish gate sees the evidence dep as a
+    ///    condemned hit and must resolve it (observeAndAdmit -> resurrect).
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
+
+    /// 4. Wrap the backend so the NEXT head(blob_key) returns the (present) result and THEN fires
+    ///    deleteExact(blob_key, t0) exactly once — GC's exact-token delete landing in the resurrect
+    ///    HEAD->GET window. Open a FRESH Store over the hook so its retire view (refreshed at open) sees
+    ///    the condemnation. The FIRST head(blob_key) in this build is the one inside the gate's
+    ///    observeAndAdmit (adoptFromTree only reads the source tree; putTree of the new tree does not
+    ///    head the blob), so the one-shot fires precisely in the window before resurrect's GET.
+    auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
+    auto s = Store::open(hook, PoolConfig{.pool_prefix = "p"});
+    auto build = s->startBuild({});
+
+    /// 5. Adopt the blob as a tokenless evidence dep, then build a NEW tree referencing it. No body in hand.
+    const TreeEntry adopted = build->adoptFromTree(source, "data.bin");
+    const TreeId tree = build->putTree({adopted});
+
+    /// 6. Publish drives the bodyless gate: tokenless+condemned -> observeAndAdmit head(blob_key) [hook
+    ///    fires deleteExact(blob_key, t0)] -> present&condemned -> resurrect GET (vanished) -> throws.
+    ///    BEFORE fix: FILE_DOESNT_EXIST (hard). AFTER fix: ABORTED "retry the operation" (retryable).
+    expectThrowsCode(DB::ErrorCodes::ABORTED,
+        [&] { build->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{}); });
 }
 
 TEST(CasBuild, PutTreeEnforcesBottomUp)

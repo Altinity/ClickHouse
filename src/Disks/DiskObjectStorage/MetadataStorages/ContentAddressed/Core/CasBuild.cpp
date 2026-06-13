@@ -162,12 +162,17 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
         }
         catch (const Exception & e)
         {
-            /// B136: the condemned incarnation vanished mid-dedup (GC's exact-token delete in the
-            /// HEAD→GET window). We hold the body — re-run the fresh-upload path instead of failing.
-            /// Only this writer-with-a-body site may recover; the shared resurrect stays fail-closed for
-            /// bodyless callers (revalidateDeps / gateCheckDeps). Any other error propagates; on the last
-            /// attempt rethrow so pathological churn surfaces rather than spinning silently.
-            if (e.code() != ErrorCodes::FILE_DOESNT_EXIST || attempt + 1 == max_attempts)
+            /// B136/B137: the condemned incarnation vanished mid-dedup (GC's exact-token delete in the
+            /// HEAD→GET window). We hold the body — re-run the fresh-upload path instead of failing. The
+            /// vanish surfaces two ways: FILE_DOESNT_EXIST from observeAndAdmit's HEAD-absent check (the
+            /// object was gone before resurrect's GET) and ABORTED from resurrect's own vanish (gone in
+            /// the GET window, B137) — both mean "object vanished ⇒ re-upload the held body". Only this
+            /// writer-with-a-body site may recover; the shared resurrect stays retryable-but-fail-closed
+            /// for bodyless callers (revalidateDeps / gateCheckDeps), which propagate the ABORTED. Any
+            /// other error propagates; on the last attempt rethrow so pathological churn surfaces rather
+            /// than spinning silently.
+            const bool vanished = e.code() == ErrorCodes::FILE_DOESNT_EXIST || e.code() == ErrorCodes::ABORTED;
+            if (!vanished || attempt + 1 == max_attempts)
                 throw;
         }
     }
@@ -223,8 +228,15 @@ void Build::resurrect(ObjectKind kind, const UInt128 & hash, const String & key)
 {
     const std::optional<GetResult> got = store->backend().get(key);
     if (!got)
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-            "Build::resurrect: object {} vanished between HEAD and GET", key);
+        /// resurrect is ONLY ever entered on a CONDEMNED (kind, hash), so a vanish here is ALWAYS the
+        /// benign GC race: exact-token deleteExact landed in the HEAD->GET window. This is the same
+        /// retryable lost-dependency situation as the sibling branches below (revalidateDeps /
+        /// gateCheckDeps), so surface it as ABORTED "retry the operation" — NOT a hard FILE_DOESNT_EXIST
+        /// (which became an HTTP-500 INSERT failure on the bodyless publish path, B137). A
+        /// genuinely-never-existed dep is a SEPARATE FILE_DOESNT_EXIST at observeAndAdmit (HEAD-absent),
+        /// which is untouched. putBlob's body-holding retry catches this ABORTED and re-uploads in hand.
+        throw Exception(ErrorCodes::ABORTED,
+            "Build::resurrect: condemned incarnation of {} deleted by GC between HEAD and GET; retry the operation", key);
 
     EnvelopeHeader header = decodeEnvelopeHeader(got->bytes, got->bytes.size(), kind);
 
