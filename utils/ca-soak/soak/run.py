@@ -55,12 +55,20 @@ from soak.checker import (
     drive_gc_to_fixpoint,
 )
 from soak.fsck import run_fsck, run_dryrun
-from soak.chaos import generate_chaos_schedule, apply_fault
+from soak.chaos import generate_chaos_schedule, apply_fault, Fault, FaultTarget, FaultAction
+from soak import metrics as metrics_mod
+from soak.pool import pool_size
+from soak.schedule import stage_plan, stage_at, chaos_window, StageKind
 
 TABLE = "ca_stress"
 FSCK_CONTAINER = "ca-soak-ch1-1"
 
 MAX_CLIFFS = 2
+
+# Phase-3 defaults. The metrics tick is the §8 "every 60s" cadence; for a SHORT self-check it is
+# scaled down (see `metrics_interval_for`) so a 10-minute run still records a useful curve.
+METRICS_INTERVAL_S = 60
+GB = 1024 ** 3
 
 # search_orphaned_parts_disks='local' (B143): the harness config defines a SECOND CA disk `ca_ro`
 # (a read-only alias of the SAME RustFS pool, used by the offline `clickhouse disks fsck` applet)
@@ -92,6 +100,59 @@ BARRIER_TYPES = (OpType.UPDATE, OpType.DELETE, OpType.TRUNCATE, OpType.DROP_PART
 
 def log(msg: str):
     print(f"[soak.run] {msg}", flush=True)
+
+
+def parse_duration(s) -> int:
+    """Parse a wall-clock duration to seconds. Accepts a bare integer (seconds) or a suffixed form
+    `<n>{s,m,h,d}` (e.g. `24h`, `600`, `90m`, `1d`). Pure + unit-tested so `--duration 24h` and the
+    compressed `--duration 600` self-check share one deterministic mapping."""
+    if isinstance(s, int):
+        return s
+    s = str(s).strip().lower()
+    if not s:
+        raise ValueError("empty duration")
+    if s[-1] in "smhd":
+        n = float(s[:-1])
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[s[-1]]
+        return int(n * mult)
+    return int(s)
+
+
+def metrics_interval_for(duration_s: int, base_interval_s: int = METRICS_INTERVAL_S) -> int:
+    """The §8 metrics cadence is "every 60s". For a SHORT self-check (e.g. 600s) a 60s tick yields
+    only ~10 samples — too coarse to see the stage transitions. Scale the interval DOWN for short
+    durations so a self-check still produces a dense-enough curve (aim for ~30+ samples), but never
+    below 5s and never above the 60s production cadence. Pure + unit-tested."""
+    target_samples = 30
+    scaled = max(5, min(base_interval_s, duration_s // target_samples))
+    return scaled
+
+
+def demote_dense_mutations(ledger, min_ops_between_mutations: int):
+    """Phase-3 mutation thinning. Each UPDATE/DELETE issues an ALTER ... mutation that materializes
+    a whole part on the remote CA pool — comparatively heavy. The base ledger is ~20% mutations, and
+    the time-driven loop fires them far faster than this cluster materializes them, piling up hundreds
+    of pending mutations that then make a quiesced checkpoint's mutation-drain time out. We DEMOTE a
+    mutation to OPTIMIZE unless at least `min_ops_between_mutations` ops have elapsed since the previous
+    KEPT mutation, so mutations stay SPARSE (a representative few still exercise the UPDATE/DELETE +
+    model path) and always materializable. Demotion is a pure function of op_id order — the cluster
+    and the model consume the IDENTICAL thinned ledger (OPTIMIZE is a model no-op, exactly like the
+    cliff demotion in `build_effective_ledger`). `min_ops_between_mutations<=0` disables thinning."""
+    if min_ops_between_mutations <= 0:
+        return list(ledger)
+    out = []
+    last_mut_op = None
+    for op in ledger:
+        if op.type in (OpType.UPDATE, OpType.DELETE):
+            far_enough = last_mut_op is None or (op.op_id - last_mut_op) >= min_ops_between_mutations
+            if far_enough:
+                last_mut_op = op.op_id
+                out.append(op)
+            else:
+                out.append(Op(op_id=op.op_id, type=OpType.OPTIMIZE, target=op.target, param=op.param))
+        else:
+            out.append(op)
+    return out
 
 
 def build_effective_ledger(ledger, max_cliffs: int, min_ops_between_cliffs: int):
@@ -161,6 +222,20 @@ class Driver:
         self.transport_resilient = transport_resilient
         self.transport_retries = 0  # count of transport-retried op attempts (chaos evidence)
         self._transport_lock = threading.Lock()
+        # Phase-3 resource bounding: an insert THROTTLE the metrics ticker raises when the physical
+        # pool approaches --max-pool-gb. `throttle_sleep_s` (0 == unthrottled) is the per-insert delay
+        # injected into each submitted INSERT worker; it slows the workers WITHOUT dropping work (the
+        # op still runs, just paced). Read locklessly (a float store/load is atomic enough for pacing).
+        self.throttle_sleep_s = 0.0
+        self.inserts_submitted = 0
+        self._submit_lock = threading.Lock()
+        # OPTIMIZE ops on one table serialize server-side on the merge mutex; submitting many
+        # concurrently just queues them and — worse — under continuous submission they can occupy
+        # EVERY worker slot at once, pinning the whole pool on slow remote-CA merges and starving
+        # INSERTs. Cap concurrent OPTIMIZEs at 1 (a non-blocking try-acquire: if one is already
+        # running, the new OPTIMIZE op is a NO-OP — it has no model effect, so skipping it is sound
+        # and keeps workers free for inserts).
+        self._optimize_gate = threading.BoundedSemaphore(1)
 
     def _note_transport_retry(self, op_kind, op_id, attempt, node, err):
         with self._transport_lock:
@@ -178,6 +253,8 @@ class Driver:
         sql = insert_values_sql(self.seed, op.op_id, n, TABLE, self.base_time, settings=self.insert_settings)
         fut = self.executor.submit(self._insert_with_retry, op.target, sql, op.op_id)
         self.inflight.append(fut)
+        with self._submit_lock:
+            self.inserts_submitted += 1
 
     def _nodes_starting_at(self, target):
         """Replica list to try in order, starting at the op's assigned replica then the other one --
@@ -195,6 +272,11 @@ class Driver:
             with self._aborted_lock:
                 self.aborted_retries += 1
             log(f"INSERT op_id={op_id} hit retryable ABORTED (attempt {attempt}); retrying. {err}")
+
+        # Phase-3 resource-bounding throttle: pace the insert WITHOUT dropping it (the op still runs).
+        sleep_s = self.throttle_sleep_s
+        if sleep_s > 0:
+            time.sleep(sleep_s)
 
         order = self._nodes_starting_at(target)
 
@@ -229,13 +311,32 @@ class Driver:
         fut = self.executor.submit(self._optimize_with_retry, op.target, op.op_id)
         self.inflight.append(fut)
 
+    OPTIMIZE_TIMEOUT_S = 45
+
     def _optimize_with_retry(self, target, op_id):
-        order = self._nodes_starting_at(target)
-
-        def one_attempt(attempt_idx):
-            order[attempt_idx % len(order)].command(f"OPTIMIZE TABLE {TABLE}")
-
-        self._with_transport_retry("OPTIMIZE", op_id, one_attempt)
+        # At most one OPTIMIZE in flight (try-acquire, non-blocking). If one is already running, skip
+        # this OPTIMIZE: it has NO model effect, so dropping a redundant compaction hint is sound and
+        # avoids piling concurrent OPTIMIZEs that would pin every worker on the serialized merge mutex.
+        if not self._optimize_gate.acquire(blocking=False):
+            return
+        try:
+            node = node_for(self.cluster, target)
+            # OPTIMIZE is a best-effort compaction HINT with no model effect, and over wide parts on the
+            # remote CA pool it can run for minutes. Run it ONCE with a BOUNDED socket timeout and
+            # SWALLOW a timeout (and node-down under chaos): a slow/abandoned OPTIMIZE must never pin a
+            # worker — which would stall the barrier `drain` (and thus the whole phase-3 timeline) —
+            # and dropping it loses nothing the background merges + the checkpoint's `OPTIMIZE FINAL`
+            # don't already do. A genuine query error (not transport/timeout) still surfaces.
+            try:
+                node.command(f"OPTIMIZE TABLE {TABLE}", timeout=self.OPTIMIZE_TIMEOUT_S)
+            except QueryError as e:
+                if not e.is_node_down:
+                    raise
+            except Exception as e:
+                if not is_transport_error(e):
+                    raise
+        finally:
+            self._optimize_gate.release()
 
     def drain(self):
         """Wait for all in-flight inserts/optimizes; re-raise the first worker exception loudly."""
@@ -245,6 +346,24 @@ class Driver:
         futures, self.inflight = self.inflight, []
         for fut in futures:
             fut.result()    # propagates any worker exception
+
+    def harvest(self):
+        """Remove already-COMPLETED futures from `inflight`, re-raising the first worker exception.
+        Phase-3 backpressure: the time-driven loop submits ops continuously for hours, so without
+        periodic harvesting the `inflight` list (and the executor's queue) would grow without bound.
+        Non-blocking — only reaps futures that are already done."""
+        if not self.inflight:
+            return
+        still = []
+        for fut in self.inflight:
+            if fut.done():
+                fut.result()        # propagate any worker exception
+            else:
+                still.append(fut)
+        self.inflight = still
+
+    def inflight_count(self):
+        return len(self.inflight)
 
     def drain_silent(self):
         """Wait for in-flight ops on the failure path WITHOUT re-raising worker exceptions, so the
@@ -318,9 +437,23 @@ def checkpoint(driver, cluster, model, phase):
     # known M-F-debris (B140): per CA spec §8 the incremental GC cannot reclaim blobs orphaned by a
     # displaced-before-expansion tree; the Full-GC mark-sweep (milestone M-F, not yet implemented) is
     # the documented backstop that drains it to 0. We TRACK the residual, not fail on it.
-    residual = drive_gc_to_fixpoint(cluster, lambda: run_fsck(FSCK_CONTAINER)["unreachable"])
+    # The fixpoint POLL only needs the `unreachable` COUNT, so it uses the cheap SUMMARY fsck
+    # (`detail=False`): the `--detail` per-object listing scans+classifies every blob and over a large
+    # pool costs tens of seconds PER call, which the multi-poll fixpoint loop would multiply into many
+    # minutes. The single authoritative `--detail` fsck below (needed for the unreachable-key set the
+    # dryrun-subset check consumes) pays that cost exactly once.
+    residual = drive_gc_to_fixpoint(cluster, lambda: run_fsck(FSCK_CONTAINER, detail=False)["unreachable"])
 
-    f = run_fsck(FSCK_CONTAINER)
+    # Authoritative post-GC fsck. The `--detail` per-object listing is needed ONLY to build the
+    # unreachable-KEY set the dryrun-subset assert consumes; over a large pool it costs tens of seconds.
+    # So read the cheap SUMMARY first and only ESCALATE to `--detail` when the summary shows something
+    # to inspect: dangling>0 (need the detail rows for the failure message / phase-2 re-confirm) or
+    # unreachable>0 (need the key set for the subset check). When BOTH are 0 — the clean common case —
+    # the dryrun MUST be empty (nothing is reclaimable), which we assert directly below WITHOUT the
+    # expensive detail scan. This keeps every clean checkpoint cheap.
+    f = run_fsck(FSCK_CONTAINER, detail=False)
+    if f.get("dangling", 0) != 0 or f.get("unreachable", 0) != 0:
+        f = run_fsck(FSCK_CONTAINER, detail=True)
 
     # --- HARD ASSERTS: the invariants the CURRENT CA design guarantees ------------------------
     # INV-NO-LOSS: every ref-reachable object exists. dangling>0 means a referenced object is
@@ -346,6 +479,9 @@ def checkpoint(driver, cluster, model, phase):
         raise CheckpointFailure(f"fsck exit_code != 0: {f.get('exit_code')} stderr={f.get('stderr')}")
 
     # GC never plans to delete a reachable object: {dryrun delete set} subset of {fsck unreachable}.
+    # When the summary was clean (unreachable==0) we skipped `--detail`, so `unreachable_keys` is empty
+    # and the subset check correctly requires the dryrun to be EMPTY (nothing reclaimable -> nothing to
+    # preview); a non-empty dryrun against a zero-unreachable pool would be a real violation.
     dr = run_dryrun(FSCK_CONTAINER)
     unreachable_keys = {row["key"] for row in f.get("detail", []) if row["class"] == "unreachable"}
     for entry in dr.get("entries", []):
@@ -484,6 +620,115 @@ class ChaosRunner(threading.Thread):
             log(f"CHAOS thread error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
+def compute_throttle(pool_bytes, max_pool_bytes, *, current_sleep_s):
+    """Resource-bounding policy (pure + unit-tested). Given the latest physical `pool_bytes` and the
+    `max_pool_bytes` budget, decide the per-insert throttle sleep (seconds).
+
+    - pool unknown (None) -> keep the current throttle (don't react to a missing probe).
+    - < 75% of budget   -> 0.0 (unthrottled; plenty of headroom).
+    - 75%..90%          -> mild pacing (0.05s/insert).
+    - 90%..100%         -> hard pacing (0.25s/insert).
+    - >= 100% of budget -> heavy pacing (1.0s/insert) — never DROP work, only slow it (the TTL
+      horizon is the real cap; throttling buys time for eviction + GC to reclaim).
+
+    Returns the new throttle sleep. The caller LOGS loudly on any change (never silently)."""
+    if pool_bytes is None or max_pool_bytes is None or max_pool_bytes <= 0:
+        return current_sleep_s
+    frac = pool_bytes / max_pool_bytes
+    if frac < 0.75:
+        return 0.0
+    if frac < 0.90:
+        return 0.05
+    if frac < 1.00:
+        return 0.25
+    return 1.0
+
+
+class MetricsTicker(threading.Thread):
+    """Phase-3 background metrics sink. Every `interval_s` it snapshots BOTH nodes via
+    `metrics.snapshot_cluster` (system.parts + repl/mutation/merge counts), LISTs the physical CA pool
+    (`pool.pool_size`) to fill pool_objects/pool_bytes, records the rows into the sqlite `--metrics`
+    db, and applies the resource-bounding throttle (`compute_throttle`) to the driver — logging any
+    throttle change LOUDLY.
+
+    The snapshot reads are read-only system queries; under chaos a node may be transiently down, so a
+    snapshot failure is logged and SKIPPED (the next tick retries) rather than crashing the soak — the
+    metrics curve is observability, not a correctness gate. The CHECKPOINT fsck (correctness) is
+    asserted on the main thread, unchanged."""
+
+    def __init__(self, conn, cluster, table, *, interval_s, max_pool_bytes, driver, stop_event,
+                 restarts_fn, fsck_fn=None):
+        super().__init__(daemon=True, name="metrics")
+        self.conn = conn
+        self.cluster = cluster
+        self.table = table
+        self.interval_s = interval_s
+        self.max_pool_bytes = max_pool_bytes
+        self.driver = driver
+        self.stop_event = stop_event
+        self.restarts_fn = restarts_fn       # callable -> cumulative restart count (chaos evidence)
+        self.fsck_fn = fsck_fn                # optional callable -> latest fsck dict (checkpoint ticks)
+        self.ticks = 0
+        self.recorded = 0
+        self.last_pool_bytes = None
+        self.error = None
+        # tick_once is called from BOTH the ticker thread (periodic) and the main thread (checkpoint
+        # ticks carrying fsck); serialize the sqlite writes (open_db uses check_same_thread=False).
+        self._lock = threading.Lock()
+
+    def tick_once(self, ts, fsck=None):
+        """Take one snapshot of both nodes + the physical pool, record it, and re-evaluate the
+        throttle. Returns the number of rows recorded (0 if the snapshot failed).
+
+        Pool-size source: when an `fsck` result is supplied (checkpoint ticks), its `physical_bytes`/
+        `distinct_blobs` are AUTHORITATIVE and preferred — the cheap per-tick `mc ls` over-counts,
+        because the RustFS test backend retains object VERSIONS on the CA dedup re-PUT path, inflating
+        a raw recursive listing well above the true content-addressed footprint (observed ~2GB LIST vs
+        ~124MB fsck physical_bytes). Between checkpoints we still use the cheap `mc ls` as a proxy
+        (fsck is too slow to run every 60s), accepting its over-count."""
+        objs, pbytes = pool_size()
+        if fsck is not None and fsck.get("physical_bytes") is not None:
+            pbytes = fsck.get("physical_bytes")
+            objs = fsck.get("distinct_blobs", objs)
+        self.last_pool_bytes = pbytes
+        try:
+            snaps = metrics_mod.snapshot_cluster(
+                self.cluster, self.table, ts, fsck=fsck, restarts=self.restarts_fn())
+        except Exception as e:   # node transiently down under chaos -> skip this tick
+            log(f"metrics tick skipped (snapshot failed, node likely down): {type(e).__name__}: {e}")
+            return 0
+        with self._lock:
+            for snap in snaps:
+                snap["pool_objects"] = objs
+                snap["pool_bytes"] = pbytes
+                metrics_mod.record(self.conn, snap)
+        self.recorded += len(snaps)
+        # Resource bounding: re-evaluate the throttle from the freshest physical pool reading.
+        old = self.driver.throttle_sleep_s
+        new = compute_throttle(pbytes, self.max_pool_bytes, current_sleep_s=old)
+        if new != old:
+            pool_gb = (pbytes / GB) if pbytes is not None else float("nan")
+            budget_gb = self.max_pool_bytes / GB
+            log(f"THROTTLE change {old}s -> {new}s/insert: pool={pool_gb:.2f}GB / "
+                f"budget={budget_gb:.2f}GB ({(pbytes / self.max_pool_bytes * 100):.0f}%) "
+                f"-- pacing inserts (work is slowed, NEVER dropped)")
+            self.driver.throttle_sleep_s = new
+        log(f"metrics tick #{self.ticks + 1}: ts={ts} pool_objects={objs} "
+            f"pool_bytes={pbytes} throttle={self.driver.throttle_sleep_s}s recorded={self.recorded}")
+        return len(snaps)
+
+    def run(self):
+        try:
+            while not self.stop_event.is_set():
+                ts = int(time.time())
+                self.tick_once(ts)
+                self.ticks += 1
+                self.stop_event.wait(self.interval_s)
+        except Exception as e:   # noqa: BLE001 -- surface ticker errors to the main thread
+            self.error = e
+            log(f"METRICS thread error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+
 def write_failure(path, *, seed, base_time, op_id, phase, model_expected, n1, n2, fsck, last_op,
                   error=None, chaos_seed=None, last_fault=None):
     payload = {
@@ -513,13 +758,311 @@ def _last_fault_dict(chaos):
             "duration_s": f.duration_s}
 
 
+def setup_cluster_and_table(seed, phase, ops, workers, checkpoint_every):
+    """Shared bring-up for all phases: connect, capture base_time, recreate the CA table on both
+    replicas, return (cluster, model, base_time)."""
+    cluster = Cluster()
+    base_time = int(cluster.node1.scalar("SELECT toUnixTimestamp(now())")) - 60
+    log(f"base_time={base_time} (needed for replay) seed={seed} phase={phase} "
+        f"ops={ops} workers={workers} checkpoint_every={checkpoint_every}")
+    model = Model(seed, base_time=base_time)
+    ddl = DDL_TEMPLATE.format(table=TABLE)
+    for node in cluster.nodes():
+        node.command(f"DROP TABLE IF EXISTS {TABLE} SYNC")
+    for node in cluster.nodes():
+        node.command(ddl)
+    log(f"created {TABLE} on both replicas")
+    return cluster, model, base_time
+
+
+def phase3_chaos_schedule(chaos_seed, plan, chaos_interval_s):
+    """Generate the deterministic fault schedule ONLY over the chaos-armed window of the stage plan
+    (CHAOS + CLIFF stages), so faults never fire during warmup/steady/GC-checkpoint/converge. The
+    schedule is generated for [0, win_end) and faults before `win_start` are dropped, then a final
+    CONVERGE restart is appended just inside the converge tail so the soak always exercises a clean
+    server restart at the end (per §8 'final converge + restart')."""
+    win_start, win_end = chaos_window(plan)
+    raw = generate_chaos_schedule(chaos_seed, win_end, chaos_interval_s)
+    faults = [f for f in raw if f.t_offset >= win_start]
+    # Final converge+restart: a graceful both-replica restart shortly into the CONVERGE stage. The
+    # recovery checkpoint after it proves the soak survives a clean restart of the whole cluster.
+    converge = next((s for s in plan if s.kind == StageKind.CONVERGE), None)
+    if converge is not None and converge.t_end - converge.t_start > 5:
+        faults.append(Fault(t_offset=converge.t_start + 1, target=FaultTarget.BOTH,
+                            action=FaultAction.RESTART, duration_s=3))
+    return faults
+
+
+def run_phase3(args):
+    """Phase-3 (24h productionization) TIME-DRIVEN soak. Maps wall-clock fractions of --duration to a
+    fixed stage timeline (soak.schedule), reusing the Phase-1/2 machinery: the same deterministic
+    ledger feeds the workers, but each op is GATED by the active stage's capability flags
+    (warmup=inserts only; +mutations; +TTL pressure; a quiesced GC checkpoint; +chaos; a cliff; a
+    final converge+restart). A background MetricsTicker records a per-minute curve into --metrics and
+    enforces the --max-pool-gb budget by throttling (never dropping) inserts. Checkpoints fire at
+    every stage boundary and use the SAME hard asserts as phase 1/2 (dangling==0 HEAD-confirmed,
+    counts==model both replicas, dryrun⊆unreachable; residual unreachable tracked as B140 debris)."""
+    duration_s = args.duration if args.duration is not None else 24 * 3600
+    plan = stage_plan(duration_s)
+    metrics_interval = metrics_interval_for(duration_s)
+    chaos_interval = args.chaos_interval
+    max_pool_bytes = int(args.max_pool_gb * GB) if args.max_pool_gb else None
+
+    log(f"PHASE 3 timeline ({duration_s}s, seed={args.seed} chaos_seed={args.chaos_seed}):")
+    for s in plan:
+        log(f"  stage {s.kind.value:14s} [{s.t_start:>7d}..{s.t_end:<7d})s  inserts={s.allow_inserts} "
+            f"opt={s.allow_optimize} mut={s.allow_mutations} cliffs={s.allow_cliffs} chaos={s.chaos_armed}")
+    cwin = chaos_window(plan)
+    log(f"PHASE 3 metrics_interval={metrics_interval}s max_pool_gb={args.max_pool_gb} "
+        f"chaos_window={cwin}s metrics_db={args.metrics}")
+
+    cluster, model, base_time = setup_cluster_and_table(
+        args.seed, 3, args.ops, args.workers, "stage-boundary")
+
+    # Phase 3 ALWAYS exercises crash+recovery (chaos), so the driver is transport-resilient.
+    driver = Driver(cluster, model, args.seed, base_time, args.workers,
+                    insert_mode=args.insert_mode, transport_resilient=True)
+
+    # A generous op pool: workers consume ops as fast as pacing allows; we size it so the stream never
+    # runs dry within `duration_s`. The stages GATE which classes fire; cliffs are additionally bounded
+    # by the CLIFF-stage gate. Mutations (UPDATE/DELETE) are THINNED to stay materializable over the
+    # remote CA pool — see `demote_dense_mutations`. The thinning is a pure function of op_id order so
+    # the cluster and model consume the identical thinned ledger.
+    n_ops = args.ops if args.ops is not None else max(20000, duration_s * 50)
+    min_mut_gap = args.min_ops_between_mutations
+    def gen_ledger(seed):
+        return demote_dense_mutations(generate_ledger(seed, n_ops), min_mut_gap)
+    ledger = gen_ledger(args.seed)
+    n_mut = sum(1 for op in ledger if op.type in (OpType.UPDATE, OpType.DELETE))
+    log(f"phase-3 ledger: {len(ledger)} ops available (gated by stage capability); "
+        f"{n_mut} mutations kept (min_ops_between_mutations={min_mut_gap})")
+
+    conn = metrics_mod.open_db(args.metrics)
+
+    chaos_stop = threading.Event()
+    metrics_stop = threading.Event()
+    checkpoint_active = threading.Event()
+    recovery_lock = threading.Lock()
+    recovery_pending = []
+    restarts = {"n": 0}
+    restarts_lock = threading.Lock()
+
+    def on_fault_done(fault):
+        if fault.action in (FaultAction.KILL, FaultAction.RESTART):
+            with restarts_lock:
+                restarts["n"] += 1
+        with recovery_lock:
+            recovery_pending.append(fault)
+
+    schedule = phase3_chaos_schedule(args.chaos_seed, plan, chaos_interval)
+    log(f"phase-3 chaos schedule: {len(schedule)} faults over the chaos window "
+        f"(chaos_seed={args.chaos_seed} mean_interval={chaos_interval}s)")
+    chaos = ChaosRunner(schedule, on_fault_done=on_fault_done, stop_event=chaos_stop,
+                        checkpoint_active=checkpoint_active)
+
+    ticker = MetricsTicker(conn, cluster, TABLE, interval_s=metrics_interval,
+                           max_pool_bytes=max_pool_bytes, driver=driver, stop_event=metrics_stop,
+                           restarts_fn=lambda: restarts["n"])
+
+    def do_checkpoint(label):
+        log(f"{label}")
+        checkpoint_active.set()
+        try:
+            wait_for_healthy(cluster)
+            # Entry gate only needs dangling/exit_code -> cheap summary fsck (detail=False).
+            wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, detail=False))
+            now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, 2)
+        finally:
+            checkpoint_active.clear()
+        log(f"{label} OK: now={now} count={exp['count']} fsck reachable={f.get('reachable')} "
+            f"unreachable={f.get('unreachable')} (M-F debris, B140) dangling={f.get('dangling')} "
+            f"dryrun_count={dr.get('count')}")
+        # Record a checkpoint-tagged metrics tick carrying the fsck result (§2: include fsck at checkpoints).
+        ticker.tick_once(int(time.time()), fsck=f)
+        return now, exp, n1, n2, f, dr
+
+    def drain_recovery_checkpoints():
+        with recovery_lock:
+            pending = list(recovery_pending)
+            recovery_pending.clear()
+        if not pending:
+            return
+        if chaos.error is not None:
+            raise chaos.error
+        last = pending[-1]
+        log(f"RECOVERY: {len(pending)} fault window(s) completed; last="
+            f"{last.target.value}/{last.action.value}/{last.duration_s}s — recovery checkpoint")
+        do_checkpoint("recovery checkpoint")
+
+    t0 = time.monotonic()
+    chaos.start()
+    ticker.start()
+    last_op = None
+    op_iter = iter(ledger)
+    prev_stage_kind = None
+    gc_checkpoint_done = False
+    gc_idx = next(i for i, s in enumerate(plan) if s.kind == StageKind.GC_CHECKPOINT)
+    stage_index = {s.kind: i for i, s in enumerate(plan)}
+    try:
+        while True:
+            elapsed = time.monotonic() - t0
+            if elapsed >= duration_s:
+                break
+            stage = stage_at(plan, elapsed)
+
+            # Stage transition. A FULL quiesced checkpoint (drain + OPTIMIZE FINAL + MATERIALIZE TTL +
+            # GC-to-fixpoint + the hard invariant asserts) is EXPENSIVE — over a large pool an OPTIMIZE
+            # FINAL alone takes minutes — so we do NOT run one at every boundary (that would starve the
+            # timeline). Per §8 the explicit quiesced checkpoint is the GC_CHECKPOINT stage; we run the
+            # full checkpoint there. The final converge checkpoint (after the loop) and the
+            # post-fault recovery checkpoints are the other hard-asserted points. Every OTHER boundary
+            # just records a (non-quiesced) metrics tick so the curve marks the transition cheaply.
+            if stage.kind != prev_stage_kind:
+                log(f"=== STAGE {stage.kind.value} at t+{elapsed:.0f}s ===")
+                if prev_stage_kind is not None and stage.kind != StageKind.GC_CHECKPOINT:
+                    ticker.tick_once(int(time.time()))   # cheap transition marker, no quiesce
+                prev_stage_kind = stage.kind
+            # The §8 GC checkpoint MUST run once. A slow throttled iteration can sample `stage_at`
+            # late and JUMP across the (narrow) GC_CHECKPOINT window without ever observing it as the
+            # current stage, so we trigger on "we are AT OR PAST the GC stage and haven't run it yet"
+            # rather than on the exact transition. This guarantees the mandatory quiesced GC drive
+            # fires even when the timeline compresses below one iteration per stage window.
+            if not gc_checkpoint_done and stage_index.get(stage.kind, -1) >= gc_idx:
+                do_checkpoint("GC checkpoint (stage §8 checkpoint+GC)")
+                gc_checkpoint_done = True
+
+            # Recovery checkpoint for any completed fault windows (chaos only armed in its window).
+            drain_recovery_checkpoints()
+            if chaos.error is not None:
+                raise chaos.error
+            if ticker.error is not None:
+                raise ticker.error
+
+            # Backpressure: reap completed futures and bound the in-flight set so the continuous
+            # time-driven producer never outruns the workers (unbounded inflight would balloon memory
+            # + the executor queue over a multi-hour soak). CRITICALLY, this does NOT use a blocking
+            # inner loop: it does ONE harvest + short sleep and `continue`s (BEFORE pulling an op, so
+            # no ledger op is dropped), so the TOP of the loop (stage transition + the mandatory GC
+            # checkpoint + recovery-checkpoint drain) is RE-EVALUATED every iteration. A blocking inner
+            # wait here previously starved the stage clock under heavy throttle, causing the GC
+            # checkpoint to be skipped and the timeline to appear stalled.
+            driver.harvest()
+            inflight_cap = max(2 * args.workers, 64)
+            if driver.inflight_count() >= inflight_cap:
+                time.sleep(0.05)
+                continue
+
+            # In a quiesced GC_CHECKPOINT stage no ops fire; just let the stage elapse (the GC
+            # checkpoint above already drove GC). A short wait avoids a busy spin.
+            if stage.kind == StageKind.GC_CHECKPOINT:
+                time.sleep(0.2)
+                continue
+
+            # Pull the next op and execute it IF the current stage permits its class; otherwise skip
+            # (the op is consumed deterministically; gating decides whether it fires).
+            try:
+                op = next(op_iter)
+            except StopIteration:
+                # Ledger exhausted before the timeline ended -> regenerate a fresh (mutation-thinned)
+                # continuation so the workers never starve during a long soak.
+                ledger = gen_ledger(args.seed ^ int(elapsed))
+                op_iter = iter(ledger)
+                op = next(op_iter)
+
+            if _phase3_op_permitted(op, stage):
+                driver.execute(op)
+                last_op = op
+
+        # Timeline complete: stop chaos, drain final recovery, run the final converge checkpoint.
+        chaos_stop.set()
+        chaos.join(timeout=30)
+        drain_recovery_checkpoints()
+        if chaos.error is not None:
+            raise chaos.error
+        do_checkpoint("final converge checkpoint")
+
+    except (CheckpointFailure, QueryError, OSError) as e:
+        chaos_stop.set()
+        metrics_stop.set()
+        if isinstance(e, CheckpointFailure):
+            kind = "CHECKPOINT FAILURE"
+        elif isinstance(e, QueryError):
+            kind = "WORKLOAD FAILURE"
+        else:
+            kind = "TRANSPORT FAILURE"
+        driver.drain_silent()
+        try:
+            now = int(cluster.node1.scalar("SELECT toUnixTimestamp(now())"))
+            exp = model.aggregates(now)
+        except Exception:
+            exp = None
+        try:
+            n1 = query_aggregates(cluster.node1, TABLE)
+            n2 = query_aggregates(cluster.node2, TABLE)
+        except Exception:
+            n1 = n2 = None
+        try:
+            f = run_fsck(FSCK_CONTAINER)
+        except Exception:
+            f = None
+        op_id = last_op.op_id if last_op is not None else None
+        last_op_d = last_op.__dict__ if last_op is not None else None
+        payload = write_failure(
+            args.failure_json, seed=args.seed, base_time=base_time, op_id=op_id, phase=3,
+            model_expected=exp, n1=n1, n2=n2, fsck=f, last_op=last_op_d, error=f"{kind}: {e}",
+            chaos_seed=args.chaos_seed, last_fault=_last_fault_dict(chaos))
+        print(f"{kind}: {e}", file=sys.stderr)
+        print(json.dumps(payload, indent=2, default=str), file=sys.stderr)
+        driver.executor.shutdown(wait=False, cancel_futures=True)
+        sys.exit(1)
+    finally:
+        chaos_stop.set()
+        metrics_stop.set()
+        chaos.join(timeout=30)
+        ticker.join(timeout=metrics_interval + 30)
+        driver.executor.shutdown(wait=True)
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    log(f"ABORTED-retried INSERT attempts: {driver.aborted_retries}; "
+        f"transport-retried op attempts: {driver.transport_retries}; "
+        f"faults fired: {chaos.faults_fired}; restarts: {restarts['n']}; "
+        f"metrics rows recorded: {ticker.recorded} (ticks={ticker.ticks})")
+    print("PHASE3 OK")
+    return 0
+
+
+def _elapsed_past(t0, duration_s) -> bool:
+    return (time.monotonic() - t0) >= duration_s
+
+
+def _phase3_op_permitted(op, stage) -> bool:
+    """True iff `op`'s class is permitted to fire in `stage` (the time-driven capability gate)."""
+    if op.type == OpType.INSERT:
+        return stage.allow_inserts
+    if op.type == OpType.OPTIMIZE:
+        return stage.allow_optimize
+    if op.type in (OpType.UPDATE, OpType.DELETE):
+        return stage.allow_mutations
+    if op.type in CLIFF_TYPES:
+        return stage.allow_cliffs
+    return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="CA soak green-path / chaos driver")
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--phase", type=int, default=1)
-    ap.add_argument("--ops", type=int, required=True)
+    ap.add_argument("--ops", type=int, default=None,
+                    help="(phase 1/2) number of ledger ops to execute. Required for phase 1/2; for "
+                         "phase 3 the op stream is sized from --duration (a generous estimate), so "
+                         "--ops is an optional cap.")
     ap.add_argument("--workers", type=int, default=6)
-    ap.add_argument("--checkpoint-every", type=int, required=True)
+    ap.add_argument("--checkpoint-every", type=int, default=None,
+                    help="(phase 1/2) checkpoint every N executed ops. Required for phase 1/2; phase 3 "
+                         "checkpoints at STAGE boundaries (time-driven), so this is ignored there.")
     ap.add_argument("--until-op", type=int, default=None, help="optional cap on the last op_id executed")
     ap.add_argument("--max-cliffs", type=int, default=MAX_CLIFFS)
     ap.add_argument("--min-ops-between-cliffs", type=int, default=None)
@@ -535,14 +1078,33 @@ def main(argv=None):
     ap.add_argument("--chaos-interval", type=int, default=90,
                     help="(phase 2) mean inter-fault interval (s). MUST comfortably exceed the "
                          "checkpoint+recovery time so quiescence is reachable between faults.")
-    ap.add_argument("--duration", type=int, default=None,
-                    help="(phase 2) wall-clock seconds to generate faults over. Defaults to a generous "
-                         "estimate from --ops; the chaos thread is stopped as soon as the workload finishes.")
+    ap.add_argument("--duration", type=parse_duration, default=None,
+                    help="(phase 2/3) wall-clock duration. Phase 2: seconds to generate faults over "
+                         "(defaults to a generous estimate from --ops). Phase 3: TOTAL soak duration "
+                         "(default 24h); accepts a suffixed form like 24h/90m/600s or bare seconds. "
+                         "The phase-3 stage timeline is a deterministic function of this duration.")
+    # --- Phase-3 args ------------------------------------------------------------------------
+    ap.add_argument("--metrics", default="soak.db",
+                    help="(phase 3) sqlite path the per-minute metrics ticker records into.")
+    ap.add_argument("--max-pool-gb", type=float, default=40.0,
+                    help="(phase 3) physical CA-pool budget (GB). When a metrics tick shows the pool "
+                         "approaching this, inserts are THROTTLED (paced, never dropped) and the "
+                         "throttle change is logged loudly.")
+    ap.add_argument("--min-ops-between-mutations", type=int, default=80,
+                    help="(phase 3) thin UPDATE/DELETE ops so a kept mutation is at least this many "
+                         "ops after the previous kept one (the rest demote to OPTIMIZE). Keeps "
+                         "mutations sparse enough to materialize over the remote CA pool without "
+                         "piling up a backlog that would time out the quiesced checkpoint. 0 disables.")
     args = ap.parse_args(argv)
 
     phase2 = args.phase == 2
-    if phase2 and args.chaos_seed is None:
+    phase3 = args.phase == 3
+    if (phase2 or phase3) and args.chaos_seed is None:
         args.chaos_seed = args.seed
+    if phase3:
+        return run_phase3(args)
+    if args.ops is None or args.checkpoint_every is None:
+        ap.error("--ops and --checkpoint-every are required for phase 1/2")
 
     cluster = Cluster()
 

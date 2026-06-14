@@ -6,7 +6,11 @@ _COLS = ["ts", "node", "parts_active", "parts_inactive", "table_rows", "bytes_on
 
 
 def open_db(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    # check_same_thread=False: the Phase-3 metrics ticker writes from its OWN thread while the main
+    # thread also records checkpoint-tagged ticks (carrying the fsck result). Callers that share the
+    # connection across threads MUST serialize their writes with a lock (MetricsTicker does); sqlite
+    # itself serializes the underlying file writes.
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     cols_ddl = ", ".join(f"{c} INTEGER" if c != "node" else "node TEXT" for c in _COLS)
     conn.execute(f"CREATE TABLE IF NOT EXISTS metrics ({cols_ddl})")
