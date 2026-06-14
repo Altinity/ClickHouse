@@ -60,6 +60,16 @@ Delete safety is **unchanged** in both pillars — it rides the durable retire�
 - **gtest (`src/Disks/tests/`):** (A) a continuing leader runs many churned rounds and persists the snap only at checkpoints (assert snap-PUT count ≪ round count); a forced fresh-`Gc`/lease-handoff reloads checkpoint + re-folds to a **byte-identical** snap; crash-replay yields identical retire decisions; `retire` issues **zero** per-candidate HEADs when the resident snap has the tokens (assert via a HEAD-counting backend). (B) a warm decode-cache hit issues **no** HEAD within the TTL but does after it / on force-fresh (HEAD-counting backend); single-flight coalesces concurrent resolves to one HEAD; a force-fresh caller always HEADs. (zstd) snap round-trips through zstd; size assertion. Full GC battery + `CasGcLeak`/`CasTruncateReclaim` stay green.
 - **Soak re-validation:** rebuild + re-run the aggressive config (6 workers / 25 GB), measure: GC-leader node `system.parts` stays bounded, S3 **HEAD-rate and read-error-rate drop sharply** (the B148 counters), no per-round whole-snap I/O, checkpoints complete. Compare against the B148 baseline (16 M HEADs, 66% error).
 
+## 6a. Protocol impact & model retesting {#protocol-impact}
+
+None of the three elements introduce a NEW protocol invariant; each is below the model's abstraction line or aligns with already-modeled behavior. Delete safety (INV-NO-LOSS / INV-NO-RETURN / INV-OVER-COUNT-ONLY) is preserved by construction. Two Pillar-A aspects touch model-relevant behavior and must be re-confirmed against the scenario battery (not modeled from scratch):
+- **Crash-recovery / lease-handoff via `folded_cursor` re-fold** (Pillar A): the snap-persistence *cadence* is an on-disk detail, but recovery now re-folds from the checkpoint cursor. This is exactly what `folded_cursor` was specified for (M-C3) — it aligns the impl with the modeled design. Re-confirm: re-fold is **deterministic + idempotent → identical retire decisions** (the fold-idempotence the model already relies on).
+- **retire-without-HEAD token trust** (Pillar A): safe under the *existing* exact-token-delete invariant — a stale token ⇒ `deleteExact` `TokenMismatch` ⇒ spared (INV-OVER-COUNT-ONLY), never a wrong delete. Obligation: trust the snap's token only when freshly folded; else fall back to HEAD.
+
+Pillar B is protocol-relevant **only at the publish gate**, which stays force-fresh — so the modeled publish-vs-GC-fence interlock is unchanged; the bounded read staleness lives on non-safety read paths (a MergeTree/MVCC consistency concern, guarded by the caller audit, not the GC safety model). zstd is a pure encoding change.
+
+**Practical note:** there is no current TLA+ model of the incarnation GC (the old `CaGcCore.tla` was invalidated by the incarnation rewrite); the M-C3 verification tier IS the gtest fault-injection scenario battery + adversarial review. "Model retesting" therefore concretely means the §6 scenario gtests (byte-identical re-fold on handoff, crash-replay identical retire decisions, retire-without-HEAD safety, publish-gate never-stale) plus the adversarial-review gate — NOT a separate TLA+ run. (If a TLA+ re-model of the cursor-recovery is later wanted, it can be added, but it is not a prerequisite.)
+
 ## 7. Scope / non-goals {#scope}
 
 - In scope: the two pillars + zstd snap.
