@@ -50,7 +50,17 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
     /// open must never mutate the pool it inspects; fsck only reads, so skip it. (Pool meta below is
     /// read-only when the pool already exists; a missing pool meta on a read-only backend fails closed.)
     if (!config.read_only)
-        runCapabilityProbe(*backend, config.pool_prefix + "/_probe");
+    {
+        /// B135: give each mount a PER-MOUNT UNIQUE probe key prefix so two servers mounting the SAME
+        /// shared pool concurrently never collide on the (formerly fixed) `<pool>/_probe/token` /
+        /// `<pool>/_probe/cas` keys. Without this, the loser of the `putIfAbsent` race aborts startup
+        /// with PreconditionFailed (and the winner's cleanup delete can cascade into the loser). With a
+        /// fresh random 128-bit id per `Store::open`, each mounter validates conditional-op support
+        /// independently. A crashed mount leaves harmless `_probe/<rand>/...` debris under the `_probe/`
+        /// namespace only (never the content planes) — acceptable.
+        const UInt128 probe_uid = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
+        runCapabilityProbe(*backend, config.pool_prefix + "/_probe/" + u128ToHex(probe_uid));
+    }
     PoolMeta meta = PoolMeta::createOrValidate(*backend, layout, config.root_shards, config.blob_header_len);
 
     /// Private ctor: make_shared cannot reach it.
