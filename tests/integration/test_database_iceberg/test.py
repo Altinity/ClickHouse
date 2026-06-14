@@ -1162,7 +1162,7 @@ def test_drop_table_purge(started_cluster):
     namespace = "test_drop_purge_ns"
     catalog = load_catalog_impl(started_cluster)
     minio_client = Minio(
-        f"{started_cluster.minio_ip}:{started_cluster.minio_port}",
+        f"{started_cluster.get_instance_ip('minio')}:9000",
         access_key=minio_access_key,
         secret_key=minio_secret_key,
         secure=False,
