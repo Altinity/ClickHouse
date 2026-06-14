@@ -687,3 +687,24 @@ INSERT attempts (B137 race): 0.
 - **B132** closed (populated-pool fsck smoke exercised at every checkpoint).
 
 Evidence: `utils/ca-soak/logs/phase1_b141.log`, `phase1_b141_server.log`.
+
+## 2026-06-14 — Soak Phase-2 (chaos) GREEN; B145 classified (test-store artifact, not CA)
+Phase-2 chaos integration validated: recovery checkpoints pass through seeded faults (both-replica
+`docker restart`, RustFS restart/pause) — every checkpoint `dangling=0` (HEAD-confirmed), counts==model
+on both replicas, dryrun⊆unreachable; residual unreachable = B140 M-F debris (tracked, non-fatal).
+`PHASE2 OK` (seed/chaos_seed 20260613). CA survives ClickHouse-server crashes + graceful object-store
+restarts with all safety invariants holding.
+
+Phase-2 findings: B142 (graceful-restart QUERY_WAS_CANCELLED → node-down retry) FIXED; B143 (restart
+orphaned-parts scan UNKNOWN_DISK on the ca_ro fsck alias → search_orphaned_parts_disks='local') FIXED;
+B144 (transient post-restart fsck dangling → wait_for_pool_consistent gate) FIXED; **B145 CLASSIFIED**:
+a hard `kill -9` of RustFS gave a transient `499 NoSuchKey` on the read path — durability probe (write
+N → kill -9 rustfs → restart → re-list, 5 runs incl. kill-during-recovery) showed **RustFS loses ZERO
+acked objects** and `fsck dangling=0`, so it's a transient beta-object-store recovery-visibility artifact,
+NOT a CA durability defect. Chaos scoped: RustFS faults graceful only (KILL→RESTART); CH keeps kill -9
+(the CA-relevant crash). Open follow-up: re-test the blob-durability-ORDERING aspect on a crash-durable
+store (real S3 / MinIO-with-fsync) — tracked under B145.
+
+SOAK STATUS: Phase-1 GREEN, Phase-2 GREEN. Remaining plan: Phase-3 (T13 metrics sink, T14 24h schedule +
+resource bounding + plot, T15 replay tooling). Findings to date: B135/B136/B137/B141/B142/B143/B144 fixed,
+B138 resolved, B132 closed, B139/B140/B145 tracked (async+dedup / M-F Full-GC / durable-store re-test).

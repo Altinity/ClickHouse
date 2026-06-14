@@ -325,8 +325,23 @@ def checkpoint(driver, cluster, model, phase):
     # --- HARD ASSERTS: the invariants the CURRENT CA design guarantees ------------------------
     # INV-NO-LOSS: every ref-reachable object exists. dangling>0 means a referenced object is
     # missing -> real data loss. The killer assertion.
+    #
+    # B144/B145: in phase 2 the `drive_gc_to_fixpoint` churn above issues many object-store
+    # operations that can RE-OPEN the transient post-restart fsck-incoherence window the entry gate
+    # (`wait_for_pool_consistent` in `do_checkpoint`) had already waited out -- so this post-GC fsck
+    # can transiently read `dangling>0` even though the pool is intact (count==model on both
+    # replicas, and a moments-later re-read clears to 0; see the B145 capture where the assert saw
+    # dangling=2434 while the handler's re-fsck saw dangling=0). The entry gate only guards the
+    # checkpoint ENTRY, not this second read. So in phase 2 we RE-CONFIRM a `dangling>0` reading via
+    # the SAME bounded settle: re-fsck until `dangling==0` is STABLE. This is NOT papering over loss --
+    # `wait_for_pool_consistent` FAILS LOUDLY (CheckpointFailure) if `dangling>0` PERSISTS past the
+    # bound, which IS a real crash-recovery / durability finding. Phase 1 has no backend faults, so a
+    # single read is authoritative and a `dangling>0` there fails immediately.
     if f.get("dangling") != 0:
-        raise CheckpointFailure(f"fsck dangling != 0: {f.get('dangling')} (INV-NO-LOSS) detail={f.get('detail')}")
+        if phase == 2:
+            f = wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER))
+        else:
+            raise CheckpointFailure(f"fsck dangling != 0: {f.get('dangling')} (INV-NO-LOSS) detail={f.get('detail')}")
     if f.get("exit_code") != 0:
         raise CheckpointFailure(f"fsck exit_code != 0: {f.get('exit_code')} stderr={f.get('stderr')}")
 
