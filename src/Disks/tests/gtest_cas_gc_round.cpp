@@ -1770,3 +1770,28 @@ TEST(CasGcRound, PreviewDeletesIsWriteFreeAndSubsetOfUnreachable)
     for (const auto & p : preview)
         EXPECT_TRUE(unreachable.contains(p.key)) << "preview delete not unreachable: " << p.key;
 }
+
+/// ---- A1 fold: skip-unchanged persist (Task 5, Pillar A1) ----
+///
+/// When no new journal records exist in any shard (shard_version == folded_cursor for every shard),
+/// the snap is UNCHANGED and already durable at state.snap_generation — the fold must NOT write a
+/// new snap generation or advance the gc/state CAS. This keeps idle rounds (churn-free pools, churn-
+/// free windows) completely write-free on the snap/state side.
+
+TEST(CasGcFold, NoChurnRoundWritesNoNewSnap)
+{
+    auto b = std::make_shared<tests::CountingBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);   /// round 1 folds the publish (snap PUT happens)
+    const GcState st1 = readState(*b, *s);
+
+    b->resetCounts();
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);   /// round 2: no new records — no new snap
+    const GcState st2 = readState(*b, *s);
+
+    EXPECT_EQ(st2.snap_generation, st1.snap_generation);                              /// generation unchanged
+    EXPECT_EQ(b->putCount(s->layout().gcSnapKey(st1.snap_generation + 1, 0)), 0u);    /// no probe write
+}

@@ -949,12 +949,26 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 
     /// 3. Fold each discovered root shard's journal records in (folded_cursor, shard_version],
     /// in journal (= insertion) order (the shared R1/R4 record semantics — foldShardRecords).
+    bool folded_any = false;
     for (const auto & [ns, root_shard] : result.root_shards)
     {
         const auto [root, manifest_token] = store->readShard(ns, root_shard);
         const String cursor_key = ns.string() + "/" + std::to_string(root_shard);
         const auto cursor_it = state.folded_cursor.find(cursor_key);
         const uint64_t cursor = cursor_it != state.folded_cursor.end() ? cursor_it->second : 0;
+
+        /// A version bump alone (e.g. from the trim step) does not mean new records exist —
+        /// the trim CAS advances shard_version without adding journal entries, so
+        /// (shard_version > cursor) can be true while the journal window is empty.
+        /// Check the journal directly: any record in (cursor, shard_version] is genuine new work.
+        const bool shard_has_new_records = std::any_of(
+            root.journal.begin(), root.journal.end(),
+            [&](const JournalRecord & r)
+            {
+                return r.at_version > cursor && r.at_version <= root.shard_version;
+            });
+        if (shard_has_new_records)
+            folded_any = true;   /// genuine new journal records exist in (cursor, shard_version]
 
         auto transitioned = foldShardRecords(result.snap, state, cursor_key, root, cursor, root.shard_version);
         result.transitioned.insert(result.transitioned.end(), transitioned.begin(), transitioned.end());
@@ -964,6 +978,15 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
         if (root.shard_version > 0 || cursor > 0)
             state.folded_cursor[cursor_key] = root.shard_version;
     }
+
+    /// No new records since the last fold: the snap is unchanged and already durable at
+    /// state.snap_generation. Skip the whole-snap re-write AND the gc/state CAS — thread the incoming
+    /// token through to retire unchanged. Safe: retire's round CAS rides exactly this token, so any
+    /// intervening lease steal Conflicts there (same zombie-window protection runRegularRound
+    /// documents for the post-fold path); and folded_cursor was not advanced past any unpersisted
+    /// records (none exist). state/state_token are returned unmodified.
+    if (!folded_any)
+        return result;
 
     /// 4. Persist, durable-before-cursor: the new-generation snap objects go durable FIRST; only
     /// then does the gc/state CAS advance snap_generation + folded_cursor. A crash between the two
