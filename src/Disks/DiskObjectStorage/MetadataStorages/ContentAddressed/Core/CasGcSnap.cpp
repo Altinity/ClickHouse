@@ -9,7 +9,7 @@
 #include <IO/ZstdInflatingReadBuffer.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
-#include <zstd.h>
+#include <limits>
 
 namespace DB
 {
@@ -379,12 +379,16 @@ String encodeGcSnap(const GcSnap & snap)
     /// 3. Prepend the 10-byte frame: magic(4) + version(1=3) + codec(1=ZSTD) + compressed_len(4).
     /// The explicit compressed_len lets the decoder detect truncation (including truncated checksum
     /// bytes) independently of the zstd stream framing.
+    /// The 4-byte length field bounds the compressed body at 4 GiB; a reachability snap will never
+    /// approach this even uncompressed, but make the assumption explicit.
+    chassert(compressed.size() <= std::numeric_limits<uint32_t>::max());
     const auto compressed_len = static_cast<uint32_t>(compressed.size());
     String out;
     out.reserve(10 + compressed.size());
     out.append(GC_SNAP_MAGIC, sizeof(GC_SNAP_MAGIC));
     out.push_back(static_cast<char>(GC_SNAP_VERSION));
     out.push_back(static_cast<char>(GC_SNAP_CODEC_ZSTD));
+    /// out is a String here (not a WriteBuffer), so write the u32 length LE by hand.
     for (int i = 0; i < 4; ++i)
         out.push_back(static_cast<char>((compressed_len >> (8 * i)) & 0xFF));
     out.append(compressed);

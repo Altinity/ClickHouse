@@ -300,7 +300,7 @@ TEST(CasGcSnap, DecodeFailClosed)
 namespace
 {
 /// Minimal binary writer mirroring the gc/snap layout, for hand-crafting malformed documents
-/// (little-endian; magic "CAGS" + version 2 header).
+/// (little-endian; magic "CAGS" + version 3 / codec RAW (0) header).
 struct SnapWriter
 {
     String buf;
