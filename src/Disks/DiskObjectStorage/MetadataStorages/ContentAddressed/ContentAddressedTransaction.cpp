@@ -78,6 +78,7 @@ bool ContentAddressedTransaction::republishRef(
     /// Move a COMMITTED ref: content addressing has no rename, so publish the SAME tree under the
     /// destination (adoptTree observes the tree and the publish gate carries the GC-race safety)
     /// and drop the source ref. Returns false (nothing written) when the source ref is absent.
+    /// Force-fresh (Pillar B): RENAME/move source read — stale mutable_files must not carry to dst.
     auto resolved = metadata_storage.store()->resolveRef(src_ns, src_ref);
     if (!resolved)
         return false;
@@ -98,7 +99,7 @@ void ContentAddressedTransaction::dropRefIfPresent(const Cas::RootNamespace & ns
     /// dropRef re-reads the shard inside its own CAS loop, so a concurrent drop can land in the window
     /// between our resolve and that re-read — surfacing as FILE_DOESNT_EXIST. Removal is replay-safe,
     /// so a ref that is already gone is success, not failure; any other error still propagates.
-    if (!metadata_storage.store()->resolveRef(ns, ref))
+    if (!metadata_storage.store()->resolveRef(ns, ref, /*allow_stale=*/true))
         return;
     try
     {
@@ -181,6 +182,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
             /// every listing by the read side).
             payload.mutable_files[".ca_mtime"] = std::to_string(static_cast<uint64_t>(::time(nullptr)));
 
+            /// Force-fresh (Pillar B): publish-gate rollback tracking — a stale result mis-tracks rollback.
             const bool ref_existed = metadata_storage.store()->resolveRef(ns, ref).has_value();
             st.build->publish(ns, ref, tree, std::move(payload));
             if (!ref_existed)
@@ -546,6 +548,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
                 dst_st.mutable_files[dst->file] = it->second;
                 return;
             }
+        /// Force-fresh (Pillar B): projection hardlink source — carry the current payload/tree_id.
         auto resolved = metadata_storage.store()->resolveRef(src->ns, src->ref);
         if (!resolved || !resolved->mutable_files.contains(src->file))
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
@@ -578,6 +581,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
         }
     }
 
+    /// Force-fresh (Pillar B): projection hardlink source — carry the current payload/tree_id.
     auto resolved = metadata_storage.store()->resolveRef(src->ns, src->ref);
     if (!resolved)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
@@ -792,6 +796,7 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
     /// under the destination and mark the source removed; commit publishes via updateRefPayload.
     if (ContentAddressed::isMutablePerPartFile(dst->file))
     {
+        /// Force-fresh (Pillar B): RENAME/move source read — stale mutable_files must not carry to dst.
         auto resolved = metadata_storage.store()->resolveRef(src->ns, src->ref);
         if (!resolved || !resolved->mutable_files.contains(src->file))
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,

@@ -311,7 +311,7 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
 std::optional<std::pair<Cas::Resolved, std::vector<Cas::TreeEntry>>>
 ContentAddressedMetadataStorage::resolveRouted(const Route & r) const
 {
-    auto resolved = store()->resolveRef(r.ns, r.ref);
+    auto resolved = store()->resolveRef(r.ns, r.ref, /*allow_stale=*/true);
     if (!resolved)
         return std::nullopt;
     /// A live ref to a missing/corrupt tree throws (INV-NO-DANGLE surfaced, never substituted).
@@ -338,6 +338,7 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 
     if (ContentAddressed::isMutablePerPartFile(r->file))
     {
+        /// Force-fresh (Pillar B): read-your-writes for a just-written mutable file — no TTL-stale manifest.
         auto resolved = store()->resolveRef(r->ns, r->ref);
         return resolved && !isReservedMutableName(r->file) && resolved->mutable_files.contains(r->file);
     }
@@ -358,7 +359,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
     if (ContentAddressed::isShadowPath(path))
     {
         if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
-            return store()->resolveRef(shadowNamespace(p->shadow_table_dir), p->part_name).has_value();
+            return store()->resolveRef(shadowNamespace(p->shadow_table_dir), p->part_name, /*allow_stale=*/true).has_value();
         if (ContentAddressed::endsWithTableUuidPair(path))
             return !store()->listRefs(shadowNamespace(path)).empty();
         /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff some shadow
@@ -384,7 +385,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             return !store()->listRefs(r->ns).empty();
         /// A part dir (live, detached, or shadow): exists iff its ref is present.
         if (r && !r->ref.empty() && r->file.empty())
-            return store()->resolveRef(r->ns, r->ref).has_value();
+            return store()->resolveRef(r->ns, r->ref, /*allow_stale=*/true).has_value();
         /// A projection dir: at least one tree entry (or mutable file) under its prefix.
         if (r && !r->ref.empty())
         {
@@ -454,7 +455,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
     /// system tables).
     auto resolve_stamp = [&](const Route & r) -> Poco::Timestamp
     {
-        auto resolved = store()->resolveRef(r.ns, r.ref);
+        auto resolved = store()->resolveRef(r.ns, r.ref, /*allow_stale=*/true);
         if (!resolved)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
         auto it = resolved->mutable_files.find(".ca_mtime");
@@ -676,6 +677,7 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
 
     if (ContentAddressed::isMutablePerPartFile(r->file))
     {
+        /// Force-fresh (Pillar B): MVCC txn_version / mutable-file read — must not serve a TTL-stale manifest.
         auto resolved = store()->resolveRef(r->ns, r->ref);
         if (!resolved || isReservedMutableName(r->file))
             return std::nullopt;
@@ -768,7 +770,7 @@ std::optional<String> ContentAddressedMetadataStorage::getPartTreeId(const Strin
     auto r = route(*p);
     if (!r || r->ref.empty() || !r->file.empty())
         return std::nullopt;
-    auto resolved = store()->resolveRef(r->ns, r->ref);
+    auto resolved = store()->resolveRef(r->ns, r->ref, /*allow_stale=*/true);
     if (!resolved)
         return std::nullopt;
     return resolved->tree_id.string();
