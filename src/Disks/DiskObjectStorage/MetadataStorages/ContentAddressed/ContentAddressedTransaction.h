@@ -90,6 +90,13 @@ private:
     std::map<std::pair<std::string, std::string>, PartStaging> parts;
     bool committed = false;
 
+    /// Refs published EARLY (at the lock-free tmp->final rename in moveDirectory), BEFORE the
+    /// owning transaction's commit decision. If the transaction is abandoned (destructed without a
+    /// successful commit() — e.g. a ZK multi failure on the replicated INSERT path rolls back AFTER
+    /// renameParts() already published), these durable refs must be dropped, else a rolled-back
+    /// insert's part survives as an orphan ref (resurrection / unexpected-part on restart). B151.
+    std::vector<std::pair<Cas::RootNamespace, std::string>> rename_published_refs;
+
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
     PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);
     const Cas::TreeEntry * findStagedEntry(const ContentAddressedMetadataStorage::Route & r) const;

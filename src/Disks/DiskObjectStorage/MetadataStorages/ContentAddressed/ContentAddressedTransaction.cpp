@@ -41,6 +41,22 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
     /// every still-open Build so its heartbeat is discarded. Replaces the PoC's pin machinery.
     if (committed)
         return;
+
+    /// Drop refs we published early at the rename (B151) — the transaction did not commit, so a
+    /// rolled-back insert must not leave a durable orphan ref. Best-effort: a failed drop leaves
+    /// GC-reclaimable debris (and the replicated restart's ZK reconcile detaches an unexpected
+    /// part), never a masked exception out of the destructor.
+    for (const auto & [ns, ref] : rename_published_refs)
+    {
+        try
+        {
+            metadata_storage.store()->dropRef(ns, ref);
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+        }
+    }
+
     for (auto & [key, st] : parts)
     {
         if (!st.build)
@@ -729,6 +745,10 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             /// data_parts lock) and mark it published; commit() then skips it. Single publish — the tmp
             /// ref was never durably published, so the republishRef below is a no-op for it.
             publishStaging(dst->ns, dst->ref, parts[dst_key]);
+            /// B151 rollback safety: this ref was published BEFORE the owning transaction's commit
+            /// decision (renameParts() precedes the ZK multi). If the transaction is abandoned, the
+            /// destructor drops it (see ~ContentAddressedTransaction).
+            rename_published_refs.emplace_back(dst->ns, dst->ref);
         }
 
         /// Move any COMMITTED source ref (a merge/mutation result rename, DETACH, ATTACH, a

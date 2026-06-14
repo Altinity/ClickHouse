@@ -54,6 +54,35 @@ TEST(CaTransactionLockScope, PublishHappensAtRenameNotCommit)
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 9u);
 }
 
+/// B151 rollback safety: a ref published at the lock-free rename must be DROPPED if the transaction
+/// is abandoned (destructed without commit) — e.g. a ZK multi failure rolls back after renameParts().
+TEST(CaTransactionLockScope, RenamePublishedRefDroppedOnAbandon)
+{
+    auto storage = openTxStorage();
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-1/tmp_insert_all_3_3_0/data.bin", "abandoned");
+        tx->moveDirectory("uui/uuid-1/tmp_insert_all_3_3_0", "uui/uuid-1/all_3_3_0");
+        EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_3_3_0"));   /// published at the rename
+        /// tx goes out of scope here WITHOUT commit() — abandon/rollback.
+    }
+    /// The early-published ref must have been dropped by the destructor.
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_3_3_0"));
+}
+
+/// A COMMITTED transaction must NOT drop its rename-published ref.
+TEST(CaTransactionLockScope, RenamePublishedRefSurvivesCommit)
+{
+    auto storage = openTxStorage();
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-1/tmp_insert_all_4_4_0/data.bin", "kept");
+        tx->moveDirectory("uui/uuid-1/tmp_insert_all_4_4_0", "uui/uuid-1/all_4_4_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_4_4_0"));
+}
+
 /// A committed-ref rename (no staged source) must NOT spuriously publish — it goes via republishRef.
 TEST(CaTransactionLockScope, CommittedRefMoveDoesNotSpuriouslyPublish)
 {
