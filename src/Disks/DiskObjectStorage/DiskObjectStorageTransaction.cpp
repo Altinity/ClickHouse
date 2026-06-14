@@ -128,6 +128,17 @@ void DiskObjectStorageTransaction::createDirectories(const std::string & path)
 
 void DiskObjectStorageTransaction::moveDirectory(const std::string & from_path, const std::string & to_path)
 {
+    /// CA: dispatch the rename EAGERLY (mirroring the createHardLink CA early-dispatch) instead of
+    /// queuing a deferred lambda that fires inside commit() under the data_parts lock. For a
+    /// content-addressed disk this is where a freshly-written part is published to its FINAL manifest
+    /// ref; renameParts() runs LOCK-FREE in the replicated paths, so the publish happens off the
+    /// data_parts lock (B151).
+    if (metadata_storage->isContentAddressed())
+    {
+        metadata_transaction->moveDirectory(from_path, to_path);
+        return;
+    }
+
     operations_to_execute.push_back([from_path, to_path](MetadataTransactionPtr tx)
     {
         tx->moveDirectory(from_path, to_path);

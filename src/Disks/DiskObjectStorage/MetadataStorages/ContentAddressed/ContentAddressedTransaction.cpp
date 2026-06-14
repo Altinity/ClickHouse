@@ -722,6 +722,13 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 src_st.build->abandon();
             }
             parts.erase(src_it);
+
+            /// B151: this is a freshly-written part being finalized tmp->final (the ONLY rename shape
+            /// with a STAGED source here — DETACH/ATTACH/delete_tmp renames have a COMMITTED source and
+            /// MISS this branch). renameParts() runs lock-free, so publish the FINAL ref NOW (off the
+            /// data_parts lock) and mark it published; commit() then skips it. Single publish — the tmp
+            /// ref was never durably published, so the republishRef below is a no-op for it.
+            publishStaging(dst->ns, dst->ref, parts[dst_key]);
         }
 
         /// Move any COMMITTED source ref (a merge/mutation result rename, DETACH, ATTACH, a
