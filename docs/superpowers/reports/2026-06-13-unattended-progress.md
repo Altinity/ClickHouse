@@ -779,3 +779,30 @@ and re-upload only changed shards/pages, not the whole blob. (3) Shard the snap 
 pinned to 1 by `fold`'s M-C3 limitation) so each round touches O(delta) shards and GC leadership can split
 per-shard across replicas. (4) Batch/skip the per-candidate `head` in `retire` and rate-limit the GC thread.
 (1)+(2) directly target the measured ~67%-of-round `decodeGcSnap`+`encodeGcSnap`+upload. Backlog B147 updated.
+
+---
+
+## 2026-06-14 (cont.) — Reduce-S3-op-count shipped, B151 lock-scope root-caused + fixed, 12h soak launched
+
+### Op-count effort (Pillar B + A1 + zstd) — SHIPPED + reviewed
+Implemented the `2026-06-14-ca-reduce-s3-op-count` plan via subagent-driven development (two-stage review per task):
+- **Pillar B** read path: single-flight coalescing for `readShardDecoded` (`ccfc88cb67b`); opt-in bounded-TTL decode cache (`01cdbdfe02b`, nits `f5112bbb5ad`); audited-caller `allow_stale` opt-in (`b14ceae418a`).
+- **Pillar A1-min** GC: `fold` skips snap re-write + gc/state CAS on idle rounds (`eeac6f8d07c`, `cdfea77519c`); resident-snap read-cache, skip `loadSnap` GET on generation match (`5c6b675ec18`, `35742055655`).
+- **zstd** snap blob compression, version-3 + codec byte (`5b4ea96a4de`, `86859f06c1b`) — 4.5× smaller.
+- A1b (decoupled checkpoint) and A2 (retire-without-HEAD) DEFERRED per the decision gate.
+
+### T9 re-validation soak → the REAL root cause (B151)
+The op-count work cut CPU + the HEAD storm, but `system.parts` STILL stalled 60–220s intermittently. User directed: look at query_log + trace_log. Found (B151): the slow `system.parts` queries did ZERO S3 I/O + ~10ms CPU over 220s wall — **blocked on the shared `data_parts` lock**; the exclusive holder is `MergeTreeData::Transaction::commit(DataPartsLock&)` doing the CA manifest publish (`putTree`+`publish`→`casPut`, a CAS-retry loop + SDK throttle-backoff) **under the lock**. Architectural mismatch: CA puts the manifest (metadata) on S3, so the in-lock metadata commit is a network round-trip.
+
+### B151 fix — SHIPPED + adversarially reviewed (Approved)
+Brainstormed → spec (`2026-06-14-ca-manifest-commit-lock-scope-design.md`, Mechanism B, **zero `src/Storages`**) → plan → implemented:
+- Publish the part's FINAL ref at the **lock-free** tmp→final rename (eager CA `moveDirectory` dispatch + publish in the staged-re-key branch); `commit()` skips already-published (`6f5e38667104`).
+- **B153 read-your-writes regression** (found via full `CaWiring*` run): Pillar B's TTL decode cache served stale shard decodes after same-`Store` writes → 7 tests red (incl. 2 I'd mislabeled as pre-existing). Fixed by invalidating `shard_decode_cache` on write in `Store::mutateShard` (`cf71b1f059c`).
+- **Critical rollback gap** (adversarial review): rename-publish precedes the ZK multi → a ZK-failure rollback orphaned the durable ref → resurrection risk. Fixed path-agnostically: `~ContentAddressedTransaction` drops rename-published refs when `!committed` (`a9dba473b36`). Re-review: **Approved**.
+- Tests: 4 new `CaTransactionLockScope.*` + all 27 `CaWiring*` green; only `CasGcLeak.DisplacedUnexpandedTreeBlobsLeak` (B140 guard) red. Minor optional `chassert` follow-up noted.
+
+### B152 — T9 PHASE3 FAILED was NOT data loss
+Post-fault consistency-settling flap (`dangling=0`, `unreachable=17430` debris); checker message bug mislabels a `dangling==0` timeout as INV-NO-LOSS. Recorded.
+
+### 12h soak — LAUNCHED (B151 validation)
+Started a 12h aggressive soak (seed 20260614, 6 workers, 25 GB) on the rebuilt binary (`c2f76dae995` era). Monitoring hourly; collecting metrics (sqlite) + query_log + trace_log. Success criteria: `system.parts` responsive (no 60s timeouts), NO `WriteBufferFromS3::finalizeImpl` under `MergeTreeData::Transaction::commit(DataPartsLock&)` in trace_log, no correctness finding. Findings appended here + to the backlog per pulse.
