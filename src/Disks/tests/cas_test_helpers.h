@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
@@ -21,7 +22,9 @@
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -267,5 +270,72 @@ inline uint64_t shardOfForTest(const String & ref_name, uint64_t root_shards)
 {
     return CityHash_v1_0_2::CityHash64(ref_name.data(), ref_name.size()) % root_shards;
 }
+
+/// Counts head/get/putIfAbsent per key for op-count assertions (Pillar B / A1 tests).
+class CountingBackend : public DB::Cas::InMemoryBackend
+{
+public:
+    DB::Cas::HeadResult head(const String & key) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++head_counts[key];
+            ++head_total;
+        }
+        return InMemoryBackend::head(key);
+    }
+
+    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range = {}) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++get_counts[key];
+            ++get_total;
+        }
+        return InMemoryBackend::get(key, range);
+    }
+
+    DB::Cas::PutOutcome putIfAbsent(const String & key, const String & bytes, DB::Cas::Token * out_token = nullptr) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++put_counts[key];
+            ++put_total;
+        }
+        return InMemoryBackend::putIfAbsent(key, bytes, out_token);
+    }
+
+    uint64_t headCount(const String & key) const { return lookup(head_counts, key); }
+    uint64_t getCount(const String & key) const { return lookup(get_counts, key); }
+    uint64_t putCount(const String & key) const { return lookup(put_counts, key); }
+    uint64_t headTotal() const { std::lock_guard lock(count_mutex); return head_total; }
+    uint64_t getTotal() const { std::lock_guard lock(count_mutex); return get_total; }
+    uint64_t putTotal() const { std::lock_guard lock(count_mutex); return put_total; }
+
+    void resetCounts()
+    {
+        std::lock_guard lock(count_mutex);
+        head_counts.clear();
+        get_counts.clear();
+        put_counts.clear();
+        head_total = get_total = put_total = 0;
+    }
+
+private:
+    uint64_t lookup(const std::map<String, uint64_t> & m, const String & key) const
+    {
+        std::lock_guard lock(count_mutex);
+        const auto it = m.find(key);
+        return it == m.end() ? 0 : it->second;
+    }
+
+    mutable std::mutex count_mutex;
+    std::map<String, uint64_t> head_counts;
+    std::map<String, uint64_t> get_counts;
+    std::map<String, uint64_t> put_counts;
+    uint64_t head_total = 0;
+    uint64_t get_total = 0;
+    uint64_t put_total = 0;
+};
 
 }
