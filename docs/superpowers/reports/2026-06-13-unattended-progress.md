@@ -708,3 +708,26 @@ store (real S3 / MinIO-with-fsync) — tracked under B145.
 SOAK STATUS: Phase-1 GREEN, Phase-2 GREEN. Remaining plan: Phase-3 (T13 metrics sink, T14 24h schedule +
 resource bounding + plot, T15 replay tooling). Findings to date: B135/B136/B137/B141/B142/B143/B144 fixed,
 B138 resolved, B132 closed, B139/B140/B145 tracked (async+dedup / M-F Full-GC / durable-store re-test).
+
+T14 COMMITTED (phase-3 24h time-driven timeline + per-minute MetricsTicker + resource bounding/throttle
++ `scripts/plot.py` + `scripts/run_24h.sh`; new `soak/schedule.py`, `soak/pool.py`; modified `soak/run.py`,
+`soak/metrics.py`; 107 unit tests green). The small e2e self-check (seed=20260613, `--duration 300
+--workers 4 --ops 400`) did NOT print `PHASE3 OK`: it ran the full STAGE timeline (warmup→steady→
+mutations→ttl_pressure→chaos), the chaos-stage `§8 checkpoint+GC` completed, then a `SYSTEM SYNC REPLICA`
+timed out under chaos (HTTP 408 `TIMEOUT_EXCEEDED`) → `WORKLOAD FAILURE`. The failure-dump's bare fsck (no
+quiesce/settle) reported `dangling=115` — the documented transient post-chaos fsck-incoherence window
+(B141/B144/B145, `wait_for_pool_consistent` rationale at `soak/run.py:538-542`), NOT a checkpoint assert
+and NOT confirmed loss. The phase-3 TIMELINE + METRICS + STAGE-checkpoint machinery work e2e: metrics DB
+(`/tmp/soak_selfcheck_small.db`, 92 rows, full schema) and the plot (degraded to TSV `/tmp/soak_curve_small.tsv`,
+46 rows, since matplotlib is absent — `scripts/plot.py` degrades correctly) were produced.
+
+B146 = fsck-at-scale gates efficient long/24h runs. Offline `clickhouse disks fsck`/`ca-gc-dryrun` is
+O(pool objects) (>120s once the LIST holds tens of thousands of objects). The prompt's "RustFS retains
+object VERSIONS on the CA re-PUT path" hypothesis is REFUTED by a direct `mc` probe: the `test` bucket is
+`un-versioned` and current-object count ≈ all-versions count (24386 vs 24387; blobs 8221 == 8221). ACTUAL
+cause: the CA pool legitimately accumulates tens of thousands of DISTINCT content-addressed `blobs/`
+(metrics showed `pool_objects` 420 → 14535 → 23959 within ~23s, ~40k mid-run), so the full LIST+resolve is
+genuinely large. Classification UNKNOWN, leaning test-infra/cost (incremental/cheaper offline fsck;
+quiesce-before-dump-fsck; bound self-check pool growth; larger `receive_timeout`). NO data-loss
+implication (`dangling=0`/`unreachable=0` whenever fsck completes on a settled pool). Gating item for the
+24h run.
