@@ -410,3 +410,43 @@ gtested). 232 Cas*/Ca* gtests green. fsck exit code verified (dangling/guard →
 
 Deferred follow-ups recorded as B132/B133/B134. Sub-projects B (workload+oracle), C (chaos/orchestration),
 D (assertion/metrics loop + 24h schedule) remain — each its own spec. B126 (RENAME-TABLE atomicity) still queued.
+
+## 2026-06-14 — CA soak Phase-1: sync inserts + grace-aware GC fixpoint; NEW real GC leak surfaced (B140)
+- **B138 RESOLVED (conclusion 1):** the decisive A/B concluded that the soak MUST use SYNC inserts.
+  With sync inserts the count checkpoints match the model EXACTLY (the ABORTED-retry of a failed sync
+  INSERT is idempotent — a failed sync insert leaves NO committed dedup token, so a retry truly
+  re-inserts); with async inserts a retry-of-async-insert loses rows (dedup-token-vs-part hazard, B139).
+- **Soak switched to SYNC by default** (`soak/run.py`): `INSERT_MODE_SETTINGS["default"]` now maps to
+  `SETTINGS async_insert=0`; `--insert-mode async` stays selectable for a future async-specific test.
+  README usage note updated.
+- **GC-fixpoint check made grace-aware** (`soak/checker.py`): replaced the "poll until the unreachable
+  count is STABLE for N rounds" predicate (which declares a FALSE fixpoint on a stable non-zero count
+  while objects sit in retire-grace — the old B137 unreachable=61 symptom) with `poll_unreachable_to_zero`,
+  which polls until `unreachable_fn()` reaches **0** with a grace-aware bound (`max(180, gc_grace_sec*6 + 30)`;
+  `Cluster` now exposes `gc_grace_sec`, mirroring `content_addressed_gc_grace_sec=5`). The assert stays
+  STRICT (`unreachable==0`); on a genuine non-reclaiming leak it raises `CheckpointFailure` loudly rather
+  than masking it. Two focused unit tests added (`tests/test_checker_logic.py`): a fake returning
+  `[61,61,40,0]` → returns 0; a stuck `[61,...]` → raises after the bound. `pytest tests/ -q`: 37 passed.
+- **Phase-1 re-validation (sync, seed 20260613, 1500 ops): NOT GREEN — and the grace-aware check did its
+  job by surfacing a REAL GC leak that the old "stable" predicate masked.**
+  - Checkpoint 1 (op 300): `count=13463`, model==node1==node2, `unreachable=0`, `dangling=0`, `dryrun=0`. PASS.
+  - Checkpoint 2 (op 600, AFTER the op-450 `TRUNCATE`): **counts are EXACTLY correct** —
+    `model==node1==node2` (count=7951, all 7 aggregates agree, `min_op=451` confirms the TRUNCATE cleared
+    ≤450), `dangling=0` → **NO data loss, no corruption**. But `unreachable` stuck at **1751** (history
+    `[1726,1726,1726,1751,1751,1751,1751]`, sampled stable for 60+s afterward) → `CHECKPOINT FAILURE: GC
+    did not reclaim to unreachable==0 within 180s`.
+  - **Diagnosis (CA-side, NOT harness): B140 — incremental cascade-driven GC does not reclaim blobs
+    orphaned by a `TRUNCATE`.** Server-log evidence: the GC discovers candidates by cascading from the
+    current manifest roots (`cascaded=6215`, `replaced=2264` early rounds), then settles at `candidates=0`
+    while 1751 content blobs (`soak_pool/blobs/...`) remain unreachable-per-fsck forever. When the TRUNCATE
+    removes the manifest roots, the cascade no longer reaches those blobs, so GC can never enqueue them as
+    candidates; `fsck` (a full sweep) correctly sees them as unreachable, GC (incremental cascade) cannot.
+    This is the documented **M-F full-GC-walk gap** (mark-sweep over `blobs/` not implemented), here proven
+    to leak after DROP/TRUNCATE-style root removal — not in-grace debris (grace=5s; stable >60s).
+  - Per the mandate, the assert was NOT loosened to hide this. The harness changes (sync default +
+    grace-aware fixpoint) are correct and are exactly what exposed the leak. Evidence preserved:
+    `utils/ca-soak/logs/phase1_sync_validate.log`, `..._server.log`, `..._failure_op599.json`.
+  - **Recorded as B140** (GC does not reclaim TRUNCATE/DROP-orphaned blobs; needs the M-F mark-sweep walk).
+    NOTE: B132's "live fsck smoke" IS now exercised end-to-end (fsck + GC dry-run run at every checkpoint
+    against a live churning cluster). Phase-1 green is BLOCKED on B140, an M-F-milestone GC feature, not a
+    harness bug.

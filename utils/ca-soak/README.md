@@ -18,7 +18,9 @@ and the same ClickHouse binary must reproduce the same sequence of operations an
 # Start the cluster (two replicas + MinIO + ZooKeeper)
 docker compose up -d
 
-# Run Phase 1 (short smoke, ~5 min)
+# Run Phase 1 (short smoke, ~5 min). Inserts run SYNC by default (async_insert=0): B138 showed
+# the sync ABORTED-retry is idempotent, while async retries lose rows via the dedup-token-vs-part
+# hazard (B139). Pass `--insert-mode async` only for a deliberate async-specific experiment.
 python3 -m soak.run --seed 1 --phase 1
 
 # Full 24-hour soak

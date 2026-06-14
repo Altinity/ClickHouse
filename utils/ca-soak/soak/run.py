@@ -93,14 +93,15 @@ def node_for(cluster, target: int):
     return cluster.node1 if target == 0 else cluster.node2
 
 
-# INSERT-mode SETTINGS suffixes. Default keeps the harness's historical behavior (no explicit
-# async_insert setting -> the server image default decides). "async" forces async_insert=1 with
-# wait_for_async_insert=1 (so the HTTP response still waits for the flush); "sync" forces
-# async_insert=0. This is the A/B knob for disentangling B138 (async-retry-unsafety vs a real CA
-# dedup-atomicity bug): a failed SYNC insert leaves NO committed dedup token, so a retry truly
-# re-inserts, whereas an async insert can commit its dedup token before the part publish fails.
+# INSERT-mode SETTINGS suffixes. B138: the soak MUST run with SYNC inserts. The decisive A/B
+# (B138) showed that with sync inserts the count checkpoints match the model EXACTLY (the
+# ABORTED-retry of a failed sync INSERT is idempotent: a failed sync insert leaves NO committed
+# dedup token, so a retry truly re-inserts), whereas an async insert can commit its dedup token
+# before the part publish fails, so the retry-of-async-insert is deduped against a part that was
+# never published -> lost rows (B139, dedup-token-vs-part hazard). Hence "default" maps to the sync
+# settings; "async" remains selectable for a future async-specific test.
 INSERT_MODE_SETTINGS = {
-    "default": "",
+    "default": "SETTINGS async_insert=0",
     "async": "SETTINGS async_insert=1, wait_for_async_insert=1",
     "sync": "SETTINGS async_insert=0",
 }
@@ -267,8 +268,9 @@ def main(argv=None):
     ap.add_argument("--failure-json", default="failure.json")
     ap.add_argument("--insert-mode", choices=sorted(INSERT_MODE_SETTINGS), default="default",
                     help="force INSERT async/sync mode by appending a SETTINGS clause to each INSERT. "
-                         "'default' keeps the server image default; 'async' sets async_insert=1, "
-                         "wait_for_async_insert=1; 'sync' sets async_insert=0. (B138 A/B knob)")
+                         "'default' and 'sync' both set async_insert=0 (B138: sync is required for an "
+                         "idempotent ABORTED-retry; async loses rows via the dedup-token-vs-part hazard, "
+                         "B139); 'async' sets async_insert=1, wait_for_async_insert=1.")
     args = ap.parse_args(argv)
 
     cluster = Cluster()
