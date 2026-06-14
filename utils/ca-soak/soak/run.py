@@ -101,8 +101,8 @@ def node_for(cluster, target: int):
 # re-inserts, whereas an async insert can commit its dedup token before the part publish fails.
 INSERT_MODE_SETTINGS = {
     "default": "",
-    "async": " SETTINGS async_insert=1, wait_for_async_insert=1",
-    "sync": " SETTINGS async_insert=0",
+    "async": "SETTINGS async_insert=1, wait_for_async_insert=1",
+    "sync": "SETTINGS async_insert=0",
 }
 
 
@@ -128,7 +128,7 @@ class Driver:
         # concurrent inserts is irrelevant; we hold the lock only to keep the dict thread-safe).
         with self.model_lock:
             self.model.apply(op)
-        sql = insert_values_sql(self.seed, op.op_id, n, TABLE, self.base_time) + self.insert_settings
+        sql = insert_values_sql(self.seed, op.op_id, n, TABLE, self.base_time, settings=self.insert_settings)
         node = node_for(self.cluster, op.target)
         fut = self.executor.submit(self._insert_with_retry, node, sql, op.op_id)
         self.inflight.append(fut)

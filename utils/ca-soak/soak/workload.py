@@ -16,7 +16,8 @@ from soak.rowgen import row_for_rid, insert_rids, BASE_TIME
 _COLS = ["op_id", "writer", "bucket", "k", "ts", "version", "v", "payload", "row_fp"]
 
 
-def insert_values_sql(seed: int, op_id: int, n: int, table: str, base_time: int = BASE_TIME) -> str:
+def insert_values_sql(seed: int, op_id: int, n: int, table: str, base_time: int = BASE_TIME,
+                      settings: str = "") -> str:
     rows = [row_for_rid(seed, rid, base_time) for rid in insert_rids(op_id, n)]
     tuples = []
     for r in rows:
@@ -27,7 +28,11 @@ def insert_values_sql(seed: int, op_id: int, n: int, table: str, base_time: int 
                 op_id=r["op_id"], writer=r["writer"], bucket=r["bucket"], k=r["k"],
                 ts=r["ts"], version=r["version"], v=r["v"], payload=r["payload"], row_fp=r["row_fp"]))
     cols = ",".join(_COLS)
-    return f"INSERT INTO {table} ({cols}) VALUES " + ",".join(tuples)
+    # The `SETTINGS` clause (if any) MUST precede `VALUES`: in the VALUES input format the parser
+    # treats everything after `VALUES` as data, so a trailing `SETTINGS ...` is parsed as a malformed
+    # tuple (CANNOT_PARSE_INPUT_ASSERTION_FAILED).
+    settings_clause = f" {settings.strip()}" if settings.strip() else ""
+    return f"INSERT INTO {table} ({cols}){settings_clause} VALUES " + ",".join(tuples)
 
 
 def update_sql(table: str, bucket: int) -> str:
