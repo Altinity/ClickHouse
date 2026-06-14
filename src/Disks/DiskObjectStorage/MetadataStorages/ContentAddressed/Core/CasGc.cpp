@@ -980,11 +980,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     }
 
     /// No new records since the last fold: the snap is unchanged and already durable at
-    /// state.snap_generation. Skip the whole-snap re-write AND the gc/state CAS — thread the incoming
-    /// token through to retire unchanged. Safe: retire's round CAS rides exactly this token, so any
-    /// intervening lease steal Conflicts there (same zombie-window protection runRegularRound
-    /// documents for the post-fold path); and folded_cursor was not advanced past any unpersisted
-    /// records (none exist). state/state_token are returned unmodified.
+    /// state.snap_generation. Skip the whole-snap re-write AND fold's own gc/state CAS.
+    /// state_token is returned UNMODIFIED, so retire's round CAS rides the incoming lease token
+    /// (preserving the zombie-steal protection runRegularRound documents). state.folded_cursor may
+    /// have been advanced to shard_version for empty-window shards; that advance is over an empty
+    /// (cursor, shard_version] range (no records to skip — same as the original always-persist code
+    /// did every round) and is persisted atomically with .round by retire's subsequent CAS.
     if (!folded_any)
         return result;
 
