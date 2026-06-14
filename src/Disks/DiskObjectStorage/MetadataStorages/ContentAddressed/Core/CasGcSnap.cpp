@@ -2,9 +2,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/ZstdDeflatingWriteBuffer.h>
+#include <IO/ZstdInflatingReadBuffer.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
+#include <zstd.h>
 
 namespace DB
 {
@@ -13,6 +18,7 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
+    extern const int ZSTD_DECODER_FAILED;
 }
 }
 
@@ -29,7 +35,12 @@ namespace
 /// the GC round. Magic + version byte at the front; fail-closed decode (bad magic / bad enum byte /
 /// truncated => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
 constexpr char GC_SNAP_MAGIC[4] = {'C', 'A', 'G', 'S'};
-constexpr uint8_t GC_SNAP_VERSION = 2;
+/// Version 3 adds a codec byte (byte 5) immediately after the version byte.
+/// Frame layout: magic(4) + version(1) + codec(1) + <compressed-or-raw body>.
+/// Old readers (version <= 2) never see version 3 — they reject it with NOT_IMPLEMENTED.
+constexpr uint8_t GC_SNAP_VERSION = 3;
+constexpr uint8_t GC_SNAP_CODEC_RAW = 0;   /// body is the raw field bytes (reserved; not emitted)
+constexpr uint8_t GC_SNAP_CODEC_ZSTD = 1;  /// body is zstd-compressed field bytes
 
 /// `EdgeKind` <-> byte. Unknown byte on decode is corruption (fail closed).
 uint8_t edgeKindToByte(EdgeKind kind)
@@ -239,45 +250,145 @@ std::vector<Candidate> GcSnap::zeroInDegreeKnown() const
     return result;
 }
 
-String encodeGcSnap(const GcSnap & snap)
+/// Encodes the snap fields (snap_shard, generation, edges, expanded, known) into a binary body
+/// string using the standard IO helpers.  The frame header (magic + version + codec) is NOT
+/// included here — only the raw field bytes.  The layout is identical to the v2 per-field layout
+/// so that the same `decodeSnapFields` can reconstruct the snap from any decompressed body.
+String GcSnap::encodeSnapFields(const GcSnap & snap)
 {
-    WriteBufferFromOwnString out;
-    out.write(GC_SNAP_MAGIC, sizeof(GC_SNAP_MAGIC));
-    writeBinaryLittleEndian(GC_SNAP_VERSION, out);
-    writeBinaryLittleEndian(snap.snap_shard, out);
-    writeBinaryLittleEndian(snap.generation, out);
+    WriteBufferFromOwnString body;
+    writeBinaryLittleEndian(snap.snap_shard, body);
+    writeBinaryLittleEndian(snap.generation, body);
 
-    writeBinaryLittleEndian(static_cast<uint32_t>(snap.edges.size()), out);
+    writeBinaryLittleEndian(static_cast<uint32_t>(snap.edges.size()), body);
     for (const auto & [id, rec] : snap.edges)                    /// canonical-edge-id order
     {
-        writeBinaryLittleEndian(edgeKindToByte(rec.edge_kind), out);
+        writeBinaryLittleEndian(edgeKindToByte(rec.edge_kind), body);
         if (rec.edge_kind == EdgeKind::Root)
         {
-            writeBinaryLittleEndian(static_cast<uint16_t>(rec.root_shard.size()), out);
-            writeString(rec.root_shard, out);
-            writeBinaryLittleEndian(static_cast<uint16_t>(rec.part_name.size()), out);
-            writeString(rec.part_name, out);
+            writeBinaryLittleEndian(static_cast<uint16_t>(rec.root_shard.size()), body);
+            writeString(rec.root_shard, body);
+            writeBinaryLittleEndian(static_cast<uint16_t>(rec.part_name.size()), body);
+            writeString(rec.part_name, body);
         }
         else
         {
-            writeBinaryLittleEndian(rec.parent_tree, out);
+            writeBinaryLittleEndian(rec.parent_tree, body);
         }
-        writeBinaryLittleEndian(static_cast<uint8_t>(rec.target_kind), out);
-        writeBinaryLittleEndian(rec.target_hash, out);
+        writeBinaryLittleEndian(static_cast<uint8_t>(rec.target_kind), body);
+        writeBinaryLittleEndian(rec.target_hash, body);
     }
 
-    writeBinaryLittleEndian(static_cast<uint32_t>(snap.expanded.size()), out);
+    writeBinaryLittleEndian(static_cast<uint32_t>(snap.expanded.size()), body);
     for (const auto & tree : snap.expanded)                      /// set order (sorted)
-        writeBinaryLittleEndian(tree, out);
+        writeBinaryLittleEndian(tree, body);
 
-    writeBinaryLittleEndian(static_cast<uint32_t>(snap.known.size()), out);
+    writeBinaryLittleEndian(static_cast<uint32_t>(snap.known.size()), body);
     for (const auto & [kind, hash] : snap.known)                 /// set order (sorted by (kind, hash))
     {
-        writeBinaryLittleEndian(kind, out);
-        writeBinaryLittleEndian(hash, out);
+        writeBinaryLittleEndian(kind, body);
+        writeBinaryLittleEndian(hash, body);
     }
 
-    return std::move(out.str());
+    return std::move(body.str());
+}
+
+/// Parses the snap fields from a ReadBuffer that is positioned at the start of the (possibly
+/// decompressed) body — i.e. right after the 6-byte frame header has been consumed.
+GcSnap GcSnap::decodeSnapFields(ReadBuffer & body)
+{
+    GcSnap snap;
+    readBinaryLittleEndian(snap.snap_shard, body);
+    readBinaryLittleEndian(snap.generation, body);
+
+    uint32_t edge_count = 0;
+    readBinaryLittleEndian(edge_count, body);
+    for (uint32_t i = 0; i < edge_count; ++i)
+    {
+        GcSnap::EdgeRec rec;
+        uint8_t edge_kind_byte = 0;
+        readBinaryLittleEndian(edge_kind_byte, body);
+        rec.edge_kind = edgeKindFromByte(edge_kind_byte);
+        if (rec.edge_kind == EdgeKind::Root)
+        {
+            uint16_t shard_len = 0;
+            readBinaryLittleEndian(shard_len, body);
+            rec.root_shard = readFixedBytes(body, shard_len);
+            uint16_t part_len = 0;
+            readBinaryLittleEndian(part_len, body);
+            rec.part_name = readFixedBytes(body, part_len);
+        }
+        else
+        {
+            readBinaryLittleEndian(rec.parent_tree, body);
+        }
+        uint8_t target_kind_byte = 0;
+        readBinaryLittleEndian(target_kind_byte, body);
+        rec.target_kind = objectKindFromByte(target_kind_byte);
+        readBinaryLittleEndian(rec.target_hash, body);
+
+        if (rec.edge_kind == EdgeKind::Pack && rec.target_kind != ObjectKind::Pack)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS gc/snap: pack edge target_kind must be 'pack', got {}",
+                static_cast<int>(rec.target_kind));
+
+        const String id = GcSnap::edgeIdFor(rec);
+        if (snap.edges.contains(id))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: duplicate edge id '{}'", id);
+        snap.addEdge(std::move(rec));
+    }
+
+    uint32_t expanded_count = 0;
+    readBinaryLittleEndian(expanded_count, body);
+    for (uint32_t i = 0; i < expanded_count; ++i)
+    {
+        UInt128 tree{};
+        readBinaryLittleEndian(tree, body);
+        snap.expanded.insert(tree);
+    }
+
+    uint32_t known_count = 0;
+    readBinaryLittleEndian(known_count, body);
+    for (uint32_t i = 0; i < known_count; ++i)
+    {
+        uint8_t kind_byte = 0;
+        readBinaryLittleEndian(kind_byte, body);
+        const ObjectKind kind = objectKindFromByte(kind_byte);
+        UInt128 hash{};
+        readBinaryLittleEndian(hash, body);
+        snap.known.insert(GcSnap::NodeKey{static_cast<uint8_t>(kind), hash});
+    }
+
+    return snap;
+}
+
+String encodeGcSnap(const GcSnap & snap)
+{
+    /// 1. Encode the field body (same byte layout as v2, without the frame header).
+    const String raw_body = GcSnap::encodeSnapFields(snap);
+
+    /// 2. Compress the body with zstd.
+    String compressed;
+    {
+        auto sink = std::make_unique<WriteBufferFromString>(compressed);
+        ZstdDeflatingWriteBuffer zstd(std::move(sink), ZSTD_defaultCLevel());
+        zstd.write(raw_body.data(), raw_body.size());
+        zstd.finalize();
+    }
+
+    /// 3. Prepend the 10-byte frame: magic(4) + version(1=3) + codec(1=ZSTD) + compressed_len(4).
+    /// The explicit compressed_len lets the decoder detect truncation (including truncated checksum
+    /// bytes) independently of the zstd stream framing.
+    const auto compressed_len = static_cast<uint32_t>(compressed.size());
+    String out;
+    out.reserve(10 + compressed.size());
+    out.append(GC_SNAP_MAGIC, sizeof(GC_SNAP_MAGIC));
+    out.push_back(static_cast<char>(GC_SNAP_VERSION));
+    out.push_back(static_cast<char>(GC_SNAP_CODEC_ZSTD));
+    for (int i = 0; i < 4; ++i)
+        out.push_back(static_cast<char>((compressed_len >> (8 * i)) & 0xFF));
+    out.append(compressed);
+    return out;
 }
 
 GcSnap decodeGcSnap(std::string_view data)
@@ -286,6 +397,7 @@ GcSnap decodeGcSnap(std::string_view data)
     {
         ReadBufferFromMemory in(data.data(), data.size());
 
+        /// --- 6-byte frame header ---
         if (readFixedBytes(in, sizeof(GC_SNAP_MAGIC)) != std::string_view(GC_SNAP_MAGIC, sizeof(GC_SNAP_MAGIC)))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: bad magic");
 
@@ -296,75 +408,49 @@ GcSnap decodeGcSnap(std::string_view data)
         if (version != GC_SNAP_VERSION)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: invalid version {}", version);
 
-        GcSnap snap;
-        readBinaryLittleEndian(snap.snap_shard, in);
-        readBinaryLittleEndian(snap.generation, in);
+        uint8_t codec = 0;
+        readBinaryLittleEndian(codec, in);
 
-        uint32_t edge_count = 0;
-        readBinaryLittleEndian(edge_count, in);
-        for (uint32_t i = 0; i < edge_count; ++i)
+        if (codec == GC_SNAP_CODEC_ZSTD)
         {
-            GcSnap::EdgeRec rec;
-            uint8_t edge_kind_byte = 0;
-            readBinaryLittleEndian(edge_kind_byte, in);
-            rec.edge_kind = edgeKindFromByte(edge_kind_byte);
-            if (rec.edge_kind == EdgeKind::Root)
-            {
-                uint16_t shard_len = 0;
-                readBinaryLittleEndian(shard_len, in);
-                rec.root_shard = readFixedBytes(in, shard_len);
-                uint16_t part_len = 0;
-                readBinaryLittleEndian(part_len, in);
-                rec.part_name = readFixedBytes(in, part_len);
-            }
-            else
-            {
-                readBinaryLittleEndian(rec.parent_tree, in);
-            }
-            uint8_t target_kind_byte = 0;
-            readBinaryLittleEndian(target_kind_byte, in);
-            rec.target_kind = objectKindFromByte(target_kind_byte);
-            readBinaryLittleEndian(rec.target_hash, in);
-
-            if (rec.edge_kind == EdgeKind::Pack && rec.target_kind != ObjectKind::Pack)
+            /// Read the 4-byte compressed_len stored in the frame (allows reliable truncation
+            /// detection that is independent of the zstd stream's own framing / checksum bytes).
+            uint32_t compressed_len = 0;
+            readBinaryLittleEndian(compressed_len, in);
+            /// Bounds-check BEFORE allocation (in.available() is exact for ReadBufferFromMemory).
+            if (compressed_len > in.available())
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS gc/snap: pack edge target_kind must be 'pack', got {}",
-                    static_cast<int>(rec.target_kind));
-
-            /// The canonical encoder iterates the edge map, so it can never emit two edges with
-            /// the same canonical id — ANY duplicate in a persisted document is corruption (and
-            /// silently deduplicating a root-edge duplicate would pick an arbitrary target).
-            const String id = GcSnap::edgeIdFor(rec);
-            if (snap.edges.contains(id))
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: duplicate edge id '{}'", id);
-            snap.addEdge(std::move(rec));                        /// rebuilds indeg (and seeds known)
+                    "CAS gc/snap: truncated compressed body (expected {} bytes, {} available)",
+                    compressed_len, in.available());
+            const std::string_view compressed_view(in.position(), compressed_len);
+            String body;
+            try
+            {
+                auto compressed_in = std::make_unique<ReadBufferFromString>(compressed_view);
+                ZstdInflatingReadBuffer zstd(std::move(compressed_in));
+                readStringUntilEOF(body, zstd);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() == ErrorCodes::ZSTD_DECODER_FAILED)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS gc/snap: zstd decompression failed (corrupt compressed body): {}", e.message());
+                throw;
+            }
+            ReadBufferFromOwnString body_buf(std::move(body));
+            return GcSnap::decodeSnapFields(body_buf);
         }
-
-        uint32_t expanded_count = 0;
-        readBinaryLittleEndian(expanded_count, in);
-        for (uint32_t i = 0; i < expanded_count; ++i)
+        else if (codec == GC_SNAP_CODEC_RAW)
         {
-            UInt128 tree{};
-            readBinaryLittleEndian(tree, in);
-            snap.expanded.insert(tree);
+            /// For RAW, the remainder is the unframed field bytes directly.
+            const std::string_view remainder(in.position(), in.available());
+            ReadBufferFromMemory body_buf(remainder.data(), remainder.size());
+            return GcSnap::decodeSnapFields(body_buf);
         }
-
-        /// The explicit known set is authoritative; the edge-derived inserts from addEdge above
-        /// are a subset of it for any document we encoded (a known node may have zero edges — that
-        /// is exactly the zero-in-degree candidate case). Union both (simple and over-count-safe).
-        uint32_t known_count = 0;
-        readBinaryLittleEndian(known_count, in);
-        for (uint32_t i = 0; i < known_count; ++i)
+        else
         {
-            uint8_t kind_byte = 0;
-            readBinaryLittleEndian(kind_byte, in);
-            const ObjectKind kind = objectKindFromByte(kind_byte);
-            UInt128 hash{};
-            readBinaryLittleEndian(hash, in);
-            snap.known.insert(GcSnap::NodeKey{static_cast<uint8_t>(kind), hash});
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: unknown codec byte {}", static_cast<int>(codec));
         }
-
-        return snap;
     });
 }
 

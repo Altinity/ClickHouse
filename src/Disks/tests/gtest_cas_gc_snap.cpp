@@ -311,7 +311,7 @@ struct SnapWriter
     void u64(uint64_t v) { for (int i = 0; i < 8; ++i) buf.push_back(static_cast<char>((v >> (8 * i)) & 0xFF)); }
     void hash(const UInt128 & h) { for (int i = 0; i < 16; ++i) buf.push_back(static_cast<char>((h >> (8 * i)) & 0xFF)); }
     void str(const String & s) { u16(static_cast<uint16_t>(s.size())); raw(s.data(), s.size()); }
-    void header() { raw("CAGS", 4); u8(2); u64(0); u64(0); }   /// version 2, shard 0, generation 0
+    void header() { raw("CAGS", 4); u8(3); u8(0); u64(0); u64(0); }   /// version 3, codec RAW (0), shard 0, generation 0
 };
 }
 

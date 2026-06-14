@@ -8,6 +8,11 @@
 #include <string_view>
 #include <vector>
 
+namespace DB
+{
+class ReadBuffer;
+}
+
 namespace DB::Cas
 {
 
@@ -99,6 +104,10 @@ private:
 
     friend String encodeGcSnap(const GcSnap &);
     friend GcSnap decodeGcSnap(std::string_view);
+
+    /// Codec helpers: encode/decode the raw field bytes (without the frame header).
+    static String encodeSnapFields(const GcSnap & snap);
+    static GcSnap decodeSnapFields(ReadBuffer & body);
 };
 
 String encodeGcSnap(const GcSnap & snap);
