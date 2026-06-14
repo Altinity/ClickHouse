@@ -1795,3 +1795,25 @@ TEST(CasGcFold, NoChurnRoundWritesNoNewSnap)
     EXPECT_EQ(st2.snap_generation, st1.snap_generation);                              /// generation unchanged
     EXPECT_EQ(b->putCount(s->layout().gcSnapKey(st1.snap_generation + 1, 0)), 0u);    /// no probe write
 }
+
+/// ---- A1 resident-snap read-cache (Task 6, Pillar A1) ----
+///
+/// When the durable snap generation is unchanged between rounds, the fold skips the per-round
+/// loadSnap GET and reuses the in-memory resident snap instead. The generation is WRITE-ONCE
+/// (putIfAbsent + byte-equal adoption), so a matching generation guarantees identical bytes —
+/// no HEAD/GET needed, no explicit invalidation required.
+
+TEST(CasGcFold, NoChurnRoundReusesResidentSnapNoGet)
+{
+    auto b = std::make_shared<tests::CountingBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);   /// round 1: folds, snap now resident
+    const GcState st1 = readState(*b, *s);
+
+    b->resetCounts();
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);   /// round 2: no churn — reuse resident snap
+    EXPECT_EQ(b->getCount(s->layout().gcSnapKey(st1.snap_generation, 0)), 0u);   /// snap NOT re-GET
+}

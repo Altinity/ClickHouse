@@ -96,7 +96,14 @@ RoundReport Gc::runRegularRound()
     /// Journal trim - the round's maintenance tail (cursors are durable; INV-JOURNAL-COVERAGE).
     trim(state, folded.root_shards);
 
-    /// Task 12: resume
+    /// Pillar A1: keep the final post-round snap resident for the next round's fold (write-once
+    /// generation makes this safe to reuse while we remain the leader at the same generation).
+    /// Only refreshed on the normal full-round completion path — NOT on the two early returns
+    /// (!acquired_lease and tryResumeIncompleteRound) so the stale-or-absent resident is always
+    /// re-validated against state.snap_generation on the next call.
+    resident_snap = folded.snap;
+    resident_generation = state.snap_generation;
+
     return report;
 }
 
@@ -944,8 +951,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     /// 1. Discover the namespace universe FROM THE REGISTRY (spec section 4/7 R1).
     result.root_shards = discoverUniverse();
 
-    /// 2. Load the authoritative snap generation.
-    result.snap = loadSnap(state);
+    /// 2. Load the authoritative snap generation — or reuse the resident cache when the durable
+    /// generation is unchanged. A snap generation is write-once (putIfAbsent + byte-equal adoption),
+    /// so a matching resident_generation == state.snap_generation guarantees identical bytes without
+    /// any HEAD/GET. This avoids the per-round whole-snap GET on idle (churn-free) rounds.
+    if (resident_snap && resident_generation == state.snap_generation)
+        result.snap = *resident_snap;
+    else
+        result.snap = loadSnap(state);
 
     /// 3. Fold each discovered root shard's journal records in (folded_cursor, shard_version],
     /// in journal (= insertion) order (the shared R1/R4 record semantics — foldShardRecords).

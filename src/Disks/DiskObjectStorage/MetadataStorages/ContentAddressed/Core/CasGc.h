@@ -274,6 +274,15 @@ private:
     bool has_observation = false;
     UInt128 last_seen_owner{};
     uint64_t last_seen_seq = 0;
+
+    /// Pillar A1 resident-snap read-cache. The Gc instance is long-lived (one per scheduler thread,
+    /// CasGcScheduler::loop), so this survives across rounds. A snap generation is write-once
+    /// (putIfAbsent + byte-equal adoption), so a matching generation guarantees identical bytes —
+    /// reusing the resident copy when resident_generation == state.snap_generation needs NO HEAD/GET
+    /// and is self-validating: if another leader advanced the generation while we did not hold the
+    /// lease, the next state read shows a different snap_generation => mismatch => reload.
+    std::optional<std::map<uint64_t, GcSnap>> resident_snap;
+    uint64_t resident_generation = 0;
 };
 
 }
