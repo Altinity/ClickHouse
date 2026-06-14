@@ -643,3 +643,47 @@ classifying, instead of trusting the LIST.
   **B141 NEW** (fsck-vs-churn transient dangling).
 - Evidence: `utils/ca-soak/logs/phase1_scoped.log`, `phase1_scoped_failure_op899.json`,
   `phase1_ch1_server.log`, `phase1_ch2_server.log`.
+
+## Phase-1 GREEN milestone (2026-06-14) — B141 fixed, soak Phase-1 `PHASE1 OK`
+
+**This is the Phase-1 milestone.** The soak's Phase-1 sync workload (seed=20260613, 1500 ops, 6
+workers, checkpoint every 300) ran to completion with `PHASE1 OK`, exit 0, after the B141 fix.
+
+### B141 fix (the unblock)
+The earlier B141 hypothesis ("non-atomic ref-walk vs LIST snapshot; mitigate by re-polling `dangling`
+to stability") was REFINED by the fix. The actual mechanism is **LIST lag**: an object-store `list`
+can lag for recently-written objects (eventual consistency / mid-churn), so a reachable, ACTUALLY-
+PRESENT object absent from a lagging LIST was falsely flagged `dangling`. The fix is authoritative,
+not a re-poll: `Cas::runFsck` now `backend.head`-confirms any reachable key missing from the LIST
+set before declaring loss. `head` is authoritative for presence; LIST is advisory. Only a
+HEAD-ALSO-absent reachable object is truly `Dangling`. HEAD is issued only for the suspected-dangling
+set (reachable∖LIST, ~0 in the healthy case), so it is cheap. `unreachable` stays LIST-based (the
+B140 M-F-debris metric, not safety-critical). Regression gtests: `CasFsck.ListLagDoesNotFalseFlag-
+PresentObjectAsDangling` (RED before the fix, GREEN after) and `CasFsck.HeadAbsentReachableIsStill-
+Dangling` (guards that a real INV-NO-LOSS violation is still caught). The assert was NOT loosened.
+
+### Invariant evidence (every checkpoint)
+All 5 checkpoints (op 300/600/900/1200/1500): counts matched the model on BOTH replicas,
+`dangling=0` (now HEAD-confirmed — no false positives), `dryrun_subset=ok`. Sample checkpoint line:
+
+```
+[soak.run] checkpoint OK: now=1781410566 count=7951 fsck reachable=4142 unreachable=3697 (M-F debris, B140) dangling=0 dryrun_count=0
+```
+
+Server logs across the full run: **zero `FILE_DOESNT_EXIST`**; no `dangling>0` anywhere. Residual
+`unreachable` (3357 at the final checkpoint) is the B140 M-F-debris (orphan blobs the incremental GC
+structurally cannot see), logged as non-fatal pending the M-F Full-GC backstop. ABORTED-retried
+INSERT attempts (B137 race): 0.
+
+### Soak findings tally (Phase-1)
+- **B135** fixed (concurrent-mount probe-key race).
+- **B136** fixed (dedup-arm resurrect re-PUT held body).
+- **B137** fixed (publish-time resurrect-vanish → ABORTED-retry).
+- **B138** resolved (it was the harness's unsafe async-insert retry, not a CA loss; soak runs sync).
+- **B139** tracked (async dedup-token-vs-part atomicity; not exercised — soak uses sync inserts).
+- **B140** tracked as M-F (displaced-before-expansion orphan-blob leak; needs Full-GC backstop;
+  guarded by the deliberately-RED `CasGcLeak.DisplacedUnexpandedTreeBlobsLeak` gtest).
+- **B141** fixed (this milestone — fsck HEAD-confirms dangling; LIST-lag false-positive gone).
+- **B132** closed (populated-pool fsck smoke exercised at every checkpoint).
+
+Evidence: `utils/ca-soak/logs/phase1_b141.log`, `phase1_b141_server.log`.

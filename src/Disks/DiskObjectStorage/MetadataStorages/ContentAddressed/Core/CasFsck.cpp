@@ -107,7 +107,28 @@ FsckReport runFsck(Store & store, bool detail)
     for (const auto & [key, labels] : reachable)
     {
         auto it = present.find(key);
-        const bool exists = it != present.end();
+        bool exists = it != present.end();
+        uint64_t size = exists ? it->second : 0;
+
+        /// INV-NO-LOSS is SAFETY-critical, so it must be authoritative against LIST lag. A LIST can lag
+        /// for recently-written objects (eventual consistency / mid-churn), so a reachable object that is
+        /// actually PRESENT may be absent from a lagging LIST. Before declaring loss, HEAD-confirm the
+        /// suspected-dangling key — `head` is authoritative for presence, LIST is merely advisory. Only a
+        /// reachable object that HEAD ALSO cannot find is truly dangling. We HEAD only the reachable∖LIST
+        /// set (~0 in the healthy case), so this stays cheap.
+        if (!exists)
+        {
+            const HeadResult h = backend.head(key);
+            if (h.exists)
+            {
+                exists = true;
+                size = h.size;
+                /// LIST lagged behind a present object — count its bytes in physical accounting too,
+                /// since the LIST-based scan above missed it.
+                report.physical_bytes += h.size;
+            }
+        }
+
         if (exists)
             ++report.reachable;
         else
@@ -117,7 +138,7 @@ FsckReport runFsck(Store & store, bool detail)
             FsckObject o;
             o.key = key;
             o.kind = kindOf(key);
-            o.size = exists ? it->second : 0;
+            o.size = size;
             o.cls = exists ? FsckClass::Reachable : FsckClass::Dangling;
             o.reachable_from = labels;
             report.objects.push_back(std::move(o));
