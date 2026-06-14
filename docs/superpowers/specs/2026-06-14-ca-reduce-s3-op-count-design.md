@@ -30,9 +30,11 @@ Today `Gc::fold` calls `loadSnap` (GET the whole snap) **every round**, and a ch
 1. **Resident snap.** Keep the decoded `GcSnap` resident in the long-lived per-leader `Gc` (the scheduler owns one). Each round, while we are the continuing leader at the current generation, **fold only new journal records** (read the changed root-shard manifests past `folded_cursor`) into the resident snap — **no per-round `loadSnap`**.
 2. **Decoupled periodic checkpoint.** Every round still CAS-writes the small `gc/state` (round/fence) + retired sets — the durable delete authority, unchanged. The **whole snap + `folded_cursor` are persisted only at a checkpoint** — when ≥ K folded records accumulated **or** ≥ M rounds elapsed (K caps recovery re-fold; M caps staleness). Between checkpoints: zero snap I/O. The existing snap-PUT-then-`gc/state`-CAS ordering (orphan-snap-at-gen+1 ignored) stays crash-safe.
 3. **Recovery / lease handoff.** A new/recovering leader loads the last checkpoint snap and **re-folds the journal delta from `folded_cursor` to now** (bounded by K). Resident snap is dropped on any `gc/state` CAS failure or lease loss (the existing detection) and reloaded next round.
-4. **`retire` without per-candidate HEAD.** The resident snap carries each known object's last-observed token/size (recorded when its edge was folded). `retire` uses that instead of a `head(objectKey)` per candidate; it falls back to a HEAD only when the snap lacks a confident observation. This removes the retire HEAD storm.
+4. **`retire` without per-candidate HEAD — DEFERRED (see below).** Originally: the resident snap carries each known object's last-observed token/size so `retire` skips the per-candidate `head`. **Deferred 2026-06-14** after a code audit (see note) showed it is only partially achievable and likely secondary. Kept out of this plan's scope.
 
-Net steady-state per-round S3 ≈ O(churn): fold the delta + write small gc/state + retire/fence/delete the candidates. The O(pool) snap I/O happens only at checkpoints.
+> **Code-audit finding (2026-06-14) — why retire-without-HEAD is deferred.** `GcSnap` stores **no token/size** — only reachability (`edges`/`indeg`/`known`/`expanded`). During `fold`, GC `GET`s tree/pack objects to expand them (their token is free from the `GetResult`), but it **never reads blobs** — blob hashes come from tree entries, never their tokens. `retire` needs the **current live** token for `deleteExact`, so for blobs (which dominate a real pool) the token is only obtainable via a HEAD. Thus retire-without-HEAD could skip the HEAD only for tree/pack candidates, never blobs — partial benefit, non-trivial new snap-token-storage surface, and the riskiest element for INV-NO-RETURN. The soak's retire HEAD storm was also likely **secondary**: a melted store stalled `deleteExact`, growing the zero-in-degree candidate backlog that `retire` re-HEADs every round; relieving the store via Pillar B (kills the `resolveRef` HEAD storm) + Pillar A1 (kills per-round snap GET+PUT) should drain that backlog so retire HEADs shrink without this change. Revisit only if the soak shows retire HEADs still dominate once the store is relieved.
+
+Net steady-state per-round S3 ≈ O(churn): fold the delta + write small gc/state + (retire/fence/delete the candidates, still HEAD-per-candidate for now). The O(pool) snap I/O happens only at checkpoints.
 
 ## 3. Pillar B — `resolveRef` decode-cache: no HEAD on a warm hit {#pillar-b}
 
@@ -72,7 +74,8 @@ Pillar B is protocol-relevant **only at the publish gate**, which stays force-fr
 
 ## 7. Scope / non-goals {#scope}
 
-- In scope: the two pillars + zstd snap.
+- In scope: Pillar B (single-flight + opt-in bounded-TTL decode cache), Pillar A1 (resident-snap read-cache + decoupled periodic checkpoint), and zstd snap compression. Implementation order is **biggest-win-first**: Pillar B → Pillar A1 → zstd.
+- **Out of scope (deferred 2026-06-14):** retire-without-HEAD (Pillar A §2.4) — only partially achievable (tree/pack only; blobs dominate) and likely secondary; revisit after soak re-validation. See the code-audit note in §2.
 - **Out of scope (separate future levers):** the publish/manifest write path redesign (log-structured manifest / batched ref-deltas / piggybacked fence — the per-publish manifest CAS), snap-sharding (`snap_shards>1`, persist only dirty shards — the deeper O(churn)-writes amplifier), object-count collapse / packing (M-F), and a separate S3 connection pool / QoS for background vs query I/O. The RetireView per-publish refresh cache already landed.
 - No on-disk compat (pre-release pool format).
 
