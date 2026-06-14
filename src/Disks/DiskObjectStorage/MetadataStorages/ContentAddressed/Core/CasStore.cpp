@@ -402,6 +402,13 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
 
         if (pool_backend->casPut(key, body, token) == CasOutcome::Committed)
         {
+            /// Read-your-writes (Pillar B): invalidate this shard's decode cache so a same-Store
+            /// allow_stale read (bounded-TTL fast-path) cannot serve the pre-write decode. A LOCAL
+            /// write is reflected immediately; cross-node staleness stays bounded by the TTL.
+            {
+                std::lock_guard cache_lock(shard_decode_cache_mutex);
+                shard_decode_cache.erase(key);
+            }
             if (out_committed_version)
                 *out_committed_version = root.shard_version;
             return;
