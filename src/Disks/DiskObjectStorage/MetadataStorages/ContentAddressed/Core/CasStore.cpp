@@ -154,7 +154,55 @@ BuildPtr Store::startBuild(BuildInfo info)
 std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & ns, uint64_t shard)
 {
     const String key = pool_layout.rootShardKey(ns, shard);
+    return coalescedReadShardDecoded(key);
+}
 
+std::shared_ptr<const RootShard> Store::coalescedReadShardDecoded(const String & key)
+{
+    std::shared_ptr<std::promise<std::shared_ptr<const RootShard>>> promise;
+    std::shared_future<std::shared_ptr<const RootShard>> future;
+    {
+        std::lock_guard lock(shard_inflight_mutex);
+        auto it = shard_inflight.find(key);
+        if (it != shard_inflight.end())
+        {
+            future = it->second;   /// follower: wait on the in-flight leader
+        }
+        else
+        {
+            promise = std::make_shared<std::promise<std::shared_ptr<const RootShard>>>();
+            future = promise->get_future().share();
+            shard_inflight.emplace(key, future);
+        }
+    }
+
+    if (!promise)
+        return future.get();   /// follower: returns the leader's result (or rethrows the leader's exception)
+
+    /// Leader: do the real work, publish to followers whether it succeeds or throws.
+    try
+    {
+        auto result = loadShardDecoded(key);
+        {
+            std::lock_guard lock(shard_inflight_mutex);
+            shard_inflight.erase(key);
+        }
+        promise->set_value(result);
+        return result;
+    }
+    catch (...)
+    {
+        {
+            std::lock_guard lock(shard_inflight_mutex);
+            shard_inflight.erase(key);
+        }
+        promise->set_exception(std::current_exception());
+        throw;
+    }
+}
+
+std::shared_ptr<const RootShard> Store::loadShardDecoded(const String & key)
+{
     /// Empty-manifest sentinel for the absent case — shared so callers can treat absent and present
     /// uniformly (no refs). Never mutated.
     static const std::shared_ptr<const RootShard> empty_shard = std::make_shared<const RootShard>();

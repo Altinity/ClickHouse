@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 #include <chrono>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -131,7 +132,13 @@ private:
     /// (always fresh) so a publish/drop never reads stale state. Correctness rests on the token
     /// uniquely identifying the incarnation's bytes (every write mints a new token), so a matching
     /// token guarantees identical content. Used by resolveRef/listRefs only.
+    /// Single-flight coalescing (Pillar B, Task 2): concurrent callers for the same shard key share
+    /// ONE head (+ at most one get); followers wait on the leader's shared_future.
     std::shared_ptr<const RootShard> readShardDecoded(const RootNamespace & ns, uint64_t shard);
+    /// The actual head+get+decode for one shard key (no coalescing). Called by coalescedReadShardDecoded.
+    std::shared_ptr<const RootShard> loadShardDecoded(const String & key);
+    /// Single-flight coalescing wrapper around loadShardDecoded.
+    std::shared_ptr<const RootShard> coalescedReadShardDecoded(const String & key);
 
     /// Read-modify-CAS one shard manifest under the manifest size guard. `mutate` edits the in-memory
     /// RootShard (which carries the freshly-read shard_version); the helper bumps shard_version, encodes,
@@ -166,6 +173,12 @@ private:
     static constexpr size_t SHARD_DECODE_CACHE_MAX_ENTRIES = 16384;
     std::mutex shard_decode_cache_mutex;
     std::unordered_map<String, std::pair<Token, std::shared_ptr<const RootShard>>> shard_decode_cache;
+
+    /// Single-flight coalescing for readShardDecoded: concurrent resolves of the SAME shard key
+    /// share ONE head (+ at most one get). The leader publishes its decode to the followers'
+    /// shared_future. Zero added staleness — all coalesced callers get the leader's fresh result.
+    std::mutex shard_inflight_mutex;
+    std::unordered_map<String, std::shared_future<std::shared_ptr<const RootShard>>> shard_inflight;
 
     /// B113 (part 2) tree decode cache: tree_id_hex -> decoded immutable tree. Trees are
     /// content-addressed (the key IS the content hash), so entries never go stale — no invalidation.

@@ -1,10 +1,15 @@
 #include <gtest/gtest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <condition_variable>
+#include <optional>
+#include <thread>
+#include <vector>
 
 namespace DB::ErrorCodes
 {
@@ -644,4 +649,121 @@ TEST(CasStore, ListNamespacesFromRegistry)
     EXPECT_EQ(shadows[0], "shadow/bk1/tbl");
     EXPECT_EQ(shadows[1], "shadow/bk2/tbl");
     EXPECT_TRUE(s->listNamespaces("nope/").empty());
+}
+
+namespace
+{
+/// Publish one ref through the real Build: tree {"f" -> blob of `payload`}.
+/// Mirrors the `publishPart` helper in gtest_cas_gc_round.cpp (local copy to avoid cross-TU linkage).
+void publishPart(const StorePtr & s, const String & ns, const String & ref, const String & payload)
+{
+    auto build = s->startBuild({});
+    build->putBlob(DB::Cas::tests::idOf(payload), BlobSource::fromString(payload));
+    TreeEntry entry;
+    entry.name = "f";
+    entry.placement = Placement::Blob;
+    entry.file_hash = DB::Cas::tests::u128Of(payload);
+    entry.file_size = payload.size();
+    const TreeId tree = build->putTree({entry});
+    build->publish(RootNamespace{ns}, ref, tree, {});
+}
+
+/// Blocks the FIRST head() call made after `arm()` on a latch so followers attach to the
+/// single-flight entry while the leader is still in-flight. Deterministic: no sleeps.
+/// Calls before `arm()` pass through immediately.
+class GatedHeadBackend : public DB::Cas::InMemoryBackend
+{
+public:
+    DB::Cas::HeadResult head(const String & key) override
+    {
+        {
+            std::unique_lock lock(m);
+            ++head_calls;
+            if (armed && !leader_in_head)
+            {
+                leader_in_head = true;
+                cv.notify_all();
+                gate.wait(lock, [this] { return released; });
+            }
+        }
+        return DB::Cas::InMemoryBackend::head(key);
+    }
+
+    /// Enable the gate: the NEXT head() call will be the "leader" and will block until release().
+    void arm()
+    {
+        std::lock_guard lock(m);
+        armed = true;
+        leader_in_head = false;
+        released = false;
+    }
+
+    void waitLeaderInHead()
+    {
+        std::unique_lock lock(m);
+        cv.wait(lock, [this] { return leader_in_head; });
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard lock(m);
+            released = true;
+        }
+        gate.notify_all();
+    }
+
+    uint64_t headCalls() const
+    {
+        std::lock_guard lock(m);
+        return head_calls;
+    }
+
+private:
+    mutable std::mutex m;
+    std::condition_variable cv;
+    std::condition_variable gate;
+    uint64_t head_calls = 0;
+    bool armed = false;
+    bool leader_in_head = false;
+    bool released = false;
+};
+}
+
+TEST(CasStoreSingleFlight, ConcurrentResolvesCoalesceToOneHead)
+{
+    using namespace DB::Cas;
+
+    /// Use GatedHeadBackend throughout. `open` + `publishPart` will call head() some times;
+    /// snapshot the counter afterwards and assert that exactly ONE more head() happens during
+    /// the concurrent burst (the single-flight leader's shard HEAD).
+    auto b = std::make_shared<GatedHeadBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");
+
+    /// Arm the gate: the NEXT head() call (the leader's shard HEAD) will block until release().
+    b->arm();
+    const uint64_t calls_before = b->headCalls();
+
+    const RootNamespace ns{"srv1/tbl"};
+    constexpr int followers = 8;
+    std::vector<std::thread> threads;
+    std::vector<std::optional<Resolved>> results(followers + 1);
+
+    threads.emplace_back([&] { results[0] = s->resolveRef(ns, "part_1"); });
+    b->waitLeaderInHead();
+    for (int i = 0; i < followers; ++i)
+        threads.emplace_back([&, i] { results[i + 1] = s->resolveRef(ns, "part_1"); });
+
+    b->release();
+    for (auto & t : threads)
+        t.join();
+
+    /// Single-flight: exactly ONE head() must have fired during the concurrent burst.
+    EXPECT_EQ(b->headCalls() - calls_before, 1u);
+    for (const auto & r : results)
+    {
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->tree_size, results[0]->tree_size);
+    }
 }
