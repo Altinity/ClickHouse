@@ -81,6 +81,8 @@ private:
         std::vector<Cas::TreeEntry> entries;       /// staged tree entries (uploads + adoptions)
         std::map<std::string, std::string> mutable_files;
         std::set<std::string> mutable_removed;     /// staged deletions for a COMMITTED part's payload
+        bool published = false;                    /// the ref is already durably published (at the
+                                                   /// lock-free rename); commit() must not re-publish it.
     };
 
     /// Keyed by (namespace string, ref name) — the routed identity, so live/detached/shadow
@@ -100,6 +102,11 @@ private:
     /// Idempotent ref removal: drop `ref` if it resolves, tolerating a concurrent drop that races
     /// between the resolve and the drop (the removal unit is meant to be replay-safe).
     void dropRefIfPresent(const Cas::RootNamespace & ns, const std::string & ref);
+
+    /// Publish one staged part durably (putTree + publish, or updateRefPayload for a mutable-only
+    /// staging) and mark it `published`. Idempotent: a no-op if already published. Returns true iff
+    /// this call newly CREATED a ref that did not exist before (for commit()'s rollback tracking).
+    bool publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st);
 };
 
 }
