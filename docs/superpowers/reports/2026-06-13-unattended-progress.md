@@ -450,3 +450,103 @@ D (assertion/metrics loop + 24h schedule) remain — each its own spec. B126 (RE
     NOTE: B132's "live fsck smoke" IS now exercised end-to-end (fsck + GC dry-run run at every checkpoint
     against a live churning cluster). Phase-1 green is BLOCKED on B140, an M-F-milestone GC feature, not a
     harness bug.
+
+## 2026-06-14 — B140 re-investigation: harness bound made backlog-scaled; the leak is REAL and NOT a TRUNCATE-only / timing artifact
+
+Goal of this pass: drive GC to a fixpoint reliably at checkpoints so Phase-1 goes green, on the
+working hypothesis (from the prior pass) that the stuck `unreachable` was a HARNESS timing artifact —
+the background `CasGcScheduler` ticks slower than the 180s poll bound, so a large post-`TRUNCATE`
+backlog could not drain in time. **That hypothesis is REFUTED by this run.**
+
+### Step 1 — GC-interval config IS honored (no wiring gap)
+Traced `content_addressed_gc_interval_sec` end-to-end:
+`MetadataStorageFactory.cpp:243-247` reads it (default 60) → CAMS ctor param `gc_interval_`
+(`ContentAddressedMetadataStorage.cpp:128,136`) → stored as `gc_interval` →
+`startup` builds `CasGcScheduler(cas_store, gc_interval, ...)` and `start`s it
+(`ContentAddressedMetadataStorage.cpp:226-228`) → the scheduler's tick is exactly
+`wake.wait_for(lock, interval, ...)` (`CasGcScheduler.cpp:64`), one `runRegularRound` per tick.
+The soak compose disk sets `content_addressed_gc_interval_sec=2` (`configs/storage_conf.xml:21`), so
+**the effective interval is 2s on both servers** — confirmed live: ch1/ch2 logged GC rounds ~2s apart
+(round N→N+1 ~2.0s). The interval config is honored; there is NO wiring gap to fix in
+`MetadataStorageFactory.cpp`.
+Also confirmed: `content_addressed_gc_grace_sec` (set =5 in the XML) is **inert** — `grep` over
+`src/Disks/.../ContentAddressed/` shows the core never reads it. There is no core retire-grace
+throttle; candidates are derived statelessly per round from the durable snap; the ONLY pacing knob is
+the GC interval. The harness's `gc_grace_sec` assumption was bogus.
+
+### Step 2 — harness made backlog-scaled (committed; correct regardless of the core bug)
+`utils/ca-soak/soak/checker.py`:
+- Added `fixpoint_timeout_s(initial_unreachable, gc_interval_s, floor_s=300, reclaim_per_round_guess=50)`
+  = `max(floor, 5 * ceil(initial/50) * gc_interval_s)`. Rationale: only the lease holder makes one
+  reclaim round per `gc_interval_s` (`CasGcScheduler::loop`), so a few-thousand-orphan backlog needs
+  many rounds; the bound scales to the measured backlog with a generous 300s floor.
+- `drive_gc_to_fixpoint` now measures the backlog once up front, short-circuits on 0, and derives the
+  bound from it (no more bogus `gc_grace_sec`). Injectable `sleep_fn`/`monotonic_fn` for pure tests.
+- Reworded `poll_unreachable_to_zero` ("backlog-scaled" not "grace-aware"); assert stays STRICT at
+  `unreachable==0` — never loosened.
+- `soak/cluster.py`: removed the bogus `gc_grace_sec` default; fixed the stale `gc_interval_s` default
+  (30 → 2, mirroring the compose value) with a comment on why it is the sole pacing knob.
+- `tests/test_checker_logic.py`: added `test_fixpoint_timeout_small_backlog_hits_floor`,
+  `test_fixpoint_timeout_large_backlog_scales`, `test_drive_gc_to_fixpoint_zero_backlog_short_circuits`,
+  `test_drive_gc_to_fixpoint_drains_large_backlog` (uses the real B140 number 1751/2473). `pytest tests/ -q`:
+  **41 passed**.
+
+### Step 3 — Phase-1 re-validation (sync, seed 20260613, 1500 ops, 6 workers, checkpoint-every 300): NOT GREEN
+- Checkpoint 1 (op 300): `count=13463`, `model==node1==node2`, `unreachable=0`, `dangling=0`,
+  `dryrun=0`. PASS — GC fully reclaimed here (rounds 11/12 deleted 60+1019, cascaded 1065+62 right
+  after the checkpoint quiesce).
+- Checkpoint 2 (op 600): **counts EXACTLY correct** — `model==node1==node2` (`count=7951`), `dangling=0`
+  → no data loss. But `unreachable` stuck at **2473** for the FULL backlog-scaled bound (495s), history
+  flat `[2473,2473,...]` (one transient 2474). `CHECKPOINT FAILURE: GC did not reclaim to
+  unreachable==0 within 495s`. exit=1. The harness did its job: it surfaced the leak loudly instead of
+  masking it.
+
+### Diagnosis — REAL core bug, refines B140 (not a timing artifact, not TRUNCATE-specific)
+Decisive evidence (live, at the quiesced op-600 checkpoint: 1 active part, both replicas 7951 rows, so
+the journal is complete and folded):
+- **ALL 2473 unreachable objects are `blobs/`; ZERO unreachable trees** (fsck detail breakdown:
+  `reachable blobs=3607, reachable trees=226, unreachable blobs=2473, unreachable trees=0`).
+- The background GC reached its OWN fixpoint: the lease leader (ch2) logged `candidates=0 deleted=0
+  cascaded=0` for 150+ consecutive rounds; `ca-gc-dryrun count=0`. Only 6 productive (`deleted>0`)
+  rounds in the entire run, all during the early/checkpoint-300 quiesce.
+- So fsck (a full sweep that walks live refs → tree contents → blobs and flags every present-but-
+  unreferenced object) sees 2473 orphan blobs, while the journal-driven GC believes nothing is
+  collectable.
+
+Root cause (read of `CasGc.cpp::foldShardRecords` + `CasGcSnap.cpp`): the GC learns a tree's child
+blob edges ONLY by **expanding** that tree the first time its `Add` is folded
+(`CasGc.cpp:735-795`, `addTreeEdge` + `markExpanded`). A blob becomes a candidate only when ALL its
+referencing trees are stripped and its in-degree reaches 0. BUT the `displaced_later` skip path
+(`CasGc.cpp:743-774`) — taken when a tree object is already gone at fold time because a competing
+COMPLETED round deleted a displaced tree — sets `tree_present=false`, calls NO `markExpanded`, and adds
+NO blob edges. Under concurrent 2-server churn (rapid OPTIMIZE/merge superseding parts, lease handoff
+between ch1/ch2 mid-fence — server log shows "lease lost during fence (stolen by …)" and
+"lease held by another mounter"), trees are routinely added-and-displaced within one fold window, so
+their blobs' edges are never recorded → those blobs are invisible to the GC forever.
+
+Why the committed gtest `CasTruncateReclaim.*` passes while the soak leaks: the gtest **interleaves GC
+rounds with the publishes so every tree gets expanded before removal** (its own header comment, lines
+16-20). That removes the exact precondition for the bug. Single-leader, expand-before-remove → no
+orphans; concurrent two-leader churn → orphans. The gtest's "core reclaims" claim is TRUE only under
+the expand-before-remove discipline it imposes; it does NOT cover the displaced-before-expansion path.
+
+This also corrects the prior pass's framing: the leak is NOT TRUNCATE-specific — at op 600 the orphans
+came from OPTIMIZE/merge churn (the run's first cliff is later), so DROP/TRUNCATE is merely one trigger
+of root removal, not the cause.
+
+### Status
+- **B140 stays OPEN as a REAL core bug**, refined: *the journal-driven incremental GC does not record
+  blob edges for a tree taken via the `displaced_later`/`FILE_DOESNT_EXIST` skip, so blobs orphaned by a
+  tree that is added-and-displaced within one fold window (common under concurrent 2-server churn /
+  lease handoff) are never enqueued as candidates and leak forever.* Fix direction: either (a) expand a
+  tree's blob edges BEFORE it can be displaced/collected (record edges on the Add even when the object
+  is already gone — requires the tree bytes, which may be unavailable), or (b) add the M-F full
+  mark-sweep over `blobs/` as a periodic backstop reconciling the incremental snap with the physical
+  set. NOT a harness bug; the assert was NOT loosened.
+- **B132 (live fsck smoke) IS now exercised end-to-end** — fsck + ca-gc-dryrun run against the live
+  churning cluster at every checkpoint.
+- Harness improvements (backlog-scaled bound, bogus-grace removal, stale-interval fix, 4 new unit
+  tests) committed — they are correct and are exactly what exposed the leak deterministically.
+- Phase-1 GREEN is BLOCKED on B140 (a core GC-completeness gap), not on harness timing.
+- Evidence: `utils/ca-soak/logs/phase1_green.log`, `phase1_green_server.log`, `phase1_ch1_gc.log`,
+  `phase1_ch2_gc.log`, and `utils/ca-soak/failure.json` (op 599).

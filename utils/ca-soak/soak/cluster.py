@@ -42,12 +42,12 @@ class QueryError(RuntimeError):
 _DEFAULTS = {
     "node1_host": "localhost", "node1_port": 8123, "node1_container": "ca-soak-ch1-1",
     "node2_host": "localhost", "node2_port": 8124, "node2_container": "ca-soak-ch2-1",
-    "gc_interval_s": 30,
-    # CA-disk GC retire grace, in seconds. Mirrors content_addressed_gc_grace_sec in
-    # configs/storage_conf.xml (currently 5). An unreachable object is not reclaimed until it has
-    # spent at least this long retired, so the GC-fixpoint poll must allow grace + several GC
-    # intervals before declaring a non-reclaiming leak.
-    "gc_grace_sec": 5,
+    # Background GC tick period, in seconds. MUST mirror content_addressed_gc_interval_sec in
+    # configs/storage_conf.xml (currently 2) — the servers' CasGcScheduler makes one reclaim round
+    # per tick (only the lease holder progresses), so this is the sole pacing knob the GC-fixpoint
+    # poll uses to scale its bound to the backlog. There is NO core retire-grace throttle:
+    # content_addressed_gc_grace_sec is inert (not read by the core), so no gc_grace_sec here.
+    "gc_interval_s": 2,
 }
 
 
@@ -131,7 +131,6 @@ class Cluster:
         self._node1 = Node(cfg("node1_host"), cfg("node1_port"), cfg("node1_container"))
         self._node2 = Node(cfg("node2_host"), cfg("node2_port"), cfg("node2_container"))
         self.gc_interval_s = cfg("gc_interval_s")
-        self.gc_grace_sec = cfg("gc_grace_sec")
 
     def nodes(self):
         return (self._node1, self._node2)
