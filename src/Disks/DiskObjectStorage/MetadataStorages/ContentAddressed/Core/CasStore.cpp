@@ -158,15 +158,14 @@ std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & n
     /// Pillar B TTL fast-path: a staleness-tolerant caller may reuse a recently-validated decode
     /// WITHOUT a HEAD. Only for PRESENT entries (absence is never TTL-cached — a just-created ref
     /// must be observable by force-fresh callers; staleness-tolerant callers re-validate on miss).
-    if (allow_stale && config.shard_decode_cache_ttl_ms > 0)
+    if (allow_stale && config.shard_decode_cache_ttl_ms.count() > 0)
     {
         std::lock_guard lock(shard_decode_cache_mutex);
         auto it = shard_decode_cache.find(key);
         if (it != shard_decode_cache.end())
         {
             const auto age = std::chrono::steady_clock::now() - it->second.validated_at;
-            const auto ttl = std::chrono::milliseconds(config.shard_decode_cache_ttl_ms);
-            if (age < ttl)
+            if (age < config.shard_decode_cache_ttl_ms)
                 return it->second.shard;
         }
     }

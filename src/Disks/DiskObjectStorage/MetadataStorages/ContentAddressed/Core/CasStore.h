@@ -34,7 +34,7 @@ struct PoolConfig
     /// Pillar B bounded-TTL decode cache: a staleness-tolerant caller (allow_stale=true) may reuse a
     /// decode validated < this many ms ago WITHOUT a HEAD. 0 disables the TTL (all callers force-fresh).
     /// Strict-freshness callers always pass allow_stale=false and always HEAD, regardless of this value.
-    uint64_t shard_decode_cache_ttl_ms = 200;
+    std::chrono::milliseconds shard_decode_cache_ttl_ms{200};
 };
 
 struct Resolved
