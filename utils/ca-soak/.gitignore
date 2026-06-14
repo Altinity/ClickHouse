@@ -1,0 +1,7 @@
+# Per-run docker logs preserved by scripts/run_phase1.sh before teardown.
+logs/
+# Scratch / downloaded artifacts.
+tmp/
+# Structured failure reproducer dumped by soak.run on a failed run.
+failure.json
+__pycache__/
