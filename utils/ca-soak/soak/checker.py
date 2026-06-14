@@ -53,6 +53,26 @@ def fixpoint_timeout_s(initial_unreachable: int, *, gc_interval_s: float, floor_
     return max(floor_s, scaled)
 
 
+def scaled_admin_timeout_s(pool_objects: int, *, floor_s: float = 600.0, per_million_s: float = 600.0,
+                           cap_s: float = 3600.0) -> float:
+    """Compute a generous, pool-size-scaled client timeout (seconds) for a blocking admin op such as
+    `SYSTEM SYNC REPLICA` over a LARGE content-addressed pool. A 24h soak builds a pool of millions of
+    objects; a SYNC that is slow-but-PROGRESSING then legitimately exceeds a fixed minute-scale bound,
+    and a tight client socket timeout turns it into a spurious HTTP-408 `TIMEOUT_EXCEEDED` even though
+    the server is making progress (the genuine-hang case is detected separately by drain-poll progress,
+    not by this single-shot bound).
+
+    The bound is `floor_s` plus `per_million_s` per million pool objects, capped at `cap_s` so a
+    pathological reading can't produce an unbounded wait. A `None`/unknown pool size collapses to the
+    floor.
+
+    Examples (floor 600, per_million 600, cap 3600): 0 objects -> 600; 1_000_000 -> 1200;
+    5_000_000 -> 3600 (cap); a huge 50_000_000 -> 3600 (cap)."""
+    if not pool_objects or pool_objects < 0:
+        return floor_s
+    return min(cap_s, floor_s + per_million_s * (pool_objects / 1_000_000.0))
+
+
 def poll_unreachable_to_stable(unreachable_fn, *, timeout_s: float, interval_s: float, stable: int = 3,
                                sleep_fn=time.sleep, monotonic_fn=time.monotonic) -> int:
     """Poll `unreachable_fn()` (current fsck.unreachable, an int) until the INCREMENTAL GC reaches ITS
@@ -95,39 +115,74 @@ def poll_unreachable_to_stable(unreachable_fn, *, timeout_s: float, interval_s: 
         sleep_fn(interval_s)
 
 
-def quiesce(cluster, table: str, timeout_s: int = 300):
-    """Caller has already paused workers. Drain replication queues + mutations + merges (bounded poll,
-    loud failure on timeout), force OPTIMIZE FINAL + MATERIALIZE TTL, re-drain, then return the server
-    now() captured AFTER convergence."""
-    deadline = time.time() + timeout_s
-    # SYSTEM SYNC REPLICA blocks server-side until the replica drains its fetch queue; under a
-    # replication backlog this legitimately exceeds the default per-call socket timeout, so give the
-    # blocking admin ops a socket timeout aligned with our own quiesce budget rather than letting a
-    # raw socket TimeoutError escape.
-    for node in cluster.nodes():
-        node.command(f"SYSTEM SYNC REPLICA {table}", timeout=timeout_s)
+def quiesce(cluster, table: str, timeout_s: int = 300, admin_timeout_s: float | None = None,
+            no_progress_grace_s: float = 120.0):
+    """Caller has already paused workers. Drain replication queues + mutations + merges, force OPTIMIZE
+    FINAL + MATERIALIZE TTL, re-drain, then return the server now() captured AFTER convergence.
 
-    def drained():
+    Long-run viability: over a LARGE pool a SYNC/OPTIMIZE that is slow-but-PROGRESSING must not be
+    tripped by a fixed minute-scale bound. `admin_timeout_s` (defaults to `scaled_admin_timeout_s`
+    over the current pool size, generous floor 600s) is the CLIENT socket timeout AND the server-side
+    `receive_timeout`/`max_execution_time` for the blocking admin ops (`SYSTEM SYNC REPLICA`,
+    `OPTIMIZE ... FINAL`, `MATERIALIZE TTL`), so a slow large-pool op no longer escapes as a spurious
+    HTTP-408 `TIMEOUT_EXCEEDED` / raw socket TimeoutError.
+
+    The drain poll distinguishes a GENUINE HANG from slow-but-working: it tracks the total backlog
+    (queue + unfinished mutations + merges) and only fails when the backlog has made NO PROGRESS for
+    `no_progress_grace_s` AND the overall `timeout_s` budget is exhausted. A backlog that keeps
+    shrinking extends the wait (the progress timer resets on every decrease) instead of tripping."""
+    if admin_timeout_s is None:
+        # Scale the admin/SYNC bound to the live pool size so a multi-million-object pool gets a
+        # proportionally generous wait. A failure to read the size collapses to the generous floor.
+        try:
+            from soak.pool import pool_size
+            objs = pool_size()[0] or 0
+        except Exception:
+            objs = 0
+        admin_timeout_s = scaled_admin_timeout_s(objs)
+    t = int(admin_timeout_s)
+    # SYSTEM SYNC REPLICA blocks server-side until the replica drains its fetch queue; align the
+    # server-side query bound (`receive_timeout`/`max_execution_time`) AND the client socket timeout
+    # with the (pool-scaled) admin bound, so a slow-but-progressing large-pool sync no longer escapes
+    # as a spurious server-side HTTP-408 `TIMEOUT_EXCEEDED` / raw socket TimeoutError.
+    admin_settings = {"receive_timeout": t, "max_execution_time": t}
+    for node in cluster.nodes():
+        node.command(f"SYSTEM SYNC REPLICA {table}", timeout=admin_timeout_s, settings=admin_settings)
+
+    def backlog():
+        total = 0
         for node in cluster.nodes():
-            if int(node.scalar(f"SELECT count() FROM system.replication_queue WHERE table='{table}'")):
-                return False
-            if int(node.scalar(f"SELECT count() FROM system.mutations WHERE table='{table}' AND NOT is_done")):
-                return False
-            if int(node.scalar(f"SELECT count() FROM system.merges WHERE table='{table}'")):
-                return False
-        return True
+            total += int(node.scalar(f"SELECT count() FROM system.replication_queue WHERE table='{table}'"))
+            total += int(node.scalar(f"SELECT count() FROM system.mutations WHERE table='{table}' AND NOT is_done"))
+            total += int(node.scalar(f"SELECT count() FROM system.merges WHERE table='{table}'"))
+        return total
 
-    while not drained():
-        if time.time() > deadline:
-            raise CheckpointFailure("quiescence timeout: queues/mutations/merges did not drain")
-        time.sleep(1)
+    def drain(stage_label: str):
+        deadline = time.time() + timeout_s
+        last_backlog = None
+        last_progress_t = time.time()
+        while True:
+            b = backlog()
+            if b == 0:
+                return
+            now = time.time()
+            if last_backlog is None or b < last_backlog:
+                # Progress: backlog shrank -> reset the no-progress timer and extend.
+                last_backlog = b
+                last_progress_t = now
+            # Fail ONLY on a genuine hang: no progress for the grace window AND the budget is spent.
+            if (now - last_progress_t) > no_progress_grace_s and now > deadline:
+                raise CheckpointFailure(
+                    f"quiescence {stage_label}: backlog stuck at {b} (no progress for "
+                    f"{now - last_progress_t:.0f}s past the {timeout_s}s budget) — genuine hang")
+            time.sleep(1)
+
+    drain("initial drain")
     for node in cluster.nodes():
-        node.command(f"OPTIMIZE TABLE {table} FINAL", timeout=timeout_s)
-        node.command(f"ALTER TABLE {table} MATERIALIZE TTL", timeout=timeout_s)
-    while not drained():
-        if time.time() > deadline:
-            raise CheckpointFailure("quiescence timeout after OPTIMIZE/MATERIALIZE TTL")
-        time.sleep(1)
+        node.command(f"OPTIMIZE TABLE {table} FINAL", timeout=admin_timeout_s, settings=admin_settings)
+        node.command(f"ALTER TABLE {table} MATERIALIZE TTL", timeout=admin_timeout_s,
+                     settings=admin_settings)
+    drain("after OPTIMIZE/MATERIALIZE TTL")
     return int(cluster.nodes()[0].scalar("SELECT toUnixTimestamp(now())"))
 
 

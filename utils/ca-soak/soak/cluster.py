@@ -12,6 +12,7 @@ import socket
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ClickHouse error code ABORTED (Common/ErrorCodes.cpp). The publish-time resurrect-vs-GC race
@@ -92,12 +93,19 @@ class Node:
     def url(self) -> str:
         return f"http://{self.host}:{self.port}/"
 
-    def query(self, sql: str, timeout: float | None = None) -> str:
+    def query(self, sql: str, timeout: float | None = None, settings: dict | None = None) -> str:
         """POST `sql` and return the raw response body (TabSeparated text), trailing newline stripped.
         `timeout` overrides the default socket timeout for this call (used for intentionally-blocking
-        admin ops such as `SYSTEM SYNC REPLICA`, whose server-side wait can exceed the default)."""
+        admin ops such as `SYSTEM SYNC REPLICA`, whose server-side wait can exceed the default).
+        `settings` are passed as URL query params (ClickHouse reads per-query settings from the URL),
+        used to align the SERVER-side bound (`receive_timeout`/`max_execution_time`) with the client
+        socket timeout for blocking admin ops so a slow-but-progressing large-pool op is not tripped by
+        a server-side HTTP-408 `TIMEOUT_EXCEEDED`."""
+        url = self.url
+        if settings:
+            url = url + "?" + urllib.parse.urlencode(settings)
         data = sql.encode("utf-8")
-        req = urllib.request.Request(self.url, data=data, method="POST")
+        req = urllib.request.Request(url, data=data, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 return resp.read().decode("utf-8").rstrip("\n")
@@ -109,9 +117,9 @@ class Node:
                 pass
             raise QueryError(self, e.code, body, sql) from e
 
-    def command(self, sql: str, timeout: float | None = None) -> None:
+    def command(self, sql: str, timeout: float | None = None, settings: dict | None = None) -> None:
         """Execute a statement expected to return no rows (DDL/DML)."""
-        self.query(sql, timeout=timeout)
+        self.query(sql, timeout=timeout, settings=settings)
 
     def scalar(self, sql: str) -> str:
         """Execute a query expected to return a single value; return it as a string."""

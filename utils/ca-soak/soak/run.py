@@ -55,6 +55,7 @@ from soak.checker import (
     drive_gc_to_fixpoint,
 )
 from soak.fsck import run_fsck, run_dryrun
+from soak.replay import dump_failure
 from soak.chaos import generate_chaos_schedule, apply_fault, Fault, FaultTarget, FaultAction
 from soak import metrics as metrics_mod
 from soak.pool import pool_size
@@ -566,6 +567,39 @@ def wait_for_pool_consistent(fsck_fn, *, timeout_s: float = 180.0, stable: int =
         sleep_fn(interval_s)
 
 
+def settle_fsck_for_dump(fsck_fn, *, timeout_s: float = 180.0, stable: int = 2, interval_s: float = 3.0,
+                         sleep_fn=time.sleep, monotonic_fn=time.monotonic):
+    """Produce an fsck verdict for the FAILURE-DUMP path that does NOT false-positive a transient
+    `dangling` (B141/B144/B145). The dump runs while the pool may still be CHURNING (workers were
+    drained best-effort, the object store may be mid-recovery), so a single bare fsck routinely reads
+    a transient `dangling>0` (HEAD-absent reachable trees) that is NOT data loss. Recording that as a
+    hard dangling claim is misleading.
+
+    Instead we reuse the SAME settle gate as the green path (`wait_for_pool_consistent`): poll until
+    `dangling==0` is STABLE for `stable` reads within a bound. We return `(fsck, status)`:
+      - "settled"            -> the pool reached a coherent `dangling==0` cut; the verdict is trusted.
+      - "persistent-dangling"-> `dangling>0` PERSISTED past the bound; a REAL durability escalation
+                                (recorded, NOT swallowed — but not re-raised here since we are already
+                                on the failure path and must finish writing the dump).
+      - "skipped"            -> fsck itself could not run (e.g. the container is gone). No claim made.
+
+    A `dangling==0` after settling is a confirmed-clean pool; a persistent one is the only hard
+    dangling claim this path makes. Injectable clock so the settle is pure-testable."""
+    try:
+        f = wait_for_pool_consistent(fsck_fn, timeout_s=timeout_s, stable=stable,
+                                     interval_s=interval_s, sleep_fn=sleep_fn, monotonic_fn=monotonic_fn)
+        return f, "settled"
+    except CheckpointFailure:
+        # Persistent dangling past the bound — re-read once to capture the last verdict for the dump.
+        try:
+            return fsck_fn(), "persistent-dangling"
+        except Exception:
+            return None, "skipped"
+    except Exception:
+        # fsck could not run at all (container down, etc.) — make no dangling claim.
+        return None, "skipped"
+
+
 class ChaosRunner(threading.Thread):
     """Background thread that fires a deterministic fault schedule WHILE the workload runs. For each
     `Fault` it sleeps until its `t_offset` (relative to run start), runs `apply_fault` (which blocks
@@ -730,24 +764,17 @@ class MetricsTicker(threading.Thread):
 
 
 def write_failure(path, *, seed, base_time, op_id, phase, model_expected, n1, n2, fsck, last_op,
-                  error=None, chaos_seed=None, last_fault=None):
-    payload = {
-        "seed": seed,
-        "chaos_seed": chaos_seed,
-        "base_time": base_time,
-        "op_id": op_id,
-        "phase": phase,
-        "error": error,
-        "last_fault": last_fault,
-        "model_expected": model_expected,
-        "node1": n1,
-        "node2": n2,
-        "fsck": {k: v for k, v in (fsck or {}).items() if k != "stdout"},
-        "last_op": last_op,
-    }
-    with open(path, "w") as fh:
-        json.dump(payload, fh, indent=2, default=str)
-    return payload
+                  error=None, chaos_seed=None, last_fault=None, until_op=None,
+                  fsck_status="not-run"):
+    """Thin wrapper over the reusable `dump_failure` (Task 15): records the two-replica observed
+    aggregates as the {node1, node2} pair and writes the stable reproducer to `path`. The
+    `fsck_status` distinguishes a settled/confirmed fsck verdict from a transient/unconfirmed or
+    skipped one (the failure-dump path must NOT record a bare fsck on a churning pool — B141/B144/
+    B145)."""
+    return dump_failure(
+        seed, base_time, op_id, phase, model_expected, (n1, n2), last_fault=last_fault,
+        path=path, chaos_seed=chaos_seed, until_op=until_op, error=error, last_op=last_op,
+        fsck=fsck, fsck_status=fsck_status)
 
 
 def _last_fault_dict(chaos):
@@ -969,6 +996,10 @@ def run_phase3(args):
                 op_iter = iter(ledger)
                 op = next(op_iter)
 
+            # Honor an explicit --until-op cap so a phase-3 run can be re-driven to just before a
+            # failing op (the time-driven loop regenerates ledgers, so the cap is on the op_id).
+            if args.until_op is not None and op.op_id > args.until_op:
+                continue
             if _phase3_op_permitted(op, stage):
                 driver.execute(op)
                 last_op = op
@@ -1001,15 +1032,16 @@ def run_phase3(args):
             n2 = query_aggregates(cluster.node2, TABLE)
         except Exception:
             n1 = n2 = None
-        try:
-            f = run_fsck(FSCK_CONTAINER)
-        except Exception:
-            f = None
+        # Quiesce-before-dump: do NOT record a bare fsck on a still-churning pool (it false-positives
+        # transient `dangling` — B141/B144/B145). Settle to a stable `dangling==0` (or label the
+        # verdict transient/persistent) before recording it.
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
             args.failure_json, seed=args.seed, base_time=base_time, op_id=op_id, phase=3,
-            model_expected=exp, n1=n1, n2=n2, fsck=f, last_op=last_op_d, error=f"{kind}: {e}",
+            model_expected=exp, n1=n1, n2=n2, fsck=f, fsck_status=fsck_status, last_op=last_op_d,
+            error=f"{kind}: {e}", until_op=args.until_op,
             chaos_seed=args.chaos_seed, last_fault=_last_fault_dict(chaos))
         print(f"{kind}: {e}", file=sys.stderr)
         print(json.dumps(payload, indent=2, default=str), file=sys.stderr)
@@ -1256,15 +1288,15 @@ def main(argv=None):
             n2 = query_aggregates(cluster.node2, TABLE)
         except Exception:
             n1 = n2 = None
-        try:
-            f = run_fsck(FSCK_CONTAINER)
-        except Exception:
-            f = None
+        # Quiesce-before-dump: settle the fsck to a stable `dangling==0` (or label it transient/
+        # persistent) rather than recording a bare fsck on a churning pool (B141/B144/B145).
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
             args.failure_json, seed=args.seed, base_time=base_time, op_id=op_id, phase=args.phase,
-            model_expected=exp, n1=n1, n2=n2, fsck=f, last_op=last_op_d, error=f"{kind}: {e}",
+            model_expected=exp, n1=n1, n2=n2, fsck=f, fsck_status=fsck_status, last_op=last_op_d,
+            error=f"{kind}: {e}", until_op=args.until_op,
             chaos_seed=args.chaos_seed, last_fault=_last_fault_dict(chaos))
         print(f"{kind}: {e}", file=sys.stderr)
         print(json.dumps(payload, indent=2, default=str), file=sys.stderr)

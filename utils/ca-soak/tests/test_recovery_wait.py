@@ -4,7 +4,7 @@ sleep/monotonic so no real time passes."""
 
 import pytest
 
-from soak.run import wait_for_healthy, wait_for_pool_consistent, _last_fault_dict
+from soak.run import wait_for_healthy, wait_for_pool_consistent, settle_fsck_for_dump, _last_fault_dict
 from soak.checker import CheckpointFailure
 from soak.chaos import Fault, FaultTarget, FaultAction
 
@@ -97,6 +97,46 @@ def test_pool_consistent_persistent_raises():
             timeout_s=20, stable=2, interval_s=3.0, sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
     assert "never reached a self-consistent state" in str(ei.value)
     assert "REAL crash-recovery" in str(ei.value)
+
+
+def test_settle_fsck_for_dump_transient_clears_to_settled():
+    # The failure-dump path must NOT record a bare fsck on a churning pool (B141/B144/B145): a
+    # transient dangling that clears to a stable dangling==0 is recorded as a confirmed-clean
+    # "settled" verdict, not a hard dangling claim.
+    clock = FakeClock()
+    seq = iter([
+        {"dangling": 8, "exit_code": 36, "reachable": 6512, "unreachable": 4599},   # transient
+        {"dangling": 0, "exit_code": 0, "reachable": 6530, "unreachable": 4400},     # clean #1
+        {"dangling": 0, "exit_code": 0, "reachable": 6530, "unreachable": 4400},     # clean #2 (stable)
+    ])
+    f, status = settle_fsck_for_dump(lambda: next(seq), timeout_s=180, stable=2, interval_s=3.0,
+                                     sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
+    assert status == "settled"
+    assert f["dangling"] == 0
+
+
+def test_settle_fsck_for_dump_persistent_dangling_labeled_not_swallowed():
+    # A PERSISTENT post-settle dangling stays a real escalation: it is recorded (labeled
+    # "persistent-dangling") rather than raised — we are already on the failure path and must finish
+    # writing the dump — but it is NOT silently turned into a clean verdict.
+    clock = FakeClock()
+    persistent = {"dangling": 12, "exit_code": 36, "reachable": 6512, "unreachable": 4599}
+    f, status = settle_fsck_for_dump(lambda: persistent, timeout_s=20, stable=2, interval_s=3.0,
+                                     sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
+    assert status == "persistent-dangling"
+    assert f["dangling"] == 12
+
+
+def test_settle_fsck_for_dump_fsck_unavailable_skipped():
+    # If fsck itself cannot run (container gone, etc.) the dump makes NO dangling claim: status
+    # "skipped", fsck None.
+    def boom():
+        raise RuntimeError("no such container")
+
+    f, status = settle_fsck_for_dump(boom, timeout_s=20, stable=2, interval_s=3.0,
+                                     sleep_fn=FakeClock().sleep, monotonic_fn=FakeClock().monotonic)
+    assert status == "skipped"
+    assert f is None
 
 
 def test_last_fault_dict_shape():

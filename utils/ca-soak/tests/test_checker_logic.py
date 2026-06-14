@@ -6,6 +6,7 @@ from soak.checker import (
     fixpoint_timeout_s,
     gc_fixpoint_reached,
     poll_unreachable_to_stable,
+    scaled_admin_timeout_s,
     CheckpointFailure,
 )
 
@@ -88,6 +89,18 @@ def test_fixpoint_timeout_large_backlog_scales():
     # The bound is monotonic in the backlog and in the interval.
     assert fixpoint_timeout_s(5000, gc_interval_s=4) > fixpoint_timeout_s(5000, gc_interval_s=2)
     assert fixpoint_timeout_s(8000, gc_interval_s=2) > fixpoint_timeout_s(5000, gc_interval_s=2)
+
+
+def test_scaled_admin_timeout_floor_and_scaling():
+    # An unknown/zero pool collapses to the generous floor.
+    assert scaled_admin_timeout_s(0, floor_s=600, per_million_s=600, cap_s=3600) == 600
+    assert scaled_admin_timeout_s(None, floor_s=600, per_million_s=600, cap_s=3600) == 600
+    # One million objects -> floor + one increment.
+    assert scaled_admin_timeout_s(1_000_000, floor_s=600, per_million_s=600, cap_s=3600) == 1200
+    # The bound is monotonic in pool size, and capped.
+    assert (scaled_admin_timeout_s(2_000_000, floor_s=600, per_million_s=600, cap_s=3600)
+            > scaled_admin_timeout_s(1_000_000, floor_s=600, per_million_s=600, cap_s=3600))
+    assert scaled_admin_timeout_s(50_000_000, floor_s=600, per_million_s=600, cap_s=3600) == 3600
 
 
 class _FakeCluster:
