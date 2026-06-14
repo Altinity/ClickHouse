@@ -767,3 +767,42 @@ TEST(CasStoreSingleFlight, ConcurrentResolvesCoalesceToOneHead)
         EXPECT_EQ(r->tree_size, results[0]->tree_size);
     }
 }
+
+/// ---------- Pillar B TTL decode cache (Task 3): opt-in bounded-TTL warm-hit path ----------
+
+TEST(CasStoreDecodeTtl, WarmHitWithinTtlSkipsHead)
+{
+    using namespace DB::Cas;
+    /// TTL of 60 s — easily satisfied in any test run.
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .shard_decode_cache_ttl_ms = 60000});
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");
+
+    const RootNamespace ns{"srv1/tbl"};
+    /// Prime the cache: one force-fresh resolve (allow_stale=false) so the entry exists and
+    /// validated_at is set.
+    ASSERT_TRUE(s->resolveRef(ns, "part_1", /*allow_stale=*/true).has_value());
+    b->resetCounts();
+
+    /// Warm hit within TTL: MUST skip both HEAD and GET.
+    ASSERT_TRUE(s->resolveRef(ns, "part_1", /*allow_stale=*/true).has_value());
+    EXPECT_EQ(b->headTotal(), 0u);   /// no HEAD
+    EXPECT_EQ(b->getTotal(), 0u);    /// no GET
+}
+
+TEST(CasStoreDecodeTtl, ForceFreshAlwaysHeads)
+{
+    using namespace DB::Cas;
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .shard_decode_cache_ttl_ms = 60000});
+    publishPart(s, "srv1/tbl", "part_1", "payload-1");
+
+    const RootNamespace ns{"srv1/tbl"};
+    /// Prime the cache.
+    ASSERT_TRUE(s->resolveRef(ns, "part_1", /*allow_stale=*/true).has_value());
+    b->resetCounts();
+
+    /// Force-fresh resolve (allow_stale defaults false): MUST HEAD regardless of cached TTL.
+    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
+    EXPECT_GE(b->headTotal(), 1u);   /// at least one HEAD
+}

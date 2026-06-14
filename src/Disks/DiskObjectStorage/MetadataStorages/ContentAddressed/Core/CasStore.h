@@ -30,6 +30,11 @@ struct PoolConfig
     std::chrono::milliseconds heartbeat_period{5000};
     bool background_heartbeats = false;       /// tests drive renewOnce explicitly
     bool read_only = false;                   /// observe-only open: skip the mutating capability probe; reads only
+
+    /// Pillar B bounded-TTL decode cache: a staleness-tolerant caller (allow_stale=true) may reuse a
+    /// decode validated < this many ms ago WITHOUT a HEAD. 0 disables the TTL (all callers force-fresh).
+    /// Strict-freshness callers always pass allow_stale=false and always HEAD, regardless of this value.
+    uint64_t shard_decode_cache_ttl_ms = 200;
 };
 
 struct Resolved
@@ -77,7 +82,7 @@ public:
     BuildPtr startBuild(BuildInfo info);                          /// W-HEARTBEAT durable before return
 
     /// ---- read side (spec §6) ----
-    std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name);
+    std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false);
     std::vector<TreeEntry> readTree(const TreeId & id);           /// validates envelope, kind, key↔hash
     BlobLocation locate(const TreeEntry & entry) const;           /// Blob/PackSlice placements only
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
@@ -134,7 +139,9 @@ private:
     /// token guarantees identical content. Used by resolveRef/listRefs only.
     /// Single-flight coalescing (Pillar B, Task 2): concurrent callers for the same shard key share
     /// ONE head (+ at most one get); followers wait on the leader's shared_future.
-    std::shared_ptr<const RootShard> readShardDecoded(const RootNamespace & ns, uint64_t shard);
+    /// Pillar B TTL fast-path (Task 3): allow_stale=true callers skip the HEAD entirely when the
+    /// cache entry was validated within shard_decode_cache_ttl_ms.
+    std::shared_ptr<const RootShard> readShardDecoded(const RootNamespace & ns, uint64_t shard, bool allow_stale = false);
     /// The actual head+get+decode for one shard key (no coalescing). Called by coalescedReadShardDecoded.
     std::shared_ptr<const RootShard> loadShardDecoded(const String & key);
     /// Single-flight coalescing wrapper around loadShardDecoded.
@@ -164,15 +171,24 @@ private:
     std::mutex registered_mutex;
     std::set<String> registered_cache;
 
-    /// B113 read-path decode cache: rootShardKey -> (token of the cached bytes, decoded immutable
-    /// manifest). Guarded by its own mutex. A token mismatch (any write to the shard) forces a fresh
-    /// get + decode; cache entries are otherwise reused across reads within and across queries.
-    /// Bounded (wholesale clear on overflow, like the tree cache) so a long-lived server that touches
-    /// many tables/backups/detached dirs cannot grow it without limit; `dropNamespace` also evicts a
-    /// dropped namespace's shard entries explicitly (they would otherwise never be re-read — leak).
+    /// B113 read-path decode cache: rootShardKey -> ShardDecodeCacheEntry. Guarded by its own mutex.
+    /// A token mismatch (any write to the shard) forces a fresh get + decode; cache entries are
+    /// otherwise reused across reads within and across queries. Bounded (wholesale clear on overflow,
+    /// like the tree cache) so a long-lived server that touches many tables/backups/detached dirs
+    /// cannot grow it without limit; `dropNamespace` also evicts a dropped namespace's shard entries
+    /// explicitly (they would otherwise never be re-read — leak).
+    /// validated_at supports the Pillar B TTL fast-path (Task 3): staleness-tolerant callers skip the
+    /// HEAD when the entry was validated within shard_decode_cache_ttl_ms. Absence is NEVER TTL-cached
+    /// — only present entries carry a validated_at stamp.
+    struct ShardDecodeCacheEntry
+    {
+        Token token;
+        std::shared_ptr<const RootShard> shard;
+        std::chrono::steady_clock::time_point validated_at;
+    };
     static constexpr size_t SHARD_DECODE_CACHE_MAX_ENTRIES = 16384;
     std::mutex shard_decode_cache_mutex;
-    std::unordered_map<String, std::pair<Token, std::shared_ptr<const RootShard>>> shard_decode_cache;
+    std::unordered_map<String, ShardDecodeCacheEntry> shard_decode_cache;
 
     /// Single-flight coalescing for readShardDecoded: concurrent resolves of the SAME shard key
     /// share ONE head (+ at most one get). The leader publishes its decode to the followers'

@@ -151,9 +151,26 @@ BuildPtr Store::startBuild(BuildInfo info)
     return std::make_shared<Build>(shared_from_this(), std::move(keeper), build_id, std::move(info));
 }
 
-std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & ns, uint64_t shard)
+std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & ns, uint64_t shard, bool allow_stale)
 {
     const String key = pool_layout.rootShardKey(ns, shard);
+
+    /// Pillar B TTL fast-path: a staleness-tolerant caller may reuse a recently-validated decode
+    /// WITHOUT a HEAD. Only for PRESENT entries (absence is never TTL-cached — a just-created ref
+    /// must be observable by force-fresh callers; staleness-tolerant callers re-validate on miss).
+    if (allow_stale && config.shard_decode_cache_ttl_ms > 0)
+    {
+        std::lock_guard lock(shard_decode_cache_mutex);
+        auto it = shard_decode_cache.find(key);
+        if (it != shard_decode_cache.end())
+        {
+            const auto age = std::chrono::steady_clock::now() - it->second.validated_at;
+            const auto ttl = std::chrono::milliseconds(config.shard_decode_cache_ttl_ms);
+            if (age < ttl)
+                return it->second.shard;
+        }
+    }
+
     return coalescedReadShardDecoded(key);
 }
 
@@ -219,8 +236,13 @@ std::shared_ptr<const RootShard> Store::loadShardDecoded(const String & key)
     {
         std::lock_guard lock(shard_decode_cache_mutex);
         auto it = shard_decode_cache.find(key);
-        if (it != shard_decode_cache.end() && it->second.first == h.token)
-            return it->second.second;
+        if (it != shard_decode_cache.end() && it->second.token == h.token)
+        {
+            /// Token match: the cached decode is still valid. Stamp validated_at so TTL-tolerant
+            /// callers can skip the next HEAD within the configured window.
+            it->second.validated_at = std::chrono::steady_clock::now();
+            return it->second.shard;
+        }
     }
 
     /// Miss (or the shard was written since we last decoded it): fetch + decode once, then cache by
@@ -241,17 +263,20 @@ std::shared_ptr<const RootShard> Store::loadShardDecoded(const String & key)
         /// demand (a stale entry would be re-validated by the head token check anyway).
         if (shard_decode_cache.size() >= SHARD_DECODE_CACHE_MAX_ENTRIES)
             shard_decode_cache.clear();
-        shard_decode_cache[key] = {object->token, decoded};
+        shard_decode_cache[key] = ShardDecodeCacheEntry{
+            .token = object->token,
+            .shard = decoded,
+            .validated_at = std::chrono::steady_clock::now()};
     }
     return decoded;
 }
 
-std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String & ref_name)
+std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale)
 {
     /// Read side (spec §6): no GC awareness, no tokens. The ref is pure manifest state — resolving it
     /// only reads the owning shard manifest; whether the named tree object is still present is checked
     /// later by readTree (INV-NO-DANGLE surfaces there).
-    const auto root = readShardDecoded(ns, shardOf(ref_name));
+    const auto root = readShardDecoded(ns, shardOf(ref_name), allow_stale);
     auto it = root->refs.find(ref_name);
     if (it == root->refs.end())
         return std::nullopt;
@@ -336,10 +361,12 @@ BlobLocation Store::locate(const TreeEntry & entry) const
 std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
 {
     /// Refs are sharded by name across all root shards; the full ref set is the union over every shard.
+    /// Listing tolerates a point-in-time snapshot: pass allow_stale=true to benefit from the TTL
+    /// fast-path and skip a HEAD per shard when a recent decode is already cached.
     std::map<String, Resolved> result;
     for (uint64_t shard = 0; shard < meta.root_shards; ++shard)
     {
-        const auto root = readShardDecoded(ns, shard);
+        const auto root = readShardDecoded(ns, shard, /*allow_stale=*/true);
         for (const auto & [ref_name, payload] : root->refs)
         {
             result.emplace(ref_name, Resolved{
