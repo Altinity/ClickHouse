@@ -101,7 +101,13 @@ RoundReport Gc::runRegularRound()
     /// Only refreshed on the normal full-round completion path — NOT on the two early returns
     /// (!acquired_lease and tryResumeIncompleteRound) so the stale-or-absent resident is always
     /// re-validated against state.snap_generation on the next call.
-    resident_snap = folded.snap;
+    /// Stored AFTER cascadeAndPersist, so the resident copy already includes the cascade strip and
+    /// any fold-through-fence delta cascade persisted — it matches the durable snap at
+    /// state.snap_generation. (When cascade did NOT advance the generation, folded.snap equals the
+    /// unchanged durable snap, so the pair is still consistent.)
+    /// folded is dead after this point (recheck/cascade consumed folded.snap by reference earlier,
+    /// trim used only folded.root_shards, and the next line returns), so move instead of copy.
+    resident_snap = std::move(folded.snap);
     resident_generation = state.snap_generation;
 
     return report;
