@@ -550,3 +550,96 @@ of root removal, not the cause.
 - Phase-1 GREEN is BLOCKED on B140 (a core GC-completeness gap), not on harness timing.
 - Evidence: `utils/ca-soak/logs/phase1_green.log`, `phase1_green_server.log`, `phase1_ch1_gc.log`,
   `phase1_ch2_gc.log`, and `utils/ca-soak/failure.json` (op 599).
+
+## 2026-06-14 — CA soak Phase-1 HONESTLY SCOPED to implemented invariants; B140 reclassified as an M-F dependency (spec-confirmed); NEW finding B141 (transient fsck-vs-churn dangling)
+
+### Reframe (spec-confirmed, NOT papering over)
+Per CA spec §8, the incremental, journal-driven GC is INTENTIONALLY incomplete: it cannot reclaim
+"debris"/"drift" (e.g. blobs orphaned by a tree that is added-and-displaced within one fold window —
+the exact B140 leak). The Full-GC mark-sweep (milestone **M-F**, NOT yet implemented) is the
+documented backstop. So `fsck.unreachable` legitimately does NOT drain to 0 under a concurrent
+churn workload; the residual is **M-F-debris**, NOT data loss (`dangling==0`, INV-NO-LOSS holds; the
+gtest `CasGcLeak.DisplacedUnexpandedTreeBlobsLeak` documents it). The previous checkpoint's
+`unreachable==0` requirement was asserting an unimplemented feature, which is why Phase-1 could not
+go green. **B140 is therefore reclassified from "open core bug, blocks green" to "M-F dependency,
+tracked not failed".**
+
+### Checker changes (`utils/ca-soak/soak/checker.py`, `soak/run.py`)
+- `poll_unreachable_to_zero` → **`poll_unreachable_to_stable`**: waits until `fsck.unreachable` STOPS
+  DECREASING (stable for K=3 consecutive polls) and RETURNS the residual; raises only on a true
+  timeout (never reaching ANY stable point — the GC still monotonically grinding, a bound problem).
+  A transient bump resets the stable run. `drive_gc_to_fixpoint` now returns the residual.
+- The checkpoint **HARD-ASSERTS** only the implemented invariants and LOGS the residual:
+  - `dangling == 0` (INV-NO-LOSS — the killer assertion);
+  - `exit_code == 0`;
+  - model aggregates `==` node1 `==` node2 (count, sum_fp, uniq_keys, sum_v, sum_version, min_op,
+    max_op) — no loss, no replica divergence;
+  - `{ca-gc-dryrun delete set} ⊆ {fsck unreachable}` (GC never plans to delete a reachable object).
+  - residual `unreachable` is logged as `unreachable=<n> (M-F debris, pending Full GC / B140)`, NOT
+    failed; a deliberately-generous tripwire (`unreachable > 50*reachable + 100000`) guards only a
+    NEW unbounded-leak class distinct from B140 (kept loose so it cannot flake).
+- `--insert-mode` default stays `sync` (`async_insert=0`).
+- Unit tests rewritten for poll-to-stable (stabilize-at-61 → 61 no raise; zero-residual → 0;
+  transient-bump resets; never-settles → raise) and drive-to-residual. **`pytest tests/ -q` → 43
+  passed.** The changes are correct and did exactly their job: they surfaced a real finding loudly
+  rather than masking it (see B141).
+
+### Phase-1 re-validation (sync, seed 20260613, 1500 ops, 6 workers, checkpoint-every 300): NOT YET GREEN — NEW finding B141
+- **Checkpoint 1 (op 300):** `count=13463`, `model==node1==node2`, `dangling=0`, `dryrun⊆unreachable`,
+  residual `unreachable=0`. PASS.
+- **Checkpoint 2 (op 600):** `count=7951`, `model==node1==node2`, `dangling=0`, `dryrun⊆unreachable`,
+  residual `unreachable=1841` logged as M-F-debris (non-fatal — the scoping works). PASS.
+- **Checkpoint 3 (op 899, a DELETE barrier):** `model==node1==node2` EXACTLY (`count=21716`,
+  sum_fp/uniq_keys/sum_v/sum_version/min_op/max_op all match on BOTH replicas → no table-level data
+  loss, no divergence), `dryrun⊆unreachable` OK, BUT the HARD `dangling==0` assert tripped:
+  **`fsck dangling != 0: 1`** on one **tree** object `soak_pool/trees/bb/bbe6321c19a642f9e978d71e9aead370`
+  (size=0 → absent from the S3 LIST), reachable-from a live ref at the instant of the checkpoint fsck.
+  `CHECKPOINT FAILURE`, exit=1. Per the task contract the assert was **NOT loosened**.
+
+### Diagnosis — B141: transient fsck-snapshot-vs-live-churn dangling, NOT real data loss
+Decisive evidence:
+- Table counts matched the model EXACTLY on BOTH replicas at the quiesced checkpoint → the data was
+  fully present and readable; no lost rows.
+- The harness's best-effort **re-fsck a few seconds later** showed `dangling=0`, and the offending
+  tree `bb/bbe632…` was **no longer in the reachable set at all** — i.e. it was a short-lived
+  intermediate tree (a part superseded by background merge / the op-899 DELETE producing a new part),
+  referenced only transiently. A **live fsck after the run** also shows `dangling=0`.
+- Server logs (`logs/phase1_ch1_server.log`, `phase1_ch2_server.log`) show NO `FILE_DOESNT_EXIST`,
+  NO "stolen"/missing-object errors, NO query failures — only normal lease arbitration
+  (`CA GC: lease held by another mounter`). The servers themselves never observed a missing object.
+- `CasFsck.cpp` mechanism (lines 82–125): fsck walks live refs → tree contents to build the
+  *reachable key set*, then `listAll` (an S3 LIST) of `blobs/`/`trees/`/`packs/` to build the
+  *present set*; a reachable key absent from the present set is flagged `dangling`. These two
+  observations are NOT a single atomic snapshot of the pool. Under constant publish churn, a ref can
+  point at a tree whose object is committed-and-GET-able but not yet returned by the bucket LIST
+  (write-then-list visibility lag on `rustfs`), OR caught mid-publish — yielding a **false-positive
+  transient dangling**.
+
+**B141 (NEW, real but NOT data loss):** `clickhouse-disks fsck` over a CA pool under concurrent live
+churn can report a transient `dangling` for an object that is referenced and physically present
+(GET-able) but not yet visible to the bucket LIST it relies on; the ref is gone moments later. This
+is a **fsck consistency-model gap** (non-atomic ref-walk vs LIST snapshot), distinct from B140 (a real
+incremental-GC completeness gap) and distinct from real INV-NO-LOSS loss. Fix direction is
+**harness/tool-side, NOT loosening the assert**: confirm `dangling` is STABLE across a bounded re-poll
+(mirror the `poll_unreachable_to_stable` discipline for the dangling reading) before failing — a
+truly-missing referenced object stays dangling across polls; a churn artifact clears. Optionally fsck
+could re-confirm each candidate-dangling object with a direct HEAD (authoritative existence) before
+classifying, instead of trusting the LIST.
+
+### Status
+- **Checker scoping landed and is correct** — Phase-1 now hard-fails only on implemented invariants
+  (dangling=0 / counts / dryrun⊆unreachable) and tracks the M-F-debris residual. The unit suite is
+  green (43 passed). This is the honest scoping the task asked for; it is NOT a loosening of the real
+  invariants.
+- **B140** = M-F dependency, TRACKED not failed (residual logged as M-F-debris); `unreachable==0`
+  returns when M-F lands (`CasGcLeak` gtest is the guard).
+- **B141** = NEW finding: transient false-positive fsck `dangling` under live churn (fsck non-atomic
+  ref-walk-vs-LIST). NOT data loss (counts exact on both replicas; cleared on re-fsck; no server
+  error). Phase-1 GREEN is now blocked on B141, NOT on the (correct) hard assert. The assert was NOT
+  loosened.
+- **B132** (live fsck smoke) exercised end-to-end at every checkpoint.
+- **Soak findings summary:** B135 fixed, B136 fixed, B137 fixed (ABORTED-retry), B138 resolved (sync
+  inserts), B139 tracked (async dedup-token-vs-part hazard, not exercised), B140 tracked (M-F debris),
+  **B141 NEW** (fsck-vs-churn transient dangling).
+- Evidence: `utils/ca-soak/logs/phase1_scoped.log`, `phase1_scoped_failure_op899.json`,
+  `phase1_ch1_server.log`, `phase1_ch2_server.log`.

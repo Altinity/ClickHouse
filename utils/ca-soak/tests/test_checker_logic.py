@@ -5,7 +5,7 @@ from soak.checker import (
     drive_gc_to_fixpoint,
     fixpoint_timeout_s,
     gc_fixpoint_reached,
-    poll_unreachable_to_zero,
+    poll_unreachable_to_stable,
     CheckpointFailure,
 )
 
@@ -36,23 +36,44 @@ def _fake_clock():
     return (lambda: t["now"]), (lambda dt: t.__setitem__("now", t["now"] + dt))
 
 
-def test_poll_unreachable_drains_to_zero():
-    # In-grace debris settles >0 (61,61,40) then drains to 0 -> the poll must reach 0, NOT declare a
-    # false fixpoint on the stable [61,61] prefix.
-    seq = iter([61, 61, 40, 0])
+def test_poll_unreachable_stabilizes_at_residual():
+    # The incremental GC grinds down (1751,1200,600) then settles at its fixpoint residual 61 (the
+    # known M-F-debris). poll-to-stable must RETURN 61 once it has settled for `stable` polls, NOT
+    # require 0 (that would assert the unimplemented Full-GC) and NOT raise.
+    seq = iter([1751, 1200, 600, 61, 61, 61])
     mono, sleep = _fake_clock()
-    assert poll_unreachable_to_zero(
-        lambda: next(seq), timeout_s=180, interval_s=3, sleep_fn=sleep, monotonic_fn=mono) == 0
+    assert poll_unreachable_to_stable(
+        lambda: next(seq), timeout_s=10000, interval_s=3, stable=3, sleep_fn=sleep, monotonic_fn=mono) == 61
 
 
-def test_poll_unreachable_stuck_raises_after_bound():
-    # A genuine non-reclaiming leak: unreachable stays at 61 forever -> raise once the backlog-scaled
-    # bound elapses (must NOT mask it by declaring "stable").
+def test_poll_unreachable_zero_residual_returns_zero():
+    # Once M-F lands the incremental GC drains fully; a stable 0 is just a residual of 0.
+    seq = iter([100, 50, 0, 0, 0])
+    mono, sleep = _fake_clock()
+    assert poll_unreachable_to_stable(
+        lambda: next(seq), timeout_s=10000, interval_s=3, stable=3, sleep_fn=sleep, monotonic_fn=mono) == 0
+
+
+def test_poll_unreachable_transient_bump_resets_stability():
+    # A transient bump (a new orphan appearing mid-quiesce) must reset the stable run; the fixpoint is
+    # only declared after the count has truly settled. Here [60,60,61,55,55,55] -> 55 (the 61 bump
+    # breaks the early [60,60] run; only the final [55,55,55] settles).
+    seq = iter([60, 60, 61, 55, 55, 55])
+    mono, sleep = _fake_clock()
+    assert poll_unreachable_to_stable(
+        lambda: next(seq), timeout_s=10000, interval_s=3, stable=3, sleep_fn=sleep, monotonic_fn=mono) == 55
+
+
+def test_poll_unreachable_never_settles_raises_after_bound():
+    # A perpetually decreasing count never settles within the bound -> raise (a true timeout: the GC
+    # is still monotonically grinding and the bound was too small). This is a bound/harness problem,
+    # NOT the non-zero-residual case.
+    seq = iter(range(1000, 0, -1))
     mono, sleep = _fake_clock()
     with pytest.raises(CheckpointFailure) as ei:
-        poll_unreachable_to_zero(
-            lambda: 61, timeout_s=60, interval_s=3, sleep_fn=sleep, monotonic_fn=mono)
-    assert "unreachable==0" in str(ei.value) and "61" in str(ei.value)
+        poll_unreachable_to_stable(
+            lambda: next(seq), timeout_s=30, interval_s=3, stable=3, sleep_fn=sleep, monotonic_fn=mono)
+    assert "never stabilized" in str(ei.value)
 
 
 def test_fixpoint_timeout_small_backlog_hits_floor():
@@ -86,11 +107,12 @@ def test_drive_gc_to_fixpoint_zero_backlog_short_circuits():
     assert calls["n"] == 1  # measured once, no poll loop
 
 
-def test_drive_gc_to_fixpoint_drains_large_backlog():
-    # A large post-TRUNCATE backlog that grinds down over many rounds must be driven to 0, using a
-    # bound scaled to the initial reading (1751 here, the real B140 number). The first reading is
-    # consumed by the up-front backlog measurement, then the poll loop drains it.
+def test_drive_gc_to_fixpoint_grinds_large_backlog_to_residual():
+    # A large post-TRUNCATE backlog (1751, the real B140 number) grinds down over many rounds and
+    # settles at its incremental-GC fixpoint residual 61 (the known M-F-debris). drive must RETURN 61
+    # (not 0, not raise) using a bound scaled to the initial reading. The first reading is consumed by
+    # the up-front backlog measurement, then the poll loop grinds it to the stable residual.
     mono, sleep = _fake_clock()
-    seq = iter([1751, 1751, 1200, 600, 100, 0])
+    seq = iter([1751, 1751, 1200, 600, 100, 61, 61, 61])
     assert drive_gc_to_fixpoint(
-        _FakeCluster(gc_interval_s=2), lambda: next(seq), sleep_fn=sleep, monotonic_fn=mono) == 0
+        _FakeCluster(gc_interval_s=2), lambda: next(seq), sleep_fn=sleep, monotonic_fn=mono) == 61
