@@ -93,13 +93,27 @@ def node_for(cluster, target: int):
     return cluster.node1 if target == 0 else cluster.node2
 
 
+# INSERT-mode SETTINGS suffixes. Default keeps the harness's historical behavior (no explicit
+# async_insert setting -> the server image default decides). "async" forces async_insert=1 with
+# wait_for_async_insert=1 (so the HTTP response still waits for the flush); "sync" forces
+# async_insert=0. This is the A/B knob for disentangling B138 (async-retry-unsafety vs a real CA
+# dedup-atomicity bug): a failed SYNC insert leaves NO committed dedup token, so a retry truly
+# re-inserts, whereas an async insert can commit its dedup token before the part publish fails.
+INSERT_MODE_SETTINGS = {
+    "default": "",
+    "async": " SETTINGS async_insert=1, wait_for_async_insert=1",
+    "sync": " SETTINGS async_insert=0",
+}
+
+
 class Driver:
-    def __init__(self, cluster, model, seed, base_time, workers):
+    def __init__(self, cluster, model, seed, base_time, workers, insert_mode="default"):
         self.cluster = cluster
         self.model = model
         self.seed = seed
         self.base_time = base_time
         self.workers = workers
+        self.insert_settings = INSERT_MODE_SETTINGS[insert_mode]
         self.model_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=workers)
         self.inflight = []          # futures for in-flight concurrent (INSERT/OPTIMIZE) ops
@@ -114,7 +128,7 @@ class Driver:
         # concurrent inserts is irrelevant; we hold the lock only to keep the dict thread-safe).
         with self.model_lock:
             self.model.apply(op)
-        sql = insert_values_sql(self.seed, op.op_id, n, TABLE, self.base_time)
+        sql = insert_values_sql(self.seed, op.op_id, n, TABLE, self.base_time) + self.insert_settings
         node = node_for(self.cluster, op.target)
         fut = self.executor.submit(self._insert_with_retry, node, sql, op.op_id)
         self.inflight.append(fut)
@@ -251,6 +265,10 @@ def main(argv=None):
     ap.add_argument("--max-cliffs", type=int, default=MAX_CLIFFS)
     ap.add_argument("--min-ops-between-cliffs", type=int, default=None)
     ap.add_argument("--failure-json", default="failure.json")
+    ap.add_argument("--insert-mode", choices=sorted(INSERT_MODE_SETTINGS), default="default",
+                    help="force INSERT async/sync mode by appending a SETTINGS clause to each INSERT. "
+                         "'default' keeps the server image default; 'async' sets async_insert=1, "
+                         "wait_for_async_insert=1; 'sync' sets async_insert=0. (B138 A/B knob)")
     args = ap.parse_args(argv)
 
     cluster = Cluster()
@@ -276,7 +294,8 @@ def main(argv=None):
     n_cliffs = sum(1 for op in effective if op.type in CLIFF_TYPES)
     log(f"effective ledger: {len(effective)} ops, {n_cliffs} cliffs (cap={args.max_cliffs}, min_gap={min_gap})")
 
-    driver = Driver(cluster, model, args.seed, base_time, args.workers)
+    driver = Driver(cluster, model, args.seed, base_time, args.workers, insert_mode=args.insert_mode)
+    log(f"insert_mode={args.insert_mode} insert_settings_suffix={INSERT_MODE_SETTINGS[args.insert_mode]!r}")
 
     executed = 0
     last_op = None
