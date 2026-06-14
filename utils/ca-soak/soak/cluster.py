@@ -8,6 +8,7 @@ ch2 :8124 by default; configurable via constructor or env) plus a `docker_exec` 
 """
 
 import os
+import socket
 import subprocess
 import time
 import urllib.error
@@ -19,6 +20,19 @@ import urllib.request
 # (this harness) must retry the INSERT. A retried identical INSERT is idempotent thanks to
 # ReplicatedMergeTree block-dedup, and the model has already applied the op exactly once.
 ABORTED_CODE = 236
+
+# Server-side exception codes that mean "this node is going down / its network is broken" rather than
+# "your query is wrong". Under Phase-2 chaos a `docker restart`/`docker stop` shuts a node down
+# GRACEFULLY: an in-flight query is then CANCELLED server-side (returns an HTTP 500 body with one of
+# these codes) instead of the TCP connection simply dropping. These are the node-down-adjacent twin of
+# a raw connection refused/reset -- the same recovery applies (retry with backoff, reroute to the
+# other replica on a ReplicatedMergeTree). They are DISTINCT from a logic error (UNKNOWN_TABLE, type
+# errors, ...) which must surface immediately, and from the B137 retryable ABORTED (handled by
+# `retry_on_aborted`).
+#   394 QUERY_WAS_CANCELLED            -- in-flight query cancelled by a graceful shutdown
+#   209 SOCKET_TIMEOUT, 210 NETWORK_ERROR -- the node's network went away mid-query
+#   735 QUERY_WAS_CANCELLED_BY_CLIENT  -- cancellation surfaced via the client-cancel path
+NODE_DOWN_CODES = (394, 209, 210, 735)
 
 
 class QueryError(RuntimeError):
@@ -38,6 +52,17 @@ class QueryError(RuntimeError):
         Detected by parsing the exception body the server returns in the HTTP response."""
         b = self.body or ""
         return ("Code: %d" % ABORTED_CODE) in b or "ABORTED" in b
+
+    @property
+    def is_node_down(self) -> bool:
+        """True if the server-side exception is a NODE-DOWN-adjacent transient (a graceful shutdown
+        cancelling an in-flight query, or a mid-query network failure) -- one of `NODE_DOWN_CODES`.
+        Under chaos this is the body-bearing twin of a dropped connection and is retried/rerouted the
+        same way. Excludes the B137 ABORTED (which has its own retry path)."""
+        b = self.body or ""
+        if self.is_aborted:
+            return False
+        return any(("Code: %d." % c) in b for c in NODE_DOWN_CODES)
 
 _DEFAULTS = {
     "node1_host": "localhost", "node1_port": 8123, "node1_container": "ca-soak-ch1-1",
@@ -92,6 +117,18 @@ class Node:
         """Execute a query expected to return a single value; return it as a string."""
         return self.query(sql).strip()
 
+    def ping(self, timeout: float = 2.0) -> bool:
+        """Return True iff the node answers `/ping` with HTTP 200 ("Ok.\\n"). Used by the Phase-2
+        recovery wait to confirm a killed/restarted node is HTTP-healthy again before checkpointing.
+        Any transport error or non-2xx means not-yet-healthy -> False (the caller polls with a bound;
+        a node that never returns is failed loudly there, not swallowed here)."""
+        req = urllib.request.Request(f"http://{self.host}:{self.port}/ping", method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
     def __repr__(self) -> str:
         return f"Node({self.host}:{self.port})"
 
@@ -116,6 +153,75 @@ def retry_on_aborted(fn, *, attempts: int = 6, backoff_s: float = 0.05, on_retry
                 if on_retry is not None:
                     on_retry(attempt, e)
                 time.sleep(backoff_s * attempt)
+    raise last
+
+
+def is_transport_error(exc: BaseException) -> bool:
+    """Classify an exception raised while talking to a node as a TRANSPORT-level failure -- the node
+    was unreachable (down/paused/restarting), as opposed to a `QueryError` (the server WAS reachable
+    and returned an HTTP error body, e.g. the B137 retryable ABORTED).
+
+    Phase-2 chaos KILLs/PAUSEs/RESTARTs a node mid-op; the in-flight HTTP call then fails with a
+    connection refused/reset/timeout BEFORE any HTTP response is produced. `urllib` surfaces these as
+    a `urllib.error.URLError` whose `.reason` is the underlying `OSError` (`ConnectionRefusedError`,
+    `ConnectionResetError`, `socket.timeout`, ...), or directly as an `OSError`/`socket.timeout` on a
+    socket-level timeout. A `urllib.error.HTTPError` is NOT a transport error (the server responded);
+    that is wrapped into a `QueryError` and handled separately.
+
+    Pure function (no I/O) so the classification is unit-testable without docker."""
+    # HTTPError is a subclass of URLError but means the server responded -> not transport.
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, QueryError):
+        return False
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, BaseException):
+            return is_transport_error(reason)
+        return True   # a URLError without an HTTP response is a connection-level failure
+    if isinstance(exc, (ConnectionError, socket.timeout, TimeoutError)):
+        return True
+    if isinstance(exc, OSError):
+        return True
+    return False
+
+
+def is_node_down(exc: BaseException) -> bool:
+    """A node-down failure under chaos comes in TWO shapes: a connection-level transport error (the
+    socket dropped -- `is_transport_error`), OR a server-side `QueryError` carrying a node-down code
+    (`QueryError.is_node_down` -- a graceful shutdown cancelled the in-flight query, e.g.
+    `QUERY_WAS_CANCELLED`/`NETWORK_ERROR`). Both get the same recovery: bounded retry + reroute to the
+    other replica. A logic `QueryError` (UNKNOWN_TABLE, ...) and the B137 ABORTED are NOT node-down."""
+    if is_transport_error(exc):
+        return True
+    if isinstance(exc, QueryError):
+        return exc.is_node_down
+    return False
+
+
+def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff_s: float = 8.0,
+                       on_retry=None, sleep_fn=time.sleep):
+    """Call `fn` and retry it on a NODE-DOWN failure (`is_node_down`: a connection-level transport
+    error OR a graceful-shutdown cancellation/network `QueryError`) with bounded, capped-exponential
+    backoff, up to `attempts` total tries. A persistent node-down after the budget is exhausted is
+    re-raised -- per the task spec, a node that never comes back within a generous bound IS a failure
+    (the feature must survive crash+restart). Other exceptions (a logic `QueryError`, the B137 ABORTED
+    transient that has its own retry, ...) propagate IMMEDIATELY so the caller's own handling sees them
+    unmasked.
+
+    `sleep_fn` is injectable so the loop is pure-testable without real sleeps."""
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if not is_node_down(e):
+                raise
+            last = e
+            if attempt < attempts:
+                if on_retry is not None:
+                    on_retry(attempt, e)
+                sleep_fn(min(max_backoff_s, backoff_s * (2 ** (attempt - 1))))
     raise last
 
 

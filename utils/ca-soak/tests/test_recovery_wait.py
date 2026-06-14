@@ -1,0 +1,110 @@
+"""Unit tests for the Phase-2 recovery health-wait (`wait_for_healthy`) and the failure payload's
+chaos fields. Pure: fake cluster/nodes whose `ping()` flips to healthy after N polls, injected
+sleep/monotonic so no real time passes."""
+
+import pytest
+
+from soak.run import wait_for_healthy, wait_for_pool_consistent, _last_fault_dict
+from soak.checker import CheckpointFailure
+from soak.chaos import Fault, FaultTarget, FaultAction
+
+
+class FakeNode:
+    """ping() returns False for the first `down_for` calls, then True."""
+
+    def __init__(self, name, down_for):
+        self.name = name
+        self.down_for = down_for
+        self.calls = 0
+
+    def ping(self, timeout=2.0):
+        self.calls += 1
+        return self.calls > self.down_for
+
+    def __repr__(self):
+        return f"FakeNode({self.name})"
+
+
+class FakeCluster:
+    def __init__(self, nodes):
+        self._nodes = nodes
+
+    def nodes(self):
+        return tuple(self._nodes)
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def test_wait_returns_once_both_healthy():
+    clock = FakeClock()
+    # node2 is down for 3 polls then recovers; node1 healthy throughout.
+    cluster = FakeCluster([FakeNode("n1", down_for=0), FakeNode("n2", down_for=3)])
+    wait_for_healthy(cluster, timeout_s=180, settle_s=2.0,
+                     sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
+    # Returned without raising; some virtual time elapsed while polling.
+    assert clock.t > 0
+
+
+def test_wait_fails_loudly_if_node_never_returns():
+    clock = FakeClock()
+    # node2 stays down far beyond the timeout -> crash-recovery failure, raised loudly.
+    cluster = FakeCluster([FakeNode("n1", down_for=0), FakeNode("n2", down_for=10**9)])
+    with pytest.raises(CheckpointFailure) as ei:
+        wait_for_healthy(cluster, timeout_s=10, settle_s=2.0,
+                         sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
+    assert "never returned HTTP-healthy" in str(ei.value)
+
+
+def test_wait_requires_settle_recheck():
+    # If a node is healthy on the first probe but the settle re-check would still pass, it returns.
+    clock = FakeClock()
+    cluster = FakeCluster([FakeNode("n1", down_for=0), FakeNode("n2", down_for=0)])
+    wait_for_healthy(cluster, timeout_s=180, settle_s=2.0,
+                     sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
+    # Both nodes were probed at least twice (initial all() + settle recheck all()).
+    assert all(n.calls >= 2 for n in cluster.nodes())
+
+
+def test_pool_consistent_returns_once_transient_dangling_clears():
+    # B144: right after a RustFS restart fsck transiently reports dangling>0 (HEAD-absent trees),
+    # then the pool settles to dangling==0. The gate must wait it out and return the clean fsck.
+    clock = FakeClock()
+    seq = iter([
+        {"dangling": 10, "exit_code": 36, "reachable": 6512, "unreachable": 4599},  # transient
+        {"dangling": 3, "exit_code": 36, "reachable": 6520, "unreachable": 4500},    # settling
+        {"dangling": 0, "exit_code": 0, "reachable": 6530, "unreachable": 4400},     # clean #1
+        {"dangling": 0, "exit_code": 0, "reachable": 6530, "unreachable": 4400},     # clean #2 (stable)
+    ])
+    out = wait_for_pool_consistent(lambda: next(seq), timeout_s=180, stable=2, interval_s=3.0,
+                                   sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
+    assert out["dangling"] == 0 and out["exit_code"] == 0
+
+
+def test_pool_consistent_persistent_raises():
+    clock = FakeClock()
+    with pytest.raises(CheckpointFailure) as ei:
+        wait_for_pool_consistent(
+            lambda: {"dangling": 10, "exit_code": 36, "reachable": 6512, "unreachable": 4599},
+            timeout_s=20, stable=2, interval_s=3.0, sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
+    assert "never reached a self-consistent state" in str(ei.value)
+    assert "REAL crash-recovery" in str(ei.value)
+
+
+def test_last_fault_dict_shape():
+    assert _last_fault_dict(None) is None
+
+    class C:
+        last_fault = Fault(t_offset=42, target=FaultTarget.CH1,
+                           action=FaultAction.KILL, duration_s=15)
+
+    d = _last_fault_dict(C())
+    assert d == {"t_offset": 42, "target": "ch1", "action": "kill", "duration_s": 15}

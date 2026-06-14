@@ -33,9 +33,17 @@ import argparse
 import json
 import sys
 import threading
+import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
 
-from soak.cluster import Cluster, QueryError, retry_on_aborted
+from soak.cluster import (
+    Cluster,
+    QueryError,
+    retry_on_aborted,
+    retry_on_transport,
+    is_transport_error,
+)
 from soak.ledger import generate_ledger, Op, OpType
 from soak.model import Model
 from soak.workload import insert_values_sql, update_sql, delete_sql, truncate_sql
@@ -47,12 +55,23 @@ from soak.checker import (
     drive_gc_to_fixpoint,
 )
 from soak.fsck import run_fsck, run_dryrun
+from soak.chaos import generate_chaos_schedule, apply_fault
 
 TABLE = "ca_stress"
 FSCK_CONTAINER = "ca-soak-ch1-1"
 
 MAX_CLIFFS = 2
 
+# search_orphaned_parts_disks='local' (B143): the harness config defines a SECOND CA disk `ca_ro`
+# (a read-only alias of the SAME RustFS pool, used by the offline `clickhouse disks fsck` applet)
+# which is NOT in the `ca` storage policy. On a server RESTART (Phase-2 chaos), MergeTreeData's
+# orphaned-parts scan (`loadDataParts`, default `search_orphaned_parts_disks=any`) iterates EVERY
+# disk in the context map -- including the remote `ca_ro` -- finds the policy parts under its
+# same-pool path, and refuses to attach the table with UNKNOWN_DISK (code 479) "Part ... was found
+# on disk 'ca_ro' which is not defined in the storage policy 'ca'". That is a FALSE positive (ca_ro
+# is the same pool as ca, just a read-only view), not a real orphan. Limiting the scan to LOCAL
+# disks skips the remote `ca_ro` alias while still catching genuinely-orphaned local parts.
+# Phase-1 never restarted a server, so this only surfaced under Phase-2 restart chaos.
 DDL_TEMPLATE = """
 CREATE TABLE {table}
 (
@@ -63,7 +82,8 @@ ENGINE = ReplicatedMergeTree('/clickhouse/tables/{table}','{{replica}}')
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY (bucket,k,op_id)
 TTL toDateTime(ts) + INTERVAL 90 MINUTE DELETE
-SETTINGS storage_policy='ca', min_bytes_for_wide_part=0, min_rows_for_wide_part=0
+SETTINGS storage_policy='ca', min_bytes_for_wide_part=0, min_rows_for_wide_part=0,
+         search_orphaned_parts_disks='local'
 """.strip()
 
 CLIFF_TYPES = (OpType.TRUNCATE, OpType.DROP_PARTITION)
@@ -112,8 +132,17 @@ INSERT_MODE_SETTINGS = {
 }
 
 
+# Phase-2 transport-retry bound. A node killed/paused by chaos comes back within its fault
+# duration_s (<= 60s) plus restart time; with capped-exponential backoff (0.5s..8s) this many
+# attempts spans several minutes -- generously longer than any single fault window. Exhausting it
+# means a node NEVER recovered, which the task spec says IS a failure (the feature must survive
+# crash+restart), so the exhausted transport error is re-raised loudly.
+TRANSPORT_ATTEMPTS = 40
+
+
 class Driver:
-    def __init__(self, cluster, model, seed, base_time, workers, insert_mode="default"):
+    def __init__(self, cluster, model, seed, base_time, workers, insert_mode="default",
+                 transport_resilient=False):
         self.cluster = cluster
         self.model = model
         self.seed = seed
@@ -126,6 +155,18 @@ class Driver:
         self.last_op = None         # last op executed (for failure.json)
         self.aborted_retries = 0    # count of ABORTED-retried INSERT attempts (B137 race evidence)
         self._aborted_lock = threading.Lock()
+        # Phase 2: tolerate a node going down mid-op (transport failure) by retrying with backoff and
+        # rerouting to the OTHER replica. Off in Phase 1 (no chaos -> a transport error is a real bug
+        # that must surface immediately).
+        self.transport_resilient = transport_resilient
+        self.transport_retries = 0  # count of transport-retried op attempts (chaos evidence)
+        self._transport_lock = threading.Lock()
+
+    def _note_transport_retry(self, op_kind, op_id, attempt, node, err):
+        with self._transport_lock:
+            self.transport_retries += 1
+        log(f"{op_kind} op_id={op_id} transport failure on {node} (attempt {attempt}); "
+            f"rerouting/retrying. {type(err).__name__}: {err}")
 
     # -- concurrent (non-barrier) op execution ------------------------------------------------
     def _submit_insert(self, op):
@@ -135,24 +176,66 @@ class Driver:
         with self.model_lock:
             self.model.apply(op)
         sql = insert_values_sql(self.seed, op.op_id, n, TABLE, self.base_time, settings=self.insert_settings)
-        node = node_for(self.cluster, op.target)
-        fut = self.executor.submit(self._insert_with_retry, node, sql, op.op_id)
+        fut = self.executor.submit(self._insert_with_retry, op.target, sql, op.op_id)
         self.inflight.append(fut)
 
-    def _insert_with_retry(self, node, sql, op_id):
-        """Execute one INSERT, retrying ONLY on the retryable ABORTED transient (B137). Scoped to
-        INSERTs: mutations/DDL are NOT routed here (they have different idempotency)."""
-        def on_retry(attempt, err):
+    def _nodes_starting_at(self, target):
+        """Replica list to try in order, starting at the op's assigned replica then the other one --
+        the rerouting order for transport retries."""
+        primary = node_for(self.cluster, target)
+        other = node_for(self.cluster, 1 - target)
+        return [primary, other]
+
+    def _insert_with_retry(self, target, sql, op_id):
+        """Execute one INSERT. Inner: retry the retryable ABORTED transient (B137). Outer (Phase 2):
+        on a TRANSPORT failure (node killed/paused mid-op), retry with bounded backoff and REROUTE to
+        the other replica -- the INSERT replicates back and RMT block-dedup keeps the retry idempotent,
+        and the model already applied the op exactly once."""
+        def aborted_on_retry(attempt, err):
             with self._aborted_lock:
                 self.aborted_retries += 1
             log(f"INSERT op_id={op_id} hit retryable ABORTED (attempt {attempt}); retrying. {err}")
-        retry_on_aborted(lambda: node.command(sql), on_retry=on_retry)
+
+        order = self._nodes_starting_at(target)
+
+        def one_attempt(attempt_idx):
+            node = order[attempt_idx % len(order)]
+            retry_on_aborted(lambda: node.command(sql), on_retry=aborted_on_retry)
+
+        self._with_transport_retry("INSERT", op_id, one_attempt)
+
+    def _with_transport_retry(self, op_kind, op_id, one_attempt):
+        """Drive `one_attempt(attempt_idx)` once if not transport-resilient (Phase 1), else with the
+        bounded transport-retry loop that reroutes across replicas (Phase 2). `one_attempt` receives a
+        0-based attempt index so it can pick the replica."""
+        if not self.transport_resilient:
+            one_attempt(0)
+            return
+        counter = {"i": 0}
+
+        def attempt():
+            i = counter["i"]
+            counter["i"] += 1
+            return one_attempt(i)
+
+        def on_retry(attempt_no, err):
+            self._note_transport_retry(op_kind, op_id, attempt_no, "assigned-replica", err)
+
+        retry_on_transport(attempt, attempts=TRANSPORT_ATTEMPTS, on_retry=on_retry)
 
     def _submit_optimize(self, op):
-        # OPTIMIZE has no model effect; run it concurrently as a cluster-only op.
-        node = node_for(self.cluster, op.target)
-        fut = self.executor.submit(node.command, f"OPTIMIZE TABLE {TABLE}")
+        # OPTIMIZE has no model effect; run it concurrently as a cluster-only op. Under chaos it is
+        # also transport-resilient (reroute/retry) so a node-down OPTIMIZE doesn't fail the run.
+        fut = self.executor.submit(self._optimize_with_retry, op.target, op.op_id)
         self.inflight.append(fut)
+
+    def _optimize_with_retry(self, target, op_id):
+        order = self._nodes_starting_at(target)
+
+        def one_attempt(attempt_idx):
+            order[attempt_idx % len(order)].command(f"OPTIMIZE TABLE {TABLE}")
+
+        self._with_transport_retry("OPTIMIZE", op_id, one_attempt)
 
     def drain(self):
         """Wait for all in-flight inserts/optimizes; re-raise the first worker exception loudly."""
@@ -176,20 +259,30 @@ class Driver:
     # -- barrier (mutation) op execution ------------------------------------------------------
     def apply_barrier(self, op):
         """Drain inserts, then apply the mutation to the cluster (on op.target's replica) AND the
-        model. The model mutation must see exactly the rows the cluster sees, hence the drain."""
+        model. The model mutation must see exactly the rows the cluster sees, hence the drain. Under
+        chaos the mutation must LAND even if its target replica is down: it is transport-resilient and
+        reroutes to the other replica (replicated DDL/mutation; idempotent table-level effect). It is
+        applied to the model ONLY AFTER the cluster command succeeds, so a never-landed mutation
+        surfaces as a transport failure instead of silently diverging the model."""
         self.drain()
-        node = node_for(self.cluster, op.target)
         if op.type == OpType.UPDATE:
-            node.command(update_sql(TABLE, self.model._pred_bucket(op.param)))
+            sql = update_sql(TABLE, self.model._pred_bucket(op.param))
         elif op.type == OpType.DELETE:
-            node.command(delete_sql(TABLE, self.model._pred_bucket(op.param)))
+            sql = delete_sql(TABLE, self.model._pred_bucket(op.param))
         elif op.type == OpType.TRUNCATE:
-            node.command(truncate_sql(TABLE))
+            sql = truncate_sql(TABLE)
         elif op.type == OpType.DROP_PARTITION:
             # Single base_time day -> one partition -> drop == full clear (matches Model).
-            node.command(truncate_sql(TABLE))
+            sql = truncate_sql(TABLE)
         else:
             raise AssertionError(f"apply_barrier on non-barrier op {op.type}")
+
+        order = self._nodes_starting_at(op.target)
+
+        def one_attempt(attempt_idx):
+            order[attempt_idx % len(order)].command(sql)
+
+        self._with_transport_retry(f"BARRIER:{op.type.name}", op.op_id, one_attempt)
         with self.model_lock:
             self.model.apply(op)
 
@@ -262,13 +355,130 @@ def checkpoint(driver, cluster, model, phase):
     return now, exp, n1, n2, f, dr
 
 
-def write_failure(path, *, seed, base_time, op_id, phase, model_expected, n1, n2, fsck, last_op, error=None):
+def wait_for_healthy(cluster, *, timeout_s: float = 180.0, settle_s: float = 2.0,
+                     sleep_fn=time.sleep, monotonic_fn=time.monotonic):
+    """Block until BOTH replicas answer `/ping` with HTTP 200, then settle briefly. Used by the
+    Phase-2 recovery wait after a fault window: a killed/restarted node must be HTTP-healthy again
+    BEFORE the checkpoint quiesces (else SYSTEM SYNC REPLICA / aggregates would hit a still-down node
+    and the checkpoint would spuriously fail). FAILS LOUDLY (CheckpointFailure) if a node never
+    returns within the bound -- a restarted node that never comes back IS a crash-recovery failure,
+    not something to swallow."""
+    deadline = monotonic_fn() + timeout_s
+    while True:
+        if all(node.ping() for node in cluster.nodes()):
+            sleep_fn(settle_s)
+            if all(node.ping() for node in cluster.nodes()):
+                return
+        if monotonic_fn() > deadline:
+            states = {repr(n): n.ping() for n in cluster.nodes()}
+            raise CheckpointFailure(
+                f"node(s) never returned HTTP-healthy within {timeout_s:.0f}s after a fault window "
+                f"(crash-recovery failure): ping states={states}")
+        sleep_fn(1.0)
+
+
+def wait_for_pool_consistent(fsck_fn, *, timeout_s: float = 180.0, stable: int = 2,
+                             interval_s: float = 3.0, sleep_fn=time.sleep, monotonic_fn=time.monotonic):
+    """Poll `fsck_fn()` (a fresh `run_fsck` result) until the CA pool is SELF-CONSISTENT -- fsck
+    `dangling==0` AND `exit_code==0` for `stable` consecutive reads -- then return the last fsck dict.
+
+    Rationale (B144): a fault that kills/restarts the RustFS OBJECT STORE leaves a transient
+    post-restart window where recently-written objects are not yet visible/durable through a FRESH
+    read-only fsck mount, even though the running server reads the table correctly (count==model on
+    both replicas). In that window fsck transiently reports `dangling>0` (HEAD-absent reachable trees)
+    and the GC dryrun/fsck views are mutually incoherent, so the dryrun-subset HARD assert can fire on
+    a non-bug. `wait_for_healthy` only gates ClickHouse `/ping`, NOT the object-store backend's
+    recovery, so the recovery checkpoint could assert pool invariants against a still-settling store.
+
+    This gate waits for the pool to reach a COHERENT cut (`dangling==0`) before the checkpoint runs
+    its hard dryrun-subset assert. It FAILS LOUDLY (`CheckpointFailure`) if the pool never reaches
+    `dangling==0` within the bound -- a PERSISTENT post-restart `dangling>0` is then a REAL
+    crash-recovery / object-store-durability finding, not a transient, and must surface.
+
+    `sleep_fn`/`monotonic_fn` are injectable so the loop is pure-testable."""
+    deadline = monotonic_fn() + timeout_s
+    consecutive_clean = 0
+    last = None
+    while True:
+        last = fsck_fn()
+        clean = last.get("dangling") == 0 and last.get("exit_code") == 0
+        consecutive_clean = consecutive_clean + 1 if clean else 0
+        if consecutive_clean >= stable:
+            return last
+        if monotonic_fn() > deadline:
+            raise CheckpointFailure(
+                f"CA pool never reached a self-consistent state (fsck dangling==0) within {timeout_s:.0f}s "
+                f"after a fault window -- PERSISTENT dangling={last.get('dangling')} "
+                f"(exit_code={last.get('exit_code')}) is a REAL crash-recovery / object-store durability "
+                f"finding (INV-NO-LOSS), not a transient. reachable={last.get('reachable')} "
+                f"unreachable={last.get('unreachable')}")
+        sleep_fn(interval_s)
+
+
+class ChaosRunner(threading.Thread):
+    """Background thread that fires a deterministic fault schedule WHILE the workload runs. For each
+    `Fault` it sleeps until its `t_offset` (relative to run start), runs `apply_fault` (which blocks
+    for the fault's `duration_s` and brings the node back), then records that a RECOVERY CHECKPOINT is
+    due. The main thread, between ops, drains the workload and runs the recovery checkpoint -- so the
+    checkpoint never races a fault and the workload is paused only for the checkpoint itself.
+
+    `apply_fault` is run HERE (not on a workload thread): it blocks for `duration_s`, and a worker
+    blocking that long would stall the whole workload."""
+
+    def __init__(self, schedule, *, on_fault_done, stop_event, checkpoint_active):
+        super().__init__(daemon=True, name="chaos")
+        self.schedule = schedule
+        self.on_fault_done = on_fault_done    # callback(fault) -> request a recovery checkpoint
+        self.stop_event = stop_event
+        # Set by the main thread WHILE a checkpoint is in progress. The chaos thread will not start a
+        # new fault while this is set, so a fault never races a quiescing checkpoint (the checkpoint's
+        # raw queries assume reachable nodes; mean_interval comfortably exceeds checkpoint time).
+        self.checkpoint_active = checkpoint_active
+        self.start_monotonic = None
+        self.last_fault = None
+        self.faults_fired = 0
+        self.error = None
+
+    def run(self):
+        self.start_monotonic = time.monotonic()
+        try:
+            for fault in self.schedule:
+                # Sleep (interruptibly) until this fault's scheduled offset.
+                while not self.stop_event.is_set():
+                    elapsed = time.monotonic() - self.start_monotonic
+                    if elapsed >= fault.t_offset:
+                        break
+                    self.stop_event.wait(min(0.5, fault.t_offset - elapsed))
+                if self.stop_event.is_set():
+                    return
+                # Do not fire while a checkpoint is quiescing the cluster -- wait it out.
+                while self.checkpoint_active.is_set() and not self.stop_event.is_set():
+                    self.stop_event.wait(0.5)
+                if self.stop_event.is_set():
+                    return
+                log(f"CHAOS firing fault #{self.faults_fired + 1} at t+{fault.t_offset}s: "
+                    f"{fault.target.value} {fault.action.value} dur={fault.duration_s}s")
+                apply_fault(fault)   # blocks for duration_s; brings node(s) back
+                self.last_fault = fault
+                self.faults_fired += 1
+                log(f"CHAOS fault window complete: {fault.target.value} {fault.action.value} "
+                    f"-> requesting recovery checkpoint")
+                self.on_fault_done(fault)
+        except Exception as e:   # noqa: BLE001 -- surface chaos-thread errors to the main thread
+            self.error = e
+            log(f"CHAOS thread error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+
+def write_failure(path, *, seed, base_time, op_id, phase, model_expected, n1, n2, fsck, last_op,
+                  error=None, chaos_seed=None, last_fault=None):
     payload = {
         "seed": seed,
+        "chaos_seed": chaos_seed,
         "base_time": base_time,
         "op_id": op_id,
         "phase": phase,
         "error": error,
+        "last_fault": last_fault,
         "model_expected": model_expected,
         "node1": n1,
         "node2": n2,
@@ -280,8 +490,16 @@ def write_failure(path, *, seed, base_time, op_id, phase, model_expected, n1, n2
     return payload
 
 
+def _last_fault_dict(chaos):
+    if chaos is None or chaos.last_fault is None:
+        return None
+    f = chaos.last_fault
+    return {"t_offset": f.t_offset, "target": f.target.value, "action": f.action.value,
+            "duration_s": f.duration_s}
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="CA soak Phase-1 green-path driver")
+    ap = argparse.ArgumentParser(description="CA soak green-path / chaos driver")
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--phase", type=int, default=1)
     ap.add_argument("--ops", type=int, required=True)
@@ -296,7 +514,20 @@ def main(argv=None):
                          "'default' and 'sync' both set async_insert=0 (B138: sync is required for an "
                          "idempotent ABORTED-retry; async loses rows via the dedup-token-vs-part hazard, "
                          "B139); 'async' sets async_insert=1, wait_for_async_insert=1.")
+    # --- Phase-2 chaos args ------------------------------------------------------------------
+    ap.add_argument("--chaos-seed", type=int, default=None,
+                    help="(phase 2) seed for the deterministic fault schedule (generate_chaos_schedule).")
+    ap.add_argument("--chaos-interval", type=int, default=90,
+                    help="(phase 2) mean inter-fault interval (s). MUST comfortably exceed the "
+                         "checkpoint+recovery time so quiescence is reachable between faults.")
+    ap.add_argument("--duration", type=int, default=None,
+                    help="(phase 2) wall-clock seconds to generate faults over. Defaults to a generous "
+                         "estimate from --ops; the chaos thread is stopped as soon as the workload finishes.")
     args = ap.parse_args(argv)
+
+    phase2 = args.phase == 2
+    if phase2 and args.chaos_seed is None:
+        args.chaos_seed = args.seed
 
     cluster = Cluster()
 
@@ -321,8 +552,75 @@ def main(argv=None):
     n_cliffs = sum(1 for op in effective if op.type in CLIFF_TYPES)
     log(f"effective ledger: {len(effective)} ops, {n_cliffs} cliffs (cap={args.max_cliffs}, min_gap={min_gap})")
 
-    driver = Driver(cluster, model, args.seed, base_time, args.workers, insert_mode=args.insert_mode)
-    log(f"insert_mode={args.insert_mode} insert_settings_suffix={INSERT_MODE_SETTINGS[args.insert_mode]!r}")
+    driver = Driver(cluster, model, args.seed, base_time, args.workers, insert_mode=args.insert_mode,
+                    transport_resilient=phase2)
+    log(f"insert_mode={args.insert_mode} insert_settings_suffix={INSERT_MODE_SETTINGS[args.insert_mode]!r} "
+        f"transport_resilient={phase2}")
+
+    # --- Phase-2 chaos wiring ----------------------------------------------------------------
+    chaos = None
+    chaos_stop = threading.Event()
+    checkpoint_active = threading.Event()
+    recovery_lock = threading.Lock()
+    recovery_pending = []   # list of Faults whose windows completed; main thread drains it at checkpoints
+
+    if phase2:
+        # Generous wall-clock estimate: the chaos thread is stopped the moment the workload finishes,
+        # so this only needs to outlast the workload. Tie it to ops with slack.
+        duration_s = args.duration if args.duration is not None else max(600, args.ops * 2)
+        schedule = generate_chaos_schedule(args.chaos_seed, duration_s, args.chaos_interval)
+        log(f"chaos schedule: {len(schedule)} faults over {duration_s}s "
+            f"(chaos_seed={args.chaos_seed} mean_interval={args.chaos_interval}s)")
+
+        def on_fault_done(fault):
+            with recovery_lock:
+                recovery_pending.append(fault)
+
+        chaos = ChaosRunner(schedule, on_fault_done=on_fault_done, stop_event=chaos_stop,
+                            checkpoint_active=checkpoint_active)
+        chaos.start()
+
+    def do_checkpoint(label, executed_count, op_id):
+        log(f"{label} at executed={executed_count} (op_id={op_id})")
+        # Hold off chaos while the checkpoint quiesces (its raw queries assume reachable nodes). In
+        # phase 2 a fault may already be mid-window when we reach a periodic checkpoint, so wait for
+        # both nodes HTTP-healthy first (loud fail if a node never returns).
+        checkpoint_active.set()
+        try:
+            if phase2:
+                wait_for_healthy(cluster)
+                # Gate on object-store/pool recovery too (B144): a fault that hit RustFS leaves a
+                # transient post-restart window where a fresh fsck mount sees recently-written trees
+                # as HEAD-absent (dangling) and the GC/fsck views are incoherent. Wait for the pool to
+                # reach a coherent cut (fsck dangling==0) BEFORE the hard dryrun-subset assert; a
+                # PERSISTENT dangling>0 past the bound is escalated as a REAL durability finding.
+                wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER))
+            now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, args.phase)
+        finally:
+            checkpoint_active.clear()
+        log(f"{label} OK: now={now} count={exp['count']} "
+            f"fsck reachable={f.get('reachable')} unreachable={f.get('unreachable')} "
+            f"(M-F debris, B140) dangling={f.get('dangling')} dryrun_count={dr.get('count')}")
+        return now, exp, n1, n2, f, dr
+
+    def drain_recovery_checkpoints(executed_count, op_id):
+        """If chaos completed any fault windows, run a RECOVERY checkpoint for them: wait for both
+        nodes HTTP-healthy (loud fail if a restarted node never returns), then the full scoped
+        checkpoint (workload already drained inside `checkpoint`)."""
+        with recovery_lock:
+            pending = list(recovery_pending)
+            recovery_pending.clear()
+        if not pending:
+            return
+        # Surface any chaos-thread error immediately.
+        if chaos is not None and chaos.error is not None:
+            raise chaos.error
+        last = pending[-1]
+        log(f"RECOVERY: {len(pending)} fault window(s) completed; last="
+            f"{last.target.value}/{last.action.value}/{last.duration_s}s — recovery checkpoint")
+        # do_checkpoint pauses the workload (drain inside `checkpoint`) and, in phase 2, waits for
+        # both nodes HTTP-healthy before quiescing (loud fail if a restarted node never returns).
+        do_checkpoint("recovery checkpoint", executed_count, op_id)
 
     executed = 0
     last_op = None
@@ -335,27 +633,34 @@ def main(argv=None):
             last_op = op
             executed += 1
 
-            if executed % args.checkpoint_every == 0:
-                log(f"checkpoint at executed={executed} (op_id={op.op_id})")
-                now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, args.phase)
-                log(f"checkpoint OK: now={now} count={exp['count']} "
-                    f"fsck reachable={f.get('reachable')} unreachable={f.get('unreachable')} "
-                    f"(M-F debris, B140) dangling={f.get('dangling')} dryrun_count={dr.get('count')}")
+            # Phase 2: run a recovery checkpoint after any completed fault window (pauses workload).
+            if phase2:
+                drain_recovery_checkpoints(executed, op.op_id)
 
-        # Final checkpoint (if the last one didn't land exactly on a boundary).
+            if executed % args.checkpoint_every == 0:
+                do_checkpoint("checkpoint", executed, op.op_id)
+
+        # Phase 2: stop chaos and drain any final recovery checkpoints before the final checkpoint.
+        if phase2:
+            chaos_stop.set()
+            chaos.join(timeout=30)
+            drain_recovery_checkpoints(executed, last_op.op_id if last_op else None)
+            if chaos is not None and chaos.error is not None:
+                raise chaos.error
+
+        # Final checkpoint (if the last one didn't land exactly on a boundary). do_checkpoint waits
+        # for HTTP-healthy in phase 2 and drains the workload inside `checkpoint`.
         if executed == 0 or executed % args.checkpoint_every != 0:
-            log(f"final checkpoint at executed={executed}")
-            now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, args.phase)
-            log(f"final checkpoint OK: now={now} count={exp['count']} "
-                f"unreachable={f.get('unreachable')} dangling={f.get('dangling')}")
+            do_checkpoint("final checkpoint", executed, last_op.op_id if last_op else None)
 
     except (CheckpointFailure, QueryError, OSError) as e:
-        # CheckpointFailure -> a model/replica divergence or a dirty CA pool at a quiesced checkpoint.
+        # CheckpointFailure -> a model/replica divergence or a dirty CA pool at a quiesced checkpoint
+        #   (in phase 2, this is post-recovery -> a crash-recovery invariant violation).
         # QueryError -> a worker-side cluster error during op execution (e.g. a write-path race).
-        # OSError (incl. socket TimeoutError) -> a transport-level failure talking to a replica (e.g. a
-        # blocking admin op exceeding its socket timeout). In every case record a structured failure with
-        # the reproducer (seed, base_time, op_id, error) instead of dumping a raw traceback, so the
-        # failure can be replayed and triaged.
+        # OSError (incl. socket TimeoutError) -> a transport-level failure talking to a replica that
+        #   the bounded retry/reroute never recovered from (in phase 2: a node that never came back).
+        # In every case record a structured failure with the reproducer instead of a raw traceback.
+        chaos_stop.set()
         if isinstance(e, CheckpointFailure):
             kind = "CHECKPOINT FAILURE"
         elif isinstance(e, QueryError):
@@ -382,16 +687,25 @@ def main(argv=None):
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
             args.failure_json, seed=args.seed, base_time=base_time, op_id=op_id, phase=args.phase,
-            model_expected=exp, n1=n1, n2=n2, fsck=f, last_op=last_op_d, error=f"{kind}: {e}")
+            model_expected=exp, n1=n1, n2=n2, fsck=f, last_op=last_op_d, error=f"{kind}: {e}",
+            chaos_seed=args.chaos_seed, last_fault=_last_fault_dict(chaos))
         print(f"{kind}: {e}", file=sys.stderr)
         print(json.dumps(payload, indent=2, default=str), file=sys.stderr)
         driver.executor.shutdown(wait=False, cancel_futures=True)
         sys.exit(1)
     finally:
+        chaos_stop.set()
+        if chaos is not None:
+            chaos.join(timeout=30)
         driver.executor.shutdown(wait=True)
 
     log(f"ABORTED-retried INSERT attempts (B137 race fired and was handled): {driver.aborted_retries}")
-    print("PHASE1 OK")
+    if phase2:
+        log(f"transport-retried op attempts (chaos node-down fired and was handled): "
+            f"{driver.transport_retries}; faults fired: {chaos.faults_fired if chaos else 0}")
+        print("PHASE2 OK")
+    else:
+        print("PHASE1 OK")
     return 0
 
 
