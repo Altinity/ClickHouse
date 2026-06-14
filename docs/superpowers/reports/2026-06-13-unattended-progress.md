@@ -731,3 +731,51 @@ genuinely large. Classification UNKNOWN, leaning test-infra/cost (incremental/ch
 quiesce-before-dump-fsck; bound self-check pool growth; larger `receive_timeout`). NO data-loss
 implication (`dangling=0`/`unreachable=0` whenever fsck completes on a settled pool). Gating item for the
 24h run.
+
+## 2026-06-14 — B147 ROOT-CAUSED: GC lease-holder re-serializes the whole-pool snap every round (O(pool) `decodeGcSnap`/`encodeGcSnap` + full-snap S3 re-upload)
+
+Reproduced and root-caused the GC CPU-saturation / query-unresponsiveness from the 24h-soak hour-2 symptom
+(ch1 ~686% CPU, `system.parts`/`SYNC REPLICA` timing out while `/ping` stayed instant). Fresh
+`utils/ca-soak` cluster, aggressive load (`python3 -m soak.run --seed 20260614 --phase 1 --ops 100000
+--workers 8`), GC interval 2s, profiled `ca-soak-ch1-1` with `system.stack_trace` (`allow_introspection_functions=1`)
+as a sampling profiler across the pool growing 64k → 247k objects.
+
+CONFIRMED ROOT CAUSE — NOT the candidate/observe scans originally suspected, but the snap (de)serialization:
+each GC round, `Cas::Gc::loadSnap` → `decodeGcSnap` JSON-parses the entire-pool `gc/snap` document into a
+Poco JSON DOM, and `fold`/`cascadeAndPersist` re-serialize it (`encodeGcSnap`) and re-upload it
+(`putIfAbsent`/`casPut`). The snap is ONE document holding every live edge + every known node for the whole
+pool (`CasGcSnap.h`). Dominant hot stack (17/18 GC-phase samples in `loadSnap`):
+
+```
+Poco::JSON::ParserImpl::parseImpl
+  <- DB::Cas::parseJsonDocument
+  <- DB::Cas::decodeGcSnap
+  <- DB::Cas::Gc::loadSnap
+  <- DB::Cas::Gc::fold
+  <- DB::Cas::Gc::runRegularRound
+  <- DB::ContentAddressed::CasGcScheduler::loop
+```
+
+CPU is spent in `Poco::Dynamic::Var` map-node construct/destruct + `MemoryTracker::alloc/free` +
+`je_sallocx`/`operator delete` (millions of tiny allocations). Secondary cost: `Gc::retire` does one S3
+`head` per candidate, and the 55 MB multipart `putIfAbsent` of the re-encoded snap (`PocoHTTPClient` poll).
+
+EVIDENCE OF O(pool) SCALING: snap blob 23 MB @ 64k objects → 55 MB @ 227k → 58 MB @ 247k; GC round duration
+~4.7s @ 50k → ~8s @ 227k → ~9–12s @ 247k (with a 2s interval the GC thread runs back-to-back, no idle gap).
+The asymmetry is the lease — whichever node holds it bears the whole cost (ch1 471–558% while leading,
+spike FOLLOWED leadership to ch2: 769% → 1277% as ch1 dropped to ~5%).
+
+UNRESPONSIVENESS REPRODUCED: at 227k objects, `SELECT count() FROM system.parts` on ch1 spiked to 23.95 s
+(≈ timeout) and stayed elevated (4.6 s, 2.1 s next rounds) while `SELECT 1` stayed 0.07 s — exactly the
+reported symptom. The spike coincides with the round's 55 MB snap multipart S3 I/O monopolizing the shared
+S3 connection pool / object-store callback-runner threads that `system.parts` (CA metadata reads) and
+`SYNC REPLICA` also use. `candidates=0`/`deleted=0` throughout — not a correctness bug; nothing reclaimed.
+
+FIX (code-level): make the steady-state round O(journal delta), not O(pool). (1) Keep the decoded `GcSnap`
+resident in the long-lived per-thread `Gc` instance across rounds and fold only the journal delta —
+eliminating `loadSnap`/`decodeGcSnap` from the steady path (durable snap still re-derivable on crash via the
+cursor). (2) Persist the snap in a binary/delta-friendly format (Poco `Var` parsing is the alloc hotspot)
+and re-upload only changed shards/pages, not the whole blob. (3) Shard the snap (`snap_shards>1`, currently
+pinned to 1 by `fold`'s M-C3 limitation) so each round touches O(delta) shards and GC leadership can split
+per-shard across replicas. (4) Batch/skip the per-candidate `head` in `retire` and rate-limit the GC thread.
+(1)+(2) directly target the measured ~67%-of-round `decodeGcSnap`+`encodeGcSnap`+upload. Backlog B147 updated.
