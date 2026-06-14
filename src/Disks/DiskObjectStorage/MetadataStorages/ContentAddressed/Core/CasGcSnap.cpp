@@ -1,7 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcSnap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnumStrings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
@@ -11,6 +11,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
 }
 }
@@ -21,43 +22,41 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint64_t GC_SNAP_VERSION = 1;
+/// gc/snap is a non-hashed metadata object, but unlike the human-inspected operational metadata it
+/// is the GC round's serialization hot path: it holds the WHOLE pool's reachability state and is
+/// parsed/serialized every round. So it is encoded BINARY (the codebase's standard IO-helper idiom,
+/// same as the hashed tree/envelope codecs) rather than JSON — the parse/serialize CPU dominated
+/// the GC round. Magic + version byte at the front; fail-closed decode (bad magic / bad enum byte /
+/// truncated => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
+constexpr char GC_SNAP_MAGIC[4] = {'C', 'A', 'G', 'S'};
+constexpr uint8_t GC_SNAP_VERSION = 2;
 
-/// `EdgeKind` <-> string. Unknown string on decode is corruption (fail closed).
-std::string_view edgeKindToString(EdgeKind kind)
+/// `EdgeKind` <-> byte. Unknown byte on decode is corruption (fail closed).
+uint8_t edgeKindToByte(EdgeKind kind)
 {
-    switch (kind)
-    {
-        case EdgeKind::Root: return "root";
-        case EdgeKind::Tree: return "tree";
-        case EdgeKind::Pack: return "pack";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: invalid edge kind {}", static_cast<int>(kind));
+    return static_cast<uint8_t>(kind);
 }
 
-EdgeKind edgeKindFromString(std::string_view s, std::string_view what)
+EdgeKind edgeKindFromByte(uint8_t b)
 {
-    if (s == "root")
-        return EdgeKind::Root;
-    if (s == "tree")
-        return EdgeKind::Tree;
-    if (s == "pack")
-        return EdgeKind::Pack;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid edge kind '{}'", what, s);
+    switch (b)
+    {
+        case static_cast<uint8_t>(EdgeKind::Root): return EdgeKind::Root;
+        case static_cast<uint8_t>(EdgeKind::Tree): return EdgeKind::Tree;
+        case static_cast<uint8_t>(EdgeKind::Pack): return EdgeKind::Pack;
+    }
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: invalid edge kind byte {}", static_cast<int>(b));
 }
 
-/// A 32-hex hash from an already-extracted string (array elements, where requireHash's
-/// object-key form does not apply); junk hex inside a persisted object is corruption.
-UInt128 hashFromHex(const String & hex, std::string_view what)
+ObjectKind objectKindFromByte(uint8_t b)
 {
-    try
+    switch (b)
     {
-        return hexToU128(hex);
+        case static_cast<uint8_t>(ObjectKind::Blob): return ObjectKind::Blob;
+        case static_cast<uint8_t>(ObjectKind::Tree): return ObjectKind::Tree;
+        case static_cast<uint8_t>(ObjectKind::Pack): return ObjectKind::Pack;
     }
-    catch (const Exception & e)
-    {
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: not a valid hash ({})", what, e.message());
-    }
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: invalid object kind byte {}", static_cast<int>(b));
 }
 
 }
@@ -243,138 +242,94 @@ std::vector<Candidate> GcSnap::zeroInDegreeKnown() const
 String encodeGcSnap(const GcSnap & snap)
 {
     WriteBufferFromOwnString out;
-    writeCString("{", out);
-    writeJsonKey(out, "format");
-    writeJsonString("cas_gc_snap", out);
-    writeChar(',', out);
-    writeJsonKey(out, "version");
-    writeIntText(GC_SNAP_VERSION, out);
-    writeChar(',', out);
-    writeJsonKey(out, "snap_shard");
-    writeIntText(snap.snap_shard, out);
-    writeChar(',', out);
-    writeJsonKey(out, "generation");
-    writeIntText(snap.generation, out);
-    writeChar(',', out);
-    writeJsonKey(out, "edges");
-    writeChar('[', out);
-    bool first = true;
+    out.write(GC_SNAP_MAGIC, sizeof(GC_SNAP_MAGIC));
+    writeBinaryLittleEndian(GC_SNAP_VERSION, out);
+    writeBinaryLittleEndian(snap.snap_shard, out);
+    writeBinaryLittleEndian(snap.generation, out);
+
+    writeBinaryLittleEndian(static_cast<uint32_t>(snap.edges.size()), out);
     for (const auto & [id, rec] : snap.edges)                    /// canonical-edge-id order
     {
-        if (!first)
-            writeChar(',', out);
-        first = false;
-
-        writeChar('{', out);
-        writeJsonKey(out, "edge_kind");
-        writeJsonString(edgeKindToString(rec.edge_kind), out);
-        writeChar(',', out);
+        writeBinaryLittleEndian(edgeKindToByte(rec.edge_kind), out);
         if (rec.edge_kind == EdgeKind::Root)
         {
-            writeJsonKey(out, "root_shard");
-            writeJsonString(rec.root_shard, out);
-            writeChar(',', out);
-            writeJsonKey(out, "part_name");
-            writeJsonString(rec.part_name, out);
+            writeBinaryLittleEndian(static_cast<uint16_t>(rec.root_shard.size()), out);
+            writeString(rec.root_shard, out);
+            writeBinaryLittleEndian(static_cast<uint16_t>(rec.part_name.size()), out);
+            writeString(rec.part_name, out);
         }
         else
         {
-            writeJsonKey(out, "parent_tree");
-            writeJsonString(u128ToHex(rec.parent_tree), out);
+            writeBinaryLittleEndian(rec.parent_tree, out);
         }
-        writeChar(',', out);
-        writeJsonKey(out, "target_kind");
-        writeJsonString(objectKindToString(rec.target_kind), out);
-        writeChar(',', out);
-        writeJsonKey(out, "target_hash");
-        writeJsonString(u128ToHex(rec.target_hash), out);
-        writeChar('}', out);
+        writeBinaryLittleEndian(static_cast<uint8_t>(rec.target_kind), out);
+        writeBinaryLittleEndian(rec.target_hash, out);
     }
-    writeChar(']', out);
-    writeChar(',', out);
-    writeJsonKey(out, "expanded");
-    writeChar('[', out);
-    first = true;
-    for (const auto & tree : snap.expanded)                      /// sorted hex (set order)
+
+    writeBinaryLittleEndian(static_cast<uint32_t>(snap.expanded.size()), out);
+    for (const auto & tree : snap.expanded)                      /// set order (sorted)
+        writeBinaryLittleEndian(tree, out);
+
+    writeBinaryLittleEndian(static_cast<uint32_t>(snap.known.size()), out);
+    for (const auto & [kind, hash] : snap.known)                 /// set order (sorted by (kind, hash))
     {
-        if (!first)
-            writeChar(',', out);
-        first = false;
-        writeJsonString(u128ToHex(tree), out);
+        writeBinaryLittleEndian(kind, out);
+        writeBinaryLittleEndian(hash, out);
     }
-    writeChar(']', out);
-    writeChar(',', out);
-    writeJsonKey(out, "known");
-    writeChar('[', out);
-    first = true;
-    for (const auto & [kind, hash] : snap.known)                 /// sorted by (kind, hash)
-    {
-        if (!first)
-            writeChar(',', out);
-        first = false;
-        writeChar('{', out);
-        writeJsonKey(out, "kind");
-        writeJsonString(objectKindToString(static_cast<ObjectKind>(kind)), out);
-        writeChar(',', out);
-        writeJsonKey(out, "hash");
-        writeJsonString(u128ToHex(hash), out);
-        writeChar('}', out);
-    }
-    writeChar(']', out);
-    writeChar('}', out);
+
     return std::move(out.str());
 }
 
 GcSnap decodeGcSnap(std::string_view data)
 {
-    return decodeJsonGuarded("gc/snap", [&]
+    return decodeGuarded("gc/snap", [&]
     {
-        auto obj = parseJsonDocument(data, "cas_gc_snap", GC_SNAP_VERSION, "gc/snap");
-        checkNoUnknownKeys(*obj,
-            {"format", "version", "snap_shard", "generation", "edges", "expanded", "known"}, "gc/snap");
+        ReadBufferFromMemory in(data.data(), data.size());
+
+        if (readFixedBytes(in, sizeof(GC_SNAP_MAGIC)) != std::string_view(GC_SNAP_MAGIC, sizeof(GC_SNAP_MAGIC)))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: bad magic");
+
+        uint8_t version = 0;
+        readBinaryLittleEndian(version, in);
+        if (version > GC_SNAP_VERSION)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "CAS gc/snap: unsupported version {}", version);
+        if (version != GC_SNAP_VERSION)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: invalid version {}", version);
 
         GcSnap snap;
-        snap.snap_shard = requireU64(*obj, "snap_shard", "gc/snap");
-        snap.generation = requireU64(*obj, "generation", "gc/snap");
+        readBinaryLittleEndian(snap.snap_shard, in);
+        readBinaryLittleEndian(snap.generation, in);
 
-        auto edges = requireArray(*obj, "edges", "gc/snap");
-        for (size_t i = 0; i < edges->size(); ++i)
+        uint32_t edge_count = 0;
+        readBinaryLittleEndian(edge_count, in);
+        for (uint32_t i = 0; i < edge_count; ++i)
         {
-            auto edge_obj = requireObjectAt(*edges, i, "gc/snap edges");
-
             GcSnap::EdgeRec rec;
-            rec.edge_kind = edgeKindFromString(requireString(*edge_obj, "edge_kind", "gc/snap edge"), "gc/snap edge");
-            switch (rec.edge_kind)
+            uint8_t edge_kind_byte = 0;
+            readBinaryLittleEndian(edge_kind_byte, in);
+            rec.edge_kind = edgeKindFromByte(edge_kind_byte);
+            if (rec.edge_kind == EdgeKind::Root)
             {
-                case EdgeKind::Root:
-                {
-                    checkNoUnknownKeys(*edge_obj,
-                        {"edge_kind", "root_shard", "part_name", "target_kind", "target_hash"}, "gc/snap root edge");
-                    rec.root_shard = requireString(*edge_obj, "root_shard", "gc/snap root edge");
-                    rec.part_name = requireString(*edge_obj, "part_name", "gc/snap root edge");
-                    break;
-                }
-                case EdgeKind::Tree:
-                {
-                    checkNoUnknownKeys(*edge_obj,
-                        {"edge_kind", "parent_tree", "target_kind", "target_hash"}, "gc/snap tree edge");
-                    rec.parent_tree = requireHash(*edge_obj, "parent_tree", "gc/snap tree edge");
-                    break;
-                }
-                case EdgeKind::Pack:
-                {
-                    checkNoUnknownKeys(*edge_obj,
-                        {"edge_kind", "parent_tree", "target_kind", "target_hash"}, "gc/snap pack edge");
-                    rec.parent_tree = requireHash(*edge_obj, "parent_tree", "gc/snap pack edge");
-                    break;
-                }
+                uint16_t shard_len = 0;
+                readBinaryLittleEndian(shard_len, in);
+                rec.root_shard = readFixedBytes(in, shard_len);
+                uint16_t part_len = 0;
+                readBinaryLittleEndian(part_len, in);
+                rec.part_name = readFixedBytes(in, part_len);
             }
-            rec.target_kind = objectKindFromString(requireString(*edge_obj, "target_kind", "gc/snap edge"), "gc/snap edge");
-            rec.target_hash = requireHash(*edge_obj, "target_hash", "gc/snap edge");
+            else
+            {
+                readBinaryLittleEndian(rec.parent_tree, in);
+            }
+            uint8_t target_kind_byte = 0;
+            readBinaryLittleEndian(target_kind_byte, in);
+            rec.target_kind = objectKindFromByte(target_kind_byte);
+            readBinaryLittleEndian(rec.target_hash, in);
+
             if (rec.edge_kind == EdgeKind::Pack && rec.target_kind != ObjectKind::Pack)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS gc/snap: pack edge target_kind must be 'pack', got '{}'",
-                    objectKindToString(rec.target_kind));
+                    "CAS gc/snap: pack edge target_kind must be 'pack', got {}",
+                    static_cast<int>(rec.target_kind));
 
             /// The canonical encoder iterates the edge map, so it can never emit two edges with
             /// the same canonical id — ANY duplicate in a persisted document is corruption (and
@@ -385,28 +340,28 @@ GcSnap decodeGcSnap(std::string_view data)
             snap.addEdge(std::move(rec));                        /// rebuilds indeg (and seeds known)
         }
 
-        auto expanded = requireArray(*obj, "expanded", "gc/snap");
-        for (size_t i = 0; i < expanded->size(); ++i)
+        uint32_t expanded_count = 0;
+        readBinaryLittleEndian(expanded_count, in);
+        for (uint32_t i = 0; i < expanded_count; ++i)
         {
-            const auto var = expanded->get(static_cast<unsigned int>(i));
-            if (var.type() != typeid(String))
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS gc/snap: expanded element {} must be a string", i);
-            snap.expanded.insert(hashFromHex(var.extract<String>(), "gc/snap expanded"));
+            UInt128 tree{};
+            readBinaryLittleEndian(tree, in);
+            snap.expanded.insert(tree);
         }
 
-        /// The explicit known array is authoritative; the edge-derived inserts from addEdge above
+        /// The explicit known set is authoritative; the edge-derived inserts from addEdge above
         /// are a subset of it for any document we encoded (a known node may have zero edges — that
         /// is exactly the zero-in-degree candidate case). Union both (simple and over-count-safe).
-        auto known = requireArray(*obj, "known", "gc/snap");
-        for (size_t i = 0; i < known->size(); ++i)
+        uint32_t known_count = 0;
+        readBinaryLittleEndian(known_count, in);
+        for (uint32_t i = 0; i < known_count; ++i)
         {
-            auto known_obj = requireObjectAt(*known, i, "gc/snap known");
-            checkNoUnknownKeys(*known_obj, {"kind", "hash"}, "gc/snap known entry");
-            const ObjectKind kind
-                = objectKindFromString(requireString(*known_obj, "kind", "gc/snap known"), "gc/snap known");
-            snap.known.insert(GcSnap::NodeKey{
-                static_cast<uint8_t>(kind), requireHash(*known_obj, "hash", "gc/snap known")});
+            uint8_t kind_byte = 0;
+            readBinaryLittleEndian(kind_byte, in);
+            const ObjectKind kind = objectKindFromByte(kind_byte);
+            UInt128 hash{};
+            readBinaryLittleEndian(hash, in);
+            snap.known.insert(GcSnap::NodeKey{static_cast<uint8_t>(kind), hash});
         }
 
         return snap;
