@@ -371,7 +371,8 @@ void IStorageCluster::read(
         {
             auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
             if (remote_initiator_cluster_name.empty())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster' or 'object_storage_cluster'");
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
 
             /// rewrite query to execute `remote('remote_host', s3(...))`
             /// remote_host can execute query itself or make on-cluster query depends on own `object_storage_cluster` setting
@@ -701,6 +702,20 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
 
     /// Follower just reads the data.
     return QueryProcessingStage::Enum::FetchColumns;
+}
+
+NamesAndTypesList IStorageCluster::getHivePartitionColumnsWithoutVirtuals() const
+{
+    // Virtual columns can contain hive columns, so we remove these hive coulmns to avoid duplicates.
+    // In non-cluster case these columns are filtered in DB::prepareReadingFromFormat function.
+    auto virtual_columns = getVirtualsList();
+    NamesAndTypesList hive_partition_filtered;
+    for (const auto & hive_name_and_type : hive_partition_columns_to_read_from_file_path)
+    {
+        if (!virtual_columns.contains(hive_name_and_type.name))
+            hive_partition_filtered.emplace_back(hive_name_and_type);
+    }
+    return hive_partition_filtered;
 }
 
 ContextPtr ReadFromCluster::updateSettings(const Settings & settings)

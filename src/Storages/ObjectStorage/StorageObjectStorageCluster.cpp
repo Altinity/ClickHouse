@@ -36,6 +36,8 @@ namespace Setting
     extern const SettingsObjectStorageGranularityLevel cluster_table_function_split_granularity;
     extern const SettingsBool parallel_replicas_for_cluster_engines;
     extern const SettingsString object_storage_cluster;
+    extern const SettingsBool object_storage_remote_initiator;
+    extern const SettingsString object_storage_remote_initiator_cluster;
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
@@ -46,6 +48,7 @@ namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int INVALID_SETTING_VALUE;
+    extern const int BAD_ARGUMENTS;
 }
 
 String StorageObjectStorageCluster::getPathSample(ContextPtr context)
@@ -622,7 +625,7 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
         predicate,
         filter,
         getVirtualsList(),
-        hive_partition_columns_to_read_from_file_path,
+        getHivePartitionColumnsWithoutVirtuals(),
         nullptr,
         local_context->getFileProgressCallback(),
         /*ignore_archive_globs=*/false,
@@ -719,9 +722,19 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
 QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr & storage_snapshot, SelectQueryInfo & query_info) const
 {
-    /// Full query if fall back to pure storage.
-    if (getClusterName(context).empty())
+    if (!isClusterSupported())
         return QueryProcessingStage::Enum::FetchColumns;
+
+    /// Full query if fall back to pure storage.
+    if (getClusterName(context).empty()  // Not cluster request
+        && context->getSettingsRef()[Setting::object_storage_remote_initiator_cluster].value.empty()) // Not request with remote initiator
+    {
+        if (context->getSettingsRef()[Setting::object_storage_remote_initiator])
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
+
+        return QueryProcessingStage::Enum::FetchColumns;
+    }
 
     /// Distributed storage.
     return IStorageCluster::getQueryProcessingStage(context, to_stage, storage_snapshot, query_info);
