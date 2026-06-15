@@ -160,7 +160,7 @@ def main():
     is_per_test_coverage = False
     runner_options = ""
     # optimal value for most of the jobs
-    nproc = int(Utils.cpu_count() * 0.6)
+    nproc = int(Utils.cpu_count() * 0.5)
     info = Info()
 
     for to in test_options:
