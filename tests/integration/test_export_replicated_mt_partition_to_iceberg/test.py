@@ -1033,11 +1033,8 @@ def test_export_partition_writes_column_statistics(cluster):
 #     synchronously with NUMBER_OF_COLUMNS_DOESNT_MATCH and nothing is scheduled.
 #   * Destination column names need not match source names — positional pairs
 #     are CAST element-wise.
-#   * Castable type differences are accepted at validation time (widening and
-#     even lossy narrowing).  Lossiness only matters at runtime: if the value
-#     does not fit the destination type, the async export worker fails and the
-#     export is marked FAILED in system.replicated_partition_exports; the Iceberg
-#     table is left untouched.
+#   * Lossless casts (e.g. widening) are accepted; lossy casts are rejected at
+#     validation time unless export_merge_tree_part_allow_lossy_cast = 1.
 # ---------------------------------------------------------------------------
 
 
@@ -1200,10 +1197,8 @@ def test_export_partition_with_castable_widening(cluster):
 
 
 def test_export_partition_with_castable_narrowing_values_fit(cluster):
-    """
-    Source column is Int64, destination expects Int32 — lossy in general but
-    not blocked, mirroring INSERT SELECT.
-    """
+    """A lossy narrowing (id Int64 -> Int32) succeeds once the user opts in via
+    export_merge_tree_part_allow_lossy_cast."""
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
@@ -1217,7 +1212,10 @@ def test_export_partition_with_castable_narrowing_values_fit(cluster):
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
+        settings={
+            "allow_insert_into_iceberg": 1,
+            "export_merge_tree_part_allow_lossy_cast": 1,
+        },
     )
     wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
 
@@ -1233,19 +1231,13 @@ def test_export_partition_with_castable_narrowing_values_fit(cluster):
 
 
 def test_export_partition_runtime_cast_failure_propagates_async(cluster):
-    """
-    Source has a String column whose value cannot be parsed as the destination
-    Int32 column.  Validation accepts the type pair (String -> Int32 is a
-    defined conversion) so the ALTER returns synchronously; the actual cast
-    runs in the async export worker and must fail there.  The failure exhausts
-    the retry budget and the export is marked FAILED in
-    system.replicated_partition_exports with a non-zero exception_count, while
-    the Iceberg table is left empty.
+    """A String value that cannot be parsed as the destination Int32 passes the
+    synchronous lossy-cast gate (with export_merge_tree_part_allow_lossy_cast = 1) but
+    fails at runtime in the async worker, marking the export FAILED and leaving Iceberg
+    empty.
 
-    (Integer narrowing overflow is not used here because the internal cast
-    `makeConvertingActions` builds uses `CastType::nonAccurate`, which wraps
-    on overflow rather than throwing — that would still produce a successful
-    export with garbage data, not a propagated failure.)
+    (Integer overflow is not used because the internal cast uses CastType::nonAccurate,
+    which wraps rather than throwing.)
     """
     node = cluster.instances["replica1"]
 
@@ -1260,7 +1252,8 @@ def test_export_partition_runtime_cast_failure_propagates_async(cluster):
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} "
-        f"SETTINGS export_merge_tree_partition_max_retries = 1, allow_insert_into_iceberg = 1"
+        f"SETTINGS export_merge_tree_partition_max_retries = 1, allow_insert_into_iceberg = 1, "
+        f"export_merge_tree_part_allow_lossy_cast = 1"
     )
 
     wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=60)

@@ -102,6 +102,9 @@ namespace ExportPartitionUtils
         /// stalls when the setting is only set at the query level.
         context_copy->setSetting("allow_insert_into_iceberg", true);
 
+        /// This setting, just like allow_insert_into_iceberg, has been verified at request time. At this point, we allow everything.
+        context_copy->setSetting("export_merge_tree_part_allow_lossy_cast", true);
+
 	    return context_copy;
     }
 

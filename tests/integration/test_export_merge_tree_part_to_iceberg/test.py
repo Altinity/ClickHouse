@@ -69,11 +69,15 @@ def get_part(node, table: str, partition_id: str) -> str:
     ).strip()
 
 
-def export_part(node, table: str, part: str, dest: str) -> None:
+def export_part(node, table: str, part: str, dest: str, extra_settings: str = "") -> None:
+    settings = (
+        "allow_experimental_export_merge_tree_part = 1, "
+        "allow_experimental_insert_into_iceberg = 1"
+    )
+    if extra_settings:
+        settings += ", " + extra_settings
     node.query(
-        f"ALTER TABLE {table} EXPORT PART '{part}' TO TABLE {dest} "
-        f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
-        f"allow_experimental_insert_into_iceberg = 1"
+        f"ALTER TABLE {table} EXPORT PART '{part}' TO TABLE {dest} SETTINGS {settings}"
     )
 
 
@@ -560,10 +564,8 @@ def test_export_part_writes_column_statistics(cluster):
 #     synchronously with NUMBER_OF_COLUMNS_DOESNT_MATCH and nothing lands.
 #   * Destination column names need not match source names — positional pairs
 #     are CAST element-wise.
-#   * Castable type differences are accepted at validation time (widening and
-#     even lossy narrowing).  Lossiness only matters at runtime: if the value
-#     does not fit the destination type, the async export worker fails and the
-#     failure surfaces via system.part_log; the Iceberg table is untouched.
+#   * Lossless casts (e.g. widening) are accepted; lossy casts are rejected at
+#     validation time unless export_merge_tree_part_allow_lossy_cast = 1.
 # ---------------------------------------------------------------------------
 
 
@@ -701,10 +703,8 @@ def test_export_part_with_castable_widening(cluster):
 
 
 def test_export_part_with_castable_narrowing_values_fit(cluster):
-    """
-    Source column is Int64, destination expects Int32 — lossy in general but
-    not blocked, mirroring INSERT SELECT.
-    """
+    """A lossy narrowing (id Int64 -> Int32) succeeds once the user opts in via
+    export_merge_tree_part_allow_lossy_cast."""
     node = cluster.instances["node1"]
     sfx = unique_suffix()
     mt = f"mt_narrow_fit_{sfx}"
@@ -716,7 +716,7 @@ def test_export_part_with_castable_narrowing_values_fit(cluster):
     node.query(f"INSERT INTO {mt} VALUES (1, 2020), (2, 2020)")
     part_2020 = get_part(node, mt, "2020")
 
-    export_part(node, mt, part_2020, iceberg)
+    export_part(node, mt, part_2020, iceberg, "export_merge_tree_part_allow_lossy_cast = 1")
     wait_for_export_part(node, mt, part_2020)
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
@@ -736,18 +736,13 @@ def test_export_part_with_castable_narrowing_values_fit(cluster):
 
 
 def test_export_part_runtime_cast_failure_propagates_async(cluster):
-    """
-    Source has a String column whose value cannot be parsed as the destination
-    Int32 column.  Validation accepts the type pair (String -> Int32 is a
-    defined conversion) so the ALTER returns synchronously; the actual cast
-    runs in the async export worker and must fail there.  The failure is
-    propagated to system.part_log (non-zero `error` column with a non-empty
-    `exception` text) and the Iceberg table is left empty.
+    """A String value that cannot be parsed as the destination Int32 passes the
+    synchronous lossy-cast gate (with export_merge_tree_part_allow_lossy_cast = 1) but
+    fails at runtime in the async worker; the failure surfaces in system.part_log and
+    Iceberg is left empty.
 
-    (Integer narrowing overflow is not used here because the internal cast
-    `makeConvertingActions` builds uses `CastType::nonAccurate`, which wraps
-    on overflow rather than throwing — that would still produce a successful
-    export with garbage data, not a propagated failure.)
+    (Integer overflow is not used because the internal cast uses CastType::nonAccurate,
+    which wraps rather than throwing.)
     """
     node = cluster.instances["node1"]
     sfx = unique_suffix()
@@ -760,7 +755,7 @@ def test_export_part_runtime_cast_failure_propagates_async(cluster):
     node.query(f"INSERT INTO {mt} VALUES ('not a number', 2020)")
     part_2020 = get_part(node, mt, "2020")
 
-    export_part(node, mt, part_2020, iceberg)
+    export_part(node, mt, part_2020, iceberg, "export_merge_tree_part_allow_lossy_cast = 1")
 
     exception = wait_for_failed_export_part(node, mt, part_2020)
     assert exception, (
