@@ -107,6 +107,12 @@ In case a table function is used as the destination, the schema can be omitted a
 - **Default**: `{part_name}_{checksum}`
 - **Description**: Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
 
+### `export_merge_tree_part_allow_lossy_cast` (Optional)
+
+- **Type**: `Bool`
+- **Default**: `false`
+- **Description**: Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
+
 
 ## Examples
 
