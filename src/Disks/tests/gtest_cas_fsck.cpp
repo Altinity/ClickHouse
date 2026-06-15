@@ -4,8 +4,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/Exception.h>
 
 #include <algorithm>
+#include <chrono>
 #include <set>
 
 using namespace DB::Cas;
@@ -84,6 +86,38 @@ TEST(CasFsck, CleanPoolHasNoDangling)
     EXPECT_EQ(report.unreachable, 0u);
     EXPECT_EQ(report.distinct_blobs, 1u);
     EXPECT_EQ(report.total_blob_refs, 2u);
+}
+
+// #5: the progress callback fires during the scan and does NOT alter the report (purely observational).
+TEST(CasFsck, ProgressCallbackFiresAndIsObservational)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPool(backend);
+    publishPart(*store, "shared-A", "all_1_1_0");
+    publishPart(*store, "shared-B", "all_2_2_0");
+
+    const auto baseline = runFsck(*store, /*detail=*/true);
+
+    uint64_t calls = 0;
+    const auto with_progress = runFsck(*store, /*detail=*/true,
+        [&](std::string_view, uint64_t, uint64_t) { ++calls; });
+
+    EXPECT_GT(calls, 0u);   // at least the end-of-listAll calls (blobs/trees/packs) fire
+    EXPECT_EQ(with_progress.reachable, baseline.reachable);
+    EXPECT_EQ(with_progress.dangling, baseline.dangling);
+    EXPECT_EQ(with_progress.unreachable, baseline.unreachable);
+    EXPECT_EQ(with_progress.physical_bytes, baseline.physical_bytes);
+}
+
+// #5: an already-expired deadline makes runFsck throw (bounded scan, not an opaque hang).
+TEST(CasFsck, ExpiredDeadlineThrowsTimeout)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPool(backend);
+    publishPart(*store, "shared-A", "all_1_1_0");
+
+    const auto past = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    EXPECT_THROW(runFsck(*store, /*detail=*/false, {}, past), DB::Exception);
 }
 
 TEST(CasFsck, MissingReachableBlobIsDangling)

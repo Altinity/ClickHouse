@@ -2,31 +2,63 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 
+#include <Common/Exception.h>
+
 #include <functional>
 #include <set>
 #include <unordered_map>
+
+namespace DB::ErrorCodes
+{
+    extern const int TIMEOUT_EXCEEDED;
+}
 
 namespace DB::Cas
 {
 
 namespace
 {
-void listAll(Backend & backend, const String & prefix, std::unordered_map<String, uint64_t> & out)
+/// Report progress every PROGRESS_PAGES list pages so a long/slow scan is visibly working (#5).
+constexpr uint64_t PROGRESS_PAGES = 16;
+
+using Deadline = std::optional<std::chrono::steady_clock::time_point>;
+
+/// Bound the WHOLE scan (checked between pages/refs): a slow-but-progressing scan surfaces a clear
+/// error instead of an opaque hang. (A single page stuck in S3-client retries is bounded by the
+/// disk's S3 retry/timeout settings, not here.)
+void checkDeadline(const Deadline & deadline, std::string_view phase)
+{
+    if (deadline && std::chrono::steady_clock::now() > *deadline)
+        throw Exception(ErrorCodes::TIMEOUT_EXCEEDED,
+            "fsck: exceeded the deadline during '{}' — likely a RustFS LIST stall under load. "
+            "Run against a QUIESCED pool, raise --timeout, or lower the disk's S3 retry budget (see B158).", phase);
+}
+
+void listAll(Backend & backend, const String & prefix, std::unordered_map<String, uint64_t> & out,
+             const FsckProgress & on_progress, const Deadline & deadline, std::string_view phase)
 {
     String cursor;
+    uint64_t pages = 0;
     while (true)
     {
         ListPage page = backend.list(prefix, cursor, 1000);
         for (const auto & k : page.keys)
             out[k.key] = k.size;
+        ++pages;
+        checkDeadline(deadline, phase);
+        if (on_progress && pages % PROGRESS_PAGES == 0)
+            on_progress(phase, out.size(), pages);
         if (page.next_cursor.empty())
             break;
         cursor = page.next_cursor;
     }
+    if (on_progress)
+        on_progress(phase, out.size(), pages);
 }
 }
 
-FsckReport runFsck(Store & store, bool detail)
+FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
+                   std::optional<std::chrono::steady_clock::time_point> deadline)
 {
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
@@ -79,6 +111,7 @@ FsckReport runFsck(Store & store, bool detail)
         }
     };
 
+    uint64_t refs_walked = 0;
     for (const String & ns_str : store.listNamespaces(""))
     {
         const RootNamespace ns{ns_str};
@@ -86,14 +119,20 @@ FsckReport runFsck(Store & store, bool detail)
         {
             std::set<String> seen;
             walk(resolved.tree_id, ns_str + "/" + ref_name, seen);
+            if (++refs_walked % 64 == 0)
+            {
+                checkDeadline(deadline, "walking refs");
+                if (on_progress)
+                    on_progress("walking refs", reachable.size(), refs_walked);
+            }
         }
     }
     report.distinct_blobs = reachable_blobs.size();
 
     std::unordered_map<String, uint64_t> present;
-    listAll(backend, layout.blobsPrefix(), present);
-    listAll(backend, layout.treesPrefix(), present);
-    listAll(backend, layout.packsPrefix(), present);
+    listAll(backend, layout.blobsPrefix(), present, on_progress, deadline, "listing blobs");
+    listAll(backend, layout.treesPrefix(), present, on_progress, deadline, "listing trees");
+    listAll(backend, layout.packsPrefix(), present, on_progress, deadline, "listing packs");
     for (const auto & [_, sz] : present)
         report.physical_bytes += sz;
 
