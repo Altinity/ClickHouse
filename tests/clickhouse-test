@@ -4435,6 +4435,11 @@ def run_tests_array(
         + colored(" NOT_FAILED ", args, "red", attrs=["bold"])
         + CL_SQUARE_BRACKET
     )
+    MSG_BROKEN = (
+        OP_SQUARE_BRACKET
+        + colored(" BROKEN ", args, "yellow", attrs=["bold"])
+        + CL_SQUARE_BRACKET
+    )
 
     MESSAGES = {
         TestStatus.FAIL: MSG_FAIL,
@@ -4442,10 +4447,12 @@ def run_tests_array(
         TestStatus.OK: MSG_OK,
         TestStatus.SKIPPED: MSG_SKIPPED,
         TestStatus.NOT_FAILED: MSG_NOT_FAILED,
+        TestStatus.BROKEN: MSG_BROKEN,
     }
 
     passed_total = 0
     skipped_total = 0
+    broken_total = 0
     failures_total = 0
     failures_chain = 0
     start_time = datetime.now()
