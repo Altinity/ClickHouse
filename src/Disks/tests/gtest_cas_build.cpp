@@ -140,7 +140,52 @@ TEST(CasBuild, ReuseBlobAbsentThrows)
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     auto build = s->startBuild({});
-    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { build->reuseBlob(idOf("never-written")); });
+    /// B156: reuseBlob treats absent-on-reuse as a retryable race (caller only reuses known-staged blobs);
+    /// genuinely-never-existed is caught by adoptTree/putBlob fail-closed paths.
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->reuseBlob(idOf("never-written")); });
+}
+
+TEST(CasBuildReuseBlob, VanishedBlobIsRetryableAborted)
+{
+    /// B156: reuseBlob on a blob that was deleted by GC after being staged (putBlob'd) in this same
+    /// transaction must throw ABORTED (retryable), NOT FILE_DOESNT_EXIST (fatal).
+    ///
+    /// The race: the blob DID exist when the transaction uploaded it; GC's exact-token deleteExact
+    /// landed between the reuseBlob call and our HEAD inside observeAndAdmit. The caller (e.g.,
+    /// ContentAddressedTransaction::createHardLink / moveDirectory / moveFile) detects ABORTED and
+    /// retries, which re-uploads the content via putBlob from the held source. The fatal
+    /// FILE_DOESNT_EXIST path is intentionally preserved for putBlob's body-holding retry and
+    /// adoptTree's never-existed fail-closed semantics — those callers are NOT going through reuseBlob.
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// 1. Upload a blob so it exists, capture its token t0.
+    BlobId id;
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        auto build0 = s0->startBuild({});
+        id = build0->putBlob(idOf("reuse-payload"), BlobSource::fromString("reuse-payload")).id;
+        t0 = b->head(s0->layout().blobKey(id)).token;
+    }
+
+    /// 2. Delete it from the backend to simulate GC's exact-token deleteExact.
+    DB::Cas::Layout layout("p");
+    b->deleteExact(layout.blobKey(id), t0);
+    ASSERT_FALSE(b->head(layout.blobKey(id)).exists);
+
+    /// 3. reuseBlob on the now-absent blob must throw ABORTED (retryable), not FILE_DOESNT_EXIST (fatal).
+    auto s = openStore(b);
+    auto build = s->startBuild({});
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->reuseBlob(id); });
+
+    /// 4. Confirm: a successful reuseBlob on a live (non-deleted) blob still works.
+    {
+        auto s1 = openStore(b);
+        auto build1 = s1->startBuild({});
+        const BlobId live_id = build1->putBlob(idOf("live-payload"), BlobSource::fromString("live-payload")).id;
+        auto ref = build1->reuseBlob(live_id);
+        EXPECT_EQ(ref.id, live_id);
+    }
 }
 
 TEST(CasBuild, ReuseBlobCondemnedResurrects)

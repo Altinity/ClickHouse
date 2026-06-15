@@ -185,7 +185,27 @@ BlobRef Build::reuseBlob(const BlobId & id)
 {
     requireAlive();
     const UInt128 logical_hash = hexToU128(id.string());
-    const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, store->layout().blobKey(id));
+    const String key = store->layout().blobKey(id);
+    uint64_t admitted;
+    try
+    {
+        admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key);
+    }
+    catch (const Exception & e)
+    {
+        /// B156: reuseBlob has NO body in hand (cold reuse of a blob staged earlier in this same
+        /// transaction). If observeAndAdmit finds it HEAD-absent, GC's exact-token deleteExact landed
+        /// between the reuse decision and our HEAD (e.g. the in-flight build's heartbeat lapsed under
+        /// load and GC condemned+deleted it). This is a BENIGN race — the blob DID exist (it was
+        /// putBlob'd in this transaction); surface it as retryable ABORTED so the caller retries (the
+        /// retry re-uploads the content via putBlob from source), mirroring resurrect's GET-vanish.
+        /// NOT a hard FILE_DOESNT_EXIST — that code is load-bearing for putBlob's body-holding retry
+        /// and adoptTree's fail-closed never-existed semantics (both deliberately untouched).
+        if (e.code() == ErrorCodes::FILE_DOESNT_EXIST)
+            throw Exception(ErrorCodes::ABORTED,
+                "Build::reuseBlob: blob {} vanished (GC-deleted between reuse decision and HEAD); retry the operation", key);
+        throw;
+    }
     return BlobRef{id, admitted};
 }
 
