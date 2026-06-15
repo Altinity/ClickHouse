@@ -45,31 +45,26 @@ ALTER TABLE 03572_ephemeral_mt_table EXPORT PART '2020_1_1_0' TO TABLE 03572_mat
 CREATE TABLE 03572_partition_type_mismatch_mt (id UInt64, year String) ENGINE = MergeTree() PARTITION BY year ORDER BY tuple();
 CREATE TABLE 03572_partition_type_mismatch_s3 (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='03572_partition_type_mismatch_s3', format='Parquet', partition_strategy='hive') PARTITION BY year;
 
--- The lossy-cast check fires synchronously BEFORE the part lookup,
--- so we don't need to insert data nor use a real part name to provoke it.
-ALTER TABLE 03572_partition_type_mismatch_mt EXPORT PART 'any_part_name' TO TABLE 03572_partition_type_mismatch_s3
+ALTER TABLE 03572_partition_type_mismatch_mt EXPORT PART '2020_1_1_0' TO TABLE 03572_partition_type_mismatch_s3
 SETTINGS allow_experimental_export_merge_tree_part = 1; -- {serverError BAD_ARGUMENTS}
 
--- A lossy cast on a non-partition column (Int64 -> Int32) may silently change values.
--- It is rejected synchronously by default. The check fires BEFORE the part lookup, so a
--- fake part name is enough to provoke it.
 CREATE TABLE 03572_lossy_mt (id Int64, year UInt16) ENGINE = MergeTree() PARTITION BY year ORDER BY tuple();
 CREATE TABLE 03572_lossy_s3 (id Int32, year UInt16) ENGINE = S3(s3_conn, filename='03572_lossy_s3', format='Parquet', partition_strategy='hive') PARTITION BY year;
 
-ALTER TABLE 03572_lossy_mt EXPORT PART 'any_part_name' TO TABLE 03572_lossy_s3
+ALTER TABLE 03572_lossy_mt EXPORT PART '2020_1_1_0' TO TABLE 03572_lossy_s3
 SETTINGS allow_experimental_export_merge_tree_part = 1; -- {serverError BAD_ARGUMENTS}
 
--- With the acknowledgment setting enabled, the same lossy cast is allowed: schema validation
--- passes and execution proceeds to the part lookup, which fails on the fake part name.
-ALTER TABLE 03572_lossy_mt EXPORT PART 'any_part_name' TO TABLE 03572_lossy_s3
+-- With the acknowledgment setting enabled, the lossy cast passes validation and reaches the
+-- part lookup, which fails because the part does not exist.
+ALTER TABLE 03572_lossy_mt EXPORT PART '2020_1_1_0' TO TABLE 03572_lossy_s3
 SETTINGS allow_experimental_export_merge_tree_part = 1, export_merge_tree_part_allow_lossy_cast = 1; -- {serverError NO_SUCH_DATA_PART}
 
--- A lossless widening cast (Int32 -> Int64) is always allowed without the setting: schema
--- validation passes and we reach the part lookup, which fails on the fake part name.
+-- A lossless widening cast (Int32 -> Int64) passes validation without the setting and reaches
+-- the part lookup, which fails because the part does not exist.
 CREATE TABLE 03572_lossless_mt (id Int32, year UInt16) ENGINE = MergeTree() PARTITION BY year ORDER BY tuple();
 CREATE TABLE 03572_lossless_s3 (id Int64, year UInt16) ENGINE = S3(s3_conn, filename='03572_lossless_s3', format='Parquet', partition_strategy='hive') PARTITION BY year;
 
-ALTER TABLE 03572_lossless_mt EXPORT PART 'any_part_name' TO TABLE 03572_lossless_s3
+ALTER TABLE 03572_lossless_mt EXPORT PART '2020_1_1_0' TO TABLE 03572_lossless_s3
 SETTINGS allow_experimental_export_merge_tree_part = 1; -- {serverError NO_SUCH_DATA_PART}
 
 DROP TABLE IF EXISTS 03572_mt_table, 03572_invalid_schema_table, 03572_ephemeral_mt_table, 03572_matching_ephemeral_s3_table, 03572_partition_type_mismatch_mt, 03572_partition_type_mismatch_s3, 03572_lossy_mt, 03572_lossy_s3, 03572_lossless_mt, 03572_lossless_s3;
