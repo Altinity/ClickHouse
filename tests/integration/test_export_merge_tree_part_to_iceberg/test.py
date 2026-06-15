@@ -553,22 +553,6 @@ def test_export_part_writes_column_statistics(cluster):
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
-# ---------------------------------------------------------------------------
-# Schema compatibility (INSERT SELECT mirror)
-#
-# EXPORT PART builds an ActionsDAG via makeConvertingActions(Position) — the
-# same primitive that powers INSERT INTO dest SELECT * FROM src.  The tests
-# below pin that contract:
-#
-#   * Column counts must match positionally; otherwise the ALTER is rejected
-#     synchronously with NUMBER_OF_COLUMNS_DOESNT_MATCH and nothing lands.
-#   * Destination column names need not match source names — positional pairs
-#     are CAST element-wise.
-#   * Lossless casts (e.g. widening) are accepted; lossy casts are rejected at
-#     validation time unless export_merge_tree_part_allow_lossy_cast = 1.
-# ---------------------------------------------------------------------------
-
-
 def test_export_part_column_count_mismatch_source_more_is_rejected(cluster):
     """
     Source has 3 columns (id, year, extra), destination has 2 (id, year).

@@ -746,40 +746,6 @@ def test_partition_key_compatibility_check(cluster):
     )
 
 
-def test_export_partition_partition_column_lossless_widening(cluster):
-    """A lossless widening of a partition column (year Int32 -> Int64) round-trips."""
-    node = cluster.instances["replica1"]
-
-    uid = unique_suffix()
-    mt_table = f"mt_pcol_widening_{uid}"
-    iceberg_table = f"iceberg_pcol_widening_{uid}"
-
-    # Source uses year Int32; destination Iceberg uses year Int64.
-    make_rmt(node, mt_table, "id Int64, year Int32", "year", replica_name="replica1")
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020)")
-
-    make_iceberg_s3(
-        node, iceberg_table, "id Int64, year Int64",
-        partition_by="year", s3_retry_attempts=3,
-    )
-
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
-
-    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
-    assert count == 3, f"Expected 3 rows in Iceberg table after export, got {count}"
-
-    result = node.query(
-        f"SELECT id, toTypeName(year), year FROM {iceberg_table} ORDER BY id"
-    ).strip()
-    assert result == "1\tInt64\t2020\n2\tInt64\t2020\n3\tInt64\t2020", (
-        f"Unexpected widened partition-column data:\n{result}"
-    )
-
-
 def test_export_ttl(cluster):
     """
     After a manifest TTL expires the same partition can be re-exported, and the
@@ -1020,24 +986,6 @@ def test_export_partition_writes_column_statistics(cluster):
     assert_exported_stats(entries)
 
 
-# ---------------------------------------------------------------------------
-# Schema compatibility (INSERT SELECT mirror)
-#
-# EXPORT PARTITION builds an ActionsDAG via makeConvertingActions(Position) — the
-# same primitive that powers INSERT INTO dest SELECT * FROM src.  The destination
-# compatibility validation in StorageReplicatedMergeTree::exportPartitionToTable
-# mirrors what the plain-MergeTree EXPORT PART path does in MergeTreeData, so the
-# tests below pin the same contract for the replicated partition export:
-#
-#   * Column counts must match positionally; otherwise the ALTER is rejected
-#     synchronously with NUMBER_OF_COLUMNS_DOESNT_MATCH and nothing is scheduled.
-#   * Destination column names need not match source names — positional pairs
-#     are CAST element-wise.
-#   * Lossless casts (e.g. widening) are accepted; lossy casts are rejected at
-#     validation time unless export_merge_tree_part_allow_lossy_cast = 1.
-# ---------------------------------------------------------------------------
-
-
 def test_export_partition_column_count_mismatch_source_more_is_rejected(cluster):
     """
     Source has 3 columns (id, year, extra), destination has 2 (id, year).
@@ -1162,12 +1110,8 @@ def test_export_partition_with_renamed_destination_column(cluster):
 
 
 def test_export_partition_with_castable_widening(cluster):
-    """
-    Source column is Int32, destination expects Int64.  makeConvertingActions
-    inserts a widening CAST; the export must succeed and the values must land
-    as Int64 in Iceberg.  The partition column `year` keeps the same Int32 type
-    on both sides so the exact-type partition check is satisfied.
-    """
+    """A lossless widening of both a data column (id Int32 -> Int64) and the
+    partition column (year Int32 -> Int64) round-trips."""
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
@@ -1177,7 +1121,7 @@ def test_export_partition_with_castable_widening(cluster):
     make_rmt(node, mt_table, "id Int32, year Int32", "year", replica_name="replica1")
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020)")
 
-    make_iceberg_s3(node, iceberg_table, "id Int64, year Int32", partition_by="year")
+    make_iceberg_s3(node, iceberg_table, "id Int64, year Int64", partition_by="year")
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
@@ -1189,9 +1133,9 @@ def test_export_partition_with_castable_widening(cluster):
     assert count == 2, f"Expected 2 rows in Iceberg table after export, got {count}"
 
     result = node.query(
-        f"SELECT id, toTypeName(id), year FROM {iceberg_table} ORDER BY id"
+        f"SELECT id, toTypeName(id), year, toTypeName(year) FROM {iceberg_table} ORDER BY id"
     ).strip()
-    assert result == "1\tInt64\t2020\n2\tInt64\t2020", (
+    assert result == "1\tInt64\t2020\tInt64\n2\tInt64\t2020\tInt64", (
         f"Unexpected widened data:\n{result}"
     )
 
@@ -1228,6 +1172,31 @@ def test_export_partition_with_castable_narrowing_values_fit(cluster):
     assert result == "1\tInt32\t2020\n2\tInt32\t2020", (
         f"Unexpected narrowed data:\n{result}"
     )
+
+
+def test_export_partition_lossy_cast_rejected_without_optin(cluster):
+    """A lossy narrowing (id Int64 -> Int32) is rejected synchronously with
+    BAD_ARGUMENTS unless export_merge_tree_part_allow_lossy_cast is set."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_lossy_reject_{uid}"
+    iceberg_table = f"iceberg_lossy_reject_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, year Int32", "year", replica_name="replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int32, year Int32", partition_by="year")
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} "
+        f"SETTINGS allow_insert_into_iceberg = 1"
+    )
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error!r}"
+    assert "lossy cast" in error, f"Expected 'lossy cast' in error, got: {error!r}"
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected no rows after a rejected export, got {count}"
 
 
 def test_export_partition_runtime_cast_failure_propagates_async(cluster):
@@ -1272,3 +1241,158 @@ def test_export_partition_runtime_cast_failure_propagates_async(cluster):
     assert count == 0, (
         f"Expected 0 rows in Iceberg table after failed export, got {count}"
     )
+
+
+def test_export_partition_all_iceberg_types(cluster):
+    """Every getIcebergType-supported type round-trips through an EXPORT PARTITION:
+    scalars use narrower source types (explicit lossless widening CASTs), plus
+    Array/Map/Tuple nested columns."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_all_types_{uid}"
+    iceberg_table = f"iceberg_all_types_{uid}"
+
+    # Scalar source types are strictly narrower than the destination; the export inserts
+    # a positional widening CAST per column (Int8->Int16, UInt32->UInt64, ...). Nested
+    # columns keep the same type on both sides.
+    source_columns = (
+        "i16 Int8, u16 UInt8, u32 UInt16, u64 UInt32, "
+        "id Int16, big Int32, f32 Float32, f64 Float64, "
+        "d Date, d32 Date32, dt DateTime, dt64 DateTime64(6), "
+        "s String, uid UUID, "
+        "arr Array(Int32), m Map(String, Int64), tup Tuple(a Int32, b String), "
+        "year Int32"
+    )
+    dest_columns = (
+        "i16 Int16, u16 UInt16, u32 UInt32, u64 UInt64, "
+        "id Int32, big Int64, f32 Float32, f64 Float64, "
+        "d Date, d32 Date32, dt DateTime, dt64 DateTime64(6), "
+        "s String, uid UUID, "
+        "arr Array(Int32), m Map(String, Int64), tup Tuple(a Int32, b String), "
+        "year Int32"
+    )
+
+    make_rmt(node, mt_table, source_columns, "year", replica_name="replica1")
+    make_iceberg_s3(node, iceberg_table, dest_columns, partition_by="year")
+
+    node.query(
+        f"""
+        INSERT INTO {mt_table}
+            (i16, u16, u32, u64, id, big, f32, f64, d, d32, dt, dt64, s, uid, arr, m, tup, year)
+        VALUES (
+            -100, 200, 50000, 4000000000,
+            12345, 1000000000, 3.14, 2.718281828459045,
+            '2024-01-15', '2024-01-15', '2024-01-15 12:30:45', '2024-01-15 12:30:45.123456',
+            'hello iceberg', '550e8400-e29b-41d4-a716-446655440000',
+            [1, 2, 3], {{'a': 10, 'b': 20}}, (7, 'seven'), 2024
+        )
+        """
+    )
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2024' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "2024", "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 1, f"Expected 1 row in Iceberg table, got {count}"
+
+    result = node.query(
+        f"""
+        SELECT
+            i16, u16, u32, u64, id, big,
+            toString(d), toString(d32), toString(dt),
+            s, toString(uid),
+            arr, m['a'], m['b'], tup.a, tup.b, year
+        FROM {iceberg_table}
+        """
+    ).strip()
+    expected = "\t".join([
+        "-100", "200", "50000", "4000000000",
+        "12345", "1000000000",
+        "2024-01-15", "2024-01-15", "2024-01-15 12:30:45.000000",
+        "hello iceberg", "550e8400-e29b-41d4-a716-446655440000",
+        "[1,2,3]", "10", "20", "7", "seven", "2024",
+    ])
+    assert result == expected, f"Unexpected round-trip data:\n{result!r}\nexpected:\n{expected!r}"
+
+    # Floats compared with a tolerance to avoid formatting flakiness.
+    floats_ok = node.query(
+        f"SELECT abs(f32 - 3.14) < 1e-4 AND abs(f64 - 2.718281828459045) < 1e-12 FROM {iceberg_table}"
+    ).strip()
+    assert floats_ok == "1", f"Float round-trip outside tolerance: {floats_ok!r}"
+
+    # DateTime64 sub-second component: assert the date part is preserved (exact format varies).
+    ts_result = node.query(f"SELECT dt64 FROM {iceberg_table}").strip()
+    assert "2024-01-15" in ts_result, f"DateTime64 date component missing: {ts_result!r}"
+
+
+def test_export_partition_all_iceberg_types_lossy(cluster):
+    """Lossy narrowing casts across types succeed with the opt-in flag: values that
+    fit round-trip, Float64 -> Float32 loses precision, and Nullable columns carry
+    both NULL and non-NULL (the latter via a lossy Nullable(Int64) -> Nullable(Int32))."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_lossy_types_{uid}"
+    iceberg_table = f"iceberg_lossy_types_{uid}"
+
+    # Each source column is wider than the destination, so the export inserts a lossy
+    # narrowing CAST (allowed only because export_merge_tree_part_allow_lossy_cast=1).
+    # Int8/UInt8 are not Iceberg-representable, so the narrowest integer dest is Int16.
+    source_columns = (
+        "big Int64, ubig UInt64, mid Int32, "
+        "f Float64, dt DateTime64(6), d Date32, "
+        "opt_s Nullable(String), opt_i Nullable(Int64), year Int32"
+    )
+    dest_columns = (
+        "big Int32, ubig UInt32, mid Int16, "
+        "f Float32, dt DateTime, d Date, "
+        "opt_s Nullable(String), opt_i Nullable(Int32), year Int32"
+    )
+
+    make_rmt(node, mt_table, source_columns, "year", replica_name="replica1")
+    make_iceberg_s3(node, iceberg_table, dest_columns, partition_by="year")
+
+    # Values chosen to fit the destination types (the async cast wraps on overflow
+    # rather than throwing, so out-of-range values would silently corrupt instead).
+    # opt_s is NULL and opt_i is set, covering both nullable paths in one row.
+    node.query(
+        f"""
+        INSERT INTO {mt_table} (big, ubig, mid, f, dt, d, opt_s, opt_i, year)
+        VALUES (
+            1000000, 2000000000, 30000,
+            2.718281828459045, '2024-01-15 12:30:45.123456', '2024-01-15',
+            NULL, 100, 2024
+        )
+        """
+    )
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2024' TO TABLE {iceberg_table}",
+        settings={
+            "allow_insert_into_iceberg": 1,
+            "export_merge_tree_part_allow_lossy_cast": 1,
+        },
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "2024", "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 1, f"Expected 1 row in Iceberg table, got {count}"
+
+    result = node.query(
+        f"SELECT big, ubig, mid, toString(d), toString(dt), opt_s, opt_i, year FROM {iceberg_table}"
+    ).strip()
+    expected = "\t".join([
+        "1000000", "2000000000", "30000",
+        "2024-01-15", "2024-01-15 12:30:45.000000", "\\N", "100", "2024",
+    ])
+    assert result == expected, f"Unexpected lossy round-trip data:\n{result!r}\nexpected:\n{expected!r}"
+
+    # Float64 -> Float32 stays within Float32 precision but is no longer exact.
+    f_checks = node.query(
+        f"SELECT abs(f - 2.718281828459045) < 1e-6, abs(f - 2.718281828459045) > 1e-9 FROM {iceberg_table}"
+    ).strip()
+    assert f_checks == "1\t1", f"Expected Float32 precision loss within tolerance, got: {f_checks!r}"
