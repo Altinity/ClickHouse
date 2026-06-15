@@ -112,10 +112,12 @@ PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const 
         /// its object ETag in the PutObject/CompleteMultipartUpload response, so no follow-up HEAD
         /// is needed — this is ~73% of the CA backend's HEADs. A backend with no write-time ETag
         /// (local files) returns nullopt and we fall back to the HEAD (a cheap local stat there).
-        if (auto etag = buf->getResultObjectETag())
+        if (auto etag = buf->getResultObjectETag(); etag && !etag->empty())
             *out_token = Token{*etag, TokenType::ETag};
         else
         {
+            /// No write-time ETag (local files) or an (anomalous) empty one: fall back to the HEAD —
+            /// the pre-existing behavior, so an empty-ETag server is never worse than before.
             auto hr = nativeHead(key);
             *out_token = hr ? hr->token : Token{};
         }
@@ -155,10 +157,11 @@ public:
             /// returns its object ETag in the response, so no follow-up HEAD is needed (the bulk of
             /// the CA backend's HEADs). Backends with no write-time ETag (local) return nullopt and
             /// we fall back to the HEAD (a cheap local stat there).
-            if (auto etag = write_buf->getResultObjectETag())
+            if (auto etag = write_buf->getResultObjectETag(); etag && !etag->empty())
                 *out_token = Token{*etag, TokenType::ETag};
             else
             {
+                /// No write-time ETag (local) or an (anomalous) empty one: fall back to the HEAD.
                 auto hr = backend.head(key);
                 *out_token = hr.exists ? hr.token : Token{};
             }

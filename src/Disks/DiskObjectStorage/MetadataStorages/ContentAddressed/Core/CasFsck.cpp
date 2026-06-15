@@ -119,12 +119,10 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
         {
             std::set<String> seen;
             walk(resolved.tree_id, ns_str + "/" + ref_name, seen);
-            if (++refs_walked % 64 == 0)
-            {
-                checkDeadline(deadline, "walking refs");
-                if (on_progress)
-                    on_progress("walking refs", reachable.size(), refs_walked);
-            }
+            ++refs_walked;
+            checkDeadline(deadline, "walking refs");   /// every ref (cheap) — fires even for pools < 64 refs
+            if (on_progress && refs_walked % 64 == 0)
+                on_progress("walking refs", reachable.size(), refs_walked);
         }
     }
     report.distinct_blobs = reachable_blobs.size();
