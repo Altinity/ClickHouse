@@ -385,28 +385,12 @@ def test_export_part_with_year_transform_partition(cluster):
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
-def test_export_part_partition_column_type_mismatch_is_rejected(cluster):
-    """
-    EXPORT PART must synchronously reject (BAD_ARGUMENTS) when a partition
-    column has different (even castable) types on source and destination.
-
-    The partition path / Iceberg partition values are computed from the
-    SOURCE part's minmax block in ExportPartTask::executeStep before
-    addExportConvertingActions casts the data, so a castable mismatch on
-    a partition column would let the path/value computation and the row
-    data disagree. The check in
-    ExportPartitionUtils::verifyPartitionColumnsExactTypeMatch rejects this
-    at ALTER time.
-
-    Failing case: source `year Int32` -> destination `year Int64`, both
-    PARTITION BY year (identity transform). Both Int32 and Int64 are valid
-    Iceberg primitives, so verifyIcebergPartitionCompatibility happily
-    accepts the spec — only the exact-type check rejects.
-    """
+def test_export_part_partition_column_lossless_widening(cluster):
+    """A lossless widening of a partition column (year Int32 -> Int64) round-trips."""
     node = cluster.instances["node1"]
     sfx = unique_suffix()
-    mt = f"mt_pcol_type_mismatch_{sfx}"
-    iceberg = f"iceberg_pcol_type_mismatch_{sfx}"
+    mt = f"mt_pcol_widening_{sfx}"
+    iceberg = f"iceberg_pcol_widening_{sfx}"
 
     make_mt(node, mt, "id Int32, year Int32", "year")
     make_iceberg_s3(node, iceberg, "id Int32, year Int64", "year")
@@ -414,39 +398,20 @@ def test_export_part_partition_column_type_mismatch_is_rejected(cluster):
     node.query(f"INSERT INTO {mt} VALUES (1, 2020), (2, 2020), (3, 2020)")
 
     part_2020 = get_part(node, mt, "2020")
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
-        f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
-        f"allow_experimental_insert_into_iceberg = 1"
-    )
-    assert "BAD_ARGUMENTS" in error, (
-        f"Expected BAD_ARGUMENTS for partition-column type mismatch, "
-        f"got: {error!r}"
-    )
-    assert "partition key column 'year'" in error, (
-        f"Expected the error message to identify the offending partition "
-        f"column 'year', got: {error!r}"
-    )
-
-    # No async work scheduled: no ExportPart row in system.part_log.
-    node.query("SYSTEM FLUSH LOGS")
-    part_log_count = node.query(
-        f"SELECT count() FROM system.part_log "
-        f"WHERE event_type = 'ExportPart' "
-        f"  AND database = currentDatabase() "
-        f"  AND table = '{mt}' "
-        f"  AND part_name = '{part_2020}'"
-    ).strip()
-    assert part_log_count == "0", (
-        f"Expected no ExportPart entries in system.part_log after a "
-        f"synchronously-rejected export, found {part_log_count}."
-    )
+    export_part(node, mt, part_2020, iceberg)
+    wait_for_export_part(node, mt, part_2020)
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
-    assert count == 0, (
-        f"Expected 0 rows in Iceberg table after rejected export, got {count}"
+    assert count == 3, f"Expected 3 rows in Iceberg table after export, got {count}"
+
+    result = node.query(
+        f"SELECT id, toTypeName(year), year FROM {iceberg} ORDER BY id"
+    ).strip()
+    assert result == "1\tInt64\t2020\n2\tInt64\t2020\n3\tInt64\t2020", (
+        f"Unexpected widened partition-column data:\n{result}"
     )
+
+    assert_part_log(node, mt, part_2020)
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")

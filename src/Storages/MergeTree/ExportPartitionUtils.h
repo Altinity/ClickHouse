@@ -89,41 +89,23 @@ namespace ExportPartitionUtils
         const std::string & exception_message,
         const LoggerPtr & log);
 
-    /// EXPORT PART/PARTITION never re-evaluates the partition key against the
-    /// destination's schema: the partition path (object storage) and the
-    /// Iceberg partition values (data lake) are derived from the SOURCE part's
-    /// minmax block in ExportPartTask::executeStep. Therefore every column the
-    /// SOURCE partition expression depends on must have an identically-typed
-    /// counterpart on the destination — castable but non-equal types are not
-    /// safe here even though `makeConvertingActions` would accept them.
-    ///
-    /// Called directly from the non-data-lake branch of
-    /// `MergeTreeData::exportPartToTable` /
-    /// `StorageReplicatedMergeTree::exportPartitionToTable`, and indirectly
-    /// for the Iceberg branch via `verifyIcebergPartitionCompatibility` which
-    /// embeds this check.  Throws BAD_ARGUMENTS on missing column or type
-    /// mismatch.
-    void verifyPartitionColumnsExactTypeMatch(
+    /// Validates that source columns can be exported into the destination with the
+    /// same positional CAST matching as `INSERT INTO dest SELECT * FROM src`. Lossy
+    /// casts are rejected unless `export_merge_tree_part_allow_lossy_cast` is set.
+    /// Throws BAD_ARGUMENTS on any violation.
+    void verifyExportSchemaCastable(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
-        const StorageID & destination_storage_id);
+        const StorageID & destination_storage_id,
+        const ContextPtr & context);
 
 #if USE_AVRO
-    /// Verifies that the source MergeTree partition key is compatible with the
-    /// destination Iceberg partition spec by:
-    ///   * Comparing partition-field source-ids and transforms in order
-    ///     against the Iceberg spec derived from the MergeTree PARTITION BY AST.
-    ///   * Embedding `verifyPartitionColumnsExactTypeMatch` so that columns
-    ///     flowing through the partition key have identical ClickHouse types on
-    ///     both sides — the Iceberg manifest's partition values come from the
-    ///     SOURCE-typed minmax block and cannot be reconciled later.
-    /// Throws BAD_ARGUMENTS on any mismatch.
+    /// Verifies the source MergeTree partition key matches the destination Iceberg
+    /// partition spec (source-ids and transforms in order). Throws BAD_ARGUMENTS on
+    /// mismatch.
     void verifyIcebergPartitionCompatibility(
         const Poco::JSON::Object::Ptr & metadata_object,
-        const ASTPtr & partition_key_ast,
-        const StorageMetadataPtr & source_metadata,
-        const StorageMetadataPtr & destination_metadata,
-        const StorageID & destination_storage_id);
+        const ASTPtr & partition_key_ast);
 #endif
 }
 

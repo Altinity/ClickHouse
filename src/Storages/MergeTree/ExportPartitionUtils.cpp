@@ -9,6 +9,10 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <filesystem>
 #include <thread>
+#include <Core/Block.h>
+#include <Core/Settings.h>
+#include <DataTypes/Utils.h>
+#include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
 
@@ -36,6 +40,11 @@ namespace ErrorCodes
     extern const int NO_SUCH_DATA_PART;
     extern const int CORRUPTED_DATA;
     extern const int NETWORK_ERROR;
+}
+
+namespace Setting
+{
+    extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
 }
 
 namespace FailPoints
@@ -404,18 +413,8 @@ namespace ExportPartitionUtils
 #if USE_AVRO
     void verifyIcebergPartitionCompatibility(
         const Poco::JSON::Object::Ptr & metadata_object,
-        const ASTPtr & partition_key_ast,
-        const StorageMetadataPtr & source_metadata,
-        const StorageMetadataPtr & destination_metadata,
-        const StorageID & destination_storage_id)
+        const ASTPtr & partition_key_ast)
     {
-        /// The Iceberg manifest's partition values are derived from the SOURCE
-        /// part's minmax block (see `IcebergMetadata::commitExportPartitionTransaction`)
-        /// while the row data is CAST to the destination Iceberg schema by
-        /// `addExportConvertingActions`. Reject castable type differences on
-        /// partition-key columns up front so the two cannot disagree.
-        verifyPartitionColumnsExactTypeMatch(source_metadata, destination_metadata, destination_storage_id);
-
         const auto original_schema_id = metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
         const auto partition_spec_id  = metadata_object->getValue<Int64>(Iceberg::f_default_spec_id);
 
@@ -531,51 +530,47 @@ namespace ExportPartitionUtils
     }
 #endif
 
-    void verifyPartitionColumnsExactTypeMatch(
+    void verifyExportSchemaCastable(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
-        const StorageID & destination_storage_id)
+        const StorageID & destination_storage_id,
+        const ContextPtr & context)
     {
-        if (!source_metadata->hasPartitionKey())
+        /// Build (and discard) the same converting DAG the export worker will build
+        /// later, to surface structural mismatches (column count, untyped casts) early.
+        Block source_sample_block;
+        for (const auto & column : source_metadata->getColumns().getReadable())
+            source_sample_block.insert({column.type->createColumn(), column.type, column.name});
+
+        const auto destination_sample_block = destination_metadata->getSampleBlockNonMaterialized();
+
+        const auto source_columns = source_sample_block.getColumnsWithTypeAndName();
+        const auto destination_columns = destination_sample_block.getColumnsWithTypeAndName();
+
+        (void) ActionsDAG::makeConvertingActions(
+            source_columns,
+            destination_columns,
+            ActionsDAG::MatchColumnsMode::Position,
+            context);
+
+        /// Lossy casts may silently change values, so reject them unless the user opts in.
+        if (context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast])
             return;
 
-        /// Use the partition expression's required columns (the ones that flow
-        /// into the destination's partition strategy via
-        /// `minmax_idx->getBlock(storage)`), not the partition expression's
-        /// sample-block output columns.  This catches both identity
-        /// partitioning (`PARTITION BY year`) and computed partitioning
-        /// (`PARTITION BY toYearNumSinceEpoch(event_date)` — required column
-        /// is `event_date`).
-        const auto required_columns
-            = source_metadata->getPartitionKey().expression->getRequiredColumnsWithTypes();
-
-        const auto & destination_columns = destination_metadata->getColumns();
-
-        for (const auto & source_column : required_columns)
+        const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
+        for (size_t i = 0; i < num_columns; ++i)
         {
-            if (!destination_columns.has(source_column.name))
+            const auto & source_column = source_columns[i];
+            const auto & destination_column = destination_columns[i];
+            if (!canBeSafelyCast(source_column.type, destination_column.type))
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot export partition: source partition key references column '{}' "
-                    "which does not exist on the destination table {}. "
-                    "EXPORT does not re-evaluate the partition key against the destination's schema, "
-                    "so every column the source partition expression depends on must be present "
-                    "on the destination with the same type.",
-                    source_column.name, destination_storage_id.getFullTableName());
-
-            const auto destination_type
-                = destination_columns.getPhysical(source_column.name).type;
-            if (!source_column.type->equals(*destination_type))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot export partition: partition key column '{}' has type {} on the source "
-                    "but {} on the destination table {}. "
-                    "EXPORT does not re-evaluate the partition key against the destination's schema, "
-                    "so castable type differences are not allowed for partition columns "
-                    "(the partition path and any Iceberg partition values are derived from the "
-                    "source-typed minmax block, while the row data is CAST to the destination type).",
-                    source_column.name,
+                    "Cannot export to {}: column '{}' requires a lossy cast from {} to {}, "
+                    "which may change values. Set `export_merge_tree_part_allow_lossy_cast = 1` "
+                    "to allow lossy casts during export.",
+                    destination_storage_id.getFullTableName(),
+                    destination_column.name,
                     source_column.type->getName(),
-                    destination_type->getName(),
-                    destination_storage_id.getFullTableName());
+                    destination_column.type->getName());
         }
     }
 }
