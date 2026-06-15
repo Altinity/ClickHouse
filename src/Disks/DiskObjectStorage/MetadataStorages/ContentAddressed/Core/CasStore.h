@@ -190,6 +190,17 @@ private:
     std::mutex shard_decode_cache_mutex;
     std::unordered_map<String, ShardDecodeCacheEntry> shard_decode_cache;
 
+    /// Per-shard-key monotonic write counter, guarded by shard_decode_cache_mutex. Bumped on every
+    /// committed manifest write (the mutateShard invalidation, alongside the cache erase). A reader
+    /// captures it BEFORE its get() and re-checks before populating shard_decode_cache: if a write
+    /// landed during the get(), the just-decoded bytes may already be superseded AND that write's
+    /// invalidation erase has already run, so caching the decode would resurrect a stale entry that
+    /// the TTL fast-path then serves — making a just-published ref look absent (read-your-writes
+    /// coherence race, B157). On seq mismatch the reader returns its own point-in-time decode but
+    /// does NOT cache it. Kept monotonic across the wholesale cache clear (never reset) so a captured
+    /// value can never spuriously match a reset counter. Bounded by distinct (namespace, shard) pairs.
+    std::unordered_map<String, uint64_t> shard_write_seq;
+
     /// Single-flight coalescing for readShardDecoded: concurrent resolves of the SAME shard key
     /// share ONE head (+ at most one get). The leader publishes its decode to the followers'
     /// shared_future. Zero added staleness — all coalesced callers get the leader's fresh result.

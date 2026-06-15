@@ -728,6 +728,64 @@ private:
     bool leader_in_head = false;
     bool released = false;
 };
+
+/// Gates the FIRST get() made after `arm()`. It SNAPSHOTS the value as-of get-entry (modelling an
+/// object-store read that began before a concurrent write committed), then blocks on a latch so the
+/// test can land a write + cache-invalidation, then returns the SNAPSHOT (stale bytes) — not the
+/// post-write value. Calls before arm(), and every call once the leader is gated, pass through
+/// immediately. Deterministic: no sleeps. Used to reproduce the read-your-writes decode-cache
+/// poisoning race (B157): an in-flight reader populating the TTL fast-path with a decode that a
+/// committed write has already superseded + invalidated.
+class GatedGetBackend : public DB::Cas::InMemoryBackend
+{
+public:
+    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range = {}) override
+    {
+        auto snapshot = DB::Cas::InMemoryBackend::get(key, range);
+        {
+            std::unique_lock lock(m);
+            if (armed && !leader_in_get)
+            {
+                leader_in_get = true;
+                cv.notify_all();
+                gate.wait(lock, [this] { return released; });
+            }
+        }
+        return snapshot;
+    }
+
+    /// Enable the gate: the NEXT get() call will be the "leader" and will block until release().
+    void arm()
+    {
+        std::lock_guard lock(m);
+        armed = true;
+        leader_in_get = false;
+        released = false;
+    }
+
+    void waitLeaderInGet()
+    {
+        std::unique_lock lock(m);
+        cv.wait(lock, [this] { return leader_in_get; });
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard lock(m);
+            released = true;
+        }
+        gate.notify_all();
+    }
+
+private:
+    std::mutex m;
+    std::condition_variable cv;
+    std::condition_variable gate;
+    bool armed = false;
+    bool leader_in_get = false;
+    bool released = false;
+};
 }
 
 TEST(CasStoreSingleFlight, ConcurrentResolvesCoalesceToOneHead)
@@ -806,4 +864,46 @@ TEST(CasStoreDecodeTtl, ForceFreshAlwaysHeads)
     /// Single-flight guarantees exactly one HEAD per miss; resolving one ref touches one shard.
     ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
     EXPECT_EQ(b->headTotal(), 1u);   /// exactly one HEAD
+}
+
+/// Read-your-writes coherence (B157): an in-flight reader whose GET snapshots a shard manifest that
+/// PREDATES a concurrent publish must NOT poison the TTL decode cache with that stale decode after
+/// the publish's invalidation erase has already run — otherwise a later allow_stale read serves the
+/// stale decode within the TTL window and the just-published ref looks absent (→ "no ref" → the
+/// adopted part is wrongly marked broken in the real server).
+TEST(CasStoreDecodeTtl, ConcurrentWriteDuringGetDoesNotPoisonStaleEntry)
+{
+    using namespace DB::Cas;
+    auto b = std::make_shared<GatedGetBackend>();
+    /// root_shards = 1: every ref maps to shard 0, so publishing part_2 invalidates the SAME shard
+    /// the gated reader is decoding for part_1. TTL of 60 s — comfortably covers the test.
+    auto s = Store::open(b, PoolConfig{
+        .pool_prefix = "p", .root_shards = 1, .shard_decode_cache_ttl_ms = std::chrono::milliseconds{60000}});
+
+    const std::string ns_str = "srv1/tbl";
+    const RootNamespace ns{ns_str};
+    /// Publish part_1 (the shard now holds one ref; publish's casPut also erased the decode cache).
+    publishPart(s, ns_str, "part_1", "payload-1");
+
+    /// Arm the gate: the next get() (the reader's leader GET inside loadShardDecoded, after a cache
+    /// miss) snapshots the gen-with-part_1 bytes, then blocks.
+    b->arm();
+    std::optional<Resolved> reader_result;
+    std::thread reader([&] { reader_result = s->resolveRef(ns, "part_1", /*allow_stale=*/true); });
+    b->waitLeaderInGet();
+
+    /// While the reader's GET is parked on the stale snapshot, publish part_2 to the SAME shard.
+    /// casPut commits the gen-with-{part_1,part_2} manifest and invalidates the decode cache.
+    publishPart(s, ns_str, "part_2", "payload-2");
+
+    /// Release the reader: its GET returns the stale gen-with-part_1 snapshot (no part_2). Without
+    /// the coherence guard it caches that decode AFTER the invalidation erase, poisoning the cache.
+    b->release();
+    reader.join();
+    ASSERT_TRUE(reader_result.has_value());   /// part_1 was always present; the reader still resolves it
+
+    /// THE ASSERTION: a subsequent allow_stale resolve of the just-published part_2 MUST see it.
+    /// With the poisoning bug it hits the stale cached decode (no part_2) and returns nullopt.
+    EXPECT_TRUE(s->resolveRef(ns, "part_2", /*allow_stale=*/true).has_value())
+        << "stale decode poisoned the TTL fast-path: just-published part_2 invisible (B157)";
 }

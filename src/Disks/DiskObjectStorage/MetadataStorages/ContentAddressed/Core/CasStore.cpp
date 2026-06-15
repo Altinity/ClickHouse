@@ -247,6 +247,17 @@ std::shared_ptr<const RootShard> Store::loadShardDecoded(const String & key)
     /// Miss (or the shard was written since we last decoded it): fetch + decode once, then cache by
     /// the token the bytes actually came from (NOT the head token — a write could have landed in
     /// between; we cache what we decoded, which is self-consistent).
+    ///
+    /// Capture the per-key write counter BEFORE the get(): a committed write that bumps it while our
+    /// get() is in flight means the bytes we are about to fetch may predate that write — and the
+    /// write's invalidation erase has already run — so caching the decode now would poison the TTL
+    /// fast-path with a stale entry the erase can no longer remove (read-your-writes coherence, B157).
+    uint64_t seq_before_get;
+    {
+        std::lock_guard lock(shard_decode_cache_mutex);
+        seq_before_get = shard_write_seq[key];
+    }
+
     std::optional<GetResult> object = pool_backend->get(key);
     if (!object)
     {
@@ -258,14 +269,22 @@ std::shared_ptr<const RootShard> Store::loadShardDecoded(const String & key)
     auto decoded = std::make_shared<const RootShard>(decodeRootShard(object->bytes));
     {
         std::lock_guard lock(shard_decode_cache_mutex);
-        /// Bound memory on a long-lived server: a wholesale clear is fine — entries re-populate on
-        /// demand (a stale entry would be re-validated by the head token check anyway).
-        if (shard_decode_cache.size() >= SHARD_DECODE_CACHE_MAX_ENTRIES)
-            shard_decode_cache.clear();
-        shard_decode_cache[key] = ShardDecodeCacheEntry{
-            .token = object->token,
-            .shard = decoded,
-            .validated_at = std::chrono::steady_clock::now()};
+        /// Skip caching if a write committed during our get() (B157): the decode may be superseded
+        /// and its invalidation erase has already run, so populating now would resurrect a stale
+        /// entry. We still RETURN the decode to our own caller — a point-in-time view, acceptable
+        /// for allow_stale; a force-fresh caller's own writes happen-before its head() so this only
+        /// ever under-caches, never serves a caller its own stale write.
+        if (shard_write_seq[key] == seq_before_get)
+        {
+            /// Bound memory on a long-lived server: a wholesale clear is fine — entries re-populate
+            /// on demand (a stale entry would be re-validated by the head token check anyway).
+            if (shard_decode_cache.size() >= SHARD_DECODE_CACHE_MAX_ENTRIES)
+                shard_decode_cache.clear();
+            shard_decode_cache[key] = ShardDecodeCacheEntry{
+                .token = object->token,
+                .shard = decoded,
+                .validated_at = std::chrono::steady_clock::now()};
+        }
     }
     return decoded;
 }
@@ -405,8 +424,12 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
             /// Read-your-writes (Pillar B): invalidate this shard's decode cache so a same-Store
             /// allow_stale read (bounded-TTL fast-path) cannot serve the pre-write decode. A LOCAL
             /// write is reflected immediately; cross-node staleness stays bounded by the TTL.
+            /// Bumping shard_write_seq under the SAME lock fences any in-flight reader (B157): a
+            /// reader whose get() straddled this casPut sees the seq change before it populates and
+            /// declines to cache its now-superseded decode (which the erase below could not remove).
             {
                 std::lock_guard cache_lock(shard_decode_cache_mutex);
+                ++shard_write_seq[key];
                 shard_decode_cache.erase(key);
             }
             if (out_committed_version)
