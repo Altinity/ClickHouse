@@ -15,5 +15,10 @@ Branch: `cas-mergetree-poc`. Evidence base: `docs/superpowers/reports/2026-06-15
 ## Log
 (appended chronologically below)
 
+### Progress 1
+- #1 spec written + refined (capability-based, not fail-loud — Native can be LocalObjectStorage which has no write-ETag). Code implemented: `WriteBufferFromS3` captures final object ETag (singlepart+multipart) + `getResultObjectETag()`; base virtual on `WriteBufferFromFileBase`; `WriteBufferFromFileDecorator` forwards it; CA backend `nativeConditionalPut` + `NativeStreamingSink::finalize` record the ETag (else HEAD). Unit test `WBS3Test.ResultObjectETagIsCaptured` added (mock S3 sets deterministic ETag). Build of `unit_tests_dbms`+`clickhouse` in progress.
+- #2 GC livelock → **B160** backlog entry written (single-leader/lease-cadence/one-scheduler-per-pool fix directions; deferred per user).
+- #5/#4/#3 specs written: `2026-06-15-ca-fsck-timeout-progress-design.md`, `…-ca-root-shards-widen-design.md`, `…-ca-rustfs-overwrite-leak-mitigation-design.md`. Plans/impl to follow after #1 validates.
+
 ### Start
 Design for #1 approved by user (head-after-put → return the PUT/CompleteMultipartUpload object ETag as the WCreate token; drop the post-write HEAD; dedup-reuse `observeAndAdmit` HEAD untouched). Model-checked against `CaIncarnationCore.tla` (`WCreate` records `nextTok`, never a HEAD; `SabotageNoReobserve` proves the gate token is load-bearing → can't drop the token, only the HEAD). Beginning spec.

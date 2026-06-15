@@ -39,8 +39,8 @@ Replace both head-after-put sites:
 ## Data flow
 `PutObject`/`CompleteMultipartUpload` response ETag → `WriteBufferFromS3.object_etag` → `getResultObjectETag()` → CA backend `Token{etag, TokenType::ETag}` → recorded `wDeps`/`DepEntry` token (= model `WCreate` `nextTok`).
 
-## Error handling (fail-close, no fallback)
-A *successful* Native conditional write that yields **no** ETag is an S3-contract violation. **Throw** (`LOGICAL_ERROR`) — do **not** silently fall back to a HEAD (that would hide the bug; per the repo's fail-close / avoid-fallback rule). Emulated mode is untouched (`TokenType::Emulated`, no ETag). The `PreconditionFailed` path needs no ETag (we didn't write).
+## Capability, not fail-close (design refinement, 2026-06-15)
+The approved design said "fail-loud if the ETag is absent." Refined after checking the code: Native mode is **not** S3-only — it also runs over `LocalObjectStorage` (tests, local-disk CA), whose "etag" is a file-mtime computed at HEAD time (`LocalObjectStorage.cpp:379`), not produced by its write buffer. So `getResultObjectETag()` is a **capability**: `WriteBufferFromS3` returns the captured strong ETag; every other write buffer returns `nullopt`. The CA backend therefore uses **the write ETag when the buffer provides one (S3 → no HEAD), else the existing `head(key)` (Local → a cheap local stat)**. This is *not* a bug-hiding fallback: a backend that genuinely has no write-time ETag (Local) legitimately needs the HEAD, and that HEAD is correct + cheap there. The S3 HEADs — the entire ~73% target — are eliminated. Emulated mode untouched (`TokenType::Emulated`). `PreconditionFailed` needs no ETag.
 
 ## Testing
 - **Consistency:** the token returned by a conditional write equals the token a subsequent `head(key)` returns (test backend), for `putIfAbsent`, `putOverwrite`, `casPut`, and the streaming sink.
