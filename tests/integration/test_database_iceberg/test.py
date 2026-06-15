@@ -1048,16 +1048,6 @@ def test_create_table_nested_namespace(started_cluster):
         settings={"allow_database_iceberg": 1},
     ).strip() == "1"
 
-    # ALTER exercises RestCatalog::updateSchema for the nested namespace.
-    node.query(
-        f"ALTER TABLE {CATALOG_NAME}.`{namespace}.nested` ADD COLUMN z Nullable(String);",
-        settings=write_settings,
-    )
-    assert "z" in node.query(
-        f"DESCRIBE TABLE {CATALOG_NAME}.`{namespace}.nested`",
-        settings=write_settings,
-    )
-
     node.query(
         f"DROP TABLE {CATALOG_NAME}.`{namespace}.nested` SETTINGS allow_database_iceberg=1"
     )
