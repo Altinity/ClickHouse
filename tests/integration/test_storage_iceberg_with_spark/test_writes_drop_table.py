@@ -33,3 +33,28 @@ def test_writes_drop_table(started_cluster_iceberg_with_spark, format_version, s
     )
     # drop should not delete user data
     assert len(files) > 0
+
+
+@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("storage_type", ["local"])
+def test_writes_drop_table_deletes_data(started_cluster_iceberg_with_spark, format_version, storage_type):
+    instance = started_cluster_iceberg_with_spark.instances["node1"]
+    TABLE_NAME = "test_writes_drop_table_deletes_data_" + storage_type + "_" + get_uuid_str()
+
+    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster_iceberg_with_spark,
+                         "(x String, y Int64)", format_version, use_version_hint=True)
+
+    instance.query(f"INSERT INTO {TABLE_NAME} VALUES ('123', 1);",
+                   settings={"allow_insert_into_iceberg": 1})
+    assert instance.query(f"SELECT * FROM {TABLE_NAME} ORDER BY ALL") == '123\t1\n'
+
+    drop_iceberg_table(instance, TABLE_NAME,
+                       settings={"iceberg_delete_data_on_drop": 1})
+
+    files = default_download_directory(
+        started_cluster_iceberg_with_spark,
+        storage_type,
+        f"/var/lib/clickhouse/user_files/iceberg_data/default/{TABLE_NAME}/",
+        f"/var/lib/clickhouse/user_files/iceberg_data/default/{TABLE_NAME}/",
+    )
+    assert len(files) == 0

@@ -491,11 +491,12 @@ def drop_iceberg_table(
     node,
     table_name,
     if_exists=False,
+    settings=None,
 ):
     if if_exists:
-        node.query(f"DROP TABLE IF EXISTS {table_name};")
+        node.query(f"DROP TABLE IF EXISTS {table_name};", settings=settings)
     else:
-        node.query(f"DROP TABLE {table_name};")
+        node.query(f"DROP TABLE {table_name};", settings=settings)
 
 
 def create_initial_data_file(
