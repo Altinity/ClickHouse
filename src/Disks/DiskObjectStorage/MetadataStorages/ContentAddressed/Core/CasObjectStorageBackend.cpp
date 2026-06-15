@@ -108,8 +108,17 @@ PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const 
 
     if (out_token)
     {
-        auto hr = nativeHead(key);
-        *out_token = hr ? hr->token : Token{};
+        /// Record the token of the incarnation WE just wrote (model WCreate). The S3 write returns
+        /// its object ETag in the PutObject/CompleteMultipartUpload response, so no follow-up HEAD
+        /// is needed — this is ~73% of the CA backend's HEADs. A backend with no write-time ETag
+        /// (local files) returns nullopt and we fall back to the HEAD (a cheap local stat there).
+        if (auto etag = buf->getResultObjectETag())
+            *out_token = Token{*etag, TokenType::ETag};
+        else
+        {
+            auto hr = nativeHead(key);
+            *out_token = hr ? hr->token : Token{};
+        }
     }
     return PutOutcome::Done;
 }
@@ -142,10 +151,17 @@ public:
 
         if (out_token)
         {
-            /// Observe the token of the incarnation we just created — same head-after-put strategy
-            /// as nativeConditionalPut (the conditional-write plumbing does not return the ETag).
-            auto hr = backend.head(key);
-            *out_token = hr.exists ? hr.token : Token{};
+            /// Record the token of the incarnation we just wrote (model WCreate). The S3 write
+            /// returns its object ETag in the response, so no follow-up HEAD is needed (the bulk of
+            /// the CA backend's HEADs). Backends with no write-time ETag (local) return nullopt and
+            /// we fall back to the HEAD (a cheap local stat there).
+            if (auto etag = write_buf->getResultObjectETag())
+                *out_token = Token{*etag, TokenType::ETag};
+            else
+            {
+                auto hr = backend.head(key);
+                *out_token = hr.exists ? hr.token : Token{};
+            }
         }
         return PutOutcome::Done;
     }

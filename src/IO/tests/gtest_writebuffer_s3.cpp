@@ -277,6 +277,7 @@ struct Client : DB::S3::Client
 
         Aws::S3::Model::PutObjectOutcome outcome;
         Aws::S3::Model::PutObjectResult result(outcome.GetResultWithOwnership());
+        result.SetETag("etag-singlepart-" + request.GetKey());
         return result;
     }
 
@@ -392,6 +393,7 @@ struct Client : DB::S3::Client
         bStore.CompleteMPU(request.GetKey(), request.GetUploadId(), etags);
 
         Aws::S3::Model::CompleteMultipartUploadResult result;
+        result.SetETag("etag-multipart-" + request.GetKey());
         return Aws::S3::Model::CompleteMultipartUploadOutcome(result);
     }
 
@@ -950,6 +952,33 @@ TEST_F(WBS3Test, PrefinalizeCalledMultipleTimes) {
         }
     }, DB::Exception);
 #endif
+}
+
+// The object ETag from the PutObject / CompleteMultipartUpload response is surfaced via
+// getResultObjectETag() after a successful finalize() — lets content-addressed callers record the
+// just-written incarnation's token WITHOUT a follow-up HEAD (CA head-after-put elimination).
+TEST_F(WBS3Test, ResultObjectETagIsCaptured) {
+    // Singlepart upload: the PutObject response ETag.
+    {
+        auto buffer = getWriteBuffer("singlepart-file");
+        writeAsOneBlock(*buffer, 10);
+        getAsyncPolicy().setAutoExecute(true);
+        buffer->finalize();
+        ASSERT_TRUE(buffer->getResultObjectETag().has_value());
+        ASSERT_EQ(*buffer->getResultObjectETag(), "etag-singlepart-singlepart-file");
+    }
+
+    // Multipart upload: the final object ETag comes from CompleteMultipartUpload, NOT a per-part tag.
+    {
+        getSettings()[Setting::s3_max_single_part_upload_size] = 0; // no single part — force multipart
+        getSettings()[Setting::s3_min_upload_part_size] = 1;
+        auto buffer = getWriteBuffer("multipart-file");
+        writeAsOneBlock(*buffer, 10);
+        getAsyncPolicy().setAutoExecute(true);
+        buffer->finalize();
+        ASSERT_TRUE(buffer->getResultObjectETag().has_value());
+        ASSERT_EQ(*buffer->getResultObjectETag(), "etag-multipart-multipart-file");
+    }
 }
 
 TEST_P(SyncAsync, EmptyFile) {
