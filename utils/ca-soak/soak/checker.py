@@ -1,8 +1,76 @@
 import time
 
+from soak.cluster import QueryError
+
 
 class CheckpointFailure(Exception):
     pass
+
+
+def sync_replica_with_readonly_retry(
+    node,
+    table: str,
+    *,
+    timeout: float | None = None,
+    settings: dict | None = None,
+    readonly_budget_s: float = 120.0,
+    backoff_start_s: float = 1.0,
+    backoff_cap_s: float = 5.0,
+    sleep_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+    log_fn=print,
+):
+    """Issue `SYSTEM SYNC REPLICA <table>` on `node`, retrying on `TABLE_IS_READ_ONLY` (code 242).
+
+    A ReplicatedMergeTree replica transiently becomes read-only while re-establishing its ZooKeeper
+    session after a chaos fault (kill/restart/pause). This window typically lasts ~tens of seconds;
+    the replica RECOVERS automatically once Keeper confirms the new session. Admin ops such as
+    `SYSTEM SYNC REPLICA` issued during/just-after a chaos fault window can hit this transient and
+    must RETRY (with bounded backoff) rather than surface as a hard `WORKLOAD FAILURE` (B155).
+
+    Retry policy:
+    - On `TABLE_IS_READ_ONLY` (code 242): log a loud warning, sleep `backoff_start_s` (capped at
+      `backoff_cap_s`), retry. If the replica is read-write again within `readonly_budget_s`, return
+      normally (the SYNC completed). If readonly PERSISTS past the budget, raise a `CheckpointFailure`
+      (a replica stuck read-only past 120 s IS a real finding, not the expected transient).
+    - Any other `QueryError` (a genuine error): re-raise immediately, no retry.
+    - `readonly_budget_s` defaults to 120 s, which is a generous safety margin above the typical
+      tens-of-seconds ZK session re-establishment time and matches the chaos fault durations.
+
+    `sleep_fn` and `monotonic_fn` are injectable so the retry loop is pure-testable without real sleeps.
+    `log_fn` defaults to `print`; callers in the harness pass the module-level `log`."""
+    deadline = monotonic_fn() + readonly_budget_s
+    attempt = 0
+    while True:
+        try:
+            node.command(f"SYSTEM SYNC REPLICA {table}", timeout=timeout, settings=settings)
+            if attempt > 0:
+                elapsed = monotonic_fn() - (deadline - readonly_budget_s)
+                log_fn(
+                    f"recovery SYNC REPLICA on {node}: replica recovered from transient readonly "
+                    f"(chaos ZK-session recovery) after {elapsed:.0f}s / {readonly_budget_s:.0f}s budget — "
+                    f"proceeding"
+                )
+            return
+        except QueryError as e:
+            if not e.is_readonly:
+                raise
+            remaining = deadline - monotonic_fn()
+            backoff = min(backoff_cap_s, backoff_start_s * (2 ** attempt))
+            attempt += 1
+            log_fn(
+                f"recovery SYNC REPLICA on {node}: replica transiently readonly "
+                f"(chaos ZK-session recovery, TABLE_IS_READ_ONLY), retrying "
+                f"({remaining:.0f}s/{readonly_budget_s:.0f}s budget remaining, backoff={backoff:.1f}s)"
+            )
+            if remaining <= 0:
+                raise CheckpointFailure(
+                    f"SYNC REPLICA {table} on {node}: replica stuck TABLE_IS_READ_ONLY for "
+                    f"{readonly_budget_s:.0f}s (budget exhausted) — replica did NOT recover its "
+                    f"ZK session within the expected window; this IS a real stuck-replica finding, "
+                    f"not the expected transient chaos window. last error: {e}"
+                ) from e
+            sleep_fn(min(backoff, remaining))
 
 
 def compare_aggregates(model: dict, node1: dict, node2: dict):
@@ -147,7 +215,15 @@ def quiesce(cluster, table: str, timeout_s: int = 300, admin_timeout_s: float | 
     # as a spurious server-side HTTP-408 `TIMEOUT_EXCEEDED` / raw socket TimeoutError.
     admin_settings = {"receive_timeout": t, "max_execution_time": t}
     for node in cluster.nodes():
-        node.command(f"SYSTEM SYNC REPLICA {table}", timeout=admin_timeout_s, settings=admin_settings)
+        # B155: a replica transiently becomes TABLE_IS_READ_ONLY while re-establishing its ZK session
+        # after a chaos fault. Retry on that transient with a generous 120s budget (the typical ZK
+        # session re-establishment takes tens of seconds; 120s is a safe margin matching chaos fault
+        # durations). Any other error is re-raised immediately — only readonly is retried here.
+        sync_replica_with_readonly_retry(
+            node, table,
+            timeout=admin_timeout_s,
+            settings=admin_settings,
+        )
 
     def backlog():
         total = 0

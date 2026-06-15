@@ -22,6 +22,14 @@ import urllib.request
 # ReplicatedMergeTree block-dedup, and the model has already applied the op exactly once.
 ABORTED_CODE = 236
 
+# ClickHouse error code TABLE_IS_READ_ONLY (Common/ErrorCodes.cpp). A ReplicatedMergeTree replica
+# transiently becomes read-only while it re-establishes its ZooKeeper session after a fault (docker
+# kill/restart/pause). The window typically lasts ~tens of seconds and the replica RECOVERS
+# automatically once the new ZK session is confirmed. Keeper-level admin ops such as
+# `SYSTEM SYNC REPLICA` that are issued during/just-after a chaos fault window can hit this transient
+# and must RETRY rather than surface as a hard WORKLOAD FAILURE. See B155.
+TABLE_IS_READ_ONLY_CODE = 242
+
 # Server-side exception codes that mean "this node is going down / its network is broken" rather than
 # "your query is wrong". Under Phase-2 chaos a `docker restart`/`docker stop` shuts a node down
 # GRACEFULLY: an in-flight query is then CANCELLED server-side (returns an HTTP 500 body with one of
@@ -53,6 +61,15 @@ class QueryError(RuntimeError):
         Detected by parsing the exception body the server returns in the HTTP response."""
         b = self.body or ""
         return ("Code: %d" % ABORTED_CODE) in b or "ABORTED" in b
+
+    @property
+    def is_readonly(self) -> bool:
+        """True if the server-side exception is the TABLE_IS_READ_ONLY transient (code 242).
+        A ReplicatedMergeTree replica becomes read-only while re-establishing its ZooKeeper session
+        after a chaos fault (kill/restart/pause); it recovers automatically within tens of seconds.
+        Detected by parsing the ClickHouse exception body in the HTTP response."""
+        b = self.body or ""
+        return ("Code: %d" % TABLE_IS_READ_ONLY_CODE) in b or "TABLE_IS_READ_ONLY" in b
 
     @property
     def is_node_down(self) -> bool:
