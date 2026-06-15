@@ -37,9 +37,21 @@ public:
     /// (observe current token; condemned in the retire view ⇒ resurrect; else adopt — free).
     BlobRef putBlob(const BlobId & id, BlobSource source);
 
-    /// Cold reuse without bytes: HEAD; absent ⇒ FILE_DOESNT_EXIST (caller must putBlob);
-    /// condemned ⇒ resurrect (GET + fresh-tag header rewrite + putOverwrite If-Match).
-    BlobRef reuseBlob(const BlobId & id);
+    /// Cold reuse without bytes: HEAD; condemned ⇒ resurrect (GET + fresh-tag header rewrite +
+    /// putOverwrite If-Match). On HEAD-absent the outcome depends on `body_recreatable` (B156b):
+    ///   true  — the blob was putBlob'd by a build in this txn (recreatable by retrying) ⇒ the
+    ///           absence is the benign dedup-vs-GC race ⇒ retryable ABORTED (caller retries, re-uploads);
+    ///   false — the blob was adopted from a committed source (tokenless W-EVIDENCE, NOT recreatable) ⇒
+    ///           the absence is a real INV-NO-LOSS loss ⇒ fail-loud FILE_DOESNT_EXIST (never masked).
+    /// Use depIsTokened on the SOURCE build to pick the flag (tokened == putBlob'd == recreatable).
+    BlobRef reuseBlob(const BlobId & id, bool body_recreatable);
+
+    /// B156b discriminator: does this build hold a TOKENED Blob dep for `hash` (putBlob'd here ⇒
+    /// recreatable) versus a TOKENLESS W-EVIDENCE dep (adoptFromTree ⇒ not recreatable)? False also
+    /// when this build has no dep for the hash at all.
+    bool depIsTokened(const UInt128 & hash) const;
+    /// Whether this build holds ANY Blob dep (tokened or tokenless) for `hash`.
+    bool hasDep(const UInt128 & hash) const;
 
     /// Carry-forward (W-EVIDENCE): records a TOKENLESS dependency (liveness evidence = the live
     /// source root). Inline entries record nothing. Returns the entry found by name in the source tree.

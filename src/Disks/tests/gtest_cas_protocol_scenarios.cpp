@@ -118,7 +118,7 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     const Token t0 = b->head(blob_key).token;
 
     auto build = s->startBuild({});
-    build->reuseBlob(idOf("payload-X"));
+    build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// GC advanced the round to 1 but dropped all entries on outcomes ⇒ EMPTY retired set; fence to 1.
@@ -145,7 +145,7 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     const Token t0 = b->head(blob_key).token;
 
     auto build = s->startBuild({});
-    build->reuseBlob(idOf("payload-X"));   /// records t0 at round 0
+    build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);   /// records t0 at round 0
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// Another writer displaces X out-of-band ⇒ a new current token t1 (same payload, fresh tag).
@@ -220,7 +220,7 @@ TEST(CasProtocol, RevalidateResurrectsWhenCurrentTokenCondemnedAtDifferentToken)
     auto build = s->startBuild({});
     /// reuseBlob ⇒ observeAndAdmit: current t0 is NOT in the condemned set {t_other} ⇒ ADOPT t0, dep
     /// recorded at observed_view_round = 1 (the current view round) ⇒ NON-STALE at publish time.
-    build->reuseBlob(idOf("payload-X"));
+    build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// publish: view round 1 == fence_round 1 ⇒ NO fence advance ⇒ revalidateDeps does NOT run; only
@@ -247,7 +247,7 @@ TEST(CasProtocol, RevalidateAbsentBlobDepAbortsRetryable)
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
 
     auto build = s->startBuild({});
-    build->reuseBlob(idOf("payload-X"));   /// records t0 at round 0
+    build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);   /// records t0 at round 0
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// A landed GC delete whose retire entry already dropped: delete X raw by its current token.
@@ -466,7 +466,7 @@ TEST(CasProtocol, ResurrectLosesRaceReObserves)
     const Token t0 = b->head(blob_key).token;
 
     auto build = s->startBuild({});
-    build->reuseBlob(idOf("payload-X"));   /// records t0 at round 0
+    build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);   /// records t0 at round 0
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// The racing writer displaces X to t1 (its resurrect won) before our gate runs.

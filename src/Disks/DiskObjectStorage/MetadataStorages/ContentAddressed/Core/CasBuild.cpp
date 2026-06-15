@@ -181,7 +181,7 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
     throw Exception(ErrorCodes::LOGICAL_ERROR, "putBlob: exhausted retries for {}", key);
 }
 
-BlobRef Build::reuseBlob(const BlobId & id)
+BlobRef Build::reuseBlob(const BlobId & id, bool body_recreatable)
 {
     requireAlive();
     const UInt128 logical_hash = hexToU128(id.string());
@@ -193,20 +193,49 @@ BlobRef Build::reuseBlob(const BlobId & id)
     }
     catch (const Exception & e)
     {
-        /// B156: reuseBlob has NO body in hand (cold reuse of a blob staged earlier in this same
-        /// transaction). If observeAndAdmit finds it HEAD-absent, GC's exact-token deleteExact landed
-        /// between the reuse decision and our HEAD (e.g. the in-flight build's heartbeat lapsed under
-        /// load and GC condemned+deleted it). This is a BENIGN race — the blob DID exist (it was
-        /// putBlob'd in this transaction); surface it as retryable ABORTED so the caller retries (the
-        /// retry re-uploads the content via putBlob from source), mirroring resurrect's GET-vanish.
-        /// NOT a hard FILE_DOESNT_EXIST — that code is load-bearing for putBlob's body-holding retry
-        /// and adoptTree's fail-closed never-existed semantics (both deliberately untouched).
-        if (e.code() == ErrorCodes::FILE_DOESNT_EXIST)
+        /// B156 (refined B156b): reuseBlob has NO body in hand. observeAndAdmit's HEAD-absent
+        /// FILE_DOESNT_EXIST means the blob is gone NOW. How to surface it depends on whether retrying
+        /// the operation can RE-CREATE the content — and that is a per-caller property, passed in as
+        /// `body_recreatable`:
+        ///
+        ///   body_recreatable == true  — the blob was putBlob'd by a build in THIS transaction
+        ///     (a TOKENED dep, heartbeat-protected). Retrying the whole operation re-writes the content,
+        ///     so the blob is re-uploaded. HEAD-absent here is the BENIGN dedup-vs-GC race (the in-flight
+        ///     build's heartbeat lapsed under load and GC condemned+deleted it between the reuse decision
+        ///     and our HEAD). Surface it as retryable ABORTED so the caller retries and CONVERGES — this
+        ///     mirrors resurrect's GET-vanish.
+        ///
+        ///   body_recreatable == false — the blob was adopted from a COMMITTED source (a TOKENLESS
+        ///     W-EVIDENCE dep, pinned by the committed source ref, NOT by a heartbeat). There is NO body
+        ///     to re-upload; retrying re-adopts the same still-gone committed blob and would spin on
+        ///     ABORTED forever (a silently-stuck background merge). HEAD-absent here means a REFERENCED
+        ///     blob was deleted — a genuine INV-NO-LOSS violation that MUST surface, NOT be masked. Keep
+        ///     the fail-loud FILE_DOESNT_EXIST (re-thrown unchanged).
+        ///
+        /// observeAndAdmit / putBlob / resurrect / adoptTree are deliberately untouched: putBlob's
+        /// body-holding retry calls observeAndAdmit DIRECTLY and still relies on its FILE_DOESNT_EXIST;
+        /// adoptTree's fail-closed never-existed FILE_DOESNT_EXIST is also direct.
+        if (e.code() == ErrorCodes::FILE_DOESNT_EXIST && body_recreatable)
             throw Exception(ErrorCodes::ABORTED,
                 "Build::reuseBlob: blob {} vanished (GC-deleted between reuse decision and HEAD); retry the operation", key);
         throw;
     }
     return BlobRef{id, admitted};
+}
+
+bool Build::depIsTokened(const UInt128 & hash) const
+{
+    /// Discriminator for B156b: a putBlob'd blob records a TOKENED dep (recreatable by retrying), an
+    /// adoptFromTree carry-forward records a TOKENLESS W-EVIDENCE dep (not recreatable — pinned by a
+    /// committed source). Returns false when this build has no dep for the hash (the caller decides
+    /// the default; not-tokened is the fail-loud, INV-NO-LOSS-safe choice).
+    auto it = deps.find({static_cast<uint8_t>(ObjectKind::Blob), hash});
+    return it != deps.end() && it->second.token.has_value();
+}
+
+bool Build::hasDep(const UInt128 & hash) const
+{
+    return deps.contains({static_cast<uint8_t>(ObjectKind::Blob), hash});
 }
 
 uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key)

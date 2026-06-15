@@ -592,7 +592,15 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
         {
             entry = *it;
             if (entry.placement == Cas::Placement::Blob)
-                buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)));
+            {
+                /// B156b: the staged source entry is either putBlob'd in this txn (TOKENED dep in the
+                /// source build ⇒ recreatable by retrying the INSERT) or adopted from a committed source
+                /// (TOKENLESS W-EVIDENCE dep ⇒ NOT recreatable, absence is a real loss). Discriminate on
+                /// the SOURCE build's dep so a vanished putBlob'd blob retries (ABORTED) while a vanished
+                /// adopted blob fails loud (FILE_DOESNT_EXIST). No source build ⇒ default not-recreatable.
+                const bool body_recreatable = src_st->build && src_st->build->depIsTokened(entry.file_hash);
+                buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+            }
             else if (entry.placement != Cas::Placement::Inline)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "ContentAddressed: staged hardlink of unsupported placement for {}", path_from);
@@ -734,7 +742,17 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 /// build... merge conservatively by abandoning nothing and re-observing):
                 for (const auto & entry : dst_st.entries)
                     if (entry.placement == Cas::Placement::Blob)
-                        dst_st.build->reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)));
+                    {
+                        /// B156b: dst_st.entries here is the UNION of the original destination entries
+                        /// (deps in dst_st.build) and the just-moved source entries (deps still in
+                        /// src_st.build, which we abandon below). An entry is recreatable iff EITHER build
+                        /// holds a TOKENED (putBlob'd) dep for it; a tokenless (adopted) dep or no dep in
+                        /// either build ⇒ not recreatable (fail-loud on vanish, no INV-NO-LOSS masking).
+                        const bool body_recreatable =
+                            dst_st.build->depIsTokened(entry.file_hash)
+                            || src_st.build->depIsTokened(entry.file_hash);
+                        dst_st.build->reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+                    }
                 src_st.build->abandon();
             }
             parts.erase(src_it);
@@ -819,7 +837,13 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
         src_st.entries.erase(it);
         entry.name = dst->file;
         if (&src_st != &dst_st && entry.placement == Cas::Placement::Blob)
-            buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)));
+        {
+            /// B156b: the cross-part re-keyed entry came from src_st; its dep lives in src_st.build.
+            /// Tokened (putBlob'd in this txn) ⇒ recreatable ⇒ retryable ABORTED on vanish; tokenless
+            /// (adopted from a committed source) or no source build ⇒ not recreatable ⇒ fail-loud.
+            const bool body_recreatable = src_st.build && src_st.build->depIsTokened(entry.file_hash);
+            buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+        }
         std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
         dst_st.entries.push_back(std::move(entry));
         return;

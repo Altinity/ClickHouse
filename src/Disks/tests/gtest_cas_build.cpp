@@ -140,22 +140,24 @@ TEST(CasBuild, ReuseBlobAbsentThrows)
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     auto build = s->startBuild({});
-    /// B156: reuseBlob treats absent-on-reuse as a retryable race (caller only reuses known-staged blobs);
-    /// genuinely-never-existed is caught by adoptTree/putBlob fail-closed paths.
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->reuseBlob(idOf("never-written")); });
+    /// B156b: a NOT-recreatable reuse (body_recreatable=false — e.g. an adopted-from-committed entry, or
+    /// genuinely-never-existed) of an absent blob stays FAIL-LOUD FILE_DOESNT_EXIST — a real loss must
+    /// surface, never be masked as a retryable ABORTED (which would spin forever with no body to re-upload).
+    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST,
+        [&] { build->reuseBlob(idOf("never-written"), /*body_recreatable*/ false); });
 }
 
-TEST(CasBuildReuseBlob, VanishedBlobIsRetryableAborted)
+TEST(CasBuildReuseBlob, VanishedRecreatableBlobIsRetryableAborted)
 {
-    /// B156: reuseBlob on a blob that was deleted by GC after being staged (putBlob'd) in this same
-    /// transaction must throw ABORTED (retryable), NOT FILE_DOESNT_EXIST (fatal).
+    /// B156b: reuseBlob with body_recreatable=TRUE on a blob that was deleted by GC after being staged
+    /// (putBlob'd) in this same transaction must throw ABORTED (retryable), NOT FILE_DOESNT_EXIST.
     ///
     /// The race: the blob DID exist when the transaction uploaded it; GC's exact-token deleteExact
     /// landed between the reuseBlob call and our HEAD inside observeAndAdmit. The caller (e.g.,
-    /// ContentAddressedTransaction::createHardLink / moveDirectory / moveFile) detects ABORTED and
-    /// retries, which re-uploads the content via putBlob from the held source. The fatal
-    /// FILE_DOESNT_EXIST path is intentionally preserved for putBlob's body-holding retry and
-    /// adoptTree's never-existed fail-closed semantics — those callers are NOT going through reuseBlob.
+    /// ContentAddressedTransaction::createHardLink staged-source branch) detects ABORTED and retries the
+    /// whole INSERT, which re-uploads the content via putBlob from source ⇒ CONVERGES. The fatal
+    /// FILE_DOESNT_EXIST path is preserved for the NOT-recreatable (adopted) case and for putBlob's
+    /// body-holding retry / adoptTree's never-existed fail-closed (those don't go through reuseBlob).
     auto b = std::make_shared<InMemoryBackend>();
 
     /// 1. Upload a blob so it exists, capture its token t0.
@@ -173,19 +175,97 @@ TEST(CasBuildReuseBlob, VanishedBlobIsRetryableAborted)
     b->deleteExact(layout.blobKey(id), t0);
     ASSERT_FALSE(b->head(layout.blobKey(id)).exists);
 
-    /// 3. reuseBlob on the now-absent blob must throw ABORTED (retryable), not FILE_DOESNT_EXIST (fatal).
+    /// 3. reuseBlob(body_recreatable=true) on the now-absent blob ⇒ ABORTED (retryable), not FILE_DOESNT_EXIST.
     auto s = openStore(b);
     auto build = s->startBuild({});
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->reuseBlob(id); });
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->reuseBlob(id, /*body_recreatable*/ true); });
 
     /// 4. Confirm: a successful reuseBlob on a live (non-deleted) blob still works.
     {
         auto s1 = openStore(b);
         auto build1 = s1->startBuild({});
         const BlobId live_id = build1->putBlob(idOf("live-payload"), BlobSource::fromString("live-payload")).id;
-        auto ref = build1->reuseBlob(live_id);
+        auto ref = build1->reuseBlob(live_id, /*body_recreatable*/ true);
         EXPECT_EQ(ref.id, live_id);
     }
+}
+
+TEST(CasBuildReuseBlob, VanishedAdoptedBlobStaysFailLoud)
+{
+    /// B156b INV-NO-LOSS guard: reuseBlob with body_recreatable=FALSE (the adopted-from-committed,
+    /// tokenless W-EVIDENCE case) on a vanished blob must throw FILE_DOESNT_EXIST — a REFERENCED blob
+    /// was deleted, a genuine loss that MUST surface, NOT be masked as a retryable ABORTED (there is no
+    /// body to re-upload, so an ABORTED retry would re-adopt the still-gone blob and spin forever).
+    /// Also confirms depIsTokened discriminates: a putBlob'd dep is tokened, an adopted dep is not.
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// 1. Create a blob and a source tree that references it by name (committed source shape).
+    DB::Cas::Layout layout("p");
+    BlobId id;
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        auto build0 = s0->startBuild({});
+        id = build0->putBlob(idOf("adopt-payload"), BlobSource::fromString("adopt-payload")).id;
+        t0 = b->head(s0->layout().blobKey(id)).token;
+    }
+    TreeEntry src_entry;
+    src_entry.name = "data.bin";
+    src_entry.placement = Placement::Blob;
+    src_entry.file_hash = u128Of("adopt-payload");
+    src_entry.file_size = 13;
+    const TreeId source = writeTreeRaw(*b, layout, {src_entry}, openStore(b)->poolMeta().pool_id);
+
+    /// 2. A build adopts the blob from the committed source tree ⇒ a TOKENLESS W-EVIDENCE dep.
+    auto s = openStore(b);
+    auto adopting = s->startBuild({});
+    adopting->adoptFromTree(source, "data.bin");
+    EXPECT_FALSE(adopting->depIsTokened(u128Of("adopt-payload")));
+    EXPECT_TRUE(adopting->hasDep(u128Of("adopt-payload")));
+
+    /// 3. GC deletes the referenced blob (exact-token deleteExact).
+    b->deleteExact(layout.blobKey(id), t0);
+    ASSERT_FALSE(b->head(layout.blobKey(id)).exists);
+
+    /// 4. reuseBlob(body_recreatable=false) on the vanished blob ⇒ FAIL-LOUD FILE_DOESNT_EXIST (NOT masked).
+    auto consumer = s->startBuild({});
+    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST,
+        [&] { consumer->reuseBlob(id, /*body_recreatable*/ false); });
+}
+
+TEST(CasBuildReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
+{
+    /// B156b discriminator unit: putBlob records a TOKENED dep (recreatable), adoptFromTree records a
+    /// TOKENLESS W-EVIDENCE dep (not recreatable). The wiring uses this to pick body_recreatable.
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    DB::Cas::Layout layout("p");
+
+    /// putBlob'd hash ⇒ tokened.
+    auto build = s->startBuild({});
+    build->putBlob(idOf("written"), BlobSource::fromString("written"));
+    EXPECT_TRUE(build->depIsTokened(u128Of("written")));
+    EXPECT_TRUE(build->hasDep(u128Of("written")));
+
+    /// Adopted hash ⇒ tokenless. The blob must exist for adoptFromTree's source tree to reference it.
+    {
+        auto s0 = openStore(b);
+        auto b0 = s0->startBuild({});
+        b0->putBlob(idOf("adopted"), BlobSource::fromString("adopted"));
+    }
+    TreeEntry src_entry;
+    src_entry.name = "f";
+    src_entry.placement = Placement::Blob;
+    src_entry.file_hash = u128Of("adopted");
+    src_entry.file_size = 7;
+    const TreeId source = writeTreeRaw(*b, layout, {src_entry}, s->poolMeta().pool_id);
+    build->adoptFromTree(source, "f");
+    EXPECT_FALSE(build->depIsTokened(u128Of("adopted")));
+    EXPECT_TRUE(build->hasDep(u128Of("adopted")));
+
+    /// Unknown hash ⇒ no dep, not tokened.
+    EXPECT_FALSE(build->depIsTokened(u128Of("unknown")));
+    EXPECT_FALSE(build->hasDep(u128Of("unknown")));
 }
 
 TEST(CasBuild, ReuseBlobCondemnedResurrects)
@@ -210,7 +290,8 @@ TEST(CasBuild, ReuseBlobCondemnedResurrects)
 
     auto s = openStore(b);
     auto build = s->startBuild({});
-    auto ref = build->reuseBlob(id);
+    /// The blob exists and is condemned (resurrect path) — body_recreatable is irrelevant here.
+    auto ref = build->reuseBlob(id, /*body_recreatable*/ true);
     EXPECT_EQ(ref.id, id);
 
     /// The object was rewritten: a NEW token, a NEW incarnation_tag, the SAME payload + header_len.
