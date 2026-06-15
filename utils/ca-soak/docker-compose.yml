@@ -15,6 +15,25 @@ services:
     env_file: configs/rustfs.env
     expose:
       - "11121"
+    # Named volume so the orphan-reaper sidecar can share it (RustFS beta leaks overwrite-orphan
+    # data dirs and does not reclaim them — #3). Removed by `docker compose down -v` each run.
+    volumes:
+      - rustfs_data:/data
+
+  # CA soak orphan reaper (test-harness only, #3): reclaims RustFS's un-reclaimed overwrite-orphan
+  # <uuid>/ data dirs under roots/. Debian sidecar (GNU find/du/sort) sharing rustfs1's data volume.
+  # Safety is in the script: scoped to roots/, keep-newest + grace window (see the spec).
+  reaper:
+    image: debian:stable-slim
+    depends_on:
+      - rustfs1
+    volumes:
+      - rustfs_data:/data
+      - ./scripts/orphan_reaper.sh:/orphan_reaper.sh:ro
+    environment:
+      GRACE_SEC: "120"
+      REAP_INTERVAL: "300"
+    entrypoint: ["bash", "/orphan_reaper.sh", "/data/test/soak_pool/roots"]
 
   # One-shot: wait for RustFS, then create the `test` bucket the CA pool path lives under.
   createbucket:
@@ -91,3 +110,6 @@ services:
       # Host port 9001 can be occupied by a stray RustFS process; 9002 avoids the collision.
       # The smoke only uses HTTP (8123/8124); the native port is exposed for convenience.
       - "9002:9000"
+
+volumes:
+  rustfs_data:
