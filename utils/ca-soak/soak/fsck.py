@@ -10,6 +10,10 @@ Both functions return a dict that is safe to assert on in integration tests.
 import subprocess
 
 
+class FsckTimeout(RuntimeError):
+    """The fsck/dryrun subprocess exceeded its timeout (an O(pool) scan crawling under load — B146/B154)."""
+
+
 # ---------------------------------------------------------------------------
 # Pure parsers (unit-tested)
 # ---------------------------------------------------------------------------
@@ -75,7 +79,8 @@ _CLICKHOUSE_DISKS = [
 ]
 
 
-def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True) -> dict:
+def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
+             timeout_s: float = 600.0) -> dict:
     """Run `clickhouse disks --disk <disk> --query "fsck [--detail]"` in the container.
 
     Uses the read-only disk (``ca_ro`` by default) so the mutating capability probe is
@@ -87,6 +92,10 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True) -> dict:
     - ``stdout`` / ``stderr``  — raw strings for diagnostic logging
     - ``detail`` (when ``detail=True``) — list of per-object dicts
       ``{"class": …, "key": …, "size": …}``
+
+    Raises ``FsckTimeout`` if the subprocess does not complete within ``timeout_s`` seconds
+    (an O(pool) scan can take 40+ minutes under load — B146/B154).  ``subprocess.run``
+    kills the child process automatically on ``TimeoutExpired`` in Python 3.x.
     """
     query = "fsck --detail" if detail else "fsck"
     cmd = [
@@ -95,7 +104,10 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True) -> dict:
         "--disk", disk,
         "--query", query,
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        raise FsckTimeout(f"fsck (detail={detail}) exceeded {timeout_s}s on {container}")
 
     # The summary line starts with "reachable="; find the first such line.
     summary_line = next(
@@ -120,10 +132,13 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True) -> dict:
     return res
 
 
-def run_dryrun(container: str, disk: str = "ca_ro") -> dict:
+def run_dryrun(container: str, disk: str = "ca_ro", timeout_s: float = 600.0) -> dict:
     """Run `clickhouse disks --disk <disk> --query ca-gc-dryrun` in the container.
 
     Returns the parsed output of `parse_dryrun`.
+
+    Raises ``FsckTimeout`` if the subprocess does not complete within ``timeout_s`` seconds
+    (an O(pool) scan can take 40+ minutes under load — B146/B154).
     """
     cmd = [
         "docker", "exec", container,
@@ -131,7 +146,10 @@ def run_dryrun(container: str, disk: str = "ca_ro") -> dict:
         "--disk", disk,
         "--query", "ca-gc-dryrun",
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        raise FsckTimeout(f"ca-gc-dryrun exceeded {timeout_s}s on {container}")
     result = parse_dryrun(p.stdout)
     result["exit_code"] = p.returncode
     result["stdout"] = p.stdout

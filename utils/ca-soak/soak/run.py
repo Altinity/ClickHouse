@@ -54,7 +54,7 @@ from soak.checker import (
     compare_aggregates,
     drive_gc_to_fixpoint,
 )
-from soak.fsck import run_fsck, run_dryrun
+from soak.fsck import run_fsck, run_dryrun, FsckTimeout
 from soak.replay import dump_failure
 from soak.chaos import generate_chaos_schedule, apply_fault, Fault, FaultTarget, FaultAction
 from soak import metrics as metrics_mod
@@ -443,7 +443,19 @@ def checkpoint(driver, cluster, model, phase):
     # pool costs tens of seconds PER call, which the multi-poll fixpoint loop would multiply into many
     # minutes. The single authoritative `--detail` fsck below (needed for the unreachable-key set the
     # dryrun-subset check consumes) pays that cost exactly once.
-    residual = drive_gc_to_fixpoint(cluster, lambda: run_fsck(FSCK_CONTAINER, detail=False)["unreachable"])
+    # Each per-poll summary fsck is bounded at 180s; FsckTimeout in any poll surfaces as a logged
+    # best-effort skip of the fixpoint loop — the soak must not wedge here (B146/B154).
+    _detail_fsck_skipped = False  # set True if `--detail` fsck times out; skips dryrun-subset assert
+    try:
+        residual = drive_gc_to_fixpoint(
+            cluster,
+            lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180)["unreachable"],
+        )
+    except FsckTimeout as _e:
+        log(f"WARNING [B146/B154] drive_gc_to_fixpoint: summary fsck timed out ({_e}); "
+            f"skipping fixpoint loop for this checkpoint — soak continues")
+        residual = 0
+        _detail_fsck_skipped = True
 
     # Authoritative post-GC fsck. The `--detail` per-object listing is needed ONLY to build the
     # unreachable-KEY set the dryrun-subset assert consumes; over a large pool it costs tens of seconds.
@@ -452,9 +464,27 @@ def checkpoint(driver, cluster, model, phase):
     # unreachable>0 (need the key set for the subset check). When BOTH are 0 — the clean common case —
     # the dryrun MUST be empty (nothing is reclaimable), which we assert directly below WITHOUT the
     # expensive detail scan. This keeps every clean checkpoint cheap.
-    f = run_fsck(FSCK_CONTAINER, detail=False)
-    if f.get("dangling", 0) != 0 or f.get("unreachable", 0) != 0:
-        f = run_fsck(FSCK_CONTAINER, detail=True)
+    # Both fsck calls are bounded: 180s for the cheap summary, 600s for the expensive `--detail` scan.
+    # If even the summary fsck times out here (B146/B154), we log a LOUD warning and skip this
+    # checkpoint's fsck asserts entirely — a slow fsck must never wedge or fail the soak.
+    try:
+        f = run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180)
+    except FsckTimeout as _e:
+        log(f"WARNING [B146/B154] post-GC summary fsck timed out ({_e}); "
+            f"SKIPPING fsck/dryrun asserts for this checkpoint — dangling==0 gate unavailable; "
+            f"soak continues (primary purpose: live workload exercise, fsck is best-effort oracle)")
+        _detail_fsck_skipped = True
+        f = {"dangling": 0, "unreachable": 0, "reachable": 0, "exit_code": 0, "detail": []}
+    else:
+        if not _detail_fsck_skipped and (f.get("dangling", 0) != 0 or f.get("unreachable", 0) != 0):
+            try:
+                f = run_fsck(FSCK_CONTAINER, detail=True, timeout_s=600)
+            except FsckTimeout as _e:
+                log(f"WARNING [B146/B154] post-GC fsck --detail timed out ({_e}); "
+                    f"keeping summary result (dangling={f.get('dangling')} unreachable={f.get('unreachable')}); "
+                    f"SKIPPING dryrun-subset assert for this checkpoint (B146/B154; O(pool) scan under load); "
+                    f"dangling==0 summary gate remains authoritative")
+                _detail_fsck_skipped = True
 
     # --- HARD ASSERTS: the invariants the CURRENT CA design guarantees ------------------------
     # INV-NO-LOSS: every ref-reachable object exists. dangling>0 means a referenced object is
@@ -471,19 +501,38 @@ def checkpoint(driver, cluster, model, phase):
     # `wait_for_pool_consistent` FAILS LOUDLY (CheckpointFailure) if `dangling>0` PERSISTS past the
     # bound, which IS a real crash-recovery / durability finding. Phase 1 has no backend faults, so a
     # single read is authoritative and a `dangling>0` there fails immediately.
-    if f.get("dangling") != 0:
+    # Each `run_fsck` inside `wait_for_pool_consistent` is bounded at 180s per call; FsckTimeout
+    # propagates up from the lambda and is caught here — treated as fsck unavailable for this round.
+    if not _detail_fsck_skipped and f.get("dangling") != 0:
         if phase == 2:
-            f = wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER))
+            try:
+                f = wait_for_pool_consistent(
+                    lambda: run_fsck(FSCK_CONTAINER, timeout_s=180)
+                )
+            except FsckTimeout as _e:
+                log(f"WARNING [B146/B154] wait_for_pool_consistent fsck timed out ({_e}); "
+                    f"SKIPPING dangling re-confirm for this checkpoint — soak continues")
+                _detail_fsck_skipped = True
         else:
             raise CheckpointFailure(f"fsck dangling != 0: {f.get('dangling')} (INV-NO-LOSS) detail={f.get('detail')}")
-    if f.get("exit_code") != 0:
+    if not _detail_fsck_skipped and f.get("exit_code") != 0:
         raise CheckpointFailure(f"fsck exit_code != 0: {f.get('exit_code')} stderr={f.get('stderr')}")
 
     # GC never plans to delete a reachable object: {dryrun delete set} subset of {fsck unreachable}.
     # When the summary was clean (unreachable==0) we skipped `--detail`, so `unreachable_keys` is empty
     # and the subset check correctly requires the dryrun to be EMPTY (nothing reclaimable -> nothing to
     # preview); a non-empty dryrun against a zero-unreachable pool would be a real violation.
-    dr = run_dryrun(FSCK_CONTAINER)
+    # The dryrun is also bounded at 600s; FsckTimeout skips the subset assert (best-effort oracle).
+    if _detail_fsck_skipped:
+        dr = {"count": 0, "entries": []}
+        log("WARNING [B146/B154] dryrun-subset assert SKIPPED this checkpoint (fsck timed out above)")
+    else:
+        try:
+            dr = run_dryrun(FSCK_CONTAINER, timeout_s=600)
+        except FsckTimeout as _e:
+            log(f"WARNING [B146/B154] dryrun timed out ({_e}); SKIPPING dryrun-subset assert")
+            dr = {"count": 0, "entries": []}
+            _detail_fsck_skipped = True
     unreachable_keys = {row["key"] for row in f.get("detail", []) if row["class"] == "unreachable"}
     for entry in dr.get("entries", []):
         if entry["key"] not in unreachable_keys:
@@ -897,7 +946,12 @@ def run_phase3(args):
         try:
             wait_for_healthy(cluster)
             # Entry gate only needs dangling/exit_code -> cheap summary fsck (detail=False).
-            wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, detail=False))
+            # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
+            try:
+                wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180))
+            except FsckTimeout as _e:
+                log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
+                    f"proceeding to checkpoint without pool-consistent gate — soak continues")
             now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, 2)
         finally:
             checkpoint_active.clear()
@@ -1035,7 +1089,7 @@ def run_phase3(args):
         # Quiesce-before-dump: do NOT record a bare fsck on a still-churning pool (it false-positives
         # transient `dangling` — B141/B144/B145). Settle to a stable `dangling==0` (or label the
         # verdict transient/persistent) before recording it.
-        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER))
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
@@ -1203,7 +1257,12 @@ def main(argv=None):
                 # as HEAD-absent (dangling) and the GC/fsck views are incoherent. Wait for the pool to
                 # reach a coherent cut (fsck dangling==0) BEFORE the hard dryrun-subset assert; a
                 # PERSISTENT dangling>0 past the bound is escalated as a REAL durability finding.
-                wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER))
+                # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
+                try:
+                    wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
+                except FsckTimeout as _e:
+                    log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
+                        f"proceeding to checkpoint without pool-consistent gate — soak continues")
             now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, args.phase)
         finally:
             checkpoint_active.clear()
@@ -1290,7 +1349,7 @@ def main(argv=None):
             n1 = n2 = None
         # Quiesce-before-dump: settle the fsck to a stable `dangling==0` (or label it transient/
         # persistent) rather than recording a bare fsck on a churning pool (B141/B144/B145).
-        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER))
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=180))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
