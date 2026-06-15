@@ -734,6 +734,10 @@ The server successfully detected this situation and will download merged part fr
     M(S3CopyObject, "Number of S3 API CopyObject calls.", ValueType::Number) \
     M(S3ListObjects, "Number of S3 API ListObjects calls.", ValueType::Number) \
     M(S3HeadObject,  "Number of S3 API HeadObject calls.", ValueType::Number) \
+    M(CasDbgExistsHit,  "DBG(CA soak): S3ObjectStorage::exists() returned true.", ValueType::Number) \
+    M(CasDbgExistsMiss, "DBG(CA soak): S3ObjectStorage::exists() returned false (404).", ValueType::Number) \
+    M(CasDbgMetaHit,    "DBG(CA soak): S3ObjectStorage::tryGetObjectMetadata() found the object.", ValueType::Number) \
+    M(CasDbgMetaMiss,   "DBG(CA soak): S3ObjectStorage::tryGetObjectMetadata() returned nullopt (404).", ValueType::Number) \
     M(S3GetObjectTagging, "Number of S3 API GetObjectTagging calls.", ValueType::Number) \
     M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.", ValueType::Number) \
     M(S3UploadPartCopy, "Number of S3 API UploadPartCopy calls.", ValueType::Number) \
