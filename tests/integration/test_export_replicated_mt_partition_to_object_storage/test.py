@@ -1533,41 +1533,8 @@ def test_export_partition_all(cluster):
 
 
 def test_export_partition_partition_column_castable_type_mismatch(cluster):
-    """
-    Post-fix contract: EXPORT PARTITION must reject castable but non-equal
-    partition-column types synchronously.
-
-    Setup
-    -----
-        * Source (ReplicatedMergeTree): ``id UInt64, year String``,
-          ``PARTITION BY year``
-        * Destination (S3, partition_strategy='hive'): ``id UInt64,
-          year UInt16``, ``PARTITION BY year``
-
-    Why the synchronous rejection is required
-    -----------------------------------------
-    ``makeConvertingActions(Position)`` accepts ``String -> UInt16`` and the
-    PARTITION BY ASTs are textually identical, so the schema/AST validators
-    would let this through.  But EXPORT does not re-evaluate the partition
-    key against the destination's schema: in ``ExportPartTask::executeStep``
-    the block fed to ``destination_storage->import`` is built from the
-    source part's minmax index (SOURCE types).  If we let the export proceed
-    the hive partition path is computed from the un-cast SOURCE value while
-    the row data is the CAST value — silent divergence from INSERT SELECT.
-    The exact-type partition-column check in
-    ``ExportPartitionUtils::verifyPartitionColumnsExactTypeMatch`` rejects
-    this pairing at ALTER time.
-
-    Assertions
-    ----------
-        * ``ALTER ... EXPORT PARTITION ID '<id>' TO TABLE ...`` raises a
-          ``BAD_ARGUMENTS`` exception whose text references the partition
-          column type mismatch.
-        * No row is created in ``system.replicated_partition_exports`` for
-          this (source_table, destination_table, partition_id) — nothing
-          was ever scheduled.
-        * No parquet file is written under any ``year=*/`` prefix in S3.
-    """
+    """A lossy partition-column cast (year String -> UInt16) is rejected synchronously
+    when export_merge_tree_part_allow_lossy_cast is off, scheduling nothing."""
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
 
@@ -1614,12 +1581,12 @@ def test_export_partition_partition_column_castable_type_mismatch(cluster):
         f"TO TABLE {s3_table}"
     )
     assert "BAD_ARGUMENTS" in error, (
-        f"Expected BAD_ARGUMENTS for partition-column type mismatch, "
+        f"Expected BAD_ARGUMENTS for a lossy partition-column cast, "
         f"got: {error!r}"
     )
-    assert "partition key column 'year'" in error, (
-        f"Expected the error message to identify the offending partition "
-        f"column 'year', got: {error!r}"
+    assert "requires a lossy cast" in error and "'year'" in error, (
+        f"Expected the error message to report the lossy cast on column "
+        f"'year', got: {error!r}"
     )
 
     # Nothing scheduled: no row in system.replicated_partition_exports.

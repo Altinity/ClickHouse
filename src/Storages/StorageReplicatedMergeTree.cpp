@@ -8388,42 +8388,16 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     auto src_snapshot = getInMemoryMetadataPtr();
     auto destination_snapshot = dest_storage->getInMemoryMetadataPtr();
 
-    /// Schema compatibility: use the same rules as `INSERT INTO dest SELECT * FROM src` —
-    /// positional matching with CAST. We surface structural mismatches synchronously at
-    /// ALTER TABLE time by building (and discarding) the same converting DAG the worker
-    /// will build later. Anything `makeConvertingActions` rejects (column-count mismatch,
-    /// untyped cast) fails here; anything it accepts will be CAST at runtime.
-    {
-        Block source_sample_block;
-        for (const auto & column : src_snapshot->getColumns().getReadable())
-            source_sample_block.insert({column.type->createColumn(), column.type, column.name});
+    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
+    ExportPartitionUtils::verifyExportSchemaCastable(
+        src_snapshot, destination_snapshot, dest_storage->getStorageID(), query_context);
 
-        const auto destination_sample_block = destination_snapshot->getSampleBlockNonMaterialized();
-
-        (void) ActionsDAG::makeConvertingActions(
-            source_sample_block.getColumnsWithTypeAndName(),
-            destination_sample_block.getColumnsWithTypeAndName(),
-            ActionsDAG::MatchColumnsMode::Position,
-            query_context);
-    }
-
-    /// For data lakes (Iceberg) the partition-key checks — both spec/transform
-    /// compatibility and ClickHouse partition-column exact-type equality — are
-    /// performed inside `verifyIcebergPartitionCompatibility` below (per partition).
-    /// For non-data-lake destinations we do the AST equivalence check here and
-    /// then run the partition-column exact-type check directly.
+    /// Iceberg partition compatibility is checked below; here we only need the
+    /// partition-key ASTs to match (partition-column types follow the lossy-cast gate).
     if (!dest_storage->isDataLake())
     {
         if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
-
-        /// EXPORT does not re-evaluate the partition key against the destination's schema:
-        /// the hive partition path is derived from the SOURCE part's minmax block in
-        /// `ExportPartTask::executeStep`, while the row data is CAST to destination types
-        /// by `addExportConvertingActions`. Reject castable type differences on
-        /// partition-key columns synchronously so the path and the row data cannot disagree.
-        ExportPartitionUtils::verifyPartitionColumnsExactTypeMatch(
-            src_snapshot, destination_snapshot, dest_storage->getStorageID());
     }
 
     zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
@@ -8597,10 +8571,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
         ExportPartitionUtils::verifyIcebergPartitionCompatibility(
             metadata_object,
-            src_snapshot->getPartitionKeyAST(),
-            src_snapshot,
-            destination_snapshot,
-            dest_storage->getStorageID());
+            src_snapshot->getPartitionKeyAST());
 
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);

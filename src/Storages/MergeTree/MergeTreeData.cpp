@@ -6745,10 +6745,7 @@ void MergeTreeData::exportPartToTable(
 
             ExportPartitionUtils::verifyIcebergPartitionCompatibility(
                 metadata_object,
-                source_metadata_ptr->getPartitionKeyAST(),
-                source_metadata_ptr,
-                destination_metadata_ptr,
-                dest_storage->getStorageID());
+                source_metadata_ptr->getPartitionKeyAST());
         }
 #else
         (void)iceberg_metadata_json_;
@@ -6756,42 +6753,16 @@ void MergeTreeData::exportPartToTable(
 #endif
     }
 
-    /// Schema compatibility: use the same rules as `INSERT INTO dest SELECT * FROM src` —
-    /// positional matching with CAST. We surface structural mismatches synchronously at
-    /// ALTER TABLE time by building (and discarding) the same converting DAG the worker
-    /// will build later. Anything `makeConvertingActions` rejects (column-count mismatch,
-    /// untyped cast) fails here; anything it accepts will be CAST at runtime.
-    {
-        Block source_sample_block;
-        for (const auto & column : source_metadata_ptr->getColumns().getReadable())
-            source_sample_block.insert({column.type->createColumn(), column.type, column.name});
+    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
+    ExportPartitionUtils::verifyExportSchemaCastable(
+        source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
 
-        const auto destination_sample_block = destination_metadata_ptr->getSampleBlockNonMaterialized();
-
-        (void) ActionsDAG::makeConvertingActions(
-            source_sample_block.getColumnsWithTypeAndName(),
-            destination_sample_block.getColumnsWithTypeAndName(),
-            ActionsDAG::MatchColumnsMode::Position,
-            query_context);
-    }
-
-    /// For data lakes (Iceberg) the partition-key checks — both spec/transform
-    /// compatibility and ClickHouse partition-column exact-type equality — are
-    /// performed inside `verifyIcebergPartitionCompatibility` above.
-    /// For non-data-lake destinations we do the AST equivalence check here and
-    /// then run the partition-column exact-type check directly.
+    /// Iceberg partition compatibility is checked above; here we only need the
+    /// partition-key ASTs to match (partition-column types follow the lossy-cast gate).
     if (!dest_storage->isDataLake())
     {
         if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
-
-        /// EXPORT does not re-evaluate the partition key against the destination's schema:
-        /// the hive partition path is derived from the SOURCE part's minmax block in
-        /// `ExportPartTask::executeStep`, while the row data is CAST to destination types
-        /// by `addExportConvertingActions`. Reject castable type differences on
-        /// partition-key columns synchronously so the path and the row data cannot disagree.
-        ExportPartitionUtils::verifyPartitionColumnsExactTypeMatch(
-            source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID());
     }
 
     auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
