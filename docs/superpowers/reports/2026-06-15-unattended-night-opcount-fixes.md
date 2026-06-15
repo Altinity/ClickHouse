@@ -12,7 +12,13 @@ Branch: `cas-mergetree-poc`. Evidence base: `docs/superpowers/reports/2026-06-15
 - [x] #2 GC single-leader / retire-contention → B160 (backlog only).
 - [ ] 12h soak with hourly reports (NEXT)
 
-Reviews: two parallel adversarial subagent reviews (#1; #5+#4) — NO blockers/majors. Two minors fixed: #1 empty-ETag → HEAD fallback (fail-safe, = old behavior); #5 deadline checked every ref (was every 64, skipped on pools <64 refs). 276 unit tests pass; only baseline `CasGcLeak.DisplacedUnexpandedTreeBlobsLeak` red (B140-deferred, pre-existing).
+### Progress 3 — soak launched (run #6), monitoring armed
+All four implementations done, tested, reviewed, committed (2a13fe5cc0f #1, d852ec53d34 #5, d0194412d0b #4, 6370753caa9→busybox #3, 14cc9c90b9f review-fixes). #2 = B160. Soak bring-up hit TWO self-inflicted harness bugs (B161): a `#` comment inside the YAML `>`-folded createbucket `sh -c` (→ sh exit 2 → ch1 dependency fail) and a suspected named-volume destabilizer; both fixed (createbucket verify-loop, reaper reverted to a host-side busybox `docker exec` loop). **Soak run #6 LIVE** (seed 20260617, 12h, 6 workers, root_shards=64, reaper loop + poller + hourly Monitor `b9kwtfoae`).
+**Hour-0 baseline (t=343s) — strongly positive:** ch1 250 parts/0.01s, ch2 210/0.01s; noref=0 broken=0 both; HEAD/PUT=1.20; **GC=0 failed/52 ok/0 retire-contention** (run#5: 300f/250rc — #4 fanout relieves B160); **err=0×412/0×503/0×broken-pipe** (run#5 had storms — #4 fixed the B158 64-permit congestion); replLag=0s; **du roots=7.4M** (run#5 hit 74G — reaper + spread), blobs=2.5G. #4 confirmed 64 shards; #1 in binary, RustFS returns matching PutObject/HEAD ETags (gate-safe), HEAD-reduction partial on this dedup-heavy workload (dedup `observeAndAdmit` HEADs remain — B161c follow-up).
+Hourly summaries append to `logs/soak6_hourly.log`; the Monitor re-invokes me each hour to record + react.
+
+### Reviews
+Two parallel adversarial subagent reviews (#1; #5+#4) — NO blockers/majors. Two minors fixed: #1 empty-ETag → HEAD fallback (fail-safe, = old behavior); #5 deadline checked every ref (was every 64, skipped on pools <64 refs). 276 unit tests pass; only baseline `CasGcLeak.DisplacedUnexpandedTreeBlobsLeak` red (B140-deferred, pre-existing).
 
 ## Log
 (appended chronologically below)
