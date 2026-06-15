@@ -45,7 +45,8 @@ public:
         String local_scratch_path_,
         ContextPtr context_ = nullptr,
         bool gc_enabled_ = true,
-        std::chrono::seconds gc_interval_ = std::chrono::seconds(60));
+        std::chrono::seconds gc_interval_ = std::chrono::seconds(60),
+        uint64_t root_shards_ = 8);
 
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
@@ -150,6 +151,7 @@ private:
 
     const bool gc_enabled;
     const std::chrono::seconds gc_interval;
+    const uint64_t root_shards;   /// creation-time shard fanout (#4); applied in startup()'s Store::open
 
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;

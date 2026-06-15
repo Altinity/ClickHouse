@@ -1025,3 +1025,21 @@ TEST(CaWiringRead, CorruptCaMtimeStampFailsClosed)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { storage->getLastModified("uui/uuid-1/all_1_1_0"); });
 }
+
+// #4: content_addressed_root_shards is plumbed through the ctor to pool creation (creation-time
+// fanout); default stays 8.
+TEST(CaWiring, RootShardsConfigurable)
+{
+    auto widened = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1",
+        std::filesystem::temp_directory_path() / "ca_wiring_rootshards", nullptr,
+        /*gc_enabled=*/false, std::chrono::seconds(60), /*root_shards=*/4);
+    widened->startup();
+    EXPECT_EQ(widened->store()->poolMeta().root_shards, 4u);
+
+    auto defaulted = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1",
+        std::filesystem::temp_directory_path() / "ca_wiring_rootshards_def", nullptr);
+    defaulted->startup();
+    EXPECT_EQ(defaulted->store()->poolMeta().root_shards, 8u);
+}

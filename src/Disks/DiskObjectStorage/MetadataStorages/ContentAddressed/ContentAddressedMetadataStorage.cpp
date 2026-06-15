@@ -125,7 +125,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     String local_scratch_path_,
     ContextPtr context_,
     bool gc_enabled_,
-    std::chrono::seconds gc_interval_)
+    std::chrono::seconds gc_interval_,
+    uint64_t root_shards_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -134,6 +135,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , context(context_)
     , gc_enabled(gc_enabled_)
     , gc_interval(gc_interval_)
+    , root_shards(root_shards_)
 {
 }
 
@@ -215,6 +217,10 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.server_id = serverIdToU128(server_id);
     pool_config.background_heartbeats = (context != nullptr) && !read_only;
     pool_config.read_only = read_only;
+    /// Creation-time only (the pool is authoritative on reopen): widening the shard fanout spreads
+    /// manifest CAS writes across more keys, reducing per-key congestion + per-key overwrite-orphan
+    /// pileup (#4). Existing pools keep their shard count.
+    pool_config.root_shards = root_shards;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
 
