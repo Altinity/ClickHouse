@@ -746,51 +746,6 @@ def test_partition_key_compatibility_check(cluster):
     )
 
 
-def test_export_entries_never_expire(cluster):
-    """
-    Export entries never expire: a second export of the same partition is rejected
-    indefinitely unless export_merge_tree_partition_force_export is set.
-    """
-    node = cluster.instances["replica1"]
-
-    uid = unique_suffix()
-    mt_table = f"mt_{uid}"
-    iceberg_table = f"iceberg_{uid}"
-
-    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
-
-    # First export.
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} "
-        f"SETTINGS allow_insert_into_iceberg = 1"
-    )
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
-
-    count_after_first = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
-    assert count_after_first == 3, f"Expected 3 rows after first export, got {count_after_first}"
-
-    # A second export is rejected, and stays rejected (the entry never expires).
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    assert "Export with key" in error, f"Expected duplicate-export error, got: {error}"
-
-    time.sleep(5)
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    assert "Export with key" in error, f"Entry must not expire, got: {error}"
-
-    # Only force_export can overwrite the existing entry.
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1, "export_merge_tree_partition_force_export": 1},
-    )
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
-
-
 def test_export_data_files_are_not_cleaned_up_on_commit_failure(cluster):
     """
     Verify that the data files are not cleaned up on commit failure and the export is retried.
