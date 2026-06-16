@@ -29,7 +29,8 @@ struct BlobRef
 class Build
 {
 public:
-    Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt128 build_id_, BuildInfo info_);
+    Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt128 build_id_,
+          uint64_t build_seq_, uint64_t epoch_, BuildInfo info_);
     ~Build();
 
     /// W-FRESH-TAG: every upload attempt mints a fresh random incarnation_tag.
@@ -74,6 +75,9 @@ public:
     void abandon();
 
     UInt128 buildId() const { return build_id; }
+    /// The strictly-increasing per-process build_seq (spec 2026-06-16). Stamped into object owner
+    /// metadata (Task 8) and the GC watermark floor (minActive) tracks it across in-flight builds.
+    uint64_t buildSeq() const { return build_seq; }
     void renewHeartbeat();                                /// test hook == HeartbeatKeeper::renewOnce
 
 private:
@@ -126,6 +130,8 @@ private:
     StorePtr store;
     std::unique_ptr<HeartbeatKeeper> heartbeat;
     UInt128 build_id{};
+    uint64_t build_seq{};                                 /// per-process monotone seq (spec 2026-06-16)
+    [[maybe_unused]] uint64_t epoch{};                    /// owning Store's process_epoch (stamped in Task 8)
     BuildInfo info;
     bool alive = true;
 

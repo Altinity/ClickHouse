@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRetireView.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -77,6 +78,16 @@ class Store : public std::enable_shared_from_this<Store>
 
 public:
     static StorePtr open(BackendPtr backend, PoolConfig config);
+    ~Store();
+
+    /// ---- per-server watermark surface (spec 2026-06-16-ca-build-watermark) ----
+    /// process_epoch: random nonzero per Store (process). GC checks epoch EQUALITY, never ordering.
+    uint64_t epoch() const { return process_epoch; }
+    /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
+    /// quiescent server's watermark floor advances to the next-to-be-allocated seq). Locks builds_mutex.
+    uint64_t minActive();
+    /// Test/assertion accessor for the next-to-allocate build_seq under the lock.
+    uint64_t peekNextBuildSeq();
 
     /// ---- write side ----
     BuildPtr startBuild(BuildInfo info);                          /// W-HEARTBEAT durable before return
@@ -125,6 +136,11 @@ public:
 private:
     Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
 
+    /// Allocate a strictly-increasing build_seq and add it to the active set (called by startBuild).
+    uint64_t allocateBuildSeq();
+    /// Remove a build_seq from the active set; idempotent (safe from publish/abandon/dtor).
+    void retireBuildSeq(uint64_t seq);
+
     uint64_t shardOf(const String & ref_name) const;             /// CityHash64(ref_name) % root_shards
     /// Read shard manifest (absent ⇒ empty RootShard with no token); used by mutateShard (writes,
     /// which need the token for the CAS) and as the uncached primitive under readShardDecoded.
@@ -170,6 +186,18 @@ private:
     /// in M-C3; full GC removes a namespace with its final manifests in M-F).
     std::mutex registered_mutex;
     std::set<String> registered_cache;
+
+    /// Per-server build watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random
+    /// nonzero u64 minted once at open: GC checks it for EQUALITY (an object stamped with a different
+    /// epoch is from a dead incarnation), never for ordering. next_build_seq is a strictly-increasing
+    /// per-process counter (monotonicity is load-bearing — a seq is never reused or lowered);
+    /// active_build_seqs holds the seqs of in-flight builds, so minActive yields the GC floor.
+    /// watermark is the Store-owned per-server renewer (anchored before any object PUT in open).
+    uint64_t process_epoch = 0;
+    std::mutex builds_mutex;
+    uint64_t next_build_seq = 1;
+    std::set<uint64_t> active_build_seqs;
+    std::unique_ptr<WatermarkKeeper> watermark;
 
     /// B113 read-path decode cache: rootShardKey -> ShardDecodeCacheEntry. Guarded by its own mutex.
     /// A token mismatch (any write to the shard) forces a fresh get + decode; cache entries are

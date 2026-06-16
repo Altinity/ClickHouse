@@ -70,6 +70,40 @@ TEST(CasStore, ReadOnlyOpenSkipsProbe)
     ASSERT_NE(store, nullptr);
 }
 
+TEST(CasStore, MinActiveTracksInFlightBuilds)
+{
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    DB::Cas::PoolConfig cfg;
+    cfg.pool_prefix = "pool";
+    cfg.server_id = DB::UInt128(1);
+    cfg.background_heartbeats = false;
+    auto store = DB::Cas::Store::open(backend, cfg);
+
+    ASSERT_EQ(store->minActive(), store->peekNextBuildSeq());   /// no builds: floor == next seq
+    auto b1 = store->startBuild({});                            /// seq 1
+    auto b2 = store->startBuild({});                            /// seq 2
+    ASSERT_EQ(store->minActive(), 1u);
+    b1->abandon();                                              /// finishes seq 1
+    ASSERT_EQ(store->minActive(), 2u);                          /// floor advances
+    b2->abandon();
+    ASSERT_EQ(store->minActive(), store->peekNextBuildSeq());   /// empty again
+}
+
+TEST(CasStore, BuildSeqIsStrictlyMonotone)
+{
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    DB::Cas::PoolConfig cfg;
+    cfg.pool_prefix = "pool";
+    cfg.server_id = DB::UInt128(1);
+    cfg.background_heartbeats = false;
+    auto store = DB::Cas::Store::open(backend, cfg);
+    auto a = store->startBuild({});
+    auto sa = a->buildSeq();
+    a->abandon();
+    auto b = store->startBuild({});
+    ASSERT_GT(b->buildSeq(), sa);                               /// never reused, never lower
+}
+
 TEST(CasPoolMeta, CreateThenReopen)
 {
     auto b = std::make_shared<InMemoryBackend>();

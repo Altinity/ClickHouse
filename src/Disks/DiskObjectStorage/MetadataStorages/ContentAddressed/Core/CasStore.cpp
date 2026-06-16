@@ -68,7 +68,40 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
 
     /// Prime the writer-side retire view once (rare by construction; see RetireView).
     store->retire_view.refresh();
+
+    /// Per-server watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random NONZERO
+    /// u64 minted once per Store: GC checks it for equality only (a different epoch == a dead
+    /// incarnation). Fold two thread_local_rng draws and avoid the 0 sentinel (UINT64_MAX is the
+    /// retired sentinel, also distinct from a live epoch).
+    store->process_epoch = thread_local_rng() ^ (static_cast<uint64_t>(thread_local_rng()) << 32);
+    if (store->process_epoch == 0)
+        store->process_epoch = 1;
+
+    /// W-ANCHOR: the per-server watermark must be durable BEFORE any object PUT. A read-only open
+    /// must never mutate the pool (the probe is skipped above for the same reason), so the watermark
+    /// — which writes the servers/<id> slot — is only constructed and anchored on a writable open.
+    if (!store->config.read_only)
+    {
+        Store * raw = store.get();
+        store->watermark = std::make_unique<WatermarkKeeper>(
+            store->pool_backend, store->pool_layout, store->config.server_id, store->process_epoch,
+            [raw] { return raw->minActive(); });
+        store->watermark->start();
+        if (store->config.background_heartbeats)
+            store->watermark->startBackground(store->config.heartbeat_period);
+    }
+
     return store;
+}
+
+Store::~Store()
+{
+    /// Stop the background renewal cleanly. We deliberately do NOT call farewell here: there is no
+    /// clean-shutdown hook plumbed through to Store dtor, and farewell would retire the epoch even on
+    /// a transient drop. The crash/shutdown path (a frozen seq) is handled by GC's frozen-seq
+    /// liveness detection (spec 2026-06-16-ca-build-watermark), so stopBackground alone is correct.
+    if (watermark)
+        watermark->stopBackground();
 }
 
 uint64_t Store::shardOf(const String & ref_name) const
@@ -133,6 +166,32 @@ std::vector<String> Store::listNamespaceFiles(const RootNamespace & ns)
     return names;
 }
 
+uint64_t Store::minActive()
+{
+    std::lock_guard lk(builds_mutex);
+    return active_build_seqs.empty() ? next_build_seq : *active_build_seqs.begin();
+}
+
+uint64_t Store::peekNextBuildSeq()
+{
+    std::lock_guard lk(builds_mutex);
+    return next_build_seq;
+}
+
+uint64_t Store::allocateBuildSeq()
+{
+    std::lock_guard lk(builds_mutex);
+    const uint64_t s = next_build_seq++;
+    active_build_seqs.insert(s);
+    return s;
+}
+
+void Store::retireBuildSeq(uint64_t seq)
+{
+    std::lock_guard lk(builds_mutex);
+    active_build_seqs.erase(seq);
+}
+
 BuildPtr Store::startBuild(BuildInfo info)
 {
     /// Mint a globally-unique build id from two thread_local_rng draws (random u128).
@@ -140,15 +199,21 @@ BuildPtr Store::startBuild(BuildInfo info)
     const UInt64 lo = thread_local_rng();
     const UInt128 build_id = (static_cast<UInt128>(hi) << 64) | lo;
 
+    /// Strictly-increasing per-process build_seq carried by the Build (spec 2026-06-16). The Build is
+    /// added to the active set here and retired on publish/abandon/dtor, so minActive — the GC floor
+    /// the Store-owned watermark renews — tracks in-flight builds.
+    const uint64_t seq = allocateBuildSeq();
+
     /// W-HEARTBEAT: the heartbeat must be durable BEFORE the build returns (and thus before any object
     /// PUT). start does the durable-first putIfAbsent; background renewal is opt-in (tests drive
-    /// renewOnce explicitly).
+    /// renewOnce explicitly). The per-build heartbeat is retained alongside the new per-server
+    /// watermark (it still gates full-GC debris); collapsing the two is a separate future cleanup.
     auto keeper = std::make_unique<HeartbeatKeeper>(pool_backend, pool_layout, build_id, config.server_id);
     keeper->start();
     if (config.background_heartbeats)
         keeper->startBackground(config.heartbeat_period);
 
-    return std::make_shared<Build>(shared_from_this(), std::move(keeper), build_id, std::move(info));
+    return std::make_shared<Build>(shared_from_this(), std::move(keeper), build_id, seq, process_epoch, std::move(info));
 }
 
 std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & ns, uint64_t shard, bool allow_stale)

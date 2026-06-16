@@ -51,20 +51,26 @@ BlobSource BlobSource::fromString(String bytes)
     return source;
 }
 
-Build::Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt128 build_id_, BuildInfo info_)
+Build::Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt128 build_id_,
+             uint64_t build_seq_, uint64_t epoch_, BuildInfo info_)
     : store(std::move(store_))
     , heartbeat(std::move(heartbeat_))
     , build_id(build_id_)
+    , build_seq(build_seq_)
+    , epoch(epoch_)
     , info(std::move(info_))
 {
 }
 
 Build::~Build()
 {
-    /// Crash semantics: the Build dtor takes no special action. If the build was not abandoned, the
-    /// heartbeat keeper's own dtor stops its background thread WITHOUT discarding the key, so the
-    /// uploads become debris that full GC reclaims under the heartbeat rules (spec §5). abandon() is
-    /// the only path that proactively discards.
+    /// Crash semantics: the Build dtor takes no special action on the heartbeat. If the build was not
+    /// abandoned, the heartbeat keeper's own dtor stops its background thread WITHOUT discarding the
+    /// key, so the uploads become debris that full GC reclaims under the heartbeat rules (spec §5).
+    /// abandon() is the only path that proactively discards.
+    /// Retire our build_seq from the Store's active set so the GC watermark floor (minActive) can
+    /// advance even if neither publish nor abandon ran (idempotent — safe if already retired).
+    store->retireBuildSeq(build_seq);
 }
 
 void Build::requireAlive() const
@@ -723,6 +729,10 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
             .op = JournalRecord::Op::Add, .ref_name = ref_name, .tree_id = payload.tree_id,
             .at_version = root.shard_version + 1});
     });
+
+    /// Published: this build is no longer in-flight. Retire its seq so the GC watermark floor
+    /// (minActive) can advance past it (idempotent — the dtor also retires).
+    store->retireBuildSeq(build_seq);
 }
 
 void Build::abandon()
@@ -730,6 +740,8 @@ void Build::abandon()
     requireAlive();
     heartbeat->stopBackground();
     heartbeat->discard();
+    /// No longer in-flight: retire the seq so the GC watermark floor can advance (idempotent).
+    store->retireBuildSeq(build_seq);
     alive = false;
 }
 
