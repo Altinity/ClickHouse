@@ -62,7 +62,7 @@ private:
 
     /// ---- Native helpers ----
     std::optional<HeadResult> nativeHead(const String & key);
-    PutOutcome nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, Token * out_token);
+    PutOutcome nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, Token * out_token, const ObjectMeta & meta);
 
     /// ---- Emulated helpers (caller holds emu_mutex) ----
     ///
@@ -74,7 +74,7 @@ private:
 
     bool emuExists(const String & key) const;
     String emuRead(const String & key, Range range) const;
-    void emuWrite(const String & key, const String & bytes);
+    void emuWrite(const String & key, const String & bytes, const ObjectMeta & meta);
     Token emuObserveToken(const String & key);   /// seeds emu_tokens lazily for pre-existing keys
 };
 

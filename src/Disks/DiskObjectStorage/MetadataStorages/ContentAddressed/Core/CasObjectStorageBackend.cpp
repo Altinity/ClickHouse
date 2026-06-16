@@ -45,6 +45,7 @@ std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
     hr.exists = true;
     hr.size = metadata->size_bytes;
     hr.token = Token{metadata->etag, TokenType::ETag};
+    hr.attributes = ObjectMeta(metadata->attributes.begin(), metadata->attributes.end());
     return hr;
 }
 
@@ -98,10 +99,13 @@ static PutOutcome finalizeConditionalWrite(WriteBuffer & buf)
 /// Issue a conditional PUT (the condition rides on `ws`) and map a precondition loss — see
 /// finalizeConditionalWrite. The condition is checked by the backend when the object is completed,
 /// so the precondition loss always surfaces from the buffer's finalize, never from write.
-PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, Token * out_token)
+PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, Token * out_token, const ObjectMeta & meta)
 {
+    std::optional<ObjectAttributes> attrs;
+    if (!meta.empty())
+        attrs.emplace(meta.begin(), meta.end());   /// ObjectMeta is the same map type as ObjectAttributes
     auto buf = object_storage->writeObject(
-        StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ws);
+        StoredObject(key), WriteMode::Rewrite, attrs, DBMS_DEFAULT_BUFFER_SIZE, ws);
     buf->write(bytes.data(), bytes.size());
     if (finalizeConditionalWrite(*buf) == PutOutcome::PreconditionFailed)
         return PutOutcome::PreconditionFailed;
@@ -195,9 +199,10 @@ private:
 class EmulatedBufferedSink final : public WriteSink
 {
 public:
-    EmulatedBufferedSink(Backend & backend_, String key_)
+    EmulatedBufferedSink(Backend & backend_, String key_, ObjectMeta meta_)
         : backend(backend_)
         , key(std::move(key_))
+        , meta(std::move(meta_))
     {
     }
 
@@ -207,7 +212,7 @@ public:
     {
         chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
         done = true;
-        return backend.putIfAbsent(key, buf.str(), out_token);
+        return backend.putIfAbsent(key, buf.str(), out_token, meta);
     }
 
     void cancel() noexcept override
@@ -225,6 +230,7 @@ public:
 private:
     Backend & backend;
     const String key;
+    const ObjectMeta meta;
     WriteBufferFromOwnString buf;
     bool done = false;
 };
@@ -274,9 +280,12 @@ String ObjectStorageBackend::emuRead(const String & key, Range range) const
     return readObjectRanged(*object_storage, emuPath(key), range);
 }
 
-void ObjectStorageBackend::emuWrite(const String & key, const String & bytes)
+void ObjectStorageBackend::emuWrite(const String & key, const String & bytes, const ObjectMeta & meta)
 {
-    auto buf = object_storage->writeObject(StoredObject(emuPath(key)), WriteMode::Rewrite);
+    std::optional<ObjectAttributes> attrs;
+    if (!meta.empty())
+        attrs.emplace(meta.begin(), meta.end());   /// ObjectMeta is the same map type as ObjectAttributes
+    auto buf = object_storage->writeObject(StoredObject(emuPath(key)), WriteMode::Rewrite, attrs);
     buf->write(bytes.data(), bytes.size());
     buf->finalize();
 }
@@ -338,6 +347,8 @@ HeadResult ObjectStorageBackend::head(const String & key)
     HeadResult hr;
     hr.exists = true;
     hr.size = metadata ? metadata->size_bytes : 0;
+    if (metadata)
+        hr.attributes = ObjectMeta(metadata->attributes.begin(), metadata->attributes.end());
     hr.token = emuObserveToken(key);
     return hr;
 }
@@ -356,20 +367,20 @@ static WriteSettings casWriteSettings()
     return ws;
 }
 
-PutOutcome ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, Token * out_token, [[maybe_unused]] const ObjectMeta & meta)
+PutOutcome ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, Token * out_token, const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {
         WriteSettings ws = casWriteSettings();
         ws.object_storage_write_if_none_match = "*";
-        return nativeConditionalPut(key, bytes, ws, out_token);
+        return nativeConditionalPut(key, bytes, ws, out_token, meta);
     }
 
     std::lock_guard lock(emu_mutex);
     if (emuExists(key))
         return PutOutcome::PreconditionFailed;
 
-    emuWrite(key, bytes);
+    emuWrite(key, bytes, meta);
     const uint64_t seq = ++emu_seq;
     emu_tokens[key] = seq;
     if (out_token)
@@ -377,7 +388,7 @@ PutOutcome ObjectStorageBackend::putIfAbsent(const String & key, const String & 
     return PutOutcome::Done;
 }
 
-WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, [[maybe_unused]] const ObjectMeta & meta)
+WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {
@@ -385,21 +396,24 @@ WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, [[maybe
         /// and is checked when finalize completes the object.
         WriteSettings ws = casWriteSettings();
         ws.object_storage_write_if_none_match = "*";
+        std::optional<ObjectAttributes> attrs;
+        if (!meta.empty())
+            attrs.emplace(meta.begin(), meta.end());   /// ObjectMeta is the same map type as ObjectAttributes
         auto buf = object_storage->writeObject(
-            StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ws);
+            StoredObject(key), WriteMode::Rewrite, attrs, DBMS_DEFAULT_BUFFER_SIZE, ws);
         return std::make_unique<NativeStreamingSink>(*this, key, std::move(buf));
     }
 
-    return std::make_unique<EmulatedBufferedSink>(*this, key);
+    return std::make_unique<EmulatedBufferedSink>(*this, key, meta);
 }
 
-PutOutcome ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token, [[maybe_unused]] const ObjectMeta & meta)
+PutOutcome ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token, const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {
         WriteSettings ws = casWriteSettings();
         ws.object_storage_write_if_match = expected.value;
-        return nativeConditionalPut(key, bytes, ws, out_token);
+        return nativeConditionalPut(key, bytes, ws, out_token, meta);
     }
 
     std::lock_guard lock(emu_mutex);
@@ -408,7 +422,7 @@ PutOutcome ObjectStorageBackend::putOverwrite(const String & key, const String &
     if (emuObserveToken(key) != expected)
         return PutOutcome::PreconditionFailed;
 
-    emuWrite(key, bytes);
+    emuWrite(key, bytes, meta);
     const uint64_t seq = ++emu_seq;
     emu_tokens[key] = seq;
     if (out_token)
@@ -416,7 +430,7 @@ PutOutcome ObjectStorageBackend::putOverwrite(const String & key, const String &
     return PutOutcome::Done;
 }
 
-CasOutcome ObjectStorageBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token, [[maybe_unused]] const ObjectMeta & meta)
+CasOutcome ObjectStorageBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token, const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {
@@ -428,7 +442,7 @@ CasOutcome ObjectStorageBackend::casPut(const String & key, const String & bytes
 
         /// The PUT-side outcomes (Done / PreconditionFailed) collapse onto CAS outcomes 1:1: a lost
         /// condition — whether a mismatched If-Match or a 404 on an If-Match PUT — is a Conflict.
-        return nativeConditionalPut(key, bytes, ws, out_token) == PutOutcome::Done
+        return nativeConditionalPut(key, bytes, ws, out_token, meta) == PutOutcome::Done
             ? CasOutcome::Committed
             : CasOutcome::Conflict;
     }
@@ -449,7 +463,7 @@ CasOutcome ObjectStorageBackend::casPut(const String & key, const String & bytes
             return CasOutcome::Conflict;
     }
 
-    emuWrite(key, bytes);
+    emuWrite(key, bytes, meta);
     const uint64_t seq = ++emu_seq;
     emu_tokens[key] = seq;
     if (out_token)

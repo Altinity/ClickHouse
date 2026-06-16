@@ -7,7 +7,13 @@
 
 #if USE_AWS_S3
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <Disks/WriteMode.h>
 #include <IO/S3Common.h>
+#include <filesystem>
+#include <map>
+#include <mutex>
 #endif
 
 using namespace DB::Cas;
@@ -315,6 +321,98 @@ TEST(CasS3Signal, FinalizeClassifierMapsPreconditionLossExactly)
 
     ThrowOnFinalizeBuffer clean;
     EXPECT_EQ(finalizeConditionalWrite(clean), PutOutcome::Done);
+}
+
+namespace
+{
+
+/// A `LocalObjectStorage` that round-trips user metadata in-process. The production
+/// `LocalObjectStorage` deliberately drops the `attributes` argument of `writeObject` and never
+/// populates `ObjectMetadata::attributes` (local files carry no `x-amz-meta-*`), so it cannot stand
+/// in for S3/RustFS when verifying the metadata threading. This test-only subclass records the
+/// attributes passed on write, keyed by physical path, and injects them back on metadata reads —
+/// exactly what a real object store does for `x-amz-meta-*`. It exercises the `EmulatedSingleProcess`
+/// `ObjectStorageBackend` threading (`putIfAbsent` → `writeObject` attributes → `head` attributes)
+/// without a live S3 backend; the real S3/RustFS round trip is verified empirically out-of-band.
+class AttributePreservingLocalObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object,
+        DB::WriteMode mode,
+        std::optional<DB::ObjectAttributes> attributes,
+        size_t buf_size,
+        const DB::WriteSettings & write_settings) override
+    {
+        if (attributes.has_value())
+        {
+            std::lock_guard lock(mutex);
+            saved_attributes[object.remote_path] = *attributes;
+        }
+        return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        auto metadata = DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+        if (metadata)
+            inject(path, *metadata);
+        return metadata;
+    }
+
+    DB::ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        auto metadata = DB::LocalObjectStorage::getObjectMetadata(path, with_tags);
+        inject(path, metadata);
+        return metadata;
+    }
+
+private:
+    void inject(const std::string & path, DB::ObjectMetadata & metadata) const
+    {
+        std::lock_guard lock(mutex);
+        if (auto it = saved_attributes.find(path); it != saved_attributes.end())
+            metadata.attributes = it->second;
+    }
+
+    mutable std::mutex mutex;
+    mutable std::map<std::string, DB::ObjectAttributes> saved_attributes;
+};
+
+DB::ObjectStoragePtr makeAttributePreservingStorageForTest()
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_meta_unit_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<AttributePreservingLocalObjectStorage>(std::move(settings));
+}
+
+}
+
+/// The `EmulatedSingleProcess` `ObjectStorageBackend` must thread user metadata through to the
+/// underlying object storage's `writeObject` attributes on `putIfAbsent` and read it back into
+/// `HeadResult::attributes` on `head`. Verified here over an attribute-preserving object storage
+/// (the production `LocalObjectStorage` drops attributes); the live S3/RustFS round trip is verified
+/// empirically out-of-band.
+TEST(CasObjectStorageBackend, EmulatedRoundTripsUserMetadata)
+{
+    ObjectStorageBackend backend(makeAttributePreservingStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+
+    DB::Cas::Token tok;
+    const DB::Cas::ObjectMeta meta{{"cas_owner", "ab:7:42"}};
+    ASSERT_EQ(backend.putIfAbsent("k/key", "body", &tok, meta), DB::Cas::PutOutcome::Done);
+
+    const auto hr = backend.head("k/key");
+    ASSERT_TRUE(hr.exists);
+    ASSERT_EQ(hr.attributes.at("cas_owner"), "ab:7:42");
 }
 
 #endif
