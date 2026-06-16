@@ -1056,7 +1056,7 @@ void RestCatalog::sendRequest(
     auto wb = DB::BuilderRWBufferFromHTTP(url)
         .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
         .withMethod(method)
-        .withSettings(read_settings)
+        .withSettings(context->getReadSettings())
         .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
         .withHostFilter(&context->getRemoteHostFilter())
         .withHeaders(headers)
@@ -1091,9 +1091,7 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogCreateNamespace);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogCreateNamespaceMicroseconds);
-        DB::ReadSettings read_settings = getContext()->getReadSettings();
-        read_settings.http_max_tries = 1;
-        sendRequest(endpoint, request_body, Poco::Net::HTTPRequest::HTTP_POST, false, read_settings);
+        sendRequest(endpoint, request_body);
     }
     catch (const DB::HTTPException & e)
     {

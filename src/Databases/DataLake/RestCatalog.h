@@ -5,7 +5,6 @@
 #include <Databases/DataLake/ICatalog.h>
 #include <Poco/Net/HTTPBasicCredentials.h>
 #include <IO/ReadWriteBufferFromHTTP.h>
-#include <IO/ReadSettings.h>
 #include <IO/HTTPHeaderEntries.h>
 #include <Interpreters/Context_fwd.h>
 #include <filesystem>
@@ -193,8 +192,7 @@ protected:
         const String & endpoint,
         Poco::JSON::Object::Ptr request_body,
         const String & method = Poco::Net::HTTPRequest::HTTP_POST,
-        bool ignore_result = false,
-        std::optional<DB::ReadSettings> read_settings_override = std::nullopt) const;
+        bool ignore_result = false) const;
 
     std::pair<std::shared_ptr<IStorageCredentials>, String> getCredentialsAndEndpoint(Poco::JSON::Object::Ptr object, const String & location) const;
 
