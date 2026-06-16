@@ -117,6 +117,8 @@ Notes:
 - **Default**: `false`
 - **Description**: Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
 
+  **Warning:** The partition key is not cast before it is written to the Apache Iceberg metadata file — it is written using the original value from the ClickHouse table. Because of this, lossy casts can make the Iceberg metadata inconsistent with the exported data files. For example, if a table is partitioned by an `Int64` column and some partition values do not fit into `Int32`, the Iceberg metadata will still contain the original `Int64` partition values, while the data files may contain the values after they were cast and truncated to `Int32`. As a result, the Iceberg metadata may say that a data file belongs to a partition with a value outside the `Int32` range, while the actual data file contains the truncated value.
+
 ## Examples
 
 ### Basic Export to S3
