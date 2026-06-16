@@ -125,13 +125,19 @@ private:
     /// Map (kind, hash) to its object key per kind (blob/tree/pack).
     String keyFor(ObjectKind kind, const UInt128 & hash) const;
 
+    /// The owner triple stamped into S3 user-metadata on every object this build writes (spec
+    /// 2026-06-16, Task 8): "cas_owner" = "<server_id_hex>:<epoch>:<build_seq>". The incremental-GC
+    /// watermark reads this from the HEAD it already does and refuses to condemn a blob owned by a
+    /// still-in-flight build (build_seq >= the server's min_active floor).
+    ObjectMeta ownerMeta() const;
+
     void requireAlive() const;                            /// throws LOGICAL_ERROR after abandon
 
     StorePtr store;
     std::unique_ptr<HeartbeatKeeper> heartbeat;
     UInt128 build_id{};
     uint64_t build_seq{};                                 /// per-process monotone seq (spec 2026-06-16)
-    [[maybe_unused]] uint64_t epoch{};                    /// owning Store's process_epoch (stamped in Task 8)
+    uint64_t epoch{};                                     /// owning Store's process_epoch (stamped in Task 8)
     BuildInfo info;
     bool alive = true;
 

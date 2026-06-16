@@ -102,6 +102,24 @@ TEST(CasBuild, PutBlobWritesEnvelopeWithFixedHeader)
     EXPECT_EQ(raw->bytes.substr(h.header_len), "hello world");
 }
 
+TEST(CasBuild, BlobCarriesOwnerTripleInMetadata)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    PoolConfig cfg;
+    cfg.pool_prefix = "pool";
+    cfg.server_id = UInt128(0xAB);
+    cfg.background_heartbeats = false;
+    auto store = Store::open(backend, cfg);
+    auto build = store->startBuild({});
+    const auto ref = build->putBlob(idOf("owner-meta-payload"), BlobSource::fromString("owner-meta-payload"));
+
+    const auto hr = backend->head(store->layout().blobKey(ref.id));
+    ASSERT_TRUE(hr.exists);
+    const String expected = u128ToHex(cfg.server_id) + ":" + std::to_string(store->epoch())
+                            + ":" + std::to_string(build->buildSeq());
+    ASSERT_EQ(hr.attributes.at("cas_owner"), expected);
+}
+
 TEST(CasBuild, PutBlobDedupSecondWriterAdopts)
 {
     auto b = std::make_shared<InMemoryBackend>();
