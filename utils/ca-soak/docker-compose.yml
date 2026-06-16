@@ -56,11 +56,18 @@ services:
       - keeper1
       - rustfs1
       - createbucket
+    # B165: cap memory so a leak fails CLOSED (ClickHouse throws + logs the consumer) instead of a
+    # kernel OOM-kill. 28g per node x2 + rustfs ~10g + driver ~5g < 91g host. See configs/memory.xml.
+    mem_limit: 28g
     volumes:
       - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
       - ./configs/storage_conf.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
       - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
       - ./configs/macros_node1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      # B165: persist server logs to the host so they survive `docker compose down -v` (the soak #7
+      # OOM destroyed all in-container logs). run_24h.sh creates+chmods logs/ch1 before `up`.
+      - ./logs/ch1:/var/log/clickhouse-server
     ports:
       - "8123:8123"
       - "9000:9000"
@@ -88,11 +95,14 @@ services:
         condition: service_completed_successfully
       ch1:
         condition: service_healthy
+    mem_limit: 28g
     volumes:
       - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
       - ./configs/storage_conf.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
       - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
       - ./configs/macros_node2.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./logs/ch2:/var/log/clickhouse-server
     ports:
       - "8124:8123"
       # Host port 9001 can be occupied by a stray RustFS process; 9002 avoids the collision.

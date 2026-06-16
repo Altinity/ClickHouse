@@ -23,6 +23,14 @@ mkdir -p "$LOGDIR"
 RUN_TS="$(date +%Y%m%dT%H%M%S)"
 COMPOSE_LOG="$LOGDIR/phase3_${RUN_TS}_server.log"
 
+# B165: per-node ClickHouse log dirs bind-mounted into the containers so the server's own logs
+# survive `docker compose down -v` (the soak #7 OOM left no in-container logs to diagnose). The
+# server runs as uid 101 inside the container, so the host dirs must be writable by it. Start each
+# run from a clean dir so a post-mortem reads only THIS run's logs.
+rm -rf "$LOGDIR/ch1" "$LOGDIR/ch2"
+mkdir -p "$LOGDIR/ch1" "$LOGDIR/ch2"
+chmod 777 "$LOGDIR/ch1" "$LOGDIR/ch2"
+
 docker compose down -v >/dev/null 2>&1; docker compose up -d
 trap 'docker compose logs --no-color > "$COMPOSE_LOG" 2>&1 || true; echo "preserved docker logs -> $COMPOSE_LOG"; docker compose down -v' EXIT
 

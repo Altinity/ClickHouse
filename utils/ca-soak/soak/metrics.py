@@ -2,7 +2,10 @@ import sqlite3
 
 _COLS = ["ts", "node", "parts_active", "parts_inactive", "table_rows", "bytes_on_disk",
          "pool_objects", "pool_bytes", "repl_queue", "mutations_pending", "merges",
-         "fsck_reachable", "fsck_unreachable", "fsck_dangling", "restarts"]
+         "fsck_reachable", "fsck_unreachable", "fsck_dangling", "restarts",
+         # B165: per-node server memory, to catch a server OOM (mem_resident = process RSS bytes,
+         # mem_tracking = ClickHouse's own MemoryTracking) before the kernel OOM-kills the node.
+         "mem_resident", "mem_tracking"]
 
 
 def open_db(path: str) -> sqlite3.Connection:
@@ -54,6 +57,17 @@ def snapshot_cluster(cluster, table: str, ts: int, fsck: dict | None = None, res
             f"SELECT count() FROM system.mutations WHERE table='{table}' AND NOT is_done") or 0)
         merges = int(node.scalar(
             f"SELECT count() FROM system.merges WHERE table='{table}'") or 0)
+
+        # B165: server memory. None (not 0) when unavailable, so a gap is visible rather than faked.
+        def _mem(sql):
+            try:
+                v = node.scalar(sql)
+                return int(v) if v not in (None, "") else None
+            except Exception:
+                return None
+        mem_resident = _mem("SELECT value FROM system.asynchronous_metrics WHERE metric='MemoryResident'")
+        mem_tracking = _mem("SELECT value FROM system.metrics WHERE metric='MemoryTracking'")
+
         out.append(dict(
             ts=ts,
             node=name,
@@ -70,5 +84,7 @@ def snapshot_cluster(cluster, table: str, ts: int, fsck: dict | None = None, res
             fsck_unreachable=(fsck or {}).get("unreachable"),
             fsck_dangling=(fsck or {}).get("dangling"),
             restarts=restarts,
+            mem_resident=mem_resident,
+            mem_tracking=mem_tracking,
         ))
     return out

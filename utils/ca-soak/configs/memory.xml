@@ -1,0 +1,10 @@
+<clickhouse>
+    <!-- B165: fail CLOSED on memory before the kernel OOM-kills the node. The docker-compose
+         `mem_limit` sets a per-container cgroup limit (the MemoryWorker uses cgroups as its source),
+         so this ratio caps ClickHouse at ~0.9 of that limit. On exceed, ClickHouse throws
+         MEMORY_LIMIT_EXCEEDED on the offending allocation and logs it (with a stack for background
+         work like the CA GC) into /var/log/clickhouse-server — which is bind-mounted to the host and
+         survives `docker compose down -v`. The node stays alive and the consumer is NAMED, instead
+         of a silent kernel OOM-kill that destroys all evidence (soak #7 / B165). -->
+    <max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>
+</clickhouse>
