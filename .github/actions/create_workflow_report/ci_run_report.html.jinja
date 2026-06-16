@@ -128,7 +128,7 @@
       text-decoration: underline;
     }
 
-    /* Tab navigation: wrapping pill strip on a white surface that matches the tables */
+    /* Tab navigation: wrapping strip; each button is an open-bottom tab shape */
     .tab {
       display: flex;
       flex-wrap: wrap;
@@ -143,10 +143,12 @@
 
     .tab button.tablinks {
       appearance: none;
-      border: 1px solid color-mix(in srgb, var(--altinity-accent) 60%, var(--altinity-white));
-      background: transparent;
+      box-sizing: border-box;
+      border: 1px solid var(--altinity-accent);
+      border-bottom: 0;
+      border-radius: 0.5rem 0.5rem 0 0;
+      background: var(--altinity-white);
       padding: 0.55rem 0.95rem;
-      border-radius: 0.5rem;
       font: inherit;
       cursor: pointer;
       white-space: nowrap;
@@ -159,8 +161,9 @@
     }
 
     .tab button.tablinks.active {
-      background: var(--altinity-accent);
-      color: var(--altinity-white);
+      background: var(--altinity-hover);
+      box-shadow: inset 0 2px 0 var(--altinity-accent);
+      color: var(--altinity-accent);
       font-weight: 600;
     }
 
