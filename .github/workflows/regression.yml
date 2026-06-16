@@ -133,7 +133,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: ${{ matrix.SUITE }}
@@ -157,7 +157,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
@@ -187,7 +187,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       storage_path: /${{ matrix.ONLY }}_partition
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
@@ -214,7 +214,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       storage_path: /${{ matrix.STORAGE }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
@@ -241,7 +241,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       storage_path: /${{ matrix.SSL }}
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
@@ -268,7 +268,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
@@ -293,7 +293,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: ldap_${{ matrix.SUITE }}
@@ -313,7 +313,7 @@ jobs:
       flags: --with-analyzer --identity-provider keycloak
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: oauth
@@ -333,7 +333,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: parquet
@@ -357,7 +357,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       storage_path: ${{ matrix.STORAGE }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
@@ -383,7 +383,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
@@ -408,7 +408,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
@@ -438,7 +438,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       storage_path: /${{ matrix.STORAGE }}
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
@@ -466,7 +466,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       storage_path: /minio
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
@@ -490,7 +490,7 @@ jobs:
         flags: --with-analyzer
         timeout_minutes: ${{ inputs.timeout_minutes }}
         runner_arch: ${{ inputs.arch }}
-        runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+        runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
         build_sha: ${{ inputs.build_sha }}
         set_commit_status: true
         job_name: swarms
@@ -514,7 +514,7 @@ jobs:
       flags: --with-analyzer
       timeout_minutes: ${{ inputs.timeout_minutes }}
       runner_arch: ${{ inputs.arch }}
-      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_type: ${{ inputs.arch == 'aarch64' && 'altinity-style-checker-aarch64' || 'altinity-style-checker' }}
       storage_path: /${{ matrix.STORAGE }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
