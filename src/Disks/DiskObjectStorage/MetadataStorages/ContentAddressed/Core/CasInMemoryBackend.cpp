@@ -15,9 +15,10 @@ namespace
 class InMemoryWriteSink final : public WriteSink
 {
 public:
-    InMemoryWriteSink(InMemoryBackend & backend, String key)
+    InMemoryWriteSink(InMemoryBackend & backend, String key, ObjectMeta meta)
         : backend_(backend)
         , key_(std::move(key))
+        , meta_(std::move(meta))
     {
     }
 
@@ -27,7 +28,7 @@ public:
     {
         chassert(!done_);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
         done_ = true;
-        return backend_.putIfAbsent(key_, buf_.str(), out_token);
+        return backend_.putIfAbsent(key_, buf_.str(), out_token, meta_);
     }
 
     void cancel() noexcept override
@@ -45,6 +46,7 @@ public:
 private:
     InMemoryBackend & backend_;
     String key_;
+    ObjectMeta meta_;
     WriteBufferFromOwnString buf_;
     bool done_ = false;
 };
@@ -86,6 +88,7 @@ std::optional<GetResult> InMemoryBackend::get(const String & key, Range range)
     GetResult gr;
     gr.bytes = std::move(result);
     gr.token = it->second.token;
+    gr.attributes = it->second.meta;
     return gr;
 }
 
@@ -100,10 +103,11 @@ HeadResult InMemoryBackend::head(const String & key)
     hr.exists = true;
     hr.size = static_cast<uint64_t>(it->second.bytes.size());
     hr.token = it->second.token;
+    hr.attributes = it->second.meta;
     return hr;
 }
 
-PutOutcome InMemoryBackend::putIfAbsent(const String & key, const String & bytes, Token * out_token)
+PutOutcome InMemoryBackend::putIfAbsent(const String & key, const String & bytes, Token * out_token, const ObjectMeta & meta)
 {
     std::lock_guard lock(mutex_);
     if (store_.count(key))
@@ -113,18 +117,19 @@ PutOutcome InMemoryBackend::putIfAbsent(const String & key, const String & bytes
     Object obj;
     obj.bytes = bytes;
     obj.token = t;
+    obj.meta = meta;
     store_[key] = std::move(obj);
     if (out_token)
         *out_token = t;
     return PutOutcome::Done;
 }
 
-WriteSinkPtr InMemoryBackend::putIfAbsentStream(const String & key)
+WriteSinkPtr InMemoryBackend::putIfAbsentStream(const String & key, const ObjectMeta & meta)
 {
-    return std::make_unique<InMemoryWriteSink>(*this, key);
+    return std::make_unique<InMemoryWriteSink>(*this, key, meta);
 }
 
-PutOutcome InMemoryBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token)
+PutOutcome InMemoryBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token, const ObjectMeta & meta)
 {
     std::lock_guard lock(mutex_);
     auto it = store_.find(key);
@@ -137,12 +142,13 @@ PutOutcome InMemoryBackend::putOverwrite(const String & key, const String & byte
     Token t = mintToken();
     it->second.bytes = bytes;
     it->second.token = t;
+    it->second.meta = meta;
     if (out_token)
         *out_token = t;
     return PutOutcome::Done;
 }
 
-CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token)
+CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token, const ObjectMeta & meta)
 {
     std::lock_guard lock(mutex_);
 
@@ -166,6 +172,7 @@ CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, con
         Object obj;
         obj.bytes = bytes;
         obj.token = t;
+        obj.meta = meta;
         store_[key] = std::move(obj);
         if (out_token)
             *out_token = t;
@@ -181,6 +188,7 @@ CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, con
         Token t = mintToken();
         it->second.bytes = bytes;
         it->second.token = t;
+        it->second.meta = meta;
         if (out_token)
             *out_token = t;
         return CasOutcome::Committed;

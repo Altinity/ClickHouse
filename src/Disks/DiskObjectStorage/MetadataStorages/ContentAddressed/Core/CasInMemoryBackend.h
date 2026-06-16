@@ -30,10 +30,13 @@ public:
 
     std::optional<GetResult> get(const String & key, Range range = {}) override;
     HeadResult head(const String & key) override;
-    PutOutcome putIfAbsent(const String & key, const String & bytes, Token * out_token = nullptr) override;
-    WriteSinkPtr putIfAbsentStream(const String & key) override;
-    PutOutcome putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token = nullptr) override;
-    CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token = nullptr) override;
+    PutOutcome putIfAbsent(const String & key, const String & bytes, Token * out_token = nullptr,
+                           const ObjectMeta & meta = {}) override;
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override;
+    PutOutcome putOverwrite(const String & key, const String & bytes, const Token & expected,
+                            Token * out_token = nullptr, const ObjectMeta & meta = {}) override;
+    CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                      Token * out_token = nullptr, const ObjectMeta & meta = {}) override;
     DeleteOutcome deleteExact(const String & key, const Token & token) override;
     ListPage list(const String & prefix, const String & cursor, size_t limit) override;
 
@@ -64,6 +67,7 @@ private:
     {
         String bytes;
         Token token;
+        ObjectMeta meta;
     };
 
     struct PendingDelete

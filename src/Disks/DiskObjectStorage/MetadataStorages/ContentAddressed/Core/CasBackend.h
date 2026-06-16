@@ -2,12 +2,18 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
 #include <IO/WriteBuffer.h>
 #include <base/types.h>
+#include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace DB::Cas
 {
+
+/// User metadata carried alongside an object (S3 x-amz-meta-*). The CA store uses exactly one entry,
+/// "cas_owner" = "<server_id_hex>:<epoch>:<build_seq>" — the owner triple the GC watermark reads.
+using ObjectMeta = std::map<String, String>;
 
 struct Range
 {
@@ -20,6 +26,7 @@ struct GetResult
 {
     String bytes;
     Token token;       /// token of the incarnation the bytes came from
+    ObjectMeta attributes;
 };
 
 struct HeadResult
@@ -27,6 +34,7 @@ struct HeadResult
     bool exists = false;
     uint64_t size = 0;
     Token token;
+    ObjectMeta attributes;
 };
 
 enum class PutOutcome : uint8_t
@@ -107,13 +115,16 @@ public:
 
     virtual std::optional<GetResult> get(const String & key, Range range = {}) = 0;   /// nullopt = absent
     virtual HeadResult head(const String & key) = 0;
-    virtual PutOutcome putIfAbsent(const String & key, const String & bytes, Token * out_token = nullptr) = 0;
+    virtual PutOutcome putIfAbsent(const String & key, const String & bytes, Token * out_token = nullptr,
+                                   const ObjectMeta & meta = {}) = 0;
     /// Streaming variant of putIfAbsent — see WriteSink. Large content blobs use this; whole-String
     /// ops remain for manifests, trees, probe and GC objects.
-    virtual WriteSinkPtr putIfAbsentStream(const String & key) = 0;
-    virtual PutOutcome putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token = nullptr) = 0;
+    virtual WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) = 0;
+    virtual PutOutcome putOverwrite(const String & key, const String & bytes, const Token & expected,
+                                    Token * out_token = nullptr, const ObjectMeta & meta = {}) = 0;
     /// expected == nullopt => create-if-absent CAS (the first write of a root manifest).
-    virtual CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token = nullptr) = 0;
+    virtual CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                              Token * out_token = nullptr, const ObjectMeta & meta = {}) = 0;
     virtual DeleteOutcome deleteExact(const String & key, const Token & token) = 0;
     virtual ListPage list(const String & prefix, const String & cursor, size_t limit) = 0;
 };

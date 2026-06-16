@@ -356,7 +356,7 @@ static WriteSettings casWriteSettings()
     return ws;
 }
 
-PutOutcome ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, Token * out_token)
+PutOutcome ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, Token * out_token, [[maybe_unused]] const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {
@@ -377,7 +377,7 @@ PutOutcome ObjectStorageBackend::putIfAbsent(const String & key, const String & 
     return PutOutcome::Done;
 }
 
-WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key)
+WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, [[maybe_unused]] const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {
@@ -393,7 +393,7 @@ WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key)
     return std::make_unique<EmulatedBufferedSink>(*this, key);
 }
 
-PutOutcome ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token)
+PutOutcome ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token, [[maybe_unused]] const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {
@@ -416,7 +416,7 @@ PutOutcome ObjectStorageBackend::putOverwrite(const String & key, const String &
     return PutOutcome::Done;
 }
 
-CasOutcome ObjectStorageBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token)
+CasOutcome ObjectStorageBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token, [[maybe_unused]] const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {

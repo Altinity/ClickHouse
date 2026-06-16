@@ -103,7 +103,7 @@ public:
     }
 
     CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                      Token * out_token = nullptr) override
+                      Token * out_token = nullptr, const ObjectMeta & meta = {}) override
     {
         {
             std::lock_guard lock(fail_mutex);
@@ -113,7 +113,7 @@ public:
                 return CasOutcome::Conflict;
             }
         }
-        return InMemoryBackend::casPut(key, bytes, expected, out_token);
+        return InMemoryBackend::casPut(key, bytes, expected, out_token, meta);
     }
 
 private:
@@ -841,14 +841,14 @@ class OnFenceHookBackend : public InMemoryBackend
 {
 public:
     CasOutcome casPut(const String & key, const String & bytes,
-                      const std::optional<Token> & expected, Token * out_token = nullptr) override
+                      const std::optional<Token> & expected, Token * out_token = nullptr, const ObjectMeta & meta = {}) override
     {
         if (!fired && key == armed_key && ++count == fire_at)
         {
             fired = true;
             hook();
         }
-        return InMemoryBackend::casPut(key, bytes, expected, out_token);
+        return InMemoryBackend::casPut(key, bytes, expected, out_token, meta);
     }
 
     void armOnCasPut(String key, std::function<void()> hook_)
@@ -1041,12 +1041,12 @@ class CaptureStateBackend : public InMemoryBackend
 {
 public:
     CasOutcome casPut(const String & key, const String & bytes,
-                      const std::optional<Token> & expected, Token * out_token = nullptr) override
+                      const std::optional<Token> & expected, Token * out_token = nullptr, const ObjectMeta & meta = {}) override
     {
         if (key == capture_key && ++count == capture_nth)
             if (const auto got = InMemoryBackend::get(key))
                 captured = got->bytes;
-        return InMemoryBackend::casPut(key, bytes, expected, out_token);
+        return InMemoryBackend::casPut(key, bytes, expected, out_token, meta);
     }
 
     void armCapture(String key, size_t nth)
@@ -1146,14 +1146,14 @@ class HookOnCasCaptureBackend : public CaptureStateBackend
 {
 public:
     CasOutcome casPut(const String & key, const String & bytes,
-                      const std::optional<Token> & expected, Token * out_token = nullptr) override
+                      const std::optional<Token> & expected, Token * out_token = nullptr, const ObjectMeta & meta = {}) override
     {
         if (!fired && key == hook_key)
         {
             fired = true;   /// before the hook - its own casPut on the same key must not re-fire
             hook();
         }
-        return CaptureStateBackend::casPut(key, bytes, expected, out_token);
+        return CaptureStateBackend::casPut(key, bytes, expected, out_token, meta);
     }
 
     void armHookOnCasPut(String key, std::function<void()> hook_)

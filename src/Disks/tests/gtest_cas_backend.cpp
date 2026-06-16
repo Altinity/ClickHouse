@@ -26,22 +26,22 @@ struct NullBackend final : Backend
         return HeadResult{};
     }
 
-    PutOutcome putIfAbsent(const String & /*key*/, const String & /*bytes*/, Token * /*out_token*/) override
+    PutOutcome putIfAbsent(const String & /*key*/, const String & /*bytes*/, Token * /*out_token*/, const ObjectMeta & /*meta*/) override
     {
         return PutOutcome::Done;
     }
 
-    WriteSinkPtr putIfAbsentStream(const String & /*key*/) override
+    WriteSinkPtr putIfAbsentStream(const String & /*key*/, const ObjectMeta & /*meta*/) override
     {
         return nullptr;   /// trivial default — streaming behavior is pinned by the CasBackendContract suite
     }
 
-    PutOutcome putOverwrite(const String & /*key*/, const String & /*bytes*/, const Token & /*expected*/, Token * /*out_token*/) override
+    PutOutcome putOverwrite(const String & /*key*/, const String & /*bytes*/, const Token & /*expected*/, Token * /*out_token*/, const ObjectMeta & /*meta*/) override
     {
         return PutOutcome::PreconditionFailed;
     }
 
-    CasOutcome casPut(const String & /*key*/, const String & /*bytes*/, const std::optional<Token> & /*expected*/, Token * /*out_token*/) override
+    CasOutcome casPut(const String & /*key*/, const String & /*bytes*/, const std::optional<Token> & /*expected*/, Token * /*out_token*/, const ObjectMeta & /*meta*/) override
     {
         return CasOutcome::Conflict;
     }
@@ -229,6 +229,22 @@ TEST(CasInMemoryFaults, VersioningMarkerMode)
     Token t1;
     b.putIfAbsent("k", "v1", &t1);
     EXPECT_TRUE(b.deleteExact("k", t1).created_delete_marker);    // probe must reject this pool
+}
+
+TEST(CasInMemoryBackend, RoundTripsUserMetadata)
+{
+    DB::Cas::InMemoryBackend backend;
+    DB::Cas::Token tok;
+    const DB::Cas::ObjectMeta meta{{"cas_owner", "ab:7:42"}};
+    ASSERT_EQ(backend.putIfAbsent("k/key", "body", &tok, meta), DB::Cas::PutOutcome::Done);
+
+    const auto hr = backend.head("k/key");
+    ASSERT_TRUE(hr.exists);
+    ASSERT_EQ(hr.attributes.at("cas_owner"), "ab:7:42");
+
+    const auto gr = backend.get("k/key");
+    ASSERT_TRUE(gr.has_value());
+    ASSERT_EQ(gr->attributes.at("cas_owner"), "ab:7:42");
 }
 
 // =====================================================================

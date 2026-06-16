@@ -295,14 +295,14 @@ public:
         return InMemoryBackend::get(key, range);
     }
 
-    DB::Cas::PutOutcome putIfAbsent(const String & key, const String & bytes, DB::Cas::Token * out_token = nullptr) override
+    DB::Cas::PutOutcome putIfAbsent(const String & key, const String & bytes, DB::Cas::Token * out_token = nullptr, const DB::Cas::ObjectMeta & meta = {}) override
     {
         {
             std::lock_guard lock(count_mutex);
             ++put_counts[key];
             ++put_total;
         }
-        return InMemoryBackend::putIfAbsent(key, bytes, out_token);
+        return InMemoryBackend::putIfAbsent(key, bytes, out_token, meta);
     }
 
     uint64_t headCount(const String & key) const { return lookup(head_counts, key); }

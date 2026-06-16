@@ -41,10 +41,10 @@ public:
     std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
     DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
     DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-    DB::Cas::PutOutcome putIfAbsent(const String & k, const String & b, DB::Cas::Token * t = nullptr) override { ++writes; return inner->putIfAbsent(k, b, t); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k) override { ++writes; return inner->putIfAbsentStream(k); }
-    DB::Cas::PutOutcome putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, DB::Cas::Token * t = nullptr) override { ++writes; return inner->putOverwrite(k, b, e, t); }
-    DB::Cas::CasOutcome casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, DB::Cas::Token * t = nullptr) override { ++writes; return inner->casPut(k, b, e, t); }
+    DB::Cas::PutOutcome putIfAbsent(const String & k, const String & b, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & meta = {}) override { ++writes; return inner->putIfAbsent(k, b, t, meta); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta = {}) override { ++writes; return inner->putIfAbsentStream(k, meta); }
+    DB::Cas::PutOutcome putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & meta = {}) override { ++writes; return inner->putOverwrite(k, b, e, t, meta); }
+    DB::Cas::CasOutcome casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & meta = {}) override { ++writes; return inner->casPut(k, b, e, t, meta); }
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { ++writes; return inner->deleteExact(k, t); }
 private:
     std::shared_ptr<DB::Cas::Backend> inner;
@@ -194,7 +194,7 @@ TEST(CasPoolMeta, CasConflictReReadsWinner)
     public:
         String winner_bytes;
         CasOutcome casPut(const String & key, const String & bytes,
-            const std::optional<Token> & expected, Token * out_token) override
+            const std::optional<Token> & expected, Token * out_token, const ObjectMeta & meta = {}) override
         {
             if (!winner_committed)
             {
@@ -203,7 +203,7 @@ TEST(CasPoolMeta, CasConflictReReadsWinner)
                 putIfAbsent(key, winner_bytes);
                 return CasOutcome::Conflict;
             }
-            return InMemoryBackend::casPut(key, bytes, expected, out_token);
+            return InMemoryBackend::casPut(key, bytes, expected, out_token, meta);
         }
     private:
         bool winner_committed = false;
