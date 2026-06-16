@@ -38,6 +38,6 @@ gc=$(q 8123 "SELECT concat(toString(countIf(message LIKE '%CA GC round failed%')
 err=$(q 8123 "SELECT concat(toString(countIf(message LIKE '%recondition%' OR message LIKE '% 412%')),'x412/',toString(countIf(message LIKE '%ervice%navailable%' OR message LIKE '% 503%')),'x503/',toString(countIf(message LIKE '%roken pipe%')),'xbp') FROM system.text_log WHERE level<='Error' FORMAT TabSeparated")
 repl=$(q 8123 "SELECT max(absolute_delay) FROM system.replicas FORMAT TabSeparated")
 du=$(docker exec ca-soak-rustfs1-1 sh -c 'echo "roots=$(du -sh /data/test/soak_pool/roots 2>/dev/null|cut -f1) blobs=$(du -sh /data/test/soak_pool/blobs 2>/dev/null|cut -f1)"' 2>/dev/null)
-reap=$(tail -1 logs/soak6_reaper.log 2>/dev/null | sed 's/.*orphan_reaper/reaper/')
+reap=$(tail -1 "$(ls -t logs/*_reaper.log 2>/dev/null | head -1)" 2>/dev/null | sed 's/.*orphan_reaper/reaper/')
 
 echo "SOAK t=${up:-?}s drv=$drv | ch1 $(sig 8123) | ch2 $(sig 8124) | HEAD/PUT=${heads:-NA} | GC=${gc:-NA} | err=${err:-NA} | replLag=${repl:-NA}s | du[$du] | ${reap:-noreap}"
