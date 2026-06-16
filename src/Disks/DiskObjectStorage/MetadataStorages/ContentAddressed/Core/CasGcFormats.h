@@ -74,6 +74,18 @@ struct RetiredSet
 String encodeGcState(const GcState & state);
 GcState decodeGcState(std::string_view data);
 
+/// Advisory GC liveness pulse (B160). A leader bumps `hb_seq` on a fast cadence independent of round
+/// progress; a follower's lease steal backs off if it sees this advance, so a slow-but-alive leader
+/// (its lease.seq frozen for the round) is never falsely stolen from. Fixed 24-byte binary:
+/// 16-byte big-endian owner + 8-byte big-endian hb_seq.
+struct GcHeartbeat
+{
+    UInt128 owner{};
+    uint64_t hb_seq = 0;
+};
+String encodeGcHeartbeat(const GcHeartbeat & hb);
+GcHeartbeat decodeGcHeartbeat(std::string_view data);
+
 String encodeRetiredSet(const RetiredSet & set);
 RetiredSet decodeRetiredSet(std::string_view data);
 

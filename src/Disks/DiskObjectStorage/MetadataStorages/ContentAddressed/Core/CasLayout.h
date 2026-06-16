@@ -114,6 +114,12 @@ public:
         return prefix + "/gc/state";
     }
 
+    /// GC heartbeat (advisory liveness pulse; B160): <prefix>/gc/hb.
+    String gcHbKey() const
+    {
+        return prefix + "/gc/hb";
+    }
+
     /// In-degree snapshot object: <prefix>/gc/snap/<generation>/<snap_shard>.
     /// Sharded by the TARGET content-hash prefix (spec §4, decision 2026-06-11): every edge
     /// targeting a node lands in the node's own snap shard, so in-degree is intra-shard.

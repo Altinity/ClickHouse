@@ -29,9 +29,11 @@ public:
 
 private:
     void loop();
+    void heartbeatLoop();   /// B160: bump gc/hb while we hold the lease, on a fast cadence (H <= W)
 
     const Cas::StorePtr store;
     const std::chrono::seconds interval;
+    const std::chrono::milliseconds hb_interval;   /// B160: heartbeat cadence H = interval/4
     const LoggerPtr log;
     const UInt128 gc_id;
 
@@ -39,6 +41,8 @@ private:
     std::condition_variable wake;
     bool stopping = false;
     std::thread thread;
+    std::atomic<bool> i_am_leader{false};   /// B160: set by the round thread, read by the heartbeat thread
+    std::thread hb_thread;
 };
 
 }

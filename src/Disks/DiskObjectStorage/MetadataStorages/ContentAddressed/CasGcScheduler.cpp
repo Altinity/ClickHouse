@@ -3,6 +3,7 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
+#include <algorithm>
 
 namespace DB::ContentAddressed
 {
@@ -10,6 +11,11 @@ namespace DB::ContentAddressed
 CasGcScheduler::CasGcScheduler(Cas::StorePtr store_, std::chrono::seconds interval_, const String & log_name)
     : store(std::move(store_))
     , interval(interval_)
+    /// B160: heartbeat cadence H = interval/4 (>= 50ms), comfortably below the follower's observation
+    /// window W (= interval), so a live leader's pulse always advances within W.
+    , hb_interval(std::max<std::chrono::milliseconds>(
+          std::chrono::milliseconds(50),
+          std::chrono::duration_cast<std::chrono::milliseconds>(interval_) / 4))
     , log(getLogger(log_name))
     /// gc_id uniqueness across instances is the Gc caller obligation - a random u128 per scheduler.
     , gc_id((static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng())
@@ -28,6 +34,7 @@ void CasGcScheduler::start()
         return;
     stopping = false;
     thread = std::thread([this] { loop(); });
+    hb_thread = std::thread([this] { heartbeatLoop(); });   /// B160
 }
 
 void CasGcScheduler::stop()
@@ -39,6 +46,8 @@ void CasGcScheduler::stop()
     wake.notify_all();
     if (thread.joinable())
         thread.join();
+    if (hb_thread.joinable())   /// B160
+        hb_thread.join();
 }
 
 void CasGcScheduler::runOneRoundNow()
@@ -67,6 +76,7 @@ void CasGcScheduler::loop()
         try
         {
             const Cas::RoundReport report = gc.runRegularRound();
+            i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);   /// B160: gate the heartbeat
             if (report.acquired_lease)
             {
                 consecutive_backoffs = 0;
@@ -91,7 +101,33 @@ void CasGcScheduler::loop()
         catch (...)
         {
             /// Idempotent round - the next tick retries; failures must never kill the pacing thread.
+            i_am_leader.store(false, std::memory_order_relaxed);   /// B160: a failed round => assume not leading
             tryLogCurrentException(log, "CA GC round failed (will retry next tick)");
+        }
+    }
+}
+
+void CasGcScheduler::heartbeatLoop()
+{
+    /// B160: while this node holds the lease, bump gc/hb every hb_interval (H <= W) so a follower
+    /// never falsely steals from us while a long round freezes our lease.seq. Independent of round
+    /// progress; advisory (a missed/lost pulse is harmless). Shares the stop signal with loop().
+    while (true)
+    {
+        {
+            std::unique_lock lock(mutex);
+            if (wake.wait_for(lock, hb_interval, [this] { return stopping; }))
+                return;
+        }
+        if (!i_am_leader.load(std::memory_order_relaxed))
+            continue;
+        try
+        {
+            Cas::Gc::pulseHeartbeat(*store, gc_id);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, "CA GC heartbeat pulse failed (advisory; will retry)");
         }
     }
 }

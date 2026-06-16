@@ -75,6 +75,11 @@ public:
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
     RoundReport runRegularRound();
 
+    /// B160 advisory heartbeat: bump <prefix>/gc/hb to {gc_id, hb_seq+1}. Best-effort (a lost CAS is
+    /// harmless — the next pulse retries). Touches NO Gc instance state, so the scheduler's separate
+    /// heartbeat thread may call it concurrently with the round thread. Static by design.
+    static void pulseHeartbeat(Store & store, UInt128 gc_id);
+
     /// One previewed deletion the next regular round would make, with the reason it is eligible.
     struct PreviewEntry
     {
@@ -274,6 +279,10 @@ private:
     bool has_observation = false;
     UInt128 last_seen_owner{};
     uint64_t last_seen_seq = 0;
+    /// B160: the heartbeat observed alongside the lease (gates the steal — a frozen lease.seq with an
+    /// ADVANCING heartbeat means the incumbent is alive mid-round, so do not steal).
+    UInt128 last_seen_hb_owner{};
+    uint64_t last_seen_hb_seq = 0;
 
     /// Pillar A1 resident-snap read-cache. The Gc instance is long-lived (one per scheduler thread,
     /// CasGcScheduler::loop), so this survives across rounds. A snap generation is write-once

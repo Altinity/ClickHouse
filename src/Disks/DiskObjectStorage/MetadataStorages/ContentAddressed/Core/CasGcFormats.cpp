@@ -220,4 +220,26 @@ RetiredSet decodeRetiredSet(std::string_view data)
     });
 }
 
+String encodeGcHeartbeat(const GcHeartbeat & hb)
+{
+    String out(24, '\0');
+    for (int i = 0; i < 16; ++i)
+        out[i] = static_cast<char>(static_cast<UInt8>(hb.owner >> (8 * (15 - i))));
+    for (int i = 0; i < 8; ++i)
+        out[16 + i] = static_cast<char>(static_cast<UInt8>(hb.hb_seq >> (8 * (7 - i))));
+    return out;
+}
+
+GcHeartbeat decodeGcHeartbeat(std::string_view data)
+{
+    if (data.size() != 24)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc heartbeat: expected 24 bytes, got {}", data.size());
+    GcHeartbeat hb;
+    for (int i = 0; i < 16; ++i)
+        hb.owner = (hb.owner << 8) | static_cast<UInt8>(data[i]);
+    for (int i = 0; i < 8; ++i)
+        hb.hb_seq = (hb.hb_seq << 8) | static_cast<UInt8>(static_cast<unsigned char>(data[16 + i]));
+    return hb;
+}
+
 }

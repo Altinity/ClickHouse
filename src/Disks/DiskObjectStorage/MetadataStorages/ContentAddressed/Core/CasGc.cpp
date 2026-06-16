@@ -1080,6 +1080,25 @@ void Gc::rememberObservation(const GcLease & lease)
     last_seen_seq = lease.seq;
 }
 
+void Gc::pulseHeartbeat(Store & store, UInt128 gc_id)
+{
+    /// B160 advisory liveness pulse: bump gc/hb to {gc_id, hb_seq+1}. Touches NO Gc instance state,
+    /// so the scheduler's separate heartbeat thread may call it concurrently with the round thread.
+    /// Best-effort: a Conflict means another writer raced us; skip — the next pulse retries.
+    const String key = store.layout().gcHbKey();
+    const auto got = store.backend().get(key);
+    GcHeartbeat hb;
+    std::optional<Token> expected;
+    if (got)
+    {
+        hb = decodeGcHeartbeat(got->bytes);
+        expected = got->token;
+    }
+    hb.owner = gc_id;   /// we believe we are the leader; take/keep gc/hb ownership
+    ++hb.hb_seq;
+    store.backend().casPut(key, encodeGcHeartbeat(hb), expected, /*out_token=*/nullptr);
+}
+
 bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
 {
     const String key = store->layout().gcStateKey();
@@ -1143,16 +1162,30 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
             continue;
         }
 
-        /// Foreign owner.
+        /// Foreign owner. B160: read the advisory heartbeat. A leader bumps gc/hb on a fast cadence
+        /// INDEPENDENT of round progress, so a slow-but-alive leader (whose lease.seq is frozen for
+        /// the duration of its round) is still seen as alive here and is NOT stolen from. gc/hb
+        /// absent, or owned by a displaced ex-leader (owner != the current gc/state owner) => no
+        /// signal => fall back to the seq-only observation below (never worse than before B160).
+        GcHeartbeat hb;
+        if (const auto hb_got = store->backend().get(store->layout().gcHbKey()))
+            hb = decodeGcHeartbeat(hb_got->bytes);
+        const bool hb_alive = has_observation
+            && hb.owner == current.lease.owner
+            && hb.hb_seq > last_seen_hb_seq;
+
         const bool incumbent_renewed = !has_observation
             || current.lease.owner != last_seen_owner
             || current.lease.seq != last_seen_seq;
-        if (incumbent_renewed)
+        if (incumbent_renewed || hb_alive)
         {
-            /// Step 3: the incumbent is alive (or this is our first sight of this lease) —
-            /// record the observation and back off. Eligibility to steal requires seeing the
-            /// SAME (owner, seq) across one whole prior round attempt of OURS.
+            /// Step 3: the incumbent is alive (it renewed, OR its heartbeat advanced — B160), or this
+            /// is our first sight of this lease — record the observation (lease + heartbeat) and back
+            /// off. Eligibility to steal requires seeing the SAME (owner, seq) AND a frozen heartbeat
+            /// across one whole prior round attempt of OURS.
             rememberObservation(current.lease);
+            last_seen_hb_owner = hb.owner;
+            last_seen_hb_seq = hb.hb_seq;
             return false;
         }
 

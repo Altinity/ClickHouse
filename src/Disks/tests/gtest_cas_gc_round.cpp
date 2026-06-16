@@ -212,6 +212,46 @@ TEST(CasGcLease, StealAfterObservedNonRenewalBumpsEpoch)
     EXPECT_EQ(st.fence_seq, st0.fence_seq + 1);                  /// steal bumps the leadership epoch
 }
 
+TEST(CasGcLease, HeartbeatBlocksFalseStealOfAliveLeader)
+{
+    /// B160: a slow-but-alive incumbent whose lease.seq is frozen for its (long) round must NOT be
+    /// stolen from, because its advisory heartbeat keeps advancing. Without the heartbeat this is
+    /// exactly StealAfterObservedNonRenewalBumpsEpoch above (a steal); WITH it, no steal.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const UInt128 leader = hexToU128("0000000000000000000000000000000a");
+    Gc gc1(s, leader);
+    Gc gc2(s, hexToU128("0000000000000000000000000000000b"));
+
+    ASSERT_TRUE(gc1.runRegularRound().acquired_lease);          /// gc1 leads (seq frozen for its round)
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);         /// gc2 observes (gc/hb absent yet)
+
+    Gc::pulseHeartbeat(*s, leader);                             /// gc1 mid-round but heartbeating (hb 0->1)
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);         /// hb advanced => alive => NO steal
+    Gc::pulseHeartbeat(*s, leader);                             /// hb 1->2
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);         /// still no steal while heartbeating
+    EXPECT_EQ(readState(*b, *s).lease.owner, leader);           /// gc1 still owns the lease
+}
+
+TEST(CasGcLease, FailoverStealOnceHeartbeatStops)
+{
+    /// B160: once the incumbent stops heartbeating (it died), a follower observing the now-frozen
+    /// heartbeat steals — automatic failover is preserved.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const UInt128 leader = hexToU128("0000000000000000000000000000000a");
+    Gc gc1(s, leader);
+    Gc gc2(s, hexToU128("0000000000000000000000000000000b"));
+
+    ASSERT_TRUE(gc1.runRegularRound().acquired_lease);
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);         /// obs #1
+    Gc::pulseHeartbeat(*s, leader);                             /// one last pulse (hb 0->1)
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);         /// hb advanced => no steal; records hb=1
+    /// gc1 now DEAD: no renew, no further pulse. hb stays at 1 == gc2's last observation.
+    EXPECT_TRUE(gc2.runRegularRound().acquired_lease);          /// hb frozen + seq frozen => STEAL
+    EXPECT_EQ(readState(*b, *s).lease.owner, hexToU128("0000000000000000000000000000000b"));
+}
+
 TEST(CasGcLease, DeadIncumbentThenRevivedIncumbentWinsRace)
 {
     /// A stalled incumbent that revives and renews BEFORE the contender's second look resets the

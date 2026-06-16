@@ -43,6 +43,22 @@ TEST(CasGcFormats, GcStateV2RoundTrip)
     EXPECT_EQ(d.fence_version.at(7).at("srv1/tbl/0"), 4u);
 }
 
+TEST(CasGcFormats, GcHeartbeatRoundTrip)
+{
+    GcHeartbeat hb;
+    hb.owner = hexToU128("0123456789abcdeffedcba9876543210");
+    hb.hb_seq = 12345;
+    GcHeartbeat d = decodeGcHeartbeat(encodeGcHeartbeat(hb));
+    EXPECT_EQ(d.owner, hb.owner);
+    EXPECT_EQ(d.hb_seq, 12345u);
+    /// boundary owners + a wrong-size blob fail closed
+    GcHeartbeat z;
+    z.owner = hexToU128("ffffffffffffffffffffffffffffffff");
+    z.hb_seq = 0;
+    EXPECT_EQ(decodeGcHeartbeat(encodeGcHeartbeat(z)).owner, z.owner);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcHeartbeat(String("short")); });
+}
+
 TEST(CasGcFormats, GcStateV2DefaultsAndReadability)
 {
     GcState s;
