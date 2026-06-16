@@ -1021,12 +1021,7 @@ bool RestCatalog::getTableMetadataImpl(
     return true;
 }
 
-void RestCatalog::sendRequest(
-    const String & endpoint,
-    Poco::JSON::Object::Ptr request_body,
-    const String & method,
-    bool ignore_result,
-    std::optional<DB::ReadSettings> read_settings_override) const
+void RestCatalog::sendRequest(const String & endpoint, Poco::JSON::Object::Ptr request_body, const String & method, bool ignore_result) const
 {
     std::ostringstream oss;  // STYLE_CHECK_ALLOW_STD_STRING_STREAM
     if (request_body)
@@ -1034,7 +1029,6 @@ void RestCatalog::sendRequest(
     const std::string body_str = DB::removeEscapedSlashes(oss.str());
 
     const auto & context = getContext();
-    DB::ReadSettings read_settings = read_settings_override ? *read_settings_override : context->getReadSettings();
 
     DB::ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback;
     if (!body_str.empty())
