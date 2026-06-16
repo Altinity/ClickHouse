@@ -1,18 +1,38 @@
 # CaResurrectLiveness — TLC results (B167 resurrect convergence)
 
 Model: `CaResurrectLiveness.tla`. Spec: `docs/superpowers/specs/2026-06-16-ca-resurrect-reupload-design.md`.
-Checker: TLC (`tmp/tla2tools.jar`); a **liveness** check (temporal property under weak fairness), `CHECK_DEADLOCK FALSE` (the bounded spec terminates legitimately).
+Checker: TLC (`tmp/tla2tools.jar`); a **liveness** check (temporal property under weak fairness of the
+build's own actions), `CHECK_DEADLOCK FALSE` (the bounded spec terminates legitimately).
 Run: `java -cp tmp/tla2tools.jar tlc2.TLC -config <cfg> CaResurrectLiveness.tla`.
 
-This is the LIVENESS dimension the safety-only `CaIncarnationCore` does not check — and which therefore did not catch B167.
+This is the LIVENESS dimension the safety-only `CaIncarnationCore` does not check — and which therefore
+did not catch B167.
+
+## Why this model was REWRITTEN (the false-confidence trap)
+
+The first version of this model collapsed the writer-side fix into ONE atomic step
+(`BuildRecreatable: published' = TRUE`), justified by the comment *"a fresh incarnation is not in any
+manifest fold until referenced, so GC cannot touch it in the span."* **That assumption is false.** The
+condemned blob is `everEdged` (it was published once, then dropped — that is *why* it is condemned) and
+stays `InDeg=0` until this build publishes. So GC's condemn guard `present ∧ everEdged ∧ InDeg=0` is
+satisfied for the build's OWN fresh incarnation too — GC can re-condemn and exact-token delete it in the
+upload→publish span. Collapsing that span to an atomic step "proved" convergence that does not exist.
+
+The rewritten model makes upload→publish NON-atomic and lets GC act in the gap, with the **build
+heartbeat guard** as the checked variable. The guard is what the old model silently assumed.
 
 ## What is modelled
 
-A blob was referenced → dropped → CONDEMNED (zero in-degree). A build dedup-hits the same content and must re-reference (resurrect) it, then PUBLISH. Two modes:
-- **Recreatable** (the fix): the build re-uploads a FRESH incarnation from its own bytes and references it in one step. A fresh incarnation is invisible to GC's manifest-fold until referenced, so GC cannot touch it in the upload→publish span.
-- **Bodyless** (today's publish-gate path): the build has no bytes, so it must GET the existing condemned object (HEAD→GET→rewrite). GC's exact-token delete can land in the HEAD→GET window; the merge then re-creates the blob (which GC re-condemns) and re-observes — an adversarial GC that deletes in every window starves it.
+A dedup hit lands on a stale condemned incarnation. The build has the body in hand (re-invokable
+`BlobSource`), so it never GETs — it re-streams a FRESH incarnation stamped with its OWN live `build_id`
+(`BuildUpload`), then references it and publishes (`BuildPublish`). GC condemns (`GcCondemn`) and
+exact-token deletes (`GcDelete`) as an unconstrained adversary. The fix:
 
-Weak fairness is on the BUILD's actions only; GC is the unconstrained adversary.
+- **`HeartbeatGuard = TRUE`**: incremental GC reads the envelope `build_id` and refuses to CONDEMN a
+  blob owned by a live build. Condemn guard becomes `present ∧ everEdged ∧ InDeg=0 ∧ ¬liveBuild(build_id)`.
+- **`HeartbeatGuard = FALSE`**: today's incremental GC — condemns on zero-in-degree alone.
+
+Weak fairness is on the BUILD's actions only; GC is unconstrained.
 
 ## Property
 
@@ -20,31 +40,40 @@ Weak fairness is on the BUILD's actions only; GC is the unconstrained adversary.
 
 ## Results
 
-| config | `Recreatable` | distinct states | result |
+| config | `HeartbeatGuard` | distinct states | result |
 |---|---|---|---|
-| `CaResurrectLiveness_recreatable` | TRUE (fix) | 4 | **PASS** — `<>published` holds |
-| `CaResurrectLiveness_sab_bodyless` | FALSE | 5 | **VIOLATED** — temporal counter-example (B167 livelock) |
+| `CaResurrectLiveness_guard`   | TRUE (fix) | 4 | **PASS** — `<>published` holds |
+| `CaResurrectLiveness_noguard` | FALSE      | 7 | **VIOLATED** — temporal counter-example (B167 livelock) |
 
 Conclusions:
-1. **The fix converges.** With `Recreatable=TRUE`, weak fairness forces the single atomic re-upload-and-reference and the build always publishes — regardless of what GC does to the old condemned incarnation.
-2. **The bodyless gate is starvable.** With `Recreatable=FALSE`, a fair behaviour never publishes: GC keeps deleting the condemned incarnation and the merge keeps re-creating it (which GC re-condemns), so the build never holds a live incarnation long enough to reference it. This is B167.
+1. **The guard converges.** With the heartbeat guard, once `BuildUpload` mints the build's fresh
+   incarnation, GC can neither condemn nor delete it (`freshOwned` ⇒ guard blocks `GcCondemn`, and
+   `GcDelete` needs `condemned`). The state `present ∧ freshOwned ∧ ¬condemned` is stable, so weak
+   fairness forces `BuildPublish`.
+2. **Writer-side re-upload ALONE is starvable.** With the guard off, a fair behaviour never publishes —
+   crucially this is the BODY-IN-HAND writer, not the old bodyless GET path. This is the sharper B167.
 
-## B167 livelock counterexample (`sab_bodyless`, lasso)
+## B167 livelock counterexample (`noguard`, lasso)
 
 ```
-State 1  present=TRUE  condemned=TRUE  published=FALSE   (a dedup hit lands on the condemned-present blob)
-State 2  GcDelete       -> present=FALSE                  (GC exact-token deletes the condemned incarnation)
-Back to State 1  ReCreate -> present=TRUE, condemned=TRUE (merge re-uploads; GC re-condemns the unreferenced re-creation)
-   ... GcDelete -> ReCreate -> GcDelete -> ...  published never becomes TRUE
+State 1  present=T condemned=T freshOwned=F published=F   (dedup hit on a stale past-build condemned incarnation)
+State 2  GcDelete    -> present=F condemned=F freshOwned=F (GC exact-token deletes the stale incarnation)
+State 3  BuildUpload -> present=T condemned=F freshOwned=T (the build re-streams its OWN fresh incarnation)
+State 4  GcCondemn   -> present=T condemned=T freshOwned=T (guard OFF: GC re-condemns the build's OWN fresh incarnation)
+Back to State 2  GcDelete -> ...                            (GC deletes it before the build references it)
+   ... GcDelete -> BuildUpload -> GcCondemn -> ...  published never becomes TRUE
 ```
-This lasso faithfully matches soak #11: the merge re-uploaded the blob (412 dedup hit on a condemned incarnation), GC re-condemned+deleted it, the bodyless gate could never re-reference it before the next delete → the part never committed (broken). The `BodylessObserve`/`BodylessComplete` race (delete in the HEAD→GET window) is a longer fair behaviour with the same outcome; TLC reports the shortest witness.
+State 3→4 is the smoking gun: GC condemning a `freshOwned=TRUE` incarnation. The old atomic model could
+not express this transition, which is why it missed the livelock. This lasso matches soak #11: the merge
+re-uploaded the blob, GC re-condemned + deleted it, and the build never held a live incarnation long
+enough to reference it → the part never committed (broken).
 
 ## Reproduce
 
 ```bash
 cd docs/superpowers/models
 JAR=../../../tmp/tla2tools.jar
-for c in CaResurrectLiveness_recreatable CaResurrectLiveness_sab_bodyless; do
+for c in CaResurrectLiveness_guard CaResurrectLiveness_noguard; do
   java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -config $c.cfg CaResurrectLiveness.tla
 done
 ```

@@ -4,127 +4,126 @@
 (*                                                                         *)
 (* Spec: docs/superpowers/specs/2026-06-16-ca-resurrect-reupload-design.md *)
 (*                                                                         *)
-(* A blob was referenced -> dropped -> CONDEMNED by GC (zero in-degree). A *)
-(* build dedup-hits the same content and must re-reference (resurrect) it, *)
-(* then PUBLISH its part. Two resurrect modes:                             *)
+(* A blob was referenced -> dropped -> CONDEMNED by GC. A build dedup-hits  *)
+(* the SAME content and must re-reference it, then PUBLISH its part. The    *)
+(* build HAS the body in hand (its BlobSource is re-invokable), so it never *)
+(* GETs the existing object — it re-streams a FRESH incarnation stamped     *)
+(* with its OWN build_id. The open question is purely about the WINDOW      *)
+(* between that fresh upload and the publish that references it.            *)
 (*                                                                         *)
-(*  - RECREATABLE (the B167 fix): the build re-uploads a FRESH incarnation *)
-(*    from its OWN bytes and references it in ONE step. A fresh incarnation *)
-(*    is invisible to GC's manifest-fold until it is referenced, so GC     *)
-(*    cannot condemn/delete it in the upload->publish span. Always makes    *)
-(*    progress.                                                            *)
+(* THE TRAP THIS MODEL EXISTS TO EXPOSE: a fresh incarnation is NOT GC-     *)
+(* invisible. The hash is `everEdged` (it WAS published once -> that is why *)
+(* it became condemned) and stays InDeg=0 until this build publishes. So    *)
+(* GC's condemn guard  present /\ everEdged /\ InDeg=0  IS satisfied for     *)
+(* the build's own fresh incarnation: GC can re-condemn and exact-token     *)
+(* delete it in the upload->publish span. An earlier version of this model  *)
+(* collapsed upload+publish into ONE atomic step and thereby "proved" the   *)
+(* writer-side re-upload converges — false confidence. It does NOT, alone.  *)
 (*                                                                         *)
-(*  - BODYLESS (today's publish-gate path): the build has no bytes, so it  *)
-(*    must re-derive them by GET-ing the EXISTING condemned object         *)
-(*    (HEAD -> GET -> rewrite). GC's exact-token delete can land in the    *)
-(*    HEAD->GET window -> ABORTED -> the merge re-creates the blob (which   *)
-(*    GC re-condemns) and re-observes -> GC deletes again -> ... An         *)
-(*    adversarial GC that deletes in EVERY window starves the build.       *)
+(* THE FIX UNDER TEST (HeartbeatGuard): incremental GC honors the BUILD     *)
+(* heartbeat — it refuses to CONDEMN a blob whose envelope build_id has a   *)
+(* live heartbeat. Condemn guard becomes                                   *)
+(*     present /\ everEdged /\ InDeg=0 /\ ~liveBuild(build_id).             *)
+(* The build's fresh incarnation carries its OWN (live) build_id, so GC     *)
+(* cannot condemn it -> it survives to the publish that references it.      *)
 (*                                                                         *)
-(* PROPERTY checked: Liveness == <>published  (the build eventually         *)
-(* publishes), under weak fairness of the build's own actions.             *)
-(*   - Recreatable = TRUE  : HOLDS (the fix converges).                    *)
-(*   - Recreatable = FALSE : VIOLATED (the B167 livelock; a fair behaviour *)
-(*     never publishes because GcDelete preempts BodylessComplete forever).*)
-(*                                                                         *)
-(* Why the existing safety model (CaIncarnationCore) did NOT catch B167:   *)
-(* it proves SAFETY (which holds — no data loss) and models the            *)
-(* body-in-hand writer; it does not model a BODYLESS gate that gives up,   *)
-(* nor check LIVENESS. This model adds exactly that dimension.             *)
+(* PROPERTY checked: Liveness == <>published, under weak fairness of the    *)
+(* build's own actions (GC is the unconstrained adversary).                *)
+(*   - HeartbeatGuard = TRUE  : HOLDS  (the fix converges).                 *)
+(*   - HeartbeatGuard = FALSE : VIOLATED — and crucially this is the        *)
+(*     body-in-hand writer, NOT the old bodyless GET path. It proves the    *)
+(*     writer-side re-stream ALONE is starvable and the heartbeat guard is  *)
+(*     load-bearing: upload(fresh) -> GC re-condemns -> GC deletes ->        *)
+(*     upload(fresh) -> ...  publish never fires.                          *)
 (***************************************************************************)
 EXTENDS Integers
 
-CONSTANT Recreatable    \* TRUE = B167 fix (re-upload fresh); FALSE = today's bodyless gate
+CONSTANT HeartbeatGuard   \* TRUE = incremental GC honors the build heartbeat (the fix); FALSE = today
 
 VARIABLES
-    present,          \* is an incarnation of the (everEdged) blob present in the pool
-    condemned,        \* is that present incarnation condemned by GC (exact-token)
-    observedPresent,  \* bodyless build observed the incarnation present (the HEAD step)
-    published         \* terminal success: the build referenced a live incarnation + published
+    present,      \* an incarnation of the (everEdged) blob is present in the pool
+    condemned,    \* GC has condemned the present incarnation (exact-token, in the retire pipeline)
+    freshOwned,   \* the present incarnation is THIS build's fresh re-stamp (carries its LIVE build_id)
+    published     \* terminal success: the build referenced its live incarnation and published
 
-vars == << present, condemned, observedPresent, published >>
+vars == << present, condemned, freshOwned, published >>
 
+\* A dedup hit lands on a STALE condemned incarnation left by a PAST build (dead heartbeat): present,
+\* condemned, not owned by us.
 Init ==
-    /\ present = TRUE          \* the condemned-but-present incarnation a dedup hit lands on
+    /\ present = TRUE
     /\ condemned = TRUE
-    /\ observedPresent = FALSE
+    /\ freshOwned = FALSE
     /\ published = FALSE
 
 ----------------------------------------------------------------------------
-\* THE FIX. One atomic step: re-upload a FRESH incarnation from the build's own bytes and reference
-\* it. A fresh incarnation is not in any manifest fold until referenced, so GC cannot touch it in the
-\* span -> the build always makes progress, regardless of what GC does to the old condemned one.
-BuildRecreatable ==
-    /\ Recreatable
+\* W-rule (writer-side): re-stream the body into a FRESH incarnation stamped with this build's own
+\* build_id. The fresh tag clears the old exact-token condemnation (GC's pending delete can no longer
+\* match), and the incarnation now carries a LIVE build_id. Enabled whenever the build does not already
+\* hold its own present fresh incarnation — i.e. on the initial stale hit AND after any GcDelete.
+BuildUpload ==
     /\ ~published
-    /\ published' = TRUE
-    /\ UNCHANGED << present, condemned, observedPresent >>
-
-\* TODAY (bodyless gate): observe the existing condemned incarnation (HEAD).
-BodylessObserve ==
-    /\ ~Recreatable
-    /\ ~published
-    /\ present
-    /\ condemned
-    /\ ~observedPresent
-    /\ observedPresent' = TRUE
-    /\ UNCHANGED << present, condemned, published >>
-
-\* Bodyless complete: the GET found the incarnation still present -> rewrite fresh + reference +
-\* publish. ENABLED ONLY while the observed incarnation is still present; GcDelete disables it.
-BodylessComplete ==
-    /\ ~Recreatable
-    /\ ~published
-    /\ observedPresent
-    /\ present
-    /\ published' = TRUE
-    /\ UNCHANGED << present, condemned, observedPresent >>
-
-\* The merge retry re-creates the blob after a vanish (putBlob has a body), and GC re-condemns the
-\* unreferenced re-creation before the gate revalidates -> back to the racy condemned-present state.
-ReCreate ==
-    /\ ~Recreatable
-    /\ ~published
-    /\ ~present
+    /\ ~(present /\ freshOwned)
     /\ present' = TRUE
-    /\ condemned' = TRUE
-    /\ observedPresent' = FALSE
+    /\ freshOwned' = TRUE
+    /\ condemned' = FALSE
     /\ UNCHANGED published
 
-\* The adversary: GC's exact-token delete of the condemned incarnation. It can land in the bodyless
-\* HEAD->GET window (after Observe, before Complete), starving the build. No fairness on GC.
+\* The publish gate references the build's own present fresh incarnation -> InDeg becomes >=1 -> publish.
+\* Enabled while that incarnation is present (condemned-or-not: a present incarnation can still be
+\* referenced; the reference re-pins it above any fence).
+BuildPublish ==
+    /\ ~published
+    /\ present
+    /\ freshOwned
+    /\ published' = TRUE
+    /\ UNCHANGED << present, condemned, freshOwned >>
+
+\* GC condemns the present incarnation (present /\ everEdged /\ InDeg=0). everEdged and InDeg=0 hold
+\* throughout (the blob was published-then-dropped; this build has not published yet). THE GUARD: with
+\* HeartbeatGuard, GC reads the envelope build_id and refuses to condemn a blob owned by a LIVE build
+\* (freshOwned). Without the guard, GC condemns regardless of ownership. No fairness on GC.
+GcCondemn ==
+    /\ present
+    /\ ~condemned
+    /\ ~published
+    /\ (HeartbeatGuard => ~freshOwned)
+    /\ condemned' = TRUE
+    /\ UNCHANGED << present, freshOwned, published >>
+
+\* GC's exact-token delete of a CONDEMNED incarnation. Removes it (and its ownership). With the guard a
+\* freshOwned incarnation never becomes condemned, so it is never deleted.
 GcDelete ==
     /\ present
     /\ condemned
     /\ present' = FALSE
-    /\ observedPresent' = FALSE   \* the observed incarnation is gone -> a stale observation
-    /\ UNCHANGED << condemned, published >>
+    /\ condemned' = FALSE
+    /\ freshOwned' = FALSE
+    /\ UNCHANGED published
 
 Next ==
-    \/ BuildRecreatable
-    \/ BodylessObserve
-    \/ BodylessComplete
-    \/ ReCreate
+    \/ BuildUpload
+    \/ BuildPublish
+    \/ GcCondemn
     \/ GcDelete
 
-\* Weak fairness on the BUILD's own actions only (GC is the adversary, unconstrained). The build keeps
-\* trying; the question is whether it can be starved.
+\* Weak fairness on the BUILD's own actions only (the build is alive and keeps trying; GC is the
+\* unconstrained adversary). The question is whether GC can starve a live, body-in-hand build.
 Spec ==
     /\ Init
     /\ [][Next]_vars
-    /\ WF_vars(BuildRecreatable)
-    /\ WF_vars(BodylessObserve)
-    /\ WF_vars(BodylessComplete)
-    /\ WF_vars(ReCreate)
+    /\ WF_vars(BuildUpload)
+    /\ WF_vars(BuildPublish)
 
 ----------------------------------------------------------------------------
-\* The build eventually publishes. HOLDS for the fix (Recreatable=TRUE), VIOLATED for the bodyless
-\* gate (Recreatable=FALSE) — GcDelete preempts BodylessComplete in every window, forever.
+\* The build eventually publishes. HOLDS with the heartbeat guard; VIOLATED without it (the sharper
+\* B167: even body-in-hand re-upload is starved by an adversarial GC that re-condemns + deletes the
+\* fresh incarnation in every upload->publish window).
 Liveness == <>published
 
 TypeOK ==
     /\ present \in BOOLEAN
     /\ condemned \in BOOLEAN
-    /\ observedPresent \in BOOLEAN
+    /\ freshOwned \in BOOLEAN
     /\ published \in BOOLEAN
 =============================================================================
