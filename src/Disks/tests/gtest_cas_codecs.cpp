@@ -489,103 +489,43 @@ TEST(CasRootShardCodec, RefsCanonicalOrderRegardlessOfInsertion)
     EXPECT_EQ(encodeRootShard(a), encodeRootShard(b));
 }
 
-/// ---------- CasRootShardCodec strict-JSON validation ----------
-
-TEST(CasRootShardCodec, StrictJsonValidation)
-{
-    /// The encoder now emits protobuf (B164a), but decode still accepts the legacy JSON format and
-    /// applies the SAME strict validation below — these decode-side rules are what this test pins.
-    /// Malformed JSON.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("{not json")); });
-    /// Wrong format value.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeRootShard(R"({"format":"cas_wrong","version":1,"shard_version":0,"fence_round":0,"refs":{},"journal":[]})"); });
-    /// Missing a required top-level key (refs).
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"journal":[]})"); });
-    /// Wrong type: shard_version as a string.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":"0","fence_round":0,"refs":{},"journal":[]})"); });
-    /// Unknown extra key at the top level.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"refs":{},"journal":[],"x":1})"); });
-    /// Future version => NOT_IMPLEMENTED (fail closed on the future, never corruption).
-    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
-        [] { decodeRootShard(R"({"format":"cas_root_shard","version":2,"shard_version":0,"fence_round":0,"refs":{},"journal":[]})"); });
-}
-
-TEST(CasRootShardCodec, TrailingJunkOnLegacyJsonThrows)
-{
-    /// On the LEGACY JSON decode path a valid document plus a stray byte is CORRUPTED_DATA (Poco
-    /// rejects trailing content). Protobuf gives no equivalent guarantee — appended bytes are parsed
-    /// as further fields — so this pins the JSON path, which the decoder still serves for old pools.
-    const String json = R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"refs":{},"journal":[]})";
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(json + "x"); });
-}
-
-TEST(CasRootShardCodec, StrictJsonRefAndJournalValidation)
-{
-    /// Bad hash hex in a ref's tree.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
-    {
-        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,)"
-            R"("refs":{"r":{"tree":"nothex","tree_size":1,"mutable_files":{}}},"journal":[]})");
-    });
-    /// Unknown extra key inside a ref payload.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
-    {
-        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,)"
-            R"("refs":{"r":{"tree":"000102030405060708090a0b0c0d0e0f","tree_size":1,"mutable_files":{},"x":1}},"journal":[]})");
-    });
-    /// Wrong type: a mutable_files value that is not a string.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
-    {
-        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,)"
-            R"("refs":{"r":{"tree":"000102030405060708090a0b0c0d0e0f","tree_size":1,"mutable_files":{"k":1}}},"journal":[]})");
-    });
-    /// Bad enum: unknown journal op.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
-    {
-        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"refs":{},)"
-            R"("journal":[{"op":"toggle","ref":"r","tree":"000102030405060708090a0b0c0d0e0f","at_version":1}]})");
-    });
-    /// Missing a required key inside a journal record.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
-    {
-        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"refs":{},)"
-            R"("journal":[{"op":"add","ref":"r","tree":"000102030405060708090a0b0c0d0e0f"}]})");
-    });
-}
-
 TEST(CasRootShardCodec, JournalAtVersionMonotonicityIsEnforced)
 {
     /// The GC fold replays the journal in order under a cursor bound; an out-of-order at_version
     /// would fold silently in vector order (corruption-induced UNDER-count = a wrong delete later)
-    /// and a record claiming a version beyond shard_version would be silently skipped by the
-    /// cursor window. Both are corruption - fail closed at decode.
+    /// and a record claiming a version beyond shard_version would be silently skipped by the cursor
+    /// window. Both are corruption - fail closed at DECODE. The encoder does NOT validate, so we
+    /// encode a deliberately-bad manifest and confirm the decoder rejects it.
 
     /// Descending at_version.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
     {
-        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":5,"fence_round":0,"refs":{},)"
-            R"("journal":[{"op":"add","ref":"r","tree":"000102030405060708090a0b0c0d0e0f","at_version":3},)"
-            R"({"op":"add","ref":"r","tree":"000102030405060708090a0b0c0d0e0f","at_version":2}]})");
-    });
+        RootShard rs;
+        rs.shard_version = 5;
+        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 3});
+        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 2});
+        const String bytes = encodeRootShard(rs);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(bytes); });
+    }
     /// at_version beyond shard_version.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, []
     {
-        decodeRootShard(R"({"format":"cas_root_shard","version":1,"shard_version":1,"fence_round":0,"refs":{},)"
-            R"("journal":[{"op":"add","ref":"r","tree":"000102030405060708090a0b0c0d0e0f","at_version":2}]})");
-    });
-    /// EQUAL at_versions are legal (non-decreasing, not strict): dropNamespace appends N Removes
-    /// at the same committed version.
-    const RootShard d = decodeRootShard(
-        R"({"format":"cas_root_shard","version":1,"shard_version":2,"fence_round":0,"refs":{},)"
-        R"("journal":[{"op":"remove","ref":"a","tree":"000102030405060708090a0b0c0d0e0f","at_version":2},)"
-        R"({"op":"remove","ref":"b","tree":"000102030405060708090a0b0c0d0e0f","at_version":2}]})");
-    ASSERT_EQ(d.journal.size(), 2u);
-    EXPECT_EQ(d.journal[0].at_version, 2u);
-    EXPECT_EQ(d.journal[1].at_version, 2u);
+        RootShard rs;
+        rs.shard_version = 1;
+        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 2});
+        const String bytes = encodeRootShard(rs);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(bytes); });
+    }
+    /// EQUAL at_versions are legal (non-decreasing, not strict): dropNamespace appends N Removes at
+    /// the same committed version.
+    {
+        RootShard rs;
+        rs.shard_version = 2;
+        rs.journal.push_back({JournalRecord::Op::Remove, "a", UInt128(1), 2});
+        rs.journal.push_back({JournalRecord::Op::Remove, "b", UInt128(1), 2});
+        const RootShard d = decodeRootShard(encodeRootShard(rs));
+        ASSERT_EQ(d.journal.size(), 2u);
+        EXPECT_EQ(d.journal[0].at_version, 2u);
+        EXPECT_EQ(d.journal[1].at_version, 2u);
+    }
 }
 
 /// ---------- CasRootShardCodec protobuf encoding (B164a) ----------
@@ -644,32 +584,19 @@ TEST(CasRootShardCodec, LargeJournalRoundTrips)
     EXPECT_EQ(d.journal[0].ref_name, "p0");
 }
 
-TEST(CasRootShardCodec, LegacyJsonManifestDecodesPositively)
+TEST(CasRootShardCodec, FailClosedOnGarbageBytes)
 {
-    /// A pre-B164 JSON manifest must still decode (forward migration: old pools served by a new binary).
-    const RootShard d = decodeRootShard(
-        R"({"format":"cas_root_shard","version":1,"shard_version":42,"fence_round":7,)"
-        R"("refs":{"part_a":{"tree":"000102030405060708090a0b0c0d0e0f","tree_size":1142,)"
-        R"("mutable_files":{"metadata_version.txt":"0"}}},)"
-        R"("journal":[{"op":"add","ref":"part_a","tree":"000102030405060708090a0b0c0d0e0f","at_version":42}]})");
-    EXPECT_EQ(d.shard_version, 42u);
-    ASSERT_EQ(d.refs.size(), 1u);
-    EXPECT_EQ(d.refs.at("part_a").tree_size, 1142u);
-    ASSERT_EQ(d.journal.size(), 1u);
-    EXPECT_EQ(d.journal[0].op, JournalRecord::Op::Add);
-}
-
-TEST(CasRootShardCodec, FailClosedOnNonJsonNonProtobufBytes)
-{
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("")); });          /// empty
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("\xff\xff\xff\xff")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("")); });               /// empty
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("\xff\xff\xff\xff")); }); /// not protobuf
+    /// Bytes that protobuf-parse but carry no (or zero) codec_version are not a conforming manifest.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("\x10\x01", 2)); });      /// only shard_version, codec_version=0
 }
 
 TEST(CasRootShardCodec, ProtobufFutureCodecVersionThrowsNotImplemented)
 {
-    /// A protobuf manifest with codec_version=3 (field 1, varint) from a newer writer must fail
-    /// closed, never be mis-read. Bytes: tag(field 1, varint)=0x08, value=3.
-    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [] { decodeRootShard(String("\x08\x03", 2)); });
+    /// A protobuf manifest with codec_version=2 (field 1, varint) from a newer writer must fail
+    /// closed, never be mis-read. Bytes: tag(field 1, varint)=0x08, value=2 (> current CODEC_VERSION=1).
+    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [] { decodeRootShard(String("\x08\x02", 2)); });
 }
 
 /// ---------- envelope fixed-length header padding (pad_to_header_len) ----------

@@ -1,10 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 /// Included by basename via clickhouse_cas_proto's SYSTEM include dir so the generated header's
 /// reserved identifiers don't trip -Weverything -Werror (same idiom as clickhouse_grpc_protos).
 #include <cas_root_shard.pb.h>
-#include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
@@ -24,10 +21,12 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint64_t ROOT_VERSION = 1;             /// the JSON format is the implicit codec v1
-constexpr uint32_t CODEC_VERSION_PROTOBUF = 2;   /// the protobuf format
+/// The only on-disk manifest format is protobuf (B164a). There is no JSON back-compat: a fresh pool
+/// is always protobuf, and `codec_version` is the fail-closed gate for future breaking changes (see
+/// the schema-evolution rules in cas_root_shard.proto).
+constexpr uint32_t CODEC_VERSION = 1;
 
-/// UInt128 <-> 16 raw bytes, big-endian (mirrors the u128ToHex byte order).
+/// UInt128 <-> 16 raw bytes, big-endian.
 std::string u128ToBytes(const UInt128 & v)
 {
     std::string out(16, '\0');
@@ -66,23 +65,12 @@ JournalRecord::Op journalOpFromProto(Cas::Proto::JournalOp op, std::string_view 
     }
 }
 
-/// `JournalRecord::Op` <- string. Unknown string on decode is corruption (fail closed). Used by the
-/// legacy JSON decoder only (the encoder is now protobuf).
-JournalRecord::Op journalOpFromString(std::string_view s, std::string_view what)
-{
-    if (s == "add")
-        return JournalRecord::Op::Add;
-    if (s == "remove")
-        return JournalRecord::Op::Remove;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid journal op '{}'", what, s);
-}
-
 }
 
 String encodeRootShard(const RootShard & root)
 {
     Cas::Proto::RootShardManifest msg;
-    msg.set_codec_version(CODEC_VERSION_PROTOBUF);
+    msg.set_codec_version(CODEC_VERSION);
     msg.set_shard_version(root.shard_version);
     msg.set_fence_round(root.fence_round);
 
@@ -120,12 +108,19 @@ String encodeRootShard(const RootShard & root)
     return out;
 }
 
-static RootShard decodeRootShardProto(std::string_view data)
+RootShard decodeRootShard(std::string_view data)
 {
+    if (data.empty())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: empty manifest");
+
     Cas::Proto::RootShardManifest msg;
     if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: protobuf parse failed");
-    if (msg.codec_version() > CODEC_VERSION_PROTOBUF)
+    /// A valid encoder always sets codec_version >= 1; a zero value means the bytes are not a
+    /// conforming manifest (e.g. random bytes that happened to protobuf-parse). Fail closed.
+    if (msg.codec_version() == 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: missing or zero codec_version");
+    if (msg.codec_version() > CODEC_VERSION)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "CAS root shard: codec_version {} is from a newer writer", msg.codec_version());
 
@@ -151,7 +146,11 @@ static RootShard decodeRootShardProto(std::string_view data)
         rec.tree_id = u128FromBytes(r.tree_id(), "root shard journal");
         rec.at_version = r.at_version();
 
-        /// Same semantic invariants the JSON decoder enforces (corruption -> fail closed).
+        /// The GC fold replays the journal in order under a cursor bound: an out-of-order at_version
+        /// would fold silently in vector order (a corruption-induced UNDER-count = a wrong delete
+        /// later), and a record beyond shard_version would be silently skipped by the cursor window.
+        /// Both are corruption - fail closed. NON-DECREASING, not strict: dropNamespace legally
+        /// appends N Removes at the same committed version.
         if (rec.at_version > root.shard_version)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS root shard: journal at_version {} exceeds shard_version {}",
@@ -164,76 +163,6 @@ static RootShard decodeRootShardProto(std::string_view data)
         root.journal.push_back(std::move(rec));
     }
     return root;
-}
-
-static RootShard decodeRootShardJson(std::string_view data)
-{
-    return decodeJsonGuarded("root shard", [&]
-    {
-        auto obj = parseJsonDocument(data, "cas_root_shard", ROOT_VERSION, "root shard");
-        checkNoUnknownKeys(*obj, {"format", "version", "shard_version", "fence_round", "refs", "journal"}, "root shard");
-
-        RootShard root;
-        root.shard_version = requireU64(*obj, "shard_version", "root shard");
-        root.fence_round = requireU64(*obj, "fence_round", "root shard");
-
-        auto refs = requireObject(*obj, "refs", "root shard");
-        for (const auto & [name, value] : *refs)
-        {
-            if (value.type() != typeid(Poco::JSON::Object::Ptr))
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: ref '{}' must be an object", name);
-            auto ref_obj = value.extract<Poco::JSON::Object::Ptr>();
-            checkNoUnknownKeys(*ref_obj, {"tree", "tree_size", "mutable_files"}, "root shard ref");
-
-            RefPayload payload;
-            payload.tree_id = requireHash(*ref_obj, "tree", "root shard ref");
-            payload.tree_size = requireU64(*ref_obj, "tree_size", "root shard ref");
-            payload.mutable_files = requireStringMap(*ref_obj, "mutable_files", "root shard ref");
-            root.refs[name] = std::move(payload);
-        }
-
-        auto journal = requireArray(*obj, "journal", "root shard");
-        for (size_t i = 0; i < journal->size(); ++i)
-        {
-            auto rec_obj = requireObjectAt(*journal, i, "root shard journal");
-            checkNoUnknownKeys(*rec_obj, {"op", "ref", "tree", "at_version"}, "root shard journal record");
-
-            JournalRecord rec;
-            rec.op = journalOpFromString(requireString(*rec_obj, "op", "root shard journal"), "root shard journal");
-            rec.ref_name = requireString(*rec_obj, "ref", "root shard journal");
-            rec.tree_id = requireHash(*rec_obj, "tree", "root shard journal");
-            rec.at_version = requireU64(*rec_obj, "at_version", "root shard journal");
-
-            /// The GC fold replays the journal in order under a cursor bound: an out-of-order
-            /// at_version would fold silently in vector order (a corruption-induced UNDER-count =
-            /// a wrong delete later), and a record beyond shard_version would be silently skipped
-            /// by the cursor window. Both are corruption - fail closed. NON-DECREASING, not
-            /// strict: dropNamespace legally appends N Removes at the same committed version.
-            if (rec.at_version > root.shard_version)
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS root shard: journal at_version {} exceeds shard_version {}",
-                    rec.at_version, root.shard_version);
-            if (!root.journal.empty() && rec.at_version < root.journal.back().at_version)
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS root shard: journal at_version {} after {} - the journal must be non-decreasing",
-                    rec.at_version, root.journal.back().at_version);
-
-            root.journal.push_back(std::move(rec));
-        }
-
-        return root;
-    });
-}
-
-RootShard decodeRootShard(std::string_view data)
-{
-    if (data.empty())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: empty manifest");
-    /// Dispatch: a legacy JSON manifest starts with '{' (0x7B); a protobuf RootShardManifest starts
-    /// with field-1's tag byte 0x08 (varint codec_version). They never collide.
-    if (data.front() == '{')
-        return decodeRootShardJson(data);
-    return decodeRootShardProto(data);
 }
 
 }

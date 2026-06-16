@@ -41,7 +41,7 @@ message JournalRecord {
 }
 
 message RootShardManifest {
-  uint32 codec_version = 1;           // = 2; the JSON format is the implicit v1; future -> NOT_IMPLEMENTED
+  uint32 codec_version = 1;           // = 1 (protobuf is the only format); 0 or > current -> reject
   uint64 shard_version = 2;
   uint64 fence_round = 3;
   map<string, RefPayload> refs = 4;

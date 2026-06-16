@@ -15,7 +15,7 @@ Replace the JSON manifest codec with **Protobuf** (chosen for compactness + enco
 - Eliminate the JSON CPU (no Poco `Var`, no char-by-char `writeJSONString`, no `checkNoUnknownKeys`).
 - ~2× fewer bytes per manifest (binary varints; 16-byte raw hashes instead of 32 hex chars; positional fields instead of repeated key strings).
 - Preserve fail-closed decode semantics and add introspectability via a decode tool.
-- Back-compatible read of existing JSON pools; transparent forward migration.
+- **No JSON back-compat** (user decision, 2026-06-16): fresh pools are always protobuf; the JSON reader is removed entirely. No dual-path, no migration.
 
 Non-goals: reducing the journal *record count* (that is B160/B163 — GC must fold/trim to keep pace); splitting journal from refs (B164c, rejected — extra hot-path PUT).
 
@@ -47,7 +47,7 @@ message JournalRecord {
 }
 
 message RootShardManifest {
-  uint32 codec_version = 1;           // = 2 (the JSON format is the implicit v1); future value -> NOT_IMPLEMENTED
+  uint32 codec_version = 1;           // = 1 (protobuf is the only format); 0 -> CORRUPTED, > current -> NOT_IMPLEMENTED
   uint64 shard_version = 2;
   uint64 fence_round = 3;
   map<string, RefPayload> refs = 4;   // decode is order-independent; see Determinism
@@ -59,25 +59,22 @@ message RootShardManifest {
 
 ### Determinism
 
-The manifest is **CAS-by-token (ETag), not content-addressed** — byte-determinism is NOT a correctness requirement. We nonetheless serialize **deterministically** (protobuf deterministic mode: `CodedOutputStream::SetSerializationDeterministic(true)`, which sorts `map<>` entries by key; `repeated` keeps insertion order) so golden tests are stable and output matches the current JSON codec's canonical ordering (refs name-sorted, mutable_files name-sorted, journal in insertion order). Decode is order-independent regardless.
+The manifest is **CAS-by-token (ETag), not content-addressed** — byte-determinism is NOT a correctness requirement. We nonetheless serialize **deterministically** (protobuf deterministic mode: `CodedOutputStream::SetSerializationDeterministic(true)`, which sorts `map<>` entries by key; `repeated` keeps insertion order) so golden tests are stable: refs and mutable_files are name-sorted (map keys), the journal stays in insertion order. Decode is order-independent regardless.
 
 ## Codec API
 
 `CasRootShardCodec.{h,cpp}` keeps the public surface unchanged so call sites (`CasStore.cpp:269,412,580`) are untouched:
 
-- `String encodeRootShard(const RootShard &)` — now builds a `RootShardManifest`, sets `codec_version=2`, serializes deterministically. Maps the existing `RootShard`/`RefPayload`/`JournalRecord` structs 1:1 onto the proto messages.
-- `RootShard decodeRootShard(std::string_view data)` — **dispatches on the first byte**:
-  - `data` empty -> `CORRUPTED_DATA`.
-  - `data[0] == '{'` (0x7B) -> **legacy JSON path** (the current decoder, kept verbatim, renamed `decodeRootShardJson`).
-  - else -> **protobuf path** (`decodeRootShardProto`): `ParseFromString` into `RootShardManifest`; on parse failure -> `CORRUPTED_DATA`; `codec_version > 2` -> `NOT_IMPLEMENTED`; `op == JOURNAL_OP_UNSPECIFIED` or `tree_id.size() != 16` -> `CORRUPTED_DATA`.
-  - First-byte dispatch is unambiguous: a `RootShardManifest` always begins with field-1's tag byte `0x08` (varint `codec_version`), never `0x7B`.
+- `String encodeRootShard(const RootShard &)` — builds a `RootShardManifest`, sets `codec_version=1`, serializes deterministically. Maps the existing `RootShard`/`RefPayload`/`JournalRecord` structs 1:1 onto the proto messages.
+- `RootShard decodeRootShard(std::string_view data)` — **protobuf only** (no JSON path):
+  - empty `data` -> `CORRUPTED_DATA`.
+  - `ParseFromArray` into `RootShardManifest`; on parse failure -> `CORRUPTED_DATA`.
+  - `codec_version == 0` (missing/zero — not a conforming manifest) -> `CORRUPTED_DATA`; `codec_version > 1` -> `NOT_IMPLEMENTED`.
+  - `op == JOURNAL_OP_UNSPECIFIED` or `tree_id.size() != 16` -> `CORRUPTED_DATA`; the journal `at_version` invariants (≤ shard_version, non-decreasing) -> `CORRUPTED_DATA`.
 
-Fail-closed parity with today: wrong format / malformed / unknown→(n/a, positional) / missing required semantics / bad hash length / bad enum -> `CORRUPTED_DATA`; future `codec_version` -> `NOT_IMPLEMENTED`.
+## Compatibility
 
-## Compatibility / migration
-
-- **Write-new, read-both.** A B164 binary always writes protobuf; it reads both JSON (legacy) and protobuf. Every `mutateShard` already does read→modify→write, so the first mutation of each shard in an existing pool transparently rewrites its manifest JSON→protobuf. No migration step, no downtime, no operator action.
-- **Forward-only.** Once a pool is written by a B164 binary, a *pre*-B164 binary cannot decode the new manifests (it has no protobuf path). This is a one-way format upgrade. Documented as a compatibility note; acceptable for the CA PoC (single-version deployments). The legacy JSON decoder is retained indefinitely so mixed/old pools keep working during rollout.
+**No JSON back-compat** (user decision, 2026-06-16). A fresh CA pool is always protobuf; the legacy JSON encoder AND decoder are removed entirely (no dual path, no first-byte dispatch, no migration). The PoC recreates pools from scratch (`docker compose down -v`), so there are no JSON manifests to read. A pre-B164 binary cannot read a B164 pool and vice-versa — a clean one-way format, not a mixed-version concern.
 
 ## Build wiring (precedent: BuzzHouse)
 
@@ -87,23 +84,22 @@ Fail-closed parity with today: wrong format / malformed / unknown→(n/a, positi
 
 ## Debuggability
 
-`clickhouse-disks ca-decode-manifest <disk> <path>` reads a manifest object and prints JSON (protobuf reflection `MessageToJsonString`, or maps back through the JSON encoder). Restores the introspection the §4 JSON gave, reusing the `clickhouse-disks` CA command pattern established by the #5 fsck work.
+Offline introspection is provided by protobuf itself: `protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto < manifest.bin` dumps a manifest to text using only the `.proto`. A `clickhouse-disks ca-decode-manifest` convenience command (reading through the disk abstraction) is an optional follow-up, not part of B164a.
 
 ## Testing (TDD)
 
-`src/Disks/tests/gtest_cas_rootshard_codec.cpp` (new):
-- **Round-trip**: encode→decode == identity for: empty manifest; refs with multi-key `mutable_files`; a large journal (e.g. 2430 records); `tree_id` boundary values (all-zero, all-FF).
-- **Golden**: a fixed `RootShard` → fixed bytes (deterministic serialization) — guards accidental format drift.
-- **Legacy JSON decode**: a captured real JSON manifest still decodes to the expected `RootShard` (back-compat).
-- **First-byte dispatch**: a JSON blob and a protobuf blob each route to the right decoder.
-- **Fail-closed**: truncated bytes, random garbage, `op=0`, `tree_id` length≠16, `codec_version=99` → the right exception code.
-- **Size/CPU micro-check** (informational, not a gate): encode+decode time and byte size, JSON vs protobuf, on a 2430-record journal — records the achieved win in the test log.
+Tests live in the existing `src/Disks/tests/gtest_cas_codecs.cpp` `CasRootShardCodec` suite (a separate file would collide on its symbols):
+- **Round-trip**: encode→decode == identity for the refs+journal manifest, the empty manifest, and a 2430-record journal.
+- **Deterministic encoding**: `encode(x) == encode(x)` across refs (a map) and journal — golden-stable.
+- **Canonical order**: two manifests built in different insertion order encode byte-identically.
+- **Journal invariants**: a deliberately-bad struct (descending `at_version`; `at_version` > shard_version) is encoded then rejected by decode (`CORRUPTED_DATA`); equal `at_version`s decode fine.
+- **Fail-closed**: empty, non-protobuf garbage, and a parseable blob with `codec_version==0` → `CORRUPTED_DATA`; `codec_version` > current → `NOT_IMPLEMENTED`.
 
 All existing `Cas*`/`CaWiring*` suites must stay green (the codec is transparent to them).
 
 ## Risks
 
-1. **Build integration** — de-risked by the BuzzHouse precedent; verify the generated headers' include path and the `dbms` link.
+1. **Build integration** — de-risked by the BuzzHouse precedent; the generated header is included by basename via the lib's SYSTEM include dir so its reserved identifiers don't trip `-Weverything -Werror`.
 2. **protobuf `map<>` serialization order** — handled by deterministic serialization (for golden tests only; correctness is order-independent).
-3. **Forward-only format** — documented; the legacy JSON reader is retained so rollout and old pools are unaffected.
-4. **proto3 zero-value ambiguity** — irrelevant here: all manifest fields are always set; the only enum-zero case is `JOURNAL_OP_UNSPECIFIED`, which is an explicit fail-closed sentinel.
+3. **One-way format** — no JSON reader, so a pre-B164 binary cannot read a B164 pool. Acceptable per the no-back-compat decision; the PoC recreates pools from scratch.
+4. **proto3 zero-value ambiguity** — handled: a missing/zero `codec_version` is rejected as `CORRUPTED_DATA`; the only other enum-zero case is `JOURNAL_OP_UNSPECIFIED`, an explicit fail-closed sentinel.
