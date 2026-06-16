@@ -493,9 +493,8 @@ TEST(CasRootShardCodec, RefsCanonicalOrderRegardlessOfInsertion)
 
 TEST(CasRootShardCodec, StrictJsonValidation)
 {
-    /// Readability pin: the encoded document carries the compact format marker.
-    EXPECT_TRUE(encodeRootShard(RootShard{}).contains(R"("format":"cas_root_shard")"));
-
+    /// The encoder now emits protobuf (B164a), but decode still accepts the legacy JSON format and
+    /// applies the SAME strict validation below — these decode-side rules are what this test pins.
     /// Malformed JSON.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("{not json")); });
     /// Wrong format value.
@@ -515,12 +514,13 @@ TEST(CasRootShardCodec, StrictJsonValidation)
         [] { decodeRootShard(R"({"format":"cas_root_shard","version":2,"shard_version":0,"fence_round":0,"refs":{},"journal":[]})"); });
 }
 
-TEST(CasRootShardCodec, TrailingJunkThrows)
+TEST(CasRootShardCodec, TrailingJunkOnLegacyJsonThrows)
 {
-    /// Symmetry with the CAGS/CART/CAHB trailing-junk rows: a valid encoding plus a stray byte is
-    /// CORRUPTED_DATA (Poco rejects trailing content after the top-level JSON object).
-    const String encoded = encodeRootShard(RootShard{});
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(encoded + "x"); });
+    /// On the LEGACY JSON decode path a valid document plus a stray byte is CORRUPTED_DATA (Poco
+    /// rejects trailing content). Protobuf gives no equivalent guarantee — appended bytes are parsed
+    /// as further fields — so this pins the JSON path, which the decoder still serves for old pools.
+    const String json = R"({"format":"cas_root_shard","version":1,"shard_version":0,"fence_round":0,"refs":{},"journal":[]})";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(json + "x"); });
 }
 
 TEST(CasRootShardCodec, StrictJsonRefAndJournalValidation)
@@ -586,6 +586,90 @@ TEST(CasRootShardCodec, JournalAtVersionMonotonicityIsEnforced)
     ASSERT_EQ(d.journal.size(), 2u);
     EXPECT_EQ(d.journal[0].at_version, 2u);
     EXPECT_EQ(d.journal[1].at_version, 2u);
+}
+
+/// ---------- CasRootShardCodec protobuf encoding (B164a) ----------
+
+TEST(CasRootShardCodec, ProtobufEncodingIsBinaryAndRoundTrips)
+{
+    RootShard rs;
+    rs.shard_version = 9;
+    rs.fence_round = 3;
+    RefPayload p;
+    p.tree_id = (UInt128(0xab) << 64) | UInt128(0xcd);
+    p.tree_size = 1142;
+    p.mutable_files[".ca_mtime"] = "1781588451";
+    rs.refs["part_a"] = p;
+    rs.journal.push_back({JournalRecord::Op::Add, "part_a", p.tree_id, 8});
+    rs.journal.push_back({JournalRecord::Op::Remove, "part_a", p.tree_id, 9});
+
+    const String encoded = encodeRootShard(rs);
+    ASSERT_FALSE(encoded.empty());
+    EXPECT_NE(encoded.front(), '{');   /// protobuf, not JSON
+
+    const RootShard d = decodeRootShard(encoded);
+    EXPECT_EQ(d.shard_version, 9u);
+    EXPECT_EQ(d.fence_round, 3u);
+    ASSERT_EQ(d.refs.size(), 1u);
+    EXPECT_EQ(d.refs.at("part_a").tree_id, p.tree_id);
+    EXPECT_EQ(d.refs.at("part_a").tree_size, 1142u);
+    EXPECT_EQ(d.refs.at("part_a").mutable_files.at(".ca_mtime"), "1781588451");
+    ASSERT_EQ(d.journal.size(), 2u);
+    EXPECT_EQ(d.journal[0].op, JournalRecord::Op::Add);
+    EXPECT_EQ(d.journal[1].op, JournalRecord::Op::Remove);
+    EXPECT_EQ(d.journal[1].at_version, 9u);
+}
+
+TEST(CasRootShardCodec, ProtobufEncodingIsDeterministic)
+{
+    /// Deterministic serialization (sorted map<> entries) keeps the bytes stable across encodes -
+    /// golden-test friendly. Includes refs (a map) and a journal (repeated, insertion order).
+    RootShard rs;
+    rs.shard_version = 5;
+    rs.refs["zzz"] = RefPayload{UInt128(0x1), 1, {{"b", "2"}, {"a", "1"}}};
+    rs.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
+    rs.journal.push_back({JournalRecord::Op::Add, "zzz", UInt128(0x1), 5});
+    EXPECT_EQ(encodeRootShard(rs), encodeRootShard(rs));
+}
+
+TEST(CasRootShardCodec, LargeJournalRoundTrips)
+{
+    RootShard rs;
+    rs.shard_version = 5000;
+    for (uint64_t v = 0; v < 2430; ++v)
+        rs.journal.push_back({JournalRecord::Op::Add, "p" + std::to_string(v % 38), UInt128(v), v});
+    const RootShard d = decodeRootShard(encodeRootShard(rs));
+    ASSERT_EQ(d.journal.size(), 2430u);
+    EXPECT_EQ(d.journal[2429].at_version, 2429u);
+    EXPECT_EQ(d.journal[0].ref_name, "p0");
+}
+
+TEST(CasRootShardCodec, LegacyJsonManifestDecodesPositively)
+{
+    /// A pre-B164 JSON manifest must still decode (forward migration: old pools served by a new binary).
+    const RootShard d = decodeRootShard(
+        R"({"format":"cas_root_shard","version":1,"shard_version":42,"fence_round":7,)"
+        R"("refs":{"part_a":{"tree":"000102030405060708090a0b0c0d0e0f","tree_size":1142,)"
+        R"("mutable_files":{"metadata_version.txt":"0"}}},)"
+        R"("journal":[{"op":"add","ref":"part_a","tree":"000102030405060708090a0b0c0d0e0f","at_version":42}]})");
+    EXPECT_EQ(d.shard_version, 42u);
+    ASSERT_EQ(d.refs.size(), 1u);
+    EXPECT_EQ(d.refs.at("part_a").tree_size, 1142u);
+    ASSERT_EQ(d.journal.size(), 1u);
+    EXPECT_EQ(d.journal[0].op, JournalRecord::Op::Add);
+}
+
+TEST(CasRootShardCodec, FailClosedOnNonJsonNonProtobufBytes)
+{
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("")); });          /// empty
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("\xff\xff\xff\xff")); });
+}
+
+TEST(CasRootShardCodec, ProtobufFutureCodecVersionThrowsNotImplemented)
+{
+    /// A protobuf manifest with codec_version=3 (field 1, varint) from a newer writer must fail
+    /// closed, never be mis-read. Bytes: tag(field 1, varint)=0x08, value=3.
+    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [] { decodeRootShard(String("\x08\x03", 2)); });
 }
 
 /// ---------- envelope fixed-length header padding (pad_to_header_len) ----------
