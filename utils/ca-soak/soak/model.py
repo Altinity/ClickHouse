@@ -20,7 +20,12 @@ class Model:
         if op.type == OpType.INSERT:
             n = 1 + (op.param % self.insert_block)
             for rid in insert_rids(op.op_id, n):
-                self.rows[rid] = row_for_rid(self.seed, rid, self.base_time)
+                r = row_for_rid(self.seed, rid, self.base_time)
+                # The model never reads `payload` (256 B/row); only the INSERT SQL emitter does, and
+                # it recomputes it from row_for_rid independently. Drop it so the oracle holds only
+                # the fields it actually uses — payload was the bulk of the per-row footprint.
+                del r["payload"]
+                self.rows[rid] = r
         elif op.type == OpType.UPDATE:
             b = self._pred_bucket(op.param)
             for r in self.rows.values():
@@ -39,6 +44,17 @@ class Model:
 
     def _expired(self, r, now: int) -> bool:
         return r["ts"] + self.ttl_seconds <= now
+
+    def prune_expired(self, now: int) -> int:
+        """Evict rows the table has already TTL-deleted. `now` is monotonic wall-clock and a row's ts
+        is fixed, so once `_expired` is true it stays true forever — pruning these rids can never
+        change `live_rows`/`aggregates` at this or any later `now`. Without this the dict retained
+        every inserted rid for the whole run and the driver OOM'd on a multi-hour soak. Returns the
+        number of rids reclaimed. Call only when the workload is drained (e.g. at a checkpoint)."""
+        expired = [rid for rid, r in self.rows.items() if self._expired(r, now)]
+        for rid in expired:
+            del self.rows[rid]
+        return len(expired)
 
     def live_rows(self, now: int):
         return [r for r in self.rows.values() if not self._expired(r, now)]

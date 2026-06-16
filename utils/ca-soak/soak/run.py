@@ -434,6 +434,14 @@ def checkpoint(driver, cluster, model, phase):
     n2 = query_aggregates(cluster.node2, TABLE)
     compare_aggregates(exp, n1, n2)
 
+    # Drop rows the table has already TTL-deleted so the oracle dict stays bounded by the live set
+    # instead of every rid ever inserted. The workload is drained here and `now` is freshly quiesced,
+    # so this never races a worker and never changes the aggregates just asserted (it removes only
+    # already-excluded expired rows). Without this the driver OOM'd (~12.8 GiB) on a multi-hour soak.
+    pruned = model.prune_expired(now)
+    if pruned:
+        log(f"model.prune_expired: reclaimed {pruned} TTL-expired rows (live={exp['count']})")
+
     # Drive the INCREMENTAL GC to ITS fixpoint (unreachable STOPS DECREASING). The residual is the
     # known M-F-debris (B140): per CA spec §8 the incremental GC cannot reclaim blobs orphaned by a
     # displaced-before-expansion tree; the Full-GC mark-sweep (milestone M-F, not yet implemented) is

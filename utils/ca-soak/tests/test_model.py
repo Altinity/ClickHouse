@@ -46,3 +46,39 @@ def test_ttl_ambiguity_band_detection():
     expiry = BASE_TIME + 0 + m.ttl_seconds
     assert m.ambiguous_band_nonempty(now=expiry, eps=5) is True
     assert m.ambiguous_band_nonempty(now=expiry + 1000, eps=5) is False
+
+# --- memory-bound regression: the model retained every inserted row FOREVER (never evicting
+# TTL-expired rids), so a multi-hour soak OOM-killed the driver (~12.8 GiB). The table sheds rows
+# via TTL DELETE; the oracle must too. prune_expired drops exactly the rows _expired/live_rows
+# already exclude, so it can never change any aggregate or live view at the same `now`. ---
+
+def test_prune_expired_removes_only_expired():
+    m = Model(seed=3)
+    m.apply(ins(0, 5))                                  # ts = BASE_TIME + 0
+    assert m.prune_expired(now=BASE_TIME) == 0          # nothing expired yet
+    assert len(m.rows) == 5
+    far = BASE_TIME + m.ttl_seconds + TS_WINDOW + 10
+    assert m.prune_expired(now=far) == 5                # all expired -> reclaimed
+    assert len(m.rows) == 0
+
+def test_prune_expired_does_not_change_live_view():
+    m = Model(seed=4)
+    m.apply(ins(0, 8))                                  # op_id 0 -> ts = BASE_TIME + 0
+    m.apply(ins(1, 8))                                  # op_id 1 -> ts = BASE_TIME + 1
+    # A `now` at which op_id 0's rows are expired but op_id 1's are not (1s of spread).
+    now = BASE_TIME + 0 + m.ttl_seconds + 1
+    before = m.aggregates(now)
+    n_before = len(m.rows)
+    reclaimed = m.prune_expired(now)
+    after = m.aggregates(now)
+    assert reclaimed > 0 and len(m.rows) < n_before     # expired rows actually dropped
+    assert after == before                              # live aggregates identical (idempotent)
+
+def test_model_row_carries_no_payload():
+    # The model never reads `payload` (256 B/row of dead weight that dominated the leak footprint);
+    # the INSERT SQL emitter recomputes it from row_for_rid independently. Storing it is pure waste.
+    m = Model(seed=5)
+    m.apply(ins(0, 3))
+    assert all("payload" not in r for r in m.rows.values())
+    # The fields the model DOES use must remain present and correct.
+    assert m.aggregates(now=BASE_TIME)["count"] == 3
