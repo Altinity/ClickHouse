@@ -6,6 +6,20 @@ package DB.Cas.Proto;
 // correctness requirement; the encoder still serializes deterministically for stable golden tests.
 // Introspect a raw manifest offline with:
 //   protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto < manifest.bin
+//
+// SCHEMA EVOLUTION RULES (read before editing):
+//  * The wire format is keyed by field NUMBER, not name. Two ways to evolve:
+//    1. ADDITIVE + safe-to-ignore (e.g. a new optional sidecar): give it a NEW field number and do
+//       NOT bump codec_version. Old readers skip the unknown field; new readers reading old data get
+//       the default. Old and new binaries interoperate automatically.
+//    2. BREAKING / unsafe-to-ignore (reinterpreting an existing field, a new mandatory invariant, a
+//       change where an old reader silently ignoring the new data would be WRONG): BUMP
+//       codec_version. The decoder fails closed on a codec_version it does not know
+//       (`> CODEC_VERSION_PROTOBUF -> NOT_IMPLEMENTED`), so old binaries refuse rather than mis-read.
+//  * NEVER reuse or change the TYPE of an existing field number. To drop a field, `reserved <n>;` its
+//    number (and `reserved "<name>";`) so it is never reused.
+//  * proto3 silently ignores unknown fields (unlike the old strict-JSON decode) — codec_version is
+//    the deliberate "an old reader must STOP here" signal for the cases where silence would be wrong.
 
 message RefPayload {
   bytes tree_id = 1;                  // raw 16 bytes (UInt128, big-endian)

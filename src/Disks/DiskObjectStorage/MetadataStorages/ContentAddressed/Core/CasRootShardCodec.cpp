@@ -1,14 +1,20 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+/// Included by basename via clickhouse_cas_proto's SYSTEM include dir so the generated header's
+/// reserved identifiers don't trip -Weverything -Werror (same idiom as clickhouse_grpc_protos).
+#include <cas_root_shard.pb.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -18,19 +24,50 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint64_t ROOT_VERSION = 1;
+constexpr uint64_t ROOT_VERSION = 1;             /// the JSON format is the implicit codec v1
+constexpr uint32_t CODEC_VERSION_PROTOBUF = 2;   /// the protobuf format
 
-/// `JournalRecord::Op` <-> string. Unknown string on decode is corruption (fail closed).
-std::string_view journalOpToString(JournalRecord::Op op)
+/// UInt128 <-> 16 raw bytes, big-endian (mirrors the u128ToHex byte order).
+std::string u128ToBytes(const UInt128 & v)
+{
+    std::string out(16, '\0');
+    for (int i = 0; i < 16; ++i)
+        out[i] = static_cast<char>(static_cast<UInt8>(v >> (8 * (15 - i))));
+    return out;
+}
+
+UInt128 u128FromBytes(const std::string & b, std::string_view what)
+{
+    if (b.size() != 16)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: tree_id must be 16 bytes, got {}", what, b.size());
+    UInt128 v = 0;
+    for (int i = 0; i < 16; ++i)
+        v = (v << 8) | static_cast<UInt8>(b[i]);
+    return v;
+}
+
+Cas::Proto::JournalOp journalOpToProto(JournalRecord::Op op)
 {
     switch (op)
     {
-        case JournalRecord::Op::Add: return "add";
-        case JournalRecord::Op::Remove: return "remove";
+        case JournalRecord::Op::Add: return Cas::Proto::JOURNAL_OP_ADD;
+        case JournalRecord::Op::Remove: return Cas::Proto::JOURNAL_OP_REMOVE;
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: invalid journal op {}", static_cast<int>(op));
 }
 
+JournalRecord::Op journalOpFromProto(Cas::Proto::JournalOp op, std::string_view what)
+{
+    switch (op)
+    {
+        case Cas::Proto::JOURNAL_OP_ADD: return JournalRecord::Op::Add;
+        case Cas::Proto::JOURNAL_OP_REMOVE: return JournalRecord::Op::Remove;
+        default: throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid journal op {}", what, static_cast<int>(op));
+    }
+}
+
+/// `JournalRecord::Op` <- string. Unknown string on decode is corruption (fail closed). Used by the
+/// legacy JSON decoder only (the encoder is now protobuf).
 JournalRecord::Op journalOpFromString(std::string_view s, std::string_view what)
 {
     if (s == "add")
@@ -40,96 +77,96 @@ JournalRecord::Op journalOpFromString(std::string_view s, std::string_view what)
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid journal op '{}'", what, s);
 }
 
-void writeMutableFiles(WriteBuffer & out, const std::map<String, String> & files)
-{
-    writeChar('{', out);
-    bool first = true;
-    for (const auto & [k, v] : files)
-    {
-        if (!first)
-            writeChar(',', out);
-        first = false;
-        writeJsonKey(out, k);
-        writeJsonString(v, out);
-    }
-    writeChar('}', out);
-}
-
 }
 
 String encodeRootShard(const RootShard & root)
 {
-    WriteBufferFromOwnString out;
-    writeCString("{", out);
-    writeJsonKey(out, "format");
-    writeJsonString("cas_root_shard", out);
-    writeChar(',', out);
-    writeJsonKey(out, "version");
-    writeIntText(ROOT_VERSION, out);
-    writeChar(',', out);
-    writeJsonKey(out, "shard_version");
-    writeIntText(root.shard_version, out);
-    writeChar(',', out);
-    writeJsonKey(out, "fence_round");
-    writeIntText(root.fence_round, out);
-    writeChar(',', out);
+    Cas::Proto::RootShardManifest msg;
+    msg.set_codec_version(CODEC_VERSION_PROTOBUF);
+    msg.set_shard_version(root.shard_version);
+    msg.set_fence_round(root.fence_round);
 
-    /// refs: JSON object keyed by ref name, iterated in std::map's sorted order.
-    writeJsonKey(out, "refs");
-    writeChar('{', out);
-    bool first_ref = true;
+    auto & refs = *msg.mutable_refs();
     for (const auto & [name, payload] : root.refs)
     {
-        if (!first_ref)
-            writeChar(',', out);
-        first_ref = false;
-
-        writeJsonKey(out, name);
-        writeChar('{', out);
-        writeJsonKey(out, "tree");
-        writeJsonString(u128ToHex(payload.tree_id), out);
-        writeChar(',', out);
-        writeJsonKey(out, "tree_size");
-        writeIntText(payload.tree_size, out);
-        writeChar(',', out);
-        writeJsonKey(out, "mutable_files");
-        writeMutableFiles(out, payload.mutable_files);
-        writeChar('}', out);
+        Cas::Proto::RefPayload p;
+        p.set_tree_id(u128ToBytes(payload.tree_id));
+        p.set_tree_size(payload.tree_size);
+        auto & mf = *p.mutable_mutable_files();
+        for (const auto & [k, v] : payload.mutable_files)
+            mf[k] = v;
+        refs[name] = std::move(p);
     }
-    writeChar('}', out);
-    writeChar(',', out);
 
-    /// journal: JSON array preserving insertion order.
-    writeJsonKey(out, "journal");
-    writeChar('[', out);
-    bool first_rec = true;
     for (const auto & rec : root.journal)
     {
-        if (!first_rec)
-            writeChar(',', out);
-        first_rec = false;
-
-        writeChar('{', out);
-        writeJsonKey(out, "op");
-        writeJsonString(journalOpToString(rec.op), out);
-        writeChar(',', out);
-        writeJsonKey(out, "ref");
-        writeJsonString(rec.ref_name, out);
-        writeChar(',', out);
-        writeJsonKey(out, "tree");
-        writeJsonString(u128ToHex(rec.tree_id), out);
-        writeChar(',', out);
-        writeJsonKey(out, "at_version");
-        writeIntText(rec.at_version, out);
-        writeChar('}', out);
+        auto * r = msg.add_journal();
+        r->set_op(journalOpToProto(rec.op));
+        r->set_ref_name(rec.ref_name);
+        r->set_tree_id(u128ToBytes(rec.tree_id));
+        r->set_at_version(rec.at_version);
     }
-    writeChar(']', out);
 
-    writeChar('}', out);
-    return std::move(out.str());
+    /// Deterministic serialization (sorts map<> entries) so golden tests are stable. Correctness
+    /// does not need it - the manifest is CAS-by-token, not content-addressed.
+    std::string out;
+    {
+        google::protobuf::io::StringOutputStream zos(&out);
+        google::protobuf::io::CodedOutputStream cos(&zos);
+        cos.SetSerializationDeterministic(true);
+        if (!msg.SerializeToCodedStream(&cos))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: protobuf serialize failed");
+    }
+    return out;
 }
 
-RootShard decodeRootShard(std::string_view data)
+static RootShard decodeRootShardProto(std::string_view data)
+{
+    Cas::Proto::RootShardManifest msg;
+    if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: protobuf parse failed");
+    if (msg.codec_version() > CODEC_VERSION_PROTOBUF)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "CAS root shard: codec_version {} is from a newer writer", msg.codec_version());
+
+    RootShard root;
+    root.shard_version = msg.shard_version();
+    root.fence_round = msg.fence_round();
+
+    for (const auto & [name, p] : msg.refs())
+    {
+        RefPayload payload;
+        payload.tree_id = u128FromBytes(p.tree_id(), "root shard ref");
+        payload.tree_size = p.tree_size();
+        for (const auto & [k, v] : p.mutable_files())
+            payload.mutable_files[k] = v;
+        root.refs[name] = std::move(payload);
+    }
+
+    for (const auto & r : msg.journal())
+    {
+        JournalRecord rec;
+        rec.op = journalOpFromProto(r.op(), "root shard journal");
+        rec.ref_name = r.ref_name();
+        rec.tree_id = u128FromBytes(r.tree_id(), "root shard journal");
+        rec.at_version = r.at_version();
+
+        /// Same semantic invariants the JSON decoder enforces (corruption -> fail closed).
+        if (rec.at_version > root.shard_version)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS root shard: journal at_version {} exceeds shard_version {}",
+                rec.at_version, root.shard_version);
+        if (!root.journal.empty() && rec.at_version < root.journal.back().at_version)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS root shard: journal at_version {} after {} - the journal must be non-decreasing",
+                rec.at_version, root.journal.back().at_version);
+
+        root.journal.push_back(std::move(rec));
+    }
+    return root;
+}
+
+static RootShard decodeRootShardJson(std::string_view data)
 {
     return decodeJsonGuarded("root shard", [&]
     {
@@ -186,6 +223,17 @@ RootShard decodeRootShard(std::string_view data)
 
         return root;
     });
+}
+
+RootShard decodeRootShard(std::string_view data)
+{
+    if (data.empty())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: empty manifest");
+    /// Dispatch: a legacy JSON manifest starts with '{' (0x7B); a protobuf RootShardManifest starts
+    /// with field-1's tag byte 0x08 (varint codec_version). They never collide.
+    if (data.front() == '{')
+        return decodeRootShardJson(data);
+    return decodeRootShardProto(data);
 }
 
 }
