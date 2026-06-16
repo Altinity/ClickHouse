@@ -56,6 +56,12 @@ struct ExportReplicatedMergeTreePartitionTaskEntry
     {
         return manifest.create_time;
     }
+
+    /// Provenance of this entry: ALTER (user) vs TTL (background task).
+    ExportReplicatedMergeTreePartitionOrigin getOrigin() const
+    {
+        return manifest.origin;
+    }
 };
 
 struct ExportPartitionTaskEntryTagByCompositeKey {};

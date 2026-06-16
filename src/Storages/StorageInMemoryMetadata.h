@@ -188,6 +188,11 @@ struct StorageInMemoryMetadata
     TTLDescriptions getGroupByTTLs() const;
     bool hasAnyGroupByTTL() const;
 
+    /// Just wrapper for table TTLs, return EXPORT TTL rules.
+    /// One entry per destination table for Replicated*MergeTree.
+    TTLDescriptions getExportTTLs() const;
+    bool hasAnyExportTTL() const;
+
     using HasDependencyCallback = std::function<bool(const String &, ColumnDependency::Kind)>;
 
     /// Returns columns, which will be needed to calculate dependencies (skip indices, projections,

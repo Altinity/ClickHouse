@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Common/IntervalKind.h>
 #include <Parsers/IAST_fwd.h>
 #include <Storages/DataDestinationType.h>
 #include <Storages/ColumnsDescription.h>
@@ -88,7 +89,10 @@ struct TTLDescription
     /// For example DISK or VOLUME
     DataDestinationType destination_type;
 
-    /// Name of destination disk or volume
+    /// Database of destination table, used only by EXPORT TTLs.
+    String destination_database;
+
+    /// Name of destination disk, volume or table
     String destination_name;
 
     /// If true, do nothing if DISK or VOLUME doesn't exist .
@@ -97,6 +101,13 @@ struct TTLDescription
 
     /// Codec name which will be used to recompress data
     ASTPtr recompression_codec;
+
+    /// For EXPORT TTLs: parsed interval as (kind, count).
+    /// e.g. `EXPORT INTERVAL 30 DAY` -> {Day, 30}.
+    /// The interval is applied to the partition's top boundary at runtime via proper date arithmetic
+    /// (variable-length kinds like Month / Year are honored exactly).
+    IntervalKind export_interval_kind{IntervalKind::Kind::Second};
+    Int64 export_interval_count = 0;
 
     /// Parse TTL structure from definition. Able to parse both column and table TTLs.
     static TTLDescription getTTLFromAST(const ASTPtr & definition_ast, const ColumnsDescription & columns, ContextPtr context, const KeyDescription & primary_key, bool is_attach);
@@ -130,6 +141,10 @@ struct TTLTableDescription
     TTLDescriptions recompression_ttl;
 
     TTLDescriptions group_by_ttl;
+
+    /// Exporting data TTL (to destination tables, one entry per destination).
+    /// Only valid for Replicated*MergeTree.
+    TTLDescriptions export_ttl;
 
     TTLTableDescription() = default;
     TTLTableDescription(const TTLTableDescription & other);

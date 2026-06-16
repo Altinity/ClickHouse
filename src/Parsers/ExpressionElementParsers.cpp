@@ -44,6 +44,7 @@
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ParserCreateQuery.h>
 #include <Parsers/ParserExplainQuery.h>
+#include <Parsers/parseDatabaseAndTableName.h>
 
 #include <Interpreters/StorageID.h>
 
@@ -2442,6 +2443,7 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     ParserKeyword s_to_disk(Keyword::TO_DISK);
     ParserKeyword s_to_volume(Keyword::TO_VOLUME);
+    ParserKeyword s_to_table(Keyword::TO_TABLE);
     ParserKeyword s_if_exists(Keyword::IF_EXISTS);
     ParserKeyword s_delete(Keyword::DELETE);
     ParserKeyword s_where(Keyword::WHERE);
@@ -2449,6 +2451,7 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ParserKeyword s_set(Keyword::SET);
     ParserKeyword s_recompress(Keyword::RECOMPRESS);
     ParserKeyword s_codec(Keyword::CODEC);
+    ParserKeyword s_export(Keyword::EXPORT);
     ParserKeyword s_materialize_ttl(Keyword::MATERIALIZE_TTL);
     ParserKeyword s_remove_ttl(Keyword::REMOVE_TTL);
     ParserKeyword s_modify_ttl(Keyword::MODIFY_TTL);
@@ -2469,6 +2472,30 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         || s_remove_ttl.checkWithoutMoving(pos, expected)
         || s_modify_ttl.checkWithoutMoving(pos, expected))
         return false;
+
+    /// EXPORT branch: `EXPORT <interval_expr> TO TABLE [db.]name`.
+    /// Has no preceding column-based expression; the interval is the only argument.
+    if (s_export.ignore(pos, expected))
+    {
+        ASTPtr interval_expr;
+        if (!parser_exp.parse(pos, interval_expr, expected))
+            return false;
+
+        if (!s_to_table.ignore(pos, expected))
+            return false;
+
+        String dest_database;
+        String dest_table;
+        if (!parseDatabaseAndTableName(pos, expected, dest_database, dest_table))
+            return false;
+
+        auto ttl_element = make_intrusive<ASTTTLElement>(TTLMode::EXPORT, DataDestinationType::TABLE, /*destination_name=*/ String{}, /*if_exists=*/ false);
+        ttl_element->destination_database = std::move(dest_database);
+        ttl_element->destination_name = std::move(dest_table);
+        ttl_element->setTTL(std::move(interval_expr));
+        node = ttl_element;
+        return true;
+    }
 
     ASTPtr ttl_expr;
     if (!parser_exp.parse(pos, ttl_expr, expected))

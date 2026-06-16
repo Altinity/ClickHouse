@@ -43,6 +43,9 @@ ColumnsDescription StorageSystemReplicatedPartitionExports::getColumnsDescriptio
         {"parts_count", std::make_shared<DataTypeUInt64>(), "Number of parts in the export."},
         {"parts_to_do", std::make_shared<DataTypeUInt64>(), "Number of parts pending to be exported."},
         {"status", std::make_shared<DataTypeString>(), "Status of the export."},
+        {"origin", std::make_shared<DataTypeString>(),
+            "Provenance of the entry: 'ALTER' for entries scheduled by `ALTER TABLE ... EXPORT PARTITION`, "
+            "'TTL' for entries scheduled by the background `TTL EXPORT` task."},
         {"last_exception_per_replica", std::make_shared<DataTypeArray>(last_exception_tuple),
             "Per-replica last exception entries. Each tuple records the most recent exception observed by that replica plus a best-effort within-replica count. Empty array if no replica has reported an exception for this task."},
         {"exception_count", std::make_shared<DataTypeUInt64>(),
@@ -145,6 +148,7 @@ void StorageSystemReplicatedPartitionExports::fillData(MutableColumns & res_colu
             res_columns[i++]->insert(info.parts_count);
             res_columns[i++]->insert(info.parts_to_do);
             res_columns[i++]->insert(info.status);
+            res_columns[i++]->insert(info.origin);
 
             Array per_replica;
             per_replica.reserve(info.last_exception_per_replica.size());

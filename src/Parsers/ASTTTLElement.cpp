@@ -32,6 +32,21 @@ ASTPtr ASTTTLElement::clone() const
 
 void ASTTTLElement::formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
 {
+    if (mode == TTLMode::EXPORT)
+    {
+        ostr << "EXPORT ";
+        auto ttl_expr = ttl();
+        auto nested_frame = frame;
+        if (auto * ast_alias = dynamic_cast<ASTWithAlias *>(ttl_expr.get()); ast_alias && !ast_alias->tryGetAlias().empty())
+            nested_frame.need_parens = true;
+        ttl_expr->format(ostr, settings, state, nested_frame);
+        ostr << " TO TABLE ";
+        if (!destination_database.empty())
+            ostr << backQuoteIfNeed(destination_database) << ".";
+        ostr << backQuoteIfNeed(destination_name);
+        return;
+    }
+
     auto ttl_expr = ttl();
     auto nested_frame = frame;
     if (auto * ast_alias = dynamic_cast<ASTWithAlias *>(ttl_expr.get()); ast_alias && !ast_alias->tryGetAlias().empty())

@@ -128,7 +128,11 @@ namespace
     }
 
     /*
-        Remove expired entries and fix non-committed exports that have already exported all parts.
+        Fix non-committed exports that have already exported all parts, and enforce task timeouts.
+
+        Note: terminal entries (COMPLETED / FAILED / KILLED) are *not* expired here. The
+        `system.replicated_partition_exports` table is an append-only history that doubles as the
+        marker source for TTL EXPORT — entries must remain visible forever.
 
         Return values:
         - true: the cleanup was successful, the entry is removed from the entries_by_key container and the function returns true. Proceed to the next entry.
@@ -149,33 +153,17 @@ namespace
         const LoggerPtr & log,
         const ContextPtr & storage_context,
         StorageReplicatedMergeTree & storage,
-        const std::string & key,
         const ExportReplicatedMergeTreePartitionManifest & metadata,
         const time_t now,
         const bool is_pending,
-        auto & entries_by_key,
         std::vector<CommitRecoveryWork> & deferred_commits
     )
     {
-        bool has_expired = metadata.create_time < now - static_cast<time_t>(metadata.ttl_seconds);
-
         bool task_timed_out = is_pending
             && metadata.task_timeout_seconds > 0
             && metadata.create_time + static_cast<time_t>(metadata.task_timeout_seconds) < now;
 
-        if (has_expired && !is_pending)
-        {
-            zk->tryRemoveRecursive(fs::path(entry_path));
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemoveRecursive);
-            auto it = entries_by_key.find(key);
-            if (it != entries_by_key.end())
-                entries_by_key.erase(it);
-            LOG_INFO(log, "ExportPartition Manifest Updating Task: Removed {}: expired", key);
-
-            return true;
-        }
-        else if (task_timed_out)
+        if (task_timed_out)
         {
             const std::string status_path = fs::path(entry_path) / "status";
 
@@ -335,6 +323,7 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         info.parts_to_do = snapshot.manifest.parts.size();
         info.parts = std::move(snapshot.manifest.parts);
         info.status = magic_enum::enum_name(snapshot.status);
+        info.origin = magic_enum::enum_name(snapshot.manifest.origin);
 
         info.last_exception_per_replica.reserve(snapshot.last_exception_per_replica.size());
         size_t total_exception_count = 0;
@@ -478,11 +467,9 @@ void ExportPartitionManifestUpdatingTask::poll()
                     storage.log.load(),
                     storage.getContext(),
                     storage,
-                    key,
                     metadata,
                     now,
                     *status == ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING,
-                    entries_by_key,
                     deferred_commits);
 
                 if (cleanup_successful)

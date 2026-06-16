@@ -59,19 +59,13 @@ TO TABLE [destination_database.]destination_table
 
 - **Type**: `Bool`
 - **Default**: `false`
-- **Description**: Ignore existing partition export and overwrite the ZooKeeper entry. Allows re-exporting a partition to the same destination before the manifest expires. **IMPORTANT:** this is dangerous because it can lead to duplicated data, use it with caution.
+- **Description**: Overwrite an existing entry in `system.replicated_partition_exports` for the same `(source, destination, partition_id)`. This is required because the system table is an append-only history; the only way to re-export the same partition to the same destination is to set this flag. **IMPORTANT:** this is dangerous because it can lead to duplicated data, use it with caution.
 
 #### `export_merge_tree_partition_max_retries` (Optional)
 
 - **Type**: `UInt64`
 - **Default**: `3`
 - **Description**: Maximum number of retries for exporting a merge tree part in an export partition task. If it exceeds, the entire task fails.
-
-#### `export_merge_tree_partition_manifest_ttl` (Optional)
-
-- **Type**: `UInt64`
-- **Default**: `180` (seconds)
-- **Description**: Determines how long the manifest will live in ZooKeeper. It prevents the same partition from being exported twice to the same destination. This setting does not affect or delete in-progress tasks; it only cleans up completed ones.
 
 #### `export_merge_tree_part_file_already_exists_policy` (Optional)
 
@@ -109,7 +103,7 @@ When the timeout is exceeded the task transitions to KILLED (same terminal state
 
 Notes:
 - Enforcement is best-effort: actual kill latency is bounded by one manifest-updater poll cycle (~30s) plus ZooKeeper watch propagation.
-- Since both this timeout and `export_merge_tree_partition_manifest_ttl` are measured from `create_time`, keep `export_merge_tree_partition_manifest_ttl` greater than `export_merge_tree_partition_task_timeout_seconds` if you want the KILLED entry to remain visible in `system.replicated_partition_exports` after the timeout fires.
+- `system.replicated_partition_exports` is an append-only history: terminal entries (`COMPLETED` / `FAILED` / `KILLED`) are never automatically removed.
 
 ## Examples
 
@@ -204,6 +198,68 @@ Status values include:
 - `COMPLETED` - Export finished successfully
 - `FAILED` - Export failed
 - `KILLED` - Export was cancelled
+
+## TTL EXPORT
+
+Replicated*MergeTree tables can drive `EXPORT PARTITION` automatically through
+the `TTL EXPORT` clause. Once a partition's *top boundary* plus the configured
+interval lies in the past, a background task on the table schedules an export
+to the destination just as if the operator had run `ALTER TABLE ... EXPORT
+PARTITION`.
+
+### Syntax
+
+```sql
+CREATE TABLE rmt_table (id UInt64, d Date)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/rmt_table', 'r1')
+PARTITION BY toYearNumSinceEpoch(d)
+ORDER BY tuple()
+TTL EXPORT INTERVAL 30 DAY TO TABLE iceberg_table;
+```
+
+Multiple `TTL EXPORT` clauses are allowed on the same table; each rule
+maintains its own progress against its destination.
+
+### Eligibility
+
+A partition is eligible when
+
+```
+top_boundary(partition_id) + INTERVAL <= now()
+```
+
+`top_boundary` is the *inclusive supremum* of the time range that the
+partition can hold. For example, a partition keyed by `toYear(d) = 2020`
+has a top boundary of `2020-12-31 23:59:59`.
+
+### Supported `PARTITION BY` expressions
+
+`TTL EXPORT` requires a closed-form inverse for the partition function. The
+curated whitelist is:
+
+| Family                | Expressions                                                          |
+|-----------------------|----------------------------------------------------------------------|
+| Identity              | `Date`, `Date32`, `DateTime`, `DateTime64`                           |
+| Generic `to*`         | `toYear`, `toYYYYMM`, `toYYYYMMDD`, `toMonday`, `toStartOf{Year,Quarter,Month,Week,Day,Hour,Minute}` |
+| Iceberg-spec transforms | `toYearNumSinceEpoch`, `toMonthNumSinceEpoch`, `toRelativeDayNum`, `toRelativeHourNum` |
+
+**Pairing with Iceberg destinations:** Apache Iceberg only accepts the four
+*Iceberg-spec transforms* above as time-bucketing partition functions
+(mapping to the Iceberg `year`, `month`, `days`, `hours` transforms). When
+exporting into an Iceberg table both the source `PARTITION BY` and the
+destination `PARTITION BY` must use the same one of those functions. The
+generic `to*` family is appropriate for non-Iceberg destinations
+(e.g. Hive-partitioned object storage).
+
+`icebergTruncate` / `icebergBucket` are not temporal and are not accepted by
+`TTL EXPORT`; bare integer columns are also rejected because they carry no
+time semantics.
+
+### Origin column
+
+Entries scheduled by the background task carry `origin = 'TTL'` in
+`system.replicated_partition_exports`; entries from manual `ALTER ... EXPORT
+PARTITION` carry `origin = 'ALTER'`.
 
 ## Related Features
 

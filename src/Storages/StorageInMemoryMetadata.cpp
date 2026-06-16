@@ -289,12 +289,12 @@ TTLTableDescription StorageInMemoryMetadata::getTableTTLs() const
 
 bool StorageInMemoryMetadata::hasAnyTableTTL() const
 {
-    return hasAnyMoveTTL() || hasRowsTTL() || hasAnyRecompressionTTL() || hasAnyGroupByTTL() || hasAnyRowsWhereTTL();
+    return hasAnyMoveTTL() || hasRowsTTL() || hasAnyRecompressionTTL() || hasAnyGroupByTTL() || hasAnyRowsWhereTTL() || hasAnyExportTTL();
 }
 
 bool StorageInMemoryMetadata::hasOnlyRowsTTL() const
 {
-    bool has_any_other_ttl = hasAnyMoveTTL() || hasAnyRecompressionTTL() || hasAnyGroupByTTL() || hasAnyRowsWhereTTL() || hasAnyColumnTTL();
+    bool has_any_other_ttl = hasAnyMoveTTL() || hasAnyRecompressionTTL() || hasAnyGroupByTTL() || hasAnyRowsWhereTTL() || hasAnyColumnTTL() || hasAnyExportTTL();
     return hasRowsTTL() && !has_any_other_ttl;
 }
 
@@ -356,6 +356,16 @@ TTLDescriptions StorageInMemoryMetadata::getGroupByTTLs() const
 bool StorageInMemoryMetadata::hasAnyGroupByTTL() const
 {
     return !table_ttl.group_by_ttl.empty();
+}
+
+TTLDescriptions StorageInMemoryMetadata::getExportTTLs() const
+{
+    return table_ttl.export_ttl;
+}
+
+bool StorageInMemoryMetadata::hasAnyExportTTL() const
+{
+    return !table_ttl.export_ttl.empty();
 }
 
 ColumnDependencies StorageInMemoryMetadata::getColumnDependencies(

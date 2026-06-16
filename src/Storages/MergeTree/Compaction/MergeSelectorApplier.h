@@ -24,6 +24,10 @@ struct MergeSelectorChoice
 };
 using MergeSelectorChoices = std::vector<MergeSelectorChoice>;
 
+/// Returns true if a TTL DROP / TTL DELETE merge is allowed for the given partition_id.
+/// Used to defer destructive TTL merges for partitions still awaiting TTL EXPORT completion.
+using TTLDropDeletePartitionFilter = std::function<bool(const String &)>;
+
 class MergeSelectorApplier
 {
 public:
@@ -31,12 +35,16 @@ public:
     const bool merge_with_ttl_allowed = false;
     const bool aggressive = false;
     const IMergeSelector::RangeFilter range_filter = nullptr;
+    /// If set, TTL DROP / TTL DELETE selectors only consider partitions for which this returns true.
+    /// Recompression TTL and regular merges ignore this filter.
+    const TTLDropDeletePartitionFilter ttl_drop_delete_partition_filter = nullptr;
 
     MergeSelectorApplier(
         std::vector<MergeConstraint> && merge_constraints_,
         bool merge_with_ttl_allowed_,
         bool aggressive_,
-        IMergeSelector::RangeFilter range_filter_);
+        IMergeSelector::RangeFilter range_filter_,
+        TTLDropDeletePartitionFilter ttl_drop_delete_partition_filter_ = nullptr);
 
     MergeSelectorChoices chooseMergesFrom(
         const PartsRanges & ranges,
