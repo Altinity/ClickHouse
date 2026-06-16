@@ -443,7 +443,7 @@ class JobConfigs:
     ).parametrize(
         Job.ParamSet(
             parameter="amd_release",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
+            runs_on=RunnerLabels.AMD_SMALL,
             requires=[
                 ArtifactNames.DEB_AMD_RELEASE,
                 ArtifactNames.CH_AMD_RELEASE,
@@ -453,7 +453,7 @@ class JobConfigs:
         ),
         Job.ParamSet(
             parameter="arm_release",
-            runs_on=RunnerLabels.FUNC_TESTER_ARM,
+            runs_on=RunnerLabels.ARM_SMALL,
             requires=[
                 ArtifactNames.DEB_ARM_RELEASE,
                 ArtifactNames.CH_ARM_RELEASE,
@@ -476,7 +476,7 @@ class JobConfigs:
     ).parametrize(
         Job.ParamSet(
             parameter="amd_release",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
+            runs_on=RunnerLabels.AMD_SMALL,
             requires=[
                 ArtifactNames.DEB_AMD_RELEASE,
                 ArtifactNames.RPM_AMD_RELEASE,
@@ -486,7 +486,7 @@ class JobConfigs:
         ),
         Job.ParamSet(
             parameter="arm_release",
-            runs_on=RunnerLabels.FUNC_TESTER_ARM,
+            runs_on=RunnerLabels.ARM_SMALL,
             requires=[
                 ArtifactNames.DEB_ARM_RELEASE,
                 ArtifactNames.RPM_ARM_RELEASE,
@@ -576,7 +576,7 @@ class JobConfigs:
         ],
         Job.ParamSet(
             parameter="amd_asan, db disk, distributed plan, sequential",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
+            runs_on=RunnerLabels.AMD_SMALL_MEM,
             requires=[ArtifactNames.CH_AMD_ASAN_GH],
         ),
         # Job.ParamSet( # NOTE (strtgbb): llvm cov jobs not configured yet. Determine if useful first.
@@ -617,18 +617,18 @@ class JobConfigs:
         # ),
         Job.ParamSet(
             parameter="amd_debug, parallel",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
+            runs_on=RunnerLabels.AMD_MEDIUM_CPU,
             requires=[ArtifactNames.CH_AMD_DEBUG_GH],
         ),
         Job.ParamSet(
             parameter="amd_debug, sequential",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
+            runs_on=RunnerLabels.AMD_SMALL,
             requires=[ArtifactNames.CH_AMD_DEBUG_GH],
         ),
         *[
             Job.ParamSet(
                 parameter=f"amd_tsan, parallel, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.AMD_LARGE,
                 requires=[ArtifactNames.CH_AMD_TSAN_GH],
             )
             for total_batches in (2,)
@@ -637,7 +637,7 @@ class JobConfigs:
         *[
             Job.ParamSet(
                 parameter=f"amd_tsan, sequential, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.AMD_SMALL,
                 requires=[ArtifactNames.CH_AMD_TSAN_GH],
             )
             for total_batches in (2,)
@@ -646,7 +646,7 @@ class JobConfigs:
         *[
             Job.ParamSet(
                 parameter=f"amd_msan, WasmEdge, parallel, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.AMD_LARGE,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
             )
             for total_batches in (4,)
@@ -655,7 +655,7 @@ class JobConfigs:
         *[
             Job.ParamSet(
                 parameter=f"amd_msan, WasmEdge, sequential, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.AMD_SMALL_MEM,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
             )
             for total_batches in (2,)
@@ -663,28 +663,28 @@ class JobConfigs:
         ],
         Job.ParamSet(
             parameter="amd_ubsan, parallel",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,  # it runs much faster than many job, no need larger machine
+            runs_on=RunnerLabels.AMD_SMALL_MEM,  # it runs much faster than many job, no need larger machine
             requires=[ArtifactNames.CH_AMD_UBSAN_GH],
         ),
         Job.ParamSet(
             parameter="amd_ubsan, sequential",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
+            runs_on=RunnerLabels.AMD_SMALL_MEM,
             requires=[ArtifactNames.CH_AMD_UBSAN_GH],
         ),
         Job.ParamSet(
             parameter="amd_debug, distributed plan, s3 storage, parallel",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,  # large machine - no boost, why?
+            runs_on=RunnerLabels.AMD_MEDIUM,  # large machine - no boost, why?
             requires=[ArtifactNames.CH_AMD_DEBUG_GH],
         ),
         Job.ParamSet(
             parameter="amd_debug, distributed plan, s3 storage, sequential",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
+            runs_on=RunnerLabels.AMD_SMALL,
             requires=[ArtifactNames.CH_AMD_DEBUG_GH],
         ),
         *[
             Job.ParamSet(
                 parameter=f"amd_tsan, s3 storage, parallel, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.AMD_MEDIUM,
                 requires=[ArtifactNames.CH_AMD_TSAN_GH],
             )
             for total_batches in (2,)
@@ -693,7 +693,7 @@ class JobConfigs:
         *[
             Job.ParamSet(
                 parameter=f"amd_tsan, s3 storage, sequential, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.AMD_SMALL_MEM,
                 requires=[ArtifactNames.CH_AMD_TSAN_GH],
             )
             for total_batches in (2,)
@@ -701,12 +701,12 @@ class JobConfigs:
         ],
         Job.ParamSet(
             parameter="arm_binary, parallel",
-            runs_on=RunnerLabels.FUNC_TESTER_ARM,
+            runs_on=RunnerLabels.ARM_MEDIUM_CPU,
             requires=[ArtifactNames.CH_ARM_BINARY_GH],
         ),
         Job.ParamSet(
             parameter="arm_binary, sequential",
-            runs_on=RunnerLabels.FUNC_TESTER_ARM,
+            runs_on=RunnerLabels.ARM_SMALL,
             requires=[ArtifactNames.CH_ARM_BINARY_GH],
         ),
     )
@@ -714,7 +714,7 @@ class JobConfigs:
         *[
             Job.ParamSet(
                 parameter=f"{BuildTypes.AMD_COVERAGE}, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.AMD_SMALL,
                 requires=[ArtifactNames.CH_COV_BIN],
             )
             for total_batches in (8,)
@@ -727,7 +727,7 @@ class JobConfigs:
         *[
             Job.ParamSet(
                 parameter=f"arm_asan, azure, parallel, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_ARM,
+                runs_on=RunnerLabels.ARM_MEDIUM,
                 requires=[ArtifactNames.CH_ARM_ASAN_GH],
             )
             for total_batches in (4,)
@@ -736,7 +736,7 @@ class JobConfigs:
         *[
             Job.ParamSet(
                 parameter=f"arm_asan, azure, sequential, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_ARM,
+                runs_on=RunnerLabels.ARM_SMALL_MEM,
                 requires=[ArtifactNames.CH_ARM_ASAN_GH],
                 timeout=3600 * 4,
             )
@@ -746,7 +746,7 @@ class JobConfigs:
     )
     bugfix_validation_it_job = (
         common_integration_test_job_config.set_name(JobNames.BUGFIX_VALIDATE_IT)
-        .set_runs_on(RunnerLabels.FUNC_TESTER_AMD)
+        .set_runs_on(RunnerLabels.AMD_SMALL_MEM)
         .set_command(
             "python3 ./ci/jobs/integration_test_job.py --options BugfixValidation"
         )

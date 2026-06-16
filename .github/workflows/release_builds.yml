@@ -889,7 +889,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   install_packages_amd_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-regression-tester]
     needs: [build_amd_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW5zdGFsbCBwYWNrYWdlcyAoYW1kX3JlbGVhc2Up') }}
     name: "Install packages (amd_release)"
@@ -936,7 +936,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   install_packages_arm_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-regression-tester-aarch64]
     needs: [build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW5zdGFsbCBwYWNrYWdlcyAoYXJtX3JlbGVhc2Up') }}
     name: "Install packages (arm_release)"
@@ -1037,7 +1037,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_arm_binary_sequential:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-regression-tester-aarch64]
     needs: [build_arm_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYmluYXJ5LCBzZXF1ZW50aWFsKQ==') }}
     name: "Stateless tests (arm_binary, sequential)"
