@@ -167,6 +167,19 @@ private:
     std::map<uint64_t, RetiredSet> retire(GcState & state, Token & state_token,
                                           const std::map<uint64_t, GcSnap> & snap);
 
+    /// B167 Part B: is this present BLOB owned by an in-flight build? Reads the envelope build_id (a
+    /// ranged GET of the fixed-length blob header) and HEADs builds/<build_id>. A live owner ⇒ the blob
+    /// is in-flight ⇒ incremental GC must NOT condemn it this round. This is the 4th condemn guard,
+    /// ~liveBuild(build_id), added to present ∧ everEdged ∧ InDeg=0. Deferral is non-destructive: a
+    /// still-live owner just defers the candidate to a later round (or to full GC's heartbeat-staleness
+    /// debris path once the build's heartbeat lapses). Blobs only — tree headers are natural-length, and
+    /// trees already converge via recreateTree's retained payload. Fail-CLOSED to "not live" on any
+    /// read/decode failure (build_id==0, vanished, corrupt header): a corrupt header must never pin an
+    /// object forever, and the recheck re-validates in-degree before any delete, so condemning anyway is
+    /// safe.
+    bool blobOwnedByLiveBuild(const Layout & layout, Backend & backend,
+                              const String & key, uint64_t object_size) const;
+
     /// R3 (spec §7 as amended 2026-06-12; the model's GFenceShard): CAS the NAMESPACE REGISTRY's
     /// fence_round first (the ordering point for namespace creation — W-REGISTER's gate floor),
     /// then CAS fence_round := round (monotone max) into EVERY root shard of every namespace in
