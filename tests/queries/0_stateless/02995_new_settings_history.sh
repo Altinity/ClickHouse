@@ -64,11 +64,7 @@ $CLICKHOUSE_LOCAL --query "
         )) AND (name NOT IN (
             SELECT arrayJoin(tupleElement(changes, 'name'))
             FROM system.settings_changes
-<<<<<<< HEAD
-            WHERE type = 'Session' AND splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 4)
-=======
-            WHERE type = 'Session' AND (splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 3) OR position(version, 'altinityantalya') > 0)
->>>>>>> 9bfc4d73feb (Merge pull request #1853 from Altinity/fix/antalya-26.4/fix-settingschangeshistory)
+            WHERE type = 'Session' AND (splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 4) OR position(version, 'altinityantalya') > 0)
         ))
         UNION ALL
         (
@@ -80,11 +76,7 @@ $CLICKHOUSE_LOCAL --query "
             )) AND (name NOT IN (
                 SELECT arrayJoin(tupleElement(changes, 'name'))
                 FROM system.settings_changes
-<<<<<<< HEAD
-                WHERE type = 'MergeTree' AND splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 4)
-=======
-                WHERE type = 'MergeTree' AND (splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 3) OR position(version, 'altinityantalya') > 0)
->>>>>>> 9bfc4d73feb (Merge pull request #1853 from Altinity/fix/antalya-26.4/fix-settingschangeshistory)
+                WHERE type = 'MergeTree' AND (splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 4) OR position(version, 'altinityantalya') > 0)
             ))
         )
         UNION ALL
@@ -95,11 +87,7 @@ $CLICKHOUSE_LOCAL --query "
             WHERE (new_settings.default != old_settings.default) AND (name NOT IN (
                 SELECT arrayJoin(tupleElement(changes, 'name'))
                 FROM system.settings_changes
-<<<<<<< HEAD
-                WHERE type = 'Session' AND splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 4)
-=======
-                WHERE type = 'Session' AND (splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 3) OR position(version, 'altinityantalya') > 0)
->>>>>>> 9bfc4d73feb (Merge pull request #1853 from Altinity/fix/antalya-26.4/fix-settingschangeshistory)
+                WHERE type = 'Session' AND (splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 4) OR position(version, 'altinityantalya') > 0)
             )) AND ${IGNORE_SETTINGS_FOR_SANITIZERS}
         )
         UNION ALL
@@ -110,11 +98,7 @@ $CLICKHOUSE_LOCAL --query "
             WHERE (new_merge_tree_settings.default != old_merge_tree_settings.default) AND (name NOT IN (
                 SELECT arrayJoin(tupleElement(changes, 'name'))
                 FROM system.settings_changes
-<<<<<<< HEAD
-                WHERE type = 'MergeTree' AND splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 4)
-=======
-                WHERE type = 'MergeTree' AND (splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 3) OR position(version, 'altinityantalya') > 0)
->>>>>>> 9bfc4d73feb (Merge pull request #1853 from Altinity/fix/antalya-26.4/fix-settingschangeshistory)
+                WHERE type = 'MergeTree' AND (splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 4) OR position(version, 'altinityantalya') > 0)
             )) AND ${IGNORED_MERGETREE_SETTINGS_FOR_CLOUD}
         )
         UNION ALL
