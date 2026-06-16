@@ -700,6 +700,10 @@ target_link_libraries(dbms PUBLIC ch_contrib::sparsehash)
 if (TARGET ch_contrib::protobuf)
     target_link_libraries(dbms PRIVATE ch_contrib::protobuf)
     target_link_libraries (clickhouse_common_io PUBLIC ch_contrib::protobuf)
+
+    # CA content-addressed RootShard manifest protobuf codec (B164a).
+    add_subdirectory("Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Proto")
+    target_link_libraries(dbms PRIVATE clickhouse_cas_proto)
 endif ()
 
 if (TARGET clickhouse_grpc_protos)

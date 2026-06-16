@@ -1,0 +1,35 @@
+syntax = "proto3";
+package DB.Cas.Proto;
+
+// Binary codec for the CA RootShard manifest (B164a). Replaces the JSON encoding on the hot CA
+// write path. The manifest is CAS-by-token (not content-addressed), so byte-determinism is not a
+// correctness requirement; the encoder still serializes deterministically for stable golden tests.
+// Introspect a raw manifest offline with:
+//   protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto < manifest.bin
+
+message RefPayload {
+  bytes tree_id = 1;                  // raw 16 bytes (UInt128, big-endian)
+  uint64 tree_size = 2;
+  map<string, string> mutable_files = 3;
+}
+
+enum JournalOp {
+  JOURNAL_OP_UNSPECIFIED = 0;         // decode fails closed on 0
+  JOURNAL_OP_ADD = 1;
+  JOURNAL_OP_REMOVE = 2;
+}
+
+message JournalRecord {
+  JournalOp op = 1;
+  string ref_name = 2;
+  bytes tree_id = 3;                  // raw 16 bytes
+  uint64 at_version = 4;
+}
+
+message RootShardManifest {
+  uint32 codec_version = 1;           // = 2; the JSON format is the implicit v1; future -> NOT_IMPLEMENTED
+  uint64 shard_version = 2;
+  uint64 fence_round = 3;
+  map<string, RefPayload> refs = 4;
+  repeated JournalRecord journal = 5; // insertion order preserved
+}
