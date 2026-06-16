@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/WriteBuffer.h>
@@ -768,4 +769,171 @@ TEST(CasBuild, FirstPublishRegistersNamespace)
     build->publish(RootNamespace{"srv9/fresh"}, "part_2", tree, RefPayload{});
     const RootsRegistry again = decodeRootsRegistry(b->get(s->layout().rootsRegistryKey())->bytes);
     EXPECT_EQ(again.registry_version, version_after_first);
+}
+
+TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
+{
+    /// B167 LIVENESS — the watermark guard kills the resurrect/condemn livelock (full adversarial form).
+    ///
+    /// THE BUG (before the fix): a blob H was referenced, dropped, and GC-condemned (everEdged ∧ InDeg=0,
+    /// condemned in the retire view). A NEW build dedup-HITS H by content and must resurrect it — it
+    /// re-streams a FRESH incarnation of H stamped with its own owner triple (Part A). But the productive
+    /// GC, re-deriving H as a zero-in-degree candidate every round (zeroInDegreeKnown is stateless),
+    /// kept RE-CONDEMNING and exact-token-DELETING that fresh incarnation in the build's upload→publish
+    /// window. The build never converged: every retry re-uploaded only to have GC delete it again →
+    /// livelock → broken/detached parts in soak.
+    ///
+    /// THE FIX (Task 10 guard + Part A re-stamp): Gc::retire calls protectedByLiveBuild on each
+    /// candidate's owner metadata and SKIPS condemning a blob whose owning build is still in-flight
+    /// (server live ∧ epoch match ∧ build_seq ≥ min_active). The fresh incarnation is owned by the
+    /// live build, so it is SPARED every round until the build publishes (pinning H) → convergence.
+    ///
+    /// FORM: full adversarial loop. A real Gc drives complete runRegularRound rounds against the same
+    /// pool while build B holds an active watermark covering H's incarnation. We assert H is SPARED
+    /// every round and that B publishes within a BOUNDED number of GC rounds, after which H reads back.
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// 1. Build A creates H ("shared-content"), publishes a part referencing it, then drops the ref.
+    ///    Capture H's first incarnation token so we can condemn exactly it.
+    PoolConfig cfg;
+    cfg.pool_prefix = "p";
+    cfg.server_id = UInt128(0xAB);
+    cfg.background_heartbeats = false;
+    const String content = "shared-content";
+    BlobId h;
+    Token h_token0;
+    {
+        auto s0 = Store::open(b, cfg);
+        auto build_a = s0->startBuild({});
+        h = build_a->putBlob(idOf(content), BlobSource::fromString(content)).id;
+        TreeEntry e;
+        e.name = "f";
+        e.placement = Placement::Blob;
+        e.file_hash = u128Of(content);
+        e.file_size = content.size();
+        const TreeId tree_a = build_a->putTree({e});
+        build_a->publish(RootNamespace{"srv1/tbl"}, "part_1", tree_a, RefPayload{});
+        h_token0 = b->head(s0->layout().blobKey(h)).token;
+        s0->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    }
+
+    /// 2. Condemn (Blob, H, h_token0) in the retire view (mirrors ReuseBlobCondemnedResurrects). A fresh
+    ///    Store::open below refreshes its retire view at open and sees the condemnation, so the dedup-hit
+    ///    on H takes the resurrect (re-stream-a-fresh-incarnation) path rather than free adoption.
+    DB::Cas::Layout layout("p");
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of(content), .token = h_token0,
+                      .size = content.size()}});
+
+    /// 3. Open the live Store and start build B. B dedup-hits the condemned H and RESURRECTS it: a fresh
+    ///    incarnation, a NEW token, stamped with B's owner triple "<server>:<epoch>:<B.build_seq>".
+    ///    B stays ACTIVE for the whole adversarial loop — its build_seq is never retired below.
+    auto s = Store::open(b, cfg);
+    const String blob_key = s->layout().blobKey(h);
+    auto build_b = s->startBuild({});
+
+    const auto ref_b = build_b->reuseBlob(h, /*body_recreatable*/ true);
+    ASSERT_EQ(ref_b.id, h);
+
+    const HeadResult after_resurrect = b->head(blob_key);
+    ASSERT_TRUE(after_resurrect.exists);
+    EXPECT_NE(after_resurrect.token, h_token0);   /// a genuinely fresh incarnation
+    const String expected_owner = u128ToHex(cfg.server_id) + ":" + std::to_string(s->epoch())
+                                  + ":" + std::to_string(build_b->buildSeq());
+    ASSERT_EQ(after_resurrect.attributes.at("cas_owner"), expected_owner)
+        << "the resurrected incarnation must be stamped with B's live owner triple (Part A)";
+
+    /// 4. The durable watermark's min_active is published WHILE B is active (each GC round below renews
+    ///    it), so the guard's clause build_seq >= min_active holds for B's incarnation: anchored at
+    ///    open, B active, min_active <= B's build_seq automatically.
+
+    /// 5. THE ADVERSARIAL LOOP. A real, productive GC keeps trying to reclaim. Round 1 reclaims the
+    ///    now-unreferenced tree_a (owned by the finished build A — UNprotected) and, by cascade, frees
+    ///    H to zero in-degree. From then on H is a standing zero-in-degree candidate that the GC
+    ///    re-derives EVERY round (zeroInDegreeKnown is stateless) and would condemn+delete — but it is
+    ///    owned by the live build B, so protectedByLiveBuild SPARES it each time. We drive far more
+    ///    rounds than B needs to publish; H must survive ALL of them.
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    constexpr int MAX_GC_ROUNDS = 8;   /// bounded-step budget: convergence must not exceed this
+
+    /// Build B assembles its tree referencing H (no publish yet — H stays unreferenced by any root).
+    TreeEntry eb;
+    eb.name = "f";
+    eb.placement = Placement::Blob;
+    eb.file_hash = u128Of(content);
+    eb.file_size = content.size();
+    const TreeId tree_b = build_b->putTree({eb});
+
+    /// One adversarial GC round + the spare invariant. Returns the report so the caller can assert no
+    /// reclaim slipped through. INV (the heart of the test): the in-flight, watermark-protected H is
+    /// NEVER condemned/deleted while build B is active — H stays present and reads back the exact
+    /// content. (Before the fix, GC re-condemned+deleted the fresh incarnation in the upload→publish
+    /// window, so H would VANISH here → livelock.) The blob plane holds exactly one blob (H), so a
+    /// reclaim of H is the only way rep.deleted could count a blob — but trees zero/cascade too, so we
+    /// assert directly on H's presence + content rather than on the aggregate counter.
+    const auto driveRoundAndAssertHSpared = [&](int round_no)
+    {
+        /// A LIVE server renews its watermark continuously (a background thread every ~heartbeat_period
+        /// in production). Renew once per GC round so B's watermark seq ADVANCES between rounds: that is
+        /// precisely what distinguishes a live server from a crashed one. (Without this, B's seq freezes
+        /// and the GC's K=2 frozen-seq crash detector correctly declares B dead and reclaims H — that is
+        /// the intended crash path, NOT the livelock this test targets.)
+        s->renewWatermarkOnce();
+        gc.runRegularRound();
+        /// (Lease may not be acquired on the very first round: injectRetire pre-seeded gc/state with
+        /// no lease owner, so the GC observes once and steals on the next round — protocol-correct,
+        /// not load-bearing for this test. The invariant below holds regardless of who leads.)
+        const HeadResult hr = b->head(blob_key);
+        ASSERT_TRUE(hr.exists) << "H was deleted by GC at round " << round_no
+                               << " despite being owned by the live build B (B167 livelock would do this)";
+        const auto raw = b->get(blob_key);
+        ASSERT_TRUE(raw.has_value());
+        const auto hdr = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
+        EXPECT_EQ(raw->bytes.substr(hdr.header_len), content)
+            << "H's content was lost/corrupted at round " << round_no;
+    };
+
+    /// Phase 1 — the livelock window. H is referenced by NO published root (B has not published yet),
+    /// so the productive GC re-derives it as a zero-in-degree candidate it WOULD condemn+delete. Drive
+    /// several full rounds (enough to establish the leader, reclaim tree_a/part_1, and cascade-free H);
+    /// the watermark guard must SPARE H's fresh incarnation every single round.
+    int rounds_run = 0;
+    constexpr int PRE_PUBLISH_ROUNDS = 4;
+    for (int i = 0; i < PRE_PUBLISH_ROUNDS; ++i)
+    {
+        driveRoundAndAssertHSpared(++rounds_run);
+        if (::testing::Test::HasFatalFailure())
+            return;
+    }
+
+    /// Phase 2 — converge. With H still alive (spared through the whole window), build B publishes a
+    /// part referencing it. publish itself legitimately re-streams the still-condemned H to a fresh
+    /// incarnation (the resurrect path on the publish gate); H is never absent. This MUST succeed —
+    /// the build converges in bounded steps.
+    build_b->publish(RootNamespace{"srv1/tbl"}, "part_2", tree_b, RefPayload{});
+    const bool published = true;
+
+    /// Phase 3 — keep the GC hammering after publish. H is now pinned by tree_b's root edge; the GC
+    /// must keep sparing it (now as a genuinely-reachable node, owned by the still-live B).
+    while (rounds_run < MAX_GC_ROUNDS)
+    {
+        driveRoundAndAssertHSpared(++rounds_run);
+        if (::testing::Test::HasFatalFailure())
+            return;
+    }
+
+    /// 6. ASSERT convergence: publish SUCCEEDED within the bounded budget, and H reads back intact.
+    ASSERT_TRUE(published) << "build B never published — the B167 livelock is back";
+    EXPECT_LE(rounds_run, MAX_GC_ROUNDS);
+
+    const auto resolved = s->resolveRef(RootNamespace{"srv1/tbl"}, "part_2");
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->tree_id, tree_b);
+
+    const auto read = s->readTree(tree_b);
+    ASSERT_EQ(read.size(), 1u);
+    const auto loc = s->locate(read[0]);
+    const auto got = b->get(loc.key, Range{loc.offset, loc.length});
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, content);
 }
