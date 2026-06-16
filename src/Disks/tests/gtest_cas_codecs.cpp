@@ -599,6 +599,36 @@ TEST(CasRootShardCodec, ProtobufFutureCodecVersionThrowsNotImplemented)
     expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [] { decodeRootShard(String("\x08\x02", 2)); });
 }
 
+/// ===================================================================================
+/// CasWatermark (Task 4)
+/// ===================================================================================
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
+
+TEST(CasWatermark, RoundTrips)
+{
+    const ServerWatermark w{.server_id = UInt128(0xABCD), .epoch = 7, .min_active = 42, .seq = 3};
+    const String body = encodeServerWatermark(w);
+    const ServerWatermark r = decodeServerWatermark(body);
+    ASSERT_EQ(r.server_id, w.server_id);
+    ASSERT_EQ(r.epoch, w.epoch);
+    ASSERT_EQ(r.min_active, w.min_active);
+    ASSERT_EQ(r.seq, w.seq);
+}
+
+/// ===================================================================================
+/// CasLayout (Task 5)
+/// ===================================================================================
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+
+TEST(CasLayout, ServerWatermarkKey)
+{
+    Layout layout("pool");
+    const String hex(32, 'a');   // 32-char u128 hex
+    ASSERT_EQ(layout.serverWatermarkKey(hex), "pool/servers/aa/" + hex);
+}
+
 /// ---------- envelope fixed-length header padding (pad_to_header_len) ----------
 
 TEST(CasEnvelope, EnvelopeHeaderPaddingReachesTargetLen)
