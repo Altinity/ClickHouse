@@ -7608,6 +7608,8 @@ Pattern for the filename of the exported merge tree part. The `part_name` and `c
 )", 0) \
     DECLARE(Bool, export_merge_tree_part_allow_lossy_cast, false, R"(
 Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
+
+Warning: the partition key is not cast before it is written to the Apache Iceberg metadata file — it is written using the original value from the ClickHouse table. Lossy casts on a partition column can therefore make the Iceberg metadata inconsistent with the exported data files. For example, if a table is partitioned by an `Int64` column and some partition values do not fit into `Int32`, the metadata will still contain the original `Int64` values while the data files contain the truncated `Int32` values.
 )", 0) \
     \
     /* ####################################################### */ \
