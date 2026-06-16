@@ -19,7 +19,7 @@ The random-u128 `build_id` dissolves into a triple that is globally unique by co
 
 - **`server_id`** (u128) — which server's watermark governs this object. Already present in the `Provenance` TLV.
 - **`epoch`** (u64) — a fresh **random** value chosen at process start. GC never orders epochs; it only asks "is this the server's *current* epoch?". A blob carrying a stale epoch belongs to a dead incarnation. No durable counter, no restart coordination.
-- **`build_seq`** (u64) — monotone within `(server, epoch)`, assigned from an in-memory counter; may reset to 0 on restart (it is only ever compared within a matching epoch).
+- **`build_seq`** (u64) — assigned from a strictly-increasing in-memory counter per `(server, epoch)`; may reset to 0 on restart (it is only ever compared within a matching epoch). **Strict monotonicity is load-bearing, not merely convenient** (TLA+ `CaBuildWatermarkNum`, `_nonmonotonic`): because `min_active` is a single scalar floor, a build number that was unique but issued *out of order* (a lower number starting after a higher one finished) would pull `min_active` back down and re-protect a finished build's condemned blob (a leak). A counter — never reused, never out-of-order — makes `min_active` monotone non-decreasing and forbids that.
 
 The triple is written into **S3 user metadata** (`x-amz-meta-*`) on every object write, so GC reads the owner from the **HEAD it already performs**, with no body read. A forensic copy also rides in the envelope's existing `build_id` field (`epoch ‖ build_seq`, 16 bytes) for fsck when metadata is unavailable; the **protocol-load-bearing read is the metadata**. No envelope format-version change.
 

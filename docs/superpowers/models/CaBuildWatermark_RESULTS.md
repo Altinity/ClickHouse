@@ -61,8 +61,27 @@ Confirms sound detection (frozen `seq` across K≥2 passes, the B160 discipline)
 
 `CaResurrectLiveness` (kept) proved the *abstract* heartbeat guard is load-bearing: guard ON → `<>published` holds; guard OFF → starvable. `CaBuildWatermark` discharges that abstraction onto the concrete oracle and shows the three concrete ways the oracle can be broken (no guard / stale active set / unsound death) each reproduce the same starvation, while the sound oracle converges and a genuine crash still reclaims (no leak). The publish-gate safety backstop and `INV-NO-LOSS/NO-DANGLE/NO-RETURN` remain `CaIncarnationCore`'s job (safety), not checked here.
 
+## Safety invariants (checked in EVERY config, sabotages included)
+
+Two state invariants are checked alongside the temporal properties, at `Builds = {b1, b2, b3}`:
+- `Inv_ProtectedNeverCondemned == Protected ⇒ ¬condemned` — the guard never leaves a protected incarnation condemned (hence never exact-token-deletable): a protected blob is never lost.
+- `Inv_NoDangle == (published ≠ {}) ⇒ present` — a published reference never dangles.
+
+Both **HOLD in all five configs, including the three sabotages.** That is the B167 thesis made machine-checkable: the sabotages break **liveness only**, never safety (no data loss — consistent with the soak evidence that the active table stayed intact).
+
+## Companion: `CaBuildWatermarkNum` — concrete numeric validation of the abstraction
+
+`CaBuildWatermark` abstracts the scalar floor as `owner ∈ activeSet`, folds `epoch` into `serverLive`, and uses one server. `CaBuildWatermarkNum.tla` discharges those abstractions with a **numeric** model: a real per-server scalar `MinActive(s) = min(active build_seqs)`, **two servers** each with its own `epoch` watermark, real `epoch` counters a restart bumps, and monotone `build_seq` allocation. It checks SAFETY (`Inv_ProtectedNeverCondemned`, `Inv_NoDangle`) exhaustively (`MaxSeq=2`, `MaxEpoch=1`).
+
+| Config | Knob | Result |
+|---|---|---|
+| `_correct` | sound guard, monotone `build_seq` | **No error** (4616 distinct states) — safety holds with the real scalar floor, 2 servers, restart/epoch |
+| `_confused` | guard checks the WRONG server's watermark | **VIOLATED** — `Inv_ProtectedNeverCondemned`; per-server scoping is load-bearing |
+| `_nonmonotonic` | `build_seq` unique but NOT monotone | **VIOLATED** — see finding below |
+
+**Finding — monotone `build_seq` allocation is load-bearing, not just uniqueness.** The first `_correct` run (before this constraint) failed: build `seq=2` re-stamped the blob, finished without referencing it (GC condemned it correctly), then a build `seq=1` *started* → `min_active` dropped to 1 → `ownerSeq=2 ≥ 1` → the scalar floor **re-protected a finished build's condemned blob** (a leak). The fix is the discipline the spec already names — `build_seq` is allocated from a **monotone counter**, so a new build's seq always *exceeds* every prior one and `min_active` can never be pulled back below a finished build's seq. `_nonmonotonic` (uniqueness without monotonicity) reproduces the violation, confirming the counter is required. The implementation MUST allocate `build_seq` strictly increasing per `(server, epoch)`, never reuse, never out-of-order.
+
 ## Residuals
 
-- Two builds, one hash, one server — the cross-build last-writer-wins case. Multi-server contention (each server its own watermark) is not enumerated; the per-server oracle is independent by construction (a blob is governed by exactly one server's watermark, its `server_id`), so the single-server model is the load-bearing case.
-- The scalar `min_active` floor is abstracted as `owner ∈ activeSet` (conservative, see above).
+- The boolean `CaBuildWatermark` uses two builds, one hash, one server; the numeric `CaBuildWatermarkNum` uses two servers / numeric floor / epoch but checks safety only. Together they cover liveness (boolean) and the floor/scoping/epoch safety (numeric). Multi-server *liveness* and >2 servers are not enumerated; the per-server oracle is independent by construction (a blob is governed by exactly one server's watermark, its `server_id`).
 - Crashed-server detection is modeled as a `serverLive`/`gcDead` flag pair with a soundness knob; the actual frozen-`seq`-across-K-passes mechanism is proven in `CaGcLeaseCore` (B160) and reused.

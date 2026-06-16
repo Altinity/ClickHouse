@@ -204,4 +204,16 @@ TypeOK ==
     /\ activeSet \subseteq Builds
     /\ serverLive \in BOOLEAN
     /\ gcDead \in BOOLEAN
+
+----------------------------------------------------------------------------
+\* SAFETY — must hold in EVERY config, sabotage included. B167 is a LIVENESS bug, not a safety bug:
+\* the sabotages must break only Liveness, never these. (If a sabotage ever violated one of these, the
+\* model would be wrong about where the danger is.)
+\*
+\* The guard never leaves a Protected incarnation condemned (hence exact-token-deletable): a protected
+\* blob is never lost.
+Inv_ProtectedNeverCondemned == Protected => ~condemned
+\* A published reference never dangles: once any build has published referencing the incarnation
+\* (InDeg>=1), it stays present (GcCondemn is disabled, so GcDelete can never fire on it).
+Inv_NoDangle == (published # {}) => present
 =============================================================================
