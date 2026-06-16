@@ -230,7 +230,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_amd_debug:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx53, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx43, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9kZWJ1Zyk=') }}
     name: "Build (amd_debug)"
@@ -287,7 +287,7 @@ jobs:
         run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_DEBUG_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_asan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx53, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx43, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9hc2FuKQ==') }}
     name: "Build (amd_asan)"
@@ -344,7 +344,7 @@ jobs:
         run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_ASAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_tsan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx53, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx43, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF90c2FuKQ==') }}
     name: "Build (amd_tsan)"
@@ -401,7 +401,7 @@ jobs:
         run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_TSAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_msan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx53, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx43, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9tc2FuKQ==') }}
     name: "Build (amd_msan)"
@@ -458,7 +458,7 @@ jobs:
         run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_MSAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_ubsan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx53, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx43, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF91YnNhbik=') }}
     name: "Build (amd_ubsan)"
@@ -515,7 +515,7 @@ jobs:
         run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_UBSAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_binary:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx53, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx43, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9iaW5hcnkp') }}
     name: "Build (amd_binary)"
@@ -629,7 +629,7 @@ jobs:
         run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_ARM_ASAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_arm_binary:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx53, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx43, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9iaW5hcnkp') }}
     name: "Build (arm_binary)"
@@ -686,7 +686,7 @@ jobs:
         run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_ARM_BIN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_coverage:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx53, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx43, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9jb3ZlcmFnZSk=') }}
     name: "Build (amd_coverage)"
@@ -731,7 +731,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_amd_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx53, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx43, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlKQ==') }}
     name: "Build (amd_release)"
@@ -776,7 +776,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_arm_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx53, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-ccx43, altinity-setup-create_snapshot, altinity-image-x86-system-ubuntu-22.04]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9yZWxlYXNlKQ==') }}
     name: "Build (arm_release)"
