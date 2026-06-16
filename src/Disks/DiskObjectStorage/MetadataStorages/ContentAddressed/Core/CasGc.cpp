@@ -597,32 +597,6 @@ void Gc::fence(GcState & state, Token & state_token)
         "CAS gc fence: gc/state moved during the fence while the lease is still ours; retry next round");
 }
 
-bool Gc::blobOwnedByLiveBuild(const Layout & layout, Backend & backend,
-                              const String & key, uint64_t object_size) const
-{
-    /// B167 Part B (see CasGc.h). Fail-CLOSED to "not live" on every read/decode failure: a corrupt or
-    /// vanished header must never pin an object, and the recheck re-validates in-degree before any
-    /// delete, so condemning anyway stays safe.
-    const uint64_t header_len = store->poolMeta().blob_header_len;
-    if (object_size < header_len)
-        return false;
-    const std::optional<GetResult> head_bytes = backend.get(key, Range{.offset = 0, .length = header_len});
-    if (!head_bytes)
-        return false;
-    EnvelopeHeader header;
-    try
-    {
-        header = decodeEnvelopeHeader(head_bytes->bytes, object_size, ObjectKind::Blob);
-    }
-    catch (const Exception &)
-    {
-        return false;
-    }
-    if (header.build_id == UInt128{})
-        return false;
-    return backend.head(layout.buildHeartbeatKey(u128ToHex(header.build_id))).exists;
-}
-
 std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
                                           const std::map<uint64_t, GcSnap> & snap)
 {
@@ -658,15 +632,6 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
                 /// No token to condemn - never fabricate one (fail closed). The object is already
                 /// gone: a crashed prior round's landed delete, or debris; the recheck has nothing
                 /// to do for it and the writer-facing barrier has nothing to bar.
-                continue;
-
-            /// B167 Part B: the 4th condemn guard ~liveBuild(build_id). Do NOT condemn a blob that is
-            /// still in-flight (its build_id heartbeat is live) — extends to incremental GC the
-            /// in-flight protection full GC already gives debris, closing the resurrect-vs-GC livelock.
-            /// Non-destructive deferral: a live owner just postpones this candidate to a later round (or
-            /// to full GC once its heartbeat lapses). Blobs only (tree headers are natural-length).
-            if (candidate.kind == ObjectKind::Blob
-                && blobOwnedByLiveBuild(layout, backend, objectKey(layout, candidate.kind, candidate.hash), observed.size))
                 continue;
 
             RetiredEntry entry;
