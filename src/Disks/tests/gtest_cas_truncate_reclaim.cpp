@@ -129,6 +129,11 @@ TEST(CasTruncateReclaim, PerRefDropOfSharedBlobsReclaimsToZero)
     for (const String & ref : refs)
         s->dropRef(ns, ref);
 
+    /// Every publishing build finished; advance the durable watermark floor past their seqs so the
+    /// Task 10 build-watermark guard no longer spares the now-dropped objects (production does this
+    /// via the background renewer ~2s; here the renewer is off, so drive it explicitly).
+    s->renewWatermarkOnce();
+
     /// Drive GC to a fixpoint and require full reclamation — this is the B140 assertion.
     {
         Gc gc(s, hexToU128("00000000000000000000000000000001"));
@@ -184,6 +189,11 @@ TEST(CasTruncateReclaim, TruncateThenKeepInsertingStillReclaims)
         }
     }
 
+    /// All publishing builds finished; advance the durable watermark floor past their seqs so the
+    /// Task 10 build-watermark guard no longer spares the dropped objects (the background renewer is
+    /// off in this test, so drive it explicitly — production renews ~2s off the write path).
+    s->renewWatermarkOnce();
+
     /// Drive to a fixpoint. unreachable must reach 0 (the pre-truncate orphans are gone) while the
     /// post-truncate refs stay reachable.
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
@@ -226,6 +236,10 @@ TEST(CasTruncateReclaim, DropNamespaceOfSharedBlobsReclaimsToZero)
 
     /// DROP TABLE: the whole namespace is tombstoned at once (one Remove per ref in the journal).
     s->dropNamespace(ns);
+
+    /// Every publishing build finished; advance the durable watermark floor past their seqs so the
+    /// Task 10 build-watermark guard no longer spares the dropped objects (renewer off here).
+    s->renewWatermarkOnce();
 
     {
         Gc gc(s, hexToU128("00000000000000000000000000000001"));

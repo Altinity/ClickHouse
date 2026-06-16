@@ -70,10 +70,14 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
     store->retire_view.refresh();
 
     /// Per-server watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random NONZERO
-    /// u64 minted once per Store: GC checks it for equality only (a different epoch == a dead
-    /// incarnation). Fold two thread_local_rng draws and avoid the 0 sentinel (UINT64_MAX is the
-    /// retired sentinel, also distinct from a live epoch).
-    store->process_epoch = thread_local_rng() ^ (static_cast<uint64_t>(thread_local_rng()) << 32);
+    /// value minted once per Store: GC checks it for equality only (a different epoch == a dead
+    /// incarnation). It rides through the watermark JSON codec, which parses integers as Int64 and
+    /// caps at 2^53 (the JSON-number interop bound — see requireU64Var / the min_active comment), so
+    /// the epoch MUST stay in that range: a full-u64 draw would round-trip-fail to decode roughly
+    /// half the time. Mask to 52 bits (collision-safe for an equality-only token) and avoid the 0
+    /// sentinel (UINT64_MAX is the retired sentinel, also distinct from a live epoch).
+    constexpr uint64_t EPOCH_MASK = (1ULL << 52) - 1;
+    store->process_epoch = (thread_local_rng() ^ (static_cast<uint64_t>(thread_local_rng()) << 32)) & EPOCH_MASK;
     if (store->process_epoch == 0)
         store->process_epoch = 1;
 
@@ -176,6 +180,15 @@ uint64_t Store::peekNextBuildSeq()
 {
     std::lock_guard lk(builds_mutex);
     return next_build_seq;
+}
+
+void Store::renewWatermarkOnce()
+{
+    /// A read-only open never anchored a watermark; there is nothing to renew (fail closed rather
+    /// than fabricate one).
+    if (!watermark)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS watermark: renewWatermarkOnce on a read-only Store");
+    watermark->renewOnce();
 }
 
 uint64_t Store::allocateBuildSeq()

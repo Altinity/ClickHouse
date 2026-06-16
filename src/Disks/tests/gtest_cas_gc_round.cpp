@@ -408,6 +408,7 @@ TEST(CasGcFold, DropZeroesTreeButChildStaysPinned)
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     const UInt128 tree_hash = hexToU128(tree.string());
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     const RoundReport rep = gc.runRegularRound();
@@ -436,6 +437,7 @@ TEST(CasGcFold, RepublishSameRefIsLastOpWins)
     const TreeId t2 = publishPart(s, "srv1/tbl", "part_1", "two");      /// same ref, new tree
     const UInt128 t1_hash = hexToU128(t1.string());
     const UInt128 t2_hash = hexToU128(t2.string());
+    s->renewWatermarkOnce();   /// both builds finished -> advance min_active past their seqs (Task 10 guard)
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     const RoundReport rep = gc.runRegularRound();
@@ -699,6 +701,9 @@ TEST(CasGcRetire, ObservesCurrentTokenDeletesExactAndDropsEntries)
     auto s = openTestStore(b);
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload-1");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    /// The publishing build finished; advance the durable watermark so its min_active passes the
+    /// build's seq (else the Task 10 guard would spare the now-dropped tree as a live build's blob).
+    s->renewWatermarkOnce();
 
     const Token pre_round_token = b->head(s->layout().treeKey(tree)).token;
 
@@ -769,6 +774,7 @@ TEST(CasGcRetire, DeletedCandidateDoesNotReappear)
     auto s = openTestStore(b);
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     const RoundReport rep1 = gc.runRegularRound();
@@ -810,6 +816,7 @@ TEST(CasGcRetire, RetireSetsDurableBeforeRoundCas)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     b->failNthCasPut(s->layout().gcStateKey(), 3);
@@ -888,6 +895,7 @@ TEST(CasGcRecheck, SparedWhenPublishRacesTheFence)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
     const String shard_key = s->layout().rootShardKey(RootNamespace{"srv1/tbl"}, shard);
@@ -925,6 +933,7 @@ TEST(CasGcRecheck, ReplacedWhenResurrectionWins)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     const String tree_key = s->layout().treeKey(tree);
     const Token t0 = b->head(tree_key).token;
@@ -952,6 +961,7 @@ TEST(CasGcRecheck, AbsentWhenAlreadyGone)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     const String tree_key = s->layout().treeKey(tree);
     const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
@@ -981,6 +991,7 @@ TEST(CasGcRetire, DivergedRetiredSetFailsClosed)
     auto s = openTestStore(b);
     publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
     /// fresh pool: the executed round is 1, fence_seq 0
     ASSERT_EQ(b->putIfAbsent(s->layout().retiredKey(1, 0, 0), "not-our-retire"), PutOutcome::Done);
 
@@ -1016,6 +1027,7 @@ TEST(CasGcRetire, RetireUsesFoldCommittedStateWithoutReread)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     b->resetCounts();
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
@@ -1381,6 +1393,7 @@ TEST(CasGcRetire, RetireReplayAdoptsOwnCrashedAttempt)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     const TreeId t1 = publishPart(s, "srv1/tbl", "part_1", "one");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     b->failNthCasPut(s->layout().gcStateKey(), 3);            /// lease=1, fold=2, retire=3
@@ -1435,7 +1448,9 @@ TEST(CasGcCascade, SharedChildSurvivesOneParentDeletion)
     const TreeId t2 = build->putTree({e2});
     build->publish(RootNamespace{"srv1/tbl"}, "part_1", t1, RefPayload{});
     build->publish(RootNamespace{"srv1/tbl"}, "part_2", t2, RefPayload{});
+    build.reset();             /// build finished -> retires its seq from the active set (Task 10 guard)
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// advance min_active past the finished build's seq
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     const RoundReport rep1 = gc.runRegularRound();
@@ -1460,6 +1475,7 @@ TEST(CasGcCascade, NeverCascadesOnReplaced)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     const String tree_key = s->layout().treeKey(tree);
     const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
@@ -1503,6 +1519,7 @@ TEST(CasGcCascade, RecreateAfterDeletionRefoldsAfterStrip)
     auto s = openTestStore(b);
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     const RoundReport rep1 = gc.runRegularRound();            /// deletes T, strips, frees B
@@ -1601,6 +1618,7 @@ TEST(CasGcResume, CompletesRoundAfterCrashBeforeFencePersist)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     b->failNthCasPut(s->layout().gcStateKey(), 4);            /// lease=1, fold=2, retire=3, FENCE=4
@@ -1634,6 +1652,7 @@ TEST(CasGcResume, AdoptsOutcomesAfterCrashBeforeCascadePersist)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     b->failNthCasPut(s->layout().gcStateKey(), 5);            /// the CASCADE persist CAS
@@ -1673,6 +1692,7 @@ TEST(CasGcScenario, ZombieDeleteAfterResurrectIs412)
     auto s = openTestStore(b);
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
     const String tree_key = s->layout().treeKey(tree);
     const Token t0 = b->head(tree_key).token;
 
@@ -1729,6 +1749,7 @@ TEST(CasGcScenario, SplitBrainLeadersOnlyDuplicateWork)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
 
     Gc gc1(s, hexToU128("0000000000000000000000000000000a"));
     Gc gc2(s, hexToU128("0000000000000000000000000000000b"));
@@ -1890,4 +1911,58 @@ TEST(CasGcWatermark, ParsesOwnerAndProtectsLiveBuild)
     ASSERT_TRUE(gc.protectedByLiveBuild(live));     /// first-seen server -> live; 7 >= 5; epoch matches
     ASSERT_FALSE(gc.protectedByLiveBuild(done));
     ASSERT_FALSE(gc.protectedByLiveBuild(stale));
+}
+
+/// ---- B167 per-server build watermark guard wired into retire (Task 10) ----
+///
+/// End-to-end: a candidate (everEdged ∧ InDeg=0 tree, referenced then dropped) whose object carries
+/// an owner triple of a LIVE build's server is SKIPPED at retire (non-destructive deferral) — the
+/// object survives the round. Once that server's min_active passes the owner's build_seq (the build
+/// finished/abandoned), the SAME candidate is condemned and deleted on the next round.
+TEST(CasGcRetire, SkipsBlobOwnedByLiveBuildThenCondemnsWhenFloorPasses)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    /// part_1's tree becomes everEdged ∧ InDeg=0 once dropped (mirrors the retire fixtures above).
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+
+    /// Stamp the dropped tree object with an owner triple for a DIFFERENT server (AB, NOT the
+    /// Store's anchored server 0), so its watermark key is fresh and we own its floor. Owner
+    /// build_seq = 7. (The Store anchored server 0's watermark on open; AB is steered by us.)
+    const String tree_key = s->layout().treeKey(tree);
+    const auto tree_obj = b->get(tree_key);
+    ASSERT_TRUE(tree_obj.has_value());
+    const ObjectMeta owner_meta{{"cas_owner", u128ToHex(DB::UInt128(0xAB)) + ":9:7"}};
+    ASSERT_EQ(b->putOverwrite(tree_key, tree_obj->bytes, tree_obj->token, nullptr, owner_meta),
+              PutOutcome::Done);
+
+    /// Server AB watermark: epoch 9, min_active 5 (7 >= 5 -> protected), seq 1.
+    const String wm_key = s->layout().serverWatermarkKey(u128ToHex(DB::UInt128(0xAB)));
+    ASSERT_EQ(b->putIfAbsent(wm_key, encodeServerWatermark({DB::UInt128(0xAB), 9, 5, 1})),
+              PutOutcome::Done);
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+
+    /// Round 1: H is owned by a live build (first-seen server -> live; epoch 9 matches; 7 >= 5),
+    /// so retire SKIPS it — no candidate, no delete, the object survives.
+    const RoundReport rep1 = gc.runRegularRound();
+    EXPECT_TRUE(rep1.acquired_lease);
+    EXPECT_EQ(rep1.candidates, 0u);                       /// the guard deferred it (not condemned)
+    EXPECT_EQ(rep1.deleted, 0u);
+    EXPECT_TRUE(b->head(tree_key).exists);                /// survived: the live build still owns it
+
+    /// Raise the floor past the owner's build_seq: min_active 5 -> 8 (7 < 8 -> unprotected). Bump
+    /// seq (1 -> 2) so the SAME Gc still judges AB as live (seq advanced => renewed, not frozen).
+    ASSERT_EQ(b->putOverwrite(wm_key, encodeServerWatermark({DB::UInt128(0xAB), 9, 8, 2}),
+                              b->head(wm_key).token, nullptr),
+              PutOutcome::Done);
+
+    /// Round 2: the floor passed the owner (build finished); the guard no longer protects, retire
+    /// condemns H and the recheck deletes it.
+    const RoundReport rep2 = gc.runRegularRound();
+    EXPECT_TRUE(rep2.acquired_lease);
+    EXPECT_EQ(rep2.candidates, 1u);                       /// now condemned
+    EXPECT_EQ(rep2.deleted, 1u);
+    EXPECT_FALSE(b->head(tree_key).exists);               /// deleted at the observed token
 }

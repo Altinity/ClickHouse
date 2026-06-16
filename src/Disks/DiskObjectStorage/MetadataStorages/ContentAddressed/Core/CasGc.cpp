@@ -612,6 +612,11 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     /// state.round = "highest round whose retire sets are durable" => THIS round is the next one.
     const uint64_t round = state.round + 1;
 
+    /// Reset the per-round watermark caches before observing candidates. The guard below
+    /// (protectedByLiveBuild) judges each owning server's liveness ONCE per round; the across-round
+    /// frozen-seq memory persists for the K=2 crash detector.
+    beginWatermarkRound();
+
     /// 1. Observe. One HEAD per candidate captures the CURRENT incarnation token - the only token
     /// the eventual delete may carry (exact-token delete, spec §7).
     ///
@@ -634,6 +639,9 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
                 /// gone: a crashed prior round's landed delete, or debris; the recheck has nothing
                 /// to do for it and the writer-facing barrier has nothing to bar.
                 continue;
+
+            if (protectedByLiveBuild(observed.attributes))
+                continue;   // owned by a live build -> skip condemn this round (non-destructive deferral)
 
             RetiredEntry entry;
             entry.kind = candidate.kind;

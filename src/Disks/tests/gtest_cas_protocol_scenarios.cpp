@@ -527,6 +527,11 @@ TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
     /// 3. the last ref to T drops; a REAL GC round retires T at t0 and fences the registry
     /// (fence_round 1). No delete exists yet in this milestone - the retire set is the barrier.
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    /// build_a (T's owner) finished; advance the durable watermark floor past its seq so the Task 10
+    /// build-watermark guard condemns T. build_b is still in-flight, but it does NOT own T (T was
+    /// written by build_a), so its still-active seq does not protect T.
+    build_a.reset();
+    s->renewWatermarkOnce();
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
@@ -576,6 +581,10 @@ TEST(CasProtocol, AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime)
     /// Detach, then a FULL GC round: T deleted at its observed token, entry dropped on the
     /// confirmed outcome, namespace fenced at round 1.
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    /// build_a (T's owner) finished; advance the durable watermark floor past its seq so the Task 10
+    /// build-watermark guard condemns T (the background renewer is off in this test).
+    build_a.reset();
+    s->renewWatermarkOnce();
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     ASSERT_FALSE(b->head(s->layout().treeKey(tree)).exists);

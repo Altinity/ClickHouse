@@ -88,6 +88,10 @@ public:
     uint64_t minActive();
     /// Test/assertion accessor for the next-to-allocate build_seq under the lock.
     uint64_t peekNextBuildSeq();
+    /// Renew the per-server watermark once (bump seq, refresh min_active from the live active set).
+    /// In production this is driven by the background renewer (background_heartbeats); tests with the
+    /// renewer disabled drive it explicitly to make a finished build's floor advance durable.
+    void renewWatermarkOnce();
 
     /// ---- write side ----
     BuildPtr startBuild(BuildInfo info);                          /// W-HEARTBEAT durable before return
