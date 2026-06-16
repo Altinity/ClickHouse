@@ -149,3 +149,10 @@ The rewritten `CaResurrectLiveness` proved the abstract heartbeat guard is load-
 ## Sequencing
 
 Ships **with** B160 (which makes GC productive and exposes B167). Merging B160 without this creates broken parts under dedup + GC load.
+
+## Implementation notes {#implementation-notes}
+
+Two facts discovered during implementation, both forced by the strict-JSON codec's integer interop bound (it caps integers at 2^53):
+
+- The `min_active = UINT64_MAX` retirement sentinel (the graceful-shutdown farewell) is wire-encoded as the JSON string `"retired"` rather than a numeric literal, and decoded back to `UINT64_MAX`. A raw `UINT64_MAX` would exceed the codec's 2^53 integer cap.
+- `epoch` is masked to 52 bits (not a full u64) so it stays within the same 2^53 codec interop bound. This is still collision-safe for an equality-only token: GC checks `epoch` for equality, never ordering, so 52 bits of randomness per process start suffice.

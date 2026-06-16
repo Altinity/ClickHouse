@@ -387,6 +387,11 @@ with the fence (⇒ refresh ⇒ sees its uploads condemned ⇒ resurrects them �
 landed pre-fence (⇒ the recheck folds its journal record ⇒ in-degree > 0 ⇒ spared). Either way: self-healing,
 no dangle, no clock in the argument.
 
+Incremental GC additionally honors a per-server build watermark (see
+`docs/superpowers/specs/2026-06-16-ca-build-watermark-design.md`) as a co-liveness mechanism for in-flight
+builds — it spares an `everEdged ∧ InDeg=0` blob whose owning build is still active; the publish gate remains
+the safety backstop.
+
 ## 6. Reader protocol and FUSE readiness {#proto-read}
 
 Reading: resolve the part via the server's in-memory state (manifests are read at attach/startup, parts cached
