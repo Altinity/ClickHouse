@@ -4,6 +4,7 @@
 #include <base/defines.h>
 #include <algorithm>
 #include <charconv>
+#include <limits>
 
 namespace DB
 {
@@ -1097,6 +1098,124 @@ void Gc::pulseHeartbeat(Store & store, UInt128 gc_id)
     hb.owner = gc_id;   /// we believe we are the leader; take/keep gc/hb ownership
     ++hb.hb_seq;
     store.backend().casPut(key, encodeGcHeartbeat(hb), expected, /*out_token=*/nullptr);
+}
+
+void Gc::beginWatermarkRound()
+{
+    /// Per-round caches reset; the across-round frozen-seq memory (last_seen_server_seq,
+    /// server_frozen_rounds) persists — it is the K=2 crash detector's accumulator.
+    watermark_cache.clear();
+    server_live_this_round.clear();
+}
+
+const ServerWatermark * Gc::watermarkOf(UInt128 server_id)
+{
+    if (const auto it = watermark_cache.find(server_id); it != watermark_cache.end())
+        return &it->second;
+
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+    const String key = layout.serverWatermarkKey(u128ToHex(server_id));
+
+    /// Absent watermark => unrecognized owner. Cache nothing (cheap re-HEAD next candidate) and
+    /// report nullptr — protectedByLiveBuild then defaults this object to unprotected.
+    const HeadResult head = backend.head(key);
+    if (!head.exists)
+        return nullptr;
+
+    const auto got = backend.get(key);
+    if (!got)
+        /// Disappeared between HEAD and GET (a farewell/restart raced us) — treat as unrecognized.
+        return nullptr;
+
+    const ServerWatermark w = decodeServerWatermark(got->bytes);
+    const auto [it, _] = watermark_cache.emplace(server_id, w);
+
+    /// Liveness verdict — computed ONCE here, on the first fetch of this server this round.
+    bool live;
+    const auto seen_it = last_seen_server_seq.find(server_id);
+    if (seen_it == last_seen_server_seq.end())
+    {
+        /// Never seen before: need a second observation before we can judge it dead, so treat as
+        /// LIVE this round and start tracking its seq.
+        live = true;
+        last_seen_server_seq[server_id] = w.seq;
+        server_frozen_rounds[server_id] = 0;
+    }
+    else if (w.seq != seen_it->second)
+    {
+        /// seq advanced since last round => the server renewed => LIVE; reset the frozen counter.
+        live = true;
+        server_frozen_rounds[server_id] = 0;
+        seen_it->second = w.seq;
+    }
+    else
+    {
+        /// seq unchanged => frozen this round. Dead iff frozen for K=2 consecutive rounds.
+        const uint64_t frozen = ++server_frozen_rounds[server_id];
+        live = frozen < 2;
+    }
+    server_live_this_round[server_id] = live;
+
+    return &it->second;
+}
+
+bool Gc::protectedByLiveBuild(const ObjectMeta & meta)
+{
+    /// The owner triple lives under the fixed "cas_owner" metadata key. Absent => unprotected
+    /// (a pre-watermark object, or one written without an owner) — the safe pre-watermark default.
+    const auto owner_it = meta.find("cas_owner");
+    if (owner_it == meta.end())
+        return false;
+
+    /// Parse "<server_hex>:<epoch>:<build_seq>". Anything not EXACTLY this shape => unprotected
+    /// (fail closed to the pre-watermark default — never fabricate a protection).
+    const String & owner = owner_it->second;
+    const auto first_colon = owner.find(':');
+    if (first_colon == String::npos)
+        return false;
+    const auto second_colon = owner.find(':', first_colon + 1);
+    if (second_colon == String::npos)
+        return false;
+    /// A third colon means a malformed (over-long) triple.
+    if (owner.find(':', second_colon + 1) != String::npos)
+        return false;
+
+    const String server_hex = owner.substr(0, first_colon);
+    const std::string_view epoch_str(owner.data() + first_colon + 1, second_colon - first_colon - 1);
+    const std::string_view seq_str(owner.data() + second_colon + 1, owner.size() - second_colon - 1);
+    if (server_hex.size() != 32 || epoch_str.empty() || seq_str.empty())
+        return false;
+
+    UInt128 server;
+    try
+    {
+        server = hexToU128(server_hex);
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    uint64_t owner_epoch = 0;
+    uint64_t owner_seq = 0;
+    {
+        const auto e = std::from_chars(epoch_str.data(), epoch_str.data() + epoch_str.size(), owner_epoch);
+        if (e.ec != std::errc{} || e.ptr != epoch_str.data() + epoch_str.size())
+            return false;
+        const auto s = std::from_chars(seq_str.data(), seq_str.data() + seq_str.size(), owner_seq);
+        if (s.ec != std::errc{} || s.ptr != seq_str.data() + seq_str.size())
+            return false;
+    }
+
+    const ServerWatermark * w = watermarkOf(server);
+    if (!w)
+        return false;
+
+    return server_live_this_round[server]
+        && w->epoch == owner_epoch
+        && owner_seq >= w->min_active
+        && w->min_active != std::numeric_limits<uint64_t>::max();
 }
 
 bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)

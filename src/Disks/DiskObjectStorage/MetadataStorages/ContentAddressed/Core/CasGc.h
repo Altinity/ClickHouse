@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcSnap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <map>
 #include <utility>
 #include <vector>
@@ -97,6 +98,20 @@ public:
     /// {preview} ⊆ {genuinely-unreachable} guarantee therefore holds ONLY at quiescence (no journal
     /// records past the folded cursor); run it then for an exact picture. No CAS/delete on any path.
     std::vector<PreviewEntry> previewDeletes();
+
+    /// B167 per-server build watermark (spec 2026-06-16-ca-build-watermark): start a fresh GC round's
+    /// watermark observation. Clears the PER-ROUND caches (watermark_cache, server_live_this_round);
+    /// the ACROSS-ROUND maps (last_seen_server_seq, server_frozen_rounds) persist — they are the K=2
+    /// frozen-seq crash detector's memory. Call once before the retire observe loop.
+    void beginWatermarkRound();
+
+    /// The condemn guard's co-liveness clause: is `meta`'s owning build still in-flight? Reads the
+    /// owner triple ("cas_owner" = "<server_hex>:<epoch>:<build_seq>") and the owning server's
+    /// watermark (cached per round). Protected IFF the server is live this round, the epoch matches,
+    /// build_seq >= min_active, and the server is not retired. Absent/malformed owner or absent
+    /// watermark => false (unprotected — the pre-watermark default, fail-safe-to-delete is the
+    /// publish gate's job, not this guard's).
+    bool protectedByLiveBuild(const ObjectMeta & meta);
 
     /// full-GC walk + debris reclaim: deferred (M-F); API slot reserved.
     ///
@@ -272,6 +287,12 @@ private:
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
 
+    /// B167: fetch the owning server's watermark for THIS round (cached). On the first fetch of a
+    /// server in a round, this also computes that server's liveness verdict ONCE (frozen-seq K=2)
+    /// and stores it in server_live_this_round. Returns nullptr if the server has no watermark
+    /// object (an unrecognized owner — unprotected).
+    const ServerWatermark * watermarkOf(UInt128 server_id);
+
     StorePtr store;
     UInt128 gc_id{};              /// this leader's identity (random u128, never 0)
 
@@ -283,6 +304,13 @@ private:
     /// ADVANCING heartbeat means the incumbent is alive mid-round, so do not steal).
     UInt128 last_seen_hb_owner{};
     uint64_t last_seen_hb_seq = 0;
+
+    /// B167 per-server build watermark caches. The PER-ROUND maps are cleared by beginWatermarkRound;
+    /// the ACROSS-ROUND maps persist (the K=2 frozen-seq crash detector's memory).
+    std::map<UInt128, ServerWatermark> watermark_cache;   /// per-round: server_id -> its watermark
+    std::map<UInt128, bool> server_live_this_round;       /// per-round: liveness verdict, computed once
+    std::map<UInt128, uint64_t> last_seen_server_seq;     /// across rounds: last seq observed per server
+    std::map<UInt128, uint64_t> server_frozen_rounds;     /// across rounds: consecutive rounds seq unchanged
 
     /// Pillar A1 resident-snap read-cache. The Gc instance is long-lived (one per scheduler thread,
     /// CasGcScheduler::loop), so this survives across rounds. A snap generation is write-once

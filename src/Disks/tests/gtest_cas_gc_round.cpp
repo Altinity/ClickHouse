@@ -3,7 +3,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Disks/tests/cas_test_helpers.h>
+
+#include <limits>
 
 #include <map>
 #include <mutex>
@@ -1856,4 +1859,35 @@ TEST(CasGcFold, NoChurnRoundReusesResidentSnapNoGet)
     b->resetCounts();
     EXPECT_TRUE(gc.runRegularRound().acquired_lease);   /// round 2: no churn — reuse resident snap
     EXPECT_EQ(b->getCount(s->layout().gcSnapKey(st1.snap_generation, 0)), 0u);   /// snap NOT re-GET
+}
+
+/// ---- B167 per-server build watermark guard (Task 9) ----
+///
+/// protectedByLiveBuild reads the candidate's owner triple ("cas_owner" =
+/// "<server_hex>:<epoch>:<build_seq>") and the owning server's watermark {epoch, min_active, seq},
+/// protecting the object IFF the server is live this round, the epoch matches, build_seq >=
+/// min_active, and the server is not retired.
+
+TEST(CasGcWatermark, ParsesOwnerAndProtectsLiveBuild)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// The Store anchors its OWN server (0x01) watermark on open; we drive a DIFFERENT server (AB)
+    /// directly so its watermark key is fresh and putIfAbsent below succeeds.
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "pool", .server_id = DB::UInt128(0x01)});
+    Gc gc(store, DB::UInt128(7));
+
+    /// server AB, epoch 9, min_active 5, seq 1.
+    ASSERT_EQ(backend->putIfAbsent(
+                  store->layout().serverWatermarkKey(u128ToHex(DB::UInt128(0xAB))),
+                  encodeServerWatermark({DB::UInt128(0xAB), 9, 5, 1})),
+              PutOutcome::Done);
+
+    const ObjectMeta live{{"cas_owner", u128ToHex(DB::UInt128(0xAB)) + ":9:7"}};   /// seq 7 >= 5 -> protected
+    const ObjectMeta done{{"cas_owner", u128ToHex(DB::UInt128(0xAB)) + ":9:3"}};   /// seq 3 < 5 -> unprotected
+    const ObjectMeta stale{{"cas_owner", u128ToHex(DB::UInt128(0xAB)) + ":1:7"}};  /// wrong epoch -> unprotected
+
+    gc.beginWatermarkRound();
+    ASSERT_TRUE(gc.protectedByLiveBuild(live));     /// first-seen server -> live; 7 >= 5; epoch matches
+    ASSERT_FALSE(gc.protectedByLiveBuild(done));
+    ASSERT_FALSE(gc.protectedByLiveBuild(stale));
 }
