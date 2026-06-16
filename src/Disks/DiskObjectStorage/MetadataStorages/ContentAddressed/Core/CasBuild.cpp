@@ -294,6 +294,12 @@ void Build::resurrect(ObjectKind kind, const UInt128 & hash, const String & key)
     /// W-FRESH-TAG on resurrect: a fresh incarnation_tag forces a distinct body so the condemned
     /// incarnation can never be re-derived; everything else (header_len, provenance, ...) is preserved.
     header.incarnation_tag = mintU128();
+    /// B167 Part A: re-stamp the CURRENT build's build_id (resurrect decoded the OLD owner's header, so
+    /// header.build_id is the prior — likely dead — build). The re-uploaded incarnation must be OWNED by
+    /// THIS live build so the incremental-GC heartbeat guard (Part B) refuses to re-condemn it in the
+    /// upload->publish span. Without this it would carry a stale build_id and get no protection — the
+    /// B167 livelock. putBlob/putTree/recreateTree already stamp build_id; this was the lone gap.
+    header.build_id = build_id;
     header.pad_to_header_len = header.header_len;   /// preserve the exact header length on re-encode
     const String new_head = encodeEnvelopeHeader(header);
     const String body = new_head + got->bytes.substr(header.header_len);
