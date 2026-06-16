@@ -101,6 +101,16 @@ bool Client::RetryStrategy::ShouldRetry(const Aws::Client::AWSError<Aws::Client:
     if (error.GetResponseCode() == Aws::Http::HttpResponseCode::MOVED_PERMANENTLY)
         return false;
 
+    /// A 412 Precondition Failed is the DETERMINISTIC result of a conditional request (If-Match /
+    /// If-None-Match — used by the content-addressed MergeTree backend for CAS and dedup writes).
+    /// Retrying never changes it: the precondition is re-evaluated server-side and the caller is the
+    /// one that must inspect the 412 and decide (re-validate / treat as a dedup hit). Some
+    /// S3-compatible servers (e.g. RustFS) return a non-AWS error body, so the SDK cannot parse the
+    /// ExceptionName and classifies the 412 as a retryable UNKNOWN error — producing a retry storm
+    /// that stalls the write path and, downstream, SYSTEM SYNC REPLICA (B166). Return it immediately.
+    if (error.GetResponseCode() == Aws::Http::HttpResponseCode::PRECONDITION_FAILED)
+        return false;
+
     if (attemptedRetries >= config.max_retries)
         return false;
 

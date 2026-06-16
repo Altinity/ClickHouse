@@ -20,6 +20,7 @@
 #include <aws/core/client/AWSError.h>
 #include <aws/core/client/CoreErrors.h>
 #include <aws/core/client/RetryStrategy.h>
+#include <aws/core/http/HttpResponse.h>
 #include <aws/core/http/URI.h>
 
 #include <Common/RemoteHostFilter.h>
@@ -195,6 +196,24 @@ static void testServerSideEncryption(
     do_request(client, uri);
     String content = getSSEAndSignedHeaders(http.getLastRequestHeader());
     EXPECT_EQ(content, expected_headers);
+}
+
+TEST(IOTestAwsS3Client, DoesNotRetryPreconditionFailed)
+{
+    /// B166: a 412 Precondition Failed (conditional CAS/dedup writes of the content-addressed
+    /// backend) must NOT be retried, even when the SDK marks it retryable because an S3-compatible
+    /// server (e.g. RustFS) returned a body whose ExceptionName it could not parse. Retrying it is a
+    /// storm that stalls the write path.
+    DB::S3::Client::RetryStrategy strategy(DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = 10});
+
+    Aws::Client::AWSError<Aws::Client::CoreErrors> precondition(Aws::Client::CoreErrors::UNKNOWN, /*isRetryable=*/true);
+    precondition.SetResponseCode(Aws::Http::HttpResponseCode::PRECONDITION_FAILED);
+    EXPECT_FALSE(strategy.ShouldRetry(precondition, /*attemptedRetries=*/0));
+
+    /// A genuinely transient error is still retried (the guard is specific to 412).
+    Aws::Client::AWSError<Aws::Client::CoreErrors> unavailable(Aws::Client::CoreErrors::SLOW_DOWN, /*isRetryable=*/true);
+    unavailable.SetResponseCode(Aws::Http::HttpResponseCode::SERVICE_UNAVAILABLE);
+    EXPECT_TRUE(strategy.ShouldRetry(unavailable, /*attemptedRetries=*/0));
 }
 
 TEST(IOTestAwsS3Client, AppendExtraSSECHeadersRead)
