@@ -209,6 +209,12 @@ public:
         return shardedKey("builds", build_id);
     }
 
+    /// Per-server build watermark key.
+    String serverWatermarkKey(const String & server_id_hex) const
+    {
+        return shardedKey("servers", server_id_hex);
+    }
+
     /// Pool-level metadata object.
     String poolMetaKey() const
     {
