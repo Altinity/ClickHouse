@@ -38,6 +38,7 @@
 #include <Core/BackgroundSchedulePool.h>
 #include <Common/EventNotifier.h>
 #include <Common/ProfileEventsScope.h>
+#include <Common/SharedMutex.h>
 #include <Common/Throttler.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperRetries.h>
@@ -525,7 +526,13 @@ private:
 
     Coordination::WatchCallbackPtr export_merge_tree_partition_watch_callback;
 
-    std::mutex export_merge_tree_partition_mutex;
+    /// Read-write lock guarding the in-memory mirror of export tasks
+    /// (export_merge_tree_partition_task_entries*). Readers (system.replicated_partition_exports
+    /// via getPartitionExportsInfo) take it shared; the background poll/scheduler/status tasks and
+    /// KILL EXPORT PARTITION take it exclusively, but only for brief in-memory mutations - never
+    /// across ZooKeeper round-trips. Acquire via ExportPartitionUtils::lockShared / lockExclusive
+    /// so contention is reflected in the ExportPartitionLock* metrics.
+    mutable SharedMutex export_merge_tree_partition_mutex;
 
     BackgroundSchedulePoolTaskHolder export_merge_tree_partition_select_task;
 

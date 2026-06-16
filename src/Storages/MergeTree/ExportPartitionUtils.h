@@ -3,8 +3,11 @@
 #include <filesystem>
 #include <vector>
 #include <string>
+#include <mutex>
+#include <shared_mutex>
 #include <Core/Field.h>
 #include <Common/Logger.h>
+#include <Common/SharedMutex.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include "Storages/IStorage.h"
 #include <config.h>
@@ -22,6 +25,15 @@ struct ExportReplicatedMergeTreePartitionManifest;
 
 namespace ExportPartitionUtils
 {
+    /// Instrumented acquisition of the storage-wide export partition state lock.
+    /// `lockShared` is for readers (e.g. system.replicated_partition_exports); `lockExclusive`
+    /// is for the brief in-memory mutations performed by the background tasks and KILL EXPORT
+    /// PARTITION. Both record wait time and waiting-thread counts via the ExportPartitionLock*
+    /// metrics. The lock MUST NOT be held across ZooKeeper round-trips - gather ZK data first,
+    /// then take the lock only to apply the result.
+    std::shared_lock<SharedMutex> lockShared(SharedMutex & mutex);
+    std::unique_lock<SharedMutex> lockExclusive(SharedMutex & mutex);
+
     std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
 
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest);

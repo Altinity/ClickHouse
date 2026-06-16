@@ -77,7 +77,7 @@ void ExportPartitionTaskScheduler::run()
     const uint32_t seed = uint32_t(std::hash<std::string>{}(storage.replica_name)) ^ uint32_t(scheduled_exports_count);
     pcg64_fast rng(seed);
 
-    std::lock_guard lock(storage.export_merge_tree_partition_mutex);
+    auto lock = ExportPartitionUtils::lockExclusive(storage.export_merge_tree_partition_mutex);
 
     auto zk = storage.getZooKeeper();
 

@@ -310,7 +310,7 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
     std::vector<EntrySnapshot> snapshots;
 
     {
-        std::lock_guard lock(storage.export_merge_tree_partition_mutex);
+        auto lock = ExportPartitionUtils::lockShared(storage.export_merge_tree_partition_mutex);
 
         snapshots.reserve(storage.export_merge_tree_partition_task_entries_by_key.size());
         for (const auto & entry : storage.export_merge_tree_partition_task_entries_by_key)
@@ -379,7 +379,11 @@ void ExportPartitionManifestUpdatingTask::poll()
     }
 
     {
-        std::lock_guard lock(storage.export_merge_tree_partition_mutex);
+        /// Writer critical section. With the read-write lock this is the exclusive side; the
+        /// expensive Iceberg/REST-catalog commits are still performed below, AFTER the lock is
+        /// released (see deferred_commits), so the shared-lock reader of
+        /// system.replicated_partition_exports is not held up by catalog round-trips.
+        auto lock = ExportPartitionUtils::lockExclusive(storage.export_merge_tree_partition_mutex);
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), storage.export_merge_tree_partition_task_entries_by_key.size());
 
@@ -644,7 +648,10 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 
     try
     {
-        std::lock_guard task_entries_lock(storage.export_merge_tree_partition_mutex);
+        /// Writer critical section (exclusive side of the read-write lock). No catalog I/O is done
+        /// here, only ZooKeeper status reads and in-memory updates, so the shared-lock reader of
+        /// system.replicated_partition_exports is not blocked by slow catalog commits.
+        auto task_entries_lock = ExportPartitionUtils::lockExclusive(storage.export_merge_tree_partition_mutex);
         auto zk = storage.getZooKeeper();
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", local_status_changes.size());

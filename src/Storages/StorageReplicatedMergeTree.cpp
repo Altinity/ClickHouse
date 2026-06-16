@@ -6131,7 +6131,7 @@ void StorageReplicatedMergeTree::shutdown(bool)
     }
 
     {
-        std::lock_guard lock(export_merge_tree_partition_mutex);
+        auto lock = ExportPartitionUtils::lockExclusive(export_merge_tree_partition_mutex);
         export_merge_tree_partition_task_entries.clear();
     }
 
@@ -10130,7 +10130,7 @@ CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & 
         return CancellationCode::CancelSent;
     };
 
-    std::lock_guard lock(export_merge_tree_partition_mutex);
+    auto lock = ExportPartitionUtils::lockExclusive(export_merge_tree_partition_mutex);
 
     const auto zk = getZooKeeper();
 
