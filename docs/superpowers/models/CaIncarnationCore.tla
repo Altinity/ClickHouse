@@ -558,6 +558,20 @@ ApplyPendCascade(t) ==
                     wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut,
                     fgRefs, fgSeen, reg, wEv >>
 
+\* P9 (2026-06-17): GC removes an absent, zero-in-degree, journal-known node from `everEdged`.
+\* Models BOTH implementation prune sites as one abstract operation — the cascade's delete-time
+\* prune and the retire observe loop's HEAD-404 prune both do exactly this. Always enabled when the
+\* node is gone: a single unconditional action is the STRONGEST verification (the prune may lag the
+\* delete arbitrarily; atomic-at-delete is a special case). everEdged is re-added only by GFold when
+\* a future journal Add re-references the hash (resurrection), exactly as in the implementation.
+GForget(h) ==
+    /\ ~present[h] /\ h \in everEdged /\ InDeg(h) = 0
+    /\ everEdged' = everEdged \ {h}
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, man, retired, inflight, gcRound, gcPhase,
+                    roundOf, fencedSet, fencePos, cursor, trimBase, rootEdges, treeEdges, marker,
+                    pendCasc, wDeps, wView, creator, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut,
+                    fgRefs, fgSeen, reg, wEv >>
+
 \* Journal trim: INV_JOURNAL_COVERAGE — only below the durable folded cursor.
 Trim(s) ==
     /\ trimBase[s] < cursor[s]
@@ -680,6 +694,7 @@ Next ==
     \/ \E t \in TreeHashes : ApplyPendCascade(t)
     \/ \E w \in Writers : WHbStart(w) \/ WHbRenew(w) \/ Wedge(w) \/ WCrash(w) \/ GObserveHb(w)
     \/ \E l \in Leaders, h \in Hashes : GDebrisRetire(l, h)
+    \/ \E h \in Hashes : GForget(h)
     \/ \E s \in Shards : FGRead(s)
     \/ FGCommit
 

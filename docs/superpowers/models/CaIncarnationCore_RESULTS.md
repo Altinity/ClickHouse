@@ -385,3 +385,41 @@ main model), no trees/debris/evidence, logical pre-compaction manifest (`RefsFro
 trimming covered by `INV_JOURNAL_COVERAGE` in the TLC model), uniform journal record encoding
 (the main model's heterogeneous `AddRec ∪ FenceRec` is a uniform `{op: Str, hs: Set(HASH)}` in
 the proof core).
+
+## P9 (2026-06-17): `GForget` — prune absent zero-in-degree nodes from `everEdged` {#p9-gforget}
+
+To eliminate the regular-GC `retire` 404-HEAD storm, the implementation removes a deleted node from
+the in-degree snapshot's `known` set (the model's `everEdged`). The model gains one action,
+`GForget(h)`, enabled when `~present[h] /\ h \in everEdged /\ InDeg(h)=0`, with effect
+`everEdged' = everEdged \ {h}`. It is added to `Next` unconditionally — a single always-enabled
+action conservatively covers BOTH implementation prune sites (the cascade's delete-time prune and
+the retire observe loop's HEAD-404 prune): if the invariants hold when the prune may lag the delete
+arbitrarily, they hold when it fires atomically at the delete.
+
+**Frame argument (why safety is preserved by construction).** `GForget` modifies ONLY `everEdged`.
+None of the safety invariants reference `everEdged`: `INV_NO_DANGLE` (refs⊆present), `INV_NO_LOSS`
+(reachable⊆present), `INV_NO_RETURN` (present⇒tok∉deadTok), `INV_JOURNAL_COVERAGE`
+(trimBase≤cursor), `MonotoneGC`, `MonotoneRegistry`, `TypeOK`. So `GForget` preserves every safety
+invariant independent of scope. The only property reading `everEdged` is the liveness `NoLeakForever`.
+
+**Results.**
+
+| run | cfg | property set | states | time | result |
+|---|---|---|---|---|---|
+| safety, no trees, 1 hash | `stage2` | TypeOK + 3 INV + MonotoneGC | 206,696 | 3s | **no error** |
+| safety, no trees, 2 hashes | `stage1` | TypeOK + 3 INV + MonotoneGC | 44,879,094 | 2m17s | **no error** |
+| safety, trees, 4 hashes | `stage3` | TypeOK + 3 INV + MonotoneGC | 65,564,923 | 4m27s | **no error** |
+| liveness | `stage2_live` | `NoLeakForever` | 81,555 | 3s | bound-artifact lasso (SEE NOTE) |
+| sabotage sanity | `sab_unconddelete` | INV set | 33,208 | 1s | **still violates `INV_NO_DANGLE`** (not masked) |
+
+**Liveness note (no regression).** `stage2_live` reports the SAME `MaxRound=2` bound-artifact lasso
+documented above (a permanently-unreachable candidate not reclaimed within the round budget). It is
+NOT introduced by `GForget`: running `stage2_live` against the model with `GForget` removed produces
+the identical counterexample (768,100 states, exit 13) — the `GForget` step does not even appear in
+the trace. The pre-existing round-cap interpretation stands unchanged.
+
+**`stage4`/`stage6` not re-run exhaustively.** Adding an always-enabled `GForget` after every delete
+multiplies interleavings; `stage4` (2 shards + debris) did not converge in practical time. Given the
+frame argument (no safety invariant reads `everEdged`), the safety verdict is independent of the
+larger scope, and `stage1`/`stage2`/`stage3` exhaustively confirm it across the no-tree and tree
+shapes. The `GForget` delta is, by inspection, scope-independent for safety.
