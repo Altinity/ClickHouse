@@ -629,7 +629,20 @@ void mutate(
             }
         }
 
-        const auto sample_block = std::make_shared<const Block>(storage_metadata->getSampleBlock());
+        TableStateSnapshot current_iceberg_snapshot;
+        current_iceberg_snapshot.metadata_file_path = metadata_path;
+        current_iceberg_snapshot.metadata_version = last_version;
+        current_iceberg_snapshot.schema_id = static_cast<Int32>(current_schema_id);
+        if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
+        {
+            Int64 snapshot_id_val = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
+            if (snapshot_id_val >= 0)
+                current_iceberg_snapshot.snapshot_id = snapshot_id_val;
+        }
+        auto fresh_storage_metadata = std::make_shared<StorageInMemoryMetadata>(*storage_metadata);
+        fresh_storage_metadata->setDataLakeTableState(DataLakeTableStateSnapshot{current_iceberg_snapshot});
+
+        const auto sample_block = std::make_shared<const Block>(fresh_storage_metadata->getSampleBlock());
         std::optional<ChunkPartitioner> chunk_partitioner;
         if (partititon_spec->has(Iceberg::f_fields) && partititon_spec->getArray(Iceberg::f_fields)->size() > 0)
             chunk_partitioner = ChunkPartitioner(partititon_spec->getArray(Iceberg::f_fields), current_schema, context, sample_block);
