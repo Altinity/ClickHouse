@@ -246,7 +246,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         const uint64_t root_shards = config.getUInt64(config_prefix + ".content_addressed_root_shards", 8);
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path,
-            global_context, gc_enabled, gc_interval, root_shards);
+            global_context, gc_enabled, gc_interval, root_shards, name);
 
         return metadata_storage;
     });

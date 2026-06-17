@@ -131,11 +131,13 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     ContextPtr context_,
     bool gc_enabled_,
     std::chrono::seconds gc_interval_,
-    uint64_t root_shards_)
+    uint64_t root_shards_,
+    String disk_name_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
     , server_id(std::move(server_id_))
+    , disk_name(!disk_name_.empty() ? disk_name_ : storage_path_prefix)
     , local_scratch_path(std::move(local_scratch_path_))
     , context(context_)
     , gc_enabled(gc_enabled_)
@@ -154,7 +156,7 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     if (!gc_scheduler)
         gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
             store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-            storage_path_prefix, makeGcRoundLogger());
+            disk_name, makeGcRoundLogger());
     gc_scheduler->runOneRoundNow();
 }
 
@@ -164,10 +166,9 @@ ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogg
     if (!context)
         return {};
     auto ctx = context;
-    /// No configured-disk-name field exists on this storage; storage_path_prefix is the closest
-    /// stable identifier (the disk's object-storage key prefix). The SYSTEM command targets disks
-    /// by their configured name, but the table's disk_name column carries this prefix.
-    const String disk = storage_path_prefix;
+    /// The configured disk name (threaded from the metadata-storage factory); falls back to
+    /// storage_path_prefix for callers that don't supply one (e.g. unit tests).
+    const String disk = disk_name;
     return [ctx, disk](const ContentAddressed::GcRoundLogRecord & r)
     {
         auto log = ctx->getContentAddressedGarbageCollectionLog();
@@ -222,7 +223,7 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
     if (!gc_scheduler)
         gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
             store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-            storage_path_prefix, makeGcRoundLogger());
+            disk_name, makeGcRoundLogger());
     return gc_scheduler->runOneRoundNow(ContentAddressed::GcRoundLogRecord::Trigger::Manual);
 }
 
@@ -305,7 +306,7 @@ void ContentAddressedMetadataStorage::startup()
     {
         gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
             cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-            storage_path_prefix, makeGcRoundLogger());
+            disk_name, makeGcRoundLogger());
         gc_scheduler->start();
     }
 }

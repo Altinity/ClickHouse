@@ -46,7 +46,8 @@ public:
         ContextPtr context_ = nullptr,
         bool gc_enabled_ = true,
         std::chrono::seconds gc_interval_ = std::chrono::seconds(60),
-        uint64_t root_shards_ = 8);
+        uint64_t root_shards_ = 8,
+        String disk_name_ = {});
 
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
@@ -151,6 +152,7 @@ private:
     const std::string storage_path_prefix;
     const std::string storage_path_full;
     const std::string server_id;
+    const std::string disk_name;
     const std::string local_scratch_path;
     const ContextPtr context;
 
