@@ -29,6 +29,9 @@
 - name: 03441_deltalake_clickhouse_virtual_columns
   reason: INVESTIGATE - S3 sometimes unreachable
   message: 'Error interacting with object store: Generic S3 error: Error performing GET'
+- name: 00157_cache_dictionary
+  reason: 'KNOWN: Timeout on slow Altinity runners (passes upstream)'
+  message: 'DB::Exception: Timeout exceeded' 
 - name: 00167_read_bytes_from_fs
   reason: INVESTIGATE - Memory limit exceeded
   message: 'DB::Exception: (total) memory limit exceeded:'
@@ -149,6 +152,12 @@
   - tsan
   - asan
 - name: test_scheduler_cpu_preemptive/test.py::test_cpu_time_fairness[fixed_longer_prd]
+  reason: INVESTIGATE - Unstable on tsan, msan
+  message: 'Failed: Timeout (>900.0s)'
+  check_types:
+  - tsan
+  - msan
+- name: test_scheduler_cpu_preemptive/test.py::test_cpu_time_fairness[random_longer_prd]
   reason: INVESTIGATE - Unstable on tsan, msan
   message: 'Failed: Timeout (>900.0s)'
   check_types:
