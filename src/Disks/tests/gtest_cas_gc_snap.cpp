@@ -68,6 +68,55 @@ TEST(CasGcSnap, ZeroInDegreeKnownEnumerator)
     EXPECT_EQ(zs2[0].hash, T);
 }
 
+TEST(CasGcSnap, ForgetRemovesNodeFromKnown)
+{
+    /// P9: a deleted node's `known` membership is removed so the retire scan stops re-deriving it.
+    GcSnap snap;
+    const UInt128 T = hexToU128("aa00000000000000000000000000000a");
+    const UInt128 B = hexToU128("bb00000000000000000000000000000b");
+    snap.addRootEdge("s/0", "p1", T);
+    snap.markExpanded(T);
+    snap.addTreeEdge(T, ObjectKind::Blob, B);
+
+    /// Drop the root edge: T -> in-degree 0, still known => a zero-in-degree candidate.
+    snap.removeRootEdge("s/0", "p1");
+    ASSERT_TRUE(snap.isKnown(ObjectKind::Tree, T));
+    {
+        bool tree_is_candidate = false;
+        for (const auto & c : snap.zeroInDegreeKnown())
+            if (c.kind == ObjectKind::Tree && c.hash == T)
+                tree_is_candidate = true;
+        ASSERT_TRUE(tree_is_candidate);
+    }
+
+    /// Forget it: gone from `known` and from the candidate set; idempotent.
+    snap.forget(ObjectKind::Tree, T);
+    EXPECT_FALSE(snap.isKnown(ObjectKind::Tree, T));
+    for (const auto & c : snap.zeroInDegreeKnown())
+        EXPECT_FALSE(c.kind == ObjectKind::Tree && c.hash == T);
+    snap.forget(ObjectKind::Tree, T);   /// no-op, must not throw
+
+    /// A later edge re-references the hash => re-added to `known` (the resurrection path).
+    snap.addRootEdge("s/0", "p1", T);
+    EXPECT_TRUE(snap.isKnown(ObjectKind::Tree, T));
+}
+
+TEST(CasGcSnap, ForgetSurvivesEncodeDecode)
+{
+    /// P9: the prune is durable — a forgotten node stays forgotten through the snap codec.
+    GcSnap snap;
+    const UInt128 A = hexToU128("aa00000000000000000000000000000a");
+    const UInt128 C = hexToU128("cc00000000000000000000000000000c");
+    snap.addRootEdge("s/0", "p1", A);
+    snap.addRootEdge("s/0", "p2", C);
+    snap.removeRootEdge("s/0", "p1");   /// A -> in-degree 0, known
+    snap.forget(ObjectKind::Tree, A);
+
+    const GcSnap round = decodeGcSnap(encodeGcSnap(snap));
+    EXPECT_FALSE(round.isKnown(ObjectKind::Tree, A));
+    EXPECT_TRUE(round.isKnown(ObjectKind::Tree, C));
+}
+
 TEST(CasGcSnap, StripTreeReturnsNewlyZeroChildren)
 {
     GcSnap snap;

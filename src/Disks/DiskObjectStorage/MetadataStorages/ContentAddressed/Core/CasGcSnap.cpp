@@ -219,6 +219,13 @@ std::vector<Candidate> GcSnap::stripTree(const UInt128 & parent_tree)
     return result;
 }
 
+void GcSnap::forget(ObjectKind kind, const UInt128 & hash)
+{
+    /// indeg holds only nonzero counts; a zero-in-degree node has no indeg entry, so erasing from
+    /// `known` is sufficient. Erasing a key not present is a no-op (idempotent).
+    known.erase(NodeKey{static_cast<uint8_t>(kind), hash});
+}
+
 void GcSnap::markExpanded(const UInt128 & tree)
 {
     expanded.insert(tree);

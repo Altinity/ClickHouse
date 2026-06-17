@@ -65,6 +65,13 @@ public:
     /// returns the children whose in-degree transitioned to 0. Idempotent.
     std::vector<Candidate> stripTree(const UInt128 & parent_tree);
 
+    /// Remove a node from `known` (the inverse of addEdge's known.insert). Set semantics: forgetting
+    /// a node not in `known` is a no-op (idempotent crash-replay). Edges/markers are untouched — a
+    /// node is only forgotten when its in-degree is already 0, so it has no incoming edge; a later
+    /// folded Add re-inserts it via addEdge. P9: keeps `known` from growing past live nodes so the
+    /// retire observe loop stops re-HEAD-404ing already-deleted candidates (model action GForget).
+    void forget(ObjectKind kind, const UInt128 & hash);
+
     void markExpanded(const UInt128 & tree);
     bool isExpanded(const UInt128 & tree) const;
 
