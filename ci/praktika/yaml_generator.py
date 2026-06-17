@@ -106,6 +106,7 @@ on:
     inputs:{DISPATCH_INPUTS}
 
 env:
+  # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
 {ENV_CHECKOUT_REFERENCE}
 {ENV_SECRETS}
@@ -119,8 +120,8 @@ jobs:
       {NAME}:
         description: {DESCRIPTION}
         required: {IS_REQUIRED}
-        default: {DEFAULT_VALUE}
-        type: {INPUT_TYPE}\
+        type: {INPUT_TYPE}
+        default: {DEFAULT_VALUE}\
 """
 
         TEMPLATE_OPTIONS_INPUT = """

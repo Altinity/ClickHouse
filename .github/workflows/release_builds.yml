@@ -6,6 +6,7 @@ on:
     inputs:
 
 env:
+  # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
   GH_TOKEN: ${{ github.token }}
   CHECKOUT_REF: ""

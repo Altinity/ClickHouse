@@ -7,10 +7,11 @@ on:
       no_cache:
         description: Run without cache
         required: false
-        default: false
         type: boolean
+        default: false
 
 env:
+  # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
   GH_TOKEN: ${{ github.token }}
   CHECKOUT_REF: ""

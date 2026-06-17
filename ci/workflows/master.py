@@ -26,8 +26,8 @@ workflow = Workflow.Config(
             name="no_cache",
             description="Run without cache",
             is_required=False,
-            default_value="false",
             input_type="boolean",
+            default_value="false",
         ),
     ],
     jobs=[
