@@ -171,6 +171,7 @@ namespace ErrorCodes
     extern const int ACCESS_DENIED;
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
+    extern const int NOT_IMPLEMENTED;
     extern const int CANNOT_KILL;
     extern const int TIMEOUT_EXCEEDED;
     extern const int TABLE_WAS_NOT_DROPPED;
@@ -2163,30 +2164,44 @@ void InterpreterSystemQuery::syncMerges()
 
 void InterpreterSystemQuery::runContentAddressedGarbageCollection(const String & disk_name)
 {
-    auto run_on = [&](const String & name, const DiskPtr & disk)
+    /// A disk's metadata storage is content-addressed iff getMetadataStorage() yields a CA storage.
+    /// Plain (non-object-storage) disks like the local `default` do not implement getMetadataStorage
+    /// at all - it throws NOT_IMPLEMENTED. For our purposes that simply means "not content-addressed":
+    /// the named path turns it into a clear BAD_ARGUMENTS, the enumeration path skips it.
+    auto content_addressed_storage_of = [](const DiskPtr & disk) -> ContentAddressedMetadataStorage *
     {
-        auto md = disk->getMetadataStorage();
+        MetadataStoragePtr md;
+        try
+        {
+            md = disk->getMetadataStorage();
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::NOT_IMPLEMENTED)
+                return nullptr;
+            throw;
+        }
         if (!md || !md->isContentAddressed())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", name);
-        auto * ca = dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
-        if (!ca)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Disk '{}' reports content-addressed but is not a ContentAddressedMetadataStorage", name);
-        ca->runGarbageCollectionRoundNow();   /// synchronous, one round
+            return nullptr;
+        return dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
     };
 
     if (!disk_name.empty())
     {
-        run_on(disk_name, getContext()->getDisk(disk_name));
+        auto disk = getContext()->getDisk(disk_name);
+        auto * ca = content_addressed_storage_of(disk);
+        if (!ca)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
+        ca->runGarbageCollectionRoundNow();   /// synchronous, one round
         return;
     }
 
     size_t ran = 0;
     for (const auto & [name, disk] : getContext()->getDisksMap())
     {
-        auto md = disk->getMetadataStorage();
-        if (md && md->isContentAddressed())
+        if (auto * ca = content_addressed_storage_of(disk))
         {
-            run_on(name, disk);
+            ca->runGarbageCollectionRoundNow();   /// synchronous, one round
             ++ran;
         }
     }
