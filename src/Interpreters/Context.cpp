@@ -6089,6 +6089,14 @@ std::shared_ptr<PartLog> Context::getPartLog() const
     return shared->system_logs->part_log;
 }
 
+std::shared_ptr<ContentAddressedGarbageCollectionLog> Context::getContentAddressedGarbageCollectionLog() const
+{
+    SharedLockGuard lock(shared->mutex);
+    if (!shared->system_logs)
+        return {};
+    return shared->system_logs->content_addressed_garbage_collection_log;
+}
+
 std::shared_ptr<BackgroundSchedulePoolLog> Context::getBackgroundSchedulePoolLog() const
 {
     SharedLockGuard lock(shared->mutex);
