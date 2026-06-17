@@ -12,6 +12,7 @@
 namespace DB::ErrorCodes
 {
 extern const int FILE_DOESNT_EXIST;
+extern const int ABORTED;
 }
 
 /// B140 regression: the incremental GC leaks the child blobs of a tree that is DISPLACED (its ref
@@ -151,4 +152,96 @@ TEST(CasGcLeak, DisplacedUnexpandedTreeBlobsLeak)
         << " GC rounds reached a fixpoint (reachable=" << after.reachable
         << ", unreachable=" << after.unreachable << "); the fold's displaced_later skip "
         << "(CasGc.cpp :771-773) never recorded treeA's blob edges into the snap";
+}
+
+/// REUSE-vs-GC race (2026-06-17 soak investigation): models the user's hypothesis — "reuse of an
+/// object that is being deleted". A build ADOPTS a committed blob B's token (B present, not yet
+/// condemned), the committed ref pinning B is DROPPED, GC retires+deletes B AND COMPLETES the round
+/// (dropping B's retired set), and only THEN does the build publish a manifest naming B.
+///
+/// The publish gate (Build::publish) refreshes the retire-view + revalidateDeps (which re-HEADs and
+/// throws on a deleted dep) ONLY when `retireView().round() < max(shard.fence_round, registry_fence)`.
+/// GC's R3 fences every shard every round, so the shard fence_round keeps advancing past the build's
+/// adopt-time view — which SHOULD force the refresh+re-HEAD and catch the deletion (ABORTED→retry).
+/// This test asserts that protection holds end-to-end for the local single-namespace path:
+/// `dangling==0`. If it FAILS, the local gate has the gap the soak hit; if it PASSES, the local path
+/// is safe and the soak's dangling lives elsewhere (cross-node replication fetch-relink reuse).
+TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+    const String B = "shared-blob-payload";
+    const String U = "build2-unique-blob";
+
+    /// build1: commit part_1 -> T1 -> blob B.
+    {
+        auto build1 = s->startBuild({});
+        build1->putBlob(idOf(B), BlobSource::fromString(B));
+        TreeEntry e;
+        e.name = "data.bin";
+        e.placement = Placement::Blob;
+        e.file_hash = u128Of(B);
+        e.file_size = B.size();
+        const TreeId t1 = build1->putTree({e});
+        build1->publish(ns, "part_1", t1, {});
+    }
+
+    /// build2: REUSE B from the committed source (no body), adopting B's token while B is present and
+    /// not condemned. build2 also uploads its OWN unique blob U so its tree is distinct and U is
+    /// build2-owned (heartbeat-protected) — only B is at risk of being collected.
+    auto build2 = s->startBuild({});
+    build2->reuseBlob(idOf(B), /*body_recreatable=*/false);
+    build2->putBlob(idOf(U), BlobSource::fromString(U));
+    TreeEntry eb;
+    eb.name = "data.bin";
+    eb.placement = Placement::Blob;
+    eb.file_hash = u128Of(B);
+    eb.file_size = B.size();
+    TreeEntry eu;
+    eu.name = "uniq.bin";
+    eu.placement = Placement::Blob;
+    eu.file_hash = u128Of(U);
+    eu.file_size = U.size();
+    const TreeId tree2 = build2->putTree({eb, eu});
+
+    /// Drop the committed pin on B and advance the watermark so B (owned by the finished build1) is
+    /// not spared. build2 has NOT published, so B is unreferenced in the journal GC folds.
+    s->dropRef(ns, "part_1");
+    s->renewWatermarkOnce();
+
+    /// GC reclaims T1 and B to a fixpoint, completing the rounds (dropping their retired sets).
+    Gc gc(s, u128Of("gc-reuse-race"));
+    runGcToFixpoint(gc);
+    ASSERT_FALSE(b->head(s->layout().blobKey(BlobId{u128ToHex(u128Of(B))})).exists)
+        << "GC must have deleted the now-unreferenced reused blob B";
+
+    /// build2 publishes part_2 -> tree2 -> {B, U}. The gate must NOT commit a ref to the deleted B.
+    /// publish may throw a retryable ABORTED if the gate re-observes the loss — that is CORRECT
+    /// (no dangle); only a SILENT commit of a dangling ref is the bug. Drive any retry to convergence.
+    bool published = false;
+    for (int attempt = 0; attempt < 8 && !published; ++attempt)
+    {
+        try
+        {
+            build2->publish(ns, "part_2", tree2, {});
+            published = true;
+        }
+        catch (const DB::Exception & e)
+        {
+            /// ABORTED = the gate re-observed the lost dep and asked us to retry (re-upload B's body).
+            /// reuseBlob has no body, so a real fix would re-derive it; here we just confirm the gate
+            /// did NOT silently dangle. A non-ABORTED throw is unexpected — rethrow.
+            if (e.code() != DB::ErrorCodes::ABORTED)
+                throw;
+            break;   /// fail-closed (no dangle) is the safe outcome; stop.
+        }
+    }
+
+    /// THE ASSERTION: no reachable object is missing. A dangling B == the soak's INV-NO-LOSS finding.
+    const FsckReport rep = runFsck(*s, /*detail=*/true);
+    EXPECT_EQ(rep.dangling, 0u)
+        << "reuse adopted a token GC later deleted; the publish gate must resurrect/re-observe B (or "
+           "fail closed), never commit a dangling ref (dangling=" << rep.dangling
+        << ", reachable=" << rep.reachable << ")";
 }
