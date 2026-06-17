@@ -92,3 +92,27 @@ On a shard `casPut` conflict, re-read once and merge pending publishes for that 
 - DELETE being free is load-bearing for the design economics (GC delete path is cost-free; all cost is on create/publish).
 - All proposals are op-count work, independent of the watermark (B167), which remains clean in the soak.
 - Next step: implement P0 (instrumentation), re-measure on a soak, then sequence P1/P3/P4 by measured dominance.
+
+## P0-MEASURED attribution (2026-06-17, ~23 min workers=2 no-chaos soak, both nodes)
+
+P0 instrumentation now attributes every CA S3 op by namespace×op. Headline: the op-count is dominated by the GC 404-storm by ~13×.
+
+| CA op (combined ch1+ch2) | count (~23 min) | note |
+|---|---|---|
+| **`CasBlobHeadMiss` + `CasTreeHeadMiss`** | **~3.81 M** | **GC observe-loop re-HEADing already-deleted blob/tree candidates — ALL on the GC leader (ch1); ch2 ≈ 0. = billed S3 404 HEADs (≈`CasDbgMetaMiss`).** |
+| `CasRootGet` | ~285 k | manifest reads (publish re-read on CAS retry + readers) |
+| `CasBlobHead` (hit) | ~161 k | dedup-check HEADs that hit |
+| `CasBlobPutDedup` | ~102 k | **blob dedup hits (412 PUT + paired HEAD); dedup-hit rate 64%** (`CasBlobPut` 56 k) |
+| `CasRootHead` | ~85 k | |
+| `CasBlobDelete` | ~55 k | GC deletes (FREE on AWS) |
+| `CasRootCas` / `CasRootCasConflict` | 93 k / **49 k** | **manifest CAS conflict rate 35%** (writer-vs-GC-fence + journal), even at workers=2 |
+| `CasBuildPut` | ~21 k | per-build heartbeat (B167c: redundant with watermark, removable) |
+| `CasTreeHead/Get/Put`, `CasGc*`, `CasServerOverwrite` | <23 k each | trees, GC state/snap/retired, watermark renewals |
+
+### Re-ranked priorities (by measured op-count)
+1. **P9 — kill the GC 404-HEAD storm** (≈90% of all read ops, ~3.8M/23min, all on the leader). The observe loop re-HEADs deleted blob/tree candidates; prune confirmed-deleted keys from the in-degree snapshot / candidate set so they are not re-observed. **By far the biggest single win** — and it's the GC leader's dominant activity.
+2. **P1/P2 — blob dedup** (64% of blob creates are dedup hits → ~102k 412 PUTs + ~161k paired HEADs over 23min). Local known-present cache eliminates both; HEAD-before-PUT downgrades the rest.
+3. **P4/P5/P6 — manifest CAS conflict** (35% of `casPut` conflict). Batch publishes + widen shards + dirty-only fence.
+4. P7 (mutation LISTs — note: at workers=2 LIST volume was modest: `CasGcList`+`CasRootList` ~1.4k; the earlier 19k LISTs were the mutation-heavy chaos run), P3 (fetch-relink), P8 (coalesce retries).
+
+**Conclusion:** the single highest-leverage optimization is **P9** — eliminating the GC observe-loop 404-storm removes ~90% of the read op-count. P0 paid for itself immediately by pinpointing this.
