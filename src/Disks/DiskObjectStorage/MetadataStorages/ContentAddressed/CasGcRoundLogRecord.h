@@ -13,11 +13,11 @@ namespace DB::ContentAddressed
 struct GcRoundLogRecord
 {
     enum class EventType { Start, Finish };
-    enum class Outcome { Led, BackedOff, Aborted };
+    enum class Outcome { Unknown, Success, NotALeader, Failed };
     enum class Trigger { Scheduled, Manual };
 
     EventType event_type = EventType::Start;
-    Outcome outcome = Outcome::Led;
+    Outcome outcome = Outcome::Unknown;   /// Unknown until a round finishes
     Trigger trigger = Trigger::Scheduled;
     String disk_name;
     String gc_id;        /// hex of the scheduler's gc_id

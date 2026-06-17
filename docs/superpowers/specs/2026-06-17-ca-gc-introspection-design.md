@@ -33,7 +33,7 @@ A new `SystemLog`, mirroring `PartLog`:
 | `gc_id` | String | the scheduler instance's `gc_id` (hex of the random u128) — which mounter led |
 | `trigger` | Enum8(`'Scheduled'`=1, `'Manual'`=2) | background tick vs the SYSTEM command |
 | `round` | UInt64 | GC round number (`RoundReport.round`); 0 on Start (not yet known) |
-| `outcome` | Enum8(`'Led'`=1, `'BackedOff'`=2, `'Aborted'`=3) | Finish only; `Led`=`acquired_lease`, `BackedOff`=another leader alive, `Aborted`=round threw |
+| `outcome` | Enum8(`'Unknown'`=1, `'Success'`=2, `'NotALeader'`=3, `'Error'`=4) | `Unknown` on Start; on Finish: `Success`=led & completed (`acquired_lease`), `NotALeader`=another replica holds the GC lease, `Error`=round threw |
 | `candidates_marked` | UInt64 | Finish only; `RoundReport.candidates` (retired/marked this round) |
 | `objects_deleted` | UInt64 | Finish only; `RoundReport.deleted` |
 | `objects_absent` | UInt64 | Finish only; `RoundReport.absent` |
@@ -41,7 +41,7 @@ A new `SystemLog`, mirroring `PartLog`:
 | `objects_spared` | UInt64 | Finish only; `RoundReport.spared` |
 | `children_cascaded` | UInt64 | Finish only; `RoundReport.cascaded` |
 | `duration_ms` | UInt64 | Finish only; Finish wall-time − Start wall-time |
-| `error` | String | exception message when `outcome='Aborted'`; empty otherwise |
+| `error` | String | exception message when `outcome='Error'`; empty otherwise |
 | `ProfileEvents` | Map(String, UInt64) | Finish only; the GC scheduler thread's ProfileEvents **delta** over the round (the P0 `Cas*` counters + S3 events attributable to this round) |
 
 The **Start** row carries only the header + `event_type='Start'`, `disk_name`, `gc_id`, `trigger`; all round-specific fields are 0/empty (the round number and counters are determined inside `runRegularRound`). A Start with no matching Finish (same `gc_id`, next `event_time`) marks a round that hung or crashed mid-flight — a deliberate diagnostic.
@@ -60,7 +60,7 @@ Around each round (in `loop()` and `runOneRoundNow()`):
 1. capture `ProfileEvents` snapshot of the current (scheduler) thread + a steady-clock start;
 2. emit a **Start** record (`gc_id`, `disk_name`, `trigger`);
 3. `report = gc.runRegularRound()` inside try/catch;
-4. emit a **Finish** record with the report (or `outcome=Aborted` + the exception `what()` on throw), `duration_ms`, and the ProfileEvents delta.
+4. emit a **Finish** record with the report (or `outcome=Error` + the exception `what()` on throw), `duration_ms`, and the ProfileEvents delta.
 
 `disk_name` and `gc_id` are passed into the scheduler at construction (`gc_id` already exists there; `disk_name` is the storage's disk name, added to the ctor / via the sink closure). The P0 `Cas*` increments occur on the scheduler thread during the round, so the per-thread ProfileEvents delta captures them exactly. **Logging is best-effort and never throws into the GC path.**
 
@@ -68,19 +68,19 @@ Around each round (in `loop()` and `runOneRoundNow()`):
 
 - **Parser** (`src/Parsers/`): add `Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION` to `ASTSystemQuery`; parse the optional disk name into the existing `disk` field (mirror `RESTART DISK`). Keyword sequence: `CONTENT ADDRESSED GARBAGE COLLECTION`.
 - **Interpreter** (`src/Interpreters/InterpreterSystemQuery.cpp`): new handler. Resolve target disk(s): if `disk` is set, look it up and require it to be a content-addressed disk (else `BAD_ARGUMENTS`: "disk '<name>' is not a content-addressed disk"); if omitted, enumerate all content-addressed disks on the node (else `BAD_ARGUMENTS`: "no content-addressed disks configured"). For each, get the `ContentAddressedMetadataStorage` and call a new public `runGarbageCollectionRoundNow()` (which calls `scheduler->runOneRoundNow()` with `trigger=Manual`) **synchronously**; return when all targets' rounds finish. Node-local (no implicit `ON CLUSTER`).
-- **Behavior:** exactly one round per target per invocation (re-run for full reclamation, since an object marked in round R is deleted in R+1). If the local node is not the GC leader for a pool, the round backs off (`outcome=BackedOff`, logged) and the command returns normally. A round that throws propagates the exception to the client (and is logged as `Aborted`).
+- **Behavior:** exactly one round per target per invocation (re-run for full reclamation, since an object marked in round R is deleted in R+1). If the local node is not the GC leader for a pool, the round backs off (`outcome=NotALeader`, logged) and the command returns normally. A round that throws propagates the exception to the client (and is logged as `Error`).
 - **Access control:** guard with a SYSTEM privilege. Reuse the disk-management privilege family if one fits (e.g. the grant covering `SYSTEM RESTART DISK`); otherwise add `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION`. Decided in the plan after checking `src/Access/Common/AccessType.h`.
 
 ## Error handling & edge cases
 
 - Log-write failure is swallowed (best-effort), never affecting GC — same contract as `part_log`.
-- A throwing round: background `loop()` logs `Aborted` and continues (today's behavior); the SYSTEM command logs `Aborted` and re-throws to the client.
+- A throwing round: background `loop()` logs `Error` and continues (today's behavior); the SYSTEM command logs `Error` and re-throws to the client.
 - Read-only disks have no scheduler; the command errors (`BAD_ARGUMENTS`, "garbage collection is not enabled on disk '<name>'") for an explicitly named read-only/GC-disabled CA disk, and skips them when the disk is omitted.
 - Concurrency: the background `loop()` and a `Manual` round can interleave; both go through `runRegularRound()` which is split-brain/idempotent-safe (the lease is work-dedup only). Two concurrent rounds on one node are serialized by the scheduler's own state where needed; the log simply records both.
 
 ## Testing
 
-- **Unit (`gtest_cas_*`):** drive `CasGcScheduler` with a capturing sink over an `InMemoryBackend`; assert (a) a Start+Finish pair per round with the right `disk_name`/`gc_id`/`trigger`; (b) `RoundReport` fields map to the Finish columns (set up a dropped-then-collectable object, run two rounds, assert `candidates_marked>0` then `objects_deleted>0`); (c) a round whose `runRegularRound` throws (inject via a failing backend) yields a Finish with `outcome='Aborted'` and a non-empty `error`, and the sink still fires.
+- **Unit (`gtest_cas_*`):** drive `CasGcScheduler` with a capturing sink over an `InMemoryBackend`; assert (a) a Start+Finish pair per round with the right `disk_name`/`gc_id`/`trigger`; (b) `RoundReport` fields map to the Finish columns (set up a dropped-then-collectable object, run two rounds, assert `candidates_marked>0` then `objects_deleted>0`); (c) a round whose `runRegularRound` throws (inject via a failing backend) yields a Finish with `outcome='Error'` and a non-empty `error`, and the sink still fires.
 - **Functional (`tests/queries/0_stateless`):** on a CA-disk table, INSERT, DROP/TRUNCATE, then `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION <disk>` two–three times; `SELECT event_type, outcome, objects_deleted FROM system.content_addressed_garbage_collection_log` shows Start/Finish pairs and a round with `objects_deleted>0`; `ProfileEvents` is populated. Assert `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION <non-ca-disk>` errors. Use the `add-test` helper; no `no-parallel` unless required.
 - **No regression:** full `Cas*`/`CaWiring*` suite green (only pre-existing B140 red).
 

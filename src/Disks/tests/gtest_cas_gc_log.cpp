@@ -184,8 +184,8 @@ TEST(CasGcLog, AbortedFinishOnThrowingRound)
     ASSERT_EQ(rows.size(), 2u) << "a throwing round still emits a Start and a (Aborted) Finish";
     EXPECT_EQ(rows[0].event_type, Rec::EventType::Start);
     EXPECT_EQ(rows[1].event_type, Rec::EventType::Finish);
-    EXPECT_EQ(rows[1].outcome, Rec::Outcome::Aborted);
-    EXPECT_FALSE(rows[1].error.empty()) << "an Aborted Finish must carry the exception text";
+    EXPECT_EQ(rows[1].outcome, Rec::Outcome::Failed);
+    EXPECT_FALSE(rows[1].error.empty()) << "a failed Finish must carry the exception text";
     EXPECT_EQ(rows[1].disk_name, "ca");
     EXPECT_FALSE(rows[1].gc_id.empty());
 }

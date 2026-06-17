@@ -188,14 +188,17 @@ ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogg
             : ContentAddressedGarbageCollectionLogElement::SCHEDULED;
         switch (r.outcome)
         {
-            case ContentAddressed::GcRoundLogRecord::Outcome::Led:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::LED;
+            case ContentAddressed::GcRoundLogRecord::Outcome::Unknown:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::UNKNOWN;
                 break;
-            case ContentAddressed::GcRoundLogRecord::Outcome::BackedOff:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::BACKED_OFF;
+            case ContentAddressed::GcRoundLogRecord::Outcome::Success:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::SUCCESS;
                 break;
-            case ContentAddressed::GcRoundLogRecord::Outcome::Aborted:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::ABORTED;
+            case ContentAddressed::GcRoundLogRecord::Outcome::NotALeader:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::NOT_A_LEADER;
+                break;
+            case ContentAddressed::GcRoundLogRecord::Outcome::Failed:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::FAILED;
                 break;
         }
         e.round = r.round;

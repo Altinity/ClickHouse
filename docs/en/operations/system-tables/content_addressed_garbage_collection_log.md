@@ -33,7 +33,7 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `gc_id` ([String](/sql-reference/data-types/string)) — The GC scheduler instance id (which mounter ran the round).
 - `trigger` ([Enum8](/sql-reference/data-types/enum)) — `Scheduled` (background tick) or `Manual` (`SYSTEM` command).
 - `round` ([UInt64](/sql-reference/data-types/int-uint)) — The GC round number (`0` on a `Start` row).
-- `outcome` ([Enum8](/sql-reference/data-types/enum)) — `Led`, `BackedOff`, or `Aborted` (meaningful on a `Finish` row). `BackedOff` means another mounter held the GC lease; `Aborted` means the round threw.
+- `outcome` ([Enum8](/sql-reference/data-types/enum)) — `Success`, `NotALeader`, or `Error` (meaningful on a `Finish` row). `NotALeader` means another mounter held the GC lease; `Error` means the round threw.
 - `candidates_marked` ([UInt64](/sql-reference/data-types/int-uint)) — Objects retired (marked) this round.
 - `objects_deleted` ([UInt64](/sql-reference/data-types/int-uint)) — Objects physically deleted this round.
 - `objects_absent` ([UInt64](/sql-reference/data-types/int-uint)) — Retire candidates found already absent.
@@ -41,7 +41,7 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `objects_spared` ([UInt64](/sql-reference/data-types/int-uint)) — Candidates spared because their in-degree was greater than zero at recheck.
 - `children_cascaded` ([UInt64](/sql-reference/data-types/int-uint)) — Child edges freed by the cascade this round.
 - `duration_ms` ([UInt64](/sql-reference/data-types/int-uint)) — The round wall-clock duration (on a `Finish` row).
-- `error` ([String](/sql-reference/data-types/string)) — The exception text when `outcome = 'Aborted'`.
+- `error` ([String](/sql-reference/data-types/string)) — The exception text when `outcome = 'Error'`.
 - `ProfileEvents` ([Map(LowCardinality(String), UInt64)](/sql-reference/data-types/map)) — The per-round `ProfileEvents` delta (the `Cas*` counters and S3/disk events for this round).
 
 ## Example {#example}

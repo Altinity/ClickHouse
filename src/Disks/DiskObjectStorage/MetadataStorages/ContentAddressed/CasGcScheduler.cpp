@@ -125,7 +125,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::
     try
     {
         const Cas::RoundReport rep = gc.runRegularRound();
-        fin.outcome = rep.acquired_lease ? Rec::Outcome::Led : Rec::Outcome::BackedOff;
+        fin.outcome = rep.acquired_lease ? Rec::Outcome::Success : Rec::Outcome::NotALeader;
         fin.round = rep.round;
         fin.candidates_marked = rep.candidates;
         fin.objects_deleted = rep.deleted;
@@ -141,7 +141,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::
     }
     catch (...)
     {
-        fin.outcome = Rec::Outcome::Aborted;
+        fin.outcome = Rec::Outcome::Failed;
         fin.error = getCurrentExceptionMessage(false);
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();

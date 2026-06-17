@@ -18,7 +18,8 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
     auto type_enum = std::make_shared<DataTypeEnum8>(DataTypeEnum8::Values{
         {"Start", static_cast<Int8>(START)}, {"Finish", static_cast<Int8>(FINISH)}});
     auto outcome_enum = std::make_shared<DataTypeEnum8>(DataTypeEnum8::Values{
-        {"Led", static_cast<Int8>(LED)}, {"BackedOff", static_cast<Int8>(BACKED_OFF)}, {"Aborted", static_cast<Int8>(ABORTED)}});
+        {"Unknown", static_cast<Int8>(UNKNOWN)}, {"Success", static_cast<Int8>(SUCCESS)},
+        {"NotALeader", static_cast<Int8>(NOT_A_LEADER)}, {"Error", static_cast<Int8>(FAILED)}});
     auto trigger_enum = std::make_shared<DataTypeEnum8>(DataTypeEnum8::Values{
         {"Scheduled", static_cast<Int8>(SCHEDULED)}, {"Manual", static_cast<Int8>(MANUAL)}});
     auto lc_string = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
@@ -34,7 +35,7 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"gc_id", std::make_shared<DataTypeString>(), "GC scheduler instance id (which mounter)."},
         {"trigger", trigger_enum, "Scheduled (background tick) or Manual (SYSTEM command)."},
         {"round", std::make_shared<DataTypeUInt64>(), "GC round number (0 on Start)."},
-        {"outcome", outcome_enum, "Led / BackedOff / Aborted (Finish only)."},
+        {"outcome", outcome_enum, "Unknown (Start) / Success (led and completed) / NotALeader (another replica holds the GC lease) / Error (the round threw)."},
         {"candidates_marked", std::make_shared<DataTypeUInt64>(), "Objects retired (marked) this round."},
         {"objects_deleted", std::make_shared<DataTypeUInt64>(), "Objects physically deleted this round."},
         {"objects_absent", std::make_shared<DataTypeUInt64>(), "Retire candidates found already absent."},
@@ -42,7 +43,7 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"objects_spared", std::make_shared<DataTypeUInt64>(), "Candidates spared (in-degree > 0 at recheck)."},
         {"children_cascaded", std::make_shared<DataTypeUInt64>(), "Child edges freed by the cascade."},
         {"duration_ms", std::make_shared<DataTypeUInt64>(), "Round wall-clock duration (Finish)."},
-        {"error", std::make_shared<DataTypeString>(), "Exception text when outcome = Aborted."},
+        {"error", std::make_shared<DataTypeString>(), "Exception text when outcome = Error."},
         {"ProfileEvents", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeUInt64>()),
             "Per-round ProfileEvents delta (the Cas* counters and S3 events for this round)."},
     };

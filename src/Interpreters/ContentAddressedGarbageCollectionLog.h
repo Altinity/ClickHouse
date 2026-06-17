@@ -10,7 +10,7 @@ namespace DB
 struct ContentAddressedGarbageCollectionLogElement
 {
     enum EventType : int8_t { START = 1, FINISH = 2 };
-    enum Outcome   : int8_t { LED = 1, BACKED_OFF = 2, ABORTED = 3 };
+    enum Outcome   : int8_t { UNKNOWN = 1, SUCCESS = 2, NOT_A_LEADER = 3, FAILED = 4 };
     enum Trigger   : int8_t { SCHEDULED = 1, MANUAL = 2 };
 
     time_t event_time = 0;
@@ -22,7 +22,7 @@ struct ContentAddressedGarbageCollectionLogElement
     Trigger trigger = SCHEDULED;
 
     UInt64 round = 0;
-    Outcome outcome = LED;          /// meaningful on FINISH
+    Outcome outcome = UNKNOWN;      /// UNKNOWN on START; set to SUCCESS/NOT_A_LEADER/FAILED on FINISH
     UInt64 candidates_marked = 0;
     UInt64 objects_deleted = 0;
     UInt64 objects_absent = 0;
