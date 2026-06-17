@@ -8,8 +8,12 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadPipeline.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/ContentAddressedGarbageCollectionLog.h>
+#include <Common/DateLUT.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <chrono>
 #include <filesystem>
 #include <ctime>
 #include <unordered_set>
@@ -25,6 +29,7 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int CORRUPTED_DATA;
     extern const int READONLY;
+    extern const int BAD_ARGUMENTS;
 }
 
 namespace
@@ -148,8 +153,77 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     /// per-call one-shot made every round after the first a silent no-op.
     if (!gc_scheduler)
         gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
-            store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full));
+            store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+            storage_path_prefix, makeGcRoundLogger());
     gc_scheduler->runOneRoundNow();
+}
+
+ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
+{
+    /// Unit tests pass a null context (no system logs); the scheduler then runs without a sink.
+    if (!context)
+        return {};
+    auto ctx = context;
+    /// No configured-disk-name field exists on this storage; storage_path_prefix is the closest
+    /// stable identifier (the disk's object-storage key prefix). The SYSTEM command targets disks
+    /// by their configured name, but the table's disk_name column carries this prefix.
+    const String disk = storage_path_prefix;
+    return [ctx, disk](const ContentAddressed::GcRoundLogRecord & r)
+    {
+        auto log = ctx->getContentAddressedGarbageCollectionLog();
+        if (!log)
+            return;
+        ContentAddressedGarbageCollectionLogElement e;
+        const auto now = std::chrono::system_clock::now();
+        e.event_time = std::chrono::system_clock::to_time_t(now);
+        e.event_time_microseconds = timeInMicroseconds(now);
+        e.event_type = r.event_type == ContentAddressed::GcRoundLogRecord::EventType::Start
+            ? ContentAddressedGarbageCollectionLogElement::START
+            : ContentAddressedGarbageCollectionLogElement::FINISH;
+        e.disk_name = r.disk_name.empty() ? disk : r.disk_name;
+        e.gc_id = r.gc_id;
+        e.trigger = r.trigger == ContentAddressed::GcRoundLogRecord::Trigger::Manual
+            ? ContentAddressedGarbageCollectionLogElement::MANUAL
+            : ContentAddressedGarbageCollectionLogElement::SCHEDULED;
+        switch (r.outcome)
+        {
+            case ContentAddressed::GcRoundLogRecord::Outcome::Led:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::LED;
+                break;
+            case ContentAddressed::GcRoundLogRecord::Outcome::BackedOff:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::BACKED_OFF;
+                break;
+            case ContentAddressed::GcRoundLogRecord::Outcome::Aborted:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::ABORTED;
+                break;
+        }
+        e.round = r.round;
+        e.candidates_marked = r.candidates_marked;
+        e.objects_deleted = r.objects_deleted;
+        e.objects_absent = r.objects_absent;
+        e.objects_replaced = r.objects_replaced;
+        e.objects_spared = r.objects_spared;
+        e.children_cascaded = r.children_cascaded;
+        e.duration_ms = r.duration_ms;
+        e.error = r.error;
+        e.profile_events = r.profile_events;
+        /// Best-effort: SystemLog::add never blocks GC; a full queue drops the row with a warning.
+        log->add(std::move(e));
+    };
+}
+
+Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
+{
+    if (read_only || !gc_enabled)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Garbage collection is not enabled on this content-addressed disk");
+    /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (the lease's
+    /// observation-window steal protocol compares consecutive observations of the same gc_id).
+    if (!gc_scheduler)
+        gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
+            store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+            storage_path_prefix, makeGcRoundLogger());
+    return gc_scheduler->runOneRoundNow(ContentAddressed::GcRoundLogRecord::Trigger::Manual);
 }
 
 void ContentAddressedMetadataStorage::startup()
@@ -230,7 +304,8 @@ void ContentAddressedMetadataStorage::startup()
     if (context && gc_enabled && !read_only)
     {
         gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
-            cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full));
+            cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+            storage_path_prefix, makeGcRoundLogger());
         gc_scheduler->start();
     }
 }

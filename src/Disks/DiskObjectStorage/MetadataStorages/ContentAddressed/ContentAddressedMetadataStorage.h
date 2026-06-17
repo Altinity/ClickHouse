@@ -51,6 +51,11 @@ public:
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
 
+    /// SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION: one synchronous GC round on the caller's thread,
+    /// emitting Start + Finish rows to system.content_addressed_garbage_collection_log. Throws
+    /// BAD_ARGUMENTS when GC is disabled (read-only disk or gc_enabled=false).
+    Cas::RoundReport runGarbageCollectionRoundNow();
+
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
     const std::string & getPath() const override { return storage_path_full; }
     bool supportsChmod() const override { return false; }
@@ -178,6 +183,11 @@ private:
     /// present-but-corrupt tree (fail closed, INV-NO-DANGLE surfaced).
     std::optional<std::pair<Cas::Resolved, std::vector<Cas::TreeEntry>>>
     resolveRouted(const Route & r) const;
+
+    /// Build the GC round sink: the std::function the scheduler calls per Start/Finish. Captures the
+    /// ContextPtr, converts the POD GcRoundLogRecord into a ContentAddressedGarbageCollectionLogElement,
+    /// and appends it to the SystemLog (best-effort). Returns an empty sink when context is null.
+    ContentAddressed::GcRoundLogger makeGcRoundLogger() const;
 };
 
 }

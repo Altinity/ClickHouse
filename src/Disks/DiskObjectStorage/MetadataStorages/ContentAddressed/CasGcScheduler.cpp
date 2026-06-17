@@ -1,14 +1,41 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
+#include <Common/ProfileEventsScope.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
 #include <algorithm>
+#include <optional>
 
 namespace DB::ContentAddressed
 {
 
-CasGcScheduler::CasGcScheduler(Cas::StorePtr store_, std::chrono::seconds interval_, const String & log_name)
+namespace
+{
+    /// Non-zero events of a per-round snapshot, keyed by event name. The snapshot is already a
+    /// delta when produced by a ProfileEventsScope (its counters start at zero on this thread).
+    std::map<String, UInt64> snapshotToMap(const ProfileEvents::Counters::Snapshot & snap)
+    {
+        std::map<String, UInt64> out;
+        for (ProfileEvents::Event e = ProfileEvents::Event(0); e < ProfileEvents::Counters::num_counters; ++e)
+        {
+            const auto value = snap[e];
+            if (value != 0)
+                out.emplace(String(ProfileEvents::getName(e)), static_cast<UInt64>(value));
+        }
+        return out;
+    }
+}
+
+CasGcScheduler::CasGcScheduler(
+    Cas::StorePtr store_,
+    std::chrono::seconds interval_,
+    const String & log_name,
+    String disk_name_,
+    GcRoundLogger logger_)
     : store(std::move(store_))
     , interval(interval_)
     /// B160: heartbeat cadence H = interval/4 (>= 50ms), comfortably below the follower's observation
@@ -19,6 +46,8 @@ CasGcScheduler::CasGcScheduler(Cas::StorePtr store_, std::chrono::seconds interv
     , log(getLogger(log_name))
     /// gc_id uniqueness across instances is the Gc caller obligation - a random u128 per scheduler.
     , gc_id((static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng())
+    , disk_name(std::move(disk_name_))
+    , logger(std::move(logger_))
 {
 }
 
@@ -33,8 +62,8 @@ void CasGcScheduler::start()
     if (thread.joinable())
         return;
     stopping = false;
-    thread = std::thread([this] { loop(); });
-    hb_thread = std::thread([this] { heartbeatLoop(); });   /// B160
+    thread = ThreadFromGlobalPool([this] { loop(); });
+    hb_thread = ThreadFromGlobalPool([this] { heartbeatLoop(); });   /// B160
 }
 
 void CasGcScheduler::stop()
@@ -50,13 +79,82 @@ void CasGcScheduler::stop()
         hb_thread.join();
 }
 
-void CasGcScheduler::runOneRoundNow()
+Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::Trigger trigger)
+{
+    using Rec = GcRoundLogRecord;
+    /// Best-effort: the table row must never break GC. A throwing sink is swallowed.
+    auto emit = [&](const Rec & r)
+    {
+        if (logger)
+        {
+            try
+            {
+                logger(r);
+            }
+            catch (...) // NOLINT(bugprone-empty-catch)
+            {
+            }
+        }
+    };
+
+    Rec start;
+    start.event_type = Rec::EventType::Start;
+    start.trigger = trigger;
+    start.disk_name = disk_name;
+    start.gc_id = Cas::u128ToHex(gc_id);
+    emit(start);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    /// ProfileEventsScope requires an attached ThreadStatus (CurrentThread::get throws otherwise).
+    /// On the server it always is: the Scheduled path runs on a ThreadFromGlobalPool, the Manual
+    /// path on the query thread. In unit tests calling runOneRoundNow on a bare gtest thread there
+    /// is none — skip the per-round delta there rather than fail the round.
+    std::optional<ProfileEventsScope> profile_scope;
+    if (CurrentThread::isInitialized())
+        profile_scope.emplace();
+
+    auto collect_profile_events = [&]() -> std::map<String, UInt64>
+    {
+        if (!profile_scope)
+            return {};
+        return snapshotToMap(*profile_scope->getSnapshot());
+    };
+
+    Rec fin = start;
+    fin.event_type = Rec::EventType::Finish;
+    try
+    {
+        const Cas::RoundReport rep = gc.runRegularRound();
+        fin.outcome = rep.acquired_lease ? Rec::Outcome::Led : Rec::Outcome::BackedOff;
+        fin.round = rep.round;
+        fin.candidates_marked = rep.candidates;
+        fin.objects_deleted = rep.deleted;
+        fin.objects_absent = rep.absent;
+        fin.objects_replaced = rep.replaced;
+        fin.objects_spared = rep.spared;
+        fin.children_cascaded = rep.cascaded;
+        fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        fin.profile_events = collect_profile_events();
+        emit(fin);
+        return rep;
+    }
+    catch (...)
+    {
+        fin.outcome = Rec::Outcome::Aborted;
+        fin.error = getCurrentExceptionMessage(false);
+        fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        fin.profile_events = collect_profile_events();
+        emit(fin);
+        throw;
+    }
+}
+
+Cas::RoundReport CasGcScheduler::runOneRoundNow(GcRoundLogRecord::Trigger trigger)
 {
     Cas::Gc gc(store, gc_id);
-    const Cas::RoundReport report = gc.runRegularRound();
-    LOG_DEBUG(log, "CA GC round {}: lease={} candidates={} deleted={} absent={} replaced={} spared={} cascaded={}",
-        report.round, report.acquired_lease, report.candidates, report.deleted, report.absent,
-        report.replaced, report.spared, report.cascaded);
+    return runRoundLogged(gc, trigger);
 }
 
 void CasGcScheduler::loop()
@@ -75,7 +173,9 @@ void CasGcScheduler::loop()
         }
         try
         {
-            const Cas::RoundReport report = gc.runRegularRound();
+            /// runRoundLogged emits the Start + Finish table rows (incl. the per-round
+            /// ProfileEvents delta) and rethrows on a round exception (after an Aborted Finish).
+            const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled);
             i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);   /// B160: gate the heartbeat
             if (report.acquired_lease)
             {
@@ -101,6 +201,7 @@ void CasGcScheduler::loop()
         catch (...)
         {
             /// Idempotent round - the next tick retries; failures must never kill the pacing thread.
+            /// runRoundLogged already emitted the Aborted Finish row before rethrowing.
             i_am_leader.store(false, std::memory_order_relaxed);   /// B160: a failed round => assume not leading
             tryLogCurrentException(log, "CA GC round failed (will retry next tick)");
         }
