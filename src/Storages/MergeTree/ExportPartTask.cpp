@@ -332,7 +332,7 @@ bool ExportPartTask::executeStep()
         {
             IStorage::IcebergCommitExportPartitionArguments iceberg_args;
             iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
-            iceberg_args.partition_values = manifest.data_part->partition.value;
+            iceberg_args.partition_source_block = block_with_partition_values;
 
             destination_storage->commitExportPartitionTransaction(
                 manifest.transaction_id,
