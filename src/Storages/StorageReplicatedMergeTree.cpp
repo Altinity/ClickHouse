@@ -10130,23 +10130,39 @@ CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & 
         return CancellationCode::CancelSent;
     };
 
-    auto lock = ExportPartitionUtils::lockExclusive(export_merge_tree_partition_mutex);
-
     const auto zk = getZooKeeper();
 
+    /// Look up the entry in the in-memory mirror under a brief shared lock and copy out what we
+    /// need; release it before any ZooKeeper round-trip so the system.replicated_partition_exports
+    /// reader is never blocked. This is a pure read of the container, so a shared lock is enough -
+    /// the KILLED status set in ZooKeeper below propagates back into the mirror via the status
+    /// watch -> handleStatusChanges.
+    bool local_entry_found = false;
+    bool local_entry_pending = false;
+    std::string local_composite_key;
+    {
+        auto lock = ExportPartitionUtils::lockShared(export_merge_tree_partition_mutex);
+        const auto entry = export_merge_tree_partition_task_entries_by_transaction_id.find(transaction_id);
+        if (entry != export_merge_tree_partition_task_entries_by_transaction_id.end())
+        {
+            local_entry_found = true;
+            local_entry_pending = entry->status == ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING;
+            local_composite_key = entry->getCompositeKey();
+        }
+    }
+
     /// if we have the entry locally, no need to list from zk. we can save some requests.
-    const auto & entry = export_merge_tree_partition_task_entries_by_transaction_id.find(transaction_id);
-    if (entry != export_merge_tree_partition_task_entries_by_transaction_id.end())
+    if (local_entry_found)
     {
         LOG_INFO(log, "Export partition task found locally, trying to cancel it");
         /// found locally, no need to get children on zk
-        if (entry->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        if (!local_entry_pending)
         {
             LOG_INFO(log, "Export partition task is not pending, can not cancel it");
             return CancellationCode::CancelCannotBeSent;
         }
 
-        return try_set_status_to_killed(zk, fs::path(zookeeper_path) / "exports" / entry->getCompositeKey() / "status");
+        return try_set_status_to_killed(zk, fs::path(zookeeper_path) / "exports" / local_composite_key / "status");
     }
     else
     {

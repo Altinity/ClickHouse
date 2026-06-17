@@ -527,11 +527,23 @@ private:
     Coordination::WatchCallbackPtr export_merge_tree_partition_watch_callback;
 
     /// Read-write lock guarding the in-memory mirror of export tasks
-    /// (export_merge_tree_partition_task_entries*). Readers (system.replicated_partition_exports
-    /// via getPartitionExportsInfo) take it shared; the background poll/scheduler/status tasks and
-    /// KILL EXPORT PARTITION take it exclusively, but only for brief in-memory mutations - never
-    /// across ZooKeeper round-trips. Acquire via ExportPartitionUtils::lockShared / lockExclusive
-    /// so contention is reflected in the ExportPartitionLock* metrics.
+    /// (export_merge_tree_partition_task_entries*). It is taken ONLY for brief in-memory
+    /// accesses, never across a ZooKeeper round-trip:
+    ///   - Readers take it shared: system.replicated_partition_exports via getPartitionExportsInfo,
+    ///     the scheduler run() snapshotting PENDING entries, and KILL EXPORT PARTITION looking up
+    ///     the entry locally.
+    ///   - Writers take it exclusively for the duration of a single container mutation only:
+    ///     poll() and handleStatusChanges() apply each insert/replace/erase/field-update under it,
+    ///     and shutdown clears the container.
+    /// The ZooKeeper I/O of poll() and handleStatusChanges() is instead serialized by
+    /// ExportPartitionManifestUpdatingTask::background_task_serialization_mutex (the "task lock"),
+    /// which those two tasks hold across their ZooKeeper reads but which readers never touch. This
+    /// split is what keeps the shared-lock reader off the slow-network ZooKeeper critical path
+    /// (DB::SharedMutex is writer-preferring, so a writer that held this across ZooKeeper would
+    /// otherwise block every new reader).
+    /// Lock ordering: background_task_serialization_mutex -> this -> export_manifests_mutex.
+    /// Acquire via ExportPartitionUtils::lockShared / lockExclusive so contention is reflected in
+    /// the ExportPartitionLock* metrics.
     mutable SharedMutex export_merge_tree_partition_mutex;
 
     BackgroundSchedulePoolTaskHolder export_merge_tree_partition_select_task;
