@@ -457,6 +457,23 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
                 return false;
             break;
         }
+        case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
+        {
+            /// The disk is OPTIONAL: SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION [<disk>] [ON CLUSTER cluster].
+            /// When omitted, the empty disk means "all content-addressed disks on this node".
+            /// First try the full target form (which also handles ON CLUSTER); if no disk follows,
+            /// fall back to parsing just the optional ON CLUSTER clause and leave the disk empty.
+            auto saved_pos = pos;
+            Expected target_expected = expected;
+            if (!parseQueryWithOnClusterAndTarget(res, pos, target_expected, SystemQueryTargetType::Disk))
+            {
+                pos = saved_pos;
+                res->disk.clear();
+                if (!parseQueryWithOnCluster(res, pos, expected))
+                    return false;
+            }
+            break;
+        }
         /// FLUSH DISTRIBUTED requires table
         /// START/STOP DISTRIBUTED SENDS does not require table
         case Type::STOP_DISTRIBUTED_SENDS:

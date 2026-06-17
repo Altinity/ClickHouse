@@ -21,6 +21,8 @@
 #include <Databases/enableAllExperimentalSettings.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/IDisk.h>
 #include <Formats/FormatSchemaInfo.h>
 #include <Functions/UserDefined/ExternalUserDefinedExecutableFunctionsLoader.h>
 #include <Interpreters/ActionLocksManager.h>
@@ -994,6 +996,12 @@ BlockIO InterpreterSystemQuery::execute()
             object_disk->waitBlobsCleanup();
             object_disk->waitBlobsCleanup();
 
+            break;
+        }
+        case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GARBAGE_COLLECTION);
+            runContentAddressedGarbageCollection(query.disk);
             break;
         }
         case Type::FLUSH_LOGS:
@@ -2153,6 +2161,39 @@ void InterpreterSystemQuery::syncMerges()
     throw DB::Exception(DB::ErrorCodes::TIMEOUT_EXCEEDED, "SYNC MERGES {}: command timed out. See the 'max_execution_time' setting", table_id.getNameForLogs());
 }
 
+void InterpreterSystemQuery::runContentAddressedGarbageCollection(const String & disk_name)
+{
+    auto run_on = [&](const String & name, const DiskPtr & disk)
+    {
+        auto md = disk->getMetadataStorage();
+        if (!md || !md->isContentAddressed())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", name);
+        auto * ca = dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
+        if (!ca)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Disk '{}' reports content-addressed but is not a ContentAddressedMetadataStorage", name);
+        ca->runGarbageCollectionRoundNow();   /// synchronous, one round
+    };
+
+    if (!disk_name.empty())
+    {
+        run_on(disk_name, getContext()->getDisk(disk_name));
+        return;
+    }
+
+    size_t ran = 0;
+    for (const auto & [name, disk] : getContext()->getDisksMap())
+    {
+        auto md = disk->getMetadataStorage();
+        if (md && md->isContentAddressed())
+        {
+            run_on(name, disk);
+            ++ran;
+        }
+    }
+    if (ran == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No content-addressed disks are configured on this node");
+}
+
 void InterpreterSystemQuery::loadPrimaryKeys()
 {
     loadOrUnloadPrimaryKeysImpl(true);
@@ -2702,6 +2743,11 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::WAIT_BLOBS_CLEANUP:
         {
             required_access.emplace_back(AccessType::SYSTEM_WAIT_BLOBS_CLEANUP);
+            break;
+        }
+        case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
+        {
+            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GARBAGE_COLLECTION);
             break;
         }
         case Type::UNFREEZE:

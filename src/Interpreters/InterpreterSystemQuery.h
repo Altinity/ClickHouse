@@ -72,6 +72,8 @@ private:
     void scheduleMerge(ASTSystemQuery & query);
     void syncMerges();
 
+    void runContentAddressedGarbageCollection(const String & disk_name);
+
     void loadPrimaryKeys();
     void unloadPrimaryKeys();
     void loadOrUnloadPrimaryKeysImpl(bool load);

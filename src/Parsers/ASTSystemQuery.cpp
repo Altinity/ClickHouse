@@ -261,6 +261,16 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         case Type::RELOAD_DICTIONARY:
         case Type::RELOAD_MODEL:
         case Type::RELOAD_FUNCTION:
+        case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
+        {
+            /// The disk is optional here; print it only when one was given.
+            if (!disk.empty())
+            {
+                ostr << ' ';
+                print_identifier(disk);
+            }
+            break;
+        }
         case Type::RESTART_DISK:
         case Type::WAIT_BLOBS_CLEANUP:
         case Type::CLEAR_DISK_METADATA_CACHE:

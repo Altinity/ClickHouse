@@ -146,6 +146,7 @@ public:
         INSTRUMENT_ADD,
         INSTRUMENT_REMOVE,
         RESET_DDL_WORKER,
+        CONTENT_ADDRESSED_GARBAGE_COLLECTION,
         END
     };
 
