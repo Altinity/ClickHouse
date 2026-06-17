@@ -1396,3 +1396,249 @@ def test_export_partition_all_iceberg_types_lossy(cluster):
         f"SELECT abs(f - 2.718281828459045) < 1e-6, abs(f - 2.718281828459045) > 1e-9 FROM {iceberg_table}"
     ).strip()
     assert f_checks == "1\t1", f"Expected Float32 precision loss within tolerance, got: {f_checks!r}"
+
+
+def _data_file_partition_records(entries):
+    """Partition dicts of the non-delete data files described by manifest entries."""
+    records = []
+    for entry in entries:
+        data_file = entry.get("data_file") or {}
+        if data_file.get("content", 0) not in (0, None):
+            continue
+        partition = data_file.get("partition")
+        if partition is not None:
+            records.append(partition)
+    return records
+
+
+def _partition_scalar(partition, field):
+    """Read a partition field value, tolerating an Avro-union ``{type: value}`` wrapper."""
+    value = partition.get(field)
+    if isinstance(value, dict):
+        assert len(value) == 1, f"Unexpected partition union shape for {field!r}: {value!r}"
+        value = next(iter(value.values()))
+    return value
+
+
+def test_export_partition_bucket_transform_metadata_matches_data(cluster):
+    """A bucket[N] partition column whose type changes Int64 -> String records the
+    destination murmur(String) bucket in the Iceberg metadata, matching the exported
+    data rather than the source hashLong bucket."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_bucket_xform_{uid}"
+    iceberg_table = f"iceberg_bucket_xform_{uid}"
+
+    # N=16, key=42 diverges: icebergBucket(16, 42::Int64)=14 (source/old hashLong) but
+    # icebergBucket(16, '42')=6 (destination/new murmur over the exported String).
+    make_rmt(node, mt_table, "id Int64, key Int64", "icebergBucket(16, key)",
+             replica_name="replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 42), (2, 42)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, key String",
+                    partition_by="icebergBucket(16, key)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 2, f"Expected 2 rows after export, got {count}"
+
+    string_bucket = int(node.query(
+        f"SELECT DISTINCT icebergBucket(16, key) FROM {iceberg_table}"
+    ).strip())
+    long_bucket = int(node.query(
+        f"SELECT DISTINCT icebergBucket(16, toInt64(key)) FROM {iceberg_table}"
+    ).strip())
+    assert string_bucket != long_bucket, (
+        f"Test setup invalid: String and Int64 buckets coincide ({string_bucket}); "
+        f"pick a different N/key so the transform diverges."
+    )
+
+    query_id = f"bucket_xform_{uid}"
+    node.query(
+        f"SELECT * FROM {iceberg_table}",
+        query_id=query_id,
+        settings={"iceberg_metadata_log_level": "manifest_file_entry"},
+    )
+    entries = fetch_manifest_entries(node, query_id)
+    partitions = _data_file_partition_records(entries)
+    assert partitions, "No data-file partition records found in manifest entries"
+    meta_values = {int(_partition_scalar(p, "key")) for p in partitions}
+    assert meta_values == {string_bucket}, (
+        f"Metadata bucket {meta_values} must equal the destination String bucket "
+        f"{string_bucket} (not the source Int64 bucket {long_bucket})."
+    )
+
+
+def test_export_partition_month_transform_metadata_matches_data(cluster):
+    """A month-transform partition records a months-since-epoch value in metadata that
+    matches the value derived from the exported data, and a transform-filtered read
+    returns the rows."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_month_xform_{uid}"
+    iceberg_table = f"iceberg_month_xform_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, event_date Date",
+             "toMonthNumSinceEpoch(event_date)", replica_name="replica1")
+    node.query(
+        f"INSERT INTO {mt_table} VALUES "
+        f"(1, '2024-03-05'), (2, '2024-03-20'), (3, '2024-03-31')"
+    )
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, event_date Date",
+                    partition_by="toMonthNumSinceEpoch(event_date)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 3, f"Expected 3 rows after export, got {count}"
+
+    month_num = int(node.query(
+        f"SELECT DISTINCT toMonthNumSinceEpoch(event_date) FROM {iceberg_table}"
+    ).strip())
+
+    query_id = f"month_xform_{uid}"
+    node.query(
+        f"SELECT * FROM {iceberg_table}",
+        query_id=query_id,
+        settings={"iceberg_metadata_log_level": "manifest_file_entry"},
+    )
+    entries = fetch_manifest_entries(node, query_id)
+    partitions = _data_file_partition_records(entries)
+    assert partitions, "No data-file partition records found in manifest entries"
+    meta_values = {int(_partition_scalar(p, "event_date")) for p in partitions}
+    assert meta_values == {month_num}, (
+        f"Metadata month {meta_values} must equal toMonthNumSinceEpoch over the data "
+        f"({month_num})."
+    )
+
+    filtered = int(node.query(
+        f"SELECT count() FROM {iceberg_table} "
+        f"WHERE toMonthNumSinceEpoch(event_date) = {month_num}"
+    ).strip())
+    assert filtered == 3, f"Transform-filtered read expected 3 rows, got {filtered}"
+
+
+def test_export_partition_identity_type_change_metadata_matches_data(cluster):
+    """An identity partition column whose type changes UInt16 -> String records the
+    destination String value in the Iceberg metadata, matching the exported data."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_identity_xform_{uid}"
+    iceberg_table = f"iceberg_identity_xform_{uid}"
+
+    make_rmt(node, mt_table, "id Int32, year UInt16", "year", replica_name="replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2024), (2, 2024)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int32, year String", partition_by="year")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 2, f"Expected 2 rows after export, got {count}"
+
+    data_year = node.query(f"SELECT DISTINCT year FROM {iceberg_table}").strip()
+    assert data_year == "2024", f"Expected exported year '2024' (String), got {data_year!r}"
+
+    query_id = f"identity_xform_{uid}"
+    node.query(
+        f"SELECT * FROM {iceberg_table}",
+        query_id=query_id,
+        settings={"iceberg_metadata_log_level": "manifest_file_entry"},
+    )
+    entries = fetch_manifest_entries(node, query_id)
+    partitions = _data_file_partition_records(entries)
+    assert partitions, "No data-file partition records found in manifest entries"
+    meta_values = {str(_partition_scalar(p, "year")) for p in partitions}
+    assert meta_values == {"2024"}, (
+        f"Metadata partition {meta_values} must equal the destination String value "
+        f"'2024' (not the source integer representation)."
+    )
+
+
+def test_export_partition_multicolumn_identity_metadata_matches_data(cluster):
+    """A multi-column identity partition (event_date Date, retention UInt64 -> Int64)
+    records per-column values in the Iceberg metadata that match the exported data."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_multicol_{uid}"
+    iceberg_table = f"iceberg_multicol_{uid}"
+
+    # Iceberg has no unsigned types, so retention widens UInt64 -> Int64; the cast is
+    # not value-preserving per canBeSafelyCast, hence the lossy opt-in below.
+    make_rmt(node, mt_table, "id Int64, event_date Date, retention UInt64",
+             "(event_date, retention)", replica_name="replica1")
+    node.query(
+        f"INSERT INTO {mt_table} VALUES "
+        f"(1, '2024-03-05', 30), (2, '2024-03-05', 30), (3, '2024-03-05', 30)"
+    )
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, event_date Date, retention Int64",
+                    partition_by="(event_date, retention)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={
+            "allow_insert_into_iceberg": 1,
+            "export_merge_tree_part_allow_lossy_cast": 1,
+        },
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 3, f"Expected 3 rows after export, got {count}"
+
+    data_retention = int(node.query(
+        f"SELECT DISTINCT retention FROM {iceberg_table}"
+    ).strip())
+    assert data_retention == 30, f"Expected exported retention 30, got {data_retention}"
+
+    days = int(node.query(
+        f"SELECT DISTINCT toInt64(event_date) FROM {iceberg_table}"
+    ).strip())
+
+    query_id = f"multicol_{uid}"
+    node.query(
+        f"SELECT * FROM {iceberg_table}",
+        query_id=query_id,
+        settings={"iceberg_metadata_log_level": "manifest_file_entry"},
+    )
+    entries = fetch_manifest_entries(node, query_id)
+    partitions = _data_file_partition_records(entries)
+    assert partitions, "No data-file partition records found in manifest entries"
+
+    meta_dates = {int(_partition_scalar(p, "event_date")) for p in partitions}
+    assert meta_dates == {days}, (
+        f"Metadata event_date {meta_dates} must equal days-since-epoch {days}."
+    )
+    meta_retentions = {int(_partition_scalar(p, "retention")) for p in partitions}
+    assert meta_retentions == {30}, (
+        f"Metadata retention {meta_retentions} must equal the exported value 30."
+    )
+
+    filtered = int(node.query(
+        f"SELECT count() FROM {iceberg_table} "
+        f"WHERE event_date = '2024-03-05' AND retention = 30"
+    ).strip())
+    assert filtered == 3, f"Partition-filtered read expected 3 rows, got {filtered}"
