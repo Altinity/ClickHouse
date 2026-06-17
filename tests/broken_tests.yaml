@@ -138,6 +138,11 @@
   message: 'All iterations has been failed. Unable to test snapshot sharing disabled'
   check_types:
   - asan
+- name: 03572_export_merge_tree_part_limits_and_table_functions
+  reason: 'INVESTIGATE - Unstable on tsan'
+  message: 'timeout: 60s'
+  check_types:
+  - tsan
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
