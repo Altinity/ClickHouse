@@ -28,6 +28,8 @@ struct GcRoundLogRecord
     UInt64 objects_replaced = 0;
     UInt64 objects_spared = 0;
     UInt64 children_cascaded = 0;
+    UInt64 forgotten_on_delete = 0;
+    UInt64 forgotten_absent = 0;
     UInt64 duration_ms = 0;
     String error;
     std::map<String, UInt64> profile_events;

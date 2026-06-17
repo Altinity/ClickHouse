@@ -133,6 +133,8 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::
         fin.objects_replaced = rep.replaced;
         fin.objects_spared = rep.spared;
         fin.children_cascaded = rep.cascaded;
+        fin.forgotten_on_delete = rep.forgotten_on_delete;
+        fin.forgotten_absent = rep.forgotten_absent;
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         fin.profile_events = collect_profile_events();

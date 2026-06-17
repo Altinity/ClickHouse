@@ -115,6 +115,8 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
 
     EXPECT_GT(rows[marking_finish_idx].candidates_marked, 0u);
     EXPECT_GT(rows[deleting_finish_idx].objects_deleted, 0u);
+    /// P9: the deletion round forgot the deleted node(s) in the same round; the record surfaces it.
+    EXPECT_GT(rows[deleting_finish_idx].forgotten_on_delete, 0u);
 
     /// Identity + timing fields are set on every record.
     for (const Rec & r : rows)

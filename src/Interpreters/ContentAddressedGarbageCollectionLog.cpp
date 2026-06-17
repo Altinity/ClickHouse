@@ -42,6 +42,8 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"objects_replaced", std::make_shared<DataTypeUInt64>(), "412-saves (a resurrection won the race)."},
         {"objects_spared", std::make_shared<DataTypeUInt64>(), "Candidates spared (in-degree > 0 at recheck)."},
         {"children_cascaded", std::make_shared<DataTypeUInt64>(), "Child edges freed by the cascade."},
+        {"forgotten_on_delete", std::make_shared<DataTypeUInt64>(), "Nodes pruned from the GC snapshot because GC deleted them this round (P9)."},
+        {"forgotten_absent", std::make_shared<DataTypeUInt64>(), "Nodes pruned because a retire HEAD found them already gone (404); >0 in steady state signals split-brain or out-of-band deletes (P9)."},
         {"duration_ms", std::make_shared<DataTypeUInt64>(), "Round wall-clock duration (Finish)."},
         {"error", std::make_shared<DataTypeString>(), "Exception text when outcome = Error."},
         {"ProfileEvents", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeUInt64>()),
@@ -68,6 +70,8 @@ void ContentAddressedGarbageCollectionLogElement::appendToBlock(MutableColumns &
     columns[i++]->insert(objects_replaced);
     columns[i++]->insert(objects_spared);
     columns[i++]->insert(children_cascaded);
+    columns[i++]->insert(forgotten_on_delete);
+    columns[i++]->insert(forgotten_absent);
     columns[i++]->insert(duration_ms);
     columns[i++]->insert(error);
     {

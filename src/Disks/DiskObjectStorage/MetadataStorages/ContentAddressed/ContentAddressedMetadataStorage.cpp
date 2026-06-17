@@ -208,6 +208,8 @@ ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogg
         e.objects_replaced = r.objects_replaced;
         e.objects_spared = r.objects_spared;
         e.children_cascaded = r.children_cascaded;
+        e.forgotten_on_delete = r.forgotten_on_delete;
+        e.forgotten_absent = r.forgotten_absent;
         e.duration_ms = r.duration_ms;
         e.error = r.error;
         e.profile_events = r.profile_events;
