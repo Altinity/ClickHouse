@@ -119,7 +119,8 @@ jobs:
       {NAME}:
         description: {DESCRIPTION}
         required: {IS_REQUIRED}
-        default: {DEFAULT_VALUE}\
+        default: {DEFAULT_VALUE}
+        type: {INPUT_TYPE}\
 """
 
         TEMPLATE_OPTIONS_INPUT = """
@@ -461,6 +462,7 @@ class PullRequestPushYamlGen:
                     DESCRIPTION=input_item.description,
                     IS_REQUIRED="true" if input_item.is_required else "false",
                     DEFAULT_VALUE=input_item.default_value or "''",
+                    INPUT_TYPE=input_item.input_type,
                 )
             else:
                 dispatch_inputs += (
