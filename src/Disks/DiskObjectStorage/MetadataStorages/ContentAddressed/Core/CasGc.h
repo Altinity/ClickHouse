@@ -28,6 +28,8 @@ struct RoundReport
     uint64_t replaced = 0;        /// 412-saves - a health metric (spec §7)
     uint64_t spared = 0;
     uint64_t cascaded = 0;        /// children freed by the cascade this round
+    uint64_t forgotten_on_delete = 0;  /// P9: nodes pruned from `known` because GC deleted them (cascade)
+    uint64_t forgotten_absent = 0;     /// P9: nodes pruned because a retire HEAD found them already gone (404)
 };
 
 /// Leader-paced regular GC (spec §7): fold -> retire -> fence -> recheck -> exact-token delete ->
@@ -180,7 +182,7 @@ private:
     /// grouped by snap shard (the input to R4 recheck). Retired ≠ dead: the entries are the
     /// writer-facing "resurrect, don't reuse" barrier.
     std::map<uint64_t, RetiredSet> retire(GcState & state, Token & state_token,
-                                          const std::map<uint64_t, GcSnap> & snap);
+                                          std::map<uint64_t, GcSnap> & snap, RoundReport & report);
 
     /// R3 (spec §7 as amended 2026-06-12; the model's GFenceShard): CAS the NAMESPACE REGISTRY's
     /// fence_round first (the ordering point for namespace creation — W-REGISTER's gate floor),
@@ -209,6 +211,8 @@ private:
     {
         std::map<uint64_t, OutcomeLog> outcomes;   /// snap_shard -> the durable outcome log
         std::vector<UInt128> deleted_trees;
+        std::vector<Candidate> deleted_nodes;      /// P9: EVERY confirmed-gone node (trees AND
+                                                   /// blobs/packs); the cascade forgets each from `known`.
         bool fence_window_records_folded = false;  /// the recheck's fold-through-fence saw records
     };
 

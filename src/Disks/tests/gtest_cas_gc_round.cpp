@@ -803,6 +803,87 @@ TEST(CasGcRetire, DeletedCandidateDoesNotReappear)
     EXPECT_FALSE(b->get(s->layout().outcomesKey(3, st.fence_seq, 0)).has_value());
 }
 
+TEST(CasGcRetire, DeleteTimePruneStopsTheReHeadStorm)
+{
+    /// P9: a node deleted in round R is FORGOTTEN from `known` in the same round (the cascade
+    /// prune), so round R+1 never re-derives it as a candidate and never re-HEAD-404s it (the
+    /// storm). Mirrors DeletedCandidateDoesNotReappear: round 1 deletes the tree, round 2 the blob.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep1 = gc.runRegularRound();           /// deletes the tree
+    EXPECT_EQ(rep1.deleted, 1u);
+    EXPECT_EQ(rep1.forgotten_on_delete, 1u);                 /// the deleted tree forgotten same round
+    EXPECT_EQ(rep1.forgotten_absent, 0u);
+
+    const RoundReport rep2 = gc.runRegularRound();           /// cascade freed the blob -> deletes it
+    EXPECT_EQ(rep2.deleted, 1u);
+    EXPECT_EQ(rep2.forgotten_on_delete, 1u);                 /// the deleted blob forgotten
+    EXPECT_EQ(rep2.forgotten_absent, 0u)                     /// THE STORM IS GONE: round-1 tree not re-HEAD'd
+        << "a deleted node must not be re-derived as a candidate next round";
+
+    const RoundReport rep3 = gc.runRegularRound();
+    EXPECT_EQ(rep3.candidates, 0u);
+    EXPECT_EQ(rep3.deleted, 0u);
+    EXPECT_EQ(rep3.forgotten_on_delete + rep3.forgotten_absent, 0u);  /// nothing left to forget
+}
+
+TEST(CasGcRetire, BlobOnlyPrunePersistsInDurableSnap)
+{
+    /// P9: a round whose only physical deletes are BLOBS (no trees) must still PERSIST the pruned
+    /// snap (the snap_changed fix). Proven by reading the durable snap directly: the forgotten blob
+    /// must be gone from `known` / the candidate set.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    gc.runRegularRound();                                    /// round 1: tree
+    const RoundReport rep2 = gc.runRegularRound();           /// round 2: blob-only delete + forget
+    ASSERT_EQ(rep2.deleted, 1u);
+    ASSERT_EQ(rep2.cascaded, 0u);                            /// no tree cascade this round => blob-only
+    ASSERT_EQ(rep2.forgotten_on_delete, 1u);
+
+    /// The durable snap (latest generation) no longer holds the forgotten blob in `known`.
+    const GcState st = readState(*b, *s);
+    const GcSnap snap = readSnap(*b, *s, st.snap_generation, 0);
+    EXPECT_FALSE(snap.isKnown(ObjectKind::Blob, u128Of("payload")))
+        << "blob prune must be persisted in the durable snap";
+    EXPECT_TRUE(snap.zeroInDegreeKnown().empty());
+}
+
+TEST(CasGcRetire, RetireForgetsOutOfBandDeletedCandidate)
+{
+    /// P9 defensive path: a genuine retire-time HEAD-404 (the object was deleted out-of-band while
+    /// still a zero-in-degree known candidate) forgets the node — no throw, self-healing.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    s->renewWatermarkOnce();
+
+    /// Delete the tree object out-of-band so the next round's retire HEAD sees a genuine 404 while
+    /// the node is still a zero-in-degree known candidate.
+    rawDeleteTree(*b, *s, tree);
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    const RoundReport rep = gc.runRegularRound();            /// must NOT throw on the 404
+    EXPECT_TRUE(rep.acquired_lease);
+    EXPECT_GT(rep.forgotten_absent, 0u) << "a genuine retire-time 404 forgets the node";
+    EXPECT_EQ(rep.deleted, 0u);                              /// GC deleted nothing itself this round
+
+    /// Self-healed: a second round no longer re-derives the forgotten node.
+    const RoundReport after = gc.runRegularRound();
+    EXPECT_TRUE(after.acquired_lease);
+    EXPECT_EQ(after.forgotten_absent, 0u);
+}
+
 TEST(CasGcRetire, RetireSetsDurableBeforeRoundCas)
 {
     /// The ordering seam (INV-MONOTONE-GC): the retire sets go durable FIRST; only then does the

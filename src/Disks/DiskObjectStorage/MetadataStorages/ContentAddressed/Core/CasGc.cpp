@@ -75,7 +75,7 @@ RoundReport Gc::runRegularRound()
     /// transitions, so a crash-replayed round re-derives the same set. `folded.transitioned` is
     /// only a health cross-check; the counts can differ legitimately (e.g. a node zeroed by an
     /// EARLIER round's fold is in zeroInDegreeKnown but did not transition in THIS fold).
-    const std::map<uint64_t, RetiredSet> retired = retire(state, state_token, folded.snap);
+    const std::map<uint64_t, RetiredSet> retired = retire(state, state_token, folded.snap, report);
     report.round = state.round;
     for (const auto & [snap_shard, set] : retired)
         report.candidates += set.entries.size();
@@ -316,11 +316,13 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
             {
                 case OutcomeKind::Deleted:
                     ++report.deleted;
+                    result.deleted_nodes.push_back(Candidate{outcome.kind, outcome.hash});
                     if (outcome.kind == ObjectKind::Tree)
                         result.deleted_trees.push_back(outcome.hash);
                     break;
                 case OutcomeKind::Absent:
                     ++report.absent;
+                    result.deleted_nodes.push_back(Candidate{outcome.kind, outcome.hash});
                     if (outcome.kind == ObjectKind::Tree)
                         result.deleted_trees.push_back(outcome.hash);
                     break;
@@ -367,6 +369,17 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
         report.cascaded += freed.size();
     }
 
+    /// P9: forget every confirmed-gone node (trees AND blobs/packs) from `known`, so the next
+    /// round's stateless candidate scan no longer re-derives — and re-HEAD-404s — them. This is the
+    /// PRIMARY prune site: a node deleted in round R is out of `known` before R's retired sets drop,
+    /// keeping `known` tight by construction. Orthogonal to stripTree above (which clears a deleted
+    /// tree's OUTGOING edges/marker; this clears the node's INCOMING `known` membership).
+    for (const Candidate & node : rechecked.deleted_nodes)
+    {
+        snap.at(hashPrefixShard(node.hash, state.snap_shards)).forget(node.kind, node.hash);
+        ++report.forgotten_on_delete;
+    }
+
     /// 2. PERSIST the post-strip snap - WITH the recheck's fence-window fold included - and
     /// advance folded_cursor to the recorded fence versions in the SAME gc/state CAS. This is the
     /// pipeline ORDERING rule that closes the cascade-vs-recreate race: a re-create-and-publish
@@ -381,7 +394,8 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
     /// mint an orphan object per round forever for nothing. The closing gc/state CAS below still
     /// runs unconditionally (cursors advance to the fence versions - vacuous coverage when the
     /// window held no records - and fence_version[<= round] is erased).
-    const bool snap_changed = !rechecked.deleted_trees.empty() || rechecked.fence_window_records_folded;
+    const bool snap_changed = !rechecked.deleted_trees.empty() || rechecked.fence_window_records_folded
+        || report.forgotten_on_delete > 0;   /// P9: a blob-only prune round must still persist the snap
     constexpr uint64_t max_generation_probes = 1000;
     uint64_t adopted_generation = state.snap_generation;
     if (snap_changed)
@@ -599,7 +613,7 @@ void Gc::fence(GcState & state, Token & state_token)
 }
 
 std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
-                                          const std::map<uint64_t, GcSnap> & snap)
+                                          std::map<uint64_t, GcSnap> & snap, RoundReport & report)
 {
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
@@ -629,16 +643,33 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     /// so no cross-round dedup is attempted here. Within one round a candidate appears once by
     /// construction (zeroInDegreeKnown yields unique nodes; a node lives in exactly one shard).
     std::map<uint64_t, RetiredSet> retired;
-    for (const auto & [snap_shard, shard_snap] : snap)
+    for (auto & [snap_shard, shard_snap] : snap)
     {
         for (const Candidate & candidate : shard_snap.zeroInDegreeKnown())
         {
             const HeadResult observed = backend.head(objectKey(layout, candidate.kind, candidate.hash));
             if (!observed.exists)
-                /// No token to condemn - never fabricate one (fail closed). The object is already
-                /// gone: a crashed prior round's landed delete, or debris; the recheck has nothing
-                /// to do for it and the writer-facing barrier has nothing to bar.
+            {
+                /// P9 defensive prune. The object is gone but its node still sits in `known`
+                /// (in-degree 0); forget it so the next round's stateless scan stops re-deriving and
+                /// re-HEAD-404ing it. In correct single-leader operation the delete-time prune (the
+                /// cascade) already keeps `known` tight, so this path is rare; it self-heals the
+                /// cases that prune cannot reach from THIS leader's snapshot: a stale leader
+                /// observing a node a live leader already deleted (split-brain — the lease is
+                /// work-dedup only, by design), the crash/resume window before a delete-time prune is
+                /// durable, and any out-of-band deletion. `exists == false` is a GENUINE 404
+                /// (getObjectInfoIfExists returns absent only for NO_SUCH_KEY/NO_SUCH_BUCKET/
+                /// RESOURCE_NOT_FOUND; every other backend error throws and aborts the round), so a
+                /// transient error never masquerades as absence — we never forget a live node. NOT a
+                /// LOGICAL_ERROR: throwing here would crash on benign split-brain races. The prune is
+                /// in-memory here; the cascade persists the same threaded snap (a crash before then
+                /// re-HEAD-404s on replay and re-forgets — idempotent, set semantics). Mutating
+                /// `shard_snap` here does not invalidate iteration: zeroInDegreeKnown() returned a
+                /// value (a snapshot copy of the candidate set).
+                shard_snap.forget(candidate.kind, candidate.hash);
+                ++report.forgotten_absent;
                 continue;
+            }
 
             if (protectedByLiveBuild(observed.attributes))
                 continue;   // owned by a live build -> skip condemn this round (non-destructive deferral)
