@@ -57,14 +57,13 @@ namespace fs = std::filesystem;
 
 namespace ExportPartitionUtils
 {
-    std::vector<Field> getPartitionValuesForIcebergCommit(
+    Block getPartitionSourceBlockForIcebergCommit(
         MergeTreeData & storage, const String & partition_id)
     {
         auto lock = storage.readLockParts();
         const auto parts = storage.getDataPartsVectorInPartitionForInternalUsage(
             MergeTreeDataPartState::Active, partition_id, lock);
-        
-        /// todo arthur: bad arguments for now, pick a better one
+
         if (parts.empty())
             throw Exception(ErrorCodes::NO_SUCH_DATA_PART,
                 "Cannot find active part for partition_id '{}' to derive Iceberg partition "
@@ -72,7 +71,7 @@ namespace ExportPartitionUtils
                 "or this replica has not yet received any part for this partition. "
                 "The commit will be retried.",
                 partition_id);
-        return parts.front()->partition.value;
+        return parts.front()->minmax_idx->getBlock(storage);
     }
 
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest)
@@ -102,8 +101,11 @@ namespace ExportPartitionUtils
         /// stalls when the setting is only set at the query level.
         context_copy->setSetting("allow_insert_into_iceberg", true);
 
-        /// This setting, just like allow_insert_into_iceberg, has been verified at request time. At this point, we allow everything.
-        context_copy->setSetting("export_merge_tree_part_allow_lossy_cast", true);
+        /// Reapply the initiator's lossy-cast decision (persisted in the manifest) so the
+        /// worker's schema revalidation honors the user's choice. Without this, a task
+        /// scheduled without the opt-in could still apply a lossy cast if the destination
+        /// schema drifts to a lossy target between scheduling and execution.
+        context_copy->setSetting("export_merge_tree_part_allow_lossy_cast", manifest.allow_lossy_cast);
 
 	    return context_copy;
     }
@@ -217,8 +219,8 @@ namespace ExportPartitionUtils
         {
             iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
             if (source_storage.getInMemoryMetadataPtr()->hasPartitionKey())
-                iceberg_args.partition_values =
-                    getPartitionValuesForIcebergCommit(source_storage, manifest.partition_id);
+                iceberg_args.partition_source_block =
+                    getPartitionSourceBlockForIcebergCommit(source_storage, manifest.partition_id);
         }
 
         destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, iceberg_args, context);
