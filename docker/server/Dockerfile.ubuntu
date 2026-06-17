@@ -8,6 +8,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG apt_archive="http://archive.ubuntu.com"
 
 # We shouldn't use `apt upgrade` to not change the upstream image. It's updated biweekly
+# Exception: targeted --only-upgrade for libssl3 to address CVE without a general upgrade.
 
 # user/group precreated explicitly with fixed uid/gid on purpose.
 # It is especially important for rootless containers: in that case entrypoint
@@ -25,6 +26,7 @@ RUN sed -i "s|http://archive.ubuntu.com|${apt_archive}|g" /etc/apt/sources.list 
         locales \
         tzdata \
         wget \
+    && apt-get install --yes --only-upgrade libssl3 \
     && busybox --install -s \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
