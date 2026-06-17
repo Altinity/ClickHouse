@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
 #include <base/defines.h>
 #include <algorithm>
 #include <charconv>
@@ -244,9 +245,25 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
                 ///      folded above (=> Spared). INV-NO-RETURN: the deleted incarnation's token
                 ///      can never be current again (W-FRESH-TAG), so a duplicated/zombie replay of
                 ///      this very call is forever harmless.
-                const DeleteOutcome deleted =
-                    backend.deleteExact(objectKey(layout, entry.kind, entry.hash), entry.token);
+                const String del_key = objectKey(layout, entry.kind, entry.hash);
+                const DeleteOutcome deleted = backend.deleteExact(del_key, entry.token);
                 /// ========================================================================
+                /// TEMP INSTRUMENTATION (instrumented soak reproduction 2026-06-17): audit every GC
+                /// content delete with its FULL pool key + outcome. This is the ONLY content-delete
+                /// site, so an fsck "reachable object MISSING" finding is attributable: a missing
+                /// blob whose key appears here was deleted by GC (then investigate the ref-vs-delete
+                /// race); one that does NOT appear was lost elsewhere (object-store durability).
+                /// Greppable marker CAGCDEL. Carries the DECISION CONTEXT (round/fence_seq/
+                /// snap_generation/shard) so a missing blob is not just attributed to GC, but
+                /// localized: read gc/snap@<gen> + the shard manifest journal for <key>'s shard to
+                /// see whether the edge was missing (fold bug) or raced the fence (recheck bug).
+                /// REVERT after the investigation.
+                LOG_INFO(getLogger("CasGcAudit"),
+                    "CAGCDEL key={} kind={} token={} round={} fence_seq={} gen={} shard={} outcome={}",
+                    del_key, static_cast<int>(entry.kind), entry.token.value, state.round, state.fence_seq,
+                    state.snap_generation, hashPrefixShard(entry.hash, state.snap_shards),
+                    deleted.kind == DeleteOutcome::Kind::Deleted ? "Deleted"
+                    : (deleted.kind == DeleteOutcome::Kind::NotFound ? "Absent" : "Replaced"));
                 if (deleted.created_delete_marker)
                     /// Versioning-enabled bucket: the probe exists to reject this pool shape; a
                     /// marker here means the pool is mis-provisioned - fail loud, never continue

@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
 #include <base/defines.h>
 #include <algorithm>
@@ -267,6 +268,10 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
 
     if (store->retireView().isCondemnedToken(kind, hash, hr.token))
     {
+        /// TEMP INSTRUMENTATION (2026-06-17): the reuse-vs-GC defense FIRED — the observed token was
+        /// condemned, so we resurrect instead of adopting. Greppable CAREUSE. REVERT after investigation.
+        LOG_INFO(getLogger("CasBuildAudit"), "CAREUSE resurrect key={} token={} round={}",
+            key, hr.token.value, store->retireView().round());
         resurrect(kind, hash, key);
         /// resurrect recorded the dep with the new token; the admitted logical size is bookkeeping for
         /// GC (M-C3) and not load-bearing in M-C2 — report the logical size where cheap (Blob only).
@@ -274,6 +279,12 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     }
 
     /// Adopt the current incarnation — free, no bytes moved.
+    /// TEMP INSTRUMENTATION (2026-06-17): reuse ADOPTED an existing incarnation's token as NOT
+    /// condemned (per this build's retire-view). If GC deletes this exact token (CAGCDEL token=...)
+    /// after this point and the publish-gate fails to reject, the committed ref dangles — the
+    /// reuse-of-an-object-being-deleted race. Correlate CAREUSE adopt vs CAGCDEL by key+token.
+    LOG_INFO(getLogger("CasBuildAudit"), "CAREUSE adopt key={} token={} round={}",
+        key, hr.token.value, store->retireView().round());
     deps[{static_cast<uint8_t>(kind), hash}] =
         DepEntry{kind, hr.token, store->retireView().round(), logical_size};
     return logical_size;
