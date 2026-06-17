@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
@@ -43,6 +44,11 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
 
 StorePtr Store::open(BackendPtr backend, PoolConfig config)
 {
+    /// B168 P0: wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,
+    /// writer, GC, watermark — flows through the per-namespace/op ProfileEvents chokepoint. The
+    /// decorator only delegates and counts; it changes no behavior (read-only opens stay write-free).
+    backend = std::make_shared<InstrumentedBackend>(std::move(backend));
+
     /// FAIL-CLOSED (design §6): the capability probe throws NOT_IMPLEMENTED on any failed check, and
     /// PoolMeta::createOrValidate is pool-authoritative — the config constants apply only at creation.
     Layout layout(config.pool_prefix);

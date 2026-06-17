@@ -738,6 +738,88 @@ The server successfully detected this situation and will download merged part fr
     M(CasDbgExistsMiss, "DBG(CA soak): S3ObjectStorage::exists() returned false (404).", ValueType::Number) \
     M(CasDbgMetaHit,    "DBG(CA soak): S3ObjectStorage::tryGetObjectMetadata() found the object.", ValueType::Number) \
     M(CasDbgMetaMiss,   "DBG(CA soak): S3ObjectStorage::tryGetObjectMetadata() returned nullopt (404).", ValueType::Number) \
+    /* CA per-namespace S3 op instrumentation (B168 P0). 80 = 8 namespaces × 10 ops; attributes the */ \
+    /* S3 op-count (PUTs/HEADs/404s/412s/LISTs) by CA operation type via the InstrumentedBackend seam. */ \
+    M(CasBlobPut,        "CA blob put S3 ops", ValueType::Number) \
+    M(CasBlobPutDedup,   "CA blob put-dedup S3 ops", ValueType::Number) \
+    M(CasBlobOverwrite,  "CA blob overwrite S3 ops", ValueType::Number) \
+    M(CasBlobCas,        "CA blob cas S3 ops", ValueType::Number) \
+    M(CasBlobCasConflict,"CA blob cas-conflict S3 ops", ValueType::Number) \
+    M(CasBlobHead,       "CA blob head S3 ops", ValueType::Number) \
+    M(CasBlobHeadMiss,   "CA blob head-miss S3 ops", ValueType::Number) \
+    M(CasBlobGet,        "CA blob get S3 ops", ValueType::Number) \
+    M(CasBlobDelete,     "CA blob delete S3 ops", ValueType::Number) \
+    M(CasBlobList,       "CA blob list S3 ops", ValueType::Number) \
+    M(CasTreePut,        "CA tree put S3 ops", ValueType::Number) \
+    M(CasTreePutDedup,   "CA tree put-dedup S3 ops", ValueType::Number) \
+    M(CasTreeOverwrite,  "CA tree overwrite S3 ops", ValueType::Number) \
+    M(CasTreeCas,        "CA tree cas S3 ops", ValueType::Number) \
+    M(CasTreeCasConflict,"CA tree cas-conflict S3 ops", ValueType::Number) \
+    M(CasTreeHead,       "CA tree head S3 ops", ValueType::Number) \
+    M(CasTreeHeadMiss,   "CA tree head-miss S3 ops", ValueType::Number) \
+    M(CasTreeGet,        "CA tree get S3 ops", ValueType::Number) \
+    M(CasTreeDelete,     "CA tree delete S3 ops", ValueType::Number) \
+    M(CasTreeList,       "CA tree list S3 ops", ValueType::Number) \
+    M(CasPackPut,        "CA pack put S3 ops", ValueType::Number) \
+    M(CasPackPutDedup,   "CA pack put-dedup S3 ops", ValueType::Number) \
+    M(CasPackOverwrite,  "CA pack overwrite S3 ops", ValueType::Number) \
+    M(CasPackCas,        "CA pack cas S3 ops", ValueType::Number) \
+    M(CasPackCasConflict,"CA pack cas-conflict S3 ops", ValueType::Number) \
+    M(CasPackHead,       "CA pack head S3 ops", ValueType::Number) \
+    M(CasPackHeadMiss,   "CA pack head-miss S3 ops", ValueType::Number) \
+    M(CasPackGet,        "CA pack get S3 ops", ValueType::Number) \
+    M(CasPackDelete,     "CA pack delete S3 ops", ValueType::Number) \
+    M(CasPackList,       "CA pack list S3 ops", ValueType::Number) \
+    M(CasRootPut,        "CA root put S3 ops", ValueType::Number) \
+    M(CasRootPutDedup,   "CA root put-dedup S3 ops", ValueType::Number) \
+    M(CasRootOverwrite,  "CA root overwrite S3 ops", ValueType::Number) \
+    M(CasRootCas,        "CA root cas S3 ops", ValueType::Number) \
+    M(CasRootCasConflict,"CA root cas-conflict S3 ops", ValueType::Number) \
+    M(CasRootHead,       "CA root head S3 ops", ValueType::Number) \
+    M(CasRootHeadMiss,   "CA root head-miss S3 ops", ValueType::Number) \
+    M(CasRootGet,        "CA root get S3 ops", ValueType::Number) \
+    M(CasRootDelete,     "CA root delete S3 ops", ValueType::Number) \
+    M(CasRootList,       "CA root list S3 ops", ValueType::Number) \
+    M(CasGcPut,          "CA gc put S3 ops", ValueType::Number) \
+    M(CasGcPutDedup,     "CA gc put-dedup S3 ops", ValueType::Number) \
+    M(CasGcOverwrite,    "CA gc overwrite S3 ops", ValueType::Number) \
+    M(CasGcCas,          "CA gc cas S3 ops", ValueType::Number) \
+    M(CasGcCasConflict,  "CA gc cas-conflict S3 ops", ValueType::Number) \
+    M(CasGcHead,         "CA gc head S3 ops", ValueType::Number) \
+    M(CasGcHeadMiss,     "CA gc head-miss S3 ops", ValueType::Number) \
+    M(CasGcGet,          "CA gc get S3 ops", ValueType::Number) \
+    M(CasGcDelete,       "CA gc delete S3 ops", ValueType::Number) \
+    M(CasGcList,         "CA gc list S3 ops", ValueType::Number) \
+    M(CasBuildPut,       "CA build put S3 ops", ValueType::Number) \
+    M(CasBuildPutDedup,  "CA build put-dedup S3 ops", ValueType::Number) \
+    M(CasBuildOverwrite, "CA build overwrite S3 ops", ValueType::Number) \
+    M(CasBuildCas,       "CA build cas S3 ops", ValueType::Number) \
+    M(CasBuildCasConflict,"CA build cas-conflict S3 ops", ValueType::Number) \
+    M(CasBuildHead,      "CA build head S3 ops", ValueType::Number) \
+    M(CasBuildHeadMiss,  "CA build head-miss S3 ops", ValueType::Number) \
+    M(CasBuildGet,       "CA build get S3 ops", ValueType::Number) \
+    M(CasBuildDelete,    "CA build delete S3 ops", ValueType::Number) \
+    M(CasBuildList,      "CA build list S3 ops", ValueType::Number) \
+    M(CasServerPut,      "CA server put S3 ops", ValueType::Number) \
+    M(CasServerPutDedup, "CA server put-dedup S3 ops", ValueType::Number) \
+    M(CasServerOverwrite,"CA server overwrite S3 ops", ValueType::Number) \
+    M(CasServerCas,      "CA server cas S3 ops", ValueType::Number) \
+    M(CasServerCasConflict,"CA server cas-conflict S3 ops", ValueType::Number) \
+    M(CasServerHead,     "CA server head S3 ops", ValueType::Number) \
+    M(CasServerHeadMiss, "CA server head-miss S3 ops", ValueType::Number) \
+    M(CasServerGet,      "CA server get S3 ops", ValueType::Number) \
+    M(CasServerDelete,   "CA server delete S3 ops", ValueType::Number) \
+    M(CasServerList,     "CA server list S3 ops", ValueType::Number) \
+    M(CasOtherPut,       "CA other put S3 ops", ValueType::Number) \
+    M(CasOtherPutDedup,  "CA other put-dedup S3 ops", ValueType::Number) \
+    M(CasOtherOverwrite, "CA other overwrite S3 ops", ValueType::Number) \
+    M(CasOtherCas,       "CA other cas S3 ops", ValueType::Number) \
+    M(CasOtherCasConflict,"CA other cas-conflict S3 ops", ValueType::Number) \
+    M(CasOtherHead,      "CA other head S3 ops", ValueType::Number) \
+    M(CasOtherHeadMiss,  "CA other head-miss S3 ops", ValueType::Number) \
+    M(CasOtherGet,       "CA other get S3 ops", ValueType::Number) \
+    M(CasOtherDelete,    "CA other delete S3 ops", ValueType::Number) \
+    M(CasOtherList,      "CA other list S3 ops", ValueType::Number) \
     M(S3GetObjectTagging, "Number of S3 API GetObjectTagging calls.", ValueType::Number) \
     M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.", ValueType::Number) \
     M(S3UploadPartCopy, "Number of S3 API UploadPartCopy calls.", ValueType::Number) \

@@ -4,6 +4,9 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInstrumentedBackend.h>
+#include <Common/ProfileEvents.h>
+#include <IO/WriteHelpers.h>
 
 #if USE_AWS_S3
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
@@ -251,6 +254,76 @@ TEST(CasInMemoryBackend, RoundTripsUserMetadata)
     const auto gr = backend.get("k/key");
     ASSERT_TRUE(gr.has_value());
     ASSERT_EQ(gr->attributes.at("cas_owner"), "ab:7:42");
+}
+
+// =====================================================================
+// B168 P0: InstrumentedBackend per-namespace/op ProfileEvents
+// =====================================================================
+
+namespace ProfileEvents
+{
+extern const Event CasBlobPut;
+extern const Event CasBlobPutDedup;
+extern const Event CasBlobHead;
+extern const Event CasBlobHeadMiss;
+extern const Event CasGcCas;
+}
+
+TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
+{
+    /// Namespace classification by substring.
+    EXPECT_EQ(classifyCasNs("pool/blobs/ab/abcdef"), CasNs::Blob);
+    EXPECT_EQ(classifyCasNs("pool/trees/00/deadbeef"), CasNs::Tree);
+    EXPECT_EQ(classifyCasNs("pool/packs/p1"), CasNs::Pack);
+    EXPECT_EQ(classifyCasNs("pool/roots/_registry"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/roots/default/_files/x"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/gc/state"), CasNs::Gc);
+    EXPECT_EQ(classifyCasNs("pool/builds/b7"), CasNs::Build);
+    EXPECT_EQ(classifyCasNs("pool/servers/ab"), CasNs::Server);
+    EXPECT_EQ(classifyCasNs("pool/_pool_meta"), CasNs::Other);
+
+    auto inner = std::make_shared<InMemoryBackend>();
+    InstrumentedBackend b(inner);
+
+    using ProfileEvents::global_counters;
+    const auto blob_put_before   = global_counters[ProfileEvents::CasBlobPut].load();
+    const auto blob_dedup_before = global_counters[ProfileEvents::CasBlobPutDedup].load();
+    const auto blob_head_before  = global_counters[ProfileEvents::CasBlobHead].load();
+    const auto blob_miss_before  = global_counters[ProfileEvents::CasBlobHeadMiss].load();
+    const auto gc_cas_before     = global_counters[ProfileEvents::CasGcCas].load();
+
+    const String blob_key = "pool/blobs/ab/abcdef0123456789";
+
+    /// First put of a blob ⇒ Put.
+    EXPECT_EQ(b.putIfAbsent(blob_key, "payload"), PutOutcome::Done);
+    /// Second put of the same key ⇒ PutDedup (content already exists).
+    EXPECT_EQ(b.putIfAbsent(blob_key, "payload"), PutOutcome::PreconditionFailed);
+    /// head of an absent blob key ⇒ HeadMiss (the 404 signal).
+    EXPECT_FALSE(b.head("pool/blobs/zz/absent").exists);
+    /// head of the present blob key ⇒ Head.
+    EXPECT_TRUE(b.head(blob_key).exists);
+    /// casPut create on a gc key ⇒ Gc Cas.
+    EXPECT_EQ(b.casPut("pool/gc/state", "g1", std::nullopt), CasOutcome::Committed);
+    /// Streaming put to a fresh blob key, then finalize ⇒ Put.
+    {
+        auto sink = b.putIfAbsentStream("pool/blobs/cd/cafebabe");
+        ASSERT_TRUE(sink != nullptr);
+        DB::writeString(String("streamed"), sink->buffer());
+        EXPECT_EQ(sink->finalize(nullptr), PutOutcome::Done);
+    }
+
+    /// Under coverage builds ProfileEvents propagate into a thread-local subtree that does not reach
+    /// `global_counters`; deltas read 0 there only (see gtest_unique_key_index_cache).
+#if !WITH_COVERAGE
+    EXPECT_EQ(global_counters[ProfileEvents::CasBlobPut].load()      - blob_put_before,   2u);
+    EXPECT_EQ(global_counters[ProfileEvents::CasBlobPutDedup].load() - blob_dedup_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CasBlobHead].load()     - blob_head_before,  1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CasBlobHeadMiss].load() - blob_miss_before,  1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CasGcCas].load()        - gc_cas_before,     1u);
+#else
+    (void)blob_put_before; (void)blob_dedup_before; (void)blob_head_before;
+    (void)blob_miss_before; (void)gc_cas_before;
+#endif
 }
 
 // =====================================================================
