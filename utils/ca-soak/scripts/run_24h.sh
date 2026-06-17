@@ -41,7 +41,7 @@ done
 
 PYTHONPATH="$(pwd)" python3 -m soak.run \
   --seed "$SEED" --phase 3 --duration "$DURATION" --workers "$WORKERS" \
-  --metrics "$METRICS" --max-pool-gb "$MAX_POOL_GB"
+  --metrics "$METRICS" --max-pool-gb "$MAX_POOL_GB" ${NO_CHAOS:+--no-chaos}
 rc=$?
 if [ "$rc" -ne 0 ]; then echo "PHASE3 FAILED (rc=$rc)"; exit "$rc"; fi
 
