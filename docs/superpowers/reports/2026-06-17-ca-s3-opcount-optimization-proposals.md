@@ -3,7 +3,24 @@
 **Status:** collecting · **Date:** 2026-06-17 · **Branch:** `cas-mergetree-poc`
 **Context:** the B167 12h soak surfaced that the CA workload's S3 request cost is large and PUT-dominated. This doc collects optimization proposals, the measurements that motivate them, and their expected impact. Complements `docs/superpowers/specs/2026-06-08-s3-ops-cost-model.md`. Ties to B157/B149 (op-count) and B167f/B167g.
 
-## Measured cost (workers=2, no-chaos, warmup→steady; both replicas; ~36 min window)
+## CORRECTED cost + waste breakdown (workers=2, no-chaos, ~3.3 h steady sample, both replicas)
+
+The 36-min figure below over-extrapolated the warmup insert burst. Clean totals at ~12,040 s (per-day ×7.18):
+
+| | ch1 (GC leader) | ch2 | combined/day | $/day |
+|---|---|---|---|---|
+| Read req (GET+HEAD) | 62.5 M | 9.6 M | ~517 M | $207 |
+| → **404 HEADs (`read_404` ≈ `CasDbgMetaMiss`)** | **51.2 M (82%)** | ~0 | **~367 M** | **$147 (wasted)** |
+| Write req (PUT+LIST) | 5.79 M | 4.33 M | ~73 M | $365 |
+| → **412 (dedup `If-None-Match` + manifest `If-Match`)** | 2.45 M (42%) | 2.51 M (58%) | **~36 M** | **$178 (wasted)** |
+| LIST | 20,932 | 20,974 | ~0.3 M | (in write tier) |
+| **Total** | | | | **≈ $571/day (~$17.4k/mo)** |
+
+**~57% of the bill (~$325/day) is pure op-count waste:** the GC 404-HEAD storm (read tier) + 412 CAS/dedup retries (write tier). Optimized floor for this workload ≈ $245/day.
+
+**Key correction:** `CasDbgMetaMiss` (50.8 M) ≈ `S3ReadRequestsErrors` (50.8 M) — these 404 metadata lookups **are real, billed S3 HEADs** (not negative-cached as first guessed), and **88% of the GC leader's 58 M HEADs are 404 misses**. The storm is entirely on the GC leader (ch1: 5 lease acquires; ch2: 0, `read_404`≈0). Merge write-amplification is also large: `MergedRows` 1.66 B from 92 M written (~18×) — inherent MergeTree, but it drives the CA blob churn.
+
+## Measured cost (workers=2, no-chaos, warmup→steady; both replicas; ~36 min window — SUPERSEDED by the corrected table above)
 
 AWS S3 Standard (us-east-1): PUT/LIST/COPY = $0.005/1k, GET/HEAD/other = $0.0004/1k, DELETE free, same-region transfer free.
 
@@ -36,6 +53,9 @@ Not in `part_log` (background): the ~7 M GC observe-scan HEADs, the manifest `ca
 
 ### P0 — Instrument the PUT/412 split (DO FIRST; cheap, safe)
 Add ProfileEvents distinguishing: `If-None-Match` 412 (dedup miss) vs `If-Match` 412 (manifest CAS conflict) vs successful create vs overwrite; and attribute PUTs per part-op (or per CA call-site). Without this we are guessing which half of the 412s dominates. Small backend change, no behavior change. **Gates P1/P4 prioritization.**
+
+### P9 — Eliminate the GC 404-HEAD storm (largest single op bucket; ~$147/day, ~367 M ops/day, all on the leader)
+The GC leader's R2 observe loop HEADs every zero-in-degree candidate to capture its token before condemning — but **82% of those HEADs are 404s** (`read_404`≈`CasDbgMetaMiss`≈51 M on ch1, ~0 on ch2). The candidate set (`zeroInDegreeKnown()`) is re-HEADing objects **already deleted in prior rounds** (or deleted by the peer) that were never pruned from the in-degree snapshot, so the same dead keys are re-probed every round (~225 rounds). Fix: **prune confirmed-deleted/absent objects from the snap so they are not re-observed** (a deleted/absent key should leave the candidate set), and/or negative-cache absent keys within a GC pass, and/or skip re-HEAD of keys whose retire outcome was already `deleted`/`absent`. This is the same family as the B160-era 404-HEAD storm but on the leader's own observe loop. **Expected: removes ~367 M HEADs/day** — the single biggest op-count item; read-tier $ is modest (~$147/day) but the CPU/latency/RustFS-load relief is large and it cleans up the dominant counter.
 
 ### P1 — Local "known-present" dedup cache (eliminates the op entirely)
 Bounded in-memory set of content hashes the server has confirmed present. On create, check first; on a hit, skip the conditional PUT **and** the follow-up HEAD → **0 S3 ops** for re-referenced content. Safe: content is immutable; a stale hit (GC-deleted since) is caught by the publish-gate re-validation → re-upload. Attacks the dedup-412 source (NewPart ~28 HEAD/op + the paired 412 PUT, MergeParts ~36 HEAD/op). **Expected: large cut to both the dedup-412 PUTs and the insert/merge HEADs.**
