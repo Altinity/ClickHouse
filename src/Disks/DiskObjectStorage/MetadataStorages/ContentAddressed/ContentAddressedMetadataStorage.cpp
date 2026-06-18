@@ -939,6 +939,9 @@ bool ContentAddressedMetadataStorage::adoptPart(
     payload.mutable_files[".ca_mtime"] = std::to_string(static_cast<uint64_t>(::time(nullptr)));
     /// tree_size is not carried on the wire (B92: the adopt path publishes 0 until the size is
     /// recovered; no read path consumes it yet).
+    /// B171: protect the adopted closure via a build-root precommit before the fail-closed publish,
+    /// so GC cannot reclaim a tree/blob between this server's adopt and its own commit.
+    build->precommit(tree);
     build->publish(ns, part_name, tree, std::move(payload));
     return true;
 }

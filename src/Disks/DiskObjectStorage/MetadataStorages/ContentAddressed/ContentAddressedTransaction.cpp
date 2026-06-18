@@ -104,6 +104,8 @@ bool ContentAddressedTransaction::republishRef(
     Cas::RefPayload payload;
     payload.tree_size = resolved->tree_size;
     payload.mutable_files = resolved->mutable_files;   /// the .ca_mtime stamp carries over (a rename is not a new part)
+    /// B171: protect the adopted closure via a build-root precommit before the fail-closed publish.
+    build->precommit(resolved->tree_id);
     build->publish(dst_ns, dst_ref, resolved->tree_id, std::move(payload));
     metadata_storage.store()->dropRef(src_ns, src_ref);
     return true;
@@ -177,6 +179,12 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// The publish wall-clock stamp backing getLastModified (reserved name, filtered from
     /// every listing by the read side).
     payload.mutable_files[".ca_mtime"] = std::to_string(static_cast<uint64_t>(::time(nullptr)));
+
+    /// B171: publish the build-root precommit edge as soon as the manifest tree is assembled and
+    /// BEFORE the fail-closed publish. Every child of `tree` (including blobs adopted/dedup'd from a
+    /// source part whose ref may be dropped concurrently) is now reachable from a durable build root,
+    /// so GC cannot reclaim the closure out from under this commit or the GC rounds in between.
+    st.build->precommit(tree);
 
     /// Force-fresh (Pillar B): publish-gate rollback tracking — a stale result mis-tracks rollback.
     const bool ref_existed = metadata_storage.store()->resolveRef(ns, ref).has_value();
