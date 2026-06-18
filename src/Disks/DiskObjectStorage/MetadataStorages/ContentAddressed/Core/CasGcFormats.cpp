@@ -21,12 +21,11 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint64_t GC_STATE_VERSION = 2;
+constexpr uint64_t GC_STATE_VERSION = 3;   /// v3: folded_cursor moved from gc/state into the snap (B140-dangle fix)
 constexpr uint64_t RETIRED_SET_VERSION = 1;
 
-/// Writes a `{"key":u64,...}` object from a string-keyed map (folded_cursor and the inner
-/// fence_version objects). The keys are "ns/shard" strings — data, so they go through the
-/// escaping writer.
+/// Writes a `{"key":u64,...}` object from a string-keyed map (used for the inner fence_version
+/// objects). The keys are "ns/shard" strings — data, so they go through the escaping writer.
 void writeU64MapObject(WriteBuffer & out, const std::map<String, uint64_t> & map)
 {
     writeChar('{', out);
@@ -86,9 +85,6 @@ String encodeGcState(const GcState & state)
     writeIntText(state.lease.seq, out);
     writeChar('}', out);
     writeChar(',', out);
-    writeJsonKey(out, "folded_cursor");
-    writeU64MapObject(out, state.folded_cursor);
-    writeChar(',', out);
     writeJsonKey(out, "fence_version");
     writeChar('{', out);
     bool first = true;
@@ -112,7 +108,7 @@ GcState decodeGcState(std::string_view data)
         auto obj = parseJsonDocument(data, "cas_gc_state", GC_STATE_VERSION, "gc/state");
         checkNoUnknownKeys(*obj,
             {"format", "version", "round", "fence_seq", "snap_shards", "snap_generation",
-             "lease", "folded_cursor", "fence_version"}, "gc/state");
+             "lease", "fence_version"}, "gc/state");
 
         GcState state;
         state.round = requireU64(*obj, "round", "gc/state");
@@ -126,8 +122,6 @@ GcState decodeGcState(std::string_view data)
         checkNoUnknownKeys(*lease, {"owner", "seq"}, "gc/state lease");
         state.lease.owner = requireHash(*lease, "owner", "gc/state lease");
         state.lease.seq = requireU64(*lease, "seq", "gc/state lease");
-
-        state.folded_cursor = u64MapFromObject(*requireObject(*obj, "folded_cursor", "gc/state"), "gc/state folded_cursor");
 
         auto fences = requireObject(*obj, "fence_version", "gc/state");
         for (const auto & [round_str, inner_var] : *fences)

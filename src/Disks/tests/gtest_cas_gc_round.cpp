@@ -384,18 +384,19 @@ TEST(CasGcFold, FreshUploadsAreNeverCandidates)
     EXPECT_TRUE(rep.acquired_lease);
     EXPECT_EQ(rep.candidates, 0u);                               /// everything pinned
 
-    /// snap durable at generation 1; cursor advanced:
+    /// B140-dangle fix: the fold cursor now lives in the snap (GcSnap::folded_cursor), not in
+    /// gc/state. The fold writes snap at gen 1 (edges, cursor=empty). The recheck folds through the
+    /// fence window, which includes the publish record (cursor=0 → fence_window_records_folded=true),
+    /// so cascadeAndPersist writes the cursor into snap gen 2. gc/state.snap_generation = 2.
     const GcState st = readState(*b, *s);
-    EXPECT_EQ(st.snap_generation, 1u);
-    const GcSnap snap = readSnap(*b, *s, 1, 0);
+    EXPECT_EQ(st.snap_generation, 2u);
+    const GcSnap snap = readSnap(*b, *s, 2, 0);   /// authoritative snap (gen 2, with cursor)
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, tree_hash), 1u);
     EXPECT_EQ(snap.inDegree(ObjectKind::Blob, u128Of("payload")), 1u);
     EXPECT_TRUE(snap.isExpanded(tree_hash));
     EXPECT_TRUE(snap.zeroInDegreeKnown().empty());
-
     const String cursor_key = "srv1/tbl/" + std::to_string(shardOfForTest("part_1", s->poolMeta().root_shards));
-    ASSERT_TRUE(st.folded_cursor.contains(cursor_key));
-    EXPECT_GT(st.folded_cursor.at(cursor_key), 0u);
+    EXPECT_FALSE(snap.folded_cursor.empty());      /// cursor advanced to the fence version in cascade snap
 }
 
 TEST(CasGcFold, DropZeroesTreeButChildStaysPinned)
@@ -499,7 +500,9 @@ TEST(CasGcFold, IncrementalSecondFoldOnlyNewRecords)
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
-    EXPECT_EQ(readState(*b, *s).snap_generation, 1u);
+    /// B140-dangle fix: each round with new records produces TWO snap writes (fold + cascade),
+    /// so snap_generation advances by 2. Round 1: fold at gen 1, cascade at gen 2.
+    EXPECT_EQ(readState(*b, *s).snap_generation, 2u);
 
     const TreeId t2 = publishPart(s, "srv1/tbl", "part_2", "two");
     b->resetCounts();
@@ -509,8 +512,9 @@ TEST(CasGcFold, IncrementalSecondFoldOnlyNewRecords)
     EXPECT_EQ(b->getCount(s->layout().treeKey(t1)), 0u);         /// already-folded record skipped
     EXPECT_EQ(b->getCount(s->layout().treeKey(t2)), 1u);
 
-    EXPECT_EQ(readState(*b, *s).snap_generation, 2u);
-    const GcSnap snap = readSnap(*b, *s, 2, 0);
+    /// Round 2: fold at gen 3, cascade at gen 4.
+    EXPECT_EQ(readState(*b, *s).snap_generation, 4u);
+    const GcSnap snap = readSnap(*b, *s, 4, 0);
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, hexToU128(t1.string())), 1u);
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, hexToU128(t2.string())), 1u);
 }
@@ -532,16 +536,16 @@ TEST(CasGcFold, DurableSnapBeforeCursorAdvance)
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc.runRegularRound(); });
 
     const GcState st = readState(*b, *s);
-    EXPECT_EQ(st.snap_generation, 0u);                           /// cursor side did NOT advance
-    EXPECT_TRUE(st.folded_cursor.empty());
+    EXPECT_EQ(st.snap_generation, 0u);                           /// gc/state CAS did NOT advance snap_gen
+    /// B140-dangle fix: cursor moved from gc/state into the snap; gc/state no longer carries it.
     EXPECT_TRUE(b->get(s->layout().gcSnapKey(1, 0)).has_value());    /// snap durable first
 
     const RoundReport rep = gc.runRegularRound();                /// replay: re-folds and lands
     EXPECT_TRUE(rep.acquired_lease);
     EXPECT_EQ(rep.candidates, 0u);
     const GcState st2 = readState(*b, *s);
-    EXPECT_EQ(st2.snap_generation, 1u);
-    EXPECT_FALSE(st2.folded_cursor.empty());
+    /// B140-dangle fix: fold at gen 1 (already orphaned, byte-equal → adopted), cascade at gen 2.
+    EXPECT_EQ(st2.snap_generation, 2u);
 }
 
 TEST(CasGcFold, ForeignDivergentGenerationIsProbedPast)
@@ -559,8 +563,9 @@ TEST(CasGcFold, ForeignDivergentGenerationIsProbedPast)
     const RoundReport rep = gc.runRegularRound();
     EXPECT_TRUE(rep.acquired_lease);
     EXPECT_EQ(rep.candidates, 0u);
-    EXPECT_EQ(readState(*b, *s).snap_generation, 2u);            /// gen 1 abandoned, gen 2 ours
-    const GcSnap snap = readSnap(*b, *s, 2, 0);
+    /// B140-dangle fix: gen 1 foreign-abandoned, gen 2 fold-ours, gen 3 cascade-ours.
+    EXPECT_EQ(readState(*b, *s).snap_generation, 3u);
+    const GcSnap snap = readSnap(*b, *s, 3, 0);
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, hexToU128(tree.string())), 1u);
 }
 
@@ -586,9 +591,9 @@ TEST(CasGcFold, GenerationProbeRecoversAfterLostCursorCas)
     EXPECT_TRUE(rep.acquired_lease);
     EXPECT_EQ(rep.candidates, 0u);
     const GcState st = readState(*b, *s);
-    EXPECT_EQ(st.snap_generation, 2u);
-    EXPECT_FALSE(st.folded_cursor.empty());
-    const GcSnap snap = readSnap(*b, *s, 2, 0);
+    /// B140-dangle fix: gen 1 orphaned (lost fold CAS), gen 2 fold-ours, gen 3 cascade-ours.
+    EXPECT_EQ(st.snap_generation, 3u);
+    const GcSnap snap = readSnap(*b, *s, 3, 0);
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, hexToU128(t1.string())), 1u);
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, hexToU128(t2.string())), 1u);
 }
@@ -676,7 +681,7 @@ TEST(CasGcFold, AbsentTreeWithoutLaterRemoveFailsClosed)
 
     const GcState st = readState(*b, *s);
     EXPECT_EQ(st.snap_generation, 0u);
-    EXPECT_TRUE(st.folded_cursor.empty());
+    /// B140-dangle fix: cursor moved from gc/state into the snap; gc/state no longer carries it.
     EXPECT_FALSE(b->get(s->layout().gcSnapKey(1, 0)).has_value());   /// nothing durable was written
 }
 

@@ -150,22 +150,23 @@ private:
     ///
     /// DURABLE-BEFORE-CURSOR: the updated snap goes durable FIRST (ALL shards, even unchanged
     /// ones - simplest correct v1; skipping byte-identical shards is a possible later
-    /// optimization), only then does ONE gc/state CAS advance snap_generation + folded_cursor
-    /// against `state_token`. Generation objects are write-once (putIfAbsent) and the write
-    /// generation PROBES UPWARD from snap_generation+1: per generation, every shard Done or
-    /// byte-equal (our own crash-replay) => adopt; any shard divergent => abandon that generation
-    /// and try one higher - a FIXED generation would wedge GC forever once an orphan plus new
-    /// journal records make the bytes unmatchable. Abandoned partials are harmless orphans
-    /// (full-GC cleans them in M-F); generations need not be dense - the gc/state pointer is
-    /// authoritative. A gc/state CAS Conflict means another leader advanced state - throw ABORTED
-    /// (retry next round). snap_shards != 1 is refused (NOT_IMPLEMENTED): cross-shard last-op-wins
-    /// displacement is undesigned in M-C3.
+    /// optimization), only then does ONE gc/state CAS advance snap_generation against `state_token`.
+    /// Generation objects are write-once (putIfAbsent) and the write generation PROBES UPWARD from
+    /// snap_generation+1: per generation, every shard Done or byte-equal (our own crash-replay) =>
+    /// adopt; any shard divergent => abandon that generation and try one higher - a FIXED generation
+    /// would wedge GC forever once an orphan plus new journal records make the bytes unmatchable.
+    /// Abandoned partials are harmless orphans (full-GC cleans them in M-F); generations need not
+    /// be dense - the gc/state pointer is authoritative. A gc/state CAS Conflict means another
+    /// leader advanced state - throw ABORTED (retry next round). snap_shards != 1 is refused
+    /// (NOT_IMPLEMENTED): cross-shard last-op-wins displacement is undesigned in M-C3.
+    /// NOTE: folded_cursor is NOT advanced by fold (B140-dangle fix): it now lives in the snap
+    /// (GcSnap::folded_cursor) and is advanced by cascadeAndPersist together with the edges.
     ///
-    /// On success `state` carries the committed snap_generation/folded_cursor and `state_token`
-    /// the committed gc/state token. The committed pair is THREADED into retire, never re-read:
-    /// a post-fold re-read would open a zombie window - a lease steal landing between the fold
-    /// CAS and the re-read hands this (now stale) leader the thief's state with its bumped
-    /// fence_seq, letting stale-snap retire sets land inside the thief's epoch paths.
+    /// On success `state` carries the committed snap_generation and `state_token` the committed
+    /// gc/state token. The committed pair is THREADED into retire, never re-read: a post-fold
+    /// re-read would open a zombie window - a lease steal landing between the fold CAS and the
+    /// re-read hands this (now stale) leader the thief's state with its bumped fence_seq, letting
+    /// stale-snap retire sets land inside the thief's epoch paths.
     FoldResult fold(GcState & state, Token & state_token);
 
     /// R2 (spec §7; the model's GRetire): the round being executed is state.round + 1 (state.round
@@ -236,12 +237,13 @@ private:
     /// The CASCADE pipeline step (spec §7; the model's Land does the strip atomically with the
     /// landing): strip every confirmed-deleted (or absent-while-held) tree's child edges + clear
     /// its marker; PERSIST the post-strip snap (including the recheck's fence-window fold) at a
-    /// probe-upward generation; ONE gc/state CAS advances snap_generation + folded_cursor to the
-    /// recorded fence versions and erases fence_version[<= round] — the ordering that closes the
-    /// cascade-vs-recreate race (a recreate lands ABOVE the fence version, so the next round folds
-    /// its Add on a snap whose marker the strip already cleared ⇒ re-expansion re-pins the
-    /// children); THEN drop the round's retired-set objects on their confirmed outcomes. The
-    /// freed children become zero-in-degree known nodes — the NEXT round's stateless candidate
+    /// probe-upward generation — writing the fence versions into the snap's folded_cursor (the
+    /// B140-dangle fix: (edges, cursor) are one write-once unit, cursor lives in snap shard 0);
+    /// ONE gc/state CAS advances snap_generation and erases fence_version[<= round] — the ordering
+    /// that closes the cascade-vs-recreate race (a recreate lands ABOVE the fence version, so the
+    /// next round folds its Add on a snap whose marker the strip already cleared ⇒ re-expansion
+    /// re-pins the children); THEN drop the round's retired-set objects on their confirmed outcomes.
+    /// The freed children become zero-in-degree known nodes — the NEXT round's stateless candidate
     /// scan retires and deletes them (LIVE-RECLAIM: ~2 regular rounds).
     void cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64_t, GcSnap> & snap,
                            const RecheckResult & rechecked,
@@ -272,12 +274,13 @@ private:
     bool tryResumeIncompleteRound(GcState & state, Token & state_token, RoundReport & report);
 
     /// Journal trim (INV-JOURNAL-COVERAGE): drop journal records with at_version <= the DURABLE
-    /// folded_cursor (the cascade CAS advanced it to the fence versions before this runs). A
-    /// manifest CAS may trim records ONLY after the corresponding cursor advance is durable -
-    /// "compact the manifest for size" is never a reason to trim. Shards with nothing to trim are
-    /// not touched (no pointless version bumps). The trim's own CAS bumps shard_version with no
-    /// journal record - vacuously covered, same argument as the fence bump.
-    void trim(const GcState & state,
+    /// folded_cursor (the cascade CAS advanced it into the snap before this runs). The cursor is
+    /// read from the snap (the single source of truth since B140-dangle fix). A manifest CAS may
+    /// trim records ONLY after the corresponding cursor advance is durable - "compact the manifest
+    /// for size" is never a reason to trim. Shards with nothing to trim are not touched (no
+    /// pointless version bumps). The trim's own CAS bumps shard_version with no journal record -
+    /// vacuously covered, same argument as the fence bump.
+    void trim(const std::map<uint64_t, GcSnap> & snap,
               const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards);
 
     /// Fold one root shard's journal records with at_version in (lo, hi] into `snap` — the shared

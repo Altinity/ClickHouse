@@ -127,10 +127,14 @@ TEST(CasGcDangle, SharedBlobUnderCountDeletesLivePinnedBlob)
     snap.snap_shard = 0;
     snap.generation = 1;
 
+    /// B140-dangle fix: the cursor now lives in the snap, not gc/state. Inject the same broken
+    /// state: cursor in snap shard 0 AHEAD of the actual edges (T_cur's Add was "cursor-skipped"
+    /// but T_cur->B is absent from the snap). In normal GC operation this divergence cannot occur
+    /// (cursor and edges are written atomically), but we inject it to show the old failure mode.
+    snap.folded_cursor[cursor_key] = cursor_past_both;             /// cursor AHEAD of the snap's real extent
     GcState st;
     st.snap_generation = 1;
     st.snap_shards = 1;
-    st.folded_cursor[cursor_key] = cursor_past_both;               /// cursor AHEAD of the snap's real extent
     ASSERT_EQ(b->putIfAbsent(s->layout().gcSnapKey(1, 0), encodeGcSnap(snap)), PutOutcome::Done);
     const auto state_head = b->head(s->layout().gcStateKey());
     if (state_head.exists)

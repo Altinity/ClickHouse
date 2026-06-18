@@ -14,8 +14,9 @@ namespace DB::Cas
 /// GC-surface formats — the part of the GC state the WRITER consumes (the publish gate reads
 /// gc/state and the retired sets to decide whether a reused object is condemned, spec §4).
 ///
-/// OWNERSHIP: these codecs are owned by GC (milestone M-C3). CAGS v2 carries the full GC
-/// controller state: the lease, the snap config, the fold cursors, and the fence versions.
+/// OWNERSHIP: these codecs are owned by GC (milestone M-C3). CAGS v3 carries the full GC
+/// controller state: the lease, the snap config, and the fence versions. The fold cursor was
+/// moved into the snap (GcSnap::folded_cursor) in B140-dangle fix (v3).
 /// Keep writer-side code forward-compatible by treating a future version as NOT_IMPLEMENTED
 /// (fail closed), never as corruption. The format is unreleased, so v1 (the M-C2 minimal CAGS)
 /// is NOT accepted — no compat shims.
@@ -25,16 +26,16 @@ namespace DB::Cas
 /// (wrong format / unknown key / missing key / wrong type / bad enum string / bad hash hex /
 /// malformed document => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
 
-/// gc/state ("cas_gc_state" v2):
-///   {"format":"cas_gc_state","version":2,
+/// gc/state ("cas_gc_state" v3):
+///   {"format":"cas_gc_state","version":3,
 ///    "round":7,"fence_seq":3,"snap_shards":1,"snap_generation":12,
 ///    "lease":{"owner":"<32hex>","seq":5},
-///    "folded_cursor":{"<ns>/<root_shard>":4},
 ///    "fence_version":{"<round>":{"<ns>/<root_shard>":4}}}
-/// folded_cursor / fence_version are indexed by ROOT shard ("ns/shard" strings — the journal
-/// sources); the snap / retired / outcome OBJECTS are indexed by target-hash-prefix snap shard.
-/// Two distinct sharding axes (spec §4). fence_version outer keys are the round as a decimal
-/// string (JSON object keys are strings).
+/// fence_version is indexed by ROOT shard ("ns/shard" strings — the journal sources); the snap /
+/// retired / outcome OBJECTS are indexed by target-hash-prefix snap shard. Two distinct sharding
+/// axes (spec §4). fence_version outer keys are the round as a decimal string (JSON object keys
+/// are strings). NOTE: the fold cursor (folded_cursor) moved from gc/state into the snap
+/// (GcSnap::folded_cursor, B140-dangle fix) so (edges, cursor) are one write-once unit.
 struct GcLease
 {
     UInt128 owner{};          /// gc leader id (random u128); 0 = never held
@@ -48,7 +49,6 @@ struct GcState
     uint64_t snap_shards = 1;      /// GC constant (target-hash-prefix sharding); set once, immutable
     uint64_t snap_generation = 0;  /// monotone; the authoritative snap objects' generation
     GcLease lease;
-    std::map<String, uint64_t> folded_cursor;                       /// "ns/shard" -> folded shard_version
     std::map<uint64_t, std::map<String, uint64_t>> fence_version;   /// round -> ("ns/shard" -> version)
 };
 

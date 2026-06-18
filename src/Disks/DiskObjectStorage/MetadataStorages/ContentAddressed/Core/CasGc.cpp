@@ -23,6 +23,22 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+namespace
+{
+
+/// The committed fold cursor for (ns, shard), read from the snap (the single source of truth).
+/// snap_shards==1 is enforced, so the whole folded_cursor map lives in snap shard 0.
+uint64_t cursorOf(const std::map<uint64_t, GcSnap> & snap, const String & cursor_key)
+{
+    const auto shard_it = snap.find(0);
+    if (shard_it == snap.end())
+        return 0;
+    const auto it = shard_it->second.folded_cursor.find(cursor_key);
+    return it != shard_it->second.folded_cursor.end() ? it->second : 0;
+}
+
+}
+
 uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len)
 {
     if (kind != ObjectKind::Blob)
@@ -96,7 +112,7 @@ RoundReport Gc::runRegularRound()
     cascadeAndPersist(state, state_token, folded.snap, rechecked, retired, report);
 
     /// Journal trim - the round's maintenance tail (cursors are durable; INV-JOURNAL-COVERAGE).
-    trim(state, folded.root_shards);
+    trim(folded.snap, folded.root_shards);
 
     /// Pillar A1: keep the final post-round snap resident for the next round's fold (write-once
     /// generation makes this safe to reuse while we remain the leader at the same generation).
@@ -115,16 +131,15 @@ RoundReport Gc::runRegularRound()
     return report;
 }
 
-void Gc::trim(const GcState & state,
+void Gc::trim(const std::map<uint64_t, GcSnap> & snap,
               const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards)
 {
     for (const auto & [ns, shard] : root_shards)
     {
         const String cursor_key = ns.string() + "/" + std::to_string(shard);
-        const auto cursor_it = state.folded_cursor.find(cursor_key);
-        if (cursor_it == state.folded_cursor.end())
+        const uint64_t cursor = cursorOf(snap, cursor_key);
+        if (cursor == 0)
             continue;
-        const uint64_t cursor = cursor_it->second;
 
         /// Touch the manifest only when there is something to trim (a peek first - the CAS loop
         /// re-reads anyway, but a per-round no-op version bump on every shard would be noise).
@@ -192,8 +207,7 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
         chassert(parse.ec == std::errc());
 
         const auto [root, manifest_token] = store->readShard(ns, shard);
-        const auto cursor_it = state.folded_cursor.find(cursor_key);
-        const uint64_t cursor = cursor_it != state.folded_cursor.end() ? cursor_it->second : 0;
+        const uint64_t cursor = cursorOf(snap, cursor_key);
         if (fence_version > cursor)
         {
             /// Did any RECORD actually sit in the window? (The fence's own bump is recordless, so
@@ -397,20 +411,23 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
         ++report.forgotten_on_delete;
     }
 
-    /// 2. PERSIST the post-strip snap - WITH the recheck's fence-window fold included - and
-    /// advance folded_cursor to the recorded fence versions in the SAME gc/state CAS. This is the
-    /// pipeline ORDERING rule that closes the cascade-vs-recreate race: a re-create-and-publish
-    /// racing the deletion necessarily lands at a shard_version ABOVE this round's fence version,
-    /// so the next round folds its Add on a snap whose marker was already CLEARED by the strip -
-    /// the re-expansion re-pins the children. Persisting the strip lazily (or not advancing the
-    /// cursors with it) would let that Add fold against a still-set marker, skip the re-expansion,
-    /// and leave the recreated live tree's children edge-less - an under-count, a wrong delete.
+    /// 2. PERSIST the post-strip snap - WITH the recheck's fence-window fold included - and the
+    /// folded_cursor advanced to the recorded fence versions IN THE SNAP BYTES (B140-dangle fix:
+    /// cursor lives in snap shard 0, so (edges, cursor) are one write-once unit that can never
+    /// diverge across a crash). This is the pipeline ORDERING rule that closes the
+    /// cascade-vs-recreate race: a re-create-and-publish racing the deletion necessarily lands at a
+    /// shard_version ABOVE this round's fence version, so the next round folds its Add on a snap
+    /// whose marker was already CLEARED by the strip - the re-expansion re-pins the children.
+    /// Persisting the strip lazily (or not advancing the cursors with it) would let that Add fold
+    /// against a still-set marker, skip the re-expansion, and leave the recreated live tree's
+    /// children edge-less - an under-count, a wrong delete.
     /// Same write-once probe-upward discipline as the fold's persist. SKIPPED when the snap is
-    /// semantically unchanged since the fold's persist (no strips, no fence-window records - the
-    /// common idle case): persisting a byte-equivalent-except-generation snap every round would
-    /// mint an orphan object per round forever for nothing. The closing gc/state CAS below still
-    /// runs unconditionally (cursors advance to the fence versions - vacuous coverage when the
-    /// window held no records - and fence_version[<= round] is erased).
+    /// semantically unchanged since the fold's persist (no strips, no fence-window records, no
+    /// forgotten nodes - the common idle case): persisting a byte-equivalent-except-generation snap
+    /// every round would mint an orphan object per round forever for nothing. When skipped, the
+    /// cursor does NOT advance (conservative: the next fold re-reads those journal records and the
+    /// trim leaves them in place - no loss). The closing gc/state CAS below still runs
+    /// unconditionally (fence_version[<= round] is erased).
     const bool snap_changed = !rechecked.deleted_trees.empty() || rechecked.fence_window_records_folded
         || report.forgotten_on_delete > 0;   /// P9: a blob-only prune round must still persist the snap
     constexpr uint64_t max_generation_probes = 1000;
@@ -426,6 +443,19 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
         for (auto & [snap_shard, shard_snap] : snap)
         {
             shard_snap.generation = generation;
+            /// Advance the fold cursor in snap shard 0 (the single source of truth, B140-dangle fix):
+            /// write the fence versions into the snap so (edges, cursor) are persisted as one
+            /// write-once unit — they can never diverge across a crash.
+            if (snap_shard == 0)
+            {
+                for (const auto & [cursor_key, fence_version] : fence_it->second)
+                {
+                    if (cursor_key == "_registry")
+                        continue;
+                    shard_snap.folded_cursor[cursor_key]
+                        = std::max(shard_snap.folded_cursor[cursor_key], fence_version);
+                }
+            }
             const String snap_key = layout.gcSnapKey(generation, snap_shard);
             const String body = encodeGcSnap(shard_snap);
             if (backend.putIfAbsent(snap_key, body) == PutOutcome::PreconditionFailed)
@@ -447,16 +477,6 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
 
     GcState next = state;
     next.snap_generation = adopted_generation;   /// unchanged when the persist was skipped
-    for (const auto & [cursor_key, fence_version] : fence_it->second)
-    {
-        if (cursor_key == "_registry")
-            continue;
-        auto it = next.folded_cursor.find(cursor_key);
-        if (it != next.folded_cursor.end())
-            it->second = std::max(it->second, fence_version);
-        else
-            next.folded_cursor[cursor_key] = fence_version;
-    }
     /// fence_version[<= round] served its recheck - erase it (gc/state must not grow forever).
     std::erase_if(next.fence_version, [&](const auto & kv) { return kv.first <= round; });
     Token committed_token;
@@ -991,7 +1011,7 @@ bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundRep
 
     const RecheckResult rechecked = recheck(state, snap, retired, report);
     cascadeAndPersist(state, state_token, snap, rechecked, retired, report);
-    trim(state, discoverUniverse());
+    trim(snap, discoverUniverse());
     return true;
 }
 
@@ -1030,8 +1050,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     {
         const auto [root, manifest_token] = store->readShard(ns, root_shard);
         const String cursor_key = ns.string() + "/" + std::to_string(root_shard);
-        const auto cursor_it = state.folded_cursor.find(cursor_key);
-        const uint64_t cursor = cursor_it != state.folded_cursor.end() ? cursor_it->second : 0;
+        const uint64_t cursor = cursorOf(result.snap, cursor_key);
 
         /// A version bump alone (e.g. from the trim step) does not mean new records exist —
         /// the trim CAS advances shard_version without adding journal entries, so
@@ -1048,26 +1067,19 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 
         auto transitioned = foldShardRecords(result.snap, state, cursor_key, root, cursor, root.shard_version);
         result.transitioned.insert(result.transitioned.end(), transitioned.begin(), transitioned.end());
-
-        /// Don't mint zero cursor entries for absent shards (the registry universe includes every
-        /// shard of every namespace; an absent shard has nothing folded and nothing to remember).
-        if (root.shard_version > 0 || cursor > 0)
-            state.folded_cursor[cursor_key] = root.shard_version;
     }
 
     /// No new records since the last fold: the snap is unchanged and already durable at
     /// state.snap_generation. Skip the whole-snap re-write AND fold's own gc/state CAS.
     /// state_token is returned UNMODIFIED, so retire's round CAS rides the incoming lease token
-    /// (preserving the zombie-steal protection runRegularRound documents). state.folded_cursor may
-    /// have been advanced to shard_version for empty-window shards; that advance is over an empty
-    /// (cursor, shard_version] range (no records to skip — same as the original always-persist code
-    /// did every round) and is persisted atomically with .round by retire's subsequent CAS.
+    /// (preserving the zombie-steal protection runRegularRound documents).
     if (!folded_any)
         return result;
 
     /// 4. Persist, durable-before-cursor: the new-generation snap objects go durable FIRST; only
-    /// then does the gc/state CAS advance snap_generation + folded_cursor. A crash between the two
-    /// loses nothing - the old generation stays authoritative.
+    /// then does the gc/state CAS advance snap_generation. A crash between the two loses nothing
+    /// - the old generation stays authoritative. (folded_cursor is NOT advanced by fold: it lives
+    /// in the snap and advances in cascadeAndPersist — B140-dangle fix.)
     ///
     /// THE WRITE GENERATION PROBES UPWARD. Generation objects are write-once, and a generation key
     /// occupied by DIFFERENT bytes can never be reused: a fold that wrote its snaps but lost the
