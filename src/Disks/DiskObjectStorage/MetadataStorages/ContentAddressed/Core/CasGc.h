@@ -291,6 +291,19 @@ private:
                                             const String & cursor_key, const RootShard & root,
                                             uint64_t lo_exclusive, uint64_t hi_inclusive);
 
+    /// B140-dangle FAIL-CLOSED coherence guard. Run at round start, AFTER the fold produces
+    /// (snap, root_shards) and BEFORE any retire/delete. For every root shard whose committed
+    /// folded_cursor (read from snap shard 0, the single source of truth) is non-zero, every
+    /// latest-per-ref journal `Add` at or below that cursor MUST have its tree expanded into the
+    /// committed snap (`isKnown(Tree, ...)`). If a folded, still-live `Add`'s tree is ABSENT from
+    /// the snap, the cursor ran ahead of the edges the snap records (the cursor-skip under-count
+    /// that lost the live `T_cur -> B` edge): refuse the round (CORRUPTED_DATA) rather than let a
+    /// stale in-degree drive a wrong delete. In normal operation (edges, cursor) are one write-once
+    /// unit and this can never fire; it is the last line of defence against an injected/out-of-model
+    /// incoherent durable state.
+    void assertSnapJournalCoherent(const std::map<uint64_t, GcSnap> & snap,
+                                   const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards);
+
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
 

@@ -79,6 +79,14 @@ RoundReport Gc::runRegularRound()
     /// R1: fold the journals into a new durable snap generation (cursors advance only after).
     FoldResult folded = fold(state, state_token);   /// non-const: the recheck folds through the fence into the same snap
 
+    /// B140-dangle FAIL-CLOSED guard: before ANY retire/delete, verify the committed snap's edges
+    /// are coherent with its folded_cursor — every folded, still-live ref `Add` at or below the
+    /// cursor has its tree expanded into the snap. An incoherent pair (cursor ahead of the edges)
+    /// is the cursor-skip under-count that would drive a wrong delete of a still-pinned blob; refuse
+    /// the round rather than proceed. Placed before `retire` so neither retire nor the recheck's
+    /// content-delete site can run on an incoherent state.
+    assertSnapJournalCoherent(folded.snap, folded.root_shards);
+
     /// R2 consumes the EXACT (state, token) the fold's CAS committed - THREADED through, never
     /// re-read. A post-fold re-read would open a zombie window: a lease steal landing between the
     /// fold CAS and the re-read hands this (now stale) leader the thief's state with its bumped
@@ -164,6 +172,42 @@ void Gc::trim(const std::map<uint64_t, GcSnap> & snap,
                 return record.at_version <= cursor;
             });
         });
+    }
+}
+
+void Gc::assertSnapJournalCoherent(const std::map<uint64_t, GcSnap> & snap,
+                                   const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards)
+{
+    const auto snap_it = snap.find(0);
+    if (snap_it == snap.end())
+        return;                                   /// cold start: nothing committed yet
+    const GcSnap & s = snap_it->second;
+    for (const auto & [ns, shard] : root_shards)
+    {
+        const String cursor_key = ns.string() + "/" + std::to_string(shard);
+        const uint64_t cursor = cursorOf(snap, cursor_key);
+        if (cursor == 0)
+            continue;
+        const auto [root, manifest_token] = store->readShard(ns, shard);
+        /// latest record per ref name:
+        std::map<String, const JournalRecord *> latest;
+        for (const JournalRecord & rec : root.journal)
+        {
+            auto it = latest.find(rec.ref_name);
+            if (it == latest.end() || it->second->at_version < rec.at_version)
+                latest[rec.ref_name] = &rec;
+        }
+        for (const auto & [ref_name, rec] : latest)
+        {
+            if (rec->op != JournalRecord::Op::Add || rec->at_version > cursor)
+                continue;                          /// only a folded, still-live Add must be reflected
+            if (!s.isKnown(ObjectKind::Tree, rec->tree_id))
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS gc: snap/journal incoherent - ref '{}' (ns {} shard {}) Add@{} is at or below the "
+                    "folded cursor {} but its tree {} is absent from the snap (B140-dangle cursor-skip); "
+                    "refusing to retire/delete this round",
+                    ref_name, ns.string(), shard, rec->at_version, cursor, u128ToHex(rec->tree_id));
+        }
     }
 }
 
