@@ -253,6 +253,15 @@ private:
     /// shared by the fold and the resume's re-fence. Absent registry => empty (fresh pool).
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverse();
 
+    /// B171: the shard numbers GC must visit for a namespace. A normal (table) namespace uses the
+    /// fixed shard fan-out [0, root_shards) — the spec's static shard model. A BUILD-ROOT namespace
+    /// (`_builds/<server>`) has ONE shard per in-flight build keyed by the per-process monotone
+    /// `build_seq`, which has no relation to root_shards and routinely exceeds it; its present shards
+    /// are discovered by LISTing the namespace prefix and parsing the numeric tails. This is the only
+    /// place the build-root namespace deviates from the ordinary shard machinery (it is identical
+    /// key-wise; `tryParseRootShardKey` classifies `_builds/<server>/<seq>` correctly).
+    std::vector<uint64_t> shardsToVisit(const RootNamespace & ns);
+
     /// Load the durable snap generation (absent shard objects => empty snaps; the fresh-pool case).
     std::map<uint64_t, GcSnap> loadSnap(const GcState & state);
 

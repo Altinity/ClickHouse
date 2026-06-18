@@ -568,11 +568,61 @@ uint64_t Build::buildShard() const
 void Build::precommit(const TreeId & manifest)
 {
     requireAlive();
-    /// TODO(B171 Task 2): publish `manifest` under buildRootNs()/buildShard() via
-    /// store->ensureRegistered + store->mutateShard (ref "part" -> manifest, journal Add), and emit
-    /// CasEvent::Precommit. STUB for the Task 1 RED repro: does nothing yet, so GC still deletes the
-    /// shared blob under the retired source build and the dangle reproduces.
-    (void)manifest;
+
+    /// B171 two-phase commit, phase 1. Publish the build's manifest tree as a ref under the build-root
+    /// namespace `_builds/<server_hex>`, shard = build_seq. GC discovers this namespace via the registry
+    /// (ensureRegistered) and folds it like any namespace → root edge → tree_expand → child in-degree ≥ 1,
+    /// so every object reachable from the precommit is protected by REACHABILITY (replacing the revocable
+    /// `cas_owner` hint). The manifest must be in this build's W-DEP-SET — it was built/adopted by this
+    /// Build (the caller putTree'd / adoptTree'd it), mirroring `publish`'s precondition.
+    const UInt128 manifest_hash = hexToU128(manifest.string());
+    auto dep_it = deps.find({static_cast<uint8_t>(ObjectKind::Tree), manifest_hash});
+    if (dep_it == deps.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "precommit: tree {} was not built/adopted by this Build", manifest.string());
+
+    /// W-REGISTER: the build-root namespace must be in roots/_registry before its first manifest exists,
+    /// so GC discovers it (it is an ordinary namespace key-wise; only behavioral branches key off
+    /// isBuildRootNamespace). Monotone — a cache hit short-circuits without I/O.
+    const RootNamespace ns = buildRootNs();
+    store->ensureRegistered(ns);
+
+    /// tree_size: for a tree we built we have the encoded payload size; for an adopted tree we may only
+    /// have 0 (the dep size) — acceptable GC bookkeeping in M-C2 (mirrors `publish`).
+    auto retained_it = retained_trees.find(manifest_hash);
+    const uint64_t tree_size =
+        retained_it != retained_trees.end() ? retained_it->second.size() : dep_it->second.size;
+
+    /// ONE CAS on the build's isolated shard: set refs["part"] = manifest, append {+, "part", manifest},
+    /// shard_version++. The SAME RootShard machinery as `publish` — the build-root edge is an ordinary
+    /// root ref the GC fold will expand.
+    store->mutateShard(ns, buildShard(), [&](RootShard & root)
+    {
+        RefPayload payload;
+        payload.tree_id = manifest_hash;
+        payload.tree_size = tree_size;
+        root.refs["part"] = payload;
+        root.journal.push_back(JournalRecord{
+            .op = JournalRecord::Op::Add, .ref_name = "part", .tree_id = manifest_hash,
+            .at_version = root.shard_version + 1});
+    });
+
+    /// B171: the precommit was published — the build-root edge now protects the manifest's closure.
+    if (store->hasEventSink())
+    {
+        CasEvent _ev;
+        _ev.type = CasEventType::Precommit;
+        _ev.namespace_ = ns.string();
+        _ev.ref_name = "part";
+        _ev.object_kind = CasEventObjectKind::Tree;
+        _ev.object_hash = manifest.string();
+        _ev.token = u128ToHex(build_id);
+        _ev.round = store->retireView().round();
+        _ev.outcome = "ok";
+        _ev.reason = "precommit: published build-root manifest edge to protect the closure during the build";
+        _ev.detail = {{"build_seq", std::to_string(build_seq)}};
+        store->emitEvent(_ev);
+    }
 }
 
 void Build::gateCheckDeps()

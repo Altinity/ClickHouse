@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <charconv>
 #include <limits>
+#include <set>
 
 namespace DB
 {
@@ -862,12 +863,15 @@ void Gc::fence(GcState & state, Token & state_token)
     /// is a fold no-op (the fold reads records, not versions), and INV-JOURNAL-COVERAGE is
     /// untouched - trim (Task 11) is gated on at_version <= folded_cursor, and a fence bump above
     /// the cursor leaves no record to trim.
-    const uint64_t root_shards_per_ns = store->poolMeta().root_shards;
+    uint64_t fenced_shards = 0;
     for (const String & ns_name : fence_universe.namespaces)
     {
         const RootNamespace ns{ns_name};
-        for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
+        /// Build-root namespaces are fenced over their PRESENT shards (one per build_seq, LISTed);
+        /// table namespaces over the static [0, root_shards) fan-out — see shardsToVisit (B171).
+        for (const uint64_t shard : shardsToVisit(ns))
         {
+            ++fenced_shards;
             uint64_t committed = 0;
             store->mutateShard(ns, shard, [&](RootShard & root)
             {
@@ -902,7 +906,7 @@ void Gc::fence(GcState & state, Token & state_token)
             _ev12.reason = "R3: fenced every root shard of every registered namespace";
             _ev12.detail = {{"fence_seq", std::to_string(state.fence_seq)},
                        {"namespaces", std::to_string(fence_universe.namespaces.size())},
-                       {"shards", std::to_string(fence_universe.namespaces.size() * root_shards_per_ns)}};
+                       {"shards", std::to_string(fenced_shards)}};
             store->emitEvent(_ev12);
         }
         return;
@@ -1248,6 +1252,16 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                             break;
                         }
                     }
+                    /// B171 pending-tolerance: under a BUILD-ROOT namespace (`_builds/<server>`) a live
+                    /// ref to an absent target is NOT a dangle — it is a legal pending/aborting
+                    /// reservation. A precommit may name a manifest tree whose object has not been
+                    /// uploaded yet, or whose closure was published before this fold but raced a delete;
+                    /// the fail-closed commit (Task 3) re-proves presence before the table ref binds the
+                    /// closure. So skip the INV-NO-DANGLE alarm and the throw here: treat it like the
+                    /// displaced-later case (no edges added for the gone tree; marker stays unset;
+                    /// over-count-only preserved). The alarm is UNCHANGED for normal (table) namespaces.
+                    if (!displaced_later && Layout::isBuildRootNamespace(ns))
+                        displaced_later = true;
                     if (!displaced_later)
                     {
                         /// B170: the manifest claims a LIVE ref to a missing tree and no later record
@@ -1382,12 +1396,59 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
     if (const auto got = store->backend().get(store->layout().rootsRegistryKey()))
     {
         const RootsRegistry registry = decodeRootsRegistry(got->bytes);
-        const uint64_t root_shards_per_ns = store->poolMeta().root_shards;
-        for (const String & ns : registry.namespaces)
-            for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
-                universe.emplace_back(RootNamespace{ns}, shard);
+        for (const String & ns_name : registry.namespaces)
+        {
+            const RootNamespace ns{ns_name};
+            /// Build-root namespaces use one shard per build_seq (LISTed), not the fixed [0, root_shards)
+            /// fan-out — see shardsToVisit (B171). Table namespaces use the static shard model.
+            for (const uint64_t shard : shardsToVisit(ns))
+                universe.emplace_back(ns, shard);
+        }
     }
     return universe;
+}
+
+std::vector<uint64_t> Gc::shardsToVisit(const RootNamespace & ns)
+{
+    if (!Layout::isBuildRootNamespace(ns))
+    {
+        /// Table namespace: the static shard fan-out [0, root_shards). The fence mints fence-only
+        /// manifests for absent shards, so the absent ones are needed too (the absent-shard hole).
+        std::vector<uint64_t> shards;
+        const uint64_t root_shards_per_ns = store->poolMeta().root_shards;
+        shards.reserve(root_shards_per_ns);
+        for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
+            shards.push_back(shard);
+        return shards;
+    }
+
+    /// Build-root namespace: enumerate the PRESENT shards (one per in-flight precommit, keyed by
+    /// build_seq, unbounded by root_shards) by LISTing the namespace's root prefix and parsing the
+    /// numeric tails. Only present shards exist (a precommit CREATES its shard; there is no
+    /// absent-shard fence hole here — a build-root shard is never published-into before its precommit
+    /// created it, and GC reclaim, not fencing, releases an abandoned one). De-duplicated + sorted for
+    /// deterministic iteration.
+    const Layout & layout = store->layout();
+    const String prefix = layout.rootNamespacePrefix(ns);
+    std::set<uint64_t> present;
+    String cursor;
+    while (true)
+    {
+        ListPage page = store->backend().list(prefix, cursor, /*limit*/ 1000);
+        for (const ListedKey & listed : page.keys)
+        {
+            if (const auto parsed = layout.tryParseRootShardKey(listed.key))
+            {
+                /// tryParseRootShardKey also skips the `_files/` sub-prefix and non-numeric tails.
+                if (parsed->first.string() == ns.string())
+                    present.insert(parsed->second);
+            }
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    return std::vector<uint64_t>(present.begin(), present.end());
 }
 
 std::map<uint64_t, GcSnap> Gc::loadSnap(const GcState & state)
