@@ -360,7 +360,7 @@ struct SnapWriter
     void u64(uint64_t v) { for (int i = 0; i < 8; ++i) buf.push_back(static_cast<char>((v >> (8 * i)) & 0xFF)); }
     void hash(const UInt128 & h) { for (int i = 0; i < 16; ++i) buf.push_back(static_cast<char>((h >> (8 * i)) & 0xFF)); }
     void str(const String & s) { u16(static_cast<uint16_t>(s.size())); raw(s.data(), s.size()); }
-    void header() { raw("CAGS", 4); u8(3); u8(0); u64(0); u64(0); }   /// version 3, codec RAW (0), shard 0, generation 0
+    void header() { raw("CAGS", 4); u8(1); u8(0); u64(0); u64(0); }   /// version 1, codec RAW (0), shard 0, generation 0
 };
 }
 
@@ -412,10 +412,33 @@ TEST(CasGcSnap, DecodeFailClosedBinaryFields)
         SnapWriter w; w.header();
         w.u32(1);
         w.u8(1); w.str("s/0"); w.str("p1"); w.u8(2); w.hash(T);
-        w.u32(0); w.u32(0);
+        w.u32(0); w.u32(0);   /// expanded, known
+        w.u32(0);              /// folded_cursor (B140-dangle fix: cursor count = 0)
         auto d = decodeGcSnap(w.buf);
         EXPECT_EQ(d.inDegree(ObjectKind::Tree, T), 1u);
     }
+}
+
+/// B140-dangle fix: the per-shard fold cursor is part of the snap's durable identity, so two snaps
+/// with identical edges but DIFFERENT cursors encode to DIFFERENT bytes. This is what makes
+/// byte-equal generation adoption cursor-aware (a leader cannot adopt an edge-equal snap folded to a
+/// different cursor), structurally preventing the cursor-skip under-count.
+TEST(CasGcSnap, CursorIsPartOfSnapIdentity)
+{
+    using namespace DB::Cas;
+    GcSnap a;
+    a.snap_shard = 0;
+    a.generation = 7;
+    a.addRootEdge("srv1/tbl/0", "part_1", UInt128{0xABCD});
+    GcSnap b = a;                                  /// identical edges/expanded/known
+
+    a.folded_cursor["srv1/tbl/0"] = 10;
+    b.folded_cursor["srv1/tbl/0"] = 11;            /// only the cursor differs
+
+    EXPECT_NE(encodeGcSnap(a), encodeGcSnap(b))
+        << "snaps folded to different cursors must not be byte-equal (else adoption is cursor-blind)";
+
+    EXPECT_EQ(decodeGcSnap(encodeGcSnap(a)).folded_cursor.at("srv1/tbl/0"), 10u);
 }
 
 /// The binary encoding is materially smaller than the previous JSON form for a realistic snap —

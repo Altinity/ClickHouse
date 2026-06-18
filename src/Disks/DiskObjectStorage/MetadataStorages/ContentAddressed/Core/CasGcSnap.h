@@ -48,6 +48,12 @@ public:
     uint64_t snap_shard = 0;
     uint64_t generation = 0;
 
+    /// Per-root-shard fold watermark ("ns/shard" -> folded shard_version) that THIS snap's edges
+    /// represent. The single source of truth for the fold cursor (B140-dangle fix): it lives in the
+    /// snap, NOT in gc/state, so a generation's (edges, cursor) can never diverge — they are the same
+    /// write-once bytes. With snap_shards==1, shard 0 carries the map over all root shards.
+    std::map<String, uint64_t> folded_cursor;
+
     /// Last-op-wins (spec §7): the canonical root-edge id is (root_shard, part_name) — the target
     /// is NOT part of the id — and `Build::publish` may legally re-publish an existing ref with a
     /// NEW tree (consecutive journal `Add`s, no `Remove` between). Adding over an existing edge

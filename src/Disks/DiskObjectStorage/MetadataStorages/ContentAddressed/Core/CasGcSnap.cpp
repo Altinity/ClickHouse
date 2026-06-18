@@ -35,10 +35,10 @@ namespace
 /// the GC round. Magic + version byte at the front; fail-closed decode (bad magic / bad enum byte /
 /// truncated => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
 constexpr char GC_SNAP_MAGIC[4] = {'C', 'A', 'G', 'S'};
-/// Version 3 adds a codec byte (byte 5) immediately after the version byte.
+/// v1 of the cursor-carrying snap (B140-dangle fix); no migration, no back-compat.
 /// Frame layout: magic(4) + version(1) + codec(1) + <compressed-or-raw body>.
-/// Old readers (version <= 2) never see version 3 — they reject it with NOT_IMPLEMENTED.
-constexpr uint8_t GC_SNAP_VERSION = 3;
+/// Old readers (version <= 0) never see version 1 — they reject it with NOT_IMPLEMENTED.
+constexpr uint8_t GC_SNAP_VERSION = 1;   /// v1 of the cursor-carrying snap (B140-dangle fix); no migration, no back-compat.
 constexpr uint8_t GC_SNAP_CODEC_RAW = 0;   /// body is the raw field bytes (reserved; not emitted)
 constexpr uint8_t GC_SNAP_CODEC_ZSTD = 1;  /// body is zstd-compressed field bytes
 
@@ -297,6 +297,14 @@ String GcSnap::encodeSnapFields(const GcSnap & snap)
         writeBinaryLittleEndian(hash, body);
     }
 
+    writeBinaryLittleEndian(static_cast<uint32_t>(snap.folded_cursor.size()), body);
+    for (const auto & [key, version] : snap.folded_cursor)        /// std::map => sorted key order (canonical)
+    {
+        writeBinaryLittleEndian(static_cast<uint16_t>(key.size()), body);
+        writeString(key, body);
+        writeBinaryLittleEndian(version, body);
+    }
+
     return std::move(body.str());
 }
 
@@ -366,6 +374,18 @@ GcSnap GcSnap::decodeSnapFields(ReadBuffer & body)
         snap.known.insert(GcSnap::NodeKey{static_cast<uint8_t>(kind), hash});
     }
 
+    uint32_t cursor_count = 0;
+    readBinaryLittleEndian(cursor_count, body);
+    for (uint32_t i = 0; i < cursor_count; ++i)
+    {
+        uint16_t key_len = 0;
+        readBinaryLittleEndian(key_len, body);
+        const String key = readFixedBytes(body, key_len);
+        uint64_t version = 0;
+        readBinaryLittleEndian(version, body);
+        snap.folded_cursor[key] = version;
+    }
+
     return snap;
 }
 
@@ -383,7 +403,7 @@ String encodeGcSnap(const GcSnap & snap)
         zstd.finalize();
     }
 
-    /// 3. Prepend the 10-byte frame: magic(4) + version(1=3) + codec(1=ZSTD) + compressed_len(4).
+    /// 3. Prepend the 10-byte frame: magic(4) + version(1=1) + codec(1=ZSTD) + compressed_len(4).
     /// The explicit compressed_len lets the decoder detect truncation (including truncated checksum
     /// bytes) independently of the zstd stream framing.
     /// The 4-byte length field bounds the compressed body at 4 GiB; a reachability snap will never
