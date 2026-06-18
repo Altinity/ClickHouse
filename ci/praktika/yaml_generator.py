@@ -42,8 +42,7 @@ on:
         required: false
         type: boolean
         default: false
-  {EVENT}:
-    branches: [{BRANCHES}]{TAGS}
+  {EVENT}:{TAGS}
 
 env:
   # Force the stdout and stderr streams to be unbuffered
@@ -344,7 +343,7 @@ class PullRequestPushYamlGen:
             # NOTE (strtgbb): We still want the cache logic, we use it for skipping based on PR config
             if (
                 # self.workflow_config.config.enable_cache
-                # and 
+                # and
                 job_name_normalized != config_job_name_normalized
             ):
                 if_expression = YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION.format(
