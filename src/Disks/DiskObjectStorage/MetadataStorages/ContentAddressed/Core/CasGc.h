@@ -107,13 +107,14 @@ public:
     /// frozen-seq crash detector's memory. Call once before the retire observe loop.
     void beginWatermarkRound();
 
-    /// The condemn guard's co-liveness clause: is `meta`'s owning build still in-flight? Reads the
-    /// owner triple ("cas_owner" = "<server_hex>:<epoch>:<build_seq>") and the owning server's
-    /// watermark (cached per round). Protected IFF the server is live this round, the epoch matches,
-    /// build_seq >= min_active, and the server is not retired. Absent/malformed owner or absent
-    /// watermark => false (unprotected — the pre-watermark default, fail-safe-to-delete is the
-    /// publish gate's job, not this guard's).
-    bool protectedByLiveBuild(const ObjectMeta & meta);
+    /// B171 precommit reclaim (§C.3, design §4.3): while folding a build-root shard, drop the precommit
+    /// of an ABANDONED build. The namespace (`_builds/<server_hex>`) + shard (== `build_seq`) encode the
+    /// owner; the build is DEAD iff the server has no watermark, is judged not-live this round (K=2
+    /// frozen-seq crash detector), or `build_seq < min_active` (retired). A dead build's `refs["part"]`
+    /// is erased + journal Remove'd (the next fold releases its edges); a live build's precommit is left
+    /// intact. The watermark is REPURPOSED here for per-precommit liveness, not per-object protection.
+    void reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t build_seq, const RootShard & root,
+                                   uint64_t round);
 
     /// full-GC walk + debris reclaim: deferred (M-F); API slot reserved.
     ///

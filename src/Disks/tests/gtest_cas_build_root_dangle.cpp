@@ -211,3 +211,65 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
     ASSERT_FALSE(s->resolveRef(ns, "refB").has_value())
         << "B171: refB must NOT be committed when its closure is missing (fail-closed)";
 }
+
+/// B171 INV-BUILDROOT-RECLAIM (§C.3, design §4.3): GC AUTOMATICALLY reclaims an ABANDONED precommit and
+/// then collects its exclusively-owned closure — no manual ref drop required (that drop is now GC's job).
+///
+/// Build B precommits a manifest naming a blob that is referenced by NO table ref. B is then RETIRED
+/// (released; its build_seq leaves the active set) and the watermark renewed so `min_active` advances
+/// past B. GC, while folding B's build-root shard, derives (server, build_seq) from the namespace +
+/// shard, judges B dead (build_seq < min_active), and RECLAIMS the precommit: it drops refs["part"] +
+/// journal Remove. The next fold releases the edges; the exclusively-owned blob hits in-degree 0 and is
+/// collected over the cascade rounds. We drive a multi-round loop (NOT the first-empty-round helper,
+/// which would halt mid-cascade between the reclaim and the leaf delete).
+/// Spec: docs/superpowers/specs/2026-06-18-ca-build-root-precommit-cpp-impl.md (§F.4)
+TEST(CasBuildRoot, AbandonedPrecommitReclaimed)
+{
+    std::shared_ptr<InMemoryBackend> backend;
+    auto s = openTestStore(backend);
+    const String P = "abandoned-precommit-only-blob";
+    const String blob_key = s->layout().blobKey(idOf(P));
+
+    /// Build B precommits a manifest naming P; P has NO table ref — the precommit edge is its only
+    /// in-degree. Then B is released so its build_seq retires.
+    uint64_t build_seq = 0;
+    {
+        auto b = s->startBuild({});
+        build_seq = b->buildSeq();
+        b->putBlob(idOf(P), BlobSource::fromString(P));
+        const TreeId t = b->putTree({blobEntry("data.bin", P)});
+        b->precommit(t);
+    }
+    s->renewWatermarkOnce();   /// B is gone; min_active now advances past B's build_seq -> precommit abandoned
+
+    /// Sanity: the precommit ref exists before GC reclaim.
+    const RootNamespace build_root_ns{"_builds/" + u128ToHex(s->poolConfig().server_id)};
+    const String shard_key = s->layout().rootShardKey(build_root_ns, build_seq);
+    {
+        const auto got = backend->get(shard_key);
+        ASSERT_TRUE(got.has_value()) << "precommit shard manifest must exist before reclaim";
+        ASSERT_TRUE(DB::Cas::decodeRootShard(got->bytes).refs.contains("part"))
+            << "precommit ref must exist before reclaim";
+    }
+    ASSERT_TRUE(backend->head(blob_key).exists) << "P must exist before GC reclaim";
+
+    /// Drive GC over many rounds: reclaim the precommit, then cascade the closure to deletion. Renew the
+    /// watermark each round so B keeps being judged DEAD (build_seq < min_active) — the reclaim verdict.
+    Gc gc(s, u128Of("gc-b171-reclaim-auto"));
+    for (int round = 0; round < 32; ++round)
+    {
+        s->renewWatermarkOnce();
+        try { gc.runRegularRound(); }
+        catch (const DB::Exception &) { break; }
+    }
+
+    /// INV-BUILDROOT-RECLAIM: the build-root ref for B's shard is gone (the precommit was reclaimed).
+    const auto after = backend->get(shard_key);
+    if (after.has_value())
+        ASSERT_FALSE(DB::Cas::decodeRootShard(after->bytes).refs.contains("part"))
+            << "GC must have AUTOMATICALLY reclaimed the abandoned precommit ref";
+
+    /// And the exclusively-owned blob is eventually deleted (no longer protected by anything).
+    ASSERT_FALSE(backend->head(blob_key).exists)
+        << "the exclusively-precommit-owned blob must be collected after the precommit is reclaimed";
+}

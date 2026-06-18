@@ -1972,87 +1972,92 @@ TEST(CasGcFold, NoChurnRoundReusesResidentSnapNoGet)
     EXPECT_EQ(b->getCount(s->layout().gcSnapKey(st1.snap_generation, 0)), 0u);   /// snap NOT re-GET
 }
 
-/// ---- B167 per-server build watermark guard (Task 9) ----
+/// ---- B171 build-root precommit reclaim (replaces the deleted B167 `protectedByLiveBuild` guard) ----
 ///
-/// protectedByLiveBuild reads the candidate's owner triple ("cas_owner" =
-/// "<server_hex>:<epoch>:<build_seq>") and the owning server's watermark {epoch, min_active, seq},
-/// protecting the object IFF the server is live this round, the epoch matches, build_seq >=
-/// min_active, and the server is not retired.
+/// Protection is no longer the per-object `cas_owner` watermark hint; it is the build-root PRECOMMIT
+/// EDGE (reachability). The watermark is REPURPOSED to judge precommit liveness for reclaim. These two
+/// tests translate the old per-object-protection coverage to the precommit/reclaim model:
+///   - a LIVE build's precommit keeps its closure alive across GC rounds (this test);
+///   - an ABANDONED precommit (build retired, min_active advanced) is RECLAIMED, then the
+///     exclusively-owned closure is collected (the next test + CasBuildRoot.AbandonedPrecommitReclaimed).
 
-TEST(CasGcWatermark, ParsesOwnerAndProtectsLiveBuild)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    /// The Store anchors its OWN server (0x01) watermark on open; we drive a DIFFERENT server (AB)
-    /// directly so its watermark key is fresh and putIfAbsent below succeeds.
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "pool", .server_id = DB::UInt128(0x01)});
-    Gc gc(store, DB::UInt128(7));
-
-    /// server AB, epoch 9, min_active 5, seq 1.
-    ASSERT_EQ(backend->putIfAbsent(
-                  store->layout().serverWatermarkKey(u128ToHex(DB::UInt128(0xAB))),
-                  encodeServerWatermark({DB::UInt128(0xAB), 9, 5, 1})),
-              PutOutcome::Done);
-
-    const ObjectMeta live{{"cas_owner", u128ToHex(DB::UInt128(0xAB)) + ":9:7"}};   /// seq 7 >= 5 -> protected
-    const ObjectMeta done{{"cas_owner", u128ToHex(DB::UInt128(0xAB)) + ":9:3"}};   /// seq 3 < 5 -> unprotected
-    const ObjectMeta stale{{"cas_owner", u128ToHex(DB::UInt128(0xAB)) + ":1:7"}};  /// wrong epoch -> unprotected
-
-    gc.beginWatermarkRound();
-    ASSERT_TRUE(gc.protectedByLiveBuild(live));     /// first-seen server -> live; 7 >= 5; epoch matches
-    ASSERT_FALSE(gc.protectedByLiveBuild(done));
-    ASSERT_FALSE(gc.protectedByLiveBuild(stale));
-}
-
-/// ---- B167 per-server build watermark guard wired into retire (Task 10) ----
-///
-/// End-to-end: a candidate (everEdged ∧ InDeg=0 tree, referenced then dropped) whose object carries
-/// an owner triple of a LIVE build's server is SKIPPED at retire (non-destructive deferral) — the
-/// object survives the round. Once that server's min_active passes the owner's build_seq (the build
-/// finished/abandoned), the SAME candidate is condemned and deleted on the next round.
-TEST(CasGcRetire, SkipsBlobOwnedByLiveBuildThenCondemnsWhenFloorPasses)
+TEST(CasGcWatermark, LiveBuildPrecommitHonoredAcrossGcRounds)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
-    /// part_1's tree becomes everEdged ∧ InDeg=0 once dropped (mirrors the retire fixtures above).
-    const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
-    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
+    const String P = "live-precommit-payload";
 
-    /// Stamp the dropped tree object with an owner triple for a DIFFERENT server (AB, NOT the
-    /// Store's anchored server 0), so its watermark key is fresh and we own its floor. Owner
-    /// build_seq = 7. (The Store anchored server 0's watermark on open; AB is steered by us.)
-    const String tree_key = s->layout().treeKey(tree);
-    const auto tree_obj = b->get(tree_key);
-    ASSERT_TRUE(tree_obj.has_value());
-    const ObjectMeta owner_meta{{"cas_owner", u128ToHex(DB::UInt128(0xAB)) + ":9:7"}};
-    ASSERT_EQ(b->putOverwrite(tree_key, tree_obj->bytes, tree_obj->token, nullptr, owner_meta),
-              PutOutcome::Done);
+    /// A live build adopts/uploads P and precommits a manifest naming it, but never publishes a TABLE
+    /// ref. P's ONLY in-degree comes from the build-root precommit edge.
+    auto build = s->startBuild({});
+    build->putBlob(idOf(P), BlobSource::fromString(P));
+    TreeEntry e;
+    e.name = "data.bin";
+    e.placement = Placement::Blob;
+    e.file_hash = u128Of(P);
+    e.file_size = P.size();
+    const TreeId t = build->putTree({e});
+    build->precommit(t);
 
-    /// Server AB watermark: epoch 9, min_active 5 (7 >= 5 -> protected), seq 1.
-    const String wm_key = s->layout().serverWatermarkKey(u128ToHex(DB::UInt128(0xAB)));
-    ASSERT_EQ(b->putIfAbsent(wm_key, encodeServerWatermark({DB::UInt128(0xAB), 9, 5, 1})),
-              PutOutcome::Done);
-
+    /// Drive several GC rounds while the build stays in-flight (renew the watermark each round so the
+    /// K=2 detector judges the owning server live and reclaim leaves the precommit honored).
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    for (int round = 0; round < 6; ++round)
+    {
+        s->renewWatermarkOnce();
+        gc.runRegularRound();
+        ASSERT_TRUE(b->head(s->layout().blobKey(idOf(P))).exists)
+            << "live build's precommit must keep P alive at round " << round;
+    }
+}
 
-    /// Round 1: H is owned by a live build (first-seen server -> live; epoch 9 matches; 7 >= 5),
-    /// so retire SKIPS it — no candidate, no delete, the object survives.
-    const RoundReport rep1 = gc.runRegularRound();
-    EXPECT_TRUE(rep1.acquired_lease);
-    EXPECT_EQ(rep1.candidates, 0u);                       /// the guard deferred it (not condemned)
-    EXPECT_EQ(rep1.deleted, 0u);
-    EXPECT_TRUE(b->head(tree_key).exists);                /// survived: the live build still owns it
+/// End-to-end reclaim verdict: a precommit whose build RETIRES (min_active advances past its build_seq)
+/// is RECLAIMED by GC; with no other reference, the closure is then collected over the cascade rounds.
+TEST(CasGcRetire, ReclaimsAbandonedPrecommitWhenFloorPasses)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const String P = "abandoned-precommit-payload";
 
-    /// Raise the floor past the owner's build_seq: min_active 5 -> 8 (7 < 8 -> unprotected). Bump
-    /// seq (1 -> 2) so the SAME Gc still judges AB as live (seq advanced => renewed, not frozen).
-    ASSERT_EQ(b->putOverwrite(wm_key, encodeServerWatermark({DB::UInt128(0xAB), 9, 8, 2}),
-                              b->head(wm_key).token, nullptr),
-              PutOutcome::Done);
+    uint64_t build_seq = 0;
+    {
+        auto build = s->startBuild({});
+        build_seq = build->buildSeq();
+        build->putBlob(idOf(P), BlobSource::fromString(P));
+        TreeEntry e;
+        e.name = "data.bin";
+        e.placement = Placement::Blob;
+        e.file_hash = u128Of(P);
+        e.file_size = P.size();
+        const TreeId t = build->putTree({e});
+        build->precommit(t);
+    }   /// build released (dtor) -> build_seq retired
 
-    /// Round 2: the floor passed the owner (build finished); the guard no longer protects, retire
-    /// condemns H and the recheck deletes it.
-    const RoundReport rep2 = gc.runRegularRound();
-    EXPECT_TRUE(rep2.acquired_lease);
-    EXPECT_EQ(rep2.candidates, 1u);                       /// now condemned
-    EXPECT_EQ(rep2.deleted, 1u);
-    EXPECT_FALSE(b->head(tree_key).exists);               /// deleted at the observed token
+    s->renewWatermarkOnce();   /// min_active advances past build_seq -> the precommit is now abandoned
+
+    /// The build-root shard for the (now retired) build must still carry the precommit ref before GC.
+    const RootNamespace build_root_ns{"_builds/" + u128ToHex(s->poolConfig().server_id)};
+    {
+        const auto got = b->get(s->layout().rootShardKey(build_root_ns, build_seq));
+        ASSERT_TRUE(got.has_value());
+        EXPECT_TRUE(decodeRootShard(got->bytes).refs.contains("part"));
+    }
+
+    /// Drive GC: the first folds reclaim the abandoned precommit (drop refs["part"] + Remove), then the
+    /// closure cascades to deletion over successive rounds.
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    for (int round = 0; round < 16; ++round)
+    {
+        s->renewWatermarkOnce();
+        try { gc.runRegularRound(); }
+        catch (const DB::Exception &) { break; }
+    }
+
+    /// The precommit ref is gone (reclaimed) and the exclusively-owned blob is deleted.
+    const auto after = b->get(s->layout().rootShardKey(build_root_ns, build_seq));
+    if (after.has_value())
+        EXPECT_FALSE(decodeRootShard(after->bytes).refs.contains("part"))
+            << "GC must have reclaimed the abandoned precommit ref";
+    EXPECT_FALSE(b->head(s->layout().blobKey(idOf(P))).exists)
+        << "the exclusively-precommit-owned blob must be collected after reclaim";
 }

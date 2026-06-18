@@ -150,7 +150,9 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
             head_bytes = encodeEnvelopeHeader(header);
         }
 
-        WriteSinkPtr sink = store->backend().putIfAbsentStream(key, ownerMeta());
+        /// B171: no owner metadata. Protection is the precommit edge (reachability), not the revocable
+        /// `cas_owner` hint that GC's deleted `protectedByLiveBuild` once read.
+        WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
         writeString(head_bytes, sink->buffer());
         const size_t before = sink->buffer().count();
         source.write_payload(sink->buffer());
@@ -371,7 +373,8 @@ void Build::resurrect(ObjectKind kind, const UInt128 & hash, const String & key)
     const String body = new_head + got->bytes.substr(header.header_len);
 
     Token new_tok;
-    const PutOutcome oc = store->backend().putOverwrite(key, body, got->token, &new_tok, ownerMeta());
+    /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
+    const PutOutcome oc = store->backend().putOverwrite(key, body, got->token, &new_tok);
     if (oc == PutOutcome::PreconditionFailed)
     {
         /// A racing writer displaced the incarnation we read (their resurrect won). Re-observe: their
@@ -503,7 +506,8 @@ TreeId Build::putTree(std::vector<TreeEntry> entries)
     /// intended_ref deliberately omitted from tree envelopes (forensics live on the published blob set).
     const String head_bytes = encodeEnvelopeHeader(header);
 
-    WriteSinkPtr sink = store->backend().putIfAbsentStream(key, ownerMeta());
+    /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
+    WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
     writeString(head_bytes, sink->buffer());
     writeString(encoded, sink->buffer());
     Token tok;
@@ -543,14 +547,6 @@ TreeId Build::putTree(std::vector<TreeEntry> entries)
 String Build::keyFor(ObjectKind kind, const UInt128 & hash) const
 {
     return objectKey(store->layout(), kind, hash);
-}
-
-ObjectMeta Build::ownerMeta() const
-{
-    /// "cas_owner" = "<server_id_hex>:<epoch>:<build_seq>" (spec 2026-06-16, Task 8). Stamped into S3
-    /// user-metadata on every object this build writes; the incremental-GC watermark reads it from HEAD.
-    return ObjectMeta{{"cas_owner",
-        u128ToHex(store->poolConfig().server_id) + ":" + std::to_string(epoch) + ":" + std::to_string(build_seq)}};
 }
 
 RootNamespace Build::buildRootNs() const
@@ -713,7 +709,8 @@ void Build::recreateTree(const UInt128 & hash)
     header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
     const String head_bytes = encodeEnvelopeHeader(header);
 
-    WriteSinkPtr sink = store->backend().putIfAbsentStream(key, ownerMeta());
+    /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
+    WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
     writeString(head_bytes, sink->buffer());
     writeString(encoded, sink->buffer());
     Token tok;

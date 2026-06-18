@@ -946,10 +946,10 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     /// state.round = "highest round whose retire sets are durable" => THIS round is the next one.
     const uint64_t round = state.round + 1;
 
-    /// Reset the per-round watermark caches before observing candidates. The guard below
-    /// (protectedByLiveBuild) judges each owning server's liveness ONCE per round; the across-round
-    /// frozen-seq memory persists for the K=2 crash detector.
-    beginWatermarkRound();
+    /// B171: retire no longer consults the watermark (the per-candidate `protectedByLiveBuild` guard
+    /// was removed — protection is now the precommit edge, via reachability). The per-round watermark
+    /// caches are begun in `fold` (it visits the build-root shards for precommit reclaim), so there is
+    /// no `beginWatermarkRound` here anymore.
 
     /// 1. Observe. One HEAD per candidate captures the CURRENT incarnation token - the only token
     /// the eventual delete may carry (exact-token delete, spec §7).
@@ -1021,25 +1021,12 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
                 continue;
             }
 
-            if (protectedByLiveBuild(observed.attributes))
-            {
-                /// B170: skip condemn — owned by a live build (non-destructive deferral).
-                {
-                    CasEvent _ev15;
-                    _ev15.type = CasEventType::GcRetireDecision;
-                    _ev15.object_kind = ev_kind;
-                    _ev15.object_hash = u128ToHex(candidate.hash);
-                    _ev15.token = observed.token.value;
-                    _ev15.round = round;
-                    _ev15.gen = state.snap_generation;
-                    _ev15.outcome = "skipped";
-                    _ev15.reason = "skip: protectedByLiveBuild (owner alive, seq >= min_active)";
-                    store->emitEvent(_ev15);
-                }
-                continue;   // owned by a live build -> skip condemn this round (non-destructive deferral)
-            }
-
-            /// B170: condemn decision — all guards held (present, known, inDeg 0, not protected).
+            /// B171: the retire decision is now PURE REACHABILITY — present ∧ known ∧ inDeg=0 ⇒ condemn.
+            /// The old `protectedByLiveBuild` per-candidate `cas_owner` guard is gone: an object an
+            /// in-flight build needs is protected by the build's PRECOMMIT EDGE (a build-root root ref
+            /// the fold expands into in-degree ≥ 1), so it is never a zero-in-degree candidate here. The
+            /// watermark is repurposed for precommit RECLAIM liveness (see reclaimAbandonedPrecommit),
+            /// not per-object protection.
             {
                 CasEvent _ev16;
                 _ev16.type = CasEventType::GcRetireDecision;
@@ -1049,7 +1036,7 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
                 _ev16.round = round;
                 _ev16.gen = state.snap_generation;
                 _ev16.outcome = "condemn";
-                _ev16.reason = "condemn: present and known and inDeg=0 and not protectedByLiveBuild";
+                _ev16.reason = "condemn: present and known and inDeg=0 (reachability)";
                 store->emitEvent(_ev16);
             }
 
@@ -1558,6 +1545,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     Backend & backend = store->backend();
     FoldResult result;
 
+    /// B171 precommit reclaim (§C.3): the fold visits the build-root shards and decides each owning
+    /// build's liveness from the per-server watermark. That uses the SAME per-round caches the K=2
+    /// crash detector accumulates, so begin the watermark round HERE (before the build-root visit
+    /// below) rather than in retire — retire no longer consults the watermark since
+    /// `protectedByLiveBuild` was removed (B171); the watermark is now read only for reclaim liveness.
+    beginWatermarkRound();
+
     /// 1. Discover the namespace universe FROM THE REGISTRY (spec section 4/7 R1).
     result.root_shards = discoverUniverse();
 
@@ -1603,6 +1597,17 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 
         auto transitioned = foldShardRecords(result.snap, state, ns, cursor_key, root, cursor, root.shard_version);
         result.transitioned.insert(result.transitioned.end(), transitioned.begin(), transitioned.end());
+
+        /// B171 precommit reclaim (§C.3): a build-root shard whose owning build is no longer live is an
+        /// ABANDONED precommit — its edges must be released so the closure becomes a normal GC candidate.
+        /// We hold the shard manifest in hand under the GC lease; reclaim drops the build-root ref (the
+        /// SAME erase + journal Remove shape `publish`/the premature-reclaim fixture use), and the NEXT
+        /// fold sees the Remove and lifts the edge. Reclaiming AFTER folding is conservative: this round's
+        /// snap still over-counts the released edges (retire never under-deletes a live ref), the next
+        /// round folds the Remove. The mutate is on the shard manifest — independent of the fold's own
+        /// gc/state + gc/snap CAS below — so it does not fight the fold.
+        if (Layout::isBuildRootNamespace(ns))
+            reclaimAbandonedPrecommit(ns, root_shard, root, state.round + 1);
     }
 
     /// No new records since the last fold: the snap is unchanged and already durable at
@@ -1749,7 +1754,7 @@ const ServerWatermark * Gc::watermarkOf(UInt128 server_id)
     const String key = layout.serverWatermarkKey(u128ToHex(server_id));
 
     /// Absent watermark => unrecognized owner. Cache nothing (cheap re-HEAD next candidate) and
-    /// report nullptr — protectedByLiveBuild then defaults this object to unprotected.
+    /// report nullptr — reclaim then treats the owning build as dead and reclaims its precommit.
     const HeadResult head = backend.head(key);
     if (!head.exists)
         return nullptr;
@@ -1791,33 +1796,28 @@ const ServerWatermark * Gc::watermarkOf(UInt128 server_id)
     return &it->second;
 }
 
-bool Gc::protectedByLiveBuild(const ObjectMeta & meta)
+void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t build_seq, const RootShard & root,
+                                   uint64_t round)
 {
-    /// The owner triple lives under the fixed "cas_owner" metadata key. Absent => unprotected
-    /// (a pre-watermark object, or one written without an owner) — the safe pre-watermark default.
-    const auto owner_it = meta.find("cas_owner");
-    if (owner_it == meta.end())
-        return false;
+    /// B171 §C.3 (design §4.3): reclaim an ABANDONED precommit — one whose owning build is no longer
+    /// live. The build-root namespace + shard ENCODE the owner: ns == `_builds/<server_hex>` and the
+    /// shard number IS the owning build's `build_seq`. Protection here is the precommit EDGE (the
+    /// `refs["part"]` root ref the fold expands); dropping the ref releases that protection, so we
+    /// reclaim ONLY when the build is provably dead.
+    ///
+    /// Nothing to reclaim if the shard already carries no precommit ref (a prior round reclaimed it, or
+    /// the build's own commit removed it — both leave a Remove'd, ref-less shard).
+    const auto part_it = root.refs.find("part");
+    if (part_it == root.refs.end())
+        return;
 
-    /// Parse "<server_hex>:<epoch>:<build_seq>". Anything not EXACTLY this shape => unprotected
-    /// (fail closed to the pre-watermark default — never fabricate a protection).
-    const String & owner = owner_it->second;
-    const auto first_colon = owner.find(':');
-    if (first_colon == String::npos)
-        return false;
-    const auto second_colon = owner.find(':', first_colon + 1);
-    if (second_colon == String::npos)
-        return false;
-    /// A third colon means a malformed (over-long) triple.
-    if (owner.find(':', second_colon + 1) != String::npos)
-        return false;
-
-    const String server_hex = owner.substr(0, first_colon);
-    const std::string_view epoch_str(owner.data() + first_colon + 1, second_colon - first_colon - 1);
-    const std::string_view seq_str(owner.data() + second_colon + 1, owner.size() - second_colon - 1);
-    if (server_hex.size() != 32 || epoch_str.empty() || seq_str.empty())
-        return false;
-
+    /// Derive the owning server_id from `_builds/<server_hex>`.
+    const String & ns_str = ns.string();
+    static constexpr std::string_view kBuildsPrefix = "_builds/";
+    chassert(ns_str.starts_with(kBuildsPrefix));
+    const String server_hex = ns_str.substr(kBuildsPrefix.size());
+    if (server_hex.size() != 32)
+        return;   /// not a well-formed build-root namespace — leave it untouched (never reclaim blindly)
     UInt128 server;
     try
     {
@@ -1825,28 +1825,65 @@ bool Gc::protectedByLiveBuild(const ObjectMeta & meta)
     }
     catch (...)
     {
-        return false;
+        return;
     }
 
-    uint64_t owner_epoch = 0;
-    uint64_t owner_seq = 0;
-    {
-        const auto e = std::from_chars(epoch_str.data(), epoch_str.data() + epoch_str.size(), owner_epoch);
-        if (e.ec != std::errc{} || e.ptr != epoch_str.data() + epoch_str.size())
-            return false;
-        const auto s = std::from_chars(seq_str.data(), seq_str.data() + seq_str.size(), owner_seq);
-        if (s.ec != std::errc{} || s.ptr != seq_str.data() + seq_str.size())
-            return false;
-    }
-
+    /// LIVENESS verdict reuses the existing watermark machinery (watermarkOf + the K=2 seq-freshness
+    /// verdict computed once per round in beginWatermarkRound's caches). The owning build is DEAD iff:
+    ///   - the server has no watermark (unrecognized / never-anchored — a stale or vanished owner), OR
+    ///   - the server is judged not-live this round (frozen seq for K=2 rounds => crash), OR
+    ///   - this build's seq is below the server's `min_active` floor (the build retired — clean abort,
+    ///     publish, or crash whose restart raised the floor; min_active == UINT64_MAX (farewell) also
+    ///     satisfies this, retiring every seq).
+    /// The build epoch is NOT stored per-precommit, so we judge by server-liveness + the min_active
+    /// floor (design §4.3): a hard-killed server returns either no watermark (vanished) or a frozen seq
+    /// (K=2 dead), and a restarted server's farewell/new-epoch renewal raises min_active past the
+    /// orphaned seq — both reclaim. A LIVE build (seq >= min_active AND server live) is LEFT intact.
     const ServerWatermark * w = watermarkOf(server);
-    if (!w)
-        return false;
+    const bool dead =
+        (w == nullptr)
+        || !server_live_this_round[server]
+        || build_seq < w->min_active;
+    if (!dead)
+        return;   /// the owning build is still live — its precommit honored (the closure stays pinned)
 
-    return server_live_this_round[server]
-        && w->epoch == owner_epoch
-        && owner_seq >= w->min_active
-        && w->min_active != std::numeric_limits<uint64_t>::max();
+    const UInt128 part_tree = part_it->second.tree_id;
+
+    /// Reclaim: drop the build-root ref + journal Remove on the build's ISOLATED shard (mirrors the
+    /// commit-time removal in `Build::publish`). The next fold reads the Remove and releases the edges,
+    /// so the closure's objects become normal zero-in-degree candidates. mutateShard re-reads + re-runs
+    /// the lambda per CAS attempt; an empty/already-removed ref on a racing attempt is a no-op.
+    store->mutateShard(ns, build_seq, [&](RootShard & fresh)
+    {
+        auto it = fresh.refs.find("part");
+        if (it == fresh.refs.end())
+            return;   /// raced — a concurrent commit/reclaim already removed it
+        const UInt128 tree = it->second.tree_id;
+        fresh.refs.erase(it);
+        fresh.journal.push_back(JournalRecord{
+            .op = JournalRecord::Op::Remove, .ref_name = "part", .tree_id = tree,
+            .at_version = fresh.shard_version + 1});
+    });
+
+    if (store->hasEventSink())
+    {
+        CasEvent ev;
+        ev.type = CasEventType::PrecommitReclaim;
+        ev.namespace_ = ns_str;
+        ev.ref_name = "part";
+        ev.object_kind = CasEventObjectKind::Tree;
+        ev.object_hash = u128ToHex(part_tree);
+        ev.round = round;
+        ev.outcome = "reclaimed";
+        ev.reason = w == nullptr
+            ? "precommit reclaim: owning server has no watermark (abandoned/vanished build)"
+            : (!server_live_this_round[server]
+                ? "precommit reclaim: owning server frozen K=2 rounds (crashed build)"
+                : "precommit reclaim: build_seq below the server's min_active floor (retired build)");
+        ev.detail = {{"build_seq", std::to_string(build_seq)},
+                     {"min_active", w ? std::to_string(w->min_active) : "absent"}};
+        store->emitEvent(ev);
+    }
 }
 
 bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)

@@ -103,23 +103,11 @@ TEST(CasBuild, PutBlobWritesEnvelopeWithFixedHeader)
     EXPECT_EQ(raw->bytes.substr(h.header_len), "hello world");
 }
 
-TEST(CasBuild, BlobCarriesOwnerTripleInMetadata)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    PoolConfig cfg;
-    cfg.pool_prefix = "pool";
-    cfg.server_id = UInt128(0xAB);
-    cfg.background_heartbeats = false;
-    auto store = Store::open(backend, cfg);
-    auto build = store->startBuild({});
-    const auto ref = build->putBlob(idOf("owner-meta-payload"), BlobSource::fromString("owner-meta-payload"));
-
-    const auto hr = backend->head(store->layout().blobKey(ref.id));
-    ASSERT_TRUE(hr.exists);
-    const String expected = u128ToHex(cfg.server_id) + ":" + std::to_string(store->epoch())
-                            + ":" + std::to_string(build->buildSeq());
-    ASSERT_EQ(hr.attributes.at("cas_owner"), expected);
-}
+/// B171: the `cas_owner` owner-triple stamping (`Build::ownerMeta`) was DELETED — protection is now
+/// the build-root precommit edge (reachability), not revocable object metadata GC reads per-candidate.
+/// The old `CasBuild.BlobCarriesOwnerTripleInMetadata` asserted that stamping; its coverage is replaced
+/// by the build-root precommit/reclaim tests (`CasBuildRoot*`, `CasBuildRootDangle*`), which prove a
+/// written-but-unreferenced object is protected by a live precommit and collectable once it is abandoned.
 
 TEST(CasBuild, PutBlobDedupSecondWriterAdopts)
 {
@@ -773,20 +761,21 @@ TEST(CasBuild, FirstPublishRegistersNamespace)
 
 TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
 {
-    /// B167 LIVENESS — the watermark guard kills the resurrect/condemn livelock (full adversarial form).
+    /// B167/B171 LIVENESS — the resurrect/condemn livelock, now closed by the build-root precommit edge.
     ///
     /// THE BUG (before the fix): a blob H was referenced, dropped, and GC-condemned (everEdged ∧ InDeg=0,
     /// condemned in the retire view). A NEW build dedup-HITS H by content and must resurrect it — it
-    /// re-streams a FRESH incarnation of H stamped with its own owner triple (Part A). But the productive
-    /// GC, re-deriving H as a zero-in-degree candidate every round (zeroInDegreeKnown is stateless),
-    /// kept RE-CONDEMNING and exact-token-DELETING that fresh incarnation in the build's upload→publish
-    /// window. The build never converged: every retry re-uploaded only to have GC delete it again →
-    /// livelock → broken/detached parts in soak.
+    /// re-streams a FRESH incarnation of H. But the productive GC, re-deriving H as a zero-in-degree
+    /// candidate every round (zeroInDegreeKnown is stateless), kept RE-CONDEMNING and exact-token-DELETING
+    /// that fresh incarnation in the build's upload→publish window. The build never converged: every retry
+    /// re-uploaded only to have GC delete it again → livelock → broken/detached parts in soak.
     ///
-    /// THE FIX (Task 10 guard + Part A re-stamp): Gc::retire calls protectedByLiveBuild on each
-    /// candidate's owner metadata and SKIPS condemning a blob whose owning build is still in-flight
-    /// (server live ∧ epoch match ∧ build_seq ≥ min_active). The fresh incarnation is owned by the
-    /// live build, so it is SPARED every round until the build publishes (pinning H) → convergence.
+    /// THE FIX (B171): protection is the build-root PRECOMMIT EDGE, not a `cas_owner` watermark hint. Build
+    /// B precommits its manifest tree (naming H) BEFORE the adversarial loop, so the GC fold lifts H to
+    /// in-degree ≥ 1 — H is never even a zero-in-degree candidate and is SPARED every round until B
+    /// publishes (the table ref pins H, then the precommit is removed) → convergence. (The earlier fix used
+    /// `protectedByLiveBuild` on per-object `cas_owner` metadata; both were deleted in B171 — see the
+    /// `CasBuildRoot*` tests for the reclaim of an ABANDONED precommit.)
     ///
     /// FORM: full adversarial loop. A real Gc drives complete runRegularRound rounds against the same
     /// pool while build B holds an active watermark covering H's incarnation. We assert H is SPARED
@@ -826,8 +815,8 @@ TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
                       .size = content.size()}});
 
     /// 3. Open the live Store and start build B. B dedup-hits the condemned H and RESURRECTS it: a fresh
-    ///    incarnation, a NEW token, stamped with B's owner triple "<server>:<epoch>:<B.build_seq>".
-    ///    B stays ACTIVE for the whole adversarial loop — its build_seq is never retired below.
+    ///    incarnation, a NEW token. B stays ACTIVE for the whole adversarial loop — its build_seq is never
+    ///    retired below.
     auto s = Store::open(b, cfg);
     const String blob_key = s->layout().blobKey(h);
     auto build_b = s->startBuild({});
@@ -838,46 +827,43 @@ TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
     const HeadResult after_resurrect = b->head(blob_key);
     ASSERT_TRUE(after_resurrect.exists);
     EXPECT_NE(after_resurrect.token, h_token0);   /// a genuinely fresh incarnation
-    const String expected_owner = u128ToHex(cfg.server_id) + ":" + std::to_string(s->epoch())
-                                  + ":" + std::to_string(build_b->buildSeq());
-    ASSERT_EQ(after_resurrect.attributes.at("cas_owner"), expected_owner)
-        << "the resurrected incarnation must be stamped with B's live owner triple (Part A)";
+    /// B171: the resurrected incarnation no longer carries a `cas_owner` triple (stamping was deleted).
+    /// Protection is now the build-root PRECOMMIT EDGE: B assembles its manifest tree naming H and
+    /// precommits it BEFORE the adversarial GC loop, so H has in-degree ≥ 1 from the build-root fold and
+    /// is never a zero-in-degree candidate — the reachability replacement for the old watermark hint.
 
-    /// 4. The durable watermark's min_active is published WHILE B is active (each GC round below renews
-    ///    it), so the guard's clause build_seq >= min_active holds for B's incarnation: anchored at
-    ///    open, B active, min_active <= B's build_seq automatically.
-
-    /// 5. THE ADVERSARIAL LOOP. A real, productive GC keeps trying to reclaim. Round 1 reclaims the
-    ///    now-unreferenced tree_a (owned by the finished build A — UNprotected) and, by cascade, frees
-    ///    H to zero in-degree. From then on H is a standing zero-in-degree candidate that the GC
-    ///    re-derives EVERY round (zeroInDegreeKnown is stateless) and would condemn+delete — but it is
-    ///    owned by the live build B, so protectedByLiveBuild SPARES it each time. We drive far more
-    ///    rounds than B needs to publish; H must survive ALL of them.
-    Gc gc(s, hexToU128("00000000000000000000000000000001"));
-    constexpr int MAX_GC_ROUNDS = 8;   /// bounded-step budget: convergence must not exceed this
-
-    /// Build B assembles its tree referencing H (no publish yet — H stays unreferenced by any root).
+    /// 4. Build B assembles its tree referencing H and PRECOMMITS it (build-root edge). H is now protected
+    ///    by reachability, not by `cas_owner` — the precommit is the new upload→publish-window protection.
     TreeEntry eb;
     eb.name = "f";
     eb.placement = Placement::Blob;
     eb.file_hash = u128Of(content);
     eb.file_size = content.size();
     const TreeId tree_b = build_b->putTree({eb});
+    build_b->precommit(tree_b);
 
-    /// One adversarial GC round + the spare invariant. Returns the report so the caller can assert no
-    /// reclaim slipped through. INV (the heart of the test): the in-flight, watermark-protected H is
-    /// NEVER condemned/deleted while build B is active — H stays present and reads back the exact
-    /// content. (Before the fix, GC re-condemned+deleted the fresh incarnation in the upload→publish
-    /// window, so H would VANISH here → livelock.) The blob plane holds exactly one blob (H), so a
-    /// reclaim of H is the only way rep.deleted could count a blob — but trees zero/cascade too, so we
-    /// assert directly on H's presence + content rather than on the aggregate counter.
+    /// 5. THE ADVERSARIAL LOOP. A real, productive GC keeps trying to reclaim. Round 1 reclaims the
+    ///    now-unreferenced tree_a (the finished build A's manifest — UNprotected) but H stays pinned by
+    ///    B's PRECOMMIT edge (in-degree ≥ 1), so H is never even a zero-in-degree candidate. We drive far
+    ///    more rounds than B needs to publish; H must survive ALL of them. (Each round still renews B's
+    ///    watermark so the K=2 crash detector keeps judging B live — the watermark now drives precommit
+    ///    reclaim liveness, so a frozen B would have its precommit reclaimed; an advancing seq keeps it.)
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    constexpr int MAX_GC_ROUNDS = 8;   /// bounded-step budget: convergence must not exceed this
+
+    /// One adversarial GC round + the spare invariant. INV (the heart of the test): the in-flight,
+    /// PRECOMMIT-protected H is NEVER condemned/deleted while build B is active — H stays present and
+    /// reads back the exact content. (Before the fix, GC re-condemned+deleted the fresh incarnation in the
+    /// upload→publish window, so H would VANISH here → livelock.) The blob plane holds exactly one blob
+    /// (H), so a reclaim of H is the only way rep.deleted could count a blob — but trees zero/cascade too,
+    /// so we assert directly on H's presence + content rather than on the aggregate counter.
     const auto driveRoundAndAssertHSpared = [&](int round_no)
     {
         /// A LIVE server renews its watermark continuously (a background thread every ~heartbeat_period
         /// in production). Renew once per GC round so B's watermark seq ADVANCES between rounds: that is
         /// precisely what distinguishes a live server from a crashed one. (Without this, B's seq freezes
-        /// and the GC's K=2 frozen-seq crash detector correctly declares B dead and reclaims H — that is
-        /// the intended crash path, NOT the livelock this test targets.)
+        /// and the GC's K=2 frozen-seq crash detector correctly declares B dead and RECLAIMS B's
+        /// precommit — releasing H. The renew keeps B live so the precommit is honored every round.)
         s->renewWatermarkOnce();
         gc.runRegularRound();
         /// (Lease may not be acquired on the very first round: injectRetire pre-seeded gc/state with
@@ -885,7 +871,7 @@ TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
         /// not load-bearing for this test. The invariant below holds regardless of who leads.)
         const HeadResult hr = b->head(blob_key);
         ASSERT_TRUE(hr.exists) << "H was deleted by GC at round " << round_no
-                               << " despite being owned by the live build B (B167 livelock would do this)";
+                               << " despite being pinned by the live build B's precommit (B167 livelock would do this)";
         const auto raw = b->get(blob_key);
         ASSERT_TRUE(raw.has_value());
         const auto hdr = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
@@ -893,10 +879,10 @@ TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
             << "H's content was lost/corrupted at round " << round_no;
     };
 
-    /// Phase 1 — the livelock window. H is referenced by NO published root (B has not published yet),
-    /// so the productive GC re-derives it as a zero-in-degree candidate it WOULD condemn+delete. Drive
-    /// several full rounds (enough to establish the leader, reclaim tree_a/part_1, and cascade-free H);
-    /// the watermark guard must SPARE H's fresh incarnation every single round.
+    /// Phase 1 — the livelock window. H is referenced by NO published TABLE root (B has not published
+    /// yet) but IS named by B's precommit, so the build-root fold lifts it to in-degree ≥ 1 — never a
+    /// zero-in-degree candidate. Drive several full rounds (enough to establish the leader and reclaim
+    /// tree_a/part_1); the precommit edge must SPARE H's fresh incarnation every single round.
     int rounds_run = 0;
     constexpr int PRE_PUBLISH_ROUNDS = 4;
     for (int i = 0; i < PRE_PUBLISH_ROUNDS; ++i)
@@ -913,8 +899,8 @@ TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
     build_b->publish(RootNamespace{"srv1/tbl"}, "part_2", tree_b, RefPayload{});
     const bool published = true;
 
-    /// Phase 3 — keep the GC hammering after publish. H is now pinned by tree_b's root edge; the GC
-    /// must keep sparing it (now as a genuinely-reachable node, owned by the still-live B).
+    /// Phase 3 — keep the GC hammering after publish. H is now pinned by tree_b's TABLE root edge (the
+    /// publish also removed the precommit); the GC must keep sparing it as a genuinely-reachable node.
     while (rounds_run < MAX_GC_ROUNDS)
     {
         driveRoundAndAssertHSpared(++rounds_run);

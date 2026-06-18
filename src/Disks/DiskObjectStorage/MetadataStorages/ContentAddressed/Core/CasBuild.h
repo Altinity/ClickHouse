@@ -132,12 +132,6 @@ private:
     /// Map (kind, hash) to its object key per kind (blob/tree/pack).
     String keyFor(ObjectKind kind, const UInt128 & hash) const;
 
-    /// The owner triple stamped into S3 user-metadata on every object this build writes (spec
-    /// 2026-06-16, Task 8): "cas_owner" = "<server_id_hex>:<epoch>:<build_seq>". The incremental-GC
-    /// watermark reads this from the HEAD it already does and refuses to condemn a blob owned by a
-    /// still-in-flight build (build_seq >= the server's min_active floor).
-    ObjectMeta ownerMeta() const;
-
     /// B171 build-root addressing. The build-root namespace is `_builds/<server_hex>` (one shard per
     /// in-flight build keyed by `build_seq`), so each build owns an isolated precommit shard with no
     /// cross-build CAS contention. GC derives the owning build's `(server_hex, build_seq)` from the
