@@ -63,6 +63,7 @@ Build::Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt1
 {
     /// B170: a build began (W-HEARTBEAT durable). build_id/seq/epoch identify it for token-join
     /// attribution against the GC delete rows.
+    if (store->hasEventSink())
     {
         CasEvent _ev0;
         _ev0.type = CasEventType::BuildStart;
@@ -170,6 +171,7 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
             deps[{static_cast<uint8_t>(ObjectKind::Blob), logical_hash}] =
                 DepEntry{ObjectKind::Blob, tok, store->retireView().round(), source.size};
             /// B170: a fresh blob incarnation was uploaded (the birth of this hash/token pair).
+            if (store->hasEventSink())
             {
                 CasEvent _ev1;
                 _ev1.type = CasEventType::BlobPut;
@@ -298,6 +300,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     {
         /// B170: the reuse-vs-GC defense FIRED — the observed token was condemned, so resurrect
         /// instead of adopting (was the CAREUSE resurrect audit line). W-FRESH-TAG displaces it.
+        if (store->hasEventSink())
         {
             CasEvent _ev2;
             _ev2.type = CasEventType::BlobReuseResurrect;
@@ -319,6 +322,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     /// B170: reuse ADOPTED an existing incarnation's token as NOT condemned (per this build's
     /// retire-view). Was the CAREUSE adopt audit line. Token-join this against a later blob_delete
     /// of the same hash/token to pin a reuse-of-an-object-being-deleted race.
+    if (store->hasEventSink())
     {
         CasEvent _ev3;
         _ev3.type = CasEventType::BlobReuseAdopt;
@@ -509,6 +513,7 @@ TreeId Build::putTree(std::vector<TreeEntry> entries)
         deps[{static_cast<uint8_t>(ObjectKind::Tree), logical_hash}] =
             DepEntry{ObjectKind::Tree, tok, store->retireView().round(), encoded.size()};
         /// B170: a fresh tree incarnation was uploaded.
+        if (store->hasEventSink())
         {
             CasEvent _ev4;
             _ev4.type = CasEventType::TreePut;
@@ -577,6 +582,7 @@ void Build::gateCheckDeps()
             {
                 /// B170: the publish gate found a condemned-by-hash dep and is displacing it
                 /// (resurrect/recreate) so an in-flight GC delete can never hit the live object.
+                if (store->hasEventSink())
                 {
                     CasEvent _ev5;
                     _ev5.type = CasEventType::GateResurrect;
@@ -655,6 +661,7 @@ void Build::revalidateDeps()
 {
     /// B170: a fence-advanced refresh invalidated stale token observations; the whole dep set is
     /// being re-validated before the gate scan (spec §5 step 5).
+    if (store->hasEventSink())
     {
         CasEvent _ev6;
         _ev6.type = CasEventType::GateRevalidate;
@@ -842,6 +849,7 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
 
     /// B170: the ref was published (RefRepoint when it already named a tree, else RefPublish). The
     /// at_version is the committed shard_version — the journal record GC will fold as a root Add.
+    if (store->hasEventSink())
     {
         CasEvent _ev7;
         _ev7.type = repointed_over ? CasEventType::RefRepoint : CasEventType::RefPublish;
@@ -860,6 +868,7 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
     /// (minActive) can advance past it (idempotent — the dtor also retires).
     store->retireBuildSeq(build_seq);
     /// B170: the build's terminal success — the part is committed.
+    if (store->hasEventSink())
     {
         CasEvent _ev8;
         _ev8.type = CasEventType::BuildPublish;
@@ -885,6 +894,7 @@ void Build::abandon()
     store->retireBuildSeq(build_seq);
     alive = false;
     /// B170: the build was abandoned (heartbeat discarded; its uploads become GC-reclaimable debris).
+    if (store->hasEventSink())
     {
         CasEvent _ev9;
         _ev9.type = CasEventType::BuildAbort;

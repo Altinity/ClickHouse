@@ -587,20 +587,20 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
         /// in-degree-zero transition with what dropped it (the parent strip), so a blob's
         /// "why did it become collectable" is reconstructable from the rows.
         for (const Candidate & child : freed)
-            {
-                CasEvent _ev8;
-                _ev8.type = CasEventType::IndegZero;
-                _ev8.object_kind = child.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
-                _ev8.object_hash = u128ToHex(child.hash);
-                _ev8.round = round;
-                _ev8.gen = state.snap_generation;
-                _ev8.reason = "last edge dropped";
-                /// prev_indeg is exactly 1: a Candidate is returned ONLY on the 1->0 transition
-                /// (dropEdgeTarget short-circuits while in-degree stays > 0).
-                _ev8.detail = {{"prev_indeg", "1"},
-                           {"dropped_by", "strip(" + u128ToHex(tree) + ")"}};
-                store->emitEvent(_ev8);
-            }
+        {
+            CasEvent _ev8;
+            _ev8.type = CasEventType::IndegZero;
+            _ev8.object_kind = child.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
+            _ev8.object_hash = u128ToHex(child.hash);
+            _ev8.round = round;
+            _ev8.gen = state.snap_generation;
+            _ev8.reason = "last edge dropped";
+            /// prev_indeg is exactly 1: a Candidate is returned ONLY on the 1->0 transition
+            /// (dropEdgeTarget short-circuits while in-degree stays > 0).
+            _ev8.detail = {{"prev_indeg", "1"},
+                       {"dropped_by", "strip(" + u128ToHex(tree) + ")"}};
+            store->emitEvent(_ev8);
+        }
     }
 
     /// P9: forget every confirmed-gone node (trees AND blobs/packs) from `known`, so the next
@@ -1193,21 +1193,21 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
             /// B170: each old target whose in-degree zeroed on the repoint — emit per freed candidate
             /// so the in-degree-zero transition (and what dropped it) is in the rows.
             for (const Candidate & old : displaced)
-                {
-                    CasEvent _ev19;
-                    _ev19.type = CasEventType::IndegZero;
-                    _ev19.namespace_ = ns.string();
-                    _ev19.object_kind = old.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
-                    _ev19.object_hash = u128ToHex(old.hash);
-                    _ev19.round = state.round;
-                    _ev19.gen = state.snap_generation;
-                    _ev19.at_version = record.at_version;
-                    _ev19.reason = "last edge dropped";
-                    /// prev_indeg is exactly 1 (Candidate returned only on the 1->0 transition).
-                    _ev19.detail = {{"prev_indeg", "1"},
-                               {"dropped_by", "root_repoint(" + record.ref_name + ")"}};
-                    store->emitEvent(_ev19);
-                }
+            {
+                CasEvent _ev19;
+                _ev19.type = CasEventType::IndegZero;
+                _ev19.namespace_ = ns.string();
+                _ev19.object_kind = old.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
+                _ev19.object_hash = u128ToHex(old.hash);
+                _ev19.round = state.round;
+                _ev19.gen = state.snap_generation;
+                _ev19.at_version = record.at_version;
+                _ev19.reason = "last edge dropped";
+                /// prev_indeg is exactly 1 (Candidate returned only on the 1->0 transition).
+                _ev19.detail = {{"prev_indeg", "1"},
+                           {"dropped_by", "root_repoint(" + record.ref_name + ")"}};
+                store->emitEvent(_ev19);
+            }
 
             /// Once-per-tree expansion: the FIRST '+' to a tree with no marker reads the tree
             /// once and adds its child-edge set (each edge into the CHILD's shard).
@@ -1347,21 +1347,21 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
             }
             /// B170: each target whose in-degree zeroed on the remove — emit per freed candidate.
             for (const Candidate & freed : cands)
-                {
-                    CasEvent _ev23;
-                    _ev23.type = CasEventType::IndegZero;
-                    _ev23.namespace_ = ns.string();
-                    _ev23.object_kind = freed.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
-                    _ev23.object_hash = u128ToHex(freed.hash);
-                    _ev23.round = state.round;
-                    _ev23.gen = state.snap_generation;
-                    _ev23.at_version = record.at_version;
-                    _ev23.reason = "last edge dropped";
-                    /// prev_indeg is exactly 1 (Candidate returned only on the 1->0 transition).
-                    _ev23.detail = {{"prev_indeg", "1"},
-                               {"dropped_by", "root_remove(" + record.ref_name + ")"}};
-                    store->emitEvent(_ev23);
-                }
+            {
+                CasEvent _ev23;
+                _ev23.type = CasEventType::IndegZero;
+                _ev23.namespace_ = ns.string();
+                _ev23.object_kind = freed.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
+                _ev23.object_hash = u128ToHex(freed.hash);
+                _ev23.round = state.round;
+                _ev23.gen = state.snap_generation;
+                _ev23.at_version = record.at_version;
+                _ev23.reason = "last edge dropped";
+                /// prev_indeg is exactly 1 (Candidate returned only on the 1->0 transition).
+                _ev23.detail = {{"prev_indeg", "1"},
+                           {"dropped_by", "root_remove(" + record.ref_name + ")"}};
+                store->emitEvent(_ev23);
+            }
         }
     }
 

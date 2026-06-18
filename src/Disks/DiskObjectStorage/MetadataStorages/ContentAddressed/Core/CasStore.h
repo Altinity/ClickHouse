@@ -144,6 +144,9 @@ public:
     /// their owning Store. `reason`/`detail` on the event carry the decision's full rationale.
     void setEventSink(CasEventSink sink) { event_sink_ = std::move(sink); }
     void emitEvent(const CasEvent & e) const { if (event_sink_) event_sink_(e); }
+    /// Cheap predicate so query-frequency hooks can skip constructing the CasEvent (+ its detail map)
+    /// entirely when the log is disabled (sink null) — a true no-op on the production hot path.
+    bool hasEventSink() const noexcept { return static_cast<bool>(event_sink_); }
 
 private:
     Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);

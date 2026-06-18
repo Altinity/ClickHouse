@@ -386,6 +386,7 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
     const RefPayload & payload = it->second;
     /// B170: a ref resolved to its tree (the read-path entry point). object_hash is the tree the
     /// ref names; pairs with a later readTree ReadMissing/DanglingAccess if that tree is gone.
+    if (hasEventSink())
     {
         CasEvent _ev0;
         _ev0.type = CasEventType::RefResolve;
@@ -423,6 +424,7 @@ std::vector<TreeEntry> Store::readTree(const TreeId & id)
     {
         /// B170: a live ref named a tree whose object is gone — INV-NO-DANGLE surfaced on the read
         /// path (the dangling-access anomaly). Record before failing closed.
+        if (hasEventSink())
         {
             CasEvent _ev1;
             _ev1.type = CasEventType::ReadMissing;
@@ -443,6 +445,7 @@ std::vector<TreeEntry> Store::readTree(const TreeId & id)
     if (u128ToHex(header.logical_hash) != id.string())
     {
         /// B170: the tree object decoded but its content hash does not match its key — corruption.
+        if (hasEventSink())
         {
             CasEvent _ev2;
             _ev2.type = CasEventType::CorruptDecode;
@@ -591,6 +594,7 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
     });
     /// B170: the ref was dropped (a '-' journal record GC will fold as a root Remove). object_hash is
     /// the tree the ref named, so a part's "publish -> drop" life is reconstructable from the rows.
+    if (hasEventSink())
     {
         CasEvent _ev3;
         _ev3.type = CasEventType::RefDrop;
