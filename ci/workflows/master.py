@@ -92,7 +92,7 @@ workflow = Workflow.Config(
     enable_commit_status_on_failure=True,
     enable_slack_feed=False,
     pre_hooks=[
-        "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py", # NOTE (carlosfelipeor): we don't use this in master CI
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
         "python3 ./ci/jobs/scripts/workflow_hooks/parse_ci_tags.py",
         # "python3 ./ci/jobs/scripts/workflow_hooks/merge_sync_pr.py", # NOTE (strtgbb): we don't do this
