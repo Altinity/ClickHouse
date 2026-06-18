@@ -608,6 +608,8 @@ void Build::precommit(const TreeId & manifest)
     });
 
     /// B171: the precommit was published — the build-root edge now protects the manifest's closure.
+    /// Record that fact so the successful-commit path (and only it) removes the edge.
+    precommitted = true;
     if (store->hasEventSink())
     {
         CasEvent _ev;
@@ -731,8 +733,9 @@ void Build::recreateTree(const UInt128 & hash)
 
 void Build::revalidateDeps()
 {
-    /// B170: a fence-advanced refresh invalidated stale token observations; the whole dep set is
-    /// being re-validated before the gate scan (spec §5 step 5).
+    /// B170/B171: re-validate the whole dependency set before the gate scan. Since B171 this runs
+    /// UNCONDITIONALLY at every commit (INV-COMMIT-FAILCLOSED), not only after a fence-advanced refresh;
+    /// members already observed at the current view round are kept without I/O (spec §4.4, §5 step 5).
     if (store->hasEventSink())
     {
         CasEvent _ev6;
@@ -740,7 +743,7 @@ void Build::revalidateDeps()
         _ev6.token = u128ToHex(build_id);
         _ev6.round = store->retireView().round();
         _ev6.outcome = "revalidating";
-        _ev6.reason = "fence advanced past this build's view; revalidate the dependency set";
+        _ev6.reason = "fail-closed commit: re-prove the dependency closure is present before writing the ref";
         _ev6.detail = {{"deps", std::to_string(deps.size())}};
         store->emitEvent(_ev6);
     }
@@ -898,15 +901,22 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
     store->mutateShard(ns, store->shardOf(ref_name), [&](RootShard & root)
     {
         /// Fence vs view: if the manifest's fence_round (floored by the registry fence at
-        /// registration, W-REGISTER) is ahead of our view, GC advanced — refresh.
+        /// registration, W-REGISTER) is ahead of our view, GC advanced — refresh BEFORE revalidating
+        /// so the dependency set is checked against the freshest reality. This ordering (refresh, then
+        /// revalidate) is load-bearing for W-REGISTER (the registry fence is the gate floor); keep it.
         if (store->retireView().round() < std::max(root.fence_round, registry_fence))
-        {
             store->retireView().refresh();
-            /// W-REVALIDATE: a fence-advanced refresh invalidates every stale token observation; re-validate
-            /// the whole dependency set BEFORE the gate scan (spec §5 step 5, §7 step 4).
-            revalidateDeps();
-        }
 
+        /// B171 INV-COMMIT-FAILCLOSED (fail-closed commit): revalidate UNCONDITIONALLY — every commit
+        /// re-proves the full closure is present (re-pin via resurrect / recreate / observeAndAdmit; a
+        /// missing non-recreatable blob → ABORTED, caller retries). This used to run only when the
+        /// fence advanced past our view, which left a window: a precommit prematurely reclaimed (e.g. a
+        /// live build whose watermark renewer froze) could let the shared blob be collected, yet a
+        /// stale-but-not-fence-advanced view would skip the presence check and commit a dangle. Running
+        /// revalidateDeps every time closes that window — a publish can NEVER commit a table ref over a
+        /// missing dependency. revalidateDeps is idempotent and re-runs naturally on each mutateShard
+        /// CAS retry (spec §4.4, §4.6). gateCheckDeps (the condemned-token / W-EVIDENCE scan) follows.
+        revalidateDeps();
         gateCheckDeps();
 
         repointed_over = root.refs.contains(ref_name);
@@ -934,6 +944,73 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
         _ev7.outcome = "ok";
         _ev7.reason = repointed_over ? "published over an existing ref (repoint)" : "published a new ref";
         store->emitEvent(_ev7);
+    }
+
+    /// B171: the table ref is now durably committed — the manifest's closure is table-pinned. Remove
+    /// the build-root precommit edge so GC's fold releases it. ORDER: the table ref Add committed FIRST
+    /// (above), THEN the precommit is removed — never the reverse, which would leave a window with
+    /// neither edge protecting the closure. A transient failure is SAFE to ignore: the commit already
+    /// succeeded, so the closure is protected by the table ref; the leftover precommit is a stale
+    /// build-root edge GC reclaims later (Task 4). We therefore catch/log/emit and continue — failing
+    /// the publish here would be wrong (the part IS committed). Only attempt removal if this build
+    /// actually precommitted (spec §B.2, design §4.4).
+    ///
+    /// NB: we drop via mutateShard on the build's ISOLATED shard (buildShard() == build_seq), mirroring
+    /// how `precommit` wrote it — NOT via Store::dropRef, which routes by shardOf(ref_name) and would
+    /// look in the wrong shard for the build-root layout. Same CAS shape as dropRef: erase refs["part"]
+    /// + append a Remove journal record (the journal Remove is what GC's fold reads to release edges).
+    if (precommitted)
+    {
+        try
+        {
+            store->mutateShard(buildRootNs(), buildShard(), [&](RootShard & root)
+            {
+                auto it = root.refs.find("part");
+                if (it == root.refs.end())
+                    throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                        "remove precommit: no ref part in build-root shard {}", buildShard());
+                const UInt128 part_tree = it->second.tree_id;
+                root.refs.erase(it);
+                root.journal.push_back(JournalRecord{
+                    .op = JournalRecord::Op::Remove, .ref_name = "part", .tree_id = part_tree,
+                    .at_version = root.shard_version + 1});
+            });
+            precommitted = false;
+            if (store->hasEventSink())
+            {
+                CasEvent _evpr;
+                _evpr.type = CasEventType::PrecommitRemoved;
+                _evpr.namespace_ = buildRootNs().string();
+                _evpr.ref_name = "part";
+                _evpr.object_kind = CasEventObjectKind::Tree;
+                _evpr.object_hash = tree.string();
+                _evpr.token = u128ToHex(build_id);
+                _evpr.outcome = "removed";
+                _evpr.reason = "fail-closed commit succeeded; closure now table-pinned, releasing the build-root edge";
+                _evpr.detail = {{"build_seq", std::to_string(build_seq)}};
+                store->emitEvent(_evpr);
+            }
+        }
+        catch (const Exception & e)
+        {
+            /// Best-effort: the commit already succeeded, so leaving a stale precommit is benign (GC
+            /// reclaims it). Do NOT propagate — that would fail an already-committed publish.
+            if (store->hasEventSink())
+            {
+                CasEvent _evpr;
+                _evpr.type = CasEventType::PrecommitRemoved;
+                _evpr.namespace_ = buildRootNs().string();
+                _evpr.ref_name = "part";
+                _evpr.object_kind = CasEventObjectKind::Tree;
+                _evpr.object_hash = tree.string();
+                _evpr.token = u128ToHex(build_id);
+                _evpr.outcome = "deferred";
+                _evpr.reason = "precommit removal failed transiently after a successful commit; left for GC reclaim: "
+                    + e.message();
+                _evpr.detail = {{"build_seq", std::to_string(build_seq)}};
+                store->emitEvent(_evpr);
+            }
+        }
     }
 
     /// Published: this build is no longer in-flight. Retire its seq so the GC watermark floor

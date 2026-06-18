@@ -154,6 +154,7 @@ private:
     uint64_t epoch{};                                     /// owning Store's process_epoch (stamped in Task 8)
     BuildInfo info;
     bool alive = true;
+    bool precommitted = false;                            /// B171: a build-root precommit edge was published (remove on commit)
 
     std::map<DepKey, DepEntry> deps;                      /// the W-DEP-SET
     std::map<UInt128, String> retained_trees;             /// encoded tree payloads for gate re-create (Task 13)

@@ -122,3 +122,92 @@ TEST(CasBuildRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
     ASSERT_TRUE(s->resolveRef(ns, "refB").has_value())
         << "B171: refB must resolve to its committed manifest";
 }
+
+/// B171 INV-COMMIT-FAILCLOSED: even if the build-root precommit is PREMATURELY RECLAIMED mid-build
+/// (e.g. a live build whose watermark renewer froze and was falsely judged dead), the real commit must
+/// NEVER publish a table ref over a missing dependency. It must fail closed — abort — never dangle.
+///
+/// Setup mirrors the primary repro: Build A publishes refA -> t1 -> { data.bin: P } then retires; Build
+/// B adopts P, assembles t2 -> { other.bin: P }, and precommits t2 (a real build-root edge now protects
+/// P). We then SIMULATE the premature reclaim by manually dropping the build-root ref (as GC's reclaim
+/// would) AND dropping refA, then renew the watermark and run GC to fixpoint. With P's only protection
+/// (the precommit edge) gone and its owner retired, GC deletes P. Build B's publish must now ABORT
+/// (revalidateDeps finds the adopted blob absent and not re-creatable) instead of committing a dangle.
+/// Spec: docs/superpowers/specs/2026-06-18-ca-build-root-precommit-design.md (§4.4, §4.6)
+TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
+{
+    std::shared_ptr<InMemoryBackend> backend;
+    auto s = openTestStore(backend);
+    const RootNamespace ns{"srv1/tbl"};
+    const String P = "shared-blob-payload-P-reclaim";
+
+    /// Build A: upload P, publish refA -> t1, retire A so min_active advances past it.
+    {
+        auto a = s->startBuild({});
+        a->putBlob(idOf(P), BlobSource::fromString(P));
+        const TreeId t1 = a->putTree({blobEntry("data.bin", P)});
+        a->publish(ns, "refA", t1, {});
+    }
+    s->renewWatermarkOnce();
+
+    /// Build B: adopt P, assemble t2, precommit it (build-root edge now protects P).
+    auto b = s->startBuild({});
+    b->reuseBlob(idOf(P), /*body_recreatable=*/false);
+    const TreeId t2 = b->putTree({blobEntry("other.bin", P)});
+    b->precommit(t2);
+
+    /// SIMULATE premature reclaim: remove the build-root precommit edge exactly as GC reclaim would —
+    /// erase refs["part"] + append a Remove journal record on the build's ISOLATED shard. The build-root
+    /// namespace is `_builds/<server_hex>`, shard = build_seq (NOT shardOf("part")); buildRootNs() and
+    /// the shard routing are private, so we reconstruct the RootNamespace from the public server_id and
+    /// drive the shard manifest CAS directly through the backend codec (Store::dropRef routes by
+    /// shardOf(ref_name) and would touch the wrong shard for this layout).
+    const RootNamespace build_root_ns{"_builds/" + u128ToHex(s->poolConfig().server_id)};
+    {
+        const String key = s->layout().rootShardKey(build_root_ns, b->buildSeq());
+        const auto got = backend->get(key);
+        ASSERT_TRUE(got.has_value()) << "precommit shard manifest must exist before reclaim";
+        DB::Cas::RootShard root = DB::Cas::decodeRootShard(got->bytes);
+        auto it = root.refs.find("part");
+        ASSERT_NE(it, root.refs.end()) << "precommit ref must exist before reclaim";
+        const DB::UInt128 part_tree = it->second.tree_id;
+        root.refs.erase(it);
+        /// Bump shard_version like mutateShard does (it increments AFTER the lambda); the journal record
+        /// pins at the NEW version, so the decode invariant at_version <= shard_version holds.
+        ++root.shard_version;
+        root.journal.push_back(JournalRecord{
+            .op = JournalRecord::Op::Remove, .ref_name = "part", .tree_id = part_tree,
+            .at_version = root.shard_version});
+        backend->casPut(key, DB::Cas::encodeRootShard(root), got->token);
+    }
+
+    /// Drop the source ref too, renew the watermark, and run GC: P is now unprotected (no precommit, no
+    /// table ref, retired owner) and gets collected. The reclaim is a CASCADE — t2 (the manifest tree,
+    /// now an orphan), then t1, then the leaf blob P are condemned over successive rounds, with empty
+    /// rounds in between. The shared runGcToFixpoint helper stops at the first empty round, so it can
+    /// halt mid-cascade; here we drive a fixed, generous number of rounds and let it settle so P is
+    /// reliably collected before the commit attempt.
+    s->dropRef(ns, "refA");
+    s->renewWatermarkOnce();
+    Gc gc(s, u128Of("gc-b171-reclaim"));
+    for (int round = 0; round < 32; ++round)
+    {
+        try { gc.runRegularRound(); }
+        catch (const DB::Exception &) { break; }
+    }
+
+    /// The shared blob must be GONE (the premature reclaim let GC collect it).
+    ASSERT_FALSE(backend->head(s->layout().blobKey(idOf(P))).exists)
+        << "premature-reclaim setup invalid: P should have been collected after losing its precommit";
+
+    /// FAIL-CLOSED: Build B's commit must THROW (ABORTED — dependency lost), never silently publish a
+    /// dangle. revalidateDeps re-proves the closure present and aborts when P is missing.
+    ASSERT_ANY_THROW(b->publish(ns, "refB", t2, {}))
+        << "B171 INV-COMMIT-FAILCLOSED: publish must abort over a missing dependency, not commit a dangle";
+
+    /// And the dangle must NOT have been committed: P still absent, refB never resolved.
+    ASSERT_FALSE(backend->head(s->layout().blobKey(idOf(P))).exists)
+        << "B171: the missing blob must stay missing — commit must not fabricate it";
+    ASSERT_FALSE(s->resolveRef(ns, "refB").has_value())
+        << "B171: refB must NOT be committed when its closure is missing (fail-closed)";
+}
