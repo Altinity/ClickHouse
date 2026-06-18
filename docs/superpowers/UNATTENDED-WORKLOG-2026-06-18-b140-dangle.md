@@ -39,3 +39,38 @@ GC reclaims it under a still-in-flight adopter → publish dangles. Pinned live 
   two-phase `Build::precommit`→fail-closed `publish`→remove precommit, GC fold + pending-tolerance +
   precommit reclaim via repurposed watermark, delete `cas_owner`/`protectedByLiveBuild`, failing-gtest
   list). Marked draft pending TLA+. Grounded in the actual layout/registry/fold/mutateShard code.
+- **T4** — TLA+ GREEN + independently re-verified (task #138 done, subagent commit `fc3ac31447b`).
+  `models/CaBuildRootPrecommit.tla` + 2×2 flag matrix. Results: buggy → `INV_NO_DANGLE_COMMITTED`
+  violated (481 distinct states to CE; my re-run exit=12 confirms); fixed (UseBuildRoot ∧
+  FailClosedCommit) → clean exhaustive 24205 states (my re-run "No error"). Non-vacuity witnesses
+  confirm the dangerous interleavings are reachable+survived. **Sharp finding:** build-root ALONE
+  still dangles (ordering window) and fail-closed-commit ALONE is clean only vacuously — both halves
+  independently necessary, jointly sufficient (validates design §4.5/§4.6). Buggy CE matches the soak
+  dangle exactly (write→adopt→BuildDie→GcDelete→Commit). Design CONFIRMED; C++ impl spec stands as-is.
+- **T5** — Starting C++ implementation (task #140): writing-plans → subagent-driven TDD.
+  Plan `plans/2026-06-18-ca-build-root-precommit.md` committed (`db0af38f506`). Build env: `build/`
+  dir, `build/src/unit_tests_dbms`.
+- **T6** — Task 1 RED (`b6e4f632456`): build-root taxonomy (`Precommit`/`PrecommitRemoved`/
+  `PrecommitReclaim`), `Layout::isBuildRootNamespace` + `_builds` reserved, `Build::precommit` stub +
+  `buildRootNs`/`buildShard`, failing dangle repro `CasBuildRootDangle.SharedBlobSurvivesSourceDrop…`
+  (RED via ABORTED "dependency lost" — blob GC-deleted under retired owner). 122 others green.
+- **T7** — Task 2 (`f3b1040f1fd`): real `Build::precommit` (build-root edge); GC folds the build root
+  with pending-tolerance (skip the live-ref→missing-tree alarm for `_builds/` namespaces). **RED test
+  now PASSES** — blob survives via reachability. Subagent CAUGHT+FIXED a latent bug: build-root shards
+  are keyed by `build_seq` (beyond table shard fan-out), so GC needed `shardsToVisit(ns)` to LIST them.
+  126/127 green.
+- **T8** — Task 3 (`b0079ca1962`): fail-closed commit (unconditional `revalidateDeps`) + remove
+  precommit after commit. New test `PrematureReclaimCommitFailsClosed` — commit ABORTs (never dangles)
+  when the precommit was reclaimed mid-build. Caught a 2nd shard-keying bug (`dropRef` not shard-aware
+  for build-root → shard-correct `mutateShard` drop). 119 green, 0 regressions.
+- **T9** — Task 4 (`973a5e5ccbe`): GC auto-reclaims abandoned precommits (watermark liveness:
+  `w==null ∨ !live ∨ build_seq<min_active`); DELETED `protectedByLiveBuild` + `cas_owner`/`ownerMeta`
+  (watermark retained, repurposed). New test `AbandonedPrecommitReclaimed`. Translated 4 existing tests
+  from the cas_owner model to the precommit/reachability model. Design-gap analysis: the putBlob→
+  precommit window is exactly the design's documented residual, closed by fail-closed commit (lost
+  work, never lost data). **161 pass, 1 intentional red.**
+- **T10** — Task 5 (`acbc906074e`): wired `Build::precommit(tree)` into ALL THREE integration publish
+  sites — `publishStaging` (INSERT/merge/mutation/hardlink), `republishRef` (RENAME/cross-engine
+  repoint), `adoptPart` (replication relink). `ninja clickhouse` + `unit_tests_dbms` build CLEAN. 141
+  pass, 1 intentional red. C++ implementation COMPLETE.
+- **T11** — Final comprehensive review of the B171 change (6 commits) before the soak.
