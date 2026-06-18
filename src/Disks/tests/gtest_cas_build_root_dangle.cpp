@@ -157,18 +157,19 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
     b->precommit(t2);
 
     /// SIMULATE premature reclaim: remove the build-root precommit edge exactly as GC reclaim would —
-    /// erase refs["part"] + append a Remove journal record on the build's ISOLATED shard. The build-root
-    /// namespace is `_builds/<server_hex>`, shard = build_seq (NOT shardOf("part")); buildRootNs() and
-    /// the shard routing are private, so we reconstruct the RootNamespace from the public server_id and
-    /// drive the shard manifest CAS directly through the backend codec (Store::dropRef routes by
-    /// shardOf(ref_name) and would touch the wrong shard for this layout).
+    /// erase refs[build_seq] + append a Remove journal record on the build-root shard. The build-root
+    /// namespace is `_builds/<server_hex>`, and since B171's fix the precommit ref name is the build_seq
+    /// and the shard is shardOf(build_seq) (sharded exactly like a table namespace). We reconstruct the
+    /// RootNamespace from the public server_id and drive the shard manifest CAS directly through the
+    /// backend codec.
     const RootNamespace build_root_ns{"_builds/" + u128ToHex(s->poolConfig().server_id)};
+    const String precommit_ref = std::to_string(b->buildSeq());
     {
-        const String key = s->layout().rootShardKey(build_root_ns, b->buildSeq());
+        const String key = s->layout().rootShardKey(build_root_ns, s->shardOf(precommit_ref));
         const auto got = backend->get(key);
         ASSERT_TRUE(got.has_value()) << "precommit shard manifest must exist before reclaim";
         DB::Cas::RootShard root = DB::Cas::decodeRootShard(got->bytes);
-        auto it = root.refs.find("part");
+        auto it = root.refs.find(precommit_ref);
         ASSERT_NE(it, root.refs.end()) << "precommit ref must exist before reclaim";
         const DB::UInt128 part_tree = it->second.tree_id;
         root.refs.erase(it);
@@ -176,7 +177,7 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
         /// pins at the NEW version, so the decode invariant at_version <= shard_version holds.
         ++root.shard_version;
         root.journal.push_back(JournalRecord{
-            .op = JournalRecord::Op::Remove, .ref_name = "part", .tree_id = part_tree,
+            .op = JournalRecord::Op::Remove, .ref_name = precommit_ref, .tree_id = part_tree,
             .at_version = root.shard_version});
         backend->casPut(key, DB::Cas::encodeRootShard(root), got->token);
     }
@@ -217,11 +218,11 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
 ///
 /// Build B precommits a manifest naming a blob that is referenced by NO table ref. B is then RETIRED
 /// (released; its build_seq leaves the active set) and the watermark renewed so `min_active` advances
-/// past B. GC, while folding B's build-root shard, derives (server, build_seq) from the namespace +
-/// shard, judges B dead (build_seq < min_active), and RECLAIMS the precommit: it drops refs["part"] +
-/// journal Remove. The next fold releases the edges; the exclusively-owned blob hits in-degree 0 and is
-/// collected over the cascade rounds. We drive a multi-round loop (NOT the first-empty-round helper,
-/// which would halt mid-cascade between the reclaim and the leaf delete).
+/// past B. GC, while folding B's build-root shard, derives the server from the namespace and build_seq
+/// from the ref NAME, judges B dead (build_seq < min_active), and RECLAIMS the precommit: it drops
+/// refs[build_seq] + journal Remove. The next fold releases the edges; the exclusively-owned blob hits
+/// in-degree 0 and is collected over the cascade rounds. We drive a multi-round loop (NOT the
+/// first-empty-round helper, which would halt mid-cascade between the reclaim and the leaf delete).
 /// Spec: docs/superpowers/specs/2026-06-18-ca-build-root-precommit-cpp-impl.md (§F.4)
 TEST(CasBuildRoot, AbandonedPrecommitReclaimed)
 {
@@ -242,13 +243,15 @@ TEST(CasBuildRoot, AbandonedPrecommitReclaimed)
     }
     s->renewWatermarkOnce();   /// B is gone; min_active now advances past B's build_seq -> precommit abandoned
 
-    /// Sanity: the precommit ref exists before GC reclaim.
+    /// Sanity: the precommit ref exists before GC reclaim. Since B171's fix the ref name IS the build_seq
+    /// and the shard is shardOf(build_seq) (sharded like a table namespace).
     const RootNamespace build_root_ns{"_builds/" + u128ToHex(s->poolConfig().server_id)};
-    const String shard_key = s->layout().rootShardKey(build_root_ns, build_seq);
+    const String precommit_ref = std::to_string(build_seq);
+    const String shard_key = s->layout().rootShardKey(build_root_ns, s->shardOf(precommit_ref));
     {
         const auto got = backend->get(shard_key);
         ASSERT_TRUE(got.has_value()) << "precommit shard manifest must exist before reclaim";
-        ASSERT_TRUE(DB::Cas::decodeRootShard(got->bytes).refs.contains("part"))
+        ASSERT_TRUE(DB::Cas::decodeRootShard(got->bytes).refs.contains(precommit_ref))
             << "precommit ref must exist before reclaim";
     }
     ASSERT_TRUE(backend->head(blob_key).exists) << "P must exist before GC reclaim";
@@ -263,10 +266,10 @@ TEST(CasBuildRoot, AbandonedPrecommitReclaimed)
         catch (const DB::Exception &) { break; }
     }
 
-    /// INV-BUILDROOT-RECLAIM: the build-root ref for B's shard is gone (the precommit was reclaimed).
+    /// INV-BUILDROOT-RECLAIM: the build-root ref for B is gone (the precommit was reclaimed).
     const auto after = backend->get(shard_key);
     if (after.has_value())
-        ASSERT_FALSE(DB::Cas::decodeRootShard(after->bytes).refs.contains("part"))
+        ASSERT_FALSE(DB::Cas::decodeRootShard(after->bytes).refs.contains(precommit_ref))
             << "GC must have AUTOMATICALLY reclaimed the abandoned precommit ref";
 
     /// And the exclusively-owned blob is eventually deleted (no longer protected by anything).

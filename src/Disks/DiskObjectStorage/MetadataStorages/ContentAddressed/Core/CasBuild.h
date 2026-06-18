@@ -132,12 +132,14 @@ private:
     /// Map (kind, hash) to its object key per kind (blob/tree/pack).
     String keyFor(ObjectKind kind, const UInt128 & hash) const;
 
-    /// B171 build-root addressing. The build-root namespace is `_builds/<server_hex>` (one shard per
-    /// in-flight build keyed by `build_seq`), so each build owns an isolated precommit shard with no
-    /// cross-build CAS contention. GC derives the owning build's `(server_hex, build_seq)` from the
-    /// namespace + shard to decide precommit-reclaim liveness.
+    /// B171 build-root addressing (fixed 2026-06-19). The build-root namespace is `_builds/<server_hex>`,
+    /// sharded EXACTLY like a table namespace: the precommit ref name is `build_seq` and the shard is
+    /// `shardOf(build_seq)`. So the build-root namespace has at most root_shards shards (bounded), each
+    /// holding many builds' precommit refs keyed by build_seq. GC derives the owning build's `build_seq`
+    /// from the REF NAME (and the server from the namespace) to decide precommit-reclaim liveness.
     RootNamespace buildRootNs() const;
-    uint64_t buildShard() const;
+    String buildRef() const;        /// the precommit ref name == std::to_string(build_seq)
+    uint64_t buildShard() const;    /// == store->shardOf(buildRef())
 
     void requireAlive() const;                            /// throws LOGICAL_ERROR after abandon
 

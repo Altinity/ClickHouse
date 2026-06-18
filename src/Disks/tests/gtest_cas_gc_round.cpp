@@ -2036,14 +2036,17 @@ TEST(CasGcRetire, ReclaimsAbandonedPrecommitWhenFloorPasses)
     s->renewWatermarkOnce();   /// min_active advances past build_seq -> the precommit is now abandoned
 
     /// The build-root shard for the (now retired) build must still carry the precommit ref before GC.
+    /// Since B171's fix the ref name IS the build_seq and the shard is shardOf(build_seq).
     const RootNamespace build_root_ns{"_builds/" + u128ToHex(s->poolConfig().server_id)};
+    const String precommit_ref = std::to_string(build_seq);
+    const String shard_key = s->layout().rootShardKey(build_root_ns, s->shardOf(precommit_ref));
     {
-        const auto got = b->get(s->layout().rootShardKey(build_root_ns, build_seq));
+        const auto got = b->get(shard_key);
         ASSERT_TRUE(got.has_value());
-        EXPECT_TRUE(decodeRootShard(got->bytes).refs.contains("part"));
+        EXPECT_TRUE(decodeRootShard(got->bytes).refs.contains(precommit_ref));
     }
 
-    /// Drive GC: the first folds reclaim the abandoned precommit (drop refs["part"] + Remove), then the
+    /// Drive GC: the first folds reclaim the abandoned precommit (drop refs[build_seq] + Remove), then the
     /// closure cascades to deletion over successive rounds.
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     for (int round = 0; round < 16; ++round)
@@ -2054,9 +2057,9 @@ TEST(CasGcRetire, ReclaimsAbandonedPrecommitWhenFloorPasses)
     }
 
     /// The precommit ref is gone (reclaimed) and the exclusively-owned blob is deleted.
-    const auto after = b->get(s->layout().rootShardKey(build_root_ns, build_seq));
+    const auto after = b->get(shard_key);
     if (after.has_value())
-        EXPECT_FALSE(decodeRootShard(after->bytes).refs.contains("part"))
+        EXPECT_FALSE(decodeRootShard(after->bytes).refs.contains(precommit_ref))
             << "GC must have reclaimed the abandoned precommit ref";
     EXPECT_FALSE(b->head(s->layout().blobKey(idOf(P))).exists)
         << "the exclusively-precommit-owned blob must be collected after reclaim";

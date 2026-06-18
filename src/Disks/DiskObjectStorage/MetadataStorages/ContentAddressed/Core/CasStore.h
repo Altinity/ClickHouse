@@ -127,6 +127,10 @@ public:
     const Layout & layout() const { return pool_layout; }
     Backend & backend() { return *pool_backend; }
     RetireView & retireView() { return retire_view; }
+    /// The shard a ref name routes to: CityHash64(ref_name) % root_shards. Build uses it to address the
+    /// publish/precommit CAS (the build-root ref name is the build_seq, B171); tests reconstruct the
+    /// build-root shard with it.
+    uint64_t shardOf(const String & ref_name) const;
 
     /// W-REGISTER (spec §5, decision 2026-06-12): CAS-append `ns` to roots/_registry if not yet
     /// present, BEFORE the namespace's first manifest is created — this orders namespace creation
@@ -158,7 +162,6 @@ private:
     /// Remove a build_seq from the active set; idempotent (safe from publish/abandon/dtor).
     void retireBuildSeq(uint64_t seq);
 
-    uint64_t shardOf(const String & ref_name) const;             /// CityHash64(ref_name) % root_shards
     /// Read shard manifest (absent ⇒ empty RootShard with no token); used by mutateShard (writes,
     /// which need the token for the CAS) and as the uncached primitive under readShardDecoded.
     std::pair<RootShard, std::optional<Token>> readShard(const RootNamespace & ns, uint64_t shard);

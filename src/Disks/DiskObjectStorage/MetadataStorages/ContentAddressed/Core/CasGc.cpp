@@ -867,8 +867,8 @@ void Gc::fence(GcState & state, Token & state_token)
     for (const String & ns_name : fence_universe.namespaces)
     {
         const RootNamespace ns{ns_name};
-        /// Build-root namespaces are fenced over their PRESENT shards (one per build_seq, LISTed);
-        /// table namespaces over the static [0, root_shards) fan-out — see shardsToVisit (B171).
+        /// Every namespace — table and build-root (B171 fix) — is fenced over the static [0, root_shards)
+        /// fan-out via shardsToVisit. Build roots are now bounded by root_shards, not per-build.
         for (const uint64_t shard : shardsToVisit(ns))
         {
             ++fenced_shards;
@@ -1386,8 +1386,8 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
         for (const String & ns_name : registry.namespaces)
         {
             const RootNamespace ns{ns_name};
-            /// Build-root namespaces use one shard per build_seq (LISTed), not the fixed [0, root_shards)
-            /// fan-out — see shardsToVisit (B171). Table namespaces use the static shard model.
+            /// Every namespace — table and build-root (B171 fix) — uses the static [0, root_shards)
+            /// fan-out via shardsToVisit. Build roots are now bounded by root_shards, not per-build.
             for (const uint64_t shard : shardsToVisit(ns))
                 universe.emplace_back(ns, shard);
         }
@@ -1395,47 +1395,21 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
     return universe;
 }
 
-std::vector<uint64_t> Gc::shardsToVisit(const RootNamespace & ns)
+std::vector<uint64_t> Gc::shardsToVisit(const RootNamespace &)
 {
-    if (!Layout::isBuildRootNamespace(ns))
-    {
-        /// Table namespace: the static shard fan-out [0, root_shards). The fence mints fence-only
-        /// manifests for absent shards, so the absent ones are needed too (the absent-shard hole).
-        std::vector<uint64_t> shards;
-        const uint64_t root_shards_per_ns = store->poolMeta().root_shards;
-        shards.reserve(root_shards_per_ns);
-        for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
-            shards.push_back(shard);
-        return shards;
-    }
-
-    /// Build-root namespace: enumerate the PRESENT shards (one per in-flight precommit, keyed by
-    /// build_seq, unbounded by root_shards) by LISTing the namespace's root prefix and parsing the
-    /// numeric tails. Only present shards exist (a precommit CREATES its shard; there is no
-    /// absent-shard fence hole here — a build-root shard is never published-into before its precommit
-    /// created it, and GC reclaim, not fencing, releases an abandoned one). De-duplicated + sorted for
-    /// deterministic iteration.
-    const Layout & layout = store->layout();
-    const String prefix = layout.rootNamespacePrefix(ns);
-    std::set<uint64_t> present;
-    String cursor;
-    while (true)
-    {
-        ListPage page = store->backend().list(prefix, cursor, /*limit*/ 1000);
-        for (const ListedKey & listed : page.keys)
-        {
-            if (const auto parsed = layout.tryParseRootShardKey(listed.key))
-            {
-                /// tryParseRootShardKey also skips the `_files/` sub-prefix and non-numeric tails.
-                if (parsed->first.string() == ns.string())
-                    present.insert(parsed->second);
-            }
-        }
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
-    return std::vector<uint64_t>(present.begin(), present.end());
+    /// EVERY namespace — table AND build-root (B171 fix) — uses the static shard fan-out [0, root_shards).
+    /// The build root is now sharded exactly like a table namespace (ref name == build_seq, shard ==
+    /// shardOf(build_seq)), so it has at most root_shards shards (bounded), each holding many builds'
+    /// precommit refs. This removes the old per-build LIST special-case whose O(total-builds-ever) fold
+    /// cost wedged GC. The fence mints fence-only manifests for absent shards, so the absent ones are
+    /// needed too (the absent-shard hole). `ns` is unused now but kept in the signature: both callers
+    /// (discoverUniverse, the fence walk) iterate this uniformly per namespace.
+    std::vector<uint64_t> shards;
+    const uint64_t root_shards_per_ns = store->poolMeta().root_shards;
+    shards.reserve(root_shards_per_ns);
+    for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
+        shards.push_back(shard);
+    return shards;
 }
 
 std::map<uint64_t, GcSnap> Gc::loadSnap(const GcState & state)
@@ -1598,11 +1572,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
         auto transitioned = foldShardRecords(result.snap, state, ns, cursor_key, root, cursor, root.shard_version);
         result.transitioned.insert(result.transitioned.end(), transitioned.begin(), transitioned.end());
 
-        /// B171 precommit reclaim (§C.3): a build-root shard whose owning build is no longer live is an
-        /// ABANDONED precommit — its edges must be released so the closure becomes a normal GC candidate.
-        /// We hold the shard manifest in hand under the GC lease; reclaim drops the build-root ref (the
-        /// SAME erase + journal Remove shape `publish`/the premature-reclaim fixture use), and the NEXT
-        /// fold sees the Remove and lifts the edge. Reclaiming AFTER folding is conservative: this round's
+        /// B171 precommit reclaim (§C.3): a build-root shard may hold precommit refs of builds no longer
+        /// live — ABANDONED precommits whose edges must be released so the closures become normal GC
+        /// candidates. We hold the shard manifest in hand under the GC lease; reclaim drops each dead
+        /// build's ref (keyed by build_seq, parsed from the ref name — the SAME erase + journal Remove
+        /// shape `publish`/the premature-reclaim fixture use), and the NEXT fold sees the Removes and lifts
+        /// the edges. Reclaiming AFTER folding is conservative: this round's
         /// snap still over-counts the released edges (retire never under-deletes a live ref), the next
         /// round folds the Remove. The mutate is on the shard manifest — independent of the fold's own
         /// gc/state + gc/snap CAS below — so it does not fight the fold.
@@ -1796,19 +1771,20 @@ const ServerWatermark * Gc::watermarkOf(UInt128 server_id)
     return &it->second;
 }
 
-void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t build_seq, const RootShard & root,
+void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, const RootShard & root,
                                    uint64_t round)
 {
-    /// B171 §C.3 (design §4.3): reclaim an ABANDONED precommit — one whose owning build is no longer
-    /// live. The build-root namespace + shard ENCODE the owner: ns == `_builds/<server_hex>` and the
-    /// shard number IS the owning build's `build_seq`. Protection here is the precommit EDGE (the
-    /// `refs["part"]` root ref the fold expands); dropping the ref releases that protection, so we
-    /// reclaim ONLY when the build is provably dead.
+    /// B171 §C.3 (design §4.3, fixed 2026-06-19): reclaim ABANDONED precommits — those whose owning
+    /// build is no longer live. The build root is sharded like any namespace now (ref name == build_seq,
+    /// shard == shardOf(build_seq)), so ONE build-root shard holds MANY precommit refs, each keyed by its
+    /// owning build's `build_seq`. We derive the server from the namespace (`_builds/<server_hex>`) and
+    /// the build_seq from each REF NAME. Protection here is the precommit EDGE (the root ref the fold
+    /// expands); dropping a ref releases that protection, so we reclaim ONLY refs whose build is provably
+    /// dead. We read the shard manifest already in hand (the fold's `root`) — no extra read per ref.
     ///
-    /// Nothing to reclaim if the shard already carries no precommit ref (a prior round reclaimed it, or
-    /// the build's own commit removed it — both leave a Remove'd, ref-less shard).
-    const auto part_it = root.refs.find("part");
-    if (part_it == root.refs.end())
+    /// Nothing to reclaim if the shard carries no refs (already-reclaimed / never-published / committed
+    /// builds that removed their own ref — all leave a ref-less or Remove'd shard).
+    if (root.refs.empty())
         return;
 
     /// Derive the owning server_id from `_builds/<server_hex>`.
@@ -1829,7 +1805,8 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t build_seq,
     }
 
     /// LIVENESS verdict reuses the existing watermark machinery (watermarkOf + the K=2 seq-freshness
-    /// verdict computed once per round in beginWatermarkRound's caches). The owning build is DEAD iff:
+    /// verdict computed once per round in beginWatermarkRound's caches). A precommit's owning build is
+    /// DEAD iff:
     ///   - the server has no watermark (unrecognized / never-anchored — a stale or vanished owner), OR
     ///   - the server is judged not-live this round (frozen seq for K=2 rounds => crash), OR
     ///   - this build's seq is below the server's `min_active` floor (the build retired — clean abort,
@@ -1840,49 +1817,76 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t build_seq,
     /// (K=2 dead), and a restarted server's farewell/new-epoch renewal raises min_active past the
     /// orphaned seq — both reclaim. A LIVE build (seq >= min_active AND server live) is LEFT intact.
     const ServerWatermark * w = watermarkOf(server);
-    const bool dead =
-        (w == nullptr)
-        || !server_live_this_round[server]
-        || build_seq < w->min_active;
-    if (!dead)
-        return;   /// the owning build is still live — its precommit honored (the closure stays pinned)
+    const bool server_live = server_live_this_round[server];
 
-    const UInt128 part_tree = part_it->second.tree_id;
-
-    /// Reclaim: drop the build-root ref + journal Remove on the build's ISOLATED shard (mirrors the
-    /// commit-time removal in `Build::publish`). The next fold reads the Remove and releases the edges,
-    /// so the closure's objects become normal zero-in-degree candidates. mutateShard re-reads + re-runs
-    /// the lambda per CAS attempt; an empty/already-removed ref on a racing attempt is a no-op.
-    store->mutateShard(ns, build_seq, [&](RootShard & fresh)
+    /// Decide which refs to reclaim from the shard manifest in hand, parsing build_seq from each ref
+    /// NAME. A ref whose name is not a parseable build_seq is left untouched (never reclaim blindly).
+    struct DeadRef { String name; UInt128 tree; uint64_t build_seq; };
+    std::vector<DeadRef> dead_refs;
+    for (const auto & [name, payload] : root.refs)
     {
-        auto it = fresh.refs.find("part");
-        if (it == fresh.refs.end())
-            return;   /// raced — a concurrent commit/reclaim already removed it
-        const UInt128 tree = it->second.tree_id;
-        fresh.refs.erase(it);
-        fresh.journal.push_back(JournalRecord{
-            .op = JournalRecord::Op::Remove, .ref_name = "part", .tree_id = tree,
-            .at_version = fresh.shard_version + 1});
+        uint64_t build_seq = 0;
+        try
+        {
+            size_t consumed = 0;
+            build_seq = std::stoull(name, &consumed);
+            if (consumed != name.size())
+                continue;   /// trailing garbage — not a clean build_seq ref
+        }
+        catch (...)
+        {
+            continue;   /// non-numeric ref name — leave it (never reclaim blindly)
+        }
+
+        const bool dead = (w == nullptr) || !server_live || build_seq < w->min_active;
+        if (dead)
+            dead_refs.push_back(DeadRef{name, payload.tree_id, build_seq});
+    }
+
+    if (dead_refs.empty())
+        return;
+
+    /// Reclaim: drop each dead build-root ref + journal Remove on the SAME shard (mirrors the commit-time
+    /// removal in `Build::publish`). The next fold reads the Removes and releases the edges, so the
+    /// closures' objects become normal zero-in-degree candidates. ONE mutateShard CAS removes all dead
+    /// refs at once; it re-reads + re-runs the lambda per attempt, so an already-removed/raced ref is a
+    /// no-op.
+    store->mutateShard(ns, shard, [&](RootShard & fresh)
+    {
+        for (const DeadRef & dr : dead_refs)
+        {
+            auto it = fresh.refs.find(dr.name);
+            if (it == fresh.refs.end())
+                continue;   /// raced — a concurrent commit/reclaim already removed it
+            const UInt128 tree = it->second.tree_id;
+            fresh.refs.erase(it);
+            fresh.journal.push_back(JournalRecord{
+                .op = JournalRecord::Op::Remove, .ref_name = dr.name, .tree_id = tree,
+                .at_version = fresh.shard_version + 1});
+        }
     });
 
     if (store->hasEventSink())
     {
-        CasEvent ev;
-        ev.type = CasEventType::PrecommitReclaim;
-        ev.namespace_ = ns_str;
-        ev.ref_name = "part";
-        ev.object_kind = CasEventObjectKind::Tree;
-        ev.object_hash = u128ToHex(part_tree);
-        ev.round = round;
-        ev.outcome = "reclaimed";
-        ev.reason = w == nullptr
-            ? "precommit reclaim: owning server has no watermark (abandoned/vanished build)"
-            : (!server_live_this_round[server]
-                ? "precommit reclaim: owning server frozen K=2 rounds (crashed build)"
-                : "precommit reclaim: build_seq below the server's min_active floor (retired build)");
-        ev.detail = {{"build_seq", std::to_string(build_seq)},
-                     {"min_active", w ? std::to_string(w->min_active) : "absent"}};
-        store->emitEvent(ev);
+        for (const DeadRef & dr : dead_refs)
+        {
+            CasEvent ev;
+            ev.type = CasEventType::PrecommitReclaim;
+            ev.namespace_ = ns_str;
+            ev.ref_name = dr.name;
+            ev.object_kind = CasEventObjectKind::Tree;
+            ev.object_hash = u128ToHex(dr.tree);
+            ev.round = round;
+            ev.outcome = "reclaimed";
+            ev.reason = w == nullptr
+                ? "precommit reclaim: owning server has no watermark (abandoned/vanished build)"
+                : (!server_live
+                    ? "precommit reclaim: owning server frozen K=2 rounds (crashed build)"
+                    : "precommit reclaim: build_seq below the server's min_active floor (retired build)");
+            ev.detail = {{"build_seq", std::to_string(dr.build_seq)},
+                         {"min_active", w ? std::to_string(w->min_active) : "absent"}};
+            store->emitEvent(ev);
+        }
     }
 }
 

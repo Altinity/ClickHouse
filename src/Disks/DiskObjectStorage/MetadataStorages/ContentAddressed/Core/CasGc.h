@@ -107,13 +107,15 @@ public:
     /// frozen-seq crash detector's memory. Call once before the retire observe loop.
     void beginWatermarkRound();
 
-    /// B171 precommit reclaim (§C.3, design §4.3): while folding a build-root shard, drop the precommit
-    /// of an ABANDONED build. The namespace (`_builds/<server_hex>`) + shard (== `build_seq`) encode the
-    /// owner; the build is DEAD iff the server has no watermark, is judged not-live this round (K=2
-    /// frozen-seq crash detector), or `build_seq < min_active` (retired). A dead build's `refs["part"]`
-    /// is erased + journal Remove'd (the next fold releases its edges); a live build's precommit is left
-    /// intact. The watermark is REPURPOSED here for per-precommit liveness, not per-object protection.
-    void reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t build_seq, const RootShard & root,
+    /// B171 precommit reclaim (§C.3, design §4.3, fixed 2026-06-19): while folding a build-root shard,
+    /// drop the precommits of ABANDONED builds. The build root is sharded like any namespace, so one
+    /// shard holds MANY precommit refs each named `std::to_string(build_seq)`. The server comes from the
+    /// namespace (`_builds/<server_hex>`); the build_seq is parsed from each REF NAME. A build is DEAD iff
+    /// the server has no watermark, is judged not-live this round (K=2 frozen-seq crash detector), or
+    /// `build_seq < min_active` (retired). Each dead ref is erased + journal Remove'd in ONE CAS on the
+    /// shard already in hand (no extra read); live builds' precommits are left intact. The watermark is
+    /// REPURPOSED here for per-precommit liveness, not per-object protection.
+    void reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, const RootShard & root,
                                    uint64_t round);
 
     /// full-GC walk + debris reclaim: deferred (M-F); API slot reserved.

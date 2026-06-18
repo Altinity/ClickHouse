@@ -555,18 +555,28 @@ RootNamespace Build::buildRootNs() const
     return RootNamespace{"_builds/" + u128ToHex(store->poolConfig().server_id)};
 }
 
+String Build::buildRef() const
+{
+    /// The precommit ref name IS the per-process monotone build_seq (B171 fix). Many builds share a
+    /// build-root shard, each keyed by its own ref name, exactly like a table namespace's refs.
+    return std::to_string(build_seq);
+}
+
 uint64_t Build::buildShard() const
 {
-    /// One shard per in-flight build, keyed by the per-process monotone build_seq.
-    return build_seq;
+    /// B171 fix: shard the build root EXACTLY like every other namespace — hash the ref name. The
+    /// build-root namespace then has at most root_shards shards (bounded), each holding many builds'
+    /// precommit refs keyed by build_seq, folded via the normal [0, root_shards) enumeration. Was
+    /// `build_seq` (per-process unique), which created an unbounded shard per build and wedged GC fold.
+    return store->shardOf(buildRef());
 }
 
 void Build::precommit(const TreeId & manifest)
 {
     requireAlive();
 
-    /// B171 two-phase commit, phase 1. Publish the build's manifest tree as a ref under the build-root
-    /// namespace `_builds/<server_hex>`, shard = build_seq. GC discovers this namespace via the registry
+    /// B171 two-phase commit, phase 1. Publish the build's manifest tree as a ref (named build_seq) under
+    /// the build-root namespace `_builds/<server_hex>`, shard = shardOf(build_seq). GC discovers it via the registry
     /// (ensureRegistered) and folds it like any namespace → root edge → tree_expand → child in-degree ≥ 1,
     /// so every object reachable from the precommit is protected by REACHABILITY (replacing the revocable
     /// `cas_owner` hint). The manifest must be in this build's W-DEP-SET — it was built/adopted by this
@@ -589,17 +599,19 @@ void Build::precommit(const TreeId & manifest)
     const uint64_t tree_size =
         retained_it != retained_trees.end() ? retained_it->second.size() : dep_it->second.size;
 
-    /// ONE CAS on the build's isolated shard: set refs["part"] = manifest, append {+, "part", manifest},
+    /// ONE CAS on the build-root shard: set refs[build_seq] = manifest, append {+, build_seq, manifest},
     /// shard_version++. The SAME RootShard machinery as `publish` — the build-root edge is an ordinary
-    /// root ref the GC fold will expand.
+    /// root ref the GC fold will expand. The ref name is the build_seq and the shard is shardOf(ref), so
+    /// many builds co-locate in the same bounded shard (B171 fix).
+    const String ref = buildRef();
     store->mutateShard(ns, buildShard(), [&](RootShard & root)
     {
         RefPayload payload;
         payload.tree_id = manifest_hash;
         payload.tree_size = tree_size;
-        root.refs["part"] = payload;
+        root.refs[ref] = payload;
         root.journal.push_back(JournalRecord{
-            .op = JournalRecord::Op::Add, .ref_name = "part", .tree_id = manifest_hash,
+            .op = JournalRecord::Op::Add, .ref_name = ref, .tree_id = manifest_hash,
             .at_version = root.shard_version + 1});
     });
 
@@ -611,7 +623,7 @@ void Build::precommit(const TreeId & manifest)
         CasEvent _ev;
         _ev.type = CasEventType::Precommit;
         _ev.namespace_ = ns.string();
-        _ev.ref_name = "part";
+        _ev.ref_name = ref;
         _ev.object_kind = CasEventObjectKind::Tree;
         _ev.object_hash = manifest.string();
         _ev.token = u128ToHex(build_id);
@@ -952,24 +964,26 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
     /// the publish here would be wrong (the part IS committed). Only attempt removal if this build
     /// actually precommitted (spec §B.2, design §4.4).
     ///
-    /// NB: we drop via mutateShard on the build's ISOLATED shard (buildShard() == build_seq), mirroring
-    /// how `precommit` wrote it — NOT via Store::dropRef, which routes by shardOf(ref_name) and would
-    /// look in the wrong shard for the build-root layout. Same CAS shape as dropRef: erase refs["part"]
-    /// + append a Remove journal record (the journal Remove is what GC's fold reads to release edges).
+    /// NB: we drop via mutateShard on the build-root shard, mirroring how `precommit` wrote it (ref name
+    /// = build_seq, shard = shardOf(ref)) — NOT via Store::dropRef, which routes by shardOf(ref_name) of
+    /// the TABLE ref. The shard happens to be shardOf(build_seq) too, so this is the same routing, but we
+    /// keep it explicit. Same CAS shape as dropRef: erase refs[build_seq] + append a Remove journal record
+    /// (the journal Remove is what GC's fold reads to release edges).
     if (precommitted)
     {
+        const String ref = buildRef();
         try
         {
             store->mutateShard(buildRootNs(), buildShard(), [&](RootShard & root)
             {
-                auto it = root.refs.find("part");
+                auto it = root.refs.find(ref);
                 if (it == root.refs.end())
                     throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-                        "remove precommit: no ref part in build-root shard {}", buildShard());
+                        "remove precommit: no ref {} in build-root shard {}", ref, buildShard());
                 const UInt128 part_tree = it->second.tree_id;
                 root.refs.erase(it);
                 root.journal.push_back(JournalRecord{
-                    .op = JournalRecord::Op::Remove, .ref_name = "part", .tree_id = part_tree,
+                    .op = JournalRecord::Op::Remove, .ref_name = ref, .tree_id = part_tree,
                     .at_version = root.shard_version + 1});
             });
             precommitted = false;
@@ -978,7 +992,7 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
                 CasEvent _evpr;
                 _evpr.type = CasEventType::PrecommitRemoved;
                 _evpr.namespace_ = buildRootNs().string();
-                _evpr.ref_name = "part";
+                _evpr.ref_name = ref;
                 _evpr.object_kind = CasEventObjectKind::Tree;
                 _evpr.object_hash = tree.string();
                 _evpr.token = u128ToHex(build_id);
@@ -997,7 +1011,7 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
                 CasEvent _evpr;
                 _evpr.type = CasEventType::PrecommitRemoved;
                 _evpr.namespace_ = buildRootNs().string();
-                _evpr.ref_name = "part";
+                _evpr.ref_name = ref;
                 _evpr.object_kind = CasEventObjectKind::Tree;
                 _evpr.object_hash = tree.string();
                 _evpr.token = u128ToHex(build_id);
