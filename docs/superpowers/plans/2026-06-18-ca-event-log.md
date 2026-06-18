@@ -51,10 +51,12 @@ enum class CasEventType
 {
     BlobPut, BlobReuseAdopt, BlobReuseResurrect, BlobRetire, BlobDelete, BlobForget,
     TreePut, TreeExpand, TreeRetire, TreeDelete, TreeStrip,
-    RefPublish, RefDrop, RootAdd, RootRemove, RootRepoint,
-    GcFoldBegin, GcFoldEnd, GcRetireObserve, GcRecheck, GcFence,
-    GcLeaseAcquire, GcLeaseSteal, GcLeaseHeartbeat, GcSnapPersist, GcCursorAdvance,
-    BuildStart, BuildPublish, BuildAbort, GateRevalidate, WatermarkRenew, Heartbeat,
+    RefPublish, RefDrop, RefRepoint, RootAdd, RootRemove, RootRepoint, IndegZero,
+    GcFoldBegin, GcFoldEnd, GcRetireObserve, GcRetireDecision, GcRecheckVerdict,
+    GcFence, GcSnapPersist, GcCursorAdvance, GcTrim, GcLeaseAcquire, GcLeaseSteal, GcLeaseHeartbeat,
+    BuildStart, BuildPublish, BuildAbort, GateRevalidate, GateResurrect, WatermarkRenew, Heartbeat,
+    RefResolve, ReadMissing, DanglingAccess,
+    FailClosed, CorruptDecode, SnapJournalIncoherent, Exception,
 };
 
 enum class CasEventObjectKind { None, Blob, Tree, Pack, Root, Snap };
@@ -225,28 +227,39 @@ Replace each existing audit `LOG_INFO` with a `store->emitEvent(...)` (keep beha
 ```
 `CAGCDEL` → `BlobDelete`/`TreeDelete` (by `entry.kind`) with `object_hash`, `token`, `round`, `gen`, `outcome` = the delete outcome string. `CAROOTREM` → `RootRemove` (`ref_name`, `at_version`, `object_hash`=tree, `round`, `gen`, `outcome` = `cands.empty() ? "ok" : "zeroed"`). `CAROOTREPOINT` → `RootRepoint`. `CAREUSE adopt`/`resurrect` (in `CasBuild.cpp`) → `BlobReuseAdopt`/`BlobReuseResurrect` (`object_hash`, `token`, `round`). (Gc reaches the Store via its `store` member; Build via its owning Store.)
 
+**Mandate (spec completeness):** EVERY `emitEvent` MUST fill `reason` (the human-readable *why* of the decision) and the relevant `detail` keys (the structured facts to reconstruct it) — see the spec §3 examples. The acceptance bar is the §4.1 reconstruction queries. It is OK to be noisy (no sampling). Add a hook at every state-changing decision, every GC internal transition, and every error/anomaly path; if a Core decision point has no `emitEvent`, that's a plan gap — add it.
+
 Then add the remaining hooks (one `emitEvent` each), at these sites:
 
-| event | site | key fields |
+| event | site | key fields / reason |
 |---|---|---|
-| `BlobPut` | `CasBuild.cpp` putBlob (after successful PUT) | object_hash, token |
-| `TreePut` | `CasBuild.cpp` putTree | object_hash |
-| `TreeExpand` | `CasGc.cpp` foldShardRecords (after `markExpanded`) | object_hash=tree, round, gen, detail{out_edges} |
-| `RefPublish` | `CasBuild.cpp` publish | namespace_, ref_name, object_hash=tree, at_version |
-| `RefDrop` | `CasStore.cpp` dropRef/republishRef | namespace_, ref_name |
+| `BlobPut` | `CasBuild.cpp` putBlob (after successful PUT) | object_hash, token; reason="uploaded" |
+| `TreePut` | `CasBuild.cpp` putTree | object_hash; reason="uploaded" |
+| `TreeExpand` | `CasGc.cpp` foldShardRecords (after `markExpanded`) | object_hash=tree, round, gen; detail{out_edges, driving_add_at_version} |
+| `RefPublish`/`RefRepoint` | `CasBuild.cpp` publish (repoint if over an existing ref) | namespace_, ref_name, object_hash=tree, at_version |
+| `RefDrop` | `CasStore.cpp` dropRef/republishRef | namespace_, ref_name, at_version |
 | `RootAdd` | `CasGc.cpp` foldShardRecords Add branch | ref_name, object_hash=tree, at_version, round, gen |
-| `BlobRetire`/`TreeRetire` | `CasGc.cpp` retire (per RetiredEntry) | object_hash, token, round |
-| `GcRecheck` | `CasGc.cpp` recheck (per outcome) | object_hash, token, round, outcome |
-| `GcFence` | `CasGc.cpp` fence | round, detail{fence_seq} |
-| `GcLeaseAcquire/Steal/Heartbeat` | `CasGc.cpp` acquireOrRenewLease / pulseHeartbeat | round, detail{owner,seq} |
-| `GcSnapPersist`/`GcCursorAdvance` | `CasGc.cpp` cascade/fold persist | gen, detail{cursor} |
+| `IndegZero` | wherever a `Candidate` is returned (addRootEdge re-point, removeRootEdge, stripTree) | object_hash, round, gen; reason+detail{prev_indeg, dropped_by} |
+| `BlobRetire`/`TreeRetire` | `CasGc.cpp` retire (per RetiredEntry written) | object_hash, token, round |
+| `GcRetireObserve` | `CasGc.cpp` retire HEAD-observe | object_hash, token; outcome="present|absent" |
+| `GcRetireDecision` | `CasGc.cpp` retire (condemn vs skip) | object_hash, round; reason="condemn …" / "skip: protectedByLiveBuild(server,min_active)" |
+| `GcRecheckVerdict` | `CasGc.cpp` recheck (per candidate) | object_hash, token, round; outcome=deleted/replaced/spared/absent; detail{indeg_at_recheck, fence_version} |
+| `BlobDelete`/`TreeDelete` | the single delete site (was `CAGCDEL`) | object_hash, token, round, gen, outcome; reason explaining the cause chain |
+| `BlobForget` | `CasGc.cpp` forget sites (P9) | object_hash, round, gen; reason="deleted"/"absent-404" |
+| `GcFence` | `CasGc.cpp` fence | round; detail{fence_seq, namespaces, shards} |
+| `GcSnapPersist`/`GcCursorAdvance` | `CasGc.cpp` fold + cascade persist | gen; detail{cursor, size, generation_probed} |
+| `GcTrim` | `CasGc.cpp` `trim` (per shard trimmed) | namespace_, round; detail{trimmed_up_to_cursor, records_removed} |
 | `GcFoldBegin/End` | `CasGc.cpp` fold entry/exit | round, gen |
-| `BlobForget` | `CasGc.cpp` forget sites | object_hash, round, gen |
-| `BuildStart/Publish/Abort`,`GateRevalidate`,`WatermarkRenew`,`Heartbeat` | `CasBuild.cpp`/`CasHeartbeat.cpp`/`CasWatermark.cpp` | as available |
+| `GcLeaseAcquire/Steal/Heartbeat` | `CasGc.cpp` acquireOrRenewLease / pulseHeartbeat | round; detail{owner, seq, fence_seq} |
+| `RefResolve` | `CasStore.cpp` resolveRef | namespace_, ref_name, object_hash=tree |
+| `ReadMissing` | wherever `readTree`/blob read throws `FILE_DOESNT_EXIST` | object_hash, reason=exception message |
+| `DanglingAccess` | a resolve/read that reaches a ref→tree→blob whose blob is absent | ref_name, object_hash=blob; reason="ref -> tree -> blob HEAD 404" |
+| `FailClosed`/`CorruptDecode`/`SnapJournalIncoherent`/`Exception` | the fail-closed `throw` sites (incl. `assertSnapJournalCoherent`, codec `CORRUPTED_DATA`, the fold "live ref to missing tree") | object_hash/ref_name as available; reason=message; detail{code, site} |
+| `BuildStart/Publish/Abort`,`GateRevalidate`,`GateResurrect`,`WatermarkRenew`,`Heartbeat` | `CasBuild.cpp`/`CasHeartbeat.cpp`/`CasWatermark.cpp` | namespace_/object_hash/token/reason as available |
 
 - [ ] **Step 1:** Convert the 4 existing audit lines to `emitEvent` (delete the `LOG_INFO` lines).
 - [ ] **Step 2:** Add the remaining hooks per the table (each a single `store->emitEvent(CasEvent{...})`).
-- [ ] **Step 3: Failing-then-passing test** — extend `gtest_cas_event_log.cpp`: open a Store with a capturing sink, `publishPart` + `dropRef` + a `Gc` round, assert events of types `RefPublish`, `RootAdd`/`TreeExpand`, `RefDrop`, and at least one `Gc*` appear.
+- [ ] **Step 3: Failing-then-passing test** — extend `gtest_cas_event_log.cpp`: open a Store with a capturing sink, `publishPart` + `dropRef` + a `Gc` round to a delete, then assert (a) events of types `RefPublish`, `RootAdd`/`TreeExpand`, `RefDrop`, `IndegZero`, a `Gc*` retire/recheck, and a `BlobDelete`/`TreeDelete` appear; (b) **every emitted event has a non-empty `reason`** (the completeness mandate); (c) **lifecycle reconstruction:** filtering the captured events by the deleted blob's `object_hash` yields, in time order, at least its edge/retire/delete chain — i.e. you can explain why it was deleted from the rows alone.
 - [ ] **Step 4: Build + run** `--gtest_filter='CasEvent.*:CasGc*.*'` → PASS (and existing `Cas*` GC tests still green).
 - [ ] **Step 5: Commit** `git commit -m "CA B170: emit CasEvents at Core hooks; consolidate CAGCDEL/CAREUSE/CASTRIP/CAROOTREM"`
 
