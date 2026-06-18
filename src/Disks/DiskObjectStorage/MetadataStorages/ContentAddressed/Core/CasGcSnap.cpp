@@ -257,10 +257,10 @@ std::vector<Candidate> GcSnap::zeroInDegreeKnown() const
     return result;
 }
 
-/// Encodes the snap fields (snap_shard, generation, edges, expanded, known) into a binary body
-/// string using the standard IO helpers.  The frame header (magic + version + codec) is NOT
-/// included here — only the raw field bytes.  The layout is identical to the v2 per-field layout
-/// so that the same `decodeSnapFields` can reconstruct the snap from any decompressed body.
+/// Encodes the snap fields (snap_shard, generation, edges, expanded, known, folded_cursor) into a
+/// binary body string using the standard IO helpers.  The frame header (magic + version + codec) is
+/// NOT included here — only the raw field bytes.  This is the v1 cursor-carrying layout, paired with
+/// `decodeSnapFields` which reconstructs the snap from any decompressed body.
 String GcSnap::encodeSnapFields(const GcSnap & snap)
 {
     WriteBufferFromOwnString body;
@@ -391,7 +391,7 @@ GcSnap GcSnap::decodeSnapFields(ReadBuffer & body)
 
 String encodeGcSnap(const GcSnap & snap)
 {
-    /// 1. Encode the field body (same byte layout as v2, without the frame header).
+    /// 1. Encode the field body (the v1 cursor-carrying layout, without the frame header).
     const String raw_body = GcSnap::encodeSnapFields(snap);
 
     /// 2. Compress the body with zstd.
