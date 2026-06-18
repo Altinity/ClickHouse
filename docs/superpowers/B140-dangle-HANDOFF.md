@@ -131,9 +131,9 @@ Either way the invariant to restore is: **a dedup-shared blob must not be delete
 - **`tmp/snapdump_live/snap_1280/0`, `snap_1281/0`, `snap_1282/0`** — the actual delete-generation `gc/snap` shard-0 bytes (gens 1280/1281 are where the 304 live dangles were deleted). **Decode these directly — no soak re-run needed to re-verify VERDICT B.**
 - **`tmp/b140_blob_gen.tsv`** — every dangling blob hash → its delete generation (e.g. `ff647af8…→1281`, `836a2543…→1280`).
 - **`tmp/cagcdel_ch1.txt`** (~119 MB) — the full ch1 `CAGCDEL` log dump (every GC content-delete: key/kind/token/round/gen/shard/outcome). `grep <hash>` to find a blob's delete gen/round/token.
-- Also: `/tmp/snapdump` (gens 671-673 + outcomes_340 + state — *detached*-dangle era) and `/tmp/snapdump3` (gens 333-335, 664-666 + state + `roots/` manifests). NB `/tmp` (not repo `tmp/`) may be cleared between sessions; the repo-root `tmp/` artifacts above are the durable ones (untracked, not gitignored, persist on disk on this machine).
+- **`tmp/snapdump3/`** — gens 333-335, 664-666 + `state` + the `roots/` **manifests** (table UUIDs + `_registry`); use these `roots/` to resolve a dangling blob → its part ref → `tree_id`. (`/tmp/snapdump` and `/tmp/snapdump3` are system-temp duplicates that may be cleared between sessions — prefer the repo-root `tmp/` copies.)
 - Logs: `utils/ca-soak/logs/p9_capture_FAILURE_dangling31.json`, `p9_capture_fsck.txt` (fresh `fsck --detail` with `reachable_from`), `p9_instr_FAILURE_dangling25.json`, `p9_instr_correlation.txt` (the 25-blob `CAREUSE`@round-vs-`CAGCDEL`@round exact-token-match table), `p9_instr_fsck_detail.txt`.
-- **Caveat:** `tmp/snapdump_live` has the delete-gen snaps but NOT the matching `roots/` manifests at gen 1281 (so resolving a dangling blob → its *live* tree `T_cur` to answer §6 may still need a fresh soak capture, or use `/tmp/snapdump3/roots/` + `utils/ca-soak/logs/p9_capture_fsck.txt` `reachable_from` from the dangling=31 run). To decode `snapdump_live`, use the temp-`GcSnap`-debug-method gtest recipe in §9.
+- For §6 (which live tree `T_cur` references a deleted blob): the captured `roots/` are not from gen 1281 exactly — use `tmp/snapdump3/roots/` + `p9_capture_fsck.txt` `reachable_from`, or re-capture in a fresh soak. VERDICT B itself is fully decodable from `tmp/snapdump_live/` via the gtest recipe in §9.
 
 ---
 
@@ -221,7 +221,7 @@ Do it via brainstorm→spec→TLA+→plan→implement, TDD. **First** resolve §
 
 ## 11. Honest caveats / gotchas
 
-- **CORRECTION:** the decisive 1280/1281 decode artifacts **ARE persisted** after all — at repo-root **`tmp/snapdump_live/snap_128{0,1,2}/0`** + **`tmp/b140_blob_gen.tsv`** + **`tmp/cagcdel_ch1.txt`** (see §7). So VERDICT B is re-decodable offline without a soak re-run. (Earlier I wrongly looked under `utils/ca-soak/tmp/` — the subagent wrote to the repo-root `tmp/`.) What may still need a fresh soak: the `roots/` manifest at gen 1281 to resolve a dangling blob → its *live* tree `T_cur` for §6's before/after question (the captured `/tmp/snapdump3/roots/` + the dangling=31 fsck `reachable_from` are the partial substitute). Note `/tmp/*` (system temp) may be cleared between sessions; the repo-root `tmp/*` are durable on this machine.
+- The decisive decode artifacts are on disk (repo-root `tmp/`): `tmp/snapdump_live/snap_128{0,1,2}/0`, `tmp/b140_blob_gen.tsv`, `tmp/cagcdel_ch1.txt`, `tmp/snapdump3/` (incl. `roots/`) — see §7. VERDICT B is re-decodable offline without a soak re-run; resolving a dangling blob → its live tree `T_cur` for §6 may still want a fresh-soak capture of the gen-1281 `roots/`.
 - `CasGcDangle` currently **tests the wrong (rejected) mechanism** — do not treat its RED as the target; rewrite it.
 - The `CaB140Dangle*.tla` models are **untracked** and the Phase-1 one uses **unfaithful** arms — keep only as contrast; the *faithful* one (no-repro) is the honest baseline to refine.
 - The soak's `gc_checkpoint` can also hit a **mutation-drain timeout** ("backlog stuck at N") under load — that's a *different*, documented, non-deterministic harness issue (`soak/run.py:136`), not this bug.
