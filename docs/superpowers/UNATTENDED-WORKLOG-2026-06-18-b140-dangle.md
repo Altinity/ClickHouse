@@ -27,3 +27,15 @@ GC reclaims it under a still-in-flight adopter → publish dangles. Pinned live 
 
 - **T0** — Set up tasks #137–#141, this work log, backlog entries. Soak stopped, cluster down, dangle
   evidence preserved under `utils/ca-soak/tmp/b140_dangle_soak_20260618/`. Starting the design spec.
+- **T1** — Design spec written + committed (`a208ab14d41`):
+  `specs/2026-06-18-ca-build-root-precommit-design.md`. Backlog B171 (active) + B172 (deferred staging)
+  added; B170 marked DONE. Tasks #137, #132, #136 closed.
+- **T2** — TLA+ phase started (task #138): dispatched a background subagent to author
+  `models/CaBuildRootPrecommit.tla` + buggy/fixed configs, with the two-config discipline (buggy MUST
+  reproduce `INV_NO_DANGLE_COMMITTED`, fixed MUST exhaust clean; premature-reclaim + ordering
+  interleavings covered). Awaiting completion before C++ implementation (ordering: TLA+ first).
+- **T3** — While TLA+ runs: drafted C++ impl spec
+  `specs/2026-06-18-ca-build-root-precommit-cpp-impl.md` (build-root namespace `_builds/<server>`,
+  two-phase `Build::precommit`→fail-closed `publish`→remove precommit, GC fold + pending-tolerance +
+  precommit reclaim via repurposed watermark, delete `cas_owner`/`protectedByLiveBuild`, failing-gtest
+  list). Marked draft pending TLA+. Grounded in the actual layout/registry/fold/mutateShard code.
