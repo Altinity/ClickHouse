@@ -14,7 +14,7 @@ from typing import Any, List, Literal, Optional
 
 import __main__
 
-from ci_utils import Shell
+from tests.ci.ci_utils import Shell
 
 logger = logging.getLogger(__name__)
 
