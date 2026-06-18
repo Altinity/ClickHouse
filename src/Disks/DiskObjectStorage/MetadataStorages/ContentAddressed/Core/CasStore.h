@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
@@ -137,8 +138,17 @@ public:
     /// short-circuits without I/O.
     uint64_t ensureRegistered(const RootNamespace & ns);
 
+    /// ---- B170 event audit (system.content_addressed_log) ----
+    /// The wiring injects a sink (CasEvent -> SystemLog row) when the log is configured; null sink
+    /// (unit tests, log disabled) makes emitEvent a no-op single branch. Build/Gc reach this via
+    /// their owning Store. `reason`/`detail` on the event carry the decision's full rationale.
+    void setEventSink(CasEventSink sink) { event_sink_ = std::move(sink); }
+    void emitEvent(const CasEvent & e) const { if (event_sink_) event_sink_(e); }
+
 private:
     Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
+
+    CasEventSink event_sink_;   /// B170: null = disabled (emitEvent no-op)
 
     /// Allocate a strictly-increasing build_seq and add it to the active set (called by startBuild).
     uint64_t allocateBuildSeq();

@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <vector>
 using namespace DB::Cas;
 TEST(CasEvent, ConstructAndCopyAndName)
 {
@@ -19,4 +22,22 @@ TEST(CasEvent, ConstructAndCopyAndName)
     EXPECT_EQ(toString(CasEventType::IndegZero), "indeg_zero");
     EXPECT_EQ(toString(CasEventType::GcRecheckVerdict), "gc_recheck_verdict");
     EXPECT_EQ(toString(CasEventObjectKind::Tree), "tree");
+}
+
+TEST(CasEvent, StoreEmitsToSink)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    std::vector<CasEvent> seen;
+    s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
+    CasEvent e;
+    e.type = CasEventType::BlobPut;
+    e.object_hash = "h";
+    s->emitEvent(e);
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0].type, CasEventType::BlobPut);
+    /// null sink => no-op (no crash, no row)
+    s->setEventSink(nullptr);
+    s->emitEvent(e);
+    EXPECT_EQ(seen.size(), 1u);
 }
