@@ -97,3 +97,13 @@ GC reclaims it under a still-in-flight adopter → publish dangles. Pinned live 
   exactly `root_shards` shards (bounded), folds via normal `[0,root_shards)` enumeration, and the
   `shardsToVisit` LIST special-case is removed. GC reclaim iterates a build-root shard's refs and
   reclaims each dead build (parsed build_seq vs min_active).
+- **T14** — Bounded-shard fix committed (`fa034f74313`, subagent): ref=`build_seq`, shard=`shardOf`,
+  `shardsToVisit` LIST removed, reclaim iterates refs. `unit_tests_dbms` + `clickhouse` clean, 141
+  pass / 1 intentional red. **Short VALIDATION soak (25m, chaos off)** confirmed the fix at scale: GC
+  rounds now advance ~19/min (round 8→161 in 8 min, vs the wedged 11-in-24-min), the reclaim pipeline
+  works (retire 4968, deletes 3880, strip 438, root_remove 30509), and dangle symptoms stay 0
+  (CORRUPTED_DATA/fail_closed/read_missing/false_reclaim all 0), precommit lifecycle clean
+  (10681/10645). **Launched the real 12h soak** (SEED 20260619, WORKERS=2, chaos ON 253 faults,
+  event log on, keep-alive, metrics `soak_b171_12h_v2.db`) on the validated binary (`fa034f74313`);
+  fresh cluster, pool reset. Tracked 20-min watcher running. This is the final 12h validation
+  (task #141). All prior phases (backlog, TLA+, C++ impl, review, regression-fix) DONE.
