@@ -10,16 +10,17 @@
 
 using namespace DB::Cas;
 using DB::Cas::tests::idOf;
-using DB::Cas::tests::shardOfForTest;
 using DB::Cas::tests::u128Of;
 
 namespace
 {
 
+/// root_shards=1 so both refs live in the single root shard 0 — the dangle is about the SINGLE
+/// snap shard's in-degree, and one cursor_key covers both refs.
 StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p"});
+    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .root_shards = 1});
 }
 
 size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
@@ -39,109 +40,125 @@ size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
 
 }
 
-/// B140-DANGLE (the 2-node soak's INV-NO-LOSS finding, deterministic single-process reproduction).
+/// B140-DANGLE — the soak's INV-NO-LOSS finding, as a deterministic single-process reproduction of
+/// the REAL (ground-truth-decoded) mechanism: a SHARED / deduplicated blob under-count via cursor
+/// incoherence. (This replaces the earlier "marker-without-edges" injection, which was REFUTED by
+/// decoding the real soak snaps: `markers_with_ZERO_child_edges = 0` — that state never occurs.)
 ///
-/// ROOT INVARIANT (broken): "a `markExpanded` tree that is still LIVE (in-degree >= 1) has ALL its
-/// tree->blob child edges present in the durable GC snapshot." The once-per-tree expansion marker is
-/// the ONLY writer of those edges (CasGc.cpp foldShardRecords: `if (!isExpanded)` :805 gates the
-/// read+`markExpanded` :865). If a tree T is left `markExpanded` WITHOUT its child edges while a live
-/// ref pins it (root edge => in-degree >= 1) and the fold cursor has advanced past T's Add, the fold
-/// NEVER re-expands T, so T's blob B sits at in-degree 0. `zeroInDegreeKnown` (CasGcSnap.cpp:250)
-/// surfaces B, retire observes its token, and the SINGLE content-delete site (CasGc.cpp:249) deletes
-/// B — even though the live ref rb -> T -> B references it. fsck (walking authoritative refs, never
-/// gc/snap) then finds B reachable-but-missing => dangling. This matches the soak exactly: GC
-/// computed in-degree 0 for a blob a live (merged) tree references, because the fold never recorded
-/// that tree's edges (round 334 cross-node reuse -> round 340 delete).
+/// GROUND TRUTH (gens 1280/1281; §6 = `utils/ca-soak/logs/p9_instr_correlation.txt`): a content-shared
+/// blob `B` is referenced by TWO live part-trees — `T_live` (older) and `T_cur` (a newer, still-live
+/// part, cross-node `adopt`-published, token unchanged). GC's snap recorded only `T_live -> B`; the
+/// live `T_cur -> B` edge was NEVER folded into the snap. When `T_live`'s part was dropped and the
+/// cascade stripped it, GC saw `inDeg(B) = 0` and deleted `B` — while the live ref `rb_cur -> T_cur`
+/// still resolves to it. `fsck` (walking authoritative refs, never `gc/snap`) then finds `B`
+/// reachable-but-missing => `dangling` = data loss.
 ///
-/// MECHANISM (b), the cascade-vs-recreate marker race the spec comment at CasGc.cpp:402-407 warns
-/// about: a strip cleared/skipped T's re-expansion while T's recreate Add landed at or below the
-/// advanced cursor, leaving the marker set without the child edge. A SUBAGENT empirically verified
-/// (built+ran 9 natural single-process interleavings) that the fold is NOT buggy in single-process
-/// sequential operation: the `displaced_later` skip (CasGc.cpp:830) is fail-closed for any live ref
-/// (rethrows FILE_DOESNT_EXIST when there is no later same-ref record), and the cascade advances the
-/// cursor in the SAME CAS that clears the marker (CasGc.cpp:448-468) with a fold-through-fence
-/// recheck (CasGc.cpp:182-209). The broken invariant therefore arises only across rounds/leaders
-/// (2-node soak); the likely PRODUCER on the leader is the cross-node replication relink
-/// (adoptFromTree tokenless-evidence, CasBuild.cpp:607-630) — to be audited with the fold invariant.
-/// We inject that exact durable mid-state (built only through the public GcSnap API:
-/// addRootEdge/markExpanded/addTreeEdge/stripTree) so the single content-delete fires deterministically
-/// (no clocks, no sleeps, no concurrency).
+/// WHY `T_cur -> B` was missing (the PINNED class — `CaB140DangleMerge.tla`): the committed
+/// `gc/state.folded_cursor` can run AHEAD of the actual fold extent of the committed snap edges,
+/// because the snap codec omits the cursor (`CasGcSnap.cpp:264`) — the snap and `folded_cursor` are
+/// two separately-durable values with no enforced coherence. The fold then treats `T_cur`'s `Add`
+/// (at a version <= the ahead cursor) as already-folded and never records its edge, and the gated
+/// journal trim (`CasGc.cpp:144`) drops that record — losing the edge permanently. The exact
+/// cross-leader interleaving that desyncs the two is unpinned; this test injects the resulting
+/// FAITHFUL durable mid-state (T_live expanded WITH its edge — no marker-without-edges; `folded_cursor`
+/// past `T_cur`'s `Add`; the snap missing `T_cur -> B`) and lets a REAL GC round delete `B`.
 ///
-/// RED today (dangling == 1). Goes green once the fold/cascade guarantees a live-pinned tree's blob
-/// edges are present in the snap before any of its children can be retired (e.g. re-expand on a
-/// folded Add when a child edge is missing, or never advance the cursor past an Add whose tree is not
-/// fully edge-recorded, or refuse to retire a candidate whose live parent is markExpanded).
-TEST(CasGcDangle, MarkedExpandedWithoutEdgesDeletesLivePinnedBlob)
+/// RED today (`dangling == 1`). Goes GREEN once the fix (cursor-in-snap: the per-shard cursor is part
+/// of the committed snap, so `folded_cursor` cannot diverge from the snap's edges; plus the
+/// fail-closed coherence assertion at the trim/delete boundary) refuses to delete on an incoherent
+/// `(snap, folded_cursor)` pair — `B` survives, `dangling == 0`.
+/// Spec: docs/superpowers/specs/2026-06-18-ca-b140-dangle-fix-v2-design.md
+TEST(CasGcDangle, SharedBlobUnderCountDeletesLivePinnedBlob)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
-    const std::string ns = "srv1/tbl";
-    const uint64_t shard = shardOfForTest("rb", s->poolMeta().root_shards);
-    const std::string cursor_key = ns + "/" + std::to_string(shard);
+    const RootNamespace ns{"srv1/tbl"};
+    const uint64_t shard = 0;
+    const std::string cursor_key = ns.string() + "/" + std::to_string(shard);
 
-    /// Publish rb -> Tb -> {B} for real: the manifest, Tb's object and B's object all exist, and rb
-    /// resolves LIVE (this is the "merged-then-detached" part that must keep referencing B).
-    auto build = s->startBuild({});
-    build->putBlob(idOf("B"), BlobSource::fromString("B"));
-    TreeEntry e;
-    e.name = "data.bin";
-    e.placement = Placement::Blob;
-    e.file_hash = u128Of("B");
-    e.file_size = std::string("B").size();
-    const TreeId Tb = build->putTree({e});
-    build->publish(RootNamespace{ns}, "rb", Tb, {});
-    build.reset();
-    s->renewWatermarkOnce();
+    /// rb_live -> T_live -> { data.bin: B }. B is uploaded here (build1).
+    {
+        auto build = s->startBuild({});
+        build->putBlob(idOf("B"), BlobSource::fromString("B"));
+        TreeEntry e;
+        e.name = "data.bin";
+        e.placement = Placement::Blob;
+        e.file_hash = u128Of("B");
+        e.file_size = std::string("B").size();
+        const TreeId t_live = build->putTree({e});
+        build->publish(ns, "rb_live", t_live, {});
+        s->renewWatermarkOnce();
+    }
+    /// Resolve T_live's hash via the live ref (the build is gone).
+    const auto t_live_opt = s->resolveRef(ns, "rb_live");
+    ASSERT_TRUE(t_live_opt.has_value());
+    const UInt128 tlive_hash = hexToU128(t_live_opt->tree_id.string());
 
-    const UInt128 tb_hash = hexToU128(Tb.string());
+    /// rb_cur -> T_cur -> { other.bin: B }. A DISTINCT tree (different entry name) that REUSES the
+    /// same shared blob B (dedup, token unchanged — the soak's cross-node `adopt`). Still live.
+    {
+        auto build = s->startBuild({});
+        build->reuseBlob(idOf("B"), /*body_recreatable=*/false);
+        TreeEntry e;
+        e.name = "other.bin";
+        e.placement = Placement::Blob;
+        e.file_hash = u128Of("B");
+        e.file_size = std::string("B").size();
+        const TreeId t_cur = build->putTree({e});
+        build->publish(ns, "rb_cur", t_cur, {});
+        s->renewWatermarkOnce();
+    }
 
-    /// Construct the CORRUPT durable snap that the cascade-vs-recreate marker race produces:
-    ///   - Tb has a ROOT edge (in-degree 1 => LIVE, never a retire candidate) and is markExpanded
-    ///     (so the fold will NOT re-expand it and re-record its child edges), but its Tb->B tree edge
-    ///     is ABSENT;
-    ///   - B is in `known` with in-degree 0 (a zero-in-degree candidate) — exactly what a strip of a
-    ///     sibling parent leaves when Tb's re-expansion was skipped.
+    /// The committed cursor we will claim: PAST both Adds (rb_live and rb_cur). The snap, however,
+    /// will reflect ONLY rb_live -> T_live -> B — the cursor-skip under-count.
+    const auto shard_obj = b->get(s->layout().rootShardKey(ns, shard));
+    ASSERT_TRUE(shard_obj.has_value());
+    const uint64_t cursor_past_both = decodeRootShard(shard_obj->bytes).shard_version;
+
+    /// Inject the FAITHFUL under-counted snap@gen1:
+    ///   - T_live is LIVE (root edge => in-degree 1) and markExpanded WITH its T_live->B edge present
+    ///     (faithful — not marker-without-edges); B is `known` with in-degree 1.
+    ///   - T_cur and rb_cur are ABSENT from the snap (their Add was treated as already-folded by the
+    ///     ahead cursor and never recorded) — the missing live edge.
     GcSnap snap;
-    snap.addRootEdge(cursor_key, "rb", tb_hash);                       /// Tb live (in-degree 1)
-    snap.markExpanded(tb_hash);                                        /// marker set => no re-expansion
-    snap.addTreeEdge(UInt128(0xDEAD), ObjectKind::Blob, u128Of("B"));  /// seed B into `known` (in-degree 1)
-    snap.stripTree(UInt128(0xDEAD));                                   /// free B: known, in-degree 0
+    snap.addRootEdge(cursor_key, "rb_live", tlive_hash);
+    snap.markExpanded(tlive_hash);
+    snap.addTreeEdge(tlive_hash, ObjectKind::Blob, u128Of("B"));   /// T_live -> B, seeds B into known (in-deg 1)
     snap.snap_shard = 0;
     snap.generation = 1;
-
-    /// Persist gc/snap@gen1 and gc/state pointing at it, with folded_cursor advanced PAST rb's Add so
-    /// the fold finds no new records and never re-expands Tb.
-    const auto shard_obj = b->get(s->layout().rootShardKey(RootNamespace{ns}, shard));
-    ASSERT_TRUE(shard_obj.has_value());
-    const RootShard root = decodeRootShard(shard_obj->bytes);
 
     GcState st;
     st.snap_generation = 1;
     st.snap_shards = 1;
-    st.folded_cursor[cursor_key] = root.shard_version;
+    st.folded_cursor[cursor_key] = cursor_past_both;               /// cursor AHEAD of the snap's real extent
     ASSERT_EQ(b->putIfAbsent(s->layout().gcSnapKey(1, 0), encodeGcSnap(snap)), PutOutcome::Done);
     const auto state_head = b->head(s->layout().gcStateKey());
     if (state_head.exists)
         b->putOverwrite(s->layout().gcStateKey(), encodeGcState(st), state_head.token);
     else
         b->putIfAbsent(s->layout().gcStateKey(), encodeGcState(st));
+
+    /// Drop rb_live (its rem lands ABOVE cursor_past_both, so the fold WILL process it): the strip of
+    /// T_live drops the only T_live->B edge the snap knows, taking in-degree(B) to 0.
+    s->dropRef(ns, "rb_live");
     s->renewWatermarkOnce();
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     const size_t rounds = runGcToFixpoint(gc);
 
-    /// rb still resolves through a present Tb — the tree is LIVE.
-    EXPECT_TRUE(s->resolveRef(RootNamespace{ns}, "rb").has_value());
-    EXPECT_TRUE(b->head(s->layout().treeKey(Tb)).exists);
+    /// rb_cur is still LIVE and still resolves through a present T_cur — its blob B must survive.
+    ASSERT_TRUE(s->resolveRef(ns, "rb_cur").has_value());
 
     const FsckReport rep = runFsck(*s, /*detail=*/true);
 
     /// THE DANGLE ASSERTION (RED today): GC must NEVER delete a blob a live ref references. Today it
-    /// does — B's only recorded in-degree was 0 because Tb was markExpanded without its Tb->B edge.
+    /// does — B's only recorded in-degree was from T_live; the live T_cur->B edge was never in the
+    /// snap (cursor ahead of the snap's edges), so stripping T_live took B to in-degree 0 and the
+    /// single content-delete site (CasGc.cpp:249) deleted it.
     EXPECT_EQ(rep.dangling, 0u)
-        << "B140-dangle: GC deleted a blob still referenced by the live ref rb -> Tb after " << rounds
-        << " rounds (dangling=" << rep.dangling << ", reachable=" << rep.reachable
-        << ", B_present=" << b->head(s->layout().blobKey(idOf("B"))).exists << "); the fold left Tb "
-        << "markExpanded without its tree->blob edge (CasGc.cpp foldShardRecords :805/:865), so "
-        << "zeroInDegreeKnown surfaced B and the single content-delete site (CasGc.cpp:249) deleted it";
+        << "B140-dangle: GC deleted shared blob B still referenced by the live ref rb_cur -> T_cur "
+        << "after " << rounds << " rounds (dangling=" << rep.dangling << ", reachable=" << rep.reachable
+        << ", B_present=" << b->head(s->layout().blobKey(idOf("B"))).exists << "); the committed "
+        << "folded_cursor ran ahead of the snap edges, so T_cur->B was never folded (cursor-skip "
+        << "under-count of a deduplicated blob).";
 }
