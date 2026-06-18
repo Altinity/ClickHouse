@@ -14,7 +14,11 @@ from typing import Any, List, Literal, Optional
 
 import __main__
 
-from tests.ci.ci_utils import Shell
+try:
+    from tests.ci.ci_utils import Shell
+except ModuleNotFoundError:
+    # Support direct script execution, e.g. `python3 ./tests/ci/version_helper.py` for grype scan.
+    from ci_utils import Shell
 
 logger = logging.getLogger(__name__)
 
