@@ -442,6 +442,10 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
     {
         const auto freed = snap.at(hashPrefixShard(tree, state.snap_shards)).stripTree(tree);
         report.cascaded += freed.size();
+        /// AUDIT (B140-dangle root-level trigger, 2026-06-18): every cascade strip of a tree, with
+        /// the children it freed (which become the next round's zero-in-degree delete candidates).
+        LOG_INFO(getLogger("CasGcAudit"), "CASTRIP tree={} round={} gen={} freed={}",
+                 u128ToHex(tree), round, state.snap_generation, freed.size());
     }
 
     /// P9: forget every confirmed-gone node (trees AND blobs/packs) from `known`, so the next
@@ -865,6 +869,13 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
             /// old target if it zeroed.
             auto displaced = shard_for(record.tree_id).addRootEdge(cursor_key, record.ref_name, record.tree_id);
             transitioned.insert(transitioned.end(), displaced.begin(), displaced.end());
+            /// AUDIT (B140-dangle root-level trigger): a republish Add re-pointed this ref to a new
+            /// tree and the OLD target's in-degree zeroed (a displacement that can drive a strip).
+            if (!displaced.empty())
+                LOG_INFO(getLogger("CasGcAudit"),
+                         "CAROOTREPOINT ref={} at_version={} new_tree={} old_zeroed={} round={} gen={}",
+                         record.ref_name, record.at_version, u128ToHex(record.tree_id),
+                         displaced.size(), state.round, state.snap_generation);
 
             /// Once-per-tree expansion: the FIRST '+' to a tree with no marker reads the tree
             /// once and adds its child-edge set (each edge into the CHILD's shard).
@@ -943,6 +954,12 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
             /// re-pointed the edge when ITS record folded (intra-shard while snap_shards == 1).
             auto cands = shard_for(record.tree_id).removeRootEdge(cursor_key, record.ref_name);
             transitioned.insert(transitioned.end(), cands.begin(), cands.end());
+            /// AUDIT (B140-dangle root-level trigger): a folded Remove dropped this ref's root edge;
+            /// `zeroed` = the tree's in-degree hit 0 (it becomes a delete candidate -> cascade strip).
+            LOG_INFO(getLogger("CasGcAudit"),
+                     "CAROOTREM ref={} at_version={} tree={} zeroed={} round={} gen={}",
+                     record.ref_name, record.at_version, u128ToHex(record.tree_id),
+                     cands.size(), state.round, state.snap_generation);
         }
     }
 
