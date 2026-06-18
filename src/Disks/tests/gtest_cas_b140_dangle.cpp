@@ -28,7 +28,17 @@ size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
     {
-        const RoundReport rep = gc.runRegularRound();
+        RoundReport rep;
+        try
+        {
+            rep = gc.runRegularRound();
+        }
+        catch (const DB::Exception &)
+        {
+            /// The fail-closed coherence guard refused this round (CORRUPTED_DATA): no delete
+            /// happened, the live blob is safe. Stop — re-running would just throw again.
+            break;
+        }
         if (!rep.acquired_lease)
             continue;
         if (rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
