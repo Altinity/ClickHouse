@@ -195,6 +195,8 @@ public:
     /// ClickHouse internal table types).
     virtual bool isRemoteDatabase() const { return false; }
 
+    virtual bool isDatalakeCatalog() const { return false; }
+
     /// Load a set of existing tables.
     /// You can call only once, right after the object is created.
     virtual void loadStoredObjects( /// NOLINT
