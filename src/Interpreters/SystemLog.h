@@ -18,6 +18,7 @@
     M(QueryThreadLog,        query_thread_log,     "Contains information about threads that execute queries, for example, thread name, thread start time, duration of query processing.") \
     M(PartLog,               part_log,             "This table contains information about events that occurred with data parts in the MergeTree family tables, such as adding or merging data.") \
     M(ContentAddressedGarbageCollectionLog, content_addressed_garbage_collection_log, "Per-round records of the content-addressed (CA) MergeTree garbage collector: a Start and a Finish row per GC round, with counts of objects marked/deleted, duration, outcome, and per-round ProfileEvents.") \
+    M(ContentAddressedLog, content_addressed_log, "Per-event content-addressed (CA) MergeTree audit log: one row per blob/tree/ref/GC decision (put, reuse, retire, delete, strip, root add/remove, in-degree-zero, fence, lease, ...) plus errors (dangling access, fail-closed). Optional, off by default; enabled for soak/CI to reconstruct an entity's whole lifetime.") \
     M(BackgroundSchedulePoolLog, background_schedule_pool_log, "Contains history of background schedule pool task executions.") \
     M(TraceLog,              trace_log,            "Contains stack traces collected by the sampling query profiler.") \
     M(CrashLog,              crash_log,            "Contains information about stack traces for fatal errors. The table does not exist in the database by default, it is created only when fatal errors occur.") \

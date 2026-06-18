@@ -128,6 +128,7 @@ class QueryThreadLog;
 class QueryViewsLog;
 class PartLog;
 class ContentAddressedGarbageCollectionLog;
+class ContentAddressedLog;
 class BackgroundSchedulePoolLog;
 class TextLog;
 class TraceLog;
@@ -1597,6 +1598,7 @@ public:
     /// Provide table name to make required checks.
     std::shared_ptr<PartLog> getPartLog() const;
     std::shared_ptr<ContentAddressedGarbageCollectionLog> getContentAddressedGarbageCollectionLog() const;
+    std::shared_ptr<ContentAddressedLog> getContentAddressedLog() const;
 
     std::shared_ptr<BackgroundSchedulePoolLog> getBackgroundSchedulePoolLog() const;
 
