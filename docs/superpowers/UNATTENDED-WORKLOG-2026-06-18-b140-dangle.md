@@ -73,4 +73,14 @@ GC reclaims it under a still-in-flight adopter → publish dangles. Pinned live 
   sites — `publishStaging` (INSERT/merge/mutation/hardlink), `republishRef` (RENAME/cross-engine
   repoint), `adoptPart` (replication relink). `ninja clickhouse` + `unit_tests_dbms` build CLEAN. 141
   pass, 1 intentional red. C++ implementation COMPLETE.
-- **T11** — Final comprehensive review of the B171 change (6 commits) before the soak.
+- **T11** — Final comprehensive review (subagent): **✅ ready for soak**, no blockers/majors. False-
+  reclaim risk cleared (12× margin: 5s watermark renewal vs 60s GC cadence + fail-closed backstop);
+  unconditional-revalidate happy path regression-free; 2 safe minors (lazy precommit reclaim on
+  abort/dtor — GC backstops; one redundant test omitted). Pre-existing intentional leak test unrelated.
+- **T12** — Rebuilt `clickhouse` clean from HEAD (`d4675354004`); launched the **12h B171 soak**
+  (SEED 20260619, WORKERS=2, chaos ON 253 faults, B170 event log on, keep-alive on failure,
+  metrics `soak_b171_12h.db`). Watcher enhanced with B171 monitors (precommit lifecycle + false-reclaim
+  "frozen" signature + CORRUPTED_DATA). **Early signal (~2 min):** precommit/precommit_removed =
+  6515/6515 (clean two-phase, zero leaks), precommit_reclaim=0, false-reclaim=0, CORRUPTED_DATA=0,
+  fail_closed=0, read_missing=0, both replicas alive. The fix is live and the dangle symptom is GONE.
+  20-min watcher running (task #141). C++ + TLA+ + soak-launch all DONE; soak is the 12h validation.
