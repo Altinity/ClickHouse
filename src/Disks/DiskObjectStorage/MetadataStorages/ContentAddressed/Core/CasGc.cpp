@@ -473,7 +473,10 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
     /// trim leaves them in place - no loss). The closing gc/state CAS below still runs
     /// unconditionally (fence_version[<= round] is erased).
     const bool snap_changed = !rechecked.deleted_trees.empty() || rechecked.fence_window_records_folded
-        || report.forgotten_on_delete > 0;   /// P9: a blob-only prune round must still persist the snap
+        || report.forgotten_on_delete > 0   /// P9: a blob-only prune round must still persist the snap
+        || report.forgotten_absent > 0;      /// P9: a retire-time 404 forgot a node in-memory; the
+                                             /// forget must go durable or the next round re-derives
+                                             /// and re-HEAD-404s it (the RetireForgets regression).
     constexpr uint64_t max_generation_probes = 1000;
     uint64_t adopted_generation = state.snap_generation;
     if (snap_changed)
@@ -1089,12 +1092,21 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 
     /// 3. Fold each discovered root shard's journal records in (folded_cursor, shard_version],
     /// in journal (= insertion) order (the shared R1/R4 record semantics — foldShardRecords).
+    /// Record the position each shard folded TO (its shard_version at read time): this is the
+    /// coherent cursor for the persisted generation — cursor == folded extent, never ahead of the
+    /// edges. The persist loop below writes these into snap shard 0's folded_cursor so fold's
+    /// generation is self-coherent (B140-dangle fix). Without it the persisted generation would
+    /// inherit the PRIOR generation's cursor (0 on a fresh pool), and the recheck's
+    /// fold-through-fence would re-fold (0, fence_version] and re-add nodes that retire's defensive
+    /// 404-prune had just forgotten — the P9-forget regression.
     bool folded_any = false;
+    std::map<String, uint64_t> folded_to;   /// cursor_key -> position fold folded to (shard_version)
     for (const auto & [ns, root_shard] : result.root_shards)
     {
         const auto [root, manifest_token] = store->readShard(ns, root_shard);
         const String cursor_key = ns.string() + "/" + std::to_string(root_shard);
         const uint64_t cursor = cursorOf(result.snap, cursor_key);
+        folded_to[cursor_key] = root.shard_version;
 
         /// A version bump alone (e.g. from the trim step) does not mean new records exist —
         /// the trim CAS advances shard_version without adding journal entries, so
@@ -1122,8 +1134,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 
     /// 4. Persist, durable-before-cursor: the new-generation snap objects go durable FIRST; only
     /// then does the gc/state CAS advance snap_generation. A crash between the two loses nothing
-    /// - the old generation stays authoritative. (folded_cursor is NOT advanced by fold: it lives
-    /// in the snap and advances in cascadeAndPersist — B140-dangle fix.)
+    /// - the old generation stays authoritative. The persisted snap shard 0 carries folded_cursor
+    /// advanced to the position fold folded to (each shard's shard_version) — (edges, cursor) are
+    /// one write-once unit (B140-dangle fix); the cascade later advances the SAME cursor through the
+    /// fence window. fold writes only its OWN folded extent, never the fence version (it has not
+    /// folded the fence window), so the cursor is never ahead of the edges.
     ///
     /// THE WRITE GENERATION PROBES UPWARD. Generation objects are write-once, and a generation key
     /// occupied by DIFFERENT bytes can never be reused: a fold that wrote its snaps but lost the
@@ -1150,6 +1165,17 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
         for (auto & [snap_shard, snap] : result.snap)
         {
             snap.generation = generation;
+            /// Advance the fold cursor in snap shard 0 (the single source of truth, B140-dangle fix)
+            /// to the position fold ACTUALLY folded to (each shard's shard_version). This makes the
+            /// persisted generation self-coherent: (edges, cursor) are one write-once unit and the
+            /// cursor never runs ahead of the edges it represents. Idempotent under the probe-upward
+            /// retry (std::max), so the encoded bytes stay stable for byte-equal adoption.
+            if (snap_shard == 0)
+            {
+                for (const auto & [cursor_key, folded_version] : folded_to)
+                    snap.folded_cursor[cursor_key]
+                        = std::max(snap.folded_cursor[cursor_key], folded_version);
+            }
             const String snap_key = layout.gcSnapKey(generation, snap_shard);
             const String body = encodeGcSnap(snap);
             if (backend.putIfAbsent(snap_key, body) == PutOutcome::PreconditionFailed)
