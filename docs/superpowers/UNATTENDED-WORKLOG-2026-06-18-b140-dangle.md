@@ -84,3 +84,16 @@ GC reclaims it under a still-in-flight adopter → publish dangles. Pinned live 
   6515/6515 (clean two-phase, zero leaks), precommit_reclaim=0, false-reclaim=0, CORRUPTED_DATA=0,
   fail_closed=0, read_missing=0, both replicas alive. The fix is live and the dangle symptom is GONE.
   20-min watcher running (task #141). C++ + TLA+ + soak-launch all DONE; soak is the 12h validation.
+- **T13** — **SOAK CAUGHT A REGRESSION (B171 follow-up).** First 20-min tick: correctness CLEAN
+  (CORRUPTED_DATA 0, fail_closed 0, all anomalies 0, precommit lifecycle 6515/6515 then 78683/78680,
+  false-reclaim 0) — the dangle is GONE. BUT GC reclaim = 0 (del/strip/retire all 0) and GC WEDGED:
+  last completed fold at round 11 (22:01), still folding 24 min later. Root cause confirmed:
+  `buildShard() == build_seq` → **91,940 distinct build-root shards** (one per build), removal only
+  empties the ref (never deletes the shard manifest), so GC's `shardsToVisit` LISTs + folds ~92k
+  shard manifests every round → fold O(total-builds) → wedged → floor never advances → retire never
+  runs → no reclaim → pool grows unbounded. This would kill any long soak. NOT a dangle/correctness
+  bug. Stopped the soak; fixing the build-root shard explosion. FIX (also a simplification): shard the
+  build root like every other namespace — ref_name = `build_seq`, shard = `shardOf(build_seq)` →
+  exactly `root_shards` shards (bounded), folds via normal `[0,root_shards)` enumeration, and the
+  `shardsToVisit` LIST special-case is removed. GC reclaim iterates a build-root shard's refs and
+  reclaims each dead build (parsed build_seq vs min_active).
