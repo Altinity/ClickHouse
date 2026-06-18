@@ -752,7 +752,8 @@ void alter(
                 metadata_json_generator.generateDropColumnMetadata(params[0].column_name);
                 break;
             case AlterCommand::Type::MODIFY_COLUMN:
-                metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type);
+                if (!metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type))
+                    return;
                 break;
             case AlterCommand::Type::RENAME_COLUMN:
                 metadata_json_generator.generateRenameColumnMetadata(params[0].column_name, params[0].rename_to);
