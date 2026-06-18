@@ -281,14 +281,16 @@ private:
     /// pointless version bumps). The trim's own CAS bumps shard_version with no journal record -
     /// vacuously covered, same argument as the fence bump.
     void trim(const std::map<uint64_t, GcSnap> & snap,
-              const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards);
+              const std::vector<std::pair<RootNamespace, uint64_t>> & root_shards,
+              uint64_t round);
 
     /// Fold one root shard's journal records with at_version in (lo, hi] into `snap` — the shared
     /// R1/R4 record semantics: last-op-wins root edges, once-per-tree expansion with the
     /// displaced-later lookahead, Remove drops the root edge. Returns the nodes that transitioned
     /// to zero in-degree (report/cross-check only; decisions read the snap statelessly).
     std::vector<Candidate> foldShardRecords(std::map<uint64_t, GcSnap> & snap, const GcState & state,
-                                            const String & cursor_key, const RootShard & root,
+                                            const RootNamespace & ns, const String & cursor_key,
+                                            const RootShard & root,
                                             uint64_t lo_exclusive, uint64_t hi_inclusive);
 
     /// B140-dangle FAIL-CLOSED coherence guard. Run at round start, AFTER the fold produces
