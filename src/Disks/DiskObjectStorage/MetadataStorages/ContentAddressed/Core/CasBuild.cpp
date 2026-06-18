@@ -61,6 +61,18 @@ Build::Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt1
     , epoch(epoch_)
     , info(std::move(info_))
 {
+    /// B170: a build began (W-HEARTBEAT durable). build_id/seq/epoch identify it for token-join
+    /// attribution against the GC delete rows.
+    {
+        CasEvent _ev0;
+        _ev0.type = CasEventType::BuildStart;
+        _ev0.ref_name = info.intended_ref.value_or("");
+        _ev0.token = u128ToHex(build_id);
+        _ev0.outcome = "started";
+        _ev0.reason = "startBuild: heartbeat durable; build in-flight";
+        _ev0.detail = {{"build_seq", std::to_string(build_seq)}, {"epoch", std::to_string(epoch)}};
+        store->emitEvent(_ev0);
+    }
 }
 
 Build::~Build()
@@ -157,6 +169,19 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
         {
             deps[{static_cast<uint8_t>(ObjectKind::Blob), logical_hash}] =
                 DepEntry{ObjectKind::Blob, tok, store->retireView().round(), source.size};
+            /// B170: a fresh blob incarnation was uploaded (the birth of this hash/token pair).
+            {
+                CasEvent _ev1;
+                _ev1.type = CasEventType::BlobPut;
+                _ev1.object_kind = CasEventObjectKind::Blob;
+                _ev1.object_hash = id.string();
+                _ev1.token = tok.value;
+                _ev1.round = store->retireView().round();
+                _ev1.outcome = "ok";
+                _ev1.reason = "uploaded a fresh blob incarnation";
+                _ev1.detail = {{"size", std::to_string(source.size)}, {"build_id", u128ToHex(build_id)}};
+                store->emitEvent(_ev1);
+            }
             return BlobRef{id, source.size};
         }
 
@@ -266,12 +291,24 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
         logical_size = hr.size - header_len;
     }
 
+    const CasEventObjectKind ev_kind =
+        kind == ObjectKind::Tree ? CasEventObjectKind::Tree
+        : (kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
     if (store->retireView().isCondemnedToken(kind, hash, hr.token))
     {
-        /// TEMP INSTRUMENTATION (2026-06-17): the reuse-vs-GC defense FIRED — the observed token was
-        /// condemned, so we resurrect instead of adopting. Greppable CAREUSE. REVERT after investigation.
-        LOG_INFO(getLogger("CasBuildAudit"), "CAREUSE resurrect key={} token={} round={}",
-            key, hr.token.value, store->retireView().round());
+        /// B170: the reuse-vs-GC defense FIRED — the observed token was condemned, so resurrect
+        /// instead of adopting (was the CAREUSE resurrect audit line). W-FRESH-TAG displaces it.
+        {
+            CasEvent _ev2;
+            _ev2.type = CasEventType::BlobReuseResurrect;
+            _ev2.object_kind = ev_kind;
+            _ev2.object_hash = u128ToHex(hash);
+            _ev2.token = hr.token.value;
+            _ev2.round = store->retireView().round();
+            _ev2.outcome = "resurrect";
+            _ev2.reason = "observed token is condemned; resurrect (fresh tag) instead of adopt";
+            store->emitEvent(_ev2);
+        }
         resurrect(kind, hash, key);
         /// resurrect recorded the dep with the new token; the admitted logical size is bookkeeping for
         /// GC (M-C3) and not load-bearing in M-C2 — report the logical size where cheap (Blob only).
@@ -279,12 +316,20 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     }
 
     /// Adopt the current incarnation — free, no bytes moved.
-    /// TEMP INSTRUMENTATION (2026-06-17): reuse ADOPTED an existing incarnation's token as NOT
-    /// condemned (per this build's retire-view). If GC deletes this exact token (CAGCDEL token=...)
-    /// after this point and the publish-gate fails to reject, the committed ref dangles — the
-    /// reuse-of-an-object-being-deleted race. Correlate CAREUSE adopt vs CAGCDEL by key+token.
-    LOG_INFO(getLogger("CasBuildAudit"), "CAREUSE adopt key={} token={} round={}",
-        key, hr.token.value, store->retireView().round());
+    /// B170: reuse ADOPTED an existing incarnation's token as NOT condemned (per this build's
+    /// retire-view). Was the CAREUSE adopt audit line. Token-join this against a later blob_delete
+    /// of the same hash/token to pin a reuse-of-an-object-being-deleted race.
+    {
+        CasEvent _ev3;
+        _ev3.type = CasEventType::BlobReuseAdopt;
+        _ev3.object_kind = ev_kind;
+        _ev3.object_hash = u128ToHex(hash);
+        _ev3.token = hr.token.value;
+        _ev3.round = store->retireView().round();
+        _ev3.outcome = "adopt";
+        _ev3.reason = "observed token not condemned; adopted the live incarnation (no bytes moved)";
+        store->emitEvent(_ev3);
+    }
     deps[{static_cast<uint8_t>(kind), hash}] =
         DepEntry{kind, hr.token, store->retireView().round(), logical_size};
     return logical_size;
@@ -463,6 +508,19 @@ TreeId Build::putTree(std::vector<TreeEntry> entries)
     {
         deps[{static_cast<uint8_t>(ObjectKind::Tree), logical_hash}] =
             DepEntry{ObjectKind::Tree, tok, store->retireView().round(), encoded.size()};
+        /// B170: a fresh tree incarnation was uploaded.
+        {
+            CasEvent _ev4;
+            _ev4.type = CasEventType::TreePut;
+            _ev4.object_kind = CasEventObjectKind::Tree;
+            _ev4.object_hash = id.string();
+            _ev4.token = tok.value;
+            _ev4.round = store->retireView().round();
+            _ev4.outcome = "ok";
+            _ev4.reason = "uploaded a fresh tree incarnation";
+            _ev4.detail = {{"size", std::to_string(encoded.size())}, {"build_id", u128ToHex(build_id)}};
+            store->emitEvent(_ev4);
+        }
     }
     else
     {
@@ -517,6 +575,20 @@ void Build::gateCheckDeps()
             /// an old token, INV-NO-RETURN), closing the window.
             if (store->retireView().findCondemned(kind, hash).has_value())
             {
+                /// B170: the publish gate found a condemned-by-hash dep and is displacing it
+                /// (resurrect/recreate) so an in-flight GC delete can never hit the live object.
+                {
+                    CasEvent _ev5;
+                    _ev5.type = CasEventType::GateResurrect;
+                    _ev5.object_kind = kind == ObjectKind::Tree ? CasEventObjectKind::Tree
+                        : (kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
+                    _ev5.object_hash = u128ToHex(hash);
+                    _ev5.token = u128ToHex(build_id);
+                    _ev5.round = store->retireView().round();
+                    _ev5.outcome = "resurrect";
+                    _ev5.reason = "gate: dep has a view hit by hash; displace via resurrect/recreate";
+                    store->emitEvent(_ev5);
+                }
                 if (kind == ObjectKind::Tree && retained_trees.contains(hash))
                     recreateTree(hash);
                 else
@@ -581,6 +653,19 @@ void Build::recreateTree(const UInt128 & hash)
 
 void Build::revalidateDeps()
 {
+    /// B170: a fence-advanced refresh invalidated stale token observations; the whole dep set is
+    /// being re-validated before the gate scan (spec §5 step 5).
+    {
+        CasEvent _ev6;
+        _ev6.type = CasEventType::GateRevalidate;
+        _ev6.token = u128ToHex(build_id);
+        _ev6.round = store->retireView().round();
+        _ev6.outcome = "revalidating";
+        _ev6.reason = "fence advanced past this build's view; revalidate the dependency set";
+        _ev6.detail = {{"deps", std::to_string(deps.size())}};
+        store->emitEvent(_ev6);
+    }
+
     /// W-REVALIDATE (the model's `WPublishReval`). Iterating `deps` while resurrect / observeAndAdmit /
     /// recreateTree MUTATE deps is safe for the same reason as gateCheckDeps: re-create keeps the SAME
     /// (kind, hash) — a tree's hash commits to its content, so its re-uploaded incarnation lives at the
@@ -727,6 +812,10 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
     /// casPut, bounded retry). The gate-aware mutate lambda owns the gate; because mutateShard
     /// re-reads + re-invokes the lambda each attempt, a fence-advanced conflict naturally re-runs the
     /// gate on the fresh fence_round (spec §5 step 5).
+    /// B170: captured inside the CAS lambda (which mutateShard re-runs per attempt — they reflect the
+    /// COMMITTED attempt) to classify the publish event as RefPublish vs RefRepoint.
+    bool repointed_over = false;
+    uint64_t committed_at_version = 0;
     store->mutateShard(ns, store->shardOf(ref_name), [&](RootShard & root)
     {
         /// Fence vs view: if the manifest's fence_round (floored by the registry fence at
@@ -741,6 +830,8 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
 
         gateCheckDeps();
 
+        repointed_over = root.refs.contains(ref_name);
+        committed_at_version = root.shard_version + 1;
         root.refs[ref_name] = payload;
         /// at_version == the committed shard_version: mutateShard bumps AFTER the lambda, so inside it
         /// the post-commit version is root.shard_version + 1 (matches dropRef).
@@ -749,9 +840,40 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
             .at_version = root.shard_version + 1});
     });
 
+    /// B170: the ref was published (RefRepoint when it already named a tree, else RefPublish). The
+    /// at_version is the committed shard_version — the journal record GC will fold as a root Add.
+    {
+        CasEvent _ev7;
+        _ev7.type = repointed_over ? CasEventType::RefRepoint : CasEventType::RefPublish;
+        _ev7.namespace_ = ns.string();
+        _ev7.ref_name = ref_name;
+        _ev7.object_kind = CasEventObjectKind::Tree;
+        _ev7.object_hash = tree.string();
+        _ev7.token = u128ToHex(build_id);
+        _ev7.at_version = committed_at_version;
+        _ev7.outcome = "ok";
+        _ev7.reason = repointed_over ? "published over an existing ref (repoint)" : "published a new ref";
+        store->emitEvent(_ev7);
+    }
+
     /// Published: this build is no longer in-flight. Retire its seq so the GC watermark floor
     /// (minActive) can advance past it (idempotent — the dtor also retires).
     store->retireBuildSeq(build_seq);
+    /// B170: the build's terminal success — the part is committed.
+    {
+        CasEvent _ev8;
+        _ev8.type = CasEventType::BuildPublish;
+        _ev8.namespace_ = ns.string();
+        _ev8.ref_name = ref_name;
+        _ev8.object_kind = CasEventObjectKind::Tree;
+        _ev8.object_hash = tree.string();
+        _ev8.token = u128ToHex(build_id);
+        _ev8.at_version = committed_at_version;
+        _ev8.outcome = "published";
+        _ev8.reason = "build committed its root manifest; no longer in-flight";
+        _ev8.detail = {{"build_seq", std::to_string(build_seq)}};
+        store->emitEvent(_ev8);
+    }
 }
 
 void Build::abandon()
@@ -762,6 +884,16 @@ void Build::abandon()
     /// No longer in-flight: retire the seq so the GC watermark floor can advance (idempotent).
     store->retireBuildSeq(build_seq);
     alive = false;
+    /// B170: the build was abandoned (heartbeat discarded; its uploads become GC-reclaimable debris).
+    {
+        CasEvent _ev9;
+        _ev9.type = CasEventType::BuildAbort;
+        _ev9.token = u128ToHex(build_id);
+        _ev9.outcome = "abandoned";
+        _ev9.reason = "abandon: heartbeat discarded; uploads become reclaimable debris";
+        _ev9.detail = {{"build_seq", std::to_string(build_seq)}};
+        store->emitEvent(_ev9);
+    }
 }
 
 }

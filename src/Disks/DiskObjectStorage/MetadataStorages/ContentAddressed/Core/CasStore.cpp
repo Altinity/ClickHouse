@@ -384,6 +384,19 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
         return std::nullopt;
 
     const RefPayload & payload = it->second;
+    /// B170: a ref resolved to its tree (the read-path entry point). object_hash is the tree the
+    /// ref names; pairs with a later readTree ReadMissing/DanglingAccess if that tree is gone.
+    {
+        CasEvent _ev0;
+        _ev0.type = CasEventType::RefResolve;
+        _ev0.namespace_ = ns.string();
+        _ev0.ref_name = ref_name;
+        _ev0.object_kind = CasEventObjectKind::Tree;
+        _ev0.object_hash = u128ToHex(payload.tree_id);
+        _ev0.outcome = "resolved";
+        _ev0.reason = "read-side resolve of a ref to its tree";
+        emitEvent(_ev0);
+    }
     return Resolved{
         .tree_id = TreeId(u128ToHex(payload.tree_id)),
         .tree_size = payload.tree_size,
@@ -407,16 +420,44 @@ std::vector<TreeEntry> Store::readTree(const TreeId & id)
     /// present-but-condemned object reads fine here.
     std::optional<GetResult> object = pool_backend->get(pool_layout.treeKey(id));
     if (!object)
+    {
+        /// B170: a live ref named a tree whose object is gone — INV-NO-DANGLE surfaced on the read
+        /// path (the dangling-access anomaly). Record before failing closed.
+        {
+            CasEvent _ev1;
+            _ev1.type = CasEventType::ReadMissing;
+            _ev1.object_kind = CasEventObjectKind::Tree;
+            _ev1.object_hash = id.string();
+            _ev1.outcome = "missing";
+            _ev1.reason = "live ref names tree but its object is missing (INV-NO-DANGLE)";
+            _ev1.detail = {{"code", "FILE_DOESNT_EXIST"}, {"site", "readTree"}};
+            emitEvent(_ev1);
+        }
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "live ref names tree {} but its object is missing — INV-NO-DANGLE", id.string());
+    }
 
     /// Validate the envelope (magic / kind=Tree / header_hash / size arithmetic), then the key↔hash
     /// binding: a tree stored at a key other than hex(logical_hash) is corruption.
     const EnvelopeHeader header = decodeEnvelopeHeader(object->bytes, object->bytes.size(), ObjectKind::Tree);
     if (u128ToHex(header.logical_hash) != id.string())
+    {
+        /// B170: the tree object decoded but its content hash does not match its key — corruption.
+        {
+            CasEvent _ev2;
+            _ev2.type = CasEventType::CorruptDecode;
+            _ev2.object_kind = CasEventObjectKind::Tree;
+            _ev2.object_hash = id.string();
+            _ev2.outcome = "corrupt";
+            _ev2.reason = "tree key/hash mismatch: object carries a different logical_hash";
+            _ev2.detail = {{"code", "CORRUPTED_DATA"}, {"site", "readTree"},
+                       {"carried_hash", u128ToHex(header.logical_hash)}};
+            emitEvent(_ev2);
+        }
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS tree key/hash mismatch: object at tree key {} carries logical_hash {}",
             id.string(), u128ToHex(header.logical_hash));
+    }
 
     auto decoded = std::make_shared<const std::vector<TreeEntry>>(
         decodeTree(std::string_view(object->bytes).substr(payloadOffset(header))));
@@ -528,6 +569,8 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
 void Store::dropRef(const RootNamespace & ns, const String & ref_name)
 {
     /// Drop = the same CAS shape as publish (spec §5 step 6): remove refs[name], append {-, name, T}.
+    UInt128 dropped_tree{};
+    uint64_t at_version = 0;
     mutateShard(ns, shardOf(ref_name), [&](RootShard & root)
     {
         auto it = root.refs.find(ref_name);
@@ -537,6 +580,8 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
                 "dropRef: no such ref {} in namespace {}", ref_name, ns.string());
 
         const UInt128 tree_id = it->second.tree_id;
+        dropped_tree = tree_id;
+        at_version = root.shard_version + 1;
         root.refs.erase(it);
         /// The at_version is the NEW shard_version this attempt commits — the helper bumps AFTER mutate,
         /// so here the post-commit version is root.shard_version + 1.
@@ -544,6 +589,20 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
             .op = JournalRecord::Op::Remove, .ref_name = ref_name, .tree_id = tree_id,
             .at_version = root.shard_version + 1});
     });
+    /// B170: the ref was dropped (a '-' journal record GC will fold as a root Remove). object_hash is
+    /// the tree the ref named, so a part's "publish -> drop" life is reconstructable from the rows.
+    {
+        CasEvent _ev3;
+        _ev3.type = CasEventType::RefDrop;
+        _ev3.namespace_ = ns.string();
+        _ev3.ref_name = ref_name;
+        _ev3.object_kind = CasEventObjectKind::Tree;
+        _ev3.object_hash = u128ToHex(dropped_tree);
+        _ev3.at_version = at_version;
+        _ev3.outcome = "ok";
+        _ev3.reason = "dropRef: removed the ref and appended a Remove record";
+        emitEvent(_ev3);
+    }
 }
 
 void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
