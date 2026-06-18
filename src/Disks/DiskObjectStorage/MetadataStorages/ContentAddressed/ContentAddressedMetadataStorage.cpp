@@ -10,6 +10,9 @@
 #include <IO/ReadPipeline.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ContentAddressedGarbageCollectionLog.h>
+#include <Interpreters/ContentAddressedLog.h>
+#include <Common/CurrentThread.h>
+#include <base/getThreadId.h>
 #include <Common/DateLUT.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -218,6 +221,44 @@ ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogg
     };
 }
 
+Cas::CasEventSink ContentAddressedMetadataStorage::makeCasEventSink() const
+{
+    /// Unit tests pass a null context (no system logs); the Store then runs without a sink.
+    if (!context)
+        return {};
+    auto ctx = context;
+    /// The configured disk name (threaded from the metadata-storage factory); falls back to
+    /// storage_path_prefix for callers that don't supply one (e.g. unit tests).
+    const String disk = disk_name;
+    return [ctx, disk](const Cas::CasEvent & ev)
+    {
+        auto log = ctx->getContentAddressedLog();
+        if (!log)
+            return;
+        ContentAddressedLogElement e;
+        const auto now = std::chrono::system_clock::now();
+        e.event_time = std::chrono::system_clock::to_time_t(now);
+        e.event_time_microseconds = timeInMicroseconds(now);
+        e.event_type = toString(ev.type);
+        e.disk_name = disk;
+        e.namespace_ = ev.namespace_;
+        e.ref_name = ev.ref_name;
+        e.object_kind = toString(ev.object_kind);
+        e.object_hash = ev.object_hash;
+        e.token = ev.token;
+        e.round = ev.round;
+        e.gen = ev.gen;
+        e.at_version = ev.at_version;
+        e.outcome = ev.outcome;
+        e.reason = ev.reason;
+        e.thread_id = getThreadId();
+        e.query_id = CurrentThread::getQueryId();
+        e.detail = ev.detail;
+        /// Best-effort: SystemLog::add never blocks the Core; a full queue drops the row with a warning.
+        log->add(std::move(e));
+    };
+}
+
 Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
 {
     if (read_only || !gc_enabled)
@@ -303,6 +344,10 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.root_shards = root_shards;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
+
+    /// B170: bridge per-event CAS decisions to system.content_addressed_log (null sink when context
+    /// is absent, e.g. unit tests — emitEvent is then a no-op single branch in the Core).
+    cas_store->setEventSink(makeCasEventSink());
 
     /// The background GC scheduler runs only on the disk-factory path (context non-null) and when
     /// enabled - the lease makes concurrent schedulers across mounters safe (work dedup), so no

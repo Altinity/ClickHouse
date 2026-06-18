@@ -7,6 +7,7 @@
 #include <Interpreters/OpenTelemetrySpanLog.h>
 #include <Interpreters/PartLog.h>
 #include <Interpreters/ContentAddressedGarbageCollectionLog.h>
+#include <Interpreters/ContentAddressedLog.h>
 #include <Interpreters/BackgroundSchedulePoolLog.h>
 #include <Interpreters/QueryMetricLog.h>
 #include <Interpreters/QueryLog.h>

@@ -66,6 +66,7 @@ services:
       - ./configs/macros_node1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
       - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
       # B165: persist server logs to the host so they survive `docker compose down -v` (the soak #7
       # OOM destroyed all in-container logs). run_24h.sh creates+chmods logs/ch1 before `up`.
       - ./logs/ch1:/var/log/clickhouse-server
@@ -104,6 +105,7 @@ services:
       - ./configs/macros_node2.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
       - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
       - ./logs/ch2:/var/log/clickhouse-server
     ports:
       - "8124:8123"

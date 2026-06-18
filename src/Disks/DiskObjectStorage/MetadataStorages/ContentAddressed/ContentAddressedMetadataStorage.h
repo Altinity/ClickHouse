@@ -190,6 +190,12 @@ private:
     /// ContextPtr, converts the POD GcRoundLogRecord into a ContentAddressedGarbageCollectionLogElement,
     /// and appends it to the SystemLog (best-effort). Returns an empty sink when context is null.
     ContentAddressed::GcRoundLogger makeGcRoundLogger() const;
+
+    /// Build the per-event CAS audit sink (B170): the std::function the Store calls on every
+    /// content-addressed decision. Captures the ContextPtr, converts the decoupled Core POD
+    /// `Cas::CasEvent` into a ContentAddressedLogElement, and appends it to the SystemLog
+    /// (best-effort). Returns an empty sink when context is null (unit tests).
+    Cas::CasEventSink makeCasEventSink() const;
 };
 
 }
