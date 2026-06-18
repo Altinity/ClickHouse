@@ -221,6 +221,16 @@ public:
         return prefix + "/_pool_meta";
     }
 
+    /// The build-root namespace (B171): `_builds/<server_hex>`, one shard per in-flight build keyed by
+    /// `build_seq`. A precommit publishes the build's manifest tree as a ref in that shard, so GC's
+    /// fold lifts the in-degree of every reachable object — replacing the revocable `cas_owner` hint.
+    /// It is an ordinary namespace key-wise (`rootShardKey` works unchanged); only behavioral branches
+    /// (fold pending-tolerance, precommit reclaim) key off `isBuildRootNamespace`.
+    static bool isBuildRootNamespace(const RootNamespace & ns)
+    {
+        return ns.string().starts_with("_builds/");
+    }
+
 private:
     String prefix;
 
@@ -248,6 +258,12 @@ private:
             if (segment == "_registry")
                 throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
                     "CasLayout: namespace '{}' uses the reserved segment '_registry'", s);
+            /// Reserved for the build-root namespace (B171: `_builds/<server_hex>`). A user namespace
+            /// must not use the `_builds` segment, but the build-root namespace itself is legal — it is
+            /// exactly `_builds/<server_hex>`, recognized by `isBuildRootNamespace`.
+            if (segment == "_builds" && !isBuildRootNamespace(ns))
+                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                    "CasLayout: namespace '{}' uses the reserved segment '_builds'", s);
             if (end == String::npos)
                 break;
             start = end + 1;

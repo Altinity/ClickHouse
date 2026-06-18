@@ -68,6 +68,13 @@ public:
     /// blob payloads are not retained).
     TreeId putTree(std::vector<TreeEntry> entries);
 
+    /// B171 two-phase commit, phase 1: publish the build's manifest tree under the build-root
+    /// namespace so GC's fold lifts the in-degree of every reachable object (protection by
+    /// reachability, replacing the revocable `cas_owner` hint). Must be called after the manifest
+    /// tree is assembled and BEFORE any adopted/dedup'd source ref could be dropped. STUB here
+    /// (Task 1 RED): records nothing yet so the dangle still reproduces. Implemented in Task 2.
+    void precommit(const TreeId & manifest);
+
     /// The publish gate — Tasks 12/13. (Stub here.)
     void publish(const RootNamespace & ns, const String & ref_name, const TreeId & tree, RefPayload payload);
 
@@ -130,6 +137,13 @@ private:
     /// watermark reads this from the HEAD it already does and refuses to condemn a blob owned by a
     /// still-in-flight build (build_seq >= the server's min_active floor).
     ObjectMeta ownerMeta() const;
+
+    /// B171 build-root addressing. The build-root namespace is `_builds/<server_hex>` (one shard per
+    /// in-flight build keyed by `build_seq`), so each build owns an isolated precommit shard with no
+    /// cross-build CAS contention. GC derives the owning build's `(server_hex, build_seq)` from the
+    /// namespace + shard to decide precommit-reclaim liveness.
+    RootNamespace buildRootNs() const;
+    uint64_t buildShard() const;
 
     void requireAlive() const;                            /// throws LOGICAL_ERROR after abandon
 

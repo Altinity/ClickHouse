@@ -49,6 +49,9 @@ String toString(CasEventType type)
         case CasEventType::BuildStart:            return "build_start";
         case CasEventType::BuildPublish:          return "build_publish";
         case CasEventType::BuildAbort:            return "build_abort";
+        case CasEventType::Precommit:             return "precommit";
+        case CasEventType::PrecommitRemoved:      return "precommit_removed";
+        case CasEventType::PrecommitReclaim:      return "precommit_reclaim";
         case CasEventType::GateRevalidate:        return "gate_revalidate";
         case CasEventType::GateResurrect:         return "gate_resurrect";
         case CasEventType::WatermarkRenew:        return "watermark_renew";

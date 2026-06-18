@@ -20,7 +20,8 @@ enum class CasEventType
     RefPublish, RefDrop, RefRepoint, RootAdd, RootRemove, RootRepoint, IndegZero,
     GcFoldBegin, GcFoldEnd, GcRetireObserve, GcRetireDecision, GcRecheckVerdict,
     GcFence, GcSnapPersist, GcCursorAdvance, GcTrim, GcLeaseAcquire, GcLeaseSteal, GcLeaseHeartbeat,
-    BuildStart, BuildPublish, BuildAbort, GateRevalidate, GateResurrect, WatermarkRenew, Heartbeat,
+    BuildStart, BuildPublish, BuildAbort, Precommit, PrecommitRemoved, PrecommitReclaim,
+    GateRevalidate, GateResurrect, WatermarkRenew, Heartbeat,
     RefResolve, ReadMissing, DanglingAccess,
     FailClosed, CorruptDecode, SnapJournalIncoherent, Exception,
 };

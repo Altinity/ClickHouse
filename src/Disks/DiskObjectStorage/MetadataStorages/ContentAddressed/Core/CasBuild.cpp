@@ -553,6 +553,28 @@ ObjectMeta Build::ownerMeta() const
         u128ToHex(store->poolConfig().server_id) + ":" + std::to_string(epoch) + ":" + std::to_string(build_seq)}};
 }
 
+RootNamespace Build::buildRootNs() const
+{
+    /// `_builds/<server_hex>` — the build-root namespace for this server (B171, spec §A).
+    return RootNamespace{"_builds/" + u128ToHex(store->poolConfig().server_id)};
+}
+
+uint64_t Build::buildShard() const
+{
+    /// One shard per in-flight build, keyed by the per-process monotone build_seq.
+    return build_seq;
+}
+
+void Build::precommit(const TreeId & manifest)
+{
+    requireAlive();
+    /// TODO(B171 Task 2): publish `manifest` under buildRootNs()/buildShard() via
+    /// store->ensureRegistered + store->mutateShard (ref "part" -> manifest, journal Add), and emit
+    /// CasEvent::Precommit. STUB for the Task 1 RED repro: does nothing yet, so GC still deletes the
+    /// shared blob under the retired source build and the dangle reproduces.
+    (void)manifest;
+}
+
 void Build::gateCheckDeps()
 {
     /// Iterating `deps` while resurrect/observeAndAdmit MUTATE deps is safe: both OVERWRITE the SAME
