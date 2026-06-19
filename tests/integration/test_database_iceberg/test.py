@@ -113,7 +113,7 @@ def create_table(
     return catalog.create_table(
         identifier=f"{namespace}.{table}",
         schema=schema,
-        location=f"s3://warehouse-rest/data",
+        location=f"s3://warehouse-rest/data/{namespace}/{table}",
         partition_spec=partition_spec,
         sort_order=sort_order,
     )
