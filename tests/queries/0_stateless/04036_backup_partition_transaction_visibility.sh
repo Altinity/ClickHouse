@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Tags: no-ordinary-database
-# no-content-addressed-storage: RESTORE writes new content part files (column blobs) via an autocommit one-shot, not through a multi-part ContentAddressedTransaction, so it hits "Autocommit writes are not supported for content part files" (Code 48 NOT_IMPLEMENTED) in DiskObjectStorageTransaction. Orthogonal to multi-part txn support — needs the BACKUP/RESTORE-on-CA contract (B16/B34).
 
 # Regression test for PR #99775:
 # getVisibleDataPartsVectorInPartitions used Active state twice instead of
