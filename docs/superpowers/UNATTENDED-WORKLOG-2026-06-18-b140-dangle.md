@@ -107,3 +107,11 @@ GC reclaims it under a still-in-flight adopter → publish dangles. Pinned live 
   event log on, keep-alive, metrics `soak_b171_12h_v2.db`) on the validated binary (`fa034f74313`);
   fresh cluster, pool reset. Tracked 20-min watcher running. This is the final 12h validation
   (task #141). All prior phases (backlog, TLA+, C++ impl, review, regression-fix) DONE.
+- **T15 — 12h soak progress (through ~2h, warmup→steady→mutations):** HEALTHY. Zero dangle the whole
+  way (CORRUPTED_DATA 0, fail_closed/read_missing/corrupt/incoherent 0). GC reclaim pipeline working
+  (del 1.48M, retire 1.48M, strip 127k); **pool BOUNDED** (sawtooth ~630–675k objects / ~13 GB,
+  reclaim keeping pace — the bounded-shard fix confirmed at scale, vs the wedged run's unbounded
+  growth). precommit lifecycle clean (~309k/309k, ≈30 in-flight); precommit_reclaim 228 (legit
+  abandoned builds) with **false-reclaim "frozen" = 0** (no false positives on live builds). A ~112k
+  steady-state replica lag at ~1h40m **converged to EXACT equality** (ch1==ch2==6,488,830) at the
+  mutations-stage checkpoint — benign lag, not divergence. Mem ~0.8–1.2 GB. Chaos window opens ~+4.8h.
