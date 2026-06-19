@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
 
 using namespace DB::Cas;
 
@@ -95,4 +96,9 @@ TEST(CasLayout, RegistryKeyAndReservedSegment)
     EXPECT_THROW(l.rootShardKey(RootNamespace{"_registry"}, 0), DB::Exception);
     EXPECT_THROW(l.rootShardKey(RootNamespace{"_registry/x"}, 0), DB::Exception);
     EXPECT_THROW(l.rootShardKey(RootNamespace{"a/_registry"}, 0), DB::Exception);
+}
+
+TEST(CasLayout, CasArchiveSuffixConstant)
+{
+    EXPECT_EQ(DB::ContentAddressed::kCasArchiveSuffix, "@cas@");
 }
