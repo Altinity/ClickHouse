@@ -174,8 +174,23 @@ public:
         if (last_ns_segment.empty())
             return std::nullopt;                       /// empty ns segment ("a//7", "//7") — Layout never writes these
 
+        /// @cas@-scoped shard parsing (design §5.1/§5.2): a key is a root-shard manifest ONLY when its
+        /// namespace's last segment is a content-addressed archive directory (`…@cas@`), or it is a
+        /// legacy build-root namespace (`_builds/…`, relocated in Phase 6). A plain mountpoint object
+        /// with a numeric tail and no `@cas@` ancestor (`roots/srv1/foo/7`) is an opaque ordinary file
+        /// and is NEVER classified as a shard.
+        const bool is_cas_archive = last_ns_segment.ends_with("@cas@");
+        const bool is_legacy_build_root = ns.starts_with("_builds/");   /// removed in Phase 6
+        if (!is_cas_archive && !is_legacy_build_root && !isPrecommitNamespaceSegment(last_ns_segment))
+            return std::nullopt;
+
         return std::make_pair(RootNamespace{String(ns)}, shard);
     }
+
+    /// True iff a namespace's last segment is the per-server precommit area (`_precommits`). Phase 1
+    /// stub: returns false until Phase 6 relocates precommits under `roots/<server>/_precommits`.
+    /// Until then build-root shards live at `_builds/<server_hex>/<N>`, admitted by `is_legacy_build_root`.
+    static bool isPrecommitNamespaceSegment(std::string_view) { return false; }
 
     /// Retired-set key: <prefix>/gc/retired/<round>.<fence_seq>/<shard>
     String retiredKey(uint64_t round, uint64_t fence_seq, uint64_t shard) const
