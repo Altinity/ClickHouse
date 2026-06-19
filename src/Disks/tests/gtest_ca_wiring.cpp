@@ -393,7 +393,8 @@ TEST(CaWiringRead, VerbatimNamespaceFiles)
     storage->store()->putNamespaceFile(storage->liveNamespace("uuid-1"), "format_version.txt", "1\n");
     storage->store()->putNamespaceFile(
         storage->liveNamespace("uuid-1"), "deduplication_logs/deduplication_log_1.txt", "log-bytes");
-    storage->store()->putNamespaceFile(storage->genericNamespace(), "clickhouse_access_check_xyz", "ok");
+    /// Loose disk-root files are plain mountpoint objects (design §5.2), not namespace files.
+    storage->store()->putMountpointObject(storage->serverId() + "/" + "clickhouse_access_check_xyz", "ok");
 
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/format_version.txt"));
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/format_version.txt"), 2u);
@@ -410,9 +411,11 @@ TEST(CaWiringRead, VerbatimNamespaceFiles)
               (std::vector<std::string>{"deduplication_log_1.txt"}));
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/deduplication_logs/deduplication_log_1.txt"));
 
-    /// Generic disk-root files route to the reserved generic namespace.
+    /// Loose disk-root files are plain objects — existsFile checks the mountpoint object, not a namespace file.
     EXPECT_TRUE(storage->existsFile("clickhouse_access_check_xyz"));
-    EXPECT_EQ(storage->tryGetInManifestBytes("clickhouse_access_check_xyz"), std::optional<String>("ok"));
+    /// Loose files are real objects — tryGetInManifestBytes returns nullopt (not in-manifest bytes).
+    EXPECT_EQ(storage->tryGetInManifestBytes("clickhouse_access_check_xyz"), std::nullopt);
+    EXPECT_EQ(storage->getFileSize("clickhouse_access_check_xyz"), 2u);
     EXPECT_FALSE(storage->existsFile("clickhouse_access_check_other"));
 }
 

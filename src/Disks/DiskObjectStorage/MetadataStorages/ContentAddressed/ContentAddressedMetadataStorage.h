@@ -134,7 +134,7 @@ public:
     Cas::RootNamespace liveNamespace(const std::string & table_uuid) const;
     Cas::RootNamespace detachedNamespace(const std::string & table_uuid) const;
     static Cas::RootNamespace shadowNamespace(const std::string & shadow_table_dir);
-    Cas::RootNamespace genericNamespace() const;
+    // (genericNamespace removed — loose files are plain mountpoint objects, design §5.2)
 
     /// The route of one parsed CA path: which namespace, which ref, which in-tree file. The single
     /// place the detached re-split (PoC B36 parser contract -> per-part detached refs) and the

@@ -413,12 +413,6 @@ Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::s
     return Cas::RootNamespace{canonicalDiskPath(shadow_table_dir)};
 }
 
-Cas::RootNamespace ContentAddressedMetadataStorage::genericNamespace() const
-{
-    /// Generic disk-root files (the startup access-check probe). "_disk" can never collide with a
-    /// real table identifier (uuids / data/<db>/<tbl> paths).
-    return Cas::RootNamespace{server_id + "/_disk"};
-}
 
 std::optional<ContentAddressedMetadataStorage::Route>
 ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p) const
@@ -464,7 +458,8 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     {
         if (auto tf = ContentAddressed::parseTableFilePath(path))
             return store()->getNamespaceFile(liveNamespace(tf->table_uuid), tf->tail).has_value();
-        return store()->getNamespaceFile(genericNamespace(), path).has_value();
+        /// A loose mountpoint object (design §5.2): a plain object at roots/<server>/<path>.
+        return store()->getMountpointObject(server_id + "/" + path).has_value();
     }
 
     auto p = ContentAddressed::parsePartFilePath(path);
@@ -566,7 +561,12 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
         return bytes->size();
 
     if (!ContentAddressed::isPartFilePath(path))
+    {
+        /// A loose mountpoint object (design §5.2): read and return its byte length.
+        if (auto bytes = store()->getMountpointObject(server_id + "/" + path))
+            return bytes->size();
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
+    }
 
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
@@ -769,7 +769,17 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         return {StoredObject("", path, bytes->size())};
 
     if (!ContentAddressed::isPartFilePath(path))
+    {
+        if (ContentAddressed::parseTableFilePath(path))
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                "ContentAddressed: table-level verbatim file is in-manifest, not a storage object: {}", path);
+        /// A loose mountpoint object: a real plain object at roots/<server>/<path>. The
+        /// StoredObject key must be the PHYSICAL path (physicalKey-adjusted for Local backends).
+        const std::string pool_key = store()->layout().mountpointObjectKey(server_id + "/" + path);
+        if (store()->getMountpointObject(server_id + "/" + path))
+            return {StoredObject(physicalKey(pool_key), path, getFileSize(path))};
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
+    }
 
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
@@ -803,7 +813,7 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     {
         if (auto tf = ContentAddressed::parseTableFilePath(path))
             return store()->getNamespaceFile(liveNamespace(tf->table_uuid), tf->tail);
-        return store()->getNamespaceFile(genericNamespace(), path);
+        return std::nullopt;   /// loose files are plain objects, not in-manifest bytes (design §5.2)
     }
 
     auto p = ContentAddressed::parsePartFilePath(path);

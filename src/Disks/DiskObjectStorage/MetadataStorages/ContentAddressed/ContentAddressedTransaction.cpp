@@ -393,26 +393,30 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     /// append depends on this).
     if (!ContentAddressed::isPartFilePath(path))
     {
-        Cas::RootNamespace ns{""};
-        std::string name;
         if (auto tf = ContentAddressed::parseTableFilePath(path))
         {
-            ns = metadata_storage.liveNamespace(tf->table_uuid);
-            name = tf->tail;
+            const Cas::RootNamespace ns = metadata_storage.liveNamespace(tf->table_uuid);
+            const std::string name = tf->tail;
+            std::string prefix_bytes;
+            if (mode == WriteMode::Append)
+                if (auto existing = metadata_storage.store()->getNamespaceFile(ns, name))
+                    prefix_bytes = std::move(*existing);
+            return std::make_unique<ContentAddressed::CaInlineWriteBuffer>(
+                [this, ns, name, carried = std::move(prefix_bytes)](std::string bytes)
+                {
+                    metadata_storage.store()->putNamespaceFile(ns, name, carried + bytes);
+                });
         }
-        else
-        {
-            ns = metadata_storage.genericNamespace();
-            name = path;
-        }
+        /// A loose disk file (the startup write probe): a plain mountpoint object (design §5.2).
+        const std::string key = metadata_storage.serverId() + "/" + path;
         std::string prefix_bytes;
         if (mode == WriteMode::Append)
-            if (auto existing = metadata_storage.store()->getNamespaceFile(ns, name))
+            if (auto existing = metadata_storage.store()->getMountpointObject(key))
                 prefix_bytes = std::move(*existing);
         return std::make_unique<ContentAddressed::CaInlineWriteBuffer>(
-            [this, ns, name, carried = std::move(prefix_bytes)](std::string bytes)
+            [this, key, carried = std::move(prefix_bytes)](std::string bytes)
             {
-                metadata_storage.store()->putNamespaceFile(ns, name, carried + bytes);
+                metadata_storage.store()->putMountpointObject(key, carried + bytes);
             });
     }
 
@@ -790,25 +794,40 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
 
 void ContentAddressedTransaction::moveFile(const std::string & path_from, const std::string & path_to)
 {
-    /// Verbatim table-level / generic files: physically move the namespace file (the mutation
-    /// entry tmp_mutation_N.txt -> mutation_N.txt rename; already durable from its finalize).
+    /// Verbatim table-level files and loose mountpoint files: physically move the object (the
+    /// mutation entry tmp_mutation_N.txt -> mutation_N.txt rename; already durable from its finalize).
     if (!ContentAddressed::isPartFilePath(path_from) && !ContentAddressed::isPartFilePath(path_to))
     {
-        auto locate_verbatim = [&](const std::string & path) -> std::pair<Cas::RootNamespace, std::string>
+        auto move_table_verbatim = [&](const ContentAddressed::TableFilePath & src_tf,
+                                       const ContentAddressed::TableFilePath & dst_tf)
         {
-            if (auto tf = ContentAddressed::parseTableFilePath(path))
-                return {metadata_storage.liveNamespace(tf->table_uuid), tf->tail};
-            return {metadata_storage.genericNamespace(), path};
+            const Cas::RootNamespace src_ns = metadata_storage.liveNamespace(src_tf.table_uuid);
+            const Cas::RootNamespace dst_ns = metadata_storage.liveNamespace(dst_tf.table_uuid);
+            if (src_ns.string() == dst_ns.string() && src_tf.tail == dst_tf.tail)
+                return;
+            auto bytes = metadata_storage.store()->getNamespaceFile(src_ns, src_tf.tail);
+            if (!bytes)
+                throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: moveFile source missing: {}", path_from);
+            metadata_storage.store()->putNamespaceFile(dst_ns, dst_tf.tail, *bytes);
+            metadata_storage.store()->removeNamespaceFile(src_ns, src_tf.tail);
         };
-        auto [src_ns, src_name] = locate_verbatim(path_from);
-        auto [dst_ns, dst_name] = locate_verbatim(path_to);
-        if (src_ns.string() == dst_ns.string() && src_name == dst_name)
+        auto src_tf = ContentAddressed::parseTableFilePath(path_from);
+        auto dst_tf = ContentAddressed::parseTableFilePath(path_to);
+        if (src_tf && dst_tf)
+        {
+            move_table_verbatim(*src_tf, *dst_tf);
             return;
-        auto bytes = metadata_storage.store()->getNamespaceFile(src_ns, src_name);
+        }
+        /// Loose mountpoint files (rare): read + put + remove plain objects.
+        const std::string src_key = metadata_storage.serverId() + "/" + path_from;
+        const std::string dst_key = metadata_storage.serverId() + "/" + path_to;
+        if (src_key == dst_key)
+            return;
+        auto bytes = metadata_storage.store()->getMountpointObject(src_key);
         if (!bytes)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: moveFile source missing: {}", path_from);
-        metadata_storage.store()->putNamespaceFile(dst_ns, dst_name, *bytes);
-        metadata_storage.store()->removeNamespaceFile(src_ns, src_name);
+        metadata_storage.store()->putMountpointObject(dst_key, *bytes);
+        metadata_storage.store()->removeMountpointObject(src_key);
         return;
     }
 
@@ -907,14 +926,15 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
         return;
     }
 
-    /// Verbatim table-level / generic file: reclaim the object NOW (the GC never scans them; a
-    /// pruned mutation entry would otherwise leak until DROP - the PoC's B50).
+    /// Verbatim table-level / loose mountpoint file: reclaim the object NOW (GC never scans them;
+    /// a pruned mutation entry would otherwise leak until DROP - the PoC's B50).
     if (auto tf = ContentAddressed::parseTableFilePath(path))
     {
         metadata_storage.store()->removeNamespaceFile(metadata_storage.liveNamespace(tf->table_uuid), tf->tail);
         return;
     }
-    metadata_storage.store()->removeNamespaceFile(metadata_storage.genericNamespace(), path);
+    /// Loose mountpoint file: exact-token delete of the plain object (design §5.2).
+    metadata_storage.store()->removeMountpointObject(metadata_storage.serverId() + "/" + path);
 }
 
 void ContentAddressedTransaction::truncateFile(const std::string &, size_t)

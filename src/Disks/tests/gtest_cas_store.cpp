@@ -919,6 +919,16 @@ TEST(CasStore, MountpointObjectRoundTrip)
     EXPECT_FALSE(store->getMountpointObject(key).has_value());
 }
 
+TEST(CasStore, LooseFileNotAShardCandidate)
+{
+    using namespace DB::Cas;
+    auto b = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    /// A loose probe object whose tail is numeric must NOT be classified as a shard manifest.
+    store->putMountpointObject("srv1/probe/7", "x");
+    EXPECT_FALSE(store->layout().tryParseRootShardKey(store->layout().mountpointObjectKey("srv1/probe/7")).has_value());
+}
+
 TEST(CasStoreDecodeTtl, ConcurrentWriteDuringGetDoesNotPoisonStaleEntry)
 {
     using namespace DB::Cas;
