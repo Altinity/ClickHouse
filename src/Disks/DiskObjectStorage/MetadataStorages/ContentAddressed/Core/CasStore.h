@@ -181,6 +181,14 @@ private:
     /// which need the token for the CAS) and as the uncached primitive under readShardDecoded.
     std::pair<RootShard, std::optional<Token>> readShard(const RootNamespace & ns, uint64_t shard);
 
+    /// ---- plain-object CAS helpers (shared by namespace-file and mountpoint-object paths) ----
+    /// head + putIfAbsent/putOverwrite loop (bounded by MAX_CAS_ATTEMPTS); throws ABORTED on live-lock.
+    void casPutObject(const String & full_key, const String & bytes);
+    /// Plain get → bytes; returns nullopt when absent.
+    std::optional<String> casGetObject(const String & full_key);
+    /// head + deleteExact loop; no-op when absent. Throws ABORTED on live-lock.
+    void casRemoveObject(const String & full_key);
+
     /// Read-path shard read with a token-validated DECODE CACHE (B113): a `head` fetches the current
     /// token cheaply; on a token match the already-decoded, IMMUTABLE manifest is returned without a
     /// `get` or a re-decode (the dominant read-heavy cost — the whole shard manifest holds many refs).

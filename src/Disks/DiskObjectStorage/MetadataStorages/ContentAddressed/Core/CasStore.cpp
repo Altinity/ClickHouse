@@ -121,37 +121,60 @@ uint64_t Store::shardOf(const String & ref_name) const
     return CityHash_v1_0_2::CityHash64(ref_name.data(), ref_name.size()) % meta.root_shards;
 }
 
-void Store::putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes)
+void Store::casPutObject(const String & full_key, const String & bytes)
 {
-    /// Verbatim files are plain keys, never content-addressed: head + conditional write, with a bounded
-    /// retry on contention. These keys have a single owner, so a contention storm is impossible — the
-    /// bound is purely a runaway brake.
-    const String key = pool_layout.namespaceFileKey(ns, name);
+    /// head + putIfAbsent/putOverwrite loop. Single-owner keys make a contention storm impossible;
+    /// the bound is a runaway brake.
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
     {
-        HeadResult head = pool_backend->head(key);
+        HeadResult head = pool_backend->head(full_key);
         if (!head.exists)
         {
-            if (pool_backend->putIfAbsent(key, bytes) == PutOutcome::Done)
+            if (pool_backend->putIfAbsent(full_key, bytes) == PutOutcome::Done)
                 return;
         }
         else
         {
-            if (pool_backend->putOverwrite(key, bytes, head.token) == PutOutcome::Done)
+            if (pool_backend->putOverwrite(full_key, bytes, head.token) == PutOutcome::Done)
                 return;
         }
         /// PreconditionFailed ⇒ the observed state changed under us; re-head and retry.
     }
-    throw Exception(ErrorCodes::ABORTED, "verbatim file CAS contention on '{}'", key);
+    throw Exception(ErrorCodes::ABORTED, "object CAS contention on '{}'", full_key);
+}
+
+std::optional<String> Store::casGetObject(const String & full_key)
+{
+    std::optional<GetResult> result = pool_backend->get(full_key);
+    if (!result)
+        return std::nullopt;
+    return result->bytes;
+}
+
+void Store::casRemoveObject(const String & full_key)
+{
+    /// head + deleteExact loop; no-op when absent. Single-owner keys; the bound is a runaway brake.
+    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
+    {
+        const HeadResult head = pool_backend->head(full_key);
+        if (!head.exists)
+            return;
+        const DeleteOutcome outcome = pool_backend->deleteExact(full_key, head.token);
+        if (outcome.kind == DeleteOutcome::Kind::Deleted || outcome.kind == DeleteOutcome::Kind::NotFound)
+            return;
+        /// TokenMismatch: a concurrent rewrite — re-head and retry.
+    }
+    throw Exception(ErrorCodes::ABORTED, "object CAS contention on '{}' (runaway live-lock brake)", full_key);
+}
+
+void Store::putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes)
+{
+    casPutObject(pool_layout.namespaceFileKey(ns, name), bytes);
 }
 
 std::optional<String> Store::getNamespaceFile(const RootNamespace & ns, const String & name)
 {
-    const String key = pool_layout.namespaceFileKey(ns, name);
-    std::optional<GetResult> result = pool_backend->get(key);
-    if (!result)
-        return std::nullopt;
-    return result->bytes;
+    return casGetObject(pool_layout.namespaceFileKey(ns, name));
 }
 
 std::vector<String> Store::listNamespaceFiles(const RootNamespace & ns)
@@ -639,67 +662,22 @@ void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
 
 void Store::removeNamespaceFile(const RootNamespace & ns, const String & name)
 {
-    const String key = pool_layout.namespaceFileKey(ns, name);
-    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
-    {
-        const HeadResult head = pool_backend->head(key);
-        if (!head.exists)
-            return;
-        const DeleteOutcome outcome = pool_backend->deleteExact(key, head.token);
-        if (outcome.kind == DeleteOutcome::Kind::Deleted || outcome.kind == DeleteOutcome::Kind::NotFound)
-            return;
-        /// TokenMismatch: a concurrent rewrite - re-head and retry (single-owner keys, runaway brake).
-    }
-    throw Exception(ErrorCodes::ABORTED,
-        "CAS removeNamespaceFile contention on {} (runaway live-lock brake)", key);
+    casRemoveObject(pool_layout.namespaceFileKey(ns, name));
 }
 
 void Store::putMountpointObject(const String & key, const String & bytes)
 {
-    /// Plain mountpoint object: same head + conditional-write CAS shape as `putNamespaceFile`,
-    /// but the key is `roots/<key>` with no namespace or `_files` wrapper (design §5.2).
-    /// Single-owner keys make a contention storm impossible; the bound is a runaway brake.
-    const String full_key = pool_layout.mountpointObjectKey(key);
-    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
-    {
-        HeadResult head = pool_backend->head(full_key);
-        if (!head.exists)
-        {
-            if (pool_backend->putIfAbsent(full_key, bytes) == PutOutcome::Done)
-                return;
-        }
-        else
-        {
-            if (pool_backend->putOverwrite(full_key, bytes, head.token) == PutOutcome::Done)
-                return;
-        }
-    }
-    throw Exception(ErrorCodes::ABORTED, "mountpoint object CAS contention on '{}'", full_key);
+    casPutObject(pool_layout.mountpointObjectKey(key), bytes);
 }
 
 std::optional<String> Store::getMountpointObject(const String & key)
 {
-    const std::optional<GetResult> result = pool_backend->get(pool_layout.mountpointObjectKey(key));
-    if (!result)
-        return std::nullopt;
-    return result->bytes;
+    return casGetObject(pool_layout.mountpointObjectKey(key));
 }
 
 void Store::removeMountpointObject(const String & key)
 {
-    /// Exact-token delete of a plain mountpoint object (design §5.2). No-op when absent.
-    const String full_key = pool_layout.mountpointObjectKey(key);
-    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
-    {
-        const HeadResult head = pool_backend->head(full_key);
-        if (!head.exists)
-            return;
-        const DeleteOutcome outcome = pool_backend->deleteExact(full_key, head.token);
-        if (outcome.kind == DeleteOutcome::Kind::Deleted || outcome.kind == DeleteOutcome::Kind::NotFound)
-            return;
-    }
-    throw Exception(ErrorCodes::ABORTED,
-        "CAS removeMountpointObject contention on '{}' (runaway live-lock brake)", full_key);
+    casRemoveObject(pool_layout.mountpointObjectKey(key));
 }
 
 void Store::dropNamespace(const RootNamespace & ns)
