@@ -426,12 +426,6 @@ void ExportPartitionManifestUpdatingTask::poll()
 
             const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
 
-            /// Read last_exception leaves (no watch). Surfacing exceptions in the system table relies
-            /// on this read being part of every poll cycle: per-part failures during PENDING do not
-            /// trigger a status watch, so the only refresh path while the task is still in-flight is
-            /// the periodic poll. An empty result collapses every "nothing actionable" case
-            /// (transient ZK error, no children, all leaves ZNONODE/malformed) into a no-op so the
-            /// in-memory copy stays intact.
             auto last_exception_per_replica = readLastExceptionPerReplica(
                 zk, fs::path(entry_path), key, storage.log.load());
 
@@ -439,40 +433,43 @@ void ExportPartitionManifestUpdatingTask::poll()
 
             /// If the zk entry has been replaced with export_merge_tree_partition_force_export, checking only for the export key is not enough
             /// we need to make sure it is the same transaction id. If it is not, it needs to be replaced.
-            bool has_local_entry_and_is_up_to_date = local_entry != entries_by_key.end()
+            bool has_local_entry = local_entry != entries_by_key.end()
                 && local_entry->manifest.transaction_id == metadata.transaction_id;
 
-            /// If the entry is up to date and we don't have the cleanup lock, refresh the in-memory
-            /// last_exception (surfaced by system.replicated_partition_exports) and early exit.
-            /// The `mutable` field is mutated under a brief exclusive mirror lock so a concurrent
-            /// shared-lock reader never observes a half-written value.
-            if (!cleanup_lock && has_local_entry_and_is_up_to_date)
+            std::string status_string;
+
+            /// In theory, we should be notified when the status changes by the status watch
+            /// but in practice, the watch is not always reliable (e.g. if the ZooKeeper session is lost)
+            /// so we need to read the status from the ZK node directly.
+            if (has_local_entry)
             {
-                if (!last_exception_per_replica.empty())
+                ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+                ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+
+                zk->tryGet(fs::path(entry_path) / "status", status_string);
+            }
+            else
+            {
+                /// If we don't have a local entry, we need to arm a status watch to be notified when the status changes
+                std::weak_ptr<ExportPartitionManifestUpdatingTask> weak_manifest_updater = storage.export_merge_tree_partition_manifest_updater;
+                auto status_watch_callback = std::make_shared<Coordination::WatchCallback>([weak_manifest_updater, key](const Coordination::WatchResponse &)
                 {
-                    auto mirror_lock = ExportPartitionUtils::lockExclusive(storage.export_merge_tree_partition_mutex);
-                    local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
-                }
-                continue;
+                    /// If the table is dropped but the watch is not removed, we need to prevent use after free
+                    /// below code assumes that if manifest updater is still alive, the status handling task is also alive
+                    if (auto manifest_updater = weak_manifest_updater.lock())
+                    {
+                        manifest_updater->addStatusChange(key);
+                        manifest_updater->storage.export_merge_tree_partition_status_handling_task->schedule();
+                    }
+                });
+
+                ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+                ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetWatch);
+    
+                zk->tryGetWatch(fs::path(entry_path) / "status", status_string, nullptr, status_watch_callback);
             }
 
-            std::weak_ptr<ExportPartitionManifestUpdatingTask> weak_manifest_updater = storage.export_merge_tree_partition_manifest_updater;
-
-            auto status_watch_callback = std::make_shared<Coordination::WatchCallback>([weak_manifest_updater, key](const Coordination::WatchResponse &)
-            {
-                /// If the table is dropped but the watch is not removed, we need to prevent use after free
-                /// below code assumes that if manifest updater is still alive, the status handling task is also alive
-                if (auto manifest_updater = weak_manifest_updater.lock())
-                {
-                    manifest_updater->addStatusChange(key);
-                    manifest_updater->storage.export_merge_tree_partition_status_handling_task->schedule();
-                }
-            });
-
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetWatch);
-            std::string status_string;
-            if (!zk->tryGetWatch(fs::path(entry_path) / "status", status_string, nullptr, status_watch_callback))
+            if (status_string.empty())
             {
                 LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: missing status", key);
                 continue;
@@ -507,21 +504,29 @@ void ExportPartitionManifestUpdatingTask::poll()
                     continue;
             }
 
-            if (has_local_entry_and_is_up_to_date)
+            if (!has_local_entry)
             {
-                /// Same refresh as the early-exit branch above; we also reach this point when
-                /// holding the cleanup lock (cleanup did not consume the entry). Mutated under a
-                /// brief exclusive mirror lock.
-                if (!last_exception_per_replica.empty())
-                {
-                    auto mirror_lock = ExportPartitionUtils::lockExclusive(storage.export_merge_tree_partition_mutex);
-                    local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
-                }
-                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: already exists", key);
-                continue;
+                addTask(metadata, *status, std::move(last_exception_per_replica), key, entries_by_key);
+                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Added new entry for task {}", key);
             }
 
-            addTask(metadata, *status, std::move(last_exception_per_replica), key, entries_by_key);
+            /// If we already have the local entry, we need to update it if the status has changed or if there are new last exceptions
+            const bool status_changed = local_entry->status != *status;
+            if (!last_exception_per_replica.empty() || status_changed)
+            {
+                auto mirror_lock = ExportPartitionUtils::lockExclusive(storage.export_merge_tree_partition_mutex);
+                if (!last_exception_per_replica.empty())
+                    local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
+                if (status_changed)
+                {
+                    local_entry->status = *status;
+                    if (local_entry->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+                        /// terminal now - we no longer need to keep the data parts alive
+                        local_entry->part_references.clear();
+                }
+            }
+            LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: already exists", key);
+            
         }
 
         /// Remove entries that were deleted by someone else
