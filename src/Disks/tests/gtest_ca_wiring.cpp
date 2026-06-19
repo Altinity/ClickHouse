@@ -919,7 +919,7 @@ public:
 };
 
 /// True for a root-shard manifest key (<...>/roots/<namespace...>/<shard_number>) — the object a
-/// single publish CASes. Tree blobs (blobs/ prefix), the registry (roots/_registry) and verbatim
+/// single publish CASes. Tree blobs (blobs/ prefix), the registry (`gc/registry`) and verbatim
 /// files (roots/<ns>/_files/...) are excluded, so counting these isolates publishes one-for-one.
 bool isShardManifestPath(const std::string & path)
 {

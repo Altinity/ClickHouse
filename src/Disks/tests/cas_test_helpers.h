@@ -140,7 +140,7 @@ inline DB::Cas::TreeId writeTreeRaw(
     return id;
 }
 
-/// Register a namespace in roots/_registry exactly as a writer's W-REGISTER does (read-modify-CAS
+/// Register a namespace in `gc/registry` exactly as a writer's W-REGISTER does (read-modify-CAS
 /// append; no-op if already present). Raw-manifest fixtures MUST register: GC discovers namespaces
 /// from the registry, never LIST — an unregistered namespace's manifests are invisible to it.
 inline void registerNamespaceRaw(

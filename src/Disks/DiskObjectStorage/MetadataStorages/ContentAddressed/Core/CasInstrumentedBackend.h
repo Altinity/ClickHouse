@@ -19,7 +19,7 @@ namespace DB::Cas
 ///   <prefix>/blobs/..   → Blob
 ///   <prefix>/trees/..   → Tree
 ///   <prefix>/packs/..   → Pack
-///   <prefix>/roots/..   → Root  (incl. /roots/_registry and /roots/<ns>/_files/)
+///   <prefix>/roots/..   → Root  (incl. /roots/<ns>/_files/ and mountpoint objects)
 ///   <prefix>/gc/..      → Gc
 ///   <prefix>/builds/..  → Build
 ///   <prefix>/servers/.. → Server

@@ -1223,7 +1223,8 @@ TEST(CasGcFence, RegistryFencedAndRecorded)
 {
     /// The namespace registry is fenced FIRST (the ordering point for namespace creation): after a
     /// round its fence_round equals the round and the committed registry_version is recorded under
-    /// the reserved "_registry" key.
+    /// the reserved `"_registry"` logical key in the fence_version map (the physical key is now
+    /// `gc/registry`, but the fence map label is a separate GC-internal discriminator).
     auto b = std::make_shared<CaptureStateBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     publishPart(s, "srv1/tbl", "part_1", "payload-1");

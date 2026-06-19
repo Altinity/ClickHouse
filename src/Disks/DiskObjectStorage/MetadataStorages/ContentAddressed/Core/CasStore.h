@@ -141,7 +141,7 @@ public:
     /// build-root shard with it.
     uint64_t shardOf(const String & ref_name) const;
 
-    /// W-REGISTER (spec §5, decision 2026-06-12): CAS-append `ns` to roots/_registry if not yet
+    /// W-REGISTER (spec §5, decision 2026-06-12): CAS-append `ns` to `gc/registry` if not yet
     /// present, BEFORE the namespace's first manifest is created — this orders namespace creation
     /// against the GC fence. Returns the registry's fence_round observed/committed in the
     /// registering attempt: the GATE FLOOR for a first publish into the namespace (a floor of 0

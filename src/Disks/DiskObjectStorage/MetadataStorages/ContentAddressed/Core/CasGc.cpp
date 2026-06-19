@@ -794,8 +794,8 @@ void Gc::fence(GcState & state, Token & state_token)
     /// fence is in this round's discovery (its shards are fenced below); one registering AFTER it
     /// observes fence_round >= round and must refresh its retire view before its first publish
     /// (W-REGISTER gate floor) - the two-horn argument at namespace granularity. The committed
-    /// registry_version is recorded under the reserved "_registry" key (checkNamespace forbids it
-    /// as a namespace segment, so it can never collide with an "ns/shard" entry).
+    /// registry_version is recorded under the reserved `"_registry"` key in `fence_version` (a
+    /// logical discriminator that never collides with any `"ns/shard"` entry).
     ///
     /// The registry decoded in the COMMITTED attempt is ALSO the shard-fence universe below. It
     /// must be: the fold's registry read is STALE by fence time, and a namespace registered in

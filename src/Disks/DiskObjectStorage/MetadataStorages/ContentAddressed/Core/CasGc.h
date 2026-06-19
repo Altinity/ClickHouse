@@ -199,7 +199,7 @@ private:
     /// ABSENT via the verified mutateShard loop (the create-if-absent CAS MINTS a fence-only
     /// manifest for an absent shard; the create race against a first publish into that shard is
     /// the required total order). Record each shard's committed shard_version (and the registry's
-    /// committed version under the reserved "_registry" key) in gc/state.fence_version[round] —
+    /// committed version under the reserved `"_registry"` logical key) in `gc/state.fence_version[round]` —
     /// the durable fence positions the recheck folds through (provable coverage; the model's
     /// fencePos[s]). The manifest CAS totally orders the fence against publishes on that shard —
     /// exactly the ordering the spec's no-return argument rests on. One fence covers the whole

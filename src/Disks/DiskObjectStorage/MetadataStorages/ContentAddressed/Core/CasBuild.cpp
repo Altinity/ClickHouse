@@ -587,9 +587,9 @@ void Build::precommit(const TreeId & manifest)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "precommit: tree {} was not built/adopted by this Build", manifest.string());
 
-    /// W-REGISTER: the build-root namespace must be in roots/_registry before its first manifest exists,
+    /// W-REGISTER: the build-root namespace must be in `gc/registry` before its first manifest exists,
     /// so GC discovers it (it is an ordinary namespace key-wise; only behavioral branches key off
-    /// isBuildRootNamespace). Monotone — a cache hit short-circuits without I/O.
+    /// `isBuildRootNamespace`). Monotone — a cache hit short-circuits without I/O.
     const RootNamespace ns = buildRootNs();
     store->ensureRegistered(ns);
 
@@ -889,7 +889,7 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
             heartbeat->renewOnce();
     }
 
-    /// W-REGISTER (spec §5, decision 2026-06-12): a namespace must be in roots/_registry BEFORE its
+    /// W-REGISTER (spec §5, decision 2026-06-12): a namespace must be in `gc/registry` BEFORE its
     /// first manifest exists — that is what orders namespace CREATION against the GC fence. The
     /// returned registry fence_round is the GATE FLOOR for this publish: a brand-new namespace's
     /// shard manifest carries fence_round 0 and could never trigger the refresh below on its own,

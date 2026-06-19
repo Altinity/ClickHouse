@@ -729,7 +729,7 @@ TEST(CasBuild, TwoBuildsPublishToSameShardSerialize)
 TEST(CasBuild, FirstPublishRegistersNamespace)
 {
     /// W-REGISTER (spec section 5, decision 2026-06-12): the first publish into a namespace
-    /// CAS-appends it to roots/_registry BEFORE the manifest exists; later publishes into the same
+    /// CAS-appends it to `gc/registry` BEFORE the manifest exists; later publishes into the same
     /// namespace hit the Store's monotone cache and leave the registry untouched.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});

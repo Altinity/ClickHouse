@@ -60,14 +60,14 @@ public:
         return shardedKey("packs", id.string());
     }
 
-    /// The namespace registry (spec §4, decision 2026-06-12): the authoritative namespace
-    /// universe, CAS-appended by a writer's first publish into a namespace (W-REGISTER), fenced by
-    /// GC like a shard, and the source of GC discovery (never LIST). The `_registry` tail is
-    /// non-numeric, so tryParseRootShardKey never classifies it as a shard manifest, and
-    /// checkNamespace reserves the segment so no namespace can collide under it.
+    /// The namespace registry (design §5.3): authoritative namespace universe, CAS-appended on
+    /// W-REGISTER, fenced by GC, the source of GC discovery (never LIST). Relocated from
+    /// `roots/_registry` to `gc/registry` — `roots/` is now data only; discovery is infrastructure.
+    /// The CAS-append + fence MECHANISM is unchanged (N5): only the key moves, and it is read/written
+    /// strictly by this computed key.
     String rootsRegistryKey() const
     {
-        return prefix + "/roots/_registry";
+        return prefix + "/gc/registry";
     }
 
     /// Root manifest for a given namespace + shard number.
@@ -112,7 +112,7 @@ public:
     /// ClickHouse path under `roots/`, with NO namespace and NO `_files` wrapper. `key` is the
     /// server-prefixed mirrored path (e.g. `srv1/clickhouse_access_check_abc`). It must NOT end in a
     /// reserved area and must not look like a shard — the `@cas@`-gated `tryParseRootShardKey`
-    /// guarantees a numeric tail here is never mis-classified. The `_files`/`_pool_meta`/`_registry`
+    /// guarantees a numeric tail here is never mis-classified. The `_files`/`_pool_meta`
     /// reservations still apply to its segments via the path itself (these never appear in a real
     /// ClickHouse loose-file path).
     String mountpointObjectKey(const String & key) const
@@ -283,11 +283,6 @@ private:
             if (segment == "_files")
                 throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
                     "CasLayout: namespace '{}' uses the reserved segment '_files'", s);
-            /// Reserved for the namespace registry object (roots/_registry); a namespace starting
-            /// with it would nest shard manifests under the registry's own key.
-            if (segment == "_registry")
-                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                    "CasLayout: namespace '{}' uses the reserved segment '_registry'", s);
             /// Reserved for the build-root namespace (B171: `_builds/<server_hex>`). A user namespace
             /// must not use the `_builds` segment, but the build-root namespace itself is legal — it is
             /// exactly `_builds/<server_hex>`, recognized by `isBuildRootNamespace`.
