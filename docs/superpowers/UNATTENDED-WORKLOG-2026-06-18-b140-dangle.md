@@ -152,3 +152,16 @@ GC reclaims it under a still-in-flight adopter → publish dangles. Pinned live 
   Open design thread (to capture as B177): CA layer as a clean content-addressed VFS (parts→thin
   adapter; content-hash-prefix-aligned **map-reduce parallel GC** — global fence + per-prefix reduce +
   cross-round cascade + per-prefix ownership; navigable introspection).
+- **T19 — soak v3 DECLARED SUCCESSFUL + stopped by operator (~7h of 12h).** Stopped intentionally (will
+  repeat later). Final tally: **110/253 chaos faults fired, 0 fatal** (RUNPY_EXIT/WORKLOAD FAILURE/
+  PHASE3 FAILED = 0). Survived the hardest faults repeatedly — **both-kill ×9** (both replicas SIGKILLed
+  at once), both-restart ×8, both-pause ×7, ch1-kill ×10, ch2-kill ×6, + all rustfs/single-node faults.
+  **Every fsck checkpoint reported `dangling=0`** (the only dangling value seen across the whole run).
+  All CA invariants clean throughout: CORRUPTED_DATA 0, fail_closed 0, read_missing 0,
+  precommit_reclaim false-positives ("frozen") 0; precommit two-phase clean (450754/450728).
+  **B140-dangle fix and B173 both validated** (B173 in-action: `TABLE_IS_READ_ONLY` observed in
+  system.errors from a both-pause and RETRIED, not fatal — the exact v2-killer now non-fatal). Cluster
+  torn down. NET RESULT of the unattended effort: B171 designed → TLA+-proven → implemented (TDD, 5
+  tasks + review) → regression (GC fold blowup) caught+fixed → B173 harness fix → clean chaos soak with
+  fsck dangling=0 throughout. Backlog: B172–B179 recorded. Design dialogue (VFS/parallel-GC/snapshots/
+  time-travel/protobuf/Jepsen) captured in B174–B179.
