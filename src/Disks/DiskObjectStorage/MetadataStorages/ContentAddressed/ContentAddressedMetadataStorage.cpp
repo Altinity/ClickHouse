@@ -388,12 +388,21 @@ MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 
 /// ==== D-W1 namespace mapping ====
 
+std::string ContentAddressedMetadataStorage::serverPrefix() const
+{
+    /// ONE canonical server token everywhere (Phase 6): the 32-hex `u128ToHex(serverIdToU128(server_id))`
+    /// — exactly the form GC already uses for `precommitNs`/`serverWatermarkKey`. Using it as the
+    /// server-prefix here lands a server's live/detached namespaces under the same `roots/<server-hex>/`
+    /// subtree as its watermark and precommits, so "drop a server" is one subtree.
+    return Cas::u128ToHex(serverIdToU128(server_id));
+}
+
 Cas::RootNamespace ContentAddressedMetadataStorage::liveNamespace(const std::string & table_uuid) const
 {
     /// Path-mirroring (design §5.1): the namespace IS the table's canonical disk path with the
     /// content-addressed boundary marked by `@cas@` on the table-dir segment, prefixed by the
-    /// server id. e.g. `srv1/store/3f2/3f2a…@cas@`.
-    return Cas::RootNamespace{server_id + "/" + ContentAddressed::mirroredArchiveNamespace(table_uuid)};
+    /// canonical server token (`serverPrefix`). e.g. `<server-hex>/store/3f2/3f2a…@cas@`.
+    return Cas::RootNamespace{serverPrefix() + "/" + ContentAddressed::mirroredArchiveNamespace(table_uuid)};
 }
 
 Cas::RootNamespace ContentAddressedMetadataStorage::detachedNamespace(const std::string & table_uuid) const
@@ -401,7 +410,7 @@ Cas::RootNamespace ContentAddressedMetadataStorage::detachedNamespace(const std:
     /// A SIBLING archive under `detached/` — preserves the non-nesting invariant (design §5.7):
     /// `…/store/…@cas@` and `…/detached/store/…@cas@` diverge at `store`/`detached`, so no
     /// namespace is a path-prefix of another and GC's per-namespace prefix-LIST never crosses.
-    return Cas::RootNamespace{server_id + "/detached/" + ContentAddressed::mirroredArchiveNamespace(table_uuid)};
+    return Cas::RootNamespace{serverPrefix() + "/detached/" + ContentAddressed::mirroredArchiveNamespace(table_uuid)};
 }
 
 Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::string & shadow_table_dir)

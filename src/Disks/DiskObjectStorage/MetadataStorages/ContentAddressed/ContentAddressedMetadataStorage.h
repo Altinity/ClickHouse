@@ -134,6 +134,13 @@ public:
     Cas::RootNamespace liveNamespace(const std::string & table_uuid) const;
     Cas::RootNamespace detachedNamespace(const std::string & table_uuid) const;
     static Cas::RootNamespace shadowNamespace(const std::string & shadow_table_dir);
+
+    /// The canonical server prefix used for server-scoped namespaces: the 32-hex
+    /// `u128ToHex(serverIdToU128(server_id))` — the SAME token GC uses for its watermark and
+    /// precommit namespace (`precommitNs`, `serverWatermarkKey`). A server's mutable control state
+    /// (live/detached namespaces, watermark, precommits) all live under this one token so dropping a
+    /// server is one `roots/<server-hex>/` subtree.
+    std::string serverPrefix() const;
     // (genericNamespace removed — loose files are plain mountpoint objects, design §5.2)
 
     /// The route of one parsed CA path: which namespace, which ref, which in-tree file. The single

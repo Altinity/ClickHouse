@@ -156,16 +156,16 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
     const TreeId t2 = b->putTree({blobEntry("other.bin", P)});
     b->precommit(t2);
 
-    /// SIMULATE premature reclaim: remove the build-root precommit edge exactly as GC reclaim would —
-    /// erase refs[build_seq] + append a Remove journal record on the build-root shard. The build-root
-    /// namespace is `_builds/<server_hex>`, and since B171's fix the precommit ref name is the build_seq
+    /// SIMULATE premature reclaim: remove the precommit edge exactly as GC reclaim would —
+    /// erase refs[build_seq] + append a Remove journal record on the precommit shard. The precommit
+    /// namespace is `<server_hex>/_precommits`, and since B171's fix the precommit ref name is the build_seq
     /// and the shard is shardOf(build_seq) (sharded exactly like a table namespace). We reconstruct the
     /// RootNamespace from the public server_id and drive the shard manifest CAS directly through the
     /// backend codec.
-    const RootNamespace build_root_ns{"_builds/" + u128ToHex(s->poolConfig().server_id)};
+    const RootNamespace precommit_ns{u128ToHex(s->poolConfig().server_id) + "/_precommits"};
     const String precommit_ref = std::to_string(b->buildSeq());
     {
-        const String key = s->layout().rootShardKey(build_root_ns, s->shardOf(precommit_ref));
+        const String key = s->layout().rootShardKey(precommit_ns, s->shardOf(precommit_ref));
         const auto got = backend->get(key);
         ASSERT_TRUE(got.has_value()) << "precommit shard manifest must exist before reclaim";
         DB::Cas::RootShard root = DB::Cas::decodeRootShard(got->bytes);
@@ -218,7 +218,7 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
 ///
 /// Build B precommits a manifest naming a blob that is referenced by NO table ref. B is then RETIRED
 /// (released; its build_seq leaves the active set) and the watermark renewed so `min_active` advances
-/// past B. GC, while folding B's build-root shard, derives the server from the namespace and build_seq
+/// past B. GC, while folding B's precommit shard, derives the server from the namespace and build_seq
 /// from the ref NAME, judges B dead (build_seq < min_active), and RECLAIMS the precommit: it drops
 /// refs[build_seq] + journal Remove. The next fold releases the edges; the exclusively-owned blob hits
 /// in-degree 0 and is collected over the cascade rounds. We drive a multi-round loop (NOT the
@@ -245,9 +245,9 @@ TEST(CasBuildRoot, AbandonedPrecommitReclaimed)
 
     /// Sanity: the precommit ref exists before GC reclaim. Since B171's fix the ref name IS the build_seq
     /// and the shard is shardOf(build_seq) (sharded like a table namespace).
-    const RootNamespace build_root_ns{"_builds/" + u128ToHex(s->poolConfig().server_id)};
+    const RootNamespace precommit_ns{u128ToHex(s->poolConfig().server_id) + "/_precommits"};
     const String precommit_ref = std::to_string(build_seq);
-    const String shard_key = s->layout().rootShardKey(build_root_ns, s->shardOf(precommit_ref));
+    const String shard_key = s->layout().rootShardKey(precommit_ns, s->shardOf(precommit_ref));
     {
         const auto got = backend->get(shard_key);
         ASSERT_TRUE(got.has_value()) << "precommit shard manifest must exist before reclaim";
@@ -266,7 +266,7 @@ TEST(CasBuildRoot, AbandonedPrecommitReclaimed)
         catch (const DB::Exception &) { break; }
     }
 
-    /// INV-BUILDROOT-RECLAIM: the build-root ref for B is gone (the precommit was reclaimed).
+    /// INV-PRECOMMIT-RECLAIM: the precommit ref for B is gone (the precommit was reclaimed).
     const auto after = backend->get(shard_key);
     if (after.has_value())
         ASSERT_FALSE(DB::Cas::decodeRootShard(after->bytes).refs.contains(precommit_ref))

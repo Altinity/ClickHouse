@@ -90,7 +90,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
 
     /// W-ANCHOR: the per-server watermark must be durable BEFORE any object PUT. A read-only open
     /// must never mutate the pool (the probe is skipped above for the same reason), so the watermark
-    /// — which writes the servers/<id> slot — is only constructed and anchored on a writable open.
+    /// — which writes the roots/<server-hex>/_watermark slot — is only constructed and anchored on a writable open.
     if (!store->config.read_only)
     {
         Store * raw = store.get();

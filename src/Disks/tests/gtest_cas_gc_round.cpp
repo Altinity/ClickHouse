@@ -2036,11 +2036,11 @@ TEST(CasGcRetire, ReclaimsAbandonedPrecommitWhenFloorPasses)
 
     s->renewWatermarkOnce();   /// min_active advances past build_seq -> the precommit is now abandoned
 
-    /// The build-root shard for the (now retired) build must still carry the precommit ref before GC.
+    /// The precommit shard for the (now retired) build must still carry the precommit ref before GC.
     /// Since B171's fix the ref name IS the build_seq and the shard is shardOf(build_seq).
-    const RootNamespace build_root_ns{"_builds/" + u128ToHex(s->poolConfig().server_id)};
+    const RootNamespace precommit_ns{u128ToHex(s->poolConfig().server_id) + "/_precommits"};
     const String precommit_ref = std::to_string(build_seq);
-    const String shard_key = s->layout().rootShardKey(build_root_ns, s->shardOf(precommit_ref));
+    const String shard_key = s->layout().rootShardKey(precommit_ns, s->shardOf(precommit_ref));
     {
         const auto got = b->get(shard_key);
         ASSERT_TRUE(got.has_value());

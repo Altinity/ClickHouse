@@ -190,10 +190,12 @@ public:
         return shardedKey("builds", build_id);
     }
 
-    /// Per-server build watermark key.
+    /// Per-server watermark key, under the server's own `roots/<server-hex>/` subtree (Phase 6):
+    /// `<prefix>/roots/<server-hex>/_watermark`. Co-located with the server's precommit namespace
+    /// (`<server-hex>/_precommits`) so a server's mutable control state is one subtree.
     String serverWatermarkKey(const String & server_id_hex) const
     {
-        return shardedKey("servers", server_id_hex);
+        return prefix + "/roots/" + server_id_hex + "/_watermark";
     }
 
     /// Pool-level metadata object.
@@ -202,14 +204,15 @@ public:
         return prefix + "/_pool_meta";
     }
 
-    /// The build-root namespace (B171): `_builds/<server_hex>`, one shard per in-flight build keyed by
+    /// The precommit namespace (B171): `<server-hex>/_precommits`, one shard per in-flight build keyed by
     /// `build_seq`. A precommit publishes the build's manifest tree as a ref in that shard, so GC's
     /// fold lifts the in-degree of every reachable object — replacing the revocable `cas_owner` hint.
     /// It is an ordinary namespace key-wise (`rootShardKey` works unchanged); only behavioral branches
-    /// (fold pending-tolerance, precommit reclaim) key off `isBuildRootNamespace`.
-    static bool isBuildRootNamespace(const RootNamespace & ns)
+    /// (fold pending-tolerance, precommit reclaim) key off `isPrecommitNamespace`. Recognized by its
+    /// LAST segment being `_precommits` (Phase 6: relocated under the server's `roots/<server-hex>/`).
+    static bool isPrecommitNamespace(const RootNamespace & ns)
     {
-        return ns.string().starts_with("_builds/");
+        return ns.string().ends_with("/_precommits");
     }
 
 private:
@@ -234,12 +237,12 @@ private:
             if (segment == "_files")
                 throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
                     "CasLayout: namespace '{}' uses the reserved segment '_files'", s);
-            /// Reserved for the build-root namespace (B171: `_builds/<server_hex>`). A user namespace
-            /// must not use the `_builds` segment, but the build-root namespace itself is legal — it is
-            /// exactly `_builds/<server_hex>`, recognized by `isBuildRootNamespace`.
-            if (segment == "_builds" && !isBuildRootNamespace(ns))
+            /// Reserved for the precommit namespace (B171: `<server-hex>/_precommits`). A user namespace
+            /// must not use the `_precommits` segment, but the precommit namespace itself is legal — it is
+            /// exactly `<server-hex>/_precommits`, recognized by `isPrecommitNamespace`.
+            if (segment == "_precommits" && !isPrecommitNamespace(ns))
                 throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                    "CasLayout: namespace '{}' uses the reserved segment '_builds'", s);
+                    "CasLayout: namespace '{}' uses the reserved segment '_precommits'", s);
             if (end == String::npos)
                 break;
             start = end + 1;

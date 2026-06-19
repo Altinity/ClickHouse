@@ -867,8 +867,8 @@ void Gc::fence(GcState & state, Token & state_token)
     for (const String & ns_name : fence_universe.namespaces)
     {
         const RootNamespace ns{ns_name};
-        /// Every namespace — table and build-root (B171 fix) — is fenced over the static [0, root_shards)
-        /// fan-out via shardsToVisit. Build roots are now bounded by root_shards, not per-build.
+        /// Every namespace — table and precommit (B171 fix) — is fenced over the static [0, root_shards)
+        /// fan-out via shardsToVisit. Precommit namespaces are now bounded by root_shards, not per-build.
         for (const uint64_t shard : shardsToVisit(ns))
         {
             ++fenced_shards;
@@ -948,7 +948,7 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
 
     /// B171: retire no longer consults the watermark (the per-candidate `protectedByLiveBuild` guard
     /// was removed — protection is now the precommit edge, via reachability). The per-round watermark
-    /// caches are begun in `fold` (it visits the build-root shards for precommit reclaim), so there is
+    /// caches are begun in `fold` (it visits the precommit shards for precommit reclaim), so there is
     /// no `beginWatermarkRound` here anymore.
 
     /// 1. Observe. One HEAD per candidate captures the CURRENT incarnation token - the only token
@@ -1023,7 +1023,7 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
 
             /// B171: the retire decision is now PURE REACHABILITY — present ∧ known ∧ inDeg=0 ⇒ condemn.
             /// The old `protectedByLiveBuild` per-candidate `cas_owner` guard is gone: an object an
-            /// in-flight build needs is protected by the build's PRECOMMIT EDGE (a build-root root ref
+            /// in-flight build needs is protected by the build's PRECOMMIT EDGE (a precommit root ref
             /// the fold expands into in-degree ≥ 1), so it is never a zero-in-degree candidate here. The
             /// watermark is repurposed for precommit RECLAIM liveness (see reclaimAbandonedPrecommit),
             /// not per-object protection.
@@ -1239,7 +1239,7 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                             break;
                         }
                     }
-                    /// B171 pending-tolerance: under a BUILD-ROOT namespace (`_builds/<server>`) a live
+                    /// B171 pending-tolerance: under a PRECOMMIT namespace (`<server>/_precommits`) a live
                     /// ref to an absent target is NOT a dangle — it is a legal pending/aborting
                     /// reservation. A precommit may name a manifest tree whose object has not been
                     /// uploaded yet, or whose closure was published before this fold but raced a delete;
@@ -1247,7 +1247,7 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                     /// closure. So skip the INV-NO-DANGLE alarm and the throw here: treat it like the
                     /// displaced-later case (no edges added for the gone tree; marker stays unset;
                     /// over-count-only preserved). The alarm is UNCHANGED for normal (table) namespaces.
-                    if (!displaced_later && Layout::isBuildRootNamespace(ns))
+                    if (!displaced_later && Layout::isPrecommitNamespace(ns))
                         displaced_later = true;
                     if (!displaced_later)
                     {
@@ -1386,8 +1386,8 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
         for (const String & ns_name : registry.namespaces)
         {
             const RootNamespace ns{ns_name};
-            /// Every namespace — table and build-root (B171 fix) — uses the static [0, root_shards)
-            /// fan-out via shardsToVisit. Build roots are now bounded by root_shards, not per-build.
+            /// Every namespace — table and precommit (B171 fix) — uses the static [0, root_shards)
+            /// fan-out via shardsToVisit. Precommit namespaces are now bounded by root_shards, not per-build.
             for (const uint64_t shard : shardsToVisit(ns))
                 universe.emplace_back(ns, shard);
         }
@@ -1397,8 +1397,8 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
 
 std::vector<uint64_t> Gc::shardsToVisit(const RootNamespace &)
 {
-    /// EVERY namespace — table AND build-root (B171 fix) — uses the static shard fan-out [0, root_shards).
-    /// The build root is now sharded exactly like a table namespace (ref name == build_seq, shard ==
+    /// EVERY namespace — table AND precommit (B171 fix) — uses the static shard fan-out [0, root_shards).
+    /// The precommit namespace is now sharded exactly like a table namespace (ref name == build_seq, shard ==
     /// shardOf(build_seq)), so it has at most root_shards shards (bounded), each holding many builds'
     /// precommit refs. This removes the old per-build LIST special-case whose O(total-builds-ever) fold
     /// cost wedged GC. The fence mints fence-only manifests for absent shards, so the absent ones are
@@ -1525,9 +1525,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     Backend & backend = store->backend();
     FoldResult result;
 
-    /// B171 precommit reclaim (§C.3): the fold visits the build-root shards and decides each owning
+    /// B171 precommit reclaim (§C.3): the fold visits the precommit shards and decides each owning
     /// build's liveness from the per-server watermark. That uses the SAME per-round caches the K=2
-    /// crash detector accumulates, so begin the watermark round HERE (before the build-root visit
+    /// crash detector accumulates, so begin the watermark round HERE (before the precommit visit
     /// below) rather than in retire — retire no longer consults the watermark since
     /// `protectedByLiveBuild` was removed (B171); the watermark is now read only for reclaim liveness.
     beginWatermarkRound();
@@ -1578,7 +1578,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
         auto transitioned = foldShardRecords(result.snap, state, ns, cursor_key, root, cursor, root.shard_version);
         result.transitioned.insert(result.transitioned.end(), transitioned.begin(), transitioned.end());
 
-        /// B171 precommit reclaim (§C.3): a build-root shard may hold precommit refs of builds no longer
+        /// B171 precommit reclaim (§C.3): a precommit shard may hold precommit refs of builds no longer
         /// live — ABANDONED precommits whose edges must be released so the closures become normal GC
         /// candidates. We hold the shard manifest in hand under the GC lease; reclaim drops each dead
         /// build's ref (keyed by build_seq, parsed from the ref name — the SAME erase + journal Remove
@@ -1587,7 +1587,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
         /// snap still over-counts the released edges (retire never under-deletes a live ref), the next
         /// round folds the Remove. The mutate is on the shard manifest — independent of the fold's own
         /// gc/state + gc/snap CAS below — so it does not fight the fold.
-        if (Layout::isBuildRootNamespace(ns))
+        if (Layout::isPrecommitNamespace(ns))
             reclaimAbandonedPrecommit(ns, root_shard, root, state.round + 1);
     }
 
@@ -1781,9 +1781,9 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, con
                                    uint64_t round)
 {
     /// B171 §C.3 (design §4.3, fixed 2026-06-19): reclaim ABANDONED precommits — those whose owning
-    /// build is no longer live. The build root is sharded like any namespace now (ref name == build_seq,
-    /// shard == shardOf(build_seq)), so ONE build-root shard holds MANY precommit refs, each keyed by its
-    /// owning build's `build_seq`. We derive the server from the namespace (`_builds/<server_hex>`) and
+    /// build is no longer live. The precommit namespace is sharded like any namespace now (ref name == build_seq,
+    /// shard == shardOf(build_seq)), so ONE precommit shard holds MANY precommit refs, each keyed by its
+    /// owning build's `build_seq`. We derive the server from the namespace (`<server_hex>/_precommits`) and
     /// the build_seq from each REF NAME. Protection here is the precommit EDGE (the root ref the fold
     /// expands); dropping a ref releases that protection, so we reclaim ONLY refs whose build is provably
     /// dead. We read the shard manifest already in hand (the fold's `root`) — no extra read per ref.
@@ -1793,13 +1793,13 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, con
     if (root.refs.empty())
         return;
 
-    /// Derive the owning server_id from `_builds/<server_hex>`.
+    /// Derive the owning server_id from `<server_hex>/_precommits` — the segment BEFORE `/_precommits`.
     const String & ns_str = ns.string();
-    static constexpr std::string_view kBuildsPrefix = "_builds/";
-    chassert(ns_str.starts_with(kBuildsPrefix));
-    const String server_hex = ns_str.substr(kBuildsPrefix.size());
+    static constexpr std::string_view kPrecommitsSuffix = "/_precommits";
+    chassert(ns_str.ends_with(kPrecommitsSuffix));
+    const String server_hex = ns_str.substr(0, ns_str.size() - kPrecommitsSuffix.size());
     if (server_hex.size() != 32)
-        return;   /// not a well-formed build-root namespace — leave it untouched (never reclaim blindly)
+        return;   /// not a well-formed precommit namespace — leave it untouched (never reclaim blindly)
     UInt128 server;
     try
     {
@@ -1852,7 +1852,7 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, con
     if (dead_refs.empty())
         return;
 
-    /// Reclaim: drop each dead build-root ref + journal Remove on the SAME shard (mirrors the commit-time
+    /// Reclaim: drop each dead precommit ref + journal Remove on the SAME shard (mirrors the commit-time
     /// removal in `Build::publish`). The next fold reads the Removes and releases the edges, so the
     /// closures' objects become normal zero-in-degree candidates. ONE mutateShard CAS removes all dead
     /// refs at once; it re-reads + re-runs the lambda per attempt, so an already-removed/raced ref is a

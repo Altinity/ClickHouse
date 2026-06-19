@@ -626,7 +626,7 @@ TEST(CasLayout, ServerWatermarkKey)
 {
     Layout layout("pool");
     const String hex(32, 'a');   // 32-char u128 hex
-    ASSERT_EQ(layout.serverWatermarkKey(hex), "pool/servers/aa/" + hex);
+    ASSERT_EQ(layout.serverWatermarkKey(hex), "pool/roots/" + hex + "/_watermark");
 }
 
 /// ---------- envelope fixed-length header padding (pad_to_header_len) ----------

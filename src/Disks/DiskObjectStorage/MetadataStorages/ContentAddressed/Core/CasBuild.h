@@ -68,7 +68,7 @@ public:
     /// blob payloads are not retained).
     TreeId putTree(std::vector<TreeEntry> entries);
 
-    /// B171 two-phase commit, phase 1: publish the build's manifest tree under the build-root
+    /// B171 two-phase commit, phase 1: publish the build's manifest tree under the precommit
     /// namespace so GC's fold lifts the in-degree of every reachable object (protection by
     /// reachability, replacing the revocable `cas_owner` hint). Must be called after the manifest
     /// tree is assembled and BEFORE any adopted/dedup'd source ref could be dropped. STUB here
@@ -132,12 +132,13 @@ private:
     /// Map (kind, hash) to its object key per kind (blob/tree/pack).
     String keyFor(ObjectKind kind, const UInt128 & hash) const;
 
-    /// B171 build-root addressing (fixed 2026-06-19). The build-root namespace is `_builds/<server_hex>`,
-    /// sharded EXACTLY like a table namespace: the precommit ref name is `build_seq` and the shard is
-    /// `shardOf(build_seq)`. So the build-root namespace has at most root_shards shards (bounded), each
-    /// holding many builds' precommit refs keyed by build_seq. GC derives the owning build's `build_seq`
-    /// from the REF NAME (and the server from the namespace) to decide precommit-reclaim liveness.
-    RootNamespace buildRootNs() const;
+    /// B171 precommit addressing (fixed 2026-06-19; relocated Phase 6). The precommit namespace is
+    /// `<server-hex>/_precommits`, sharded EXACTLY like a table namespace: the precommit ref name is
+    /// `build_seq` and the shard is `shardOf(build_seq)`. So the precommit namespace has at most
+    /// root_shards shards (bounded), each holding many builds' precommit refs keyed by build_seq. GC
+    /// derives the owning build's `build_seq` from the REF NAME (and the server from the namespace) to
+    /// decide precommit-reclaim liveness.
+    RootNamespace precommitNs() const;
     String buildRef() const;        /// the precommit ref name == std::to_string(build_seq)
     uint64_t buildShard() const;    /// == store->shardOf(buildRef())
 
@@ -150,7 +151,7 @@ private:
     uint64_t epoch{};                                     /// owning Store's process_epoch (stamped in Task 8)
     BuildInfo info;
     bool alive = true;
-    bool precommitted = false;                            /// B171: a build-root precommit edge was published (remove on commit)
+    bool precommitted = false;                            /// B171: a precommit edge was published (remove on commit)
 
     std::map<DepKey, DepEntry> deps;                      /// the W-DEP-SET
     std::map<UInt128, String> retained_trees;             /// encoded tree payloads for gate re-create (Task 13)

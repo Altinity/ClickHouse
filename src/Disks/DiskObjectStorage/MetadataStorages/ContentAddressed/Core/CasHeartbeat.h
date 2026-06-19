@@ -19,7 +19,7 @@ namespace DB::Cas
 /// Heartbeats gate only DEBRIS reclamation by full GC (M-F): a wedged heartbeat delays cleanup,
 /// never correctness — the publish GATE, not the heartbeat, is the safety mechanism (spec §5).
 /// Incremental GC additionally consults a per-server build watermark (`CasWatermark.h`,
-/// `servers/<server_id>`) to spare in-flight builds' blobs (co-liveness); the publish gate
+/// `roots/<server-hex>/_watermark`) to spare in-flight builds' blobs (co-liveness); the publish gate
 /// remains the safety mechanism (B167, spec 2026-06-16-ca-build-watermark-design).
 ///
 /// Non-hashed metadata object => STRICT JSON ("cas_heartbeat" v1, spec §4 encoding split,

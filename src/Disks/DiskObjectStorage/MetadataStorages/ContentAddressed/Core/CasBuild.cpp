@@ -549,23 +549,24 @@ String Build::keyFor(ObjectKind kind, const UInt128 & hash) const
     return objectKey(store->layout(), kind, hash);
 }
 
-RootNamespace Build::buildRootNs() const
+RootNamespace Build::precommitNs() const
 {
-    /// `_builds/<server_hex>` — the build-root namespace for this server (B171, spec §A).
-    return RootNamespace{"_builds/" + u128ToHex(store->poolConfig().server_id)};
+    /// `<server_hex>/_precommits` — the precommit namespace for this server (B171, spec §A; relocated
+    /// under the server's own subtree in Phase 6).
+    return RootNamespace{u128ToHex(store->poolConfig().server_id) + "/_precommits"};
 }
 
 String Build::buildRef() const
 {
     /// The precommit ref name IS the per-process monotone build_seq (B171 fix). Many builds share a
-    /// build-root shard, each keyed by its own ref name, exactly like a table namespace's refs.
+    /// precommit shard, each keyed by its own ref name, exactly like a table namespace's refs.
     return std::to_string(build_seq);
 }
 
 uint64_t Build::buildShard() const
 {
-    /// B171 fix: shard the build root EXACTLY like every other namespace — hash the ref name. The
-    /// build-root namespace then has at most root_shards shards (bounded), each holding many builds'
+    /// B171 fix: shard the precommit namespace EXACTLY like every other namespace — hash the ref name. The
+    /// precommit namespace then has at most root_shards shards (bounded), each holding many builds'
     /// precommit refs keyed by build_seq, folded via the normal [0, root_shards) enumeration. Was
     /// `build_seq` (per-process unique), which created an unbounded shard per build and wedged GC fold.
     return store->shardOf(buildRef());
@@ -576,7 +577,7 @@ void Build::precommit(const TreeId & manifest)
     requireAlive();
 
     /// B171 two-phase commit, phase 1. Publish the build's manifest tree as a ref (named build_seq) under
-    /// the build-root namespace `_builds/<server_hex>`, shard = shardOf(build_seq). GC discovers it via the registry
+    /// the precommit namespace `<server_hex>/_precommits`, shard = shardOf(build_seq). GC discovers it via the registry
     /// (ensureRegistered) and folds it like any namespace → root edge → tree_expand → child in-degree ≥ 1,
     /// so every object reachable from the precommit is protected by REACHABILITY (replacing the revocable
     /// `cas_owner` hint). The manifest must be in this build's W-DEP-SET — it was built/adopted by this
@@ -587,10 +588,10 @@ void Build::precommit(const TreeId & manifest)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "precommit: tree {} was not built/adopted by this Build", manifest.string());
 
-    /// W-REGISTER: the build-root namespace must be in `gc/registry` before its first manifest exists,
+    /// W-REGISTER: the precommit namespace must be in `gc/registry` before its first manifest exists,
     /// so GC discovers it (it is an ordinary namespace key-wise; only behavioral branches key off
-    /// `isBuildRootNamespace`). Monotone — a cache hit short-circuits without I/O.
-    const RootNamespace ns = buildRootNs();
+    /// `isPrecommitNamespace`). Monotone — a cache hit short-circuits without I/O.
+    const RootNamespace ns = precommitNs();
     store->ensureRegistered(ns);
 
     /// tree_size: for a tree we built we have the encoded payload size; for an adopted tree we may only
@@ -599,8 +600,8 @@ void Build::precommit(const TreeId & manifest)
     const uint64_t tree_size =
         retained_it != retained_trees.end() ? retained_it->second.size() : dep_it->second.size;
 
-    /// ONE CAS on the build-root shard: set refs[build_seq] = manifest, append {+, build_seq, manifest},
-    /// shard_version++. The SAME RootShard machinery as `publish` — the build-root edge is an ordinary
+    /// ONE CAS on the precommit shard: set refs[build_seq] = manifest, append {+, build_seq, manifest},
+    /// shard_version++. The SAME RootShard machinery as `publish` — the precommit edge is an ordinary
     /// root ref the GC fold will expand. The ref name is the build_seq and the shard is shardOf(ref), so
     /// many builds co-locate in the same bounded shard (B171 fix).
     const String ref = buildRef();
@@ -615,7 +616,7 @@ void Build::precommit(const TreeId & manifest)
             .at_version = root.shard_version + 1});
     });
 
-    /// B171: the precommit was published — the build-root edge now protects the manifest's closure.
+    /// B171: the precommit was published — the precommit edge now protects the manifest's closure.
     /// Record that fact so the successful-commit path (and only it) removes the edge.
     precommitted = true;
     if (store->hasEventSink())
@@ -629,7 +630,7 @@ void Build::precommit(const TreeId & manifest)
         _ev.token = u128ToHex(build_id);
         _ev.round = store->retireView().round();
         _ev.outcome = "ok";
-        _ev.reason = "precommit: published build-root manifest edge to protect the closure during the build";
+        _ev.reason = "precommit: published precommit manifest edge to protect the closure during the build";
         _ev.detail = {{"build_seq", std::to_string(build_seq)}};
         store->emitEvent(_ev);
     }
@@ -956,15 +957,15 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
     }
 
     /// B171: the table ref is now durably committed — the manifest's closure is table-pinned. Remove
-    /// the build-root precommit edge so GC's fold releases it. ORDER: the table ref Add committed FIRST
+    /// the precommit edge so GC's fold releases it. ORDER: the table ref Add committed FIRST
     /// (above), THEN the precommit is removed — never the reverse, which would leave a window with
     /// neither edge protecting the closure. A transient failure is SAFE to ignore: the commit already
     /// succeeded, so the closure is protected by the table ref; the leftover precommit is a stale
-    /// build-root edge GC reclaims later (Task 4). We therefore catch/log/emit and continue — failing
+    /// precommit edge GC reclaims later (Task 4). We therefore catch/log/emit and continue — failing
     /// the publish here would be wrong (the part IS committed). Only attempt removal if this build
     /// actually precommitted (spec §B.2, design §4.4).
     ///
-    /// NB: we drop via mutateShard on the build-root shard, mirroring how `precommit` wrote it (ref name
+    /// NB: we drop via mutateShard on the precommit shard, mirroring how `precommit` wrote it (ref name
     /// = build_seq, shard = shardOf(ref)) — NOT via Store::dropRef, which routes by shardOf(ref_name) of
     /// the TABLE ref. The shard happens to be shardOf(build_seq) too, so this is the same routing, but we
     /// keep it explicit. Same CAS shape as dropRef: erase refs[build_seq] + append a Remove journal record
@@ -974,12 +975,12 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
         const String ref = buildRef();
         try
         {
-            store->mutateShard(buildRootNs(), buildShard(), [&](RootShard & root)
+            store->mutateShard(precommitNs(), buildShard(), [&](RootShard & root)
             {
                 auto it = root.refs.find(ref);
                 if (it == root.refs.end())
                     throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-                        "remove precommit: no ref {} in build-root shard {}", ref, buildShard());
+                        "remove precommit: no ref {} in precommit shard {}", ref, buildShard());
                 const UInt128 part_tree = it->second.tree_id;
                 root.refs.erase(it);
                 root.journal.push_back(JournalRecord{
@@ -991,13 +992,13 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
             {
                 CasEvent _evpr;
                 _evpr.type = CasEventType::PrecommitRemoved;
-                _evpr.namespace_ = buildRootNs().string();
+                _evpr.namespace_ = precommitNs().string();
                 _evpr.ref_name = ref;
                 _evpr.object_kind = CasEventObjectKind::Tree;
                 _evpr.object_hash = tree.string();
                 _evpr.token = u128ToHex(build_id);
                 _evpr.outcome = "removed";
-                _evpr.reason = "fail-closed commit succeeded; closure now table-pinned, releasing the build-root edge";
+                _evpr.reason = "fail-closed commit succeeded; closure now table-pinned, releasing the precommit edge";
                 _evpr.detail = {{"build_seq", std::to_string(build_seq)}};
                 store->emitEvent(_evpr);
             }
@@ -1010,7 +1011,7 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
             {
                 CasEvent _evpr;
                 _evpr.type = CasEventType::PrecommitRemoved;
-                _evpr.namespace_ = buildRootNs().string();
+                _evpr.namespace_ = precommitNs().string();
                 _evpr.ref_name = ref;
                 _evpr.object_kind = CasEventObjectKind::Tree;
                 _evpr.object_hash = tree.string();

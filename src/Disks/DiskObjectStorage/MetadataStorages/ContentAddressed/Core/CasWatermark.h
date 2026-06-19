@@ -16,8 +16,8 @@ namespace DB::Cas
 {
 
 /// Per-server build watermark (spec 2026-06-16-ca-build-watermark): one object per server under
-/// servers/<server_id>, renewed async ~2s off the write path, anchored synchronously before the first
-/// object PUT. Strict JSON, fail-closed decode (mirrors CasHeartbeat encoding split).
+/// roots/<server-hex>/_watermark (Phase 6), renewed async ~2s off the write path, anchored synchronously
+/// before the first object PUT. Strict JSON, fail-closed decode (mirrors CasHeartbeat encoding split).
 ///
 /// Non-hashed metadata object => STRICT JSON ("cas_server_watermark" v1):
 ///   {"format":"cas_server_watermark","version":1,"server_id":"<32 lowercase hex>",
