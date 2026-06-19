@@ -25,6 +25,7 @@
 #include <Common/TerminalSize.h>
 
 #include <Common/logger_useful.h>
+#include <Core/ServerUUID.h>
 #include <Loggers/OwnFormattingChannel.h>
 #include <Loggers/OwnPatternFormatter.h>
 #include "config.h"
@@ -573,6 +574,16 @@ int DisksApp::main(const std::vector<String> & /*args*/)
     String path = config().getString("path", DBMS_DEFAULT_PATH);
 
     global_context->setPath(path);
+
+    /// Load the server UUID so that live CA namespaces resolve correctly.
+    /// Only load when the uuid file already exists — clickhouse-disks inspects existing
+    /// pools and must NOT create or mutate the uuid file (the disk may be read-only).
+    /// If the file is absent, ServerUUID stays Nil and shadow/non-live navigation works.
+    {
+        fs::path uuid_file = fs::path(path) / "uuid";
+        if (fs::exists(uuid_file))
+            ServerUUID::load(uuid_file, &logger());
+    }
 
     client = std::make_unique<DisksClient>(config(), global_context);
 
