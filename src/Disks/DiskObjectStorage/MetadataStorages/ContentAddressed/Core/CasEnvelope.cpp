@@ -25,6 +25,15 @@ namespace
 {
 
 constexpr uint8_t FORMAT_VERSION = 1;
+/// 96 is the EXACT packed size of the v1 core fields, not a round number:
+///   magic[4] + format_version/kind/hash_algo/flags[4] + header_len[4] + index_len[4]
+///   + logical_size[8] + four u128s (logical_hash, domain_id, incarnation_tag, build_id)[64]
+///   + header_hash[8] = 96.
+/// It is 8-aligned (12*8) AND 16-aligned (6*16), so the four u128s sit on natural 16-byte boundaries
+/// with zero padding. The core is never grown: new fields go into the [96, header_len) TLV extensions
+/// (forward-compatible), and a fixed per-pool header length — used so every blob's payload starts at a
+/// constant offset for an O(1) `locate` — is set independently via `pad_to_header_len` / blob_header_len.
+/// Rounding the core up to 128/256 would only waste bytes per object with no benefit.
 constexpr uint32_t CORE_HEADER_LEN = 96;
 constexpr uint32_t MAX_HEADER_LEN = 16384;
 constexpr size_t HEADER_HASH_OFFSET = 88;

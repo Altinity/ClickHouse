@@ -175,6 +175,14 @@ Every blob, tree, and pack object is `header ‖ [pack index] ‖ payload`:
 of the same logical object; identity is everything below it. Key = hex(`logical_hash`) for all three kinds.
 `header_len + logical_size == object_size` gives truncation detection for free.
 
+**Why 96.** The core size is not a round number — it is the *exact packed size of the v1 fields above*
+(magic[4] + version/kind/hash_algo/flags[4] + header_len[4] + index_len[4] + logical_size[8] + four u128s[64]
++ header_hash[8] = 96). 96 is both 8-aligned (12×8) and 16-aligned (6×16), so the four `u128` fields land on
+natural 16-byte boundaries with zero padding. The core is never grown: new fields go in the `[96, header_len)`
+TLV area (forward-compatible), and a fixed *per-pool* header length — so every blob's payload starts at a
+constant offset for an O(1) `locate` — is set independently via `pad_to_header_len` (the pool's blob header
+length). So rounding the core up to 128/256 would only waste bytes per object with no benefit.
+
 **Checksum policy.** No payload bytes are ever hashed twice: at write the hash comes from `checksums.txt`; the
 hot read path performs **no** CA-level payload verification — ClickHouse compressed blocks carry their own
 per-block checksums verified on decompression. Payload-vs-hash verification exists only as the D5 attach-time
