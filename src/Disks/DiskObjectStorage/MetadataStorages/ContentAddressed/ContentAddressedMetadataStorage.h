@@ -186,6 +186,44 @@ private:
     std::optional<std::pair<Cas::Resolved, std::vector<Cas::TreeEntry>>>
     resolveRouted(const Route & r) const;
 
+    /// One disk-relative path, classified ONCE so the read-surface methods never re-derive the same
+    /// shadow/table/part/projection/table-subdir cascade. The order is load-bearing and reproduced
+    /// verbatim in classifyDiskPath: shadow BEFORE table-uuid (a shadow table dir also satisfies
+    /// parseTableUuid), the detached container before a part dir, then projection, then table-subdir.
+    /// Placeholders use braces (not angle brackets) to keep -Wdocumentation-html happy.
+    enum class PathKind
+    {
+        ShadowPartDir,      /// shadow/{bk}/.../{part}      — frozen part dir (route set)
+        ShadowTableDir,     /// shadow/{bk}/.../{u3}/{uuid} — frozen table dir (shadow_table_ns set)
+        ShadowIntermediate, /// shadow, shadow/{bk}, …      — any other shadow path (shadow_scope set)
+        TableDir,           /// {u3}/{uuid} or data/{db}/{tbl} (table_uuid set)
+        DetachedContainer,  /// {table}/detached            — route set, ref empty, part==detached
+        PartDir,            /// {table}/{part}              — route set, ref non-empty, file empty
+        ProjectionDir,      /// {table}/{part}/{proj}.proj  — route set, projection_prefix set
+        TableSubdir,        /// {table}/deduplication_logs/… (table_file set)
+        Unknown,            /// none of the above (the directory cascade falls through to false/{})
+    };
+
+    /// The result of classifyDiskPath: the directory-cascade `kind` plus the precomputed pieces the
+    /// methods would otherwise re-parse. The file methods (existsFile/getFileSize/getStorageObjects)
+    /// key on `is_part_file_path` first (the original top-level isPartFilePath dispatch), then consume
+    /// `route`/`table_file`; the directory methods switch on `kind`.
+    struct PathClass
+    {
+        PathKind kind = PathKind::Unknown;
+        bool is_part_file_path = false;                     /// ContentAddressed::isPartFilePath(path)
+        std::optional<Route> route;                         /// route(parsePartFilePath(path)), if any
+        std::string shadow_scope;                           /// scoped mirrored-LIST prefix (shadow dirs)
+        std::optional<Cas::RootNamespace> shadow_table_ns;  /// ShadowTableDir namespace
+        std::string table_uuid;                             /// TableDir identifier
+        std::string projection_prefix;                      /// "{proj}.proj/" for ProjectionDir
+        std::optional<ContentAddressed::TableFilePath> table_file;  /// parseTableFilePath(path), if any
+    };
+
+    /// Classify a disk-relative path ONCE, reproducing the exact branch order the methods used to
+    /// re-derive independently (see PathKind). Pure w.r.t. the store except for parsing.
+    PathClass classifyDiskPath(const std::string & path) const;
+
     /// Build the GC round sink: the std::function the scheduler calls per Start/Finish. Captures the
     /// ContextPtr, converts the POD GcRoundLogRecord into a ContentAddressedGarbageCollectionLogElement,
     /// and appends it to the SystemLog (best-effort). Returns an empty sink when context is null.

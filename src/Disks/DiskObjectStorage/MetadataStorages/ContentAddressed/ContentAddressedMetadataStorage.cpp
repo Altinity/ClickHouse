@@ -450,101 +450,161 @@ ContentAddressedMetadataStorage::resolveRouted(const Route & r) const
     return std::make_pair(*resolved, store()->readTree(resolved->tree_id));
 }
 
+ContentAddressedMetadataStorage::PathClass
+ContentAddressedMetadataStorage::classifyDiskPath(const std::string & path) const
+{
+    PathClass c;
+
+    /// Parse once. The file family keys on is_part_file_path (the original top-level isPartFilePath
+    /// dispatch); both families consume `route`/`table_file` instead of re-parsing.
+    c.is_part_file_path = ContentAddressed::isPartFilePath(path);
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (p)
+        c.route = route(*p);
+    c.table_file = ContentAddressed::parseTableFilePath(path);
+
+    /// ==== directory cascade — order is load-bearing (see PathKind) ====
+
+    /// Shadow BEFORE table-uuid: a shadow table dir also satisfies parseTableUuid.
+    if (ContentAddressed::isShadowPath(path))
+    {
+        if (p && !p->backup_name.empty() && p->file.empty())
+        {
+            /// route(*p) already yields {shadowNamespace(shadow_table_dir), part_name, ""} here.
+            c.kind = PathKind::ShadowPartDir;
+            return c;
+        }
+        if (ContentAddressed::endsWithTableUuidPair(path))
+        {
+            c.kind = PathKind::ShadowTableDir;
+            c.shadow_table_ns = shadowNamespace(path);
+            return c;
+        }
+        c.kind = PathKind::ShadowIntermediate;
+        const std::string canonical = canonicalDiskPath(path);
+        c.shadow_scope = canonical.empty() ? "shadow/" : canonical + "/";
+        return c;
+    }
+
+    if (auto uuid = ContentAddressed::parseTableUuid(path))
+    {
+        c.kind = PathKind::TableDir;
+        c.table_uuid = *uuid;
+        return c;
+    }
+
+    if (p && c.route)
+    {
+        const Route & r = *c.route;
+        /// Detached CONTAINER before part dir: route gives an empty ref for <table>/detached.
+        if (r.ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
+            c.kind = PathKind::DetachedContainer;
+        else if (!r.ref.empty() && r.file.empty())
+            c.kind = PathKind::PartDir;
+        else if (!r.ref.empty())
+        {
+            if (auto prefix = projectionDirPrefix(r.file))
+            {
+                c.kind = PathKind::ProjectionDir;
+                c.projection_prefix = *prefix;
+            }
+        }
+        if (c.kind != PathKind::Unknown)
+            return c;
+    }
+
+    /// A table-level SUBDIRECTORY (deduplication_logs/…).
+    if (c.table_file)
+        c.kind = PathKind::TableSubdir;
+    return c;
+}
+
 /// ==== read surface ====
 
 bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 {
-    if (!ContentAddressed::isPartFilePath(path))
+    const auto c = classifyDiskPath(path);
+
+    if (!c.is_part_file_path)
     {
-        if (auto tf = ContentAddressed::parseTableFilePath(path))
-            return store()->getNamespaceFile(liveNamespace(tf->table_uuid), tf->tail).has_value();
+        if (c.table_file)
+            return store()->getNamespaceFile(liveNamespace(c.table_file->table_uuid), c.table_file->tail).has_value();
         /// A loose mountpoint object (design §5.2): a plain object at roots/<server>/<path>.
         return store()->getMountpointObject(server_id + "/" + path).has_value();
     }
 
-    auto p = ContentAddressed::parsePartFilePath(path);
-    if (!p || p->file.empty())
+    if (!c.route || c.route->file.empty())
         return false;
-    auto r = route(*p);
-    if (!r || r->file.empty())
-        return false;
+    const Route & r = *c.route;
 
-    if (ContentAddressed::isMutablePerPartFile(r->file))
+    if (ContentAddressed::isMutablePerPartFile(r.file))
     {
         /// Force-fresh (Pillar B): read-your-writes for a just-written mutable file — no TTL-stale manifest.
-        auto resolved = store()->resolveRef(r->ns, r->ref);
-        return resolved && !isReservedMutableName(r->file) && resolved->mutable_files.contains(r->file);
+        auto resolved = store()->resolveRef(r.ns, r.ref);
+        return resolved && !isReservedMutableName(r.file) && resolved->mutable_files.contains(r.file);
     }
 
-    auto rt = resolveRouted(*r);
+    auto rt = resolveRouted(r);
     if (!rt)
         return false;
     for (const auto & entry : rt->second)
-        if (entry.name == r->file)
+        if (entry.name == r.file)
             return true;
     return false;
 }
 
 bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
 {
-    /// FREEZE shadow namespace — routed BEFORE the live branches (a shadow table dir also
-    /// satisfies parseTableUuid).
-    if (ContentAddressed::isShadowPath(path))
+    const auto c = classifyDiskPath(path);
+    switch (c.kind)
     {
-        if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
-            return store()->resolveRef(shadowNamespace(p->shadow_table_dir), p->part_name, /*allow_stale=*/true).has_value();
-        if (ContentAddressed::endsWithTableUuidPair(path))
-            return !store()->listRefs(shadowNamespace(path)).empty();
-        /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff the scoped S3
-        /// LIST of the mirrored subtree finds any objects (design §5.3). A non-empty LIST means
-        /// at least one shadow archive exists under this path; GC removes S3 objects for fully-
-        /// dropped archives, so a bare LIST is a reliable existence signal without registry access.
-        const std::string canonical = canonicalDiskPath(path);
-        const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
-        return !store()->listMirroredChildren(scope).empty();
-    }
+        case PathKind::ShadowPartDir:
+        case PathKind::PartDir:
+            /// A part dir (live, detached, or shadow): exists iff its ref is present.
+            return store()->resolveRef(c.route->ns, c.route->ref, /*allow_stale=*/true).has_value();
 
-    if (auto uuid = ContentAddressed::parseTableUuid(path))
-        /// Table dir exists iff it has at least one committed part (the PoC's refs-only rule).
-        return !store()->listRefs(liveNamespace(*uuid)).empty();
+        case PathKind::ShadowTableDir:
+            return !store()->listRefs(*c.shadow_table_ns).empty();
 
-    auto p = ContentAddressed::parsePartFilePath(path);
-    if (p)
-    {
-        auto r = route(*p);
-        /// The detached CONTAINER dir <table>/detached: route gives an empty ref.
-        if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
-            return !store()->listRefs(r->ns).empty();
-        /// A part dir (live, detached, or shadow): exists iff its ref is present.
-        if (r && !r->ref.empty() && r->file.empty())
-            return store()->resolveRef(r->ns, r->ref, /*allow_stale=*/true).has_value();
-        /// A projection dir: at least one tree entry (or mutable file) under its prefix.
-        if (r && !r->ref.empty())
+        case PathKind::ShadowIntermediate:
+            /// Exists iff the scoped mirrored LIST finds any objects (design §5.3): GC removes S3
+            /// objects for fully-dropped archives, so a bare LIST is a reliable existence signal.
+            return !store()->listMirroredChildren(c.shadow_scope).empty();
+
+        case PathKind::TableDir:
+            /// Table dir exists iff it has at least one committed part (the PoC's refs-only rule).
+            return !store()->listRefs(liveNamespace(c.table_uuid)).empty();
+
+        case PathKind::DetachedContainer:
+            return !store()->listRefs(c.route->ns).empty();
+
+        case PathKind::ProjectionDir:
         {
-            if (auto prefix = projectionDirPrefix(r->file))
-            {
-                auto rt = resolveRouted(*r);
-                if (!rt)
-                    return false;
-                for (const auto & entry : rt->second)
-                    if (entry.name.starts_with(*prefix))
-                        return true;
-                for (const auto & [file, _] : rt->first.mutable_files)
-                    if (file.starts_with(*prefix))
-                        return true;
+            /// A projection dir: at least one tree entry (or mutable file) under its prefix.
+            auto rt = resolveRouted(*c.route);
+            if (!rt)
                 return false;
-            }
+            for (const auto & entry : rt->second)
+                if (entry.name.starts_with(c.projection_prefix))
+                    return true;
+            for (const auto & [file, _] : rt->first.mutable_files)
+                if (file.starts_with(c.projection_prefix))
+                    return true;
+            return false;
         }
-    }
 
-    /// A table-level SUBDIRECTORY (deduplication_logs/...): at least one verbatim file under it.
-    if (auto tf = ContentAddressed::parseTableFilePath(path))
-    {
-        const std::string prefix = tf->tail + "/";
-        for (const auto & name : store()->listNamespaceFiles(liveNamespace(tf->table_uuid)))
-            if (name.starts_with(prefix))
-                return true;
-        return false;
+        case PathKind::TableSubdir:
+        {
+            /// A table-level SUBDIRECTORY (deduplication_logs/...): at least one verbatim file under it.
+            const std::string prefix = c.table_file->tail + "/";
+            for (const auto & name : store()->listNamespaceFiles(liveNamespace(c.table_file->table_uuid)))
+                if (name.starts_with(prefix))
+                    return true;
+            return false;
+        }
+
+        case PathKind::Unknown:
+            return false;
     }
     return false;
 }
@@ -559,7 +619,9 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     if (auto bytes = tryGetInManifestBytes(path))
         return bytes->size();
 
-    if (!ContentAddressed::isPartFilePath(path))
+    const auto c = classifyDiskPath(path);
+
+    if (!c.is_part_file_path)
     {
         /// A loose mountpoint object (design §5.2): read and return its byte length.
         if (auto bytes = store()->getMountpointObject(server_id + "/" + path))
@@ -567,20 +629,17 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
     }
 
-    auto p = ContentAddressed::parsePartFilePath(path);
-    if (!p || p->file.empty())
+    if (!c.route || c.route->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
-    auto r = route(*p);
-    if (!r || r->file.empty())
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
+    const Route & r = *c.route;
 
-    auto rt = resolveRouted(*r);
+    auto rt = resolveRouted(r);
     if (!rt)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
     for (const auto & entry : rt->second)
-        if (entry.name == r->file)
+        if (entry.name == r.file)
             return entry.file_size;
-    throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in tree of {}", r->file, path);
+    throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in tree of {}", r.file, path);
 }
 
 Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::string & path) const
@@ -622,120 +681,113 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
 
 std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const std::string & path) const
 {
-    if (ContentAddressed::isShadowPath(path))
+    /// Collapse a routed part dir's tree entries + mutable files to their first components
+    /// (projections surface as ONE <proj>.proj entry). Shared by the shadow-part-dir and live/
+    /// detached part-dir kinds.
+    auto list_part_dir = [&](const Route & r) -> std::vector<std::string>
     {
-        /// Shadow PART dir: the frozen part's file names (first components).
-        if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
+        auto rt = resolveRouted(r);
+        if (!rt)
+            return {};
+        std::unordered_set<std::string> result;
+        for (const auto & entry : rt->second)
+            addFirstComponent(result, entry.name);
+        for (const auto & [file, _] : rt->first.mutable_files)
+            if (!isReservedMutableName(file))
+                addFirstComponent(result, file);
+        return toVector(std::move(result));
+    };
+
+    const auto c = classifyDiskPath(path);
+    switch (c.kind)
+    {
+        case PathKind::ShadowPartDir:
+        case PathKind::PartDir:
+            /// A part dir (live, detached, or shadow): logical file names, nested keys collapsed to
+            /// their first component (projections surface as ONE <proj>.proj entry).
+            return list_part_dir(*c.route);
+
+        case PathKind::ShadowTableDir:
         {
-            auto rt = resolveRouted(Route{shadowNamespace(p->shadow_table_dir), p->part_name, ""});
-            if (!rt)
-                return {};
-            std::unordered_set<std::string> result;
-            for (const auto & entry : rt->second)
-                addFirstComponent(result, entry.name);
-            for (const auto & [file, _] : rt->first.mutable_files)
-                if (!isReservedMutableName(file))
-                    addFirstComponent(result, file);
-            return toVector(std::move(result));
-        }
-        /// Shadow TABLE dir: the frozen part names.
-        if (ContentAddressed::endsWithTableUuidPair(path))
-        {
+            /// Shadow TABLE dir: the frozen part names.
             std::vector<std::string> result;
-            for (const auto & [ref, _] : store()->listRefs(shadowNamespace(path)))
+            for (const auto & [ref, _] : store()->listRefs(*c.shadow_table_ns))
                 result.push_back(ref);
             return result;
         }
-        /// Shadow INTERMEDIATE dir: enumerate children via a scoped S3 LIST of the mirrored
-        /// subtree (design §5.3). A mirrored LIST naturally surfaces intermediate path segments
-        /// AND `@cas@`-suffixed table dirs; strip the trailing `@cas@` for the logical view.
-        /// Loose LIST is fine: the existing listRefs re-check filters out dropped-but-registered
-        /// archives so they don't appear as false children.
-        const std::string canonical = canonicalDiskPath(path);
-        const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
-        auto strip_cas = [](std::string s)
-        {
-            constexpr std::string_view suffix = "@cas@";
-            if (s.size() >= suffix.size() && std::string_view(s).ends_with(suffix))
-                s.resize(s.size() - suffix.size());
-            return s;
-        };
-        std::unordered_set<std::string> result;
-        for (const auto & child : store()->listMirroredChildren(scope))
-            result.emplace(strip_cas(child));
-        return toVector(std::move(result));
-    }
 
-    /// Table dir: part names from refs + table-level verbatim file names (first components —
-    /// StorageMergeTree::loadMutations scans this dir for mutation_* entries).
-    if (auto uuid = ContentAddressed::parseTableUuid(path))
-    {
-        std::unordered_set<std::string> result;
-        for (const auto & [ref, _] : store()->listRefs(liveNamespace(*uuid)))
-            result.emplace(ref);
-        for (const auto & name : store()->listNamespaceFiles(liveNamespace(*uuid)))
-            addFirstComponent(result, name);
-        return toVector(std::move(result));
-    }
-
-    if (auto p = ContentAddressed::parsePartFilePath(path))
-    {
-        auto r = route(*p);
-        /// The detached CONTAINER dir: the detached part directory names (B36's intent — never
-        /// the files inside, never a dir-stripped mutable file).
-        if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
+        case PathKind::ShadowIntermediate:
         {
-            std::vector<std::string> result;
-            for (const auto & [ref, _] : store()->listRefs(r->ns))
-                result.push_back(ref);
-            return result;
-        }
-        /// A part dir (live, detached part, shadow handled above): logical file names, nested
-        /// keys collapsed to their first component (projections surface as ONE <proj>.proj entry).
-        if (r && !r->ref.empty() && r->file.empty())
-        {
-            auto rt = resolveRouted(*r);
-            if (!rt)
-                return {};
-            std::unordered_set<std::string> result;
-            for (const auto & entry : rt->second)
-                addFirstComponent(result, entry.name);
-            for (const auto & [file, _] : rt->first.mutable_files)
-                if (!isReservedMutableName(file))
-                    addFirstComponent(result, file);
-            return toVector(std::move(result));
-        }
-        /// A projection dir: inner names with the <proj>.proj/ prefix stripped.
-        if (r && !r->ref.empty())
-        {
-            if (auto prefix = projectionDirPrefix(r->file))
+            /// Shadow INTERMEDIATE dir: enumerate children via a scoped S3 LIST of the mirrored
+            /// subtree (design §5.3). A mirrored LIST naturally surfaces intermediate path segments
+            /// AND `@cas@`-suffixed table dirs; strip the trailing `@cas@` for the logical view.
+            /// Loose LIST is fine: the existing listRefs re-check filters out dropped-but-registered
+            /// archives so they don't appear as false children.
+            auto strip_cas = [](std::string s)
             {
-                auto rt = resolveRouted(*r);
-                if (!rt)
-                    return {};
-                std::unordered_set<std::string> result;
-                for (const auto & entry : rt->second)
-                    if (entry.name.starts_with(*prefix))
-                        result.emplace(entry.name.substr(prefix->size()));
-                for (const auto & [file, _] : rt->first.mutable_files)
-                    if (!isReservedMutableName(file) && file.starts_with(*prefix))
-                        result.emplace(file.substr(prefix->size()));
-                return toVector(std::move(result));
-            }
+                constexpr std::string_view suffix = "@cas@";
+                if (s.size() >= suffix.size() && std::string_view(s).ends_with(suffix))
+                    s.resize(s.size() - suffix.size());
+                return s;
+            };
+            std::unordered_set<std::string> result;
+            for (const auto & child : store()->listMirroredChildren(c.shadow_scope))
+                result.emplace(strip_cas(child));
+            return toVector(std::move(result));
         }
-    }
 
-    /// A table-level SUBDIRECTORY: verbatim files under <subdir>/, first-component collapsed.
-    if (auto tf = ContentAddressed::parseTableFilePath(path))
-    {
-        const std::string prefix = tf->tail + "/";
-        std::unordered_set<std::string> result;
-        for (const auto & name : store()->listNamespaceFiles(liveNamespace(tf->table_uuid)))
-            if (name.starts_with(prefix))
-                addFirstComponent(result, name.substr(prefix.size()));
-        return toVector(std::move(result));
-    }
+        case PathKind::TableDir:
+        {
+            /// Table dir: part names from refs + table-level verbatim file names (first components —
+            /// StorageMergeTree::loadMutations scans this dir for mutation_* entries).
+            std::unordered_set<std::string> result;
+            for (const auto & [ref, _] : store()->listRefs(liveNamespace(c.table_uuid)))
+                result.emplace(ref);
+            for (const auto & name : store()->listNamespaceFiles(liveNamespace(c.table_uuid)))
+                addFirstComponent(result, name);
+            return toVector(std::move(result));
+        }
 
+        case PathKind::DetachedContainer:
+        {
+            /// The detached CONTAINER dir: the detached part directory names (B36's intent — never
+            /// the files inside, never a dir-stripped mutable file).
+            std::vector<std::string> result;
+            for (const auto & [ref, _] : store()->listRefs(c.route->ns))
+                result.push_back(ref);
+            return result;
+        }
+
+        case PathKind::ProjectionDir:
+        {
+            /// A projection dir: inner names with the <proj>.proj/ prefix stripped.
+            auto rt = resolveRouted(*c.route);
+            if (!rt)
+                return {};
+            std::unordered_set<std::string> result;
+            for (const auto & entry : rt->second)
+                if (entry.name.starts_with(c.projection_prefix))
+                    result.emplace(entry.name.substr(c.projection_prefix.size()));
+            for (const auto & [file, _] : rt->first.mutable_files)
+                if (!isReservedMutableName(file) && file.starts_with(c.projection_prefix))
+                    result.emplace(file.substr(c.projection_prefix.size()));
+            return toVector(std::move(result));
+        }
+
+        case PathKind::TableSubdir:
+        {
+            /// A table-level SUBDIRECTORY: verbatim files under <subdir>/, first-component collapsed.
+            const std::string prefix = c.table_file->tail + "/";
+            std::unordered_set<std::string> result;
+            for (const auto & name : store()->listNamespaceFiles(liveNamespace(c.table_file->table_uuid)))
+                if (name.starts_with(prefix))
+                    addFirstComponent(result, name.substr(prefix.size()));
+            return toVector(std::move(result));
+        }
+
+        case PathKind::Unknown:
+            return {};
+    }
     return {};
 }
 
@@ -756,12 +808,14 @@ bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path)
     /// DiskObjectStorage::removeDirectory proceeds straight to the ref-unlink instead of throwing
     /// CANNOT_RMDIR per removal (the PoC's B45). Same for a projection subdir (B60). The detached
     /// CONTAINER and TABLE dirs keep the listing-based emptiness (DROP TABLE's non-empty guard).
-    if (auto p = ContentAddressed::parsePartFilePath(path))
+    /// This keys on the routed (ref, file) directly — NOT on the directory-cascade kind — because
+    /// the original predicate fires for any routed part/projection dir (live, detached, OR shadow),
+    /// which the kind would split into ShadowPartDir/ShadowIntermediate.
+    if (const auto c = classifyDiskPath(path); c.route && !c.route->ref.empty())
     {
-        auto r = route(*p);
-        if (r && !r->ref.empty() && r->file.empty())
+        if (c.route->file.empty())
             return true;
-        if (r && !r->ref.empty() && projectionDirPrefix(r->file))
+        if (projectionDirPrefix(c.route->file))
             return true;
     }
     return !iterateDirectory(path)->isValid();
@@ -776,9 +830,11 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     if (auto bytes = tryGetInManifestBytes(path))
         return {StoredObject("", path, bytes->size())};
 
-    if (!ContentAddressed::isPartFilePath(path))
+    const auto c = classifyDiskPath(path);
+
+    if (!c.is_part_file_path)
     {
-        if (ContentAddressed::parseTableFilePath(path))
+        if (c.table_file)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                 "ContentAddressed: table-level verbatim file is in-manifest, not a storage object: {}", path);
         /// A loose mountpoint object: a real plain object at roots/<server>/<path>. The
@@ -789,19 +845,16 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
     }
 
-    auto p = ContentAddressed::parsePartFilePath(path);
-    if (!p || p->file.empty())
+    if (!c.route || c.route->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
-    auto r = route(*p);
-    if (!r || r->file.empty())
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
+    const Route & r = *c.route;
 
-    auto rt = resolveRouted(*r);
+    auto rt = resolveRouted(r);
     if (!rt)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
     for (const auto & entry : rt->second)
     {
-        if (entry.name != r->file)
+        if (entry.name != r.file)
             continue;
         const auto location = store()->locate(entry);
         /// StoredObject carries no range (the recorded upstream delta) — the PAYLOAD length is the
@@ -809,7 +862,7 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         /// getBlobViewPlan's view window, the only byte-reading path.
         return {StoredObject(location.key, path, location.length)};
     }
-    throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in tree of {}", r->file, path);
+    throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in tree of {}", r.file, path);
 }
 
 std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(const std::string & path) const
@@ -817,37 +870,36 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     if (!cas_store)
         return std::nullopt;
 
-    if (!ContentAddressed::isPartFilePath(path))
+    const auto c = classifyDiskPath(path);
+
+    if (!c.is_part_file_path)
     {
-        if (auto tf = ContentAddressed::parseTableFilePath(path))
-            return store()->getNamespaceFile(liveNamespace(tf->table_uuid), tf->tail);
+        if (c.table_file)
+            return store()->getNamespaceFile(liveNamespace(c.table_file->table_uuid), c.table_file->tail);
         return std::nullopt;   /// loose files are plain objects, not in-manifest bytes (design §5.2)
     }
 
-    auto p = ContentAddressed::parsePartFilePath(path);
-    if (!p || p->file.empty())
+    if (!c.route || c.route->file.empty())
         return std::nullopt;
-    auto r = route(*p);
-    if (!r || r->file.empty())
-        return std::nullopt;
+    const Route & r = *c.route;
 
-    if (ContentAddressed::isMutablePerPartFile(r->file))
+    if (ContentAddressed::isMutablePerPartFile(r.file))
     {
         /// Force-fresh (Pillar B): MVCC txn_version / mutable-file read — must not serve a TTL-stale manifest.
-        auto resolved = store()->resolveRef(r->ns, r->ref);
-        if (!resolved || isReservedMutableName(r->file))
+        auto resolved = store()->resolveRef(r.ns, r.ref);
+        if (!resolved || isReservedMutableName(r.file))
             return std::nullopt;
-        auto it = resolved->mutable_files.find(r->file);
+        auto it = resolved->mutable_files.find(r.file);
         if (it == resolved->mutable_files.end())
             return std::nullopt;
         return it->second;
     }
 
-    auto rt = resolveRouted(*r);
+    auto rt = resolveRouted(r);
     if (!rt)
         return std::nullopt;
     for (const auto & entry : rt->second)
-        if (entry.name == r->file && entry.placement == Cas::Placement::Inline)
+        if (entry.name == r.file && entry.placement == Cas::Placement::Inline)
             return entry.inline_bytes;
     return std::nullopt;
 }
