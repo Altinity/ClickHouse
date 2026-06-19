@@ -31,6 +31,13 @@ inline constexpr std::string_view kDetachedDirName = "detached";
 /// `Cas::Layout::tryParseRootShardKey`).
 inline constexpr std::string_view kCasArchiveSuffix = "@cas@";
 
+/// Compose the mirrored content-addressed archive path for a table identifier as the parser reports
+/// it. Atomic tables report the bare `<uuid>` → reconstruct `store/<u3>/<uuid>@cas@` (u3 = first 3
+/// chars, matching ClickHouse's store fanout). Non-Atomic tables report the full joined
+/// `data/<db>/<tbl>` path → append `@cas@` to it verbatim. The `@cas@` suffix lands on the
+/// table-dir (last) segment in both cases. Pure; no ClickHouse dependency.
+std::string mirroredArchiveNamespace(const std::string & table_uuid);
+
 /// Reserved table-level subdirectory: TABLE_DIR/deduplication_logs/FILE is structurally
 /// indistinguishable from a part file in the Atomic layout, so the name is reserved — never a part
 /// dir; its contents are table-level verbatim files. ClickHouse part names never take this form.

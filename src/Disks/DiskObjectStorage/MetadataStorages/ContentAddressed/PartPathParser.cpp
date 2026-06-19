@@ -246,6 +246,18 @@ std::optional<TableFilePath> parseTableFilePath(const std::string & path)
     return r;
 }
 
+std::string mirroredArchiveNamespace(const std::string & table_uuid)
+{
+    if (table_uuid.find('/') == std::string::npos)
+    {
+        /// Atomic: a bare uuid; mirror ClickHouse's store/<u3>/<uuid> fanout.
+        const std::string u3 = table_uuid.substr(0, 3);
+        return "store/" + u3 + "/" + table_uuid + std::string(kCasArchiveSuffix);
+    }
+    /// Non-Atomic: a full data/<db>/<tbl> path already; append the suffix to the last segment.
+    return table_uuid + std::string(kCasArchiveSuffix);
+}
+
 bool isShadowPath(const std::string & path)
 {
     size_t i = 0;

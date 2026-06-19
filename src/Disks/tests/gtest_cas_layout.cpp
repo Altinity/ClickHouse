@@ -118,3 +118,14 @@ TEST(CasLayout, TryParseRootShardKeyCasGated)
     /// Negative: a numeric tail directly under a non-@cas@ namespace segment.
     EXPECT_FALSE(l.tryParseRootShardKey("p/roots/srv1/store/3f2/3f2a-uuid/7").has_value());
 }
+
+TEST(CasVfsPaths, MirroredArchiveNamespace)
+{
+    using DB::ContentAddressed::mirroredArchiveNamespace;
+    /// Atomic: bare uuid -> store/<u3>/<uuid>@cas@
+    EXPECT_EQ(mirroredArchiveNamespace("3f2a0000-0000-0000-0000-000000000001"),
+              "store/3f2/3f2a0000-0000-0000-0000-000000000001@cas@");
+    /// Non-Atomic: a full data/db/tbl path is used verbatim, @cas@ appended to the last segment.
+    EXPECT_EQ(mirroredArchiveNamespace("data/mydb/events"),
+              "data/mydb/events@cas@");
+}

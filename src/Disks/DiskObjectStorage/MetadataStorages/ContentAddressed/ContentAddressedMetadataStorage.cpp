@@ -390,12 +390,18 @@ MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 
 Cas::RootNamespace ContentAddressedMetadataStorage::liveNamespace(const std::string & table_uuid) const
 {
-    return Cas::RootNamespace{server_id + "/" + table_uuid};
+    /// Path-mirroring (design §5.1): the namespace IS the table's canonical disk path with the
+    /// content-addressed boundary marked by `@cas@` on the table-dir segment, prefixed by the
+    /// server id. e.g. `srv1/store/3f2/3f2a…@cas@`.
+    return Cas::RootNamespace{server_id + "/" + ContentAddressed::mirroredArchiveNamespace(table_uuid)};
 }
 
 Cas::RootNamespace ContentAddressedMetadataStorage::detachedNamespace(const std::string & table_uuid) const
 {
-    return Cas::RootNamespace{server_id + "/detached/" + table_uuid};
+    /// A SIBLING archive under `detached/` — preserves the non-nesting invariant (design §5.7):
+    /// `…/store/…@cas@` and `…/detached/store/…@cas@` diverge at `store`/`detached`, so no
+    /// namespace is a path-prefix of another and GC's per-namespace prefix-LIST never crosses.
+    return Cas::RootNamespace{server_id + "/detached/" + ContentAddressed::mirroredArchiveNamespace(table_uuid)};
 }
 
 Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::string & shadow_table_dir)
