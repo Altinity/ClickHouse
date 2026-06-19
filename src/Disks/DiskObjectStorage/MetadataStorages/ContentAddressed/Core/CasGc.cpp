@@ -1497,9 +1497,15 @@ bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundRep
     if (!state.fence_version.contains(round))
         fence(state, state_token);
 
+    /// B140-dangle FAIL-CLOSED guard (task #131, symmetry with runRegularRound): a resumed round
+    /// reaches the SAME content-delete (via recheck) on the loaded durable snap; verify the snap's
+    /// folded_cursor is coherent with its edges before any delete, exactly as the normal path does.
+    const auto resume_universe = discoverUniverse();
+    assertSnapJournalCoherent(snap, resume_universe);
+
     const RecheckResult rechecked = recheck(state, snap, retired, report);
     cascadeAndPersist(state, state_token, snap, rechecked, retired, report);
-    trim(snap, discoverUniverse(), state.round);
+    trim(snap, resume_universe, state.round);
     return true;
 }
 
