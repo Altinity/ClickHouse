@@ -905,6 +905,20 @@ TEST(CasStoreDecodeTtl, ForceFreshAlwaysHeads)
 /// the publish's invalidation erase has already run — otherwise a later allow_stale read serves the
 /// stale decode within the TTL window and the just-published ref looks absent (→ "no ref" → the
 /// adopted part is wrongly marked broken in the real server).
+TEST(CasStore, MountpointObjectRoundTrip)
+{
+    auto b = std::make_shared<DB::Cas::InMemoryBackend>();
+    auto store = DB::Cas::Store::open(b, DB::Cas::PoolConfig{.pool_prefix = "p"});
+    const String key = "srv1/clickhouse_access_check_abc";
+    EXPECT_FALSE(store->getMountpointObject(key).has_value());
+    store->putMountpointObject(key, "probe-bytes");
+    auto got = store->getMountpointObject(key);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, "probe-bytes");
+    store->removeMountpointObject(key);
+    EXPECT_FALSE(store->getMountpointObject(key).has_value());
+}
+
 TEST(CasStoreDecodeTtl, ConcurrentWriteDuringGetDoesNotPoisonStaleEntry)
 {
     using namespace DB::Cas;

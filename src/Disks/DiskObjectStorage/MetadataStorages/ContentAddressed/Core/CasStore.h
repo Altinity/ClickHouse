@@ -121,6 +121,15 @@ public:
     /// the object NOW - the reachability GC never scans them.
     void removeNamespaceFile(const RootNamespace & ns, const String & name);
 
+    /// ---- plain mountpoint objects (loose, non-content-addressed disk files; design §5.2) ----
+    /// A loose disk file (the startup write probe; anything written outside a `@cas@` archive) is a
+    /// plain object at its mirrored path `roots/<key>`. No manifest, no journal, no dedup. GC never
+    /// scans these (it deletes only content and folds only registered namespaces); they are owned by
+    /// their path and removed only by `removeMountpointObject`.
+    void putMountpointObject(const String & key, const String & bytes);
+    std::optional<String> getMountpointObject(const String & key);
+    void removeMountpointObject(const String & key);
+
     /// Internal surface for Build (same TU family; not for the wiring):
     const PoolConfig & poolConfig() const { return config; }
     const PoolMeta & poolMeta() const { return meta; }

@@ -108,6 +108,21 @@ public:
         return prefix + "/roots/" + ns.string() + "/_files/";
     }
 
+    /// A PLAIN mountpoint object (design §5.2): a loose, non-content-addressed file mirrored at its
+    /// ClickHouse path under `roots/`, with NO namespace and NO `_files` wrapper. `key` is the
+    /// server-prefixed mirrored path (e.g. `srv1/clickhouse_access_check_abc`). It must NOT end in a
+    /// reserved area and must not look like a shard — the `@cas@`-gated `tryParseRootShardKey`
+    /// guarantees a numeric tail here is never mis-classified. The `_files`/`_pool_meta`/`_registry`
+    /// reservations still apply to its segments via the path itself (these never appear in a real
+    /// ClickHouse loose-file path).
+    String mountpointObjectKey(const String & key) const
+    {
+        if (key.empty() || key.front() == '/' || key.back() == '/' || key.find("//") != String::npos)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "CasLayout: mountpoint object key must be a clean relative path, got '{}'", key);
+        return prefix + "/roots/" + key;
+    }
+
     /// GC keys.
     String gcStateKey() const
     {

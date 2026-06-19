@@ -653,6 +653,54 @@ void Store::removeNamespaceFile(const RootNamespace & ns, const String & name)
         "CAS removeNamespaceFile contention on {} (runaway live-lock brake)", key);
 }
 
+void Store::putMountpointObject(const String & key, const String & bytes)
+{
+    /// Plain mountpoint object: same head + conditional-write CAS shape as `putNamespaceFile`,
+    /// but the key is `roots/<key>` with no namespace or `_files` wrapper (design §5.2).
+    /// Single-owner keys make a contention storm impossible; the bound is a runaway brake.
+    const String full_key = pool_layout.mountpointObjectKey(key);
+    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
+    {
+        HeadResult head = pool_backend->head(full_key);
+        if (!head.exists)
+        {
+            if (pool_backend->putIfAbsent(full_key, bytes) == PutOutcome::Done)
+                return;
+        }
+        else
+        {
+            if (pool_backend->putOverwrite(full_key, bytes, head.token) == PutOutcome::Done)
+                return;
+        }
+    }
+    throw Exception(ErrorCodes::ABORTED, "mountpoint object CAS contention on '{}'", full_key);
+}
+
+std::optional<String> Store::getMountpointObject(const String & key)
+{
+    const std::optional<GetResult> result = pool_backend->get(pool_layout.mountpointObjectKey(key));
+    if (!result)
+        return std::nullopt;
+    return result->bytes;
+}
+
+void Store::removeMountpointObject(const String & key)
+{
+    /// Exact-token delete of a plain mountpoint object (design §5.2). No-op when absent.
+    const String full_key = pool_layout.mountpointObjectKey(key);
+    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
+    {
+        const HeadResult head = pool_backend->head(full_key);
+        if (!head.exists)
+            return;
+        const DeleteOutcome outcome = pool_backend->deleteExact(full_key, head.token);
+        if (outcome.kind == DeleteOutcome::Kind::Deleted || outcome.kind == DeleteOutcome::Kind::NotFound)
+            return;
+    }
+    throw Exception(ErrorCodes::ABORTED,
+        "CAS removeMountpointObject contention on '{}' (runaway live-lock brake)", full_key);
+}
+
 void Store::dropNamespace(const RootNamespace & ns)
 {
     /// Tombstone every TOUCHED shard, then delete the verbatim files. GC removes the manifest OBJECTS
