@@ -137,3 +137,18 @@ GC reclaims it under a still-in-flight adopter → publish dangles. Pinned live 
   + `retry_on_transport` retries readonly (INSERT + all BARRIER ops); `_optimize_with_retry` swallows
   readonly (no model effect). `checker.py` already retried readonly for SYNC REPLICA — extended the
   same tolerance to the workload paths. Restarting the soak for a clean run-to-completion 12h.
+- **T18 — soak v3: B173 VALIDATED + B140-dangle clean deep into chaos (~6h).** The 12h v3 run
+  (SEED 20260619, WORKERS=2, chaos, B173 harness fix, metrics `soak_b171_12h_v3.db`) passed warmup→
+  steady→mutations→ttl→gc_checkpoint→chaos with every GC/recovery checkpoint `fsck dangling=0`.
+  **The both-pause fault (which killed v2) fired 3×: #19 (41s), #33 (37s), #35 (5s) — ALL survived**
+  (RUNPY_EXIT/WORKLOAD FAILURE/PHASE3 FAILED = 0); #19's 41s pause exceeded v2's fatal 40s, so it is
+  not timing-luck — the transient `TABLE_IS_READ_ONLY` is now retried, not fatal. Also survived chaos
+  ch1 kill (53s), ch1/ch2 restarts, rustfs restart/pause. Throughout: CORRUPTED_DATA 0, all CA
+  anomalies 0, precommit_reclaim false-positives ("frozen") 0, precommit lifecycle clean (~449k/449k).
+  v3 has passed the v2 death point; expected to run to 12h completion.
+- **Design dialogue (parallel, no code):** recorded backlog B174 (gc/snap retention knob), B175
+  (time-travel = GC-materialized snapshot-roots, tiered/GFS retention), B176 (gc/snap→protobuf +
+  blob-envelope TLV; benchmark first), and the 96-byte header rationale (CasEnvelope + spec §3.1).
+  Open design thread (to capture as B177): CA layer as a clean content-addressed VFS (parts→thin
+  adapter; content-hash-prefix-aligned **map-reduce parallel GC** — global fence + per-prefix reduce +
+  cross-round cascade + per-prefix ownership; navigable introspection).
