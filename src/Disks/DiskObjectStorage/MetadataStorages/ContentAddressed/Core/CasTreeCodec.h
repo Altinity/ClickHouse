@@ -11,7 +11,7 @@ namespace DB::Cas
 {
 
 /// Canonical tree codec — protocol spec §3. A tree is the directory listing of one logical folder
-/// (a part). Entries are sorted by name byte-wise so that two identical folders produce a
+/// (a ref). Entries are sorted by name byte-wise so that two identical folders produce a
 /// byte-identical payload (and therefore hash identically). Magic "CATR", version 1.
 
 enum class Placement : uint8_t

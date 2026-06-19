@@ -32,7 +32,7 @@ struct CasEvent
 {
     CasEventType type = CasEventType::Heartbeat;
     String namespace_;          /// roots/<ns> (empty if N/A)
-    String ref_name;            /// part name / ref (empty if N/A)
+    String ref_name;            /// the ref name — a mutable directory handle, git-style (empty if N/A)
     CasEventObjectKind object_kind = CasEventObjectKind::None;
     String object_hash;         /// lowercase hex (empty if N/A)
     String token;               /// incarnation token (empty if N/A)

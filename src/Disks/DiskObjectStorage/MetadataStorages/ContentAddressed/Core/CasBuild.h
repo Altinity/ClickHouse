@@ -24,7 +24,7 @@ struct BlobRef
 };
 
 /// The writer protocol (spec §5) — the W-rules live HERE, not in the wiring. One Build per written
-/// part. Thread-compat: a Build is used by ONE thread (the wiring's commit path); the Store-shared
+/// ref. Thread-compat: a Build is used by ONE thread (the wiring's commit path); the Store-shared
 /// RetireView it consults is itself thread-safe.
 class Build
 {

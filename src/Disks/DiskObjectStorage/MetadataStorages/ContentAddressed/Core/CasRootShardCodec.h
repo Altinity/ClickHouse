@@ -11,20 +11,20 @@ namespace DB::Cas
 {
 
 /// Root-shard manifest codec — the only mutable object and the single commit point (protocol spec §3).
-/// One manifest names a set of refs (parts) → their tree, plus the per-ref mutable sidecar files and
+/// One manifest names a set of refs → their tree, plus the per-ref mutable sidecar files and
 /// an embedded reachability journal.
 ///
 /// Non-hashed metadata object => STRICT JSON (spec §4 encoding split, decision 2026-06-11):
 ///   {"format":"cas_root_shard","version":1,"shard_version":7,"fence_round":2,
-///    "refs":{"part_1":{"tree":"<32 lowercase hex>","tree_size":123,
+///    "refs":{"ref_1":{"tree":"<32 lowercase hex>","tree_size":123,
 ///                      "mutable_files":{"txn_version.txt":"42"}}},
-///    "journal":[{"op":"add","ref":"part_1","tree":"<32 lowercase hex>","at_version":7}]}
+///    "journal":[{"op":"add","ref":"ref_1","tree":"<32 lowercase hex>","at_version":7}]}
 /// `refs` is a JSON object keyed by ref name (name-sorted, std::map order); `journal` is an array in
 /// insertion order. `op`: "add" | "remove". Fail-closed decode (wrong format / unknown key / missing
 /// key / wrong type / bad enum string / bad hash hex / malformed document => CORRUPTED_DATA; future
 /// version => NOT_IMPLEMENTED).
 
-/// The per-ref payload: the content tree plus the mutable per-part files (txn_version.txt,
+/// The per-ref payload: the content tree plus the mutable per-ref files (txn_version.txt,
 /// metadata_version.txt, ...) that are excluded from the content hash and live here per-ref.
 struct RefPayload
 {
