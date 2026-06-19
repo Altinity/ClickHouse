@@ -115,3 +115,13 @@ GC reclaims it under a still-in-flight adopter → publish dangles. Pinned live 
   abandoned builds) with **false-reclaim "frozen" = 0** (no false positives on live builds). A ~112k
   steady-state replica lag at ~1h40m **converged to EXACT equality** (ch1==ch2==6,488,830) at the
   mutations-stage checkpoint — benign lag, not divergence. Mem ~0.8–1.2 GB. Chaos window opens ~+4.8h.
+- **T16 — 12h soak through ~5.3h (chaos active): CLEAN GC CHECKPOINT, fsck `dangling=0`.** The
+  `gc_checkpoint` stage ran a quiesced `clickhouse-disks fsck` and reported **`fsck reachable=19
+  unreachable=0 dangling=0 dryrun_count=0`** — the authoritative no-dangle verification, after the
+  chaos window opened (+4.8h) and a full TTL/cliff drain (839,493 TTL rows pruned; table → 0 rows;
+  replicas exactly equal). Pool drained to **15 objects / 14 KB** at the cliff bottom — GC fully
+  reclaimed (no leak; the bounded-shard fix bottoms out cleanly). The fail-closed guard fired once
+  correctly under chaos (`FILE_DOESNT_EXIST`: "object … absent — cannot reuse (caller must upload it)"
+  — refused a missing-blob reuse rather than dangling; CORRUPTED_DATA stayed 0). Throughout 0–5.3h:
+  CORRUPTED_DATA 0, all CA anomalies 0, precommit_reclaim false-positives ("frozen") 0, every
+  stage-boundary checkpoint converged. The B140-dangle fix is validated under chaos.
