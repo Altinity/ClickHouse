@@ -387,12 +387,6 @@ void ExportPartitionManifestUpdatingTask::poll()
     {
         /// Task-serialization critical section: background_task_serialization_mutex is held
         /// across the ZooKeeper reads below so poll() and handleStatusChanges() never overlap,
-        /// but it is NOT the mirror lock. Every in-memory mutation of the task container takes
-        /// export_merge_tree_partition_mutex exclusively for the brief mutation only (see the
-        /// lockExclusive scopes below and inside addTask / tryCleanup / removeStaleEntries), so
-        /// the shared-lock reader of system.replicated_partition_exports is never blocked by a
-        /// ZooKeeper round-trip. The expensive Iceberg/REST-catalog commits run afterwards, with
-        /// no lock held at all (see deferred_commits).
         std::lock_guard task_guard(background_task_serialization_mutex);
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), storage.export_merge_tree_partition_task_entries_by_key.size());
