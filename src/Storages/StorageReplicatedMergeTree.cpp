@@ -10095,6 +10095,8 @@ CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & 
     /// Called from a query thread (KILL EXPORT PARTITION via InterpreterKillQueryQuery), which does not have a component set.
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::killExportPartition");
 
+    /// This is best-effort, even if we manage to set it to killed, it might be overwritten by a successful commit.
+
     auto try_set_status_to_killed = [this](const zkutil::ZooKeeperPtr & zk, const std::string & status_path)
     {
         Coordination::Stat stat;
