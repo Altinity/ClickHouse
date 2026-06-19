@@ -965,3 +965,18 @@ TEST(CasStoreDecodeTtl, ConcurrentWriteDuringGetDoesNotPoisonStaleEntry)
     EXPECT_TRUE(s->resolveRef(ns, "part_2", /*allow_stale=*/true).has_value())
         << "stale decode poisoned the TTL fast-path: just-published part_2 invisible (B157)";
 }
+
+TEST(CasStore, ListMirroredChildren)
+{
+    using namespace DB::Cas;
+    auto b = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    /// Seed two shadow archives by writing a verbatim file into each (creates the prefix in S3).
+    store->putNamespaceFile(RootNamespace{"shadow/bk1/store/3f2/3f2a-uuid@cas@"}, "x", "1");
+    store->putNamespaceFile(RootNamespace{"shadow/bk2/store/3f2/3f2a-uuid@cas@"}, "x", "1");
+    auto children = store->listMirroredChildren("shadow/");
+    std::sort(children.begin(), children.end());
+    ASSERT_EQ(children.size(), 2u);
+    EXPECT_EQ(children[0], "bk1");
+    EXPECT_EQ(children[1], "bk2");
+}

@@ -106,6 +106,12 @@ public:
     /// Dropped namespaces linger registered until full GC (M-F) — visible-but-empty, never wrong.
     std::vector<String> listNamespaces(const String & prefix);
 
+    /// Scoped LIST of the mirrored subtree (design §5.3): the distinct next-path-segment names under
+    /// `roots/<prefix>` (a loose LIST used by browse only; callers re-check `listRefs`/`getFileSize`
+    /// before showing an entry). NOT authoritative — GC still uses the compact registry. `prefix`
+    /// is a server-relative or shadow-relative path ending in '/'.
+    std::vector<String> listMirroredChildren(const String & prefix);
+
     /// ---- ref lifecycle (CAS loops on the owning shard) ----
     void dropRef(const RootNamespace & ns, const String & ref_name);            /// refs−− + '-' journal, atomic
     void updateRefPayload(const RootNamespace & ns, const String & ref_name,

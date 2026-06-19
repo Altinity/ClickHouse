@@ -495,14 +495,13 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             return store()->resolveRef(shadowNamespace(p->shadow_table_dir), p->part_name, /*allow_stale=*/true).has_value();
         if (ContentAddressed::endsWithTableUuidPair(path))
             return !store()->listRefs(shadowNamespace(path)).empty();
-        /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff some shadow
-        /// namespace (= a literal shadow table dir) under it still has refs. Registration alone is
-        /// not existence - dropped namespaces linger registered until full GC (visible-but-empty).
-        const std::string prefix = canonicalDiskPath(path) + "/";
-        for (const auto & ns : store()->listNamespaces("shadow/"))
-            if (ns.starts_with(prefix) && !store()->listRefs(Cas::RootNamespace{ns}).empty())
-                return true;
-        return false;
+        /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff the scoped S3
+        /// LIST of the mirrored subtree finds any objects (design §5.3). A non-empty LIST means
+        /// at least one shadow archive exists under this path; GC removes S3 objects for fully-
+        /// dropped archives, so a bare LIST is a reliable existence signal without registry access.
+        const std::string canonical = canonicalDiskPath(path);
+        const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
+        return !store()->listMirroredChildren(scope).empty();
     }
 
     if (auto uuid = ContentAddressed::parseTableUuid(path))
@@ -647,14 +646,23 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
                 result.push_back(ref);
             return result;
         }
-        /// Shadow INTERMEDIATE dir: derive children from the registered shadow namespaces that
-        /// still have refs (dropped ones linger registered until full GC - never list them).
+        /// Shadow INTERMEDIATE dir: enumerate children via a scoped S3 LIST of the mirrored
+        /// subtree (design §5.3). A mirrored LIST naturally surfaces intermediate path segments
+        /// AND `@cas@`-suffixed table dirs; strip the trailing `@cas@` for the logical view.
+        /// Loose LIST is fine: the existing listRefs re-check filters out dropped-but-registered
+        /// archives so they don't appear as false children.
         const std::string canonical = canonicalDiskPath(path);
-        const std::string prefix = canonical.empty() ? "shadow" : canonical;
+        const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
+        auto strip_cas = [](std::string s)
+        {
+            constexpr std::string_view suffix = "@cas@";
+            if (s.size() >= suffix.size() && std::string_view(s).ends_with(suffix))
+                s.resize(s.size() - suffix.size());
+            return s;
+        };
         std::unordered_set<std::string> result;
-        for (const auto & ns : store()->listNamespaces("shadow/"))
-            if (ns.starts_with(prefix + "/") && !store()->listRefs(Cas::RootNamespace{ns}).empty())
-                addFirstComponent(result, ns.substr(prefix.size() + 1));
+        for (const auto & child : store()->listMirroredChildren(scope))
+            result.emplace(strip_cas(child));
         return toVector(std::move(result));
     }
 
