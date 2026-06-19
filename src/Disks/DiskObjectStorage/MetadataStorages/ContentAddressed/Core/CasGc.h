@@ -260,9 +260,9 @@ private:
     /// fixed shard fan-out [0, root_shards) — the spec's static shard model. A BUILD-ROOT namespace
     /// (`_builds/<server>`) has ONE shard per in-flight build keyed by the per-process monotone
     /// `build_seq`, which has no relation to root_shards and routinely exceeds it; its present shards
-    /// are discovered by LISTing the namespace prefix and parsing the numeric tails. This is the only
+    /// are discovered by LISTing the namespace prefix and collecting the numeric tails. This is the only
     /// place the build-root namespace deviates from the ordinary shard machinery (it is identical
-    /// key-wise; `tryParseRootShardKey` classifies `_builds/<server>/<seq>` correctly).
+    /// key-wise).
     std::vector<uint64_t> shardsToVisit(const RootNamespace & ns);
 
     /// Load the durable snap generation (absent shard objects => empty snaps; the fresh-pool case).

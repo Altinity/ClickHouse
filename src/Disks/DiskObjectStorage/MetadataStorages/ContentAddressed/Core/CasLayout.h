@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Common/Exception.h>
 #include <base/types.h>
-#include <charconv>
 #include <optional>
 #include <string_view>
 
@@ -111,10 +110,9 @@ public:
     /// A PLAIN mountpoint object (design §5.2): a loose, non-content-addressed file mirrored at its
     /// ClickHouse path under `roots/`, with NO namespace and NO `_files` wrapper. `key` is the
     /// server-prefixed mirrored path (e.g. `srv1/clickhouse_access_check_abc`). It must NOT end in a
-    /// reserved area and must not look like a shard — the `@cas@`-gated `tryParseRootShardKey`
-    /// guarantees a numeric tail here is never mis-classified. The `_files`/`_pool_meta`
-    /// reservations still apply to its segments via the path itself (these never appear in a real
-    /// ClickHouse loose-file path).
+    /// reserved area. Shard discovery is via the registry (`listNamespaces`) + static `[0, root_shards)`
+    /// fan-out — not by key classification. The `_files`/`_pool_meta` reservations still apply to its
+    /// segments via the path itself (these never appear in a real ClickHouse loose-file path).
     String mountpointObjectKey(const String & key) const
     {
         if (key.empty() || key.front() == '/' || key.back() == '/' || key.find("//") != String::npos)
@@ -159,53 +157,6 @@ public:
     String blobsPrefix() const { return prefix + "/blobs/"; }
     String treesPrefix() const { return prefix + "/trees/"; }
     String packsPrefix() const { return prefix + "/packs/"; }
-
-    /// Classifies a LISTed key as a root-shard manifest: <prefix>/roots/<namespace...>/<shard_number>.
-    /// Returns nullopt for verbatim files (a `_files` segment), non-numeric tails, or foreign keys.
-    /// A classifier over list output, not a validator — never throws.
-    std::optional<std::pair<RootNamespace, uint64_t>> tryParseRootShardKey(const String & key) const
-    {
-        const String roots = rootsPrefix();
-        if (!key.starts_with(roots))
-            return std::nullopt;
-        const std::string_view rest(key.data() + roots.size(), key.size() - roots.size());
-
-        const size_t last_slash = rest.rfind('/');
-        if (last_slash == std::string_view::npos || last_slash == 0 || last_slash + 1 == rest.size())
-            return std::nullopt;                       /// need "<ns>/<tail>" with both parts non-empty
-
-        const std::string_view tail = rest.substr(last_slash + 1);
-        uint64_t shard = 0;
-        const auto [end, ec] = std::from_chars(tail.data(), tail.data() + tail.size(), shard);
-        if (ec != std::errc() || end != tail.data() + tail.size())
-            return std::nullopt;                       /// non-numeric (or overflow) tail is not a shard
-
-        const std::string_view ns = rest.substr(0, last_slash);
-        /// the segment immediately before the tail must not be the reserved verbatim-file area
-        const size_t prev_slash = ns.rfind('/');
-        const std::string_view last_ns_segment = prev_slash == std::string_view::npos ? ns : ns.substr(prev_slash + 1);
-        if (last_ns_segment == "_files")
-            return std::nullopt;
-        if (last_ns_segment.empty())
-            return std::nullopt;                       /// empty ns segment ("a//7", "//7") — Layout never writes these
-
-        /// @cas@-scoped shard parsing (design §5.1/§5.2): a key is a root-shard manifest ONLY when its
-        /// namespace's last segment is a content-addressed archive directory (`…@cas@`), or it is a
-        /// legacy build-root namespace (`_builds/…`, relocated in Phase 6). A plain mountpoint object
-        /// with a numeric tail and no `@cas@` ancestor (`roots/srv1/foo/7`) is an opaque ordinary file
-        /// and is NEVER classified as a shard.
-        const bool is_cas_archive = last_ns_segment.ends_with("@cas@");
-        const bool is_legacy_build_root = ns.starts_with("_builds/");   /// removed in Phase 6
-        if (!is_cas_archive && !is_legacy_build_root && !isPrecommitNamespaceSegment(last_ns_segment))
-            return std::nullopt;
-
-        return std::make_pair(RootNamespace{String(ns)}, shard);
-    }
-
-    /// True iff a namespace's last segment is the per-server precommit area (`_precommits`). Phase 1
-    /// stub: returns false until Phase 6 relocates precommits under `roots/<server>/_precommits`.
-    /// Until then build-root shards live at `_builds/<server_hex>/<N>`, admitted by `is_legacy_build_root`.
-    static bool isPrecommitNamespaceSegment(std::string_view) { return false; }
 
     /// Retired-set key: <prefix>/gc/retired/<round>.<fence_seq>/<shard>
     String retiredKey(uint64_t round, uint64_t fence_seq, uint64_t shard) const

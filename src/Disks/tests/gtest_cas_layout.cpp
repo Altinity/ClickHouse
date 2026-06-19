@@ -61,23 +61,6 @@ TEST(CasLayout, GcSnapAndRootsKeys)
     EXPECT_EQ(l.rootsPrefix(), "p/roots/");
 }
 
-TEST(CasLayout, TryParseRootShardKey)
-{
-    Layout l("p");
-    auto a = l.tryParseRootShardKey("p/roots/srv1/3f2e-uuid@cas@/7");
-    ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->first, RootNamespace{"srv1/3f2e-uuid@cas@"});
-    EXPECT_EQ(a->second, 7u);
-    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/srv1/tbl@cas@/_files/format_version.txt").has_value());
-    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/srv1/tbl@cas@/_files/123").has_value());
-    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/srv1/tbl@cas@/notashard").has_value());
-    EXPECT_FALSE(l.tryParseRootShardKey("p/blobs/aa/aabb").has_value());
-    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/7").has_value());          /// no namespace segment
-    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/").has_value());
-    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/a//7").has_value());       /// empty last ns segment ("a/")
-    EXPECT_FALSE(l.tryParseRootShardKey("p/roots//7").has_value());         /// empty namespace ("/")
-}
-
 TEST(CasLayout, ShortIdThrows)
 {
     Layout l{"p"};
@@ -100,22 +83,6 @@ TEST(CasLayout, RegistryKeyMovedToGc)
 TEST(CasLayout, CasArchiveSuffixConstant)
 {
     EXPECT_EQ(DB::ContentAddressed::kCasArchiveSuffix, "@cas@");
-}
-
-TEST(CasLayout, TryParseRootShardKeyCasGated)
-{
-    Layout l("p");
-    /// Positive: a @cas@ archive directory with a numeric tail is a shard.
-    auto a = l.tryParseRootShardKey("p/roots/srv1/store/3f2/3f2a-uuid@cas@/7");
-    ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->first, RootNamespace{"srv1/store/3f2/3f2a-uuid@cas@"});
-    EXPECT_EQ(a->second, 7u);
-    /// Negative: a plain mountpoint object with a numeric tail but NO @cas@ ancestor is opaque.
-    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/srv1/foo/7").has_value());
-    /// Negative: the @cas@ archive's verbatim-file area is still excluded.
-    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/srv1/store/3f2/3f2a-uuid@cas@/_files/123").has_value());
-    /// Negative: a numeric tail directly under a non-@cas@ namespace segment.
-    EXPECT_FALSE(l.tryParseRootShardKey("p/roots/srv1/store/3f2/3f2a-uuid/7").has_value());
 }
 
 TEST(CasVfsPaths, MirroredArchiveNamespace)
