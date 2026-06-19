@@ -47,6 +47,24 @@ def test_ttl_ambiguity_band_detection():
     assert m.ambiguous_band_nonempty(now=expiry, eps=5) is True
     assert m.ambiguous_band_nonempty(now=expiry + 1000, eps=5) is False
 
+def test_ttl_ambiguity_band_clears_by_advancing_now():
+    # The checkpoint wait-out loop (run.checkpoint) relies on this invariant: a row's TTL boundary is
+    # FIXED (ts + ttl_seconds) while `now` advances monotonically, so advancing `now` just past the band
+    # (eps + 1) moves the row cleanly past expiry and the band becomes empty. This is what makes the
+    # bounded wait-and-retry terminate instead of fuzzing the exact-aggregate assertion.
+    m = Model(seed=3)
+    m.apply(ins(0, 5))
+    # The latest TTL boundary across all inserted rows; sitting `now` on it makes the band non-empty.
+    latest_expiry = max(r["ts"] + m.ttl_seconds for r in m.rows.values())
+    eps = 10
+    assert m.ambiguous_band_nonempty(now=latest_expiry, eps=eps) is True
+    # One wait of eps + 1 clears the band: every boundary is now strictly more than eps behind `now`,
+    # so no row sits within ±eps of it anymore.
+    cleared_now = latest_expiry + (eps + 1)
+    assert m.ambiguous_band_nonempty(now=cleared_now, eps=eps) is False
+    # ...and every row is now unambiguously expired, so the exact assertion can proceed against 0.
+    assert m.aggregates(now=cleared_now)["count"] == 0
+
 # --- memory-bound regression: the model retained every inserted row FOREVER (never evicting
 # TTL-expired rids), so a multi-hour soak OOM-killed the driver (~12.8 GiB). The table sheds rows
 # via TTL DELETE; the oracle must too. prune_expired drops exactly the rows _expired/live_rows

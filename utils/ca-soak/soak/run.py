@@ -428,10 +428,29 @@ def checkpoint(driver, cluster, model, phase):
     driver.drain()
     now = quiesce(cluster, TABLE)
 
-    if model.ambiguous_band_nonempty(now, eps=10):
-        raise CheckpointFailure(
-            f"ambiguous TTL band non-empty at now={now} (a row sits within 10s of its TTL boundary; "
-            f"scheduling issue — checkpoint cannot be asserted exactly)")
+    # A row whose TTL expiry sits within ±eps of `now` makes the exact-aggregate assertion ambiguous:
+    # we cannot tell whether the table has already TTL-deleted it. This is a checkpoint-TIMING artifact,
+    # not corruption (B173-class) — so WAIT OUT the band rather than failing. Sleep just past the band
+    # (eps+1) and re-quiesce to refresh `now`; the boundary is fixed (`ts + ttl_seconds`) and `now`
+    # advances monotonically, so the row falls cleanly past expiry within a bounded number of tries.
+    # The sleep only moves wall-clock checkpoint timing — it does NOT touch the seeded op ledger, so the
+    # run stays deterministic-friendly. Only a genuinely stuck schedule (band never clears within the
+    # bound) is fatal. The exact `compare_aggregates` assertion below is unchanged.
+    AMBIGUOUS_BAND_EPS = 10
+    AMBIGUOUS_BAND_MAX_ATTEMPTS = 6
+    band_attempt = 0
+    while model.ambiguous_band_nonempty(now, eps=AMBIGUOUS_BAND_EPS):
+        if band_attempt >= AMBIGUOUS_BAND_MAX_ATTEMPTS:
+            raise CheckpointFailure(
+                f"ambiguous TTL band still non-empty at now={now} after "
+                f"{AMBIGUOUS_BAND_MAX_ATTEMPTS} waits (a row stays within {AMBIGUOUS_BAND_EPS}s of its "
+                f"TTL boundary; genuinely stuck scheduling — checkpoint cannot be asserted exactly)")
+        band_attempt += 1
+        wait_s = AMBIGUOUS_BAND_EPS + 1
+        log(f"checkpoint: ambiguous TTL band non-empty at now={now}; waiting {wait_s}s to clear "
+            f"(attempt {band_attempt}/{AMBIGUOUS_BAND_MAX_ATTEMPTS})")
+        time.sleep(wait_s)
+        now = quiesce(cluster, TABLE)
 
     exp = model.aggregates(now)
     n1 = query_aggregates(cluster.node1, TABLE)
