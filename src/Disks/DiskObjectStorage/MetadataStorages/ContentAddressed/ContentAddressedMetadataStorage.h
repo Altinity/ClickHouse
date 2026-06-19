@@ -143,6 +143,15 @@ public:
     std::string serverPrefix() const;
     // (genericNamespace removed — loose files are plain mountpoint objects, design §5.2)
 
+    /// Enumerate the children of a GENERIC intermediate live-tree directory (the disk root "",
+    /// `store`, the `store/<u3>` shard dir, or any loose-file container above a table dir) via a
+    /// server-scoped mirrored S3 LIST of `roots/<server-hex>/<path>/`. `@cas@`-suffixed table-dir
+    /// segments are surfaced under their logical (unsuffixed) name. This is what makes top-down
+    /// `clickhouse-disks` traversal of the live tree behave like a normal disk; concrete
+    /// `store/<u3>/<uuid>/<part>/<file>` navigation is still served by the exact-shape branches.
+    std::vector<std::string> listLiveTreeChildren(const std::string & path) const;
+    bool liveTreeDirHasChildren(const std::string & path) const;
+
     /// The route of one parsed CA path: which namespace, which ref, which in-tree file. The single
     /// place the detached re-split (PoC B36 parser contract -> per-part detached refs) and the
     /// shadow mapping happen.

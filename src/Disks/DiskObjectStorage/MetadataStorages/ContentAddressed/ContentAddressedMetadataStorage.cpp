@@ -102,6 +102,16 @@ void addFirstComponent(std::unordered_set<std::string> & out, const std::string 
     out.emplace(slash == std::string::npos ? name : name.substr(0, slash));
 }
 
+/// Drop a trailing `@cas@` content-addressing boundary marker from a mirrored path segment, so a
+/// table-dir surfaces under its logical (unsuffixed) name in directory listings.
+std::string stripCasArchiveSuffix(std::string s)
+{
+    const auto & suffix = ContentAddressed::kCasArchiveSuffix;
+    if (s.size() >= suffix.size() && std::string_view(s).ends_with(suffix))
+        s.resize(s.size() - suffix.size());
+    return s;
+}
+
 std::vector<std::string> toVector(std::unordered_set<std::string> && set)
 {
     return std::vector<std::string>(std::make_move_iterator(set.begin()), std::make_move_iterator(set.end()));
@@ -397,6 +407,26 @@ std::string ContentAddressedMetadataStorage::serverPrefix() const
     return Cas::u128ToHex(serverIdToU128(server_id));
 }
 
+std::vector<std::string> ContentAddressedMetadataStorage::listLiveTreeChildren(const std::string & path) const
+{
+    const std::string canonical = canonicalDiskPath(path);
+    const std::string scope = serverPrefix() + "/" + (canonical.empty() ? "" : canonical + "/");
+    std::unordered_set<std::string> result;
+    for (const auto & child : store()->listMirroredChildren(scope))
+        result.emplace(stripCasArchiveSuffix(child));
+    return toVector(std::move(result));
+}
+
+bool ContentAddressedMetadataStorage::liveTreeDirHasChildren(const std::string & path) const
+{
+    const std::string canonical = canonicalDiskPath(path);
+    /// The disk root always exists; otherwise a non-empty server-scoped mirrored LIST is the signal.
+    if (canonical.empty())
+        return true;
+    const std::string scope = serverPrefix() + "/" + canonical + "/";
+    return !store()->listMirroredChildren(scope).empty();
+}
+
 Cas::RootNamespace ContentAddressedMetadataStorage::liveNamespace(const std::string & table_uuid) const
 {
     /// Path-mirroring (design §5.1): the namespace IS the table's canonical disk path with the
@@ -513,6 +543,11 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
         return !store()->listMirroredChildren(scope).empty();
     }
 
+    /// The Atomic `store/<u3>` shard dir (see listDirectory): route to the generic existence signal
+    /// before parseTableUuid/parseTableFilePath misclaim it as a non-Atomic table.
+    if (ContentAddressed::isAtomicShardDir(path))
+        return liveTreeDirHasChildren(path);
+
     if (auto uuid = ContentAddressed::parseTableUuid(path))
         /// Table dir exists iff it has at least one committed part (the PoC's refs-only rule).
         return !store()->listRefs(liveNamespace(*uuid)).empty();
@@ -555,7 +590,11 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
                 return true;
         return false;
     }
-    return false;
+
+    /// A generic INTERMEDIATE live-tree directory (disk root, `store`, ...): exists iff a
+    /// server-scoped mirrored LIST finds any object. Keeps `cd`/existence consistent with
+    /// listDirectory so `clickhouse-disks` traversal behaves like a normal disk.
+    return liveTreeDirHasChildren(path);
 }
 
 bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & path) const
@@ -662,18 +701,18 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         /// archives so they don't appear as false children.
         const std::string canonical = canonicalDiskPath(path);
         const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
-        auto strip_cas = [](std::string s)
-        {
-            constexpr std::string_view suffix = "@cas@";
-            if (s.size() >= suffix.size() && std::string_view(s).ends_with(suffix))
-                s.resize(s.size() - suffix.size());
-            return s;
-        };
         std::unordered_set<std::string> result;
         for (const auto & child : store()->listMirroredChildren(scope))
-            result.emplace(strip_cas(child));
+            result.emplace(stripCasArchiveSuffix(child));
         return toVector(std::move(result));
     }
+
+    /// The Atomic `store/<u3>` shard dir: a pure intermediate dir whose only child is the
+    /// uuid-anchored table dir. Its path shape collides with the non-Atomic `data/<db>` fallback of
+    /// both parseTableUuid and parseTableFilePath, so it MUST be routed to the generic mirrored LIST
+    /// BEFORE those branches claim it.
+    if (ContentAddressed::isAtomicShardDir(path))
+        return listLiveTreeChildren(path);
 
     /// Table dir: part names from refs + table-level verbatim file names (first components —
     /// StorageMergeTree::loadMutations scans this dir for mutation_* entries).
@@ -745,7 +784,11 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         return toVector(std::move(result));
     }
 
-    return {};
+    /// A generic INTERMEDIATE live-tree directory (the disk root "", `store`, or any loose-file
+    /// container above a table dir): a server-scoped mirrored LIST. (`store/<u3>` is handled by the
+    /// early guard above, since its non-Atomic-table ambiguity would otherwise misroute it here too
+    /// late, after parseTableUuid/parseTableFilePath have already claimed it.)
+    return listLiveTreeChildren(path);
 }
 
 DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std::string & path) const

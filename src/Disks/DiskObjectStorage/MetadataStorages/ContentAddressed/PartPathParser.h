@@ -92,6 +92,13 @@ std::optional<PartFilePath> parsePartFilePath(const std::string & path);
 /// layout, the full joined data/db/table path for non-Atomic.
 std::optional<std::string> parseTableUuid(const std::string & path);
 
+/// True iff the path is an Atomic-layout INTERMEDIATE shard directory `store/<u3>`, where <u3> is a
+/// 3-character uuid prefix (the only child it has on disk is a uuid-anchored `<u3>/<uuid>` table
+/// dir). This shape is ambiguous with the non-Atomic `data/<db>` fallback of parseTableUuid, so the
+/// metadata router must consult it FIRST and treat `store/<u3>` as a generic intermediate dir to be
+/// enumerated by a mirrored LIST — never as a non-Atomic table id.
+bool isAtomicShardDir(const std::string & path);
+
 /// Strict "this dir IS a uuid-anchored table dir" predicate: the path's LAST two components form
 /// an Atomic <uuid[:3]>/<uuid> pair. Unlike parseTableUuid it rejects the non-Atomic fallback —
 /// the shadow router uses it to tell a shadow TABLE dir from a shadow INTERMEDIATE dir.

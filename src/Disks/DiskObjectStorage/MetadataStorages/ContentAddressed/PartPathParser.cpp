@@ -185,6 +185,17 @@ std::optional<std::string> parseTableUuid(const std::string & path)
     return std::nullopt;
 }
 
+bool isAtomicShardDir(const std::string & path)
+{
+    // The Atomic on-disk layout shards table dirs as `store/<u3>/<uuid>@cas@`, so `store/<u3>` is a
+    // pure intermediate shard directory: the literal `store` root followed by exactly one 3-char
+    // uuid-prefix component, with nothing after it. This is ambiguous with the non-Atomic
+    // data/<db> fallback (both are two non-part components with no uuid anchor), so the router uses
+    // this strict predicate to disambiguate before parseTableUuid.
+    auto p = splitNonEmpty(path);
+    return p.size() == 2 && p[0] == "store" && p[1].size() == 3;
+}
+
 bool endsWithTableUuidPair(const std::string & path)
 {
     auto p = splitNonEmpty(path);
