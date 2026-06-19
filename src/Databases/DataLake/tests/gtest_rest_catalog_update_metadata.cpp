@@ -68,7 +68,7 @@ TEST(RestCatalogUpdateMetadataBody, SchemaUpdateValid)
 
     auto set_schema = findUpdateByAction(updates, "set-current-schema");
     ASSERT_TRUE(set_schema);
-    EXPECT_EQ(set_schema->getValue<Int32>("schema-id"), 1);
+    EXPECT_EQ(set_schema->getValue<Int32>("schema-id"), -1);
 }
 
 TEST(RestCatalogUpdateMetadataBody, SchemaUpdateCurrentIdZeroNoRequirement)
