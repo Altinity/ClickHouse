@@ -125,3 +125,15 @@ GC reclaims it under a still-in-flight adopter → publish dangles. Pinned live 
   — refused a missing-blob reuse rather than dangling; CORRUPTED_DATA stayed 0). Throughout 0–5.3h:
   CORRUPTED_DATA 0, all CA anomalies 0, precommit_reclaim false-positives ("frozen") 0, every
   stage-boundary checkpoint converged. The B140-dangle fix is validated under chaos.
+- **T17 — soak runner exited at ~6.5h on a HARNESS over-strictness (NOT a product/B140 bug).**
+  `RUNPY_EXIT=1` at chaos fault #45 (`both pause 40s`): pausing BOTH CH nodes drops both Keeper
+  sessions, so on recovery a replica is transiently read-only; the harness's concurrent workload
+  `OPTIMIZE TABLE` hit `TABLE_IS_READ_ONLY` (code 242) and the driver classified it FATAL
+  (`WORKLOAD FAILURE`). At that very checkpoint the fsck was clean (`dangling=0`, `fsck_status=settled`)
+  and CORRUPTED_DATA/anomalies/false-reclaim all 0 — the CA layer was perfectly consistent; only the
+  harness bailed on an expected transient (same class as B167h). Through 0–6.5h incl. heavy chaos
+  (ch1 kill 53s, ch2 restart, rustfs restart/pause, both-pause): every fsck `dangling=0`. **The
+  B140-dangle fix is validated.** Recorded harness debt **B173** and FIXED it: `cluster.is_readonly`
+  + `retry_on_transport` retries readonly (INSERT + all BARRIER ops); `_optimize_with_retry` swallows
+  readonly (no model effect). `checker.py` already retried readonly for SYNC REPLICA — extended the
+  same tolerance to the workload paths. Restarting the soak for a clean run-to-completion 12h.

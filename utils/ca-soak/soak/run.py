@@ -331,7 +331,11 @@ class Driver:
             try:
                 node.command(f"OPTIMIZE TABLE {TABLE}", timeout=self.OPTIMIZE_TIMEOUT_S)
             except QueryError as e:
-                if not e.is_node_down:
+                # node-down (graceful-shutdown cancel) and the transient TABLE_IS_READ_ONLY (a replica
+                # re-establishing its Keeper session after a chaos pause/restart -- esp. `both pause`)
+                # are both expected under chaos. OPTIMIZE has NO model effect, so dropping it is sound;
+                # only a genuine logic error surfaces.
+                if not (e.is_node_down or e.is_readonly):
                     raise
             except Exception as e:
                 if not is_transport_error(e):
@@ -938,9 +942,9 @@ def run_phase3(args):
         with recovery_lock:
             recovery_pending.append(fault)
 
-    schedule = phase3_chaos_schedule(args.chaos_seed, plan, chaos_interval)
+    schedule = [] if args.no_chaos else phase3_chaos_schedule(args.chaos_seed, plan, chaos_interval)
     log(f"phase-3 chaos schedule: {len(schedule)} faults over the chaos window "
-        f"(chaos_seed={args.chaos_seed} mean_interval={chaos_interval}s)")
+        f"(chaos_seed={args.chaos_seed} mean_interval={chaos_interval}s no_chaos={args.no_chaos})")
     chaos = ChaosRunner(schedule, on_fault_done=on_fault_done, stop_event=chaos_stop,
                         checkpoint_active=checkpoint_active)
 
@@ -1172,6 +1176,9 @@ def main(argv=None):
     ap.add_argument("--chaos-interval", type=int, default=90,
                     help="(phase 2) mean inter-fault interval (s). MUST comfortably exceed the "
                          "checkpoint+recovery time so quiescence is reachable between faults.")
+    ap.add_argument("--no-chaos", action="store_true",
+                    help="(phase 3) disable ALL faults — empty chaos schedule, including the forced "
+                         "converge restart. Use for a clean smoke that isolates non-chaos behavior.")
     ap.add_argument("--duration", type=parse_duration, default=None,
                     help="(phase 2/3) wall-clock duration. Phase 2: seconds to generate faults over "
                          "(defaults to a generous estimate from --ops). Phase 3: TOTAL soak duration "

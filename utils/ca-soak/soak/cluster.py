@@ -224,6 +224,16 @@ def is_node_down(exc: BaseException) -> bool:
     return False
 
 
+def is_readonly(exc: BaseException) -> bool:
+    """A ReplicatedMergeTree replica is transiently read-only (TABLE_IS_READ_ONLY, code 242) while it
+    re-establishes its ZooKeeper session after a chaos fault -- especially a `both pause` that drops
+    BOTH replicas' Keeper sessions, so neither reroute target is writable until they reconnect. This
+    is a TRANSIENT, not a logic error, and gets the same recovery as node-down (bounded retry +
+    reroute + backoff). The retry is safe: a readonly-rejected INSERT never committed (RMT block-dedup
+    keeps the rerouted retry idempotent), and OPTIMIZE has no model effect."""
+    return isinstance(exc, QueryError) and exc.is_readonly
+
+
 def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff_s: float = 8.0,
                        on_retry=None, sleep_fn=time.sleep):
     """Call `fn` and retry it on a NODE-DOWN failure (`is_node_down`: a connection-level transport
@@ -240,7 +250,7 @@ def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff
         try:
             return fn()
         except Exception as e:
-            if not is_node_down(e):
+            if not (is_node_down(e) or is_readonly(e)):
                 raise
             last = e
             if attempt < attempts:
