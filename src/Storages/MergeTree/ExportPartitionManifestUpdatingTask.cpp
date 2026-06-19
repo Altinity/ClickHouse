@@ -508,6 +508,7 @@ void ExportPartitionManifestUpdatingTask::poll()
             {
                 addTask(metadata, *status, std::move(last_exception_per_replica), key, entries_by_key);
                 LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Added new entry for task {}", key);
+                continue;
             }
 
             /// If we already have the local entry, we need to update it if the status has changed or if there are new last exceptions
