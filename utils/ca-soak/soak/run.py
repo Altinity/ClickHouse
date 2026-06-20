@@ -874,8 +874,15 @@ def setup_cluster_and_table(seed, phase, ops, workers, checkpoint_every):
         f"ops={ops} workers={workers} checkpoint_every={checkpoint_every}")
     model = Model(seed, base_time=base_time)
     ddl = DDL_TEMPLATE.format(table=TABLE)
+    # A pre-existing large CA-over-S3 table can take a long time to DROP ... SYNC (object teardown
+    # over slow S3), well past the default query timeout. Give the setup DROP a generous explicit
+    # timeout so a leftover table never times out the whole bring-up; warn if it is actually slow.
     for node in cluster.nodes():
-        node.command(f"DROP TABLE IF EXISTS {TABLE} SYNC")
+        t0 = time.monotonic()
+        node.command(f"DROP TABLE IF EXISTS {TABLE} SYNC", timeout=900)
+        dt = time.monotonic() - t0
+        if dt > 30:
+            log(f"setup DROP {TABLE} SYNC on {node.container} took {dt:.1f}s (large CA/S3 table)")
     for node in cluster.nodes():
         node.command(ddl)
     log(f"created {TABLE} on both replicas")
