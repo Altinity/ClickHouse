@@ -207,3 +207,27 @@ captures the return/`SystemExit` code, flushes stdout/stderr, and `os._exit(code
 entirely so the harness terminates promptly and deterministically (exit code preserved for CI).
 Validated: 152 harness unit tests green; a phase-1 smoke prints `PHASE1 OK` and exits rc=0 with no
 lingering python process.
+
+## T34 — B187 root-cause + fix + validation; clean P1/P2 baseline (2026-06-20)
+
+Investigating the "stuck merge" that stalled the P1/P2 baseline soak, traced (system.merges + symbolized
+stack_trace + system.errors + rustfs disk inspect) to: a conditional `If-None-Match:*` blob PUT of an
+ALREADY-EXISTING blob (dedup hit, verified on rustfs disk) → rustfs early-rejects (412) and closes before
+draining the ~967 KiB body → ClickHouse gets a transport **Broken pipe**, NOT a parsed 412 → evades both
+the CA 412-catch and the B166 SDK 412-fast-path → retried as a network error 500× × 5 s ≈ 42 min on the
+merge finalize critical path → merge wedge → checkpoint quiesce never drains (looked like B184, wasn't).
+
+FIX (B187): the B118 `Expect: 100-continue` negotiation (lets the server reject before the body) was gated
+at body ≥ 1 MiB and missed the 967 KiB blob. Made the threshold a per-disk S3 setting
+`expect_continue_min_bytes` (default 1 MiB — no B120 regression for other stores); CA-over-rustfs soak disk
+sets it to 64 KiB. Retry budget left unchanged (operator request). Files: S3Defines.h, S3AuthSettings.cpp,
+PocoHTTPClient.{h,cpp}, diskSettings.cpp, soak storage_conf.xml.
+
+VALIDATED: the same 20-min no-chaos soak that previously wedged forever now completes **PHASE3 OK**
+(final converge checkpoint OK, count=368162, dangling=0, dryrun_count=0). Broken-pipe 360×-on-one-blob →
+7 total; Retrying-S3 storm → 9/12 (no storm); zero merge wedges. The residual handful are sub-64 KiB
+conditional blobs (below the threshold) that complete fast and don't storm.
+
+Clean P1/P2 baseline captured: `utils/ca-soak/logs/casmetrics_baseline_clean.csv` (B187 fix in, P1/P2 not
+yet): CasBlobPutDedup=731,643 vs CasBlobPut=315,128 (~70% blob creates are dedup hits — P1/P2's target),
+CasBlobHead=1,057,174, CasRootCasConflict=255,363. This supersedes the wedged-run casmetrics_baseline.csv.
