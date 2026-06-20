@@ -55,6 +55,28 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+namespace
+{
+
+/// A content-addressed mutable per-part file atomic-write rename (e.g. txn_version.txt.tmp ->
+/// txn_version.txt, the MVCC creation-CSN / removal-TID protocol). Both endpoints are mutable
+/// per-part files in the same part. Such a rename only re-keys the part's staged sidecar map, so it
+/// must be dispatched EAGERLY (in program order, like writeFile / createHardLink / moveDirectory) and
+/// NOT deferred to commit replay: the part-directory rename (moveDirectory) is eager and publishes the
+/// part's manifest + sidecar, so a deferred rename here would replay AFTER that publish, stranding the
+/// .tmp file in the published sidecar and failing the rename (B182 — merge/mutation inside an explicit
+/// transaction).
+bool isContentAddressedMutablePartFileRename(const std::string & from_path, const std::string & to_path)
+{
+    auto from = ContentAddressed::parsePartFilePath(from_path);
+    if (!from || from->file.empty() || !ContentAddressed::isMutablePerPartFile(from->file))
+        return false;
+    auto to = ContentAddressed::parsePartFilePath(to_path);
+    return to && !to->file.empty() && ContentAddressed::isMutablePerPartFile(to->file);
+}
+
+}
+
 void DiskObjectStorageTransaction::waitBlobRemoval(const StoredObjects & blobs) const
 {
     try
@@ -147,6 +169,15 @@ void DiskObjectStorageTransaction::moveDirectory(const std::string & from_path, 
 
 void DiskObjectStorageTransaction::moveFile(const String & from_path, const String & to_path)
 {
+    /// CA: a mutable per-part file's atomic-write rename re-keys the staged sidecar and must run in
+    /// program order, BEFORE the eager moveDirectory publish — dispatch it eagerly (see
+    /// isContentAddressedMutablePartFileRename, B182).
+    if (metadata_storage->isContentAddressed() && isContentAddressedMutablePartFileRename(from_path, to_path))
+    {
+        metadata_transaction->moveFile(from_path, to_path);
+        return;
+    }
+
     operations_to_execute.push_back([from_path, to_path](MetadataTransactionPtr tx)
     {
         tx->moveFile(from_path, to_path);
@@ -163,6 +194,15 @@ void DiskObjectStorageTransaction::truncateFile(const String & path, size_t size
 
 void DiskObjectStorageTransaction::replaceFile(const std::string & from_path, const std::string & to_path)
 {
+    /// CA: a mutable per-part file's atomic-write replace re-keys the staged sidecar and must run in
+    /// program order, BEFORE the eager moveDirectory publish — dispatch it eagerly (see
+    /// isContentAddressedMutablePartFileRename, B182).
+    if (metadata_storage->isContentAddressed() && isContentAddressedMutablePartFileRename(from_path, to_path))
+    {
+        metadata_transaction->replaceFile(from_path, to_path);
+        return;
+    }
+
     operations_to_execute.push_back([from_path, to_path](MetadataTransactionPtr tx)
     {
         tx->replaceFile(from_path, to_path);

@@ -723,8 +723,10 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
 
         /// Re-key a STAGED source into the destination (B67: merge stagings; on a mutable-file
         /// collision PREFER the existing destination bytes - the newer MVCC state).
+        bool had_staged_source = false;
         if (auto src_it = parts.find(src_key); src_it != parts.end())
         {
+            had_staged_source = true;
             PartStaging & dst_st = parts[dst_key];
             PartStaging & src_st = src_it->second;
             for (auto & entry : src_st.entries)
@@ -776,6 +778,22 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             /// decision (renameParts() precedes the ZK multi). If the transaction is abandoned, the
             /// destructor drops it (see ~ContentAddressedTransaction).
             rename_published_refs.emplace_back(dst->ns, dst->ref);
+        }
+
+        if (had_staged_source)
+        {
+            /// A freshly-written part finalized tmp->final: the staged manifest published above is the
+            /// part's AUTHORITATIVE content. The B151 invariant assumes the tmp ref "was never durably
+            /// published", so the move below would be a no-op — but a nested sub-storage CAN durably
+            /// publish a committed ref AT THE PART'S OWN PATH: the vertical-merge / mutation text-index
+            /// builder (MergeTask / MutateTask createTemporaryTextIndexStorage) writes scratch under
+            /// `<part>/text_index_tmp/` through a SEPARATE DataPartStorage whose own commitTransaction
+            /// publishes a committed `<part>` ref holding only those scratch files. republishing that
+            /// over the just-published real manifest CLOBBERS the part (skip-index / statistics files
+            /// vanish from the tree, B183). Drop the spurious scratch ref instead — its blobs become
+            /// unreachable and GC reclaims them; the real manifest at `dst` stands.
+            dropRefIfPresent(src->ns, src->ref);
+            return;
         }
 
         /// Move any COMMITTED source ref (a merge/mutation result rename, DETACH, ATTACH, a

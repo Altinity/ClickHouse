@@ -48,3 +48,92 @@ Branch: `cas-vfs-path-mapping` (off `cas-mergetree-poc`). Operator granted unatt
 All mandate items done: (1) full stateless suite = refactor regression-clean (pre-existing CA gaps → B182/B183); (2) no refactor regressions to fix; disks-traversal bugs fixed (c9465f0b368); (3) 4h soak: Phase 6 GC PROVEN no-loss via audit log (922k deletes, 0 deleted-while-referenced), 3 harness fragilities fixed (TTL-band, merge-aware quiescence, setup-DROP timeout), clean chaos-completion BLOCKED by flaky rustfs backend (38% write loss → B185); (4) clickhouse-disks traversal validated + 2 bugs fixed; (5) **B181 DONE** (detached folds into table @cas@ archive; lane+gtests green). Deferred to backlog: B182 (txn MVCC on CA), B183 (text-index/statistics in tree), B184 (CA/S3 large-merge perf), B185 (rustfs write-loss → need conformant backend for the no-loss soak). Branch cas-vfs-path-mapping ready for review.
 - T26 — **CORRECTION (operator challenge): "rustfs loses 38% of writes" was WRONG.** The 1.6M `S3WriteRequestsErrors` are ~1.57M `PreconditionFailed` (412) = by-design CAS conditional-write contention on root-shard manifests (sample msg: 412 on `…@cas@/7` size 272), NOT failures/loss. Genuine rustfs transient errors in the failure hour ≈6k: 1284×503, 1207×429 (rate limits), 1281×500, ~2k conn-reset/timeout — retryable overload, all retried. **No data lost:** oracle node1==node2 matched; repairs = 306,247 gate_revalidate (re-read, found present) vs only 1,865 gate_resurrect (re-create) ≈165:1; live fsck=0; GC no-loss (922k deletes, 0 deleted-while-referenced). The dangling=94 was a TRANSIENT read-unavailability false-positive (rustfs 429/503 under load), the 180s settle budget too short under the load. Phase 6 durability-clean. Real fix = harness-side (fsck should RETRY transient reads before declaring dangling; the write-error metric conflates 412-CAS-contention with failures), NOT a different backend. Rewriting B185.
 - **DRY cleanup (2026-06-20):** collapsed the 3 duplicated `detached/`-prefix filter loops (`existsDirectory`, `listDirectory`, `removeRecursive`) into one helper `ContentAddressedMetadataStorage::detachedRefNames` (returns full ref names); net −1 line; all detached gtests pass (347 PASS, 2 pre-existing reds only); 04287/04288/04289 lane: stdout correct, FAIL = benign LOCAL-pool stderr WARNING artifact only.
+
+---
+
+## T27 — B182 (transactions) root-caused as a B151 REGRESSION + fix (2026-06-20)
+
+User directive: "afair transactions and text indexes used to work. probably some regression. that is the first priority."
+
+### Repro (deterministic, local CA disk + embedded Keeper, see tmp/ca-repro/)
+- B182: `BEGIN; INSERT; INSERT; OPTIMIZE FINAL; COMMIT` →
+  `Code:107 ContentAddressed: moveFile source mutable file missing: .../tmp_merge_all_1_2_1/txn_version.txt.tmp`
+- B183: vertical merge + text index (`02346_text_index_vertical_merge.sql`) →
+  `Code:107 ContentAddressed: file skp_idx_idx_c1.cmrk2 not in tree of .../all_1_2_1/...`
+- Note: plain (non-txn) INSERT/merge work because txn_version writes are DEFERRED for non-transactional parts.
+  Basic `BEGIN;INSERT;COMMIT` works; only merge/mutation-inside-txn fails.
+
+### B182 root cause (CONFIRMED by trace logging)
+`DiskObjectStorageTransaction::moveDirectory` dispatches the part-dir rename EAGERLY for CA (B151,
+commit 6f5e3866710) — it publishes `tmp_merge_*` → final ref immediately. But the atomic-write rename
+`txn_version.txt.tmp → txn_version.txt` (issued earlier via `storeInfoToDataPartStorage`) is a QUEUED
+`replaceFile` op that only replays at commit, AFTER the eager publish. So the publish captures the
+un-renamed `.tmp`, erases the staging, and the queued replaceFile then finds an empty staging →
+committed-mutable branch → `resolveRef(tmp_merge ref)` fails (ref was published under the FINAL name).
+This is a regression introduced by B151's eager-publish-at-rename.
+
+### Fix
+`DiskObjectStorageTransaction::moveFile`/`replaceFile`: when the rename is a CA mutable per-part file
+atomic-write rename (both endpoints mutable per-part files), dispatch EAGERLY (like writeFile /
+createHardLink / moveDirectory) instead of queuing. The `.tmp → final` re-key then completes in staging
+BEFORE the eager moveDirectory publish, so the published sidecar carries the correct `txn_version.txt`.
+Helper: `isContentAddressedMutablePartFileRename`.
+
+Status: fix built & verifying. B183 (vertical-merge text-index tree) still open — separate path
+(temporary_text_index_storage merge-back).
+
+## T28 — B183 (text indexes on vertical-merge / mutation) root-caused + fix (2026-06-20)
+
+### Scope of breakage (confirmed by repro)
+- Plain INSERT + text index: WORKS.
+- HORIZONTAL merge + text index: WORKS.
+- VERTICAL merge + text index: BROKEN.
+- Mutation `MATERIALIZE INDEX` (and any mutation that rebuilds a text index): BROKEN.
+The broken cases are exactly those that use `createTemporaryTextIndexStorage` (MergeTask.cpp:2847,
+MutateTask.cpp:1764) — a `text_index_tmp` SUBDIRECTORY inside the part with its OWN DataPartStorage
++ transaction.
+
+### Root cause (CONFIRMED by content/publish trace)
+On CA, `<part>/text_index_tmp/...` routes to the part's OWN ref. The temp storage's separate
+`commitTransaction()` therefore DURABLY PUBLISHES a committed `<part>` ref holding ONLY the
+`text_index_tmp/*` scratch files. The main merge transaction stages the real part files (+ the merged
+`skp_idx_*`, `statistics.packed`) into its own staging and publishes the correct `all_*` manifest at the
+eager rename (publishStaging). But `moveDirectory` then unconditionally calls
+`republishRef(tmp_merge → all)`, which ADOPTS the spurious committed `tmp_merge` ref (scratch-only tree)
+and republishes it OVER the just-published real manifest — clobbering it. Reads then fail with
+`file skp_idx_*.cmrk2 / statistics.packed not in tree`.
+This violated B151's own stated invariant ("the tmp ref was never durably published, so the republishRef
+below is a no-op"); the nested text-index sub-storage breaks that assumption.
+`removeRecursive(text_index_tmp)` (MergeTask:2313) is a no-op on CA (routes to a projection-subdir
+no-op), so the spurious ref is never cleaned there.
+
+### Fix
+In `ContentAddressedTransaction::moveDirectory`, when the part-dir move had a STAGED source (the fresh
+tmp->final publish — `had_staged_source`), DROP any committed source ref of the same tmp name
+(`dropRefIfPresent`) instead of `republishRef`-ing it. The staged manifest is authoritative; the
+committed tmp ref is spurious scratch (the text_index_tmp sub-storage commit). Its blobs become
+unreachable → GC reclaims them. The committed-source rename path (DETACH/ATTACH/delete_tmp) is
+unchanged (it has no staged source).
+
+Status: both B182 + B183 fixes built (traces removed); validating next.
+
+## T29 — Validation: both fixes verified, 2 gtest failures proven PRE-EXISTING (2026-06-20)
+
+### Functional verification (local CA disk + Keeper)
+- B182 repro (merge in txn): exception -> returns 2. FIXED.
+- B183 repro (vertical-merge text index): exception -> returns 2214 (== pre-merge count). FIXED.
+- Mutation `MATERIALIZE INDEX` (was broken): returns 111, no exception. FIXED.
+- Oracle (vertical-merge text index, CA vs `default` disk): CA=2214, default=2214 — IDENTICAL.
+- Broader txn scenarios (merge/delete/rollback in txn): CA behaves identically to the `default` disk.
+
+### CA gtests
+Filter `CaWiring*:CaPartPathParser*:CasStore*:Cas*` → 292/294 pass; 2 fail:
+- `CaWiringOps.FreezeViaHardLinksIntoShadow` (gtest_ca_wiring.cpp:776)
+- `CasGcLeak.DisplacedUnexpandedTreeBlobsLeak` (gtest_cas_gc_leak.cpp:150)
+Both PROVEN PRE-EXISTING: `git stash`-ed both fixes, rebuilt unit_tests_dbms clean, and BOTH still fail
+identically. They are unrelated to B182/B183:
+- `CasGcLeak.*` is a self-documented intentional RED TDD test ("THE B140 ASSERTION (RED today)…
+  unreachable == 2 today"), added by 47d3107ee8c — the unfixed B140 displaced-tree GC leak.
+- `CaWiringOps.FreezeViaHardLinksIntoShadow` regressed in the VFS refactor (af54aa415bc, shadow/mountpoint
+  namespace change): `removeRecursive("shadow/bk1")` no longer makes `existsDirectory("shadow/bk1")` false.
+  My diff touches neither shadow nor GC nor createHardLink/removeRecursive paths. -> new backlog item.
