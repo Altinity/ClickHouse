@@ -41,6 +41,21 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     , pool_layout(config.pool_prefix)
     , retire_view(pool_backend, pool_layout)
 {
+    if (config.dedup_cache_bytes > 0)
+        dedup_cache = std::make_unique<DedupCache>(
+            "LRU", CurrentMetrics::end(), CurrentMetrics::end(),
+            config.dedup_cache_bytes, DedupCache::NO_MAX_COUNT, DedupCache::DEFAULT_SIZE_RATIO);
+}
+
+bool Store::dedupCacheContains(const UInt128 & blob_hash) const
+{
+    return dedup_cache && dedup_cache->contains(blob_hash);
+}
+
+void Store::dedupCacheAdd(const UInt128 & blob_hash)
+{
+    if (dedup_cache)
+        dedup_cache->set(blob_hash, std::make_shared<DedupPresent>());
 }
 
 StorePtr Store::open(BackendPtr backend, PoolConfig config)

@@ -101,6 +101,9 @@ private:
     /// HEAD the key; absent ⇒ FILE_DOESNT_EXIST; condemned-at-current-token ⇒ resurrect; else record
     /// the current token as the dep. Returns the admitted size.
     uint64_t observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key);
+    /// Overload for callers that already hold a fresh, present HeadResult for `key` (the putBlob
+    /// HEAD-before-PUT path), avoiding a redundant second HEAD. `hr.exists` MUST be true. (B168 P1/P2)
+    uint64_t observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key, const HeadResult & hr);
     /// Resurrect: GET whole object, rebuild header with a FRESH incarnation_tag preserving header_len
     /// and all other TLVs, putOverwrite(If-Match observed token). Records the new token as the dep.
     void resurrect(ObjectKind kind, const UInt128 & hash, const String & key);

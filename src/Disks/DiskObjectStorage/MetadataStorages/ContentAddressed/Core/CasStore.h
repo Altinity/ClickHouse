@@ -8,6 +8,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
+#include <Common/CacheBase.h>
+#include <Common/CurrentMetrics.h>
+#include <Common/HashTable/Hash.h>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -27,6 +30,13 @@ struct PoolConfig
     UInt128 server_id{};                      /// provenance + heartbeats
     uint64_t root_shards = 8;                 /// creation-time only; pool is authoritative on reopen
     uint64_t blob_header_len = 256;           /// creation-time only; ditto
+    /// P1 (dedup cache): byte ceiling for the per-disk known-present blob-hash LRU set. 0 disables the
+    /// cache (every create misses → P2-only). A hint cache; correctness never depends on it (a stale
+    /// hit is caught by the mandatory HEAD in putBlob — design 2026-06-20, B168).
+    uint64_t dedup_cache_bytes = 64ULL << 20;        /// 64 MiB
+    /// P2 (HEAD-before-PUT): on a dedup-cache MISS, a blob whose body is >= this many bytes is written
+    /// HEAD-first (a cheap HEAD avoids streaming a body that would 412). 0 disables the size trigger.
+    uint64_t dedup_head_first_min_bytes = 1ULL << 20;   /// 1 MiB
     uint64_t manifest_soft_limit = 16ULL << 20;
     uint64_t manifest_hard_limit = 64ULL << 20;
     std::chrono::milliseconds heartbeat_period{5000};
@@ -142,6 +152,12 @@ public:
     const Layout & layout() const { return pool_layout; }
     Backend & backend() { return *pool_backend; }
     RetireView & retireView() { return retire_view; }
+
+    /// P1 known-present blob-hash cache (design 2026-06-20, B168). A HINT only — correctness never
+    /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.
+    /// No-ops when disabled (dedup_cache_bytes == 0).
+    bool dedupCacheContains(const UInt128 & blob_hash) const;
+    void dedupCacheAdd(const UInt128 & blob_hash);
     /// The shard a ref name routes to: CityHash64(ref_name) % root_shards. Build uses it to address the
     /// publish/precommit CAS (the build-root ref name is the build_seq, B171); tests reconstruct the
     /// build-root shard with it.
@@ -221,6 +237,14 @@ private:
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;
+
+    /// P1 known-present cache: a bytes-bounded LRU set of blob hashes confirmed present in the pool.
+    /// Value is a 1-byte presence marker; DedupWeight charges a fixed per-entry byte estimate so the
+    /// configured `dedup_cache_bytes` is an honest memory ceiling. nullptr ⇔ disabled.
+    struct DedupPresent {};
+    struct DedupWeight { size_t operator()(const DedupPresent &) const { return 64; } };
+    using DedupCache = CacheBase<UInt128, DedupPresent, UInt128Hash, DedupWeight>;
+    std::unique_ptr<DedupCache> dedup_cache;
     /// pool_layout MUST precede retire_view: the ctor init list builds retire_view from pool_layout.
     Layout pool_layout;
     RetireView retire_view;

@@ -3,10 +3,18 @@
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <Common/ProfileEvents.h>
 #include <Common/thread_local_rng.h>
 #include <base/defines.h>
 #include <algorithm>
 #include <chrono>
+
+namespace ProfileEvents
+{
+    extern const Event CasBlobDedupCacheHit;
+    extern const Event CasBlobHeadFirst;
+    extern const Event CasBlobBodyPutAvoided;
+}
 
 namespace DB
 {
@@ -108,6 +116,31 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
     const PoolMeta & meta = store->poolMeta();
     const PoolConfig & cfg = store->poolConfig();
 
+    /// B168 P1/P2: HEAD-before-PUT on a likely dedup hit (cache says present) or a large body (where a
+    /// wasted body-PUT that 412s is expensive — and on a store that early-closes a doomed conditional
+    /// PUT, the broken-pipe + retry storm of B187). A present HEAD ⇒ admit without streaming the body;
+    /// a stale/absent HEAD ⇒ fall through to the normal conditional upload. SAFE by construction: we
+    /// always genuinely observe present-at-round before skipping the body, so the cache can never cause
+    /// a dangle (a stale hit just HEADs 404 and uploads).
+    const bool head_first =
+        store->dedupCacheContains(logical_hash)
+        || (cfg.dedup_head_first_min_bytes > 0 && source.size >= cfg.dedup_head_first_min_bytes);
+    if (head_first)
+    {
+        ProfileEvents::increment(ProfileEvents::CasBlobHeadFirst);
+        const HeadResult hr = store->backend().head(key);
+        if (hr.exists)
+        {
+            ProfileEvents::increment(ProfileEvents::CasBlobBodyPutAvoided);
+            if (store->dedupCacheContains(logical_hash))
+                ProfileEvents::increment(ProfileEvents::CasBlobDedupCacheHit);
+            const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key, hr);
+            store->dedupCacheAdd(logical_hash);
+            return BlobRef{id, admitted};
+        }
+        /// hr.exists == false → stale cache entry or genuinely new content → fall through to the upload.
+    }
+
     /// B136: bounded retry loop. The happy paths (fresh upload ⇒ Done; existing live incarnation ⇒
     /// adopt) execute exactly once. The loop only re-iterates on the dedup GC race: when our
     /// conditional upload hit PreconditionFailed (the content key already exists as a prior
@@ -186,6 +219,8 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
                 _ev1.detail = {{"size", std::to_string(source.size)}, {"build_id", u128ToHex(build_id)}};
                 store->emitEvent(_ev1);
             }
+            /// P1: this hash is now known-present — future writers can HEAD-first and skip the body.
+            store->dedupCacheAdd(logical_hash);
             return BlobRef{id, source.size};
         }
 
@@ -194,6 +229,8 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
         try
         {
             const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key);
+            /// P1: dedup-confirmed present — record so future writers HEAD-first instead of body-PUT.
+            store->dedupCacheAdd(logical_hash);
             return BlobRef{id, admitted};
         }
         catch (const Exception & e)
@@ -280,7 +317,13 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     if (!hr.exists)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "Build: object {} absent — cannot reuse (caller must upload it)", key);
+    return observeAndAdmit(kind, hash, key, hr);
+}
 
+uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key, const HeadResult & hr)
+{
+    /// `hr.exists` is guaranteed by the caller (the 3-arg wrapper checked it; the putBlob HEAD-first
+    /// path only calls this on a present HEAD). Avoids a redundant second HEAD on the dedup-hit path.
     /// Logical (payload) size = object size minus the pool's fixed blob header; trees would need a
     /// decode, so report 0. GUARD against unsigned underflow: a truncated/corrupt blob whose object
     /// size is below the header length must surface as CORRUPTED_DATA, never wrap to a huge value

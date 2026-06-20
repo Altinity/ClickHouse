@@ -145,7 +145,9 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     bool gc_enabled_,
     std::chrono::seconds gc_interval_,
     uint64_t root_shards_,
-    String disk_name_)
+    String disk_name_,
+    uint64_t dedup_cache_bytes_,
+    uint64_t dedup_head_first_min_bytes_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -156,6 +158,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_enabled(gc_enabled_)
     , gc_interval(gc_interval_)
     , root_shards(root_shards_)
+    , dedup_cache_bytes(dedup_cache_bytes_)
+    , dedup_head_first_min_bytes(dedup_head_first_min_bytes_)
 {
 }
 
@@ -352,6 +356,8 @@ void ContentAddressedMetadataStorage::startup()
     /// manifest CAS writes across more keys, reducing per-key congestion + per-key overwrite-orphan
     /// pileup (#4). Existing pools keep their shard count.
     pool_config.root_shards = root_shards;
+    pool_config.dedup_cache_bytes = dedup_cache_bytes;
+    pool_config.dedup_head_first_min_bytes = dedup_head_first_min_bytes;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
 
