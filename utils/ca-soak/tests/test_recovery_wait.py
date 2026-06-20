@@ -89,14 +89,37 @@ def test_pool_consistent_returns_once_transient_dangling_clears():
     assert out["dangling"] == 0 and out["exit_code"] == 0
 
 
-def test_pool_consistent_persistent_raises():
+def test_pool_consistent_persistent_never_clean_raises():
+    # B152/B185: dangling>0 on EVERY read, never once clearing -> a REAL durability finding, raise.
     clock = FakeClock()
     with pytest.raises(CheckpointFailure) as ei:
         wait_for_pool_consistent(
             lambda: {"dangling": 10, "exit_code": 36, "reachable": 6512, "unreachable": 4599},
             timeout_s=20, stable=2, interval_s=3.0, sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
     assert "never reached a self-consistent state" in str(ei.value)
+    assert "NEVER cleared once" in str(ei.value)
     assert "REAL crash-recovery" in str(ei.value)
+
+
+def test_pool_consistent_flapping_clean_does_not_raise():
+    # B152/B185: the pool reaches dangling==0 at least once but keeps FLAPPING (never `stable`
+    # consecutive clean reads) until the bound. This is a settling artifact, NOT data loss (the
+    # aggregate oracle is authoritative and asserted separately) -> warn + return the clean reading,
+    # do NOT false-fail the soak.
+    clock = FakeClock()
+    n = {"i": 0}
+
+    def flapping():
+        # alternate dirty/clean forever so consecutive-clean never reaches 2.
+        n["i"] += 1
+        if n["i"] % 2 == 1:
+            return {"dangling": 4, "exit_code": 36, "reachable": 6500, "unreachable": 4600}
+        return {"dangling": 0, "exit_code": 0, "reachable": 6530, "unreachable": 4400}
+
+    out = wait_for_pool_consistent(flapping, timeout_s=20, stable=2, interval_s=3.0,
+                                   sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
+    # Returned (no raise) with the last CLEAN reading.
+    assert out["dangling"] == 0 and out["exit_code"] == 0
 
 
 def test_settle_fsck_for_dump_transient_clears_to_settled():

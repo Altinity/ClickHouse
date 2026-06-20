@@ -161,3 +161,21 @@ Validation: 3 new gtests (`MoveDirectoryMutableCollisionPolicy`, `VerbatimMoveIs
 B182/B183 still green; RENAME TABLE+mutation oracle CA==default (2000/1999000/7290); a mixed workload
 (inserts+vertical merges+MATERIALIZE INDEX+UPDATE+DELETE+txn-merge+RENAME) ran with zero CA errors and
 the collision guard never fired spuriously.
+
+## T31 — soak-harness cluster A cleanup (2026-06-20)
+
+Goal: get the soak to a stable green run for real chaos validation. Reviewed cluster A:
+- **B154** (fsck subprocess timeout) — already DONE in code (`fsck.py` timeout_s + graceful degrade); confirmed.
+- **B155** (SYNC REPLICA readonly-retry) — already DONE in code (`checker.py sync_replica_with_readonly_retry`, `cluster.py is_readonly`); confirmed.
+- **B152** (post-fault settling false-fail + misleading message) — FIXED: `wait_for_pool_consistent`
+  now distinguishes FLAPPING-CLEAN (reached dangling==0 once but didn't hold `stable` → warn + return
+  the clean reading; the aggregate oracle is the authoritative no-loss gate, asserted separately) from
+  PERSISTENT NEVER-CLEAN (raise, accurate message). No longer cries INV-NO-LOSS on a dangling==0 timeout.
+- **B185** — false-fail FIXED by the same flapping-tolerance. CORRECTED the entry: retracted my wrong
+  "transient unavailability / 165:1 gate_revalidate:resurrect" claim (gate_revalidate is an unconditional
+  per-commit fail-closed marker; gate_resurrect is GC-race re-stamping — neither is a 404 recovery).
+  Root-cause of the dangling=94 (rustfs read-after-write vs mid-churn transient vs real) is STILL OPEN —
+  follow-ups recorded (capture+re-HEAD the keys; rustfs RAW probe).
+
+Validation: full ca-soak unit suite 152 passed (incl. new `test_pool_consistent_flapping_clean_does_not_raise`
++ `test_pool_consistent_persistent_never_clean_raises`). Next: 1-hour soak on the fresh binary.

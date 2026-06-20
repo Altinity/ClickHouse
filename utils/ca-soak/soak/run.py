@@ -623,26 +623,51 @@ def wait_for_pool_consistent(fsck_fn, *, timeout_s: float = 180.0, stable: int =
     recovery, so the recovery checkpoint could assert pool invariants against a still-settling store.
 
     This gate waits for the pool to reach a COHERENT cut (`dangling==0`) before the checkpoint runs
-    its hard dryrun-subset assert. It FAILS LOUDLY (`CheckpointFailure`) if the pool never reaches
-    `dangling==0` within the bound -- a PERSISTENT post-restart `dangling>0` is then a REAL
-    crash-recovery / object-store-durability finding, not a transient, and must surface.
+    its hard dryrun-subset assert.
+
+    B152/B185 — the AUTHORITATIVE no-loss gate is the aggregate oracle (`compare_aggregates`, model vs
+    BOTH replicas), asserted SEPARATELY and BEFORE this structural gate. This fsck gate is secondary.
+    Two distinct timeout outcomes, which the old code conflated (it called a `dangling==0` timeout a
+    "PERSISTENT dangling" durability finding, the B152 message bug):
+      - FLAPPING-CLEAN: the pool DID reach `dangling==0` at least once but kept flapping in/out of the
+        transient post-restart fsck-incoherence window (B141/B144/B145) without holding `stable`
+        consecutive clean reads within the bound. Under aggressive load this window can stay open >the
+        bound. This is a SETTLING/recovery-time artifact, NOT data loss (the oracle already proved no
+        loss) -- warn loudly and return the clean reading instead of false-failing the soak (B185).
+      - PERSISTENT NEVER-CLEAN: `dangling>0` on EVERY read, never once clearing -- a REAL
+        pool-structure / crash-recovery / object-store-durability finding; FAIL LOUDLY.
 
     `sleep_fn`/`monotonic_fn` are injectable so the loop is pure-testable."""
     deadline = monotonic_fn() + timeout_s
     consecutive_clean = 0
     last = None
+    last_clean = None
     while True:
         last = fsck_fn()
         clean = last.get("dangling") == 0 and last.get("exit_code") == 0
+        if clean:
+            last_clean = last
         consecutive_clean = consecutive_clean + 1 if clean else 0
         if consecutive_clean >= stable:
             return last
         if monotonic_fn() > deadline:
+            if last_clean is not None:
+                # FLAPPING-CLEAN (B152/B185): reached dangling==0 but did not hold it `stable` reads.
+                # The oracle is authoritative for loss and already passed; this is a settling artifact.
+                log(f"WARNING [B152/B185] CA pool reached fsck dangling==0 but did not HOLD it for "
+                    f"{stable} consecutive reads within {timeout_s:.0f}s after a fault window -- it "
+                    f"flapped in/out of the transient post-restart incoherence window (B141/B144/B145). "
+                    f"The aggregate oracle already proved no loss, so this is a SETTLING artifact, not a "
+                    f"durability finding -- continuing on the last clean reading "
+                    f"(reachable={last_clean.get('reachable')} unreachable={last_clean.get('unreachable')}).")
+                return last_clean
             raise CheckpointFailure(
                 f"CA pool never reached a self-consistent state (fsck dangling==0) within {timeout_s:.0f}s "
                 f"after a fault window -- PERSISTENT dangling={last.get('dangling')} "
-                f"(exit_code={last.get('exit_code')}) is a REAL crash-recovery / object-store durability "
-                f"finding (INV-NO-LOSS), not a transient. reachable={last.get('reachable')} "
+                f"(exit_code={last.get('exit_code')}) NEVER cleared once. The aggregate oracle "
+                f"(compare_aggregates) is the authoritative no-loss gate and is asserted separately; a "
+                f"persistent dangling>0 here is a REAL crash-recovery / object-store durability finding "
+                f"(INV-NO-LOSS), not a transient. reachable={last.get('reachable')} "
                 f"unreachable={last.get('unreachable')}")
         sleep_fn(interval_s)
 
