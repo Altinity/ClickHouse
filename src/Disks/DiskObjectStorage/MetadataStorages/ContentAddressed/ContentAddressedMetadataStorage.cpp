@@ -147,7 +147,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t root_shards_,
     String disk_name_,
     uint64_t dedup_cache_bytes_,
-    uint64_t dedup_head_first_min_bytes_)
+    uint64_t dedup_head_first_min_bytes_,
+    uint64_t gc_snap_generations_to_keep_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -160,6 +161,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , root_shards(root_shards_)
     , dedup_cache_bytes(dedup_cache_bytes_)
     , dedup_head_first_min_bytes(dedup_head_first_min_bytes_)
+    , gc_snap_generations_to_keep(gc_snap_generations_to_keep_)
 {
 }
 
@@ -358,6 +360,7 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.root_shards = root_shards;
     pool_config.dedup_cache_bytes = dedup_cache_bytes;
     pool_config.dedup_head_first_min_bytes = dedup_head_first_min_bytes;
+    pool_config.gc_snap_generations_to_keep = gc_snap_generations_to_keep;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
 

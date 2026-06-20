@@ -40,6 +40,29 @@ TEST(CasGcFormats, GcStateV3RoundTrip)
     EXPECT_EQ(d.fence_version.at(7).at("srv1/tbl/0"), 4u);
 }
 
+TEST(CasGcFormats, GcStateSnapPrunedThroughRoundTrip)
+{
+    GcState s;
+    s.snap_shards = 2;
+    s.snap_generation = 42;
+    s.snap_pruned_through = 38;
+    auto d = decodeGcState(encodeGcState(s));
+    EXPECT_EQ(d.snap_pruned_through, 38u);
+}
+
+TEST(CasGcFormats, GcStateSnapPrunedThroughBackCompatDefaultsZero)
+{
+    /// An old gc/state written before B174 has no "snap_pruned_through" key — it must decode to 0,
+    /// not throw on the strict unknown-key check (the key is optional on read).
+    const String old_state =
+        R"({"format":"cas_gc_state","version":3,"round":1,"fence_seq":0,"snap_shards":1,)"
+        R"("snap_generation":5,"lease":{"owner":"00000000000000000000000000000000","seq":0},)"
+        R"("fence_version":{}})";
+    auto d = decodeGcState(old_state);
+    EXPECT_EQ(d.snap_pruned_through, 0u);
+    EXPECT_EQ(d.snap_generation, 5u);
+}
+
 TEST(CasGcFormats, GcHeartbeatRoundTrip)
 {
     GcHeartbeat hb;

@@ -37,6 +37,12 @@ struct PoolConfig
     /// P2 (HEAD-before-PUT): on a dedup-cache MISS, a blob whose body is >= this many bytes is written
     /// HEAD-first (a cheap HEAD avoids streaming a body that would 412). 0 disables the size trigger.
     uint64_t dedup_head_first_min_bytes = 1ULL << 20;   /// 1 MiB
+    /// B174 (gc/snap retention): how many superseded snap generations to retain. After committing
+    /// generation G, generations <= G - this are pruned (bounded per round). 0 = keep ALL
+    /// (debug/forensics — replay GC's in-degree view as-of a past round). Default 3 = the safety
+    /// margin covering any in-flight/resuming leader (a leader more than `keep` generations behind
+    /// has lost its lease; its round-commit CAS fails).
+    uint64_t gc_snap_generations_to_keep = 3;
     uint64_t manifest_soft_limit = 16ULL << 20;
     uint64_t manifest_hard_limit = 64ULL << 20;
     std::chrono::milliseconds heartbeat_period{5000};

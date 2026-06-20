@@ -48,6 +48,7 @@ struct GcState
     uint64_t fence_seq = 0;        /// leadership-epoch component of retired/outcome paths (spec §4)
     uint64_t snap_shards = 1;      /// GC constant (target-hash-prefix sharding); set once, immutable
     uint64_t snap_generation = 0;  /// monotone; the authoritative snap objects' generation
+    uint64_t snap_pruned_through = 0;   /// B174: highest snap generation fully pruned (retention cursor)
     GcLease lease;
     std::map<uint64_t, std::map<String, uint64_t>> fence_version;   /// round -> ("ns/shard" -> version)
 };

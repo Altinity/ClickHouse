@@ -2065,3 +2065,56 @@ TEST(CasGcRetire, ReclaimsAbandonedPrecommitWhenFloorPasses)
     EXPECT_FALSE(b->head(s->layout().blobKey(idOf(P))).exists)
         << "the exclusively-precommit-owned blob must be collected after reclaim";
 }
+
+/// B174: each round folds the latest publish's journal record (snap_changed), advancing
+/// snap_generation by ~1/round. With the default keep=3, GC must prune every generation <= G-3
+/// while retaining the last 3, and the durable cursor snap_pruned_through must track G-3.
+TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);                                   /// default gc_snap_generations_to_keep = 3
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+
+    for (int i = 0; i < 10; ++i)
+    {
+        publishPart(s, "srv1/tbl", "part_" + std::to_string(i), "payload_" + std::to_string(i));
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    }
+
+    const GcState st = readState(*b, *s);
+    const uint64_t G = st.snap_generation;
+    ASSERT_GE(G, 6u) << "snap_generation did not advance enough to exercise retention";
+
+    /// the last 3 generations are retained
+    for (uint64_t g = G; g > G - 3; --g)
+        EXPECT_TRUE(b->get(s->layout().gcSnapKey(g, 0)).has_value())
+            << "generation " << g << " (within keep window) must be retained";
+    /// everything at or below G-3 is pruned
+    for (uint64_t g = 1; g <= G - 3; ++g)
+        EXPECT_FALSE(b->get(s->layout().gcSnapKey(g, 0)).has_value())
+            << "generation " << g << " (<= G-keep) must be pruned";
+    EXPECT_EQ(st.snap_pruned_through, G - 3);
+}
+
+/// B174: gc_snap_generations_to_keep == 0 disables pruning entirely (forensics/time-travel of GC's
+/// view) — every generation survives and the cursor never advances.
+TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .gc_snap_generations_to_keep = 0});
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+
+    for (int i = 0; i < 8; ++i)
+    {
+        publishPart(s, "srv1/tbl", "part_" + std::to_string(i), "payload_" + std::to_string(i));
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    }
+
+    const GcState st = readState(*b, *s);
+    const uint64_t G = st.snap_generation;
+    ASSERT_GE(G, 4u);
+    for (uint64_t g = 1; g <= G; ++g)
+        EXPECT_TRUE(b->get(s->layout().gcSnapKey(g, 0)).has_value())
+            << "generation " << g << " must survive when keep == 0";
+    EXPECT_EQ(st.snap_pruned_through, 0u);
+}

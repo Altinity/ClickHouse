@@ -651,6 +651,7 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
                                              /// forget must go durable or the next round re-derives
                                              /// and re-HEAD-404s it (the RetireForgets regression).
     constexpr uint64_t max_generation_probes = 1000;
+    constexpr uint64_t MAX_PRUNE_GENERATIONS_PER_ROUND = 64;   /// B174: bound the per-round prune burst
     uint64_t adopted_generation = state.snap_generation;
     if (snap_changed)
     for (uint64_t generation = state.snap_generation + 1; ; ++generation)
@@ -699,6 +700,35 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
     next.snap_generation = adopted_generation;   /// unchanged when the persist was skipped
     /// fence_version[<= round] served its recheck - erase it (gc/state must not grow forever).
     std::erase_if(next.fence_version, [&](const auto & kv) { return kv.first <= round; });
+
+    /// B174: prune superseded snap generations. loadSnap reads ONLY gcSnapKey(snap_generation), so
+    /// any generation strictly below the committed one is dead; keep `keep` as the safety margin for
+    /// in-flight/resuming leaders (a leader more than `keep` generations behind has lost its lease —
+    /// its round-commit CAS fails). Walk forward from the durable cursor, bounded per round, so a
+    /// large legacy backlog drains over many rounds without ever LISTing the generation directories.
+    /// Done BEFORE the gc/state CAS so the advanced cursor rides the same write: if the CAS then
+    /// loses the lease, the deletes were still below the winner's even-higher floor (safe) and the
+    /// cursor is not durably advanced (idempotent retry — old generations are write-once, so a
+    /// re-HEAD finds them absent).
+    const uint64_t keep = store->poolConfig().gc_snap_generations_to_keep;
+    if (keep > 0 && adopted_generation > keep)
+    {
+        const uint64_t prune_floor = adopted_generation - keep;   /// prune generations <= prune_floor
+        uint64_t generation = next.snap_pruned_through + 1;
+        uint64_t pruned = 0;
+        for (; generation <= prune_floor && pruned < MAX_PRUNE_GENERATIONS_PER_ROUND; ++generation, ++pruned)
+        {
+            for (uint64_t snap_shard = 0; snap_shard < state.snap_shards; ++snap_shard)
+            {
+                const String snap_key = layout.gcSnapKey(generation, snap_shard);
+                const HeadResult hr = backend.head(snap_key);
+                if (hr.exists)
+                    backend.deleteExact(snap_key, hr.token);   /// NotFound/TokenMismatch tolerated
+            }
+        }
+        next.snap_pruned_through = generation - 1;   /// highest generation fully processed this round
+    }
+
     Token committed_token;
     if (backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token, &committed_token)
         != CasOutcome::Committed)

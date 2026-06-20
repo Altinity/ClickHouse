@@ -76,6 +76,9 @@ String encodeGcState(const GcState & state)
     writeJsonKey(out, "snap_generation");
     writeIntText(state.snap_generation, out);
     writeChar(',', out);
+    writeJsonKey(out, "snap_pruned_through");
+    writeIntText(state.snap_pruned_through, out);
+    writeChar(',', out);
     writeJsonKey(out, "lease");
     writeChar('{', out);
     writeJsonKey(out, "owner");
@@ -108,7 +111,7 @@ GcState decodeGcState(std::string_view data)
         auto obj = parseJsonDocument(data, "cas_gc_state", GC_STATE_VERSION, "gc/state");
         checkNoUnknownKeys(*obj,
             {"format", "version", "round", "fence_seq", "snap_shards", "snap_generation",
-             "lease", "fence_version"}, "gc/state");
+             "snap_pruned_through", "lease", "fence_version"}, "gc/state");
 
         GcState state;
         state.round = requireU64(*obj, "round", "gc/state");
@@ -117,6 +120,8 @@ GcState decodeGcState(std::string_view data)
         if (state.snap_shards == 0)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: snap_shards must be >= 1");
         state.snap_generation = requireU64(*obj, "snap_generation", "gc/state");
+        if (obj->has("snap_pruned_through"))
+            state.snap_pruned_through = requireU64(*obj, "snap_pruned_through", "gc/state");
 
         auto lease = requireObject(*obj, "lease", "gc/state");
         checkNoUnknownKeys(*lease, {"owner", "seq"}, "gc/state lease");

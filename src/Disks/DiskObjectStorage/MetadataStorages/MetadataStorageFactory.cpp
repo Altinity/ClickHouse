@@ -246,9 +246,11 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         const uint64_t root_shards = config.getUInt64(config_prefix + ".content_addressed_root_shards", 8);
         const uint64_t dedup_cache_bytes = config.getUInt64(config_prefix + ".content_addressed_dedup_cache_bytes", 64ULL << 20);
         const uint64_t dedup_head_first_min_bytes = config.getUInt64(config_prefix + ".content_addressed_dedup_head_first_min_bytes", 1ULL << 20);
+        const uint64_t gc_snap_generations_to_keep = config.getUInt64(config_prefix + ".content_addressed_gc_snap_generations_to_keep", 3);
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path,
-            global_context, gc_enabled, gc_interval, root_shards, name, dedup_cache_bytes, dedup_head_first_min_bytes);
+            global_context, gc_enabled, gc_interval, root_shards, name, dedup_cache_bytes, dedup_head_first_min_bytes,
+            gc_snap_generations_to_keep);
 
         return metadata_storage;
     });
