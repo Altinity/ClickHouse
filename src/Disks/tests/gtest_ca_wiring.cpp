@@ -341,25 +341,59 @@ TEST(CaWiringRead, ProjectionDirectory)
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/p.proj/data.bin"), 9u);
 }
 
-TEST(CaWiringRead, DetachedNamespace)
+TEST(CaWiringRead, DetachedFoldedIntoTableNamespace)
 {
     auto storage = openWiringStorage();
-    publishWiredPart(*storage, storage->detachedNamespace("uuid-1"), "broken_all_1_1_0");
+    /// B181: a detached part is a `detached/`-prefixed ref INSIDE the table's own archive namespace,
+    /// not a separate sibling namespace. Publish it that way through the core, and ALSO a live part
+    /// that shares the same base name to prove the live↔detached collision is impossible (the ref
+    /// names `all_1_1_0` and `detached/all_1_1_0` differ — one namespace, no re-split needed).
+    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "detached/broken_all_1_1_0");
+    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "broken_all_1_1_0");
 
-    /// The detached CONTAINER lists the detached part DIRECTORY names (B36's intent).
+    /// The TABLE dir collapses the `detached/<part>` refs to the single `detached` subdir entry
+    /// alongside the live part name.
+    auto top = storage->listDirectory("uui/uuid-1");
+    std::sort(top.begin(), top.end());
+    EXPECT_EQ(top, (std::vector<std::string>{"broken_all_1_1_0", "detached"}));
+
+    /// The detached CONTAINER lists the detached part DIRECTORY names (B36's intent), prefix-stripped
+    /// — and NOT the live part of the same base name.
     EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/detached"));
     EXPECT_EQ(storage->listDirectory("uui/uuid-1/detached"), (std::vector<std::string>{"broken_all_1_1_0"}));
-    /// A single detached part dir + its files (per-part refs in the detached namespace — the new
-    /// layout; the PoC's shared-ref re-keying is gone).
+    /// A single detached part dir + its files (the detached part is its own `detached/`-prefixed ref).
     EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/detached/broken_all_1_1_0"));
     auto names = storage->listDirectory("uui/uuid-1/detached/broken_all_1_1_0");
     std::sort(names.begin(), names.end());
     EXPECT_EQ(names, (std::vector<std::string>{"data.bin", "metadata_version.txt", "p.proj", "uuid.txt"}));
-    /// The B62 shape: a detached part's mutable file resolves through the detached namespace.
+    /// The B62 shape: a detached part's mutable file resolves through the `detached/`-prefixed ref.
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/detached/broken_all_1_1_0/metadata_version.txt"));
     EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/detached/broken_all_1_1_0/metadata_version.txt"),
               std::optional<String>("5"));
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/detached/broken_all_1_1_0/data.bin"));
+}
+
+TEST(CaWiringRoute, DetachedFoldsIntoTableNamespaceWithPrefixedRef)
+{
+    /// B181: a detached part file routes to the table's OWN archive namespace under a
+    /// `detached/`-prefixed ref — NOT a separate sibling namespace.
+    auto storage = openWiringStorage();
+    auto p = parsePartFilePath("store/uui/uuid-1/detached/broken_all_1_1_0/data.bin");
+    ASSERT_TRUE(p.has_value());
+    auto r = storage->route(*p);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->ns.string(), storage->liveNamespace("uuid-1").string());
+    EXPECT_EQ(r->ref, "detached/broken_all_1_1_0");
+    EXPECT_EQ(r->file, "data.bin");
+
+    /// The detached CONTAINER dir routes to the table ns with an empty ref (filtered listing).
+    auto pc = parsePartFilePath("store/uui/uuid-1/detached/broken_all_1_1_0");
+    ASSERT_TRUE(pc.has_value());
+    auto rc = storage->route(*pc);
+    ASSERT_TRUE(rc.has_value());
+    EXPECT_EQ(rc->ns.string(), storage->liveNamespace("uuid-1").string());
+    EXPECT_EQ(rc->ref, "detached/broken_all_1_1_0");
+    EXPECT_TRUE(rc->file.empty());
 }
 
 TEST(CaWiringRead, ShadowFreezeTree)
