@@ -7,6 +7,7 @@
 #include <IO/copyData.h>
 #include <algorithm>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
 #include <ctime>
 
 namespace DB
@@ -661,18 +662,40 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
     /// RENAME TABLE / cross-engine move: both endpoints are TABLE dirs. Republish every ref (live
     /// AND folded-in `detached/`-prefixed refs, B181) plus every verbatim file under the new table
     /// identity, then drop the old namespace (the blobs/trees are content-addressed and untouched).
+    ///
+    /// B126 — no native cross-namespace atomicity (object storage has no directory rename, unlike a
+    /// non-CAS disk where RENAME TABLE is a single atomic directory rename). This is a best-effort
+    /// multi-op move, but it is RE-DRIVABLE/IDEMPOTENT: `republishRef` no-ops when the source ref is
+    /// already gone (resolveRef miss after a prior drive moved it), `putNamespaceFile` is
+    /// last-writer-wins (re-putting identical bytes is a no-op), and `dropNamespace` of an
+    /// already-empty/absent namespace is a no-op. So a mid-loop throw leaves the table SPLIT across the
+    /// two namespaces, but re-driving the SAME rename completes it. There is no in-call compensation;
+    /// true atomicity would need a durable move-journal (deliberately out of scope — it would touch the
+    /// tested GC/journal layer). On partial failure we log loudly so the split state is diagnosable.
     if (auto src_table = ContentAddressed::parseTableUuid(path_from))
     {
         if (auto dst_table = ContentAddressed::parseTableUuid(path_to))
         {
             const auto from_ns = metadata_storage.liveNamespace(*src_table);
             const auto to_ns = metadata_storage.liveNamespace(*dst_table);
-            for (const auto & [ref, _] : metadata_storage.store()->listRefs(from_ns))
-                republishRef(from_ns, ref, to_ns, ref);
-            for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_ns))
-                if (auto bytes = metadata_storage.store()->getNamespaceFile(from_ns, name))
-                    metadata_storage.store()->putNamespaceFile(to_ns, name, *bytes);
-            metadata_storage.store()->dropNamespace(from_ns);
+            try
+            {
+                for (const auto & [ref, _] : metadata_storage.store()->listRefs(from_ns))
+                    republishRef(from_ns, ref, to_ns, ref);
+                for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_ns))
+                    if (auto bytes = metadata_storage.store()->getNamespaceFile(from_ns, name))
+                        metadata_storage.store()->putNamespaceFile(to_ns, name, *bytes);
+                metadata_storage.store()->dropNamespace(from_ns);
+            }
+            catch (...)
+            {
+                LOG_ERROR(getLogger("ContentAddressedTransaction"),
+                    "RENAME TABLE move was only partially applied: the table is SPLIT across namespaces "
+                    "'{}' and '{}'. The move is idempotent — retrying the same RENAME re-drives it to "
+                    "completion (already-moved refs/files are no-ops). Underlying error: {}",
+                    from_ns.string(), to_ns.string(), getCurrentExceptionMessage(/*with_stacktrace=*/false));
+                throw;
+            }
             return;
         }
     }
@@ -721,8 +744,11 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
         if (src_key == dst_key)
             return;
 
-        /// Re-key a STAGED source into the destination (B67: merge stagings; on a mutable-file
-        /// collision PREFER the existing destination bytes - the newer MVCC state).
+        /// Re-key a STAGED source into the destination (B67: merge stagings). B124: a move carries the
+        /// SOURCE's content to the destination — the POSIX `rename` semantic the rest of MergeTree
+        /// assumes, and exactly what `moveFile` does (`dst[file] = src_bytes`). On the happy path the
+        /// destination staging is freshly-created/empty so there is no collision at all; this only
+        /// matters if some future op-order stages the same mutable file under BOTH keys.
         bool had_staged_source = false;
         if (auto src_it = parts.find(src_key); src_it != parts.end())
         {
@@ -735,7 +761,19 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 dst_st.entries.push_back(std::move(entry));
             }
             for (auto & [file, bytes] : src_st.mutable_files)
-                dst_st.mutable_files.emplace(file, std::move(bytes));   /// dest bytes win on collision
+            {
+                /// B124: source-wins (aligned with moveFile / POSIX rename). A genuine collision with
+                /// DIFFERING bytes means the assumed operation order is wrong — fail loud rather than
+                /// silently dropping a just-written mutable file (the lost-update hazard). Identical
+                /// bytes are a benign re-key (idempotent), so only differing bytes throw.
+                if (auto dit = dst_st.mutable_files.find(file);
+                    dit != dst_st.mutable_files.end() && dit->second != bytes)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "ContentAddressed: moveDirectory mutable-file collision on '{}' ({} -> {}): "
+                        "source and destination staged different bytes for the same file",
+                        file, src->ref, dst->ref);
+                dst_st.mutable_files[file] = std::move(bytes);
+            }
             for (const auto & file : src_st.mutable_removed)
                 dst_st.mutable_removed.insert(file);
             if (!src_st.build)
@@ -820,9 +858,20 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
             const Cas::RootNamespace dst_ns = metadata_storage.liveNamespace(dst_tf.table_uuid);
             if (src_ns.string() == dst_ns.string() && src_tf.tail == dst_tf.tail)
                 return;
+            /// B123: a verbatim rename is emulated as get(src) -> put(dst) -> remove(src) because object
+            /// storage has no atomic rename. SINGLE-WRITER CONTRACT: only the owning server renames its
+            /// own table-level verbatim files (mutation entries), so there is no concurrent writer to
+            /// race the blind put(dst) against — the put's last-writer-wins is safe under that contract.
+            /// Idempotent re-drive: if the source is already gone but the destination is present, a
+            /// previous drive completed this move — treat as done (matches a re-driven FS rename, which
+            /// is an ENOENT-tolerant no-op) instead of throwing FILE_DOESNT_EXIST.
             auto bytes = metadata_storage.store()->getNamespaceFile(src_ns, src_tf.tail);
             if (!bytes)
+            {
+                if (metadata_storage.store()->getNamespaceFile(dst_ns, dst_tf.tail))
+                    return;
                 throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: moveFile source missing: {}", path_from);
+            }
             metadata_storage.store()->putNamespaceFile(dst_ns, dst_tf.tail, *bytes);
             metadata_storage.store()->removeNamespaceFile(src_ns, src_tf.tail);
         };
@@ -833,14 +882,19 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
             move_table_verbatim(*src_tf, *dst_tf);
             return;
         }
-        /// Loose mountpoint files (rare): read + put + remove plain objects.
+        /// Loose mountpoint files (rare): read + put + remove plain objects. Same B123 single-writer
+        /// contract + idempotent re-drive as the table-verbatim branch above.
         const std::string src_key = metadata_storage.serverId() + "/" + path_from;
         const std::string dst_key = metadata_storage.serverId() + "/" + path_to;
         if (src_key == dst_key)
             return;
         auto bytes = metadata_storage.store()->getMountpointObject(src_key);
         if (!bytes)
+        {
+            if (metadata_storage.store()->getMountpointObject(dst_key))
+                return;
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: moveFile source missing: {}", path_from);
+        }
         metadata_storage.store()->putMountpointObject(dst_key, *bytes);
         metadata_storage.store()->removeMountpointObject(src_key);
         return;
@@ -862,7 +916,10 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
     auto & src_st = stagingFor(*src);
     auto & dst_st = stagingFor(*dst);
 
-    /// Staged mutable bytes re-key in place.
+    /// Staged mutable bytes re-key in place. B124 canonical policy: SOURCE-wins — a move/rename carries
+    /// the source's content to the destination, overwriting any prior dest bytes (the POSIX `rename`
+    /// semantic, and what the atomic-write `.tmp -> final` rename requires). moveDirectory's staged
+    /// merge is aligned to this same policy.
     if (auto mit = src_st.mutable_files.find(src->file); mit != src_st.mutable_files.end())
     {
         auto bytes = std::move(mit->second);
@@ -923,11 +980,30 @@ void ContentAddressedTransaction::replaceFile(const std::string & path_from, con
 
 void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if_exists*/, bool /*should_remove_objects*/)
 {
-    /// Part file: drop the staged state so it never reaches the published tree. A mutable file
-    /// that exists only in the COMMITTED payload is staged for removal (commit publishes the
-    /// deletion via updateRefPayload - the MVCC removeTmpMetadataFile shape). Committed CONTENT
-    /// files are never unlinked one-by-one on CA (the part's ref-drop is the removal unit) - the
-    /// per-file unlinks of the MergeTree fast-removal path are no-ops here.
+    /// Part file. Three sub-cases:
+    ///   1. A file STAGED in this transaction (content entry or mutable bytes): drop the staged state
+    ///      so it never reaches the published tree.
+    ///   2. A MUTABLE file that exists only in the COMMITTED payload: stage it for removal so commit
+    ///      publishes the deletion via updateRefPayload (the MVCC removeTmpMetadataFile shape).
+    ///   3. A COMMITTED CONTENT file (not staged here, not mutable): **deliberate NO-OP**.
+    ///
+    /// B123 — LOAD-BEARING INVARIANT, do not "fix" with a blanket fail-closed assert:
+    /// On a content-addressed disk a committed part is ONE atomic ref (its manifest tree); the removal
+    /// UNIT is the whole-part ref-drop done by `removeDirectory(<part>)`, NOT per-file unlinks. The
+    /// MergeTree fast-removal path (IMergeTreeDataPart::remove) unlinks EVERY part file one-by-one and
+    /// THEN calls `removeDirectory` — so these per-file unlinks of committed content files MUST be
+    /// no-ops here, and `removeDirectory` is what actually frees the part. An assertion that "a
+    /// committed content-file unlink never happens" would therefore fire on every normal part removal
+    /// and break it.
+    ///
+    /// The cost of this design is a narrow FAIL-OPEN: if some caller ever unlinks a SINGLE committed
+    /// content file expecting it gone WITHOUT dropping the whole part, the bytes survive in the
+    /// manifest (a no-op here), whereas on a non-CAS disk the file would actually be deleted. This
+    /// shape does NOT occur in MergeTree today (a committed content file is only ever removed as part
+    /// of a whole-part removal, i.e. followed by `removeDirectory`); the invariant holds because the
+    /// MergeTree layer treats a part directory as the indivisible removal unit. If that ever changes
+    /// (a code path that surgically deletes one committed content file and relies on it being gone),
+    /// this no-op becomes a correctness bug and the removal must instead go through ref-drop.
     if (auto r = routeOf(path); r && !r->file.empty())
     {
         auto & st = stagingFor(*r);
@@ -938,6 +1014,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
         st.mutable_files.erase(r->file);
         if (!staged_here && ContentAddressed::isMutablePerPartFile(r->file))
             st.mutable_removed.insert(r->file);
+        /// else: a committed CONTENT file → sub-case 3, the deliberate no-op documented above.
         return;
     }
 

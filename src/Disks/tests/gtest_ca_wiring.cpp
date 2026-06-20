@@ -748,6 +748,76 @@ TEST(CaWiringOps, TableRenameMovesRefsFilesAndDetached)
     EXPECT_TRUE(storage->existsDirectory("uui/uuid-2/detached/all_1_1_0"));
 }
 
+/// B126: RENAME TABLE move_namespace is idempotent — re-driving the SAME rename after it completed is a
+/// clean no-op (the source namespace is already gone), so a partial-failure re-drive is safe.
+TEST(CaWiringOps, TableRenameIsIdempotentOnRedrive)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "live");
+    tx->commit(DB::NoCommitOptions{});
+    storage->store()->putNamespaceFile(storage->liveNamespace("uuid-1"), "format_version.txt", "1\n");
+
+    auto tx2 = storage->createTransaction();
+    tx2->moveDirectory("uui/uuid-1", "uui/uuid-2");
+    tx2->commit(DB::NoCommitOptions{});
+
+    /// Re-drive the identical rename: uuid-1 is empty/gone, so every step no-ops; must not throw.
+    auto tx3 = storage->createTransaction();
+    EXPECT_NO_THROW(tx3->moveDirectory("uui/uuid-1", "uui/uuid-2"));
+    tx3->commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(storage->existsFile("uui/uuid-2/all_1_1_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-2/format_version.txt"));
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1"));
+}
+
+/// B123: a verbatim-file move (get->put->remove, no native rename) is idempotent on re-drive — once the
+/// source is gone but the destination is present, a re-driven move is a no-op, not a FILE_DOESNT_EXIST.
+TEST(CaWiringOps, VerbatimMoveIsIdempotentOnRedrive)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/tmp_mutation_7.txt", "cmds");
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    ca_tx.moveFile("uui/uuid-1/tmp_mutation_7.txt", "uui/uuid-1/mutation_7.txt");
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/mutation_7.txt"));
+    /// Re-drive: source gone, destination present → no-op (no throw).
+    EXPECT_NO_THROW(ca_tx.moveFile("uui/uuid-1/tmp_mutation_7.txt", "uui/uuid-1/mutation_7.txt"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/mutation_7.txt"));
+    /// Both source and destination absent → genuine missing source still throws.
+    EXPECT_ANY_THROW(ca_tx.moveFile("uui/uuid-1/tmp_mutation_8.txt", "uui/uuid-1/mutation_8.txt"));
+}
+
+/// B124: moveDirectory's staged-merge is source-wins, and a genuine collision (the same mutable file
+/// staged under BOTH the source and destination part keys with DIFFERING bytes) fails loud instead of
+/// silently dropping a just-written file. Identical bytes are a benign idempotent re-key.
+TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
+{
+    /// Differing bytes → fail loud.
+    {
+        auto storage = openWiringStorage();
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, "uui/uuid-1/tmp_x/txn_version.txt", "A");
+        writeThroughTransaction(*tx, "uui/uuid-1/all_9_9_9/txn_version.txt", "B");
+        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+        EXPECT_ANY_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_x", "uui/uuid-1/all_9_9_9"));
+    }
+    /// Identical bytes → benign, no throw (source-wins, idempotent). Both parts carry real content so
+    /// the eager publish-at-rename builds a proper ref (a mutable-only staging would instead hit
+    /// updateRefPayload on a not-yet-committed ref — unrelated to the collision policy under test).
+    {
+        auto storage = openWiringStorage();
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, "uui/uuid-1/tmp_y/data.bin", "d1");
+        writeThroughTransaction(*tx, "uui/uuid-1/tmp_y/txn_version.txt", "SAME");
+        writeThroughTransaction(*tx, "uui/uuid-1/all_8_8_8/data.bin", "d2");
+        writeThroughTransaction(*tx, "uui/uuid-1/all_8_8_8/txn_version.txt", "SAME");
+        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+        EXPECT_NO_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_y", "uui/uuid-1/all_8_8_8"));
+    }
+}
+
 TEST(CaWiringOps, FreezeViaHardLinksIntoShadow)
 {
     auto storage = openWiringStorage();

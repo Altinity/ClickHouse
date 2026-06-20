@@ -137,3 +137,27 @@ identically. They are unrelated to B182/B183:
 - `CaWiringOps.FreezeViaHardLinksIntoShadow` regressed in the VFS refactor (af54aa415bc, shadow/mountpoint
   namespace change): `removeRecursive("shadow/bk1")` no longer makes `existsDirectory("shadow/bk1")` false.
   My diff touches neither shadow nor GC nor createHardLink/removeRecursive paths. -> new backlog item.
+
+## T30 — B123 / B124 / B126 latent write-path hardening (2026-06-20)
+
+Three write-path-review correctness items (user's B86/B87/B88 = backlog B123/B124/B126), all latent +
+single-writer-mitigated. Direction confirmed with the operator (detailed RU writeup), then implemented.
+
+- **B124 (collision policy):** aligned both move paths to SOURCE-wins (POSIX rename semantic; matches
+  the atomic `.tmp`->final rename). `moveDirectory` staged-merge `emplace`(dest-wins) → source-wins +
+  fail-loud `LOGICAL_ERROR` on a genuine differing-bytes collision (silent lost-update → loud error).
+- **B123 (verbatim RMW + unlink):** documented the single-writer contract for the verbatim get→put→
+  remove move and made it idempotent on re-drive (src gone + dst present → no-op). For `unlinkFile`,
+  documented the LOAD-BEARING no-op invariant (committed content files are removed via whole-part
+  ref-drop, not per-file unlink — a blanket assert would break fast-removal); the operator emphasised
+  this must be documented. No risky assert added.
+- **B126 (RENAME TABLE atomicity):** documented + made explicit that `move_namespace` is idempotent /
+  re-drivable; wrapped in try/catch with a loud LOG_ERROR naming both namespaces on partial failure.
+  Durable move-journal (true atomicity) deliberately out of scope.
+
+Validation: 3 new gtests (`MoveDirectoryMutableCollisionPolicy`, `VerbatimMoveIsIdempotentOnRedrive`,
+`TableRenameIsIdempotentOnRedrive`) PASS; full CA gtests 299/301 (the 2 fails are the known pre-existing
+`FreezeViaHardLinksIntoShadow` [B186] + `CasGcLeak.*` [B140]). Functional sanity on the local CA server:
+B182/B183 still green; RENAME TABLE+mutation oracle CA==default (2000/1999000/7290); a mixed workload
+(inserts+vertical merges+MATERIALIZE INDEX+UPDATE+DELETE+txn-merge+RENAME) ran with zero CA errors and
+the collision guard never fired spuriously.
