@@ -18,10 +18,18 @@ namespace DB::ContentAddressed
 /// (shadow/<backup>/store/<uuid[:3]>/<uuid>/<part>/...).
 inline constexpr std::string_view kShadowDirName = "shadow";
 
-/// The MergeTree detached-parts namespace. parsePartFilePath reports a detached path with
+/// The MergeTree detached-parts directory. parsePartFilePath reports a detached path with
 /// part_name == kDetachedDirName and the real detached part dir as the FIRST component of `file`
 /// (the PoC contract, B36); the transaction/read routing re-splits it.
 inline constexpr std::string_view kDetachedDirName = "detached";
+
+/// B181: detached parts live INSIDE the table's OWN archive namespace as refs keyed by this
+/// prefix — `detached/PART` versus a live `PART`. One namespace per table; the live-vs-detached
+/// name collision is impossible because the ref names differ. The routing prepends this to the
+/// detached part name to form the ref, and the `TABLE/detached` container dir surfaces the
+/// table's refs filtered to this prefix (stripped for display). No parallel detached namespace
+/// exists anymore (the old `detachedNamespace` is gone).
+inline constexpr std::string_view kDetachedRefPrefix = "detached/";
 
 /// The content-addressing boundary marker: a SUFFIX on a table-dir segment (`…/<uuid>@cas@`), not a
 /// path segment. It marks where the mirrored ClickHouse path ends and the content-addressed archive

@@ -18,9 +18,9 @@ namespace DB
 /// parsing (PartPathParser) + namespace mapping (D-W1) + StoredObjects construction; NO protocol
 /// state, NO internals-exposing accessors — the protocol lives in Cas::Store/Build/Gc.
 ///
-/// Namespace mapping (M-W decision D-W1, shadow refined during T2):
+/// Namespace mapping (M-W decision D-W1, shadow refined during T2; detached folded in B181):
 ///   live part      SERVER_ID/TABLE_UUID            ref = PART_DIR
-///   detached part  SERVER_ID/detached/TABLE_UUID   ref = DETACHED_PART_DIR
+///   detached part  SERVER_ID/TABLE_UUID            ref = detached/DETACHED_PART_DIR
 ///   FREEZE shadow  the LITERAL shadow table dir     ref = PART_DIR
 ///                  (shadow/BACKUP/store/U3/UUID or shadow/BACKUP/data/DB/TBL — bijective with
 ///                  the disk path for both Atomic and non-Atomic layouts, so the shadow tree
@@ -130,9 +130,9 @@ public:
     std::unique_ptr<ReadBufferFromFileBase> readBlobPayload(
         const Cas::BlobLocation & location, const std::string & path, const ReadSettings & settings) const;
 
-    /// D-W1 namespace mapping (shared with the transaction — ONE definition).
+    /// D-W1 namespace mapping (shared with the transaction — ONE definition). Detached parts (B181)
+    /// live INSIDE this same table namespace as `detached/`-prefixed refs, not a sibling namespace.
     Cas::RootNamespace liveNamespace(const std::string & table_uuid) const;
-    Cas::RootNamespace detachedNamespace(const std::string & table_uuid) const;
     static Cas::RootNamespace shadowNamespace(const std::string & shadow_table_dir);
 
     /// The canonical server prefix used for server-scoped namespaces: the 32-hex
@@ -153,12 +153,14 @@ public:
     bool liveTreeDirHasChildren(const std::string & path) const;
 
     /// The route of one parsed CA path: which namespace, which ref, which in-tree file. The single
-    /// place the detached re-split (PoC B36 parser contract -> per-part detached refs) and the
-    /// shadow mapping happen.
+    /// place the detached re-split (PoC B36 parser contract -> in-namespace `detached/`-prefixed
+    /// refs, B181) and the shadow mapping happen.
     struct Route
     {
         Cas::RootNamespace ns{""};
-        std::string ref;    /// empty => the path is the namespace's container dir
+        /// empty => the path is the namespace's container dir. For a detached part this is
+        /// `detached/<part>` (a ref inside the table namespace, not a separate namespace).
+        std::string ref;
         std::string file;   /// empty => the path is the part dir itself
     };
     std::optional<Route> route(const ContentAddressed::PartFilePath & p) const;
