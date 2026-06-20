@@ -521,21 +521,24 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         return;
     }
 
-    /// Table dir: the live namespace, its detached namespace, and every verbatim file go.
+    /// Table dir: the table's namespace (live + folded-in detached refs, B181) and every verbatim
+    /// file go in one dropNamespace.
     if (auto uuid = ContentAddressed::parseTableUuid(path))
     {
         metadata_storage.store()->dropNamespace(metadata_storage.liveNamespace(*uuid));
-        metadata_storage.store()->dropNamespace(metadata_storage.detachedNamespace(*uuid));
         return;
     }
 
     if (auto p = ContentAddressed::parsePartFilePath(path))
     {
         auto r = metadata_storage.route(*p);
-        /// The detached CONTAINER dir: drop the whole detached namespace.
+        /// The detached CONTAINER dir (DROP DETACHED / table-detach): drop every `detached/`-prefixed
+        /// ref in the table namespace; the live refs and verbatim files stay (B181: one namespace).
         if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
         {
-            metadata_storage.store()->dropNamespace(r->ns);
+            for (const auto & [ref, _] : metadata_storage.store()->listRefs(r->ns))
+                if (ref.starts_with(ContentAddressed::kDetachedRefPrefix))
+                    dropRefIfPresent(r->ns, ref);
             return;
         }
         /// A single part dir (live or detached): drop its ref.
@@ -657,25 +660,21 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
     auto src = src_p ? metadata_storage.route(*src_p) : std::nullopt;
     auto dst = dst_p ? metadata_storage.route(*dst_p) : std::nullopt;
 
-    /// RENAME TABLE / cross-engine move: both endpoints are TABLE dirs. Republish every live and
-    /// detached ref plus every verbatim file under the new table identity, then drop the old
-    /// namespaces (the blobs/trees are content-addressed and untouched).
+    /// RENAME TABLE / cross-engine move: both endpoints are TABLE dirs. Republish every ref (live
+    /// AND folded-in `detached/`-prefixed refs, B181) plus every verbatim file under the new table
+    /// identity, then drop the old namespace (the blobs/trees are content-addressed and untouched).
     if (auto src_table = ContentAddressed::parseTableUuid(path_from))
     {
         if (auto dst_table = ContentAddressed::parseTableUuid(path_to))
         {
-            auto move_namespace = [&](const Cas::RootNamespace & from_ns, const Cas::RootNamespace & to_ns)
-            {
-                auto refs = metadata_storage.store()->listRefs(from_ns);
-                for (const auto & [ref, _] : refs)
-                    republishRef(from_ns, ref, to_ns, ref);
-                for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_ns))
-                    if (auto bytes = metadata_storage.store()->getNamespaceFile(from_ns, name))
-                        metadata_storage.store()->putNamespaceFile(to_ns, name, *bytes);
-                metadata_storage.store()->dropNamespace(from_ns);
-            };
-            move_namespace(metadata_storage.liveNamespace(*src_table), metadata_storage.liveNamespace(*dst_table));
-            move_namespace(metadata_storage.detachedNamespace(*src_table), metadata_storage.detachedNamespace(*dst_table));
+            const auto from_ns = metadata_storage.liveNamespace(*src_table);
+            const auto to_ns = metadata_storage.liveNamespace(*dst_table);
+            for (const auto & [ref, _] : metadata_storage.store()->listRefs(from_ns))
+                republishRef(from_ns, ref, to_ns, ref);
+            for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_ns))
+                if (auto bytes = metadata_storage.store()->getNamespaceFile(from_ns, name))
+                    metadata_storage.store()->putNamespaceFile(to_ns, name, *bytes);
+            metadata_storage.store()->dropNamespace(from_ns);
             return;
         }
     }
