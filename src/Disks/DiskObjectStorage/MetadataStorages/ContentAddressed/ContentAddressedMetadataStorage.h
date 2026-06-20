@@ -165,6 +165,9 @@ public:
     };
     std::optional<Route> route(const ContentAddressed::PartFilePath & p) const;
 
+    /// Full `detached/<part>` ref names in a namespace (B181: detached parts fold into the table ns).
+    std::vector<std::string> detachedRefNames(const Cas::RootNamespace & ns) const;
+
 private:
     const ObjectStoragePtr object_storage;
     const std::string storage_path_prefix;

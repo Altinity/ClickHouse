@@ -486,6 +486,15 @@ ContentAddressedMetadataStorage::resolveRouted(const Route & r) const
     return std::make_pair(*resolved, store()->readTree(resolved->tree_id));
 }
 
+std::vector<std::string> ContentAddressedMetadataStorage::detachedRefNames(const Cas::RootNamespace & ns) const
+{
+    std::vector<std::string> refs;
+    for (const auto & [ref, _] : store()->listRefs(ns))
+        if (ref.starts_with(ContentAddressed::kDetachedRefPrefix))
+            refs.push_back(ref);
+    return refs;
+}
+
 /// ==== read surface ====
 
 bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
@@ -553,15 +562,9 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
     if (p)
     {
         auto r = route(*p);
-        /// The detached CONTAINER dir <table>/detached: route gives an empty ref. It exists iff the
-        /// table namespace holds at least one `detached/`-prefixed ref (B181: detached folded in).
+        /// The detached CONTAINER dir <table>/detached: exists iff it has at least one ref (B181).
         if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
-        {
-            for (const auto & [ref, _] : store()->listRefs(r->ns))
-                if (ref.starts_with(ContentAddressed::kDetachedRefPrefix))
-                    return true;
-            return false;
-        }
+            return !detachedRefNames(r->ns).empty();
         /// A part dir (live, detached, or shadow): exists iff its ref is present.
         if (r && !r->ref.empty() && r->file.empty())
             return store()->resolveRef(r->ns, r->ref, /*allow_stale=*/true).has_value();
@@ -717,10 +720,9 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
     if (ContentAddressed::isAtomicShardDir(path))
         return listLiveTreeChildren(path);
 
-    /// Table dir: part names from refs + table-level verbatim file names (first components —
-    /// StorageMergeTree::loadMutations scans this dir for mutation_* entries). B181: detached parts
-    /// are `detached/<part>` refs in this same namespace; addFirstComponent collapses them to the
-    /// single `detached` subdir entry (the on-disk shape), exactly like a nested verbatim file.
+    /// Table dir: part names (live + B181 detached `detached/<part>` refs) + table-level verbatim
+    /// file names; addFirstComponent collapses both to their first path segment (live part names and
+    /// the single `detached` subdir, exactly like a nested verbatim file).
     if (auto uuid = ContentAddressed::parseTableUuid(path))
     {
         std::unordered_set<std::string> result;
@@ -734,16 +736,12 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
     if (auto p = ContentAddressed::parsePartFilePath(path))
     {
         auto r = route(*p);
-        /// The detached CONTAINER dir: the detached part directory names (B36's intent — never
-        /// the files inside, never a dir-stripped mutable file). B181: detached parts are
-        /// `detached/`-prefixed refs in the table namespace, so filter on the prefix and strip it
-        /// for the logical view (live `<part>` refs are excluded).
+        /// The detached CONTAINER dir: detached part names (prefix stripped; never files, B36/B181).
         if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
         {
             std::vector<std::string> result;
-            for (const auto & [ref, _] : store()->listRefs(r->ns))
-                if (ref.starts_with(ContentAddressed::kDetachedRefPrefix))
-                    result.push_back(ref.substr(ContentAddressed::kDetachedRefPrefix.size()));
+            for (const auto & ref : detachedRefNames(r->ns))
+                result.push_back(ref.substr(ContentAddressed::kDetachedRefPrefix.size()));
             return result;
         }
         /// A part dir (live, detached part, shadow handled above): logical file names, nested

@@ -532,13 +532,11 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     if (auto p = ContentAddressed::parsePartFilePath(path))
     {
         auto r = metadata_storage.route(*p);
-        /// The detached CONTAINER dir (DROP DETACHED / table-detach): drop every `detached/`-prefixed
-        /// ref in the table namespace; the live refs and verbatim files stay (B181: one namespace).
+        /// The detached CONTAINER dir (DROP DETACHED / table-detach): drop all detached refs (B181).
         if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
         {
-            for (const auto & [ref, _] : metadata_storage.store()->listRefs(r->ns))
-                if (ref.starts_with(ContentAddressed::kDetachedRefPrefix))
-                    dropRefIfPresent(r->ns, ref);
+            for (const auto & ref : metadata_storage.detachedRefNames(r->ns))
+                dropRefIfPresent(r->ns, ref);
             return;
         }
         /// A single part dir (live or detached): drop its ref.
