@@ -82,6 +82,8 @@ struct PocoHTTPClientConfiguration : public Aws::Client::ClientConfiguration
 
     /// See PoolBase::BehaviourOnLimit
     bool s3_use_adaptive_timeouts = true;
+    /// Conditional PUT (If-None-Match / If-Match) bodies >= this negotiate Expect: 100-continue (B118/B187).
+    size_t expect_continue_min_bytes = DEFAULT_EXPECT_CONTINUE_MIN_BYTES;
     size_t http_keep_alive_timeout = DEFAULT_HTTP_KEEP_ALIVE_TIMEOUT;
     size_t http_keep_alive_max_requests = DEFAULT_HTTP_KEEP_ALIVE_MAX_REQUEST;
 
@@ -224,6 +226,7 @@ protected:
     const RemoteHostFilter & remote_host_filter;
     unsigned int s3_max_redirects = DEFAULT_MAX_REDIRECTS;
     bool s3_use_adaptive_timeouts = true;
+    size_t expect_continue_min_bytes = DEFAULT_EXPECT_CONTINUE_MIN_BYTES;
     const UInt64 http_max_fields = 1000000;
     const UInt64 http_max_field_name_size = 128 * 1024;
     const UInt64 http_max_field_value_size = 128 * 1024;

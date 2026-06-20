@@ -23,6 +23,12 @@
                      keys — drops per-key 64-permit congestion (503) and per-key overwrite-orphan
                      pileup. Creation-time; the fresh per-run pool picks it up. -->
                 <content_addressed_root_shards>64</content_addressed_root_shards>
+                <!-- B187: rustfs honors Expect: 100-continue, so negotiate it for ALL conditional
+                     blob PUTs >= 64 KiB (not just the default >= 1 MiB). A dedup-hit conditional PUT
+                     (If-None-Match:* on an existing blob) then gets a clean early 412 instead of
+                     rustfs closing mid-body -> a transport Broken pipe -> the 500x5s retry storm that
+                     wedges the merge finalize. 64 KiB still spares the high-volume tiny manifest casPuts. -->
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
             </ca>
 
             <!-- Read-only fsck view over the SAME endpoint. <readonly>true</readonly> is parsed by
@@ -38,6 +44,7 @@
                 <secret_access_key>clickhouse</secret_access_key>
                 <content_addressed_allow_shared_pool>1</content_addressed_allow_shared_pool>
                 <content_addressed_gc_enabled>0</content_addressed_gc_enabled>
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
                 <readonly>true</readonly>
             </ca_ro>
         </disks>

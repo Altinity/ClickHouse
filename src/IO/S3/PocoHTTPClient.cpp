@@ -221,6 +221,7 @@ PocoHTTPClient::PocoHTTPClient(const PocoHTTPClientConfiguration & client_config
     , remote_host_filter(client_configuration.remote_host_filter)
     , s3_max_redirects(client_configuration.s3_max_redirects)
     , s3_use_adaptive_timeouts(client_configuration.s3_use_adaptive_timeouts)
+    , expect_continue_min_bytes(client_configuration.expect_continue_min_bytes)
     , http_max_fields(client_configuration.http_max_fields)
     , http_max_field_name_size(client_configuration.http_max_field_name_size)
     , http_max_field_value_size(client_configuration.http_max_field_value_size)
@@ -641,7 +642,11 @@ void PocoHTTPClient::makeRequestInternalImpl(
                 if (end_pos > 0)
                     content_body_size = static_cast<size_t>(end_pos);
             }
-            static constexpr size_t min_body_size_for_expect_continue = 1024 * 1024;
+            /// Per-disk gate (B187): default keeps the historical 1 MiB (safe on Expect-ignoring
+            /// stores, B120); a disk over a store that honors Expect lowers it so sub-1MiB conditional
+            /// blob PUTs also reject-before-body instead of streaming a doomed body that the store
+            /// closes mid-upload → a transport Broken pipe → the 500×5s retry storm that wedges merges.
+            const size_t min_body_size_for_expect_continue = expect_continue_min_bytes;
             const bool conditional_write
                 = method == Poco::Net::HTTPRequest::HTTP_PUT
                 && content_body_size >= min_body_size_for_expect_continue
