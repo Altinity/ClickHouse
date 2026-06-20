@@ -31,6 +31,7 @@ IDENTICAL effective ledger.
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -1444,4 +1445,18 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    # Deterministic, prompt process exit after the verdict. Each phase runner does its REAL cleanup
+    # (executor shutdown(wait=True), metrics-DB close, thread joins) in its own `finally` BEFORE
+    # returning, so nothing durable is skipped here. We then `os._exit` to bypass interpreter-shutdown
+    # atexit handlers, which were observed to leave the driver lingering for a long time AFTER the
+    # verdict was already printed and flushed (post-`PHASE3 OK`: a single sleeping main thread stuck in
+    # finalization). Preserve the return code (and a `sys.exit(N)` raised on the failure path).
+    _rc = 0
+    try:
+        _rc = main() or 0
+    except SystemExit as _e:
+        _rc = _e.code if isinstance(_e.code, int) else (0 if _e.code in (None, 0) else 1)
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    os._exit(_rc)

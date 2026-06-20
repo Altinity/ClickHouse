@@ -196,3 +196,14 @@ no failure.json).
   the OLD code this is precisely the spurious `PHASE3 FAILED`. 0 hard failures / 0 tracebacks.
 
 This is the chaos validation that was missing for B181/B182/B183/B123-126 — now green end-to-end.
+
+## T33 — fix soak-driver post-verdict teardown linger (2026-06-20)
+
+After `PHASE3 OK`/`PHASE1 OK` the driver process lingered (single sleeping main thread stuck in
+interpreter-shutdown / an atexit handler) — the verdict was already printed+flushed and all real
+cleanup (executor `shutdown(wait=True)`, metrics-DB close, thread joins) had run in the phase runner's
+`finally` BEFORE returning, so the linger was pure atexit-finalization stall. Fix: `__main__` now
+captures the return/`SystemExit` code, flushes stdout/stderr, and `os._exit(code)` — bypassing atexit
+entirely so the harness terminates promptly and deterministically (exit code preserved for CI).
+Validated: 152 harness unit tests green; a phase-1 smoke prints `PHASE1 OK` and exits rc=0 with no
+lingering python process.
