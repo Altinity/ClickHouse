@@ -179,3 +179,20 @@ Goal: get the soak to a stable green run for real chaos validation. Reviewed clu
 
 Validation: full ca-soak unit suite 152 passed (incl. new `test_pool_consistent_flapping_clean_does_not_raise`
 + `test_pool_consistent_persistent_never_clean_raises`). Next: 1-hour soak on the fresh binary.
+
+## T32 — 1-hour chaos soak GREEN on the fresh binary (2026-06-20)
+
+Recreated the ca-soak cluster on the fresh binary (B182/B183/B123/B124/B126 + harness B152 fixes) and
+ran `python3 -m soak.run --seed 20260620 --phase 3 --duration 1h`. Result: **PHASE3 OK** (clean exit,
+no failure.json).
+
+- Faults fired: 15 (incl. the harshest `both kill` / `both pause` / `both restart`); restarts: 9.
+- Every recovery checkpoint passed; final converge checkpoint OK (`count=1875147 dangling=0
+  dryrun_count=0 unreachable=0`). Both replicas final `count=1875147` (oracle holds — zero divergence).
+- transport-retried op attempts: 9; ABORTED-retried INSERT: 0.
+- **B152/B185 fix validated LIVE:** exactly 1 benign `WARNING [B152/B185]` at the gc_checkpoint — the
+  pool reached fsck `dangling==0` but flapped (didn't hold `stable`); the gate warned + continued on the
+  clean reading instead of false-failing (the oracle had already proved no loss, `unreachable=0`). Under
+  the OLD code this is precisely the spurious `PHASE3 FAILED`. 0 hard failures / 0 tracebacks.
+
+This is the chaos validation that was missing for B181/B182/B183/B123-126 — now green end-to-end.
