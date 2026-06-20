@@ -5,10 +5,62 @@ from soak.checker import (
     drive_gc_to_fixpoint,
     fixpoint_timeout_s,
     gc_fixpoint_reached,
+    is_genuine_hang,
     poll_unreachable_to_stable,
     scaled_admin_timeout_s,
     CheckpointFailure,
 )
+
+
+# --- merge-aware quiescence hang detection (is_genuine_hang) ---
+# On CA-over-S3 a single large merge legitimately runs >10min with the rest of the queue postponed
+# behind it; the backlog COUNT stays flat while real work executes. A flat count is a hang ONLY when
+# NOTHING is executing.
+
+def _hang(**over):
+    base = dict(backlog_flat=True, active_merges=0, errored_queue=0,
+                grace_exceeded=True, budget_exceeded=True, absolute_cap_exceeded=False)
+    base.update(over)
+    return is_genuine_hang(**base)
+
+
+def test_hang_flat_idle_with_grace_and_budget_spent_is_hang():
+    # Flat backlog, nothing executing, grace+budget spent -> true stall.
+    assert _hang() == (True, "idle-flat")
+
+
+def test_hang_flat_but_active_merge_is_not_a_hang():
+    # The core CA/S3 case: flat COUNT but a long merge is executing -> NOT a hang, keep waiting.
+    assert _hang(active_merges=1) == (False, "")
+
+
+def test_hang_active_merge_overrides_absolute_cap():
+    # Even past the absolute cap, an executing merge is never capped (cap only trips when idle).
+    assert _hang(active_merges=1, absolute_cap_exceeded=True) == (False, "")
+
+
+def test_hang_errored_queue_fails_fast_even_with_active_merge():
+    # A genuine last_exception is a real error, distinct from slowness -> fail fast regardless.
+    assert _hang(active_merges=2, errored_queue=1) == (True, "errored")
+
+
+def test_hang_progressing_backlog_not_a_hang():
+    # Backlog still shrinking (not flat) -> progress, keep waiting.
+    assert _hang(backlog_flat=False) == (False, "")
+
+
+def test_hang_grace_not_yet_exceeded_not_a_hang():
+    assert _hang(grace_exceeded=False) == (False, "")
+
+
+def test_hang_budget_not_yet_exceeded_not_a_hang():
+    assert _hang(budget_exceeded=False) == (False, "")
+
+
+def test_hang_absolute_cap_when_idle_is_capped():
+    # Wedged-run backstop: cap tripped while nothing executes (and grace/budget not yet spent).
+    assert _hang(grace_exceeded=False, budget_exceeded=False,
+                 absolute_cap_exceeded=True) == (True, "capped")
 
 
 def test_compare_aggregates_match():

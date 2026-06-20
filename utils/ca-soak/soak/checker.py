@@ -183,8 +183,44 @@ def poll_unreachable_to_stable(unreachable_fn, *, timeout_s: float, interval_s: 
         sleep_fn(interval_s)
 
 
+def is_genuine_hang(*, backlog_flat: bool, active_merges: int, errored_queue: int,
+                    grace_exceeded: bool, budget_exceeded: bool, absolute_cap_exceeded: bool):
+    """Pure decision: is the quiescence drain a GENUINE HANG (vs. slow-but-progressing)?
+
+    Inputs (all booleans/counts derived by the caller from live cluster state):
+      backlog_flat          - the total backlog COUNT has not decreased for the grace window.
+      active_merges         - number of merges/mutations CURRENTLY EXECUTING in `system.merges`.
+      errored_queue         - number of replication-queue entries with a real `last_exception`.
+      grace_exceeded        - no-progress grace window has elapsed.
+      budget_exceeded       - the soft `timeout_s` budget is exhausted.
+      absolute_cap_exceeded - the hard absolute backstop cap is exhausted.
+
+    Returns (is_hang: bool, reason: str). `reason` is one of:
+      "errored"   - a queue entry carries a genuine `last_exception`; fail FAST (a real error,
+                     distinct from slowness — handled by the caller before calling here too).
+      "idle-flat" - backlog flat + grace+budget spent + NOTHING executing: a true stall.
+      "capped"    - the hard absolute cap tripped while nothing is executing (wedged-run backstop).
+      ""          - not a hang; keep waiting.
+
+    A flat backlog with ≥1 active merge/mutation is NOT a hang: on CA-over-S3 a single large
+    merge legitimately runs >10min with the rest of the queue postponed behind it, so the COUNT
+    stays flat while real work executes. We only declare a hang when nothing is executing."""
+    if errored_queue > 0:
+        return True, "errored"
+    if active_merges > 0:
+        # Work is executing — never a hang, regardless of a flat count. The absolute cap only
+        # trips when NOTHING is executing, so a long-but-progressing merge cannot be capped.
+        return False, ""
+    if backlog_flat and grace_exceeded and budget_exceeded:
+        return True, "idle-flat"
+    if absolute_cap_exceeded:
+        return True, "capped"
+    return False, ""
+
+
 def quiesce(cluster, table: str, timeout_s: int = 300, admin_timeout_s: float | None = None,
-            no_progress_grace_s: float = 120.0):
+            no_progress_grace_s: float = 120.0, absolute_cap_s: float = 1800.0,
+            log_fn=print):
     """Caller has already paused workers. Drain replication queues + mutations + merges, force OPTIMIZE
     FINAL + MATERIALIZE TTL, re-drain, then return the server now() captured AFTER convergence.
 
@@ -195,10 +231,16 @@ def quiesce(cluster, table: str, timeout_s: int = 300, admin_timeout_s: float | 
     `OPTIMIZE ... FINAL`, `MATERIALIZE TTL`), so a slow large-pool op no longer escapes as a spurious
     HTTP-408 `TIMEOUT_EXCEEDED` / raw socket TimeoutError.
 
-    The drain poll distinguishes a GENUINE HANG from slow-but-working: it tracks the total backlog
-    (queue + unfinished mutations + merges) and only fails when the backlog has made NO PROGRESS for
-    `no_progress_grace_s` AND the overall `timeout_s` budget is exhausted. A backlog that keeps
-    shrinking extends the wait (the progress timer resets on every decrease) instead of tripping."""
+    The drain poll is MERGE-AWARE: it distinguishes a GENUINE HANG from slow-but-working. A flat
+    backlog COUNT is NOT treated as a hang while real work is actively executing — on CA-over-S3 a
+    single large merge legitimately runs >10min (one active merge on a huge high-level part, with a
+    `MUTATE_PART`/`MATERIALIZE TTL` mutation postponed behind it as "not disjoint"), so the COUNT
+    stays flat while the merge progresses with zero exceptions. The drain treats the system as
+    PROGRESSING if there is ≥1 active merge/mutation in `system.merges` OR the backlog count
+    decreased since the last poll. It declares a hang ONLY when the backlog is flat AND there are NO
+    active merges/mutations AND the grace+budget windows are spent (a true stall: queue stuck with
+    nothing executing). A generous `absolute_cap_s` (30min) is a backstop, but it too only trips
+    when nothing is executing. A queue entry carrying a real `last_exception` still fails FAST."""
     if admin_timeout_s is None:
         # Scale the admin/SYNC bound to the live pool size so a multi-million-object pool gets a
         # proportionally generous wait. A failure to read the size collapses to the generous floor.
@@ -233,8 +275,34 @@ def quiesce(cluster, table: str, timeout_s: int = 300, admin_timeout_s: float | 
             total += int(node.scalar(f"SELECT count() FROM system.merges WHERE table='{table}'"))
         return total
 
+    def merge_activity():
+        """Return (active_merges, max_elapsed_s) across the cluster: how many merges/mutations are
+        CURRENTLY EXECUTING in `system.merges`, and the largest elapsed of any of them. ≥1 active
+        means real work is in flight (so a flat backlog is slow-but-progressing, not a hang)."""
+        active = 0
+        max_elapsed = 0.0
+        for node in cluster.nodes():
+            active += int(node.scalar(f"SELECT count() FROM system.merges WHERE table='{table}'"))
+            e = node.scalar(f"SELECT max(elapsed) FROM system.merges WHERE table='{table}'")
+            try:
+                max_elapsed = max(max_elapsed, float(e))
+            except (TypeError, ValueError):
+                pass  # NULL/empty when there are no active merges
+        return active, max_elapsed
+
+    def errored_queue():
+        """Count replication-queue entries carrying a genuine `last_exception` (a real error,
+        distinct from slowness). Any such entry fails the checkpoint FAST."""
+        total = 0
+        for node in cluster.nodes():
+            total += int(node.scalar(
+                f"SELECT count() FROM system.replication_queue "
+                f"WHERE table='{table}' AND last_exception != ''"))
+        return total
+
     def drain(stage_label: str):
         deadline = time.time() + timeout_s
+        absolute_deadline = time.time() + absolute_cap_s
         last_backlog = None
         last_progress_t = time.time()
         while True:
@@ -242,15 +310,46 @@ def quiesce(cluster, table: str, timeout_s: int = 300, admin_timeout_s: float | 
             if b == 0:
                 return
             now = time.time()
+            backlog_flat = True
             if last_backlog is None or b < last_backlog:
                 # Progress: backlog shrank -> reset the no-progress timer and extend.
                 last_backlog = b
                 last_progress_t = now
-            # Fail ONLY on a genuine hang: no progress for the grace window AND the budget is spent.
-            if (now - last_progress_t) > no_progress_grace_s and now > deadline:
+                backlog_flat = False
+
+            errs = errored_queue()
+            active, max_elapsed = merge_activity()
+            grace_exceeded = (now - last_progress_t) > no_progress_grace_s
+            budget_exceeded = now > deadline
+            absolute_cap_exceeded = now > absolute_deadline
+
+            is_hang, reason = is_genuine_hang(
+                backlog_flat=backlog_flat,
+                active_merges=active,
+                errored_queue=errs,
+                grace_exceeded=grace_exceeded,
+                budget_exceeded=budget_exceeded,
+                absolute_cap_exceeded=absolute_cap_exceeded,
+            )
+            if is_hang:
+                if reason == "errored":
+                    raise CheckpointFailure(
+                        f"quiescence {stage_label}: {errs} replication-queue entr(ies) carry a real "
+                        f"last_exception — genuine error (failing fast, not slowness)")
+                if reason == "capped":
+                    raise CheckpointFailure(
+                        f"quiescence {stage_label}: backlog stuck at {b} and nothing executing in "
+                        f"system.merges — absolute cap of {absolute_cap_s:.0f}s exhausted — wedged run")
                 raise CheckpointFailure(
-                    f"quiescence {stage_label}: backlog stuck at {b} (no progress for "
-                    f"{now - last_progress_t:.0f}s past the {timeout_s}s budget) — genuine hang")
+                    f"quiescence {stage_label}: backlog stuck at {b} with NO active merges (no "
+                    f"progress for {now - last_progress_t:.0f}s past the {timeout_s}s budget) — "
+                    f"genuine hang")
+            if backlog_flat and grace_exceeded and budget_exceeded and active > 0:
+                # Slow-but-progressing: flat COUNT but real work is executing. Log once per poll
+                # that we are extending the wait so the operator can see why we are not failing.
+                log_fn(
+                    f"quiesce {stage_label}: backlog={b} flat but {active} active merge(s) "
+                    f"(max elapsed {max_elapsed:.0f}s) — still progressing, extending wait")
             time.sleep(1)
 
     drain("initial drain")
