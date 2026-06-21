@@ -73,3 +73,11 @@ note (no regression). Commit.
 Build clickhouse+unit_tests_dbms clean; full CA suite = 2 known reds only; then restart the ca-soak
 cluster and run a chaos soak confirming no `Code 499` and no fatal adopt failures under the
 hot-duplicate workload. Update backlog (B190/B189 → DONE), commit.
+
+---
+## Execution log (resumable state)
+- **Task 1 DONE+APPROVED** (`21549755d0e`): `get()` NoSuchKey→nullopt.
+- **Task 2 DONE+APPROVED** (`d34f65f4587` + cleanup `cee3ae33c91`): `uploadFromSource`; `resurrect` deleted; zero `get()` in CasBuild; 5 protocol tests legitimately rewritten to ABORTED.
+- **Task 3 DONE+APPROVED** (`a2752471cc6`): `gateCheckDeps`+`revalidateDeps` → one `checkAndResolveDeps`; behaviorally equivalent, redundant HEADs removed.
+- **Task 4 A+B DONE** (`<see git log>`): `adoptStagedBlob` helper (6 sites→1); `republishRef` precommit-first. **REVIEW STILL PENDING.** **Part C DEFERRED** — `createHardLink` committed-source `adoptFromTree`→`readTree` GETs a LIVE (ref-pinned) source tree at staging, before precommit. Not an INV-1 violation (live, not condemned); INV-2 nicety only. Fix needs deferred-tree-entry-read post-precommit OR per-file entry metadata in the ref payload (Store/staging restructure). Track as its own item if not done here.
+- **REMAINING: Task 4 review; Task 5** (filter `pending_blobs` by staged-tree hashes — kill orphaned uploads, B189); **Task 6** (retire dead `reuseBlob`/`body_recreatable`); **Task 7** (build + chaos soak: no Code 499 / no fatal adopt; update backlog B190/B189 → DONE). Baseline now 321 pass / 2 known reds.
