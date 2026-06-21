@@ -1151,3 +1151,185 @@ TEST(CaWiring, RootShardsConfigurable)
     defaulted->startup();
     EXPECT_EQ(defaulted->store()->poolMeta().root_shards, 8u);
 }
+
+/// ==== B188 precommit-first order invariant (Task 6) ====
+///
+/// A RecordingLocalObjectStorage records every writeObject call as (logical_key). "Logical" means the
+/// bare pool key (without the emu_root prefix) — the same string the Layout functions produce, so
+/// the `/blobs/`, `/trees/`, and `/_precommits/` substring tests are unambiguous.
+///
+/// After commit the test asserts: the FIRST write to a key containing "/_precommits/" happened before
+/// ALL writes to keys containing "/blobs/" or "/trees/". The precommit ref is what pins the in-flight
+/// build-root closure so GC cannot reclaim the not-yet-uploaded content objects; therefore every pool
+/// write to blobs/trees must be AFTER the precommit ref is durably written (B188 invariant).
+
+namespace
+{
+
+class RecordingLocalObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    struct Record
+    {
+        std::string key;   /// logical (emu_root stripped)
+    };
+
+    std::vector<Record> writes;   /// append-only; no mutex (tests are single-threaded)
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object,
+        DB::WriteMode mode,
+        std::optional<DB::ObjectAttributes> attributes,
+        size_t buf_size,
+        const DB::WriteSettings & write_settings) override
+    {
+        /// Strip the common-key-prefix (emu_root) to recover the logical key. The emu_root is
+        /// returned by getCommonKeyPrefix() and always ends with a path separator in LocalObjectStorage.
+        const std::string & physical = object.remote_path;
+        const std::string root = getCommonKeyPrefix();
+        std::string logical;
+        if (!root.empty() && physical.starts_with(root))
+            logical = physical.substr(root.size());
+        else
+            logical = physical;
+        /// Strip any leading slash left after prefix removal.
+        if (!logical.empty() && logical.front() == '/')
+            logical = logical.substr(1);
+        writes.push_back({logical});
+        return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+};
+
+std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const std::string & tag)
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("ca_b188_" + tag + "_" + unique)).string();
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+    return std::make_shared<RecordingLocalObjectStorage>(
+        DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+}
+
+}
+
+/// B188: every pool write to /blobs/ or /trees/ must come AFTER the first write to a
+/// /_precommits/ key. The transaction writes a fresh content file (pending blob) AND
+/// adopts an existing committed blob via hardlink — both paths must satisfy the invariant.
+TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
+{
+    auto recording = makeRecordingStorageForTest("order");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        recording, "pool", "srv1",
+        std::filesystem::temp_directory_path() / "ca_b188_order_scratch", nullptr);
+    storage->startup();
+
+    /// Phase 1: publish a committed source part — this gives us a committed blob to adopt in Phase 2.
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "source-blob");
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    /// Phase 2: a new transaction that BOTH writes a fresh content blob (all_1_1_0/data.bin, pending)
+    /// AND carries forward the committed blob via hardlink (all_1_1_0/extra.bin, adopt path). We clear
+    /// the write log after Phase 1 so only Phase 2's writes are analysed.
+    recording->writes.clear();
+
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "fresh-content");
+    /// Adopt from the COMMITTED source part (W-EVIDENCE path in createHardLink — the committed-source
+    /// branch, exercising adoptFromTree). This records a tokenless dep during staging (no pool op yet).
+    tx->createHardLink("uui/uuid-1/all_0_0_0/data.bin", "uui/uuid-1/all_1_1_0/extra.bin");
+    tx->commit(DB::NoCommitOptions{});
+
+    const auto & log = recording->writes;
+
+    /// Find the first precommit write.
+    int first_precommit_idx = -1;
+    for (int i = 0; i < static_cast<int>(log.size()); ++i)
+    {
+        if (log[i].key.find("/_precommits/") != std::string::npos)
+        {
+            first_precommit_idx = i;
+            break;
+        }
+    }
+
+    ASSERT_GE(first_precommit_idx, 0)
+        << "No write to a /_precommits/ key was recorded — precommit step did not fire";
+
+    /// Every write to /blobs/ or /trees/ must have an index AFTER first_precommit_idx.
+    for (int i = 0; i < static_cast<int>(log.size()); ++i)
+    {
+        const auto & key = log[i].key;
+        const bool is_content_pool_op =
+            key.find("/blobs/") != std::string::npos ||
+            key.find("/trees/") != std::string::npos;
+        if (!is_content_pool_op)
+            continue;
+        EXPECT_GT(i, first_precommit_idx)
+            << "Content pool write to '" << key << "' at index " << i
+            << " came BEFORE the first precommit write at index " << first_precommit_idx
+            << " — violates B188 precommit-first invariant";
+    }
+
+    /// Sanity: the part is readable after commit.
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/extra.bin"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 13u);   /// "fresh-content"
+
+    /// Confirm at least one blob and one tree write was recorded (both paths were exercised).
+    const bool has_blob_write = std::any_of(log.begin(), log.end(),
+        [](const RecordingLocalObjectStorage::Record & r) { return r.key.find("/blobs/") != std::string::npos; });
+    const bool has_tree_write = std::any_of(log.begin(), log.end(),
+        [](const RecordingLocalObjectStorage::Record & r) { return r.key.find("/trees/") != std::string::npos; });
+    EXPECT_TRUE(has_blob_write) << "No /blobs/ write recorded — fresh blob path not exercised";
+    EXPECT_TRUE(has_tree_write) << "No /trees/ write recorded — tree upload path not exercised";
+}
+
+/// B188 pending-blob hardlink (Task 6 Test 2): within a SINGLE transaction, write a content file
+/// into part X (pending blob, not yet uploaded), then createHardLink that SAME file into part Y
+/// (the cross-part pending-source branch: `&dst_st != src_st`, copies the PendingBlob record so
+/// publishStaging uploads it for the dst part too). After commit both parts must read back the
+/// identical content.
+TEST(CaWiringPending, HardlinkOfPendingBlobCommitsAndReadsBack)
+{
+    auto storage = openWiringStorage();
+
+    auto tx = storage->createTransaction();
+
+    /// Write fresh content into part X — the blob is PENDING (not uploaded yet, temp-file only).
+    writeThroughTransaction(*tx, "uui/uuid-1/all_10_10_0/data.bin", "pending-payload");
+
+    /// Before commit, hardlink part X's file into part Y. At this point:
+    ///   - src_st = staging for all_10_10_0 (exists: contains the pending blob)
+    ///   - dst_st = staging for all_11_11_0 (created fresh here)
+    ///   - &dst_st != src_st => PendingBlob is COPIED into dst_st.pending_blobs
+    ///   - Both builds get recordPendingBlobDep (tokenless dep — no pool op until post-precommit)
+    tx->createHardLink("uui/uuid-1/all_10_10_0/data.bin", "uui/uuid-1/all_11_11_0/data.bin");
+
+    /// Nothing visible yet (B188: no uploads before precommit).
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_10_10_0/data.bin"));
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_11_11_0/data.bin"));
+
+    tx->commit(DB::NoCommitOptions{});
+
+    /// Both parts must be visible and carry the same content.
+    ASSERT_TRUE(storage->existsFile("uui/uuid-1/all_10_10_0/data.bin"));
+    ASSERT_TRUE(storage->existsFile("uui/uuid-1/all_11_11_0/data.bin"));
+
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_10_10_0/data.bin"), 15u);   /// "pending-payload"
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_11_11_0/data.bin"), 15u);
+
+    /// Both parts must point to the SAME underlying blob object (content-addressed identity).
+    auto objs_x = storage->getStorageObjects("uui/uuid-1/all_10_10_0/data.bin");
+    auto objs_y = storage->getStorageObjects("uui/uuid-1/all_11_11_0/data.bin");
+    ASSERT_EQ(objs_x.size(), 1u);
+    ASSERT_EQ(objs_y.size(), 1u);
+    EXPECT_EQ(objs_x[0].remote_path, objs_y[0].remote_path)
+        << "Hardlinked pending blob must map to the SAME pool object in both parts";
+}
