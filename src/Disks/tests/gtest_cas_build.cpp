@@ -21,6 +21,7 @@ extern const int ABORTED;
 
 using namespace DB::Cas;
 using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::fenceNamespace;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
 using DB::Cas::tests::shardOfForTest;
@@ -1086,4 +1087,144 @@ TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
     const auto got = b->get(loc.key, Range{loc.offset, loc.length});
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->bytes, content);
+}
+
+TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
+{
+    /// B188 regression: the three adopt sites in ContentAddressedTransaction (createHardLink,
+    /// moveDirectory two-build merge, moveFile cross-part) called reuseBlob for a committed-source
+    /// (non-pending) blob DURING STAGING — before any precommit protection existed. reuseBlob does an
+    /// eager HEAD (observeAndAdmit) at that moment; for a tokenless dep (body_recreatable=false) it
+    /// threw fatal FILE_DOESNT_EXIST when the blob had been GC-deleted in the adopt window. The fix
+    /// replaces those three reuseBlob calls with adoptEvidence, which records a tokenless dep WITHOUT
+    /// any backend call, deferring the observation to the publish gate (post-precommit). The gate
+    /// (revalidateDeps) throws retryable ABORTED when the blob is absent — not a fatal error.
+    ///
+    /// This test validates both sides of the contract at the Build API level:
+    ///   A) adoptEvidence + stageTree + precommit + publish on an absent blob whose evidence went stale
+    ///      (GC advanced a round after the dep was recorded) → ABORTED (retryable), NOT FILE_DOESNT_EXIST.
+    ///   B) reuseBlob(id, body_recreatable=false) on an absent blob → FILE_DOESNT_EXIST (EAGER, fatal).
+    ///      (This documents the old behavior that the three transaction sites no longer trigger.)
+    ///   C) adoptEvidence + stageTree + precommit + publish on a PRESENT blob → succeeds (positive case).
+    ///
+    /// To make the evidence go stale (dep.observed_view_round < current retire_view round), the test uses
+    /// the GC fence mechanism: inject gc/state at round=1 before Part A (so the dep records
+    /// observed_view_round=1), delete the blob, then inject gc/state at round=2 and raise fence_round=2
+    /// on the target shard. The publish lambda sees fence_round=2 > current view round=1, calls
+    /// retireView().refresh() which reads the new gc/state (round=2), and revalidateDeps then finds the
+    /// tokenless dep stale (1 < 2), HEADs the absent blob, and throws ABORTED.
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// 1. Build A: upload the blob and publish a ref that references it. Capture the blob id and token.
+    BlobId id;
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        auto build_a = s0->startBuild({});
+        id = build_a->putBlob(idOf("b188-content"), BlobSource::fromString("b188-content")).id;
+        t0 = b->head(s0->layout().blobKey(id)).token;
+        TreeEntry e;
+        e.name = "f.bin";
+        e.placement = Placement::Blob;
+        e.file_hash = u128Of("b188-content");
+        e.file_size = 12;
+        const TreeId tree_a = build_a->putTree({e});
+        build_a->publish(RootNamespace{"srv1/tbl"}, "part_1", tree_a, RefPayload{});
+    }
+
+    DB::Cas::Layout layout("p");
+    const String blob_key = layout.blobKey(id);
+
+    /// Part C — POSITIVE: blob present; adoptEvidence + stageTree + precommit + publish succeeds.
+    {
+        auto s = openStore(b);
+        auto build = s->startBuild({});
+
+        TreeEntry entry;
+        entry.name = "f.bin";
+        entry.placement = Placement::Blob;
+        entry.file_hash = u128Of("b188-content");
+        entry.file_size = 12;
+
+        build->adoptEvidence(entry);
+
+        const TreeId staged = build->stageTree({entry});
+        build->precommit(staged);
+        build->uploadStagedTree(staged);
+
+        EXPECT_NO_THROW(
+            build->publish(RootNamespace{"srv1/tbl"}, "part_2", staged, RefPayload{}));
+    }
+
+    /// Part B — OLD BEHAVIOR (still preserved for reuseBlob itself; the transaction sites no longer call it
+    /// on committed-source blobs): reuseBlob(id, body_recreatable=false) HEADs eagerly and throws
+    /// FILE_DOESNT_EXIST immediately at staging time — before any precommit protection exists.
+    /// The blob is still present here, so we delete it for this sub-test then restore it.
+    /// (Run Part B before the permanent GC-delete used for Part A, so the blob is still live.)
+    {
+        auto s = openStore(b);
+        auto build = s->startBuild({});
+
+        /// Delete the blob to simulate the absence at the reuseBlob call site.
+        b->deleteExact(blob_key, t0);
+        ASSERT_FALSE(b->head(blob_key).exists);
+
+        expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST,
+            [&] { build->reuseBlob(id, /*body_recreatable=*/ false); });
+
+        /// Re-upload the blob so Part A can simulate GC-delete separately.
+        auto s1 = openStore(b);
+        auto restore = s1->startBuild({});
+        restore->putBlob(idOf("b188-content"), BlobSource::fromString("b188-content"));
+        t0 = b->head(blob_key).token;
+    }
+
+    /// Part A — NEW CONTRACT: adoptEvidence records a tokenless dep WITHOUT eager HEAD. The publish gate
+    /// (revalidateDeps, post-precommit) observes the blob and throws ABORTED when it is absent. This is
+    /// retryable — the caller retries the whole INSERT which re-uploads from source.
+    ///
+    /// Step: inject gc/state round=1 so the store opens with retire_view at round=1.
+    injectRetire(*b, layout, /*round=*/ 1, /*fence_seq=*/ 0, /*shard=*/ 0, {});
+
+    {
+        auto s = openStore(b);   /// retire_view.refresh() at open → round=1
+        auto build = s->startBuild({});
+
+        TreeEntry entry;
+        entry.name = "f.bin";
+        entry.placement = Placement::Blob;
+        entry.file_hash = u128Of("b188-content");
+        entry.file_size = 12;
+
+        /// adoptEvidence must NOT throw — no eager HEAD even though we will delete the blob next.
+        EXPECT_NO_THROW(build->adoptEvidence(entry));   /// observed_view_round = 1
+
+        const TreeId staged = build->stageTree({entry});
+
+        /// precommit must not throw either — it sees the dep but does not HEAD the blob.
+        EXPECT_NO_THROW(build->precommit(staged));
+        build->uploadStagedTree(staged);
+
+        /// Simulate the B188 race: GC deletes the blob in the adopt→precommit window (after staging,
+        /// before the publish gate runs). Also advance the gc/state to round=2 and raise fence_round=2
+        /// on the target namespace shard so the publish lambda's fence check triggers a view refresh,
+        /// making the recorded dep stale (observed_view_round=1 < refreshed round=2).
+        b->deleteExact(blob_key, t0);
+        ASSERT_FALSE(b->head(blob_key).exists);
+
+        /// Advance gc/state to round=2; re-inject with no retired entries (the blob was GC-deleted but
+        /// we simulate this by direct deleteExact above — the test only needs the view round to advance).
+        injectRetire(*b, layout, /*round=*/ 2, /*fence_seq=*/ 0, /*shard=*/ 0, {});
+
+        /// Raise fence_round=2 on the target namespace (srv1/tbl) and target ref (part_3) so the
+        /// publish lambda refreshes the view before calling revalidateDeps.
+        const uint64_t root_shards = s->poolMeta().root_shards;
+        fenceNamespace(*b, layout, RootNamespace{"srv1/tbl"}, root_shards, /*round=*/ 2);
+
+        /// publish drives the gate: fence_round=2 > view_round=1 → view refresh to round=2 →
+        /// revalidateDeps finds tokenless dep with observed_view_round=1 < 2 → stale → HEAD absent blob
+        /// → ABORTED (retryable). NOT the old FILE_DOESNT_EXIST.
+        expectThrowsCode(DB::ErrorCodes::ABORTED,
+            [&] { build->publish(RootNamespace{"srv1/tbl"}, "part_3", staged, RefPayload{}); });
+    }
 }

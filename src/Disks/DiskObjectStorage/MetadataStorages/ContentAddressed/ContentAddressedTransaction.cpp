@@ -673,13 +673,11 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
                 }
                 else
                 {
-                    /// B156b: the staged source entry is either putBlob'd in this txn (TOKENED dep in the
-                    /// source build ⇒ recreatable by retrying the INSERT) or adopted from a committed source
-                    /// (TOKENLESS W-EVIDENCE dep ⇒ NOT recreatable, absence is a real loss). Discriminate on
-                    /// the SOURCE build's dep so a vanished putBlob'd blob retries (ABORTED) while a vanished
-                    /// adopted blob fails loud (FILE_DOESNT_EXIST). No source build ⇒ default not-recreatable.
-                    const bool body_recreatable = src_st->build && src_st->build->depIsTokened(entry.file_hash);
-                    buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+                    /// B188: record a tokenless W-EVIDENCE dep with NO eager HEAD. The publish gate
+                    /// (post-precommit) observes/resurrects it, or fails RETRYABLE (ABORTED) if it genuinely
+                    /// vanished — never a fatal FILE_DOESNT_EXIST during staging, before any precommit
+                    /// protection exists.
+                    buildFor(*dst, dst_st).adoptEvidence(entry);
                 }
             }
             else if (entry.placement != Cas::Placement::Inline)
@@ -872,15 +870,11 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                         }
                         else
                         {
-                            /// B156b: dst_st.entries here is the UNION of the original destination entries
-                            /// (deps in dst_st.build) and the just-moved source entries (deps still in
-                            /// src_st.build, which we abandon below). An entry is recreatable iff EITHER build
-                            /// holds a TOKENED (putBlob'd) dep for it; a tokenless (adopted) dep or no dep in
-                            /// either build ⇒ not recreatable (fail-loud on vanish, no INV-NO-LOSS masking).
-                            const bool body_recreatable =
-                                dst_st.build->depIsTokened(entry.file_hash)
-                                || src_st.build->depIsTokened(entry.file_hash);
-                            dst_st.build->reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+                            /// B188: record a tokenless W-EVIDENCE dep with NO eager HEAD. The publish gate
+                            /// (post-precommit) observes/resurrects it, or fails RETRYABLE (ABORTED) if it
+                            /// genuinely vanished — never a fatal FILE_DOESNT_EXIST during staging, before any
+                            /// precommit protection exists.
+                            dst_st.build->adoptEvidence(entry);
                         }
                     }
                 src_st.build->abandon();
@@ -1031,11 +1025,11 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
             }
             else
             {
-                /// B156b: the cross-part re-keyed entry came from src_st; its dep lives in src_st.build.
-                /// Tokened (putBlob'd in this txn) ⇒ recreatable ⇒ retryable ABORTED on vanish; tokenless
-                /// (adopted from a committed source) or no source build ⇒ not recreatable ⇒ fail-loud.
-                const bool body_recreatable = src_st.build && src_st.build->depIsTokened(entry.file_hash);
-                buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+                /// B188: record a tokenless W-EVIDENCE dep with NO eager HEAD. The publish gate
+                /// (post-precommit) observes/resurrects it, or fails RETRYABLE (ABORTED) if it genuinely
+                /// vanished — never a fatal FILE_DOESNT_EXIST during staging, before any precommit
+                /// protection exists.
+                buildFor(*dst, dst_st).adoptEvidence(entry);
             }
         }
         std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
