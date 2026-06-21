@@ -45,6 +45,9 @@ public:
     ///   false — the blob was adopted from a committed source (tokenless W-EVIDENCE, NOT recreatable) ⇒
     ///           the absence is a real INV-NO-LOSS loss ⇒ fail-loud FILE_DOESNT_EXIST (never masked).
     /// Use depIsTokened on the SOURCE build to pick the flag (tokened == putBlob'd == recreatable).
+    /// B188: the ContentAddressedTransaction adopt sites no longer call reuseBlob for committed-source
+    /// entries — they use adoptEvidence + the post-precommit gate; reuseBlob remains for direct
+    /// callers/tests.
     BlobRef reuseBlob(const BlobId & id, bool body_recreatable);
 
     /// B156b discriminator: does this build hold a TOKENED Blob dep for `hash` (putBlob'd here ⇒

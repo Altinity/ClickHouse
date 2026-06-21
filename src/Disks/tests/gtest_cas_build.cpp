@@ -1135,6 +1135,10 @@ TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(id);
 
+    /// Part execution order is load-bearing: C runs first because it needs the blob present; B runs
+    /// next because it temporarily deletes the blob (then restores it); A runs last because it
+    /// permanently GC-deletes the blob to drive the absent-evidence gate path.
+    ///
     /// Part C — POSITIVE: blob present; adoptEvidence + stageTree + precommit + publish succeeds.
     {
         auto s = openStore(b);
@@ -1177,6 +1181,9 @@ TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
         auto restore = s1->startBuild({});
         restore->putBlob(idOf("b188-content"), BlobSource::fromString("b188-content"));
         t0 = b->head(blob_key).token;
+        /// The restore build never publishes — abandon it (the convention for non-publishing builds) so
+        /// it leaves no zombie build-root/heartbeat entry before Part A.
+        restore->abandon();
     }
 
     /// Part A — NEW CONTRACT: adoptEvidence records a tokenless dep WITHOUT eager HEAD. The publish gate
