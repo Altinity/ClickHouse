@@ -1155,9 +1155,9 @@ TEST(CaWiring, RootShardsConfigurable)
 
 /// ==== B188 precommit-first order invariant (Task 6) ====
 ///
-/// A RecordingLocalObjectStorage records every pool op — WRITES (writeObject) AND READS (the
-/// exists/tryGetObjectMetadata that back the CA backend's `head`, and the readObject that backs its
-/// `get`) — as (op_name, logical_key). "Logical" means the bare pool key (without the emu_root
+/// A RecordingLocalObjectStorage records the four IObjectStorage methods the CA emulated-mode backend
+/// uses on the commit path — writeObject (PUT), exists + getObjectMetadata (the HEAD), and readObject
+/// (the GET) — as (op_name, logical_key). "Logical" means the bare pool key (without the emu_root
 /// prefix) — the same string the Layout functions produce, so the `/blobs/`, `/trees/`, and
 /// `/_precommits/` substring tests are unambiguous.
 ///
@@ -1172,6 +1172,9 @@ TEST(CaWiring, RootShardsConfigurable)
 namespace
 {
 
+/// Records the four IObjectStorage methods the CA emulated-mode backend uses on the commit path
+/// (writeObject/exists/getObjectMetadata/readObject). listObjects/copyObject are deliberately NOT
+/// overridden — they are not on the commit path the order invariant gates.
 class RecordingLocalObjectStorage final : public DB::LocalObjectStorage
 {
 public:
@@ -1253,6 +1256,17 @@ std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const s
         DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
 }
 
+/// Index of the first writeObject to a /_precommits/ key (the durable precommit), or -1. Anchors on
+/// the WRITE, not on any op: mutateShard(precommitNs) reads the precommit-shard key (exists/readObject)
+/// before its casPut, so an any-op scan would anchor on that READ rather than the durable write.
+int firstPrecommitWriteIdx(const std::vector<RecordingLocalObjectStorage::Record> & log)
+{
+    for (int i = 0; i < static_cast<int>(log.size()); ++i)
+        if (log[i].op == "writeObject" && log[i].key.find("/_precommits/") != std::string::npos)
+            return i;
+    return -1;
+}
+
 }
 
 /// B188: every pool op (read OR write) on /blobs/ or /trees/ must come AFTER the first write to a
@@ -1276,8 +1290,9 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
     }
 
     /// Phase 2: a new transaction that BOTH writes a fresh content blob (all_1_1_0/data.bin, pending)
-    /// AND carries forward the committed blob via hardlink (all_1_1_0/extra.bin, adopt path). We clear
-    /// the op log after Phase 1 so only Phase 2's ops are analysed.
+    /// AND carries forward that PENDING blob via hardlink into a second fresh part (all_2_2_0/extra.bin,
+    /// the cross-part pending-source adopt path). We clear the op log after Phase 1 so only Phase 2's
+    /// ops are analysed.
     recording->ops.clear();
 
     auto tx = storage->createTransaction();
@@ -1307,19 +1322,10 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
             && (r.key.find("/blobs/") != std::string::npos || r.key.find("/trees/") != std::string::npos))
             own_content_keys.insert(r.key);
 
-    /// Find the first precommit write (an op on a /_precommits/ key).
-    int first_precommit_idx = -1;
-    for (int i = 0; i < static_cast<int>(log.size()); ++i)
-    {
-        if (log[i].key.find("/_precommits/") != std::string::npos)
-        {
-            first_precommit_idx = i;
-            break;
-        }
-    }
-
+    /// Anchor on the first precommit WRITE (the durable casPut), not on any precommit-key op.
+    const int first_precommit_idx = firstPrecommitWriteIdx(log);
     ASSERT_GE(first_precommit_idx, 0)
-        << "No op on a /_precommits/ key was recorded — precommit step did not fire";
+        << "No write to a /_precommits/ key was recorded — precommit step did not fire";
 
     /// Every op (read OR write) on one of THIS build's own content keys must have an index AFTER
     /// first_precommit_idx. This gates HEAD (exists/getObjectMetadata) and GET (readObject), not just
@@ -1408,18 +1414,10 @@ TEST(CaWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
 
     const auto & log = recording->ops;
 
-    /// Locate the first precommit write.
-    int first_precommit_idx = -1;
-    for (int i = 0; i < static_cast<int>(log.size()); ++i)
-    {
-        if (log[i].key.find("/_precommits/") != std::string::npos)
-        {
-            first_precommit_idx = i;
-            break;
-        }
-    }
+    /// Anchor on the first precommit WRITE (the durable casPut), not on any precommit-key op.
+    const int first_precommit_idx = firstPrecommitWriteIdx(log);
     ASSERT_GE(first_precommit_idx, 0)
-        << "No op on a /_precommits/ key was recorded — precommit step did not fire";
+        << "No write to a /_precommits/ key was recorded — precommit step did not fire";
 
     /// TARGETED assertion: the adopted (foreign, committed) blob key must NOT be touched by ANY op
     /// (HEAD via exists/getObjectMetadata, GET via readObject, or PUT via writeObject) before the
