@@ -517,19 +517,19 @@ TreeId Build::stageTree(std::vector<TreeEntry> entries)
             case Placement::Blob:
                 if (!deps.contains({static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}))
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "putTree: child blob {} not in dependency set (W-TREE-BUILD)",
+                        "stageTree: child blob {} not in dependency set (W-TREE-BUILD)",
                         u128ToHex(entry.file_hash));
                 break;
             case Placement::Subtree:
                 if (!deps.contains({static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}))
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "putTree: child tree {} not in dependency set (W-TREE-BUILD)",
+                        "stageTree: child tree {} not in dependency set (W-TREE-BUILD)",
                         u128ToHex(entry.file_hash));
                 break;
             case Placement::PackSlice:
                 if (!deps.contains({static_cast<uint8_t>(ObjectKind::Pack), entry.pack_hash}))
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "putTree: child pack {} not in dependency set (W-TREE-BUILD)",
+                        "stageTree: child pack {} not in dependency set (W-TREE-BUILD)",
                         u128ToHex(entry.pack_hash));
                 break;
             case Placement::Inline:

@@ -915,6 +915,10 @@ TEST(CasBuild, StageTreeRetainsAndDefersUpload)
     /// staged: payload retained + dep recorded, but the tree OBJECT is NOT uploaded yet.
     EXPECT_FALSE(b->head(s->layout().treeKey(t)).exists);
 
+    /// precommit accepts the staged tree even though its object is absent: stageTree recorded the
+    /// (tokenless) Tree dep, which is exactly precommit's precondition.
+    EXPECT_NO_THROW(build->precommit(t));
+
     build->uploadStagedTree(t);
     EXPECT_TRUE(b->head(s->layout().treeKey(t)).exists);
 }
