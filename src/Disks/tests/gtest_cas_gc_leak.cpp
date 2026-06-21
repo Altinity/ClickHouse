@@ -159,8 +159,8 @@ TEST(CasGcLeak, DisplacedUnexpandedTreeBlobsLeak)
 /// condemned), the committed ref pinning B is DROPPED, GC retires+deletes B AND COMPLETES the round
 /// (dropping B's retired set), and only THEN does the build publish a manifest naming B.
 ///
-/// The publish gate (Build::publish) refreshes the retire-view + revalidateDeps (which re-HEADs and
-/// throws on a deleted dep) ONLY when `retireView().round() < max(shard.fence_round, registry_fence)`.
+/// The publish gate (Build::publish) refreshes the retire-view and runs `checkAndResolveDeps` (which
+/// re-HEADs and throws on a deleted dep) ONLY when `retireView().round() < max(shard.fence_round, registry_fence)`.
 /// GC's R3 fences every shard every round, so the shard fence_round keeps advancing past the build's
 /// adopt-time view — which SHOULD force the refresh+re-HEAD and catch the deletion (ABORTED→retry).
 /// This test asserts that protection holds end-to-end for the local single-namespace path:

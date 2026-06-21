@@ -12,11 +12,12 @@
 /// state through the on-storage GC surface ONLY (injectRetire writes gc/state + a retired set;
 /// fenceNamespace raises fence_round — exactly the writes a GC leader performs), then publishes. The
 /// Store refreshes its retire view at open; Build::publish refreshes again on a fence-advanced conflict
-/// and runs revalidateDeps (W-REVALIDATE) before the gate scan (W-EVIDENCE / condemned-token).
+/// and then runs `checkAndResolveDeps` — the merged W-REVALIDATE + W-EVIDENCE + condemned-token pass
+/// (B190 Task 3; replaces the former separate `revalidateDeps` + `gateCheckDeps` calls).
 ///
 /// The standard pattern: build + upload (records tokens at view round 0), THEN inject retire + fence,
 /// THEN publish. The first CAS attempt reads the fenced manifest, sees view.round() < fence_round,
-/// refreshes, and revalidates.
+/// refreshes, and runs `checkAndResolveDeps`.
 
 namespace DB::ErrorCodes
 {
@@ -99,7 +100,7 @@ TEST(CasProtocol, FenceConflictCondemnedBlobDepAbortsRetryable)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// First CAS reads fence_round=1 > view round 0 ⇒ refresh ⇒ revalidateDeps: X condemned at t0
+    /// First CAS reads fence_round=1 > view round 0 ⇒ refresh ⇒ `checkAndResolveDeps`: X condemned at t0
     /// ⇒ Case(a): dep's own token condemned, no retained payload ⇒ ABORTED (INV-1; caller must retry).
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
 
@@ -183,8 +184,8 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
 TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentToken)
 {
     /// B190 INV-1 Case(b): a token-bearing dep whose OWN token t0 is LIVE (not condemned), but a
-    /// DIFFERENT phantom token t_other for the same hash IS condemned. gateCheckDeps: hash hit, but
-    /// isCondemnedToken(t0)=false ⇒ Case(b): dep's own token is live ⇒ re-observe (observeAndAdmit,
+    /// DIFFERENT phantom token t_other for the same hash IS condemned. `checkAndResolveDeps`: hash hit,
+    /// but isCondemnedToken(t0)=false ⇒ Case(b): dep's own token is live ⇒ re-observe (observeAndAdmit,
     /// HEAD-only, no GET) ⇒ current still t0 ⇒ adopt t0 (keep in place, no upload). The old resurrect
     /// path would have re-uploaded from GET(condemned_object), which is forbidden by INV-1.
     ///
@@ -219,8 +220,8 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
-    /// publish: view round 1 == fence_round 1 ⇒ NO fence advance ⇒ revalidateDeps does NOT run; only
-    /// gateCheckDeps gates. Hash hit (t_other condemned) but dep's own t0 is NOT condemned ⇒ Case(b):
+    /// publish: view round 1 == fence_round 1 ⇒ NO fence advance ⇒ no refresh before the gate.
+    /// `checkAndResolveDeps`: hash hit (t_other condemned) but dep's own t0 is NOT condemned ⇒ Case(b):
     /// observeAndAdmit (HEAD-only) ⇒ current t0 is live ⇒ re-adopt t0. Publish lands.
     build->publish(ns, "part_1", tree, RefPayload{});
 
@@ -286,7 +287,7 @@ TEST(CasProtocol, RevalidateAbsentTreeDepRecreates)
 
 TEST(CasProtocol, EvidenceHitCondemnedBlobAbortsRetryable)
 {
-    /// B190 INV-1: W-EVIDENCE (tokenless dep) on blob X — gateCheckDeps: view hit by hash ⇒
+    /// B190 INV-1: W-EVIDENCE (tokenless dep) on blob X — `checkAndResolveDeps`: view hit by hash ⇒
     /// observeAndAdmit ⇒ HEAD ⇒ current t0 condemned ⇒ ABORTED (blob has no retained source bytes;
     /// INV-1 forbids GET). The old behavior was resurrect-by-GET, which is now forbidden.
     ///
@@ -311,7 +312,7 @@ TEST(CasProtocol, EvidenceHitCondemnedBlobAbortsRetryable)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// refresh ⇒ revalidateDeps SKIPS the tokenless dep ⇒ gateCheckDeps: tokenless X has a view hit ⇒
+    /// refresh ⇒ `checkAndResolveDeps`: tokenless X has a view hit (condemned at t0) ⇒
     /// observeAndAdmit ⇒ HEAD ⇒ current t0 condemned ⇒ ABORTED (INV-1; no source bytes to re-upload).
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
 
@@ -349,7 +350,7 @@ TEST(CasProtocol, WedgedHeartbeatCondemnedBlobDepAbortsRetryable)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// refresh ⇒ revalidateDeps: X condemned at dep's own t0 ⇒ Case(a): no retained payload ⇒ ABORTED.
+    /// refresh ⇒ `checkAndResolveDeps`: X condemned at dep's own t0 ⇒ Case(a): no retained payload ⇒ ABORTED.
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
 
     /// The condemned object stays at t0 — nothing was written.
@@ -460,7 +461,7 @@ TEST(CasProtocol, ResurrectLosesRaceCondemnedDepAbortsRetryable)
 {
     /// B190 INV-1: a tokened dep whose OWN token t0 is condemned. Even if the object was
     /// concurrently displaced to t1 (live), the dep's own token t0 is still condemned in the view ⇒
-    /// revalidateDeps Case(a): dep's own token condemned, blob has no retained source bytes ⇒ ABORTED.
+    /// `checkAndResolveDeps` Case(a): dep's own token condemned, blob has no retained source bytes ⇒ ABORTED.
     ///
     /// The old resurrect path would have GET'd the current incarnation (t1, uncondemned) and
     /// rewritten it with putOverwrite. INV-1 forbids GET on any dying object and forbids GET
@@ -490,7 +491,7 @@ TEST(CasProtocol, ResurrectLosesRaceCondemnedDepAbortsRetryable)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// refresh ⇒ revalidateDeps: hash hit (t0), dep's own t0 IS condemned ⇒ Case(a): no retained
+    /// refresh ⇒ `checkAndResolveDeps`: hash hit (t0), dep's own t0 IS condemned ⇒ Case(a): no retained
     /// source bytes ⇒ ABORTED (INV-1; caller must retry from scratch with its own source bytes).
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
 
@@ -567,14 +568,14 @@ TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
 TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
 {
     /// B190 Task-3 coverage: a TOKENLESS (W-EVIDENCE) dep recorded at the CURRENT view round (fresh —
-    /// observed_view_round == current round, so revalidateDeps' stale-check does NOT fire) that has a
-    /// view hit by hash MUST still be resolved by the gate scan (observeAndAdmit → ABORTED when condemned).
+    /// observed_view_round == current round, so the stale branch does NOT fire) that has a
+    /// view hit by hash MUST still be resolved by `checkAndResolveDeps` (observeAndAdmit → ABORTED
+    /// when condemned).
     ///
-    /// This case is exercised exclusively by gateCheckDeps (not revalidateDeps): revalidateDeps skips
-    /// tokenless deps with a view hit (`if (hits.has_value()) continue`) and only acts on them via the
-    /// stale branch. With a fresh dep there is no stale branch, so only the gate scan handles it. After
-    /// the Task-3 merge into a single checkAndResolveDeps pass, the merged routine must preserve this
-    /// path: "fresh tokenless + hit → observeAndAdmit."
+    /// In the merged `checkAndResolveDeps` pass: a fresh tokenless dep with a view hit goes
+    /// directly to observeAndAdmit (the stale-refresh branch is skipped because
+    /// observed_view_round == current round). This test verifies that path is preserved:
+    /// "fresh tokenless + hit → observeAndAdmit."
     ///
     /// Discriminating assertion: publish throws ABORTED (condemned blob, no source bytes) — NOT
     /// FILE_DOESNT_EXIST and NOT success (which would publish a dangle).
@@ -601,13 +602,12 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     const TreeEntry adopted = build->adoptFromTree(source, "data.bin");
     const TreeId tree = build->putTree({adopted});
 
-    /// No fence advance (round stays 1): revalidateDeps will see observed_view_round=1 >= round=1
-    /// (fresh) and skip the stale branch. With a hash hit, revalidateDeps continues to gateCheckDeps.
-    /// The merged single-pass routine must also enter the hit branch regardless of staleness.
+    /// No fence advance (round stays 1): `checkAndResolveDeps` will see observed_view_round=1 >= round=1
+    /// (fresh) — skips the stale-refresh branch. The hash hit still triggers observeAndAdmit.
     ///
-    /// Publish: no fence advance ⇒ no refresh ⇒ revalidateDeps sees the dep as fresh ⇒ skips the
-    /// stale branch ⇒ hits.has_value() → continue ⇒ gateCheckDeps: tokenless + hit ⇒ observeAndAdmit
-    /// ⇒ HEAD ⇒ current t0 condemned ⇒ ABORTED (INV-1; blob has no retained source bytes).
+    /// Publish: no fence advance ⇒ no refresh ⇒ `checkAndResolveDeps`: dep is fresh (skips stale
+    /// branch); hits.has_value() → tokenless + hit ⇒ observeAndAdmit ⇒ HEAD ⇒ current t0 condemned
+    /// ⇒ ABORTED (INV-1; blob has no retained source bytes).
     expectThrowsCode(DB::ErrorCodes::ABORTED,
         [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
 

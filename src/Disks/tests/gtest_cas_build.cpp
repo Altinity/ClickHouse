@@ -1121,7 +1121,7 @@ TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
     /// source (non-pending) blob DURING STAGING — before any precommit protection existed. The fix
     /// (B188) replaces those three reuseBlob calls with adoptEvidence, which records a tokenless dep
     /// WITHOUT any backend call, deferring the observation to the publish gate (post-precommit). The
-    /// gate (revalidateDeps) throws retryable ABORTED when the blob is absent — not a fatal error.
+    /// gate (`checkAndResolveDeps`) throws retryable ABORTED when the blob is absent — not a fatal error.
     /// B190 removes reuseBlob entirely (no production callers).
     ///
     /// This test validates the adoptEvidence contract at the Build API level:
@@ -1133,8 +1133,8 @@ TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
     /// the GC fence mechanism: inject gc/state at round=1 before Part A (so the dep records
     /// observed_view_round=1), delete the blob, then inject gc/state at round=2 and raise fence_round=2
     /// on the target shard. The publish lambda sees fence_round=2 > current view round=1, calls
-    /// retireView().refresh() which reads the new gc/state (round=2), and revalidateDeps then finds the
-    /// tokenless dep stale (1 < 2), HEADs the absent blob, and throws ABORTED.
+    /// retireView().refresh() which reads the new gc/state (round=2), and `checkAndResolveDeps` then
+    /// finds the tokenless dep stale (1 < 2), HEADs the absent blob, and throws ABORTED.
     auto b = std::make_shared<InMemoryBackend>();
 
     /// 1. Build A: upload the blob and publish a ref that references it. Capture the blob id and token.
@@ -1182,8 +1182,8 @@ TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
     }
 
     /// Part A — NEW CONTRACT: adoptEvidence records a tokenless dep WITHOUT eager HEAD. The publish gate
-    /// (revalidateDeps, post-precommit) observes the blob and throws ABORTED when it is absent. This is
-    /// retryable — the caller retries the whole INSERT which re-uploads from source.
+    /// (`checkAndResolveDeps`, post-precommit) observes the blob and throws ABORTED when it is absent.
+    /// This is retryable — the caller retries the whole INSERT which re-uploads from source.
     ///
     /// Step: inject gc/state round=1 so the store opens with retire_view at round=1.
     injectRetire(*b, layout, /*round=*/ 1, /*fence_seq=*/ 0, /*shard=*/ 0, {});
@@ -1219,13 +1219,13 @@ TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
         injectRetire(*b, layout, /*round=*/ 2, /*fence_seq=*/ 0, /*shard=*/ 0, {});
 
         /// Raise fence_round=2 on the target namespace (srv1/tbl) and target ref (part_3) so the
-        /// publish lambda refreshes the view before calling revalidateDeps.
+        /// publish lambda refreshes the view before running `checkAndResolveDeps`.
         const uint64_t root_shards = s->poolMeta().root_shards;
         fenceNamespace(*b, layout, RootNamespace{"srv1/tbl"}, root_shards, /*round=*/ 2);
 
         /// publish drives the gate: fence_round=2 > view_round=1 → view refresh to round=2 →
-        /// revalidateDeps finds tokenless dep with observed_view_round=1 < 2 → stale → HEAD absent blob
-        /// → ABORTED (retryable). NOT the old FILE_DOESNT_EXIST.
+        /// `checkAndResolveDeps` finds tokenless dep with observed_view_round=1 < 2 → stale → HEAD absent
+        /// blob → ABORTED (retryable). NOT the old FILE_DOESNT_EXIST.
         expectThrowsCode(DB::ErrorCodes::ABORTED,
             [&] { build->publish(RootNamespace{"srv1/tbl"}, "part_3", staged, RefPayload{}); });
     }

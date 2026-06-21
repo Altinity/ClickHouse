@@ -78,11 +78,13 @@ public:
     /// B171 two-phase commit, phase 1: publish the build's manifest tree under the precommit
     /// namespace so GC's fold lifts the in-degree of every reachable object (protection by
     /// reachability, replacing the revocable `cas_owner` hint). Must be called after the manifest
-    /// tree is assembled and BEFORE any adopted/dedup'd source ref could be dropped. STUB here
-    /// (Task 1 RED): records nothing yet so the dangle still reproduces. Implemented in Task 2.
+    /// tree is assembled and BEFORE any adopted/dedup'd source ref could be dropped. Implemented
+    /// as the B171 precommit-first protocol: the build root ref is written to the precommit
+    /// namespace via a durable CAS PUT before any blob/tree pool operations run post-staging.
     void precommit(const TreeId & manifest);
 
-    /// The publish gate — Tasks 12/13. (Stub here.)
+    /// The publish gate: runs `checkAndResolveDeps` (merged W-REVALIDATE + W-EVIDENCE +
+    /// condemned-token scan) then writes the final ref under `ns`/`ref_name`.
     void publish(const RootNamespace & ns, const String & ref_name, const TreeId & tree, RefPayload payload);
 
     /// Stop renewals and delete own heartbeat; uploads become debris (heartbeat-gated full-GC reclaim).

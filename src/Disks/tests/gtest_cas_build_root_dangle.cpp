@@ -64,18 +64,15 @@ TreeEntry blobEntry(const String & name, const String & payload)
 ///   `cas_owner` and is no longer protected by any in-flight build.
 ///
 ///   Build B starts and ADOPTS the same blob P via tokenless evidence (adoptEvidence — the cross-node
-///   adopt case), assembles t2 -> { other.bin: P }, and `precommit(t2)` — which under the
-///   current code is a STUB (no build-root edge published).
+///   adopt case), assembles t2 -> { other.bin: P }, and `precommit(t2)` — which publishes a durable
+///   build-root ref so GC's fold lifts the in-degree of P's closure.
 ///
-///   refA is dropped + watermark renewed; GC runs to fixpoint. Because P's only recorded in-degree was
-///   refA -> t1, and the precommit recorded NO build-root edge, GC sees inDeg(P)=0 with a retired owner
-///   and DELETES P. Build B then publishes refB -> t2 naming a blob that no longer exists — a dangle
-///   (or an ABORTED at commit).
+///   refA is dropped + watermark renewed; GC runs to fixpoint. P is protected by B's precommit edge,
+///   so GC must NOT delete it. Build B then publishes refB -> t2 successfully.
 ///
-/// THE POSITIVE INVARIANT (RED under current code): the whole flow must succeed AND P must survive,
-/// because B's precommit should have pinned P's closure across A's retire + GC. With the precommit a
-/// stub this fails — that IS the bug. Goes GREEN once Task 2/3 land (precommit publishes a build-root
-/// edge GC folds; fail-closed commit).
+/// THE POSITIVE INVARIANT: the whole flow must succeed AND P must survive, because B's precommit pins
+/// P's closure across A's retire + GC (B171 two-phase commit; `checkAndResolveDeps` proves closure
+/// present at publish time).
 /// Spec: docs/superpowers/specs/2026-06-18-ca-build-root-precommit-cpp-impl.md (§F.1)
 TEST(CasBuildRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
 {
@@ -133,7 +130,7 @@ TEST(CasBuildRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
 /// P). We then SIMULATE the premature reclaim by manually dropping the build-root ref (as GC's reclaim
 /// would) AND dropping refA, then renew the watermark and run GC to fixpoint. With P's only protection
 /// (the precommit edge) gone and its owner retired, GC deletes P. Build B's publish must now ABORT
-/// (revalidateDeps finds the adopted blob absent and not re-creatable) instead of committing a dangle.
+/// (`checkAndResolveDeps` finds the adopted blob absent and not re-creatable) instead of committing a dangle.
 /// Spec: docs/superpowers/specs/2026-06-18-ca-build-root-precommit-design.md (§4.4, §4.6)
 TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
 {
@@ -204,7 +201,7 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
         << "premature-reclaim setup invalid: P should have been collected after losing its precommit";
 
     /// FAIL-CLOSED: Build B's commit must THROW (ABORTED — dependency lost), never silently publish a
-    /// dangle. revalidateDeps re-proves the closure present and aborts when P is missing.
+    /// dangle. `checkAndResolveDeps` re-proves the closure present and aborts when P is missing.
     ASSERT_ANY_THROW(b->publish(ns, "refB", t2, {}))
         << "B171 INV-COMMIT-FAILCLOSED: publish must abort over a missing dependency, not commit a dangle";
 
