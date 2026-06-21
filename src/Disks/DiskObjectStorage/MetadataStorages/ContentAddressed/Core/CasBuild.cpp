@@ -720,81 +720,6 @@ void Build::precommit(const TreeId & manifest)
     }
 }
 
-void Build::gateCheckDeps()
-{
-    /// Iterating `deps` while uploadFromSource/observeAndAdmit MUTATE deps is safe: both OVERWRITE
-    /// the SAME (kind, hash) entry (deps[thatkey].token), never insert a new key, so the iterator we
-    /// hold and the map structure stay valid. (We resolve via the loop's own key.)
-    for (auto & [key, dep] : deps)
-    {
-        /// Iteration-safety invariant, made self-enforcing: the DepKey's kind byte (key.first) matches
-        /// dep.kind, so deps[{kind, hash}] inside uploadFromSource/observeAndAdmit overwrites the SAME
-        /// entry being iterated — never inserts a new key that would invalidate the loop.
-        chassert(static_cast<uint8_t>(dep.kind) == key.first);
-
-        const ObjectKind kind = dep.kind;
-        const UInt128 & hash = key.second;
-
-        if (dep.token.has_value())
-        {
-            /// Token-bearing: ANY view hit BY HASH ⇒ re-create/uploadFromSource (spec §5 step 5:
-            /// "members with a view hit ⇒ resurrect" — a view hit is by HASH, not by our exact observed
-            /// token). The current incarnation may have been displaced to a DIFFERENT token t' that GC
-            /// then condemned; displacing it (a fresh tag) makes any in-flight DELETE If-Match:t' 412,
-            /// closing the §8 R4 spared-orphan window. INV-NO-RETURN: a fresh tag never reuses an old
-            /// token, so INV-NO-RETURN holds.
-            if (store->retireView().findCondemned(kind, hash).has_value())
-            {
-                /// B170 / INV-1: the publish gate found a view hit by hash for this dep.
-                /// Two sub-cases (mirroring revalidateDeps):
-                ///  (a) dep's OWN token is condemned (this exact incarnation targeted by GC) →
-                ///      tree with retained: recreateTree; blob/pack: retryable ABORTED (INV-1).
-                ///  (b) dep's OWN token is live (displaced-incarnation case) →
-                ///      re-observe via observeAndAdmit (HEAD-only, no GET) to adopt the current token.
-                if (store->hasEventSink())
-                {
-                    CasEvent _ev5;
-                    _ev5.type = CasEventType::GateResurrect;
-                    _ev5.object_kind = kind == ObjectKind::Tree ? CasEventObjectKind::Tree
-                        : (kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
-                    _ev5.object_hash = u128ToHex(hash);
-                    _ev5.token = u128ToHex(build_id);
-                    _ev5.round = store->retireView().round();
-                    _ev5.outcome = "recreate-or-reobserve";
-                    _ev5.reason = "gate: dep has a view hit by hash (INV-1: no GET)";
-                    store->emitEvent(_ev5);
-                }
-                if (store->retireView().isCondemnedToken(kind, hash, *dep.token))
-                {
-                    /// Case (a): dep's own token is condemned.
-                    if (kind == ObjectKind::Tree && retained_trees.contains(hash))
-                        recreateTree(hash);
-                    else
-                        /// No source bytes at the gate (blob/pack with condemned own token) →
-                        /// retryable ABORTED. The outer INSERT retry re-uploads from source. (INV-1)
-                        throw Exception(ErrorCodes::ABORTED,
-                            "gateCheckDeps: condemned dep {} has no retained payload; retry the operation (INV-1)",
-                            u128ToHex(hash));
-                }
-                else
-                {
-                    /// Case (b): dep's own token is live but a displaced incarnation was condemned.
-                    /// Re-observe to adopt the current token (HEAD-only, no GET).
-                    observeAndAdmit(kind, hash, keyFor(kind, hash));
-                }
-            }
-        }
-        else
-        {
-            /// Tokenless evidence (W-EVIDENCE): any condemned token for (kind, hash) ⇒ resolve the HEAD
-            /// via observeAndAdmit (adopt the live incarnation; condemned → ABORTED for re-try).
-            /// This turns the dep token-bearing.
-            if (store->retireView().findCondemned(kind, hash).has_value())
-                observeAndAdmit(kind, hash, keyFor(kind, hash));
-        }
-    }
-}
-
 void Build::recreateTree(const UInt128 & hash)
 {
     /// W-REVALIDATE re-create branch. The encoded payload was RETAINED at stageTree, so a tree is
@@ -810,11 +735,16 @@ void Build::recreateTree(const UInt128 & hash)
     uploadFromSource(ObjectKind::Tree, hash, key, retained_it->second);
 }
 
-void Build::revalidateDeps()
+void Build::checkAndResolveDeps()
 {
-    /// B170/B171: re-validate the whole dependency set before the gate scan. Since B171 this runs
-    /// UNCONDITIONALLY at every commit (INV-COMMIT-FAILCLOSED), not only after a fence-advanced refresh;
-    /// members already observed at the current view round are kept without I/O (spec §4.4, §5 step 5).
+    /// B190 Task 3 merged gate pass: W-REVALIDATE (the model's `WPublishReval`) + W-EVIDENCE /
+    /// condemned-token scan in a SINGLE loop over `deps`. Replaces the former separate
+    /// `revalidateDeps` + `gateCheckDeps` calls. Runs INSIDE the publish mutateShard lambda —
+    /// re-runs on every CAS retry (idempotent: re-observe is safe).
+    ///
+    /// Iterating `deps` while uploadFromSource/observeAndAdmit/recreateTree mutate deps is safe:
+    /// all three overwrite the SAME (kind, hash) entry (deps[thatkey].token / observed_view_round),
+    /// never insert a new key — so the map structure and the current iterator stay valid.
     if (store->hasEventSink())
     {
         CasEvent _ev6;
@@ -827,127 +757,133 @@ void Build::revalidateDeps()
         store->emitEvent(_ev6);
     }
 
-    /// W-REVALIDATE (the model's `WPublishReval`). Iterating `deps` while uploadFromSource /
-    /// observeAndAdmit / recreateTree MUTATE deps is safe for the same reason as gateCheckDeps:
-    /// re-create keeps the SAME (kind, hash) — a tree's hash commits to its content, so its
-    /// re-uploaded incarnation lives at the identical key — and uploadFromSource/observeAndAdmit
-    /// OVERWRITE deps[k], never insert a new key. So the iterator and the map structure stay valid.
     for (auto & [key, dep] : deps)
     {
+        /// Iteration-safety invariant: DepKey's kind byte (key.first) == dep.kind, so any mutation
+        /// inside uploadFromSource/observeAndAdmit/recreateTree overwrites THIS entry, never a new key.
+        chassert(static_cast<uint8_t>(dep.kind) == key.first);
+
         const ObjectKind kind = dep.kind;
         const UInt128 & hash = key.second;
-
         const String k = keyFor(kind, hash);
+
         const std::optional<std::vector<Token>> hits = store->retireView().findCondemned(kind, hash);
 
-        /// Tokenless evidence (W-EVIDENCE) with a view HIT is resolved by gateCheckDeps. But a
-        /// stale evidence member with NO hit must be RE-OBSERVED here, exactly like a stale token:
-        /// retire entries DROP on confirmed outcomes (F1), so "no entry" can mean "the object was
-        /// condemned, deleted, and its entry dropped" - the durable witness is the OBJECT, not the
-        /// view. Evidence staleness = the view round advanced past the round the evidence was
-        /// recorded at (the live-source-root argument only covers the fence/recheck handshake of
-        /// the SAME round window; a full round boundary in between invalidates it - the source may
-        /// have dropped and the object been reclaimed). Discovered by the Task-9 integration test:
-        /// without this, an evidence dep on a deleted tree sails through a refreshed gate and the
-        /// publish DANGLES (the model's DepOK requires present[h] for evidence deps too).
         if (!dep.token.has_value())
         {
-            if (hits.has_value())
-                continue;   /// gateCheckDeps resolves the hit (W-EVIDENCE)
-            if (dep.observed_view_round >= store->retireView().round())
-                continue;   /// evidence as fresh as the view - the handshake covers it
-            const HeadResult hr = store->backend().head(k);
-            if (!hr.exists)
-            {
-                if (kind == ObjectKind::Tree && retained_trees.contains(hash))
-                    recreateTree(hash);
-                else
-                    throw Exception(ErrorCodes::ABORTED,
-                        "publish evidence dependency {} lost and not re-creatable; retry the operation",
-                        u128ToHex(hash));
-            }
-            else
-            {
-                /// Present: resolve the stale evidence to a TOKEN-BEARING entry observed at the
-                /// current round (adopt the current token; condemned → ABORTED from observeAndAdmit,
-                /// propagated as retryable — the outer INSERT retry re-uploads from source; INV-1).
-                observeAndAdmit(kind, hash, k);
-            }
-            continue;
-        }
-
-        if (hits.has_value())
-        {
-            /// ANY view hit BY HASH ⇒ action needed. A view hit is by HASH (not by our exact dep token)
-            /// because the current incarnation may have been displaced to a DIFFERENT token t' that GC
-            /// then condemned; our stale dep.token doesn't capture t'. We must act on any hash hit.
+            /// ── TOKENLESS (W-EVIDENCE) dep ──────────────────────────────────────────────────────
             ///
-            /// Two sub-cases:
-            ///  (a) dep's OWN token is condemned (this exact incarnation is targeted by GC) →
-            ///      tree with retained payload: recreateTree (INV-1: no GET). Blob: retryable ABORTED.
-            ///  (b) dep's OWN token is NOT condemned but there's a hash hit (displaced incarnation case)
-            ///      → re-observe the current token via observeAndAdmit (HEAD-only, no GET). If the current
-            ///      token is live → adopt. If condemned → observeAndAdmit throws ABORTED (INV-1).
-            /// This is precisely the old "resurrect" behavior minus the GET: we act on any hash hit but
-            /// only perform I/O (HEAD) in case (b), and never read the body.
-            if (store->retireView().isCondemnedToken(kind, hash, *dep.token))
+            /// Priority 1: any view hit by hash — act regardless of staleness.
+            /// Retire entries drop on confirmed outcomes (F1), so "no hit" can mean "condemned, deleted,
+            /// entry dropped". When the entry IS still there (hit), it identifies a condemned token for
+            /// this hash. observeAndAdmit HEADs the object; if the current token is condemned it throws
+            /// ABORTED (INV-1: no GET of the dying object). This covers both fresh and stale evidence
+            /// deps — the old two-pass did this in gateCheckDeps after revalidateDeps' `continue`.
+            if (hits.has_value())
             {
-                /// Case (a): dep's own token is condemned.
-                if (kind == ObjectKind::Tree && retained_trees.contains(hash))
-                    recreateTree(hash);
-                else
-                    throw Exception(ErrorCodes::ABORTED,
-                        "revalidateDeps: condemned dep {} has no retained payload; retry the operation (INV-1)",
-                        u128ToHex(hash));
-            }
-            else
-            {
-                /// Case (b): dep's own token is live, but a different incarnation was displaced and
-                /// condemned. Re-observe to adopt the current token (displaced or same). This also
-                /// re-stamps observed_view_round so a later check treats it as fresh. observeAndAdmit
-                /// throws ABORTED if the current incarnation is itself condemned (bounded by caller).
                 observeAndAdmit(kind, hash, k);
+                continue;
             }
+
+            /// Priority 2: no hit + stale (the view round advanced past the evidence's recording round).
+            /// The live-source-root argument covers only the SAME round window; a full boundary in between
+            /// invalidates it (the source may have been dropped and the object reclaimed). Re-observe.
+            if (dep.observed_view_round < store->retireView().round())
+            {
+                const HeadResult hr = store->backend().head(k);
+                if (!hr.exists)
+                {
+                    if (kind == ObjectKind::Tree && retained_trees.contains(hash))
+                        recreateTree(hash);
+                    else
+                        throw Exception(ErrorCodes::ABORTED,
+                            "publish evidence dependency {} lost and not re-creatable; retry the operation",
+                            u128ToHex(hash));
+                }
+                else
+                {
+                    /// Present: adopt the current token via the 4-arg overload to avoid a redundant second
+                    /// HEAD (we already hold `hr`). Condemned → ABORTED from observeAndAdmit (INV-1).
+                    observeAndAdmit(kind, hash, k, hr);
+                }
+            }
+            /// Priority 3: no hit + fresh → keep (evidence as fresh as the view; the handshake covers it).
         }
-        else if (dep.observed_view_round < store->retireView().round())
+        else
         {
-            /// No entry for the hash (the `if` above consumed every view hit) AND stale-observed ⇒ the
-            /// W-REVALIDATE single re-observation (one HEAD). We re-observe ONLY members observed under an
-            /// older round; a member already observed at this round needs nothing (the else-keep below).
-            const HeadResult hr = store->backend().head(k);
-            if (!hr.exists)
+            /// ── TOKEN-BEARING dep ───────────────────────────────────────────────────────────────
+            ///
+            /// Priority 1: any view hit by hash — act regardless of staleness.
+            /// A hit is by HASH: the current incarnation may have been displaced to a different token t'
+            /// that GC then condemned; our dep.token may be stale and not capture t'. We act on any hit.
+            if (hits.has_value())
             {
-                /// deleted / absent in the refreshed reality.
-                if (kind == ObjectKind::Tree && retained_trees.contains(hash))
-                    recreateTree(hash);   /// spec §7 step 4: deleted/absent ⇒ re-create
+                if (store->hasEventSink())
+                {
+                    CasEvent _ev5;
+                    _ev5.type = CasEventType::GateResurrect;
+                    _ev5.object_kind = kind == ObjectKind::Tree ? CasEventObjectKind::Tree
+                        : (kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
+                    _ev5.object_hash = u128ToHex(hash);
+                    _ev5.token = u128ToHex(build_id);
+                    _ev5.round = store->retireView().round();
+                    _ev5.outcome = "recreate-or-reobserve";
+                    _ev5.reason = "gate: dep has a view hit by hash (INV-1: no GET)";
+                    store->emitEvent(_ev5);
+                }
+
+                if (store->retireView().isCondemnedToken(kind, hash, *dep.token))
+                {
+                    /// Case (a): dep's own token is condemned.
+                    if (kind == ObjectKind::Tree && retained_trees.contains(hash))
+                        recreateTree(hash);
+                    else
+                        /// No source bytes at the gate (blob/pack with condemned own token) →
+                        /// retryable ABORTED. The outer INSERT retry re-uploads from source. (INV-1)
+                        throw Exception(ErrorCodes::ABORTED,
+                            "checkAndResolveDeps: condemned dep {} has no retained payload; retry the operation (INV-1)",
+                            u128ToHex(hash));
+                }
                 else
-                    /// A blob payload is not retained — fail closed and retryable. Do NOT fabricate a
-                    /// dangling reference (INV-NO-DANGLE); the caller re-runs the operation, which
-                    /// re-uploads the blob bytes from source.
-                    throw Exception(ErrorCodes::ABORTED,
-                        "publish dependency {} lost and not re-creatable; retry the operation",
-                        u128ToHex(hash));
+                {
+                    /// Case (b): dep's own token is live, but a displaced incarnation's token was
+                    /// condemned. Re-observe to adopt the current token (HEAD-only, no GET). observeAndAdmit
+                    /// throws ABORTED if the current incarnation is itself condemned (bounded by caller).
+                    observeAndAdmit(kind, hash, k);
+                }
+                continue;
             }
-            else if (hr.token == *dep.token)
+
+            /// Priority 2: no hit + stale — W-REVALIDATE single re-observation (one HEAD).
+            if (dep.observed_view_round < store->retireView().round())
             {
-                /// current == observed ⇒ KEEP — safe by the IN-FLIGHT DISJUNCTION (model-checked): a
-                /// delete in flight for (hash, t) implies its retire entry is still HELD, or t was
-                /// already DISPLACED (current ≠ t, forced through a gate-mandated resurrect). A delete
-                /// for the CURRENT token therefore implies a held entry — which would be a VIEW HIT, and
-                /// we are in the no-hit branch. So no-hit + current==observed is publishable. We only
-                /// re-stamp observed_view_round so a later same-publish recheck treats it as fresh.
-                dep.observed_view_round = store->retireView().round();
+                const HeadResult hr = store->backend().head(k);
+                if (!hr.exists)
+                {
+                    /// Deleted / absent in the refreshed reality.
+                    if (kind == ObjectKind::Tree && retained_trees.contains(hash))
+                        recreateTree(hash);   /// spec §7 step 4: deleted/absent ⇒ re-create
+                    else
+                        throw Exception(ErrorCodes::ABORTED,
+                            "publish dependency {} lost and not re-creatable; retry the operation",
+                            u128ToHex(hash));
+                }
+                else if (hr.token == *dep.token)
+                {
+                    /// current == observed ⇒ KEEP — safe by the IN-FLIGHT DISJUNCTION (model-checked): a
+                    /// delete in flight for (hash, t) implies its retire entry is still HELD (a VIEW HIT),
+                    /// and we are in the no-hit branch. Re-stamp so a later same-publish recheck is fresh.
+                    dep.observed_view_round = store->retireView().round();
+                }
+                else
+                {
+                    /// current token differs ⇒ adopt the newer token via the 4-arg overload (pass the
+                    /// already-fetched hr — avoids a redundant second HEAD). condemned → ABORTED (INV-1).
+                    observeAndAdmit(kind, hash, k, hr);
+                }
             }
-            else
-            {
-                /// current token differs ⇒ treat as a FRESH cold reuse of the current token (spec §7
-                /// step 4: replaced ⇒ adopt the newer token; condemned → ABORTED, INV-1 preserved).
-                observeAndAdmit(kind, hash, k);
-            }
+            /// Priority 3: no hit + fresh → keep (already valid at this view round).
         }
-        /// else: already valid at this view round — either observed_view_round >= round (re-observed /
-        /// uploaded under the current view), or condemned-but-not-at-our-token (a different incarnation's
-        /// entry, irrelevant to us). KEEP.
     }
 }
 
@@ -1007,16 +943,15 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
             store->retireView().refresh();
 
         /// B171 INV-COMMIT-FAILCLOSED (fail-closed commit): revalidate UNCONDITIONALLY — every commit
-        /// re-proves the full closure is present (re-pin via resurrect / recreate / observeAndAdmit; a
-        /// missing non-recreatable blob → ABORTED, caller retries). This used to run only when the
-        /// fence advanced past our view, which left a window: a precommit prematurely reclaimed (e.g. a
-        /// live build whose watermark renewer froze) could let the shared blob be collected, yet a
-        /// stale-but-not-fence-advanced view would skip the presence check and commit a dangle. Running
-        /// revalidateDeps every time closes that window — a publish can NEVER commit a table ref over a
-        /// missing dependency. revalidateDeps is idempotent and re-runs naturally on each mutateShard
-        /// CAS retry (spec §4.4, §4.6). gateCheckDeps (the condemned-token / W-EVIDENCE scan) follows.
-        revalidateDeps();
-        gateCheckDeps();
+        /// re-proves the full closure is present (re-pin via recreate / observeAndAdmit; a missing
+        /// non-recreatable blob → ABORTED, caller retries). This used to run only when the fence advanced
+        /// past our view, which left a window: a precommit prematurely reclaimed could let the shared blob
+        /// be collected, yet a stale-but-not-fence-advanced view would skip the presence check and commit a
+        /// dangle. Running checkAndResolveDeps every time closes that window — a publish can NEVER commit a
+        /// table ref over a missing dependency. checkAndResolveDeps is idempotent and re-runs naturally on
+        /// each mutateShard CAS retry (spec §4.4, §4.6). It merges the former revalidateDeps +
+        /// gateCheckDeps into a single pass (B190 Task 3).
+        checkAndResolveDeps();
 
         repointed_over = root.refs.contains(ref_name);
         committed_at_version = root.shard_version + 1;

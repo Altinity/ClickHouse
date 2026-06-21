@@ -564,6 +564,59 @@ TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
     /// concrete. (Verified red with the floor disabled.)
 }
 
+TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
+{
+    /// B190 Task-3 coverage: a TOKENLESS (W-EVIDENCE) dep recorded at the CURRENT view round (fresh —
+    /// observed_view_round == current round, so revalidateDeps' stale-check does NOT fire) that has a
+    /// view hit by hash MUST still be resolved by the gate scan (observeAndAdmit → ABORTED when condemned).
+    ///
+    /// This case is exercised exclusively by gateCheckDeps (not revalidateDeps): revalidateDeps skips
+    /// tokenless deps with a view hit (`if (hits.has_value()) continue`) and only acts on them via the
+    /// stale branch. With a fresh dep there is no stale branch, so only the gate scan handles it. After
+    /// the Task-3 merge into a single checkAndResolveDeps pass, the merged routine must preserve this
+    /// path: "fresh tokenless + hit → observeAndAdmit."
+    ///
+    /// Discriminating assertion: publish throws ABORTED (condemned blob, no source bytes) — NOT
+    /// FILE_DOESNT_EXIST and NOT success (which would publish a dangle).
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// Pre-inject retire state at round=1 BEFORE opening the store — the store's open-time refresh
+    /// lands at round=1, so any dep recorded thereafter is non-stale (observed_view_round == 1).
+    DB::Cas::Layout layout("p");
+    writeBlobRaw(*b, layout, "payload-fresh-ev", 256 /*blob_header_len*/, UInt128{} /*pool_id*/);
+    const String blob_key = layout.blobKey(idOf("payload-fresh-ev"));
+    const Token t0 = b->head(blob_key).token;
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-fresh-ev"), .token = t0, .size = 16}});
+
+    /// Open the store AFTER injecting round=1 — retire view refreshes at round=1.
+    auto s = openStore(b);
+    ASSERT_EQ(s->retireView().round(), 1u);
+
+    const RootNamespace ns{"srv1/tbl"};
+    const TreeId source = writeTreeRaw(*b, s->layout(), {blobEntry("data.bin", "payload-fresh-ev")}, s->poolMeta().pool_id);
+
+    auto build = s->startBuild({});
+    /// adoptFromTree records a TOKENLESS dep at observed_view_round = 1 (the current round) — FRESH.
+    const TreeEntry adopted = build->adoptFromTree(source, "data.bin");
+    const TreeId tree = build->putTree({adopted});
+
+    /// No fence advance (round stays 1): revalidateDeps will see observed_view_round=1 >= round=1
+    /// (fresh) and skip the stale branch. With a hash hit, revalidateDeps continues to gateCheckDeps.
+    /// The merged single-pass routine must also enter the hit branch regardless of staleness.
+    ///
+    /// Publish: no fence advance ⇒ no refresh ⇒ revalidateDeps sees the dep as fresh ⇒ skips the
+    /// stale branch ⇒ hits.has_value() → continue ⇒ gateCheckDeps: tokenless + hit ⇒ observeAndAdmit
+    /// ⇒ HEAD ⇒ current t0 condemned ⇒ ABORTED (INV-1; blob has no retained source bytes).
+    expectThrowsCode(DB::ErrorCodes::ABORTED,
+        [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
+
+    /// The condemned blob stays at t0 — nothing was written by the gate.
+    EXPECT_EQ(b->head(blob_key).token, t0);
+    /// No ref was published.
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+}
+
 TEST(CasProtocol, AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime)
 {
     /// The SAME-ROUND companion of the scenario above (found refreshing the TLA+ model, B91,

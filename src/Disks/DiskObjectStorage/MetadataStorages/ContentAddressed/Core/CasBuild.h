@@ -131,31 +131,41 @@ private:
     /// (adopt the live token, or throw ABORTED if still condemned — caller retries with source bytes).
     void uploadFromSource(ObjectKind kind, const UInt128 & hash, const String & key, std::string_view source_bytes);
 
-    /// The publish gate's W-EVIDENCE + condemned-token scan (spec §5). For each dependency with a view
-    /// hit by hash (INV-1: never GET the dying object): a tree with a retained payload ⇒ recreate via
-    /// uploadFromSource; a blob/adopted dep with no source in hand ⇒ retryable ABORTED (the caller
-    /// retries from source). A token-bearing dep whose own token is live but whose hash was displaced
-    /// and condemned ⇒ observeAndAdmit (HEAD-only, adopt the current token). A tokenless (W-EVIDENCE)
-    /// dep whose (kind, hash) has any condemned token ⇒ observeAndAdmit (adopt the live HEAD, or ABORTED
-    /// if condemned). With an empty retire view this is a no-op. Runs INSIDE the publish mutate lambda,
-    /// so it re-runs on every CAS retry — idempotent (re-observe). Task 13 extends it with revalidateDeps.
-    void gateCheckDeps();
-
-    /// W-REVALIDATE (the model's `WPublishReval`). Called once, immediately after a fence-advanced
-    /// `retireView().refresh` in the publish lambda and BEFORE gateCheckDeps. A token observation is
-    /// valid only relative to the retire view at which it was made (finding F1): retire entries drop
-    /// on confirmed outcomes, so the refreshed view alone cannot condemn a STALE observation — the
-    /// durable witness is the object itself. For every token-bearing member whose hash has NO entry
-    /// in the refreshed view yet was observed under an older round, this re-observes (one HEAD) and
-    /// keeps / adopts / re-creates per the rule. See spec §7 step 4 (the no-return argument's
-    /// publish-after-fence branch).
-    void revalidateDeps();
+    /// Merged publish-gate pass (B190 Task 3): W-REVALIDATE + W-EVIDENCE + condemned-token scan in a
+    /// single loop over `deps`. Replaces the former separate `revalidateDeps` + `gateCheckDeps` calls.
+    ///
+    /// Per dep, in priority order:
+    ///
+    /// Tokenless (W-EVIDENCE) dep:
+    ///   • Any view hit by hash → observeAndAdmit (adopt the live HEAD; condemned → ABORTED, INV-1).
+    ///     This covers both fresh and stale tokenless deps: the hit is unconditional on staleness.
+    ///   • No hit + stale (observed_view_round < current round) → HEAD:
+    ///       absent  → tree with retained: recreate; else ABORTED.
+    ///       present → observeAndAdmit(4-arg, pass already-fetched hr — no redundant second HEAD).
+    ///   • No hit + fresh → keep.
+    ///
+    /// Token-bearing dep:
+    ///   • Any view hit by hash:
+    ///       own token condemned (Case a) → tree with retained: recreate; else ABORTED (INV-1).
+    ///       own token live (Case b, phantom) → observeAndAdmit (HEAD-only, adopt current token).
+    ///   • No hit + stale → HEAD:
+    ///       absent  → tree with retained: recreate; else ABORTED.
+    ///       same token as dep → re-stamp observed_view_round (IN-FLIGHT DISJUNCTION keep-branch).
+    ///       different token  → observeAndAdmit(4-arg, pass already-fetched hr — no second HEAD).
+    ///   • No hit + fresh → keep.
+    ///
+    /// Iterating `deps` while uploadFromSource/observeAndAdmit/recreateTree mutate deps is safe:
+    /// all three overwrite the SAME (kind, hash) entry (never insert a new key), so the map structure
+    /// and the current iterator stay valid throughout.
+    ///
+    /// Runs INSIDE the publish mutateShard lambda — re-runs on every CAS retry (idempotent).
+    void checkAndResolveDeps();
 
     /// W-REVALIDATE re-create branch for trees: re-upload retained_trees[hash] as a FRESH Tree
     /// incarnation (fresh incarnation_tag, putIfAbsentStream If-None-Match), then record the new
     /// token + observed_view_round. On PreconditionFailed (someone re-created it concurrently) ⇒
     /// observeAndAdmit. Trees are ALWAYS re-creatable because their encoded payload is retained;
-    /// blob payloads are not retained (hence the ABORTED branch in revalidateDeps for a lost blob).
+    /// blob payloads are not retained (hence the ABORTED branch in checkAndResolveDeps for a lost blob).
     void recreateTree(const UInt128 & hash);
 
     /// Map (kind, hash) to its object key per kind (blob/tree/pack).
