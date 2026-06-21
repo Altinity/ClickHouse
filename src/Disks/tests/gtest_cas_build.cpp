@@ -759,6 +759,98 @@ TEST(CasBuild, FirstPublishRegistersNamespace)
     EXPECT_EQ(again.registry_version, version_after_first);
 }
 
+TEST(CasBuild, AdoptEvidenceNoBackendOp)
+{
+    /// B188: adoptEvidence records a TOKENLESS W-EVIDENCE dep from an already-resolved TreeEntry
+    /// WITHOUT any backend call (no HEAD, no GET, no PUT).
+    ///
+    /// Two behavioural assertions:
+    ///   1. No backend HEAD or stream_put fires during adoptEvidence (counted via CountingBackend).
+    ///   2. The recorded dep is usable by putTree: after adoptEvidence(entry), calling putTree({entry})
+    ///      does NOT throw LOGICAL_ERROR (W-TREE-BUILD enforces "every child in dep set").
+
+    /// Use the CountingBackend from gtest_ca_dedup_cache.cpp — same delegating pattern, same two
+    /// counters (heads, stream_puts). Re-implement a minimal counting wrapper here inline so this test
+    /// is self-contained and does not pull in the other file's anonymous namespace.
+    struct LocalCountingBackend final : public Backend
+    {
+        explicit LocalCountingBackend(BackendPtr inner_) : inner(std::move(inner_)) {}
+        size_t heads = 0;
+        size_t stream_puts = 0;
+        size_t gets = 0;
+
+        HeadResult head(const String & k) override { ++heads; return inner->head(k); }
+        WriteSinkPtr putIfAbsentStream(const String & k, const ObjectMeta & meta = {}) override
+        {
+            ++stream_puts;
+            return inner->putIfAbsentStream(k, meta);
+        }
+        std::optional<GetResult> get(const String & k, Range r = {}) override { ++gets; return inner->get(k, r); }
+        ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+        PutOutcome putIfAbsent(const String & k, const String & bts, Token * t = nullptr, const ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, t, m); }
+        PutOutcome putOverwrite(const String & k, const String & bts, const Token & e, Token * t = nullptr, const ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, t, m); }
+        CasOutcome casPut(const String & k, const String & bts, const std::optional<Token> & e, Token * t = nullptr, const ObjectMeta & m = {}) override { return inner->casPut(k, bts, e, t, m); }
+        DeleteOutcome deleteExact(const String & k, const Token & t) override { return inner->deleteExact(k, t); }
+    private:
+        BackendPtr inner;
+    };
+
+    /// 1. Set up the store: use a raw InMemoryBackend for setup writes, wrap it in the counting
+    ///    decorator only for the Build that will call adoptEvidence.
+    auto raw = std::make_shared<InMemoryBackend>();
+
+    /// Upload the blob content so putTree's own putIfAbsentStream (for the tree object) succeeds.
+    /// The blob itself must exist on the backend so that putTree can upload the tree that references
+    /// it. We upload via a throwaway build using the raw backend (not the counting backend), so the
+    /// setup counts don't pollute the test's counter.
+    {
+        auto s0 = openStore(raw);
+        auto b0 = s0->startBuild({});
+        b0->putBlob(idOf("b188-content"), BlobSource::fromString("b188-content"));
+    }
+
+    /// 2. Wrap the backend in the counting decorator and open a FRESH Store over it.
+    auto counting = std::make_shared<LocalCountingBackend>(raw);
+    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p"});
+    auto build = s->startBuild({});
+
+    /// 3. Construct a Blob TreeEntry (the same content as above). adoptEvidence is called on a
+    ///    hand-crafted TreeEntry rather than going through adoptFromTree — that IS the B188 interface.
+    TreeEntry entry;
+    entry.name = "b188.bin";
+    entry.placement = Placement::Blob;
+    entry.file_hash = u128Of("b188-content");
+    entry.file_size = 12;
+
+    /// Reset the counters after Store::open (which may HEAD gc/state etc. during retireView refresh).
+    counting->heads = 0;
+    counting->stream_puts = 0;
+    counting->gets = 0;
+
+    /// 4. Call adoptEvidence — must record the dep WITHOUT touching the backend.
+    EXPECT_NO_THROW(build->adoptEvidence(entry));
+
+    /// Assertion 1: no HEAD, no GET, no stream_put during adoptEvidence.
+    EXPECT_EQ(counting->heads, 0u) << "adoptEvidence must not HEAD the backend";
+    EXPECT_EQ(counting->stream_puts, 0u) << "adoptEvidence must not PUT to the backend";
+    EXPECT_EQ(counting->gets, 0u) << "adoptEvidence must not GET from the backend";
+
+    /// Assertion 2: dep is recorded — putTree({entry}) must succeed (W-TREE-BUILD passes).
+    /// putTree WILL call putIfAbsentStream to upload the tree object, but that is expected and
+    /// separate from the adoptEvidence call itself.
+    EXPECT_NO_THROW(build->putTree({entry}));
+
+    /// Inline entry: adoptEvidence records nothing (Inline has no standalone object).
+    TreeEntry inline_entry;
+    inline_entry.name = "small";
+    inline_entry.placement = Placement::Inline;
+    inline_entry.inline_bytes = "xy";
+    inline_entry.file_size = 2;
+    EXPECT_NO_THROW(build->adoptEvidence(inline_entry));
+    /// putTree with inline only also succeeds (no dep needed for Inline).
+    EXPECT_NO_THROW(build->putTree({inline_entry}));
+}
+
 TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
 {
     /// B167/B171 LIVENESS — the resurrect/condemn livelock, now closed by the build-root precommit edge.

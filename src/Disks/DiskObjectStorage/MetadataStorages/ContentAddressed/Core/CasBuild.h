@@ -58,6 +58,12 @@ public:
     /// source root). Inline entries record nothing. Returns the entry found by name in the source tree.
     TreeEntry adoptFromTree(const TreeId & source, const String & name);
 
+    /// B188: record a TOKENLESS W-EVIDENCE dep directly from an already-resolved TreeEntry — NO HEAD,
+    /// no backend call. Lets the staging adopt sites record the dep by hash without asserting presence
+    /// before precommit; the publish gate observes/resurrects it post-precommit. Inline entries record
+    /// nothing. adoptFromTree delegates here.
+    void adoptEvidence(const TreeEntry & entry);
+
     /// Whole-tree adoption (FREEZE / detached re-attach / replication relink): tokenless evidence on
     /// the tree root; the closure is covered by the publish gate + fence/recheck handshake.
     void adoptTree(const TreeId & id);

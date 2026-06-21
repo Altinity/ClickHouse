@@ -431,6 +431,33 @@ void Build::resurrect(ObjectKind kind, const UInt128 & hash, const String & key)
             kind == ObjectKind::Blob ? got->bytes.size() - store->poolMeta().blob_header_len : 0};
 }
 
+void Build::adoptEvidence(const TreeEntry & entry)
+{
+    requireAlive();
+
+    /// W-EVIDENCE: record a TOKENLESS dependency — liveness evidence is the live source root, not a
+    /// token. Inline entries reference no standalone object, so they record nothing.
+    /// NO backend call (no HEAD, no GET, no PUT) — the caller already holds the resolved entry.
+    const uint64_t view_round = store->retireView().round();
+    switch (entry.placement)
+    {
+        case Placement::Blob:
+            deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}] =
+                DepEntry{ObjectKind::Blob, std::nullopt, view_round, entry.file_size};
+            break;
+        case Placement::Subtree:
+            deps[{static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}] =
+                DepEntry{ObjectKind::Tree, std::nullopt, view_round, entry.file_size};
+            break;
+        case Placement::PackSlice:
+            deps[{static_cast<uint8_t>(ObjectKind::Pack), entry.pack_hash}] =
+                DepEntry{ObjectKind::Pack, std::nullopt, view_round, entry.pack_length};
+            break;
+        case Placement::Inline:
+            break;   /// no standalone object — nothing to depend on
+    }
+}
+
 TreeEntry Build::adoptFromTree(const TreeId & source, const String & name)
 {
     requireAlive();
@@ -444,26 +471,7 @@ TreeEntry Build::adoptFromTree(const TreeId & source, const String & name)
         if (entry.name != name)
             continue;
 
-        /// W-EVIDENCE: record a TOKENLESS dependency — liveness evidence is the live source root, not a
-        /// token. Inline entries reference no standalone object, so they record nothing.
-        const uint64_t view_round = store->retireView().round();
-        switch (entry.placement)
-        {
-            case Placement::Blob:
-                deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}] =
-                    DepEntry{ObjectKind::Blob, std::nullopt, view_round, entry.file_size};
-                break;
-            case Placement::Subtree:
-                deps[{static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}] =
-                    DepEntry{ObjectKind::Tree, std::nullopt, view_round, entry.file_size};
-                break;
-            case Placement::PackSlice:
-                deps[{static_cast<uint8_t>(ObjectKind::Pack), entry.pack_hash}] =
-                    DepEntry{ObjectKind::Pack, std::nullopt, view_round, entry.pack_length};
-                break;
-            case Placement::Inline:
-                break;   /// no standalone object — nothing to depend on
-        }
+        adoptEvidence(entry);
         return entry;
     }
 
