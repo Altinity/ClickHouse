@@ -116,13 +116,13 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    /// X pre-exists out-of-band; the build cold-reuses it (records the current token t0 at round 0).
+    /// X pre-exists out-of-band; the build dedup-adopts it via putBlob (records the current token t0).
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Token t0 = b->head(blob_key).token;
 
     auto build = s->startBuild({});
-    build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0 (TOKENED dep)
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// GC advanced the round to 1 but dropped all entries on outcomes ⇒ EMPTY retired set; fence to 1.
@@ -149,7 +149,7 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     const Token t0 = b->head(blob_key).token;
 
     auto build = s->startBuild({});
-    build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);   /// records t0 at round 0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0 at round 0
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// Another writer displaces X out-of-band ⇒ a new current token t1 (same payload, fresh tag).
@@ -214,9 +214,9 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
 
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});   /// open-time refresh ⇒ view round 1
     auto build = s->startBuild({});
-    /// reuseBlob ⇒ observeAndAdmit: current t0 is NOT in the condemned set {t_other} ⇒ ADOPT t0, dep
+    /// putBlob dedup-adopts t0: current t0 is NOT in the condemned set {t_other} ⇒ ADOPT t0, dep
     /// recorded at observed_view_round = 1 (the current view round) ⇒ NON-STALE at publish time.
-    build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// publish: view round 1 == fence_round 1 ⇒ NO fence advance ⇒ revalidateDeps does NOT run; only
@@ -243,7 +243,7 @@ TEST(CasProtocol, RevalidateAbsentBlobDepAbortsRetryable)
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
 
     auto build = s->startBuild({});
-    build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);   /// records t0 at round 0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts token at round 0
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// A landed GC delete whose retire entry already dropped: delete X raw by its current token.
@@ -458,7 +458,7 @@ TEST(CasProtocol, FreezeIntoShadowNamespace)
 
 TEST(CasProtocol, ResurrectLosesRaceCondemnedDepAbortsRetryable)
 {
-    /// B190 INV-1: a reuseBlob dep whose OWN token t0 is condemned. Even if the object was
+    /// B190 INV-1: a tokened dep whose OWN token t0 is condemned. Even if the object was
     /// concurrently displaced to t1 (live), the dep's own token t0 is still condemned in the view ⇒
     /// revalidateDeps Case(a): dep's own token condemned, blob has no retained source bytes ⇒ ABORTED.
     ///
@@ -478,7 +478,7 @@ TEST(CasProtocol, ResurrectLosesRaceCondemnedDepAbortsRetryable)
     const Token t0 = b->head(blob_key).token;
 
     auto build = s->startBuild({});
-    build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);   /// records t0 at round 0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0 at round 0
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// Another writer displaces X to t1 (uncondemned) before our gate runs.

@@ -63,8 +63,8 @@ TreeEntry blobEntry(const String & name, const String & payload)
 ///   retiring its build_seq so the GC watermark `min_active` advances PAST A. P now carries A's
 ///   `cas_owner` and is no longer protected by any in-flight build.
 ///
-///   Build B starts and ADOPTS the same blob P via the dedup path (reuseBlob, body_recreatable=false —
-///   the cross-node adopt case), assembles t2 -> { other.bin: P }, and `precommit(t2)` — which under the
+///   Build B starts and ADOPTS the same blob P via tokenless evidence (adoptEvidence — the cross-node
+///   adopt case), assembles t2 -> { other.bin: P }, and `precommit(t2)` — which under the
 ///   current code is a STUB (no build-root edge published).
 ///
 ///   refA is dropped + watermark renewed; GC runs to fixpoint. Because P's only recorded in-degree was
@@ -94,11 +94,12 @@ TEST(CasBuildRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
     }
     s->renewWatermarkOnce();   /// A is gone; min_active now advances past A's build_seq
 
-    /// Build B: adopt the SAME blob P (dedup / cross-node adopt — tokenless evidence), assemble t2,
-    /// and precommit it. The precommit is meant to pin P's closure for the duration of the build.
+    /// Build B: adopt the SAME blob P (cross-node adopt — tokenless evidence via adoptEvidence), assemble
+    /// t2, and precommit it. The precommit is meant to pin P's closure for the duration of the build.
     auto b = s->startBuild({});
-    b->reuseBlob(idOf(P), /*body_recreatable=*/false);
-    const TreeId t2 = b->putTree({blobEntry("other.bin", P)});
+    const TreeEntry pe = blobEntry("other.bin", P);
+    b->adoptEvidence(pe);
+    const TreeId t2 = b->putTree({pe});
     b->precommit(t2);
 
     /// The source ref disappears, and the watermark is renewed so the closure looks collectable.
@@ -150,10 +151,11 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
     }
     s->renewWatermarkOnce();
 
-    /// Build B: adopt P, assemble t2, precommit it (build-root edge now protects P).
+    /// Build B: adopt P via tokenless evidence, assemble t2, precommit it (build-root edge protects P).
     auto b = s->startBuild({});
-    b->reuseBlob(idOf(P), /*body_recreatable=*/false);
-    const TreeId t2 = b->putTree({blobEntry("other.bin", P)});
+    const TreeEntry pe2 = blobEntry("other.bin", P);
+    b->adoptEvidence(pe2);
+    const TreeId t2 = b->putTree({pe2});
     b->precommit(t2);
 
     /// SIMULATE premature reclaim: remove the precommit edge exactly as GC reclaim would —

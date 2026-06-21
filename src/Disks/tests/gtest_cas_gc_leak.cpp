@@ -187,17 +187,17 @@ TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
         build1->publish(ns, "part_1", t1, {});
     }
 
-    /// build2: REUSE B from the committed source (no body), adopting B's token while B is present and
-    /// not condemned. build2 also uploads its OWN unique blob U so its tree is distinct and U is
-    /// build2-owned (heartbeat-protected) — only B is at risk of being collected.
+    /// build2: adopt B via tokenless evidence (replaces the former reuseBlob(false)); build2 also
+    /// uploads its OWN unique blob U so its tree is distinct and U is build2-owned
+    /// (heartbeat-protected) — only B is at risk of being collected.
     auto build2 = s->startBuild({});
-    build2->reuseBlob(idOf(B), /*body_recreatable=*/false);
-    build2->putBlob(idOf(U), BlobSource::fromString(U));
     TreeEntry eb;
     eb.name = "data.bin";
     eb.placement = Placement::Blob;
     eb.file_hash = u128Of(B);
     eb.file_size = B.size();
+    build2->adoptEvidence(eb);   /// tokenless dep (no HEAD) — replaces reuseBlob(false)
+    build2->putBlob(idOf(U), BlobSource::fromString(U));
     TreeEntry eu;
     eu.name = "uniq.bin";
     eu.placement = Placement::Blob;
@@ -230,8 +230,8 @@ TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
         catch (const DB::Exception & e)
         {
             /// ABORTED = the gate re-observed the lost dep and asked us to retry (re-upload B's body).
-            /// reuseBlob has no body, so a real fix would re-derive it; here we just confirm the gate
-            /// did NOT silently dangle. A non-ABORTED throw is unexpected — rethrow.
+            /// The tokenless adopt has no body; a real caller would re-derive it from source.
+            /// Here we just confirm the gate did NOT silently dangle. A non-ABORTED throw is unexpected.
             if (e.code() != DB::ErrorCodes::ABORTED)
                 throw;
             break;   /// fail-closed (no dangle) is the safe outcome; stop.

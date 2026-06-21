@@ -105,15 +105,15 @@ TEST(CasGcDangle, SharedBlobUnderCountDeletesLivePinnedBlob)
     const UInt128 tlive_hash = hexToU128(t_live_opt->tree_id.string());
 
     /// rb_cur -> T_cur -> { other.bin: B }. A DISTINCT tree (different entry name) that REUSES the
-    /// same shared blob B (dedup, token unchanged — the soak's cross-node `adopt`). Still live.
+    /// same shared blob B (tokenless adopt — the soak's cross-node `adopt`). Still live.
     {
         auto build = s->startBuild({});
-        build->reuseBlob(idOf("B"), /*body_recreatable=*/false);
         TreeEntry e;
         e.name = "other.bin";
         e.placement = Placement::Blob;
         e.file_hash = u128Of("B");
         e.file_size = std::string("B").size();
+        build->adoptEvidence(e);   /// tokenless dep (no HEAD) — replaces reuseBlob(false)
         const TreeId t_cur = build->putTree({e});
         build->publish(ns, "rb_cur", t_cur, {});
         s->renewWatermarkOnce();

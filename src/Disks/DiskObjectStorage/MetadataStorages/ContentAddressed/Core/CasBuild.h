@@ -39,20 +39,8 @@ public:
     /// bytes; else adopt — free).
     BlobRef putBlob(const BlobId & id, BlobSource source);
 
-    /// Cold reuse without bytes: HEAD; condemned ⇒ retryable ABORTED (no source bytes in hand; the
-    /// caller retries from source). On HEAD-absent the outcome depends on `body_recreatable` (B156b):
-    ///   true  — the blob was putBlob'd by a build in this txn (recreatable by retrying) ⇒ the
-    ///           absence is the benign dedup-vs-GC race ⇒ retryable ABORTED (caller retries, re-uploads);
-    ///   false — the blob was adopted from a committed source (tokenless W-EVIDENCE, NOT recreatable) ⇒
-    ///           the absence is a real INV-NO-LOSS loss ⇒ fail-loud FILE_DOESNT_EXIST (never masked).
-    /// Use depIsTokened on the SOURCE build to pick the flag (tokened == putBlob'd == recreatable).
-    /// B188: the ContentAddressedTransaction adopt sites no longer call reuseBlob for committed-source
-    /// entries — they use adoptEvidence + the post-precommit gate; reuseBlob remains for direct
-    /// callers/tests.
-    BlobRef reuseBlob(const BlobId & id, bool body_recreatable);
-
     /// B156b discriminator: does this build hold a TOKENED Blob dep for `hash` (putBlob'd here ⇒
-    /// recreatable) versus a TOKENLESS W-EVIDENCE dep (adoptFromTree ⇒ not recreatable)? False also
+    /// tokened) versus a TOKENLESS W-EVIDENCE dep (adoptFromTree / adoptEvidence ⇒ tokenless)? False also
     /// when this build has no dep for the hash at all.
     bool depIsTokened(const UInt128 & hash) const;
     /// Whether this build holds ANY Blob dep (tokened or tokenless) for `hash`.
@@ -116,10 +104,9 @@ private:
     };
     using DepKey = std::pair<uint8_t, UInt128>;           /// (kind, hash)
 
-    /// The §5 step-2 cold-reuse rule, shared by putBlob's PreconditionFailed branch and reuseBlob:
-    /// HEAD the key; absent ⇒ FILE_DOESNT_EXIST; condemned-at-current-token ⇒ throw ABORTED
-    /// (caller must re-upload from its own source bytes); else record the current token as the dep.
-    /// Returns the admitted size.
+    /// The §5 step-2 cold-reuse rule: HEAD the key; absent ⇒ FILE_DOESNT_EXIST;
+    /// condemned-at-current-token ⇒ throw ABORTED (caller must re-upload from its own source bytes);
+    /// else record the current token as the dep. Returns the admitted size.
     uint64_t observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key);
     /// Overload for callers that already hold a fresh, present HeadResult for `key` (the putBlob
     /// HEAD-before-PUT path), avoiding a redundant second HEAD. `hr.exists` MUST be true. (B168 P1/P2)

@@ -191,50 +191,6 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
     throw Exception(ErrorCodes::LOGICAL_ERROR, "putBlob: exhausted retries for {}", key);
 }
 
-BlobRef Build::reuseBlob(const BlobId & id, bool body_recreatable)
-{
-    requireAlive();
-    const UInt128 logical_hash = hexToU128(id.string());
-    const String key = store->layout().blobKey(id);
-    uint64_t admitted;
-    try
-    {
-        admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key);
-    }
-    catch (const Exception & e)
-    {
-        /// B156 (refined B156b): reuseBlob has NO body in hand. observeAndAdmit can throw:
-        ///   • FILE_DOESNT_EXIST — blob is absent (HEAD returned 404).
-        ///   • ABORTED           — blob is present but condemned (INV-1: observeAndAdmit no longer
-        ///     calls resurrect/GET; it throws ABORTED instead so the caller supplies source bytes).
-        /// Both mean "blob unavailable". How to surface it depends on `body_recreatable`:
-        ///
-        ///   body_recreatable == true  — the blob was putBlob'd by a build in THIS transaction
-        ///     (a TOKENED dep, heartbeat-protected). Retrying the whole operation re-writes the content,
-        ///     so the blob is re-uploaded. Surface it as retryable ABORTED so the caller retries and
-        ///     CONVERGES.
-        ///
-        ///   body_recreatable == false — the blob was adopted from a COMMITTED source (a TOKENLESS
-        ///     W-EVIDENCE dep, pinned by the committed source ref, NOT by a heartbeat). There is NO body
-        ///     to re-upload; retrying re-adopts the same still-gone committed blob and would spin on
-        ///     ABORTED forever (a silently-stuck background merge). HEAD-absent here means a REFERENCED
-        ///     blob was deleted — a genuine INV-NO-LOSS violation that MUST surface, NOT be masked. Keep
-        ///     the fail-loud FILE_DOESNT_EXIST.
-        const bool unavailable =
-            e.code() == ErrorCodes::FILE_DOESNT_EXIST || e.code() == ErrorCodes::ABORTED;
-        if (unavailable && body_recreatable)
-            throw Exception(ErrorCodes::ABORTED,
-                "Build::reuseBlob: blob {} unavailable (absent or condemned); retry the operation", key);
-        if (e.code() == ErrorCodes::ABORTED && !body_recreatable)
-            /// Condemned but body not recreatable: the committed source may still hold it (the
-            /// condemnation is unconfirmed). Surface as FILE_DOESNT_EXIST (the INV-NO-LOSS path).
-            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-                "Build::reuseBlob: blob {} condemned with no recreatable body (INV-NO-LOSS)", key);
-        throw;
-    }
-    return BlobRef{id, admitted};
-}
-
 bool Build::depIsTokened(const UInt128 & hash) const
 {
     /// Discriminator for B156b: a putBlob'd blob records a TOKENED dep (recreatable by retrying), an
@@ -286,7 +242,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
         /// object via backend().get. Throw ABORTED so the caller can re-upload from its OWN source bytes.
         ///   • putBlob (has BlobSource): catches ABORTED, calls uploadFromSource from held bytes.
         ///   • uploadStagedTree / recreateTree (has retained_trees payload): calls uploadFromSource.
-        ///   • reuseBlob / gate bodyless (no source): propagates ABORTED (retryable; caller retries op).
+        ///   • gate bodyless (no source): propagates ABORTED (retryable; caller retries op).
         if (store->hasEventSink())
         {
             CasEvent _ev2;
