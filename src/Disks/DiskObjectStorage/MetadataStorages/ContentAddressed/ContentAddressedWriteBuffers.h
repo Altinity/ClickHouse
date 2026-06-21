@@ -14,9 +14,9 @@ namespace DB::ContentAddressed
 /// once all bytes are written, so the buffer spills to a unique local temp file while hashing
 /// (the streaming HashingWriteBuffer convention — the pool-wide file-hash function the wiring
 /// defines; the core never re-hashes payloads). On finalize it hands (hash_hex, size, temp_path)
-/// to the owning transaction, which uploads through Build::putBlob — the W-rules (fresh tag,
-/// dedup-as-cold-reuse, retire-view checks) live in the core, NOT here. The temp file is removed
-/// after the callback returns (the callback streams from it).
+/// to the owning transaction; B188: the transaction owns the temp file post-finalize and uploads it
+/// post-precommit, so finalizeImpl no longer removes it. cancelImpl and the destructor (on error
+/// paths) still remove it.
 class CaContentWriteBuffer : public WriteBufferFromFileBase
 {
 public:
@@ -46,6 +46,7 @@ private:
     std::string temp_path;
     std::unique_ptr<WriteBufferFromFile> temp_file;
     std::unique_ptr<HashingWriteBuffer> hashing;
+    bool temp_ownership_transferred = false;   /// B188: set after on_finalized; the dtor skips removeTempFile
 };
 
 /// Write buffer for bytes that live INSIDE pool metadata (a mutable per-part file staged into

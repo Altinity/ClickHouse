@@ -39,7 +39,10 @@ CaContentWriteBuffer::~CaContentWriteBuffer()
 {
     /// Best-effort cleanup if finalize was never reached (exception unwind / cancel).
     cancel();
-    removeTempFile();
+    /// B188: if on_finalized ran successfully the transaction owns the temp file and will clean it up
+    /// post-commit (or in its own destructor). Do not remove it here.
+    if (!temp_ownership_transferred)
+        removeTempFile();
 }
 
 void CaContentWriteBuffer::nextImpl()
@@ -61,11 +64,13 @@ void CaContentWriteBuffer::finalizeImpl()
     hashing->finalize();
     temp_file->finalize();
 
-    /// The transaction's callback uploads via Build::putBlob, streaming from temp_path.
+    /// B188: on successful finalize, ownership of temp_path transfers to the transaction (it uploads
+    /// the blob post-precommit and cleans up). cancel() still removes it.
     if (on_finalized)
+    {
         on_finalized(hash_hex, size, temp_path);
-
-    removeTempFile();
+        temp_ownership_transferred = true;
+    }
 }
 
 void CaContentWriteBuffer::cancelImpl() noexcept

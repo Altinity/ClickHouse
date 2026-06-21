@@ -458,6 +458,13 @@ void Build::adoptEvidence(const TreeEntry & entry)
     }
 }
 
+void Build::recordPendingBlobDep(const UInt128 & hash, uint64_t size)
+{
+    requireAlive();
+    deps[{static_cast<uint8_t>(ObjectKind::Blob), hash}] =
+        DepEntry{ObjectKind::Blob, std::nullopt, store->retireView().round(), size};
+}
+
 TreeEntry Build::adoptFromTree(const TreeId & source, const String & name)
 {
     requireAlive();

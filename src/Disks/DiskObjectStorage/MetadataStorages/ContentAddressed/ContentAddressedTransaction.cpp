@@ -6,6 +6,7 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/copyData.h>
 #include <algorithm>
+#include <filesystem>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <ctime>
@@ -38,6 +39,11 @@ ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadat
 
 ContentAddressedTransaction::~ContentAddressedTransaction()
 {
+    /// B188: always clean up pending temp files (whether committed or not). On the success path
+    /// cleanupPendingTempFiles was already called at the end of commit(); this call is the defensive
+    /// backstop for aborted/exception-unwound transactions whose publishStaging never ran.
+    cleanupPendingTempFiles();
+
     /// An uncommitted transaction's uploads become heartbeat-gated debris (W-HEARTBEAT): abandon
     /// every still-open Build so its heartbeat is discarded. Replaces the PoC's pin machinery.
     if (committed)
@@ -138,6 +144,30 @@ ContentAddressedTransaction::PartStaging * ContentAddressedTransaction::findStag
     return it == parts.end() ? nullptr : &it->second;
 }
 
+void ContentAddressedTransaction::cleanupPendingTempFiles() noexcept
+{
+    for (auto & [key, st] : parts)
+    {
+        for (const auto & pb : st.pending_blobs)
+        {
+            std::error_code ec;
+            std::filesystem::remove(pb.temp_path, ec);
+        }
+        st.pending_blobs.clear();
+    }
+}
+
+const ContentAddressedTransaction::PartStaging::PendingBlob *
+ContentAddressedTransaction::findPendingBlob(const PartStaging & st, const UInt128 & hash) const
+{
+    /// B188: locate a pending blob by hash. Returns nullptr when the blob has already been uploaded
+    /// (post-precommit, pending_blobs is cleared) or was never staged as pending.
+    for (const auto & pb : st.pending_blobs)
+        if (pb.hash == hash)
+            return &pb;
+    return nullptr;
+}
+
 std::optional<ContentAddressedMetadataStorage::Route>
 ContentAddressedTransaction::routeOf(const std::string & path) const
 {
@@ -174,20 +204,30 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "ContentAddressedTransaction: staged entries for {}/{} without a Build", ns.string(), ref);
 
-    auto tree = st.build->putTree(st.entries);
+    /// B188 precommit-first: stage the tree LOCALLY (no upload), precommit to protect the whole
+    /// closure by reachability, THEN do every pool write (tree object + pending blobs) and publish.
+    const Cas::TreeId tree = st.build->stageTree(st.entries);
+
     Cas::RefPayload payload;
     payload.mutable_files = st.mutable_files;
-    /// The publish wall-clock stamp backing getLastModified (reserved name, filtered from
-    /// every listing by the read side).
     payload.mutable_files[".ca_mtime"] = std::to_string(static_cast<uint64_t>(::time(nullptr)));
 
-    /// B171: publish the build-root precommit edge as soon as the manifest tree is assembled and
-    /// BEFORE the fail-closed publish. Every child of `tree` (including blobs adopted/dedup'd from a
-    /// source part whose ref may be dropped concurrently) is now reachable from a durable build root,
-    /// so GC cannot reclaim the closure out from under this commit or the GC rounds in between.
-    st.build->precommit(tree);
+    st.build->precommit(tree);                       /// closure now reachable from a durable build root
 
-    /// Force-fresh (Pillar B): publish-gate rollback tracking — a stale result mis-tracks rollback.
+    st.build->uploadStagedTree(tree);                /// pool write #1 — under protection
+    for (const auto & pb : st.pending_blobs)         /// pool writes #2 — uploads + 412/HEAD/resurrect
+    {
+        Cas::BlobSource source;
+        source.size = pb.size;
+        const std::string temp_path = pb.temp_path;
+        source.write_payload = [temp_path](WriteBuffer & out)
+        {
+            ReadBufferFromFile in(temp_path);
+            copyData(in, out);
+        };
+        st.build->putBlob(Cas::BlobId(Cas::u128ToHex(pb.hash)), std::move(source));
+    }
+
     const bool ref_existed = metadata_storage.store()->resolveRef(ns, ref).has_value();
     st.build->publish(ns, ref, tree, std::move(payload));
     st.published = true;
@@ -237,6 +277,8 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         throw;
     }
     committed = true;
+    /// B188: temp files for all pending blobs have been uploaded in publishStaging; remove them now.
+    cleanupPendingTempFiles();
 }
 
 TransactionCommitOutcomeVariant ContentAddressedTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
@@ -274,14 +316,21 @@ const Cas::TreeEntry * ContentAddressedTransaction::findStagedEntry(
 std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageObjects(const std::string & path) const
 {
     /// B59 read-your-writes: a projection spill-and-merge reads back its own temp blocks before
-    /// the parent part's single commit. Staged content blobs are already uploaded - locate them.
+    /// the parent part's single commit. Staged content blobs may be pending (B188: not yet uploaded).
     auto r = const_cast<ContentAddressedTransaction *>(this)->routeOf(path);
     if (!r || r->file.empty())
+        return {};
+    auto it = parts.find({r->ns.string(), r->ref});
+    if (it == parts.end())
         return {};
     if (const auto * entry = findStagedEntry(*r))
     {
         if (entry->placement == Cas::Placement::Blob)
         {
+            /// B188: a pending blob has not been uploaded yet — its storage object does not exist in
+            /// the pool. Return empty so the caller falls back to tryReadFileInFlight (local temp read).
+            if (findPendingBlob(it->second, entry->file_hash))
+                return {};
             const auto location = metadata_storage.store()->locate(*entry);
             return StoredObjects{StoredObject(location.key, path, location.length)};
         }
@@ -307,7 +356,13 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFile
         if (entry->placement == Cas::Placement::Inline)
             return std::make_unique<ReadBufferFromOwnMemoryFile>(path, entry->inline_bytes);
         if (entry->placement == Cas::Placement::Blob)
+        {
+            /// B188: a pending blob has not been uploaded yet — serve reads from the local temp file
+            /// (the same file that will be streamed to the pool in publishStaging post-precommit).
+            if (const auto * pb = findPendingBlob(it->second, entry->file_hash))
+                return std::make_unique<ReadBufferFromFile>(pb->temp_path);
             return metadata_storage.readBlobPayload(metadata_storage.store()->locate(*entry), path, settings);
+        }
     }
     return nullptr;
 }
@@ -440,8 +495,9 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             });
     }
 
-    /// A CONTENT part file: spill + hash, then upload through Build::putBlob (W-FRESH-TAG /
-    /// dedup-as-cold-reuse / retire-view checks live in the core) and stage the tree entry.
+    /// A CONTENT part file: spill + hash into a local temp file, then stage the blob as PENDING
+    /// (B188 precommit-first). The blob is NOT uploaded here; publishStaging uploads it post-precommit.
+    /// recordPendingBlobDep lets stageTree's W-TREE-BUILD check pass without any pool op at staging time.
     return std::make_unique<ContentAddressed::CaContentWriteBuffer>(
         metadata_storage.scratchPath(),
         buf_size,
@@ -450,21 +506,18 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         [this, route = *r](const std::string & hash_hex, size_t size, const std::string & temp_path)
         {
             auto & st = stagingFor(route);
-            Cas::BlobSource source;
-            source.size = size;
-            source.write_payload = [&temp_path](WriteBuffer & out)
-            {
-                ReadBufferFromFile in(temp_path);
-                copyData(in, out);
-            };
-            buildFor(route, st).putBlob(Cas::BlobId(hash_hex), std::move(source));
+            const UInt128 hash = Cas::hexToU128(hash_hex);
+            /// B188: do NOT upload here. Record the pending blob (uploaded post-precommit in
+            /// publishStaging) and a tokenless dep so stageTree's W-TREE-BUILD check passes; putBlob
+            /// later overwrites it with the tokened dep. The temp file is kept (transaction owns it).
+            st.pending_blobs.push_back({hash, temp_path, size});
+            buildFor(route, st).recordPendingBlobDep(hash, size);
 
             Cas::TreeEntry entry;
             entry.name = route.file;
             entry.placement = Cas::Placement::Blob;
-            entry.file_hash = Cas::hexToU128(hash_hex);
+            entry.file_hash = hash;
             entry.file_size = size;
-            /// A re-write of the SAME staged name replaces the entry (whole-file rewrites).
             std::erase_if(st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
             st.entries.push_back(std::move(entry));
         });
@@ -607,13 +660,27 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
             entry = *it;
             if (entry.placement == Cas::Placement::Blob)
             {
-                /// B156b: the staged source entry is either putBlob'd in this txn (TOKENED dep in the
-                /// source build ⇒ recreatable by retrying the INSERT) or adopted from a committed source
-                /// (TOKENLESS W-EVIDENCE dep ⇒ NOT recreatable, absence is a real loss). Discriminate on
-                /// the SOURCE build's dep so a vanished putBlob'd blob retries (ABORTED) while a vanished
-                /// adopted blob fails loud (FILE_DOESNT_EXIST). No source build ⇒ default not-recreatable.
-                const bool body_recreatable = src_st->build && src_st->build->depIsTokened(entry.file_hash);
-                buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+                /// B188: a pending blob (not yet uploaded) must NOT be reuseBlob'd — the pool object does
+                /// not exist yet. Record a tokenless dep on the dst build via recordPendingBlobDep, and if
+                /// the dst staging is different from the src staging, copy the pending blob record so
+                /// publishStaging uploads it for the dst part too.
+                if (const auto * pb = findPendingBlob(*src_st, entry.file_hash))
+                {
+                    auto & dst_build = buildFor(*dst, dst_st);
+                    dst_build.recordPendingBlobDep(entry.file_hash, entry.file_size);
+                    if (&dst_st != src_st)
+                        dst_st.pending_blobs.push_back(*pb);
+                }
+                else
+                {
+                    /// B156b: the staged source entry is either putBlob'd in this txn (TOKENED dep in the
+                    /// source build ⇒ recreatable by retrying the INSERT) or adopted from a committed source
+                    /// (TOKENLESS W-EVIDENCE dep ⇒ NOT recreatable, absence is a real loss). Discriminate on
+                    /// the SOURCE build's dep so a vanished putBlob'd blob retries (ABORTED) while a vanished
+                    /// adopted blob fails loud (FILE_DOESNT_EXIST). No source build ⇒ default not-recreatable.
+                    const bool body_recreatable = src_st->build && src_st->build->depIsTokened(entry.file_hash);
+                    buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+                }
             }
             else if (entry.placement != Cas::Placement::Inline)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -776,6 +843,10 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             }
             for (const auto & file : src_st.mutable_removed)
                 dst_st.mutable_removed.insert(file);
+            /// B188: move pending blobs from src to dst — they will be uploaded in dst's publishStaging.
+            for (auto & pb : src_st.pending_blobs)
+                dst_st.pending_blobs.push_back(std::move(pb));
+            src_st.pending_blobs.clear();
             if (!src_st.build)
             {
             }
@@ -792,15 +863,25 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 for (const auto & entry : dst_st.entries)
                     if (entry.placement == Cas::Placement::Blob)
                     {
-                        /// B156b: dst_st.entries here is the UNION of the original destination entries
-                        /// (deps in dst_st.build) and the just-moved source entries (deps still in
-                        /// src_st.build, which we abandon below). An entry is recreatable iff EITHER build
-                        /// holds a TOKENED (putBlob'd) dep for it; a tokenless (adopted) dep or no dep in
-                        /// either build ⇒ not recreatable (fail-loud on vanish, no INV-NO-LOSS masking).
-                        const bool body_recreatable =
-                            dst_st.build->depIsTokened(entry.file_hash)
-                            || src_st.build->depIsTokened(entry.file_hash);
-                        dst_st.build->reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+                        /// B188: pending blobs (not yet uploaded) must NOT be reuseBlob'd — the pool object
+                        /// does not exist yet. Use recordPendingBlobDep to record the dep on the dst build.
+                        /// The pending blob record was already moved to dst_st.pending_blobs above.
+                        if (findPendingBlob(dst_st, entry.file_hash))
+                        {
+                            dst_st.build->recordPendingBlobDep(entry.file_hash, entry.file_size);
+                        }
+                        else
+                        {
+                            /// B156b: dst_st.entries here is the UNION of the original destination entries
+                            /// (deps in dst_st.build) and the just-moved source entries (deps still in
+                            /// src_st.build, which we abandon below). An entry is recreatable iff EITHER build
+                            /// holds a TOKENED (putBlob'd) dep for it; a tokenless (adopted) dep or no dep in
+                            /// either build ⇒ not recreatable (fail-loud on vanish, no INV-NO-LOSS masking).
+                            const bool body_recreatable =
+                                dst_st.build->depIsTokened(entry.file_hash)
+                                || src_st.build->depIsTokened(entry.file_hash);
+                            dst_st.build->reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+                        }
                     }
                 src_st.build->abandon();
             }
@@ -937,11 +1018,25 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
         entry.name = dst->file;
         if (&src_st != &dst_st && entry.placement == Cas::Placement::Blob)
         {
-            /// B156b: the cross-part re-keyed entry came from src_st; its dep lives in src_st.build.
-            /// Tokened (putBlob'd in this txn) ⇒ recreatable ⇒ retryable ABORTED on vanish; tokenless
-            /// (adopted from a committed source) or no source build ⇒ not recreatable ⇒ fail-loud.
-            const bool body_recreatable = src_st.build && src_st.build->depIsTokened(entry.file_hash);
-            buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+            /// B188: a pending blob (not yet uploaded) must NOT be reuseBlob'd. Move the pending blob
+            /// record to dst_st and record a tokenless dep on the dst build. The file is MOVED (not
+            /// copied) — remove it from src_st.pending_blobs so only dst_st uploads it.
+            auto pb_it = std::find_if(src_st.pending_blobs.begin(), src_st.pending_blobs.end(),
+                [&](const PartStaging::PendingBlob & pb) { return pb.hash == entry.file_hash; });
+            if (pb_it != src_st.pending_blobs.end())
+            {
+                dst_st.pending_blobs.push_back(std::move(*pb_it));
+                src_st.pending_blobs.erase(pb_it);
+                buildFor(*dst, dst_st).recordPendingBlobDep(entry.file_hash, entry.file_size);
+            }
+            else
+            {
+                /// B156b: the cross-part re-keyed entry came from src_st; its dep lives in src_st.build.
+                /// Tokened (putBlob'd in this txn) ⇒ recreatable ⇒ retryable ABORTED on vanish; tokenless
+                /// (adopted from a committed source) or no source build ⇒ not recreatable ⇒ fail-loud.
+                const bool body_recreatable = src_st.build && src_st.build->depIsTokened(entry.file_hash);
+                buildFor(*dst, dst_st).reuseBlob(Cas::BlobId(Cas::u128ToHex(entry.file_hash)), body_recreatable);
+            }
         }
         std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
         dst_st.entries.push_back(std::move(entry));

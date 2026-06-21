@@ -83,6 +83,9 @@ private:
         std::set<std::string> mutable_removed;     /// staged deletions for a COMMITTED part's payload
         bool published = false;                    /// the ref is already durably published (at the
                                                    /// lock-free rename); commit() must not re-publish it.
+
+        struct PendingBlob { UInt128 hash; std::string temp_path; uint64_t size = 0; };
+        std::vector<PendingBlob> pending_blobs;    /// B188: spilled+hashed locally; uploaded post-precommit
     };
 
     /// Keyed by (namespace string, ref name) — the routed identity, so live/detached/shadow
@@ -100,6 +103,8 @@ private:
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
     PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);
     const Cas::TreeEntry * findStagedEntry(const ContentAddressedMetadataStorage::Route & r) const;
+    /// B188: return the temp_path for a pending blob (hash match), or empty string if already uploaded.
+    const PartStaging::PendingBlob * findPendingBlob(const PartStaging & st, const UInt128 & hash) const;
     Cas::Build & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
     std::optional<ContentAddressedMetadataStorage::Route> routeOf(const std::string & path) const;
     /// Move a COMMITTED ref by republish (adoptTree + publish same tree + dropRef). false = absent source.
@@ -109,6 +114,8 @@ private:
     /// Idempotent ref removal: drop `ref` if it resolves, tolerating a concurrent drop that races
     /// between the resolve and the drop (the removal unit is meant to be replay-safe).
     void dropRefIfPresent(const Cas::RootNamespace & ns, const std::string & ref);
+
+    void cleanupPendingTempFiles() noexcept;   /// B188: remove all parts' pending temp files (commit/abort/dtor)
 
     /// Publish one staged part durably (putTree + publish, or updateRefPayload for a mutable-only
     /// staging) and mark it `published`. Idempotent: a no-op if already published. Returns true iff

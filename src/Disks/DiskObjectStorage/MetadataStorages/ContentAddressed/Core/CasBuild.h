@@ -64,6 +64,11 @@ public:
     /// nothing. adoptFromTree delegates here.
     void adoptEvidence(const TreeEntry & entry);
 
+    /// B188: record a TOKENLESS Blob dep by hash (no HEAD) for a blob whose bytes are staged locally
+    /// and will be putBlob'd post-precommit. putBlob later overwrites it with the tokened dep on
+    /// upload. Lets stageTree's W-TREE-BUILD check pass without any pool op at staging time.
+    void recordPendingBlobDep(const UInt128 & hash, uint64_t size);
+
     /// Whole-tree adoption (FREEZE / detached re-attach / replication relink): tokenless evidence on
     /// the tree root; the closure is covered by the publish gate + fence/recheck handshake.
     void adoptTree(const TreeId & id);
