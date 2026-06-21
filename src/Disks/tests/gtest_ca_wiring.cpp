@@ -1355,6 +1355,104 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
     EXPECT_FALSE(own_content_keys.empty()) << "No own content keys collected — gate would be vacuous";
 }
 
+/// B188 committed-source adopt (the LITERAL bug path): when createHardLink carries forward a blob
+/// from a COMMITTED source part (the source is NOT staged in this transaction), it takes the
+/// adoptFromTree -> adoptEvidence branch — a TOKENLESS W-EVIDENCE dep with NO eager HEAD on the
+/// adopted blob. The regression this guards is reverting adoptEvidence to a reuseBlob(false) (or any
+/// observeAndAdmit) that HEADs the adopted blob during staging, before any precommit protection
+/// exists. The own-content gate in NoContentPoolOpBeforePrecommit CANNOT catch this: the adopted blob
+/// is FOREIGN (owned by the live source part, never written by this transaction), so it is absent from
+/// own_content_keys. This test asserts a TARGETED invariant on that exact foreign blob key: no
+/// exists/getObjectMetadata/readObject/writeObject on it before first_precommit_idx.
+///
+/// adoptFromTree legitimately READS the source TREE during staging (to find the entry) — that is fine
+/// and is NOT asserted here; the assertion is scoped to the adopted BLOB key alone.
+TEST(CaWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
+{
+    auto recording = makeRecordingStorageForTest("committed_adopt");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        recording, "pool", "srv1",
+        std::filesystem::temp_directory_path() / "ca_b188_committed_adopt_scratch", nullptr);
+    storage->startup();
+
+    /// Phase 1: commit a source part with a content blob. Capture the source blob's logical key from
+    /// the recorded /blobs/ write (the SAME key derivation the recorder uses, so the substring/index
+    /// comparisons in Phase 2 line up exactly).
+    recording->ops.clear();
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "committed-source-blob");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    std::string source_blob_key;
+    for (const auto & r : recording->ops)
+    {
+        if (r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos)
+        {
+            source_blob_key = r.key;
+            break;
+        }
+    }
+    ASSERT_FALSE(source_blob_key.empty())
+        << "Phase 1 recorded no /blobs/ write — could not capture the committed-source blob key";
+
+    /// Phase 2: a FRESH transaction that hardlinks the COMMITTED source blob into a NEW part. The
+    /// source part (all_0_0_0) is not staged here, so createHardLink takes the committed-source branch
+    /// (adoptFromTree -> adoptEvidence). Clear the log so only Phase 2's ops are analysed.
+    recording->ops.clear();
+    {
+        auto tx = storage->createTransaction();
+        tx->createHardLink("uui/uuid-1/all_0_0_0/data.bin", "uui/uuid-1/all_5_5_0/data.bin");
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    const auto & log = recording->ops;
+
+    /// Locate the first precommit write.
+    int first_precommit_idx = -1;
+    for (int i = 0; i < static_cast<int>(log.size()); ++i)
+    {
+        if (log[i].key.find("/_precommits/") != std::string::npos)
+        {
+            first_precommit_idx = i;
+            break;
+        }
+    }
+    ASSERT_GE(first_precommit_idx, 0)
+        << "No op on a /_precommits/ key was recorded — precommit step did not fire";
+
+    /// TARGETED assertion: the adopted (foreign, committed) blob key must NOT be touched by ANY op
+    /// (HEAD via exists/getObjectMetadata, GET via readObject, or PUT via writeObject) before the
+    /// precommit write. With the bug reintroduced, adoptEvidence -> reuseBlob -> observeAndAdmit would
+    /// HEAD this exact key during staging at an index < first_precommit_idx, failing here.
+    bool adopted_blob_touched_before_precommit = false;
+    for (int i = 0; i < first_precommit_idx; ++i)
+    {
+        if (log[i].key == source_blob_key)
+        {
+            adopted_blob_touched_before_precommit = true;
+            ADD_FAILURE()
+                << "Adopted committed-source blob op '" << log[i].op << "' on '" << log[i].key
+                << "' at index " << i << " came BEFORE the first precommit write at index "
+                << first_precommit_idx << " — violates B188 (committed-source adopt must not HEAD/GET/"
+                << "PUT the adopted blob before precommit; expected a tokenless adoptEvidence dep)";
+        }
+    }
+    EXPECT_FALSE(adopted_blob_touched_before_precommit);
+
+    /// The committed-source adopt also must NOT re-upload the blob at all (content carried forward by
+    /// reference): no writeObject on the source blob key in Phase 2.
+    const bool reuploaded = std::any_of(log.begin(), log.end(),
+        [&](const RecordingLocalObjectStorage::Record & r)
+        { return r.op == "writeObject" && r.key == source_blob_key; });
+    EXPECT_FALSE(reuploaded) << "Committed-source adopt re-uploaded the blob — should carry by reference";
+
+    /// Sanity: the new part reads back and shares the source blob object.
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_5_5_0/data.bin"));
+    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_0_0_0/data.bin")[0].remote_path,
+              storage->getStorageObjects("uui/uuid-1/all_5_5_0/data.bin")[0].remote_path);
+}
+
 /// B188 pending-blob hardlink (Task 6 Test 2): within a SINGLE transaction, write a content file
 /// into part X (pending blob, not yet uploaded), then createHardLink that SAME file into part Y
 /// (the cross-part pending-source branch: `&dst_st != src_st`, copies the PendingBlob record so
