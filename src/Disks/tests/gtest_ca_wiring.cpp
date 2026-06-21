@@ -989,6 +989,7 @@ TEST(CaWiringExchange, AdoptOfReclaimedTreeFallsBack)
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Common/Exception.h>
 #include <algorithm>
+#include <set>
 
 namespace DB::ErrorCodes
 {
@@ -1154,14 +1155,19 @@ TEST(CaWiring, RootShardsConfigurable)
 
 /// ==== B188 precommit-first order invariant (Task 6) ====
 ///
-/// A RecordingLocalObjectStorage records every writeObject call as (logical_key). "Logical" means the
-/// bare pool key (without the emu_root prefix) — the same string the Layout functions produce, so
-/// the `/blobs/`, `/trees/`, and `/_precommits/` substring tests are unambiguous.
+/// A RecordingLocalObjectStorage records every pool op — WRITES (writeObject) AND READS (the
+/// exists/tryGetObjectMetadata that back the CA backend's `head`, and the readObject that backs its
+/// `get`) — as (op_name, logical_key). "Logical" means the bare pool key (without the emu_root
+/// prefix) — the same string the Layout functions produce, so the `/blobs/`, `/trees/`, and
+/// `/_precommits/` substring tests are unambiguous.
 ///
 /// After commit the test asserts: the FIRST write to a key containing "/_precommits/" happened before
-/// ALL writes to keys containing "/blobs/" or "/trees/". The precommit ref is what pins the in-flight
-/// build-root closure so GC cannot reclaim the not-yet-uploaded content objects; therefore every pool
-/// write to blobs/trees must be AFTER the precommit ref is durably written (B188 invariant).
+/// ALL ops (read OR write) on keys containing "/blobs/" or "/trees/". The precommit ref is what pins
+/// the in-flight build-root closure so GC cannot reclaim the not-yet-uploaded content objects;
+/// therefore every pool op touching a content blob or the manifest tree must be AFTER the precommit
+/// ref is durably written. The READ gating is the heart of the B188 fix: the original bug was an
+/// EAGER HEAD on a content blob during staging, before any precommit protection existed — a
+/// write-only assertion would not catch its reintroduction.
 
 namespace
 {
@@ -1173,21 +1179,18 @@ public:
 
     struct Record
     {
+        std::string op;    /// "writeObject" | "exists" | "getObjectMetadata" | "readObject"
         std::string key;   /// logical (emu_root stripped)
     };
 
-    std::vector<Record> writes;   /// append-only; no mutex (tests are single-threaded)
+    /// Append-only; mutable so the const read methods (exists/readObject/tryGetObjectMetadata) can
+    /// record. No mutex — these tests are single-threaded.
+    mutable std::vector<Record> ops;
 
-    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
-        const DB::StoredObject & object,
-        DB::WriteMode mode,
-        std::optional<DB::ObjectAttributes> attributes,
-        size_t buf_size,
-        const DB::WriteSettings & write_settings) override
+    /// Strip the common-key-prefix (emu_root) to recover the logical key. The emu_root is returned by
+    /// getCommonKeyPrefix() and always ends with a path separator in LocalObjectStorage.
+    std::string toLogical(const std::string & physical) const
     {
-        /// Strip the common-key-prefix (emu_root) to recover the logical key. The emu_root is
-        /// returned by getCommonKeyPrefix() and always ends with a path separator in LocalObjectStorage.
-        const std::string & physical = object.remote_path;
         const std::string root = getCommonKeyPrefix();
         std::string logical;
         if (!root.empty() && physical.starts_with(root))
@@ -1197,8 +1200,44 @@ public:
         /// Strip any leading slash left after prefix removal.
         if (!logical.empty() && logical.front() == '/')
             logical = logical.substr(1);
-        writes.push_back({logical});
+        return logical;
+    }
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object,
+        DB::WriteMode mode,
+        std::optional<DB::ObjectAttributes> attributes,
+        size_t buf_size,
+        const DB::WriteSettings & write_settings) override
+    {
+        ops.push_back({"writeObject", toLogical(object.remote_path)});
         return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+
+    /// Backs the CA backend's `head` (emuExists) and gates its `get` (emuExists before emuRead).
+    bool exists(const DB::StoredObject & object) const override
+    {
+        ops.push_back({"exists", toLogical(object.remote_path)});
+        return DB::LocalObjectStorage::exists(object);
+    }
+
+    /// Backs the CA backend's `head` size/attributes lookup (emuPath stat).
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        ops.push_back({"getObjectMetadata", toLogical(path)});
+        return DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+    }
+
+    /// Backs the CA backend's `get` body read (readObjectRanged).
+    std::unique_ptr<DB::ReadBufferFromFileBase> readObject(
+        const DB::StoredObject & object,
+        const DB::ReadSettings & read_settings,
+        std::optional<size_t> read_hint,
+        bool use_external_buffer,
+        bool restrict_seek) const override
+    {
+        ops.push_back({"readObject", toLogical(object.remote_path)});
+        return DB::LocalObjectStorage::readObject(object, read_settings, read_hint, use_external_buffer, restrict_seek);
     }
 };
 
@@ -1216,9 +1255,11 @@ std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const s
 
 }
 
-/// B188: every pool write to /blobs/ or /trees/ must come AFTER the first write to a
-/// /_precommits/ key. The transaction writes a fresh content file (pending blob) AND
-/// adopts an existing committed blob via hardlink — both paths must satisfy the invariant.
+/// B188: every pool op (read OR write) on /blobs/ or /trees/ must come AFTER the first write to a
+/// /_precommits/ key — including HEAD (exists/getObjectMetadata) and GET (readObject), since the
+/// exact bug was an eager HEAD on a content blob during staging. The transaction writes a fresh
+/// content file (pending blob) AND adopts an existing committed blob via hardlink — both paths must
+/// satisfy the invariant.
 TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("order");
@@ -1236,19 +1277,37 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
 
     /// Phase 2: a new transaction that BOTH writes a fresh content blob (all_1_1_0/data.bin, pending)
     /// AND carries forward the committed blob via hardlink (all_1_1_0/extra.bin, adopt path). We clear
-    /// the write log after Phase 1 so only Phase 2's writes are analysed.
-    recording->writes.clear();
+    /// the op log after Phase 1 so only Phase 2's ops are analysed.
+    recording->ops.clear();
 
     auto tx = storage->createTransaction();
     writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "fresh-content");
-    /// Adopt from the COMMITTED source part (W-EVIDENCE path in createHardLink — the committed-source
-    /// branch, exercising adoptFromTree). This records a tokenless dep during staging (no pool op yet).
-    tx->createHardLink("uui/uuid-1/all_0_0_0/data.bin", "uui/uuid-1/all_1_1_0/extra.bin");
+    /// Adopt by hardlinking a PENDING blob (the file just written above) into a SECOND fresh part
+    /// (all_2_2_0). This is the B188-relevant adopt: the cross-part pending-source branch copies the
+    /// PendingBlob into the dst build (NO eager pool op — the blob is not durable yet, so a HEAD/GET on
+    /// it before precommit would be the exact bug). We deliberately do NOT adopt from the committed
+    /// source part here: adoptFromTree(committed source) legitimately READS that source's
+    /// already-durable, ref-pinned tree during staging — a foreign-tree read that is NOT a B188
+    /// violation (the invariant is about THIS build's own not-yet-uploaded content, never a committed
+    /// object owned by a live part). Gating it would be a false positive; see the committed-source
+    /// adopt coverage in CaWiringOps.HardLinkCarriesForwardWithoutReupload.
+    tx->createHardLink("uui/uuid-1/all_1_1_0/data.bin", "uui/uuid-1/all_2_2_0/extra.bin");
     tx->commit(DB::NoCommitOptions{});
 
-    const auto & log = recording->writes;
+    const auto & log = recording->ops;
 
-    /// Find the first precommit write.
+    /// The content objects THIS transaction publishes are exactly the keys it WRITES under /blobs/
+    /// or /trees/ (the staged tree + the fresh/pending blobs). The B188 invariant is that the build
+    /// must not touch ITS OWN staged content before precommit. Reads of foreign committed objects
+    /// (another part's tree) are legitimate and must not be gated — so we restrict the gate to the
+    /// set of content keys this transaction itself wrote.
+    std::set<std::string> own_content_keys;
+    for (const auto & r : log)
+        if (r.op == "writeObject"
+            && (r.key.find("/blobs/") != std::string::npos || r.key.find("/trees/") != std::string::npos))
+            own_content_keys.insert(r.key);
+
+    /// Find the first precommit write (an op on a /_precommits/ key).
     int first_precommit_idx = -1;
     for (int i = 0; i < static_cast<int>(log.size()); ++i)
     {
@@ -1260,35 +1319,40 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
     }
 
     ASSERT_GE(first_precommit_idx, 0)
-        << "No write to a /_precommits/ key was recorded — precommit step did not fire";
+        << "No op on a /_precommits/ key was recorded — precommit step did not fire";
 
-    /// Every write to /blobs/ or /trees/ must have an index AFTER first_precommit_idx.
+    /// Every op (read OR write) on one of THIS build's own content keys must have an index AFTER
+    /// first_precommit_idx. This gates HEAD (exists/getObjectMetadata) and GET (readObject), not just
+    /// PUT (writeObject) — an eager HEAD/GET on the build's own pending blob or staged tree before
+    /// precommit is the exact B188 regression this guards against.
     for (int i = 0; i < static_cast<int>(log.size()); ++i)
     {
-        const auto & key = log[i].key;
-        const bool is_content_pool_op =
-            key.find("/blobs/") != std::string::npos ||
-            key.find("/trees/") != std::string::npos;
-        if (!is_content_pool_op)
+        if (!own_content_keys.contains(log[i].key))
             continue;
         EXPECT_GT(i, first_precommit_idx)
-            << "Content pool write to '" << key << "' at index " << i
+            << "Own-content pool op '" << log[i].op << "' on '" << log[i].key << "' at index " << i
             << " came BEFORE the first precommit write at index " << first_precommit_idx
-            << " — violates B188 precommit-first invariant";
+            << " — violates B188 precommit-first invariant (no HEAD/GET/PUT on this build's content before precommit)";
     }
 
-    /// Sanity: the part is readable after commit.
+    /// Sanity: both parts are readable after commit, with the SAME underlying blob (content identity).
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/extra.bin"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_2_2_0/extra.bin"));
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 13u);   /// "fresh-content"
+    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path,
+              storage->getStorageObjects("uui/uuid-1/all_2_2_0/extra.bin")[0].remote_path);
 
-    /// Confirm at least one blob and one tree write was recorded (both paths were exercised).
+    /// Confirm at least one blob and one tree WRITE was recorded (both upload paths were exercised),
+    /// so the gate above actually had content keys to check.
     const bool has_blob_write = std::any_of(log.begin(), log.end(),
-        [](const RecordingLocalObjectStorage::Record & r) { return r.key.find("/blobs/") != std::string::npos; });
+        [](const RecordingLocalObjectStorage::Record & r)
+        { return r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos; });
     const bool has_tree_write = std::any_of(log.begin(), log.end(),
-        [](const RecordingLocalObjectStorage::Record & r) { return r.key.find("/trees/") != std::string::npos; });
+        [](const RecordingLocalObjectStorage::Record & r)
+        { return r.op == "writeObject" && r.key.find("/trees/") != std::string::npos; });
     EXPECT_TRUE(has_blob_write) << "No /blobs/ write recorded — fresh blob path not exercised";
     EXPECT_TRUE(has_tree_write) << "No /trees/ write recorded — tree upload path not exercised";
+    EXPECT_FALSE(own_content_keys.empty()) << "No own content keys collected — gate would be vacuous";
 }
 
 /// B188 pending-blob hardlink (Task 6 Test 2): within a SINGLE transaction, write a content file
