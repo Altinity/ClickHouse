@@ -769,9 +769,10 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     ///   2. The recorded dep is usable by putTree: after adoptEvidence(entry), calling putTree({entry})
     ///      does NOT throw LOGICAL_ERROR (W-TREE-BUILD enforces "every child in dep set").
 
-    /// Use the CountingBackend from gtest_ca_dedup_cache.cpp — same delegating pattern, same two
-    /// counters (heads, stream_puts). Re-implement a minimal counting wrapper here inline so this test
-    /// is self-contained and does not pull in the other file's anonymous namespace.
+    /// tests::CountingBackend (cas_test_helpers.h) extends InMemoryBackend directly and only intercepts
+    /// head/get/putIfAbsent — NOT putIfAbsentStream. This test needs to prove adoptEvidence touches the
+    /// backend on no path at all, including the streaming write path that putBlob/putTree use, so we use
+    /// a delegating wrapper that intercepts putIfAbsentStream (and head/get) over an inner InMemoryBackend.
     struct LocalCountingBackend final : public Backend
     {
         explicit LocalCountingBackend(BackendPtr inner_) : inner(std::move(inner_)) {}
@@ -849,6 +850,53 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     EXPECT_NO_THROW(build->adoptEvidence(inline_entry));
     /// putTree with inline only also succeeds (no dep needed for Inline).
     EXPECT_NO_THROW(build->putTree({inline_entry}));
+
+    /// Subtree branch: build a REAL child tree (the one putTree({entry}) created above is a valid tree),
+    /// then on a FRESH build over a FRESH counting backend adoptEvidence a Subtree entry pointing at it
+    /// and assert ZERO backend ops — same tokenless-no-IO contract as the Blob case. We re-derive the
+    /// child tree id deterministically by re-encoding the single-blob tree.
+    const TreeId child_tree = treeIdFor(encodeTree({entry}));
+    {
+        auto counting2 = std::make_shared<LocalCountingBackend>(raw);
+        auto s2 = Store::open(counting2, PoolConfig{.pool_prefix = "p"});
+        auto build2 = s2->startBuild({});
+
+        TreeEntry subtree_entry;
+        subtree_entry.name = "sub";
+        subtree_entry.placement = Placement::Subtree;
+        subtree_entry.file_hash = hexToU128(child_tree.string());
+        subtree_entry.file_size = 1;
+
+        counting2->heads = 0;
+        counting2->stream_puts = 0;
+        counting2->gets = 0;
+        EXPECT_NO_THROW(build2->adoptEvidence(subtree_entry));
+        EXPECT_EQ(counting2->heads, 0u) << "adoptEvidence(Subtree) must not HEAD the backend";
+        EXPECT_EQ(counting2->stream_puts, 0u) << "adoptEvidence(Subtree) must not PUT to the backend";
+        EXPECT_EQ(counting2->gets, 0u) << "adoptEvidence(Subtree) must not GET from the backend";
+    }
+
+    /// PackSlice branch: a hand-built PackSlice entry (no end-to-end pack object needed — adoptEvidence
+    /// records the dep by pack_hash without touching the backend). Assert no-throw and zero backend ops.
+    {
+        auto counting3 = std::make_shared<LocalCountingBackend>(raw);
+        auto s3 = Store::open(counting3, PoolConfig{.pool_prefix = "p"});
+        auto build3 = s3->startBuild({});
+
+        TreeEntry pack_entry;
+        pack_entry.name = "packed";
+        pack_entry.placement = Placement::PackSlice;
+        pack_entry.pack_hash = u128Of("b188-pack");
+        pack_entry.pack_length = 64;
+
+        counting3->heads = 0;
+        counting3->stream_puts = 0;
+        counting3->gets = 0;
+        EXPECT_NO_THROW(build3->adoptEvidence(pack_entry));
+        EXPECT_EQ(counting3->heads, 0u) << "adoptEvidence(PackSlice) must not HEAD the backend";
+        EXPECT_EQ(counting3->stream_puts, 0u) << "adoptEvidence(PackSlice) must not PUT to the backend";
+        EXPECT_EQ(counting3->gets, 0u) << "adoptEvidence(PackSlice) must not GET from the backend";
+    }
 }
 
 TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
