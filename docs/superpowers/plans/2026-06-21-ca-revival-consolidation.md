@@ -94,3 +94,4 @@ Finish the plan autonomously, then re-review, then run a 24h soak. Exact remaini
 Baseline at this point: 321 pass / 2 known reds (`CaWiringOps.FreezeViaHardLinksIntoShadow`, `CasGcLeak.DisplacedUnexpandedTreeBlobsLeak`).
 - **Task 4 APPROVED** (`8c32979ab0e`): copy/move semantics preserved; republishRef precommit-first correct. One stale `republishRef` header comment in ContentAddressedTransaction.h ~L111 (still says "adoptTree") — folded into Task 5 fix.
 - **Task 5 DONE** (`46b07615dad`): filter pending_blobs by staged-tree hashes (no orphaned uploads); republishRef comment fixed. 323/2. Per-task review DEFERRED to final holistic re-review.
+- **Task 6 DONE** (`5ffea837742`): retired reuseBlob/body_recreatable (260 del); tests ported w/ coverage map; depIsTokened/hasDep kept. 323/2. ALL 6 CODE TASKS DONE. Next: clickhouse build (running), final holistic re-review, backlog B190/B189 DONE, 24h soak.
