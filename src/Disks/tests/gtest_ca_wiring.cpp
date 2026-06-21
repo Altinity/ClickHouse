@@ -1493,3 +1493,146 @@ TEST(CaWiringPending, HardlinkOfPendingBlobCommitsAndReadsBack)
     EXPECT_EQ(objs_x[0].remote_path, objs_y[0].remote_path)
         << "Hardlinked pending blob must map to the SAME pool object in both parts";
 }
+
+/// ==== B190 Task 4: precommit-first for republishRef and committed-source createHardLink ====
+///
+/// B190-A: republishRef (called by moveDirectory for a COMMITTED part rename — RENAME TABLE, DETACH,
+/// ATTACH, delete_tmp_ rename) must NOT call adoptTree (which HEADs the source tree) before precommit.
+/// It should record a TOKENLESS tree-evidence dep and precommit FIRST. The source part's tree key
+/// must not be accessed (exists / getObjectMetadata / readObject) before the first precommit write.
+TEST(CaWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
+{
+    auto recording = makeRecordingStorageForTest("republish");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        recording, "pool", "srv1",
+        std::filesystem::temp_directory_path() / "ca_b190_republish_scratch", nullptr);
+    storage->startup();
+
+    /// Phase 1: commit a source part. Capture its tree key from the /trees/ write.
+    recording->ops.clear();
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "republish-source");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    std::string source_tree_key;
+    for (const auto & r : recording->ops)
+    {
+        if (r.op == "writeObject" && r.key.find("/trees/") != std::string::npos)
+        {
+            source_tree_key = r.key;
+            break;
+        }
+    }
+    ASSERT_FALSE(source_tree_key.empty())
+        << "Phase 1 recorded no /trees/ write — could not capture the source tree key";
+
+    /// Phase 2: a COMMITTED rename (delete_tmp_ pattern) that triggers republishRef. Clear the log
+    /// so only Phase 2's ops are analysed.
+    recording->ops.clear();
+    {
+        auto tx = storage->createTransaction();
+        tx->moveDirectory("uui/uuid-1/all_1_1_0", "uui/uuid-1/delete_tmp_all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    const auto & log = recording->ops;
+
+    const int first_precommit_idx = firstPrecommitWriteIdx(log);
+    ASSERT_GE(first_precommit_idx, 0)
+        << "No write to a /_precommits/ key was recorded — precommit step did not fire";
+
+    /// The source tree key must NOT be accessed (HEAD via exists/getObjectMetadata, GET via readObject,
+    /// or PUT via writeObject) before the precommit write. With adoptTree before precommit (the old
+    /// code), observeAndAdmit HEADs the tree key at an index < first_precommit_idx, failing here.
+    bool tree_touched_before_precommit = false;
+    for (int i = 0; i < first_precommit_idx; ++i)
+    {
+        if (log[i].key == source_tree_key)
+        {
+            tree_touched_before_precommit = true;
+            ADD_FAILURE()
+                << "republishRef tree op '" << log[i].op << "' on '" << log[i].key
+                << "' at index " << i << " came BEFORE the first precommit write at index "
+                << first_precommit_idx << " — violates B190 precommit-first: republishRef must not "
+                << "HEAD/GET/PUT the source tree before precommit (use tokenless adoptEvidence)";
+        }
+    }
+    EXPECT_FALSE(tree_touched_before_precommit);
+
+    /// Sanity: the renamed part is visible under the new name and NOT under the old name.
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/delete_tmp_all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/delete_tmp_all_1_1_0/data.bin"));
+}
+
+/// B190-B: the adoptStagedBlob helper unifies the 6 inline pending/uploaded adopt blocks from
+/// createHardLink / moveFile / moveDirectory. The observable invariant: after refactoring, ALL
+/// six sites still produce the same result as before — pending blobs are copied (hardlink) or
+/// moved (moveFile/moveDirectory), and uploaded blobs are adopted by tokenless evidence. This test
+/// exercises the non-trivial CROSS-PART pending path (createHardLink copies; moveFile moves) and
+/// verifies both a copy and a move of the SAME pending source produce the correct committed state.
+TEST(CaWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
+{
+    /// Use a recording storage so we can verify no pre-precommit pool ops on own content.
+    auto recording = makeRecordingStorageForTest("adopt_helper");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        recording, "pool", "srv1",
+        std::filesystem::temp_directory_path() / "ca_b190_adopt_scratch", nullptr);
+    storage->startup();
+
+    recording->ops.clear();
+
+    /// One transaction: write a pending blob into part A, hardlink (COPY pending) into part B,
+    /// and moveFile (MOVE pending) of a DIFFERENT pending blob from part A into part C.
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_A_A_0/data.bin", "blob-for-copy");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_A_A_0/extra.bin", "blob-for-move");
+
+    /// createHardLink = COPY semantics: both src and dst should see the blob after commit.
+    tx->createHardLink("uui/uuid-1/all_A_A_0/data.bin", "uui/uuid-1/all_B_B_0/data.bin");
+
+    /// moveFile cross-part = MOVE semantics: src loses the blob, dst gains it.
+    {
+        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+        ca_tx.moveFile("uui/uuid-1/all_A_A_0/extra.bin", "uui/uuid-1/all_C_C_0/extra.bin");
+    }
+
+    tx->commit(DB::NoCommitOptions{});
+
+    const auto & log = recording->ops;
+    const int first_precommit_idx = firstPrecommitWriteIdx(log);
+    ASSERT_GE(first_precommit_idx, 0)
+        << "No precommit write recorded";
+
+    /// Collect own content keys (blobs/trees this transaction wrote).
+    std::set<std::string> own_content_keys;
+    for (const auto & r : log)
+        if (r.op == "writeObject"
+            && (r.key.find("/blobs/") != std::string::npos || r.key.find("/trees/") != std::string::npos))
+            own_content_keys.insert(r.key);
+
+    /// No own-content pool op before precommit (B188 invariant extends to all adopt sites).
+    for (int i = 0; i < static_cast<int>(log.size()); ++i)
+    {
+        if (!own_content_keys.contains(log[i].key))
+            continue;
+        EXPECT_GT(i, first_precommit_idx)
+            << "Own-content op '" << log[i].op << "' on '" << log[i].key << "' at index " << i
+            << " before precommit at " << first_precommit_idx;
+    }
+
+    /// COPY semantics: both A and B see the copied blob.
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_A_A_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_B_B_0/data.bin"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_A_A_0/data.bin"), 13u);   /// "blob-for-copy" (13 bytes)
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_B_B_0/data.bin"), 13u);
+    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_A_A_0/data.bin")[0].remote_path,
+              storage->getStorageObjects("uui/uuid-1/all_B_B_0/data.bin")[0].remote_path)
+        << "COPY (hardlink): both parts must share the same blob object";
+
+    /// MOVE semantics: A loses extra.bin, C gains it.
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_A_A_0/extra.bin"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_C_C_0/extra.bin"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_C_C_0/extra.bin"), 13u);   /// "blob-for-move" (13 bytes)
+}

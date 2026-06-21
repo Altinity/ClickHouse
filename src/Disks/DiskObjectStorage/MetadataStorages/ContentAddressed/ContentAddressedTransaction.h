@@ -118,6 +118,21 @@ private:
 
     void cleanupPendingTempFiles() noexcept;   /// B188: remove all parts' pending temp files (commit/abort/dtor)
 
+    /// B190 Task 4: unified adopt helper that collapses the 6 inline pending/uploaded dispatch
+    /// blocks in createHardLink / moveFile (cross-part) / moveDirectory (two-build merge).
+    ///
+    /// `pb != nullptr` (pending, not yet uploaded):
+    ///   - `copy_pending=true`  → push a copy of *pb into dst_st.pending_blobs (hardlink semantics:
+    ///     both src and dst upload independently; src's copy is left in place by the caller).
+    ///   - `copy_pending=false` → the pb record is already in dst_st (moved or already there);
+    ///     just record the dep without any additional push.
+    ///   In both cases: dst_build.recordPendingBlobDep(entry.file_hash, entry.file_size).
+    ///
+    /// `pb == nullptr` (uploaded / committed): dst_build.adoptEvidence(entry) — tokenless W-EVIDENCE,
+    /// no pool HEAD/GET before precommit.
+    void adoptStagedBlob(const PartStaging::PendingBlob * pb, const Cas::TreeEntry & entry,
+                         PartStaging & dst_st, Cas::Build & dst_build, bool copy_pending);
+
     /// Publish one staged part durably (putTree + publish, or updateRefPayload for a mutable-only
     /// staging) and mark it `published`. Idempotent: a no-op if already published. Returns true iff
     /// this call newly CREATED a ref that did not exist before (for commit()'s rollback tracking).

@@ -99,19 +99,27 @@ bool ContentAddressedTransaction::republishRef(
     const Cas::RootNamespace & dst_ns, const std::string & dst_ref)
 {
     /// Move a COMMITTED ref: content addressing has no rename, so publish the SAME tree under the
-    /// destination (adoptTree observes the tree and the publish gate carries the GC-race safety)
-    /// and drop the source ref. Returns false (nothing written) when the source ref is absent.
+    /// destination and drop the source ref. Returns false (nothing written) when the source ref is absent.
     /// Force-fresh (Pillar B): RENAME/move source read — stale mutable_files must not carry to dst.
     auto resolved = metadata_storage.store()->resolveRef(src_ns, src_ref);
     if (!resolved)
         return false;
     auto build = metadata_storage.store()->startBuild(
         Cas::BuildInfo{.intended_ref = dst_ns.string() + "/" + dst_ref, .op = Cas::ProvenanceOp::Other});
-    build->adoptTree(resolved->tree_id);
+    /// B190 Task 4 (precommit-first): record a TOKENLESS tree-evidence dep WITHOUT HEADing the tree
+    /// object. A synthetic Subtree TreeEntry carries the (hash, size) from the resolved ref metadata —
+    /// no pool GET/HEAD needed. The merged publish gate (post-precommit) re-proves the dep at publish.
+    /// This eliminates the adoptTree → observeAndAdmit → HEAD that happened before precommit.
+    Cas::TreeEntry tree_evidence;
+    tree_evidence.placement = Cas::Placement::Subtree;
+    tree_evidence.file_hash = Cas::hexToU128(resolved->tree_id.string());
+    tree_evidence.file_size = resolved->tree_size;
+    build->adoptEvidence(tree_evidence);
     Cas::RefPayload payload;
     payload.tree_size = resolved->tree_size;
     payload.mutable_files = resolved->mutable_files;   /// the .ca_mtime stamp carries over (a rename is not a new part)
-    /// B171: protect the adopted closure via a build-root precommit before the fail-closed publish.
+    /// B190 precommit-first: protect the adopted closure via a build-root precommit BEFORE the
+    /// fail-closed publish. The publish gate (checkAndResolveDeps) re-proves the tree dep at publish time.
     build->precommit(resolved->tree_id);
     build->publish(dst_ns, dst_ref, resolved->tree_id, std::move(payload));
     metadata_storage.store()->dropRef(src_ns, src_ref);
@@ -166,6 +174,28 @@ ContentAddressedTransaction::findPendingBlob(const PartStaging & st, const UInt1
         if (pb.hash == hash)
             return &pb;
     return nullptr;
+}
+
+void ContentAddressedTransaction::adoptStagedBlob(
+    const PartStaging::PendingBlob * pb, const Cas::TreeEntry & entry,
+    PartStaging & dst_st, Cas::Build & dst_build, bool copy_pending)
+{
+    if (pb)
+    {
+        /// Pending blob (not yet uploaded): record a tokenless dep so stageTree's W-TREE-BUILD
+        /// check passes without any pool op. If copy_pending, push a copy of the pb record into
+        /// dst_st so publishStaging uploads it for the dst part too (hardlink = copy semantics).
+        /// If !copy_pending, the record is already in dst_st (moved by caller) — skip the push.
+        if (copy_pending)
+            dst_st.pending_blobs.push_back(*pb);
+        dst_build.recordPendingBlobDep(entry.file_hash, entry.file_size);
+    }
+    else
+    {
+        /// Uploaded / committed: record a tokenless W-EVIDENCE dep — no pool HEAD/GET before
+        /// precommit. The publish gate (post-precommit) observes/resurrects it if needed.
+        dst_build.adoptEvidence(entry);
+    }
 }
 
 std::optional<ContentAddressedMetadataStorage::Route>
@@ -660,25 +690,11 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
             entry = *it;
             if (entry.placement == Cas::Placement::Blob)
             {
-                /// B188: a pending blob (not yet uploaded) must NOT be reuseBlob'd — the pool object does
-                /// not exist yet. Record a tokenless dep on the dst build via recordPendingBlobDep, and if
-                /// the dst staging is different from the src staging, copy the pending blob record so
-                /// publishStaging uploads it for the dst part too.
-                if (const auto * pb = findPendingBlob(*src_st, entry.file_hash))
-                {
-                    auto & dst_build = buildFor(*dst, dst_st);
-                    dst_build.recordPendingBlobDep(entry.file_hash, entry.file_size);
-                    if (&dst_st != src_st)
-                        dst_st.pending_blobs.push_back(*pb);
-                }
-                else
-                {
-                    /// B188: record a tokenless W-EVIDENCE dep with NO eager HEAD. The publish gate
-                    /// (post-precommit) observes/resurrects it, or fails RETRYABLE (ABORTED) if it genuinely
-                    /// vanished — never a fatal FILE_DOESNT_EXIST during staging, before any precommit
-                    /// protection exists.
-                    buildFor(*dst, dst_st).adoptEvidence(entry);
-                }
+                /// B190 Task 4: unified adopt dispatch. copy_pending=(&dst_st != src_st) so the pending
+                /// blob record is copied into dst_st only when the destination is a different part
+                /// (hardlink = copy semantics; same-part is a self-ref that shouldn't duplicate the record).
+                const auto * pb = findPendingBlob(*src_st, entry.file_hash);
+                adoptStagedBlob(pb, entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/(&dst_st != src_st));
             }
             else if (entry.placement != Cas::Placement::Inline)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -861,21 +877,9 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 for (const auto & entry : dst_st.entries)
                     if (entry.placement == Cas::Placement::Blob)
                     {
-                        /// B188: pending blobs (not yet uploaded) must NOT be reuseBlob'd — the pool object
-                        /// does not exist yet. Use recordPendingBlobDep to record the dep on the dst build.
-                        /// The pending blob record was already moved to dst_st.pending_blobs above.
-                        if (findPendingBlob(dst_st, entry.file_hash))
-                        {
-                            dst_st.build->recordPendingBlobDep(entry.file_hash, entry.file_size);
-                        }
-                        else
-                        {
-                            /// B188: record a tokenless W-EVIDENCE dep with NO eager HEAD. The publish gate
-                            /// (post-precommit) observes/resurrects it, or fails RETRYABLE (ABORTED) if it
-                            /// genuinely vanished — never a fatal FILE_DOESNT_EXIST during staging, before any
-                            /// precommit protection exists.
-                            dst_st.build->adoptEvidence(entry);
-                        }
+                        /// B190 Task 4: unified adopt dispatch. Pending blob records were already moved
+                        /// to dst_st.pending_blobs above (MOVE semantics), so copy_pending=false.
+                        adoptStagedBlob(findPendingBlob(dst_st, entry.file_hash), entry, dst_st, *dst_st.build, /*copy_pending=*/false);
                     }
                 src_st.build->abandon();
             }
@@ -1012,25 +1016,17 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
         entry.name = dst->file;
         if (&src_st != &dst_st && entry.placement == Cas::Placement::Blob)
         {
-            /// B188: a pending blob (not yet uploaded) must NOT be reuseBlob'd. Move the pending blob
-            /// record to dst_st and record a tokenless dep on the dst build. The file is MOVED (not
-            /// copied) — remove it from src_st.pending_blobs so only dst_st uploads it.
+            /// B190 Task 4: unified adopt dispatch. MOVE semantics — physically move the pending blob
+            /// record from src_st to dst_st FIRST (so dst_st owns the upload), then call adoptStagedBlob
+            /// with copy_pending=false (the record is already in dst_st; no additional copy needed).
             auto pb_it = std::find_if(src_st.pending_blobs.begin(), src_st.pending_blobs.end(),
                 [&](const PartStaging::PendingBlob & pb) { return pb.hash == entry.file_hash; });
             if (pb_it != src_st.pending_blobs.end())
             {
                 dst_st.pending_blobs.push_back(std::move(*pb_it));
                 src_st.pending_blobs.erase(pb_it);
-                buildFor(*dst, dst_st).recordPendingBlobDep(entry.file_hash, entry.file_size);
             }
-            else
-            {
-                /// B188: record a tokenless W-EVIDENCE dep with NO eager HEAD. The publish gate
-                /// (post-precommit) observes/resurrects it, or fails RETRYABLE (ABORTED) if it genuinely
-                /// vanished — never a fatal FILE_DOESNT_EXIST during staging, before any precommit
-                /// protection exists.
-                buildFor(*dst, dst_st).adoptEvidence(entry);
-            }
+            adoptStagedBlob(findPendingBlob(dst_st, entry.file_hash), entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/false);
         }
         std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
         dst_st.entries.push_back(std::move(entry));
