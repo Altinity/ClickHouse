@@ -21,6 +21,14 @@
 
 #include <algorithm>
 
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int FILE_DOESNT_EXIST;
+}
+}
+
 namespace DB::Cas
 {
 
@@ -237,6 +245,27 @@ private:
 
 }
 
+/// True when an exception from `IObjectStorage::readObject` means "the object is simply not there".
+/// Two surfaces:
+///   1. S3/RustFS:        `S3Exception` with `S3Errors::NO_SUCH_KEY` (the modeled enum — the primary
+///      signal) or `getExceptionName() == "NoSuchKey"` (the canonical XML `<Code>` string, present
+///      when the SDK was able to parse it; mirrors `finalizeConditionalWrite`'s detection).
+///   2. Local / emulated: `DB::Exception` with `ErrorCodes::FILE_DOESNT_EXIST` (from
+///      `ReadBufferFromFile` when `open(2)` returns ENOENT).
+///
+/// Any other error (network, auth, throttle, corruption) propagates unchanged — fail-closed.
+static bool isObjectNotFound(const std::exception & e)
+{
+#if USE_AWS_S3
+    if (const auto * s3e = dynamic_cast<const S3Exception *>(&e))
+        return s3e->getS3ErrorCode() == Aws::S3::S3Errors::NO_SUCH_KEY
+            || s3e->getExceptionName() == "NoSuchKey";
+#endif
+    if (const auto * dbe = dynamic_cast<const Exception *>(&e))
+        return dbe->code() == ErrorCodes::FILE_DOESNT_EXIST;
+    return false;
+}
+
 /// Read the whole object at `path` and honor `range` by substr. Objects on this path are small (root
 /// manifests, tree/blob bodies in tests), so read-whole + substr is the correct and simplest way to
 /// serve a sub-range — no seek/limit machinery needed.
@@ -315,8 +344,22 @@ std::optional<GetResult> ObjectStorageBackend::get(const String & key, Range ran
         if (!hr)
             return std::nullopt;
 
+        /// The object may be deleted between the HEAD above and the GET below (a GC or concurrent
+        /// writer racing the read window). Catch the not-found signal and honor the `optional`
+        /// contract — callers such as `Store::loadShardDecoded` already handle a nullopt return and
+        /// treat it as "raced a deletion, absent". Any other error (network, auth, corruption)
+        /// propagates unchanged — fail-closed by construction.
         GetResult gr;
-        gr.bytes = readObjectRanged(*object_storage, key, range);
+        try
+        {
+            gr.bytes = readObjectRanged(*object_storage, key, range);
+        }
+        catch (const std::exception & e)
+        {
+            if (isObjectNotFound(e))
+                return std::nullopt;
+            throw;
+        }
         gr.token = hr->token;
         return gr;
     }
@@ -325,8 +368,21 @@ std::optional<GetResult> ObjectStorageBackend::get(const String & key, Range ran
     if (!emuExists(key))
         return std::nullopt;
 
+    /// The emulated path holds emu_mutex across the exists-check and the read, so no concurrent
+    /// caller in this process can delete the file in between. External deletion (e.g. a test teardown
+    /// racing a read) is still handled: convert FILE_DOESNT_EXIST to nullopt rather than letting it
+    /// escape as an unexplained exception.
     GetResult gr;
-    gr.bytes = emuRead(key, range);
+    try
+    {
+        gr.bytes = emuRead(key, range);
+    }
+    catch (const std::exception & e)
+    {
+        if (isObjectNotFound(e))
+            return std::nullopt;
+        throw;
+    }
     gr.token = emuObserveToken(key);
     return gr;
 }

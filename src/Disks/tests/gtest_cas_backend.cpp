@@ -13,6 +13,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/WriteMode.h>
+#include <IO/ReadBufferFromFileBase.h>
 #include <IO/S3Common.h>
 #include <filesystem>
 #include <map>
@@ -488,6 +489,89 @@ TEST(CasObjectStorageBackend, EmulatedRoundTripsUserMetadata)
     const auto hr = backend.head("k/key");
     ASSERT_TRUE(hr.exists);
     ASSERT_EQ(hr.attributes.at("cas_owner"), "ab:7:42");
+}
+
+namespace
+{
+
+/// A `LocalObjectStorage` whose `readObject` throws `S3Exception(NO_SUCH_KEY)` for a configured
+/// physical key, while `tryGetObjectMetadata` still reports that key as PRESENT.
+/// This simulates the HEAD→GET race window: the HEAD succeeds, then the object is deleted before
+/// the GET arrives.
+class NativeReadThrowsNoSuchKeyObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    void setThrowOnRead(const std::string & path)
+    {
+        throw_on_read_path = path;
+    }
+
+    std::unique_ptr<DB::ReadBufferFromFileBase> readObject(
+        const DB::StoredObject & object,
+        const DB::ReadSettings & read_settings,
+        std::optional<size_t> read_hint,
+        bool use_external_buffer,
+        bool restrict_seek) const override
+    {
+        if (object.remote_path == throw_on_read_path)
+            throw DB::S3Exception(
+                "NoSuchKey: The specified key does not exist.",
+                Aws::S3::S3Errors::NO_SUCH_KEY);
+
+        return DB::LocalObjectStorage::readObject(object, read_settings, read_hint, use_external_buffer, restrict_seek);
+    }
+
+private:
+    std::string throw_on_read_path;
+};
+
+DB::ObjectStoragePtr makeThrowOnReadStorageForTest(const std::string & physical_key)
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_midget_unit_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    auto storage = std::make_shared<NativeReadThrowsNoSuchKeyObjectStorage>(std::move(settings));
+
+    /// Write the object so tryGetObjectMetadata reports it present (HEAD succeeds).
+    {
+        auto buf = storage->writeObject(DB::StoredObject(physical_key), DB::WriteMode::Rewrite, std::nullopt);
+        buf->write("content", 7);
+        buf->finalize();
+    }
+
+    /// Now configure: future readObject calls for this key will throw NO_SUCH_KEY.
+    storage->setThrowOnRead(physical_key);
+    return storage;
+}
+
+}
+
+/// `ObjectStorageBackend::get` in `Native` mode: when `tryGetObjectMetadata` (`nativeHead`) reports the
+/// key PRESENT but `readObject` throws `S3Exception(NO_SUCH_KEY)` — simulating a deletion in the
+/// HEAD→GET window — `get` MUST return `std::nullopt` rather than letting the raw exception escape.
+TEST(CasObjectStorageBackend, NativeModeGetReturnsNulloptOnMidGetNoSuchKey)
+{
+    /// The Native mode backend uses the key verbatim as the physical path (no emu_root prefix), so we
+    /// use the same string for both the physical key and the logical key.
+    const std::string key = "pool/blobs/ab/abcdef0123456789abcdef0123456789";
+    auto storage = makeThrowOnReadStorageForTest(key);
+
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+
+    /// HEAD reports the key present; readObject then throws NO_SUCH_KEY.
+    /// Contract: get must return std::nullopt, not propagate the S3Exception.
+    /// Call through the base-class interface so the default `Range{}` arg is available.
+    Backend & iface = backend;
+    const auto result = iface.get(key);
+    EXPECT_FALSE(result.has_value());
 }
 
 #endif
