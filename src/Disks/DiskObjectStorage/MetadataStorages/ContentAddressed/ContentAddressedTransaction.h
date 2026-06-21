@@ -108,7 +108,7 @@ private:
     const PartStaging::PendingBlob * findPendingBlob(const PartStaging & st, const UInt128 & hash) const;
     Cas::Build & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
     std::optional<ContentAddressedMetadataStorage::Route> routeOf(const std::string & path) const;
-    /// Move a COMMITTED ref by republish (adoptTree + publish same tree + dropRef). false = absent source.
+    /// Move a COMMITTED ref by republish (tokenless tree-evidence dep + precommit-first + publish + dropRef). false = absent source.
     bool republishRef(const Cas::RootNamespace & src_ns, const std::string & src_ref,
                       const Cas::RootNamespace & dst_ns, const std::string & dst_ref);
 

@@ -7,7 +7,9 @@
 #include <IO/copyData.h>
 #include <algorithm>
 #include <filesystem>
+#include <unordered_set>
 #include <Common/Exception.h>
+#include <Common/HashTable/Hash.h>
 #include <Common/logger_useful.h>
 #include <ctime>
 
@@ -244,9 +246,21 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
 
     st.build->precommit(tree);                       /// closure now reachable from a durable build root
 
+    /// B189: build the set of blob hashes actually referenced by the staged tree. Only
+    /// Placement::Blob entries represent pending content uploads — Subtree/PackSlice/Inline are
+    /// not pending blobs. A pending_blob whose hash is NOT in this set had its tree entry removed
+    /// by unlinkFile/replaceFile and must not be uploaded (it is an orphan). Its temp file is
+    /// still cleaned by cleanupPendingTempFiles at commit end.
+    std::unordered_set<UInt128, UInt128Hash> referenced_hashes;
+    for (const auto & entry : st.entries)
+        if (entry.placement == Cas::Placement::Blob)
+            referenced_hashes.insert(entry.file_hash);
+
     st.build->uploadStagedTree(tree);                /// pool write #1 — under protection
     for (const auto & pb : st.pending_blobs)         /// pool writes #2 — uploads + 412/HEAD/resurrect
     {
+        if (!referenced_hashes.count(pb.hash))
+            continue;   /// B189: orphaned pending blob (entry removed by unlinkFile/replaceFile) — skip
         Cas::BlobSource source;
         source.size = pb.size;
         const std::string temp_path = pb.temp_path;
@@ -1056,9 +1070,10 @@ void ContentAddressedTransaction::replaceFile(const std::string & path_from, con
     if (auto dst = routeOf(path_to); dst && !dst->file.empty())
     {
         auto & dst_st = stagingFor(*dst);
-        /// B188: a matching pending_blobs record (if any) is left in place — harmless (the unreferenced
-        /// blob becomes GC debris); we do NOT purge it because the same hash may still be referenced by
-        /// another staged entry.
+        /// A matching pending_blobs record (if any) is left in place — its temp file is cleaned by
+        /// cleanupPendingTempFiles at commit end, and the orphaned record is filtered out of the
+        /// publish upload by the staged-tree-hash check in publishStaging (B189). We do NOT purge it
+        /// eagerly because the same hash may still be referenced by another staged entry.
         std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == dst->file; });
         dst_st.mutable_files.erase(dst->file);
         dst_st.mutable_removed.erase(dst->file);
@@ -1098,9 +1113,10 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
         const bool staged_here = st.mutable_files.contains(r->file)
             || std::any_of(st.entries.begin(), st.entries.end(),
                            [&](const Cas::TreeEntry & e) { return e.name == r->file; });
-        /// B188: a matching pending_blobs record (if any) is left in place — harmless (the unreferenced
-        /// blob becomes GC debris); we do NOT purge it because the same hash may still be referenced by
-        /// another staged entry.
+        /// A matching pending_blobs record (if any) is left in place — its temp file is cleaned by
+        /// cleanupPendingTempFiles at commit end, and the orphaned record is filtered out of the
+        /// publish upload by the staged-tree-hash check in publishStaging (B189). We do NOT purge it
+        /// eagerly because the same hash may still be referenced by another staged entry.
         std::erase_if(st.entries, [&](const Cas::TreeEntry & e) { return e.name == r->file; });
         st.mutable_files.erase(r->file);
         if (!staged_here && ContentAddressed::isMutablePerPartFile(r->file))

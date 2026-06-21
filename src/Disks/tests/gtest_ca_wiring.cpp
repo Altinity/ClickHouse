@@ -1636,3 +1636,108 @@ TEST(CaWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_C_C_0/extra.bin"));
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_C_C_0/extra.bin"), 13u);   /// "blob-for-move" (13 bytes)
 }
+
+/// ==== B189: orphaned pending blob must NOT be uploaded after unlinkFile / replaceFile ====
+///
+/// When a file is written (pending blob X) and then unlinked (or replaced) within the same
+/// transaction, X's tree entry is removed — so X is NOT referenced by the staged tree. Before the
+/// B189 fix, publishStaging iterated pending_blobs unconditionally and uploaded X anyway (a wasted
+/// PUT of an unreferenced blob). After the fix, publishStaging builds the set of blob hashes
+/// referenced by the staged tree entries and uploads ONLY those — orphaned blobs are skipped.
+///
+/// The test uses RecordingLocalObjectStorage to capture every writeObject call. After commit it
+/// checks that the orphaned blob's pool key received NO writeObject, while a kept blob (written and
+/// NOT removed in the same transaction) IS uploaded.
+TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterUnlink)
+{
+    auto recording = makeRecordingStorageForTest("b189_unlink");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        recording, "pool", "srv1",
+        std::filesystem::temp_directory_path() / "ca_b189_unlink_scratch", nullptr);
+    storage->startup();
+
+    recording->ops.clear();
+
+    auto tx = storage->createTransaction();
+
+    /// Write blob X — this will be unlinked (orphaned) before commit.
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/orphan.bin", "orphan-bytes");
+
+    /// Write blob Y — this is kept (its tree entry survives to the staged tree).
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/kept.bin", "kept-bytes");
+
+    /// Unlink blob X — removes its tree entry; the pending_blobs record remains but is now orphaned.
+    tx->unlinkFile("uui/uuid-1/all_1_1_0/orphan.bin", false, false);
+
+    /// Sanity: the unlinked file is no longer staged (in-flight should not report it).
+    EXPECT_FALSE(tx->tryGetInFlightFileSize("uui/uuid-1/all_1_1_0/orphan.bin").has_value());
+    EXPECT_EQ(tx->tryGetInFlightFileSize("uui/uuid-1/all_1_1_0/kept.bin"), std::optional<uint64_t>(10));
+
+    tx->commit(DB::NoCommitOptions{});
+
+    const auto & log = recording->ops;
+
+    /// Collect blob keys written by this transaction (only /blobs/ writeObjects).
+    std::vector<std::string> blob_writes;
+    for (const auto & r : log)
+        if (r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos)
+            blob_writes.push_back(r.key);
+
+    /// Exactly ONE blob must have been uploaded (the kept one). The orphaned blob's pool key must
+    /// NOT appear in any writeObject — B189: orphan is filtered out of the publish upload.
+    EXPECT_EQ(blob_writes.size(), 1u)
+        << "Expected exactly 1 blob upload (the kept blob); got " << blob_writes.size()
+        << ". If 2, the orphaned pending blob was uploaded — B189 regression.";
+
+    /// The kept file is visible after commit; the orphaned file is not.
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/kept.bin"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/kept.bin"), 10u);   /// "kept-bytes"
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/orphan.bin"));
+}
+
+/// B189 companion: the same orphan-filter applies when the tree entry is removed by replaceFile
+/// (the destination entry erased before the move). Write blob X to dst, then replaceFile src->dst
+/// (erases X's entry, moves src's entry to dst). The orphaned X must not be uploaded.
+TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
+{
+    auto recording = makeRecordingStorageForTest("b189_replace");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        recording, "pool", "srv1",
+        std::filesystem::temp_directory_path() / "ca_b189_replace_scratch", nullptr);
+    storage->startup();
+
+    recording->ops.clear();
+
+    auto tx = storage->createTransaction();
+
+    /// Write blob X into the destination slot — it will be erased by replaceFile.
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "original-bytes");
+
+    /// Write blob Y into the source slot — it will replace the destination.
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/new.bin", "replacement-bytes");
+
+    /// replaceFile: erases the dst entry (X orphaned), then moves src->dst.
+    {
+        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+        ca_tx.replaceFile("uui/uuid-1/all_1_1_0/new.bin", "uui/uuid-1/all_1_1_0/data.bin");
+    }
+
+    tx->commit(DB::NoCommitOptions{});
+
+    const auto & log = recording->ops;
+
+    /// Exactly ONE blob must have been uploaded (the replacement blob Y).
+    std::vector<std::string> blob_writes;
+    for (const auto & r : log)
+        if (r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos)
+            blob_writes.push_back(r.key);
+
+    EXPECT_EQ(blob_writes.size(), 1u)
+        << "Expected exactly 1 blob upload (the replacement blob); got " << blob_writes.size()
+        << ". If 2, the orphaned original blob was uploaded — B189 regression.";
+
+    /// After commit the destination slot carries the replacement content.
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 17u);   /// "replacement-bytes"
+    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/new.bin"));
+}
