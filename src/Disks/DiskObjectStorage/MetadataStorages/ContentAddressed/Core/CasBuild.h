@@ -68,10 +68,14 @@ public:
     /// the tree root; the closure is covered by the publish gate + fence/recheck handshake.
     void adoptTree(const TreeId & id);
 
-    /// W-TREE-BUILD: every child referenced by `entries` must already be in the dependency set
-    /// (LOGICAL_ERROR otherwise). Encodes canonically, uploads like a blob (natural header length),
-    /// and RETAINS the encoded payload (trees are always re-creatable during the gate's W-REVALIDATE;
-    /// blob payloads are not retained).
+    /// Encode + hash the tree, retain its payload, record a TOKENLESS Tree dep — LOCAL ONLY, no
+    /// upload. precommit needs the dep (it tolerates an absent tree object); uploadStagedTree uploads
+    /// the object post-precommit. W-TREE-BUILD: every child must already be in the dep set.
+    TreeId stageTree(std::vector<TreeEntry> entries);
+    /// Upload a previously-staged tree object (putIfAbsentStream from the retained payload; on
+    /// PreconditionFailed -> observeAndAdmit). Records the TOKENED dep. Runs after precommit.
+    void uploadStagedTree(const TreeId & id);
+    /// Convenience = stageTree + uploadStagedTree (callers/tests that do not precommit-first).
     TreeId putTree(std::vector<TreeEntry> entries);
 
     /// B171 two-phase commit, phase 1: publish the build's manifest tree under the precommit

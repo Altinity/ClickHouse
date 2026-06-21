@@ -899,6 +899,26 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     }
 }
 
+TEST(CasBuild, StageTreeRetainsAndDefersUpload)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    auto build = s->startBuild({});
+    build->putBlob(idOf("x"), BlobSource::fromString("x"));   /// child must be a dep first
+    TreeEntry e;
+    e.name = "f";
+    e.placement = Placement::Blob;
+    e.file_hash = u128Of("x");
+    e.file_size = 1;
+
+    const TreeId t = build->stageTree({e});
+    /// staged: payload retained + dep recorded, but the tree OBJECT is NOT uploaded yet.
+    EXPECT_FALSE(b->head(s->layout().treeKey(t)).exists);
+
+    build->uploadStagedTree(t);
+    EXPECT_TRUE(b->head(s->layout().treeKey(t)).exists);
+}
+
 TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
 {
     /// B167/B171 LIVENESS — the resurrect/condemn livelock, now closed by the build-root precommit edge.

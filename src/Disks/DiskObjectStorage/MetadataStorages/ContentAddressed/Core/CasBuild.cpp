@@ -505,7 +505,7 @@ void Build::adoptTree(const TreeId & id)
     observeAndAdmit(ObjectKind::Tree, hash, keyFor(ObjectKind::Tree, hash));
 }
 
-TreeId Build::putTree(std::vector<TreeEntry> entries)
+TreeId Build::stageTree(std::vector<TreeEntry> entries)
 {
     requireAlive();
 
@@ -540,6 +540,32 @@ TreeId Build::putTree(std::vector<TreeEntry> entries)
     const String encoded = encodeTree(std::move(entries));   /// canonical sort + duplicate-name check
     const TreeId id = treeIdFor(encoded);
     const UInt128 logical_hash = hexToU128(id.string());
+
+    /// RETAIN the encoded payload: trees are always re-creatable during the gate's W-REVALIDATE
+    /// (Task 13), unlike blob payloads which are not retained.
+    retained_trees[logical_hash] = encoded;
+
+    /// Record a TOKENLESS Tree dep — LOCAL ONLY, no upload. precommit tolerates an absent tree
+    /// object (it just needs the dep in the set); uploadStagedTree uploads the object post-precommit.
+    deps[{static_cast<uint8_t>(ObjectKind::Tree), logical_hash}] =
+        DepEntry{ObjectKind::Tree, std::nullopt, store->retireView().round(), encoded.size()};
+
+    return id;
+}
+
+void Build::uploadStagedTree(const TreeId & id)
+{
+    requireAlive();
+
+    const UInt128 logical_hash = hexToU128(id.string());
+
+    /// Recover the retained payload — must have been staged first.
+    auto it = retained_trees.find(logical_hash);
+    if (it == retained_trees.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "uploadStagedTree: tree {} was not staged", id.string());
+    const String & encoded = it->second;
+
     const String key = store->layout().treeKey(id);
     const PoolMeta & meta = store->poolMeta();
     const PoolConfig & cfg = store->poolConfig();
@@ -588,10 +614,12 @@ TreeId Build::putTree(std::vector<TreeEntry> entries)
         /// the cold-reuse rule, which adopts or resurrects and records the Tree dep.
         observeAndAdmit(ObjectKind::Tree, logical_hash, key);
     }
+}
 
-    /// RETAIN the encoded payload: trees are always re-creatable during the gate's W-REVALIDATE
-    /// (Task 13), unlike blob payloads which are not retained.
-    retained_trees[logical_hash] = encoded;
+TreeId Build::putTree(std::vector<TreeEntry> entries)
+{
+    auto id = stageTree(std::move(entries));
+    uploadStagedTree(id);
     return id;
 }
 
