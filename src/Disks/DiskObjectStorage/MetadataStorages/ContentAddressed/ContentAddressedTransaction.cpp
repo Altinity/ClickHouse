@@ -1066,6 +1066,9 @@ void ContentAddressedTransaction::replaceFile(const std::string & path_from, con
     if (auto dst = routeOf(path_to); dst && !dst->file.empty())
     {
         auto & dst_st = stagingFor(*dst);
+        /// B188: a matching pending_blobs record (if any) is left in place — harmless (the unreferenced
+        /// blob becomes GC debris); we do NOT purge it because the same hash may still be referenced by
+        /// another staged entry.
         std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == dst->file; });
         dst_st.mutable_files.erase(dst->file);
         dst_st.mutable_removed.erase(dst->file);
@@ -1105,6 +1108,9 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
         const bool staged_here = st.mutable_files.contains(r->file)
             || std::any_of(st.entries.begin(), st.entries.end(),
                            [&](const Cas::TreeEntry & e) { return e.name == r->file; });
+        /// B188: a matching pending_blobs record (if any) is left in place — harmless (the unreferenced
+        /// blob becomes GC debris); we do NOT purge it because the same hash may still be referenced by
+        /// another staged entry.
         std::erase_if(st.entries, [&](const Cas::TreeEntry & e) { return e.name == r->file; });
         st.mutable_files.erase(r->file);
         if (!staged_here && ContentAddressed::isMutablePerPartFile(r->file))

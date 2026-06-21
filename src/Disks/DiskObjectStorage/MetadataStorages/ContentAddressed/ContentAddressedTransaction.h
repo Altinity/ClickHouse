@@ -103,7 +103,8 @@ private:
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
     PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);
     const Cas::TreeEntry * findStagedEntry(const ContentAddressedMetadataStorage::Route & r) const;
-    /// B188: return the temp_path for a pending blob (hash match), or empty string if already uploaded.
+    /// B188: return a pointer to the pending (staged-but-not-yet-uploaded) blob for `hash`, or nullptr
+    /// if not pending (already uploaded or never staged).
     const PartStaging::PendingBlob * findPendingBlob(const PartStaging & st, const UInt128 & hash) const;
     Cas::Build & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
     std::optional<ContentAddressedMetadataStorage::Route> routeOf(const std::string & path) const;
