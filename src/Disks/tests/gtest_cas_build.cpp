@@ -276,8 +276,12 @@ TEST(CasBuildReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
     EXPECT_FALSE(build->hasDep(u128Of("unknown")));
 }
 
-TEST(CasBuild, ReuseBlobCondemnedResurrects)
+TEST(CasBuild, ReuseBlobCondemnedThrowsAbortedRetryable)
 {
+    /// INV-1 (revival-from-source): reuseBlob has NO source bytes. After the B190 refactor,
+    /// observeAndAdmit throws ABORTED (not resurrect-by-GET) when it sees a condemned token.
+    /// reuseBlob(body_recreatable=true) on a condemned blob must therefore throw ABORTED so the
+    /// outer operation retries and re-uploads from source via putBlob.
     auto b = std::make_shared<InMemoryBackend>();
 
     /// Write X via a throwaway build; capture its token t0.
@@ -298,20 +302,13 @@ TEST(CasBuild, ReuseBlobCondemnedResurrects)
 
     auto s = openStore(b);
     auto build = s->startBuild({});
-    /// The blob exists and is condemned (resurrect path) — body_recreatable is irrelevant here.
-    auto ref = build->reuseBlob(id, /*body_recreatable*/ true);
-    EXPECT_EQ(ref.id, id);
+    /// reuseBlob has no source bytes — condemned → ABORTED (retryable), NOT a silent resurrect-by-GET.
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->reuseBlob(id, /*body_recreatable*/ true); });
 
-    /// The object was rewritten: a NEW token, a NEW incarnation_tag, the SAME payload + header_len.
-    auto raw = b->get(s->layout().blobKey(id));
-    ASSERT_TRUE(raw.has_value());
-    EXPECT_NE(raw->token, t0);
-    auto h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
-    EXPECT_EQ(h.header_len, s->poolMeta().blob_header_len);
-    EXPECT_EQ(raw->bytes.substr(h.header_len), "payload-X");
-
-    /// INV-NO-RETURN: the condemned incarnation is unreachable by its old token.
-    EXPECT_EQ(b->deleteExact(s->layout().blobKey(id), t0).kind, DeleteOutcome::Kind::TokenMismatch);
+    /// The object is still present (reuseBlob did not mutate it — no GET, no putOverwrite).
+    const HeadResult hr = b->head(s->layout().blobKey(id));
+    ASSERT_TRUE(hr.exists);
+    EXPECT_EQ(hr.token, t0) << "reuseBlob must not modify the condemned object";
 }
 
 TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
@@ -344,8 +341,8 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
     /// 4. putBlob with a re-invokable body.
     ///    BEFORE fix: putIfAbsent -> PreconditionFailed -> observeAndAdmit HEAD (present, condemned)
     ///                -> resurrect GET (vanished, deleted in the window) -> throws FILE_DOESNT_EXIST.
-    ///    AFTER fix:  the FILE_DOESNT_EXIST is caught; putBlob re-runs the fresh-upload path with the
-    ///                still-held body; the object is recreated under a FRESH token.
+    ///    AFTER fix:  condemned dedup → uploadFromSource directly from held body; the object is
+    ///                recreated under a FRESH token. NO GET of the condemned object (INV-1).
     auto ref = build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
     EXPECT_EQ(ref.id, id);
 
@@ -362,6 +359,152 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
     EXPECT_EQ(raw->bytes.substr(h.header_len), "payload-X");
 
     EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
+}
+
+/// INV-1 (revival-from-source): a condemned blob is NEVER read via GET to revive it.
+/// putBlob on a condemned-dedup hit must re-upload from its OWN source bytes — never calling
+/// backend().get(blob_key). This test counts backend GETs on the blob key and asserts zero.
+TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
+{
+    /// A delegating backend that counts get() calls on a specific key to assert INV-1.
+    struct GetCountingBackend final : public DB::Cas::Backend
+    {
+        explicit GetCountingBackend(BackendPtr inner_, String watched_key_)
+            : inner(std::move(inner_)), watched_key(std::move(watched_key_)) {}
+        size_t get_count = 0;
+
+        DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
+        std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override
+        {
+            if (k == watched_key)
+                ++get_count;
+            return inner->get(k, r);
+        }
+        DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+        DB::Cas::PutOutcome putIfAbsent(const String & k, const String & bts, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, t, m); }
+        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
+        DB::Cas::PutOutcome putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, t, m); }
+        DB::Cas::CasOutcome casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, bts, e, t, m); }
+        DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & tok) override { return inner->deleteExact(k, tok); }
+    private:
+        BackendPtr inner;
+        String watched_key;
+    };
+
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// 1. Upload blob Y via a throwaway build; capture the token t0.
+    BlobId id;
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        auto build0 = s0->startBuild({});
+        id = build0->putBlob(idOf("payload-Y"), BlobSource::fromString("payload-Y")).id;
+        t0 = b->head(s0->layout().blobKey(id)).token;
+    }
+
+    /// 2. Condemn (Blob, hash(Y), t0) in the retire view, then GC-delete the object so it is absent
+    ///    (simulates GC completing the delete before the writer's dedup hit).
+    DB::Cas::Layout layout("p");
+    const String blob_key = layout.blobKey(id);
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-Y"), .token = t0, .size = 9}});
+    b->deleteExact(blob_key, t0);
+    ASSERT_FALSE(b->head(blob_key).exists);
+
+    /// 3. Open a fresh Store over a GET-counting wrapper; the retire view sees the condemnation at open.
+    auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
+    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p"});
+    auto build = s->startBuild({});
+
+    /// 4. putBlob Y — the object is absent (was deleted). The dedup-hit (PreconditionFailed) path
+    ///    won't fire (object is gone, so putIfAbsentStream → Done on the first attempt).
+    ///    However, even if a racing re-creation happens between the check and the upload, the
+    ///    condemned branch must NEVER call backend().get(blob_key).
+    ///
+    ///    Second scenario tested below: object still PRESENT and condemned (GC hasn't deleted it yet).
+    auto ref = build->putBlob(idOf("payload-Y"), BlobSource::fromString("payload-Y"));
+    EXPECT_EQ(ref.id, id);
+    EXPECT_EQ(counting->get_count, 0u) << "INV-1: putBlob must not GET the dying object to revive it";
+
+    const HeadResult hr = b->head(blob_key);
+    ASSERT_TRUE(hr.exists);
+    EXPECT_NE(hr.token, t0) << "a fresh incarnation must have a new token";
+    const auto raw = b->get(blob_key);
+    ASSERT_TRUE(raw.has_value());
+    const auto hdr = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
+    EXPECT_EQ(raw->bytes.substr(hdr.header_len), "payload-Y");
+}
+
+/// INV-1 variant: blob is PRESENT and condemned (GC hasn't fired the delete yet). putBlob dedup-hits
+/// it via PreconditionFailed, sees condemned token, and must re-upload from source — NEVER GET.
+TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
+{
+    struct GetCountingBackend final : public DB::Cas::Backend
+    {
+        explicit GetCountingBackend(BackendPtr inner_, String watched_key_)
+            : inner(std::move(inner_)), watched_key(std::move(watched_key_)) {}
+        size_t get_count = 0;
+
+        DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
+        std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override
+        {
+            if (k == watched_key)
+                ++get_count;
+            return inner->get(k, r);
+        }
+        DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+        DB::Cas::PutOutcome putIfAbsent(const String & k, const String & bts, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, t, m); }
+        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
+        DB::Cas::PutOutcome putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, t, m); }
+        DB::Cas::CasOutcome casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, bts, e, t, m); }
+        DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & tok) override { return inner->deleteExact(k, tok); }
+    private:
+        BackendPtr inner;
+        String watched_key;
+    };
+
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// 1. Upload blob Z via a throwaway build; capture the token t0.
+    BlobId id;
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        auto build0 = s0->startBuild({});
+        id = build0->putBlob(idOf("payload-Z"), BlobSource::fromString("payload-Z")).id;
+        t0 = b->head(s0->layout().blobKey(id)).token;
+    }
+
+    /// 2. Condemn (Blob, hash(Z), t0) — object still PRESENT (GC condemned but not yet deleted).
+    DB::Cas::Layout layout("p");
+    const String blob_key = layout.blobKey(id);
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-Z"), .token = t0, .size = 9}});
+    ASSERT_TRUE(b->head(blob_key).exists) << "blob must be PRESENT for the condemned-present path";
+
+    /// 3. Open a fresh Store over a GET-counting wrapper.
+    auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
+    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p"});
+    auto build = s->startBuild({});
+
+    /// 4. putBlob Z: putIfAbsentStream → PreconditionFailed (object present) → observeAndAdmit →
+    ///    sees condemned token → must call uploadFromSource (NOT resurrect/GET).
+    ///    The re-upload overwrites the condemned incarnation with a fresh one via putIfAbsentStream
+    ///    (which 412s because the object is still present) → uploadFromSource calls observeAndAdmit
+    ///    again (adopt the now-present fresh or still-condemned-but-displaced result). The critical
+    ///    invariant: backend().get(blob_key) is NEVER called at any point.
+    auto ref = build->putBlob(idOf("payload-Z"), BlobSource::fromString("payload-Z"));
+    EXPECT_EQ(ref.id, id);
+    EXPECT_EQ(counting->get_count, 0u) << "INV-1: putBlob must not GET the condemned object";
+
+    const HeadResult hr = b->head(blob_key);
+    ASSERT_TRUE(hr.exists);
+    EXPECT_NE(hr.token, t0) << "condemned incarnation must be displaced by a fresh token";
+    const auto raw = b->get(blob_key);
+    ASSERT_TRUE(raw.has_value());
+    const auto hdr = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
+    EXPECT_EQ(raw->bytes.substr(hdr.header_len), "payload-Z");
 }
 
 TEST(CasBuild, PublishResurrectVanishedThrowsAbortedRetryable)
@@ -971,28 +1114,31 @@ TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
         s0->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
     }
 
-    /// 2. Condemn (Blob, H, h_token0) in the retire view (mirrors ReuseBlobCondemnedResurrects). A fresh
-    ///    Store::open below refreshes its retire view at open and sees the condemnation, so the dedup-hit
-    ///    on H takes the resurrect (re-stream-a-fresh-incarnation) path rather than free adoption.
+    /// 2. Condemn (Blob, H, h_token0) in the retire view. A fresh Store::open below refreshes its
+    ///    retire view at open and sees the condemnation, so the dedup-hit on H takes the
+    ///    uploadFromSource (re-stream-a-fresh-incarnation-from-source) path rather than free adoption.
+    ///    INV-1 (B190): no resurrect-by-GET; putBlob re-uploads from its OWN source bytes.
     DB::Cas::Layout layout("p");
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of(content), .token = h_token0,
                       .size = content.size()}});
 
-    /// 3. Open the live Store and start build B. B dedup-hits the condemned H and RESURRECTS it: a fresh
-    ///    incarnation, a NEW token. B stays ACTIVE for the whole adversarial loop — its build_seq is never
-    ///    retired below.
+    /// 3. Open the live Store and start build B. B dedup-hits the condemned H and re-uploads from
+    ///    source (uploadFromSource via putBlob): a fresh incarnation, a NEW token. B stays ACTIVE for
+    ///    the whole adversarial loop — its build_seq is never retired below.
     auto s = Store::open(b, cfg);
     const String blob_key = s->layout().blobKey(h);
     auto build_b = s->startBuild({});
 
-    const auto ref_b = build_b->reuseBlob(h, /*body_recreatable*/ true);
+    /// B190: use putBlob (holds source bytes) instead of reuseBlob (has no source bytes).
+    /// putBlob detects the condemned dedup hit and calls uploadFromSource — no GET of dying object.
+    const auto ref_b = build_b->putBlob(h, BlobSource::fromString(content));
     ASSERT_EQ(ref_b.id, h);
 
     const HeadResult after_resurrect = b->head(blob_key);
     ASSERT_TRUE(after_resurrect.exists);
     EXPECT_NE(after_resurrect.token, h_token0);   /// a genuinely fresh incarnation
-    /// B171: the resurrected incarnation no longer carries a `cas_owner` triple (stamping was deleted).
+    /// B171: the re-uploaded incarnation no longer carries a `cas_owner` triple (stamping was deleted).
     /// Protection is now the build-root PRECOMMIT EDGE: B assembles its manifest tree naming H and
     /// precommits it BEFORE the adversarial GC loop, so H has in-degree ≥ 1 from the build-root fold and
     /// is never a zero-in-degree candidate — the reachability replacement for the old watermark hint.

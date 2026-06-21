@@ -116,15 +116,19 @@ private:
     using DepKey = std::pair<uint8_t, UInt128>;           /// (kind, hash)
 
     /// The §5 step-2 cold-reuse rule, shared by putBlob's PreconditionFailed branch and reuseBlob:
-    /// HEAD the key; absent ⇒ FILE_DOESNT_EXIST; condemned-at-current-token ⇒ resurrect; else record
-    /// the current token as the dep. Returns the admitted size.
+    /// HEAD the key; absent ⇒ FILE_DOESNT_EXIST; condemned-at-current-token ⇒ throw ABORTED
+    /// (caller must re-upload from its own source bytes); else record the current token as the dep.
+    /// Returns the admitted size.
     uint64_t observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key);
     /// Overload for callers that already hold a fresh, present HeadResult for `key` (the putBlob
     /// HEAD-before-PUT path), avoiding a redundant second HEAD. `hr.exists` MUST be true. (B168 P1/P2)
     uint64_t observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key, const HeadResult & hr);
-    /// Resurrect: GET whole object, rebuild header with a FRESH incarnation_tag preserving header_len
-    /// and all other TLVs, putOverwrite(If-Match observed token). Records the new token as the dep.
-    void resurrect(ObjectKind kind, const UInt128 & hash, const String & key);
+    /// INV-1 (revival-from-source): revive a condemned or absent object by re-uploading from source_bytes
+    /// without reading the dying object (no backend().get). Builds a FRESH envelope header (new
+    /// incarnation_tag, this build's build_id), streams header + source_bytes via putIfAbsentStream.
+    /// On Done: records the tokened dep. On PreconditionFailed (live incarnation): calls observeAndAdmit
+    /// (adopt the live token, or throw ABORTED if still condemned — caller retries with source bytes).
+    void uploadFromSource(ObjectKind kind, const UInt128 & hash, const String & key, std::string_view source_bytes);
 
     /// The publish gate's W-EVIDENCE + condemned-token scan (spec §5). For each dependency: a
     /// token-bearing dep condemned at its token ⇒ resurrect; a tokenless (W-EVIDENCE) dep whose

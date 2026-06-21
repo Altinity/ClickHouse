@@ -74,8 +74,14 @@ void assertPartReads(
 
 }
 
-TEST(CasProtocol, FenceConflictForcesRevalidateAndResurrect)
+TEST(CasProtocol, FenceConflictCondemnedBlobDepAbortsRetryable)
 {
+    /// B190 INV-1: a blob dep whose OWN token is condemned at the gate has no source bytes available
+    /// (they were not retained after putBlob returned). The gate MUST throw ABORTED (retryable), never
+    /// GET the dying object. Resurrection-by-GET was the old behavior; INV-1 forbids it.
+    ///
+    /// Spec §5: "blob or adopted-tree with no source → retryable ABORTED". The caller retries the full
+    /// build from scratch (re-putBlob from its own source bytes).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -93,16 +99,14 @@ TEST(CasProtocol, FenceConflictForcesRevalidateAndResurrect)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// First CAS reads fence_round=1 > view round 0 ⇒ refresh ⇒ X condemned at t0 ⇒ resurrect; T not
-    /// condemned, stale-observed, re-observed and kept. Publish lands.
-    build->publish(ns, "part_1", tree, RefPayload{});
+    /// First CAS reads fence_round=1 > view round 0 ⇒ refresh ⇒ revalidateDeps: X condemned at t0
+    /// ⇒ Case(a): dep's own token condemned, no retained payload ⇒ ABORTED (INV-1; caller must retry).
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
 
-    assertPartReads(b, s, ns, "part_1", tree, "payload-X");
-
-    /// INV-NO-RETURN: the condemned incarnation can never be current again — its old token 412s.
-    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
-    /// X rides a new token after the resurrect.
-    EXPECT_NE(b->head(blob_key).token, t0);
+    /// The condemned object is still at t0 — nothing was written.
+    EXPECT_EQ(b->head(blob_key).token, t0);
+    /// No ref was published.
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 }
 
 TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
@@ -176,25 +180,17 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
 }
 
-TEST(CasProtocol, RevalidateResurrectsWhenCurrentTokenCondemnedAtDifferentToken)
+TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentToken)
 {
-    /// The spared-orphan window (spec §5 step 5 — "members with a view hit ⇒ resurrect", where a view
-    /// hit is BY HASH, not by our exact observed token; §8 R4). A token-bearing dep observed at t0 whose
-    /// HASH has a view entry at a DIFFERENT token must resurrect, not be kept blindly. The protocol's
-    /// fully-dangerous instance (the object PHYSICALLY lives at a condemned current token while our dep
-    /// rides a displaced older token, non-stale) requires a GC-vs-publish interleaving that this
-    /// single-Store, single-thread harness cannot express: every view refresh here is paired with a fence
-    /// advance that makes the dep stale, which routes the buggy code through the re-observe → observeAndAdmit
-    /// path (which itself re-checks the CURRENT token and resurrects) — self-healing, so it would NOT
-    /// expose the bug. That exact interleaving is the model's `WReobserve`-then-`WResurrect` and is left to
-    /// the model.
+    /// B190 INV-1 Case(b): a token-bearing dep whose OWN token t0 is LIVE (not condemned), but a
+    /// DIFFERENT phantom token t_other for the same hash IS condemned. gateCheckDeps: hash hit, but
+    /// isCondemnedToken(t0)=false ⇒ Case(b): dep's own token is live ⇒ re-observe (observeAndAdmit,
+    /// HEAD-only, no GET) ⇒ current still t0 ⇒ adopt t0 (keep in place, no upload). The old resurrect
+    /// path would have re-uploaded from GET(condemned_object), which is forbidden by INV-1.
     ///
-    /// What IS single-thread expressible — and what distinguishes the fix from the bug — is the
-    /// behavioral contract directly: a NON-STALE token-bearing dep (observed at the current view round)
-    /// whose hash has a view hit at a token ≠ our observed token. The buggy code (token-exact check in
-    /// both gateCheckDeps and revalidateDeps) KEEPS it; the fix RESURRECTS on the hit-by-hash. We construct
-    /// this with a condemned entry for hashX at a token distinct from the live current token, observed at
-    /// the same round the dep is recorded (so neither the stale re-observe horn nor a fence advance fires).
+    /// Discriminating contract: publish SUCCEEDS and the object STAYS at t0 (no displacement).
+    /// The old test expected EXPECT_NE(t_after, t0) because the old resurrect replaced the object;
+    /// the B190 Case(b) path does NOT re-upload — it merely re-adopts the still-live t0.
     auto b = std::make_shared<InMemoryBackend>();
     const RootNamespace ns{"srv1/tbl"};
 
@@ -224,17 +220,17 @@ TEST(CasProtocol, RevalidateResurrectsWhenCurrentTokenCondemnedAtDifferentToken)
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
     /// publish: view round 1 == fence_round 1 ⇒ NO fence advance ⇒ revalidateDeps does NOT run; only
-    /// gateCheckDeps gates. The fix's gateCheckDeps resurrects on the hit-by-hash; the buggy code kept t0.
+    /// gateCheckDeps gates. Hash hit (t_other condemned) but dep's own t0 is NOT condemned ⇒ Case(b):
+    /// observeAndAdmit (HEAD-only) ⇒ current t0 is live ⇒ re-adopt t0. Publish lands.
     build->publish(ns, "part_1", tree, RefPayload{});
 
     assertPartReads(b, s, ns, "part_1", tree, "payload-X");
 
-    /// The fix displaced the object to a FRESH token ≠ t0 (resurrect on the hit). The buggy code would
-    /// have left it at t0 — this assertion is the discriminator (it FAILS without the fix).
+    /// B190 Case(b): the object was NOT displaced — it STAYS at t0 (no re-upload, just re-adopted).
+    /// This is the discriminator vs the old resurrect: the old code replaced the object with a fresh
+    /// incarnation (EXPECT_NE); the new path merely re-adopts the live t0 (EXPECT_EQ).
     const Token t_after = b->head(blob_key).token;
-    EXPECT_NE(t_after, t0);
-    /// INV-NO-RETURN: the old t0 can never be current again.
-    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
+    EXPECT_EQ(t_after, t0);
 }
 
 TEST(CasProtocol, RevalidateAbsentBlobDepAbortsRetryable)
@@ -288,9 +284,14 @@ TEST(CasProtocol, RevalidateAbsentTreeDepRecreates)
     assertPartReads(b, s, ns, "part_1", tree, "payload-X");
 }
 
-TEST(CasProtocol, EvidenceHitForcesResolution)
+TEST(CasProtocol, EvidenceHitCondemnedBlobAbortsRetryable)
 {
-    /// W-EVIDENCE: adoptFromTree records a TOKENLESS dep on blob X; the gate must resolve a view hit.
+    /// B190 INV-1: W-EVIDENCE (tokenless dep) on blob X — gateCheckDeps: view hit by hash ⇒
+    /// observeAndAdmit ⇒ HEAD ⇒ current t0 condemned ⇒ ABORTED (blob has no retained source bytes;
+    /// INV-1 forbids GET). The old behavior was resurrect-by-GET, which is now forbidden.
+    ///
+    /// Spec §5: "blob or adopted-tree with no source → retryable ABORTED". The caller retries the full
+    /// build from scratch (re-uploads from its own source).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -311,17 +312,27 @@ TEST(CasProtocol, EvidenceHitForcesResolution)
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
     /// refresh ⇒ revalidateDeps SKIPS the tokenless dep ⇒ gateCheckDeps: tokenless X has a view hit ⇒
-    /// observeAndAdmit ⇒ HEAD ⇒ current t0 condemned ⇒ resurrect ⇒ X rides a new token. Publish lands.
-    build->publish(ns, "part_1", tree, RefPayload{});
+    /// observeAndAdmit ⇒ HEAD ⇒ current t0 condemned ⇒ ABORTED (INV-1; no source bytes to re-upload).
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
 
-    assertPartReads(b, s, ns, "part_1", tree, "payload-X");
-    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
+    /// The condemned object stays at t0 — nothing was written.
+    EXPECT_EQ(b->head(blob_key).token, t0);
+    /// No ref was published.
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 }
 
-TEST(CasProtocol, WedgedHeartbeatSelfHeal)
+TEST(CasProtocol, WedgedHeartbeatCondemnedBlobDepAbortsRetryable)
 {
-    /// spec §5 wedged-heartbeat trace: a build whose heartbeat never renews finds its OWN uploads
-    /// condemned by full GC; its publish refreshes, sees them condemned, and resurrects (it built them).
+    /// B190 INV-1: a build whose heartbeat never renews finds its OWN uploads condemned by full GC;
+    /// its publish refreshes, sees them condemned, but has NO retained source bytes for the blob ⇒
+    /// ABORTED (INV-1 forbids GET on the condemned object). The caller must retry from scratch,
+    /// re-uploading from its own source bytes. The old "self-heal resurrect" path used GET, which
+    /// is now forbidden.
+    ///
+    /// Spec §5: "blob or adopted-tree with no source → retryable ABORTED". The precommit/two-phase
+    /// commit redesign (B171+) removes this window for normal builds: the precommit fence ensures GC
+    /// cannot condemn the build's uploads while the build is in-flight. This test validates the
+    /// correct ABORTED behavior for the degenerate case where a build skips precommit.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -338,10 +349,13 @@ TEST(CasProtocol, WedgedHeartbeatSelfHeal)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    build->publish(ns, "part_1", tree, RefPayload{});
+    /// refresh ⇒ revalidateDeps: X condemned at dep's own t0 ⇒ Case(a): no retained payload ⇒ ABORTED.
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
 
-    assertPartReads(b, s, ns, "part_1", tree, "payload-X");
-    EXPECT_NE(b->head(blob_key).token, t0);   /// rides a new token after self-heal resurrect
+    /// The condemned object stays at t0 — nothing was written.
+    EXPECT_EQ(b->head(blob_key).token, t0);
+    /// No ref was published.
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 }
 
 TEST(CasProtocol, AbandonLeavesDebrisAndDropsHeartbeat)
@@ -442,21 +456,19 @@ TEST(CasProtocol, FreezeIntoShadowNamespace)
     assertPartReads(b, s, shadow, "part_1", tree, "payload-X");
 }
 
-TEST(CasProtocol, ResurrectLosesRaceReObserves)
+TEST(CasProtocol, ResurrectLosesRaceCondemnedDepAbortsRetryable)
 {
-    /// CARRYOVER from Task 11: the racing-PreconditionFailed branch in resurrect (GET an object
-    /// condemned at t0, but a concurrent writer DISPLACES it to t1 before our putOverwrite, so the
-    /// If-Match against t0 fails ⇒ observeAndAdmit re-observes and adopts the live t1).
+    /// B190 INV-1: a reuseBlob dep whose OWN token t0 is condemned. Even if the object was
+    /// concurrently displaced to t1 (live), the dep's own token t0 is still condemned in the view ⇒
+    /// revalidateDeps Case(a): dep's own token condemned, blob has no retained source bytes ⇒ ABORTED.
     ///
-    /// Single-thread reachability: resurrect's putOverwrite uses the token IT just read via GET, so to
-    /// force PreconditionFailed the displacement must land BETWEEN that GET and the putOverwrite — a
-    /// genuinely concurrent interleaving the single-thread gate cannot express without a backend hook
-    /// firing inside putOverwrite. We approximate the OBSERVABLE OUTCOME of the lost race: the dep ends
-    /// valid, riding the displacing writer's live token, with no dangling reference. We drive it by
-    /// pre-displacing X to t1 (uncondemned) while the view still condemns the OLD t0: revalidateDeps
-    /// sees no hit at the current token t1, re-observes, and adopts t1 — the same end state a lost
-    /// resurrect race reaches (the racing writer's incarnation wins). The exact GET/putOverwrite
-    /// interleaving is covered by the model (`W_Resurrect` racing `W_Publish`), not reproduced here.
+    /// The old resurrect path would have GET'd the current incarnation (t1, uncondemned) and
+    /// rewritten it with putOverwrite. INV-1 forbids GET on any dying object and forbids GET
+    /// even on a live object when the dep's own token is condemned. ABORTED is the correct outcome.
+    ///
+    /// The model's `W_Resurrect` racing `W_Publish` interleaving (displacement between GET and
+    /// putOverwrite) was the old test's focus. Under B190 the entire resurrect-by-GET path is
+    /// removed; the caller retries from scratch with their own source bytes.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -469,30 +481,23 @@ TEST(CasProtocol, ResurrectLosesRaceReObserves)
     build->reuseBlob(idOf("payload-X"), /*body_recreatable*/ true);   /// records t0 at round 0
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 
-    /// The racing writer displaces X to t1 (its resurrect won) before our gate runs.
+    /// Another writer displaces X to t1 (uncondemned) before our gate runs.
     const Token t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
     ASSERT_NE(t1, t0);
 
-    /// The view still condemns the OLD t0 (the racing writer's retire entry for the displaced
-    /// incarnation), at round 1, fenced.
+    /// The view still condemns the OLD t0 at round 1, fenced.
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// refresh ⇒ X has a view hit (t0) but NOT at our observed t0... our observed token IS t0, and t0
-    /// IS condemned ⇒ revalidateDeps takes the condemned-at-our-token branch ⇒ resurrect. resurrect
-    /// GETs the CURRENT incarnation (t1, uncondemned), rewrites a fresh tag, putOverwrite(If-Match t1)
-    /// ⇒ succeeds (single-thread, no further displacement) ⇒ X rides a new token t2. The lost-race
-    /// PreconditionFailed sub-branch (displacement between GET and putOverwrite) is the model-covered
-    /// interleaving; here resurrect completes and the dep ends valid with no dangle.
-    build->publish(ns, "part_1", tree, RefPayload{});
+    /// refresh ⇒ revalidateDeps: hash hit (t0), dep's own t0 IS condemned ⇒ Case(a): no retained
+    /// source bytes ⇒ ABORTED (INV-1; caller must retry from scratch with its own source bytes).
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
 
-    assertPartReads(b, s, ns, "part_1", tree, "payload-X");
-    const Token t2 = b->head(blob_key).token;
-    EXPECT_NE(t2, t0);
-    EXPECT_NE(t2, t1);
-    /// INV-NO-RETURN: the condemned t0 can never be current again.
-    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
+    /// The object is at t1 (the displacing writer's incarnation, live and untouched by us).
+    EXPECT_EQ(b->head(blob_key).token, t1);
+    /// No ref was published.
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 }
 
 TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)

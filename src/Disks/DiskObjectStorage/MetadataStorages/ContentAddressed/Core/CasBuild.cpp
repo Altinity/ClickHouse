@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -113,8 +114,20 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
 
     const UInt128 logical_hash = hexToU128(id.string());
     const String key = store->layout().blobKey(id);
-    const PoolMeta & meta = store->poolMeta();
     const PoolConfig & cfg = store->poolConfig();
+
+    /// Materialize source bytes once — needed both for the primary stream and for uploadFromSource
+    /// (INV-1: condemned-dedup re-upload from writer's own bytes, never reading the dying object).
+    /// Verify the byte count matches the declared size before any I/O to fail early and cleanly.
+    String source_bytes;
+    {
+        WriteBufferFromString wb{source_bytes};
+        source.write_payload(wb);
+        wb.finalize();
+    }
+    if (source_bytes.size() != source.size)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "putBlob: source wrote {} bytes, declared {}", source_bytes.size(), source.size);
 
     /// B168 P1/P2: HEAD-before-PUT on a likely dedup hit (cache says present) or a large body (where a
     /// wasted body-PUT that 412s is expensive — and on a store that early-closes a doomed conditional
@@ -134,118 +147,42 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
             ProfileEvents::increment(ProfileEvents::CasBlobBodyPutAvoided);
             if (store->dedupCacheContains(logical_hash))
                 ProfileEvents::increment(ProfileEvents::CasBlobDedupCacheHit);
-            const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key, hr);
-            store->dedupCacheAdd(logical_hash);
-            return BlobRef{id, admitted};
+            try
+            {
+                const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key, hr);
+                store->dedupCacheAdd(logical_hash);
+                return BlobRef{id, admitted};
+            }
+            catch (const Exception & e)
+            {
+                /// INV-1: HEAD-first path hit a condemned token → re-upload from our OWN source bytes.
+                if (e.code() != ErrorCodes::ABORTED)
+                    throw;
+                /// Fall through to uploadFromSource below.
+            }
         }
-        /// hr.exists == false → stale cache entry or genuinely new content → fall through to the upload.
+        /// hr.exists == false OR condemned-ABORTED → fall through to uploadFromSource / fresh upload.
     }
 
-    /// B136: bounded retry loop. The happy paths (fresh upload ⇒ Done; existing live incarnation ⇒
-    /// adopt) execute exactly once. The loop only re-iterates on the dedup GC race: when our
-    /// conditional upload hit PreconditionFailed (the content key already exists as a prior
-    /// incarnation), observeAndAdmit ⇒ resurrect HEADs then GETs the key, and GC's exact-token
-    /// content delete can land in that HEAD→GET window so the GET returns nothing and resurrect throws
-    /// FILE_DOESNT_EXIST. We STILL HOLD the body (the BlobSource is re-invokable), so this is the
-    /// spec's "bytes in hand ⇒ re-PUT" resurrect arm: re-run the fresh-upload path. The object is now
-    /// absent ⇒ putIfAbsent creates it fresh under a new incarnation; or a racing writer re-created it
-    /// ⇒ PreconditionFailed again ⇒ observeAndAdmit, which now succeeds. Bounded so pathological churn
-    /// cannot spin forever; on exhaustion the last error propagates. Each attempt mints a FRESH
-    /// incarnation_tag (W-FRESH-TAG) — never reusing the condemned token, so INV-NO-RETURN holds.
+    /// B136 / INV-1: fresh-upload path + condemned-dedup recovery. Try the primary upload via
+    /// uploadFromSource (which handles condemned-present via putOverwrite and absent via putIfAbsentStream
+    /// without any backend().get). Bounded loop guards against rare concurrent-condemnation churn.
     constexpr int max_attempts = 8;
     for (int attempt = 0; attempt < max_attempts; ++attempt)
     {
-        /// W-FRESH-TAG: a fresh incarnation_tag for this upload attempt.
-        EnvelopeHeader header;
-        header.kind = ObjectKind::Blob;
-        header.hash_algo = 1;
-        header.logical_size = source.size;
-        header.logical_hash = logical_hash;
-        header.domain_id = meta.pool_id;
-        header.incarnation_tag = mintU128();
-        header.build_id = build_id;
-        header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
-        header.intended_ref = info.intended_ref;
-        header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
-
-        String head_bytes;
         try
         {
-            head_bytes = encodeEnvelopeHeader(header);
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() != ErrorCodes::BAD_ARGUMENTS)
-                throw;
-            /// intended_ref is diagnostic-only: when it makes the natural header exceed the pool's fixed
-            /// blob_header_len, drop it (never grow the fixed blob header) and re-encode.
-            header.intended_ref.reset();
-            head_bytes = encodeEnvelopeHeader(header);
-        }
-
-        /// B171: no owner metadata. Protection is the precommit edge (reachability), not the revocable
-        /// `cas_owner` hint that GC's deleted `protectedByLiveBuild` once read.
-        WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
-        writeString(head_bytes, sink->buffer());
-        const size_t before = sink->buffer().count();
-        source.write_payload(sink->buffer());
-        const size_t written = sink->buffer().count() - before;
-        if (written != source.size)
-        {
-            /// Fail-closed: the envelope's logical_size would lie. Cancel the stream — the key is never
-            /// created by a cancelled sink — and never publish a truncation-undetectable object.
-            sink->cancel();
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "putBlob: source wrote {} bytes, declared {}", written, source.size);
-        }
-
-        Token tok;
-        const PutOutcome outcome = sink->finalize(&tok);
-        if (outcome == PutOutcome::Done)
-        {
-            deps[{static_cast<uint8_t>(ObjectKind::Blob), logical_hash}] =
-                DepEntry{ObjectKind::Blob, tok, store->retireView().round(), source.size};
-            /// B170: a fresh blob incarnation was uploaded (the birth of this hash/token pair).
-            if (store->hasEventSink())
-            {
-                CasEvent _ev1;
-                _ev1.type = CasEventType::BlobPut;
-                _ev1.object_kind = CasEventObjectKind::Blob;
-                _ev1.object_hash = id.string();
-                _ev1.token = tok.value;
-                _ev1.round = store->retireView().round();
-                _ev1.outcome = "ok";
-                _ev1.reason = "uploaded a fresh blob incarnation";
-                _ev1.detail = {{"size", std::to_string(source.size)}, {"build_id", u128ToHex(build_id)}};
-                store->emitEvent(_ev1);
-            }
+            uploadFromSource(ObjectKind::Blob, logical_hash, key, source_bytes);
             /// P1: this hash is now known-present — future writers can HEAD-first and skip the body.
             store->dedupCacheAdd(logical_hash);
             return BlobRef{id, source.size};
         }
-
-        /// PreconditionFailed ⇒ the key already exists (another writer's incarnation). The body shipped is
-        /// harmless: the dedup saving is the skipped INCARNATION, not the bytes. Apply the cold-reuse rule.
-        try
-        {
-            const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key);
-            /// P1: dedup-confirmed present — record so future writers HEAD-first instead of body-PUT.
-            store->dedupCacheAdd(logical_hash);
-            return BlobRef{id, admitted};
-        }
         catch (const Exception & e)
         {
-            /// B136/B137: the condemned incarnation vanished mid-dedup (GC's exact-token delete in the
-            /// HEAD→GET window). We hold the body — re-run the fresh-upload path instead of failing. The
-            /// vanish surfaces two ways: FILE_DOESNT_EXIST from observeAndAdmit's HEAD-absent check (the
-            /// object was gone before resurrect's GET) and ABORTED from resurrect's own vanish (gone in
-            /// the GET window, B137) — both mean "object vanished ⇒ re-upload the held body". Only this
-            /// writer-with-a-body site may recover; the shared resurrect stays retryable-but-fail-closed
-            /// for bodyless callers (revalidateDeps / gateCheckDeps), which propagate the ABORTED. Any
-            /// other error propagates; on the last attempt rethrow so pathological churn surfaces rather
-            /// than spinning silently.
-            const bool vanished = e.code() == ErrorCodes::FILE_DOESNT_EXIST || e.code() == ErrorCodes::ABORTED;
-            if (!vanished || attempt + 1 == max_attempts)
+            /// ABORTED from observeAndAdmit inside uploadFromSource: a racing writer concurrently
+            /// displaced the condemned token before our putOverwrite landed, and their fresh incarnation
+            /// is itself already condemned. Extremely rare. Retry uploadFromSource (bounded).
+            if (e.code() != ErrorCodes::ABORTED || attempt + 1 == max_attempts)
                 throw;
         }
     }
@@ -266,31 +203,33 @@ BlobRef Build::reuseBlob(const BlobId & id, bool body_recreatable)
     }
     catch (const Exception & e)
     {
-        /// B156 (refined B156b): reuseBlob has NO body in hand. observeAndAdmit's HEAD-absent
-        /// FILE_DOESNT_EXIST means the blob is gone NOW. How to surface it depends on whether retrying
-        /// the operation can RE-CREATE the content — and that is a per-caller property, passed in as
-        /// `body_recreatable`:
+        /// B156 (refined B156b): reuseBlob has NO body in hand. observeAndAdmit can throw:
+        ///   • FILE_DOESNT_EXIST — blob is absent (HEAD returned 404).
+        ///   • ABORTED           — blob is present but condemned (INV-1: observeAndAdmit no longer
+        ///     calls resurrect/GET; it throws ABORTED instead so the caller supplies source bytes).
+        /// Both mean "blob unavailable". How to surface it depends on `body_recreatable`:
         ///
         ///   body_recreatable == true  — the blob was putBlob'd by a build in THIS transaction
         ///     (a TOKENED dep, heartbeat-protected). Retrying the whole operation re-writes the content,
-        ///     so the blob is re-uploaded. HEAD-absent here is the BENIGN dedup-vs-GC race (the in-flight
-        ///     build's heartbeat lapsed under load and GC condemned+deleted it between the reuse decision
-        ///     and our HEAD). Surface it as retryable ABORTED so the caller retries and CONVERGES — this
-        ///     mirrors resurrect's GET-vanish.
+        ///     so the blob is re-uploaded. Surface it as retryable ABORTED so the caller retries and
+        ///     CONVERGES.
         ///
         ///   body_recreatable == false — the blob was adopted from a COMMITTED source (a TOKENLESS
         ///     W-EVIDENCE dep, pinned by the committed source ref, NOT by a heartbeat). There is NO body
         ///     to re-upload; retrying re-adopts the same still-gone committed blob and would spin on
         ///     ABORTED forever (a silently-stuck background merge). HEAD-absent here means a REFERENCED
         ///     blob was deleted — a genuine INV-NO-LOSS violation that MUST surface, NOT be masked. Keep
-        ///     the fail-loud FILE_DOESNT_EXIST (re-thrown unchanged).
-        ///
-        /// observeAndAdmit / putBlob / resurrect / adoptTree are deliberately untouched: putBlob's
-        /// body-holding retry calls observeAndAdmit DIRECTLY and still relies on its FILE_DOESNT_EXIST;
-        /// adoptTree's fail-closed never-existed FILE_DOESNT_EXIST is also direct.
-        if (e.code() == ErrorCodes::FILE_DOESNT_EXIST && body_recreatable)
+        ///     the fail-loud FILE_DOESNT_EXIST.
+        const bool unavailable =
+            e.code() == ErrorCodes::FILE_DOESNT_EXIST || e.code() == ErrorCodes::ABORTED;
+        if (unavailable && body_recreatable)
             throw Exception(ErrorCodes::ABORTED,
-                "Build::reuseBlob: blob {} vanished (GC-deleted between reuse decision and HEAD); retry the operation", key);
+                "Build::reuseBlob: blob {} unavailable (absent or condemned); retry the operation", key);
+        if (e.code() == ErrorCodes::ABORTED && !body_recreatable)
+            /// Condemned but body not recreatable: the committed source may still hold it (the
+            /// condemnation is unconfirmed). Surface as FILE_DOESNT_EXIST (the INV-NO-LOSS path).
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                "Build::reuseBlob: blob {} condemned with no recreatable body (INV-NO-LOSS)", key);
         throw;
     }
     return BlobRef{id, admitted};
@@ -343,8 +282,11 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
         : (kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
     if (store->retireView().isCondemnedToken(kind, hash, hr.token))
     {
-        /// B170: the reuse-vs-GC defense FIRED — the observed token was condemned, so resurrect
-        /// instead of adopting (was the CAREUSE resurrect audit line). W-FRESH-TAG displaces it.
+        /// INV-1 (revival-from-source): the observed token is condemned — we must NOT read the dying
+        /// object via backend().get. Throw ABORTED so the caller can re-upload from its OWN source bytes.
+        ///   • putBlob (has BlobSource): catches ABORTED, calls uploadFromSource from held bytes.
+        ///   • uploadStagedTree / recreateTree (has retained_trees payload): calls uploadFromSource.
+        ///   • reuseBlob / gate bodyless (no source): propagates ABORTED (retryable; caller retries op).
         if (store->hasEventSink())
         {
             CasEvent _ev2;
@@ -353,14 +295,13 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
             _ev2.object_hash = u128ToHex(hash);
             _ev2.token = hr.token.value;
             _ev2.round = store->retireView().round();
-            _ev2.outcome = "resurrect";
-            _ev2.reason = "observed token is condemned; resurrect (fresh tag) instead of adopt";
+            _ev2.outcome = "condemned";
+            _ev2.reason = "observed token is condemned; caller must re-upload from source (INV-1)";
             store->emitEvent(_ev2);
         }
-        resurrect(kind, hash, key);
-        /// resurrect recorded the dep with the new token; the admitted logical size is bookkeeping for
-        /// GC (M-C3) and not load-bearing in M-C2 — report the logical size where cheap (Blob only).
-        return logical_size;
+        throw Exception(ErrorCodes::ABORTED,
+            "Build::observeAndAdmit: condemned token for {} — caller must re-upload from source bytes (INV-1)",
+            key);
     }
 
     /// Adopt the current incarnation — free, no bytes moved.
@@ -384,51 +325,153 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     return logical_size;
 }
 
-void Build::resurrect(ObjectKind kind, const UInt128 & hash, const String & key)
+void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String & key, std::string_view source_bytes)
 {
-    const std::optional<GetResult> got = store->backend().get(key);
-    if (!got)
-        /// resurrect is ONLY ever entered on a CONDEMNED (kind, hash), so a vanish here is ALWAYS the
-        /// benign GC race: exact-token deleteExact landed in the HEAD->GET window. This is the same
-        /// retryable lost-dependency situation as the sibling branches below (revalidateDeps /
-        /// gateCheckDeps), so surface it as ABORTED "retry the operation" — NOT a hard FILE_DOESNT_EXIST
-        /// (which became an HTTP-500 INSERT failure on the bodyless publish path, B137). A
-        /// genuinely-never-existed dep is a SEPARATE FILE_DOESNT_EXIST at observeAndAdmit (HEAD-absent),
-        /// which is untouched. putBlob's body-holding retry catches this ABORTED and re-uploads in hand.
-        throw Exception(ErrorCodes::ABORTED,
-            "Build::resurrect: condemned incarnation of {} deleted by GC between HEAD and GET; retry the operation", key);
+    /// INV-1 (revival-from-source): re-upload a condemned or absent object from the writer's OWN
+    /// source bytes — NEVER calls backend().get to read the dying object. W-FRESH-TAG: fresh
+    /// incarnation_tag and this build's build_id so the new incarnation is owned by THIS live build
+    /// (the B167 fix — the prior resurrect was the lone gap).
+    const PoolMeta & meta = store->poolMeta();
+    const PoolConfig & cfg = store->poolConfig();
 
-    EnvelopeHeader header = decodeEnvelopeHeader(got->bytes, got->bytes.size(), kind);
-
-    /// FOLLOW-UP(M-F): for huge blobs, server-side multipart copy-to-self (spec §5 step 2) instead of
-    /// GET+PUT — copy preserving the bytes, rewriting only the incarnation header.
-    /// W-FRESH-TAG on resurrect: a fresh incarnation_tag forces a distinct body so the condemned
-    /// incarnation can never be re-derived; everything else (header_len, provenance, ...) is preserved.
-    header.incarnation_tag = mintU128();
-    /// B167 Part A: re-stamp the CURRENT build's build_id (resurrect decoded the OLD owner's header, so
-    /// header.build_id is the prior — likely dead — build). The re-uploaded incarnation must be OWNED by
-    /// THIS live build so the incremental-GC heartbeat guard (Part B) refuses to re-condemn it in the
-    /// upload->publish span. Without this it would carry a stale build_id and get no protection — the
-    /// B167 livelock. putBlob/putTree/recreateTree already stamp build_id; this was the lone gap.
-    header.build_id = build_id;
-    header.pad_to_header_len = header.header_len;   /// preserve the exact header length on re-encode
-    const String new_head = encodeEnvelopeHeader(header);
-    const String body = new_head + got->bytes.substr(header.header_len);
-
-    Token new_tok;
-    /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
-    const PutOutcome oc = store->backend().putOverwrite(key, body, got->token, &new_tok);
-    if (oc == PutOutcome::PreconditionFailed)
+    auto buildHeader = [&]() -> String
     {
-        /// A racing writer displaced the incarnation we read (their resurrect won). Re-observe: their
-        /// fresh incarnation is adoptable unless it too is condemned. observeAndAdmit records the dep.
+        EnvelopeHeader header;
+        header.kind = kind;
+        header.hash_algo = 1;
+        header.logical_size = source_bytes.size();
+        header.logical_hash = hash;
+        header.domain_id = meta.pool_id;
+        header.incarnation_tag = mintU128();
+        header.build_id = build_id;
+        header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
+        if (kind == ObjectKind::Blob)
+        {
+            header.intended_ref = info.intended_ref;
+            header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
+        }
+        /// Trees use natural header length (no pad) — pad_to_header_len stays 0.
+        try
+        {
+            return encodeEnvelopeHeader(header);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() != ErrorCodes::BAD_ARGUMENTS)
+                throw;
+            /// intended_ref is diagnostic-only: when it makes the header exceed blob_header_len, drop it.
+            header.intended_ref.reset();
+            return encodeEnvelopeHeader(header);
+        }
+    };
+
+    const CasEventObjectKind ev_kind =
+        kind == ObjectKind::Tree ? CasEventObjectKind::Tree
+        : (kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
+
+    auto recordDoneAndEmit = [&](Token tok)
+    {
+        deps[{static_cast<uint8_t>(kind), hash}] =
+            DepEntry{kind, tok, store->retireView().round(), source_bytes.size()};
+        if (store->hasEventSink())
+        {
+            CasEvent _ev;
+            _ev.type = (kind == ObjectKind::Tree) ? CasEventType::TreePut : CasEventType::BlobPut;
+            _ev.object_kind = ev_kind;
+            _ev.object_hash = u128ToHex(hash);
+            _ev.token = tok.value;
+            _ev.round = store->retireView().round();
+            _ev.outcome = "ok";
+            _ev.reason = "uploadFromSource: fresh incarnation from writer's own source bytes (INV-1)";
+            _ev.detail = {{"size", std::to_string(source_bytes.size())}, {"build_id", u128ToHex(build_id)}};
+            store->emitEvent(_ev);
+        }
+    };
+
+    /// Phase 1: try If-None-Match upload (object absent or race with another writer).
+    {
+        /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
+        WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
+        writeString(buildHeader(), sink->buffer());
+        writeString(source_bytes, sink->buffer());
+        Token tok;
+        const PutOutcome outcome = sink->finalize(&tok);
+        if (outcome == PutOutcome::Done)
+        {
+            recordDoneAndEmit(tok);
+            return;
+        }
+    }
+
+    /// PreconditionFailed: an incarnation exists. HEAD it to check whether it is condemned or live.
+    /// We do NOT read the body (no backend().get) — we only need the token to decide:
+    ///   • live (not condemned)  → adopt; this is the standard dedup case.
+    ///   • condemned             → displace via putOverwrite(If-Match: current_token) using our
+    ///                            source_bytes, so we never read the dying object. This is the
+    ///                            equivalent of the old `resurrect` minus the GET.
+    const HeadResult hr = store->backend().head(key);
+    if (!hr.exists)
+    {
+        /// Object vanished between putIfAbsentStream (412d) and our HEAD — a concurrent GC delete.
+        /// The object is now absent; re-try putIfAbsentStream (tail-recurse is safe — bounded by caller).
+        WriteSinkPtr sink2 = store->backend().putIfAbsentStream(key);
+        writeString(buildHeader(), sink2->buffer());
+        writeString(source_bytes, sink2->buffer());
+        Token tok2;
+        const PutOutcome outcome2 = sink2->finalize(&tok2);
+        if (outcome2 == PutOutcome::Done)
+        {
+            recordDoneAndEmit(tok2);
+            return;
+        }
+        /// Still 412 after the vanish-and-retry: a racing writer re-created it. Adopt their token.
         observeAndAdmit(kind, hash, key);
         return;
     }
 
-    deps[{static_cast<uint8_t>(kind), hash}] =
-        DepEntry{kind, new_tok, store->retireView().round(),
-            kind == ObjectKind::Blob ? got->bytes.size() - store->poolMeta().blob_header_len : 0};
+    if (!store->retireView().isCondemnedToken(kind, hash, hr.token))
+    {
+        /// Live (not condemned): adopt the current incarnation — free, no bytes moved.
+        observeAndAdmit(kind, hash, key, hr);
+        return;
+    }
+
+    /// Condemned: displace the condemned incarnation with our fresh source bytes via If-Match.
+    /// CRITICAL: we use putOverwrite (NOT backend().get) — we have the source bytes, so no GET needed.
+    /// W-FRESH-TAG: a fresh incarnation_tag minted inside buildHeader() ensures INV-NO-RETURN.
+    Token new_tok;
+    const PutOutcome oc = store->backend().putOverwrite(key, buildHeader() + String(source_bytes), hr.token, &new_tok);
+    if (oc == PutOutcome::Done)
+    {
+        recordDoneAndEmit(new_tok);
+        return;
+    }
+    /// PreconditionFailed from putOverwrite: either a racing writer displaced the condemned token
+    /// before us (their fresh token doesn't match hr.token), OR GC deleted the object between our
+    /// HEAD and the putOverwrite (absent → If-Match always fails). HEAD again to disambiguate.
+    {
+        const HeadResult hr2 = store->backend().head(key);
+        if (!hr2.exists)
+        {
+            /// Object deleted in the window — try fresh If-None-Match upload (it is now absent).
+            WriteSinkPtr sink3 = store->backend().putIfAbsentStream(key);
+            writeString(buildHeader(), sink3->buffer());
+            writeString(source_bytes, sink3->buffer());
+            Token tok3;
+            const PutOutcome outcome3 = sink3->finalize(&tok3);
+            if (outcome3 == PutOutcome::Done)
+            {
+                recordDoneAndEmit(tok3);
+                return;
+            }
+            /// Still 412 — a racing writer re-created it. Observe their token.
+            observeAndAdmit(kind, hash, key);
+            return;
+        }
+        /// Present with a different token — a racing writer displaced the condemned incarnation.
+        /// Adopt their token (or throw ABORTED if it too is condemned — bounded by caller loop).
+        observeAndAdmit(kind, hash, key, hr2);
+    }
 }
 
 void Build::adoptEvidence(const TreeEntry & entry)
@@ -500,7 +543,7 @@ void Build::adoptTree(const TreeId & id)
     /// argument that justifies tokenless evidence for adoptFromTree CHILDREN does not apply to
     /// the root being adopted: a detached/frozen tree is exactly NOT pinned by anything. Absent
     /// => FILE_DOESNT_EXIST (fail closed; the caller re-creates from source or aborts the
-    /// re-attach); condemned => resurrect (the cold-reuse rule, same as reuseBlob).
+    /// re-attach); condemned => ABORTED from observeAndAdmit (INV-1: no GET; caller retries).
     /// FOLLOW-UP(M-W): size 0 here flows into `RefPayload.tree_size` at publish for adopt-published
     /// parts (FREEZE / detached re-attach / replication relink). Harmless in M-C2 (no read path
     /// consumes tree_size — `readTree` GETs the whole object, `locate` uses per-entry file_size), but
@@ -571,56 +614,11 @@ void Build::uploadStagedTree(const TreeId & id)
     if (it == retained_trees.end())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "uploadStagedTree: tree {} was not staged", id.string());
-    const String & encoded = it->second;
 
     const String key = store->layout().treeKey(id);
-    const PoolMeta & meta = store->poolMeta();
-    const PoolConfig & cfg = store->poolConfig();
-
-    /// Tree envelope: NATURAL header length (no pad). W-FRESH-TAG: fresh incarnation_tag.
-    EnvelopeHeader header;
-    header.kind = ObjectKind::Tree;
-    header.hash_algo = 1;
-    header.logical_size = encoded.size();
-    header.logical_hash = logical_hash;
-    header.domain_id = meta.pool_id;
-    header.incarnation_tag = mintU128();
-    header.build_id = build_id;
-    header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
-    /// intended_ref deliberately omitted from tree envelopes (forensics live on the published blob set).
-    const String head_bytes = encodeEnvelopeHeader(header);
-
-    /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
-    WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
-    writeString(head_bytes, sink->buffer());
-    writeString(encoded, sink->buffer());
-    Token tok;
-    const PutOutcome outcome = sink->finalize(&tok);
-    if (outcome == PutOutcome::Done)
-    {
-        deps[{static_cast<uint8_t>(ObjectKind::Tree), logical_hash}] =
-            DepEntry{ObjectKind::Tree, tok, store->retireView().round(), encoded.size()};
-        /// B170: a fresh tree incarnation was uploaded.
-        if (store->hasEventSink())
-        {
-            CasEvent _ev4;
-            _ev4.type = CasEventType::TreePut;
-            _ev4.object_kind = CasEventObjectKind::Tree;
-            _ev4.object_hash = id.string();
-            _ev4.token = tok.value;
-            _ev4.round = store->retireView().round();
-            _ev4.outcome = "ok";
-            _ev4.reason = "uploaded a fresh tree incarnation";
-            _ev4.detail = {{"size", std::to_string(encoded.size())}, {"build_id", u128ToHex(build_id)}};
-            store->emitEvent(_ev4);
-        }
-    }
-    else
-    {
-        /// The identical tree already exists (a just-dropped identical tree may be condemned): apply
-        /// the cold-reuse rule, which adopts or resurrects and records the Tree dep.
-        observeAndAdmit(ObjectKind::Tree, logical_hash, key);
-    }
+    /// Thin caller of uploadFromSource — INV-1: never reads the dying object even if the tree
+    /// is condemned (uploadFromSource uses the retained payload, not a GET).
+    uploadFromSource(ObjectKind::Tree, logical_hash, key, it->second);
 }
 
 TreeId Build::putTree(std::vector<TreeEntry> entries)
@@ -724,14 +722,14 @@ void Build::precommit(const TreeId & manifest)
 
 void Build::gateCheckDeps()
 {
-    /// Iterating `deps` while resurrect/observeAndAdmit MUTATE deps is safe: both OVERWRITE the SAME
-    /// (kind, hash) entry (deps[thatkey].token), never insert a new key, so the iterator we hold and
-    /// the map structure stay valid. (We resolve via the loop's own key.)
+    /// Iterating `deps` while uploadFromSource/observeAndAdmit MUTATE deps is safe: both OVERWRITE
+    /// the SAME (kind, hash) entry (deps[thatkey].token), never insert a new key, so the iterator we
+    /// hold and the map structure stay valid. (We resolve via the loop's own key.)
     for (auto & [key, dep] : deps)
     {
         /// Iteration-safety invariant, made self-enforcing: the DepKey's kind byte (key.first) matches
-        /// dep.kind, so deps[{kind, hash}] inside resurrect/observeAndAdmit overwrites the SAME entry
-        /// being iterated — never inserts a new key that would invalidate the loop.
+        /// dep.kind, so deps[{kind, hash}] inside uploadFromSource/observeAndAdmit overwrites the SAME
+        /// entry being iterated — never inserts a new key that would invalidate the loop.
         chassert(static_cast<uint8_t>(dep.kind) == key.first);
 
         const ObjectKind kind = dep.kind;
@@ -739,18 +737,20 @@ void Build::gateCheckDeps()
 
         if (dep.token.has_value())
         {
-            /// Token-bearing: ANY view hit BY HASH ⇒ resurrect/recreate (spec §5 step 5: "members with a
-            /// view hit ⇒ resurrect" — a view hit is by HASH, not by our exact observed token). The
-            /// current incarnation may have been displaced to a DIFFERENT token t' that GC then condemned;
-            /// keeping our stale token while the object lives at the condemned t' would let an in-flight
-            /// DELETE If-Match:t' (zombie/duplicate GC delete) hit the live object ⇒ dangling ref. The §8
-            /// R4 spared-orphan is safe only because the orphan's token was DISPLACED by a resurrect first;
-            /// resurrect/recreate on any hit performs exactly that displacement (a fresh tag never reuses
-            /// an old token, INV-NO-RETURN), closing the window.
+            /// Token-bearing: ANY view hit BY HASH ⇒ re-create/uploadFromSource (spec §5 step 5:
+            /// "members with a view hit ⇒ resurrect" — a view hit is by HASH, not by our exact observed
+            /// token). The current incarnation may have been displaced to a DIFFERENT token t' that GC
+            /// then condemned; displacing it (a fresh tag) makes any in-flight DELETE If-Match:t' 412,
+            /// closing the §8 R4 spared-orphan window. INV-NO-RETURN: a fresh tag never reuses an old
+            /// token, so INV-NO-RETURN holds.
             if (store->retireView().findCondemned(kind, hash).has_value())
             {
-                /// B170: the publish gate found a condemned-by-hash dep and is displacing it
-                /// (resurrect/recreate) so an in-flight GC delete can never hit the live object.
+                /// B170 / INV-1: the publish gate found a view hit by hash for this dep.
+                /// Two sub-cases (mirroring revalidateDeps):
+                ///  (a) dep's OWN token is condemned (this exact incarnation targeted by GC) →
+                ///      tree with retained: recreateTree; blob/pack: retryable ABORTED (INV-1).
+                ///  (b) dep's OWN token is live (displaced-incarnation case) →
+                ///      re-observe via observeAndAdmit (HEAD-only, no GET) to adopt the current token.
                 if (store->hasEventSink())
                 {
                     CasEvent _ev5;
@@ -760,20 +760,34 @@ void Build::gateCheckDeps()
                     _ev5.object_hash = u128ToHex(hash);
                     _ev5.token = u128ToHex(build_id);
                     _ev5.round = store->retireView().round();
-                    _ev5.outcome = "resurrect";
-                    _ev5.reason = "gate: dep has a view hit by hash; displace via resurrect/recreate";
+                    _ev5.outcome = "recreate-or-reobserve";
+                    _ev5.reason = "gate: dep has a view hit by hash (INV-1: no GET)";
                     store->emitEvent(_ev5);
                 }
-                if (kind == ObjectKind::Tree && retained_trees.contains(hash))
-                    recreateTree(hash);
+                if (store->retireView().isCondemnedToken(kind, hash, *dep.token))
+                {
+                    /// Case (a): dep's own token is condemned.
+                    if (kind == ObjectKind::Tree && retained_trees.contains(hash))
+                        recreateTree(hash);
+                    else
+                        /// No source bytes at the gate (blob/pack with condemned own token) →
+                        /// retryable ABORTED. The outer INSERT retry re-uploads from source. (INV-1)
+                        throw Exception(ErrorCodes::ABORTED,
+                            "gateCheckDeps: condemned dep {} has no retained payload; retry the operation (INV-1)",
+                            u128ToHex(hash));
+                }
                 else
-                    resurrect(kind, hash, keyFor(kind, hash));
+                {
+                    /// Case (b): dep's own token is live but a displaced incarnation was condemned.
+                    /// Re-observe to adopt the current token (HEAD-only, no GET).
+                    observeAndAdmit(kind, hash, keyFor(kind, hash));
+                }
             }
         }
         else
         {
             /// Tokenless evidence (W-EVIDENCE): any condemned token for (kind, hash) ⇒ resolve the HEAD
-            /// via observeAndAdmit (adopt the live incarnation, or resurrect if it too is condemned).
+            /// via observeAndAdmit (adopt the live incarnation; condemned → ABORTED for re-try).
             /// This turns the dep token-bearing.
             if (store->retireView().findCondemned(kind, hash).has_value())
                 observeAndAdmit(kind, hash, keyFor(kind, hash));
@@ -783,48 +797,17 @@ void Build::gateCheckDeps()
 
 void Build::recreateTree(const UInt128 & hash)
 {
-    /// W-REVALIDATE re-create branch. The encoded payload was RETAINED at putTree, so a tree is always
-    /// re-creatable: re-upload it as a FRESH incarnation. W-FRESH-TAG: a fresh incarnation_tag.
+    /// W-REVALIDATE re-create branch. The encoded payload was RETAINED at stageTree, so a tree is
+    /// always re-creatable. Thin caller of uploadFromSource — INV-1: never reads the dying object.
     const auto retained_it = retained_trees.find(hash);
     if (retained_it == retained_trees.end())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "Build::recreateTree: no retained payload for tree {} (only built trees are re-creatable)",
             u128ToHex(hash));
 
-    const String & encoded = retained_it->second;
     const TreeId id{u128ToHex(hash)};
     const String key = store->layout().treeKey(id);
-    const PoolMeta & meta = store->poolMeta();
-    const PoolConfig & cfg = store->poolConfig();
-
-    EnvelopeHeader header;
-    header.kind = ObjectKind::Tree;
-    header.hash_algo = 1;
-    header.logical_size = encoded.size();
-    header.logical_hash = hash;
-    header.domain_id = meta.pool_id;
-    header.incarnation_tag = mintU128();
-    header.build_id = build_id;
-    header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
-    const String head_bytes = encodeEnvelopeHeader(header);
-
-    /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
-    WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
-    writeString(head_bytes, sink->buffer());
-    writeString(encoded, sink->buffer());
-    Token tok;
-    const PutOutcome outcome = sink->finalize(&tok);
-    if (outcome == PutOutcome::Done)
-    {
-        deps[{static_cast<uint8_t>(ObjectKind::Tree), hash}] =
-            DepEntry{ObjectKind::Tree, tok, store->retireView().round(), encoded.size()};
-        return;
-    }
-
-    /// PreconditionFailed ⇒ a concurrent writer re-created it first. Apply the cold-reuse rule against
-    /// the current incarnation (adopt it, or resurrect if it too is condemned). observeAndAdmit records
-    /// the dep with the current round.
-    observeAndAdmit(ObjectKind::Tree, hash, key);
+    uploadFromSource(ObjectKind::Tree, hash, key, retained_it->second);
 }
 
 void Build::revalidateDeps()
@@ -844,11 +827,11 @@ void Build::revalidateDeps()
         store->emitEvent(_ev6);
     }
 
-    /// W-REVALIDATE (the model's `WPublishReval`). Iterating `deps` while resurrect / observeAndAdmit /
-    /// recreateTree MUTATE deps is safe for the same reason as gateCheckDeps: re-create keeps the SAME
-    /// (kind, hash) — a tree's hash commits to its content, so its re-uploaded incarnation lives at the
-    /// identical key — and resurrect/observeAndAdmit OVERWRITE deps[k], never insert a new key. So the
-    /// iterator and the map structure stay valid.
+    /// W-REVALIDATE (the model's `WPublishReval`). Iterating `deps` while uploadFromSource /
+    /// observeAndAdmit / recreateTree MUTATE deps is safe for the same reason as gateCheckDeps:
+    /// re-create keeps the SAME (kind, hash) — a tree's hash commits to its content, so its
+    /// re-uploaded incarnation lives at the identical key — and uploadFromSource/observeAndAdmit
+    /// OVERWRITE deps[k], never insert a new key. So the iterator and the map structure stay valid.
     for (auto & [key, dep] : deps)
     {
         const ObjectKind kind = dep.kind;
@@ -886,7 +869,8 @@ void Build::revalidateDeps()
             else
             {
                 /// Present: resolve the stale evidence to a TOKEN-BEARING entry observed at the
-                /// current round (adopt the current token, or resurrect if it is condemned).
+                /// current round (adopt the current token; condemned → ABORTED from observeAndAdmit,
+                /// propagated as retryable — the outer INSERT retry re-uploads from source; INV-1).
                 observeAndAdmit(kind, hash, k);
             }
             continue;
@@ -894,17 +878,36 @@ void Build::revalidateDeps()
 
         if (hits.has_value())
         {
-            /// ANY view hit BY HASH ⇒ resurrect (blob) or re-create from the retained payload (tree).
-            /// Spec §5 step 5: "members with a view hit ⇒ resurrect" — a view hit is by HASH, NOT by our
-            /// exact observed token. The current incarnation may be condemned at its CURRENT token (a
-            /// prior writer displaced t → t', GC then condemned t'); displacing it (a fresh tag) makes any
-            /// in-flight DELETE If-Match:<current> 412, closing the §8 R4 spared-orphan window. Resurrect
-            /// on any hit is the conservative, model-faithful (WResurrect) choice (INV-NO-RETURN: a fresh
-            /// tag never reuses an old token), and it covers the §7 step-4 "held entry ⇒ resurrect" horn.
-            if (kind == ObjectKind::Tree && retained_trees.contains(hash))
-                recreateTree(hash);
+            /// ANY view hit BY HASH ⇒ action needed. A view hit is by HASH (not by our exact dep token)
+            /// because the current incarnation may have been displaced to a DIFFERENT token t' that GC
+            /// then condemned; our stale dep.token doesn't capture t'. We must act on any hash hit.
+            ///
+            /// Two sub-cases:
+            ///  (a) dep's OWN token is condemned (this exact incarnation is targeted by GC) →
+            ///      tree with retained payload: recreateTree (INV-1: no GET). Blob: retryable ABORTED.
+            ///  (b) dep's OWN token is NOT condemned but there's a hash hit (displaced incarnation case)
+            ///      → re-observe the current token via observeAndAdmit (HEAD-only, no GET). If the current
+            ///      token is live → adopt. If condemned → observeAndAdmit throws ABORTED (INV-1).
+            /// This is precisely the old "resurrect" behavior minus the GET: we act on any hash hit but
+            /// only perform I/O (HEAD) in case (b), and never read the body.
+            if (store->retireView().isCondemnedToken(kind, hash, *dep.token))
+            {
+                /// Case (a): dep's own token is condemned.
+                if (kind == ObjectKind::Tree && retained_trees.contains(hash))
+                    recreateTree(hash);
+                else
+                    throw Exception(ErrorCodes::ABORTED,
+                        "revalidateDeps: condemned dep {} has no retained payload; retry the operation (INV-1)",
+                        u128ToHex(hash));
+            }
             else
-                resurrect(kind, hash, k);
+            {
+                /// Case (b): dep's own token is live, but a different incarnation was displaced and
+                /// condemned. Re-observe to adopt the current token (displaced or same). This also
+                /// re-stamps observed_view_round so a later check treats it as fresh. observeAndAdmit
+                /// throws ABORTED if the current incarnation is itself condemned (bounded by caller).
+                observeAndAdmit(kind, hash, k);
+            }
         }
         else if (dep.observed_view_round < store->retireView().round())
         {
@@ -938,7 +941,7 @@ void Build::revalidateDeps()
             else
             {
                 /// current token differs ⇒ treat as a FRESH cold reuse of the current token (spec §7
-                /// step 4: replaced ⇒ adopt the newer token, or resurrect if it too is condemned).
+                /// step 4: replaced ⇒ adopt the newer token; condemned → ABORTED, INV-1 preserved).
                 observeAndAdmit(kind, hash, k);
             }
         }
