@@ -1,126 +1,130 @@
-# CA adopt: defer presence to the gate (precommit-first for adopted blobs) — design (B188)
+# CA build: precommit-first — no pool operation before the precommit (B188)
 
 **Status:** design for review
 **Date:** 2026-06-21
-**Backlog:** B188. Model: `docs/superpowers/models/CaBuildRootPrecommit.tla` (B171).
+**Backlog:** B188. Model: `docs/superpowers/models/CaBuildRootPrecommit.tla` (B171). Relates to B172.
 
-## Problem
+## Requirement (operator, non-negotiable)
 
-The 24h trust-soak failed at T+228min (steady-state, no chaos) with a fatal
-`Code 107 FILE_DOESNT_EXIST: Build: object blobs/e9/e9be… absent — cannot reuse (caller must
-upload it)`. A staged part operation (`createHardLink`/`moveFile`/`clonePart`) adopts a content blob
-by reference via `reuseBlob`, which **eagerly HEADs** the blob (`observeAndAdmit`, `CasBuild.cpp:316`)
-**during staging — before any precommit**. Under sustained churn a hot duplicate-content blob whose
-in-degree legitimately hit 0 is GC-deleted; the eager HEAD finds it absent and, for a tokenless
-(`body_recreatable=false`) adopt, throws a **fatal** `FILE_DOESNT_EXIST` instead of a retryable abort.
-No data is lost (the INSERT is never acknowledged), but the query fails spuriously.
+The build must **precommit its full manifest tree before it touches the pool**. Every pool
+operation that can observe-or-mutate a content object — conditional `PUT`, dedup `HEAD`, the 412
+retry loop, `resurrect`, adopt-observe — MUST run **only after the precommit edge is durable**, so
+the entire closure is protected by reachability from a durable build root the moment any object is
+created, observed, or relied upon. This is the model's `INV_BUILDROOT_PROTECTS` taken literally:
+protect first, then act.
 
-## Why this diverges from the model
+## Why this is possible
 
-`CaBuildRootPrecommit.tla` (exhaustively clean, TRUE/TRUE, 24205 states) establishes two protections:
+`CaContentWriteBuffer::finalizeImpl` **spills each content file to a local temp file and computes
+its CityHash128 before any upload** (`ContentAddressedWriteBuffers.cpp:55-68`). So at the end of
+staging every file's content hash is known from local temp files — the full manifest tree is
+computable with **zero** pool operations. There is no chicken-and-egg: hashes come from the local
+spill, not from uploading.
 
-- **`INV_BUILDROOT_PROTECTS`** — `Precommit(bld,t)` references the full manifest tree by hash and
-  protects the whole closure by reachability **from Precommit onward**. It does NOT require
-  protection from adopt onward.
-- **`INV_COMMIT_FAILCLOSED`** — a blob missing at commit takes the retryable `CommitAbort` path,
-  never a fatal dangle.
+## Current behavior (the bug)
 
-In the model, `AdoptBlob` simply records the blob in the dep set; the adopt→precommit window is
-**tolerated** because a deletion there surfaces as `CommitAbort` (retry). The implementation diverges
-only because `reuseBlob`'s eager HEAD turns that window's deletion into a **fatal** error at staging
-time, before the precommit and before the gate.
+Staging issues pool operations **before** any precommit:
+- `writeFile` content path: the spill-finalize callback calls `Build::putBlob` **immediately**
+  (upload + conditional-PUT; on 412 → `observeAndAdmit` HEAD → adopt/resurrect), then **deletes the
+  temp file** (`ContentAddressedWriteBuffers.cpp:68`).
+- adopt path (`createHardLink`/`moveFile`/`clonePart` → `reuseBlob`): an eager `observeAndAdmit`
+  HEAD, fatal `FILE_DOESNT_EXIST` on absent.
 
-## The implementation already has the right pieces
+`precommit(tree)` only runs at commit, in `publishStaging` (`ContentAddressedTransaction.cpp:188`),
+**after** all of the above. So a hot duplicate-content blob GC'd during the unprotected staging
+window makes an adopt fail fatally (the 24h-soak failure, B188), and even written-blob dedup
+HEAD/resurrect run unprotected.
 
-- `adoptFromTree` records a **tokenless W-EVIDENCE dep with no HEAD**
-  (`deps[{Blob,hash}] = DepEntry{Blob, std::nullopt, view_round, size}`). This is the model's
-  `AdoptBlob`.
-- `precommit(tree)` runs at commit, before publish (`publishStaging`, `ContentAddressedTransaction.cpp:177-192`)
-  → `INV_BUILDROOT_PROTECTS`.
-- The publish gate (`revalidateDeps`/`gateCheckDeps`) resolves a tokenless dep post-precommit:
-  present ⇒ admit, condemned ⇒ resurrect, **absent ⇒ retryable `ABORTED`** (`CasBuild.cpp:839`).
-  This is `INV_COMMIT_FAILCLOSED`.
+## Design — defer ALL pool I/O to after the precommit
 
-The only offender is the eager HEAD in the three `reuseBlob` call sites.
+### Staging phase: local-only, no pool operations
+1. **Content `writeFile`** (`CaContentWriteBuffer` callback): instead of `putBlob`, **record a
+   pending blob** `{hash, temp_path, size}` in the part staging and add the `Blob` tree entry.
+   **Do not upload. Do not delete the temp file** — ownership of the temp file transfers to the
+   transaction (cleaned up at commit/abort/destruction).
+2. **Adopt** (`createHardLink`/`moveFile`/`clonePart` content-blob branches): call
+   `Build::adoptEvidence(entry)` — record the tokenless W-EVIDENCE dep by hash, **no HEAD**. Delete
+   the `body_recreatable`/`reuseBlob` calls at these sites.
+3. Mutable per-part files and inline entries: unchanged (they are payload/overlay, not pool blobs).
 
-## Design
+After staging: the part has a complete set of tree entries (all hashes known), a set of pending
+local temp files for the to-be-uploaded blobs, and tokenless deps for the adopted blobs. **No pool
+object has been created, HEADed, or resurrected.**
 
-### 1. `Build::adoptEvidence(const TreeEntry & entry)` — new method
-Factor the tokenless-dep recording out of `adoptFromTree` into a method that takes a `TreeEntry`
-(which already carries `placement`, `file_hash`/`pack_hash`, `file_size`/`pack_length`) and records
-the W-EVIDENCE dep — **no backend call, no HEAD**:
+### Commit phase (`publishStaging`): protect, then materialize
+1. `putTree(entries)` — assemble the manifest tree. (W-TREE-BUILD is satisfied: written blobs are
+   added as deps when their pending entry is recorded; adopted blobs via `adoptEvidence`. See
+   "Dep bookkeeping" below.)
+2. **`precommit(tree)`** — publish the build-root → tree edge. The full closure (written + adopted)
+   is now GC-protected by reachability. **This is the upfront precommit.**
+3. **Materialize each pending written blob:** `putBlob(hash, source-from-temp_path)` — the upload,
+   the conditional-PUT, the 412 dedup branch (HEAD + adopt/resurrect) **all run here, with the
+   precommit already durable**. The W-FRESH-TAG retry loop is unchanged; it just executes under
+   protection.
+4. **`publish`** — the fail-closed gate (`gateCheckDeps`/`revalidateDeps`) re-proves the closure
+   present, resurrects condemned members, and on a genuinely-absent member throws **retryable
+   `ABORTED`** (`CasBuild.cpp:839`) — never a fatal dangle. (`INV_COMMIT_FAILCLOSED`.)
+5. Clean up the part's temp files; on success drop the precommit edge.
 
-```cpp
-void Build::adoptEvidence(const TreeEntry & entry)
-{
-    requireAlive();
-    const uint64_t view_round = store->retireView().round();
-    switch (entry.placement)
-    {
-        case Placement::Blob:
-            deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}] =
-                DepEntry{ObjectKind::Blob, std::nullopt, view_round, entry.file_size};
-            break;
-        case Placement::Subtree:
-            deps[{static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}] =
-                DepEntry{ObjectKind::Tree, std::nullopt, view_round, entry.file_size};
-            break;
-        case Placement::PackSlice:
-            deps[{static_cast<uint8_t>(ObjectKind::Pack), entry.pack_hash}] =
-                DepEntry{ObjectKind::Pack, std::nullopt, view_round, entry.pack_length};
-            break;
-        case Placement::Inline:
-            break;
-    }
-}
-```
-`adoptFromTree` keeps its current behavior by calling `adoptEvidence(entry)` on the found entry.
+### Dep bookkeeping (the one subtlety)
+`putTree` requires every child to already be in the build's dep set (W-TREE-BUILD). Today `putBlob`
+records the (tokened) dep as a side effect of uploading. Since we now upload *after* `putTree`, the
+written-blob dep must be recorded at **staging** time (when the pending entry is added) so `putTree`
+sees it, then **finalized** (token stamped) when `putBlob` runs post-precommit.
 
-### 2. Replace the three eager-adopt sites
-`ContentAddressedTransaction.cpp`, the staged-source content-blob branches in `createHardLink`
-(~615), `moveFile` (~802), `clonePart`/`replaceFile` (~943): replace
+Approach: at staging, record the written blob as a **tokenless** dep (same shape as `adoptEvidence`
+— `DepEntry{Blob, std::nullopt, view_round, size}`). At commit, `putTree` → `precommit` → then for
+each pending blob call `putBlob`, which **overwrites** the dep with the real tokened entry (it
+already does `deps[{Blob,hash}] = DepEntry{..., tok, ...}` on a fresh upload, and `observeAndAdmit`
+on the 412 branch). So the dep starts tokenless (pre-upload, for `putTree`) and becomes tokened
+(post-upload). The publish gate runs last and sees the final tokened/tokenless mix, exactly as today.
 
-```cpp
-const bool body_recreatable = ... depIsTokened(entry.file_hash) ...;
-dst_build.reuseBlob(BlobId(u128ToHex(entry.file_hash)), body_recreatable);
-```
-with
-```cpp
-dst_build.adoptEvidence(entry);   // record W-EVIDENCE dep by hash; gate verifies post-precommit
-```
-Delete the now-unused `body_recreatable` computations at these sites.
+### Eager-publish-at-rename (B151) interaction
+`moveDirectory` can publish a part at the lock-free rename (B151), bypassing `commit()`'s
+`publishStaging`. That path must follow the same order: assemble tree → precommit → materialize
+pending blobs → publish. The pending-blob materialization step is invoked from the shared publish
+helper so both the eager-rename path and the `commit()` path go through it. (Implementation: move
+the "materialize pending blobs" loop into the same place that does `putTree`/`precommit`/`publish`,
+so there is a single ordered publish routine.)
 
-### 3. Gate, precommit, putTree — unchanged
-- `putTree`'s W-TREE-BUILD invariant ("every child in the dep set") is satisfied: `adoptEvidence`
-  records the dep.
-- `precommit` then protects the closure; the gate observes/resurrects/aborts-retryable.
+## What does NOT change
+- `putBlob`'s internals (W-FRESH-TAG, the bounded 412 retry loop, dedup-as-cold-reuse, P1/P2
+  HEAD-before-PUT) — unchanged; they simply run after precommit.
+- The publish gate — unchanged; it already does present⇒admit / condemned⇒resurrect / absent⇒
+  retryable `ABORTED`.
+- Written-blob protection model — was heartbeat (tokened dep); now *also* covered by the precommit
+  reachability, strictly stronger.
+- The pool layout, codecs, GC.
 
-### 4. `reuseBlob`
-Becomes unused by these sites. Leave it in place (still part of the `Build` API / referenced by
-tests) unless a follow-up confirms it is fully dead; no behavior change to it.
-
-## Why this is precommit-first for adopted blobs (your expectation)
-The precommit references the assembled tree — which now includes every adopted hash via the
-W-EVIDENCE deps — and protects the closure from precommit through publish across the intervening GC
-rounds. The adopt no longer asserts presence before that protection exists; the residual
-adopt→precommit window is, per the model, a retryable abort, not a fatal error. Written blobs are
-unchanged (already heartbeat-protected via tokened deps — the model's owner protection).
-
-## Out of scope
-- Upload-after-precommit / S3 private-staging + server-side copy (B172) — a perf/footprint
-  optimization, not required for this correctness fix.
-- Whether `reuseBlob` can be deleted entirely — a later cleanup.
+## Tradeoff
+Temp files for a part's content blobs are held in local scratch until commit instead of being
+streamed-and-freed per file. Peak scratch ≈ the part size, which the merge/insert already
+materializes locally — acceptable. If local-disk pressure becomes an issue, the **B172** variant
+parks bytes in a private S3 staging prefix (still not a *pool* object) and server-side-copies them
+into the pool after precommit; same precommit-first guarantee, no extra local disk. Out of scope here.
 
 ## Testing
-- A gtest reproducing the race deterministically: a build adopts a blob by reference; GC deletes
-  the blob (in-degree 0) before commit; assert the commit takes a **retryable `ABORTED`** (not fatal
-  `FILE_DOESNT_EXIST`), and that with the blob present-but-condemned it resurrects and commits.
-- A gtest that `adoptEvidence` records the dep without any backend HEAD (use a counting backend:
-  zero `head` calls at adopt time).
-- The existing CA gtest suite + a no-chaos soak segment over the hot-duplicate workload to confirm
-  no fatal `FILE_DOESNT_EXIST` from adopts.
+- **Reproduce B188 deterministically:** a build adopts a blob by reference; GC deletes it
+  (in-degree 0) before commit; assert the commit takes a **retryable `ABORTED`**, never fatal
+  `FILE_DOESNT_EXIST`; and with the blob present-but-condemned it resurrects and commits.
+- **Order invariant:** with a counting/recording backend, assert **zero** pool ops (no `head`, no
+  `putIfAbsentStream`/`putIfAbsent`, no `get`) occur on content-blob keys **before** the precommit
+  ref write, for a part with both fresh-written and adopted blobs.
+- **adoptEvidence** records the dep with no backend call.
+- **Round-trip:** a part with N written + M adopted blobs commits, reads back identical; a re-insert
+  of duplicate content dedups (412 path) correctly post-precommit.
+- Full CA gtest suite green (modulo the 2 known pre-existing reds); a no-chaos soak segment over the
+  hot-duplicate workload shows no fatal `FILE_DOESNT_EXIST` from adopts.
 
 ## Files
-- `Core/CasBuild.h` / `Core/CasBuild.cpp` — `adoptEvidence`; `adoptFromTree` delegates to it.
-- `ContentAddressedTransaction.cpp` — three call-site swaps; drop `body_recreatable` there.
-- `Disks/tests/gtest_cas_build.cpp` (or `gtest_ca_transaction.cpp`) — the regression tests.
+- `Core/CasBuild.{h,cpp}` — `adoptEvidence` (done); ensure `putBlob` overwrites the pre-recorded
+  tokenless dep (verify; it already assigns the dep).
+- `ContentAddressedWriteBuffers.{h,cpp}` — content callback records a pending blob and **transfers**
+  temp-file ownership instead of uploading+deleting.
+- `ContentAddressedTransaction.{h,cpp}` — `PartStaging` gains a pending-blob list (`{hash,temp_path,
+  size}`) + temp-file cleanup; the content `writeFile` callback records pending instead of `putBlob`;
+  the three adopt sites call `adoptEvidence`; a single ordered publish routine does
+  `putTree → precommit → materialize pending blobs → publish`; both `commit()` and the B151
+  eager-rename path go through it.
+- `Disks/tests/gtest_cas_build.cpp` / `gtest_ca_transaction.cpp` — the order-invariant + B188
+  regression tests.
