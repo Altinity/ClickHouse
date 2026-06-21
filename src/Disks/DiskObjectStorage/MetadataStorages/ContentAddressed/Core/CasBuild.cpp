@@ -36,8 +36,8 @@ namespace DB::Cas
 namespace
 {
 
-/// Two thread_local_rng draws composed into a UInt128. Used both to mint build ids and, per upload
-/// AND per resurrect, a FRESH incarnation_tag (W-FRESH-TAG).
+/// Two thread_local_rng draws composed into a UInt128. Used both to mint build ids and to mint, on
+/// every upload/re-upload, a FRESH incarnation_tag (W-FRESH-TAG).
 UInt128 mintU128()
 {
     const UInt64 hi = thread_local_rng();

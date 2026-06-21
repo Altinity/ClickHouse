@@ -35,11 +35,12 @@ public:
 
     /// W-FRESH-TAG: every upload attempt mints a fresh random incarnation_tag.
     /// New content: streaming PUT If-None-Match:*; on PreconditionFailed ⇒ the cold-reuse rule
-    /// (observe current token; condemned in the retire view ⇒ resurrect; else adopt — free).
+    /// (observe current token; condemned ⇒ uploadFromSource — re-upload from the writer's source
+    /// bytes; else adopt — free).
     BlobRef putBlob(const BlobId & id, BlobSource source);
 
-    /// Cold reuse without bytes: HEAD; condemned ⇒ resurrect (GET + fresh-tag header rewrite +
-    /// putOverwrite If-Match). On HEAD-absent the outcome depends on `body_recreatable` (B156b):
+    /// Cold reuse without bytes: HEAD; condemned ⇒ retryable ABORTED (no source bytes in hand; the
+    /// caller retries from source). On HEAD-absent the outcome depends on `body_recreatable` (B156b):
     ///   true  — the blob was putBlob'd by a build in this txn (recreatable by retrying) ⇒ the
     ///           absence is the benign dedup-vs-GC race ⇒ retryable ABORTED (caller retries, re-uploads);
     ///   false — the blob was adopted from a committed source (tokenless W-EVIDENCE, NOT recreatable) ⇒
@@ -130,11 +131,14 @@ private:
     /// (adopt the live token, or throw ABORTED if still condemned — caller retries with source bytes).
     void uploadFromSource(ObjectKind kind, const UInt128 & hash, const String & key, std::string_view source_bytes);
 
-    /// The publish gate's W-EVIDENCE + condemned-token scan (spec §5). For each dependency: a
-    /// token-bearing dep condemned at its token ⇒ resurrect; a tokenless (W-EVIDENCE) dep whose
-    /// (kind, hash) has any condemned token ⇒ observeAndAdmit (adopt-or-resurrect the HEAD). With an
-    /// empty retire view this is a no-op. Runs INSIDE the publish mutate lambda, so it re-runs on
-    /// every CAS retry — idempotent (re-observe). Task 13 extends it with revalidateDeps.
+    /// The publish gate's W-EVIDENCE + condemned-token scan (spec §5). For each dependency with a view
+    /// hit by hash (INV-1: never GET the dying object): a tree with a retained payload ⇒ recreate via
+    /// uploadFromSource; a blob/adopted dep with no source in hand ⇒ retryable ABORTED (the caller
+    /// retries from source). A token-bearing dep whose own token is live but whose hash was displaced
+    /// and condemned ⇒ observeAndAdmit (HEAD-only, adopt the current token). A tokenless (W-EVIDENCE)
+    /// dep whose (kind, hash) has any condemned token ⇒ observeAndAdmit (adopt the live HEAD, or ABORTED
+    /// if condemned). With an empty retire view this is a no-op. Runs INSIDE the publish mutate lambda,
+    /// so it re-runs on every CAS retry — idempotent (re-observe). Task 13 extends it with revalidateDeps.
     void gateCheckDeps();
 
     /// W-REVALIDATE (the model's `WPublishReval`). Called once, immediately after a fence-advanced

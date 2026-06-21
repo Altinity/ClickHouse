@@ -507,13 +507,14 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     EXPECT_EQ(raw->bytes.substr(hdr.header_len), "payload-Z");
 }
 
-TEST(CasBuild, PublishResurrectVanishedThrowsAbortedRetryable)
+TEST(CasBuild, PublishBodylessCondemnedDepThrowsAbortedRetryable)
 {
-    /// B137: the resurrect HEAD->GET window also races GC's exact-token delete on the BODYLESS publish
-    /// path (gateCheckDeps -> observeAndAdmit -> resurrect), where no writer holds the body to re-upload.
-    /// That vanish must surface as ABORTED ("retry the operation") — a retryable transient, matching the
-    /// sibling lost-dependency branches — NOT a hard FILE_DOESNT_EXIST (which became an HTTP-500 INSERT
-    /// failure).
+    /// B137/B190: a BODYLESS publish dep (tokenless W-EVIDENCE) whose hash is condemned must surface as
+    /// ABORTED ("retry the operation") — a retryable transient, matching the sibling lost-dependency
+    /// branches — NOT a hard FILE_DOESNT_EXIST (which became an HTTP-500 INSERT failure). Under INV-1 the
+    /// gate never reads the dying object: observeAndAdmit does a HEAD only; a condemned HEAD ⇒ ABORTED
+    /// (the caller retries from source). Even with a concurrent exact-token delete racing the HEAD, the
+    /// outcome is the same retryable ABORTED.
     auto b = std::make_shared<InMemoryBackend>();
 
     /// 1. Write payload-X via a throwaway build to create the blob object; capture its token t0.
@@ -538,16 +539,16 @@ TEST(CasBuild, PublishResurrectVanishedThrowsAbortedRetryable)
     const TreeId source = writeTreeRaw(*b, layout, {src_entry}, openStore(b)->poolMeta().pool_id);
 
     /// 3. Condemn (Blob, hash(X), t0) in the retire view, so the publish gate sees the evidence dep as a
-    ///    condemned hit and must resolve it (observeAndAdmit -> resurrect).
+    ///    condemned hit and must resolve it (observeAndAdmit -> HEAD-only, no GET).
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
 
     /// 4. Wrap the backend so the NEXT head(blob_key) returns the (present) result and THEN fires
-    ///    deleteExact(blob_key, t0) exactly once — GC's exact-token delete landing in the resurrect
-    ///    HEAD->GET window. Open a FRESH Store over the hook so its retire view (refreshed at open) sees
-    ///    the condemnation. The FIRST head(blob_key) in this build is the one inside the gate's
-    ///    observeAndAdmit (adoptFromTree only reads the source tree; putTree of the new tree does not
-    ///    head the blob), so the one-shot fires precisely in the window before resurrect's GET.
+    ///    deleteExact(blob_key, t0) exactly once — GC's exact-token delete racing the gate's HEAD.
+    ///    Open a FRESH Store over the hook so its retire view (refreshed at open) sees the condemnation.
+    ///    The FIRST head(blob_key) in this build is the one inside the gate's observeAndAdmit
+    ///    (adoptFromTree only reads the source tree; putTree of the new tree does not head the blob), so
+    ///    the one-shot fires precisely in that HEAD window.
     auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
     auto s = Store::open(hook, PoolConfig{.pool_prefix = "p"});
     auto build = s->startBuild({});
@@ -557,7 +558,7 @@ TEST(CasBuild, PublishResurrectVanishedThrowsAbortedRetryable)
     const TreeId tree = build->putTree({adopted});
 
     /// 6. Publish drives the bodyless gate: tokenless+condemned -> observeAndAdmit head(blob_key) [hook
-    ///    fires deleteExact(blob_key, t0)] -> present&condemned -> resurrect GET (vanished) -> throws.
+    ///    fires deleteExact(blob_key, t0)] -> condemned (or vanished) HEAD -> ABORTED, no GET (INV-1).
     ///    BEFORE fix: FILE_DOESNT_EXIST (hard). AFTER fix: ABORTED "retry the operation" (retryable).
     expectThrowsCode(DB::ErrorCodes::ABORTED,
         [&] { build->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{}); });
@@ -1067,13 +1068,13 @@ TEST(CasBuild, StageTreeRetainsAndDefersUpload)
     EXPECT_TRUE(b->head(s->layout().treeKey(t)).exists);
 }
 
-TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
+TEST(CasBuild, ConvergesUnderProductiveGc)
 {
-    /// B167/B171 LIVENESS — the resurrect/condemn livelock, now closed by the build-root precommit edge.
+    /// B167/B171 LIVENESS — the re-upload/condemn livelock, now closed by the build-root precommit edge.
     ///
     /// THE BUG (before the fix): a blob H was referenced, dropped, and GC-condemned (everEdged ∧ InDeg=0,
-    /// condemned in the retire view). A NEW build dedup-HITS H by content and must resurrect it — it
-    /// re-streams a FRESH incarnation of H. But the productive GC, re-deriving H as a zero-in-degree
+    /// condemned in the retire view). A NEW build dedup-HITS H by content and must re-upload it from
+    /// source — it re-streams a FRESH incarnation of H. But the productive GC, re-deriving H as a zero-in-degree
     /// candidate every round (zeroInDegreeKnown is stateless), kept RE-CONDEMNING and exact-token-DELETING
     /// that fresh incarnation in the build's upload→publish window. The build never converged: every retry
     /// re-uploaded only to have GC delete it again → livelock → broken/detached parts in soak.
@@ -1135,9 +1136,9 @@ TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
     const auto ref_b = build_b->putBlob(h, BlobSource::fromString(content));
     ASSERT_EQ(ref_b.id, h);
 
-    const HeadResult after_resurrect = b->head(blob_key);
-    ASSERT_TRUE(after_resurrect.exists);
-    EXPECT_NE(after_resurrect.token, h_token0);   /// a genuinely fresh incarnation
+    const HeadResult after_reupload = b->head(blob_key);
+    ASSERT_TRUE(after_reupload.exists);
+    EXPECT_NE(after_reupload.token, h_token0);   /// a genuinely fresh incarnation
     /// B171: the re-uploaded incarnation no longer carries a `cas_owner` triple (stamping was deleted).
     /// Protection is now the build-root PRECOMMIT EDGE: B assembles its manifest tree naming H and
     /// precommits it BEFORE the adversarial GC loop, so H has in-degree ≥ 1 from the build-root fold and
@@ -1204,9 +1205,9 @@ TEST(CasBuild, ResurrectConvergesUnderProductiveGc)
     }
 
     /// Phase 2 — converge. With H still alive (spared through the whole window), build B publishes a
-    /// part referencing it. publish itself legitimately re-streams the still-condemned H to a fresh
-    /// incarnation (the resurrect path on the publish gate); H is never absent. This MUST succeed —
-    /// the build converges in bounded steps.
+    /// part referencing it. The gate sees H's dep is already tokened at the fresh incarnation (uploaded
+    /// from source above) and live, so it keeps it; H is never absent. This MUST succeed — the build
+    /// converges in bounded steps.
     build_b->publish(RootNamespace{"srv1/tbl"}, "part_2", tree_b, RefPayload{});
     const bool published = true;
 
