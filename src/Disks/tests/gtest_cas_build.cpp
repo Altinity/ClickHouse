@@ -385,6 +385,111 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     EXPECT_EQ(raw->bytes.substr(hdr.header_len), "payload-Z");
 }
 
+TEST(CasBuild, PutBlobVanishDuringRevivalReUploadsNotFatal)
+{
+    /// B190 sibling (INV-3): inside uploadFromSource the post-412 path re-observes via the 3-arg
+    /// observeAndAdmit. If the object is GC-deleted in the window (present at the conditional PUT
+    /// → 412, but gone at the subsequent HEAD), the 3-arg overload throws FILE_DOESNT_EXIST. Before
+    /// the fix that escaped putBlob's ABORTED-only retry catch as a FATAL INSERT failure. putBlob
+    /// HOLDS the source bytes, so a vanish here must RE-UPLOAD from those bytes within the bounded
+    /// retry loop — never fatal. The fix wraps uploadFromSource's two 3-arg observeAndAdmit calls so
+    /// FILE_DOESNT_EXIST becomes the retryable ABORTED putBlob already handles.
+    ///
+    /// A scripted backend reproduces the exact race for the watched key:
+    ///   • the first TWO putIfAbsentStream finalize() calls return PreconditionFailed (the object was
+    ///     "present" at the conditional PUT, then "re-created" by a racing writer) — modelling S3's 412;
+    ///   • the first TWO head() calls return absent (GC deleted the object in the HEAD window).
+    /// After the script is exhausted both delegate to the inner backend, so the bounded retry's clean
+    /// re-upload lands.
+    ///
+    /// Trace WITH the fix:
+    ///   attempt 0: putIfAbsentStream#1 finalize→412 ; head#1→absent (uploadFromSource line ~378 branch);
+    ///              putIfAbsentStream#2 finalize→412 ; observeAndAdmit head#2→absent→ABORTED (wrapped) →
+    ///              putBlob catch retries.
+    ///   attempt 1: putIfAbsentStream#3 finalize→delegates→Done → putBlob returns. No fatal escape.
+    struct ScriptedVanishBackend final : public DB::Cas::Backend
+    {
+        ScriptedVanishBackend(BackendPtr inner_, String watched_key_)
+            : inner(std::move(inner_)), watched_key(std::move(watched_key_)) {}
+
+        size_t head_absent_budget = 2;       /// first N head(watched) calls report absent
+        size_t finalize_412_budget = 2;      /// first N finalize() on watched return PreconditionFailed
+
+        /// A sink wrapper that forces PreconditionFailed for the scripted budget, else delegates.
+        struct ScriptedSink final : public DB::Cas::WriteSink
+        {
+            ScriptedSink(WriteSinkPtr inner_, bool force_412_)
+                : inner(std::move(inner_)), force_412(force_412_) {}
+            DB::WriteBuffer & buffer() override { return inner->buffer(); }
+            DB::Cas::PutOutcome finalize(DB::Cas::Token * out_token) override
+            {
+                if (force_412)
+                {
+                    /// Abandon the underlying upload so the key is never created by it, and report 412.
+                    inner->cancel();
+                    return DB::Cas::PutOutcome::PreconditionFailed;
+                }
+                return inner->finalize(out_token);
+            }
+            void cancel() noexcept override { inner->cancel(); }
+            WriteSinkPtr inner;
+            bool force_412;
+        };
+
+        DB::Cas::HeadResult head(const String & k) override
+        {
+            if (k == watched_key && head_absent_budget > 0)
+            {
+                --head_absent_budget;
+                return DB::Cas::HeadResult{};   /// exists == false
+            }
+            return inner->head(k);
+        }
+        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta = {}) override
+        {
+            const bool force_412 = (k == watched_key && finalize_412_budget > 0);
+            if (force_412)
+                --finalize_412_budget;
+            return std::make_unique<ScriptedSink>(inner->putIfAbsentStream(k, meta), force_412);
+        }
+        std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
+        DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+        DB::Cas::PutOutcome putIfAbsent(const String & k, const String & bts, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, t, m); }
+        DB::Cas::PutOutcome putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, t, m); }
+        DB::Cas::CasOutcome casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, DB::Cas::Token * t = nullptr, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, bts, e, t, m); }
+        DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
+
+        BackendPtr inner;
+        String watched_key;
+    };
+
+    auto raw = std::make_shared<InMemoryBackend>();
+    DB::Cas::Layout layout("p");
+    const String blob_key = layout.blobKey(idOf("payload-V"));
+
+    /// The blob does NOT need to pre-exist: the scripted backend models the conditional-PUT 412
+    /// (object present at PUT time) independently of the inner store, then reports absent on HEAD.
+    auto scripted = std::make_shared<ScriptedVanishBackend>(raw, blob_key);
+    auto s = Store::open(scripted, PoolConfig{.pool_prefix = "p"});
+    auto build = s->startBuild({});
+
+    /// putBlob holds "payload-V" as source bytes. The vanish-during-revival must NOT be fatal:
+    ///   BEFORE fix: observeAndAdmit (line ~393) throws FILE_DOESNT_EXIST, escapes putBlob's
+    ///               ABORTED-only catch → fatal.
+    ///   AFTER fix:  wrapped to ABORTED → putBlob retries → re-uploads from held bytes → succeeds.
+    BlobRef ref;
+    EXPECT_NO_THROW(ref = build->putBlob(idOf("payload-V"), BlobSource::fromString("payload-V")));
+    EXPECT_EQ(ref.id, idOf("payload-V"));
+
+    /// The blob is present with a fresh incarnation and the exact payload — re-uploaded from source.
+    const HeadResult hr = raw->head(blob_key);
+    ASSERT_TRUE(hr.exists) << "putBlob must have re-uploaded the vanished blob from its held source bytes";
+    const auto stored = raw->get(blob_key);
+    ASSERT_TRUE(stored.has_value());
+    const auto h = decodeEnvelopeHeader(stored->bytes, stored->bytes.size(), ObjectKind::Blob);
+    EXPECT_EQ(stored->bytes.substr(h.header_len), "payload-V");
+}
+
 TEST(CasBuild, PublishBodylessCondemnedDepThrowsAbortedRetryable)
 {
     /// B137/B190: a BODYLESS publish dep (tokenless W-EVIDENCE) whose hash is condemned must surface as

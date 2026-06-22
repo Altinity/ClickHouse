@@ -179,9 +179,13 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
         }
         catch (const Exception & e)
         {
-            /// ABORTED from observeAndAdmit inside uploadFromSource: a racing writer concurrently
-            /// displaced the condemned token before our putOverwrite landed, and their fresh incarnation
-            /// is itself already condemned. Extremely rare. Retry uploadFromSource (bounded).
+            /// ABORTED from uploadFromSource is retryable — re-upload from our held source bytes
+            /// (bounded). Two cases produce it:
+            ///   • a racing writer displaced the condemned token before our putOverwrite landed and
+            ///     their fresh incarnation is itself already condemned (observeAndAdmit → ABORTED); or
+            ///   • the object was GC-deleted during the post-412 revival re-observe (B190 sibling):
+            ///     reviveObserve converts FILE_DOESNT_EXIST → ABORTED so the vanish re-uploads here
+            ///     rather than escaping FATAL. Both are rare races covered by the bounded loop.
             if (e.code() != ErrorCodes::ABORTED || attempt + 1 == max_attempts)
                 throw;
         }
@@ -334,6 +338,30 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         kind == ObjectKind::Tree ? CasEventObjectKind::Tree
         : (kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
 
+    /// Revival-local wrapper for the post-412 re-observe (B190 sibling, INV-3). On the post-412 path a
+    /// racing writer is assumed to have (re-)created the object, so we adopt its token via the 3-arg
+    /// observeAndAdmit. But the object can be GC-deleted in the window (present at the conditional PUT
+    /// → 412, gone at the subsequent HEAD), making the 3-arg overload throw FILE_DOESNT_EXIST. The
+    /// caller (putBlob / uploadStagedTree / recreateTree) HOLDS the source bytes, so a vanish here is a
+    /// retryable race: convert FILE_DOESNT_EXIST → ABORTED so putBlob's bounded retry loop re-uploads
+    /// from those bytes (and tree callers likewise re-create). Without this, FILE_DOESNT_EXIST escaped
+    /// putBlob's ABORTED-only catch as a FATAL INSERT failure — the sibling of the gate bug.
+    auto reviveObserve = [&](const String & k_)
+    {
+        try
+        {
+            observeAndAdmit(kind, hash, k_);
+        }
+        catch (const Exception & e_)
+        {
+            if (e_.code() != ErrorCodes::FILE_DOESNT_EXIST)
+                throw;
+            throw Exception(ErrorCodes::ABORTED,
+                "uploadFromSource: object {} vanished (GC-deleted) during revival re-observe; "
+                "retry the operation — re-upload from held source bytes (INV-3)", k_);
+        }
+    };
+
     auto recordDoneAndEmit = [&](Token tok)
     {
         deps[{static_cast<uint8_t>(kind), hash}] =
@@ -390,7 +418,8 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
             return;
         }
         /// Still 412 after the vanish-and-retry: a racing writer re-created it. Adopt their token.
-        observeAndAdmit(kind, hash, key);
+        /// reviveObserve converts FILE_DOESNT_EXIST (deleted again in the window) → ABORTED (retryable).
+        reviveObserve(key);
         return;
     }
 
@@ -430,7 +459,8 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
                 return;
             }
             /// Still 412 — a racing writer re-created it. Observe their token.
-            observeAndAdmit(kind, hash, key);
+            /// reviveObserve converts FILE_DOESNT_EXIST (deleted again in the window) → ABORTED (retryable).
+            reviveObserve(key);
             return;
         }
         /// Present with a different token — a racing writer displaced the condemned incarnation.
