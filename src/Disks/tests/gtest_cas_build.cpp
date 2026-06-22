@@ -442,6 +442,73 @@ TEST(CasBuild, PublishBodylessCondemnedDepThrowsAbortedRetryable)
         [&] { build->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{}); });
 }
 
+TEST(CasBuild, GateBodylessAdoptFullyDeletedObjectThrowsAbortedNotFatal)
+{
+    /// B190 residual (soak bug): a TOKENLESS (W-EVIDENCE) adopt dep whose object is FULLY GC-DELETED
+    /// (HEAD absent, not merely condemned-present) must throw ABORTED from the gate — not the old fatal
+    /// FILE_DOESNT_EXIST that the 3-arg observeAndAdmit used to emit.
+    ///
+    /// Scenario:
+    ///   1. Blob X exists with token t0; a tokenless dep is recorded via adoptFromTree (no body in hand).
+    ///   2. GC condemns X (retire view hit by hash) AND fully deletes the object (deleteExact → HEAD absent).
+    ///   3. The publish gate runs: tokenless dep + view hit → calls observeAndAdmit(3-arg) → HEAD →
+    ///      absent → should throw ABORTED (retryable, INV-3), NOT FILE_DOESNT_EXIST (fatal).
+    ///
+    /// The gate's absent-object path is distinct from the condemned-present path tested by
+    /// PublishBodylessCondemnedDepThrowsAbortedRetryable (which fires GC delete AFTER the HEAD via
+    /// HeadThenDeleteOnceBackend). HERE the object is absent BEFORE the HEAD call.
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// 1. Write payload-B190 via a throwaway build; capture its token t0.
+    BlobId id;
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        auto build0 = s0->startBuild({});
+        id = build0->putBlob(idOf("payload-B190"), BlobSource::fromString("payload-B190")).id;
+        t0 = b->head(s0->layout().blobKey(id)).token;
+    }
+
+    DB::Cas::Layout layout("p");
+    const String blob_key = layout.blobKey(id);
+
+    /// 2. A source tree referencing blob hash(B190) by name — adoptFromTree records a TOKENLESS dep.
+    TreeEntry src_entry;
+    src_entry.name = "data.bin";
+    src_entry.placement = Placement::Blob;
+    src_entry.file_hash = u128Of("payload-B190");
+    src_entry.file_size = 11;
+    const TreeId source = writeTreeRaw(*b, layout, {src_entry}, openStore(b)->poolMeta().pool_id);
+
+    /// 3. Condemn (Blob, hash(B190), t0) in the retire view AND immediately GC-delete the object.
+    ///    The retire entry stays present (GC has not yet confirmed the outcome and dropped it), so
+    ///    `checkAndResolveDeps` will find a view hit by hash — triggering the observeAndAdmit path.
+    ///    The object is now absent: HEAD will return exists=false.
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-B190"), .token = t0, .size = 11}});
+    ASSERT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::Deleted);
+    ASSERT_FALSE(b->head(blob_key).exists) << "object must be absent before the gate HEAD";
+
+    /// 4. Open a fresh Store over the raw backend — retire view (refreshed at open) sees the condemnation.
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto build = s->startBuild({});
+
+    /// 5. Adopt the blob as a tokenless evidence dep; build a NEW tree referencing it. No body in hand.
+    const TreeEntry adopted = build->adoptFromTree(source, "data.bin");
+    const TreeId tree = build->putTree({adopted});
+
+    /// 6. Publish drives the gate:
+    ///    tokenless dep + view hit → observeAndAdmit(3-arg) → HEAD → absent → ABORTED (INV-3).
+    ///    BEFORE fix: threw FILE_DOESNT_EXIST "object ... absent — cannot reuse" → fatal INSERT failure.
+    ///    AFTER fix:  throws ABORTED (retryable) — the outer INSERT retries and re-materializes from source.
+    expectThrowsCode(DB::ErrorCodes::ABORTED,
+        [&] { build->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{}); });
+
+    /// No ref was published and the blob stays absent.
+    EXPECT_FALSE(s->resolveRef(RootNamespace{"srv1/tbl"}, "part_1").has_value());
+    EXPECT_FALSE(b->head(blob_key).exists);
+}
+
 TEST(CasBuild, PutTreeEnforcesBottomUp)
 {
     auto b = std::make_shared<InMemoryBackend>();

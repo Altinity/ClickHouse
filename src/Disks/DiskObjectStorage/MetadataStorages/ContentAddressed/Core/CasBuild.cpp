@@ -210,8 +210,17 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
 {
     const HeadResult hr = store->backend().head(key);
     if (!hr.exists)
+        /// Object absent at observe time. Two contexts call this overload:
+        ///   1. adoptTree (fail-closed): a detached/frozen tree that is absent at adopt time is
+        ///      NOT a transient race — it was GC-collected. The caller must abort or re-create from
+        ///      source (not retry forever). FILE_DOESNT_EXIST is the right outcome for adoptTree.
+        ///   2. checkAndResolveDeps gate (retryable): a GC-deleted object at gate time is a race
+        ///      under INV-3 — the caller retries the whole operation and re-materializes from source.
+        ///      The gate catches FILE_DOESNT_EXIST here and re-throws it as ABORTED (see
+        ///      gateObserveAndAdmit below) so the INSERT layer sees the uniform retryable error.
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-            "Build: object {} absent — cannot reuse (caller must upload it)", key);
+            "Build::observeAndAdmit: object {} vanished (GC-deleted) before observe; "
+            "caller must re-upload/re-materialize from source", key);
     return observeAndAdmit(kind, hash, key, hr);
 }
 
@@ -713,6 +722,33 @@ void Build::checkAndResolveDeps()
         store->emitEvent(_ev6);
     }
 
+    /// Gate-local wrapper: calls the 3-arg observeAndAdmit and converts FILE_DOESNT_EXIST (object absent
+    /// at observe time) to ABORTED. At the publish gate, an object that is fully GC-deleted before our
+    /// HEAD is a transient race under INV-3 — the caller retries the operation and re-materializes from
+    /// source. Every other absent/condemned outcome in the gate already throws ABORTED; this wrapper
+    /// makes the absent-at-HEAD path consistent. Note: adoptTree also calls the 3-arg overload and
+    /// intentionally keeps FILE_DOESNT_EXIST (fail-closed semantics for detached-tree re-attach) — it
+    /// does NOT use this wrapper.
+    auto gateObserveAndAdmit = [&](ObjectKind k_, const UInt128 & h_, const String & kstr_)
+    {
+        try
+        {
+            observeAndAdmit(k_, h_, kstr_);
+        }
+        catch (const Exception & e_)
+        {
+            if (e_.code() != ErrorCodes::FILE_DOESNT_EXIST)
+                throw;
+            /// B190 residual (INV-3): object vanished (GC-deleted) between the retire-view hit and our
+            /// HEAD. The dep is lost with no source bytes at the gate → retryable ABORTED, matching all
+            /// other absent/condemned gate branches. The soak saw: "WORKLOAD FAILURE: Code 107 ... blobs/
+            /// 0b/0b343... absent — cannot reuse" — exactly this path for a bodyless adopt dep.
+            throw Exception(ErrorCodes::ABORTED,
+                "checkAndResolveDeps: object {} vanished (GC-deleted) before gate observe; "
+                "retry the operation — re-upload/re-materialize from source (INV-3)", kstr_);
+        }
+    };
+
     for (auto & [key, dep] : deps)
     {
         /// Iteration-safety invariant: DepKey's kind byte (key.first) == dep.kind, so any mutation
@@ -737,7 +773,7 @@ void Build::checkAndResolveDeps()
             /// deps — the old two-pass did this in gateCheckDeps after revalidateDeps' `continue`.
             if (hits.has_value())
             {
-                observeAndAdmit(kind, hash, k);
+                gateObserveAndAdmit(kind, hash, k);
                 continue;
             }
 
@@ -805,7 +841,9 @@ void Build::checkAndResolveDeps()
                     /// Case (b): dep's own token is live, but a displaced incarnation's token was
                     /// condemned. Re-observe to adopt the current token (HEAD-only, no GET). observeAndAdmit
                     /// throws ABORTED if the current incarnation is itself condemned (bounded by caller).
-                    observeAndAdmit(kind, hash, k);
+                    /// gateObserveAndAdmit converts FILE_DOESNT_EXIST (object absent — GC-deleted in the
+                    /// window between the view hit and our HEAD) to ABORTED (INV-3 retryable).
+                    gateObserveAndAdmit(kind, hash, k);
                 }
                 continue;
             }
