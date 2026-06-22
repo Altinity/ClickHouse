@@ -20,7 +20,6 @@ from pyiceberg.table.sorting import SortField, SortOrder
 from pyiceberg.transforms import DayTransform, IdentityTransform
 from pyiceberg.types import (
     DoubleType,
-    IntegerType,
     LongType,
     FloatType,
     NestedField,
@@ -113,7 +112,7 @@ def create_table(
     return catalog.create_table(
         identifier=f"{namespace}.{table}",
         schema=schema,
-        location=f"s3://warehouse-rest/data/{namespace}/{table}",
+        location=f"s3://warehouse-rest/data",
         partition_spec=partition_spec,
         sort_order=sort_order,
     )
