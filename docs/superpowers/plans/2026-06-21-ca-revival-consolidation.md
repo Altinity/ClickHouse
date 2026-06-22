@@ -103,3 +103,21 @@ Baseline at this point: 321 pass / 2 known reds (`CaWiringOps.FreezeViaHardLinks
 - **FIX:** change the 3-arg `observeAndAdmit` HEAD-absent throw (line 213) from fatal `FILE_DOESNT_EXIST` to **retryable `ABORTED`** ("object vanished between adopt and observe; retry — INV-3"). VERIFY every caller treats ABORTED as re-upload/retry: putBlob catches ABORTED (lines 159,185 → uploadFromSource from held bytes); gate bodyless propagates ABORTED (INSERT retries, re-materializes from source); uploadFromSource's observeAndAdmit calls must handle it. ADD a test: gate re-observe of a bodyless tokenless dep whose object is FULLY DELETED (HeadThenDeleteOnceBackend or a delete-the-key backend) → ABORTED, NOT FILE_DOESNT_EXIST. The existing tests covered condemned-token→ABORTED but NOT absent-object→ABORTED — that coverage gap let this through.
 - **REOPEN B190** (residual): the gate bodyless-adopt HEAD-absent → fatal. Same family, last uncovered sub-path.
 - Other soak signals were HEALTHY: B174 gc/snap bounded (gen~4), replicas converged, ABORTED self-heal working (the condemned-dedup→re-upload-from-source path fired thousands of times benignly). Only this one absent-at-gate sub-path is fatal.
+
+## RESIDUAL FIXED — INV-3 vanish-is-retryable now COMPLETE across gate + revival — 2026-06-22
+Two commits closed the soak-v3 residual and its sibling:
+- **`ef9c9e9c9e2`** (gate): `gateObserveAndAdmit` wrapper in `checkAndResolveDeps` converts the
+  HEAD-absent `FILE_DOESNT_EXIST` → retryable `ABORTED` at the two bodyless-adopt gate sites
+  (~CasBuild.cpp:806/876). Closes the exact soak-v3 fatal (`cannot reuse` at the gate). Completeness-reviewed.
+- **`a0cbca8fd55`** (sibling): `reviveObserve` wrapper in `uploadFromSource` converts the same
+  HEAD-absent throw at its two post-412 re-observe sites (~CasBuild.cpp:422/463) → `ABORTED`, which
+  `putBlob`'s bounded retry loop turns into a re-upload from held source bytes. Tree callers
+  (`uploadStagedTree`/`recreateTree`) get retryable instead of fatal too. TDD test
+  `CasBuild.PutBlobVanishDuringRevivalReUploadsNotFatal` (RED→GREEN). 321/2 known reds.
+- **Completeness audit (full class closed):** the bare 3-arg `observeAndAdmit` (the only overload that
+  throws `FILE_DOESNT_EXIST`) has exactly THREE reachable call sites: `reviveObserve` (353, →ABORTED),
+  `gateObserveAndAdmit` (806/876, →ABORTED), and `adoptTree` (550, intentionally fail-closed at staging).
+  Every other site (152/429/468/829/906) uses the 4-arg overload (present `HeadResult` in hand; condemned
+  → ABORTED, never FILE_DOESNT_EXIST). The dedup-vs-GC fatal class is uniformly closed by construction.
+- **NEXT: 24h SOAK v4** on the fully-fixed binary (both commits). Watch: zero `Code 499`, zero
+  `cannot reuse`/fatal `FILE_DOESNT_EXIST`; B174 gc/snap bounded; replicas converged; dangling=0.
