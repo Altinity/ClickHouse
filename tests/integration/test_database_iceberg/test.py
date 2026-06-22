@@ -20,6 +20,7 @@ from pyiceberg.table.sorting import SortField, SortOrder
 from pyiceberg.transforms import DayTransform, IdentityTransform
 from pyiceberg.types import (
     DoubleType,
+    IntegerType,
     LongType,
     FloatType,
     NestedField,
