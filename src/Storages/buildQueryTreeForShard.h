@@ -16,8 +16,13 @@ using PlannerContextPtr = std::shared_ptr<PlannerContext>;
 class Context;
 using ContextPtr = std::shared_ptr<const Context>;
 
-QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_context, QueryTreeNodePtr query_tree_to_modify, bool allow_global_join_for_right_table);
+QueryTreeNodePtr buildQueryTreeForShard(
+    const PlannerContextPtr & planner_context,
+    QueryTreeNodePtr query_tree_to_modify,
+    bool allow_global_join_for_right_table,
+    bool find_cross_join = false);
 
-void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context);
+void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context, bool force_prefer_global_join = false);
+void rewriteInToGlobalIn(QueryTreeNodePtr & query_tree_to_modify, ContextPtr context, bool rewrite_for_distributed = false);
 
 }

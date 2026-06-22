@@ -25,12 +25,12 @@
 - [ ] <!---ci_exclude_stateless--> Stateless tests
 - [ ] <!---ci_exclude_stateful--> Stateful tests
 - [ ] <!---ci_exclude_performance--> Performance tests
-- [ ] <!---ci_exclude_asan--> All with ASAN
+- [x] <!---ci_exclude_aarch64|arm-->  Aarch64 tests
+- [x] <!---ci_exclude_asan--> All with ASAN
 - [x] <!---ci_exclude_tsan--> All with TSAN
 - [x] <!---ci_exclude_msan--> All with MSAN
 - [x] <!---ci_exclude_ubsan--> All with UBSAN
 - [x] <!---ci_exclude_coverage--> All with Coverage
-- [ ] <!---ci_exclude_aarch64|arm--> All with Aarch64
 - [ ] <!---ci_exclude_regression--> All Regression
 - [ ] <!---no_ci_cache--> Disable CI Cache
 
@@ -42,6 +42,7 @@
 - [ ] <!---ci_regression_clickhouse_keeper--> ClickHouse Keeper (1h)
 - [x] <!---ci_regression_iceberg--> Iceberg (2h)
 - [ ] <!---ci_regression_ldap--> LDAP (1h)
+- [x] <!---ci_regression_oauth--> OAuth (5m)
 - [x] <!---ci_regression_parquet--> Parquet (1.5h)
 - [ ] <!---ci_regression_rbac--> RBAC (1.5h)
 - [ ] <!---ci_regression_ssl_server--> SSL Server (1h)

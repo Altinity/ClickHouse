@@ -140,7 +140,7 @@ def started_cluster():
 
         yield cluster
     finally:
-        shutil.rmtree(os.path.join(SCRIPT_DIR, "data/generated/"))
+        shutil.rmtree(os.path.join(SCRIPT_DIR, "data/generated/"), ignore_errors=True)
         cluster.shutdown()
 
 
@@ -832,8 +832,8 @@ def test_object_storage_remote_initiator(started_cluster):
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
 
     # Cluster with dots in the host names
     query_id = uuid.uuid4().hex
@@ -860,8 +860,8 @@ def test_object_storage_remote_initiator(started_cluster):
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
 
     users = node.query(
         f"""
@@ -902,8 +902,8 @@ def test_object_storage_remote_initiator(started_cluster):
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
 
     users = node.query(
         f"""
@@ -963,8 +963,8 @@ def test_object_storage_remote_initiator(started_cluster):
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
 
     users = node.query(
         f"""
@@ -1171,7 +1171,8 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
     node.query("SET allow_experimental_analyzer = DEFAULT")
 
 
-def test_joins(started_cluster):
+@pytest.mark.parametrize("join_mode", ["local", "global"])
+def test_joins(started_cluster, join_mode):
     node = started_cluster.instances["s0_0_0"]
 
     # Table join_table only exists on the node 's0_0_0'.
@@ -1205,7 +1206,7 @@ def test_joins(started_cluster):
             join_table AS t2
         ON t1.value = t2.id
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
 
@@ -1228,7 +1229,7 @@ def test_joins(started_cluster):
                 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
         ON t1.value = t2.id
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
 
@@ -1246,7 +1247,7 @@ def test_joins(started_cluster):
         ON t1.value = t2.id
         WHERE (t1.value % 2)
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
 
@@ -1265,7 +1266,7 @@ def test_joins(started_cluster):
         ON t1.value = t2.id
         WHERE (t2.id % 2)
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
 
@@ -1283,13 +1284,14 @@ def test_joins(started_cluster):
         ON t1.value = t2.id
         WHERE (t1.value % 2) AND ((t2.id % 3) == 2)
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
 
     res = list(map(str.split, result5.splitlines()))
     assert len(res) == 6
 
+    # With WHERE clause with global subquery
     result6 = node.query(
         f"""
         SELECT name FROM
@@ -1298,12 +1300,28 @@ def test_joins(started_cluster):
                 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
         WHERE value IN (SELECT id FROM join_table)
         ORDER BY name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
     res = list(map(str.split, result6.splitlines()))
     assert len(res) == 25
 
+    # With WHERE clause with global subquery
+    result6 = node.query(
+        f"""
+        SELECT name FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        WHERE value GLOBAL IN (SELECT id FROM join_table)
+        ORDER BY name
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
+        """
+    )
+    res = list(map(str.split, result6.splitlines()))
+    assert len(res) == 25
+
+    # With WHERE clause without columns in condition
     result7 = node.query(
         f"""
         SELECT count() FROM
@@ -1314,11 +1332,12 @@ def test_joins(started_cluster):
             join_table AS t2
         ON 1
         GROUP BY ALL
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
     assert result7.strip() == "625"
 
+    # With WHERE clause without columns in condition and with local column in SELECT
     result8 = node.query(
         f"""
         SELECT count(), t2.id FROM
@@ -1329,7 +1348,7 @@ def test_joins(started_cluster):
             join_table AS t2
         ON 1
         GROUP BY ALL
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
     res = list(map(str.split, result8.splitlines()))
@@ -1427,8 +1446,8 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator
-    assert queries == ["3"]
+    # initial node + remote initiator
+    assert queries == ["2"]
 
     users = node.query(
         f"""
@@ -1472,8 +1491,8 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
 
     users = node.query(
         f"""
@@ -1490,3 +1509,113 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
     assert users[1:] == ["s0_0_0\tdefault",
                      "s0_0_1\tfoo",
                      "s0_1_0\tfoo"]
+
+
+def test_object_storage_remote_initiator_aggregation(started_cluster):
+    node = started_cluster.instances["s0_0_0"]
+
+    # Remove initiator without cluster request
+    # Check that aggregation works on nodes
+    query_id = uuid.uuid4().hex
+
+    result = node.query(
+        f"""
+        SELECT sum(value) from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_remote_initiator_cluster='cluster_with_dots_and_user'
+        """,
+        query_id = query_id,
+    )
+
+    assert result == "67802152770\n"
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    result_rows = node.query(
+        f"""
+        SELECT sum(result_rows)
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+                AND is_initial_query = 0
+            ORDER BY ALL
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # Data processed on cluster 'hidden_cluster_with_username_and_password'.
+    # Cluster contains two nodes, each returns one row.
+    assert result_rows == ["2"]
+
+    # Remove initiator without cluster request
+    # Check that aggregation works on nodes
+    query_id = uuid.uuid4().hex
+
+    result = node.query(
+        f"""
+        SELECT value % 2 as bit, sum(value) from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        GROUP BY bit
+        ORDER BY bit
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_remote_initiator_cluster='cluster_with_dots_and_user'
+        """,
+        query_id = query_id,
+    )
+
+    assert result == "0\t41117771522\n1\t26684381248\n"
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    result_rows = node.query(
+        f"""
+        SELECT sum(result_rows)
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+                AND is_initial_query = 0
+            ORDER BY ALL
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # Data processed on cluster 'hidden_cluster_with_username_and_password'.
+    # Cluster contains two nodes, each returns up to two rows, at least two rows totaly.
+    result_rows = int(result_rows[0])
+    assert result_rows >= 2 and result_rows <= 4
+
+
+def test_hive_partitioning_with_where_condition(started_cluster):
+    node = started_cluster.instances["s0_0_0"]
+    test_id = uuid.uuid4().hex[:8]
+
+    for i in range(1, 5):
+        node.query(
+            f"""
+            INSERT INTO FUNCTION s3('http://minio1:9001/root/hive/{test_id}/date=2000-01-0{i}/data.csv',
+                'minio','{minio_secret_key}','CSVWithNames','d UInt64')
+            SELECT number FROM numbers(10)
+            SETTINGS s3_truncate_on_insert=1
+            """)
+
+    # Direct query
+    result = node.query(
+        f"""
+        SELECT count() FROM s3('http://minio1:9001/root/hive/{test_id}/date=*/data.csv',
+            'minio','{minio_secret_key}','CSVWithNames','d UInt64')
+        WHERE date='2000-01-02'
+        SETTINGS use_hive_partitioning=1
+        """
+    )
+    assert result.strip() == "10"
+
+    result = node.query(
+        f"""
+        SELECT count() FROM s3Cluster('cluster_simple', 'http://minio1:9001/root/hive/{test_id}/date=*/data.csv',
+            'minio','{minio_secret_key}','CSVWithNames','d UInt64')
+        WHERE date='2000-01-02'
+        SETTINGS use_hive_partitioning=1
+        """
+    )
+    assert result.strip() == "10"

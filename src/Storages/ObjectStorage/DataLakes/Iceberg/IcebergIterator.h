@@ -26,6 +26,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergTableStateSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 namespace DB
 {
@@ -43,7 +44,8 @@ public:
         const ActionsDAG * filter_dag_,
         TableStateSnapshotPtr table_snapshot_,
         IcebergDataSnapshotPtr data_snapshot_,
-        PersistentTableComponents persistent_components);
+        PersistentTableComponents persistent_components,
+        std::shared_ptr<SecondaryStorages> secondary_storages_);
 
     std::optional<DB::Iceberg::ProcessedManifestFileEntryPtr> next();
 
@@ -55,6 +57,8 @@ private:
     Iceberg::IcebergDataSnapshotPtr data_snapshot;
     PersistentTableComponents persistent_components;
     LoggerPtr log;
+
+    std::shared_ptr<SecondaryStorages> secondary_storages;
 
     size_t manifest_file_index = 0;
     Iceberg::ManifestIteratorPtr current_manifest_file_iterator;
@@ -74,7 +78,8 @@ public:
         IDataLakeMetadata::FileProgressCallback callback_,
         Iceberg::TableStateSnapshotPtr table_snapshot_,
         Iceberg::IcebergDataSnapshotPtr data_snapshot_,
-        Iceberg::PersistentTableComponents persistent_components_);
+        Iceberg::PersistentTableComponents persistent_components_,
+        std::shared_ptr<SecondaryStorages> secondary_storages_);
 
     ObjectInfoPtr next(size_t) override;
 
@@ -85,6 +90,7 @@ private:
     LoggerPtr logger;
     std::shared_ptr<ActionsDAG> filter_dag;
     ObjectStoragePtr object_storage;
+    ContextPtr local_context;
     const Iceberg::TableStateSnapshotPtr table_state_snapshot;
     Iceberg::PersistentTableComponents persistent_components;
     Iceberg::SingleThreadIcebergKeysIterator data_files_iterator;
@@ -97,6 +103,7 @@ private:
     std::exception_ptr exception;
     std::mutex exception_mutex;
     Int32 table_schema_id;
+    std::shared_ptr<SecondaryStorages> secondary_storages;  // Sometimes data or manifests can be located on another storage
 };
 }
 

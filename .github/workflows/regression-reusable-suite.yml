@@ -93,6 +93,7 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       pr_number: ${{ github.event.number }}
       artifacts: builds
+      GH_BINARY_ARTIFACT_NAME: ${{ inputs.runner_arch == 'aarch64' && 'CH_ARM_BIN_GH' || 'CH_AMD_BINARY_GH' }}
       # Args
       args: --test-to-end
         --no-colors
@@ -127,7 +128,30 @@ jobs:
       - name: 🛠️ Setup
         run: .github/setup.sh
 
+      - name: 📥 Try get binary from GH artifact
+        id: get_binary_gh
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.GH_BINARY_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/gh_binary
+
+      - name: 🔎 Resolve binary source
+        id: resolve_binary_source
+        run: |
+          GH_BINARY="${{ runner.temp }}/gh_binary/clickhouse"
+          if [ -f "$GH_BINARY" ]; then
+            chmod +x "$GH_BINARY"
+            echo "clickhouse_path=$GH_BINARY" >> "$GITHUB_ENV"
+            echo "has_gh_binary=true" >> "$GITHUB_OUTPUT"
+            echo "Using GH artifact binary: $GH_BINARY"
+          else
+            echo "has_gh_binary=false" >> "$GITHUB_OUTPUT"
+            echo "GH artifact binary not found, fallback to S3 URL resolution"
+          fi
+
       - name: 📦 Get deb url
+        if: ${{ steps.resolve_binary_source.outputs.has_gh_binary != 'true' }}
         env:
           S3_BASE_URL: https://altinity-build-artifacts.s3.amazonaws.com/
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}

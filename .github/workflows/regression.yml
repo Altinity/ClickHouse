@@ -277,7 +277,7 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: iceberg
-      extra_args: --only ${{ matrix.PART == 1 && '"/iceberg/iceberg engine/rest catalog/*" "/iceberg/s3 table function/*" "/iceberg/icebergS3 table function/*" "/iceberg/iceberg cache/*"' || '"/iceberg/iceberg engine/glue catalog/*" "/iceberg/iceberg table engine/*"' }}
+      extra_args: --only ${{ matrix.PART == 1 && '"/iceberg/iceberg engine/rest catalog/*" "/iceberg/s3 table function/*" "/iceberg/icebergS3 table function/*" "/iceberg/iceberg cache/*"' || '"/iceberg/iceberg engine/glue catalog/*" "/iceberg/iceberg table engine/*" "/iceberg/export partition/*"' }}
     secrets: inherit
   LDAP:
     if: |
@@ -301,6 +301,26 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: ldap_${{ matrix.SUITE }}
+    secrets: inherit
+
+  OAuth:
+    if: |
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'oauth')
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      workflow_config: ${{ inputs.workflow_config }}
+      suite_name: oauth
+      suite_executable: regression.py
+      output_format: new-fails
+      flags: --with-analyzer --identity-provider keycloak
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_arch: ${{ inputs.arch }}
+      runner_type: ${{ inputs.runner_type }}
+      build_sha: ${{ inputs.build_sha }}
+      set_commit_status: true
+      job_name: oauth
     secrets: inherit
 
   Parquet:

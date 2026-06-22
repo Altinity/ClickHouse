@@ -31,6 +31,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 namespace DB
 {
@@ -143,10 +144,11 @@ public:
         const std::vector<Field> & partition_values,
         SharedHeader sample_block,
         const std::vector<String> & data_file_paths,
-        StorageObjectStorageConfigurationPtr configuration,
         ContextPtr context) override;
 
     CompressionMethod getCompressionMethod() const { return persistent_components.metadata_compression_method; }
+
+    std::string getTableLocation() const override { return persistent_components.table_location; }
 
     bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override;
     bool supportsDelete() const override { return true; }
@@ -219,19 +221,18 @@ private:
         const std::vector<String> & partition_columns,
         const std::vector<DataTypePtr> & partition_types,
         SharedHeader sample_block,
-        const std::vector<String> & data_file_paths,
+        const std::vector<Iceberg::IcebergPathFromMetadata> & data_file_paths_in_metadata,
         const std::vector<IcebergSerializedFileStats> & per_file_stats,
         Int64 total_data_files,
         Int64 total_rows,
         Int64 total_chunks_size,
         std::shared_ptr<DataLake::ICatalog> catalog,
         const StorageID & table_id,
-        const String & blob_storage_type_name,
-        const String & blob_storage_namespace_name,
         ContextPtr context);
 
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
+    mutable std::shared_ptr<SecondaryStorages> secondary_storages;
     DB::Iceberg::PersistentTableComponents persistent_components;
     const DataLakeStorageSettings & data_lake_settings;
     const String write_format;
