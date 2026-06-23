@@ -349,9 +349,7 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
             const uint64_t indeg_at_recheck =
                 snap.at(hashPrefixShard(entry.hash, state.snap_shards)).inDegree(entry.kind, entry.hash);
             const uint64_t fence_version_for_round = state.fence_seq;   /// the leadership-epoch fence seq
-            const CasEventObjectKind ev_kind =
-                entry.kind == ObjectKind::Tree ? CasEventObjectKind::Tree
-                : (entry.kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
+            const CasEventObjectKind ev_kind = toEventKind(entry.kind);
             if (indeg_at_recheck > 0)
             {
                 /// A publish at or below the fence re-pinned it (folded above) - never delete.
@@ -592,7 +590,7 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
         {
             CasEvent _ev8;
             _ev8.type = CasEventType::IndegZero;
-            _ev8.object_kind = child.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
+            _ev8.object_kind = toEventKind(child.kind);
             _ev8.object_hash = u128ToHex(child.hash);
             _ev8.round = round;
             _ev8.gen = state.snap_generation;
@@ -619,7 +617,7 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
         {
             CasEvent _ev9;
             _ev9.type = CasEventType::BlobForget;
-            _ev9.object_kind = node.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
+            _ev9.object_kind = toEventKind(node.kind);
             _ev9.object_hash = u128ToHex(node.hash);
             _ev9.round = round;
             _ev9.gen = state.snap_generation;
@@ -998,9 +996,7 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     {
         for (const Candidate & candidate : shard_snap.zeroInDegreeKnown())
         {
-            const CasEventObjectKind ev_kind =
-                candidate.kind == ObjectKind::Tree ? CasEventObjectKind::Tree
-                : (candidate.kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
+            const CasEventObjectKind ev_kind = toEventKind(candidate.kind);
             const HeadResult observed = backend.head(objectKey(layout, candidate.kind, candidate.hash));
             /// B170: HEAD-observe — the current incarnation token, the only token the eventual
             /// exact-token delete may carry.
@@ -1058,8 +1054,7 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
                     {
                         CasEvent _ev_indeg;
                         _ev_indeg.type = CasEventType::IndegZero;
-                        _ev_indeg.object_kind =
-                            child.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
+                        _ev_indeg.object_kind = toEventKind(child.kind);
                         _ev_indeg.object_hash = u128ToHex(child.hash);
                         _ev_indeg.round = round;
                         _ev_indeg.gen = state.snap_generation;
@@ -1254,7 +1249,7 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                 CasEvent _ev19;
                 _ev19.type = CasEventType::IndegZero;
                 _ev19.namespace_ = ns.string();
-                _ev19.object_kind = old.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
+                _ev19.object_kind = toEventKind(old.kind);
                 _ev19.object_hash = u128ToHex(old.hash);
                 _ev19.round = state.round;
                 _ev19.gen = state.snap_generation;
@@ -1484,7 +1479,7 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                 CasEvent _ev23;
                 _ev23.type = CasEventType::IndegZero;
                 _ev23.namespace_ = ns.string();
-                _ev23.object_kind = freed.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
+                _ev23.object_kind = toEventKind(freed.kind);
                 _ev23.object_hash = u128ToHex(freed.hash);
                 _ev23.round = state.round;
                 _ev23.gen = state.snap_generation;

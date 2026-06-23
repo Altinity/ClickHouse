@@ -246,9 +246,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
         logical_size = hr.size - header_len;
     }
 
-    const CasEventObjectKind ev_kind =
-        kind == ObjectKind::Tree ? CasEventObjectKind::Tree
-        : (kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
+    const CasEventObjectKind ev_kind = toEventKind(kind);
     if (store->retireView().isCondemnedToken(kind, hash, hr.token))
     {
         /// INV-1 (revival-from-source): the observed token is condemned — we must NOT read the dying
@@ -334,9 +332,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         }
     };
 
-    const CasEventObjectKind ev_kind =
-        kind == ObjectKind::Tree ? CasEventObjectKind::Tree
-        : (kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
+    const CasEventObjectKind ev_kind = toEventKind(kind);
 
     /// Revival-local wrapper for the post-412 re-observe (B190 sibling, INV-3). On the post-412 path a
     /// racing writer is assumed to have (re-)created the object, so we adopt its token via the 3-arg
@@ -896,8 +892,7 @@ void Build::checkAndResolveDeps()
                 {
                     CasEvent _ev5;
                     _ev5.type = CasEventType::GateResurrect;
-                    _ev5.object_kind = kind == ObjectKind::Tree ? CasEventObjectKind::Tree
-                        : (kind == ObjectKind::Pack ? CasEventObjectKind::Pack : CasEventObjectKind::Blob);
+                    _ev5.object_kind = toEventKind(kind);
                     _ev5.object_hash = u128ToHex(hash);
                     _ev5.token = u128ToHex(build_id);
                     _ev5.round = store->retireView().round();
