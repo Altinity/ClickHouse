@@ -21,6 +21,14 @@ RUN sed -i "s|http://archive.ubuntu.com|${apt_archive}|g" /etc/apt/sources.list 
     && useradd -r -g clickhouse --uid=101 --home-dir=/var/lib/clickhouse --shell=/bin/bash clickhouse \
     && apt-get update \
     && apt-get install --yes --no-install-recommends \
+        libgnutls30 \
+        libssl3 \
+        openssl \
+        libsystemd0 \
+        libudev1 \
+        libgcrypt20 \
+        sed \
+        liblzma5 \
         busybox \
         ca-certificates \
         locales \
@@ -28,7 +36,7 @@ RUN sed -i "s|http://archive.ubuntu.com|${apt_archive}|g" /etc/apt/sources.list 
         wget \
         gpgv \
     && busybox --install -s \
-    && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
 #docker-official-library:off
 # The part between `docker-official-library` tags is related to our builds
