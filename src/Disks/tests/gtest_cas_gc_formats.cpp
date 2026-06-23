@@ -11,7 +11,7 @@
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
-extern const int NOT_IMPLEMENTED;
+extern const int UNKNOWN_FORMAT_VERSION;
 }
 
 using namespace DB::Cas;
@@ -94,9 +94,9 @@ TEST(CasGcFormats, GcStateV3DefaultsAndReadability)
 
 TEST(CasGcFormats, GcStateV3Validation)
 {
-    /// future version => NOT_IMPLEMENTED; v1/v2 (old CAGS) => CORRUPTED_DATA (unreleased, no compat);
+    /// future version => UNKNOWN_FORMAT_VERSION; v1/v2 (old CAGS) => CORRUPTED_DATA (unreleased, no compat);
     /// unknown top-level key, unknown lease key, non-numeric fence_version round key => CORRUPTED_DATA.
-    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [] { decodeGcState(
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [] { decodeGcState(
         R"({"format":"cas_gc_state","version":4,"round":0,"fence_seq":0,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"fence_version":{}})"); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
         R"({"format":"cas_gc_state","version":1,"round":1,"fence_seq":1})"); });
@@ -215,8 +215,8 @@ void expectStrictJsonContract(Decode && decode, const String & expected_format, 
     /// version as a string (wrong type).
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { decode(R"({"format":")" + expected_format + R"(","version":")" + version_str + R"("})"); });
-    /// Future version => NOT_IMPLEMENTED (fail closed on the future, never corruption).
-    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
+    /// Future version => UNKNOWN_FORMAT_VERSION (fail closed on the future, never corruption).
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { decode(R"({"format":")" + expected_format + R"(","version":)" + std::to_string(current_version + 1) + "}"); });
 }
 

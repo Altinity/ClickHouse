@@ -5,7 +5,7 @@
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
-extern const int NOT_IMPLEMENTED;
+extern const int UNKNOWN_FORMAT_VERSION;
 }
 
 using namespace DB::Cas;
@@ -338,11 +338,11 @@ TEST(CasGcSnap, DecodeFailClosed)
     /// Truncated mid-stream (drop the last byte of a valid document).
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcSnap(good.substr(0, good.size() - 1)); });
 
-    /// Future version (byte right after the 4-byte magic) => NOT_IMPLEMENTED.
+    /// Future version (byte right after the 4-byte magic) => UNKNOWN_FORMAT_VERSION.
     {
         String future = good;
         future[4] = static_cast<char>(0xFF);
-        expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { decodeGcSnap(future); });
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeGcSnap(future); });
     }
 }
 

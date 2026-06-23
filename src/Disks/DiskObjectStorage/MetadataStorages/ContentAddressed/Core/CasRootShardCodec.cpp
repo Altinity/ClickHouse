@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 /// Included by basename via clickhouse_cas_proto's SYSTEM include dir so the generated header's
 /// reserved identifiers don't trip -Weverything -Werror (same idiom as clickhouse_grpc_protos).
 #include <cas_root_shard.pb.h>
@@ -12,7 +13,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
-    extern const int NOT_IMPLEMENTED;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -179,9 +180,7 @@ RootShard decodeRootShard(std::string_view data)
     /// conforming manifest (e.g. random bytes that happened to protobuf-parse). Fail closed.
     if (msg.codec_version() == 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: missing or zero codec_version");
-    if (msg.codec_version() > CODEC_VERSION)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "CAS root shard: codec_version {} is from a newer writer", msg.codec_version());
+    checkVersion(CODEC_VERSION, msg.codec_version(), "root shard");
 
     RootShard root;
     root.shard_version = msg.shard_version();

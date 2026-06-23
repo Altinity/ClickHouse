@@ -14,7 +14,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
-    extern const int NOT_IMPLEMENTED;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -188,9 +188,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
         /// [4] format_version
         uint8_t format_version = 0;
         readBinaryLittleEndian(format_version, in);
-        if (format_version > FORMAT_VERSION)
-            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
-                "CHCA envelope: unsupported format_version {}", format_version);
+        checkVersion(FORMAT_VERSION, format_version, "CHCA envelope");
 
         EnvelopeHeader h;
 
@@ -327,7 +325,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
         }
 
         if (saw_unknown_critical)
-            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
+            throw DB::Exception(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
                 "CHCA envelope: unknown critical extension present (fail closed)");
 
         return h;

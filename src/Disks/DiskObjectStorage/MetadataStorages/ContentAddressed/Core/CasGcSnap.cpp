@@ -16,7 +16,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
-    extern const int NOT_IMPLEMENTED;
+    extern const int UNKNOWN_FORMAT_VERSION;
     extern const int LOGICAL_ERROR;
     extern const int ZSTD_DECODER_FAILED;
 }
@@ -33,11 +33,11 @@ namespace
 /// parsed/serialized every round. So it is encoded BINARY (the codebase's standard IO-helper idiom,
 /// same as the hashed tree/envelope codecs) rather than JSON — the parse/serialize CPU dominated
 /// the GC round. Magic + version byte at the front; fail-closed decode (bad magic / bad enum byte /
-/// truncated => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
+/// truncated => CORRUPTED_DATA; future version => UNKNOWN_FORMAT_VERSION).
 constexpr char GC_SNAP_MAGIC[4] = {'C', 'A', 'G', 'S'};
 /// v1 of the cursor-carrying snap (B140-dangle fix); no migration, no back-compat.
 /// Frame layout: magic(4) + version(1) + codec(1) + <compressed-or-raw body>.
-/// Old readers (version <= 0) never see version 1 — they reject it with NOT_IMPLEMENTED.
+/// Old readers (version <= 0) never see version 1 — they reject it with UNKNOWN_FORMAT_VERSION.
 constexpr uint8_t GC_SNAP_VERSION = 1;   /// v1 of the cursor-carrying snap (B140-dangle fix); no migration, no back-compat.
 constexpr uint8_t GC_SNAP_CODEC_RAW = 0;   /// body is the raw field bytes (reserved; not emitted)
 constexpr uint8_t GC_SNAP_CODEC_ZSTD = 1;  /// body is zstd-compressed field bytes
@@ -434,8 +434,7 @@ GcSnap decodeGcSnap(std::string_view data)
 
         uint8_t version = 0;
         readBinaryLittleEndian(version, in);
-        if (version > GC_SNAP_VERSION)
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "CAS gc/snap: unsupported version {}", version);
+        checkVersion(GC_SNAP_VERSION, version, "gc/snap");
         if (version != GC_SNAP_VERSION)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: invalid version {}", version);
 

@@ -14,7 +14,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
-    extern const int NOT_IMPLEMENTED;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -82,8 +82,7 @@ std::vector<TreeEntry> decodeTree(std::string_view data)
 
         uint8_t version = 0;
         readBinaryLittleEndian(version, in);
-        if (version > TREE_VERSION)
-            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "CAS tree: unsupported version {}", version);
+        checkVersion(TREE_VERSION, version, "tree");
 
         uint32_t count = 0;
         readBinaryLittleEndian(count, in);

@@ -22,6 +22,7 @@ namespace ErrorCodes
     extern const int CANNOT_READ_ALL_DATA;
     extern const int CORRUPTED_DATA;
     extern const int NOT_IMPLEMENTED;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -35,7 +36,7 @@ namespace DB::Cas
 /// NON-HASHED metadata object (root manifests, gc/state, retired sets, heartbeats, _pool_meta,
 /// checkpoints, outcomes) is STRICT JSON: a top-level object carrying `format` + `version`,
 /// fail-closed parsing (wrong format / unknown key / missing key / wrong type / malformed document
-/// => CORRUPTED_DATA; newer version => NOT_IMPLEMENTED) via the helpers in the second half of this
+/// => CORRUPTED_DATA; newer version => UNKNOWN_FORMAT_VERSION) via the helpers in the second half of this
 /// file. These objects are the operational surface a human inspects with plain S3 tools during an
 /// incident; they are never hashed, so canonical byte stability is not required.
 
@@ -104,7 +105,7 @@ inline void writeJsonKey(WriteBuffer & out, std::string_view key)
 
 /// Decode-boundary guard for the JSON codecs: translates `Poco::Exception` (parser errors) and any
 /// bad-cast/conversion error into CORRUPTED_DATA. Already-classified `DB::Exception`s
-/// (CORRUPTED_DATA / NOT_IMPLEMENTED from the helpers below) pass through unchanged.
+/// (CORRUPTED_DATA / UNKNOWN_FORMAT_VERSION from the helpers below) pass through unchanged.
 template <typename F>
 auto decodeJsonGuarded(std::string_view what, F && f)
 {
@@ -248,9 +249,19 @@ inline void checkNoUnknownKeys(
     }
 }
 
+/// Fail-closed gate for "this object was written by a newer version than this build understands".
+/// `what` names the object in the message. Throws UNKNOWN_FORMAT_VERSION (the canonical "newer-writer
+/// on-disk format" code) so an operator can tell a future-version object from an unsupported operation.
+inline void checkVersion(uint32_t current, uint32_t seen, std::string_view what)
+{
+    if (seen > current)
+        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
+            "CAS {}: on-disk version {} is newer than this build supports (max {})", what, seen, current);
+}
+
 /// Common decode prologue for every non-hashed metadata object: parse the document (malformed =>
 /// CORRUPTED_DATA), require `format` == expected (else CORRUPTED_DATA), require an integer
-/// `version`; a version above `current_version` => NOT_IMPLEMENTED (fail closed on the future,
+/// `version`; a version above `current_version` => UNKNOWN_FORMAT_VERSION (fail closed on the future,
 /// never misreported as corruption), any other unexpected version => CORRUPTED_DATA.
 inline Poco::JSON::Object::Ptr parseJsonDocument(
     std::string_view data, std::string_view expected_format, uint64_t current_version, std::string_view what)
@@ -261,8 +272,7 @@ inline Poco::JSON::Object::Ptr parseJsonDocument(
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS {}: unexpected format '{}' (expected '{}')", what, format, expected_format);
     const uint64_t version = requireU64(*obj, "version", what);
-    if (version > current_version)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "CAS {}: unsupported version {}", what, version);
+    checkVersion(static_cast<uint32_t>(current_version), static_cast<uint32_t>(version), what);
     if (version != current_version)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid version {}", what, version);
     return obj;

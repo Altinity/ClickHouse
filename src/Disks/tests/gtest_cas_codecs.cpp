@@ -7,7 +7,7 @@ namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
-extern const int NOT_IMPLEMENTED;
+extern const int UNKNOWN_FORMAT_VERSION;
 }
 
 using namespace DB::Cas;
@@ -142,7 +142,7 @@ TEST(CasEnvelope, FutureVersionThrows)
     String bytes = encodeEnvelopeHeader(h);
     bytes[4] = 2;  /// format_version = 2 (version is validated before the header hash, so the code is pinned)
     expectThrowsCode(
-        DB::ErrorCodes::NOT_IMPLEMENTED,
+        DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
 }
 
@@ -204,7 +204,7 @@ TEST(CasEnvelope, CriticalUnknownExtensionThrows)
     h.unknown_critical_tlv = true;  /// emit an unknown TLV type with the critical flag set
     String bytes = encodeEnvelopeHeader(h);
     expectThrowsCode(
-        DB::ErrorCodes::NOT_IMPLEMENTED,
+        DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
 }
 
@@ -592,11 +592,11 @@ TEST(CasRootShardCodec, FailClosedOnGarbageBytes)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("\x10\x01", 2)); });      /// only shard_version, codec_version=0
 }
 
-TEST(CasRootShardCodec, ProtobufFutureCodecVersionThrowsNotImplemented)
+TEST(CasRootShardCodec, ProtobufFutureCodecVersionThrowsUnknownFormatVersion)
 {
     /// A protobuf manifest with codec_version=2 (field 1, varint) from a newer writer must fail
     /// closed, never be mis-read. Bytes: tag(field 1, varint)=0x08, value=2 (> current CODEC_VERSION=1).
-    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [] { decodeRootShard(String("\x08\x02", 2)); });
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [] { decodeRootShard(String("\x08\x02", 2)); });
 }
 
 /// B199-S2: inline closure round-trip (nested staged entries) on the precommit `Add` journal record.

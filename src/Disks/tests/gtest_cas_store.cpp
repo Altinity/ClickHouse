@@ -16,6 +16,7 @@ namespace DB::ErrorCodes
 extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
 extern const int NOT_IMPLEMENTED;
+extern const int UNKNOWN_FORMAT_VERSION;
 extern const int FILE_DOESNT_EXIST;
 extern const int LOGICAL_ERROR;
 }
@@ -122,7 +123,7 @@ TEST(CasPoolMeta, FailClosed)
     Layout layout("p");
     b->putIfAbsent(layout.poolMetaKey(),
         R"({"format":"cas_pool_meta","version":2,"pool_id":"00000000000000000000000000000001","root_shards":8,"blob_header_len":256})");
-    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { PoolMeta::createOrValidate(*b, layout, 8, 256); });
     auto b2 = std::make_shared<InMemoryBackend>();
     b2->putIfAbsent(layout.poolMetaKey(), "garbage");
