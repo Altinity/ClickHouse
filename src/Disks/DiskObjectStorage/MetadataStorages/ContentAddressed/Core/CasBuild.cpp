@@ -651,6 +651,55 @@ uint64_t Build::buildShard() const
     return store->shardOf(buildRef());
 }
 
+std::vector<ClosureNode> Build::buildStagedClosure(UInt128 root_hash) const
+{
+    /// B199-S2 Task 4: traverse the in-memory staged trees (retained_trees) depth-first from root_hash.
+    /// Produces one ClosureNode per BUILT tree (those in retained_trees); adopted subtrees (Subtree entries
+    /// whose hash is NOT in retained_trees) stop recursion — they appear in their parent's entries only.
+    /// Never reads from the pool/backend: all data comes from retained_trees (in-memory encoded payloads).
+    std::vector<ClosureNode> result;
+    std::set<UInt128> visited;
+
+    /// Iterative DFS using a stack of tree hashes to process.
+    std::vector<UInt128> stack;
+    stack.push_back(root_hash);
+
+    while (!stack.empty())
+    {
+        const UInt128 hash = stack.back();
+        stack.pop_back();
+
+        /// Dedup: skip trees we have already emitted a ClosureNode for.
+        if (!visited.insert(hash).second)
+            continue;
+
+        /// Only emit a ClosureNode for trees THIS build staged (retained_trees).
+        /// Adopted subtrees (hash NOT in retained_trees) are leaves — recursion stops here.
+        auto it = retained_trees.find(hash);
+        if (it == retained_trees.end())
+            continue;
+
+        /// Decode the in-memory encoded tree payload — no backend/pool call.
+        const std::vector<TreeEntry> entries = decodeTree(it->second);
+
+        /// Emit this node (tree hash + its entries).
+        ClosureNode node;
+        node.tree_hash = hash;
+        node.entries = entries;
+        result.push_back(std::move(node));
+
+        /// For each Subtree entry whose hash is ALSO in retained_trees, recurse (push onto stack).
+        /// Adopted subtrees (not in retained_trees) are intentionally not pushed — they are leaves.
+        for (const TreeEntry & entry : entries)
+        {
+            if (entry.placement == Placement::Subtree && retained_trees.contains(entry.file_hash))
+                stack.push_back(entry.file_hash);
+        }
+    }
+
+    return result;
+}
+
 void Build::precommit(const TreeId & manifest)
 {
     requireAlive();
@@ -689,6 +738,9 @@ void Build::precommit(const TreeId & manifest)
         RefPayload payload;
         payload.tree_id = manifest_hash;
         payload.tree_size = tree_size;
+        /// B199-S2 Task 4: populate closure from the staged tree structure IN MEMORY — no pool read.
+        /// GC (Task 5) uses this to protect/reclaim the build's closure without reading tree objects.
+        payload.closure = buildStagedClosure(manifest_hash);
         root.refs[ref] = payload;
         root.journal.push_back(JournalRecord{
             .op = JournalRecord::Op::Add, .ref_name = ref, .tree_id = manifest_hash,

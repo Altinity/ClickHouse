@@ -4,6 +4,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 #include <functional>
 #include <map>
+#include <set>
+#include <vector>
 
 namespace DB { class WriteBuffer; }
 
@@ -159,6 +161,14 @@ private:
 
     /// Map (kind, hash) to its object key per kind (blob/tree/pack).
     String keyFor(ObjectKind kind, const UInt128 & hash) const;
+
+    /// B199-S2 Task 4: build the inline closure of a staged manifest tree from the in-memory retained
+    /// payloads — never reads from the pool/backend. Returns a vector of ClosureNodes, one per tree
+    /// that this build staged (i.e. the hash is in retained_trees). Adopted subtrees (Subtree entries
+    /// whose hashes are NOT in retained_trees) are recorded only as entries in their parent's node
+    /// (leaf stop — we must NOT reclaim someone else's subtree). Dedup: each tree hash appears at most
+    /// once across the result.
+    std::vector<ClosureNode> buildStagedClosure(UInt128 root_hash) const;
 
     /// B171 precommit addressing (fixed 2026-06-19; relocated Phase 6). The precommit namespace is
     /// `<server-hex>/_precommits`, sharded EXACTLY like a table namespace: the precommit ref name is

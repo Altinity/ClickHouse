@@ -1402,3 +1402,53 @@ TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
             [&] { build->publish(RootNamespace{"srv1/tbl"}, "part_3", staged, RefPayload{}); });
     }
 }
+
+/// B199-S2 Task 4: precommit populates RefPayload.closure from the build's staged tree structure.
+/// The flat-manifest case: one staged tree (the manifest) referencing two blobs → closure has exactly
+/// one ClosureNode containing the manifest's tree_hash and both blob entries.
+TEST(CasBuild, PrecommitRefCarriesInlineClosure)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = Store::open(
+        [&]() -> std::shared_ptr<InMemoryBackend>
+        {
+            b = std::make_shared<InMemoryBackend>();
+            return b;
+        }(),
+        PoolConfig{.pool_prefix = "p", .root_shards = 1});
+
+    auto build = s->startBuild({});
+    build->putBlob(idOf("B1"), BlobSource::fromString("B1"));
+    build->putBlob(idOf("B2"), BlobSource::fromString("B2"));
+
+    TreeEntry e1;
+    e1.name = "data.bin";
+    e1.placement = Placement::Blob;
+    e1.file_hash = u128Of("B1");
+    e1.file_size = 2;
+
+    TreeEntry e2;
+    e2.name = "data.mrk";
+    e2.placement = Placement::Blob;
+    e2.file_hash = u128Of("B2");
+    e2.file_size = 2;
+
+    const TreeId t = build->stageTree({e1, e2});
+    build->precommit(t);
+
+    /// Read the precommit shard manifest using the same pattern as PrematureReclaimCommitFailsClosed.
+    const RootNamespace precommit_ns{u128ToHex(s->poolConfig().server_id) + "/_precommits"};
+    const String precommit_ref = std::to_string(build->buildSeq());
+    const String shard_key = s->layout().rootShardKey(precommit_ns, s->shardOf(precommit_ref));
+    const auto shard_raw = b->get(shard_key);
+    ASSERT_TRUE(shard_raw.has_value());
+
+    const RootShard rs = decodeRootShard(shard_raw->bytes);
+    const auto ref_it = rs.refs.find(precommit_ref);
+    ASSERT_NE(ref_it, rs.refs.end());
+    const RefPayload & pl = ref_it->second;
+
+    ASSERT_EQ(pl.closure.size(), 1u);
+    EXPECT_EQ(pl.closure[0].tree_hash, hexToU128(t.string()));
+    ASSERT_EQ(pl.closure[0].entries.size(), 2u);
+}
