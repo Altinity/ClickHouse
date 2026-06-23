@@ -59,19 +59,13 @@ TO TABLE [destination_database.]destination_table
 
 - **Type**: `Bool`
 - **Default**: `false`
-- **Description**: Ignore existing partition export and overwrite the ZooKeeper entry. Allows re-exporting a partition to the same destination before the manifest expires. **IMPORTANT:** this is dangerous because it can lead to duplicated data, use it with caution.
+- **Description**: Ignore existing partition export and overwrite the ZooKeeper entry. Allows re-exporting a partition that was already exported to the same destination. **IMPORTANT:** this is dangerous because it can lead to duplicated data, use it with caution.
 
 #### `export_merge_tree_partition_max_retries` (Optional)
 
 - **Type**: `UInt64`
 - **Default**: `3`
 - **Description**: Maximum number of retries for exporting a merge tree part in an export partition task. If it exceeds, the entire task fails.
-
-#### `export_merge_tree_partition_manifest_ttl` (Optional)
-
-- **Type**: `UInt64`
-- **Default**: `180` (seconds)
-- **Description**: Determines how long the manifest will live in ZooKeeper. It prevents the same partition from being exported twice to the same destination. This setting does not affect or delete in-progress tasks; it only cleans up completed ones.
 
 #### `export_merge_tree_part_file_already_exists_policy` (Optional)
 
@@ -109,7 +103,16 @@ When the timeout is exceeded the task transitions to KILLED (same terminal state
 
 Notes:
 - Enforcement is best-effort: actual kill latency is bounded by one manifest-updater poll cycle (~30s) plus ZooKeeper watch propagation.
-- Since both this timeout and `export_merge_tree_partition_manifest_ttl` are measured from `create_time`, keep `export_merge_tree_partition_manifest_ttl` greater than `export_merge_tree_partition_task_timeout_seconds` if you want the KILLED entry to remain visible in `system.replicated_partition_exports` after the timeout fires.
+
+### `export_merge_tree_part_allow_lossy_cast` (Optional)
+
+- **Type**: `Bool`
+- **Default**: `false`
+- **Description**: Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
+
+  When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use. This keeps the Iceberg metadata consistent with the data files.
+
+  **Warning:** A lossy cast on a partition column remains semantically truncating. For example, if a table is partitioned by an `Int64` column and some partition values do not fit into a destination `Int32` partition column, both the data files and the Iceberg metadata will contain the truncated `Int32` value (they agree with each other, but the original `Int64` value is lost). Such casts require `export_merge_tree_part_allow_lossy_cast = 1`.
 
 ## Examples
 

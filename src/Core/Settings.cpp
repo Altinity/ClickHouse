@@ -7558,10 +7558,6 @@ Ignore existing partition export and overwrite the zookeeper entry
     DECLARE(UInt64, export_merge_tree_partition_max_retries, 3, R"(
 Maximum number of retries for exporting a merge tree part in an export partition task
 )", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_manifest_ttl, 86400, R"(
-Determines how long the manifest will live in ZooKeeper. It prevents the same partition from being exported twice to the same destination.
-This setting does not affect / delete in progress tasks. It'll only cleanup the completed ones.
-)", 0) \
     DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 86400, R"(
 Maximum wall-clock duration (in seconds) an export partition task is allowed to remain in the PENDING state before it is auto-killed by the background cleanup loop.
 The timeout is measured from the manifest's create_time. Set to 0 to disable the timeout.
@@ -7573,7 +7569,6 @@ In such scenario, ClickHouse would attempt to commit those files again producing
 
 Notes:
 - Enforcement is best-effort: actual kill latency is bounded by one manifest-updater poll cycle (~30s) plus ZooKeeper watch propagation.
-- Since both this timeout and `export_merge_tree_partition_manifest_ttl` are measured from `create_time`, keep `export_merge_tree_partition_manifest_ttl` greater than `export_merge_tree_partition_task_timeout_seconds` if you want the KILLED entry to remain visible in `system.replicated_partition_exports` after the timeout fires.
 )", 0) \
     DECLARE(MergeTreePartExportFileAlreadyExistsPolicy, export_merge_tree_part_file_already_exists_policy, MergeTreePartExportFileAlreadyExistsPolicy::skip, R"(
 Possible values:
@@ -7605,6 +7600,11 @@ Has no effect on `EXPORT PARTITION <id>` (single-partition export).
 )", 0) \
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
 Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_allow_lossy_cast, false, R"(
+Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
+
+When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use, so the metadata stays consistent with the data. A lossy cast on a partition column remains semantically truncating: both the data files and the metadata contain the truncated value, and such casts require this setting to be enabled.
 )", 0) \
     \
     /* ####################################################### */ \
@@ -7943,6 +7943,7 @@ Maximum number of WebAssembly UDF instances that can run in parallel per functio
 
 #define OBSOLETE_SETTINGS(M, ALIAS) \
     /** Obsolete settings which are kept around for compatibility reasons. They have no effect anymore. */ \
+    MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_manifest_ttl, 86400) \
     MAKE_OBSOLETE(M, Bool, query_condition_cache_store_conditions_as_plaintext, false) \
     MAKE_OBSOLETE(M, Bool, update_insert_deduplication_token_in_dependent_materialized_views, 0) \
     MAKE_OBSOLETE(M, UInt64, max_memory_usage_for_all_queries, 0) \

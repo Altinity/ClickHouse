@@ -164,7 +164,6 @@ struct ExportReplicatedMergeTreePartitionManifest
     std::vector<String> parts;
     time_t create_time;
     size_t max_retries;
-    size_t ttl_seconds;
     size_t task_timeout_seconds;
     size_t max_threads;
     bool parallel_formatting;
@@ -174,6 +173,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
     String filename_pattern;
     bool write_full_path_in_iceberg_metadata = false;
+    bool allow_lossy_cast = false;
     String iceberg_metadata_json;
 
     std::string toJsonString() const
@@ -205,9 +205,9 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("filename_pattern", filename_pattern);
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
-        json.set("ttl_seconds", ttl_seconds);
         json.set("task_timeout_seconds", task_timeout_seconds);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
+        json.set("allow_lossy_cast", allow_lossy_cast);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -240,7 +240,6 @@ struct ExportReplicatedMergeTreePartitionManifest
             manifest.parts.push_back(parts_array->getElement<String>(static_cast<unsigned int>(i)));
         
         manifest.create_time = json->getValue<time_t>("create_time");
-        manifest.ttl_seconds = json->getValue<size_t>("ttl_seconds");
         manifest.task_timeout_seconds = json->getValue<size_t>("task_timeout_seconds");
         manifest.max_threads = json->getValue<size_t>("max_threads");
         manifest.parallel_formatting = json->getValue<bool>("parallel_formatting");
@@ -261,6 +260,11 @@ struct ExportReplicatedMergeTreePartitionManifest
         }
 
         manifest.write_full_path_in_iceberg_metadata = json->getValue<bool>("write_full_path_in_iceberg_metadata");
+
+        /// Default to true for tasks created before this field existed, so an in-flight
+        /// export scheduled with the old permissive worker behavior is not wrongly rejected
+        /// on upgrade. New tasks always persist the initiator's actual choice.
+        manifest.allow_lossy_cast = json->has("allow_lossy_cast") ? json->getValue<bool>("allow_lossy_cast") : true;
 
         return manifest;
     }
