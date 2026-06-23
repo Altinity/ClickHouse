@@ -26,22 +26,13 @@ constexpr uint64_t HEARTBEAT_VERSION = 1;
 String encodeHeartbeat(const Heartbeat & heartbeat)
 {
     WriteBufferFromOwnString out;
-    writeCString("{", out);
-    writeJsonKey(out, "format");
-    writeJsonString("cas_heartbeat", out);
-    writeChar(',', out);
-    writeJsonKey(out, "version");
-    writeIntText(HEARTBEAT_VERSION, out);
-    writeChar(',', out);
-    writeJsonKey(out, "server_id");
-    writeJsonString(u128ToHex(heartbeat.server_id), out);
-    writeChar(',', out);
-    writeJsonKey(out, "heartbeat_seq");
-    writeIntText(heartbeat.heartbeat_seq, out);
-    writeChar(',', out);
-    writeJsonKey(out, "created_at_ms");
-    writeIntText(heartbeat.created_at_ms, out);
-    writeChar('}', out);
+    JsonObjectWriter writer(out);
+    writer.field("format", "cas_heartbeat");
+    writer.field("version", HEARTBEAT_VERSION);
+    writer.field("server_id", u128ToHex(heartbeat.server_id));
+    writer.field("heartbeat_seq", heartbeat.heartbeat_seq);
+    writer.field("created_at_ms", heartbeat.created_at_ms);
+    writer.finalize();
     return std::move(out.str());
 }
 

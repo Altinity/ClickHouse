@@ -3,8 +3,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcSnap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <limits>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
@@ -412,4 +415,109 @@ TEST(CasGcSnapCodec, ZstdRoundTripAndShrinks)
     GTEST_LOG_(INFO) << "gc/snap zstd-encoded size for 2000 root edges: " << encoded.size() << " bytes"
                      << " (uncompressed footprint estimate: " << 2000u * 40u << " bytes)";
     EXPECT_LT(encoded.size(), 2000u * 40u);
+}
+
+/// ===================================================================================
+/// R10 strict-JSON encoder goldens. These pin the EXACT bytes a fixed instance of each strict-JSON
+/// metadata encoder emits, so routing the encoders through `JsonObjectWriter` cannot move a single
+/// byte. The literals were captured by running each encoder BEFORE the R10 refactor.
+/// ===================================================================================
+
+namespace
+{
+constexpr std::string_view GOLDEN_WATERMARK_LIVE =
+    R"({"format":"cas_server_watermark","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","epoch":7,"min_active":42,"seq":3})";
+constexpr std::string_view GOLDEN_WATERMARK_RETIRED =
+    R"({"format":"cas_server_watermark","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","epoch":7,"min_active":"retired","seq":9})";
+constexpr std::string_view GOLDEN_HEARTBEAT =
+    R"({"format":"cas_heartbeat","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","heartbeat_seq":42,"created_at_ms":1234567890123})";
+constexpr std::string_view GOLDEN_POOL_META =
+    R"({"format":"cas_pool_meta","version":1,"pool_id":"000102030405060708090a0b0c0d0e0f","root_shards":16,"blob_header_len":96})";
+constexpr std::string_view GOLDEN_ROOTS_REGISTRY =
+    R"({"format":"cas_roots_registry","version":1,"registry_version":5,"fence_round":2,"namespaces":["alpha","beta","gamma/sub"]})";
+constexpr std::string_view GOLDEN_ROOTS_REGISTRY_EMPTY =
+    R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":[]})";
+constexpr std::string_view GOLDEN_RETIRED_SET =
+    R"({"format":"cas_retired_set","version":1,"entries":[{"kind":"blob","hash":"000102030405060708090a0b0c0d0e0f","token":"etag-1","token_type":"etag","size":1234},{"kind":"tree","hash":"ffffffffffffffffffffffffffffffff","token":"42","token_type":"emulated","size":0}]})";
+constexpr std::string_view GOLDEN_RETIRED_SET_EMPTY =
+    R"({"format":"cas_retired_set","version":1,"entries":[]})";
+constexpr std::string_view GOLDEN_OUTCOME_LOG =
+    R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"etag-1","token_type":"etag","outcome":"deleted"},{"kind":"blob","hash":"bb00000000000000000000000000000b","token":"7","token_type":"emulated","outcome":"spared"}]})";
+constexpr std::string_view GOLDEN_OUTCOME_LOG_EMPTY =
+    R"({"format":"cas_gc_outcomes","version":1,"entries":[]})";
+}
+
+TEST(CasJsonGolden, ServerWatermarkLive)
+{
+    const ServerWatermark w{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
+                            .epoch = 7, .min_active = 42, .seq = 3};
+    EXPECT_EQ(encodeServerWatermark(w), GOLDEN_WATERMARK_LIVE);
+}
+
+TEST(CasJsonGolden, ServerWatermarkRetired)
+{
+    const ServerWatermark w{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
+                            .epoch = 7, .min_active = std::numeric_limits<uint64_t>::max(), .seq = 9};
+    EXPECT_EQ(encodeServerWatermark(w), GOLDEN_WATERMARK_RETIRED);
+}
+
+TEST(CasJsonGolden, Heartbeat)
+{
+    const Heartbeat hb{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
+                       .heartbeat_seq = 42, .created_at_ms = 1234567890123};
+    EXPECT_EQ(encodeHeartbeat(hb), GOLDEN_HEARTBEAT);
+}
+
+TEST(CasJsonGolden, PoolMeta)
+{
+    const PoolMeta pm{.pool_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
+                      .root_shards = 16, .blob_header_len = 96};
+    EXPECT_EQ(encodePoolMeta(pm), GOLDEN_POOL_META);
+}
+
+TEST(CasJsonGolden, RootsRegistry)
+{
+    RootsRegistry registry;
+    registry.registry_version = 5;
+    registry.fence_round = 2;
+    registry.namespaces = {"alpha", "beta", "gamma/sub"};
+    EXPECT_EQ(encodeRootsRegistry(registry), GOLDEN_ROOTS_REGISTRY);
+}
+
+TEST(CasJsonGolden, RootsRegistryEmptyNamespaces)
+{
+    RootsRegistry registry;
+    registry.registry_version = 1;
+    registry.fence_round = 0;
+    EXPECT_EQ(encodeRootsRegistry(registry), GOLDEN_ROOTS_REGISTRY_EMPTY);
+}
+
+TEST(CasJsonGolden, RetiredSet)
+{
+    RetiredSet rs;
+    rs.entries.push_back({ObjectKind::Blob, hexToU128("000102030405060708090a0b0c0d0e0f"),
+                          Token{"etag-1", TokenType::ETag}, 1234});
+    rs.entries.push_back({ObjectKind::Tree, hexToU128("ffffffffffffffffffffffffffffffff"),
+                          Token{"42", TokenType::Emulated}, 0});
+    EXPECT_EQ(encodeRetiredSet(rs), GOLDEN_RETIRED_SET);
+}
+
+TEST(CasJsonGolden, RetiredSetEmpty)
+{
+    EXPECT_EQ(encodeRetiredSet(RetiredSet{}), GOLDEN_RETIRED_SET_EMPTY);
+}
+
+TEST(CasJsonGolden, OutcomeLog)
+{
+    OutcomeLog log;
+    log.entries.push_back({ObjectKind::Tree, hexToU128("aa00000000000000000000000000000a"),
+                           Token{"etag-1", TokenType::ETag}, OutcomeKind::Deleted});
+    log.entries.push_back({ObjectKind::Blob, hexToU128("bb00000000000000000000000000000b"),
+                           Token{"7", TokenType::Emulated}, OutcomeKind::Spared});
+    EXPECT_EQ(encodeOutcomeLog(log), GOLDEN_OUTCOME_LOG);
+}
+
+TEST(CasJsonGolden, OutcomeLogEmpty)
+{
+    EXPECT_EQ(encodeOutcomeLog(OutcomeLog{}), GOLDEN_OUTCOME_LOG_EMPTY);
 }

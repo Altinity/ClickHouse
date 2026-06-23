@@ -154,14 +154,13 @@ GcState decodeGcState(std::string_view data)
 String encodeRetiredSet(const RetiredSet & set)
 {
     WriteBufferFromOwnString out;
-    writeCString("{", out);
-    writeJsonKey(out, "format");
-    writeJsonString("cas_retired_set", out);
-    writeChar(',', out);
-    writeJsonKey(out, "version");
-    writeIntText(RETIRED_SET_VERSION, out);
-    writeChar(',', out);
-    writeJsonKey(out, "entries");
+    JsonObjectWriter writer(out);
+    writer.field("format", "cas_retired_set");
+    writer.field("version", RETIRED_SET_VERSION);
+
+    /// `entries` is an array of flat objects: open it through beginValueField, then write each entry
+    /// with its own JsonObjectWriter (same separator/escaping rules).
+    writer.beginValueField("entries");
     writeChar('[', out);
     bool first = true;
     for (const auto & entry : set.entries)
@@ -170,25 +169,16 @@ String encodeRetiredSet(const RetiredSet & set)
             writeChar(',', out);
         first = false;
 
-        writeChar('{', out);
-        writeJsonKey(out, "kind");
-        writeJsonString(objectKindToString(entry.kind), out);
-        writeChar(',', out);
-        writeJsonKey(out, "hash");
-        writeJsonString(u128ToHex(entry.hash), out);
-        writeChar(',', out);
-        writeJsonKey(out, "token");
-        writeJsonString(entry.token.value, out);
-        writeChar(',', out);
-        writeJsonKey(out, "token_type");
-        writeJsonString(tokenTypeToString(entry.token.type), out);
-        writeChar(',', out);
-        writeJsonKey(out, "size");
-        writeIntText(entry.size, out);
-        writeChar('}', out);
+        JsonObjectWriter entry_writer(out);
+        entry_writer.field("kind", objectKindToString(entry.kind));
+        entry_writer.field("hash", u128ToHex(entry.hash));
+        entry_writer.field("token", entry.token.value);
+        entry_writer.field("token_type", tokenTypeToString(entry.token.type));
+        entry_writer.field("size", entry.size);
+        entry_writer.finalize();
     }
     writeChar(']', out);
-    writeChar('}', out);
+    writer.finalize();
     return std::move(out.str());
 }
 

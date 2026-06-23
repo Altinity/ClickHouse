@@ -136,6 +136,55 @@ inline void writeJsonKey(WriteBuffer & out, std::string_view key)
     writeChar(':', out);
 }
 
+/// Emits a strict-JSON object with the EXACT brace/comma/colon/quoting the CAS metadata encoders use.
+/// The constructor opens with `{`; the caller invokes `field` (or `beginValueField`) in the legacy
+/// field ORDER and the writer inserts the `,` separator before every field after the first; `finalize`
+/// closes with `}`. There is NO whitespace: keys and string values go through `writeJsonString` (the
+/// same escaper the hand-written encoders call), numbers through `writeIntText`. Byte-identical to the
+/// hand-written encoders (golden-asserted in `gtest_cas_gc_formats.cpp`, suite `CasJsonGolden`).
+///
+/// Shapes that do NOT fit a flat object (a nested object with dynamic keys, an array, a conditional
+/// value) are handled two ways: `field` covers the flat string/number fields, and `beginValueField`
+/// writes only the separator + `"key":` so the caller can append a hand-written value (an array body,
+/// a nested object) right after — keeping the separator boilerplate shared without constraining the value.
+class JsonObjectWriter
+{
+public:
+    explicit JsonObjectWriter(WriteBuffer & out_) : out(out_) { writeChar('{', out); }
+
+    /// `"key":"<escaped value>"`
+    void field(std::string_view key, std::string_view value)
+    {
+        beginValueField(key);
+        writeJsonString(value, out);
+    }
+
+    /// `"key":<num>`
+    void field(std::string_view key, uint64_t value)
+    {
+        beginValueField(key);
+        writeIntText(value, out);
+    }
+
+    /// Writes the separator (if needed) and `"key":`, leaving the cursor positioned for the caller to
+    /// append the value bytes directly — for fields whose value is not a flat string/number (arrays,
+    /// nested objects, the watermark's conditional `min_active`).
+    void beginValueField(std::string_view key)
+    {
+        if (!first)
+            writeChar(',', out);
+        first = false;
+        writeJsonKey(out, key);
+    }
+
+    /// Closes the object with `}`. Call exactly once.
+    void finalize() { writeChar('}', out); }
+
+private:
+    WriteBuffer & out;
+    bool first = true;   /// inserts ',' before every field after the first
+};
+
 /// Decode-boundary guard for the JSON codecs: translates `Poco::Exception` (parser errors) and any
 /// bad-cast/conversion error into CORRUPTED_DATA. Already-classified `DB::Exception`s
 /// (CORRUPTED_DATA / UNKNOWN_FORMAT_VERSION from the helpers below) pass through unchanged.

@@ -52,22 +52,13 @@ UInt128 mintPoolId()
 String encodePoolMeta(const PoolMeta & pm)
 {
     WriteBufferFromOwnString out;
-    writeCString("{", out);
-    writeJsonKey(out, "format");
-    writeJsonString("cas_pool_meta", out);
-    writeChar(',', out);
-    writeJsonKey(out, "version");
-    writeIntText(POOL_META_VERSION, out);
-    writeChar(',', out);
-    writeJsonKey(out, "pool_id");
-    writeJsonString(u128ToHex(pm.pool_id), out);
-    writeChar(',', out);
-    writeJsonKey(out, "root_shards");
-    writeIntText(pm.root_shards, out);
-    writeChar(',', out);
-    writeJsonKey(out, "blob_header_len");
-    writeIntText(pm.blob_header_len, out);
-    writeChar('}', out);
+    JsonObjectWriter writer(out);
+    writer.field("format", "cas_pool_meta");
+    writer.field("version", POOL_META_VERSION);
+    writer.field("pool_id", u128ToHex(pm.pool_id));
+    writer.field("root_shards", pm.root_shards);
+    writer.field("blob_header_len", pm.blob_header_len);
+    writer.finalize();
     return std::move(out.str());
 }
 

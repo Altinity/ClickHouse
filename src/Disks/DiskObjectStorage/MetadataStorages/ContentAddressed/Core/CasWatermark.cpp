@@ -32,28 +32,18 @@ constexpr std::string_view RETIRED_SENTINEL = "retired";
 String encodeServerWatermark(const ServerWatermark & w)
 {
     WriteBufferFromOwnString out;
-    writeCString("{", out);
-    writeJsonKey(out, "format");
-    writeJsonString("cas_server_watermark", out);
-    writeChar(',', out);
-    writeJsonKey(out, "version");
-    writeIntText(WATERMARK_VERSION, out);
-    writeChar(',', out);
-    writeJsonKey(out, "server_id");
-    writeJsonString(u128ToHex(w.server_id), out);
-    writeChar(',', out);
-    writeJsonKey(out, "epoch");
-    writeIntText(w.epoch, out);
-    writeChar(',', out);
-    writeJsonKey(out, "min_active");
+    JsonObjectWriter writer(out);
+    writer.field("format", "cas_server_watermark");
+    writer.field("version", WATERMARK_VERSION);
+    writer.field("server_id", u128ToHex(w.server_id));
+    writer.field("epoch", w.epoch);
+    /// min_active is conditional: the retired sentinel rides as a string, a live value as a number.
     if (w.min_active == std::numeric_limits<uint64_t>::max())
-        writeJsonString(RETIRED_SENTINEL, out);
+        writer.field("min_active", RETIRED_SENTINEL);
     else
-        writeIntText(w.min_active, out);
-    writeChar(',', out);
-    writeJsonKey(out, "seq");
-    writeIntText(w.seq, out);
-    writeChar('}', out);
+        writer.field("min_active", w.min_active);
+    writer.field("seq", w.seq);
+    writer.finalize();
     return std::move(out.str());
 }
 

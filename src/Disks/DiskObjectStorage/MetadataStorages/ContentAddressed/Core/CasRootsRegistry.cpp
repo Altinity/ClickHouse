@@ -22,20 +22,15 @@ constexpr uint64_t ROOTS_REGISTRY_VERSION = 1;
 String encodeRootsRegistry(const RootsRegistry & registry)
 {
     WriteBufferFromOwnString out;
-    writeCString("{", out);
-    writeJsonKey(out, "format");
-    writeJsonString("cas_roots_registry", out);
-    writeChar(',', out);
-    writeJsonKey(out, "version");
-    writeIntText(ROOTS_REGISTRY_VERSION, out);
-    writeChar(',', out);
-    writeJsonKey(out, "registry_version");
-    writeIntText(registry.registry_version, out);
-    writeChar(',', out);
-    writeJsonKey(out, "fence_round");
-    writeIntText(registry.fence_round, out);
-    writeChar(',', out);
-    writeJsonKey(out, "namespaces");
+    JsonObjectWriter writer(out);
+    writer.field("format", "cas_roots_registry");
+    writer.field("version", ROOTS_REGISTRY_VERSION);
+    writer.field("registry_version", registry.registry_version);
+    writer.field("fence_round", registry.fence_round);
+
+    /// `namespaces` is a JSON array, not a flat field: open it through beginValueField and write the
+    /// (comma-separated, no whitespace) string elements by hand.
+    writer.beginValueField("namespaces");
     writeChar('[', out);
     bool first = true;
     for (const String & ns : registry.namespaces)
@@ -46,7 +41,7 @@ String encodeRootsRegistry(const RootsRegistry & registry)
         writeJsonString(ns, out);
     }
     writeChar(']', out);
-    writeChar('}', out);
+    writer.finalize();
     return std::move(out.str());
 }
 
