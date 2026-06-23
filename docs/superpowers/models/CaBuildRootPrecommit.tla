@@ -48,6 +48,43 @@
        build's precommit; fail-closed commit still saves correctness.
 
    The two flags are independent so the 2x2 table isolates which mechanism is load-bearing.
+
+   ------------------------------------------------------------------------------
+   B199-S2 EXTENSION (2026-06-23): INLINE CLOSURE — the never-expanded-tree leak
+   ------------------------------------------------------------------------------
+   Spec: ../specs/2026-06-23-ca-precommit-inline-closure-design.md (§3/§4).
+
+   THE S2 LEAK (space-only; dangling=0, not data loss). GC learns a precommit's
+   closure by EXPANDING the tree object (reading trees/<hash> once, recording
+   tree->child edges). If the tree object is GONE before that read (a stale/competing
+   leader delete; lease is work-dedup, not safety), the expansion 404s, the closure is
+   never recorded, and on reclaim the build's unique blobs are never released ->
+   they leak as unreachable debris forever.
+
+   THE FIX. The precommit records its closure INLINE in the ref payload at precommit
+   time (the writer holds the full staged structure in hand — the only safe capture
+   point; a condemned/deleted object must never be GET-ed to recover it). GC seeds the
+   protection edges from that RECORDED closure (no tree read, never 404s -> S2 closed by
+   construction). On reclaim, GC mirror-drops the closure edges; the children fall to
+   in-degree 0 and go through the existing retire->delete tail. A closure member that
+   was never uploaded (partial build) is simply already-absent: its delete is an
+   idempotent no-op (deleteExact NotFound).
+
+   MODELED HERE.
+     - `closure[bld]`  : the recorded inline closure (set of object ids), seeded at
+                          Precommit. Protection + reclaim both source edges from THIS,
+                          not from reading the (possibly gone) tree object.
+     - `uploaded[h]`   : the object's bytes were actually uploaded. A closure member can
+                          be recorded /\ ~uploaded (the partial-build / never-uploaded
+                          case); present[h] => uploaded[h].
+     - `InlineClosure` : TRUE  = fix  (precommit records the full closure inline; GC
+                          seeds from it; never depends on the tree object existing).
+                          FALSE = old lazy path (closure is recorded only if the tree
+                          object is present to be expanded at fold time; a gone tree =>
+                          empty closure => the S2 leak).
+   INV_NO_LEAK (liveness): for an abandoned build, every closure member with no other
+   live reference is eventually NOT present (reclaimed). Holds with InlineClosure=TRUE;
+   the leak (FALSE) starves it.
 *)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -57,8 +94,10 @@ CONSTANTS
     Blobs,              \* blob hashes, e.g. {b1}
     UseBuildRoot,       \* FALSE = buggy (protection = revocable owner hint, no build root)
                         \* TRUE  = fix  (precommit edge protects reachable present objects)
-    FailClosedCommit    \* FALSE = buggy (commit publishes table ref with no presence check)
+    FailClosedCommit,   \* FALSE = buggy (commit publishes table ref with no presence check)
                         \* TRUE  = fix  (commit verifies full closure present, else aborts)
+    InlineClosure       \* FALSE = old lazy path (closure recorded only if tree readable -> S2 leak)
+                        \* TRUE  = fix  (precommit records closure inline; GC seeds + reclaims from it)
 
 ASSUME Trees \cap Blobs = {}
 Hashes == Trees \cup Blobs
@@ -80,10 +119,26 @@ VARIABLES
     committed,      \* SUBSET Trees                   trees a build successfully committed (table)
     aborted,        \* SUBSET Builds                  builds whose Commit aborted (fail-closed)
     adopted,        \* [Builds -> SUBSET Blobs]       blobs a build has adopted (intends to ref)
-    everDangle      \* BOOLEAN                         latch: a committed table ref ever dangled
+    everDangle,     \* BOOLEAN                         latch: a committed table ref ever dangled
+    uploaded,       \* [Hashes -> BOOLEAN]             bytes were uploaded (present => uploaded);
+                    \*                                 recorded /\ ~uploaded = never-uploaded member
+    closure,        \* [Builds -> SUBSET Hashes]       RECORDED inline closure seeded at Precommit:
+                    \*                                 GC seeds protection edges from this, not from
+                    \*                                 reading the (possibly gone) tree object
+    everSnapped,    \* SUBSET Hashes                   monotone: objects GC ever enumerated into the
+                    \*                                 in-degree snap (table-reachable, or recorded in
+                    \*                                 a precommit closure). The S2 leak surface: an
+                    \*                                 object NEVER snapped is invisible debris GC
+                    \*                                 cannot reclaim, even at in-degree 0.
+    staged          \* SUBSET Hashes                   monotone: the TRUE staged structure of every
+                    \*                                 precommit ({t} \cup Children(t)), independent of
+                    \*                                 whether the closure was recorded inline. This is
+                    \*                                 the SHOULD-be-reclaimable set INV_NO_LEAK ranges
+                    \*                                 over -- the fix records it inline (-> snapped ->
+                    \*                                 reclaimed); the lazy path drops it (-> leak).
 
 vars == << present, tableRefs, owner, precommit, buildLive, judgedDead,
-           committed, aborted, adopted, everDangle >>
+           committed, aborted, adopted, everDangle, uploaded, closure, everSnapped, staged >>
 
 \* ----------------------------------------------------------------- helpers
 TableClosure == UNION { Reach(t) : t \in tableRefs }
@@ -97,21 +152,38 @@ OwnerProtected(h) ==
     /\ buildLive[owner[h]]
     /\ owner[h] \notin judgedDead
 
-\* FIXED: protected iff reachable from a LIVE build's precommit (build-root edge).
+\* The edges a precommit contributes to the snap. B199-S2: these are seeded from the RECORDED
+\* inline closure (closure[bld] -> the root precommit[bld] plus its recorded children), NOT by
+\* reading the tree object. So an in-flight build pins exactly {precommit[bld]} \cup closure[bld].
+\* (With InlineClosure=FALSE the closure may be empty even though the tree exists -> the S2 leak.)
+BuildRootEdges(bld) ==
+    IF precommit[bld] = None THEN {} ELSE {precommit[bld]} \cup closure[bld]
+
+\* FIXED: protected iff reachable from a LIVE build's precommit, sourced from the inline closure.
 BuildRootProtected(h) ==
     \E bld \in Builds :
         /\ buildLive[bld]
-        /\ precommit[bld] # None
-        /\ h \in Reach(precommit[bld])
+        /\ h \in BuildRootEdges(bld)
 
 Protected(h) ==
     IF UseBuildRoot THEN BuildRootProtected(h) ELSE OwnerProtected(h)
 
 \* In-degree from durable references that actually pin (table refs always; build-root
-\* precommit edges pin too in the fixed model, via the GC fold).
+\* precommit edges pin too in the fixed model, seeded from the recorded inline closure).
 PinnedByTable(h)     == \E t \in tableRefs : h \in Reach(t)
-PinnedByBuildRoot(h) == UseBuildRoot /\ (\E bld \in Builds : precommit[bld] # None /\ h \in Reach(precommit[bld]))
+PinnedByBuildRoot(h) == UseBuildRoot /\ (\E bld \in Builds : h \in BuildRootEdges(bld))
 InDegZero(h)         == ~PinnedByTable(h) /\ ~PinnedByBuildRoot(h)
+
+\* B199-S2 GC VISIBILITY (the in-degree snap). GC reclaims an object only if it appears in the
+\* snap -- which is built by expanding the things GC knows about: table refs (always expanded) and,
+\* in the fixed model, the precommit's RECORDED inline closure (BuildRootEdges). An object that was
+\* never recorded in any closure and is not table-reachable is invisible "unreachable debris" GC
+\* never enumerates -> it cannot be reclaimed. This is precisely the S2 leak surface: when the lazy
+\* path (InlineClosure=FALSE) records an empty closure for a gone tree, the children are never
+\* snapped and leak forever. Membership is MONOTONE (everSnapped) -- once enumerated, a later
+\* in-degree drop (e.g. reclaim mirror-dropping the closure edges) does not un-snap the object, so
+\* GC can still delete it. What it never re-derives is an object it never enumerated in the first place.
+NewlySnapped(h) == PinnedByTable(h) \/ (\E bld \in Builds : h \in BuildRootEdges(bld))
 
 Init ==
     /\ present       = [h \in Hashes |-> FALSE]
@@ -124,6 +196,10 @@ Init ==
     /\ aborted       = {}
     /\ adopted       = [bld \in Builds |-> {}]
     /\ everDangle    = FALSE
+    /\ uploaded      = [h \in Hashes |-> FALSE]
+    /\ closure       = [bld \in Builds |-> {}]
+    /\ everSnapped   = {}
+    /\ staged        = {}
 
 \* ----------------------------------------------------------------- actions
 
@@ -131,10 +207,11 @@ Init ==
 WriteBlob(bld, b) ==
     /\ buildLive[bld]
     /\ ~present[b]
-    /\ present'  = [present EXCEPT ![b] = TRUE]
-    /\ owner'    = [owner   EXCEPT ![b] = bld]
-    /\ adopted'  = [adopted EXCEPT ![bld] = @ \cup {b}]   \* writer trivially "holds" its blob
-    /\ UNCHANGED << tableRefs, precommit, buildLive, judgedDead, committed, aborted, everDangle >>
+    /\ present'  = [present  EXCEPT ![b] = TRUE]
+    /\ uploaded' = [uploaded EXCEPT ![b] = TRUE]          \* bytes landed in the pool
+    /\ owner'    = [owner    EXCEPT ![b] = bld]
+    /\ adopted'  = [adopted  EXCEPT ![bld] = @ \cup {b}]  \* writer trivially "holds" its blob
+    /\ UNCHANGED << tableRefs, precommit, buildLive, judgedDead, committed, aborted, everDangle, closure, everSnapped, staged >>
 
 \* A build ADOPTS an already-present blob (dedup): no bytes moved, owner UNCHANGED.
 \* It records the blob in its dep set (adopted[bld]). In the buggy model this confers NO
@@ -145,7 +222,7 @@ AdoptBlob(bld, b) ==
     /\ buildLive[bld]
     /\ present[b]
     /\ adopted' = [adopted EXCEPT ![bld] = @ \cup {b}]
-    /\ UNCHANGED << present, tableRefs, owner, precommit, buildLive, judgedDead, committed, aborted, everDangle >>
+    /\ UNCHANGED << present, tableRefs, owner, precommit, buildLive, judgedDead, committed, aborted, everDangle, uploaded, closure, everSnapped, staged >>
 
 \* A build publishes a TABLE ref directly (the pre-existing independent pin, e.g. t1 over b1).
 \* Requires the closure present. Models content already committed by some prior, now-retired
@@ -153,26 +230,45 @@ AdoptBlob(bld, b) ==
 PublishTableRef(t) ==
     /\ \A c \in Children(t) : present[c]
     /\ t \notin tableRefs
-    /\ present'   = [present EXCEPT ![t] = TRUE]
+    /\ present'   = [present  EXCEPT ![t] = TRUE]
+    /\ uploaded'  = [uploaded EXCEPT ![t] = TRUE]
     /\ tableRefs' = tableRefs \cup {t}
     /\ committed' = committed \cup {t}
-    /\ UNCHANGED << owner, precommit, buildLive, judgedDead, aborted, adopted, everDangle >>
+    /\ everSnapped' = everSnapped \cup Reach(t)   \* table ref is expanded -> its closure is snapped
+    /\ UNCHANGED << owner, precommit, buildLive, judgedDead, aborted, adopted, everDangle, closure, staged >>
 
 \* FIXED ONLY: a build publishes its precommit (build-root ref -> tree). Tiny write of hashes;
-\* may be published before the bytes land (build root tolerates absent objects).
+\* may be published before the bytes land (build root tolerates absent objects). B199-S2: the
+\* precommit RECORDS its closure INLINE here (the writer holds the staged structure in hand).
+\*   InlineClosure=TRUE  : record the full structural closure (the staged children), sourced from
+\*                         the payload -- NEVER depends on the tree object existing. S2 closed by
+\*                         construction: the children are recorded even for a never-uploaded tree.
+\*   InlineClosure=FALSE : the OLD lazy path -- GC would learn the closure only by reading the tree
+\*                         OBJECT at fold time, so the closure is recorded ONLY if the tree is
+\*                         present to be expanded; a gone/un-uploaded tree => EMPTY closure (the
+\*                         S2 leak: the children are never recorded, never protected, never reclaimed).
 Precommit(bld, t) ==
     /\ UseBuildRoot
     /\ buildLive[bld]
     /\ precommit[bld] = None
     /\ precommit' = [precommit EXCEPT ![bld] = t]
-    /\ UNCHANGED << present, tableRefs, owner, buildLive, judgedDead, committed, aborted, adopted, everDangle >>
+    /\ closure'   = [closure EXCEPT ![bld] =
+                       IF InlineClosure \/ present[t] THEN Children(t) ELSE {}]
+    \* The recorded closure (root + children) enters the snap. With InlineClosure=FALSE and a gone
+    \* tree, closure'[bld] is empty, so the children are NOT snapped here -> the S2 leak surface.
+    /\ everSnapped' = everSnapped \cup {t} \cup closure'[bld]
+    \* The TRUE staged structure ({t} \cup its real children) -- recorded regardless of InlineClosure.
+    \* INV_NO_LEAK ranges over this: with the fix it equals closure' (-> snapped); the lazy path
+    \* records a SUBSET into the snap yet the full structure was still staged -> the leaked remainder.
+    /\ staged'      = staged \cup {t} \cup Children(t)
+    /\ UNCHANGED << present, tableRefs, owner, buildLive, judgedDead, committed, aborted, adopted, everDangle, uploaded >>
 
 \* An INDEPENDENT table ref is dropped (its in-degree contribution disappears). This is the
 \* DropTableRef that can take the shared blob to in-degree 0 while another build still wants it.
 DropTableRef(t) ==
     /\ t \in tableRefs
     /\ tableRefs' = tableRefs \ {t}
-    /\ UNCHANGED << present, owner, precommit, buildLive, judgedDead, committed, aborted, adopted, everDangle >>
+    /\ UNCHANGED << present, owner, precommit, buildLive, judgedDead, committed, aborted, adopted, everDangle, uploaded, closure, everSnapped, staged >>
 
 \* The real COMMIT: build bld publishes a table ref -> its manifest tree t. The build must
 \* have adopted/written every blob in t's closure (it assembled the manifest). The manifest
@@ -187,11 +283,13 @@ Commit(bld, t) ==
     /\ Children(t) \subseteq adopted[bld]        \* the build assembled this tree's closure
     /\ (UseBuildRoot => precommit[bld] = t)      \* fixed: must have precommitted this tree
     /\ FailClosedCommit => (\A c \in Children(t) : present[c])  \* fail-closed presence gate
-    /\ present'   = [present EXCEPT ![t] = TRUE] \* write the manifest tree
+    /\ present'   = [present  EXCEPT ![t] = TRUE] \* write the manifest tree
+    /\ uploaded'  = [uploaded EXCEPT ![t] = TRUE]
     /\ tableRefs' = tableRefs \cup {t}
     /\ committed' = committed \cup {t}
     /\ everDangle' = everDangle \/ (\E c \in Children(t) : ~present[c])
-    /\ UNCHANGED << owner, precommit, buildLive, judgedDead, aborted, adopted >>
+    /\ everSnapped' = everSnapped \cup Reach(t)   \* committed table ref is expanded -> snapped
+    /\ UNCHANGED << owner, precommit, buildLive, judgedDead, aborted, adopted, closure, staged >>
 
 \* Commit ABORT path (fail-closed): closure incomplete => do NOT publish; mark aborted (retry).
 \* This is the path that saves correctness after a premature GcReclaimPrecommit + GcDelete.
@@ -203,7 +301,7 @@ CommitAbort(bld, t) ==
     /\ (UseBuildRoot => precommit[bld] = t)
     /\ \E c \in Children(t) : ~present[c]         \* a blob in the closure is missing
     /\ aborted' = aborted \cup {bld}
-    /\ UNCHANGED << present, tableRefs, owner, precommit, buildLive, judgedDead, committed, adopted, everDangle >>
+    /\ UNCHANGED << present, tableRefs, owner, precommit, buildLive, judgedDead, committed, adopted, everDangle, uploaded, closure, everSnapped, staged >>
 
 \* FIXED ONLY: remove a precommit after a successful commit (normal happy-path teardown).
 RemovePrecommit(bld) ==
@@ -211,7 +309,8 @@ RemovePrecommit(bld) ==
     /\ precommit[bld] # None
     /\ precommit[bld] \in tableRefs               \* its tree is now a real table ref
     /\ precommit' = [precommit EXCEPT ![bld] = None]
-    /\ UNCHANGED << present, tableRefs, owner, buildLive, judgedDead, committed, aborted, adopted, everDangle >>
+    /\ closure'   = [closure   EXCEPT ![bld] = {}] \* drop the inline-closure edges (committed tree pins now)
+    /\ UNCHANGED << present, tableRefs, owner, buildLive, judgedDead, committed, aborted, adopted, everDangle, uploaded, everSnapped, staged >>
 
 \* A build truly dies (clean retire or hard crash): it stops acting AND GC judges it dead.
 \* In the buggy model this is what makes a blob's owner-protection lapse (min_active rises).
@@ -219,7 +318,7 @@ BuildDie(bld) ==
     /\ buildLive[bld]
     /\ buildLive'  = [buildLive EXCEPT ![bld] = FALSE]
     /\ judgedDead' = judgedDead \cup {bld}        \* seq < min_active / epoch mismatch
-    /\ UNCHANGED << present, tableRefs, owner, precommit, committed, aborted, adopted, everDangle >>
+    /\ UNCHANGED << present, tableRefs, owner, precommit, committed, aborted, adopted, everDangle, uploaded, closure, everSnapped, staged >>
 
 \* FALSE-POSITIVE freeze (§4.6 residual fragility): the build's background heartbeat renewer
 \* stalls (e.g. an S3 retry storm), so GC JUDGES it dead -- but it is still RUNNING (buildLive
@@ -229,7 +328,7 @@ BuildFreeze(bld) ==
     /\ buildLive[bld]
     /\ bld \notin judgedDead
     /\ judgedDead' = judgedDead \cup {bld}
-    /\ UNCHANGED << present, tableRefs, owner, precommit, buildLive, committed, aborted, adopted, everDangle >>
+    /\ UNCHANGED << present, tableRefs, owner, precommit, buildLive, committed, aborted, adopted, everDangle, uploaded, closure, everSnapped, staged >>
 
 \* GC fold of the build root: structural, no state change beyond what InDeg helpers already
 \* derive from precommit. Kept as a named (stuttering) step so the trace shows the fold point.
@@ -237,22 +336,32 @@ GcFold ==
     /\ UNCHANGED vars
 
 \* FIXED ONLY: GC reclaims a precommit whose owning build is judged dead (retire/crash) OR a
-\* FALSE-positive on a frozen-but-live build. Removing the edge can drop protection.
+\* FALSE-positive on a frozen-but-live build. Removing the edge can drop protection. B199-S2:
+\* the reclaim MIRROR-DROPS the recorded inline-closure edges (closure[bld] := {}) -- exactly the
+\* edges Precommit seeded -- so the members fall to in-degree 0 and are released by GcDelete. A
+\* never-uploaded member is already absent, so its eventual delete is an idempotent no-op.
 GcReclaimPrecommit(bld) ==
     /\ UseBuildRoot
     /\ precommit[bld] # None
     /\ precommit[bld] \notin tableRefs            \* not yet committed (else RemovePrecommit)
     /\ (~buildLive[bld] \/ bld \in judgedDead) \* judged dead -- may be a false positive
     /\ precommit' = [precommit EXCEPT ![bld] = None]
-    /\ UNCHANGED << present, tableRefs, owner, buildLive, judgedDead, committed, aborted, adopted, everDangle >>
+    /\ closure'   = [closure   EXCEPT ![bld] = {}] \* mirror-drop the inline-closure edges
+    /\ UNCHANGED << present, tableRefs, owner, buildLive, judgedDead, committed, aborted, adopted, everDangle, uploaded, everSnapped, staged >>
 
-\* GC condemns + deletes an in-degree-0, unprotected, present object.
+\* GC condemns + deletes an in-degree-0, unprotected, present object. B199-S2: GC can only act on
+\* an object it has ENUMERATED into the snap (everSnapped) -- an object never recorded in any closure
+\* and never table-reachable is invisible debris GC cannot reclaim. (h \in everSnapped) is the
+\* enabling guard that distinguishes a reclaimable in-degree-0 object from a leaked one. The guard
+\* is the EXPANSION-snap model (UseBuildRoot); the legacy owner-hint model (UseBuildRoot=FALSE) keeps
+\* its original enabling condition so the buggy/buildrootonly counterexamples reproduce unchanged.
 GcDelete(h) ==
     /\ present[h]
+    /\ (UseBuildRoot => h \in everSnapped)
     /\ InDegZero(h)
     /\ ~Protected(h)
     /\ present' = [present EXCEPT ![h] = FALSE]
-    /\ UNCHANGED << tableRefs, owner, precommit, buildLive, judgedDead, committed, aborted, adopted, everDangle >>
+    /\ UNCHANGED << tableRefs, owner, precommit, buildLive, judgedDead, committed, aborted, adopted, everDangle, uploaded, closure, everSnapped, staged >>
 
 \* ----------------------------------------------------------------- next / spec
 Next ==
@@ -277,6 +386,10 @@ TypeOK ==
     /\ aborted       \subseteq Builds
     /\ adopted       \in [Builds -> SUBSET Blobs]
     /\ everDangle    \in BOOLEAN
+    /\ uploaded      \in [Hashes -> BOOLEAN]
+    /\ closure       \in [Builds -> SUBSET Hashes]
+    /\ everSnapped   \subseteq Hashes
+    /\ staged        \subseteq Hashes
 
 \* INV-NO-DANGLE-COMMITTED (strict, reader-facing): every object in the closure of any
 \* TABLE ref is present, and no committed table ref ever dangled.
@@ -296,12 +409,59 @@ INV_BUILDROOT_PROTECTS ==
 
 \* INV-COMMIT-FAILCLOSED: any committed table ref's closure is present (no commit-creates-
 \* dangle), even after a premature reclaim. With FailClosedCommit this is structural.
+\* (This is the NO-LOSS guarantee for this model: a committed reader-facing ref never loses
+\* a closure member -- the reader never observes a dangle.)
 INV_COMMIT_FAILCLOSED ==
     FailClosedCommit =>
         (\A t \in committed : \A h \in Reach(t) : (t \in tableRefs) => present[h])
 
+\* An object has a LEGITIMATE LIVE reference: it is pinned by a published table ref (reader-facing
+\* truth) OR by the build-root edges of a STILL-LIVE build (an in-flight build legitimately holding
+\* it). Anything else that is present is garbage that GC should reclaim.
+OtherLiveRef(h) ==
+    \/ PinnedByTable(h)
+    \/ (\E bld \in Builds : buildLive[bld] /\ h \in BuildRootEdges(bld))
+
+\* INV-NO-RETURN (safety): a closure member that GC reclaimed (deleted) is never resurrected by a
+\* read/GET of the condemned object -- it can only come back as a FRESH re-upload from source. In
+\* this model the only way present[h] turns back TRUE is WriteBlob/PublishTableRef/Commit, all of
+\* which are fresh writes (WriteBlob requires ~present and re-stamps owner; the trees are written by
+\* their own committing build). No action GETs a condemned object to revive it. We assert the
+\* structural consequence: a present object's bytes were produced by a fresh upload (uploaded[h]),
+\* never conjured from a deleted incarnation. (Honors [[feedback-ca-resurrect-invariant]].)
+INV_NO_RETURN ==
+    \A h \in Hashes : present[h] => uploaded[h]
+
+\* INV-NO-LEAK (liveness): garbage is eventually reclaimed OR legitimately re-referenced -- it never
+\* stays present-and-unreferenced forever. This is the S2 property: for an ABANDONED build (dead, its
+\* precommit reclaimed -> closure dropped -> no OtherLiveRef), every recorded closure member with no
+\* other live reference is eventually NOT present. With InlineClosure=TRUE the member was snapped at
+\* Precommit, so after reclaim it is a visible in-degree-0 object that GcDelete reclaims; the
+\* never-uploaded member is already absent (its delete is an idempotent no-op). With InlineClosure
+\* =FALSE and a gone tree, the member was NEVER snapped -> GcDelete can never fire on it -> it stays
+\* present-and-unreferenced forever (the S2 leak) and this property is VIOLATED.
+\* Scope: STAGED members only (objects some precommit actually staged). A blob never staged by any
+\* build is outside the precommit-closure model and not what inline-closure governs.
+INV_NO_LEAK ==
+    \A h \in Hashes :
+        (h \in staged /\ present[h] /\ ~OtherLiveRef(h)) ~> (~present[h] \/ OtherLiveRef(h))
+
 \* StateConstraint: the model is finite already, but bound the explorable space explicitly.
 StateConstraint == TRUE
+
+\* ----------------------------------------------------------------- fair spec (for INV-NO-LEAK)
+\* INV-NO-LEAK is a liveness property, so it needs fairness. GC must eventually act on a reclaimable
+\* object and the abandoning build must eventually be reclaimed -- otherwise any safety-only Spec can
+\* "leak" simply by stuttering. We put WEAK FAIRNESS on the GC reclaim/delete actions and on the
+\* teardown that abandons a build (BuildDie + GcReclaimPrecommit). The WRITER side gets NO fairness
+\* (a build may abandon at any point; we do not force it to commit). This isolates "does GC drain the
+\* garbage of an abandoned build" from "does the build make progress".
+FairSpec ==
+    /\ Init
+    /\ [][Next]_vars
+    /\ \A bld \in Builds : WF_vars(BuildDie(bld))
+    /\ \A bld \in Builds : WF_vars(GcReclaimPrecommit(bld))
+    /\ \A h \in Hashes   : WF_vars(GcDelete(h))
 
 \* ----------------------------------------------------------------- reachability WITNESSES
 \* These are NOT safety invariants -- they are NEGATED reachability probes. Each asserts that a
