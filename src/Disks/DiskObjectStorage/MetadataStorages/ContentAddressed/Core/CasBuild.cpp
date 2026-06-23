@@ -376,11 +376,10 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
         writeString(buildHeader(), sink->buffer());
         writeString(source_bytes, sink->buffer());
-        Token tok;
-        const PutOutcome outcome = sink->finalize(&tok);
-        if (outcome == PutOutcome::Done)
+        const PutResult res = sink->finalize();
+        if (res.outcome == PutOutcome::Done)
         {
-            recordDoneAndEmit(tok);
+            recordDoneAndEmit(res.token);
             return;
         }
     }
@@ -399,11 +398,10 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         WriteSinkPtr sink2 = store->backend().putIfAbsentStream(key);
         writeString(buildHeader(), sink2->buffer());
         writeString(source_bytes, sink2->buffer());
-        Token tok2;
-        const PutOutcome outcome2 = sink2->finalize(&tok2);
-        if (outcome2 == PutOutcome::Done)
+        const PutResult res2 = sink2->finalize();
+        if (res2.outcome == PutOutcome::Done)
         {
-            recordDoneAndEmit(tok2);
+            recordDoneAndEmit(res2.token);
             return;
         }
         /// Still 412 after the vanish-and-retry: a racing writer re-created it. Adopt their token.
@@ -422,11 +420,10 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     /// Condemned: displace the condemned incarnation with our fresh source bytes via If-Match.
     /// CRITICAL: we use putOverwrite (NOT backend().get) — we have the source bytes, so no GET needed.
     /// W-FRESH-TAG: a fresh incarnation_tag minted inside buildHeader() ensures INV-NO-RETURN.
-    Token new_tok;
-    const PutOutcome oc = store->backend().putOverwrite(key, buildHeader() + String(source_bytes), hr.token, &new_tok);
-    if (oc == PutOutcome::Done)
+    const PutResult overwrite_res = store->backend().putOverwrite(key, buildHeader() + String(source_bytes), hr.token);
+    if (overwrite_res.outcome == PutOutcome::Done)
     {
-        recordDoneAndEmit(new_tok);
+        recordDoneAndEmit(overwrite_res.token);
         return;
     }
     /// PreconditionFailed from putOverwrite: either a racing writer displaced the condemned token
@@ -440,11 +437,10 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
             WriteSinkPtr sink3 = store->backend().putIfAbsentStream(key);
             writeString(buildHeader(), sink3->buffer());
             writeString(source_bytes, sink3->buffer());
-            Token tok3;
-            const PutOutcome outcome3 = sink3->finalize(&tok3);
-            if (outcome3 == PutOutcome::Done)
+            const PutResult res3 = sink3->finalize();
+            if (res3.outcome == PutOutcome::Done)
             {
-                recordDoneAndEmit(tok3);
+                recordDoneAndEmit(res3.token);
                 return;
             }
             /// Still 412 — a racing writer re-created it. Observe their token.

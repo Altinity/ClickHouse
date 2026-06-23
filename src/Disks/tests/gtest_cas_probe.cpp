@@ -47,7 +47,7 @@ TEST(CasProbe, ConcurrentMountsDoNotCollide)
     auto b = std::make_shared<InMemoryBackend>();
 
     /// Simulate a concurrent mounter whose probe object under the legacy fixed key is still present.
-    ASSERT_EQ(b->putIfAbsent("p/_probe/token", "concurrent-mounter-in-flight"), PutOutcome::Done);
+    ASSERT_EQ(b->putIfAbsent("p/_probe/token", "concurrent-mounter-in-flight").outcome, PutOutcome::Done);
 
     /// A real (second) mount over the same shared pool must still succeed — its probe runs under a
     /// fresh per-mount-unique prefix and never touches the seeded fixed key.

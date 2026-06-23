@@ -118,15 +118,19 @@ void WatermarkKeeper::start()
     Token token;
     if (!head.exists)
     {
-        if (backend->putIfAbsent(key, body, &token) != PutOutcome::Done)
+        const PutResult res = backend->putIfAbsent(key, body);
+        if (res.outcome != PutOutcome::Done)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS watermark: key '{}' appeared between head and putIfAbsent — concurrent writer on our own server slot", key);
+        token = res.token;
     }
     else
     {
-        if (backend->putOverwrite(key, body, head.token, &token) != PutOutcome::Done)
+        const PutResult res = backend->putOverwrite(key, body, head.token);
+        if (res.outcome != PutOutcome::Done)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS watermark: key '{}' was touched while claiming our own server slot — failing closed", key);
+        token = res.token;
     }
 
     seq = 1;
@@ -147,10 +151,11 @@ void WatermarkKeeper::renewOnce()
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS watermark: renew before start on key '{}'", key);
 
     const String body = encodeServerWatermark({.server_id = server_id, .epoch = epoch, .min_active = min_active, .seq = seq + 1});
-    Token token;
-    if (backend->putOverwrite(key, body, last_token, &token) != PutOutcome::Done)
+    const PutResult res = backend->putOverwrite(key, body, last_token);
+    if (res.outcome != PutOutcome::Done)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS watermark: key '{}' was touched by a foreign writer — failing closed, never re-minting", key);
+    const Token token = res.token;
 
     ++seq;
     last_token = token;
@@ -170,13 +175,13 @@ void WatermarkKeeper::farewell()
 
     const String body = encodeServerWatermark(
         {.server_id = server_id, .epoch = epoch, .min_active = std::numeric_limits<uint64_t>::max(), .seq = seq + 1});
-    Token token;
-    const PutOutcome outcome = backend->putOverwrite(key, body, last_token, &token);
+    const PutResult res = backend->putOverwrite(key, body, last_token);
+    const Token token = res.token;
     /// Dead regardless of the outcome below: we attempted the retirement, the keeper must never
     /// renew this key again.
     dead = true;
 
-    if (outcome != PutOutcome::Done)
+    if (res.outcome != PutOutcome::Done)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS watermark: farewell of key '{}' hit a foreign incarnation — the world is broken", key);
 

@@ -145,7 +145,7 @@ TEST(CasGcDangle, SharedBlobUnderCountDeletesLivePinnedBlob)
     GcState st;
     st.snap_generation = 1;
     st.snap_shards = 1;
-    ASSERT_EQ(b->putIfAbsent(s->layout().gcSnapKey(1, 0), encodeGcSnap(snap)), PutOutcome::Done);
+    ASSERT_EQ(b->putIfAbsent(s->layout().gcSnapKey(1, 0), encodeGcSnap(snap)).outcome, PutOutcome::Done);
     const auto state_head = b->head(s->layout().gcStateKey());
     if (state_head.exists)
         b->putOverwrite(s->layout().gcStateKey(), encodeGcState(st), state_head.token);

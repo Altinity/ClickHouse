@@ -107,7 +107,7 @@ static PutOutcome finalizeConditionalWrite(WriteBuffer & buf)
 /// Issue a conditional PUT (the condition rides on `ws`) and map a precondition loss — see
 /// finalizeConditionalWrite. The condition is checked by the backend when the object is completed,
 /// so the precondition loss always surfaces from the buffer's finalize, never from write.
-PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, Token * out_token, const ObjectMeta & meta)
+PutResult ObjectStorageBackend::nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, const ObjectMeta & meta)
 {
     std::optional<ObjectAttributes> attrs;
     if (!meta.empty())
@@ -116,25 +116,23 @@ PutOutcome ObjectStorageBackend::nativeConditionalPut(const String & key, const 
         StoredObject(key), WriteMode::Rewrite, attrs, DBMS_DEFAULT_BUFFER_SIZE, ws);
     buf->write(bytes.data(), bytes.size());
     if (finalizeConditionalWrite(*buf) == PutOutcome::PreconditionFailed)
-        return PutOutcome::PreconditionFailed;
+        return {PutOutcome::PreconditionFailed, {}};
 
-    if (out_token)
+    /// Record the token of the incarnation WE just wrote (model WCreate). The S3 write returns
+    /// its object ETag in the PutObject/CompleteMultipartUpload response, so no follow-up HEAD
+    /// is needed — this is ~73% of the CA backend's HEADs. A backend with no write-time ETag
+    /// (local files) returns nullopt and we fall back to the HEAD (a cheap local stat there).
+    Token token;
+    if (auto etag = buf->getResultObjectETag(); etag && !etag->empty())
+        token = Token{*etag, TokenType::ETag};
+    else
     {
-        /// Record the token of the incarnation WE just wrote (model WCreate). The S3 write returns
-        /// its object ETag in the PutObject/CompleteMultipartUpload response, so no follow-up HEAD
-        /// is needed — this is ~73% of the CA backend's HEADs. A backend with no write-time ETag
-        /// (local files) returns nullopt and we fall back to the HEAD (a cheap local stat there).
-        if (auto etag = buf->getResultObjectETag(); etag && !etag->empty())
-            *out_token = Token{*etag, TokenType::ETag};
-        else
-        {
-            /// No write-time ETag (local files) or an (anomalous) empty one: fall back to the HEAD —
-            /// the pre-existing behavior, so an empty-ETag server is never worse than before.
-            auto hr = nativeHead(key);
-            *out_token = hr ? hr->token : Token{};
-        }
+        /// No write-time ETag (local files) or an (anomalous) empty one: fall back to the HEAD —
+        /// the pre-existing behavior, so an empty-ETag server is never worse than before.
+        auto hr = nativeHead(key);
+        token = hr ? hr->token : Token{};
     }
-    return PutOutcome::Done;
+    return {PutOutcome::Done, token};
 }
 
 namespace
@@ -156,29 +154,27 @@ public:
 
     WriteBuffer & buffer() override { return *write_buf; }
 
-    PutOutcome finalize(Token * out_token) override
+    PutResult finalize() override
     {
         chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
         done = true;
         if (finalizeConditionalWrite(*write_buf) == PutOutcome::PreconditionFailed)
-            return PutOutcome::PreconditionFailed;
+            return {PutOutcome::PreconditionFailed, {}};
 
-        if (out_token)
+        /// Record the token of the incarnation we just wrote (model WCreate). The S3 write
+        /// returns its object ETag in the response, so no follow-up HEAD is needed (the bulk of
+        /// the CA backend's HEADs). Backends with no write-time ETag (local) return nullopt and
+        /// we fall back to the HEAD (a cheap local stat there).
+        Token token;
+        if (auto etag = write_buf->getResultObjectETag(); etag && !etag->empty())
+            token = Token{*etag, TokenType::ETag};
+        else
         {
-            /// Record the token of the incarnation we just wrote (model WCreate). The S3 write
-            /// returns its object ETag in the response, so no follow-up HEAD is needed (the bulk of
-            /// the CA backend's HEADs). Backends with no write-time ETag (local) return nullopt and
-            /// we fall back to the HEAD (a cheap local stat there).
-            if (auto etag = write_buf->getResultObjectETag(); etag && !etag->empty())
-                *out_token = Token{*etag, TokenType::ETag};
-            else
-            {
-                /// No write-time ETag (local) or an (anomalous) empty one: fall back to the HEAD.
-                auto hr = backend.head(key);
-                *out_token = hr.exists ? hr.token : Token{};
-            }
+            /// No write-time ETag (local) or an (anomalous) empty one: fall back to the HEAD.
+            auto hr = backend.head(key);
+            token = hr.exists ? hr.token : Token{};
         }
-        return PutOutcome::Done;
+        return {PutOutcome::Done, token};
     }
 
     void cancel() noexcept override
@@ -216,11 +212,11 @@ public:
 
     WriteBuffer & buffer() override { return buf; }
 
-    PutOutcome finalize(Token * out_token) override
+    PutResult finalize() override
     {
         chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
         done = true;
-        return backend.putIfAbsent(key, buf.str(), out_token, meta);
+        return backend.putIfAbsent(key, buf.str(), meta);
     }
 
     void cancel() noexcept override
@@ -423,25 +419,23 @@ static WriteSettings casWriteSettings()
     return ws;
 }
 
-PutOutcome ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, Token * out_token, const ObjectMeta & meta)
+PutResult ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {
         WriteSettings ws = casWriteSettings();
         ws.object_storage_write_if_none_match = "*";
-        return nativeConditionalPut(key, bytes, ws, out_token, meta);
+        return nativeConditionalPut(key, bytes, ws, meta);
     }
 
     std::lock_guard lock(emu_mutex);
     if (emuExists(key))
-        return PutOutcome::PreconditionFailed;
+        return {PutOutcome::PreconditionFailed, {}};
 
     emuWrite(key, bytes, meta);
     const uint64_t seq = ++emu_seq;
     emu_tokens[key] = seq;
-    if (out_token)
-        *out_token = Token{std::to_string(seq), TokenType::Emulated};
-    return PutOutcome::Done;
+    return {PutOutcome::Done, Token{std::to_string(seq), TokenType::Emulated}};
 }
 
 WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, const ObjectMeta & meta)
@@ -463,30 +457,28 @@ WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, const O
     return std::make_unique<EmulatedBufferedSink>(*this, key, meta);
 }
 
-PutOutcome ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token, const ObjectMeta & meta)
+PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {
         WriteSettings ws = casWriteSettings();
         ws.object_storage_write_if_match = expected.value;
-        return nativeConditionalPut(key, bytes, ws, out_token, meta);
+        return nativeConditionalPut(key, bytes, ws, meta);
     }
 
     std::lock_guard lock(emu_mutex);
     if (!emuExists(key))
-        return PutOutcome::PreconditionFailed;
+        return {PutOutcome::PreconditionFailed, {}};
     if (emuObserveToken(key) != expected)
-        return PutOutcome::PreconditionFailed;
+        return {PutOutcome::PreconditionFailed, {}};
 
     emuWrite(key, bytes, meta);
     const uint64_t seq = ++emu_seq;
     emu_tokens[key] = seq;
-    if (out_token)
-        *out_token = Token{std::to_string(seq), TokenType::Emulated};
-    return PutOutcome::Done;
+    return {PutOutcome::Done, Token{std::to_string(seq), TokenType::Emulated}};
 }
 
-CasOutcome ObjectStorageBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token, const ObjectMeta & meta)
+CasResult ObjectStorageBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta)
 {
     if (mode == Mode::Native)
     {
@@ -498,9 +490,10 @@ CasOutcome ObjectStorageBackend::casPut(const String & key, const String & bytes
 
         /// The PUT-side outcomes (Done / PreconditionFailed) collapse onto CAS outcomes 1:1: a lost
         /// condition — whether a mismatched If-Match or a 404 on an If-Match PUT — is a Conflict.
-        return nativeConditionalPut(key, bytes, ws, out_token, meta) == PutOutcome::Done
-            ? CasOutcome::Committed
-            : CasOutcome::Conflict;
+        PutResult put = nativeConditionalPut(key, bytes, ws, meta);
+        return put.outcome == PutOutcome::Done
+            ? CasResult{CasOutcome::Committed, put.token}
+            : CasResult{CasOutcome::Conflict, {}};
     }
 
     std::lock_guard lock(emu_mutex);
@@ -509,22 +502,20 @@ CasOutcome ObjectStorageBackend::casPut(const String & key, const String & bytes
     if (!expected.has_value())
     {
         if (exists)
-            return CasOutcome::Conflict;
+            return {CasOutcome::Conflict, {}};
     }
     else
     {
         if (!exists)
-            return CasOutcome::Conflict;
+            return {CasOutcome::Conflict, {}};
         if (emuObserveToken(key) != *expected)
-            return CasOutcome::Conflict;
+            return {CasOutcome::Conflict, {}};
     }
 
     emuWrite(key, bytes, meta);
     const uint64_t seq = ++emu_seq;
     emu_tokens[key] = seq;
-    if (out_token)
-        *out_token = Token{std::to_string(seq), TokenType::Emulated};
-    return CasOutcome::Committed;
+    return {CasOutcome::Committed, Token{std::to_string(seq), TokenType::Emulated}};
 }
 
 DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token & token)

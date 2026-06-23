@@ -24,11 +24,11 @@ public:
 
     WriteBuffer & buffer() override { return buf_; }
 
-    PutOutcome finalize(Token * out_token) override
+    PutResult finalize() override
     {
         chassert(!done_);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
         done_ = true;
-        return backend_.putIfAbsent(key_, buf_.str(), out_token, meta_);
+        return backend_.putIfAbsent(key_, buf_.str(), meta_);
     }
 
     void cancel() noexcept override
@@ -107,11 +107,11 @@ HeadResult InMemoryBackend::head(const String & key)
     return hr;
 }
 
-PutOutcome InMemoryBackend::putIfAbsent(const String & key, const String & bytes, Token * out_token, const ObjectMeta & meta)
+PutResult InMemoryBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta)
 {
     std::lock_guard lock(mutex_);
     if (store_.count(key))
-        return PutOutcome::PreconditionFailed;
+        return {PutOutcome::PreconditionFailed, {}};
 
     Token t = mintToken();
     Object obj;
@@ -119,9 +119,7 @@ PutOutcome InMemoryBackend::putIfAbsent(const String & key, const String & bytes
     obj.token = t;
     obj.meta = meta;
     store_[key] = std::move(obj);
-    if (out_token)
-        *out_token = t;
-    return PutOutcome::Done;
+    return {PutOutcome::Done, t};
 }
 
 WriteSinkPtr InMemoryBackend::putIfAbsentStream(const String & key, const ObjectMeta & meta)
@@ -129,26 +127,24 @@ WriteSinkPtr InMemoryBackend::putIfAbsentStream(const String & key, const Object
     return std::make_unique<InMemoryWriteSink>(*this, key, meta);
 }
 
-PutOutcome InMemoryBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token, const ObjectMeta & meta)
+PutResult InMemoryBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)
 {
     std::lock_guard lock(mutex_);
     auto it = store_.find(key);
     if (it == store_.end())
-        return PutOutcome::PreconditionFailed;
+        return {PutOutcome::PreconditionFailed, {}};
 
     if (enforce_tokens_ && it->second.token != expected)
-        return PutOutcome::PreconditionFailed;
+        return {PutOutcome::PreconditionFailed, {}};
 
     Token t = mintToken();
     it->second.bytes = bytes;
     it->second.token = t;
     it->second.meta = meta;
-    if (out_token)
-        *out_token = t;
-    return PutOutcome::Done;
+    return {PutOutcome::Done, t};
 }
 
-CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token, const ObjectMeta & meta)
+CasResult InMemoryBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta)
 {
     std::lock_guard lock(mutex_);
 
@@ -157,7 +153,7 @@ CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, con
     if (fail_it != fail_next_cas_.end())
     {
         fail_next_cas_.erase(fail_it);
-        return CasOutcome::Conflict;
+        return {CasOutcome::Conflict, {}};
     }
 
     auto it = store_.find(key);
@@ -167,31 +163,27 @@ CasOutcome InMemoryBackend::casPut(const String & key, const String & bytes, con
     {
         // create-if-absent CAS
         if (exists)
-            return CasOutcome::Conflict;
+            return {CasOutcome::Conflict, {}};
         Token t = mintToken();
         Object obj;
         obj.bytes = bytes;
         obj.token = t;
         obj.meta = meta;
         store_[key] = std::move(obj);
-        if (out_token)
-            *out_token = t;
-        return CasOutcome::Committed;
+        return {CasOutcome::Committed, t};
     }
     else
     {
         // swap-if-current CAS
         if (!exists)
-            return CasOutcome::Conflict;
+            return {CasOutcome::Conflict, {}};
         if (enforce_tokens_ && it->second.token != *expected)
-            return CasOutcome::Conflict;
+            return {CasOutcome::Conflict, {}};
         Token t = mintToken();
         it->second.bytes = bytes;
         it->second.token = t;
         it->second.meta = meta;
-        if (out_token)
-            *out_token = t;
-        return CasOutcome::Committed;
+        return {CasOutcome::Committed, t};
     }
 }
 

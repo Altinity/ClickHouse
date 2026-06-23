@@ -120,7 +120,7 @@ TEST(CasHeartbeat, ForeignOverwriteFailsClosed)
     const String key = layout.buildHeartbeatKey(u128ToHex(build_id));
     auto head = b->head(key);
     ASSERT_TRUE(head.exists);
-    ASSERT_EQ(b->putOverwrite(key, "foreign", head.token), PutOutcome::Done);
+    ASSERT_EQ(b->putOverwrite(key, "foreign", head.token).outcome, PutOutcome::Done);
 
     expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { hb.renewOnce(); });
 }

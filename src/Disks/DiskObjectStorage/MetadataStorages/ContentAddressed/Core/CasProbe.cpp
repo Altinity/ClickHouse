@@ -34,8 +34,9 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
         // ---- Step 1: putIfAbsent fresh → Done; read-after-write returns the bytes. ----
         Token t1;
         {
-            const auto outcome = backend.putIfAbsent(key, "probe-v1", &t1);
-            if (outcome != PutOutcome::Done)
+            const auto res = backend.putIfAbsent(key, "probe-v1");
+            t1 = res.token;
+            if (res.outcome != PutOutcome::Done)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: putIfAbsent on a fresh key returned PreconditionFailed — backend is unexpectedly occupied or broken");
         }
@@ -48,7 +49,7 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
 
         // ---- Step 2: putIfAbsent same key → PreconditionFailed; bytes intact. ----
         {
-            const auto outcome = backend.putIfAbsent(key, "should-not-land");
+            const auto outcome = backend.putIfAbsent(key, "should-not-land").outcome;
             if (outcome != PutOutcome::PreconditionFailed)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: putIfAbsent on an existing key was not rejected (PreconditionFailed expected) — "
@@ -63,7 +64,7 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
         // ---- Step 3: putOverwrite wrong token → PreconditionFailed; bytes intact. ----
         {
             Token wrong_token{"totally-wrong-token", TokenType::Emulated};
-            const auto outcome = backend.putOverwrite(key, "clobbered", wrong_token);
+            const auto outcome = backend.putOverwrite(key, "clobbered", wrong_token).outcome;
             if (outcome != PutOutcome::PreconditionFailed)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: putOverwrite with a wrong token was not rejected (PreconditionFailed expected) — "
@@ -77,8 +78,9 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
         // ---- Step 4: putOverwrite correct token → Done; bytes replaced; token changed. ----
         Token t2;
         {
-            const auto outcome = backend.putOverwrite(key, "probe-v2", t1, &t2);
-            if (outcome != PutOutcome::Done)
+            const auto res = backend.putOverwrite(key, "probe-v2", t1);
+            t2 = res.token;
+            if (res.outcome != PutOutcome::Done)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: putOverwrite with the correct token was rejected — backend does not accept valid overwrite");
             if (t2 == t1)
@@ -94,15 +96,16 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
         // 5a: create-if-absent (nullopt expected).
         Token ct1;
         {
-            const auto outcome = backend.casPut(cas_key, "cas-s1", std::nullopt, &ct1);
-            if (outcome != CasOutcome::Committed)
+            const auto res = backend.casPut(cas_key, "cas-s1", std::nullopt);
+            ct1 = res.token;
+            if (res.outcome != CasOutcome::Committed)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: casPut create-if-absent (nullopt expected) was not committed — "
                     "backend does not support CAS create-if-absent");
         }
         // 5b: conflict on existing (nullopt expected, but key exists).
         {
-            const auto outcome = backend.casPut(cas_key, "cas-s1x", std::nullopt);
+            const auto outcome = backend.casPut(cas_key, "cas-s1x", std::nullopt).outcome;
             if (outcome != CasOutcome::Conflict)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: casPut with nullopt expected against an existing key was not Conflict — "
@@ -111,7 +114,7 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
         // 5c: conflict on stale token.
         {
             Token stale{"stale-token", TokenType::Emulated};
-            const auto outcome = backend.casPut(cas_key, "cas-s1y", stale);
+            const auto outcome = backend.casPut(cas_key, "cas-s1y", stale).outcome;
             if (outcome != CasOutcome::Conflict)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: casPut with a stale token was not Conflict — "
@@ -127,8 +130,9 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
         // 5d: commit on current token.
         Token ct2;
         {
-            const auto outcome = backend.casPut(cas_key, "cas-s2", ct1, &ct2);
-            if (outcome != CasOutcome::Committed)
+            const auto res = backend.casPut(cas_key, "cas-s2", ct1);
+            ct2 = res.token;
+            if (res.outcome != CasOutcome::Committed)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: casPut with the current token was not committed — "
                     "backend does not honor casPut with matching token");

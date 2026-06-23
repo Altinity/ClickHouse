@@ -79,10 +79,11 @@ void HeartbeatKeeper::start()
         std::chrono::system_clock::now().time_since_epoch()).count());
 
     const String body = encodeHeartbeat({.server_id = server_id, .heartbeat_seq = 1, .created_at_ms = created_at_ms});
-    Token token;
-    if (backend->putIfAbsent(key, body, &token) != PutOutcome::Done)
+    const PutResult res = backend->putIfAbsent(key, body);
+    if (res.outcome != PutOutcome::Done)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS heartbeat: key '{}' already exists — the globally-unique build id collided, the world is broken", key);
+    const Token token = res.token;
 
     seq = 1;
     last_token = token;
@@ -98,10 +99,11 @@ void HeartbeatKeeper::renewOnce()
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renew before start on key '{}'", key);
 
     const String body = encodeHeartbeat({.server_id = server_id, .heartbeat_seq = seq + 1, .created_at_ms = created_at_ms});
-    Token token;
-    if (backend->putOverwrite(key, body, last_token, &token) != PutOutcome::Done)
+    const PutResult res = backend->putOverwrite(key, body, last_token);
+    if (res.outcome != PutOutcome::Done)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS heartbeat: key '{}' was touched by a foreign writer — failing closed, never re-minting", key);
+    const Token token = res.token;
 
     ++seq;
     last_token = token;

@@ -469,7 +469,7 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
     {
         const String key = layout.outcomesKey(round, state.fence_seq, snap_shard);
         const String body = encodeOutcomeLog(log);
-        if (backend.putIfAbsent(key, body) == PutOutcome::PreconditionFailed)
+        if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
         {
             const auto existing = backend.get(key);
             if (!existing)
@@ -676,14 +676,13 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
         next.snap_pruned_through = generation - 1;   /// highest generation fully processed this round
     }
 
-    Token committed_token;
-    if (backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token, &committed_token)
-        != CasOutcome::Committed)
+    const CasResult cascade_res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
+    if (cascade_res.outcome != CasOutcome::Committed)
         throw Exception(ErrorCodes::ABORTED,
             "CAS gc cascade: gc/state moved during the cascade persist (another leader advanced it); "
             "retry next round");
     state = std::move(next);
-    state_token = committed_token;
+    state_token = cascade_res.token;
 
     /// B170: the cascade persisted a new snap generation (or skipped it on the idle path) and the
     /// gc/state CAS advanced the fold cursor through the fence window. Emit both transitions so a
@@ -801,7 +800,7 @@ uint64_t Gc::persistGenerationProbingUpward(const GcState & state, std::map<uint
             }
             const String snap_key = layout.gcSnapKey(generation, snap_shard);
             const String body = encodeGcSnap(shard_snap);
-            if (backend.putIfAbsent(snap_key, body) == PutOutcome::PreconditionFailed)
+            if (backend.putIfAbsent(snap_key, body).outcome == PutOutcome::PreconditionFailed)
             {
                 const auto existing = backend.get(snap_key);
                 if (!existing || existing->bytes != body)
@@ -857,9 +856,9 @@ void Gc::fence(GcState & state, Token & state_token)
                 registry = decodeRootsRegistry(got->bytes);
             registry.fence_round = std::max(registry.fence_round, round);
             ++registry.registry_version;
-            const CasOutcome outcome = got
+            const CasOutcome outcome = (got
                 ? backend.casPut(registry_key, encodeRootsRegistry(registry), got->token)
-                : backend.casPut(registry_key, encodeRootsRegistry(registry), std::nullopt);
+                : backend.casPut(registry_key, encodeRootsRegistry(registry), std::nullopt)).outcome;
             if (outcome == CasOutcome::Committed)
             {
                 state.fence_version[round]["_registry"] = registry.registry_version;
@@ -929,11 +928,10 @@ void Gc::fence(GcState & state, Token & state_token)
 
     /// 2. ONE gc/state CAS persists the whole fence_version[round] vector (everything else in
     /// `state` preserved - it is the retire-committed state mutated in place).
-    Token committed_token;
-    if (backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token, &committed_token)
-        == CasOutcome::Committed)
+    const CasResult fence_res = backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token);
+    if (fence_res.outcome == CasOutcome::Committed)
     {
-        state_token = committed_token;
+        state_token = fence_res.token;
         /// B170: the monotone fence committed — the durable point the recheck folds through.
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
@@ -1152,7 +1150,7 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     {
         const String key = layout.retiredKey(round, state.fence_seq, snap_shard);
         const String body = encodeRetiredSet(set);
-        if (backend.putIfAbsent(key, body) == PutOutcome::PreconditionFailed)
+        if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
         {
             const auto existing = backend.get(key);
             if (!existing)
@@ -1179,9 +1177,8 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
     /// only re-derivable durable state - the replay adopts the byte-equal sets and re-runs this CAS.
     GcState next = state;
     next.round = round;
-    Token committed_token;
-    if (backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token, &committed_token)
-        != CasOutcome::Committed)
+    const CasResult retire_res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
+    if (retire_res.outcome != CasOutcome::Committed)
     {
         /// Another leader moved gc/state under us. Bounded and fail-closed: this leader's round
         /// attempt ends here (the lease makes contention rare); the re-read only sharpens the
@@ -1195,7 +1192,7 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
             "CAS gc retire: gc/state moved during retire (another leader advanced it); retry next round");
     }
     state = std::move(next);
-    state_token = committed_token;
+    state_token = retire_res.token;
     return retired;
 }
 
@@ -1736,9 +1733,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     /// folded extent, never the fence version (it has not folded the fence window), so the cursor is
     /// never ahead of the edges.
     state.snap_generation = persistGenerationProbingUpward(state, result.snap, folded_to, "fold");
-    Token committed_token;
-    if (backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token, &committed_token)
-        != CasOutcome::Committed)
+    const CasResult fold_res = backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token);
+    if (fold_res.outcome != CasOutcome::Committed)
         /// Another leader advanced gc/state under us. The new-generation snap we just wrote is
         /// orphaned garbage - harmless (write-once, never referenced by any cursor); full-GC
         /// reclaims it in M-F.
@@ -1747,7 +1743,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 
     /// The committed token is threaded to retire - the round CAS rides exactly this incarnation,
     /// so any intervening lease steal Conflicts there (no re-read window, see runRegularRound).
-    state_token = committed_token;
+    state_token = fold_res.token;
     return result;
 }
 
@@ -1774,7 +1770,7 @@ void Gc::pulseHeartbeat(Store & store, UInt128 gc_id)
     }
     hb.owner = gc_id;   /// we believe we are the leader; take/keep gc/hb ownership
     ++hb.hb_seq;
-    const CasOutcome outcome = store.backend().casPut(key, encodeGcHeartbeat(hb), expected, /*out_token=*/nullptr);
+    const CasOutcome outcome = store.backend().casPut(key, encodeGcHeartbeat(hb), expected).outcome;
     /// B170: the advisory liveness pulse (B160) — a leader bumping gc/hb so a follower's steal backs
     /// off. Distinct from the lease-renew GcLeaseHeartbeat in acquireOrRenewLease; only the committed
     /// pulse is an event (a Conflict means another writer raced us — best-effort, the next pulse retries).
@@ -1989,13 +1985,12 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
             /// Step 1: fresh pool — create gc/state holding our lease (create-if-absent CAS).
             GcState fresh;
             fresh.lease = GcLease{gc_id, 1};
-            Token committed_token;
-            if (store->backend().casPut(key, encodeGcState(fresh), /*expected*/ std::nullopt, &committed_token)
-                == CasOutcome::Committed)
+            const CasResult acquire_res = store->backend().casPut(key, encodeGcState(fresh), /*expected*/ std::nullopt);
+            if (acquire_res.outcome == CasOutcome::Committed)
             {
                 rememberObservation(fresh.lease);
                 state = std::move(fresh);
-                state_token = committed_token;
+                state_token = acquire_res.token;
                 /// B170: lease acquired on a fresh pool (gc/state created holding our lease).
                 EventEmitter{*store}.emit([&](CasEvent & e)
                 {
@@ -2020,15 +2015,14 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
             /// Step 2: renew — seq advances, fence_seq does NOT (renewal is not a new epoch).
             GcState next = current;
             ++next.lease.seq;
-            Token committed_token;
-            if (store->backend().casPut(key, encodeGcState(next), got->token, &committed_token)
-                == CasOutcome::Committed)
+            const CasResult renew_res = store->backend().casPut(key, encodeGcState(next), got->token);
+            if (renew_res.outcome == CasOutcome::Committed)
             {
                 /// Remember the COMMITTED (owner, seq) so the next renew never self-triggers
                 /// a steal-window anomaly.
                 rememberObservation(next.lease);
                 state = std::move(next);
-                state_token = committed_token;
+                state_token = renew_res.token;
                 /// B170: lease renewed (seq advanced; fence_seq unchanged — not a new epoch).
                 EventEmitter{*store}.emit([&](CasEvent & e)
                 {
@@ -2083,13 +2077,12 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
         next.lease.owner = gc_id;
         ++next.lease.seq;
         ++next.fence_seq;
-        Token committed_token;
-        if (store->backend().casPut(key, encodeGcState(next), got->token, &committed_token)
-            == CasOutcome::Committed)
+        const CasResult steal_res = store->backend().casPut(key, encodeGcState(next), got->token);
+        if (steal_res.outcome == CasOutcome::Committed)
         {
             rememberObservation(next.lease);
             state = std::move(next);
-            state_token = committed_token;
+            state_token = steal_res.token;
             /// B170: lease STOLEN from a dead incumbent — fence_seq++ opens a new leadership epoch.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {

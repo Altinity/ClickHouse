@@ -145,12 +145,12 @@ void Store::casPutObject(const String & full_key, const String & bytes)
         HeadResult head = pool_backend->head(full_key);
         if (!head.exists)
         {
-            if (pool_backend->putIfAbsent(full_key, bytes) == PutOutcome::Done)
+            if (pool_backend->putIfAbsent(full_key, bytes).outcome == PutOutcome::Done)
                 return;
         }
         else
         {
-            if (pool_backend->putOverwrite(full_key, bytes, head.token) == PutOutcome::Done)
+            if (pool_backend->putOverwrite(full_key, bytes, head.token).outcome == PutOutcome::Done)
                 return;
         }
         /// PreconditionFailed ⇒ the observed state changed under us; re-head and retry.
@@ -586,7 +586,7 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
             LOG_WARNING(getLogger("CasStore"),
                 "manifest {} size {} crossed soft limit {}", key, body.size(), config.manifest_soft_limit);
 
-        if (pool_backend->casPut(key, body, token) == CasOutcome::Committed)
+        if (pool_backend->casPut(key, body, token).outcome == CasOutcome::Committed)
         {
             /// Read-your-writes (Pillar B): invalidate this shard's decode cache so a same-Store
             /// allow_stale read (bounded-TTL fast-path) cannot serve the pre-write decode. A LOCAL
@@ -729,22 +729,9 @@ void Store::dropNamespace(const RootNamespace & ns)
     {
         ListPage page = pool_backend->list(prefix, cursor, /*limit*/ 1000);
         for (const ListedKey & listed : page.keys)
-        {
-            for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
-            {
-                HeadResult head = pool_backend->head(listed.key);
-                if (!head.exists)
-                    break;                  /// NotFound ⇒ already gone (idempotent)
-                DeleteOutcome outcome = pool_backend->deleteExact(listed.key, head.token);
-                if (outcome.kind == DeleteOutcome::Kind::Deleted
-                    || outcome.kind == DeleteOutcome::Kind::NotFound)
-                    break;
-                /// TokenMismatch ⇒ the object changed under us; re-head and retry.
-                if (attempt + 1 == MAX_CAS_ATTEMPTS)
-                    throw Exception(ErrorCodes::ABORTED,
-                        "verbatim file delete contention on {}", listed.key);
-            }
-        }
+            /// Single-owner head → deleteExact with the bounded TokenMismatch-retry: exactly the
+            /// casRemoveObject contract (no-op on absent, idempotent on NotFound, ABORTED on live-lock).
+            casRemoveObject(listed.key);
         if (page.next_cursor.empty())
             break;
         cursor = page.next_cursor;
@@ -803,9 +790,9 @@ uint64_t Store::ensureRegistered(const RootNamespace & ns)
 
         registry.namespaces.insert(ns.string());
         ++registry.registry_version;
-        const CasOutcome outcome = got
+        const CasOutcome outcome = (got
             ? pool_backend->casPut(key, encodeRootsRegistry(registry), got->token)
-            : pool_backend->casPut(key, encodeRootsRegistry(registry), std::nullopt);
+            : pool_backend->casPut(key, encodeRootsRegistry(registry), std::nullopt)).outcome;
         if (outcome == CasOutcome::Committed)
         {
             std::lock_guard lock(registered_mutex);

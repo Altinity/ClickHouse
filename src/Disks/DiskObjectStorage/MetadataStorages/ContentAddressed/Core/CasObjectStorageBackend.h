@@ -40,14 +40,14 @@ public:
 
     std::optional<GetResult> get(const String & key, Range range) override;
     HeadResult head(const String & key) override;
-    PutOutcome putIfAbsent(const String & key, const String & bytes, Token * out_token, const ObjectMeta & meta = {}) override;
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override;
 
     /// Native mode: true streaming — bytes flow straight into the object storage's write buffer with
     /// `If-None-Match: *` riding on the request. EmulatedSingleProcess mode: memory-buffered delegation
     /// to putIfAbsent (acceptable: this mode exists for unit tests only).
     WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override;
-    PutOutcome putOverwrite(const String & key, const String & bytes, const Token & expected, Token * out_token, const ObjectMeta & meta = {}) override;
-    CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected, Token * out_token, const ObjectMeta & meta = {}) override;
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta = {}) override;
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta = {}) override;
     DeleteOutcome deleteExact(const String & key, const Token & token) override;
     ListPage list(const String & prefix, const String & cursor, size_t limit) override;
 
@@ -62,7 +62,7 @@ private:
 
     /// ---- Native helpers ----
     std::optional<HeadResult> nativeHead(const String & key);
-    PutOutcome nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, Token * out_token, const ObjectMeta & meta);
+    PutResult nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, const ObjectMeta & meta);
 
     /// ---- Emulated helpers (caller holds emu_mutex) ----
     ///

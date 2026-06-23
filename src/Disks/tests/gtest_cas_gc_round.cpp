@@ -140,18 +140,18 @@ public:
         seen = 0;
     }
 
-    CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                      Token * out_token = nullptr, const ObjectMeta & meta = {}) override
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                     const ObjectMeta & meta = {}) override
     {
         {
             std::lock_guard lock(fail_mutex);
             if (fail_at != 0 && key == fail_key && ++seen == fail_at)
             {
                 fail_at = 0;                                     /// one-shot
-                return CasOutcome::Conflict;
+                return {CasOutcome::Conflict, {}};
             }
         }
-        return InMemoryBackend::casPut(key, bytes, expected, out_token, meta);
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
     }
 
 private:
@@ -594,7 +594,7 @@ TEST(CasGcFold, ForeignDivergentGenerationIsProbedPast)
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
-    ASSERT_EQ(b->putIfAbsent(s->layout().gcSnapKey(1, 0), "not-our-fold"), PutOutcome::Done);
+    ASSERT_EQ(b->putIfAbsent(s->layout().gcSnapKey(1, 0), "not-our-fold").outcome, PutOutcome::Done);
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     const RoundReport rep = gc.runRegularRound();
@@ -647,7 +647,7 @@ TEST(CasGcFold, SnapShardsOtherThanOneIsNotImplemented)
     auto s = openTestStore(b);
     GcState injected;
     injected.snap_shards = 2;
-    ASSERT_EQ(b->putIfAbsent(s->layout().gcStateKey(), encodeGcState(injected)), PutOutcome::Done);
+    ASSERT_EQ(b->putIfAbsent(s->layout().gcStateKey(), encodeGcState(injected)).outcome, PutOutcome::Done);
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     EXPECT_FALSE(gc.runRegularRound().acquired_lease);           /// first sight of the never-held lease
@@ -1055,15 +1055,15 @@ TEST(CasGcRetire, RetireSetsDurableBeforeRoundCas)
 class OnFenceHookBackend : public InMemoryBackend
 {
 public:
-    CasOutcome casPut(const String & key, const String & bytes,
-                      const std::optional<Token> & expected, Token * out_token = nullptr, const ObjectMeta & meta = {}) override
+    CasResult casPut(const String & key, const String & bytes,
+                     const std::optional<Token> & expected, const ObjectMeta & meta = {}) override
     {
         if (!fired && key == armed_key && ++count == fire_at)
         {
             fired = true;
             hook();
         }
-        return InMemoryBackend::casPut(key, bytes, expected, out_token, meta);
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
     }
 
     void armOnCasPut(String key, std::function<void()> hook_)
@@ -1115,7 +1115,7 @@ TEST(CasGcRecheck, SparedWhenPublishRacesTheFence)
         root.journal.push_back(JournalRecord{
             .op = JournalRecord::Op::Add, .ref_name = "part_1",
             .tree_id = hexToU128(tree.string()), .at_version = root.shard_version, .closure = {}});
-        ASSERT_EQ(b->InMemoryBackend::casPut(shard_key, encodeRootShard(root), got->token, nullptr),
+        ASSERT_EQ(b->InMemoryBackend::casPut(shard_key, encodeRootShard(root), got->token).outcome,
                   CasOutcome::Committed);
     });
 
@@ -1198,7 +1198,7 @@ TEST(CasGcRetire, DivergedRetiredSetFailsClosed)
     s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
     s->renewWatermarkOnce();   /// build finished -> advance min_active past its seq (Task 10 guard)
     /// fresh pool: the executed round is 1, fence_seq 0
-    ASSERT_EQ(b->putIfAbsent(s->layout().retiredKey(1, 0, 0), "not-our-retire"), PutOutcome::Done);
+    ASSERT_EQ(b->putIfAbsent(s->layout().retiredKey(1, 0, 0), "not-our-retire").outcome, PutOutcome::Done);
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc.runRegularRound(); });
@@ -1260,13 +1260,13 @@ TEST(CasGcRetire, RetireUsesFoldCommittedStateWithoutReread)
 class CaptureStateBackend : public InMemoryBackend
 {
 public:
-    CasOutcome casPut(const String & key, const String & bytes,
-                      const std::optional<Token> & expected, Token * out_token = nullptr, const ObjectMeta & meta = {}) override
+    CasResult casPut(const String & key, const String & bytes,
+                     const std::optional<Token> & expected, const ObjectMeta & meta = {}) override
     {
         if (key == capture_key && ++count == capture_nth)
             if (const auto got = InMemoryBackend::get(key))
                 captured = got->bytes;
-        return InMemoryBackend::casPut(key, bytes, expected, out_token, meta);
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
     }
 
     void armCapture(String key, size_t nth)
@@ -1366,15 +1366,15 @@ TEST(CasGcFence, RegistryFencedAndRecorded)
 class HookOnCasCaptureBackend : public CaptureStateBackend
 {
 public:
-    CasOutcome casPut(const String & key, const String & bytes,
-                      const std::optional<Token> & expected, Token * out_token = nullptr, const ObjectMeta & meta = {}) override
+    CasResult casPut(const String & key, const String & bytes,
+                     const std::optional<Token> & expected, const ObjectMeta & meta = {}) override
     {
         if (!fired && key == hook_key)
         {
             fired = true;   /// before the hook - its own casPut on the same key must not re-fire
             hook();
         }
-        return CaptureStateBackend::casPut(key, bytes, expected, out_token, meta);
+        return CaptureStateBackend::casPut(key, bytes, expected, meta);
     }
 
     void armHookOnCasPut(String key, std::function<void()> hook_)
@@ -1492,7 +1492,7 @@ TEST(CasGcFence, MonotoneNeverLowers)
     RootShard staged = decodeRootShard(got->bytes);
     staged.fence_round = 5;
     ++staged.shard_version;
-    ASSERT_EQ(b->casPut(shard_key, encodeRootShard(staged), got->token), CasOutcome::Committed);
+    ASSERT_EQ(b->casPut(shard_key, encodeRootShard(staged), got->token).outcome, CasOutcome::Committed);
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     b->armCapture(s->layout().gcStateKey(), 5);                  /// pre-erase point (the recheck CAS)
@@ -1801,7 +1801,7 @@ TEST(CasGcTrim, RecordAboveTheCursorSurvives)
         root.journal.push_back(JournalRecord{
             .op = JournalRecord::Op::Add, .ref_name = "late_part",
             .tree_id = u128Of("late-tree"), .at_version = root.shard_version, .closure = {}});
-        ASSERT_EQ(b->InMemoryBackend::casPut(shard_key, encodeRootShard(root), got->token, nullptr),
+        ASSERT_EQ(b->InMemoryBackend::casPut(shard_key, encodeRootShard(root), got->token).outcome,
                   CasOutcome::Committed);
     });
 

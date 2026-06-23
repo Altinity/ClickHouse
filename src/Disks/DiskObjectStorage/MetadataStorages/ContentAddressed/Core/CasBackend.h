@@ -39,7 +39,7 @@ struct HeadResult
 
 enum class PutOutcome : uint8_t
 {
-    Done,                 /// object written; out_token (if requested) is the new incarnation's token
+    Done,                 /// object written; the returned PutResult.token is the new incarnation's token
     PreconditionFailed,   /// If-None-Match hit an existing key / If-Match mismatched — nothing changed
 };
 
@@ -48,6 +48,20 @@ enum class CasOutcome : uint8_t
     Committed,
     Conflict,             /// expected token (or absence) did not match — nothing changed
 };
+
+/// Result of a backend write: the outcome plus the resulting object token (previously a `Token * out_token`
+/// out-parameter). `token` is set ONLY when the write actually landed an incarnation (a `Done`/`Committed`
+/// outcome); on `PreconditionFailed`/`Conflict` nothing was written and `token` is left default-constructed,
+/// exactly mirroring the old contract where callers only read `*out_token` on success.
+template <typename Outcome>
+struct WriteResultT
+{
+    Outcome outcome;
+    Token token;
+};
+
+using PutResult = WriteResultT<PutOutcome>;
+using CasResult = WriteResultT<CasOutcome>;
 
 struct DeleteOutcome
 {
@@ -66,7 +80,7 @@ struct ListPage
 
 /// Streaming conditional create (If-None-Match:* semantics). The caller writes the FULL object body
 /// (envelope header + payload) into buffer, then calls finalize exactly once:
-///   - Done                ⇒ the object is durable; out_token (if requested) is the new incarnation's token
+///   - Done                ⇒ the object is durable; the returned PutResult.token is the new incarnation's token
 ///   - PreconditionFailed  ⇒ the key already existed — NOTHING was changed (same contract as putIfAbsent)
 /// finalize may throw on storage errors; PreconditionFailed is an OUTCOME, never an exception.
 /// cancel (or destruction before finalize) abandons the upload: the key is never created by it.
@@ -81,7 +95,7 @@ class WriteSink
 public:
     virtual ~WriteSink() = default;
     virtual WriteBuffer & buffer() = 0;
-    virtual PutOutcome finalize(Token * out_token) = 0;
+    virtual PutResult finalize() = 0;
     virtual void cancel() noexcept = 0;
 };
 
@@ -115,16 +129,15 @@ public:
 
     virtual std::optional<GetResult> get(const String & key, Range range = {}) = 0;   /// nullopt = absent
     virtual HeadResult head(const String & key) = 0;
-    virtual PutOutcome putIfAbsent(const String & key, const String & bytes, Token * out_token = nullptr,
-                                   const ObjectMeta & meta = {}) = 0;
+    virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) = 0;
     /// Streaming variant of putIfAbsent — see WriteSink. Large content blobs use this; whole-String
     /// ops remain for manifests, trees, probe and GC objects.
     virtual WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) = 0;
-    virtual PutOutcome putOverwrite(const String & key, const String & bytes, const Token & expected,
-                                    Token * out_token = nullptr, const ObjectMeta & meta = {}) = 0;
+    virtual PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
+                                   const ObjectMeta & meta = {}) = 0;
     /// expected == nullopt => create-if-absent CAS (the first write of a root manifest).
-    virtual CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                              Token * out_token = nullptr, const ObjectMeta & meta = {}) = 0;
+    virtual CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                             const ObjectMeta & meta = {}) = 0;
     virtual DeleteOutcome deleteExact(const String & key, const Token & token) = 0;
     virtual ListPage list(const String & prefix, const String & cursor, size_t limit) = 0;
 };

@@ -86,30 +86,29 @@ public:
         return result;
     }
 
-    PutOutcome putIfAbsent(const String & key, const String & bytes, Token * out_token = nullptr,
-                           const ObjectMeta & meta = {}) override
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
     {
-        PutOutcome outcome = inner->putIfAbsent(key, bytes, out_token, meta);
-        incrementCasEvent(classifyCasNs(key), outcome == PutOutcome::Done ? CasOp::Put : CasOp::PutDedup);
-        return outcome;
+        PutResult result = inner->putIfAbsent(key, bytes, meta);
+        incrementCasEvent(classifyCasNs(key), result.outcome == PutOutcome::Done ? CasOp::Put : CasOp::PutDedup);
+        return result;
     }
 
     WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override;
 
-    PutOutcome putOverwrite(const String & key, const String & bytes, const Token & expected,
-                            Token * out_token = nullptr, const ObjectMeta & meta = {}) override
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
+                           const ObjectMeta & meta = {}) override
     {
-        PutOutcome outcome = inner->putOverwrite(key, bytes, expected, out_token, meta);
-        incrementCasEvent(classifyCasNs(key), outcome == PutOutcome::Done ? CasOp::Overwrite : CasOp::CasConflict);
-        return outcome;
+        PutResult result = inner->putOverwrite(key, bytes, expected, meta);
+        incrementCasEvent(classifyCasNs(key), result.outcome == PutOutcome::Done ? CasOp::Overwrite : CasOp::CasConflict);
+        return result;
     }
 
-    CasOutcome casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                      Token * out_token = nullptr, const ObjectMeta & meta = {}) override
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                     const ObjectMeta & meta = {}) override
     {
-        CasOutcome outcome = inner->casPut(key, bytes, expected, out_token, meta);
-        incrementCasEvent(classifyCasNs(key), outcome == CasOutcome::Committed ? CasOp::Cas : CasOp::CasConflict);
-        return outcome;
+        CasResult result = inner->casPut(key, bytes, expected, meta);
+        incrementCasEvent(classifyCasNs(key), result.outcome == CasOutcome::Committed ? CasOp::Cas : CasOp::CasConflict);
+        return result;
     }
 
     DeleteOutcome deleteExact(const String & key, const Token & token) override

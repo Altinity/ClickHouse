@@ -36,9 +36,9 @@ struct NullBackend final : Backend
         return HeadResult{};
     }
 
-    PutOutcome putIfAbsent(const String & /*key*/, const String & /*bytes*/, Token * /*out_token*/, const ObjectMeta & /*meta*/) override
+    PutResult putIfAbsent(const String & /*key*/, const String & /*bytes*/, const ObjectMeta & /*meta*/) override
     {
-        return PutOutcome::Done;
+        return {PutOutcome::Done, {}};
     }
 
     WriteSinkPtr putIfAbsentStream(const String & /*key*/, const ObjectMeta & /*meta*/) override
@@ -46,14 +46,14 @@ struct NullBackend final : Backend
         return nullptr;   /// trivial default — streaming behavior is pinned by the CasBackendContract suite
     }
 
-    PutOutcome putOverwrite(const String & /*key*/, const String & /*bytes*/, const Token & /*expected*/, Token * /*out_token*/, const ObjectMeta & /*meta*/) override
+    PutResult putOverwrite(const String & /*key*/, const String & /*bytes*/, const Token & /*expected*/, const ObjectMeta & /*meta*/) override
     {
-        return PutOutcome::PreconditionFailed;
+        return {PutOutcome::PreconditionFailed, {}};
     }
 
-    CasOutcome casPut(const String & /*key*/, const String & /*bytes*/, const std::optional<Token> & /*expected*/, Token * /*out_token*/, const ObjectMeta & /*meta*/) override
+    CasResult casPut(const String & /*key*/, const String & /*bytes*/, const std::optional<Token> & /*expected*/, const ObjectMeta & /*meta*/) override
     {
-        return CasOutcome::Conflict;
+        return {CasOutcome::Conflict, {}};
     }
 
     DeleteOutcome deleteExact(const String & /*key*/, const Token & /*token*/) override
@@ -83,13 +83,13 @@ TEST(CasBackend, NullBackendShapeAndDefaults)
     EXPECT_TRUE(h.token.empty());
 
     // putIfAbsent returns Done
-    EXPECT_EQ(ref.putIfAbsent("k", "v"), PutOutcome::Done);
+    EXPECT_EQ(ref.putIfAbsent("k", "v").outcome, PutOutcome::Done);
 
     // putOverwrite returns PreconditionFailed
-    EXPECT_EQ(ref.putOverwrite("k", "v", Token{}), PutOutcome::PreconditionFailed);
+    EXPECT_EQ(ref.putOverwrite("k", "v", Token{}).outcome, PutOutcome::PreconditionFailed);
 
     // casPut returns Conflict
-    EXPECT_EQ(ref.casPut("k", "v", std::nullopt), CasOutcome::Conflict);
+    EXPECT_EQ(ref.casPut("k", "v", std::nullopt).outcome, CasOutcome::Conflict);
 
     // deleteExact default kind is NotFound
     DeleteOutcome d = b.deleteExact("k", Token{});
@@ -116,10 +116,11 @@ TEST(CasBackend, NullBackendShapeAndDefaults)
 TEST(CasInMemory, PutIfAbsentAndGet)
 {
     InMemoryBackend b;
-    Token t1;
-    EXPECT_EQ(b.putIfAbsent("k", "v1", &t1), PutOutcome::Done);
+    const auto put = b.putIfAbsent("k", "v1");
+    const Token t1 = put.token;
+    EXPECT_EQ(put.outcome, PutOutcome::Done);
     EXPECT_FALSE(t1.empty());
-    EXPECT_EQ(b.putIfAbsent("k", "clobber"), PutOutcome::PreconditionFailed);
+    EXPECT_EQ(b.putIfAbsent("k", "clobber").outcome, PutOutcome::PreconditionFailed);
     auto g = b.get("k");
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(g->bytes, "v1");
@@ -130,32 +131,32 @@ TEST(CasInMemory, PutIfAbsentAndGet)
 TEST(CasInMemory, OverwriteIsTokenExactAndMintsFreshToken)
 {
     InMemoryBackend b;
-    Token t1, t2;
-    b.putIfAbsent("k", "v1", &t1);
-    EXPECT_EQ(b.putOverwrite("k", "v2", Token{"wrong", TokenType::Emulated}), PutOutcome::PreconditionFailed);
+    const Token t1 = b.putIfAbsent("k", "v1").token;
+    EXPECT_EQ(b.putOverwrite("k", "v2", Token{"wrong", TokenType::Emulated}).outcome, PutOutcome::PreconditionFailed);
     EXPECT_EQ(b.get("k")->bytes, "v1");                       // untouched on mismatch
-    EXPECT_EQ(b.putOverwrite("k", "v2", t1, &t2), PutOutcome::Done);
-    EXPECT_NE(t2, t1);                                        // tokens never repeat
+    const auto overwrite = b.putOverwrite("k", "v2", t1);
+    EXPECT_EQ(overwrite.outcome, PutOutcome::Done);
+    EXPECT_NE(overwrite.token, t1);                           // tokens never repeat
     EXPECT_EQ(b.get("k")->bytes, "v2");
 }
 
 TEST(CasInMemory, CasPutCreateAndSwap)
 {
     InMemoryBackend b;
-    Token t1, t2;
-    EXPECT_EQ(b.casPut("m", "s1", std::nullopt, &t1), CasOutcome::Committed);     // create-if-absent
-    EXPECT_EQ(b.casPut("m", "s1x", std::nullopt), CasOutcome::Conflict);          // exists now
-    EXPECT_EQ(b.casPut("m", "s2", Token{"stale", TokenType::Emulated}), CasOutcome::Conflict);
+    const auto create = b.casPut("m", "s1", std::nullopt);
+    const Token t1 = create.token;
+    EXPECT_EQ(create.outcome, CasOutcome::Committed);                             // create-if-absent
+    EXPECT_EQ(b.casPut("m", "s1x", std::nullopt).outcome, CasOutcome::Conflict);  // exists now
+    EXPECT_EQ(b.casPut("m", "s2", Token{"stale", TokenType::Emulated}).outcome, CasOutcome::Conflict);
     EXPECT_EQ(b.get("m")->bytes, "s1");
-    EXPECT_EQ(b.casPut("m", "s2", t1, &t2), CasOutcome::Committed);
+    EXPECT_EQ(b.casPut("m", "s2", t1).outcome, CasOutcome::Committed);
     EXPECT_EQ(b.get("m")->bytes, "s2");
 }
 
 TEST(CasInMemory, DeleteExactEnforced)
 {
     InMemoryBackend b;
-    Token t1;
-    b.putIfAbsent("k", "v1", &t1);
+    const Token t1 = b.putIfAbsent("k", "v1").token;
     auto d1 = b.deleteExact("k", Token{"wrong", TokenType::Emulated});
     EXPECT_EQ(d1.kind, DeleteOutcome::Kind::TokenMismatch);
     EXPECT_TRUE(b.get("k").has_value());                      // SURVIVES wrong-token delete
@@ -195,16 +196,14 @@ TEST(CasInMemory, RangeGetAndHeadAndList)
 TEST(CasInMemoryFaults, HeldDeleteLandsLater)
 {
     InMemoryBackend b;
-    Token t1;
-    b.putIfAbsent("k", "v1", &t1);
+    const Token t1 = b.putIfAbsent("k", "v1").token;
     b.setHoldDeletes(true);
     auto d = b.deleteExact("k", t1);                  // message "sent", not landed
     EXPECT_EQ(d.kind, DeleteOutcome::Kind::Deleted);  // caller sees the send accepted
     EXPECT_TRUE(b.get("k").has_value());              // ... but nothing landed yet
     ASSERT_EQ(b.pendingDeletes(), 1u);
     // the object is resurrected before the zombie lands:
-    Token t2;
-    b.putOverwrite("k", "v1'", t1, &t2);
+    b.putOverwrite("k", "v1'", t1);
     auto landed = b.landPendingDelete(0);             // the zombie lands NOW
     EXPECT_EQ(landed.kind, DeleteOutcome::Kind::TokenMismatch);   // 412 — INV-NO-RETURN in miniature
     EXPECT_EQ(b.get("k")->bytes, "v1'");
@@ -213,20 +212,18 @@ TEST(CasInMemoryFaults, HeldDeleteLandsLater)
 TEST(CasInMemoryFaults, InjectedCasConflictFiresOnce)
 {
     InMemoryBackend b;
-    Token t1;
-    b.casPut("m", "s1", std::nullopt, &t1);
+    const Token t1 = b.casPut("m", "s1", std::nullopt).token;
     b.failNextCasPut("m");
-    EXPECT_EQ(b.casPut("m", "s2", t1), CasOutcome::Conflict);     // injected
+    EXPECT_EQ(b.casPut("m", "s2", t1).outcome, CasOutcome::Conflict);     // injected
     EXPECT_EQ(b.get("m")->bytes, "s1");
-    EXPECT_EQ(b.casPut("m", "s2", t1), CasOutcome::Committed);    // next attempt is real
+    EXPECT_EQ(b.casPut("m", "s2", t1).outcome, CasOutcome::Committed);    // next attempt is real
 }
 
 TEST(CasInMemoryFaults, NonEnforcingModeMimicsBadBackend)
 {
     InMemoryBackend b;
     b.setEnforceTokens(false);                        // MinIO-OSS-shaped backend
-    Token t1;
-    b.putIfAbsent("k", "v1", &t1);
+    b.putIfAbsent("k", "v1");
     auto d = b.deleteExact("k", Token{"totally-wrong", TokenType::Emulated});
     EXPECT_EQ(d.kind, DeleteOutcome::Kind::Deleted);  // silently deletes anyway — the dangerous behavior
     EXPECT_FALSE(b.get("k").has_value());
@@ -236,17 +233,15 @@ TEST(CasInMemoryFaults, VersioningMarkerMode)
 {
     InMemoryBackend b;
     b.setSimulateDeleteMarkers(true);
-    Token t1;
-    b.putIfAbsent("k", "v1", &t1);
+    const Token t1 = b.putIfAbsent("k", "v1").token;
     EXPECT_TRUE(b.deleteExact("k", t1).created_delete_marker);    // probe must reject this pool
 }
 
 TEST(CasInMemoryBackend, RoundTripsUserMetadata)
 {
     DB::Cas::InMemoryBackend backend;
-    DB::Cas::Token tok;
     const DB::Cas::ObjectMeta meta{{"cas_owner", "ab:7:42"}};
-    ASSERT_EQ(backend.putIfAbsent("k/key", "body", &tok, meta), DB::Cas::PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent("k/key", "body", meta).outcome, DB::Cas::PutOutcome::Done);
 
     const auto hr = backend.head("k/key");
     ASSERT_TRUE(hr.exists);
@@ -298,21 +293,21 @@ TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     const String blob_key = "pool/blobs/ab/abcdef0123456789";
 
     /// First put of a blob ⇒ Put.
-    EXPECT_EQ(b.putIfAbsent(blob_key, "payload"), PutOutcome::Done);
+    EXPECT_EQ(b.putIfAbsent(blob_key, "payload").outcome, PutOutcome::Done);
     /// Second put of the same key ⇒ PutDedup (content already exists).
-    EXPECT_EQ(b.putIfAbsent(blob_key, "payload"), PutOutcome::PreconditionFailed);
+    EXPECT_EQ(b.putIfAbsent(blob_key, "payload").outcome, PutOutcome::PreconditionFailed);
     /// head of an absent blob key ⇒ HeadMiss (the 404 signal).
     EXPECT_FALSE(b.head("pool/blobs/zz/absent").exists);
     /// head of the present blob key ⇒ Head.
     EXPECT_TRUE(b.head(blob_key).exists);
     /// casPut create on a gc key ⇒ Gc Cas.
-    EXPECT_EQ(b.casPut("pool/gc/state", "g1", std::nullopt), CasOutcome::Committed);
+    EXPECT_EQ(b.casPut("pool/gc/state", "g1", std::nullopt).outcome, CasOutcome::Committed);
     /// Streaming put to a fresh blob key, then finalize ⇒ Put.
     {
         auto sink = b.putIfAbsentStream("pool/blobs/cd/cafebabe");
         ASSERT_TRUE(sink != nullptr);
         DB::writeString(String("streamed"), sink->buffer());
-        EXPECT_EQ(sink->finalize(nullptr), PutOutcome::Done);
+        EXPECT_EQ(sink->finalize().outcome, PutOutcome::Done);
     }
 
     /// Under coverage builds ProfileEvents propagate into a thread-local subtree that does not reach
@@ -482,9 +477,8 @@ TEST(CasObjectStorageBackend, EmulatedRoundTripsUserMetadata)
 {
     ObjectStorageBackend backend(makeAttributePreservingStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
 
-    DB::Cas::Token tok;
     const DB::Cas::ObjectMeta meta{{"cas_owner", "ab:7:42"}};
-    ASSERT_EQ(backend.putIfAbsent("k/key", "body", &tok, meta), DB::Cas::PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent("k/key", "body", meta).outcome, DB::Cas::PutOutcome::Done);
 
     const auto hr = backend.head("k/key");
     ASSERT_TRUE(hr.exists);

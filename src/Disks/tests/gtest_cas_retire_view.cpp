@@ -64,13 +64,13 @@ TEST(CasRetireView, RefreshDropsRewrittenEntries)
     {
         auto head = b->head(layout.retiredKey(2, 1, 0));
         ASSERT_TRUE(head.exists);
-        ASSERT_EQ(b->putOverwrite(layout.retiredKey(2, 1, 0), encodeRetiredSet(RetiredSet{}), head.token),
+        ASSERT_EQ(b->putOverwrite(layout.retiredKey(2, 1, 0), encodeRetiredSet(RetiredSet{}), head.token).outcome,
                   PutOutcome::Done);
     }
     {
         auto head = b->head(layout.gcStateKey());
         ASSERT_TRUE(head.exists);
-        ASSERT_EQ(b->putOverwrite(layout.gcStateKey(), tests::encodeMinimalGcState(3, 1), head.token),
+        ASSERT_EQ(b->putOverwrite(layout.gcStateKey(), tests::encodeMinimalGcState(3, 1), head.token).outcome,
                   PutOutcome::Done);
     }
 

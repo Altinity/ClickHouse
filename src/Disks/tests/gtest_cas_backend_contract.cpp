@@ -18,10 +18,11 @@ class CasBackendContract : public ::testing::TestWithParam<std::function<Backend
 TEST_P(CasBackendContract, PutIfAbsentAndGet)
 {
     auto b = GetParam()();
-    Token t1;
-    EXPECT_EQ(b->putIfAbsent("k", "v1", &t1), PutOutcome::Done);
+    const auto put = b->putIfAbsent("k", "v1");
+    const Token t1 = put.token;
+    EXPECT_EQ(put.outcome, PutOutcome::Done);
     EXPECT_FALSE(t1.empty());
-    EXPECT_EQ(b->putIfAbsent("k", "clobber"), PutOutcome::PreconditionFailed);
+    EXPECT_EQ(b->putIfAbsent("k", "clobber").outcome, PutOutcome::PreconditionFailed);
     auto g = b->get("k");
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(g->bytes, "v1");
@@ -32,32 +33,32 @@ TEST_P(CasBackendContract, PutIfAbsentAndGet)
 TEST_P(CasBackendContract, OverwriteIsTokenExactAndMintsFreshToken)
 {
     auto b = GetParam()();
-    Token t1, t2;
-    b->putIfAbsent("k", "v1", &t1);
-    EXPECT_EQ(b->putOverwrite("k", "v2", Token{"wrong", TokenType::Emulated}), PutOutcome::PreconditionFailed);
+    const Token t1 = b->putIfAbsent("k", "v1").token;
+    EXPECT_EQ(b->putOverwrite("k", "v2", Token{"wrong", TokenType::Emulated}).outcome, PutOutcome::PreconditionFailed);
     EXPECT_EQ(b->get("k")->bytes, "v1");                       // untouched on mismatch
-    EXPECT_EQ(b->putOverwrite("k", "v2", t1, &t2), PutOutcome::Done);
-    EXPECT_NE(t2, t1);                                         // tokens never repeat
+    const auto overwrite = b->putOverwrite("k", "v2", t1);
+    EXPECT_EQ(overwrite.outcome, PutOutcome::Done);
+    EXPECT_NE(overwrite.token, t1);                            // tokens never repeat
     EXPECT_EQ(b->get("k")->bytes, "v2");
 }
 
 TEST_P(CasBackendContract, CasPutCreateAndSwap)
 {
     auto b = GetParam()();
-    Token t1, t2;
-    EXPECT_EQ(b->casPut("m", "s1", std::nullopt, &t1), CasOutcome::Committed);     // create-if-absent
-    EXPECT_EQ(b->casPut("m", "s1x", std::nullopt), CasOutcome::Conflict);          // exists now
-    EXPECT_EQ(b->casPut("m", "s2", Token{"stale", TokenType::Emulated}), CasOutcome::Conflict);
+    const auto create = b->casPut("m", "s1", std::nullopt);
+    const Token t1 = create.token;
+    EXPECT_EQ(create.outcome, CasOutcome::Committed);                              // create-if-absent
+    EXPECT_EQ(b->casPut("m", "s1x", std::nullopt).outcome, CasOutcome::Conflict);  // exists now
+    EXPECT_EQ(b->casPut("m", "s2", Token{"stale", TokenType::Emulated}).outcome, CasOutcome::Conflict);
     EXPECT_EQ(b->get("m")->bytes, "s1");
-    EXPECT_EQ(b->casPut("m", "s2", t1, &t2), CasOutcome::Committed);
+    EXPECT_EQ(b->casPut("m", "s2", t1).outcome, CasOutcome::Committed);
     EXPECT_EQ(b->get("m")->bytes, "s2");
 }
 
 TEST_P(CasBackendContract, DeleteExactnessAndSurvival)
 {
     auto b = GetParam()();
-    Token t1;
-    b->putIfAbsent("k", "v1", &t1);
+    const Token t1 = b->putIfAbsent("k", "v1").token;
     auto d1 = b->deleteExact("k", Token{"wrong", TokenType::Emulated});
     EXPECT_EQ(d1.kind, DeleteOutcome::Kind::TokenMismatch);
     EXPECT_TRUE(b->get("k").has_value());                      // SURVIVES wrong-token delete
@@ -70,8 +71,7 @@ TEST_P(CasBackendContract, DeleteExactnessAndSurvival)
 TEST_P(CasBackendContract, DeleteNotFound)
 {
     auto b = GetParam()();
-    Token t1;
-    b->putIfAbsent("k", "v1", &t1);
+    const Token t1 = b->putIfAbsent("k", "v1").token;
     b->deleteExact("k", t1);
     EXPECT_EQ(b->deleteExact("k", t1).kind, DeleteOutcome::Kind::NotFound);
 }
@@ -119,8 +119,7 @@ TEST_P(CasBackendContract, ListPagination)
 TEST_P(CasBackendContract, ReadAfterWrite)
 {
     auto b = GetParam()();
-    Token t1;
-    b->putIfAbsent("rw", "payload", &t1);
+    const Token t1 = b->putIfAbsent("rw", "payload").token;
     auto g = b->get("rw");
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(g->bytes, "payload");
@@ -137,15 +136,14 @@ TEST_P(CasBackendContract, ReadAfterWrite)
 TEST_P(CasBackendContract, OverwriteAndCasOnMissingKey)
 {
     auto b = GetParam()();
-    Token t1;
-    b->putIfAbsent("k", "v1", &t1);
+    const Token t1 = b->putIfAbsent("k", "v1").token;
     EXPECT_EQ(b->deleteExact("k", t1).kind, DeleteOutcome::Kind::Deleted);
     ASSERT_FALSE(b->get("k").has_value());                     // key is absent
 
-    EXPECT_EQ(b->putOverwrite("k", "v2", t1), PutOutcome::PreconditionFailed);
+    EXPECT_EQ(b->putOverwrite("k", "v2", t1).outcome, PutOutcome::PreconditionFailed);
     EXPECT_FALSE(b->get("k").has_value());                     // still absent
 
-    EXPECT_EQ(b->casPut("k", "v2", t1), CasOutcome::Conflict);
+    EXPECT_EQ(b->casPut("k", "v2", t1).outcome, CasOutcome::Conflict);
     EXPECT_FALSE(b->get("k").has_value());                     // still absent
 }
 
@@ -155,8 +153,9 @@ TEST_P(CasBackendContract, StreamPutRoundTrip)
     auto sink = b->putIfAbsentStream("k/stream1");
     sink->buffer().write("hello ", 6);
     sink->buffer().write("world", 5);
-    Token tok;
-    ASSERT_EQ(sink->finalize(&tok), PutOutcome::Done);
+    const auto res = sink->finalize();
+    const Token tok = res.token;
+    ASSERT_EQ(res.outcome, PutOutcome::Done);
     ASSERT_FALSE(tok.empty());
     auto got = b->get("k/stream1");
     ASSERT_TRUE(got.has_value());
@@ -167,11 +166,12 @@ TEST_P(CasBackendContract, StreamPutRoundTrip)
 TEST_P(CasBackendContract, StreamPutPreconditionAtFinalize)
 {
     auto b = GetParam()();
-    Token first;
-    ASSERT_EQ(b->putIfAbsent("k/stream2", "original", &first), PutOutcome::Done);
+    const auto first_put = b->putIfAbsent("k/stream2", "original");
+    const Token first = first_put.token;
+    ASSERT_EQ(first_put.outcome, PutOutcome::Done);
     auto sink = b->putIfAbsentStream("k/stream2");
     sink->buffer().write("loser", 5);
-    ASSERT_EQ(sink->finalize(nullptr), PutOutcome::PreconditionFailed);
+    ASSERT_EQ(sink->finalize().outcome, PutOutcome::PreconditionFailed);
     auto got = b->get("k/stream2");
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->bytes, "original");    /// the failed conditional write left the object unmodified
@@ -204,8 +204,9 @@ TEST_P(CasBackendContract, StreamPutEmptyBody)
 {
     auto b = GetParam()();
     auto sink = b->putIfAbsentStream("k/stream_empty");
-    Token tok;
-    ASSERT_EQ(sink->finalize(&tok), PutOutcome::Done);
+    const auto res = sink->finalize();
+    const Token tok = res.token;
+    ASSERT_EQ(res.outcome, PutOutcome::Done);
     ASSERT_FALSE(tok.empty());
     auto got = b->get("k/stream_empty");
     ASSERT_TRUE(got.has_value());
@@ -232,8 +233,9 @@ TEST_P(CasBackendContract, StreamPutLargeBody)
         sink->buffer().write(chunk.data(), chunk.size());
         expected += chunk;
     }
-    Token tok;
-    ASSERT_EQ(sink->finalize(&tok), PutOutcome::Done);
+    const auto res = sink->finalize();
+    const Token tok = res.token;
+    ASSERT_EQ(res.outcome, PutOutcome::Done);
 
     auto got = b->get("k/stream_large");
     ASSERT_TRUE(got.has_value());

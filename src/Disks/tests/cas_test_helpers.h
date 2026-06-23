@@ -156,9 +156,9 @@ inline void registerNamespaceRaw(
             return;
         registry.namespaces.insert(ns.string());
         ++registry.registry_version;
-        const auto outcome = got
+        const auto outcome = (got
             ? backend.casPut(layout.rootsRegistryKey(), DB::Cas::encodeRootsRegistry(registry), got->token)
-            : backend.casPut(layout.rootsRegistryKey(), DB::Cas::encodeRootsRegistry(registry), std::nullopt);
+            : backend.casPut(layout.rootsRegistryKey(), DB::Cas::encodeRootsRegistry(registry), std::nullopt)).outcome;
         if (outcome == DB::Cas::CasOutcome::Committed)
             return;
     }
@@ -252,9 +252,7 @@ inline DB::Cas::Token displaceObjectToken(
     const String new_head = DB::Cas::encodeEnvelopeHeader(header);
     const String body = new_head + got->bytes.substr(header.header_len);
 
-    DB::Cas::Token new_tok;
-    backend.putOverwrite(key, body, got->token, &new_tok);
-    return new_tok;
+    return backend.putOverwrite(key, body, got->token).token;
 }
 
 inline DB::Cas::Token displaceBlobToken(
@@ -295,14 +293,14 @@ public:
         return InMemoryBackend::get(key, range);
     }
 
-    DB::Cas::PutOutcome putIfAbsent(const String & key, const String & bytes, DB::Cas::Token * out_token = nullptr, const DB::Cas::ObjectMeta & meta = {}) override
+    DB::Cas::PutResult putIfAbsent(const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta = {}) override
     {
         {
             std::lock_guard lock(count_mutex);
             ++put_counts[key];
             ++put_total;
         }
-        return InMemoryBackend::putIfAbsent(key, bytes, out_token, meta);
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
     }
 
     uint64_t headCount(const String & key) const { return lookup(head_counts, key); }

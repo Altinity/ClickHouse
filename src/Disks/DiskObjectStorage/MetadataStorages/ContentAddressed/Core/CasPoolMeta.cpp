@@ -98,7 +98,7 @@ PoolMeta PoolMeta::createOrValidate(Backend & backend, const Layout & layout, ui
     pm.root_shards = root_shards;
     pm.blob_header_len = blob_header_len;
 
-    if (backend.casPut(key, encodePoolMeta(pm), /*expected*/ std::nullopt) == CasOutcome::Committed)
+    if (backend.casPut(key, encodePoolMeta(pm), /*expected*/ std::nullopt).outcome == CasOutcome::Committed)
         return pm;
 
     /// Lost the race: the winner's object MUST be present now.

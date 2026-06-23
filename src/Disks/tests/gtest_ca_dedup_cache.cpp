@@ -32,9 +32,9 @@ public:
 
     std::optional<GetResult> get(const String & k, Range r = {}) override { return inner->get(k, r); }
     ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-    PutOutcome putIfAbsent(const String & k, const String & b, Token * t = nullptr, const ObjectMeta & m = {}) override { return inner->putIfAbsent(k, b, t, m); }
-    PutOutcome putOverwrite(const String & k, const String & b, const Token & e, Token * t = nullptr, const ObjectMeta & m = {}) override { return inner->putOverwrite(k, b, e, t, m); }
-    CasOutcome casPut(const String & k, const String & b, const std::optional<Token> & e, Token * t = nullptr, const ObjectMeta & m = {}) override { return inner->casPut(k, b, e, t, m); }
+    PutResult putIfAbsent(const String & k, const String & b, const ObjectMeta & m = {}) override { return inner->putIfAbsent(k, b, m); }
+    PutResult putOverwrite(const String & k, const String & b, const Token & e, const ObjectMeta & m = {}) override { return inner->putOverwrite(k, b, e, m); }
+    CasResult casPut(const String & k, const String & b, const std::optional<Token> & e, const ObjectMeta & m = {}) override { return inner->casPut(k, b, e, m); }
     DeleteOutcome deleteExact(const String & k, const Token & t) override { return inner->deleteExact(k, t); }
 
 private:

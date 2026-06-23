@@ -175,11 +175,11 @@ public:
 
     WriteBuffer & buffer() override { return inner->buffer(); }
 
-    PutOutcome finalize(Token * out_token) override
+    PutResult finalize() override
     {
-        PutOutcome outcome = inner->finalize(out_token);
-        incrementCasEvent(ns, outcome == PutOutcome::Done ? CasOp::Put : CasOp::PutDedup);
-        return outcome;
+        PutResult result = inner->finalize();
+        incrementCasEvent(ns, result.outcome == PutOutcome::Done ? CasOp::Put : CasOp::PutDedup);
+        return result;
     }
 
     void cancel() noexcept override { inner->cancel(); }
