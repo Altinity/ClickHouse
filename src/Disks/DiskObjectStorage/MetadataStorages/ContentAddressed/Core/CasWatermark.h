@@ -1,15 +1,11 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
-#include <Common/Logger.h>
-#include <Common/ThreadPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasSingleWriterSlot.h>
 #include <base/extended_types.h>
 #include <base/types.h>
-#include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
-#include <mutex>
 #include <string_view>
 
 namespace DB::Cas
@@ -44,60 +40,36 @@ ServerWatermark decodeServerWatermark(std::string_view data);
 /// can already exist from a prior process incarnation — start CLAIMS it (HEAD → putIfAbsent if
 /// absent, else putOverwrite against the observed token) for the new epoch. There is a single
 /// writer per server_id, so any precondition failure during renewal means a foreign touch — fail
-/// closed with an exception, never re-mint. Mirrors HeartbeatKeeper, but anchors a per-server slot
-/// instead of a per-build one, and farewell retires the epoch (min_active = UINT64_MAX) rather than
-/// deleting the object.
-class WatermarkKeeper
+/// closed with an exception, never re-mint. A `SingleWriterSlot` (shared with `HeartbeatKeeper`),
+/// but it anchors a per-server slot instead of a per-build one, and farewell retires the epoch
+/// (min_active = UINT64_MAX) rather than deleting the object.
+class WatermarkKeeper final : public SingleWriterSlot
 {
 public:
     WatermarkKeeper(BackendPtr backend_, const Layout & layout_, UInt128 server_id_, uint64_t epoch_,
                     std::function<uint64_t()> min_active_fn_);
 
-    /// Stops the background thread only (no farewell). Destruction without farewell is the crash
-    /// path: the watermark persists, its seq stops advancing, and full GC observes the frozen seq.
-    ~WatermarkKeeper();
-
     /// Claims the per-server slot for our epoch with seq=1 — durable when start returns (W-ANCHOR).
     /// HEAD the key: if absent putIfAbsent, else putOverwrite against the observed current token (a
     /// fresh process legitimately overwrites its own server slot — single writer per server_id).
-    void start();
-
-    /// seq++ via putOverwrite against the last token we wrote, refreshing min_active from the
-    /// callback; LOGICAL_ERROR on a foreign touch (single-writer fail-closed contract).
-    void renewOnce();
+    void start() { doStart(); }
 
     /// Retires the epoch: putOverwrite against the last token with min_active = UINT64_MAX and
     /// seq+1, same epoch. Stops the background thread first. The keeper is done afterwards.
-    void farewell();
+    /// NOTE: has no production caller (the `Store` dtor calls `stopBackground`, never `farewell`);
+    /// preserved as an explicit policy method.
+    void farewell() { doTerminate(); }
 
-    void startBackground(std::chrono::milliseconds period);
-    void stopBackground();   /// idempotent
-
-    /// Local-clock bound for diagnostics: when the background loop stops (renewal failure), this
-    /// stops advancing.
-    std::chrono::steady_clock::time_point lastRenewTime() const;
+protected:
+    RenewPayload prepareRenew() const override;
+    String encodeBody(uint64_t seq_, const RenewPayload & payload) const override;
+    Token claim(const String & body) override;
+    void terminate() override;
 
 private:
-    void backgroundLoop(std::chrono::milliseconds period);
-
-    BackendPtr backend;
-    String key;
     UInt128 server_id;
     uint64_t epoch;
     std::function<uint64_t()> min_active_fn;
-
-    mutable std::mutex state_mutex;
-    uint64_t seq = 0;            /// 0 = not started
-    Token last_token;            /// the incarnation WE wrote — the only one we ever renew
-    bool dead = false;           /// set by farewell
-    std::chrono::steady_clock::time_point last_renew_time;
-
-    std::mutex background_mutex;
-    std::condition_variable wakeup;
-    bool stop_requested = false;
-    ThreadFromGlobalPool thread;
-
-    LoggerPtr log;
 };
 
 }
