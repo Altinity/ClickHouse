@@ -23,7 +23,7 @@ enum class CasEventType
     BuildStart, BuildPublish, BuildAbort, Precommit, PrecommitRemoved, PrecommitReclaim,
     GateRevalidate, GateResurrect, WatermarkRenew, Heartbeat,
     RefResolve, ReadMissing, DanglingAccess,
-    FailClosed, CorruptDecode, SnapJournalIncoherent, Exception,
+    CorruptDangle, CorruptDecode, SnapJournalIncoherent, Exception,
 };
 
 enum class CasEventObjectKind { None, Blob, Tree, Pack, Root, Snap };

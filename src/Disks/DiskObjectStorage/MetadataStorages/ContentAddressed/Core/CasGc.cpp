@@ -1291,30 +1291,36 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
 
                 /// A folded Add implies the tree was published, but the object may legitimately be gone
                 /// NOW (displaced later in the journal + a completed competing round deleted it; or a
-                /// precommit naming a not-yet-uploaded / raced tree). Tolerance is PER-NODE, never
-                /// whole-closure (B199-S2 Task 7 follow-up): a deeper adopted node that 404s must NOT
-                /// drop the edges/marks already in hand for STAGED nodes — those are authoritative from
-                /// the inline closure regardless of any adopted object's presence (dropping them would
-                /// reopen the S2 leak: a staged parent would become a never-expanded tree and leak its
-                /// OWN unique blobs on abandon).
-                ///   • ROOT 404 under a table ns: tolerate ONLY if a later record for the SAME ref
-                ///     displaces this Add (Remove or re-pointing Add); otherwise a live ref to a missing
-                ///     tree is INV-NO-DANGLE — fail closed (the unchanged B170 contract).
-                ///   • ROOT 404 under a precommit ns: a precommit naming an absent target is a legal
-                ///     pending/aborting reservation (B171) — tolerate (the root joins `pending_nodes`).
-                ///   • Any node 404 reached DEEPER under a precommit ns: tolerate as pending — that node
-                ///     joins `pending_nodes` (it is not marked expanded), but its parent's edge INTO it
-                ///     and all other staged edges/marks are kept. A later present-object Add re-expands
-                ///     the absent node once its object arrives.
-                ///   • A node 404 reached deeper under a TABLE ns: a present parent referencing a missing
-                ///     child is a real dangle — fail closed (propagate; unchanged). A table-ns node never
-                ///     enters `pending_nodes`.
+                /// precommit naming a not-yet-uploaded / raced tree; or — should-never-happen —
+                /// corruption: a live committed ref whose tree object vanished). Tolerance is PER-NODE,
+                /// never whole-closure (B199-S2 Task 7 follow-up): a deeper node that 404s must NOT drop
+                /// the edges/marks already in hand for STAGED nodes — those are authoritative from the
+                /// inline closure regardless of any adopted object's presence (dropping them would reopen
+                /// the S2 leak: a staged parent would become a never-expanded tree and leak its OWN
+                /// unique blobs on abandon).
+                ///
+                /// GC NEVER FAILS CLOSED on a 404 during fold, in ANY namespace (decision 2026-06-23):
+                /// the object is ALREADY gone, so throwing cannot recover it — it only WEDGES GC (the
+                /// next round re-hits the same 404 and reclaims nothing, so garbage accumulates forever).
+                /// A 404 is a "should-never-happen" diagnostic, not a fatal condition — only GC deletes
+                /// objects, so a live-referenced tree being absent means upstream corruption. The right
+                /// response is to log it loudly and KEEP CLEANING everything else. Every 404 therefore
+                /// joins `pending_nodes` and returns {}: the node is NOT markExpanded and its children are
+                /// not recorded, but the in-edge from its parent and all other edges ARE recorded, so the
+                /// in-degree-driven, idempotent delete handles the rest. Severity of the diagnostic:
+                ///   • committed/table ns, live ref to a missing tree with NO displacing record → DATA
+                ///     CORRUPTION: emit a loud `CorruptDangle` diagnostic (GC continues). fsck will report
+                ///     the tree as dangling (a live in-edge keeps it from deletion), surfacing the bug.
+                ///   • table-ns root 404 WITH a later displacing record → tolerate QUIETLY (not a dangle).
+                ///   • precommit ns (incl. adopt) → tolerate (a precommit/adopt naming an absent target is
+                ///     a legal pending/aborting/raced reservation, B171); not corruption.
                 /// Marking/edges are BUFFERED, then applied: every buffered edge is applied (a pending
                 /// node contributes no edges AS A PARENT — it returned {} — so only the in-edge from its
                 /// non-pending parent survives, giving it in-degree = the "known but unexpanded" state);
                 /// markExpanded is applied for every buffered node EXCEPT those in `pending_nodes`. So a
                 /// node is marked expanded ONLY when its entries were fully in hand (staged-inline or a
-                /// successful readTree) ⇒ a marked node always has COMPLETE edges.
+                /// successful readTree) ⇒ a marked node always has COMPLETE edges. A non-404 readTree
+                /// error still propagates (only FILE_DOESNT_EXIST is tolerated).
                 std::set<UInt128> pending_nodes;
 
                 auto rootDisplacedLater = [&]() -> bool
@@ -1329,12 +1335,13 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                     return false;
                 };
 
-                auto failClosedMissingTree = [&](const Exception & e)
+                auto emitCorruptDangle = [&](const Exception & e)
                 {
-                    /// B170: the manifest claims a LIVE ref to a missing tree and no later record
-                    /// displaces it — INV-NO-DANGLE surfaced. Record before propagating (fail closed).
+                    /// A live committed ref names a tree whose object is gone and nothing displaces it —
+                    /// upstream corruption (only GC deletes objects). Record it loudly; GC does NOT fail
+                    /// closed (a throw would only wedge GC — see above). fsck reports the tree as dangling.
                     CasEvent _ev20;
-                    _ev20.type = CasEventType::FailClosed;
+                    _ev20.type = CasEventType::CorruptDangle;
                     _ev20.namespace_ = ns.string();
                     _ev20.ref_name = record.ref_name;
                     _ev20.object_kind = CasEventObjectKind::Tree;
@@ -1342,17 +1349,17 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                     _ev20.round = state.round;
                     _ev20.gen = state.snap_generation;
                     _ev20.at_version = record.at_version;
-                    _ev20.outcome = "fail_closed";
-                    _ev20.reason = e.message();
+                    _ev20.outcome = "dangle_observed";
+                    _ev20.reason = "corruption: live ref to missing tree — GC continues (" + e.message() + ")";
                     _ev20.detail = {{"code", "FILE_DOESNT_EXIST"},
                                {"site", "foldShardRecords: live ref to missing tree"}};
                     store->emitEvent(_ev20);
                 };
 
-                /// The unified source: inline for staged nodes, readTree otherwise. On a tolerated 404 it
-                /// records `node` in `pending_nodes` and returns {} (that node is left unexpanded); on an
-                /// intolerable 404 it fails closed (propagate). A staged node is in `by_node` ⇒ never
-                /// readTree ⇒ never pending — only adopted/committed nodes can become pending.
+                /// The unified source: inline for staged nodes, readTree otherwise. On a 404 it records
+                /// `node` in `pending_nodes` and returns {} (that node is left unexpanded) — NEVER throws
+                /// (see above); a non-404 error propagates. A staged node is in `by_node` ⇒ never readTree
+                /// ⇒ never pending — only adopted/committed nodes can become pending.
                 auto unifiedSource = [&](const UInt128 & node) -> std::vector<TreeEntry>
                 {
                     if (auto it = by_node.find(node); it != by_node.end())
@@ -1366,16 +1373,16 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                         if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
                             throw;
                         const bool is_root = node == record.tree_id;
-                        if (precommit_ns || (is_root && rootDisplacedLater()))
-                        {
-                            /// Pending/displaced tolerance: this node is left unexpanded (see above).
-                            pending_nodes.insert(node);
-                            return {};
-                        }
-                        /// Table ns: root with no displacing record, or a missing internal child — a real
-                        /// dangle. Fail closed.
-                        failClosedMissingTree(e);
-                        throw;
+                        /// Corruption (loud diagnostic) iff TABLE ns AND not a legal/raced absence — i.e.
+                        /// a live committed ref's ROOT tree gone with no displacing record, OR a present
+                        /// table-ns parent referencing a missing CHILD. A precommit-ns 404, or a table-ns
+                        /// root that a later record displaces, is legal/raced — tolerate quietly. Either
+                        /// way the node joins `pending_nodes` (left unexpanded) and GC continues.
+                        const bool displaced_root = is_root && rootDisplacedLater();
+                        if (!precommit_ns && !displaced_root)
+                            emitCorruptDangle(e);
+                        pending_nodes.insert(node);
+                        return {};
                     }
                 };
 

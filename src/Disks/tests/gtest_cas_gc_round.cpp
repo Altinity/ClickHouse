@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Disks/tests/cas_test_helpers.h>
 
+#include <algorithm>
 #include <limits>
 
 #include <map>
@@ -670,23 +672,103 @@ TEST(CasGcFold, AbsentTreeWithLaterDisplacingAddSkipsExpansion)
     EXPECT_TRUE(snap.isExpanded(hexToU128(t2.string())));
 }
 
-TEST(CasGcFold, AbsentTreeWithoutLaterRemoveFailsClosed)
+TEST(CasGcFold, AbsentTreeWithoutLaterRemoveEmitsCorruptDangleAndContinues)
 {
-    /// readTree-absent DECISION, fail-closed branch: no later Remove => the manifest claims a LIVE
-    /// ref to a missing tree (INV-NO-DANGLE surfaced) => the exception propagates; nothing durable
-    /// moved (the fold aborts before the snap/cursor persist).
+    /// readTree-absent DECISION (2026-06-23): a LIVE committed ref names a tree whose object is gone
+    /// and NOTHING displaces it — upstream corruption (only GC deletes objects). GC must NOT fail
+    /// closed: a throw cannot recover the already-gone object, it only WEDGES GC (the next round
+    /// re-hits the same 404 and reclaims nothing). Instead GC emits a loud `corrupt_dangle` diagnostic
+    /// and CONTINUES. The tree is left UNEXPANDED but its live root in-edge keeps it known (in-degree
+    /// >= 1), so retire never deletes it (fsck would report it dangling — the bug surfaces there).
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
     const TreeId tree = publishPart(s, "srv1/tbl", "part_1", "payload");
+    const UInt128 tree_hash = hexToU128(tree.string());
     rawDeleteTree(*b, *s, tree);
 
-    Gc gc(s, hexToU128("00000000000000000000000000000001"));
-    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { gc.runRegularRound(); });
+    std::vector<CasEvent> seen;
+    s->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
 
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    RoundReport rep;
+    EXPECT_NO_THROW(rep = gc.runRegularRound());   /// never fails closed on a 404
+    EXPECT_TRUE(rep.acquired_lease);
+    EXPECT_EQ(rep.deleted, 0u);                    /// the live in-edge keeps the missing tree from deletion
+
+    /// A loud corruption diagnostic was emitted for the missing tree (NOT worded as "fail closed").
+    const size_t corrupt = std::count_if(seen.begin(), seen.end(), [&](const CasEvent & e)
+    {
+        return e.type == CasEventType::CorruptDangle && e.object_hash == u128ToHex(tree_hash);
+    });
+    EXPECT_EQ(corrupt, 1u);
+
+    /// The round COMPLETED and persisted a snap generation (GC kept working, did not abort).
     const GcState st = readState(*b, *s);
-    EXPECT_EQ(st.snap_generation, 0u);
-    /// B140-dangle fix: cursor moved from gc/state into the snap; gc/state no longer carries it.
-    EXPECT_FALSE(b->get(s->layout().gcSnapKey(1, 0)).has_value());   /// nothing durable was written
+    EXPECT_EQ(st.round, 1u);
+
+    /// The missing tree was NOT expanded (no readTree), but its live root in-edge keeps it known.
+    const GcSnap snap = readSnap(*b, *s, 1, 0);
+    EXPECT_FALSE(snap.isExpanded(tree_hash));
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, tree_hash), 1u);
+}
+
+TEST(CasGcCorruptCommittedTree, MissingTreeOfLiveRefDoesNotHaltGc)
+{
+    /// The decisive guarantee: a corrupt committed tree (live ref, object gone) must NOT halt GC — the
+    /// rest of the pool keeps getting reclaimed. Set up BOTH a corruption (treeX, a live ref whose tree
+    /// object we delete out-of-band) AND unrelated reclaimable garbage (part_garbage, published then its
+    /// ref dropped + watermark advanced). Run GC to fixpoint and assert: GC never throws, the unrelated
+    /// garbage IS fully reclaimed (its tree + blob objects reach present=0), the corrupt treeX stays
+    /// (its live in-edge keeps it — fsck reports it dangling, never deleted), and a corruption
+    /// diagnostic fired. A throw-based fail-closed would have wedged GC and left the garbage forever.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+
+    /// Corruption: a live committed ref to treeX whose object we then delete (no displacing record).
+    const TreeId tree_x = publishPart(s, "srv1/tbl", "part_live", "x-payload");
+    const UInt128 tree_x_hash = hexToU128(tree_x.string());
+
+    /// Unrelated reclaimable garbage: a second part, dropped (its ref removed) and watermark-advanced so
+    /// GC may retire it. Its tree + uniquely-owned blob must be deleted by GC's normal cascade.
+    const TreeId tree_garbage = publishPart(s, "srv1/tbl", "part_garbage", "garbage-payload");
+    const String garbage_blob_key = s->layout().blobKey(BlobId{u128ToHex(u128Of("garbage-payload"))});
+    const String garbage_tree_key = s->layout().treeKey(tree_garbage);
+    s->dropRef(RootNamespace{"srv1/tbl"}, "part_garbage");
+    s->renewWatermarkOnce();   /// build finished -> min_active passes its seq (Task 10 guard)
+
+    /// Now corrupt treeX (delete its object out-of-band, as nothing legitimately would).
+    rawDeleteTree(*b, *s, tree_x);
+
+    std::vector<CasEvent> seen;
+    s->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
+
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    EXPECT_NO_THROW({
+        for (int i = 0; i < 8; ++i)
+            gc.runRegularRound();
+    });
+
+    /// The corruption was observed (loud diagnostic), not swallowed.
+    const size_t corrupt = std::count_if(seen.begin(), seen.end(), [&](const CasEvent & e)
+    {
+        return e.type == CasEventType::CorruptDangle && e.object_hash == u128ToHex(tree_x_hash);
+    });
+    EXPECT_GE(corrupt, 1u);
+
+    /// PROOF GC DID NOT HALT: the unrelated garbage was fully reclaimed.
+    EXPECT_FALSE(b->head(garbage_tree_key).exists) << "GC halted: garbage tree not reclaimed";
+    EXPECT_FALSE(b->head(garbage_blob_key).exists) << "GC halted: garbage blob not reclaimed";
+
+    /// The corrupt treeX is NOT reclaimed: its live ref still resolves, and the snap keeps it known with
+    /// a non-zero in-degree (the live root edge), so retire never made it a delete candidate. (We can't
+    /// re-read treeX's object — we deleted it to simulate the corruption — and `runFsck`/`readTree`
+    /// legitimately throw on a live ref to a missing tree, so we assert via the durable ref + snap.)
+    EXPECT_TRUE(s->resolveRef(RootNamespace{"srv1/tbl"}, "part_live").has_value())
+        << "the corrupt part's ref must survive — GC must not drop a live ref";
+    const GcState st = readState(*b, *s);
+    const GcSnap snap = readSnap(*b, *s, st.snap_generation, 0);
+    EXPECT_GE(snap.inDegree(ObjectKind::Tree, tree_x_hash), 1u)
+        << "the live in-edge must keep the corrupt treeX known (never a zero-in-degree delete candidate)";
 }
 
 /// ---- R2 RETIRE (Task 7) ----

@@ -21,7 +21,7 @@ ColumnsDescription ContentAddressedLogElement::getColumnsDescription()
         {"event_date", std::make_shared<DataTypeDate>(), "Event date."},
         {"event_time", std::make_shared<DataTypeDateTime>(), "Event time."},
         {"event_time_microseconds", std::make_shared<DataTypeDateTime64>(6), "Event time with microseconds."},
-        {"event_type", lc_string, "The CA decision/event (blob_put, blob_reuse_adopt, tree_expand, root_remove, indeg_zero, gc_retire_decision, gc_recheck_verdict, blob_delete, tree_strip, dangling_access, fail_closed, ...)."},
+        {"event_type", lc_string, "The CA decision/event (blob_put, blob_reuse_adopt, tree_expand, root_remove, indeg_zero, gc_retire_decision, gc_recheck_verdict, blob_delete, tree_strip, dangling_access, corrupt_dangle, ...)."},
         {"disk_name", lc_string, "Content-addressed disk / pool the event belongs to."},
         {"namespace", std::make_shared<DataTypeString>(), "roots/<namespace> (server/table), empty if N/A."},
         {"ref_name", std::make_shared<DataTypeString>(), "Part name / ref the event concerns, empty if N/A."},

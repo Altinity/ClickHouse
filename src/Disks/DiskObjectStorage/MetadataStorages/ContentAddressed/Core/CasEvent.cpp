@@ -59,7 +59,7 @@ String toString(CasEventType type)
         case CasEventType::RefResolve:            return "ref_resolve";
         case CasEventType::ReadMissing:           return "read_missing";
         case CasEventType::DanglingAccess:        return "dangling_access";
-        case CasEventType::FailClosed:            return "fail_closed";
+        case CasEventType::CorruptDangle:         return "corrupt_dangle";
         case CasEventType::CorruptDecode:         return "corrupt_decode";
         case CasEventType::SnapJournalIncoherent: return "snap_journal_incoherent";
         case CasEventType::Exception:             return "exception";
