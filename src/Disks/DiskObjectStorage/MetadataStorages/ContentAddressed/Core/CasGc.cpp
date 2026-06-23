@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasClosureWalk.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -172,7 +173,7 @@ void Gc::trim(const std::map<uint64_t, GcSnap> & snap,
 {
     for (const auto & [ns, shard] : root_shards)
     {
-        const String cursor_key = ns.string() + "/" + std::to_string(shard);
+        const String cursor_key = cursorKey(ns, shard);
         const uint64_t cursor = cursorOf(snap, cursor_key);
         if (cursor == 0)
             continue;
@@ -229,7 +230,7 @@ void Gc::assertSnapJournalCoherent(const std::map<uint64_t, GcSnap> & snap,
     const GcSnap & s = snap_it->second;
     for (const auto & [ns, shard] : root_shards)
     {
-        const String cursor_key = ns.string() + "/" + std::to_string(shard);
+        const String cursor_key = cursorKey(ns, shard);
         const uint64_t cursor = cursorOf(snap, cursor_key);
         if (cursor == 0)
             continue;
@@ -307,13 +308,8 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
     {
         if (cursor_key == "_registry")
             continue;   /// the registry fence orders namespace creation; it carries no journal
-        const size_t slash = cursor_key.rfind('/');
-        chassert(slash != String::npos);
-        const RootNamespace ns{cursor_key.substr(0, slash)};
-        uint64_t shard = 0;
-        [[maybe_unused]] const auto parse =
-            std::from_chars(cursor_key.data() + slash + 1, cursor_key.data() + cursor_key.size(), shard);
-        chassert(parse.ec == std::errc());
+        chassert(cursor_key.rfind('/') != String::npos);
+        const auto [ns, shard] = parseCursorKey(cursor_key);
 
         const auto [root, manifest_token] = store->readShard(ns, shard);
         const uint64_t cursor = cursorOf(snap, cursor_key);
@@ -913,7 +909,7 @@ void Gc::fence(GcState & state, Token & state_token)
             /// Safe in the provable-coverage direction: the recheck must fold THROUGH at least the
             /// recorded version, and recording the higher replayed version is MORE conservative
             /// (folds more, never less).
-            state.fence_version[round][ns.string() + "/" + std::to_string(shard)] = committed;
+            state.fence_version[round][cursorKey(ns, shard)] = committed;
         }
     }
 
@@ -1685,7 +1681,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     for (const auto & [ns, root_shard] : result.root_shards)
     {
         const auto [root, manifest_token] = store->readShard(ns, root_shard);
-        const String cursor_key = ns.string() + "/" + std::to_string(root_shard);
+        const String cursor_key = cursorKey(ns, root_shard);
         const uint64_t cursor = cursorOf(result.snap, cursor_key);
         folded_to[cursor_key] = root.shard_version;
 

@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -37,6 +38,38 @@ using DB::Cas::tests::u128Of;
 /// becomes steal-eligible when it observes the SAME (owner, seq) across two of its own
 /// consecutive round attempts. No test below sleeps or reads a clock — "time" is simply the
 /// order of runRegularRound calls.
+
+/// Golden test (R3): `cursorKey` and `parseCursorKey` must produce the IDENTICAL strings and
+/// parse results as the legacy inline expressions in `CasGc.cpp`.  The namespace "srv1/tbl"
+/// deliberately contains a '/' to exercise the rfind-based last-slash split rule.
+TEST(CasGcCursorKey, RoundTripsAndMatchesLegacyFormat)
+{
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// Format: must match the legacy inline expression ns.string() + "/" + std::to_string(shard)
+    EXPECT_EQ(cursorKey(ns, 7), "srv1/tbl/7");
+    EXPECT_EQ(cursorKey(ns, 0), "srv1/tbl/0");
+    EXPECT_EQ(cursorKey(RootNamespace{"simple"}, 42), "simple/42");
+
+    /// Parse: must reproduce the legacy rfind('/') split + from_chars shard
+    {
+        const auto [pns, pshard] = parseCursorKey("srv1/tbl/7");
+        EXPECT_EQ(pns.string(), "srv1/tbl");
+        EXPECT_EQ(pshard, 7u);
+    }
+    {
+        const auto [pns, pshard] = parseCursorKey("simple/42");
+        EXPECT_EQ(pns.string(), "simple");
+        EXPECT_EQ(pshard, 42u);
+    }
+    /// Round-trip: cursorKey -> parseCursorKey must recover the original inputs
+    {
+        const auto key = cursorKey(ns, 7);
+        const auto [pns, pshard] = parseCursorKey(key);
+        EXPECT_EQ(pns.string(), ns.string());
+        EXPECT_EQ(pshard, 7u);
+    }
+}
 
 namespace
 {
