@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasClosureWalk.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -1342,27 +1343,44 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                 if (tree_present)
                 {
                     uint64_t out_edges = 0;
-                    for (const TreeEntry & entry : entries)
+                    /// Unified closure traversal (CasClosureWalk): DFS from the root tree, recurse on
+                    /// Subtree, dedup via the walk's seen-set. The ROOT tree's entries are already in
+                    /// hand (read above, with the displaced_later/precommit 404 tolerance applied), so
+                    /// the source returns them directly for the root and only `readTree`s deeper nodes.
+                    /// A SUBTREE-level readTree failure is fail-closed: a present parent referencing a
+                    /// missing child is a real dangle (the displaced_later ref-journal tolerance applies
+                    /// only to the root ref, not to internal subtrees), so the exception propagates.
+                    auto backendSource = [&](const UInt128 & node) -> std::vector<TreeEntry>
+                    {
+                        if (node == record.tree_id)
+                            return entries;
+                        return store->readTree(TreeId(u128ToHex(node)));
+                    };
+                    auto on_tree = [&](const UInt128 & tree)
+                    {
+                        shard_for(tree).markExpanded(tree);
+                    };
+                    auto on_edge = [&](const UInt128 & parent_tree, const TreeEntry & entry)
                     {
                         switch (entry.placement)
                         {
                             case Placement::Blob:
-                                shard_for(entry.file_hash).addTreeEdge(record.tree_id, ObjectKind::Blob, entry.file_hash);
+                                shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Blob, entry.file_hash);
                                 ++out_edges;
                                 break;
                             case Placement::Subtree:
-                                shard_for(entry.file_hash).addTreeEdge(record.tree_id, ObjectKind::Tree, entry.file_hash);
+                                shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Tree, entry.file_hash);
                                 ++out_edges;
                                 break;
                             case Placement::PackSlice:
-                                shard_for(entry.pack_hash).addPackEdge(record.tree_id, entry.pack_hash);
+                                shard_for(entry.pack_hash).addPackEdge(parent_tree, entry.pack_hash);
                                 ++out_edges;
                                 break;
                             case Placement::Inline:
                                 break;   /// embedded bytes - no separate object, no edge
                         }
-                    }
-                    tree_home.markExpanded(record.tree_id);
+                    };
+                    closureWalk(record.tree_id, backendSource, on_tree, on_edge);
                     /// B170: the tree was expanded — its child edges are now recorded in the snap.
                     /// This is the "set the expansion marker / record child edges" transition.
                     {

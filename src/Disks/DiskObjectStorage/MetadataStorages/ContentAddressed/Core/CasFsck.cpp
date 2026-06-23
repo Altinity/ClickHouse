@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasClosureWalk.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 
@@ -68,17 +69,24 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
     std::unordered_map<String, std::vector<String>> reachable;
     std::set<String> reachable_blobs;
 
-    std::function<void(const TreeId &, const String &, std::set<String> &)> walk =
-        [&](const TreeId & tree_id, const String & label, std::set<String> & seen)
+    /// One closure traversal (CasClosureWalk) drives the fsck reachability accounting. The seen-set
+    /// dedup, the Subtree recursion, and the Inline skip all live inside `closureWalk`; here we only
+    /// record what each tree/edge makes reachable, keyed by the ref `label`.
+    auto walk = [&](const TreeId & root, const String & label)
     {
-        const String tkey = layout.treeKey(tree_id);
-        if (detail)
-            reachable[tkey].push_back(label);
-        else
-            reachable.try_emplace(tkey);
-        if (!seen.insert(tree_id.string()).second)
-            return;
-        for (const TreeEntry & e : store.readTree(tree_id))
+        auto backendSource = [&](const UInt128 & node) -> std::vector<TreeEntry>
+        {
+            return store.readTree(TreeId(u128ToHex(node)));
+        };
+        auto on_tree = [&](const UInt128 & tree)
+        {
+            const String tkey = layout.treeKey(TreeId(u128ToHex(tree)));
+            if (detail)
+                reachable[tkey].push_back(label);
+            else
+                reachable.try_emplace(tkey);
+        };
+        auto on_edge = [&](const UInt128 & /*parent_tree*/, const TreeEntry & e)
         {
             if (e.placement == Placement::Blob)
             {
@@ -103,12 +111,10 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
                 ++report.total_blob_refs;
                 report.referenced_logical_bytes += e.file_size;
             }
-            else if (e.placement == Placement::Subtree)
-            {
-                walk(TreeId(u128ToHex(e.file_hash)), label, seen);
-            }
-            /// Placement::Inline carries its bytes in the tree payload — no separate object.
-        }
+            /// Placement::Subtree yields an edge here too, but the child tree itself is recorded by
+            /// `on_tree` when `closureWalk` recurses into it — nothing to account for the edge.
+        };
+        closureWalk(hexToU128(root.string()), backendSource, on_tree, on_edge);
     };
 
     uint64_t refs_walked = 0;
@@ -117,8 +123,7 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
         const RootNamespace ns{ns_str};
         for (const auto & [ref_name, resolved] : store.listRefs(ns))
         {
-            std::set<String> seen;
-            walk(resolved.tree_id, ns_str + "/" + ref_name, seen);
+            walk(resolved.tree_id, ns_str + "/" + ref_name);
             ++refs_walked;
             checkDeadline(deadline, "walking refs");   /// every ref (cheap) — fires even for pools < 64 refs
             if (on_progress && refs_walked % 64 == 0)
