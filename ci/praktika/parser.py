@@ -95,7 +95,7 @@ class WorkflowConfigParser:
         # populate WorkflowYaml.branches
         if self.config.event in (Workflow.Event.PUSH,):
             assert (
-                self.config.branches
+                self.config.branches or self.config.tags
             ), f'Workflow.Config.branches (e.g. ["main"]) must be set for workflow with event [{self.config.event}], workflow [{self.workflow_name}]'
             assert (
                 not self.config.base_branches
