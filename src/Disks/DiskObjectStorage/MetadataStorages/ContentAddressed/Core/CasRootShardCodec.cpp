@@ -112,7 +112,10 @@ ClosureNode decodeClosureNode(const Cas::Proto::ClosureNodeProto & pn)
         e.placement = placementFromProto(pe.placement(), "closure node entry");
         e.file_hash = u128FromBytes(pe.file_hash(), "closure node entry file_hash");
         e.file_size = pe.file_size();
-        if (e.placement == Placement::PackSlice && !pe.pack_hash().empty())
+        /// Symmetric with encode (which always writes pack_hash for PackSlice): decode it
+        /// unconditionally so u128FromBytes fails closed (CORRUPTED_DATA) on an absent/short
+        /// field, rather than silently zero-filling and losing a GC pack-edge.
+        if (e.placement == Placement::PackSlice)
             e.pack_hash = u128FromBytes(pe.pack_hash(), "closure node entry pack_hash");
         node.entries.push_back(std::move(e));
     }
