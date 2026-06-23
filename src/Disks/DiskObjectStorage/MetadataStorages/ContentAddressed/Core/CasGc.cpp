@@ -635,51 +635,13 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
         || report.forgotten_absent > 0;      /// P9: a retire-time 404 forgot a node in-memory; the
                                              /// forget must go durable or the next round re-derives
                                              /// and re-HEAD-404s it (the RetireForgets regression).
-    constexpr uint64_t max_generation_probes = 1000;
     constexpr uint64_t MAX_PRUNE_GENERATIONS_PER_ROUND = 64;   /// B174: bound the per-round prune burst
+    /// Same write-once probe-upward persist the fold uses, here advancing snap shard 0's cursor from
+    /// the recorded fence versions. SKIPPED when the snap is unchanged (the common idle case) — the
+    /// generation then stays at state.snap_generation and the cursor does not advance (conservative).
     uint64_t adopted_generation = state.snap_generation;
     if (snap_changed)
-    for (uint64_t generation = state.snap_generation + 1; ; ++generation)
-    {
-        if (generation > state.snap_generation + max_generation_probes)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "CAS gc cascade: no adoptable snap generation within {} probes above {} (runaway divergence)",
-                max_generation_probes, state.snap_generation);
-        bool diverged = false;
-        for (auto & [snap_shard, shard_snap] : snap)
-        {
-            shard_snap.generation = generation;
-            /// Advance the fold cursor in snap shard 0 (the single source of truth, B140-dangle fix):
-            /// write the fence versions into the snap so (edges, cursor) are persisted as one
-            /// write-once unit — they can never diverge across a crash.
-            if (snap_shard == 0)
-            {
-                for (const auto & [cursor_key, fence_version] : fence_it->second)
-                {
-                    if (cursor_key == "_registry")
-                        continue;
-                    shard_snap.folded_cursor[cursor_key]
-                        = std::max(shard_snap.folded_cursor[cursor_key], fence_version);
-                }
-            }
-            const String snap_key = layout.gcSnapKey(generation, snap_shard);
-            const String body = encodeGcSnap(shard_snap);
-            if (backend.putIfAbsent(snap_key, body) == PutOutcome::PreconditionFailed)
-            {
-                const auto existing = backend.get(snap_key);
-                if (!existing || existing->bytes != body)
-                {
-                    diverged = true;
-                    break;
-                }
-            }
-        }
-        if (!diverged)
-        {
-            adopted_generation = generation;
-            break;
-        }
-    }
+        adopted_generation = persistGenerationProbingUpward(state, snap, fence_it->second, "cascade");
 
     GcState next = state;
     next.snap_generation = adopted_generation;   /// unchanged when the persist was skipped
@@ -788,6 +750,70 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "CAS gc cascade: retired set at {} changed under us (token mismatch on drop)", key);
         }
+    }
+}
+
+uint64_t Gc::persistGenerationProbingUpward(const GcState & state, std::map<uint64_t, GcSnap> & snap,
+                                            const std::map<String, uint64_t> & cursor_source,
+                                            std::string_view phase)
+{
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+
+    /// THE WRITE GENERATION PROBES UPWARD. Generation objects are write-once, and a generation key
+    /// occupied by DIFFERENT bytes can never be reused: an attempt that wrote its snaps but lost the
+    /// gc/state CAS leaves an orphan at snap_generation+1, and once ANY new journal record arrives
+    /// every later persist covers a larger range — its bytes can never match the orphan again, so a
+    /// FIXED write generation would abort forever (a permanent GC wedge). Per probed generation:
+    /// every shard Done or byte-equal => adopt it (byte-equality keeps crash-replay adoption: the
+    /// orphan of OUR identical earlier attempt is reused, not abandoned); ANY shard divergent =>
+    /// abandon the generation (partially written objects there are orphans — harmless, write-once,
+    /// never referenced by any cursor; full-GC reclaims them in M-F) and retry one higher. The
+    /// adopted generation is > the snap_generation we read and the gc/state CAS below guards the
+    /// advance, so INV-MONOTONE-GC holds; generations need NOT be dense — the gc/state pointer is
+    /// authoritative, a reader never enumerates generations.
+    constexpr uint64_t max_generation_probes = 1000;   /// runaway brake, never a legitimate bound
+    for (uint64_t generation = state.snap_generation + 1; ; ++generation)
+    {
+        if (generation > state.snap_generation + max_generation_probes)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS gc {}: no adoptable snap generation within {} probes above {} (runaway divergence)",
+                phase, max_generation_probes, state.snap_generation);
+
+        bool diverged = false;
+        for (auto & [snap_shard, shard_snap] : snap)
+        {
+            shard_snap.generation = generation;
+            /// Advance the fold cursor in snap shard 0 (the single source of truth, B140-dangle fix)
+            /// to the position represented by the edges. This makes the persisted generation
+            /// self-coherent: (edges, cursor) are one write-once unit and the cursor never runs ahead
+            /// of the edges it represents. Idempotent under the probe-upward retry (std::max), so the
+            /// encoded bytes stay stable for byte-equal adoption.
+            if (snap_shard == 0)
+            {
+                for (const auto & [cursor_key, version] : cursor_source)
+                {
+                    if (cursor_key == "_registry")
+                        continue;
+                    shard_snap.folded_cursor[cursor_key]
+                        = std::max(shard_snap.folded_cursor[cursor_key], version);
+                }
+            }
+            const String snap_key = layout.gcSnapKey(generation, snap_shard);
+            const String body = encodeGcSnap(shard_snap);
+            if (backend.putIfAbsent(snap_key, body) == PutOutcome::PreconditionFailed)
+            {
+                const auto existing = backend.get(snap_key);
+                if (!existing || existing->bytes != body)
+                {
+                    diverged = true;
+                    break;
+                }
+                /// byte-equal: OUR replay (a prior attempt crashed or lost the cursor CAS) — adopt.
+            }
+        }
+        if (!diverged)
+            return generation;
     }
 }
 
@@ -1701,71 +1727,15 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     if (!folded_any)
         return result;
 
-    /// 4. Persist, durable-before-cursor: the new-generation snap objects go durable FIRST; only
-    /// then does the gc/state CAS advance snap_generation. A crash between the two loses nothing
-    /// - the old generation stays authoritative. The persisted snap shard 0 carries folded_cursor
-    /// advanced to the position fold folded to (each shard's shard_version) — (edges, cursor) are
-    /// one write-once unit (B140-dangle fix); the cascade later advances the SAME cursor through the
-    /// fence window. fold writes only its OWN folded extent, never the fence version (it has not
-    /// folded the fence window), so the cursor is never ahead of the edges.
-    ///
-    /// THE WRITE GENERATION PROBES UPWARD. Generation objects are write-once, and a generation key
-    /// occupied by DIFFERENT bytes can never be reused: a fold that wrote its snaps but lost the
-    /// gc/state CAS leaves an orphan at snap_generation+1, and once ANY new journal record arrives
-    /// every later fold covers a larger range - its bytes can never match the orphan again, so a
-    /// FIXED write generation would abort forever (a permanent GC wedge). Per probed generation:
-    /// every shard Done or byte-equal => adopt it (byte-equality keeps crash-replay adoption: the
-    /// orphan of OUR identical earlier attempt is reused, not abandoned); ANY shard divergent =>
-    /// abandon the generation (partially written objects there are orphans - harmless, write-once,
-    /// never referenced by any cursor; full-GC reclaims them in M-F) and retry one higher. The
-    /// adopted generation is > the snap_generation we read and the gc/state CAS below guards the
-    /// advance, so INV-MONOTONE-GC holds; generations need NOT be dense - the gc/state pointer is
-    /// authoritative, a reader never enumerates generations.
-    constexpr uint64_t max_generation_probes = 1000;   /// runaway brake, never a legitimate bound
-    uint64_t adopted_generation = 0;
-    for (uint64_t generation = state.snap_generation + 1; ; ++generation)
-    {
-        if (generation > state.snap_generation + max_generation_probes)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "CAS gc fold: no adoptable snap generation within {} probes above {} (runaway divergence)",
-                max_generation_probes, state.snap_generation);
-
-        bool diverged = false;
-        for (auto & [snap_shard, snap] : result.snap)
-        {
-            snap.generation = generation;
-            /// Advance the fold cursor in snap shard 0 (the single source of truth, B140-dangle fix)
-            /// to the position fold ACTUALLY folded to (each shard's shard_version). This makes the
-            /// persisted generation self-coherent: (edges, cursor) are one write-once unit and the
-            /// cursor never runs ahead of the edges it represents. Idempotent under the probe-upward
-            /// retry (std::max), so the encoded bytes stay stable for byte-equal adoption.
-            if (snap_shard == 0)
-            {
-                for (const auto & [cursor_key, folded_version] : folded_to)
-                    snap.folded_cursor[cursor_key]
-                        = std::max(snap.folded_cursor[cursor_key], folded_version);
-            }
-            const String snap_key = layout.gcSnapKey(generation, snap_shard);
-            const String body = encodeGcSnap(snap);
-            if (backend.putIfAbsent(snap_key, body) == PutOutcome::PreconditionFailed)
-            {
-                const auto existing = backend.get(snap_key);
-                if (!existing || existing->bytes != body)
-                {
-                    diverged = true;
-                    break;
-                }
-                /// byte-equal: OUR replay (a prior attempt crashed or lost the cursor CAS) - adopt.
-            }
-        }
-        if (!diverged)
-        {
-            adopted_generation = generation;
-            break;
-        }
-    }
-
-    state.snap_generation = adopted_generation;
+    /// 4. Persist, durable-before-cursor: the new-generation snap objects go durable FIRST (via the
+    /// shared probe-upward persist); only then does the gc/state CAS advance snap_generation. A crash
+    /// between the two loses nothing — the old generation stays authoritative. The persisted snap
+    /// shard 0 carries folded_cursor advanced to the position fold folded to (each shard's
+    /// shard_version, in `folded_to`) — (edges, cursor) are one write-once unit (B140-dangle fix);
+    /// the cascade later advances the SAME cursor through the fence window. fold writes only its OWN
+    /// folded extent, never the fence version (it has not folded the fence window), so the cursor is
+    /// never ahead of the edges.
+    state.snap_generation = persistGenerationProbingUpward(state, result.snap, folded_to, "fold");
     Token committed_token;
     if (backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token, &committed_token)
         != CasOutcome::Committed)

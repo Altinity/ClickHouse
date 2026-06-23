@@ -252,6 +252,21 @@ private:
                            const RecheckResult & rechecked,
                            const std::map<uint64_t, RetiredSet> & retired, RoundReport & report);
 
+    /// The shared "probe-upward generation persist" loop used by BOTH the fold's persist (step 4)
+    /// and the cascade's post-strip persist (step 2). Generation objects are write-once: per probed
+    /// generation, every shard either putIfAbsent-succeeds or is byte-equal (OUR crash-replay orphan,
+    /// adopted) => adopt it; ANY divergent shard => abandon (its partial objects are harmless,
+    /// write-once, never cursor-referenced) and retry one higher, up to `max_generation_probes`.
+    /// Before each putIfAbsent the loop stamps `generation` onto every shard and advances snap shard
+    /// 0's `folded_cursor` (std::max, idempotent under retry) from `cursor_source` so (edges, cursor)
+    /// persist as one write-once unit (B140-dangle fix). The reserved `"_registry"` key in
+    /// `cursor_source` is never a real cursor and is skipped (a no-op for sources that never contain
+    /// it). `phase` selects the runaway-brake exception text ("fold" / "cascade"). Returns the
+    /// adopted generation (always > state.snap_generation).
+    uint64_t persistGenerationProbingUpward(const GcState & state, std::map<uint64_t, GcSnap> & snap,
+                                            const std::map<String, uint64_t> & cursor_source,
+                                            std::string_view phase);
+
     /// Discover the namespace universe from the registry (namespaces x ALL root_shards shards);
     /// shared by the fold and the resume's re-fence. Absent registry => empty (fresh pool).
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverse();
