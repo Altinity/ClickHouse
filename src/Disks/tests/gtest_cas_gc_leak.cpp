@@ -159,6 +159,84 @@ FsckReport displaceDeleteAndGc(
 
 }
 
+/// B199-S2 Task-7 regression: GC must NOT throw `LOGICAL_ERROR` when folding a precommit `Add` whose
+/// inline closure is EMPTY. Both production adopt paths precommit an ADOPTED (unstaged) root, which
+/// `buildStagedClosure` leaves empty: replication relink (`adoptTree` + `precommit`) and rename/move
+/// (`republishRef` → `adoptEvidence` + `precommit`). The Task-5 fold added an empty-closure guard that
+/// THREW under the precommit namespace, so GC broke on the first fold over such an `Add`.
+///
+/// REACHABILITY (the subtle part the single-server wiring harness CANNOT exercise): the empty-closure
+/// guard fires only when the adopted root is still UN-EXPANDED in the shared snap when its precommit
+/// `Add` folds. On one server the staged build that originally created the tree leaves a non-empty
+/// precommit `Add` that expands the tree FIRST, so a same-server re-adopt always sees it expanded. The
+/// genuine trigger is RECEIVER-side replication: a second server adopts a tree BUILT ELSEWHERE, so its
+/// pool has no prior expanding `Add` for that tree, and its precommit `Add` (empty closure) folds
+/// un-expanded. Modelled here as two `Store`s over ONE shared backend (sender A, receiver B); B's
+/// precommit namespace sorts before A's so B's adopt `Add` folds first, against the un-expanded tree.
+///
+/// Fixed by the unified fold source: an empty closure ⇒ `readTree` the adopted root (kept present by
+/// the live source it was adopted from) instead of throwing. The fold expands it and GC proceeds.
+
+/// Sender A commits a tree; receiver B (a second Store over the SAME backend) ADOPTS it (`adoptTree` +
+/// `precommit` + `publish`, exactly `adoptPart`). B's GC must fold B's adopted-root precommit `Add`
+/// (empty closure, un-expanded tree) without throwing, and reclaim nothing erroneously (dangling==0).
+TEST(CasGcAdoptedPrecommit, RelinkAdoptedRootFoldDoesNotThrow)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto sa = Store::open(b, PoolConfig{.pool_prefix = "p", .server_id = hexToU128("ffffffffffffffffffffffffffffffff")});
+    auto sb = Store::open(b, PoolConfig{.pool_prefix = "p", .server_id = hexToU128("00000000000000000000000000000001")});
+
+    const TreeId t = publishPart2Precommit(sa, RootNamespace{"srv_a/tbl"}, "all_1_1_0", "data-A", "mark-A");
+
+    /// Receiver B adopts the committed tree (present in the shared backend) and publishes its own ref —
+    /// the relink. `adoptTree` does not stage the tree, so B's precommit `Add` carries an empty closure.
+    auto build_b = sb->startBuild({});
+    build_b->adoptTree(t);
+    build_b->precommit(t);
+    build_b->publish(RootNamespace{"srv_b/tbl"}, "all_1_1_0", t, {});
+
+    Gc gc(sb, hexToU128("00000000000000000000000000000099"));
+    EXPECT_NO_THROW(runGcToFixpoint(gc))
+        << "GC must fold the adopted-root precommit Add (empty inline closure) by reading the committed "
+        << "tree, not throw LOGICAL_ERROR";
+
+    const FsckReport after = runFsck(*sb, /*detail=*/false);
+    EXPECT_EQ(after.dangling, 0u) << "the adopted closure stays reachable — no data loss";
+    /// Both refs resolve to T and its blobs are reachable.
+    EXPECT_TRUE(sb->resolveRef(RootNamespace{"srv_b/tbl"}, "all_1_1_0").has_value());
+}
+
+/// Rename/move path: `republishRef` adopts the source tree via `adoptEvidence` (tokenless) and
+/// precommits it — also an ADOPTED root with an empty inline closure. Same shared-backend, sender/
+/// receiver shape so the rename's precommit `Add` folds against an un-expanded tree.
+TEST(CasGcAdoptedPrecommit, RepublishAdoptedRootFoldDoesNotThrow)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto sa = Store::open(b, PoolConfig{.pool_prefix = "p", .server_id = hexToU128("ffffffffffffffffffffffffffffffff")});
+    auto sb = Store::open(b, PoolConfig{.pool_prefix = "p", .server_id = hexToU128("00000000000000000000000000000001")});
+
+    const TreeId t = publishPart2Precommit(sa, RootNamespace{"srv_a/tbl"}, "all_1_1_0", "data-A", "mark-A");
+
+    /// Mirror `republishRef`: adopt the tree by tokenless evidence, precommit, publish under the
+    /// destination ref. The adopted root is not staged, so the precommit `Add`'s inline closure is empty.
+    auto build_b = sb->startBuild({});
+    TreeEntry tree_evidence;
+    tree_evidence.placement = Placement::Subtree;
+    tree_evidence.file_hash = hexToU128(t.string());
+    tree_evidence.file_size = 0;
+    build_b->adoptEvidence(tree_evidence);
+    build_b->precommit(t);
+    build_b->publish(RootNamespace{"srv_b/tbl"}, "delete_tmp_all_1_1_0", t, {});
+
+    Gc gc(sb, hexToU128("00000000000000000000000000000099"));
+    EXPECT_NO_THROW(runGcToFixpoint(gc))
+        << "GC must fold the republished adopted-root precommit Add (empty inline closure) without throwing";
+
+    const FsckReport after = runFsck(*sb, /*detail=*/false);
+    EXPECT_EQ(after.dangling, 0u) << "the renamed/republished closure stays reachable — no data loss";
+    EXPECT_TRUE(sb->resolveRef(RootNamespace{"srv_b/tbl"}, "delete_tmp_all_1_1_0").has_value());
+}
+
 /// The displaced-and-vanished-tree leak repro that USED to live here (`DisplacedUnexpandedTreeBlobsLeak`)
 /// drove `build->publish(...)` DIRECTLY with NO precommit — a path production never takes. It has been
 /// rewritten to run through the GENUINE `ContentAddressedTransaction`/wiring entry point as
