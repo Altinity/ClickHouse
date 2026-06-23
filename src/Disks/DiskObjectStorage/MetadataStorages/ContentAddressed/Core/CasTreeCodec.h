@@ -32,6 +32,7 @@ struct TreeEntry
     UInt128 pack_hash{};       /// PackSlice only
     uint64_t pack_offset = 0;  /// PackSlice only (absolute offset within the pack object)
     uint64_t pack_length = 0;  /// PackSlice only
+    bool operator==(const TreeEntry &) const = default;
 };
 
 /// Encodes entries into the canonical payload. SORTS entries by name byte-wise; throws BAD_ARGUMENTS

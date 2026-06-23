@@ -333,7 +333,7 @@ TEST(CasStore, ResolveReadLocateRoundTrip)
     RootShard root;
     root.shard_version = 1;
     root.refs["part_1"] = RefPayload{
-        .tree_id = hexToU128(tree.string()), .tree_size = 0, .mutable_files = {{"txn_version.txt", "42"}}};
+        .tree_id = hexToU128(tree.string()), .tree_size = 0, .mutable_files = {{"txn_version.txt", "42"}}, .closure = {}};
     /// Place the manifest in the shard the Store will look in for "part_1".
     publishRaw(*b, layout, RootNamespace{"srv1/tbl"},
         shardOfForTest("part_1", s->poolMeta().root_shards), root);
@@ -371,7 +371,7 @@ TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
 
     RootShard root;
     root.shard_version = 1;
-    root.refs["part_1"] = RefPayload{.tree_id = u128Of("tree-part_1"), .tree_size = 7, .mutable_files = {}};
+    root.refs["part_1"] = RefPayload{.tree_id = u128Of("tree-part_1"), .tree_size = 7, .mutable_files = {}, .closure = {}};
     publishRaw(*b, layout, ns, shard, root);
 
     /// First resolve decodes + caches; second is a cache hit — both must see part_1.
@@ -414,7 +414,7 @@ TEST(CasStore, ListRefsMergesAllShards)
         const String ref(1, c);
         const UInt128 tree_id = u128Of("tree-" + ref);
         by_shard[shardOfForTest(ref, shards)].refs[ref] =
-            RefPayload{.tree_id = tree_id, .tree_size = 0, .mutable_files = {}};
+            RefPayload{.tree_id = tree_id, .tree_size = 0, .mutable_files = {}, .closure = {}};
     }
     for (auto & [shard, root] : by_shard)
     {
@@ -472,7 +472,7 @@ TEST(CasStore, ReadTreeFailsClosed)
         const UInt128 missing_tree = u128Of("missing");
         RootShard root;
         root.shard_version = 1;
-        root.refs["part_x"] = RefPayload{.tree_id = missing_tree, .tree_size = 0, .mutable_files = {}};
+        root.refs["part_x"] = RefPayload{.tree_id = missing_tree, .tree_size = 0, .mutable_files = {}, .closure = {}};
         publishRaw(*b, layout, ns, shardOfForTest("part_x", s->poolMeta().root_shards), root);
 
         auto r = s->resolveRef(ns, "part_x");
@@ -516,7 +516,7 @@ TEST(CasStore, DropRefAppendsJournalAtomically)
 
     RootShard root;
     root.shard_version = 1;
-    root.refs["part_1"] = RefPayload{.tree_id = tree_id, .tree_size = 7, .mutable_files = {}};
+    root.refs["part_1"] = RefPayload{.tree_id = tree_id, .tree_size = 7, .mutable_files = {}, .closure = {}};
     publishRaw(*b, layout, ns, shard, root);
 
     s->dropRef(ns, "part_1");
@@ -549,7 +549,7 @@ TEST(CasStore, UpdateRefPayloadMutatesWithoutJournal)
     RootShard root;
     root.shard_version = 3;
     root.refs["part_1"] = RefPayload{
-        .tree_id = tree_id, .tree_size = 11, .mutable_files = {{"txn_version.txt", "1"}}};
+        .tree_id = tree_id, .tree_size = 11, .mutable_files = {{"txn_version.txt", "1"}}, .closure = {}};
     publishRaw(*b, layout, ns, shard, root);
 
     const size_t journal_before = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes).journal.size();
@@ -591,7 +591,7 @@ TEST(CasStore, DropRefSurvivesCasConflict)
 
     RootShard root;
     root.shard_version = 1;
-    root.refs["part_1"] = RefPayload{.tree_id = tree_id, .tree_size = 7, .mutable_files = {}};
+    root.refs["part_1"] = RefPayload{.tree_id = tree_id, .tree_size = 7, .mutable_files = {}, .closure = {}};
     publishRaw(*b, layout, ns, shard, root);
 
     /// Inject one artificial Conflict: the loop must re-read the (unchanged) manifest and re-apply.
@@ -627,7 +627,7 @@ TEST(CasStore, DropNamespaceTombstonesAndRemovesFiles)
         const uint64_t shard = shardOfForTest(name, shards);
         by_shard[shard].shard_version = 1;
         by_shard[shard].refs[name] = RefPayload{
-            .tree_id = u128Of("tree-" + name), .tree_size = 3, .mutable_files = {}};
+            .tree_id = u128Of("tree-" + name), .tree_size = 3, .mutable_files = {}, .closure = {}};
     }
     for (const auto & [shard, root] : by_shard)
         publishRaw(*b, layout, ns, shard, root);

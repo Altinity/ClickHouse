@@ -479,12 +479,12 @@ TEST(CasRootShardCodec, RefsCanonicalOrderRegardlessOfInsertion)
     /// std::map already keeps refs name-sorted, but verify two manifests built in different insertion
     /// order encode byte-identically.
     RootShard a;
-    a.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}};
-    a.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
+    a.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}, {}};
+    a.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}, {}};
 
     RootShard b;
-    b.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
-    b.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}};
+    b.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}, {}};
+    b.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}, {}};
 
     EXPECT_EQ(encodeRootShard(a), encodeRootShard(b));
 }
@@ -566,8 +566,8 @@ TEST(CasRootShardCodec, ProtobufEncodingIsDeterministic)
     /// golden-test friendly. Includes refs (a map) and a journal (repeated, insertion order).
     RootShard rs;
     rs.shard_version = 5;
-    rs.refs["zzz"] = RefPayload{UInt128(0x1), 1, {{"b", "2"}, {"a", "1"}}};
-    rs.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
+    rs.refs["zzz"] = RefPayload{UInt128(0x1), 1, {{"b", "2"}, {"a", "1"}}, {}};
+    rs.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}, {}};
     rs.journal.push_back({JournalRecord::Op::Add, "zzz", UInt128(0x1), 5});
     EXPECT_EQ(encodeRootShard(rs), encodeRootShard(rs));
 }
@@ -597,6 +597,52 @@ TEST(CasRootShardCodec, ProtobufFutureCodecVersionThrowsNotImplemented)
     /// A protobuf manifest with codec_version=2 (field 1, varint) from a newer writer must fail
     /// closed, never be mis-read. Bytes: tag(field 1, varint)=0x08, value=2 (> current CODEC_VERSION=1).
     expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [] { decodeRootShard(String("\x08\x02", 2)); });
+}
+
+/// B199-S2: inline closure round-trip (nested staged entries).
+TEST(CasRootShardCodec, RefPayloadClosureRoundTrips)
+{
+    RootShard in;
+    in.shard_version = 7;
+
+    RefPayload pl;
+    pl.tree_id = UInt128(0x54);   /// 'T'
+    pl.tree_size = 55;
+
+    /// nested closure: tree T -> {Blob B1, Subtree S}; S -> {Blob B2}
+    ClosureNode nodeT;
+    nodeT.tree_hash = UInt128(0x54);   /// 'T'
+    {
+        TreeEntry e1;
+        e1.placement = Placement::Blob;
+        e1.file_hash = UInt128(0x4231);   /// 'B1'
+        e1.file_size = 52;
+        nodeT.entries.push_back(e1);
+
+        TreeEntry e2;
+        e2.placement = Placement::Subtree;
+        e2.file_hash = UInt128(0x53);     /// 'S'
+        e2.file_size = 10;
+        nodeT.entries.push_back(e2);
+    }
+    pl.closure.push_back(nodeT);
+
+    ClosureNode nodeS;
+    nodeS.tree_hash = UInt128(0x53);   /// 'S'
+    {
+        TreeEntry e;
+        e.placement = Placement::Blob;
+        e.file_hash = UInt128(0x4232);   /// 'B2'
+        e.file_size = 3;
+        nodeS.entries.push_back(e);
+    }
+    pl.closure.push_back(nodeS);
+
+    in.refs["4815"] = pl;
+
+    const RootShard out = decodeRootShard(encodeRootShard(in));
+    ASSERT_TRUE(out.refs.contains("4815"));
+    EXPECT_EQ(out.refs.at("4815").closure, pl.closure);
 }
 
 /// ===================================================================================

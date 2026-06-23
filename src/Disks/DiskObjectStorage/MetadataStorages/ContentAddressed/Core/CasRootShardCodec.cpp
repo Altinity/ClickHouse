@@ -5,6 +5,7 @@
 #include <Common/Exception.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+#include <cstdint>
 
 namespace DB
 {
@@ -65,6 +66,59 @@ JournalRecord::Op journalOpFromProto(Cas::Proto::JournalOp op, std::string_view 
     }
 }
 
+uint32_t placementToProto(Placement p)
+{
+    return static_cast<uint32_t>(p);
+}
+
+Placement placementFromProto(uint32_t v, std::string_view what)
+{
+    switch (v)
+    {
+        case static_cast<uint32_t>(Placement::Inline):    return Placement::Inline;
+        case static_cast<uint32_t>(Placement::Blob):      return Placement::Blob;
+        case static_cast<uint32_t>(Placement::PackSlice): return Placement::PackSlice;
+        case static_cast<uint32_t>(Placement::Subtree):   return Placement::Subtree;
+        default:
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: unknown placement value {} in closure entry", what, v);
+    }
+}
+
+Cas::Proto::ClosureNodeProto encodeClosureNode(const ClosureNode & node)
+{
+    Cas::Proto::ClosureNodeProto pn;
+    pn.set_tree_hash(u128ToBytes(node.tree_hash));
+    for (const auto & e : node.entries)
+    {
+        auto * pe = pn.add_entries();
+        pe->set_placement(placementToProto(e.placement));
+        pe->set_file_hash(u128ToBytes(e.file_hash));
+        pe->set_file_size(e.file_size);
+        if (e.placement == Placement::PackSlice)
+            pe->set_pack_hash(u128ToBytes(e.pack_hash));
+    }
+    return pn;
+}
+
+ClosureNode decodeClosureNode(const Cas::Proto::ClosureNodeProto & pn)
+{
+    ClosureNode node;
+    node.tree_hash = u128FromBytes(pn.tree_hash(), "closure node tree_hash");
+    node.entries.reserve(static_cast<size_t>(pn.entries_size()));
+    for (const auto & pe : pn.entries())
+    {
+        TreeEntry e;
+        e.placement = placementFromProto(pe.placement(), "closure node entry");
+        e.file_hash = u128FromBytes(pe.file_hash(), "closure node entry file_hash");
+        e.file_size = pe.file_size();
+        if (e.placement == Placement::PackSlice && !pe.pack_hash().empty())
+            e.pack_hash = u128FromBytes(pe.pack_hash(), "closure node entry pack_hash");
+        node.entries.push_back(std::move(e));
+    }
+    return node;
+}
+
 }
 
 String encodeRootShard(const RootShard & root)
@@ -83,6 +137,8 @@ String encodeRootShard(const RootShard & root)
         auto & mf = *p.mutable_mutable_files();
         for (const auto & [k, v] : payload.mutable_files)
             mf[k] = v;
+        for (const auto & node : payload.closure)
+            *p.add_closure() = encodeClosureNode(node);
         refs[name] = std::move(p);
     }
 
@@ -135,6 +191,9 @@ RootShard decodeRootShard(std::string_view data)
         payload.tree_size = p.tree_size();
         for (const auto & [k, v] : p.mutable_files())
             payload.mutable_files[k] = v;
+        payload.closure.reserve(static_cast<size_t>(p.closure_size()));
+        for (const auto & pn : p.closure())
+            payload.closure.push_back(decodeClosureNode(pn));
         root.refs[name] = std::move(payload);
     }
 

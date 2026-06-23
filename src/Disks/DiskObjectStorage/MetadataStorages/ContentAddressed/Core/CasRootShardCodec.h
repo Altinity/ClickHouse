@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
@@ -24,6 +25,17 @@ namespace DB::Cas
 /// key / wrong type / bad enum string / bad hash hex / malformed document => CORRUPTED_DATA; future
 /// version => NOT_IMPLEMENTED).
 
+/// One tree node of a precommit's inline closure: the node's tree hash and its staged entries.
+/// Only placement/file_hash/file_size/pack_hash are serialized (the closure only feeds the GC walk;
+/// name/inline_bytes/pack_offset/pack_length are NOT needed and intentionally omitted — decode sets
+/// them to their defaults).
+struct ClosureNode
+{
+    UInt128 tree_hash{};
+    std::vector<TreeEntry> entries;
+    bool operator==(const ClosureNode &) const = default;
+};
+
 /// The per-ref payload: the content tree plus the mutable per-ref files (txn_version.txt,
 /// metadata_version.txt, ...) that are excluded from the content hash and live here per-ref.
 struct RefPayload
@@ -31,6 +43,8 @@ struct RefPayload
     UInt128 tree_id{};
     uint64_t tree_size = 0;
     std::map<String, String> mutable_files;
+    std::vector<ClosureNode> closure;   /// populated only for precommit refs (B199-S2)
+    bool operator==(const RefPayload &) const = default;
 };
 
 /// One reachability-delta record appended on publish.

@@ -21,10 +21,28 @@ package DB.Cas.Proto;
 //  * proto3 silently ignores unknown fields (unlike the old strict-JSON decode) — codec_version is
 //    the deliberate "an old reader must STOP here" signal for the cases where silence would be wrong.
 
+// Serialized form of a single DB.Cas.TreeEntry for closure storage.
+// Only the fields needed by the GC walk are serialized; name/inline_bytes/
+// pack_offset/pack_length are intentionally omitted (decode leaves them at defaults).
+message TreeEntryProto {
+  uint32 placement = 1;   // DB.Cas.Placement enum value (Inline=1, Blob=2, PackSlice=3, Subtree=4)
+  bytes  file_hash = 2;   // raw 16 bytes (UInt128, big-endian); blob/pack/subtree hash
+  uint64 file_size = 3;
+  bytes  pack_hash = 4;   // raw 16 bytes; PackSlice only
+}
+
+// One tree node in a precommit's inline closure: the node's tree hash and its staged entries.
+// An ADDITIVE field (field 4 of RefPayload); old readers skip it.
+message ClosureNodeProto {
+  bytes tree_hash = 1;                    // raw 16 bytes (UInt128, big-endian)
+  repeated TreeEntryProto entries = 2;
+}
+
 message RefPayload {
-  bytes tree_id = 1;                  // raw 16 bytes (UInt128, big-endian)
+  bytes tree_id = 1;                      // raw 16 bytes (UInt128, big-endian)
   uint64 tree_size = 2;
   map<string, string> mutable_files = 3;
+  repeated ClosureNodeProto closure = 4;  // NEW (B199-S2); empty for non-precommit refs
 }
 
 enum JournalOp {
