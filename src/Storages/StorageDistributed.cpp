@@ -876,7 +876,7 @@ ColumnNameToColumnNodeMap buildColumnNodesForTableExpression(const QueryTreeNode
 
     // Rebuild per-column nodes (including ALIAS expressions) for the replacement table expression.
     const auto & storage_snapshot = table_node ? table_node->getStorageSnapshot() : table_function_node->getStorageSnapshot();
-    auto get_column_options = GetColumnsOptions(GetColumnsOptions::All).withVirtuals();
+    auto get_column_options = GetColumnsOptions(GetColumnsOptions::All).withVirtuals(VirtualsKind::All, VirtualsMaterializationPlace::All);
     if (storage_snapshot->storage.supportsSubcolumns())
         get_column_options.withSubcolumns();
 
@@ -1195,7 +1195,7 @@ void StorageDistributed::read(
     std::vector<SelectQueryInfo> additional_query_infos;
 
     const auto & settings = local_context->getSettingsRef();
-    auto metadata_ptr = getInMemoryMetadataPtr();
+    auto metadata_ptr = getInMemoryMetadataPtr(local_context, false);
 
     auto describe_segment_target = [&](const HybridSegment & segment) -> String
     {
@@ -1362,36 +1362,11 @@ void StorageDistributed::read(
             is_remote_function,
             additional_query_infos);
 
-<<<<<<< HEAD
-    auto shard_filter_generator = ClusterProxy::getShardFilterGeneratorForCustomKey(
-        *modified_query_info.getCluster(), local_context, getInMemoryMetadataPtr(local_context, false)->columns);
-
-    ClusterProxy::executeQuery(
-        query_plan,
-        header,
-        processed_stage,
-        remote_storage,
-        remote_table_function_ptr,
-        select_stream_factory,
-        log,
-        local_context,
-        modified_query_info,
-        sharding_key_expr,
-        sharding_key_column_name,
-        *distributed_settings,
-        shard_filter_generator,
-        is_remote_function);
-
-    /// This is possible when skip_unavailable_shards is enabled and all shards were skipped
-    /// (e.g., every shard had a missing table with no remote replicas).
-    if (!query_plan.isInitialized())
-        throw Exception(ErrorCodes::ALL_CONNECTION_TRIES_FAILED, "No available shards to query");
-=======
-        /// This is a bug, it is possible only when there is no shards to query, and this is handled earlier.
+        /// This is possible when skip_unavailable_shards is enabled and all shards were skipped
+        /// (e.g., every shard had a missing table with no remote replicas).
         if (!query_plan.isInitialized())
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Pipeline is not initialized");
+            throw Exception(ErrorCodes::ALL_CONNECTION_TRIES_FAILED, "No available shards to query");
     }
->>>>>>> bdef614e1f2 (Merge pull request #1694 from Altinity/feature/antalya-26.3/pr-1442)
 }
 
 
@@ -2402,8 +2377,11 @@ void StorageDistributed::setHybridLayout(std::vector<HybridSegment> segments_)
 
     auto virtuals = createVirtuals();
     // or _segment_index?
-    virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in Hybrid (0 for main table, 1+ for additional segments)");
-    setVirtuals(virtuals);
+    virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in Hybrid (0 for main table, 1+ for additional segments)", VirtualsMaterializationPlace::Reader);
+
+    StorageInMemoryMetadata new_metadata = *getInMemoryMetadataPtr(nullptr, false);
+    new_metadata.setVirtuals(virtuals);
+    setInMemoryMetadata(new_metadata);
 }
 
 void StorageDistributed::setCachedColumnsToCast(ColumnsDescription columns)
@@ -2754,7 +2732,7 @@ void registerStorageHybrid(StorageFactory & factory)
                     ColumnsDescription segment_columns;
 
                     if (validated_table)
-                        segment_columns = validated_table->getInMemoryMetadataPtr()->getColumns();
+                        segment_columns = validated_table->getInMemoryMetadataPtr(local_context, false)->getColumns();
 
                     validate_segment_schema(segment_columns, storage_id.getNameForLogs());
 
