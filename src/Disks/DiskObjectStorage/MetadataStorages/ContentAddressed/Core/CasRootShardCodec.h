@@ -15,15 +15,14 @@ namespace DB::Cas
 /// One manifest names a set of refs → their tree, plus the per-ref mutable sidecar files and
 /// an embedded reachability journal.
 ///
-/// Non-hashed metadata object => STRICT JSON (spec §4 encoding split, decision 2026-06-11):
-///   {"format":"cas_root_shard","version":1,"shard_version":7,"fence_round":2,
-///    "refs":{"ref_1":{"tree":"<32 lowercase hex>","tree_size":123,
-///                      "mutable_files":{"txn_version.txt":"42"}}},
-///    "journal":[{"op":"add","ref":"ref_1","tree":"<32 lowercase hex>","at_version":7}]}
-/// `refs` is a JSON object keyed by ref name (name-sorted, std::map order); `journal` is an array in
-/// insertion order. `op`: "add" | "remove". Fail-closed decode (wrong format / unknown key / missing
-/// key / wrong type / bad enum string / bad hash hex / malformed document => CORRUPTED_DATA; future
-/// version => NOT_IMPLEMENTED).
+/// Non-hashed metadata object => binary protobuf (`Proto/cas_root_shard.proto`, `RootShardManifest`,
+/// B164a; replaced the earlier strict-JSON encoding). The manifest is CAS-by-token, not
+/// content-addressed, so byte-determinism is not a correctness requirement; the encoder still
+/// serializes deterministically (name-sorted refs via std::map; journal in insertion order). `refs`
+/// maps ref name → its tree + per-ref mutable sidecar files; `journal` is the reachability-delta list
+/// (`op`: add | remove). Fail-closed decode (unknown/missing required field / wrong type / bad hash
+/// length / bad enum => CORRUPTED_DATA; a future `codec_version` => NOT_IMPLEMENTED). Introspect a raw
+/// manifest offline with `protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto`.
 
 /// One tree node of a precommit's inline closure: the node's tree hash and its staged entries.
 /// Rides the precommit-namespace journal `Add` record (B199-S2): it survives the commit/abandon
