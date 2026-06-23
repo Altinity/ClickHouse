@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import html
 import os
 import sys
 import time
@@ -194,11 +195,13 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> pd.DataFram
             )
         pr = response.json()
         label_names = [l["name"] for l in pr.get("labels", [])]
+        # Escape at collection time so untrusted PR data cannot inject HTML
+        # regardless of how columns are later rendered.
         rows.append(
             {
-                "pr_name": pr.get("title", ""),
+                "pr_name": html.escape(str(pr.get("title", "")), quote=True),
                 "pr_number": pr_number,
-                "pr_labels": ", ".join(sorted(label_names)),
+                "pr_labels": html.escape(", ".join(sorted(label_names)), quote=True),
             }
         )
     return pd.DataFrame(rows)
@@ -808,7 +811,11 @@ def url_to_html_link(url: str) -> str:
 
 
 def format_pr_labels_with_verification(labels: str) -> str:
-    """Format the PR labels with verification."""
+    """Format the PR labels with verification.
+
+    Expects ``labels`` to be already HTML-escaped at collection time
+    (see _enrich_prs_in_release_merge_prs).
+    """
     labels_list = labels.split(", ")
     if "verified" in labels_list:
         return labels
@@ -849,6 +856,9 @@ def format_results_as_html_table(results) -> str:
 
     results.columns = [format_col_name(col) for col in results.columns]
 
+    # NOTE: to_html is called with escape=False, so any new column carrying
+    # untrusted text must either be HTML-escaped at collection time or have an
+    # explicit formatter below that escapes it.
     formatters = {
         "Results Link": url_to_html_link,
         "Test Name": format_test_name_for_linewrap,
