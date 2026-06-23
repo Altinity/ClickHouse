@@ -96,15 +96,25 @@ CONSTANTS
                         \* TRUE  = fix  (precommit edge protects reachable present objects)
     FailClosedCommit,   \* FALSE = buggy (commit publishes table ref with no presence check)
                         \* TRUE  = fix  (commit verifies full closure present, else aborts)
-    InlineClosure       \* FALSE = old lazy path (closure recorded only if tree readable -> S2 leak)
+    InlineClosure,      \* FALSE = old lazy path (closure recorded only if tree readable -> S2 leak)
                         \* TRUE  = fix  (precommit records closure inline; GC seeds + reclaims from it)
+    BuildTree,          \* \in Trees        the abandoned-precommit's manifest tree; it references ALL
+                        \*                  of Blobs (the shared blob(s) PLUS any unique-to-this-build).
+    UniqueToBuildTree   \* SUBSET Blobs     blobs referenced ONLY by BuildTree (unique to that build);
+                        \*                  other trees reference Blobs \ UniqueToBuildTree (the shared
+                        \*                  part). {} reproduces the single-shared-blob topology.
 
 ASSUME Trees \cap Blobs = {}
+ASSUME BuildTree \in Trees
+ASSUME UniqueToBuildTree \subseteq Blobs
 Hashes == Trees \cup Blobs
 None    == "none"
 
-\* Both trees reference the single shared blob (dedup); this is the load-bearing topology.
-Children(t) == Blobs
+\* A tree references its subset of blobs (dedup: distinct trees may share a blob). The BuildTree
+\* references everything (shared + its unique blobs); every other tree references only the shared part.
+\* This makes "unique vs shared" expressible without inline cfg function literals (the TLC cfg parser
+\* rejects @@/:> as a constant value): the per-tree map is derived from two simple model-value constants.
+Children(t) == IF t = BuildTree THEN Blobs ELSE (Blobs \ UniqueToBuildTree)
 Reach(t)    == {t} \cup Children(t)
 
 VARIABLES
@@ -504,4 +514,20 @@ W_LiveFrozenReclaimDeleteReached ==
         /\ bld \in judgedDead
         /\ precommit[bld] = None
         /\ \E b \in adopted[bld] : ~present[b])
+
+\* W5 (b2 config only -- requires Blobs={b1,b2}, TreeBlobs=(t1:>{b1} @@ t2:>{b1,b2})): the
+\* SHARED-vs-UNIQUE outcome is reached. A blob b is "shared" if it is in a committed table ref's
+\* closure; the abandoned precommit also referenced it. After abandonment + reclaim, the SHARED blob
+\* (b1, pinned by committed t1) stays PRESENT, while the abandoned build's UNIQUE blob (b2, referenced
+\* ONLY by the reclaimed precommit t2) has been RECLAIMED. NEGATED probe: TLC reports it violated
+\* exactly when this exact "shared spared AND unique reclaimed" state is reachable.
+W_SharedSparedUniqueReclaimed ==
+    ~(\E sh \in Blobs, uq \in Blobs :
+        /\ sh # uq
+        /\ PinnedByTable(sh)            \* shared blob: held by a committed table ref
+        /\ present[sh]                  \*   -> spared
+        /\ ~PinnedByTable(uq)           \* unique blob: NOT held by any committed ref
+        /\ uq \in staged                \*   -> it was a staged member of some (now abandoned) precommit
+        /\ ~present[uq]                 \*   -> reclaimed
+        /\ (\A bld \in Builds : ~buildLive[bld]))  \* all builds abandoned
 =================================================================================

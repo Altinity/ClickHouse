@@ -225,12 +225,16 @@ the ≤2 builds / ≤2 objects bound). `TLC` v2.19, OpenJDK 21, `-workers auto`.
 
 | cfg | flags | spec | result | distinct states |
 |---|---|---|---|---|
-| `CaBuildRootPrecommit_fixed.cfg`          | UBR=T, FCC=T, IC=T | `Spec`     | **clean** (all 4 safety invariants) | **45161** |
-| `CaBuildRootPrecommit_buggy.cfg`          | UBR=F, FCC=F, IC=T | `Spec`     | `INV_NO_DANGLE_COMMITTED` violated (CE preserved) | 484 (to CE) |
-| `CaBuildRootPrecommit_buildrootonly.cfg`  | UBR=T, FCC=F, IC=T | `Spec`     | `INV_NO_DANGLE_COMMITTED` violated (CE preserved) | 3357 (to CE) |
-| `CaBuildRootPrecommit_failclosedonly.cfg` | UBR=F, FCC=T, IC=T | `Spec`     | clean (closure/snap inert under UBR=F) | 2193 |
-| **`CaBuildRootPrecommit_inlineclosure.cfg`** | **UBR=T, FCC=T, IC=T** | **`FairSpec`** | **clean** — safety + **`INV_NO_LEAK` HOLDS** | **45161** |
-| `CaBuildRootPrecommit_lazyleak.cfg`       | UBR=T, FCC=T, IC=**F** | `FairSpec` | **`INV_NO_LEAK` VIOLATED** — S2 leak reproduced | 71953 (to CE) |
+| `CaBuildRootPrecommit_fixed.cfg`          | UBR=T, FCC=T, IC=T, b1 | `Spec`     | **clean** (all 4 safety invariants) | **45161** |
+| `CaBuildRootPrecommit_buggy.cfg`          | UBR=F, FCC=F, IC=T, b1 | `Spec`     | `INV_NO_DANGLE_COMMITTED` violated (CE preserved) | ~505 (to CE)* |
+| `CaBuildRootPrecommit_buildrootonly.cfg`  | UBR=T, FCC=F, IC=T, b1 | `Spec`     | `INV_NO_DANGLE_COMMITTED` violated (CE preserved) | ~3031 (to CE)* |
+| `CaBuildRootPrecommit_failclosedonly.cfg` | UBR=F, FCC=T, IC=T, b1 | `Spec`     | clean (closure/snap inert under UBR=F) | 2193 |
+| **`CaBuildRootPrecommit_inlineclosure.cfg`** | **UBR=T, FCC=T, IC=T, b1** | **`FairSpec`** | **clean** — safety + **`INV_NO_LEAK` HOLDS** | **45161** |
+| `CaBuildRootPrecommit_lazyleak.cfg`       | UBR=T, FCC=T, IC=**F**, b1 | `FairSpec` | **`INV_NO_LEAK` VIOLATED** — S2 leak reproduced | 71953 (to CE) |
+| **`CaBuildRootPrecommit_inlineclosure_b2.cfg`** | **UBR=T, FCC=T, IC=T, b1+b2** | **`FairSpec`** | **clean** — safety + **`INV_NO_LEAK` HOLDS** (shared-spared + unique-reclaimed) | **310993** |
+
+(* "to CE" counts are reported at counterexample discovery and vary slightly with parallel-worker
+scheduling; the verdict — `INV_NO_DANGLE_COMMITTED` violated — is deterministic.)
 
 No deadlock (`CHECK_DEADLOCK FALSE` on the fair configs, as the model legitimately reaches
 terminal quiescent states). The legacy 2×2 safety results are **unchanged in verdict** (state
@@ -238,6 +242,14 @@ counts shifted from the extra `closure`/`uploaded`/`everSnapped`/`staged` state:
 45161; `failclosedonly` 2193 unchanged since the new logic is inert under `UseBuildRoot=FALSE`).
 The fixed config remains **non-vacuous** (witness `W_BuildRootProtectReached` still reported
 reachable under the new state).
+
+**Per-tree blob references (topology parameter).** To make "unique vs shared" expressible,
+`Children(t)` is now derived from two model-value constants instead of the old `Children(t)==Blobs`:
+`BuildTree` (the abandoned-precommit's manifest tree, which references all of `Blobs`) and
+`UniqueToBuildTree` (blobs referenced *only* by `BuildTree`); every other tree references
+`Blobs \ UniqueToBuildTree`. With `UniqueToBuildTree={}` this reproduces the original
+single-shared-blob topology exactly (verified: `fixed`/`failclosedonly` state counts and all
+verdicts unchanged).
 
 ### `INV_NO_LEAK` holds — and the leak is real
 
@@ -254,15 +266,51 @@ reachable under the new state).
   `b1 ∉ everSnapped` → `GcDelete` can **never** fire → `b1` leaks forever. This is exactly the
   never-expanded-tree S2 leak; the inline closure (IC=T) closes it by construction.
 
+### Two-blob run: shared spared, unique reclaimed (`Blobs={b1,b2}`)
+
+The single-blob model exercises the leak only indirectly (every tree shares the one blob). The
+`inlineclosure_b2` config makes the S2 prose literal — *"the abandoned build's unique blobs leak;
+shared blobs stay spared"* — with `Blobs={b1,b2}`, `BuildTree=t2`, `UniqueToBuildTree={b2}`:
+
+- `t1 → {b1}` — a committed table ref over the **shared** blob `b1`.
+- `t2 → {b1, b2}` — an abandoned precommit's manifest tree over the shared `b1` **plus** a blob
+  `b2` **unique** to that build.
+
+**Result: clean, exhaustive over 310993 distinct states** — all four safety invariants **and**
+`INV_NO_LEAK` hold. Both halves are confirmed explicitly:
+
+- **Shared spared.** `INV_NO_DANGLE_COMMITTED` guarantees `b1` (in committed `t1`'s closure) stays
+  present even after `t2`'s build is abandoned and reclaimed — `t1`'s edge keeps `b1` pinned, so
+  `GcDelete` never fires on it. The shared blob is spared by pure edge arithmetic (two distinct
+  `tree→b1` edges; reclaiming `t2`'s does not drop `t1`'s).
+- **Unique reclaimed.** `INV_NO_LEAK` guarantees `b2` (referenced only by the abandoned `t2`,
+  recorded in its inline closure → snapped) is eventually reclaimed: after `GcReclaimPrecommit`
+  mirror-drops `t2`'s closure, `b2` is a visible in-degree-0 object that `GcDelete` removes.
+
+Non-vacuity: the negated reachability probe `W_SharedSparedUniqueReclaimed`
+(`CaBuildRootPrecommit_b2_witness.cfg`) is reported **violated == reachable** — TLC actually reaches
+a state with all builds abandoned, `b1` present (shared, table-pinned) and `b2` not present
+(unique, reclaimed). So the green b2 result is *because the fix spares-and-reclaims correctly*, not
+because the topology is never exercised.
+
+### Caveat — flat manifests only (subtree recursion is gtest-covered, not modeled here)
+
+This is a **flat** model: a tree references blobs directly, with **no nested subtrees**. The design's
+subtree recursion / nested-manifest handling (design §2's `walk` recursing on `Subtree`, §3's
+inline-sourced expansion of subtrees) is validated by the C++ gtest (the new nested-manifest test in
+`src/Disks/tests/gtest_cas_gc_leak.cpp`), **not** by this model. A green result here is **not** a
+claim about the recursion fix.
+
 ### Run
 
 ```
 cd docs/superpowers/models
 JAR=../../../tmp/tla2tools.jar
-# safety 2x2 (unchanged verdicts) + the two B199-S2 liveness configs:
-for cfg in fixed buggy buildrootonly failclosedonly inlineclosure lazyleak ; do
+# safety 2x2 (unchanged verdicts) + the B199-S2 liveness configs (single-blob and two-blob):
+for cfg in fixed buggy buildrootonly failclosedonly inlineclosure lazyleak inlineclosure_b2 ; do
   java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -metadir ../../../tmp/tlc-meta-brp-$cfg \
        -workers auto -config CaBuildRootPrecommit_$cfg.cfg CaBuildRootPrecommit.tla
 done
-# inlineclosure => clean (INV_NO_LEAK holds) ; lazyleak => INV_NO_LEAK violated (S2 leak reproduced)
+# inlineclosure, inlineclosure_b2 => clean (INV_NO_LEAK holds) ; lazyleak => INV_NO_LEAK violated.
+# b2 non-vacuity: run CaBuildRootPrecommit_b2_witness.cfg => W_SharedSparedUniqueReclaimed reachable.
 ```
