@@ -32,14 +32,29 @@ object (operator constraint): the closure lives in the precommit ref payload we 
 
 ## Design
 
-### 1. Inline closure in the precommit `RefPayload`
-`RefPayload` (`Core/CasRootShardCodec.h:29`, protobuf via `cas_root_shard.proto`, B164a) gains an inline
-closure — the staged `[TreeEntry]` structure the build already built in `stageTree` (nested; adopted
+### 1. Inline closure on the precommit journal `Add` record
+The closure lives on the precommit's **journal `Add` record** (`JournalRecord`, `Core/CasRootShardCodec.h`,
+protobuf via `Proto/cas_root_shard.proto`, B164a) — **not** on `RefPayload`. The record gains an inline
+closure: the staged `[TreeEntry]` structure the build already built in `stageTree` (nested; adopted
 subtrees recorded as **leaf** roots, since their children are protected by the live source they were
-adopted from and must not be reclaimed with this build). Populated **only for precommit refs**; table
-refs keep just `tree_id`.
+adopted from and must not be reclaimed with this build). Populated **only on precommit-namespace `Add`
+records**; table-namespace records and all `Remove` records keep just `tree_id`.
 
-The closure is **always populated** on every precommit. The feature is in development with **no prod
+**Why the `Add` record and not `RefPayload` (load-bearing — earlier framing was wrong).** GC protects a
+precommit by **folding its journal `Add`**, and it must source the closure at that fold. But the
+`RefPayload` is **erased before the `Add` is folded**: `Build::publish` does `refs.erase` + a `Remove`
+record on commit (`CasBuild.cpp:1012`), and `reclaimAbandonedPrecommit` does the same on abandon
+(`CasGc.cpp:1947-1953`). A closure on `RefPayload` is therefore gone (`root.refs.at(ref)` →
+`key not found`) by the time the abandoned-build `Add` folds — exactly the S2 path we must close. The
+journal `Add` record **survives** both commit-erase and table-ref displacement; it is removed only by
+`trim` (`CasGc.cpp:169`) **after** the record is folded into the durable snap. So the `Add` record is the
+only carrier that is present precisely when GC needs it.
+
+This is **not** journal refcounting. It is **one** bounded closure list on the **single** precommit `Add`
+record — transient (precommit-namespace only, trimmed once folded), sized by one build's staged tree. It
+is NOT a per-blob `+1`/`-1` stream of journal records (that *would* be refcounting and is rejected).
+
+The closure is **always populated** on every precommit `Add`. The feature is in development with **no prod
 users and no pre-existing precommit objects**, so there is NO old-precommit / empty-closure case to
 support and NO fallback to the old lazy tree-read (see §3 — the precommit tree-read is deleted outright).
 The protobuf field being technically optional is just a codec detail, not a runtime contingency.
@@ -75,9 +90,11 @@ walk(root, entriesOf, visit):
 ### 3. Precommit protection = inline-sourced expansion (not a tree read)
 On folding a precommit `Add`, do exactly what expansion does today — `addRootEdge(shard, build_seq,
 manifest_tree)` then per-child `addTreeEdge`/`addPackEdge` + `markExpanded(manifest_tree)` — but source
-the children from the **inline closure** (`walk(manifest_tree, entriesOf=inline, addTreeEdge)`) instead of
-`readTree`. The resulting snap state (root edge + tree edges + marker) is **identical** to a committed
-expansion; the only difference is where the entries came from. Consequences:
+the children from the **inline closure on the `Add` record itself** (`record.closure`, via
+`walk(manifest_tree, entriesOf=inline, addTreeEdge)`) instead of `readTree`. The closure is read from the
+folding `JournalRecord` in hand — **never** from `root.refs` (which may already be erased; §1). The
+resulting snap state (root edge + tree edges + marker) is **identical** to a committed expansion; the only
+difference is where the entries came from. Consequences:
 - The precommit `Add` fold **no longer reads the tree** ⇒ **delete** the precommit branch of expansion:
   the `readTree` for precommit refs and the precommit pending-tolerance/404 path (`CasGc.cpp:1307-1316`).
   The displaced/`FailClosed` handling for **table** namespaces is unchanged.
@@ -118,11 +135,13 @@ recorded list; abort/reclaim drops them; a closure member may be never-uploaded 
 is eventually reclaimed). TLC clean within bounds is a gate before/with implementation.
 
 ## Files
-- `Core/CasRootShardCodec.{h}` + `cas_root_shard.proto` — `RefPayload` inline closure field (+ codec).
-- `Core/CasBuild.cpp` — `Build::precommit` populates the inline closure from staging.
+- `Core/CasRootShardCodec.{h}` + `Proto/cas_root_shard.proto` — `JournalRecord` inline closure field
+  (+ codec); `RefPayload` carries NO closure.
+- `Core/CasBuild.cpp` — `Build::precommit` populates the inline closure on the `Add` journal record it
+  appends (from staging, in-memory).
 - `Core/CasGc.cpp` — refactor fold-expand onto the unified walk; precommit `Add` → expand via the walk
-  with the **inline** source; **delete** the precommit tree-read + pending-tolerance branch.
-  `reclaimAbandonedPrecommit` is unchanged (existing `Remove`→cascade; §4).
+  with the **inline** source read from `record.closure`; **delete** the precommit tree-read +
+  pending-tolerance branch. `reclaimAbandonedPrecommit` is unchanged (existing `Remove`→cascade; §4).
 - `Core/CasGcSnap.{h,cpp}` — **no new edge helpers needed**: inline-sourced expansion reuses
   `addRootEdge`/`addTreeEdge`/`markExpanded` and reclaim reuses `removeRootEdge`/`stripTree` exactly as
   the committed path does. (Touch only if the unified-walk refactor wants a small shared helper.)

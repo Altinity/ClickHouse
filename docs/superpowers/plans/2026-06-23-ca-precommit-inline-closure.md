@@ -4,7 +4,7 @@
 
 **Goal:** Close the never-expanded-tree GC leak (B199-S2) by construction: the precommit ref carries its staged closure inline, so GC expands a precommit from that inline data (never reading the tree object), and the existing `Remove`→cascade (+ B199-S1) releases the closure on abandon.
 
-**Architecture:** Add an inline `closure` (the staged `[TreeEntry]` per tree node) to the precommit `RefPayload`. Extract the three near-duplicate closure traversals into ONE `walk(root, entriesOf, visit)` parameterized by a child *source* (`inline` | `backend=readTree`) and a *visitor* (`fold-addEdge` | `fsck-reachable`). On folding a precommit `Add`, expand via the walk with the inline source — identical snap state to a committed expansion, but no `readTree` and no 404 — then delete the precommit tree-read/pending-tolerance branch. Reclaim is unchanged (existing `Remove`→`removeRootEdge`→cascade; B199-S1 covers the absent-tree case). The traversal unification also fixes a latent fold-expand subtree-recursion gap.
+**Architecture:** Add an inline `closure` (the staged `[TreeEntry]` per tree node) to the precommit **journal `Add` record** (`JournalRecord`) — NOT to `RefPayload`. (Load-bearing: `RefPayload` is erased on commit/reclaim *before* GC folds the `Add`, so a closure there is gone exactly on the S2 path; the journal `Add` record survives commit-erase + displacement and is removed only by `trim` after it is folded.) Extract the three near-duplicate closure traversals into ONE `walk(root, entriesOf, visit)` parameterized by a child *source* (`inline` | `backend=readTree`) and a *visitor* (`fold-addEdge` | `fsck-reachable`). On folding a precommit `Add`, expand via the walk with the inline source read from `record.closure` — identical snap state to a committed expansion, but no `readTree` and no 404 — then delete the precommit tree-read/pending-tolerance branch. Reclaim is unchanged (existing `Remove`→`removeRootEdge`→cascade; B199-S1 covers the absent-tree case). The traversal unification also fixes a latent fold-expand subtree-recursion gap.
 
 **Tech Stack:** C++ (ClickHouse `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`), protobuf (`cas_root_shard.proto`), gtest (`src/Disks/tests/`), TLA+/TLC (`docs/superpowers/models/`). Build dir `build/`; unit binary `build/src/unit_tests_dbms`. Branch `cas-vfs-path-mapping` (NOT master).
 
@@ -15,11 +15,11 @@
 ## File structure (what each touched file is responsible for)
 
 - `Core/CasTreeCodec.h` — `TreeEntry` (already defined: `name`, `placement`, `file_hash`, `file_size`, `inline_bytes`, `pack_hash`, `pack_offset`, `pack_length`). No change; consumed.
-- `cas_root_shard.proto` + `Core/CasRootShardCodec.{h,cpp}` — `RefPayload` gains a nested `closure` (a list of `{tree_hash, [entry]}` nodes). Codec encodes/decodes it (additive field, no `codec_version` bump).
+- `Proto/cas_root_shard.proto` + `Core/CasRootShardCodec.{h,cpp}` — `JournalRecord` gains a nested `closure` (a list of `{tree_hash, [entry]}` nodes); `RefPayload` carries NO closure. Codec encodes/decodes it on journal records (additive field, no `codec_version` bump).
 - `Core/CasClosureWalk.{h,cpp}` — NEW: the single `walk(root, entriesOf, visit)` traversal + the two source adapters and the visitor typedef. One responsibility: recurse a manifest closure given a child source.
-- `Core/CasGc.cpp` — `foldShardRecords` calls `walk(..., backendSource)` for table refs and `walk(..., inlineSource)` for precommit refs; the precommit `readTree`/pending-tolerance branch is deleted. `reclaimAbandonedPrecommit` unchanged.
+- `Core/CasGc.cpp` — `foldShardRecords` calls `walk(..., backendSource)` for table refs and `walk(..., inlineSource over record.closure)` for precommit refs; the precommit `readTree`/pending-tolerance branch is deleted. `reclaimAbandonedPrecommit` unchanged.
 - `Core/CasFsck.cpp` — `walk` lambda replaced by a call into `CasClosureWalk` with the backend source + a reachability visitor.
-- `Core/CasBuild.cpp` — `Build::precommit` fills `RefPayload.closure` from the staged tree structure.
+- `Core/CasBuild.cpp` — `Build::precommit` fills the `Add` journal record's `closure` from the staged tree structure.
 - `docs/superpowers/models/CaBuildRootPrecommit.tla` — model the inline-closure protect/reclaim; TLC gate.
 - `src/Disks/tests/gtest_cas_*.cpp` — codec round-trip, walk unit tests, precommit-populates-closure, S2 green, nested-manifest recursion.
 
@@ -56,7 +56,16 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Task 2: `RefPayload.closure` field — proto + codec
+> **CARRIER CORRECTION (post-Task-4):** Tasks 2 and 4 below were implemented and committed storing the
+> closure on `RefPayload`. That carrier is WRONG: `RefPayload` is erased (`refs.erase` + `Remove`) on both
+> commit (`Build::publish`, `CasBuild.cpp:1012`) and abandon (`reclaimAbandonedPrecommit`,
+> `CasGc.cpp:1947-1953`) **before** GC folds the precommit `Add`, so `root.refs.at(record.ref_name)` throws
+> `key not found` exactly on the S2 path. The closure must live on the precommit journal **`Add` record**
+> (`JournalRecord`), which survives commit-erase + displacement and is removed only by `trim` after it is
+> folded. **Task 5 (rewritten below) performs this move across codec + Build + GC as one compiling unit and
+> completes S2.** Read Tasks 2/4 for the committed baseline; Task 5 is the authoritative end state.
+
+## Task 2: `RefPayload.closure` field — proto + codec  *(committed on RefPayload; carrier moved in Task 5)*
 
 **Files:**
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/cas_root_shard.proto`
@@ -285,31 +294,70 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Task 5: GC folds a precommit `Add` via the inline source; delete the precommit tree-read (S2 → GREEN)
+## Task 5: Move closure carrier `RefPayload` → journal `Add` record; fold precommit `Add` via the inline source; delete the precommit tree-read (S2 → GREEN)
+
+This task moves the closure carrier and completes S2 as ONE compiling unit (the codec/Build/GC pieces do
+not compile independently after the field moves). It supersedes the `RefPayload`-closure location from the
+committed Tasks 2 and 4.
 
 **Files:**
-- Modify: `Core/CasGc.cpp` (`foldShardRecords`)
-- Test: `src/Disks/tests/gtest_cas_gc_leak.cpp` (the existing S2 tests are the gate)
+- Modify: `Core/Proto/cas_root_shard.proto` (move `closure` from `RefPayload` → `JournalRecord`)
+- Modify: `Core/CasRootShardCodec.h` (move `closure` field from `RefPayload` struct → `JournalRecord` struct), `Core/CasRootShardCodec.cpp` (encode/decode on journal records, not refs)
+- Modify: `Core/CasBuild.cpp` (`Build::precommit`: set closure on the `Add` record it appends, not on `payload`)
+- Modify: `Core/CasGc.cpp` (`foldShardRecords`: inline source over `record.closure`)
+- Test: `src/Disks/tests/gtest_cas_root_shard_codec.cpp` (closure round-trip now on a journal `Add` record), `src/Disks/tests/gtest_cas_build.cpp` (precommit test reads the `Add` record's closure), `src/Disks/tests/gtest_cas_gc_leak.cpp` (S2 gate)
 
 - [ ] **Step 1: Confirm the RED baseline.**
 Run: `build/src/unit_tests_dbms --gtest_filter='CasGcLeak.*' 2>&1 | tail -8`
 Expected: `..._S2_NoFoldBetween` and raw `DisplacedUnexpandedTreeBlobsLeak` FAIL (`unreachable=2`); `..._S1_FoldBetween` PASS.
 
-- [ ] **Step 2: Implement the inline-source branch.** In `foldShardRecords`, where it processes an `Add` for a tree (`CasGc.cpp:~1268`), branch on `Layout::isPrecommitNamespace(ns)`:
-  - **precommit ns:** build an `inlineSource` from the ref's `RefPayload.closure` (a `node→entries` lookup over the `ClosureNode` list), then `closureWalk(record.tree_id, inlineSource, markExpanded, addTreeEdge/addPackEdge)`. The `RefPayload` is in `root.refs[record.ref_name]`. NO `readTree`, NO 404 path.
-  - **table ns:** the existing `closureWalk(..., backendSource)` from Task 3 (with its `readTree`-404/displaced/FailClosed contract).
-  **Delete** the precommit pending-tolerance branch (`CasGc.cpp:1307-1316`, the `if (Layout::isPrecommitNamespace(ns)) displaced_later = true;`) — it is unreachable now that precommit refs never reach `readTree`.
+- [ ] **Step 2: Move the proto field.** In `Core/Proto/cas_root_shard.proto`:
+  - Remove `repeated ClosureNodeProto closure = 4;` from `message RefPayload` and add `reserved 4;` (field numbers are never reused — schema-evolution rule; dev-only data so no `codec_version` bump).
+  - Add `repeated ClosureNodeProto closure = 5;` to `message JournalRecord` (fields 1–4 are `op`/`ref_name`/`tree_id`/`at_version`; 5 is free). Keep `ClosureNodeProto`/`TreeEntryProto` as-is.
 
-- [ ] **Step 3: Run the S2 tests — GREEN.**
+- [ ] **Step 3: Move the C++ field.** In `Core/CasRootShardCodec.h`: delete `std::vector<ClosureNode> closure;` from `struct RefPayload`; add `std::vector<ClosureNode> closure;   /// populated only on precommit-ns Add records (B199-S2)` to `struct JournalRecord` (keep `bool operator==(const JournalRecord &) const = default;` — add it if absent, the codec round-trip test needs it). `ClosureNode` stays where it is. Update the `RefPayload`/`JournalRecord` doc comments to match.
+
+- [ ] **Step 4: Move the codec.** In `Core/CasRootShardCodec.cpp`: in the `RefPayload` encode/decode, drop the closure handling. In the `JournalRecord` encode path, write each `ClosureNode` (`tree_hash` + entries' `placement`/`file_hash`/`file_size`/`pack_hash`) into the proto `JournalRecord.closure`; in decode, reconstruct `record.closure` (entries get empty `name`/`inline_bytes`). Reuse the existing `encodeClosureNode`/`decodeClosureNode` helpers verbatim — only their call site moves from the ref message to the journal message.
+
+- [ ] **Step 5: Move the round-trip test.** In `gtest_cas_root_shard_codec.cpp`, retarget `RefPayloadClosureRoundTrips` (rename to `JournalAddClosureRoundTrips`): put the nested closure on a `JournalRecord{op=Add, ref_name="4815", tree_id=T, closure={...}}` pushed to `in.journal`, and assert `out.journal[0].closure == in.journal[0].closure`. Keep a `RefPayload` round-trip (without closure) so ref encode/decode stays covered.
+Run: `ninja -C build unit_tests_dbms > build/build_b199s2_t5.log 2>&1 && build/src/unit_tests_dbms --gtest_filter='CasRootShardCodec.*' 2>&1 | tail -6` → PASS.
+
+- [ ] **Step 6: Move the `Build::precommit` population.** In `CasBuild.cpp:736-748`, remove `payload.closure = buildStagedClosure(manifest_hash);` and instead set the closure on the appended `Add` record:
+```cpp
+store->mutateShard(ns, buildShard(), [&](RootShard & root)
+{
+    RefPayload payload;
+    payload.tree_id = manifest_hash;
+    payload.tree_size = tree_size;
+    root.refs[ref] = payload;
+    /// B199-S2: the closure rides the Add journal record (it survives the commit/abandon refs.erase
+    /// and is trimmed only after GC folds it), so GC can protect/reclaim the build's closure WITHOUT
+    /// reading any tree object. Built in-memory from the staged structure — no pool read.
+    root.journal.push_back(JournalRecord{
+        .op = JournalRecord::Op::Add, .ref_name = ref, .tree_id = manifest_hash,
+        .at_version = root.shard_version + 1, .closure = buildStagedClosure(manifest_hash)});
+});
+```
+(`buildStagedClosure` is unchanged — it already returns `std::vector<ClosureNode>` from `retained_trees` with no pool read.) Note the designated-initializer order must match the struct's declaration order (`-Werror=missing-designated-field-initializers`).
+
+- [ ] **Step 7: Retarget the `Build` precommit test.** In `gtest_cas_build.cpp`, `PrecommitRefCarriesInlineClosure`: read the closure from the precommit shard's journal `Add` record (find the `JournalRecord` with `op==Add && ref_name==build_seq` in `rs.journal`) instead of `rs.refs.at(...).closure`. Rename to `PrecommitAddRecordCarriesInlineClosure`.
+Run: `build/src/unit_tests_dbms --gtest_filter='CasBuild.*' 2>&1 | tail -6` → PASS.
+
+- [ ] **Step 8: Implement the inline-source fold branch.** In `foldShardRecords`, where it processes an `Add` for a tree (`CasGc.cpp:~1269`, the `isExpanded` block), branch on `Layout::isPrecommitNamespace(ns)`:
+  - **precommit ns:** build an `inlineSource` from **`record.closure`** (a `node→entries` lookup over the `ClosureNode` list on the folding record), then `closureWalk(record.tree_id, inlineSource, on_tree=markExpanded, on_edge=addTreeEdge/addPackEdge)`. NEVER touch `root.refs` — it may be erased. NO `readTree`, NO 404 path. An empty `record.closure` under a precommit ns is a corruption (every precommit `Add` is populated, §1) — fail closed (throw `LOGICAL_ERROR`) rather than silently leaking.
+  - **table ns:** the existing `closureWalk(..., backendSource)` from Task 3 (with its `readTree`-404/displaced/FailClosed contract) — unchanged.
+  **Delete** the precommit pending-tolerance branch (`CasGc.cpp:1308-1317`, the `if (!displaced_later && Layout::isPrecommitNamespace(ns)) displaced_later = true;`) — unreachable now that precommit refs never reach `readTree`.
+
+- [ ] **Step 9: Run the S2 tests — GREEN.**
 Run: `ninja -C build unit_tests_dbms > build/build_b199s2_t5.log 2>&1 && build/src/unit_tests_dbms --gtest_filter='CasGcLeak.*' 2>&1 | tail -8`
 Expected: `..._S2_NoFoldBetween` and raw `DisplacedUnexpandedTreeBlobsLeak` now PASS (`unreachable=0`, `dangling=0`); `..._S1_FoldBetween` still PASS.
 
-- [ ] **Step 4: Update the now-stale RED comments** in `gtest_cas_gc_leak.cpp` for the two S2 tests (they are now GREEN — say so; mirror the wording the S1 test got after its fix).
+- [ ] **Step 10: Update the now-stale RED comments** in `gtest_cas_gc_leak.cpp` for the two S2 tests (they are now GREEN — say so; mirror the wording the S1 test got after its fix).
 
-- [ ] **Step 5: Commit.**
+- [ ] **Step 11: Commit.**
 ```bash
-git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp src/Disks/tests/gtest_cas_gc_leak.cpp
-git commit -m "CA B199-S2: fold precommit Add via inline closure (no readTree); delete precommit tree-read/pending-tolerance — DisplacedUnexpandedTreeBlobsLeak S2 GREEN
+git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Proto/cas_root_shard.proto src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.* src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp src/Disks/tests/gtest_cas_root_shard_codec.cpp src/Disks/tests/gtest_cas_build.cpp src/Disks/tests/gtest_cas_gc_leak.cpp
+git commit -m "CA B199-S2: carry the precommit closure on the journal Add record (survives commit/abandon refs.erase); fold precommit Add via inline closure (no readTree); delete precommit tree-read/pending-tolerance — DisplacedUnexpandedTreeBlobsLeak S2 GREEN
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
