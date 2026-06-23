@@ -16,13 +16,13 @@
                      mounter refuses to attach (PoolMeta ownership check). -->
                 <content_addressed_allow_shared_pool>1</content_addressed_allow_shared_pool>
                 <!-- Background reachability GC enabled on both servers, running aggressively. -->
-                <content_addressed_gc_enabled>1</content_addressed_gc_enabled>
+                <gc_enabled>1</gc_enabled>
                 <content_addressed_gc_grace_sec>5</content_addressed_gc_grace_sec>
-                <content_addressed_gc_interval_sec>2</content_addressed_gc_interval_sec>
+                <gc_interval_sec>2</gc_interval_sec>
                 <!-- #4: widen shard fanout (default 8) so manifest CAS writes spread across more
                      keys — drops per-key 64-permit congestion (503) and per-key overwrite-orphan
                      pileup. Creation-time; the fresh per-run pool picks it up. -->
-                <content_addressed_root_shards>64</content_addressed_root_shards>
+                <root_shards>64</root_shards>
                 <!-- B187: rustfs honors Expect: 100-continue, so negotiate it for ALL conditional
                      blob PUTs >= 64 KiB (not just the default >= 1 MiB). A dedup-hit conditional PUT
                      (If-None-Match:* on an existing blob) then gets a clean early 412 instead of
@@ -43,7 +43,7 @@
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
                 <content_addressed_allow_shared_pool>1</content_addressed_allow_shared_pool>
-                <content_addressed_gc_enabled>0</content_addressed_gc_enabled>
+                <gc_enabled>0</gc_enabled>
                 <expect_continue_min_bytes>65536</expect_continue_min_bytes>
                 <readonly>true</readonly>
             </ca_ro>

@@ -33,8 +33,8 @@ SETTINGS disk = disk(
     metadata_type = content_addressed,
     name = '${DISK}',
     path = '${DISK}_pool/',
-    content_addressed_gc_enabled = 1,
-    content_addressed_gc_interval_sec = 1),
+    gc_enabled = 1,
+    gc_interval_sec = 1),
     old_parts_lifetime = 1"
 
 # Two distinct inserts => distinct blobs (not deduped away); TRUNCATE drops every ref so the

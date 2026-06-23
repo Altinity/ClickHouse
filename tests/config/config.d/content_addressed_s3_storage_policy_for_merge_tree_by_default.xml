@@ -14,12 +14,12 @@
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
                 <!-- Real server-local scratch dir for the write-buffer spill. -->
-                <cas_scratch_path>content_addressed_s3_scratch/</cas_scratch_path>
+                <scratch_path>content_addressed_s3_scratch/</scratch_path>
                 <!-- Background GC pacing: the incarnation protocol's fence/recheck handshake
                      replaces the old grace window (M-W D-W5); a short interval so reclamation
                      happens during the run. -->
-                <content_addressed_gc_enabled>1</content_addressed_gc_enabled>
-                <content_addressed_gc_interval_sec>5</content_addressed_gc_interval_sec>
+                <gc_enabled>1</gc_enabled>
+                <gc_interval_sec>5</gc_interval_sec>
             </content_addressed_s3>
         </disks>
         <policies>

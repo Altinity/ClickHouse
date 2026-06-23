@@ -225,7 +225,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// compute their local working dir (see the `local` registration above): it is a real
         /// filesystem path under the server data path, NEVER the object-storage key prefix (which for
         /// a remote object storage such as s3 is a remote key prefix and not a usable local path).
-        auto local_scratch_path = config.getString(config_prefix + ".cas_scratch_path",
+        auto local_scratch_path = config.getString(config_prefix + ".scratch_path",
                                                     fs::path(Context::getGlobalContextInstance()->getPath()) / "disks" / name / "cas_scratch" / "");
         /// A configured RELATIVE scratch path must be anchored to the server data path, NOT the
         /// process CWD (which varies by launch method) — otherwise the write-buffer spill lands in an
@@ -239,14 +239,14 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// fence/recheck handshake make shared pools safe, and the GC lease dedups leaders — the old
         /// single-owner claim and its allow_shared_pool opt-in are gone (M-W D-W5/D-W6).
         auto global_context = Context::getGlobalContextInstance();
-        const bool gc_enabled = config.getBool(config_prefix + ".content_addressed_gc_enabled", true);
+        const bool gc_enabled = config.getBool(config_prefix + ".gc_enabled", true);
         const auto gc_interval = std::chrono::seconds(
-            config.getUInt64(config_prefix + ".content_addressed_gc_interval_sec", 60));
+            config.getUInt64(config_prefix + ".gc_interval_sec", 60));
         /// Creation-time shard fanout (#4): default 8, configurable to spread manifest CAS writes.
-        const uint64_t root_shards = config.getUInt64(config_prefix + ".content_addressed_root_shards", 8);
-        const uint64_t dedup_cache_bytes = config.getUInt64(config_prefix + ".content_addressed_dedup_cache_bytes", 64ULL << 20);
-        const uint64_t dedup_head_first_min_bytes = config.getUInt64(config_prefix + ".content_addressed_dedup_head_first_min_bytes", 1ULL << 20);
-        const uint64_t gc_snap_generations_to_keep = config.getUInt64(config_prefix + ".content_addressed_gc_snap_generations_to_keep", 3);
+        const uint64_t root_shards = config.getUInt64(config_prefix + ".root_shards", 8);
+        const uint64_t dedup_cache_bytes = config.getUInt64(config_prefix + ".dedup_cache_bytes", 64ULL << 20);
+        const uint64_t dedup_head_first_min_bytes = config.getUInt64(config_prefix + ".dedup_head_first_min_bytes", 1ULL << 20);
+        const uint64_t gc_snap_generations_to_keep = config.getUInt64(config_prefix + ".gc_snap_generations_to_keep", 3);
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path,
             global_context, gc_enabled, gc_interval, root_shards, name, dedup_cache_bytes, dedup_head_first_min_bytes,

@@ -1213,7 +1213,7 @@ TEST(CaWiringRead, CorruptCaMtimeStampFailsClosed)
         [&] { storage->getLastModified("uui/uuid-1/all_1_1_0"); });
 }
 
-// #4: content_addressed_root_shards is plumbed through the ctor to pool creation (creation-time
+// #4: root_shards is plumbed through the ctor to pool creation (creation-time
 // fanout); default stays 8.
 TEST(CaWiring, RootShardsConfigurable)
 {

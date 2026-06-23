@@ -34,8 +34,8 @@ DISK_DEF="disk(
     metadata_type = content_addressed,
     name = '04295_content_addressed_mut',
     path = '${POOL_DIR}/',
-    content_addressed_gc_enabled = 1,
-    content_addressed_gc_interval_sec = 1)"
+    gc_enabled = 1,
+    gc_interval_sec = 1)"
 
 $CLICKHOUSE_CLIENT --query "DROP TABLE IF EXISTS t_cas_mut_leftovers SYNC"
 

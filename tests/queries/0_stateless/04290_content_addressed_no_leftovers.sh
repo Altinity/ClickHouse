@@ -9,7 +9,7 @@
 #
 # We put the pool under CLICKHOUSE_USER_FILES_UNIQUE (an absolute path both the server and this
 # shell can see on a local run) and enable the background reachability GC aggressively
-# (content_addressed_gc_enabled=1, grace=2s, interval=1s). We then:
+# (gc_enabled=1, grace=2s, interval=1s). We then:
 #   (1) record the baseline blobs+parts object count (~0),
 #   (2) CREATE a MergeTree on the CA disk and INSERT several distinct batches to make many blobs,
 #   (3) assert the count rose above baseline,
@@ -43,8 +43,8 @@ DISK_DEF="disk(
     metadata_type = content_addressed,
     name = '04290_content_addressed',
     path = '${POOL_DIR}/',
-    content_addressed_gc_enabled = 1,
-    content_addressed_gc_interval_sec = 1)"
+    gc_enabled = 1,
+    gc_interval_sec = 1)"
 
 $CLICKHOUSE_CLIENT --query "DROP TABLE IF EXISTS t_cas_leftovers SYNC"
 
