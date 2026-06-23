@@ -81,31 +81,29 @@ RoundReport Gc::runRegularRound()
 
     /// B170: fold begins — the round's R1. round here is state.round (pre-retire); generation is the
     /// authoritative one being folded.
+    EventEmitter{*store}.emit([&](CasEvent & e)
     {
-        CasEvent _ev0;
-        _ev0.type = CasEventType::GcFoldBegin;
-        _ev0.object_kind = CasEventObjectKind::Snap;
-        _ev0.round = state.round;
-        _ev0.gen = state.snap_generation;
-        _ev0.reason = "R1: fold journals into a new durable snap generation";
-        store->emitEvent(_ev0);
-    }
+        e.type = CasEventType::GcFoldBegin;
+        e.object_kind = CasEventObjectKind::Snap;
+        e.round = state.round;
+        e.gen = state.snap_generation;
+        e.reason = "R1: fold journals into a new durable snap generation";
+    });
 
     /// R1: fold the journals into a new durable snap generation (cursors advance only after).
     FoldResult folded = fold(state, state_token);   /// non-const: the recheck folds through the fence into the same snap
 
     /// B170: fold ended — the snap generation after the fold's persist (advanced iff records folded).
+    EventEmitter{*store}.emit([&](CasEvent & e)
     {
-        CasEvent _ev1;
-        _ev1.type = CasEventType::GcFoldEnd;
-        _ev1.object_kind = CasEventObjectKind::Snap;
-        _ev1.round = state.round;
-        _ev1.gen = state.snap_generation;
-        _ev1.outcome = "ok";
-        _ev1.reason = "R1 complete";
-        _ev1.detail = {{"transitioned", std::to_string(folded.transitioned.size())}};
-        store->emitEvent(_ev1);
-    }
+        e.type = CasEventType::GcFoldEnd;
+        e.object_kind = CasEventObjectKind::Snap;
+        e.round = state.round;
+        e.gen = state.snap_generation;
+        e.outcome = "ok";
+        e.reason = "R1 complete";
+        e.detail = {{"transitioned", std::to_string(folded.transitioned.size())}};
+    });
 
     /// B140-dangle FAIL-CLOSED guard: before ANY retire/delete, verify the committed snap's edges
     /// are coherent with its folded_cursor — every folded, still-live ref `Add` at or below the
@@ -205,19 +203,18 @@ void Gc::trim(const std::map<uint64_t, GcSnap> & snap,
             removed = before - fresh.journal.size();
         });
         /// B170: journal trim for this shard (records provably incorporated into the durable snap).
+        EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            CasEvent _ev2;
-            _ev2.type = CasEventType::GcTrim;
-            _ev2.namespace_ = ns.string();
-            _ev2.round = round;
-            _ev2.object_kind = CasEventObjectKind::Root;
-            _ev2.outcome = "trimmed";
-            _ev2.reason = "INV-JOURNAL-COVERAGE: trimmed records at or below the durable cursor";
-            _ev2.detail = {{"shard", std::to_string(shard)},
+            e.type = CasEventType::GcTrim;
+            e.namespace_ = ns.string();
+            e.round = round;
+            e.object_kind = CasEventObjectKind::Root;
+            e.outcome = "trimmed";
+            e.reason = "INV-JOURNAL-COVERAGE: trimmed records at or below the durable cursor";
+            e.detail = {{"shard", std::to_string(shard)},
                        {"trimmed_up_to_cursor", std::to_string(cursor)},
                        {"records_removed", std::to_string(removed)}};
-            store->emitEvent(_ev2);
-        }
+        });
     }
 }
 
@@ -251,22 +248,21 @@ void Gc::assertSnapJournalCoherent(const std::map<uint64_t, GcSnap> & snap,
             {
                 /// B170: the coherence guard tripped — record the anomaly with the entity it touches
                 /// before failing closed, so the incident is a single SQL query, not a log-grep.
+                EventEmitter{*store}.emit([&](CasEvent & e)
                 {
-                    CasEvent _ev3;
-                    _ev3.type = CasEventType::SnapJournalIncoherent;
-                    _ev3.namespace_ = ns.string();
-                    _ev3.ref_name = ref_name;
-                    _ev3.object_kind = CasEventObjectKind::Tree;
-                    _ev3.object_hash = u128ToHex(rec->tree_id);
-                    _ev3.at_version = rec->at_version;
-                    _ev3.outcome = "fail_closed";
-                    _ev3.reason = "snap/journal incoherent: live Add at or below cursor but tree absent from snap (B140-dangle cursor-skip)";
-                    _ev3.detail = {{"cursor", std::to_string(cursor)},
+                    e.type = CasEventType::SnapJournalIncoherent;
+                    e.namespace_ = ns.string();
+                    e.ref_name = ref_name;
+                    e.object_kind = CasEventObjectKind::Tree;
+                    e.object_hash = u128ToHex(rec->tree_id);
+                    e.at_version = rec->at_version;
+                    e.outcome = "fail_closed";
+                    e.reason = "snap/journal incoherent: live Add at or below cursor but tree absent from snap (B140-dangle cursor-skip)";
+                    e.detail = {{"cursor", std::to_string(cursor)},
                                {"shard", std::to_string(shard)},
                                {"code", "CORRUPTED_DATA"},
                                {"site", "assertSnapJournalCoherent"}};
-                    store->emitEvent(_ev3);
-                }
+                });
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS gc: snap/journal incoherent - ref '{}' (ns {} shard {}) Add@{} is at or below the "
                     "folded cursor {} but its tree {} is absent from the snap (B140-dangle cursor-skip); "
@@ -352,20 +348,19 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
                 outcome.outcome = OutcomeKind::Spared;
                 /// B170: the recheck spared this candidate — record the verdict + the in-degree it
                 /// found through the fold-through-fence, so a "why wasn't it deleted" is answerable.
+                EventEmitter{*store}.emit([&](CasEvent & e)
                 {
-                    CasEvent _ev4;
-                    _ev4.type = CasEventType::GcRecheckVerdict;
-                    _ev4.object_kind = ev_kind;
-                    _ev4.object_hash = u128ToHex(entry.hash);
-                    _ev4.token = entry.token.value;
-                    _ev4.round = round;
-                    _ev4.gen = state.snap_generation;
-                    _ev4.outcome = "spared";
-                    _ev4.reason = "inDeg>0 after fold-through-fence; a publish re-pinned it";
-                    _ev4.detail = {{"indeg_at_recheck", std::to_string(indeg_at_recheck)},
+                    e.type = CasEventType::GcRecheckVerdict;
+                    e.object_kind = ev_kind;
+                    e.object_hash = u128ToHex(entry.hash);
+                    e.token = entry.token.value;
+                    e.round = round;
+                    e.gen = state.snap_generation;
+                    e.outcome = "spared";
+                    e.reason = "inDeg>0 after fold-through-fence; a publish re-pinned it";
+                    e.detail = {{"indeg_at_recheck", std::to_string(indeg_at_recheck)},
                                {"fence_seq", std::to_string(fence_version_for_round)}};
-                    store->emitEvent(_ev4);
-                }
+                });
             }
             else
             {
@@ -396,16 +391,16 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
                 const String del_outcome =
                     deleted.kind == DeleteOutcome::Kind::Deleted ? "deleted"
                     : (deleted.kind == DeleteOutcome::Kind::NotFound ? "absent" : "replaced");
+                EventEmitter{*store}.emit([&](CasEvent & e)
                 {
-                    CasEvent _ev5;
-                    _ev5.type = entry.kind == ObjectKind::Tree ? CasEventType::TreeDelete : CasEventType::BlobDelete;
-                    _ev5.object_kind = ev_kind;
-                    _ev5.object_hash = u128ToHex(entry.hash);
-                    _ev5.token = entry.token.value;
-                    _ev5.round = round;
-                    _ev5.gen = state.snap_generation;
-                    _ev5.outcome = del_outcome;
-                    _ev5.reason = "in-degree 0 through fence; recheck confirmed 0; exact-token delete";
+                    e.type = entry.kind == ObjectKind::Tree ? CasEventType::TreeDelete : CasEventType::BlobDelete;
+                    e.object_kind = ev_kind;
+                    e.object_hash = u128ToHex(entry.hash);
+                    e.token = entry.token.value;
+                    e.round = round;
+                    e.gen = state.snap_generation;
+                    e.outcome = del_outcome;
+                    e.reason = "in-degree 0 through fence; recheck confirmed 0; exact-token delete";
                     /// `token_outcome` = the exact-token deleteExact verdict (deleted/absent/replaced),
                     /// matching the recheck verdict — the load-bearing fact for B140-dangle attribution
                     /// ("did our token actually remove the bytes, or did a fresh incarnation displace it").
@@ -415,14 +410,13 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
                     /// last edge is recorded on the earlier `IndegZero` row for this same `object_hash`
                     /// (its `dropped_by` = strip(<tree>) / root_remove(<ref>) / root_repoint(<ref>)),
                     /// so the attribution join is object_hash -> IndegZero.dropped_by, not a field here.
-                    _ev5.detail = {{"fence_seq", std::to_string(state.fence_seq)},
+                    e.detail = {{"fence_seq", std::to_string(state.fence_seq)},
                                {"shard", std::to_string(hashPrefixShard(entry.hash, state.snap_shards))},
                                {"indeg_at_recheck", "0"},
                                {"token_outcome", del_outcome},
                                {"parent_tree", "see IndegZero.dropped_by for object_hash=" + u128ToHex(entry.hash)},
                                {"key", del_key}};
-                    store->emitEvent(_ev5);
-                }
+                });
                 if (deleted.created_delete_marker)
                     /// Versioning-enabled bucket: the probe exists to reject this pool shape; a
                     /// marker here means the pool is mis-provisioned - fail loud, never continue
@@ -445,23 +439,22 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
                 }
                 /// B170: the recheck verdict for the delete arm (deleted/absent/replaced). Pairs with
                 /// the blob_delete/tree_delete above so a recheck verdict exists for every candidate.
+                EventEmitter{*store}.emit([&](CasEvent & e)
                 {
-                    CasEvent _ev6;
-                    _ev6.type = CasEventType::GcRecheckVerdict;
-                    _ev6.object_kind = ev_kind;
-                    _ev6.object_hash = u128ToHex(entry.hash);
-                    _ev6.token = entry.token.value;
-                    _ev6.round = round;
-                    _ev6.gen = state.snap_generation;
-                    _ev6.outcome = del_outcome;
-                    _ev6.reason = del_outcome == "replaced"
+                    e.type = CasEventType::GcRecheckVerdict;
+                    e.object_kind = ev_kind;
+                    e.object_hash = u128ToHex(entry.hash);
+                    e.token = entry.token.value;
+                    e.round = round;
+                    e.gen = state.snap_generation;
+                    e.outcome = del_outcome;
+                    e.reason = del_outcome == "replaced"
                         ? "token displaced (412); a fresh incarnation pins it"
                         : (del_outcome == "absent" ? "already gone (our own crashed delete landed)"
                                                    : "inDeg 0 confirmed through fence; deleted");
-                    _ev6.detail = {{"indeg_at_recheck", "0"},
+                    e.detail = {{"indeg_at_recheck", "0"},
                                {"fence_seq", std::to_string(state.fence_seq)}};
-                    store->emitEvent(_ev6);
-                }
+                });
             }
             computed[snap_shard].entries.push_back(std::move(outcome));
         }
@@ -567,36 +560,34 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
         report.cascaded += freed.size();
         /// B170: every cascade strip of a tree, with the children it freed (the next round's
         /// zero-in-degree delete candidates). Was the CASTRIP audit line.
+        EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            CasEvent _ev7;
-            _ev7.type = CasEventType::TreeStrip;
-            _ev7.object_kind = CasEventObjectKind::Tree;
-            _ev7.object_hash = u128ToHex(tree);
-            _ev7.round = round;
-            _ev7.gen = state.snap_generation;
-            _ev7.outcome = "stripped";
-            _ev7.reason = "cascade strip of confirmed-deleted tree; child edges freed";
-            _ev7.detail = {{"freed", std::to_string(freed.size())}};
-            store->emitEvent(_ev7);
-        }
+            e.type = CasEventType::TreeStrip;
+            e.object_kind = CasEventObjectKind::Tree;
+            e.object_hash = u128ToHex(tree);
+            e.round = round;
+            e.gen = state.snap_generation;
+            e.outcome = "stripped";
+            e.reason = "cascade strip of confirmed-deleted tree; child edges freed";
+            e.detail = {{"freed", std::to_string(freed.size())}};
+        });
         /// B170: each freed child whose in-degree just hit 0 is a new retire candidate — emit the
         /// in-degree-zero transition with what dropped it (the parent strip), so a blob's
         /// "why did it become collectable" is reconstructable from the rows.
         for (const Candidate & child : freed)
-        {
-            CasEvent _ev8;
-            _ev8.type = CasEventType::IndegZero;
-            _ev8.object_kind = toEventKind(child.kind);
-            _ev8.object_hash = u128ToHex(child.hash);
-            _ev8.round = round;
-            _ev8.gen = state.snap_generation;
-            _ev8.reason = "last edge dropped";
-            /// prev_indeg is exactly 1: a Candidate is returned ONLY on the 1->0 transition
-            /// (dropEdgeTarget short-circuits while in-degree stays > 0).
-            _ev8.detail = {{"prev_indeg", "1"},
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::IndegZero;
+                e.object_kind = toEventKind(child.kind);
+                e.object_hash = u128ToHex(child.hash);
+                e.round = round;
+                e.gen = state.snap_generation;
+                e.reason = "last edge dropped";
+                /// prev_indeg is exactly 1: a Candidate is returned ONLY on the 1->0 transition
+                /// (dropEdgeTarget short-circuits while in-degree stays > 0).
+                e.detail = {{"prev_indeg", "1"},
                        {"dropped_by", "strip(" + u128ToHex(tree) + ")"}};
-            store->emitEvent(_ev8);
-        }
+            });
     }
 
     /// P9: forget every confirmed-gone node (trees AND blobs/packs) from `known`, so the next
@@ -610,17 +601,16 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
         ++report.forgotten_on_delete;
         /// B170: P9 prune — the node is forgotten from `known` so the next round's stateless scan
         /// stops re-deriving (and re-HEAD-404ing) it. Closes the node's lifecycle in the rows.
+        EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            CasEvent _ev9;
-            _ev9.type = CasEventType::BlobForget;
-            _ev9.object_kind = toEventKind(node.kind);
-            _ev9.object_hash = u128ToHex(node.hash);
-            _ev9.round = round;
-            _ev9.gen = state.snap_generation;
-            _ev9.outcome = "forgotten";
-            _ev9.reason = "deleted/absent in this round; pruned from known (P9)";
-            store->emitEvent(_ev9);
-        }
+            e.type = CasEventType::BlobForget;
+            e.object_kind = toEventKind(node.kind);
+            e.object_hash = u128ToHex(node.hash);
+            e.round = round;
+            e.gen = state.snap_generation;
+            e.outcome = "forgotten";
+            e.reason = "deleted/absent in this round; pruned from known (P9)";
+        });
     }
 
     /// 2. PERSIST the post-strip snap - WITH the recheck's fence-window fold included - and the
@@ -738,14 +728,14 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
     /// snap-vs-truth divergence query can pin which generation a fact landed in.
     if (snap_changed)
     {
+        EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            CasEvent _ev10;
-            _ev10.type = CasEventType::GcSnapPersist;
-            _ev10.object_kind = CasEventObjectKind::Snap;
-            _ev10.round = round;
-            _ev10.gen = adopted_generation;
-            _ev10.outcome = "persisted";
-            _ev10.reason = "cascade persisted the post-strip snap (strips/fence-window/forgets)";
+            e.type = CasEventType::GcSnapPersist;
+            e.object_kind = CasEventObjectKind::Snap;
+            e.round = round;
+            e.gen = adopted_generation;
+            e.outcome = "persisted";
+            e.reason = "cascade persisted the post-strip snap (strips/fence-window/forgets)";
             /// `cursor` = the folded cursors persisted into snap shard 0 ("ns/shard:version" pairs,
             /// the single source of truth the new generation carries). `size` = the snap's edge-shard
             /// count (the serialized snap is sharded over these). `generation_probed` = how many
@@ -759,24 +749,22 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
                         persisted_cursor += ",";
                     persisted_cursor += cursor_key + ":" + std::to_string(folded_version);
                 }
-            _ev10.detail = {{"prev_generation", std::to_string(prev_generation)},
+            e.detail = {{"prev_generation", std::to_string(prev_generation)},
                        {"cursor", persisted_cursor},
                        {"size", std::to_string(snap.size())},
                        {"generation_probed", std::to_string(adopted_generation - prev_generation)},
                        {"deleted_trees", std::to_string(rechecked.deleted_trees.size())},
                        {"forgotten_on_delete", std::to_string(report.forgotten_on_delete)}};
-            store->emitEvent(_ev10);
-        }
+        });
+        EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            CasEvent _ev11;
-            _ev11.type = CasEventType::GcCursorAdvance;
-            _ev11.object_kind = CasEventObjectKind::Snap;
-            _ev11.round = round;
-            _ev11.gen = adopted_generation;
-            _ev11.outcome = "advanced";
-            _ev11.reason = "fold cursor advanced to the recorded fence versions (one write-once unit)";
-            store->emitEvent(_ev11);
-        }
+            e.type = CasEventType::GcCursorAdvance;
+            e.object_kind = CasEventObjectKind::Snap;
+            e.round = round;
+            e.gen = adopted_generation;
+            e.outcome = "advanced";
+            e.reason = "fold cursor advanced to the recorded fence versions (one write-once unit)";
+        });
     }
 
     /// 3. The entries "drop on confirmed outcomes": with the outcomes durable AND the cascade
@@ -921,19 +909,18 @@ void Gc::fence(GcState & state, Token & state_token)
     {
         state_token = committed_token;
         /// B170: the monotone fence committed — the durable point the recheck folds through.
+        EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            CasEvent _ev12;
-            _ev12.type = CasEventType::GcFence;
-            _ev12.object_kind = CasEventObjectKind::Snap;
-            _ev12.round = round;
-            _ev12.gen = state.snap_generation;
-            _ev12.outcome = "fenced";
-            _ev12.reason = "R3: fenced every root shard of every registered namespace";
-            _ev12.detail = {{"fence_seq", std::to_string(state.fence_seq)},
+            e.type = CasEventType::GcFence;
+            e.object_kind = CasEventObjectKind::Snap;
+            e.round = round;
+            e.gen = state.snap_generation;
+            e.outcome = "fenced";
+            e.reason = "R3: fenced every root shard of every registered namespace";
+            e.detail = {{"fence_seq", std::to_string(state.fence_seq)},
                        {"namespaces", std::to_string(fence_universe.namespaces.size())},
                        {"shards", std::to_string(fenced_shards)}};
-            store->emitEvent(_ev12);
-        }
+        });
         return;
     }
 
@@ -996,18 +983,17 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
             const HeadResult observed = backend.head(objectKey(layout, candidate.kind, candidate.hash));
             /// B170: HEAD-observe — the current incarnation token, the only token the eventual
             /// exact-token delete may carry.
+            EventEmitter{*store}.emit([&](CasEvent & e)
             {
-                CasEvent _ev13;
-                _ev13.type = CasEventType::GcRetireObserve;
-                _ev13.object_kind = ev_kind;
-                _ev13.object_hash = u128ToHex(candidate.hash);
-                _ev13.token = observed.exists ? observed.token.value : "";
-                _ev13.round = round;
-                _ev13.gen = state.snap_generation;
-                _ev13.outcome = observed.exists ? "present" : "absent";
-                _ev13.reason = "zero-in-degree candidate; HEAD-observe current token";
-                store->emitEvent(_ev13);
-            }
+                e.type = CasEventType::GcRetireObserve;
+                e.object_kind = ev_kind;
+                e.object_hash = u128ToHex(candidate.hash);
+                e.token = observed.exists ? observed.token.value : "";
+                e.round = round;
+                e.gen = state.snap_generation;
+                e.outcome = observed.exists ? "present" : "absent";
+                e.reason = "zero-in-degree candidate; HEAD-observe current token";
+            });
             if (!observed.exists)
             {
                 /// P9 defensive prune. The object is gone but its node still sits in `known`
@@ -1047,34 +1033,32 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
                     const std::vector<Candidate> freed = shard_snap.stripTree(candidate.hash);
                     report.cascaded += freed.size();
                     for (const Candidate & child : freed)
-                    {
-                        CasEvent _ev_indeg;
-                        _ev_indeg.type = CasEventType::IndegZero;
-                        _ev_indeg.object_kind = toEventKind(child.kind);
-                        _ev_indeg.object_hash = u128ToHex(child.hash);
-                        _ev_indeg.round = round;
-                        _ev_indeg.gen = state.snap_generation;
-                        _ev_indeg.reason = "last edge dropped";
-                        _ev_indeg.detail = {{"prev_indeg", "1"},
+                        EventEmitter{*store}.emit([&](CasEvent & e)
+                        {
+                            e.type = CasEventType::IndegZero;
+                            e.object_kind = toEventKind(child.kind);
+                            e.object_hash = u128ToHex(child.hash);
+                            e.round = round;
+                            e.gen = state.snap_generation;
+                            e.reason = "last edge dropped";
+                            e.detail = {{"prev_indeg", "1"},
                                             {"dropped_by", "retire-absent-strip(" + u128ToHex(candidate.hash) + ")"}};
-                        store->emitEvent(_ev_indeg);
-                    }
+                        });
                 }
                 shard_snap.forget(candidate.kind, candidate.hash);
                 ++report.forgotten_absent;
                 /// B170: defensive prune — the candidate is gone (a 404) but still sat in `known`.
                 /// Forget it so the next round stops re-deriving and re-HEAD-404ing it.
+                EventEmitter{*store}.emit([&](CasEvent & e)
                 {
-                    CasEvent _ev14;
-                    _ev14.type = CasEventType::BlobForget;
-                    _ev14.object_kind = ev_kind;
-                    _ev14.object_hash = u128ToHex(candidate.hash);
-                    _ev14.round = round;
-                    _ev14.gen = state.snap_generation;
-                    _ev14.outcome = "forgotten";
-                    _ev14.reason = "retire-time HEAD 404; pruned from known (P9 defensive)";
-                    store->emitEvent(_ev14);
-                }
+                    e.type = CasEventType::BlobForget;
+                    e.object_kind = ev_kind;
+                    e.object_hash = u128ToHex(candidate.hash);
+                    e.round = round;
+                    e.gen = state.snap_generation;
+                    e.outcome = "forgotten";
+                    e.reason = "retire-time HEAD 404; pruned from known (P9 defensive)";
+                });
                 continue;
             }
 
@@ -1084,18 +1068,17 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
             /// the fold expands into in-degree ≥ 1), so it is never a zero-in-degree candidate here. The
             /// watermark is repurposed for precommit RECLAIM liveness (see reclaimAbandonedPrecommit),
             /// not per-object protection.
+            EventEmitter{*store}.emit([&](CasEvent & e)
             {
-                CasEvent _ev16;
-                _ev16.type = CasEventType::GcRetireDecision;
-                _ev16.object_kind = ev_kind;
-                _ev16.object_hash = u128ToHex(candidate.hash);
-                _ev16.token = observed.token.value;
-                _ev16.round = round;
-                _ev16.gen = state.snap_generation;
-                _ev16.outcome = "condemn";
-                _ev16.reason = "condemn: present and known and inDeg=0 (reachability)";
-                store->emitEvent(_ev16);
-            }
+                e.type = CasEventType::GcRetireDecision;
+                e.object_kind = ev_kind;
+                e.object_hash = u128ToHex(candidate.hash);
+                e.token = observed.token.value;
+                e.round = round;
+                e.gen = state.snap_generation;
+                e.outcome = "condemn";
+                e.reason = "condemn: present and known and inDeg=0 (reachability)";
+            });
 
             RetiredEntry entry;
             entry.kind = candidate.kind;
@@ -1103,19 +1086,18 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
             entry.token = observed.token;
             entry.size = retiredLogicalSize(candidate.kind, observed.size, store->poolMeta().blob_header_len);
             /// B170: the retire entry written for this incarnation (per RetiredEntry).
+            EventEmitter{*store}.emit([&](CasEvent & e)
             {
-                CasEvent _ev17;
-                _ev17.type = candidate.kind == ObjectKind::Tree ? CasEventType::TreeRetire : CasEventType::BlobRetire;
-                _ev17.object_kind = ev_kind;
-                _ev17.object_hash = u128ToHex(candidate.hash);
-                _ev17.token = observed.token.value;
-                _ev17.round = round;
-                _ev17.gen = state.snap_generation;
-                _ev17.outcome = "retired";
-                _ev17.reason = "condemned candidate written to the round's retired set";
-                _ev17.detail = {{"size", std::to_string(entry.size)}};
-                store->emitEvent(_ev17);
-            }
+                e.type = candidate.kind == ObjectKind::Tree ? CasEventType::TreeRetire : CasEventType::BlobRetire;
+                e.object_kind = ev_kind;
+                e.object_hash = u128ToHex(candidate.hash);
+                e.token = observed.token.value;
+                e.round = round;
+                e.gen = state.snap_generation;
+                e.outcome = "retired";
+                e.reason = "condemned candidate written to the round's retired set";
+                e.detail = {{"size", std::to_string(entry.size)}};
+            });
             retired[hashPrefixShard(candidate.hash, state.snap_shards)].entries.push_back(std::move(entry));
         }
     }
@@ -1221,41 +1203,39 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
             transitioned.insert(transitioned.end(), displaced.begin(), displaced.end());
             /// B170: the root edge for this ref (a publish Add folded into the snap). A repoint over
             /// an existing edge displaces the old target — emit RootRepoint, else RootAdd.
+            EventEmitter{*store}.emit([&](CasEvent & e)
             {
-                CasEvent _ev18;
-                _ev18.type = displaced.empty() ? CasEventType::RootAdd : CasEventType::RootRepoint;
-                _ev18.namespace_ = ns.string();
-                _ev18.ref_name = record.ref_name;
-                _ev18.object_kind = CasEventObjectKind::Tree;
-                _ev18.object_hash = u128ToHex(record.tree_id);
-                _ev18.round = state.round;
-                _ev18.gen = state.snap_generation;
-                _ev18.at_version = record.at_version;
-                _ev18.outcome = "ok";
-                _ev18.reason = displaced.empty()
+                e.type = displaced.empty() ? CasEventType::RootAdd : CasEventType::RootRepoint;
+                e.namespace_ = ns.string();
+                e.ref_name = record.ref_name;
+                e.object_kind = CasEventObjectKind::Tree;
+                e.object_hash = u128ToHex(record.tree_id);
+                e.round = state.round;
+                e.gen = state.snap_generation;
+                e.at_version = record.at_version;
+                e.outcome = "ok";
+                e.reason = displaced.empty()
                     ? "folded Add(" + record.ref_name + ")"
                     : "folded republish Add(" + record.ref_name + "); old target displaced";
-                _ev18.detail = {{"displaced", std::to_string(displaced.size())}};
-                store->emitEvent(_ev18);
-            }
+                e.detail = {{"displaced", std::to_string(displaced.size())}};
+            });
             /// B170: each old target whose in-degree zeroed on the repoint — emit per freed candidate
             /// so the in-degree-zero transition (and what dropped it) is in the rows.
             for (const Candidate & old : displaced)
-            {
-                CasEvent _ev19;
-                _ev19.type = CasEventType::IndegZero;
-                _ev19.namespace_ = ns.string();
-                _ev19.object_kind = toEventKind(old.kind);
-                _ev19.object_hash = u128ToHex(old.hash);
-                _ev19.round = state.round;
-                _ev19.gen = state.snap_generation;
-                _ev19.at_version = record.at_version;
-                _ev19.reason = "last edge dropped";
-                /// prev_indeg is exactly 1 (Candidate returned only on the 1->0 transition).
-                _ev19.detail = {{"prev_indeg", "1"},
+                EventEmitter{*store}.emit([&](CasEvent & e)
+                {
+                    e.type = CasEventType::IndegZero;
+                    e.namespace_ = ns.string();
+                    e.object_kind = toEventKind(old.kind);
+                    e.object_hash = u128ToHex(old.hash);
+                    e.round = state.round;
+                    e.gen = state.snap_generation;
+                    e.at_version = record.at_version;
+                    e.reason = "last edge dropped";
+                    /// prev_indeg is exactly 1 (Candidate returned only on the 1->0 transition).
+                    e.detail = {{"prev_indeg", "1"},
                            {"dropped_by", "root_repoint(" + record.ref_name + ")"}};
-                store->emitEvent(_ev19);
-            }
+                });
 
             /// Once-per-tree expansion: the FIRST '+' to a tree with no marker reads the tree
             /// once and adds its child-edge set (each edge into the CHILD's shard).
@@ -1331,20 +1311,21 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                     /// A live committed ref names a tree whose object is gone and nothing displaces it —
                     /// upstream corruption (only GC deletes objects). Record it loudly; GC does NOT fail
                     /// closed (a throw would only wedge GC — see above). fsck reports the tree as dangling.
-                    CasEvent _ev20;
-                    _ev20.type = CasEventType::CorruptDangle;
-                    _ev20.namespace_ = ns.string();
-                    _ev20.ref_name = record.ref_name;
-                    _ev20.object_kind = CasEventObjectKind::Tree;
-                    _ev20.object_hash = u128ToHex(record.tree_id);
-                    _ev20.round = state.round;
-                    _ev20.gen = state.snap_generation;
-                    _ev20.at_version = record.at_version;
-                    _ev20.outcome = "dangle_observed";
-                    _ev20.reason = "corruption: live ref to missing tree — GC continues (" + e.message() + ")";
-                    _ev20.detail = {{"code", "FILE_DOESNT_EXIST"},
+                    EventEmitter{*store}.emit([&](CasEvent & ev)
+                    {
+                        ev.type = CasEventType::CorruptDangle;
+                        ev.namespace_ = ns.string();
+                        ev.ref_name = record.ref_name;
+                        ev.object_kind = CasEventObjectKind::Tree;
+                        ev.object_hash = u128ToHex(record.tree_id);
+                        ev.round = state.round;
+                        ev.gen = state.snap_generation;
+                        ev.at_version = record.at_version;
+                        ev.outcome = "dangle_observed";
+                        ev.reason = "corruption: live ref to missing tree — GC continues (" + e.message() + ")";
+                        ev.detail = {{"code", "FILE_DOESNT_EXIST"},
                                {"site", "foldShardRecords: live ref to missing tree"}};
-                    store->emitEvent(_ev20);
+                    });
                 };
 
                 /// The unified source: inline for staged nodes, readTree otherwise. On a 404 it records
@@ -1425,20 +1406,21 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                 {
                     /// B170: the tree was expanded — its child edges are now recorded in the snap.
                     /// This is the "set the expansion marker / record child edges" transition.
-                    CasEvent _ev21;
-                    _ev21.type = CasEventType::TreeExpand;
-                    _ev21.namespace_ = ns.string();
-                    _ev21.ref_name = record.ref_name;
-                    _ev21.object_kind = CasEventObjectKind::Tree;
-                    _ev21.object_hash = u128ToHex(record.tree_id);
-                    _ev21.round = state.round;
-                    _ev21.gen = state.snap_generation;
-                    _ev21.at_version = record.at_version;
-                    _ev21.outcome = "expanded";
-                    _ev21.reason = "first folded Add to this tree; child edges recorded in snap";
-                    _ev21.detail = {{"out_edges", std::to_string(out_edges)},
+                    EventEmitter{*store}.emit([&](CasEvent & e)
+                    {
+                        e.type = CasEventType::TreeExpand;
+                        e.namespace_ = ns.string();
+                        e.ref_name = record.ref_name;
+                        e.object_kind = CasEventObjectKind::Tree;
+                        e.object_hash = u128ToHex(record.tree_id);
+                        e.round = state.round;
+                        e.gen = state.snap_generation;
+                        e.at_version = record.at_version;
+                        e.outcome = "expanded";
+                        e.reason = "first folded Add to this tree; child edges recorded in snap";
+                        e.detail = {{"out_edges", std::to_string(out_edges)},
                                {"driving_add_at_version", std::to_string(record.at_version)}};
-                    store->emitEvent(_ev21);
+                    });
                 }
             }
         }
@@ -1454,38 +1436,36 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
             transitioned.insert(transitioned.end(), cands.begin(), cands.end());
             /// B170: a folded Remove dropped this ref's root edge (was the CAROOTREM audit line).
             /// `zeroed` = the tree's in-degree hit 0 (it becomes a delete candidate -> cascade strip).
+            EventEmitter{*store}.emit([&](CasEvent & e)
             {
-                CasEvent _ev22;
-                _ev22.type = CasEventType::RootRemove;
-                _ev22.namespace_ = ns.string();
-                _ev22.ref_name = record.ref_name;
-                _ev22.object_kind = CasEventObjectKind::Tree;
-                _ev22.object_hash = u128ToHex(record.tree_id);
-                _ev22.round = state.round;
-                _ev22.gen = state.snap_generation;
-                _ev22.at_version = record.at_version;
-                _ev22.outcome = cands.empty() ? "ok" : "zeroed";
-                _ev22.reason = "folded Remove(" + record.ref_name + ")";
-                _ev22.detail = {{"zeroed", cands.empty() ? "false" : "true"}};
-                store->emitEvent(_ev22);
-            }
+                e.type = CasEventType::RootRemove;
+                e.namespace_ = ns.string();
+                e.ref_name = record.ref_name;
+                e.object_kind = CasEventObjectKind::Tree;
+                e.object_hash = u128ToHex(record.tree_id);
+                e.round = state.round;
+                e.gen = state.snap_generation;
+                e.at_version = record.at_version;
+                e.outcome = cands.empty() ? "ok" : "zeroed";
+                e.reason = "folded Remove(" + record.ref_name + ")";
+                e.detail = {{"zeroed", cands.empty() ? "false" : "true"}};
+            });
             /// B170: each target whose in-degree zeroed on the remove — emit per freed candidate.
             for (const Candidate & freed : cands)
-            {
-                CasEvent _ev23;
-                _ev23.type = CasEventType::IndegZero;
-                _ev23.namespace_ = ns.string();
-                _ev23.object_kind = toEventKind(freed.kind);
-                _ev23.object_hash = u128ToHex(freed.hash);
-                _ev23.round = state.round;
-                _ev23.gen = state.snap_generation;
-                _ev23.at_version = record.at_version;
-                _ev23.reason = "last edge dropped";
-                /// prev_indeg is exactly 1 (Candidate returned only on the 1->0 transition).
-                _ev23.detail = {{"prev_indeg", "1"},
+                EventEmitter{*store}.emit([&](CasEvent & e)
+                {
+                    e.type = CasEventType::IndegZero;
+                    e.namespace_ = ns.string();
+                    e.object_kind = toEventKind(freed.kind);
+                    e.object_hash = u128ToHex(freed.hash);
+                    e.round = state.round;
+                    e.gen = state.snap_generation;
+                    e.at_version = record.at_version;
+                    e.reason = "last edge dropped";
+                    /// prev_indeg is exactly 1 (Candidate returned only on the 1->0 transition).
+                    e.detail = {{"prev_indeg", "1"},
                            {"dropped_by", "root_remove(" + record.ref_name + ")"}};
-                store->emitEvent(_ev23);
-            }
+                });
         }
     }
 
@@ -1829,15 +1809,14 @@ void Gc::pulseHeartbeat(Store & store, UInt128 gc_id)
     /// off. Distinct from the lease-renew GcLeaseHeartbeat in acquireOrRenewLease; only the committed
     /// pulse is an event (a Conflict means another writer raced us — best-effort, the next pulse retries).
     if (outcome == CasOutcome::Committed)
-    {
-        CasEvent ev;
-        ev.type = CasEventType::GcLeaseHeartbeat;
-        ev.object_kind = CasEventObjectKind::Snap;
-        ev.outcome = "pulsed";
-        ev.reason = "advisory heartbeat pulse (B160): bumped gc/hb so a follower steal backs off";
-        ev.detail = {{"owner", u128ToHex(gc_id)}, {"hb_seq", std::to_string(hb.hb_seq)}};
-        store.emitEvent(ev);
-    }
+        EventEmitter{store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::GcLeaseHeartbeat;
+            e.object_kind = CasEventObjectKind::Snap;
+            e.outcome = "pulsed";
+            e.reason = "advisory heartbeat pulse (B160): bumped gc/hb so a follower steal backs off";
+            e.detail = {{"owner", u128ToHex(gc_id)}, {"hb_seq", std::to_string(hb.hb_seq)}};
+        });
 }
 
 void Gc::beginWatermarkRound()
@@ -1995,28 +1974,24 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, con
         }
     });
 
-    if (store->hasEventSink())
-    {
-        for (const DeadRef & dr : dead_refs)
+    for (const DeadRef & dr : dead_refs)
+        EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            CasEvent ev;
-            ev.type = CasEventType::PrecommitReclaim;
-            ev.namespace_ = ns_str;
-            ev.ref_name = dr.name;
-            ev.object_kind = CasEventObjectKind::Tree;
-            ev.object_hash = u128ToHex(dr.tree);
-            ev.round = round;
-            ev.outcome = "reclaimed";
-            ev.reason = w == nullptr
+            e.type = CasEventType::PrecommitReclaim;
+            e.namespace_ = ns_str;
+            e.ref_name = dr.name;
+            e.object_kind = CasEventObjectKind::Tree;
+            e.object_hash = u128ToHex(dr.tree);
+            e.round = round;
+            e.outcome = "reclaimed";
+            e.reason = w == nullptr
                 ? "precommit reclaim: owning server has no watermark (abandoned/vanished build)"
                 : (!server_live
                     ? "precommit reclaim: owning server frozen K=2 rounds (crashed build)"
                     : "precommit reclaim: build_seq below the server's min_active floor (retired build)");
-            ev.detail = {{"build_seq", std::to_string(dr.build_seq)},
+            e.detail = {{"build_seq", std::to_string(dr.build_seq)},
                          {"min_active", w ? std::to_string(w->min_active) : "absent"}};
-            store->emitEvent(ev);
-        }
-    }
+        });
 }
 
 bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
@@ -2052,17 +2027,16 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
                 state = std::move(fresh);
                 state_token = committed_token;
                 /// B170: lease acquired on a fresh pool (gc/state created holding our lease).
+                EventEmitter{*store}.emit([&](CasEvent & e)
                 {
-                    CasEvent _ev24;
-                    _ev24.type = CasEventType::GcLeaseAcquire;
-                    _ev24.round = state.round;
-                    _ev24.gen = state.snap_generation;
-                    _ev24.outcome = "acquired";
-                    _ev24.reason = "fresh pool: created gc/state holding our lease";
-                    _ev24.detail = {{"owner", u128ToHex(gc_id)}, {"seq", std::to_string(state.lease.seq)},
+                    e.type = CasEventType::GcLeaseAcquire;
+                    e.round = state.round;
+                    e.gen = state.snap_generation;
+                    e.outcome = "acquired";
+                    e.reason = "fresh pool: created gc/state holding our lease";
+                    e.detail = {{"owner", u128ToHex(gc_id)}, {"seq", std::to_string(state.lease.seq)},
                                {"fence_seq", std::to_string(state.fence_seq)}};
-                    store->emitEvent(_ev24);
-                }
+                });
                 return true;
             }
             /// A racer created it first — re-read and fall through to renew/observe/steal.
@@ -2086,17 +2060,16 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
                 state = std::move(next);
                 state_token = committed_token;
                 /// B170: lease renewed (seq advanced; fence_seq unchanged — not a new epoch).
+                EventEmitter{*store}.emit([&](CasEvent & e)
                 {
-                    CasEvent _ev25;
-                    _ev25.type = CasEventType::GcLeaseHeartbeat;
-                    _ev25.round = state.round;
-                    _ev25.gen = state.snap_generation;
-                    _ev25.outcome = "renewed";
-                    _ev25.reason = "lease renew: seq advanced (same epoch)";
-                    _ev25.detail = {{"owner", u128ToHex(gc_id)}, {"seq", std::to_string(state.lease.seq)},
+                    e.type = CasEventType::GcLeaseHeartbeat;
+                    e.round = state.round;
+                    e.gen = state.snap_generation;
+                    e.outcome = "renewed";
+                    e.reason = "lease renew: seq advanced (same epoch)";
+                    e.detail = {{"owner", u128ToHex(gc_id)}, {"seq", std::to_string(state.lease.seq)},
                                {"fence_seq", std::to_string(state.fence_seq)}};
-                    store->emitEvent(_ev25);
-                }
+                });
                 return true;
             }
             /// Someone moved the lease under us (a steal happened) — re-read once; if the owner
@@ -2148,19 +2121,18 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
             state = std::move(next);
             state_token = committed_token;
             /// B170: lease STOLEN from a dead incumbent — fence_seq++ opens a new leadership epoch.
+            EventEmitter{*store}.emit([&](CasEvent & e)
             {
-                CasEvent _ev26;
-                _ev26.type = CasEventType::GcLeaseSteal;
-                _ev26.round = state.round;
-                _ev26.gen = state.snap_generation;
-                _ev26.outcome = "stolen";
-                _ev26.reason = "incumbent did not renew across our observation window; stole the lease";
-                _ev26.detail = {{"owner", u128ToHex(gc_id)},
+                e.type = CasEventType::GcLeaseSteal;
+                e.round = state.round;
+                e.gen = state.snap_generation;
+                e.outcome = "stolen";
+                e.reason = "incumbent did not renew across our observation window; stole the lease";
+                e.detail = {{"owner", u128ToHex(gc_id)},
                            {"prev_owner", u128ToHex(current.lease.owner)},
                            {"seq", std::to_string(state.lease.seq)},
                            {"fence_seq", std::to_string(state.fence_seq)}};
-                store->emitEvent(_ev26);
-            }
+            });
             return true;
         }
 

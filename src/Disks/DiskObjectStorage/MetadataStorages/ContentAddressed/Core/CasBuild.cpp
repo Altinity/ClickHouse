@@ -73,17 +73,15 @@ Build::Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt1
 {
     /// B170: a build began (W-HEARTBEAT durable). build_id/seq/epoch identify it for token-join
     /// attribution against the GC delete rows.
-    if (store->hasEventSink())
+    EventEmitter{*store}.emit([&](CasEvent & e)
     {
-        CasEvent _ev0;
-        _ev0.type = CasEventType::BuildStart;
-        _ev0.ref_name = info.intended_ref.value_or("");
-        _ev0.token = u128ToHex(build_id);
-        _ev0.outcome = "started";
-        _ev0.reason = "startBuild: heartbeat durable; build in-flight";
-        _ev0.detail = {{"build_seq", std::to_string(build_seq)}, {"epoch", std::to_string(epoch)}};
-        store->emitEvent(_ev0);
-    }
+        e.type = CasEventType::BuildStart;
+        e.ref_name = info.intended_ref.value_or("");
+        e.token = u128ToHex(build_id);
+        e.outcome = "started";
+        e.reason = "startBuild: heartbeat durable; build in-flight";
+        e.detail = {{"build_seq", std::to_string(build_seq)}, {"epoch", std::to_string(epoch)}};
+    });
 }
 
 Build::~Build()
@@ -255,18 +253,16 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
         ///   • putBlob (has BlobSource): catches ABORTED, calls uploadFromSource from held bytes.
         ///   • uploadStagedTree / recreateTree (has retained_trees payload): calls uploadFromSource.
         ///   • gate bodyless (no source): propagates ABORTED (retryable; caller retries op).
-        if (store->hasEventSink())
+        EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            CasEvent _ev2;
-            _ev2.type = CasEventType::BlobReuseResurrect;
-            _ev2.object_kind = ev_kind;
-            _ev2.object_hash = u128ToHex(hash);
-            _ev2.token = hr.token.value;
-            _ev2.round = store->retireView().round();
-            _ev2.outcome = "condemned";
-            _ev2.reason = "observed token is condemned; caller must re-upload from source (INV-1)";
-            store->emitEvent(_ev2);
-        }
+            e.type = CasEventType::BlobReuseResurrect;
+            e.object_kind = ev_kind;
+            e.object_hash = u128ToHex(hash);
+            e.token = hr.token.value;
+            e.round = store->retireView().round();
+            e.outcome = "condemned";
+            e.reason = "observed token is condemned; caller must re-upload from source (INV-1)";
+        });
         throw Exception(ErrorCodes::ABORTED,
             "Build::observeAndAdmit: condemned token for {} — caller must re-upload from source bytes (INV-1)",
             key);
@@ -276,18 +272,16 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     /// B170: reuse ADOPTED an existing incarnation's token as NOT condemned (per this build's
     /// retire-view). Was the CAREUSE adopt audit line. Token-join this against a later blob_delete
     /// of the same hash/token to pin a reuse-of-an-object-being-deleted race.
-    if (store->hasEventSink())
+    EventEmitter{*store}.emit([&](CasEvent & e)
     {
-        CasEvent _ev3;
-        _ev3.type = CasEventType::BlobReuseAdopt;
-        _ev3.object_kind = ev_kind;
-        _ev3.object_hash = u128ToHex(hash);
-        _ev3.token = hr.token.value;
-        _ev3.round = store->retireView().round();
-        _ev3.outcome = "adopt";
-        _ev3.reason = "observed token not condemned; adopted the live incarnation (no bytes moved)";
-        store->emitEvent(_ev3);
-    }
+        e.type = CasEventType::BlobReuseAdopt;
+        e.object_kind = ev_kind;
+        e.object_hash = u128ToHex(hash);
+        e.token = hr.token.value;
+        e.round = store->retireView().round();
+        e.outcome = "adopt";
+        e.reason = "observed token not condemned; adopted the live incarnation (no bytes moved)";
+    });
     deps[{static_cast<uint8_t>(kind), hash}] =
         DepEntry{kind, hr.token, store->retireView().round(), logical_size};
     return logical_size;
@@ -363,19 +357,17 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     {
         deps[{static_cast<uint8_t>(kind), hash}] =
             DepEntry{kind, tok, store->retireView().round(), source_bytes.size()};
-        if (store->hasEventSink())
+        EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            CasEvent _ev;
-            _ev.type = (kind == ObjectKind::Tree) ? CasEventType::TreePut : CasEventType::BlobPut;
-            _ev.object_kind = ev_kind;
-            _ev.object_hash = u128ToHex(hash);
-            _ev.token = tok.value;
-            _ev.round = store->retireView().round();
-            _ev.outcome = "ok";
-            _ev.reason = "uploadFromSource: fresh incarnation from writer's own source bytes (INV-1)";
-            _ev.detail = {{"size", std::to_string(source_bytes.size())}, {"build_id", u128ToHex(build_id)}};
-            store->emitEvent(_ev);
-        }
+            e.type = (kind == ObjectKind::Tree) ? CasEventType::TreePut : CasEventType::BlobPut;
+            e.object_kind = ev_kind;
+            e.object_hash = u128ToHex(hash);
+            e.token = tok.value;
+            e.round = store->retireView().round();
+            e.outcome = "ok";
+            e.reason = "uploadFromSource: fresh incarnation from writer's own source bytes (INV-1)";
+            e.detail = {{"size", std::to_string(source_bytes.size())}, {"build_id", u128ToHex(build_id)}};
+        });
     };
 
     /// Phase 1: try If-None-Match upload (object absent or race with another writer).
@@ -743,21 +735,19 @@ void Build::precommit(const TreeId & manifest)
     /// B171: the precommit was published — the precommit edge now protects the manifest's closure.
     /// Record that fact so the successful-commit path (and only it) removes the edge.
     precommitted = true;
-    if (store->hasEventSink())
+    EventEmitter{*store}.emit([&](CasEvent & e)
     {
-        CasEvent _ev;
-        _ev.type = CasEventType::Precommit;
-        _ev.namespace_ = ns.string();
-        _ev.ref_name = ref;
-        _ev.object_kind = CasEventObjectKind::Tree;
-        _ev.object_hash = manifest.string();
-        _ev.token = u128ToHex(build_id);
-        _ev.round = store->retireView().round();
-        _ev.outcome = "ok";
-        _ev.reason = "precommit: published precommit manifest edge to protect the closure during the build";
-        _ev.detail = {{"build_seq", std::to_string(build_seq)}};
-        store->emitEvent(_ev);
-    }
+        e.type = CasEventType::Precommit;
+        e.namespace_ = ns.string();
+        e.ref_name = ref;
+        e.object_kind = CasEventObjectKind::Tree;
+        e.object_hash = manifest.string();
+        e.token = u128ToHex(build_id);
+        e.round = store->retireView().round();
+        e.outcome = "ok";
+        e.reason = "precommit: published precommit manifest edge to protect the closure during the build";
+        e.detail = {{"build_seq", std::to_string(build_seq)}};
+    });
 }
 
 void Build::recreateTree(const UInt128 & hash)
@@ -785,17 +775,15 @@ void Build::checkAndResolveDeps()
     /// Iterating `deps` while uploadFromSource/observeAndAdmit/recreateTree mutate deps is safe:
     /// all three overwrite the SAME (kind, hash) entry (deps[thatkey].token / observed_view_round),
     /// never insert a new key — so the map structure and the current iterator stay valid.
-    if (store->hasEventSink())
+    EventEmitter{*store}.emit([&](CasEvent & e)
     {
-        CasEvent _ev6;
-        _ev6.type = CasEventType::GateRevalidate;
-        _ev6.token = u128ToHex(build_id);
-        _ev6.round = store->retireView().round();
-        _ev6.outcome = "revalidating";
-        _ev6.reason = "fail-closed commit: re-prove the dependency closure is present before writing the ref";
-        _ev6.detail = {{"deps", std::to_string(deps.size())}};
-        store->emitEvent(_ev6);
-    }
+        e.type = CasEventType::GateRevalidate;
+        e.token = u128ToHex(build_id);
+        e.round = store->retireView().round();
+        e.outcome = "revalidating";
+        e.reason = "fail-closed commit: re-prove the dependency closure is present before writing the ref";
+        e.detail = {{"deps", std::to_string(deps.size())}};
+    });
 
     /// Gate-local wrapper: calls the 3-arg observeAndAdmit and converts FILE_DOESNT_EXIST (object absent
     /// at observe time) to ABORTED. At the publish gate, an object that is fully GC-deleted before our
@@ -885,18 +873,16 @@ void Build::checkAndResolveDeps()
             /// that GC then condemned; our dep.token may be stale and not capture t'. We act on any hit.
             if (hits.has_value())
             {
-                if (store->hasEventSink())
+                EventEmitter{*store}.emit([&](CasEvent & e)
                 {
-                    CasEvent _ev5;
-                    _ev5.type = CasEventType::GateResurrect;
-                    _ev5.object_kind = toEventKind(kind);
-                    _ev5.object_hash = u128ToHex(hash);
-                    _ev5.token = u128ToHex(build_id);
-                    _ev5.round = store->retireView().round();
-                    _ev5.outcome = "recreate-or-reobserve";
-                    _ev5.reason = "gate: dep has a view hit by hash (INV-1: no GET)";
-                    store->emitEvent(_ev5);
-                }
+                    e.type = CasEventType::GateResurrect;
+                    e.object_kind = toEventKind(kind);
+                    e.object_hash = u128ToHex(hash);
+                    e.token = u128ToHex(build_id);
+                    e.round = store->retireView().round();
+                    e.outcome = "recreate-or-reobserve";
+                    e.reason = "gate: dep has a view hit by hash (INV-1: no GET)";
+                });
 
                 if (store->retireView().isCondemnedToken(kind, hash, *dep.token))
                 {
@@ -1033,20 +1019,18 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
 
     /// B170: the ref was published (RefRepoint when it already named a tree, else RefPublish). The
     /// at_version is the committed shard_version — the journal record GC will fold as a root Add.
-    if (store->hasEventSink())
+    EventEmitter{*store}.emit([&](CasEvent & e)
     {
-        CasEvent _ev7;
-        _ev7.type = repointed_over ? CasEventType::RefRepoint : CasEventType::RefPublish;
-        _ev7.namespace_ = ns.string();
-        _ev7.ref_name = ref_name;
-        _ev7.object_kind = CasEventObjectKind::Tree;
-        _ev7.object_hash = tree.string();
-        _ev7.token = u128ToHex(build_id);
-        _ev7.at_version = committed_at_version;
-        _ev7.outcome = "ok";
-        _ev7.reason = repointed_over ? "published over an existing ref (repoint)" : "published a new ref";
-        store->emitEvent(_ev7);
-    }
+        e.type = repointed_over ? CasEventType::RefRepoint : CasEventType::RefPublish;
+        e.namespace_ = ns.string();
+        e.ref_name = ref_name;
+        e.object_kind = CasEventObjectKind::Tree;
+        e.object_hash = tree.string();
+        e.token = u128ToHex(build_id);
+        e.at_version = committed_at_version;
+        e.outcome = "ok";
+        e.reason = repointed_over ? "published over an existing ref (repoint)" : "published a new ref";
+    });
 
     /// B171: the table ref is now durably committed — the manifest's closure is table-pinned. Remove
     /// the precommit edge so GC's fold releases it. ORDER: the table ref Add committed FIRST
@@ -1080,40 +1064,36 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
                     .at_version = root.shard_version + 1, .closure = {}});
             });
             precommitted = false;
-            if (store->hasEventSink())
+            EventEmitter{*store}.emit([&](CasEvent & e)
             {
-                CasEvent _evpr;
-                _evpr.type = CasEventType::PrecommitRemoved;
-                _evpr.namespace_ = precommitNs().string();
-                _evpr.ref_name = ref;
-                _evpr.object_kind = CasEventObjectKind::Tree;
-                _evpr.object_hash = tree.string();
-                _evpr.token = u128ToHex(build_id);
-                _evpr.outcome = "removed";
-                _evpr.reason = "fail-closed commit succeeded; closure now table-pinned, releasing the precommit edge";
-                _evpr.detail = {{"build_seq", std::to_string(build_seq)}};
-                store->emitEvent(_evpr);
-            }
+                e.type = CasEventType::PrecommitRemoved;
+                e.namespace_ = precommitNs().string();
+                e.ref_name = ref;
+                e.object_kind = CasEventObjectKind::Tree;
+                e.object_hash = tree.string();
+                e.token = u128ToHex(build_id);
+                e.outcome = "removed";
+                e.reason = "fail-closed commit succeeded; closure now table-pinned, releasing the precommit edge";
+                e.detail = {{"build_seq", std::to_string(build_seq)}};
+            });
         }
         catch (const Exception & e)
         {
             /// Best-effort: the commit already succeeded, so leaving a stale precommit is benign (GC
             /// reclaims it). Do NOT propagate — that would fail an already-committed publish.
-            if (store->hasEventSink())
+            EventEmitter{*store}.emit([&](CasEvent & ev)
             {
-                CasEvent _evpr;
-                _evpr.type = CasEventType::PrecommitRemoved;
-                _evpr.namespace_ = precommitNs().string();
-                _evpr.ref_name = ref;
-                _evpr.object_kind = CasEventObjectKind::Tree;
-                _evpr.object_hash = tree.string();
-                _evpr.token = u128ToHex(build_id);
-                _evpr.outcome = "deferred";
-                _evpr.reason = "precommit removal failed transiently after a successful commit; left for GC reclaim: "
+                ev.type = CasEventType::PrecommitRemoved;
+                ev.namespace_ = precommitNs().string();
+                ev.ref_name = ref;
+                ev.object_kind = CasEventObjectKind::Tree;
+                ev.object_hash = tree.string();
+                ev.token = u128ToHex(build_id);
+                ev.outcome = "deferred";
+                ev.reason = "precommit removal failed transiently after a successful commit; left for GC reclaim: "
                     + e.message();
-                _evpr.detail = {{"build_seq", std::to_string(build_seq)}};
-                store->emitEvent(_evpr);
-            }
+                ev.detail = {{"build_seq", std::to_string(build_seq)}};
+            });
         }
     }
 
@@ -1121,21 +1101,19 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
     /// (minActive) can advance past it (idempotent — the dtor also retires).
     store->retireBuildSeq(build_seq);
     /// B170: the build's terminal success — the part is committed.
-    if (store->hasEventSink())
+    EventEmitter{*store}.emit([&](CasEvent & e)
     {
-        CasEvent _ev8;
-        _ev8.type = CasEventType::BuildPublish;
-        _ev8.namespace_ = ns.string();
-        _ev8.ref_name = ref_name;
-        _ev8.object_kind = CasEventObjectKind::Tree;
-        _ev8.object_hash = tree.string();
-        _ev8.token = u128ToHex(build_id);
-        _ev8.at_version = committed_at_version;
-        _ev8.outcome = "published";
-        _ev8.reason = "build committed its root manifest; no longer in-flight";
-        _ev8.detail = {{"build_seq", std::to_string(build_seq)}};
-        store->emitEvent(_ev8);
-    }
+        e.type = CasEventType::BuildPublish;
+        e.namespace_ = ns.string();
+        e.ref_name = ref_name;
+        e.object_kind = CasEventObjectKind::Tree;
+        e.object_hash = tree.string();
+        e.token = u128ToHex(build_id);
+        e.at_version = committed_at_version;
+        e.outcome = "published";
+        e.reason = "build committed its root manifest; no longer in-flight";
+        e.detail = {{"build_seq", std::to_string(build_seq)}};
+    });
 }
 
 void Build::abandon()
@@ -1147,16 +1125,14 @@ void Build::abandon()
     store->retireBuildSeq(build_seq);
     alive = false;
     /// B170: the build was abandoned (heartbeat discarded; its uploads become GC-reclaimable debris).
-    if (store->hasEventSink())
+    EventEmitter{*store}.emit([&](CasEvent & e)
     {
-        CasEvent _ev9;
-        _ev9.type = CasEventType::BuildAbort;
-        _ev9.token = u128ToHex(build_id);
-        _ev9.outcome = "abandoned";
-        _ev9.reason = "abandon: heartbeat discarded; uploads become reclaimable debris";
-        _ev9.detail = {{"build_seq", std::to_string(build_seq)}};
-        store->emitEvent(_ev9);
-    }
+        e.type = CasEventType::BuildAbort;
+        e.token = u128ToHex(build_id);
+        e.outcome = "abandoned";
+        e.reason = "abandon: heartbeat discarded; uploads become reclaimable debris";
+        e.detail = {{"build_seq", std::to_string(build_seq)}};
+    });
 }
 
 }
