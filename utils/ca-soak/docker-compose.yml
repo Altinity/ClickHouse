@@ -53,9 +53,16 @@ services:
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: "1"
     depends_on:
-      - keeper1
-      - rustfs1
-      - createbucket
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      # Must wait for the bucket to be CREATED, not just for createbucket to start: the CA pool
+      # probes S3 (writes _probe/token) on startup and exits if the bucket is absent. The short-form
+      # list only gated on container start, which raced a fresh `down -v` (wiped rustfs volume → the
+      # bucket had to be recreated) and crashed ch1 with NoSuchBucket. Mirror ch2's gate.
+      createbucket:
+        condition: service_completed_successfully
     # B165: cap memory so a leak fails CLOSED (ClickHouse throws + logs the consumer) instead of a
     # kernel OOM-kill. 28g per node x2 + rustfs ~10g + driver ~5g < 91g host. See configs/memory.xml.
     mem_limit: 28g
