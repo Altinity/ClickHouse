@@ -121,3 +121,21 @@ Two commits closed the soak-v3 residual and its sibling:
   → ABORTED, never FILE_DOESNT_EXIST). The dedup-vs-GC fatal class is uniformly closed by construction.
 - **NEXT: 24h SOAK v4** on the fully-fixed binary (both commits). Watch: zero `Code 499`, zero
   `cannot reuse`/fatal `FILE_DOESNT_EXIST`; B174 gc/snap bounded; replicas converged; dangling=0.
+
+## SOAK v4 — PASS (full clean 24h chaos run) — 2026-06-23 05:07 CEST
+Re-run on the fully-fixed binary (gate residual `ef9c9e9c9e2` + sibling `a0cbca8fd55`), fresh pool.
+`PHASE3 OK`, driver exited **rc=0** at T+24h. Final tallies:
+- **faults fired: 517; restarts: 339/node** (both/ch1/ch2 kill+pause + rustfs restart/pause).
+- **ABORTED-retried INSERT attempts: 220** (the INV-1 dedup-vs-GC self-heal — fired and **recovered every time**, zero escalations to the fatal class this consolidation eliminated); transport-retried op attempts: 315.
+- **Regression watch = 0 across the entire run on both nodes:** `Code499`, `cannot-reuse`,
+  `FILE_DOESNT_EXIST`, `WORKLOAD FAILURE` — all zero. (v3 failed at T+249 on exactly these; v4 clean for 24h.)
+- **Final converge checkpoint:** `reachable=21, dangling=0, dryrun_subset=ok`; `unreachable=20`
+  (the known M-F debris / B199 leak class — space-only, well-characterized this round with a chosen fix;
+  NOT a loss). TTL reclaimed 1,068,936 rows → table drained to live=0.
+- **B174 pool bound held** throughout (pool 17–37 objects at quiesce; GC net-reclaiming, deletes>puts).
+
+**VERDICT:** the revival consolidation (B190 merged gate + sibling `uploadFromSource` fix; precommit-first
+INV-1/2/3) is **validated under 24h chaos** — survives 517 fault injections incl. simultaneous both-replica
+kills + rustfs restarts with zero data loss and zero fatal-class errors. **B190 + B189 FULLY VALIDATED.**
+Residual known-and-characterized: the `unreachable` debris (B199 chosen fix = unified `releaseClosure`;
+catch-all sweep B198) — space-only, not a beta blocker on correctness.
