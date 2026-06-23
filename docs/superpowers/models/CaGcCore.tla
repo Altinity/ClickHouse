@@ -1,4 +1,10 @@
 -------------------------------- MODULE CaGcCore --------------------------------
+\* =====================================================================================
+\* HISTORICAL / SUPERSEDED. Models the abandoned EBR / epoch / generation GC design
+\* (2026-06-07 EBR-era spec). The CURRENT model is CaIncarnationCore.tla (incarnation-token
+\* core). Kept only as the record of EBR-era checking. The "STABILIZED CORE" wording below
+\* refers to that superseded design. See CaIncarnationCore_README.md / README.md.
+\* =====================================================================================
 (***************************************************************************)
 (* TLA+ specification of the STABILIZED CORE of the content-addressed (CA) *)
 (* MergeTree garbage collector (the "Keeper-only" Epoch-Based Reclamation  *)

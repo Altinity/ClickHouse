@@ -1,3 +1,7 @@
+> **HISTORICAL.** These are results for the SUPERSEDED EBR/epoch/generation model (`CaGcCore.tla`).
+> The current model is `CaIncarnationCore.tla` — see `CaIncarnationCore_RESULTS.md`. Kept as the
+> record of EBR-era checking. (Banner added 2026-06-23; mirrors the one already in `README.md`.)
+
 # CA GC core — TLC model-checking results
 
 TLC (v2.19, OpenJDK 21) was run on `CaGcCore.tla` against the four staged configs. This is

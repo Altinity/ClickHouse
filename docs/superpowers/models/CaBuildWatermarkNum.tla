@@ -1,4 +1,11 @@
 --------------------- MODULE CaBuildWatermarkNum ---------------------
+\* =====================================================================================
+\* STALE vs SHIPPED CODE (2026-06-23 currency review). Same removed blob-guard subject as
+\* CaBuildWatermark (B171 removed per-candidate watermark blob-protection). The monotone
+\* build_seq / min_active floor lemma it validates IS still load-bearing -- but for precommit-ref
+\* reclaim (build_seq < min_active, CasGc.cpp ~1877), NOT blob protection. Superseded as a
+\* blob-protection model; floor lemma retained. Details: MODEL_CURRENCY_REVIEW_2026-06-22.md.
+\* =====================================================================================
 (***************************************************************************)
 (* CONCRETE, NUMERIC validation of the watermark oracle (B167) — the part  *)
 (* CaBuildWatermark abstracts away. Here `min_active` is a real per-server  *)

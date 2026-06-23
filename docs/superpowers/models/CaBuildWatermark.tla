@@ -1,4 +1,11 @@
 ----------------------- MODULE CaBuildWatermark -----------------------
+\* =====================================================================================
+\* STALE vs SHIPPED CODE (2026-06-23 currency review). Models the per-candidate
+\* protectedByLiveBuild watermark BLOB-guard that B171 REMOVED (CasGc.cpp ~979). The watermark
+\* now only drives precommit-ref reclaim liveness, not blob protection; in-flight blob protection
+\* is precommit reachability -> CaBuildRootPrecommit.tla. Superseded; kept as historical record.
+\* Details: MODEL_CURRENCY_REVIEW_2026-06-22.md.
+\* =====================================================================================
 (***************************************************************************)
 (* TLA+ LIVENESS model of the CA per-server build WATERMARK (B167).        *)
 (*                                                                         *)

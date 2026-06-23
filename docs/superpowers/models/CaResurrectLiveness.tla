@@ -1,4 +1,11 @@
 ----------------------- MODULE CaResurrectLiveness -----------------------
+\* =====================================================================================
+\* STALE vs SHIPPED CODE (2026-06-23 currency review). Models an abstract condemn-time
+\* HeartbeatGuard that was NEVER implemented (heartbeat-gated condemn belongs to the deferred
+\* M-F Full GC). Shipped in-flight protection is precommit reachability -> CaBuildRootPrecommit.tla.
+\* Superseded as a model of current behavior; kept as historical record.
+\* Details: MODEL_CURRENCY_REVIEW_2026-06-22.md.
+\* =====================================================================================
 (***************************************************************************)
 (* TLA+ LIVENESS model of the CA resurrect convergence (B167).             *)
 (*                                                                         *)
