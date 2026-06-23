@@ -44,6 +44,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
             {"export_merge_tree_partition_task_timeout_seconds", "3600", "86400", "Increase default value to make it more realistic"},
             {"data_lake_delete_data_on_drop", false, false, "New setting that unifies dropping of data lake data; the released `iceberg_delete_data_on_drop` is kept as an alias for it."},
+            {"export_merge_tree_part_allow_lossy_cast", false, false, "New setting to gate lossy casts in EXPORT PART/PARTITION behind explicit acknowledgment"},
         });
         addSettingsChanges(settings_changes_history, "26.3",
         {
