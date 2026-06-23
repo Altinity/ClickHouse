@@ -480,6 +480,7 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     , export_merge_tree_partition_task_entries_by_key(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByCompositeKey>())
     , export_merge_tree_partition_task_entries_by_transaction_id(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByTransactionId>())
     , export_merge_tree_partition_task_entries_by_create_time(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByCreateTime>())
+    , export_read_model(std::make_unique<const ExportPartitionTaskEntriesContainer>())
     , cleanup_thread(*this)
     , deduplication_hashes_cache(*this, "deduplication_hashes")
     , async_block_ids_cache(*this, "async_blocks")
@@ -6132,8 +6133,10 @@ void StorageReplicatedMergeTree::shutdown(bool)
     }
 
     {
-        auto lock = ExportPartitionUtils::lockExclusive(export_merge_tree_partition_mutex);
+        /// Export tasks were deactivate()d above, so no writer is running. Clear the container and
+        /// publish an empty read-model so late readers observe no tasks.
         export_merge_tree_partition_task_entries.clear();
+        export_read_model.set(std::make_unique<const ExportPartitionTaskEntriesContainer>());
     }
 
     {
@@ -10109,22 +10112,23 @@ CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & 
 
     const auto zk = getZooKeeper();
 
-    /// Look up the entry in the in-memory mirror under a brief shared lock and copy out what we
-    /// need; release it before any ZooKeeper round-trip so the system.replicated_partition_exports
-    /// reader is never blocked. This is a pure read of the container, so a shared lock is enough -
-    /// the KILLED status set in ZooKeeper below propagates back into the mirror via the status
-    /// watch -> handleStatusChanges.
+    /// Read the published snapshot (shared_ptr copy, no lock, no ZooKeeper). The KILLED status set
+    /// below propagates back into the mirror via the status watch -> handleStatusChanges.
     bool local_entry_found = false;
     bool local_entry_pending = false;
     std::string local_composite_key;
     {
-        auto lock = ExportPartitionUtils::lockShared(export_merge_tree_partition_mutex);
-        const auto entry = export_merge_tree_partition_task_entries_by_transaction_id.find(transaction_id);
-        if (entry != export_merge_tree_partition_task_entries_by_transaction_id.end())
+        const auto model = export_read_model.get();
+        if (model)
         {
-            local_entry_found = true;
-            local_entry_pending = entry->status == ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING;
-            local_composite_key = entry->getCompositeKey();
+            const auto & by_transaction_id = model->get<ExportPartitionTaskEntryTagByTransactionId>();
+            const auto entry = by_transaction_id.find(transaction_id);
+            if (entry != by_transaction_id.end())
+            {
+                local_entry_found = true;
+                local_entry_pending = entry->status == ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING;
+                local_composite_key = entry->getCompositeKey();
+            }
         }
     }
 

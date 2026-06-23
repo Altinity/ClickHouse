@@ -37,6 +37,7 @@
 #include <Storages/TableZnodeInfo.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <Common/EventNotifier.h>
+#include <Common/MultiVersion.h>
 #include <Common/ProfileEventsScope.h>
 #include <Common/SharedMutex.h>
 #include <Common/Throttler.h>
@@ -526,16 +527,20 @@ private:
 
     Coordination::WatchCallbackPtr export_merge_tree_partition_watch_callback;
 
-    mutable SharedMutex export_merge_tree_partition_mutex;
-
     BackgroundSchedulePoolTaskHolder export_merge_tree_partition_select_task;
 
+    /// Writer-private mirror, mutated only by poll() / handleStatusChanges() under M_task. Readers
+    /// use export_read_model instead. part_references pin PENDING tasks' data parts and live here only.
     ExportPartitionTaskEntriesContainer export_merge_tree_partition_task_entries;
-    
-    // Convenience references to indexes
+
+    // Convenience references to indexes (writer-private, see above)
     ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByCompositeKey>::type & export_merge_tree_partition_task_entries_by_key;
     ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByTransactionId>::type & export_merge_tree_partition_task_entries_by_transaction_id;
     ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByCreateTime>::type & export_merge_tree_partition_task_entries_by_create_time;
+
+    /// Immutable snapshot republished after each writer batch (part_references stripped). Readers
+    /// (system table, scheduler, KILL) get() a consistent version with no lock and no ZooKeeper.
+    MultiVersion<ExportPartitionTaskEntriesContainer> export_read_model;
     /// A thread that removes old parts, log entries, and blocks.
     ReplicatedMergeTreeCleanupThread cleanup_thread;
 

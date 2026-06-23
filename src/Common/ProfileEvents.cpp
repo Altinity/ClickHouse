@@ -344,10 +344,6 @@
     M(ExportPartitionZooKeeperMulti, "Number of 'multi' requests to ZooKeeper made by the export partition feature.", ValueType::Number) \
     M(ExportPartitionZooKeeperExists, "Number of 'exists' requests to ZooKeeper made by the export partition feature.", ValueType::Number) \
     M(ExportPartsRejectedByMemoryLimit, "Number of background export part tasks rejected due to background memory limit.", ValueType::Number) \
-    M(ExportPartitionLockReadWaitMicroseconds, "Total time spent waiting to acquire the export partition in-memory state lock for reading (shared).", ValueType::Microseconds) \
-    M(ExportPartitionLockWriteWaitMicroseconds, "Total time spent waiting to acquire the export partition in-memory state lock for writing (exclusive).", ValueType::Microseconds) \
-    M(ExportPartitionLockReadAcquisitions, "Number of times the export partition in-memory state lock was acquired for reading (shared).", ValueType::Number) \
-    M(ExportPartitionLockWriteAcquisitions, "Number of times the export partition in-memory state lock was acquired for writing (exclusive).", ValueType::Number) \
     \
     M(DistributedConnectionTries, "Total count of distributed connection attempts.", ValueType::Number) \
     M(DistributedConnectionUsable, "Total count of successful distributed connections to a usable server (with required table, but maybe stale).", ValueType::Number) \

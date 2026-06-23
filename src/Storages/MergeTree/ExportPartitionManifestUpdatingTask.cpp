@@ -39,7 +39,7 @@ namespace
 {
     /// Work item describing a commit-recovery attempt that has been deferred out of
     /// the `poll()` critical section. Captures everything by value so it can be
-    /// executed safely after `export_merge_tree_partition_mutex` has been released.
+    /// executed safely after the M_task critical section has been released.
     struct CommitRecoveryWork
     {
         ExportReplicatedMergeTreePartitionManifest metadata;
@@ -245,11 +245,9 @@ namespace
                     return;
                 }
 
-                /// A replica exported the last part but the commit never landed. Capture everything
-                /// needed to run commit() outside `export_merge_tree_partition_mutex`. The
-                /// commit path performs network I/O (REST catalog + S3) with up to
-                /// MAX_TRANSACTION_RETRIES = 100 retries; holding the storage-wide mutex across
-                /// that work is what caused `system.replicated_partition_exports` to hang.
+                /// A replica exported the last part but the commit never landed. Run commit()
+                /// outside M_task: it does network I/O (REST catalog + S3, up to
+                /// MAX_TRANSACTION_RETRIES=100) and must not block the other background task.
                 ///
                 /// The outer poll() loop stays on the normal path: it will call addTask() so the
                 /// in-memory container reflects the PENDING entry. The status watch registered by
@@ -271,51 +269,52 @@ ExportPartitionManifestUpdatingTask::ExportPartitionManifestUpdatingTask(Storage
 {
 }
 
+void ExportPartitionManifestUpdatingTask::publishReadModel()
+{
+    /// Called under M_task. part_references are not copied: the published version is informational
+    /// only, and parts must be pinned solely by the authoritative container.
+    auto model = std::make_unique<ExportPartitionTaskEntriesContainer>();
+    for (const auto & entry : storage.export_merge_tree_partition_task_entries_by_key)
+    {
+        ExportReplicatedMergeTreePartitionTaskEntry copy = entry;
+        copy.part_references.clear(); /// never pin parts inside a published version
+        model->insert(std::move(copy));
+    }
+    storage.export_read_model.set(std::move(model));
+}
+
 std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::getPartitionExportsInfo() const
 {
-    /// Snapshot just the fields we need under the lock, then build the public
-    /// ReplicatedPartitionExportInfo vector after releasing it. This keeps the critical
-    /// section O(entries) of cheap struct copies (manifest + enum) rather than also
-    /// covering the formatting / Array construction performed by the caller.
-    struct EntrySnapshot
-    {
-        ExportReplicatedMergeTreePartitionManifest manifest;
-        ExportReplicatedMergeTreePartitionTaskEntry::Status status;
-        std::map<String, LastExceptionEntry> last_exception_per_replica;
-    };
-
-    std::vector<EntrySnapshot> snapshots;
-
-    {
-        auto lock = ExportPartitionUtils::lockShared(storage.export_merge_tree_partition_mutex);
-
-        snapshots.reserve(storage.export_merge_tree_partition_task_entries_by_key.size());
-        for (const auto & entry : storage.export_merge_tree_partition_task_entries_by_key)
-            snapshots.push_back(EntrySnapshot{entry.manifest, entry.status, entry.last_exception_per_replica});
-    }
+    /// Wait-free read of the published snapshot: a shared_ptr copy, no lock, no ZooKeeper.
+    const auto model = storage.export_read_model.get();
 
     std::vector<ReplicatedPartitionExportInfo> infos;
-    infos.reserve(snapshots.size());
+    if (!model)
+        return infos;
 
-    for (auto & snapshot : snapshots)
+    infos.reserve(model->size());
+
+    for (const auto & entry : model->get<ExportPartitionTaskEntryTagByCompositeKey>())
     {
+        const auto & manifest = entry.manifest;
+
         ReplicatedPartitionExportInfo info;
 
-        info.destination_database = snapshot.manifest.destination_database;
-        info.destination_table = snapshot.manifest.destination_table;
-        info.partition_id = snapshot.manifest.partition_id;
-        info.transaction_id = snapshot.manifest.transaction_id;
-        info.query_id = snapshot.manifest.query_id;
-        info.create_time = snapshot.manifest.create_time;
-        info.source_replica = snapshot.manifest.source_replica;
-        info.parts_count = snapshot.manifest.number_of_parts;
-        info.parts_to_do = snapshot.manifest.parts.size();
-        info.parts = std::move(snapshot.manifest.parts);
-        info.status = magic_enum::enum_name(snapshot.status);
+        info.destination_database = manifest.destination_database;
+        info.destination_table = manifest.destination_table;
+        info.partition_id = manifest.partition_id;
+        info.transaction_id = manifest.transaction_id;
+        info.query_id = manifest.query_id;
+        info.create_time = manifest.create_time;
+        info.source_replica = manifest.source_replica;
+        info.parts_count = manifest.number_of_parts;
+        info.parts_to_do = manifest.parts.size();
+        info.parts = manifest.parts;
+        info.status = magic_enum::enum_name(entry.status);
 
-        info.last_exception_per_replica.reserve(snapshot.last_exception_per_replica.size());
+        info.last_exception_per_replica.reserve(entry.last_exception_per_replica.size());
         size_t total_exception_count = 0;
-        for (const auto & [_, ex] : snapshot.last_exception_per_replica)
+        for (const auto & [_, ex] : entry.last_exception_per_replica)
         {
             total_exception_count += ex.count;
             info.last_exception_per_replica.push_back(ex);
@@ -356,16 +355,12 @@ void ExportPartitionManifestUpdatingTask::poll()
     }
 
     {
-        /// Task-serialization critical section: background_task_serialization_mutex is held
-        /// across the ZooKeeper reads below so poll() and handleStatusChanges() never overlap,
+        /// M_task: serializes poll() vs handleStatusChanges() and guards the authoritative
+        /// container across the ZooKeeper reads below. Readers use the read-model we republish at
+        /// the end of this block.
         std::lock_guard task_guard(background_task_serialization_mutex);
 
-        size_t entries_count_before = 0;
-        {
-            auto mirror_lock = ExportPartitionUtils::lockShared(storage.export_merge_tree_partition_mutex);
-            entries_count_before = storage.export_merge_tree_partition_task_entries_by_key.size();
-        }
-        LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), entries_count_before);
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), storage.export_merge_tree_partition_task_entries_by_key.size());
 
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildrenWatch);
@@ -399,23 +394,12 @@ void ExportPartitionManifestUpdatingTask::poll()
             auto last_exception_per_replica = readLastExceptionPerReplica(
                 zk, fs::path(entry_path), key, storage.log.load());
 
-            /// Snapshot the lookup under a brief shared mirror lock so the read never races a
-            /// concurrent exclusive mutation. We capture only existence and the current status into
-            /// locals and release the lock immediately - the iterator is not carried across the
-            /// ZooKeeper I/O below (and never across the shared->exclusive gap, since DB::SharedMutex
-            /// is not upgradeable).
+            /// Plain lookup is safe: poll() is the sole mutator while holding M_task.
             /// If the zk entry has been replaced with export_merge_tree_partition_force_export, checking only for the export key is not enough
             /// we need to make sure it is the same transaction id. If it is not, it needs to be replaced.
-            bool has_local_entry = false;
-            ExportReplicatedMergeTreePartitionTaskEntry::Status local_status{};
-            {
-                auto mirror_lock = ExportPartitionUtils::lockShared(storage.export_merge_tree_partition_mutex);
-                const auto local_entry = entries_by_key.find(key);
-                has_local_entry = local_entry != entries_by_key.end()
-                    && local_entry->manifest.transaction_id == metadata.transaction_id;
-                if (has_local_entry)
-                    local_status = local_entry->status;
-            }
+            const auto local_entry = entries_by_key.find(key);
+            const bool has_local_entry = local_entry != entries_by_key.end()
+                && local_entry->manifest.transaction_id == metadata.transaction_id;
 
             std::string status_string;
 
@@ -487,23 +471,17 @@ void ExportPartitionManifestUpdatingTask::poll()
             }
 
             /// If we already have the local entry, we need to update it if the status has changed or if there are new last exceptions.
-            /// `status_changed` is computed from the snapshot taken above; the actual mutation re-finds
-            /// the iterator under a brief exclusive mirror lock so no iterator crosses the shared->exclusive gap.
-            const bool status_changed = local_status != *status;
+            const bool status_changed = local_entry->status != *status;
             if (!last_exception_per_replica.empty() || status_changed)
             {
-                auto mirror_lock = ExportPartitionUtils::lockExclusive(storage.export_merge_tree_partition_mutex);
-                auto it = entries_by_key.find(key);
-                if (it == entries_by_key.end())
-                    continue;
                 if (!last_exception_per_replica.empty())
-                    it->last_exception_per_replica = std::move(last_exception_per_replica);
+                    local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
                 if (status_changed)
                 {
-                    it->status = *status;
-                    if (it->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+                    local_entry->status = *status;
+                    if (local_entry->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
                         /// terminal now - we no longer need to keep the data parts alive
-                        it->part_references.clear();
+                        local_entry->part_references.clear();
                 }
             }
             LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: already exists", key);
@@ -513,17 +491,13 @@ void ExportPartitionManifestUpdatingTask::poll()
         /// Remove entries that were deleted by someone else
         removeStaleEntries(zk_children, entries_by_key);
 
-        size_t entries_count_after = 0;
-        {
-            auto mirror_lock = ExportPartitionUtils::lockShared(storage.export_merge_tree_partition_mutex);
-            entries_count_after = entries_by_key.size();
-        }
-        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: finished polling for new entries. Number of entries: {}", entries_count_after);
+        /// Publish this poll() cycle's changes to readers.
+        publishReadModel();
+
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: finished polling for new entries. Number of entries: {}", entries_by_key.size());
     }
-    /// `background_task_serialization_mutex` released here (the mirror lock was only ever held
-    /// briefly, per mutation, inside the section above). Everything below runs without any lock
-    /// so concurrent readers of `system.replicated_partition_exports` and handleStatusChanges()
-    /// are not blocked by the (potentially slow) catalog round-trips below.
+    /// M_task released here. The catalog round-trips below run without any lock, so readers and
+    /// handleStatusChanges() are not blocked by them.
     ///
     /// `cleanup_lock` (the ZK ephemeral node) is INTENTIONALLY still held here and is only
     /// destructed at end of function. This preserves the existing cross-replica invariant:
@@ -602,11 +576,8 @@ void ExportPartitionManifestUpdatingTask::addTask(
         }
     }
 
-    /// Insert or update entry. The multi_index container automatically maintains both indexes.
-    /// Only the container mutation takes the mirror lock (exclusively, briefly); the part-reference
-    /// gathering above ran lock-free.
+    /// Called from poll() under M_task (sole mutator), so no extra locking is required.
     ExportReplicatedMergeTreePartitionTaskEntry entry {metadata, status, std::move(part_references), std::move(last_exception_per_replica)};
-    auto mirror_lock = ExportPartitionUtils::lockExclusive(storage.export_merge_tree_partition_mutex);
     auto it = entries_by_key.find(key);
     if (it != entries_by_key.end())
         entries_by_key.replace(it, entry);
@@ -619,20 +590,15 @@ void ExportPartitionManifestUpdatingTask::removeStaleEntries(
     auto & entries_by_key
 )
 {
-    /// Collect the stale keys first (read-only iteration; poll() is the sole container mutator
-    /// while it holds background_task_serialization_mutex). Then kill the local export tasks and
-    /// erase the entries, taking the mirror lock exclusively only for the brief erase and never
-    /// across killExportPart (which takes export_manifests_mutex).
+    /// Called from poll() under M_task. Collect stale keys first, then kill and erase them
+    /// (killExportPart takes export_manifests_mutex; lock order M_task -> export_manifests_mutex).
     std::vector<std::pair<std::string, std::string>> stale_keys; /// (composite key, transaction id)
+    for (const auto & entry : entries_by_key)
     {
-        auto mirror_lock = ExportPartitionUtils::lockShared(storage.export_merge_tree_partition_mutex);
-        for (const auto & entry : entries_by_key)
-        {
-            const auto & key = entry.getCompositeKey();
-            if (zk_children.contains(key))
-                continue;
-            stale_keys.emplace_back(key, entry.manifest.transaction_id);
-        }
+        const auto & key = entry.getCompositeKey();
+        if (zk_children.contains(key))
+            continue;
+        stale_keys.emplace_back(key, entry.manifest.transaction_id);
     }
 
     for (const auto & [key, transaction_id] : stale_keys)
@@ -648,7 +614,6 @@ void ExportPartitionManifestUpdatingTask::removeStaleEntries(
             tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
         }
 
-        auto mirror_lock = ExportPartitionUtils::lockExclusive(storage.export_merge_tree_partition_mutex);
         auto it = entries_by_key.find(key);
         if (it != entries_by_key.end())
             entries_by_key.erase(it);
@@ -663,7 +628,7 @@ void ExportPartitionManifestUpdatingTask::addStatusChange(const std::string & ke
 
 void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 {
-    /// copy the events to a local queue to avoid holding the status_changes_mutex while also holding export_merge_tree_partition_mutex
+    /// copy the events to a local queue to avoid holding status_changes_mutex under M_task
     std::queue<std::string> local_status_changes;
     {
         std::lock_guard lock(status_changes_mutex);
@@ -672,13 +637,12 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 
     try
     {
-        /// Task-serialization critical section: background_task_serialization_mutex serializes
-        /// this against poll() and is held across the ZooKeeper status reads below. No catalog I/O
-        /// happens here. Each in-memory entry mutation takes export_merge_tree_partition_mutex
-        /// exclusively for the brief write only, so the shared-lock reader of
-        /// system.replicated_partition_exports is never blocked by a ZooKeeper round-trip.
+        /// M_task: serializes this against poll() and guards the authoritative container across the
+        /// ZooKeeper reads below. Readers use the read-model we republish at the end of this batch.
         std::lock_guard task_guard(background_task_serialization_mutex);
         auto zk = storage.getZooKeeper();
+
+        const bool had_changes = !local_status_changes.empty();
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", local_status_changes.size());
 
@@ -693,20 +657,15 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
                     "Failpoint: simulating exception during status change handling for key {}", key);
             });
 
-            /// Snapshot existence and the transaction id under a brief shared mirror lock. The
-            /// iterator is not carried across the ZooKeeper I/O below; the actual write re-finds it
-            /// under an exclusive lock (DB::SharedMutex is not upgradeable).
-            std::string transaction_id;
+            /// Holding M_task (sole mutator), the iterator stays valid across the ZooKeeper reads
+            /// and killExportPart below (killExportPart touches only export_manifests_mutex).
+            const auto it = storage.export_merge_tree_partition_task_entries_by_key.find(key);
+            if (it == storage.export_merge_tree_partition_task_entries_by_key.end())
             {
-                auto mirror_lock = ExportPartitionUtils::lockShared(storage.export_merge_tree_partition_mutex);
-                auto it = storage.export_merge_tree_partition_task_entries_by_key.find(key);
-                if (it == storage.export_merge_tree_partition_task_entries_by_key.end())
-                {
-                    local_status_changes.pop();
-                    continue;
-                }
-                transaction_id = it->manifest.transaction_id;
+                local_status_changes.pop();
+                continue;
             }
+            const std::string transaction_id = it->manifest.transaction_id;
 
             ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
             ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
@@ -738,8 +697,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             auto fetched = readLastExceptionPerReplica(
                 zk, fs::path(storage.zookeeper_path) / "exports" / key, key, storage.log.load());
 
-            /// If status changed to KILLED, cancel local export operations. killExportPart takes
-            /// export_manifests_mutex (not the mirror lock), so call it without the mirror lock held.
+            /// If status changed to KILLED, cancel local export operations.
             if (*new_status == ExportReplicatedMergeTreePartitionTaskEntry::Status::KILLED)
             {
                 try
@@ -753,32 +711,24 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
                 }
             }
 
-            /// Apply the in-memory updates under a brief exclusive mirror lock. Re-find the iterator
-            /// here so it is obtained and used under the same exclusive lock that guards the write.
+            /// Apply the in-memory updates directly (poll() cannot run concurrently under M_task).
+            if (!fetched.empty())
+                it->last_exception_per_replica = std::move(fetched);
+
+            it->status = *new_status;
+
+            if (it->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
             {
-                auto mirror_lock = ExportPartitionUtils::lockExclusive(storage.export_merge_tree_partition_mutex);
-
-                auto it = storage.export_merge_tree_partition_task_entries_by_key.find(key);
-                if (it == storage.export_merge_tree_partition_task_entries_by_key.end())
-                {
-                    local_status_changes.pop();
-                    continue;
-                }
-
-                if (!fetched.empty())
-                    it->last_exception_per_replica = std::move(fetched);
-
-                it->status = *new_status;
-
-                if (it->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
-                {
-                    /// we no longer need to keep the data parts alive
-                    it->part_references.clear();
-                }
+                /// we no longer need to keep the data parts alive
+                it->part_references.clear();
             }
 
             local_status_changes.pop();
         }
+
+        /// Publish this batch's status transitions to readers.
+        if (had_changes)
+            publishReadModel();
     }
     catch (...)
     {

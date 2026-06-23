@@ -1,8 +1,6 @@
 #include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ProfileEvents.h>
-#include <Common/CurrentMetrics.h>
-#include <Common/Stopwatch.h>
 #include <Common/FailPoint.h>
 #include <Common/escapeForFileName.h>
 #include <Common/logger_useful.h>
@@ -30,16 +28,6 @@ namespace ProfileEvents
     extern const Event ExportPartitionZooKeeperGetChildren;
     extern const Event ExportPartitionZooKeeperSet;
     extern const Event ExportPartitionZooKeeperMulti;
-    extern const Event ExportPartitionLockReadWaitMicroseconds;
-    extern const Event ExportPartitionLockWriteWaitMicroseconds;
-    extern const Event ExportPartitionLockReadAcquisitions;
-    extern const Event ExportPartitionLockWriteAcquisitions;
-}
-
-namespace CurrentMetrics
-{
-    extern const Metric ExportPartitionLockWaitingReaders;
-    extern const Metric ExportPartitionLockWaitingWriters;
 }
 
 namespace DB
@@ -69,26 +57,6 @@ namespace fs = std::filesystem;
 
 namespace ExportPartitionUtils
 {
-    std::shared_lock<SharedMutex> lockShared(SharedMutex & mutex)
-    {
-        CurrentMetrics::Increment waiting(CurrentMetrics::ExportPartitionLockWaitingReaders);
-        Stopwatch watch;
-        std::shared_lock<SharedMutex> lock(mutex);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionLockReadWaitMicroseconds, watch.elapsedMicroseconds());
-        ProfileEvents::increment(ProfileEvents::ExportPartitionLockReadAcquisitions);
-        return lock;
-    }
-
-    std::unique_lock<SharedMutex> lockExclusive(SharedMutex & mutex)
-    {
-        CurrentMetrics::Increment waiting(CurrentMetrics::ExportPartitionLockWaitingWriters);
-        Stopwatch watch;
-        std::unique_lock<SharedMutex> lock(mutex);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionLockWriteWaitMicroseconds, watch.elapsedMicroseconds());
-        ProfileEvents::increment(ProfileEvents::ExportPartitionLockWriteAcquisitions);
-        return lock;
-    }
-
     Block getPartitionSourceBlockForIcebergCommit(
         MergeTreeData & storage, const String & partition_id)
     {

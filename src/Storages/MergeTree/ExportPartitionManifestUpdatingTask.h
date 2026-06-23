@@ -43,16 +43,16 @@ private:
         auto & entries_by_key
     );
 
+    /// Republish export_read_model as a fresh immutable copy (part_references stripped). Called
+    /// under M_task at the end of each poll() / handleStatusChanges() batch.
+    void publishReadModel();
+
     std::mutex status_changes_mutex;
     std::queue<std::string> status_changes;
 
-    /// Serializes the full bodies of poll() and handleStatusChanges() against each other.
-    /// Held across ZooKeeper I/O so those two tasks never overlap; the mirror lock
-    /// (StorageReplicatedMergeTree::export_merge_tree_partition_mutex) is then taken only
-    /// briefly under this, for the in-memory container mutations. This is what lets the
-    /// system.replicated_partition_exports reader (which takes the mirror lock shared and
-    /// briefly) avoid waiting behind slow-network ZooKeeper round-trips.
-    /// Lock ordering: this -> export_merge_tree_partition_mutex -> export_manifests_mutex.
+    /// M_task: serializes poll() and handleStatusChanges() and is the sole guard of the
+    /// writer-private authoritative container. Held across ZooKeeper I/O; no reader takes it
+    /// (readers use export_read_model). Lock ordering: this -> export_manifests_mutex.
     std::mutex background_task_serialization_mutex;
 };
 

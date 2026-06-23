@@ -77,39 +77,17 @@ void ExportPartitionTaskScheduler::run()
     const uint32_t seed = uint32_t(std::hash<std::string>{}(storage.replica_name)) ^ uint32_t(scheduled_exports_count);
     pcg64_fast rng(seed);
 
-    /// Snapshot the PENDING entries under a brief shared lock, then perform all ZooKeeper
-    /// work and exportPartToTable below WITHOUT holding the lock. The scheduler is a pure
-    /// reader of the in-memory mirror - it no longer writes entry.status (the status
-    /// converges via the status watch -> handleStatusChanges and poll()), so a shared lock
-    /// is sufficient and the system.replicated_partition_exports reader is never blocked by
-    /// the scheduler.
-    struct PendingEntrySnapshot
-    {
-        std::string key;
-        ExportReplicatedMergeTreePartitionManifest manifest;
-    };
-
-    std::vector<PendingEntrySnapshot> pending_entries;
-    {
-        auto lock = ExportPartitionUtils::lockShared(storage.export_merge_tree_partition_mutex);
-
-        // Iterate sorted by create_time
-        for (const auto & entry : storage.export_merge_tree_partition_task_entries_by_create_time)
-        {
-            /// No need to query zk for status if the local one is not PENDING
-            if (entry.status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
-            {
-                LOG_INFO(storage.log, "ExportPartition scheduler task: Skipping... Local status is {}", magic_enum::enum_name(entry.status).data());
-                continue;
-            }
-
-            pending_entries.push_back(PendingEntrySnapshot{entry.getCompositeKey(), entry.manifest});
-        }
-    }
+    /// Hold the published snapshot for the whole pass and iterate it directly (sorted by
+    /// create_time). It is immutable and the shared_ptr copy never blocks the writer. The scheduler
+    /// is a pure reader; status converges via the status watch -> handleStatusChanges and poll().
+    const auto model = storage.export_read_model.get();
+    if (!model)
+        return;
 
     auto zk = storage.getZooKeeper();
 
-    for (const auto & pending : pending_entries)
+    // Iterate sorted by create_time
+    for (const auto & entry : model->get<ExportPartitionTaskEntryTagByCreateTime>())
     {
         if (scheduled_exports_count >= available_move_executors)
         {
@@ -117,8 +95,15 @@ void ExportPartitionTaskScheduler::run()
             break;
         }
 
-        const auto & manifest = pending.manifest;
-        const auto & key = pending.key;
+        /// No need to query zk for status if the local one is not PENDING
+        if (entry.status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        {
+            LOG_INFO(storage.log, "ExportPartition scheduler task: Skipping... Local status is {}", magic_enum::enum_name(entry.status).data());
+            continue;
+        }
+
+        const auto & manifest = entry.manifest;
+        const auto key = entry.getCompositeKey();
         const auto database = storage.getContext()->resolveDatabase(manifest.destination_database);
         const auto & table = manifest.destination_table;
 
@@ -158,7 +143,7 @@ void ExportPartitionTaskScheduler::run()
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
         std::vector<std::string> parts_in_processing_or_pending;
-        
+
         if (Coordination::Error::ZOK != zk->tryGetChildren(fs::path(storage.zookeeper_path) / "exports" / key / "processing", parts_in_processing_or_pending))
         {
             LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get parts in processing or pending, skipping");
