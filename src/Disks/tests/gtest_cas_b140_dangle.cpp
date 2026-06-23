@@ -73,10 +73,10 @@ size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
 /// FAITHFUL durable mid-state (T_live expanded WITH its edge — no marker-without-edges; `folded_cursor`
 /// past `T_cur`'s `Add`; the snap missing `T_cur -> B`) and lets a REAL GC round delete `B`.
 ///
-/// RED today (`dangling == 1`). Goes GREEN once the fix (cursor-in-snap: the per-shard cursor is part
-/// of the committed snap, so `folded_cursor` cannot diverge from the snap's edges; plus the
-/// fail-closed coherence assertion at the trim/delete boundary) refuses to delete on an incoherent
-/// `(snap, folded_cursor)` pair — `B` survives, `dangling == 0`.
+/// FIXED — GREEN since the cursor-in-snap fix (the per-shard cursor is part of the committed snap, so
+/// `folded_cursor` cannot diverge from the snap's edges; plus the fail-closed coherence assertion at the
+/// trim/delete boundary): GC refuses to delete on an incoherent `(snap, folded_cursor)` pair — `B`
+/// survives, `dangling == 0`. (Was RED at write-time as the TDD repro; the fix landed and this asserts it.)
 /// Spec: docs/superpowers/specs/2026-06-18-ca-b140-dangle-fix-v2-design.md
 TEST(CasGcDangle, SharedBlobUnderCountDeletesLivePinnedBlob)
 {
