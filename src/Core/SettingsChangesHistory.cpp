@@ -154,9 +154,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.3.10.20001.altinityantalya",
         {
             // {"export_merge_tree_partition_task_timeout_seconds", "3600", "86400", "Increase default value to make it more realistic"},
-        addSettingsChanges(settings_changes_history, "26.3.1.20001.altinityantalya",
-        {
-            {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
         });
         addSettingsChanges(settings_changes_history, "26.3",
         {
@@ -424,7 +421,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             // {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
             // {"object_storage_remote_initiator", false, false, "New setting."},
             // {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
-            // {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
+            {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
             // {"lock_object_storage_task_distribution_ms", 500, 500, "New setting."},
             // {"allow_retries_in_cluster_requests", false, false, "New setting"},
             // {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
