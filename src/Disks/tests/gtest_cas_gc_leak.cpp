@@ -202,6 +202,7 @@ TEST(CasGcAdoptedPrecommit, RelinkAdoptedRootFoldDoesNotThrow)
 
     const FsckReport after = runFsck(*sb, /*detail=*/false);
     EXPECT_EQ(after.dangling, 0u) << "the adopted closure stays reachable — no data loss";
+    EXPECT_EQ(after.unreachable, 0u) << "no space leak — the adopted tree's blobs are reachable, not orphaned";
     /// Both refs resolve to T and its blobs are reachable.
     EXPECT_TRUE(sb->resolveRef(RootNamespace{"srv_b/tbl"}, "all_1_1_0").has_value());
 }
@@ -234,7 +235,89 @@ TEST(CasGcAdoptedPrecommit, RepublishAdoptedRootFoldDoesNotThrow)
 
     const FsckReport after = runFsck(*sb, /*detail=*/false);
     EXPECT_EQ(after.dangling, 0u) << "the renamed/republished closure stays reachable — no data loss";
+    EXPECT_EQ(after.unreachable, 0u) << "no space leak — the republished tree's blobs are reachable, not orphaned";
     EXPECT_TRUE(sb->resolveRef(RootNamespace{"srv_b/tbl"}, "delete_tmp_all_1_1_0").has_value());
+}
+
+/// B199-S2 Task-7 follow-up regression (point #4): per-node 404 tolerance must NOT discard the STAGED
+/// portion of a closure when a deeper ADOPTED subtree's object is transiently absent. A build STAGES a
+/// parent `P` (in the inline closure) whose entries reference an ADOPTED subtree `C` (tokenless
+/// evidence — NOT staged, NOT in the closure) plus `P`'s OWN unique blob; `C`'s object is absent at
+/// fold (never uploaded — a relink/rename race). The build is then ABANDONED.
+///
+/// The Task-7 first cut used a single `pending_incomplete` bool: any tolerated 404 (here `C`) discarded
+/// ALL buffered marks/edges, so `P`'s staged edge `P→blob` was dropped, `P` never expanded, and on
+/// abandon the cascade freed nothing — `P`'s OWN unique blob leaked (the exact S2 class we close).
+/// With per-node tolerance, `P`'s staged edges/mark survive (only `C` is left pending/unexpanded), so
+/// the abandon cascade strips `P`'s edges and reclaims `P`'s blob: `unreachable == 0`.
+TEST(CasGcAdoptedPrecommit, StagedParentWithAbsentAdoptedSubtreeReclaimsOwnBlobs)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+
+    /// Compute an adopted subtree `C`'s tree id WITHOUT uploading its object (a throwaway local stage):
+    /// `C`'s object is therefore absent in the pool, so `readTree(C)` 404s at fold time.
+    TreeId c_tree;
+    {
+        auto throwaway = s->startBuild({});
+        throwaway->recordPendingBlobDep(u128Of("c-blob"), 6);
+        TreeEntry ce;
+        ce.name = "c.bin";
+        ce.placement = Placement::Blob;
+        ce.file_hash = u128Of("c-blob");
+        ce.file_size = 6;
+        c_tree = throwaway->stageTree({ce});   /// LOCAL only — C's object is never uploaded
+        throwaway->abandon();
+    }
+
+    /// The real build: adopt `C` by tokenless evidence (no presence assertion), then STAGE a parent `P`
+    /// referencing `C` as a Subtree plus `P`'s OWN unique blob `p-blob`. precommit + upload P's object +
+    /// putBlob P's body — but NEVER publish (the build is abandoned below).
+    auto build = s->startBuild({});
+    TreeEntry c_evidence;
+    c_evidence.placement = Placement::Subtree;
+    c_evidence.file_hash = hexToU128(c_tree.string());
+    c_evidence.file_size = 0;
+    build->adoptEvidence(c_evidence);               /// C is adopted — NOT staged, so NOT in the closure
+    build->recordPendingBlobDep(u128Of("p-blob"), 6);
+
+    TreeEntry pe_sub;
+    pe_sub.name = "child";
+    pe_sub.placement = Placement::Subtree;
+    pe_sub.file_hash = hexToU128(c_tree.string());
+    pe_sub.file_size = 0;
+    TreeEntry pe_blob;
+    pe_blob.name = "p.bin";
+    pe_blob.placement = Placement::Blob;
+    pe_blob.file_hash = u128Of("p-blob");
+    pe_blob.file_size = 6;
+
+    const TreeId p_tree = build->stageTree({pe_sub, pe_blob});   /// P is STAGED → in the inline closure
+    build->precommit(p_tree);
+    build->uploadStagedTree(p_tree);                              /// P's object present
+    build->putBlob(idOf("p-blob"), BlobSource::fromString("p-blob"));   /// P's own unique blob present
+    build->abandon();                                            /// no commit — the build is abandoned
+
+    /// Build finished (abandoned) → advance min_active past its seq so GC reclaims the orphaned precommit.
+    s->renewWatermarkOnce();
+
+    /// Drive enough rounds for the full reclaim cascade: round 0 folds P's precommit Add (per-node
+    /// tolerance records P's staged edges, C left pending) and reclaims the abandoned ref (appends a
+    /// Remove); a later round folds the Remove, retires P, and the cascade frees + deletes P's blob.
+    /// (runGcToFixpoint's heuristic would stop after round 0, whose RETIRE ran on the pre-reclaim snap
+    /// and reports zero work — so use a fixed adequate round count instead.)
+    Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    EXPECT_NO_THROW({
+        for (int i = 0; i < 8; ++i)
+            gc.runRegularRound();
+    });
+
+    const FsckReport after = runFsck(*s, /*detail=*/false);
+    EXPECT_EQ(after.dangling, 0u) << "INV-NO-LOSS: nothing reachable was lost";
+    EXPECT_EQ(after.unreachable, 0u)
+        << "P's OWN unique blob (p-blob) must be reclaimed despite the adopted subtree C's object being "
+        << "absent at fold — per-node tolerance keeps P's staged edges so the abandon cascade frees "
+        << "P's blob; unreachable=" << after.unreachable;
 }
 
 /// The displaced-and-vanished-tree leak repro that USED to live here (`DisplacedUnexpandedTreeBlobsLeak`)

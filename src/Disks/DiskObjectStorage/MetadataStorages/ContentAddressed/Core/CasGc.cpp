@@ -1291,21 +1291,31 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
 
                 /// A folded Add implies the tree was published, but the object may legitimately be gone
                 /// NOW (displaced later in the journal + a completed competing round deleted it; or a
-                /// precommit naming a not-yet-uploaded / raced tree). Tolerance:
+                /// precommit naming a not-yet-uploaded / raced tree). Tolerance is PER-NODE, never
+                /// whole-closure (B199-S2 Task 7 follow-up): a deeper adopted node that 404s must NOT
+                /// drop the edges/marks already in hand for STAGED nodes — those are authoritative from
+                /// the inline closure regardless of any adopted object's presence (dropping them would
+                /// reopen the S2 leak: a staged parent would become a never-expanded tree and leak its
+                /// OWN unique blobs on abandon).
                 ///   • ROOT 404 under a table ns: tolerate ONLY if a later record for the SAME ref
                 ///     displaces this Add (Remove or re-pointing Add); otherwise a live ref to a missing
                 ///     tree is INV-NO-DANGLE — fail closed (the unchanged B170 contract).
                 ///   • ROOT 404 under a precommit ns: a precommit naming an absent target is a legal
-                ///     pending/aborting reservation (B171) — tolerate.
-                ///   • Any node 404 reached DEEPER under a precommit ns: tolerate as pending (B199-S2
-                ///     Task 7, option a) — skip the whole expansion, mark nothing, record no partial
-                ///     edges; a later table-ns Add re-expands the closure once its objects are present.
+                ///     pending/aborting reservation (B171) — tolerate (the root joins `pending_nodes`).
+                ///   • Any node 404 reached DEEPER under a precommit ns: tolerate as pending — that node
+                ///     joins `pending_nodes` (it is not marked expanded), but its parent's edge INTO it
+                ///     and all other staged edges/marks are kept. A later present-object Add re-expands
+                ///     the absent node once its object arrives.
                 ///   • A node 404 reached deeper under a TABLE ns: a present parent referencing a missing
-                ///     child is a real dangle — fail closed (propagate; unchanged).
-                /// Marking/edges are BUFFERED and applied only if the walk completes with no tolerated
-                /// 404, so a tolerated-pending expansion leaves the snap untouched (no markExpanded).
-                bool tree_present = true;
-                bool pending_incomplete = false;
+                ///     child is a real dangle — fail closed (propagate; unchanged). A table-ns node never
+                ///     enters `pending_nodes`.
+                /// Marking/edges are BUFFERED, then applied: every buffered edge is applied (a pending
+                /// node contributes no edges AS A PARENT — it returned {} — so only the in-edge from its
+                /// non-pending parent survives, giving it in-degree = the "known but unexpanded" state);
+                /// markExpanded is applied for every buffered node EXCEPT those in `pending_nodes`. So a
+                /// node is marked expanded ONLY when its entries were fully in hand (staged-inline or a
+                /// successful readTree) ⇒ a marked node always has COMPLETE edges.
+                std::set<UInt128> pending_nodes;
 
                 auto rootDisplacedLater = [&]() -> bool
                 {
@@ -1340,8 +1350,9 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                 };
 
                 /// The unified source: inline for staged nodes, readTree otherwise. On a tolerated 404 it
-                /// returns {} and sets pending_incomplete (the buffered effects are discarded after the
-                /// walk); on an intolerable 404 it fails closed (propagate).
+                /// records `node` in `pending_nodes` and returns {} (that node is left unexpanded); on an
+                /// intolerable 404 it fails closed (propagate). A staged node is in `by_node` ⇒ never
+                /// readTree ⇒ never pending — only adopted/committed nodes can become pending.
                 auto unifiedSource = [&](const UInt128 & node) -> std::vector<TreeEntry>
                 {
                     if (auto it = by_node.find(node); it != by_node.end())
@@ -1357,8 +1368,8 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                         const bool is_root = node == record.tree_id;
                         if (precommit_ns || (is_root && rootDisplacedLater()))
                         {
-                            /// Pending/displaced tolerance: skip the expansion entirely (see above).
-                            pending_incomplete = true;
+                            /// Pending/displaced tolerance: this node is left unexpanded (see above).
+                            pending_nodes.insert(node);
                             return {};
                         }
                         /// Table ns: root with no displacing record, or a missing internal child — a real
@@ -1368,7 +1379,7 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                     }
                 };
 
-                /// BUFFER marks + edges so a tolerated-pending walk leaves the snap untouched.
+                /// BUFFER marks + edges so per-node tolerance can be applied after the walk.
                 std::vector<UInt128> to_mark;
                 std::vector<std::pair<UInt128, TreeEntry>> to_edge;
                 auto on_tree = [&](const UInt128 & tree)
@@ -1382,37 +1393,37 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
 
                 closureWalk(record.tree_id, unifiedSource, on_tree, on_edge);
 
-                if (pending_incomplete)
-                {
-                    tree_present = false;   /// nothing recorded; a later present-object Add re-expands
-                }
-                else
-                {
-                    for (const UInt128 & tree : to_mark)
+                /// Apply ALL buffered edges (a pending node contributed none as a parent), but mark only
+                /// nodes whose entries were fully in hand (NOT pending).
+                for (const UInt128 & tree : to_mark)
+                    if (!pending_nodes.contains(tree))
                         shard_for(tree).markExpanded(tree);
-                    for (const auto & [parent_tree, entry] : to_edge)
+                for (const auto & [parent_tree, entry] : to_edge)
+                {
+                    switch (entry.placement)
                     {
-                        switch (entry.placement)
-                        {
-                            case Placement::Blob:
-                                shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Blob, entry.file_hash);
-                                ++out_edges;
-                                break;
-                            case Placement::Subtree:
-                                shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Tree, entry.file_hash);
-                                ++out_edges;
-                                break;
-                            case Placement::PackSlice:
-                                shard_for(entry.pack_hash).addPackEdge(parent_tree, entry.pack_hash);
-                                ++out_edges;
-                                break;
-                            case Placement::Inline:
-                                break;   /// embedded bytes - no separate object, no edge
-                        }
+                        case Placement::Blob:
+                            shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Blob, entry.file_hash);
+                            ++out_edges;
+                            break;
+                        case Placement::Subtree:
+                            shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Tree, entry.file_hash);
+                            ++out_edges;
+                            break;
+                        case Placement::PackSlice:
+                            shard_for(entry.pack_hash).addPackEdge(parent_tree, entry.pack_hash);
+                            ++out_edges;
+                            break;
+                        case Placement::Inline:
+                            break;   /// embedded bytes - no separate object, no edge
                     }
                 }
 
-                if (tree_present)
+                /// The root counts as expanded (emit TreeExpand) iff it was NOT pending — an adopted root
+                /// that 404'd (relink/rename racing a drop) stays unexpanded and is re-expanded by a later
+                /// present-object Add.
+                const bool root_expanded = !pending_nodes.contains(record.tree_id);
+                if (root_expanded)
                 {
                     /// B170: the tree was expanded — its child edges are now recorded in the snap.
                     /// This is the "set the expansion marker / record child edges" transition.
