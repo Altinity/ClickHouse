@@ -280,21 +280,21 @@ String GcSnap::encodeSnapFields(const GcSnap & snap)
         }
         else
         {
-            writeBinaryLittleEndian(rec.parent_tree, body);
+            writeU128LE(body, rec.parent_tree);
         }
         writeBinaryLittleEndian(static_cast<uint8_t>(rec.target_kind), body);
-        writeBinaryLittleEndian(rec.target_hash, body);
+        writeU128LE(body, rec.target_hash);
     }
 
     writeBinaryLittleEndian(static_cast<uint32_t>(snap.expanded.size()), body);
     for (const auto & tree : snap.expanded)                      /// set order (sorted)
-        writeBinaryLittleEndian(tree, body);
+        writeU128LE(body, tree);
 
     writeBinaryLittleEndian(static_cast<uint32_t>(snap.known.size()), body);
     for (const auto & [kind, hash] : snap.known)                 /// set order (sorted by (kind, hash))
     {
         writeBinaryLittleEndian(kind, body);
-        writeBinaryLittleEndian(hash, body);
+        writeU128LE(body, hash);
     }
 
     writeBinaryLittleEndian(static_cast<uint32_t>(snap.folded_cursor.size()), body);
@@ -335,12 +335,12 @@ GcSnap GcSnap::decodeSnapFields(ReadBuffer & body)
         }
         else
         {
-            readBinaryLittleEndian(rec.parent_tree, body);
+            rec.parent_tree = readU128LE(body);
         }
         uint8_t target_kind_byte = 0;
         readBinaryLittleEndian(target_kind_byte, body);
         rec.target_kind = objectKindFromByte(target_kind_byte);
-        readBinaryLittleEndian(rec.target_hash, body);
+        rec.target_hash = readU128LE(body);
 
         if (rec.edge_kind == EdgeKind::Pack && rec.target_kind != ObjectKind::Pack)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -357,8 +357,7 @@ GcSnap GcSnap::decodeSnapFields(ReadBuffer & body)
     readBinaryLittleEndian(expanded_count, body);
     for (uint32_t i = 0; i < expanded_count; ++i)
     {
-        UInt128 tree{};
-        readBinaryLittleEndian(tree, body);
+        const UInt128 tree = readU128LE(body);
         snap.expanded.insert(tree);
     }
 
@@ -369,8 +368,7 @@ GcSnap GcSnap::decodeSnapFields(ReadBuffer & body)
         uint8_t kind_byte = 0;
         readBinaryLittleEndian(kind_byte, body);
         const ObjectKind kind = objectKindFromByte(kind_byte);
-        UInt128 hash{};
-        readBinaryLittleEndian(hash, body);
+        const UInt128 hash = readU128LE(body);
         snap.known.insert(GcSnap::NodeKey{static_cast<uint8_t>(kind), hash});
     }
 

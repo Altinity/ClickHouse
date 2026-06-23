@@ -40,6 +40,39 @@ namespace DB::Cas
 /// file. These objects are the operational surface a human inspects with plain S3 tools during an
 /// incident; they are never hashed, so canonical byte stability is not required.
 
+/// ---------------------------------------------------------------------------------------------
+/// On-disk UInt128 wire forms. CAS serializes a 128-bit hash in two distinct non-hex byte orders,
+/// and BOTH are FROZEN — changing the bytes breaks every object already written. These named, typed
+/// helpers exist so a 128-bit (de)serialization can never be mis-paired with the wrong order: a site
+/// asks for the order it means by name instead of open-coding it. (The lowercase-hex form lives in
+/// `CasIds.h` as `u128ToHex` / `hexToU128` and is out of scope here.)
+///
+/// LE binary form — used by the hashed/identity codecs (envelope header fields, the canonical tree
+/// payload, the gc snapshot body): exactly `writeBinaryLittleEndian` / `readBinaryLittleEndian`.
+inline void writeU128LE(WriteBuffer & out, const UInt128 & v) { writeBinaryLittleEndian(v, out); }
+inline UInt128 readU128LE(ReadBuffer & in) { UInt128 v; readBinaryLittleEndian(v, in); return v; }
+
+/// BE 16-byte form — used by the root-shard manifest's protobuf `bytes` fields (`tree_id`,
+/// `tree_hash`, `file_hash`, `pack_hash`). Body copied VERBATIM from the former hand-rolled
+/// `u128ToBytes` / `u128FromBytes` in `CasRootShardCodec.cpp` so the bytes are unchanged.
+inline std::string u128ToBytesBE(const UInt128 & v)
+{
+    std::string out(16, '\0');
+    for (int i = 0; i < 16; ++i)
+        out[i] = static_cast<char>(static_cast<UInt8>(v >> (8 * (15 - i))));
+    return out;
+}
+
+inline UInt128 u128FromBytesBE(const std::string & b, std::string_view what)
+{
+    if (b.size() != 16)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: tree_id must be 16 bytes, got {}", what, b.size());
+    UInt128 v = 0;
+    for (int i = 0; i < 16; ++i)
+        v = (v << 8) | static_cast<UInt8>(b[i]);
+    return v;
+}
+
 /// Read exactly `n` raw bytes. The bounds check MUST precede the allocation: `n` typically comes
 /// from a length field just read off the wire, so on corrupted input it can be huge (a u32 field
 /// admits 4 GiB) — allocating first would mean a multi-GiB transient allocation, which under a

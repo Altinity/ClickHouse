@@ -70,7 +70,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header)
             {
                 WriteBufferFromString body_buf(body);
                 writeBinaryLittleEndian(header.provenance->created_at_ms, body_buf);
-                writeBinaryLittleEndian(header.provenance->creator_server_id, body_buf);
+                writeU128LE(body_buf, header.provenance->creator_server_id);
                 writeBinaryLittleEndian(header.provenance->ch_version, body_buf);
                 writeBinaryLittleEndian(static_cast<uint8_t>(header.provenance->op), body_buf);
                 body_buf.finalize();
@@ -154,10 +154,10 @@ String encodeEnvelopeHeader(EnvelopeHeader & header)
         writeBinaryLittleEndian(header_len, out_buf);                       /// [8,12)  header_len
         writeBinaryLittleEndian(header.index_len, out_buf);                 /// [12,16) index_len
         writeBinaryLittleEndian(header.logical_size, out_buf);              /// [16,24) logical_size
-        writeBinaryLittleEndian(header.logical_hash, out_buf);              /// [24,40)
-        writeBinaryLittleEndian(header.domain_id, out_buf);                 /// [40,56)
-        writeBinaryLittleEndian(header.incarnation_tag, out_buf);           /// [56,72)
-        writeBinaryLittleEndian(header.build_id, out_buf);                  /// [72,88)
+        writeU128LE(out_buf, header.logical_hash);                          /// [24,40)
+        writeU128LE(out_buf, header.domain_id);                             /// [40,56)
+        writeU128LE(out_buf, header.incarnation_tag);                       /// [56,72)
+        writeU128LE(out_buf, header.build_id);                              /// [72,88)
         writeBinaryLittleEndian(static_cast<uint64_t>(0), out_buf);         /// [88,96) header_hash placeholder (zeroed)
 
         writeString(ext, out_buf);                                          /// [96, header_len) TLV extensions
@@ -234,10 +234,10 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
         readBinaryLittleEndian(h.logical_size, in);
 
         /// [24,40) [40,56) [56,72) [72,88)
-        readBinaryLittleEndian(h.logical_hash, in);
-        readBinaryLittleEndian(h.domain_id, in);
-        readBinaryLittleEndian(h.incarnation_tag, in);
-        readBinaryLittleEndian(h.build_id, in);
+        h.logical_hash = readU128LE(in);
+        h.domain_id = readU128LE(in);
+        h.incarnation_tag = readU128LE(in);
+        h.build_id = readU128LE(in);
 
         /// [88,96) header_hash
         uint64_t stored_header_hash = 0;
@@ -294,7 +294,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
                 ReadBufferFromMemory body(head_bytes.data() + in.count(), len);
                 Provenance p;
                 readBinaryLittleEndian(p.created_at_ms, body);
-                readBinaryLittleEndian(p.creator_server_id, body);
+                p.creator_server_id = readU128LE(body);
                 readBinaryLittleEndian(p.ch_version, body);
                 uint8_t op = 0;
                 readBinaryLittleEndian(op, body);

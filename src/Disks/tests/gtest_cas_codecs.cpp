@@ -712,3 +712,59 @@ TEST(CasEnvelope, EnvelopeHeaderPaddingReachesTargetLen)
         encodeEnvelopeHeader(bad);
     });
 }
+
+/// ===================================================================================
+/// On-disk byte-order goldens (R9): the two non-hex UInt128 wire forms are FROZEN. These pin the
+/// EXACT bytes a fixed input encodes to, so routing the codecs through the named `writeU128LE` /
+/// `u128ToBytesBE` helpers cannot move a single byte. The constants were captured from the encoders
+/// BEFORE the R9 refactor.
+/// ===================================================================================
+
+namespace
+{
+String toHexBytes(const String & s)
+{
+    String r;
+    for (unsigned char c : s)
+    {
+        static const char * d = "0123456789abcdef";
+        r += d[c >> 4];
+        r += d[c & 0xf];
+    }
+    return r;
+}
+}
+
+/// LE binary form: the envelope header. `logical_hash` (offset [24,40)) appears little-endian in the
+/// golden — e.g. 0x0123...3210 serializes as bytes 10 32 54 ... — pinning the LE order.
+TEST(CasByteOrderGolden, EnvelopeLittleEndian)
+{
+    EnvelopeHeader h = makeBlobHeader();
+    const String encoded = encodeEnvelopeHeader(h);
+    static constexpr std::string_view golden =
+        "43484341010101006000000000000000e8030000000000001032547698badcfe"
+        "efcdab8967452301420000000000000000000000000000009900000000000000"
+        "0000000000000000070000000000000000000000000000002e4166483f7a343b";
+    EXPECT_EQ(toHexBytes(encoded), golden);
+}
+
+/// BE 16-byte form: the root-shard manifest's protobuf `tree_id` bytes. The id (0xab<<64)|0xcd
+/// appears big-endian in the golden — bytes ...00 ab ...00 cd — pinning the BE order.
+TEST(CasByteOrderGolden, RootShardBigEndian)
+{
+    RootShard rs;
+    rs.shard_version = 9;
+    rs.fence_round = 3;
+    RefPayload p;
+    p.tree_id = (UInt128(0xab) << 64) | UInt128(0xcd);
+    p.tree_size = 1142;
+    p.mutable_files[".ca_mtime"] = "1781588451";
+    rs.refs["part_a"] = p;
+    rs.journal.push_back({JournalRecord::Op::Add, "part_a", p.tree_id, 8, {}});
+    const String encoded = encodeRootShard(rs);
+    static constexpr std::string_view golden =
+        "08011009180322380a06706172745f61122e0a1000000000000000ab00000000"
+        "000000cd10f6081a170a092e63615f6d74696d65120a31373831353838343531"
+        "2a1e08011206706172745f611a1000000000000000ab00000000000000cd2008";
+    EXPECT_EQ(toHexBytes(encoded), golden);
+}

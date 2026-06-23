@@ -28,24 +28,8 @@ namespace
 /// the schema-evolution rules in cas_root_shard.proto).
 constexpr uint32_t CODEC_VERSION = 1;
 
-/// UInt128 <-> 16 raw bytes, big-endian.
-std::string u128ToBytes(const UInt128 & v)
-{
-    std::string out(16, '\0');
-    for (int i = 0; i < 16; ++i)
-        out[i] = static_cast<char>(static_cast<UInt8>(v >> (8 * (15 - i))));
-    return out;
-}
-
-UInt128 u128FromBytes(const std::string & b, std::string_view what)
-{
-    if (b.size() != 16)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: tree_id must be 16 bytes, got {}", what, b.size());
-    UInt128 v = 0;
-    for (int i = 0; i < 16; ++i)
-        v = (v << 8) | static_cast<UInt8>(b[i]);
-    return v;
-}
+/// UInt128 <-> 16 raw bytes, big-endian: routed through the named, FROZEN-byte-order helpers
+/// `u128ToBytesBE` / `u128FromBytesBE` in `CasCodecUtil.h` (the bodies were moved there verbatim).
 
 Cas::Proto::JournalOp journalOpToProto(JournalRecord::Op op)
 {
@@ -89,15 +73,15 @@ Placement placementFromProto(uint32_t v, std::string_view what)
 Cas::Proto::ClosureNodeProto encodeClosureNode(const ClosureNode & node)
 {
     Cas::Proto::ClosureNodeProto pn;
-    pn.set_tree_hash(u128ToBytes(node.tree_hash));
+    pn.set_tree_hash(u128ToBytesBE(node.tree_hash));
     for (const auto & e : node.entries)
     {
         auto * pe = pn.add_entries();
         pe->set_placement(placementToProto(e.placement));
-        pe->set_file_hash(u128ToBytes(e.file_hash));
+        pe->set_file_hash(u128ToBytesBE(e.file_hash));
         pe->set_file_size(e.file_size);
         if (e.placement == Placement::PackSlice)
-            pe->set_pack_hash(u128ToBytes(e.pack_hash));
+            pe->set_pack_hash(u128ToBytesBE(e.pack_hash));
     }
     return pn;
 }
@@ -105,19 +89,19 @@ Cas::Proto::ClosureNodeProto encodeClosureNode(const ClosureNode & node)
 ClosureNode decodeClosureNode(const Cas::Proto::ClosureNodeProto & pn)
 {
     ClosureNode node;
-    node.tree_hash = u128FromBytes(pn.tree_hash(), "closure node tree_hash");
+    node.tree_hash = u128FromBytesBE(pn.tree_hash(), "closure node tree_hash");
     node.entries.reserve(static_cast<size_t>(pn.entries_size()));
     for (const auto & pe : pn.entries())
     {
         TreeEntry e;
         e.placement = placementFromProto(pe.placement(), "closure node entry");
-        e.file_hash = u128FromBytes(pe.file_hash(), "closure node entry file_hash");
+        e.file_hash = u128FromBytesBE(pe.file_hash(), "closure node entry file_hash");
         e.file_size = pe.file_size();
         /// Symmetric with encode (which always writes pack_hash for PackSlice): decode it
-        /// unconditionally so u128FromBytes fails closed (CORRUPTED_DATA) on an absent/short
+        /// unconditionally so u128FromBytesBE fails closed (CORRUPTED_DATA) on an absent/short
         /// field, rather than silently zero-filling and losing a GC pack-edge.
         if (e.placement == Placement::PackSlice)
-            e.pack_hash = u128FromBytes(pe.pack_hash(), "closure node entry pack_hash");
+            e.pack_hash = u128FromBytesBE(pe.pack_hash(), "closure node entry pack_hash");
         node.entries.push_back(std::move(e));
     }
     return node;
@@ -136,7 +120,7 @@ String encodeRootShard(const RootShard & root)
     for (const auto & [name, payload] : root.refs)
     {
         Cas::Proto::RefPayload p;
-        p.set_tree_id(u128ToBytes(payload.tree_id));
+        p.set_tree_id(u128ToBytesBE(payload.tree_id));
         p.set_tree_size(payload.tree_size);
         auto & mf = *p.mutable_mutable_files();
         for (const auto & [k, v] : payload.mutable_files)
@@ -149,7 +133,7 @@ String encodeRootShard(const RootShard & root)
         auto * r = msg.add_journal();
         r->set_op(journalOpToProto(rec.op));
         r->set_ref_name(rec.ref_name);
-        r->set_tree_id(u128ToBytes(rec.tree_id));
+        r->set_tree_id(u128ToBytesBE(rec.tree_id));
         r->set_at_version(rec.at_version);
         for (const auto & node : rec.closure)
             *r->add_closure() = encodeClosureNode(node);
@@ -189,7 +173,7 @@ RootShard decodeRootShard(std::string_view data)
     for (const auto & [name, p] : msg.refs())
     {
         RefPayload payload;
-        payload.tree_id = u128FromBytes(p.tree_id(), "root shard ref");
+        payload.tree_id = u128FromBytesBE(p.tree_id(), "root shard ref");
         payload.tree_size = p.tree_size();
         for (const auto & [k, v] : p.mutable_files())
             payload.mutable_files[k] = v;
@@ -201,7 +185,7 @@ RootShard decodeRootShard(std::string_view data)
         JournalRecord rec;
         rec.op = journalOpFromProto(r.op(), "root shard journal");
         rec.ref_name = r.ref_name();
-        rec.tree_id = u128FromBytes(r.tree_id(), "root shard journal");
+        rec.tree_id = u128FromBytesBE(r.tree_id(), "root shard journal");
         rec.at_version = r.at_version();
         rec.closure.reserve(static_cast<size_t>(r.closure_size()));
         for (const auto & pn : r.closure())
