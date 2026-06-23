@@ -33,13 +33,16 @@ object (operator constraint): the closure lives in the precommit ref payload we 
 ## Design
 
 ### 1. Inline closure in the precommit `RefPayload`
-`RefPayload` (`Core/CasRootShardCodec.h:29`, protobuf via `cas_root_shard.proto`, B164a) gains an
-optional inline closure — the staged `[TreeEntry]` structure the build already built in `stageTree`
-(nested; adopted subtrees recorded as **leaf** roots, since their children are protected by the live
-source they were adopted from and must not be reclaimed with this build). Populated **only for precommit
-refs**; table refs keep just `tree_id`. Protobuf-optional ⇒ backward-compatible: an old precommit ref
-(no field) reads as empty closure and falls back to today's lazy behavior (S2 may still leak for
-pre-upgrade in-flight builds only — transient).
+`RefPayload` (`Core/CasRootShardCodec.h:29`, protobuf via `cas_root_shard.proto`, B164a) gains an inline
+closure — the staged `[TreeEntry]` structure the build already built in `stageTree` (nested; adopted
+subtrees recorded as **leaf** roots, since their children are protected by the live source they were
+adopted from and must not be reclaimed with this build). Populated **only for precommit refs**; table
+refs keep just `tree_id`.
+
+The closure is **always populated** on every precommit. The feature is in development with **no prod
+users and no pre-existing precommit objects**, so there is NO old-precommit / empty-closure case to
+support and NO fallback to the old lazy tree-read (see §3 — the precommit tree-read is deleted outright).
+The protobuf field being technically optional is just a codec detail, not a runtime contingency.
 
 Stored form is the decoded `[TreeEntry]` (what `stageTree` produced) — not re-encoded tree bytes — so the
 walk consumes `[TreeEntry]` uniformly with no re-encode and no duplication of the `trees/` object's bytes.
