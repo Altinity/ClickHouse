@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPlacement.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
@@ -473,23 +474,21 @@ void Build::adoptEvidence(const TreeEntry & entry)
     /// token. Inline entries reference no standalone object, so they record nothing.
     /// NO backend call (no HEAD, no GET, no PUT) — the caller already holds the resolved entry.
     const uint64_t view_round = store->retireView().round();
-    switch (entry.placement)
-    {
-        case Placement::Blob:
+    visitPlacement(entry.placement,
+        [&] {},   /// Inline: no standalone object — nothing to depend on
+        [&] {   /// Blob: tokenless dep keyed by file_hash
             deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}] =
                 DepEntry{ObjectKind::Blob, std::nullopt, view_round, entry.file_size};
-            break;
-        case Placement::Subtree:
-            deps[{static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}] =
-                DepEntry{ObjectKind::Tree, std::nullopt, view_round, entry.file_size};
-            break;
-        case Placement::PackSlice:
+        },
+        [&] {   /// PackSlice: tokenless dep keyed by pack_hash
             deps[{static_cast<uint8_t>(ObjectKind::Pack), entry.pack_hash}] =
                 DepEntry{ObjectKind::Pack, std::nullopt, view_round, entry.pack_length};
-            break;
-        case Placement::Inline:
-            break;   /// no standalone object — nothing to depend on
-    }
+        },
+        [&] {   /// Subtree: tokenless dep keyed by file_hash (child tree id)
+            deps[{static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}] =
+                DepEntry{ObjectKind::Tree, std::nullopt, view_round, entry.file_size};
+        }
+    );
 }
 
 void Build::recordPendingBlobDep(const UInt128 & hash, uint64_t size)
@@ -553,29 +552,27 @@ TreeId Build::stageTree(std::vector<TreeEntry> entries)
     /// W-TREE-BUILD: bottom-up discipline — every referenced child must already be a dependency.
     for (const TreeEntry & entry : entries)
     {
-        switch (entry.placement)
-        {
-            case Placement::Blob:
+        visitPlacement(entry.placement,
+            [&] {},   /// Inline: inline bytes need no dependency
+            [&] {   /// Blob: must already be in the dep set
                 if (!deps.contains({static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}))
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
                         "stageTree: child blob {} not in dependency set (W-TREE-BUILD)",
                         u128ToHex(entry.file_hash));
-                break;
-            case Placement::Subtree:
-                if (!deps.contains({static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}))
-                    throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "stageTree: child tree {} not in dependency set (W-TREE-BUILD)",
-                        u128ToHex(entry.file_hash));
-                break;
-            case Placement::PackSlice:
+            },
+            [&] {   /// PackSlice: must already be in the dep set (keyed by pack_hash)
                 if (!deps.contains({static_cast<uint8_t>(ObjectKind::Pack), entry.pack_hash}))
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
                         "stageTree: child pack {} not in dependency set (W-TREE-BUILD)",
                         u128ToHex(entry.pack_hash));
-                break;
-            case Placement::Inline:
-                break;   /// inline bytes need no dependency
-        }
+            },
+            [&] {   /// Subtree: child tree must already be in the dep set
+                if (!deps.contains({static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}))
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "stageTree: child tree {} not in dependency set (W-TREE-BUILD)",
+                        u128ToHex(entry.file_hash));
+            }
+        );
     }
 
     const String encoded = encodeTree(std::move(entries));   /// canonical sort + duplicate-name check

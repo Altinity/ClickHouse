@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPlacement.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
@@ -52,22 +53,19 @@ String encodeTree(std::vector<TreeEntry> entries)
         writeBinaryLittleEndian(e.file_hash, out);
         writeBinaryLittleEndian(e.file_size, out);
 
-        switch (e.placement)
-        {
-            case Placement::Inline:
+        visitPlacement(e.placement,
+            [&] {   /// Inline: write inline byte-count then the bytes
                 writeBinaryLittleEndian(static_cast<uint32_t>(e.inline_bytes.size()), out);
                 writeString(e.inline_bytes, out);
-                break;
-            case Placement::Blob:
-                break;
-            case Placement::PackSlice:
+            },
+            [&] {},   /// Blob: no extra fields
+            [&] {   /// PackSlice: write pack_hash, offset, length
                 writeBinaryLittleEndian(e.pack_hash, out);
                 writeBinaryLittleEndian(e.pack_offset, out);
                 writeBinaryLittleEndian(e.pack_length, out);
-                break;
-            case Placement::Subtree:
-                break;
-        }
+            },
+            [&] {}    /// Subtree: no extra fields
+        );
     }
 
     return std::move(out.str());
@@ -109,25 +107,20 @@ std::vector<TreeEntry> decodeTree(std::string_view data)
             readBinaryLittleEndian(e.file_hash, in);
             readBinaryLittleEndian(e.file_size, in);
 
-            switch (e.placement)
-            {
-                case Placement::Inline:
-                {
+            visitPlacement(e.placement,
+                [&] {   /// Inline: read byte-count then the bytes
                     uint32_t len = 0;
                     readBinaryLittleEndian(len, in);
                     e.inline_bytes = readFixedBytes(in, len);
-                    break;
-                }
-                case Placement::Blob:
-                    break;
-                case Placement::PackSlice:
+                },
+                [&] {},   /// Blob: no extra fields
+                [&] {   /// PackSlice: read pack_hash, offset, length
                     readBinaryLittleEndian(e.pack_hash, in);
                     readBinaryLittleEndian(e.pack_offset, in);
                     readBinaryLittleEndian(e.pack_length, in);
-                    break;
-                case Placement::Subtree:
-                    break;
-            }
+                },
+                [&] {}    /// Subtree: no extra fields
+            );
 
             entries.push_back(std::move(e));
         }
