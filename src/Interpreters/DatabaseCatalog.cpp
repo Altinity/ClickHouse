@@ -91,11 +91,7 @@ namespace Setting
 {
     extern const SettingsBool fsync_metadata;
     extern const SettingsBool allow_experimental_analyzer;
-<<<<<<< HEAD
     extern const SettingsBool show_remote_databases_in_system_tables;
-=======
-    extern const SettingsBool show_data_lake_catalogs_in_system_tables;
->>>>>>> 9b3bb099f56 (Merge pull request #1675 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-100452)
 }
 
 namespace MergeTreeSetting
@@ -2292,14 +2288,9 @@ Names TableNameHints::getAllRegisteredNames() const
 {
     if (!database)
         return {};
-<<<<<<< HEAD
     /// Remote databases (data lake catalogs, MySQL, PostgreSQL) typically list tables via a remote
     /// service, which is expensive. Skip when user opted out of seeing them in system tables.
     if (database->isRemoteDatabase() && context && !context->getSettingsRef()[Setting::show_remote_databases_in_system_tables])
-=======
-    /// DataLakeCatalog::getAllTableNames lists all tables from remote catalog - expensive. Skip when user opted out.
-    if (database->isDatalakeCatalog() && context && !context->getSettingsRef()[Setting::show_data_lake_catalogs_in_system_tables])
->>>>>>> 9b3bb099f56 (Merge pull request #1675 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-100452)
         return {};
     return database->getAllTableNames(context);
 }
