@@ -71,9 +71,10 @@ struct RootShard
 /// journal is preserved in insertion order; mutable files within a ref are name-sorted (std::map).
 String encodeRootShard(const RootShard & root);
 
-/// Decodes a manifest. Throws CORRUPTED_DATA on a wrong `format`, malformed JSON, an unknown/missing
-/// key, a wrong field type, a bad hash hex, or a journal `op` outside {"add","remove"}; a future
-/// `version` throws NOT_IMPLEMENTED.
+/// Decodes a manifest. Throws CORRUPTED_DATA on malformed protobuf, a bad enum (`JournalOp`
+/// unspecified), a wrong-length hash, or any field-level inconsistency; a future `codec_version`
+/// throws (see the version gate in the .cpp). (The wire format is protobuf — `RootShardManifest` in
+/// `Proto/cas_root_shard.proto`, B164a — not the pre-B164a strict JSON this comment once described.)
 RootShard decodeRootShard(std::string_view data);
 
 }
