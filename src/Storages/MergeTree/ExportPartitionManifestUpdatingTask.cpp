@@ -285,14 +285,12 @@ void ExportPartitionManifestUpdatingTask::publishReadModel()
 
 std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::getPartitionExportsInfo() const
 {
-    /// Wait-free read of the published snapshot: a shared_ptr copy, no lock, no ZooKeeper.
     const auto model = storage.export_read_model.get();
 
-    std::vector<ReplicatedPartitionExportInfo> infos;
     if (!model)
-        return infos;
+        return {};
 
-    infos.reserve(model->size());
+    std::vector<ReplicatedPartitionExportInfo> infos(model->size());
 
     for (const auto & entry : model->get<ExportPartitionTaskEntryTagByCompositeKey>())
     {
@@ -491,7 +489,6 @@ void ExportPartitionManifestUpdatingTask::poll()
         /// Remove entries that were deleted by someone else
         removeStaleEntries(zk_children, entries_by_key);
 
-        /// Publish this poll() cycle's changes to readers.
         publishReadModel();
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating task: finished polling for new entries. Number of entries: {}", entries_by_key.size());
