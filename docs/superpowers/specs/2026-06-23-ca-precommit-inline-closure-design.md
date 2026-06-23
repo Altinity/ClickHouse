@@ -66,30 +66,40 @@ walk(root, entriesOf, visit):
 - **Sources (`entriesOf`):** `inline` (precommit — from the deserialized payload; **no I/O, never
   absent**) | `backend` (`readTree(node)` — the existing lazy expansion; **all absent/displaced/pending
   handling lives here and ONLY here**, `CasGc.cpp:1268-1340`).
-- **Visitors:** `fold` → `addTreeEdge`/`addPackEdge` + `markExpanded`; `fsck` → mark reachable; `reclaim`
-  → drop the precommit's flat edges (feeds the existing cascade).
+- **Visitors:** `fold` → `addTreeEdge`/`addPackEdge` + `markExpanded`; `fsck` → mark reachable. (Reclaim
+  is NOT a walk consumer — see §4: it reuses the existing cascade.)
 - The walk **recurses on `Subtree`** (like fsck does today, `CasFsck.cpp:108`), which **fixes the latent
   fold-expand gap** (`CasGc.cpp:1353` adds the subtree edge but never expands it — masked today by flat
   manifests). `fsck`'s `walk` and `fold`'s expand are refactored onto this one routine.
 
-### 3. Precommit protection = flat direct edges (not tree-expansion)
-On folding a precommit `Add`, instead of `readTree`-expanding the tree, `walk(inline, addFlatEdge)` seeds
-**direct edges `ref_pc → member`** for every closure member (recursively, per §2). Consequences:
-- The precommit `Add` fold **no longer reads the tree** ⇒ **delete** the precommit branch of the
-  expansion: the `readTree` for precommit refs and the precommit pending-tolerance/404 path
-  (`CasGc.cpp:1307-1316`). The displaced/`FailClosed` handling for **table** namespaces is unchanged.
-- A blob shared between an in-flight precommit and a committed part carries **two edges**
-  (`table_tree→blob` + `ref_pc→blob`); in-degree = their sum. Pure edge arithmetic — no "seed if not
-  known" special-case (that was an artifact of the seed-at-0 framing).
-- Members are in the graph via the precommit edge **regardless of the tree object** ⇒ S2 closed by
-  construction.
+### 3. Precommit protection = inline-sourced expansion (not a tree read)
+On folding a precommit `Add`, do exactly what expansion does today — `addRootEdge(shard, build_seq,
+manifest_tree)` then per-child `addTreeEdge`/`addPackEdge` + `markExpanded(manifest_tree)` — but source
+the children from the **inline closure** (`walk(manifest_tree, entriesOf=inline, addTreeEdge)`) instead of
+`readTree`. The resulting snap state (root edge + tree edges + marker) is **identical** to a committed
+expansion; the only difference is where the entries came from. Consequences:
+- The precommit `Add` fold **no longer reads the tree** ⇒ **delete** the precommit branch of expansion:
+  the `readTree` for precommit refs and the precommit pending-tolerance/404 path (`CasGc.cpp:1307-1316`).
+  The displaced/`FailClosed` handling for **table** namespaces is unchanged.
+- The inline source never 404s, so the manifest tree's children are **always recorded** in the snap,
+  regardless of whether the tree OBJECT exists ⇒ **S2 closed by construction**.
+- A blob shared between an in-flight precommit and a committed part has **one** `tree→blob` edge per
+  referencing tree (precommit's manifest tree and the committed part's tree are distinct trees ⇒ two
+  edges into the blob); pure edge arithmetic, no "seed if not known" special-case (that was an artifact
+  of the abandoned seed-at-0 framing).
 
-### 4. Reclaim = mirror −1 over the same inline closure
-`reclaimAbandonedPrecommit`, on a dead precommit ref, runs `walk(inline, dropEdge)` to drop the
-`ref_pc→member` edges (and the precommit root ref), exactly mirroring §3. Newly-zeroed members become
-ordinary zero-in-degree candidates the next round and go through the **unchanged** retire → fence →
-recheck → exact-token-delete tail. A member that was never uploaded (partial build) → `deleteExact`
-returns `NotFound` ⇒ idempotent no-op (`CasGc.h:278`). Shared members keep their committed edge → spared.
+### 4. Reclaim — the EXISTING path, now always effective (no new walk)
+`reclaimAbandonedPrecommit` is **unchanged**: it drops the dead precommit ref and journals a `Remove`.
+The next fold's `removeRootEdge` drops the precommit root edge → the manifest tree reaches in-degree 0 →
+retire. From there the children are released by machinery that **already exists**:
+- manifest tree object **present** → normal cascade `stripTree(manifest_tree)` releases its children;
+- manifest tree object **absent** (never uploaded / deleted) → **B199-S1** (committed `6d1e2daae40`):
+  retire's absent-tree branch already `stripTree`s before `forget`, releasing the children.
+Either way the children (recorded by §3's inline-sourced expansion) drop to in-degree 0 and go through
+the **unchanged** retire → fence → recheck → exact-token-delete tail. A never-uploaded member → `deleteExact`
+`NotFound` ⇒ idempotent no-op (`CasGc.h:278`). Shared members keep their committed tree's edge → spared.
+So S2 is closed by §3 alone (always-record) + the already-landed S1/cascade (always-release); reclaim
+needs no closure-walk of its own.
 
 ### 5. Commit path — unchanged
 A committed table ref → `tree_id` → `walk(backend)` expansion exactly as today. `uploadStagedTree` still
@@ -110,11 +120,12 @@ is eventually reclaimed). TLC clean within bounds is a gate before/with implemen
 ## Files
 - `Core/CasRootShardCodec.{h}` + `cas_root_shard.proto` — `RefPayload` inline closure field (+ codec).
 - `Core/CasBuild.cpp` — `Build::precommit` populates the inline closure from staging.
-- `Core/CasGc.cpp` — precommit `Add` → flat-edge seed via the unified walk; **delete** precommit
-  tree-read + pending-tolerance; `reclaimAbandonedPrecommit` → mirror-drop via the unified walk (pass the
-  fold snap in). Refactor fold-expand onto the unified walk.
-- `Core/CasGcSnap.{h,cpp}` — flat-edge add/drop helpers if the existing `addTreeEdge`/`stripTree` don't
-  cover `ref→member` directly; keep shard-agnostic (no new `snap_shards==1` debt).
+- `Core/CasGc.cpp` — refactor fold-expand onto the unified walk; precommit `Add` → expand via the walk
+  with the **inline** source; **delete** the precommit tree-read + pending-tolerance branch.
+  `reclaimAbandonedPrecommit` is unchanged (existing `Remove`→cascade; §4).
+- `Core/CasGcSnap.{h,cpp}` — **no new edge helpers needed**: inline-sourced expansion reuses
+  `addRootEdge`/`addTreeEdge`/`markExpanded` and reclaim reuses `removeRootEdge`/`stripTree` exactly as
+  the committed path does. (Touch only if the unified-walk refactor wants a small shared helper.)
 - `Core/CasFsck.cpp` — refactor `walk` onto the unified routine.
 - `docs/superpowers/models/CaBuildRootPrecommit.tla` — the model extension above.
 - `src/Disks/tests/gtest_cas_gc_leak.cpp` — S2 tests flip GREEN; add a nested-manifest (subtree) test
