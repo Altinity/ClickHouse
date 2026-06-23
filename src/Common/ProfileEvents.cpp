@@ -734,10 +734,6 @@ The server successfully detected this situation and will download merged part fr
     M(S3CopyObject, "Number of S3 API CopyObject calls.", ValueType::Number) \
     M(S3ListObjects, "Number of S3 API ListObjects calls.", ValueType::Number) \
     M(S3HeadObject,  "Number of S3 API HeadObject calls.", ValueType::Number) \
-    M(CasDbgExistsHit,  "DBG(CA soak): S3ObjectStorage::exists() returned true.", ValueType::Number) \
-    M(CasDbgExistsMiss, "DBG(CA soak): S3ObjectStorage::exists() returned false (404).", ValueType::Number) \
-    M(CasDbgMetaHit,    "DBG(CA soak): S3ObjectStorage::tryGetObjectMetadata() found the object.", ValueType::Number) \
-    M(CasDbgMetaMiss,   "DBG(CA soak): S3ObjectStorage::tryGetObjectMetadata() returned nullopt (404).", ValueType::Number) \
     /* CA per-namespace S3 op instrumentation (B168 P0). 80 = 8 namespaces × 10 ops; attributes the */ \
     /* S3 op-count (PUTs/HEADs/404s/412s/LISTs) by CA operation type via the InstrumentedBackend seam. */ \
     M(CasBlobPut,        "CA blob put S3 ops", ValueType::Number) \

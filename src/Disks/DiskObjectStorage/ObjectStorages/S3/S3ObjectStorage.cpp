@@ -45,26 +45,6 @@ namespace ProfileEvents
     extern const Event S3ListObjects;
     extern const Event DiskS3DeleteObjects;
     extern const Event DiskS3ListObjects;
-    extern const Event CasDbgExistsHit;
-    extern const Event CasDbgExistsMiss;
-    extern const Event CasDbgMetaHit;
-    extern const Event CasDbgMetaMiss;
-}
-
-namespace
-{
-/// DBG (CA soak): on a blob/tree HEAD that 404s, log a sampled caller stack so the 80%-404 HEAD
-/// storm can be attributed to its real caller. Rate-limited (1/2000) to keep symbolization cheap.
-/// Throwaway diagnostic — remove after the op-count root cause is pinned.
-void casDbgSampleHeadMiss(const char * site, const std::string & path)
-{
-    if (path.find("/blobs/") == std::string::npos && path.find("/trees/") == std::string::npos)
-        return;
-    static std::atomic<uint64_t> counter{0};
-    if (counter.fetch_add(1, std::memory_order_relaxed) % 2000 != 0)
-        return;
-    LOG_INFO(getLogger("CasDbgHead"), "CASDBG head-404 site={} path={} stack:\n{}", site, path, StackTrace().toString());
-}
 }
 
 namespace CurrentMetrics
@@ -246,9 +226,6 @@ bool S3ObjectStorage::exists(const StoredObject & object) const
 {
     auto settings_ptr = s3_settings.get();
     const bool e = S3::objectExists(*client.get(), uri.bucket, object.remote_path, {});
-    ProfileEvents::increment(e ? ProfileEvents::CasDbgExistsHit : ProfileEvents::CasDbgExistsMiss);
-    if (!e)
-        casDbgSampleHeadMiss("exists", object.remote_path);
     return e;
 }
 
@@ -568,12 +545,7 @@ std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadata(const std::s
     auto object_info = S3::getObjectInfoIfExists(*client.get(), uri.bucket, path, {}, /* with_metadata= */ true, with_tags);
 
     if (object_info.size == 0 && object_info.last_modification_time == 0 && object_info.metadata.empty())
-    {
-        ProfileEvents::increment(ProfileEvents::CasDbgMetaMiss);
-        casDbgSampleHeadMiss("tryGetObjectMetadata", path);
         return {};
-    }
-    ProfileEvents::increment(ProfileEvents::CasDbgMetaHit);
 
     ObjectMetadata result;
     result.size_bytes = object_info.size;
