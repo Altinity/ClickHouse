@@ -54,10 +54,16 @@ This is **not** journal refcounting. It is **one** bounded closure list on the *
 record — transient (precommit-namespace only, trimmed once folded), sized by one build's staged tree. It
 is NOT a per-blob `+1`/`-1` stream of journal records (that *would* be refcounting and is rejected).
 
-The closure is **always populated** on every precommit `Add`. The feature is in development with **no prod
-users and no pre-existing precommit objects**, so there is NO old-precommit / empty-closure case to
-support and NO fallback to the old lazy tree-read (see §3 — the precommit tree-read is deleted outright).
-The protobuf field being technically optional is just a codec detail, not a runtime contingency.
+The closure covers **only the nodes this build STAGED** (its own `stageTree` output — the nodes subject to
+the S2 displaced-before-expansion leak). A precommit whose **root is adopted** (not staged) legitimately
+carries an **empty** closure, and a staged manifest may reference **adopted subtrees** absent from the
+closure. Adopted nodes are **not** a leak risk: they are protected by the **live source** they were adopted
+from, so their tree OBJECT is present and GC reads it normally (see §3 — the precommit fold sources staged
+nodes inline and **falls back to `readTree` for adopted nodes**). Two production paths precommit an adopted
+root and so produce an empty closure: replication relink (`adoptTree` + `precommit`,
+`ContentAddressedMetadataStorage.cpp`) and rename/detach/move (`adoptEvidence` + `precommit`,
+`ContentAddressedTransaction.cpp`, deliberately no HEAD before precommit per B190). An empty closure is
+therefore **normal, not corruption** — there is no fail-closed guard on it.
 
 Stored form is the decoded `[TreeEntry]` (what `stageTree` produced) — not re-encoded tree bytes — so the
 walk consumes `[TreeEntry]` uniformly with no re-encode and no duplication of the `trees/` object's bytes.
@@ -78,32 +84,42 @@ walk(root, entriesOf, visit):
             Inline:   (no object)
 ```
 
-- **Sources (`entriesOf`):** `inline` (precommit — from the deserialized payload; **no I/O, never
-  absent**) | `backend` (`readTree(node)` — the existing lazy expansion; **all absent/displaced/pending
-  handling lives here and ONLY here**, `CasGc.cpp:1268-1340`).
+- **Source (`entriesOf`) — ONE unified function** for both namespaces: `closure.contains(node) ?
+  closure[node] (inline, no I/O — the S2 protection for STAGED nodes) : readTree(node) (backend — for
+  ADOPTED/committed nodes, whose object a live source keeps present)`. For a table-ns `Add` the closure is
+  empty, so the source is always `readTree` — identical to today. The `readTree` 404/displaced/pending
+  handling lives here and ONLY here (`CasGc.cpp:~1268-1340`).
 - **Visitors:** `fold` → `addTreeEdge`/`addPackEdge` + `markExpanded`; `fsck` → mark reachable. (Reclaim
   is NOT a walk consumer — see §4: it reuses the existing cascade.)
 - The walk **recurses on `Subtree`** (like fsck does today, `CasFsck.cpp:108`), which **fixes the latent
   fold-expand gap** (`CasGc.cpp:1353` adds the subtree edge but never expands it — masked today by flat
   manifests). `fsck`'s `walk` and `fold`'s expand are refactored onto this one routine.
 
-### 3. Precommit protection = inline-sourced expansion (not a tree read)
-On folding a precommit `Add`, do exactly what expansion does today — `addRootEdge(shard, build_seq,
-manifest_tree)` then per-child `addTreeEdge`/`addPackEdge` + `markExpanded(manifest_tree)` — but source
-the children from the **inline closure on the `Add` record itself** (`record.closure`, via
-`walk(manifest_tree, entriesOf=inline, addTreeEdge)`) instead of `readTree`. The closure is read from the
-folding `JournalRecord` in hand — **never** from `root.refs` (which may already be erased; §1). The
-resulting snap state (root edge + tree edges + marker) is **identical** to a committed expansion; the only
-difference is where the entries came from. Consequences:
-- The precommit `Add` fold **no longer reads the tree** ⇒ **delete** the precommit branch of expansion:
-  the `readTree` for precommit refs and the precommit pending-tolerance/404 path (`CasGc.cpp:1307-1316`).
-  The displaced/`FailClosed` handling for **table** namespaces is unchanged.
-- The inline source never 404s, so the manifest tree's children are **always recorded** in the snap,
-  regardless of whether the tree OBJECT exists ⇒ **S2 closed by construction**.
-- A blob shared between an in-flight precommit and a committed part has **one** `tree→blob` edge per
-  referencing tree (precommit's manifest tree and the committed part's tree are distinct trees ⇒ two
-  edges into the blob); pure edge arithmetic, no "seed if not known" special-case (that was an artifact
-  of the abandoned seed-at-0 framing).
+### 3. Precommit protection = unified expansion (inline for staged, `readTree` for adopted)
+On folding ANY `Add` (precommit or table), expand exactly as today — `addRootEdge` then per-child
+`addTreeEdge`/`addPackEdge` + `markExpanded` — driving `walk(manifest_tree, entriesOf=source, …)` with the
+**one unified source** of §2. The closure feeding that source is read from the **folding `JournalRecord` in
+hand** (`record.closure`) — **never** from `root.refs` (which may already be erased; §1). The resulting
+snap state (root edge + tree edges + marker) is identical to a committed expansion. Consequences:
+- **STAGED nodes** (in the closure) are sourced inline ⇒ the precommit fold **does not read them**, so their
+  children are recorded **regardless of whether the tree OBJECT exists** ⇒ **S2 closed by construction** for
+  the build's own staged closure (the only nodes the displaced-before-expansion race can strand).
+- **ADOPTED nodes** (closure-absent: an adopted root, or an adopted subtree inside a staged manifest) fall
+  back to `readTree`. This is safe and non-circular: an adopted node's object is kept present by the **live
+  source** it was adopted from, so reading it is reading a live-protected object, NOT reviving a condemned
+  one ([[feedback-ca-resurrect-invariant]]). Recording their real child edges here also avoids the
+  `markExpanded`-with-no-edges hazard (a later real expansion being suppressed by the once-per-tree gate).
+- The two former branches (precommit vs table) **collapse into one** — the unified source is the difference,
+  so there is no separate "precommit tree-read" to delete and no empty-closure fail-closed guard. This is
+  the tree-walk simplification the design set out to deliver.
+- **404 on an adopted node during a precommit fold** (the live source was concurrently dropped — a
+  multi-leader race) is **tolerated as pending**: do not `markExpanded`, record no partial edges, skip — the
+  same precommit pending-tolerance the table path already has for a displaced root. The doomed precommit is
+  caught by the fail-closed commit gate or reclaimed; failing closed here would turn a benign cross-server
+  race into GC-stopping exceptions. (For a **table** ns the existing displaced-later/`FailClosed` contract is
+  unchanged: a live table ref to a missing tree with no later displacing record is still a dangle.)
+- A blob shared between an in-flight precommit and a committed part has one `tree→blob` edge per referencing
+  tree (distinct trees ⇒ two edges into the blob); pure edge arithmetic, no "seed if not known" special-case.
 
 ### 4. Reclaim — the EXISTING path, now always effective (no new walk)
 `reclaimAbandonedPrecommit` is **unchanged**: it drops the dead precommit ref and journals a `Remove`.
@@ -112,7 +128,7 @@ retire. From there the children are released by machinery that **already exists*
 - manifest tree object **present** → normal cascade `stripTree(manifest_tree)` releases its children;
 - manifest tree object **absent** (never uploaded / deleted) → **B199-S1** (committed `6d1e2daae40`):
   retire's absent-tree branch already `stripTree`s before `forget`, releasing the children.
-Either way the children (recorded by §3's inline-sourced expansion) drop to in-degree 0 and go through
+Either way the children (recorded by §3's unified expansion) drop to in-degree 0 and go through
 the **unchanged** retire → fence → recheck → exact-token-delete tail. A never-uploaded member → `deleteExact`
 `NotFound` ⇒ idempotent no-op (`CasGc.h:278`). Shared members keep their committed tree's edge → spared.
 So S2 is closed by §3 alone (always-record) + the already-landed S1/cascade (always-release); reclaim
@@ -139,9 +155,11 @@ is eventually reclaimed). TLC clean within bounds is a gate before/with implemen
   (+ codec); `RefPayload` carries NO closure.
 - `Core/CasBuild.cpp` — `Build::precommit` populates the inline closure on the `Add` journal record it
   appends (from staging, in-memory).
-- `Core/CasGc.cpp` — refactor fold-expand onto the unified walk; precommit `Add` → expand via the walk
-  with the **inline** source read from `record.closure`; **delete** the precommit tree-read +
-  pending-tolerance branch. `reclaimAbandonedPrecommit` is unchanged (existing `Remove`→cascade; §4).
+- `Core/CasGc.cpp` — refactor fold-expand onto the unified walk; every `Add` expands via the **one unified
+  source** (`record.closure`-inline for staged nodes, `readTree` fallback for adopted nodes — §2/§3). KEEP
+  the precommit pending-tolerance so a 404 on an adopted node during a precommit fold is tolerated (§3); the
+  table-ns displaced/`FailClosed` contract is unchanged. There is NO empty-closure fail-closed guard.
+  `reclaimAbandonedPrecommit` is unchanged (existing `Remove`→cascade; §4).
 - `Core/CasGcSnap.{h,cpp}` — **no new edge helpers needed**: inline-sourced expansion reuses
   `addRootEdge`/`addTreeEdge`/`markExpanded` and reclaim reuses `removeRootEdge`/`stripTree` exactly as
   the committed path does. (Touch only if the unified-walk refactor wants a small shared helper.)
@@ -151,8 +169,13 @@ is eventually reclaimed). TLC clean within bounds is a gate before/with implemen
   exercising the recursion fix.
 
 ## Testing
-- `..._S2_NoFoldBetween` and raw `DisplacedUnexpandedTreeBlobsLeak` → GREEN (`unreachable=0`).
+- `..._S2_NoFoldBetween` (Build-level) and `CaWiringGc.DisplacedTreeBlobsReclaimedThroughRealPath`
+  (genuine `ContentAddressedTransaction` path) → GREEN (`unreachable=0`, `dangling=0`).
 - `..._S1_FoldBetween` stays GREEN; `CasGcDangle.*` / `CasReuseGcRace.*` stay GREEN; `dangling=0`.
+- **Adopted-root regression (the empty-closure path)**: run a GC round to fixpoint AFTER a replication
+  `adoptPart` and AFTER a rename/`republishRef`, asserting the precommit fold does **not** throw and
+  `dangling=0` (these adopt an unstaged root → empty closure → must expand via the `readTree` fallback, not
+  fail closed). This is the coverage the original tests lacked.
 - New nested-manifest test: a tree with a built `Subtree` whose blobs must be expanded/reclaimed (proves
   the unified walk recurses; today's fold would miss them).
 - Full `Cas*`/`CaWiring*` suite no-regress (known reds only).

@@ -410,6 +410,51 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
+## Task 7: Unified fold source — fix the adopted-root regression (code-quality review Blocker + Important)
+
+Commit `f60914b8c239` (Task 5) introduced a **regression**: it made the precommit fold use a PURE inline
+source and added an empty-closure `LOGICAL_ERROR` guard. But two production paths precommit an **adopted**
+(unstaged) root → `buildStagedClosure` returns EMPTY → the guard throws on the first GC fold over that
+record, breaking GC after replication relink and after rename/detach/move. Pure-inline also marks an
+adopted subtree `expanded` with NO child edges (a latent leak). Fix: ONE unified source that sources staged
+nodes inline and **falls back to `readTree` for adopted nodes** (closure-absent), keeping S2 closed
+(staged nodes never read) while reading adopted nodes (their object is kept present by the live source).
+A 404 on an adopted node during a precommit fold is tolerated as pending (decision: option (a)). See the
+updated spec §1/§2/§3.
+
+**Files:**
+- Modify: `Core/CasGc.cpp` (`foldShardRecords` — the `Add` expansion block)
+- Test: `src/Disks/tests/gtest_ca_wiring.cpp` (adopt + rename GC regression tests)
+
+- [ ] **Step 1: Write the failing adopted-root regression tests** in `gtest_ca_wiring.cpp` (model on `CaWiringGc.DroppedPartIsReclaimedByRounds` / `DisplacedTreeBlobsReclaimedThroughRealPath` for the harness):
+  - `CaWiringGc.AdoptedRootPrecommitFoldDoesNotThrow`: commit a part, then drive a replication `adoptPart` of its tree id into a second part name (via the `IContentAddressedExchange` accessor, as `CaWiringExchange.AdoptPartPublishesOwnRef` does), then run GC to fixpoint (`runOneGcRoundForTest` ×8) and assert it does not throw and `runFsck(...).dangling == 0`.
+  - `CaWiringGc.RenamedPartPrecommitFoldDoesNotThrow`: commit a part, rename/move it (the operation that drives `republishRef`), then run GC to fixpoint and assert no throw + `dangling == 0`.
+  Run them FIRST against the current binary to confirm they reproduce the throw (RED): `ninja -C build unit_tests_dbms > build/build_b199s2_t7.log 2>&1 && build/src/unit_tests_dbms --gtest_filter='CaWiringGc.AdoptedRootPrecommitFoldDoesNotThrow:CaWiringGc.RenamedPartPrecommitFoldDoesNotThrow' 2>&1 | tail -20`. Expected: at least one FAILS with a `LOGICAL_ERROR` from the fold (proves the regression). If they pass as-is, investigate whether the harness actually runs a fold over the adopted precommit `Add` before declaring them adequate.
+
+- [ ] **Step 2: Implement the unified source** in `foldShardRecords`. Replace the precommit/table two-branch logic with ONE source used for every `Add`:
+  - Build `by_node` (`std::map<UInt128, std::vector<TreeEntry>>`) from `record.closure` (empty for table-ns and adopted-root precommits).
+  - `source(node) = by_node.contains(node) ? by_node[node] : readTree(node)`.
+  - Wrap the `readTree` calls with the EXISTING 404 handling: for the ROOT, the displaced-later check + (for precommit ns) pending-tolerance + (for table ns) `FailClosed`; for an adopted node reached during the walk under a precommit ns, a 404 is tolerated as pending (do NOT `markExpanded`, record no edges, skip — option (a)); under a table ns the existing fail-closed-on-missing-child contract is unchanged.
+  - **DELETE** the empty-closure `LOGICAL_ERROR` guard added in Task 5.
+  - **RESTORE/KEEP** the precommit pending-tolerance (do not leave it deleted as Task 5 did).
+  Keep the once-per-tree `isExpanded`/`markExpanded` gate and the `TreeExpand` event semantics. The cleanest structure realizes the spec's "two branches collapse into one".
+
+- [ ] **Step 3: Run the regression tests — GREEN.** `build/src/unit_tests_dbms --gtest_filter='CaWiringGc.*' 2>&1 | tail -20` → the two new tests PASS; existing `CaWiringGc.*` still PASS.
+
+- [ ] **Step 4: S2 + leak tests still GREEN.** `build/src/unit_tests_dbms --gtest_filter='CasGcLeak.*:CaWiringGc.DisplacedTreeBlobsReclaimedThroughRealPath' 2>&1 | tail -12` → all GREEN (S2 must NOT regress — staged nodes still inline-sourced).
+
+- [ ] **Step 5: Full CA-suite gate.** `build/src/unit_tests_dbms --gtest_filter='Cas*:Ca*' 2>&1 | tail -20` → only the known baseline red `CaWiringOps.FreezeViaHardLinksIntoShadow`.
+
+- [ ] **Step 6: Commit.**
+```bash
+git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp src/Disks/tests/gtest_ca_wiring.cpp
+git commit -m "CA B199-S2 fix: unified fold source (inline for staged, readTree fallback for adopted) — fixes adopted-root precommit regression (relink/rename) + adopted-subtree no-edge leak; drop empty-closure guard; keep precommit pending-tolerance
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
 ## Post-plan validation (not a code task)
 After all tasks: rebuild `clickhouse`, run a fresh ca-soak (multi-leader stale-delete is S2's trigger) and confirm the steady-state `unreachable` drains toward 0 (vs the ~20 floor before), with `dangling=0` and all regression watches 0. Update backlog B199 → S2 DONE.
 
