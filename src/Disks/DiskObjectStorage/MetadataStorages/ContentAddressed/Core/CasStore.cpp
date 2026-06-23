@@ -629,7 +629,7 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
         /// so here the post-commit version is root.shard_version + 1.
         root.journal.push_back(JournalRecord{
             .op = JournalRecord::Op::Remove, .ref_name = ref_name, .tree_id = tree_id,
-            .at_version = root.shard_version + 1});
+            .at_version = root.shard_version + 1, .closure = {}});
     });
     /// B170: the ref was dropped (a '-' journal record GC will fold as a root Remove). object_hash is
     /// the tree the ref named, so a part's "publish -> drop" life is reconstructable from the rows.
@@ -717,7 +717,7 @@ void Store::dropNamespace(const RootNamespace & ns)
             for (const auto & [ref_name, payload] : shard_root.refs)
                 shard_root.journal.push_back(JournalRecord{
                     .op = JournalRecord::Op::Remove, .ref_name = ref_name, .tree_id = payload.tree_id,
-                    .at_version = shard_root.shard_version + 1});
+                    .at_version = shard_root.shard_version + 1, .closure = {}});
             shard_root.refs.clear();
         });
     }

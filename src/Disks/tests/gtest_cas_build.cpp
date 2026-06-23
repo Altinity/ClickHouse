@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
@@ -1403,10 +1404,10 @@ TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
     }
 }
 
-/// B199-S2 Task 4: precommit populates RefPayload.closure from the build's staged tree structure.
-/// The flat-manifest case: one staged tree (the manifest) referencing two blobs → closure has exactly
-/// one ClosureNode containing the manifest's tree_hash and both blob entries.
-TEST(CasBuild, PrecommitRefCarriesInlineClosure)
+/// B199-S2: precommit populates the closure on the precommit-ns `Add` journal record from the build's
+/// staged tree structure. The flat-manifest case: one staged tree (the manifest) referencing two blobs
+/// → closure has exactly one `ClosureNode` containing the manifest's tree_hash and both blob entries.
+TEST(CasBuild, PrecommitAddRecordCarriesInlineClosure)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = Store::open(
@@ -1444,11 +1445,15 @@ TEST(CasBuild, PrecommitRefCarriesInlineClosure)
     ASSERT_TRUE(shard_raw.has_value());
 
     const RootShard rs = decodeRootShard(shard_raw->bytes);
-    const auto ref_it = rs.refs.find(precommit_ref);
-    ASSERT_NE(ref_it, rs.refs.end());
-    const RefPayload & pl = ref_it->second;
 
-    ASSERT_EQ(pl.closure.size(), 1u);
-    EXPECT_EQ(pl.closure[0].tree_hash, hexToU128(t.string()));
-    ASSERT_EQ(pl.closure[0].entries.size(), 2u);
+    /// The closure rides the precommit-ns `Add` journal record, not the ref payload.
+    const auto rec_it = std::find_if(
+        rs.journal.begin(), rs.journal.end(),
+        [&](const JournalRecord & r)
+        { return r.op == JournalRecord::Op::Add && r.ref_name == precommit_ref; });
+    ASSERT_NE(rec_it, rs.journal.end());
+
+    ASSERT_EQ(rec_it->closure.size(), 1u);
+    EXPECT_EQ(rec_it->closure[0].tree_hash, hexToU128(t.string()));
+    ASSERT_EQ(rec_it->closure[0].entries.size(), 2u);
 }

@@ -996,10 +996,10 @@ TEST(CasGcRecheck, SparedWhenPublishRacesTheFence)
         ASSERT_TRUE(got.has_value());
         RootShard root = decodeRootShard(got->bytes);
         ++root.shard_version;
-        root.refs["part_1"] = RefPayload{.tree_id = hexToU128(tree.string()), .tree_size = 0, .mutable_files = {}, .closure = {}};
+        root.refs["part_1"] = RefPayload{.tree_id = hexToU128(tree.string()), .tree_size = 0, .mutable_files = {}};
         root.journal.push_back(JournalRecord{
             .op = JournalRecord::Op::Add, .ref_name = "part_1",
-            .tree_id = hexToU128(tree.string()), .at_version = root.shard_version});
+            .tree_id = hexToU128(tree.string()), .at_version = root.shard_version, .closure = {}});
         ASSERT_EQ(b->InMemoryBackend::casPut(shard_key, encodeRootShard(root), got->token, nullptr),
                   CasOutcome::Committed);
     });
@@ -1342,9 +1342,9 @@ TEST(CasGcDiscovery, UsesRegistryNotList)
     /// bypass registerNamespaceRaw deliberately: a manifest for a ghost namespace
     RootShard ghost;
     ghost.shard_version = 1;
-    ghost.refs["ghost_part"] = RefPayload{.tree_id = u128Of("ghost-tree"), .tree_size = 0, .mutable_files = {}, .closure = {}};
+    ghost.refs["ghost_part"] = RefPayload{.tree_id = u128Of("ghost-tree"), .tree_size = 0, .mutable_files = {}};
     ghost.journal.push_back(JournalRecord{
-        .op = JournalRecord::Op::Add, .ref_name = "ghost_part", .tree_id = u128Of("ghost-tree"), .at_version = 1});
+        .op = JournalRecord::Op::Add, .ref_name = "ghost_part", .tree_id = u128Of("ghost-tree"), .at_version = 1, .closure = {}});
     b->casPut(s->layout().rootShardKey(RootNamespace{"ghost/ns"}, 0), encodeRootShard(ghost), std::nullopt);
 
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
@@ -1682,10 +1682,10 @@ TEST(CasGcTrim, RecordAboveTheCursorSurvives)
         ASSERT_TRUE(got.has_value());
         RootShard root = decodeRootShard(got->bytes);
         ++root.shard_version;
-        root.refs["late_part"] = RefPayload{.tree_id = u128Of("late-tree"), .tree_size = 0, .mutable_files = {}, .closure = {}};
+        root.refs["late_part"] = RefPayload{.tree_id = u128Of("late-tree"), .tree_size = 0, .mutable_files = {}};
         root.journal.push_back(JournalRecord{
             .op = JournalRecord::Op::Add, .ref_name = "late_part",
-            .tree_id = u128Of("late-tree"), .at_version = root.shard_version});
+            .tree_id = u128Of("late-tree"), .at_version = root.shard_version, .closure = {}});
         ASSERT_EQ(b->InMemoryBackend::casPut(shard_key, encodeRootShard(root), got->token, nullptr),
                   CasOutcome::Committed);
     });

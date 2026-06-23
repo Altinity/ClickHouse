@@ -177,7 +177,7 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
         ++root.shard_version;
         root.journal.push_back(JournalRecord{
             .op = JournalRecord::Op::Remove, .ref_name = precommit_ref, .tree_id = part_tree,
-            .at_version = root.shard_version});
+            .at_version = root.shard_version, .closure = {}});
         backend->casPut(key, DB::Cas::encodeRootShard(root), got->token);
     }
 

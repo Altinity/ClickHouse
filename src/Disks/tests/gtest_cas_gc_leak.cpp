@@ -53,33 +53,6 @@ StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
     return Store::open(out_backend, PoolConfig{.pool_prefix = "p"});
 }
 
-/// Publish one ref naming a two-blob tree with the given payloads. No GC round is interleaved, so
-/// the tree is NOT expanded into the durable snap before it can be displaced. Returns the tree id.
-TreeId publishPart2(
-    const StorePtr & s, const String & ns, const String & ref,
-    const String & payload_a, const String & payload_b)
-{
-    auto build = s->startBuild({});
-    build->putBlob(idOf(payload_a), BlobSource::fromString(payload_a));
-    build->putBlob(idOf(payload_b), BlobSource::fromString(payload_b));
-
-    TreeEntry ea;
-    ea.name = "data.bin";
-    ea.placement = Placement::Blob;
-    ea.file_hash = u128Of(payload_a);
-    ea.file_size = payload_a.size();
-
-    TreeEntry eb;
-    eb.name = "data.cmrk3";
-    eb.placement = Placement::Blob;
-    eb.file_hash = u128Of(payload_b);
-    eb.file_size = payload_b.size();
-
-    const TreeId tree = build->putTree({ea, eb});
-    build->publish(RootNamespace{ns}, ref, tree, {});
-    return tree;
-}
-
 size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
 {
     size_t rounds = 0;
@@ -120,8 +93,8 @@ size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
 ///                                      // precommit-removal step, replicated exactly by going through
 ///                                      // Build::publish rather than hand-rolling it.
 ///
-/// Mirrors `publishPart2` (same ref, same two TreeEntry blobs data.bin / data.cmrk3) but every byte of
-/// the closure is born under treeA's own unique precommit ref first. Returns the tree id.
+/// Same ref, two TreeEntry blobs (data.bin / data.cmrk3), but every byte of the closure is born under
+/// treeA's own unique precommit ref first — the production precommit-first order. Returns the tree id.
 TreeId publishPart2Precommit(
     const StorePtr & s, const RootNamespace & ns, const String & ref,
     const String & payload_a, const String & payload_b)
@@ -186,63 +159,13 @@ FsckReport displaceDeleteAndGc(
 
 }
 
-/// The deterministic core repro of the soak's two-server churn: a ref is published to treeA and then
-/// re-published to treeB (last-op-wins displacement, two consecutive `Add`s in one fold window with
-/// no `Remove` between), and treeA's object is removed before the GC ever folds — exactly as a
-/// competing GC round's landed delete would. The fold then takes the `displaced_later` skip and
-/// never records treeA's blob edges, so treeA's UNIQUE blobs (not shared with treeB) leak.
-///
-/// `data-A` / `mark-A` are referenced ONLY by treeA; treeB references the distinct `data-B` /
-/// `mark-B`. After GC reaches a fixpoint the live ref points at treeB, so treeB's blobs are
-/// reachable; treeA's two blobs are unreachable orphans. The desired post-fix state is
-/// `unreachable == 0` (treeA's blobs reclaimed). dangling stays 0 throughout — no data loss.
-TEST(CasGcLeak, DisplacedUnexpandedTreeBlobsLeak)
-{
-    std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
-    const RootNamespace ns{"srv1/tbl"};
-    const String ref = "all_0_0_0";
-
-    /// Publish treeA (unique blobs data-A / mark-A). NO GC round runs here, so treeA is never
-    /// expanded into the snap.
-    const TreeId tree_a = publishPart2(s, ns.string(), ref, "data-A", "mark-A");
-
-    /// Re-publish the SAME ref to treeB (distinct blobs data-B / mark-B): last-op-wins, a second
-    /// `Add` for the ref with no `Remove` between — treeA's root edge is displaced in this fold
-    /// window.
-    publishPart2(s, ns.string(), ref, "data-B", "mark-B");
-
-    /// A competing GC round already deleted the displaced treeA object: make its read 404. The
-    /// deleteExact-by-token is exactly how the GC's content-delete site removes an object, so this
-    /// faithfully reproduces "the object is GONE when the fold tries to expand it".
-    {
-        const String tree_a_key = s->layout().treeKey(tree_a);
-        const auto head = b->head(tree_a_key);
-        ASSERT_TRUE(head.exists) << "treeA object must exist before we delete it";
-        ASSERT_EQ(b->deleteExact(tree_a_key, head.token).kind, DeleteOutcome::Kind::Deleted);
-        /// Sanity: the Store now 404s on treeA, driving the fold's FILE_DOESNT_EXIST branch.
-        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->readTree(tree_a); });
-    }
-
-    /// Drive the incremental GC to a true fixpoint.
-    Gc gc(s, hexToU128("00000000000000000000000000000001"));
-    const size_t rounds = runGcToFixpoint(gc);
-
-    const FsckReport after = runFsck(*s, /*detail=*/false);
-
-    /// INV-NO-LOSS holds: treeB and its blobs are reachable, nothing dangles.
-    EXPECT_EQ(after.dangling, 0u) << "displacement must never lose a reachable object";
-    EXPECT_GT(after.reachable, 0u) << "the live ref points at treeB; treeB's closure is reachable";
-
-    /// THE B140 ASSERTION (RED today): treeA's two unique orphaned blobs must be reclaimed by the
-    /// time the GC reaches a fixpoint. They are not — the displaced_later skip never recorded their
-    /// edges, so the incremental GC cannot see them. unreachable == 2 today (data-A, mark-A).
-    EXPECT_EQ(after.unreachable, 0u)
-        << "B140: displaced-and-vanished treeA's blobs leaked after " << rounds
-        << " GC rounds reached a fixpoint (reachable=" << after.reachable
-        << ", unreachable=" << after.unreachable << "); the fold's displaced_later skip "
-        << "(CasGc.cpp :771-773) never recorded treeA's blob edges into the snap";
-}
+/// The displaced-and-vanished-tree leak repro that USED to live here (`DisplacedUnexpandedTreeBlobsLeak`)
+/// drove `build->publish(...)` DIRECTLY with NO precommit — a path production never takes. It has been
+/// rewritten to run through the GENUINE `ContentAddressedTransaction`/wiring entry point as
+/// `CaWiringGc.DisplacedTreeBlobsReclaimedThroughRealPath` (`gtest_ca_wiring.cpp`), where the
+/// precommit-first B199-S2 inline-closure fold + B199-S1 retire-strip reclaim treeA's blobs. The two
+/// deterministic Build-level precommit repros below (`..._S1_FoldBetween` / `..._S2_NoFoldBetween`)
+/// stay as focused unit-level coverage of the same fix.
 
 /// DIAGNOSTIC (2026-06-23): is the B140 leak reachable through the REAL precommit-first transaction
 /// path, or is it only a raw-publish-API hazard that precommit-first prevents? The original
@@ -263,22 +186,21 @@ TEST(CasGcLeak, DisplacedUnexpandedTreeBlobsLeak)
 /// expansion skip (:1261-1305) is therefore NOT the operative mechanism in this path — it is the raw
 /// test's mechanism, not this one.
 ///
-/// The leak is one pipeline stage LATER, in retire (CasGc.cpp :1003-1051). After the precommit Remove
-/// and the table-ref displacement, treeA hits in-degree 0 and becomes a zero-in-degree retire
-/// candidate. But the competing delete already removed treeA's OBJECT, so retire's R2 HEAD-observe sees
-/// it absent (`present` gate, :1018) and takes the P9 DEFENSIVE-FORGET branch (:1036
-/// `shard_snap.forget(treeA)`): treeA is dropped from `known` WITHOUT being stripped. Unlike the
-/// cascade's `stripTree` (cascadeAndPersist :571), `forget` (CasGcSnap.cpp :219-227) removes only the
-/// node's own membership — it does NOT decrement its children's in-degree. So treeA's recorded edges
-/// treeA→{data-A, mark-A} are never released; data-A / mark-A keep in-degree 1 forever, never surface
-/// as zero-in-degree candidates, and leak. A vanished-before-retire expanded tree is reclaimed only by
-/// a full-sweep Full GC, exactly as the §8 "drift" class the design assigns to Full GC.
+/// The leak was one pipeline stage LATER, in retire (CasGc.cpp). After the precommit Remove and the
+/// table-ref displacement, treeA hits in-degree 0 and becomes a zero-in-degree retire candidate. The
+/// competing delete already removed treeA's OBJECT, so retire's HEAD-observe sees it absent — B199-S1
+/// landed the fix here: the retire absent-tree branch now `stripTree`s treeA (releasing its recorded
+/// child edges) BEFORE forgetting it, so treeA→{data-A, mark-A} are decremented to in-degree 0 and the
+/// children surface as candidates and are reclaimed.
+///
+/// GREEN (B199-S1 + B199-S2): the precommit Add carries treeA's closure INLINE on the journal record,
+/// so the fold records treeA→{data-A, mark-A} from the recorded closure even when the tree object has
+/// vanished — no readTree — and the B199-S1 retire strip then releases them. unreachable==0.
 ///
 /// S1 (contrast): one GC fold runs AFTER treeA's precommit/commit but BEFORE the displacement, so
-/// treeA is unambiguously expanded with its object present. Even so it is RED — because the leak is
-/// the retire-time forget of the vanished tree, not the expansion. (Note: that first fold also
-/// populates the Store's content-addressed tree_cache for treeA, so the post-delete `readTree` sanity
-/// 404 in the helper is expected to be a non-fatal EXPECT, not a hard assertion.)
+/// treeA is unambiguously expanded with its object present; the B199-S1 retire strip reclaims its
+/// children. (Note: that first fold also populates the Store's content-addressed tree_cache for treeA,
+/// so the post-delete `readTree` sanity 404 in the helper is a non-fatal EXPECT, not a hard assertion.)
 TEST(CasGcLeak, DisplacedUnexpandedTreeBlobsLeakPrecommitPath_S1_FoldBetween)
 {
     std::shared_ptr<InMemoryBackend> b;
@@ -318,11 +240,11 @@ TEST(CasGcLeak, DisplacedUnexpandedTreeBlobsLeakPrecommitPath_S1_FoldBetween)
 /// precommit Remove (removed-on-commit) and the treeB displacement and treeA's object-delete are all
 /// pending when the single GC fold finally runs.
 ///
-/// EMPIRICAL: RED, unreachable==2 — precommit-first does NOT prevent the leak. Here treeA's object is
-/// ALREADY deleted when the single fold runs, so the precommit Add's readTree 404s and the expansion
-/// takes the precommit-namespace pending-tolerance skip (CasGc.cpp :1280-1281) — treeA is NOT expanded.
-/// But that does not even matter: even in S1, where treeA IS expanded, the retire-time forget of the
-/// vanished tree (:1036) leaks its children just the same. Both routes converge on the same leak.
+/// GREEN (B199-S2): the worst case — treeA's object is ALREADY deleted when the single fold runs — is
+/// now closed. The precommit Add carries treeA's closure INLINE on the journal record, so the fold
+/// records treeA→{data-A, mark-A} from the recorded closure WITHOUT any readTree (no 404, no skip), and
+/// the B199-S1 retire absent-tree strip then releases those edges so the children reach in-degree 0 and
+/// are reclaimed. unreachable==0; dangling==0 throughout (no data loss).
 TEST(CasGcLeak, DisplacedUnexpandedTreeBlobsLeakPrecommitPath_S2_NoFoldBetween)
 {
     std::shared_ptr<InMemoryBackend> b;
@@ -343,11 +265,10 @@ TEST(CasGcLeak, DisplacedUnexpandedTreeBlobsLeakPrecommitPath_S2_NoFoldBetween)
               << " reachable=" << after.reachable << " dangling=" << after.dangling
               << "  => " << (after.unreachable == 0 ? "GREEN" : "RED") << std::endl;
     EXPECT_EQ(after.unreachable, 0u)
-        << "S2: precommit-first did NOT prevent the leak — treeA's object was already deleted when the "
-        << "single fold ran (precommit Add readTree 404 → precommit-ns pending-tolerance skip, "
-        << "CasGc.cpp :1280-1281, so no expansion), and even if it had been expanded the retire-time "
-        << "P9 forget of the vanished tree (:1036) would leak its children anyway; treeA's unique blobs "
-        << "leaked (unreachable=" << after.unreachable << ")";
+        << "S2: B199-S2 should reclaim treeA's blobs even though its object was already deleted when the "
+        << "single fold ran — the precommit Add's INLINE closure records treeA→{data-A, mark-A} without a "
+        << "readTree, and the B199-S1 retire strip releases them; treeA's unique blobs must be reclaimed "
+        << "(unreachable=" << after.unreachable << ")";
 }
 
 /// REUSE-vs-GC race (2026-06-17 soak investigation): models the user's hypothesis — "reuse of an

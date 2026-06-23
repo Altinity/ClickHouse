@@ -738,13 +738,13 @@ void Build::precommit(const TreeId & manifest)
         RefPayload payload;
         payload.tree_id = manifest_hash;
         payload.tree_size = tree_size;
-        /// B199-S2 Task 4: populate closure from the staged tree structure IN MEMORY — no pool read.
-        /// GC (Task 5) uses this to protect/reclaim the build's closure without reading tree objects.
-        payload.closure = buildStagedClosure(manifest_hash);
         root.refs[ref] = payload;
+        /// B199-S2: the closure rides the Add journal record (it survives the commit/abandon refs.erase
+        /// and is trimmed only after GC folds it), so GC can protect/reclaim the build's closure WITHOUT
+        /// reading any tree object. Built in-memory from the staged structure — no pool read.
         root.journal.push_back(JournalRecord{
             .op = JournalRecord::Op::Add, .ref_name = ref, .tree_id = manifest_hash,
-            .at_version = root.shard_version + 1});
+            .at_version = root.shard_version + 1, .closure = buildStagedClosure(manifest_hash)});
     });
 
     /// B171: the precommit was published — the precommit edge now protects the manifest's closure.
@@ -1036,7 +1036,7 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
         /// the post-commit version is root.shard_version + 1 (matches dropRef).
         root.journal.push_back(JournalRecord{
             .op = JournalRecord::Op::Add, .ref_name = ref_name, .tree_id = payload.tree_id,
-            .at_version = root.shard_version + 1});
+            .at_version = root.shard_version + 1, .closure = {}});
     });
 
     /// B170: the ref was published (RefRepoint when it already named a tree, else RefPublish). The
@@ -1085,7 +1085,7 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
                 root.refs.erase(it);
                 root.journal.push_back(JournalRecord{
                     .op = JournalRecord::Op::Remove, .ref_name = ref, .tree_id = part_tree,
-                    .at_version = root.shard_version + 1});
+                    .at_version = root.shard_version + 1, .closure = {}});
             });
             precommitted = false;
             if (store->hasEventSink())

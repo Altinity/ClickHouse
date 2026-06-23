@@ -1271,134 +1271,158 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
             GcSnap & tree_home = shard_for(record.tree_id);
             if (!tree_home.isExpanded(record.tree_id))
             {
-                std::vector<TreeEntry> entries;
-                bool tree_present = true;
-                try
+                uint64_t out_edges = 0;
+                /// Shared by both the inline (precommit) and backend (table) sources: mark each visited
+                /// tree expanded and record one child edge per non-Inline entry into the CHILD's shard.
+                auto on_tree = [&](const UInt128 & tree)
                 {
-                    entries = store->readTree(TreeId(u128ToHex(record.tree_id)));
-                }
-                catch (const Exception & e)
+                    shard_for(tree).markExpanded(tree);
+                };
+                auto on_edge = [&](const UInt128 & parent_tree, const TreeEntry & entry)
                 {
-                    if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
-                        throw;
-                    /// DECISION (Task 6, refined by review): a journal Add implies the tree was
-                    /// published, but the object may legitimately be gone NOW - this record's
-                    /// edge was DISPLACED later in the journal and an already COMPLETED
-                    /// competing round deleted the displaced tree (in-order folding still
-                    /// visits the Add). Displacement proof is a later record for the SAME
-                    /// ref_name: a Remove drops the edge, and a later Add re-points it
-                    /// (last-op-wins republish - the COMMON mutation path). Either => skip the
-                    /// expansion (the edges would be stripped/displaced anyway; the marker
-                    /// stays unset; no edges were added for a gone tree, so over-count-only is
-                    /// preserved). No later record for the ref => the manifest claims a LIVE
-                    /// ref to a missing tree => INV-NO-DANGLE surfaced; fail closed
-                    /// (propagate). The op check stays EXPLICIT: a future journal op (e.g. the
-                    /// model's fence records) must NOT count as displacement.
-                    bool displaced_later = false;
-                    for (size_t ahead = record_idx + 1; ahead < root.journal.size(); ++ahead)
+                    switch (entry.placement)
                     {
-                        const JournalRecord & next = root.journal[ahead];
-                        if ((next.op == JournalRecord::Op::Remove || next.op == JournalRecord::Op::Add)
-                            && next.ref_name == record.ref_name && next.at_version > record.at_version)
-                        {
-                            displaced_later = true;
+                        case Placement::Blob:
+                            shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Blob, entry.file_hash);
+                            ++out_edges;
                             break;
-                        }
+                        case Placement::Subtree:
+                            shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Tree, entry.file_hash);
+                            ++out_edges;
+                            break;
+                        case Placement::PackSlice:
+                            shard_for(entry.pack_hash).addPackEdge(parent_tree, entry.pack_hash);
+                            ++out_edges;
+                            break;
+                        case Placement::Inline:
+                            break;   /// embedded bytes - no separate object, no edge
                     }
-                    /// B171 pending-tolerance: under a PRECOMMIT namespace (`<server>/_precommits`) a live
-                    /// ref to an absent target is NOT a dangle — it is a legal pending/aborting
-                    /// reservation. A precommit may name a manifest tree whose object has not been
-                    /// uploaded yet, or whose closure was published before this fold but raced a delete;
-                    /// the fail-closed commit (Task 3) re-proves presence before the table ref binds the
-                    /// closure. So skip the INV-NO-DANGLE alarm and the throw here: treat it like the
-                    /// displaced-later case (no edges added for the gone tree; marker stays unset;
-                    /// over-count-only preserved). The alarm is UNCHANGED for normal (table) namespaces.
-                    if (!displaced_later && Layout::isPrecommitNamespace(ns))
-                        displaced_later = true;
-                    if (!displaced_later)
+                };
+
+                bool tree_present = true;
+                if (Layout::isPrecommitNamespace(ns))
+                {
+                    /// B199-S2: a precommit Add carries the build's closure INLINE on the journal record
+                    /// (it survived the commit/abandon `refs.erase` and the tree-object displacement that
+                    /// would 404 a `readTree`). Seed the protection edges from that recorded closure — NO
+                    /// pool read, NO 404 tolerance. This closes the DisplacedUnexpandedTreeBlobsLeak: the
+                    /// children's edges are recorded even when the manifest tree object is already gone,
+                    /// so the subsequent Remove→cascade releases the build's unique blobs on abandon.
+                    if (record.closure.empty())
+                        throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "CAS GC: precommit Add for ref {} (tree {}) carries no inline closure — every "
+                            "precommit Add is populated, so an empty closure is corruption (fail closed)",
+                            record.ref_name, u128ToHex(record.tree_id));
+
+                    std::map<UInt128, std::vector<TreeEntry>> by_node;
+                    for (const ClosureNode & node : record.closure)
+                        by_node.emplace(node.tree_hash, node.entries);
+                    auto inlineSource = [&by_node](const UInt128 & node) -> std::vector<TreeEntry>
                     {
-                        /// B170: the manifest claims a LIVE ref to a missing tree and no later record
-                        /// displaces it — INV-NO-DANGLE surfaced. Record before propagating (fail closed).
-                        {
-                            CasEvent _ev20;
-                            _ev20.type = CasEventType::FailClosed;
-                            _ev20.namespace_ = ns.string();
-                            _ev20.ref_name = record.ref_name;
-                            _ev20.object_kind = CasEventObjectKind::Tree;
-                            _ev20.object_hash = u128ToHex(record.tree_id);
-                            _ev20.round = state.round;
-                            _ev20.gen = state.snap_generation;
-                            _ev20.at_version = record.at_version;
-                            _ev20.outcome = "fail_closed";
-                            _ev20.reason = e.message();
-                            _ev20.detail = {{"code", "FILE_DOESNT_EXIST"},
-                                       {"site", "foldShardRecords: live ref to missing tree"}};
-                            store->emitEvent(_ev20);
-                        }
-                        throw;
+                        auto it = by_node.find(node);
+                        if (it == by_node.end())
+                            return {};
+                        return it->second;
+                    };
+                    closureWalk(record.tree_id, inlineSource, on_tree, on_edge);
+                }
+                else
+                {
+                    std::vector<TreeEntry> entries;
+                    try
+                    {
+                        entries = store->readTree(TreeId(u128ToHex(record.tree_id)));
                     }
-                    tree_present = false;
+                    catch (const Exception & e)
+                    {
+                        if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
+                            throw;
+                        /// DECISION (Task 6, refined by review): a journal Add implies the tree was
+                        /// published, but the object may legitimately be gone NOW - this record's
+                        /// edge was DISPLACED later in the journal and an already COMPLETED
+                        /// competing round deleted the displaced tree (in-order folding still
+                        /// visits the Add). Displacement proof is a later record for the SAME
+                        /// ref_name: a Remove drops the edge, and a later Add re-points it
+                        /// (last-op-wins republish - the COMMON mutation path). Either => skip the
+                        /// expansion (the edges would be stripped/displaced anyway; the marker
+                        /// stays unset; no edges were added for a gone tree, so over-count-only is
+                        /// preserved). No later record for the ref => the manifest claims a LIVE
+                        /// ref to a missing tree => INV-NO-DANGLE surfaced; fail closed
+                        /// (propagate). The op check stays EXPLICIT: a future journal op (e.g. the
+                        /// model's fence records) must NOT count as displacement.
+                        bool displaced_later = false;
+                        for (size_t ahead = record_idx + 1; ahead < root.journal.size(); ++ahead)
+                        {
+                            const JournalRecord & next = root.journal[ahead];
+                            if ((next.op == JournalRecord::Op::Remove || next.op == JournalRecord::Op::Add)
+                                && next.ref_name == record.ref_name && next.at_version > record.at_version)
+                            {
+                                displaced_later = true;
+                                break;
+                            }
+                        }
+                        if (!displaced_later)
+                        {
+                            /// B170: the manifest claims a LIVE ref to a missing tree and no later record
+                            /// displaces it — INV-NO-DANGLE surfaced. Record before propagating (fail closed).
+                            {
+                                CasEvent _ev20;
+                                _ev20.type = CasEventType::FailClosed;
+                                _ev20.namespace_ = ns.string();
+                                _ev20.ref_name = record.ref_name;
+                                _ev20.object_kind = CasEventObjectKind::Tree;
+                                _ev20.object_hash = u128ToHex(record.tree_id);
+                                _ev20.round = state.round;
+                                _ev20.gen = state.snap_generation;
+                                _ev20.at_version = record.at_version;
+                                _ev20.outcome = "fail_closed";
+                                _ev20.reason = e.message();
+                                _ev20.detail = {{"code", "FILE_DOESNT_EXIST"},
+                                           {"site", "foldShardRecords: live ref to missing tree"}};
+                                store->emitEvent(_ev20);
+                            }
+                            throw;
+                        }
+                        tree_present = false;
+                    }
+
+                    if (tree_present)
+                    {
+                        /// Unified closure traversal (CasClosureWalk): DFS from the root tree, recurse on
+                        /// Subtree, dedup via the walk's seen-set. The ROOT tree's entries are already in
+                        /// hand (read above, with the displaced_later 404 tolerance applied), so the source
+                        /// returns them directly for the root and only `readTree`s deeper nodes.
+                        /// A SUBTREE-level readTree failure is fail-closed: a present parent referencing a
+                        /// missing child is a real dangle (the displaced_later ref-journal tolerance applies
+                        /// only to the root ref, not to internal subtrees), so the exception propagates.
+                        auto backendSource = [&](const UInt128 & node) -> std::vector<TreeEntry>
+                        {
+                            if (node == record.tree_id)
+                                return entries;
+                            return store->readTree(TreeId(u128ToHex(node)));
+                        };
+                        closureWalk(record.tree_id, backendSource, on_tree, on_edge);
+                    }
                 }
 
                 if (tree_present)
                 {
-                    uint64_t out_edges = 0;
-                    /// Unified closure traversal (CasClosureWalk): DFS from the root tree, recurse on
-                    /// Subtree, dedup via the walk's seen-set. The ROOT tree's entries are already in
-                    /// hand (read above, with the displaced_later/precommit 404 tolerance applied), so
-                    /// the source returns them directly for the root and only `readTree`s deeper nodes.
-                    /// A SUBTREE-level readTree failure is fail-closed: a present parent referencing a
-                    /// missing child is a real dangle (the displaced_later ref-journal tolerance applies
-                    /// only to the root ref, not to internal subtrees), so the exception propagates.
-                    auto backendSource = [&](const UInt128 & node) -> std::vector<TreeEntry>
-                    {
-                        if (node == record.tree_id)
-                            return entries;
-                        return store->readTree(TreeId(u128ToHex(node)));
-                    };
-                    auto on_tree = [&](const UInt128 & tree)
-                    {
-                        shard_for(tree).markExpanded(tree);
-                    };
-                    auto on_edge = [&](const UInt128 & parent_tree, const TreeEntry & entry)
-                    {
-                        switch (entry.placement)
-                        {
-                            case Placement::Blob:
-                                shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Blob, entry.file_hash);
-                                ++out_edges;
-                                break;
-                            case Placement::Subtree:
-                                shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Tree, entry.file_hash);
-                                ++out_edges;
-                                break;
-                            case Placement::PackSlice:
-                                shard_for(entry.pack_hash).addPackEdge(parent_tree, entry.pack_hash);
-                                ++out_edges;
-                                break;
-                            case Placement::Inline:
-                                break;   /// embedded bytes - no separate object, no edge
-                        }
-                    };
-                    closureWalk(record.tree_id, backendSource, on_tree, on_edge);
                     /// B170: the tree was expanded — its child edges are now recorded in the snap.
                     /// This is the "set the expansion marker / record child edges" transition.
-                    {
-                        CasEvent _ev21;
-                        _ev21.type = CasEventType::TreeExpand;
-                        _ev21.namespace_ = ns.string();
-                        _ev21.ref_name = record.ref_name;
-                        _ev21.object_kind = CasEventObjectKind::Tree;
-                        _ev21.object_hash = u128ToHex(record.tree_id);
-                        _ev21.round = state.round;
-                        _ev21.gen = state.snap_generation;
-                        _ev21.at_version = record.at_version;
-                        _ev21.outcome = "expanded";
-                        _ev21.reason = "first folded Add to this tree; child edges recorded in snap";
-                        _ev21.detail = {{"out_edges", std::to_string(out_edges)},
-                                   {"driving_add_at_version", std::to_string(record.at_version)}};
-                        store->emitEvent(_ev21);
-                    }
+                    CasEvent _ev21;
+                    _ev21.type = CasEventType::TreeExpand;
+                    _ev21.namespace_ = ns.string();
+                    _ev21.ref_name = record.ref_name;
+                    _ev21.object_kind = CasEventObjectKind::Tree;
+                    _ev21.object_hash = u128ToHex(record.tree_id);
+                    _ev21.round = state.round;
+                    _ev21.gen = state.snap_generation;
+                    _ev21.at_version = record.at_version;
+                    _ev21.outcome = "expanded";
+                    _ev21.reason = "first folded Add to this tree; child edges recorded in snap";
+                    _ev21.detail = {{"out_edges", std::to_string(out_edges)},
+                               {"driving_add_at_version", std::to_string(record.at_version)}};
+                    store->emitEvent(_ev21);
                 }
             }
         }
@@ -1951,7 +1975,7 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, con
             fresh.refs.erase(it);
             fresh.journal.push_back(JournalRecord{
                 .op = JournalRecord::Op::Remove, .ref_name = dr.name, .tree_id = tree,
-                .at_version = fresh.shard_version + 1});
+                .at_version = fresh.shard_version + 1, .closure = {}});
         }
     });
 

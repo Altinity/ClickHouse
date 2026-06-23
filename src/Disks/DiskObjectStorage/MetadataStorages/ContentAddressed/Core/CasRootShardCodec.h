@@ -26,6 +26,8 @@ namespace DB::Cas
 /// version => NOT_IMPLEMENTED).
 
 /// One tree node of a precommit's inline closure: the node's tree hash and its staged entries.
+/// Rides the precommit-namespace journal `Add` record (B199-S2): it survives the commit/abandon
+/// `refs.erase` and is trimmed only after GC folds it.
 /// Only placement/file_hash/file_size/pack_hash are serialized (the closure only feeds the GC walk;
 /// name/inline_bytes/pack_offset/pack_length are NOT needed and intentionally omitted — decode sets
 /// them to their defaults).
@@ -43,7 +45,6 @@ struct RefPayload
     UInt128 tree_id{};
     uint64_t tree_size = 0;
     std::map<String, String> mutable_files;
-    std::vector<ClosureNode> closure;   /// populated only for precommit refs (B199-S2)
     bool operator==(const RefPayload &) const = default;
 };
 
@@ -55,6 +56,8 @@ struct JournalRecord
     String ref_name;
     UInt128 tree_id{};
     uint64_t at_version = 0;
+    std::vector<ClosureNode> closure;   /// populated only on precommit-ns Add records (B199-S2)
+    bool operator==(const JournalRecord &) const = default;
 };
 
 struct RootShard

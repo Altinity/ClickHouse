@@ -155,7 +155,12 @@ TEST(CaPartPathParser, MutablePerPartFiles)
 /// backend self-selects EmulatedSingleProcess token semantics).
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadPipeline.h>
@@ -931,6 +936,79 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
     tx3->commit(DB::NoCommitOptions{});
     EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_9_9_0/data.bin")[0].remote_path, blob_key);
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_9_9_0/data.bin"));
+}
+
+/// B199 (real-path leak repro, replaces the former Build-level `CasGcLeak.DisplacedUnexpandedTreeBlobsLeak`):
+/// the original repro drove `build->publish(...)` DIRECTLY with NO precommit — a path production NEVER
+/// takes (`ContentAddressedTransaction` always goes precommit-first). This test reproduces the SAME
+/// scenario through the GENUINE transaction/wiring entry point and asserts it is reclaimed:
+///   - commit a part to treeA (unique content),
+///   - DISPLACE the part's ref to treeB (distinct content) by RE-WRITING the same part path in a fresh
+///     transaction: `publishStaging` republishes the existing ref via `build->publish` — a second `Add`
+///     for the same ref name with NO Remove between (last-op-wins displacement),
+///   - delete treeA's TREE OBJECT at the backend BEFORE any GC fold (a competing GC's landed delete,
+///     `deleteExact`-by-token — the same primitive GC uses),
+///   - run GC to a fixpoint.
+/// GREEN because the real path is precommit-first: treeA was born under its own unique precommit ref
+/// whose `Add` carries treeA's closure INLINE on the journal record (B199-S2), so the fold records
+/// treeA→{its blobs} from the recorded closure WITHOUT reading the vanished tree object, and the
+/// B199-S1 retire absent-tree strip then releases those edges. treeA's unique blobs are reclaimed
+/// (`unreachable==0`); `dangling==0` throughout (treeB and its closure are never at risk — no data loss).
+TEST(CaWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
+{
+    auto storage = openWiringStorage();
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    ASSERT_NE(exchange, nullptr);
+
+    /// Commit treeA with unique content (data-A / mark-A), through the real precommit-first transaction.
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "data-A");
+        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.cmrk3", "mark-A");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    const auto tree_a_hex = exchange->getPartTreeId("uui/uuid-1/all_0_0_0");
+    ASSERT_TRUE(tree_a_hex.has_value());
+
+    /// DISPLACE: re-write the SAME part path with DISTINCT content (data-B / mark-B) in a fresh
+    /// transaction. publishStaging republishes ref `all_0_0_0` → treeB via build->publish, appending a
+    /// second Add for the ref with no intervening Remove (last-op-wins). Confirm the displacement is real:
+    /// the ref now resolves to a DIFFERENT tree.
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "data-B");
+        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.cmrk3", "mark-B");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    const auto tree_b_hex = exchange->getPartTreeId("uui/uuid-1/all_0_0_0");
+    ASSERT_TRUE(tree_b_hex.has_value());
+    ASSERT_NE(*tree_a_hex, *tree_b_hex)
+        << "the second write must displace the ref to a distinct tree (last-op-wins Add, no Remove)";
+
+    /// A competing GC round already deleted the displaced treeA OBJECT: remove it at the backend by
+    /// token, BEFORE any fold here, so the fold would 404 a readTree of treeA.
+    {
+        auto & backend = storage->store()->backend();
+        const String tree_a_key = storage->store()->layout().treeKey(DB::Cas::TreeId(*tree_a_hex));
+        const auto head = backend.head(tree_a_key);
+        ASSERT_TRUE(head.exists) << "treeA object must exist before we delete it";
+        ASSERT_EQ(backend.deleteExact(tree_a_key, head.token).kind, DB::Cas::DeleteOutcome::Kind::Deleted);
+        ASSERT_FALSE(backend.head(tree_a_key).exists) << "treeA backend object must be gone after the delete";
+    }
+
+    /// Drive GC to a fixpoint. The dropped-part test needs ~3 rounds (next-round cascade reclamation);
+    /// give a generous bound so the displaced-tree closure fully drains.
+    for (int i = 0; i < 8; ++i)
+        storage->runOneGcRoundForTest();
+
+    const DB::Cas::FsckReport after = DB::Cas::runFsck(*storage->store(), /*detail=*/false);
+    EXPECT_EQ(after.dangling, 0u) << "displacement must never lose a reachable object (treeB stays live)";
+    EXPECT_GT(after.reachable, 0u) << "the live ref points at treeB; treeB's closure is reachable";
+    EXPECT_EQ(after.unreachable, 0u)
+        << "B199 real-path: treeA's unique blobs (data-A / mark-A) must be reclaimed even though treeA's "
+        << "object vanished before the fold — the precommit Add's INLINE closure records treeA's edges "
+        << "without a readTree (B199-S2) and the retire absent-tree strip releases them (B199-S1); "
+        << "unreachable=" << after.unreachable;
 }
 
 /// ==== M-W Task 11: the DataPartsExchange facade (relink) ====

@@ -435,9 +435,9 @@ TEST(CasRootShardCodec, RoundTripRefsAndJournal)
     all_2.tree_size = 8192;
     rs.refs["all_2_2_0"] = all_2;
 
-    rs.journal.push_back({JournalRecord::Op::Add, "all_1_1_0", all_1.tree_id, 40});
-    rs.journal.push_back({JournalRecord::Op::Add, "all_2_2_0", all_2.tree_id, 41});
-    rs.journal.push_back({JournalRecord::Op::Remove, "all_0_0_0", (UInt128(0x99) << 64), 42});
+    rs.journal.push_back({JournalRecord::Op::Add, "all_1_1_0", all_1.tree_id, 40, {}});
+    rs.journal.push_back({JournalRecord::Op::Add, "all_2_2_0", all_2.tree_id, 41, {}});
+    rs.journal.push_back({JournalRecord::Op::Remove, "all_0_0_0", (UInt128(0x99) << 64), 42, {}});
 
     const String encoded = encodeRootShard(rs);
     const RootShard d = decodeRootShard(encoded);
@@ -479,12 +479,12 @@ TEST(CasRootShardCodec, RefsCanonicalOrderRegardlessOfInsertion)
     /// std::map already keeps refs name-sorted, but verify two manifests built in different insertion
     /// order encode byte-identically.
     RootShard a;
-    a.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}, {}};
-    a.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}, {}};
+    a.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}};
+    a.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
 
     RootShard b;
-    b.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}, {}};
-    b.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}, {}};
+    b.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
+    b.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}};
 
     EXPECT_EQ(encodeRootShard(a), encodeRootShard(b));
 }
@@ -501,8 +501,8 @@ TEST(CasRootShardCodec, JournalAtVersionMonotonicityIsEnforced)
     {
         RootShard rs;
         rs.shard_version = 5;
-        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 3});
-        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 2});
+        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 3, {}});
+        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 2, {}});
         const String bytes = encodeRootShard(rs);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(bytes); });
     }
@@ -510,7 +510,7 @@ TEST(CasRootShardCodec, JournalAtVersionMonotonicityIsEnforced)
     {
         RootShard rs;
         rs.shard_version = 1;
-        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 2});
+        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 2, {}});
         const String bytes = encodeRootShard(rs);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(bytes); });
     }
@@ -519,8 +519,8 @@ TEST(CasRootShardCodec, JournalAtVersionMonotonicityIsEnforced)
     {
         RootShard rs;
         rs.shard_version = 2;
-        rs.journal.push_back({JournalRecord::Op::Remove, "a", UInt128(1), 2});
-        rs.journal.push_back({JournalRecord::Op::Remove, "b", UInt128(1), 2});
+        rs.journal.push_back({JournalRecord::Op::Remove, "a", UInt128(1), 2, {}});
+        rs.journal.push_back({JournalRecord::Op::Remove, "b", UInt128(1), 2, {}});
         const RootShard d = decodeRootShard(encodeRootShard(rs));
         ASSERT_EQ(d.journal.size(), 2u);
         EXPECT_EQ(d.journal[0].at_version, 2u);
@@ -540,8 +540,8 @@ TEST(CasRootShardCodec, ProtobufEncodingIsBinaryAndRoundTrips)
     p.tree_size = 1142;
     p.mutable_files[".ca_mtime"] = "1781588451";
     rs.refs["part_a"] = p;
-    rs.journal.push_back({JournalRecord::Op::Add, "part_a", p.tree_id, 8});
-    rs.journal.push_back({JournalRecord::Op::Remove, "part_a", p.tree_id, 9});
+    rs.journal.push_back({JournalRecord::Op::Add, "part_a", p.tree_id, 8, {}});
+    rs.journal.push_back({JournalRecord::Op::Remove, "part_a", p.tree_id, 9, {}});
 
     const String encoded = encodeRootShard(rs);
     ASSERT_FALSE(encoded.empty());
@@ -566,9 +566,9 @@ TEST(CasRootShardCodec, ProtobufEncodingIsDeterministic)
     /// golden-test friendly. Includes refs (a map) and a journal (repeated, insertion order).
     RootShard rs;
     rs.shard_version = 5;
-    rs.refs["zzz"] = RefPayload{UInt128(0x1), 1, {{"b", "2"}, {"a", "1"}}, {}};
-    rs.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}, {}};
-    rs.journal.push_back({JournalRecord::Op::Add, "zzz", UInt128(0x1), 5});
+    rs.refs["zzz"] = RefPayload{UInt128(0x1), 1, {{"b", "2"}, {"a", "1"}}};
+    rs.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
+    rs.journal.push_back({JournalRecord::Op::Add, "zzz", UInt128(0x1), 5, {}});
     EXPECT_EQ(encodeRootShard(rs), encodeRootShard(rs));
 }
 
@@ -577,7 +577,7 @@ TEST(CasRootShardCodec, LargeJournalRoundTrips)
     RootShard rs;
     rs.shard_version = 5000;
     for (uint64_t v = 0; v < 2430; ++v)
-        rs.journal.push_back({JournalRecord::Op::Add, "p" + std::to_string(v % 38), UInt128(v), v});
+        rs.journal.push_back({JournalRecord::Op::Add, "p" + std::to_string(v % 38), UInt128(v), v, {}});
     const RootShard d = decodeRootShard(encodeRootShard(rs));
     ASSERT_EQ(d.journal.size(), 2430u);
     EXPECT_EQ(d.journal[2429].at_version, 2429u);
@@ -599,15 +599,17 @@ TEST(CasRootShardCodec, ProtobufFutureCodecVersionThrowsNotImplemented)
     expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [] { decodeRootShard(String("\x08\x02", 2)); });
 }
 
-/// B199-S2: inline closure round-trip (nested staged entries).
-TEST(CasRootShardCodec, RefPayloadClosureRoundTrips)
+/// B199-S2: inline closure round-trip (nested staged entries) on the precommit `Add` journal record.
+TEST(CasRootShardCodec, JournalAddClosureRoundTrips)
 {
     RootShard in;
     in.shard_version = 7;
 
-    RefPayload pl;
-    pl.tree_id = UInt128(0x54);   /// 'T'
-    pl.tree_size = 55;
+    JournalRecord rec;
+    rec.op = JournalRecord::Op::Add;
+    rec.ref_name = "4815";
+    rec.tree_id = UInt128(0x54);   /// 'T'
+    rec.at_version = 1;
 
     /// nested closure: tree T -> {Blob B1, Subtree S}; S -> {Blob B2}
     ClosureNode nodeT;
@@ -625,7 +627,7 @@ TEST(CasRootShardCodec, RefPayloadClosureRoundTrips)
         e2.file_size = 10;
         nodeT.entries.push_back(e2);
     }
-    pl.closure.push_back(nodeT);
+    rec.closure.push_back(nodeT);
 
     ClosureNode nodeS;
     nodeS.tree_hash = UInt128(0x53);   /// 'S'
@@ -636,13 +638,13 @@ TEST(CasRootShardCodec, RefPayloadClosureRoundTrips)
         e.file_size = 3;
         nodeS.entries.push_back(e);
     }
-    pl.closure.push_back(nodeS);
+    rec.closure.push_back(nodeS);
 
-    in.refs["4815"] = pl;
+    in.journal.push_back(rec);
 
     const RootShard out = decodeRootShard(encodeRootShard(in));
-    ASSERT_TRUE(out.refs.contains("4815"));
-    EXPECT_EQ(out.refs.at("4815").closure, pl.closure);
+    ASSERT_EQ(out.journal.size(), 1u);
+    EXPECT_EQ(out.journal[0].closure, in.journal[0].closure);
 }
 
 /// ===================================================================================

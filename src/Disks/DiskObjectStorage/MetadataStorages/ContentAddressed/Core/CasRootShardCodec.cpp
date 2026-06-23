@@ -140,8 +140,6 @@ String encodeRootShard(const RootShard & root)
         auto & mf = *p.mutable_mutable_files();
         for (const auto & [k, v] : payload.mutable_files)
             mf[k] = v;
-        for (const auto & node : payload.closure)
-            *p.add_closure() = encodeClosureNode(node);
         refs[name] = std::move(p);
     }
 
@@ -152,6 +150,8 @@ String encodeRootShard(const RootShard & root)
         r->set_ref_name(rec.ref_name);
         r->set_tree_id(u128ToBytes(rec.tree_id));
         r->set_at_version(rec.at_version);
+        for (const auto & node : rec.closure)
+            *r->add_closure() = encodeClosureNode(node);
     }
 
     /// Deterministic serialization (sorts map<> entries) so golden tests are stable. Correctness
@@ -194,9 +194,6 @@ RootShard decodeRootShard(std::string_view data)
         payload.tree_size = p.tree_size();
         for (const auto & [k, v] : p.mutable_files())
             payload.mutable_files[k] = v;
-        payload.closure.reserve(static_cast<size_t>(p.closure_size()));
-        for (const auto & pn : p.closure())
-            payload.closure.push_back(decodeClosureNode(pn));
         root.refs[name] = std::move(payload);
     }
 
@@ -207,6 +204,9 @@ RootShard decodeRootShard(std::string_view data)
         rec.ref_name = r.ref_name();
         rec.tree_id = u128FromBytes(r.tree_id(), "root shard journal");
         rec.at_version = r.at_version();
+        rec.closure.reserve(static_cast<size_t>(r.closure_size()));
+        for (const auto & pn : r.closure())
+            rec.closure.push_back(decodeClosureNode(pn));
 
         /// The GC fold replays the journal in order under a cursor bound: an out-of-order at_version
         /// would fold silently in vector order (a corruption-induced UNDER-count = a wrong delete
