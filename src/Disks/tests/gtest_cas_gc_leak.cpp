@@ -88,8 +88,15 @@ size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
         const RoundReport rep = gc.runRegularRound();
         if (!rep.acquired_lease)
             continue;
+        /// A round that only STRIPPED a tree's child edges or FORGOT an absent node has not reached a
+        /// fixpoint: the children it freed (cascade cadence) are deleted only by a SUBSEQUENT round.
+        /// The normal delete-cascade keeps this loop alive via `rep.deleted > 0`, but the retire-time
+        /// absent-tree path (B199-S1) deletes nothing in the stripping round — it forgets the vanished
+        /// tree and strips its edges — so we must also continue while there is pending cascade work
+        /// (`cascaded`) or an in-memory forget that the next round acts on (`forgotten_absent`).
         if (rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
-            && rep.replaced == 0 && rep.spared == 0)
+            && rep.replaced == 0 && rep.spared == 0
+            && rep.cascaded == 0 && rep.forgotten_absent == 0)
             break;
     }
     return rounds;

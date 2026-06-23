@@ -1033,6 +1033,41 @@ std::map<uint64_t, RetiredSet> Gc::retire(GcState & state, Token & state_token,
                 /// re-HEAD-404s on replay and re-forgets — idempotent, set semantics). Mutating
                 /// `shard_snap` here does not invalidate iteration: zeroInDegreeKnown() returned a
                 /// value (a snapshot copy of the candidate set).
+                ///
+                /// B199-S1: if the absent candidate is a TREE that WAS expanded, its child edges are
+                /// in this (home) shard's snap. A bare `forget` drops the tree node from `known` but
+                /// does NOT release those edges, so each child keeps its in-degree contribution from
+                /// this tree and never reaches zero — its (now genuinely-unreferenced) blobs leak as
+                /// `unreachable` debris forever (the soak's space-only leak; dangling stays 0 — not
+                /// data loss). Release the children the SAME way the delete-time cascade does
+                /// (cascadeAndPersist: `stripTree`), THEN forget the tree node. `stripTree` drops the
+                /// tree's child edges, decrements each child's in-degree, clears the `expanded` marker,
+                /// and returns the newly-zeroed children — which become zero-in-degree candidates a
+                /// SUBSEQUENT round picks up via the normal cascade cadence (we do NOT delete them
+                /// inline). This is in-memory only (like `forget`); the actual child deletes still go
+                /// through the next round's fence→recheck→exact-token path, so a concurrent
+                /// re-reference is still caught (no dangle introduced). A never-expanded tree (S2)
+                /// strips as a no-op — its edges were never recorded — and its children still leak;
+                /// that class needs an eager-edge/full-sweep backstop, out of S1 scope.
+                if (candidate.kind == ObjectKind::Tree)
+                {
+                    const std::vector<Candidate> freed = shard_snap.stripTree(candidate.hash);
+                    report.cascaded += freed.size();
+                    for (const Candidate & child : freed)
+                    {
+                        CasEvent _ev_indeg;
+                        _ev_indeg.type = CasEventType::IndegZero;
+                        _ev_indeg.object_kind =
+                            child.kind == ObjectKind::Tree ? CasEventObjectKind::Tree : CasEventObjectKind::Blob;
+                        _ev_indeg.object_hash = u128ToHex(child.hash);
+                        _ev_indeg.round = round;
+                        _ev_indeg.gen = state.snap_generation;
+                        _ev_indeg.reason = "last edge dropped";
+                        _ev_indeg.detail = {{"prev_indeg", "1"},
+                                            {"dropped_by", "retire-absent-strip(" + u128ToHex(candidate.hash) + ")"}};
+                        store->emitEvent(_ev_indeg);
+                    }
+                }
                 shard_snap.forget(candidate.kind, candidate.hash);
                 ++report.forgotten_absent;
                 /// B170: defensive prune — the candidate is gone (a 404) but still sat in `known`.
