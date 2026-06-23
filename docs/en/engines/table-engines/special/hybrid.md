@@ -20,7 +20,11 @@ Typical use cases include:
 - Tiered storage, for example fresh data on a local cluster and historical data in S3.
 - Gradual roll-outs where only a subset of rows should be served from a new backend.
 
+<<<<<<< HEAD
 By giving mutually exclusive predicates to the segments (for example, `date < watermark` and `date >= watermark`), you ensure that each row is read from exactly one source. To move the boundary at runtime without recreating the table, use [`hybridParam()`](#dynamic-watermarks-with-hybridparam) placeholders in predicates.
+=======
+By giving mutually exclusive predicates to the segments (for example, `date < watermark` and `date >= watermark`), you ensure that each row is read from exactly one source.
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
 
 ## Enable the engine
 
@@ -58,6 +62,7 @@ You must pass at least two arguments – the first table function and its predic
 - `INSERT` statements are forwarded to the first table function only. If you need multi-destination writes, use explicit `INSERT` statements into the respective sources.
 - Align schemas across the segments. ClickHouse builds a common header and rejects creation if any segment misses a column defined in the Hybrid schema. If the physical types differ you may need to add casts on one side or in the query, just as you would when reading from heterogeneous replicas.
 
+<<<<<<< HEAD
 ## Dynamic watermarks with `hybridParam()`
 
 Hard-coded date literals in predicates work, but changing the boundary requires recreating the table. `hybridParam()` lets you embed a named, typed placeholder in any predicate and manage its value through ordinary engine `SETTINGS`:
@@ -109,6 +114,8 @@ ALTER TABLE tiered MODIFY SETTING
 - `ALTER TABLE ... RESET SETTING` is not supported on Hybrid tables. Use `MODIFY SETTING` to change a watermark value.
 - Watermark names in `SETTINGS` and `ALTER` must exactly match a `hybridParam()` declared in the predicates. Typos are rejected.
 
+=======
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
 ## Example: local cluster plus S3 historical tier
 
 The following commands illustrate a two-segment layout. Hot data stays on a local ClickHouse cluster, while historical rows come from public S3 Parquet files.

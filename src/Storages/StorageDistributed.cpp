@@ -42,7 +42,10 @@
 #include <Parsers/ASTAsterisk.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
+<<<<<<< HEAD
 #include <Parsers/ASTSetQuery.h>
+=======
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTInsertQuery.h>
@@ -880,7 +883,11 @@ ColumnNameToColumnNodeMap buildColumnNodesForTableExpression(const QueryTreeNode
 
     // Rebuild per-column nodes (including ALIAS expressions) for the replacement table expression.
     const auto & storage_snapshot = table_node ? table_node->getStorageSnapshot() : table_function_node->getStorageSnapshot();
+<<<<<<< HEAD
     auto get_column_options = GetColumnsOptions(GetColumnsOptions::All).withVirtuals();
+=======
+    auto get_column_options = GetColumnsOptions(GetColumnsOptions::All).withVirtuals(VirtualsKind::All, VirtualsMaterializationPlace::All);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
     if (storage_snapshot->storage.supportsSubcolumns())
         get_column_options.withSubcolumns();
 
@@ -1236,7 +1243,11 @@ void StorageDistributed::read(
     std::vector<SelectQueryInfo> additional_query_infos;
 
     const auto & settings = local_context->getSettingsRef();
+<<<<<<< HEAD
     auto metadata_ptr = getInMemoryMetadataPtr();
+=======
+    auto metadata_ptr = getInMemoryMetadataPtr(local_context, false);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
 
     auto describe_segment_target = [&](const HybridSegment & segment) -> String
     {
@@ -1268,6 +1279,7 @@ void StorageDistributed::read(
 
         LOG_TRACE(log, "rewriteSelectQuery (target: {}) -> {}", target, ast->formatForLogging());
     };
+<<<<<<< HEAD
 
     auto watermark_snapshot = hybrid_watermark_params.get();
 
@@ -1301,6 +1313,8 @@ void StorageDistributed::read(
         visitHybridParams(predicate_ast, replace_hybrid_params);
         return predicate_ast;
     };
+=======
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
 
     if (settings[Setting::allow_experimental_analyzer])
     {
@@ -1312,7 +1326,11 @@ void StorageDistributed::read(
             query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
             remote_storage_id,
             remote_table_function_ptr,
+<<<<<<< HEAD
             substitute_watermarks(base_segment_predicate));
+=======
+            base_segment_predicate);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
         Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_distributed, local_context, SelectQueryOptions(processed_stage).analyze());
         /** For distributed tables we do not need constants in header, since we don't send them to remote servers.
           * Moreover, constants can break some functions like `hostName` that are constants only for local queries.
@@ -1345,7 +1363,11 @@ void StorageDistributed::read(
                     query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
                     segment.storage_id ? *segment.storage_id : StorageID::createEmpty(),
                     segment.storage_id ? nullptr :  segment.table_function_ast,
+<<<<<<< HEAD
                     substitute_watermarks(segment.predicate_ast));
+=======
+                    segment.predicate_ast);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
 
                 additional_query_info.query = queryNodeToDistributedSelectQuery(additional_query_tree);
                 additional_query_info.query_tree = std::move(additional_query_tree);
@@ -1366,7 +1388,11 @@ void StorageDistributed::read(
         modified_query_info.query = ClusterProxy::rewriteSelectQuery(
             local_context, modified_query_info.query,
             remote_database, remote_table, remote_table_function_ptr,
+<<<<<<< HEAD
             substitute_watermarks(base_segment_predicate));
+=======
+            base_segment_predicate);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
         log_rewritten_query(base_target, modified_query_info.query);
 
         if (!segments.empty())
@@ -1375,21 +1401,32 @@ void StorageDistributed::read(
             {
                 SelectQueryInfo additional_query_info = query_info;
 
+<<<<<<< HEAD
                 ASTPtr resolved_predicate = substitute_watermarks(segment.predicate_ast);
+=======
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
                 if (segment.storage_id)
                 {
                     additional_query_info.query = ClusterProxy::rewriteSelectQuery(
                         local_context, additional_query_info.query,
                         segment.storage_id->database_name, segment.storage_id->table_name,
                         nullptr,
+<<<<<<< HEAD
                         resolved_predicate);
+=======
+                        segment.predicate_ast);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
                 }
                 else
                 {
                     additional_query_info.query = ClusterProxy::rewriteSelectQuery(
                         local_context, additional_query_info.query,
                         "", "", segment.table_function_ast,
+<<<<<<< HEAD
                         resolved_predicate);
+=======
+                        segment.predicate_ast);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
                 }
 
                 log_rewritten_query(describe_segment_target(segment), additional_query_info.query);
@@ -1437,9 +1474,16 @@ void StorageDistributed::read(
             is_remote_function,
             additional_query_infos);
 
+<<<<<<< HEAD
         /// This is a bug, it is possible only when there is no shards to query, and this is handled earlier.
         if (!query_plan.isInitialized())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Pipeline is not initialized");
+=======
+        /// This is possible when skip_unavailable_shards is enabled and all shards were skipped
+        /// (e.g., every shard had a missing table with no remote replicas).
+        if (!query_plan.isInitialized())
+            throw Exception(ErrorCodes::ALL_CONNECTION_TRIES_FAILED, "No available shards to query");
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
     }
 }
 
@@ -2547,8 +2591,16 @@ void StorageDistributed::setHybridLayout(std::vector<HybridSegment> segments_)
 
     auto virtuals = createVirtuals();
     // or _segment_index?
+<<<<<<< HEAD
     virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in Hybrid (0 for main table, 1+ for additional segments)");
     setVirtuals(virtuals);
+=======
+    virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in Hybrid (0 for main table, 1+ for additional segments)", VirtualsMaterializationPlace::Reader);
+
+    StorageInMemoryMetadata new_metadata = *getInMemoryMetadataPtr(nullptr, false);
+    new_metadata.setVirtuals(virtuals);
+    setInMemoryMetadata(new_metadata);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
 }
 
 void StorageDistributed::setCachedColumnsToCast(ColumnsDescription columns)
@@ -2779,6 +2831,7 @@ void registerStorageHybrid(StorageFactory & factory)
                             "TableFunctionRemote did not return a StorageDistributed or StorageProxy, got: {}", actual_type);
         }
 
+<<<<<<< HEAD
         /// Declared types per watermark name — enforces a single type contract.
         std::unordered_map<String, String> hybridparam_declared_types;
         /// Effective watermark values from SETTINGS, keyed by name.
@@ -2838,6 +2891,14 @@ void registerStorageHybrid(StorageFactory & factory)
             {
                 auto syntax_result = TreeRewriter(local_context).analyze(predicate_for_validation, physical_columns);
                 ExpressionAnalyzer(predicate_for_validation, syntax_result, local_context).getActions(true);
+=======
+        auto validate_predicate = [&](ASTPtr & predicate, size_t argument_index)
+        {
+            try
+            {
+                auto syntax_result = TreeRewriter(local_context).analyze(predicate, physical_columns);
+                ExpressionAnalyzer(predicate, syntax_result, local_context).getActions(true);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
             }
             catch (const Exception & e)
             {
@@ -2847,7 +2908,11 @@ void registerStorageHybrid(StorageFactory & factory)
         };
 
         ASTPtr second_arg = engine_args[1];
+<<<<<<< HEAD
         collect_hybrid_params(second_arg);
+=======
+        validate_predicate(second_arg, 1);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
         distributed_storage->setBaseSegmentPredicate(second_arg);
 
         // Parse additional table function pairs (if any)
@@ -2861,7 +2926,11 @@ void registerStorageHybrid(StorageFactory & factory)
             ASTPtr table_function_ast = engine_args[i];
             ASTPtr predicate_ast = engine_args[i + 1];
 
+<<<<<<< HEAD
             collect_hybrid_params(predicate_ast);
+=======
+            validate_predicate(predicate_ast, i + 1);
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
 
             // Validate table function or table identifier
             if (const auto * func = table_function_ast->as<ASTFunction>())
@@ -2920,7 +2989,11 @@ void registerStorageHybrid(StorageFactory & factory)
                         // Update AST so the table definition stores a fully qualified name.
                         auto qualified_identifier = make_intrusive<ASTTableIdentifier>(storage_id.database_name, storage_id.table_name);
                         qualified_identifier->alias = ast_identifier->alias;
+<<<<<<< HEAD
                         qualified_identifier->prefer_alias_to_column_name = ast_identifier->prefer_alias_to_column_name;
+=======
+                        qualified_identifier->setPreferAliasToColumnName(ast_identifier->preferAliasToColumnName());
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
                         table_function_ast = qualified_identifier;
                         engine_args[i] = table_function_ast;
                     }
@@ -2952,7 +3025,11 @@ void registerStorageHybrid(StorageFactory & factory)
                     ColumnsDescription segment_columns;
 
                     if (validated_table)
+<<<<<<< HEAD
                         segment_columns = validated_table->getInMemoryMetadataPtr()->getColumns();
+=======
+                        segment_columns = validated_table->getInMemoryMetadataPtr(local_context, false)->getColumns();
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
 
                     validate_segment_schema(segment_columns, storage_id.getNameForLogs());
 
@@ -2992,6 +3069,7 @@ void registerStorageHybrid(StorageFactory & factory)
             distributed_storage->setCachedColumnsToCast(ColumnsDescription(cast_cols));
         }
 
+<<<<<<< HEAD
         /// Validate SETTINGS and build effective watermark values map.
         if (args.storage_def->settings)
         {
@@ -3080,6 +3158,15 @@ void registerStorageHybrid(StorageFactory & factory)
         {
             return name.starts_with(StorageDistributed::HYBRID_WATERMARK_PREFIX);
         },
+=======
+        return distributed_storage;
+    },
+    {
+        .supports_settings = false,
+        .supports_parallel_insert = true,
+        .supports_schema_inference = true,
+        .source_access_type = AccessTypeObjects::Source::REMOTE,
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
     });
 }
 

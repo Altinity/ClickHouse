@@ -395,6 +395,7 @@ void executeQuery(
                 unavailable_shard_tracker = std::make_shared<UnavailableShardTracker>(shards, max_num, max_ratio);
         }
     }
+    const bool has_additional_query_infos = !additional_query_infos.empty();
 
     if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
     {

@@ -47,7 +47,11 @@ Internal function that marks ALIAS column expressions for the analyzer. Not inte
         },
         .returned_value = {"Returns expr unchanged.", {"Any"}},
         .introduced_in = {25, 8},
+<<<<<<< HEAD
         .category = FunctionDocumentation::Category::Other,
+=======
+        .category = FunctionDocumentation::Category::Internal,
+>>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
     });
 }
 
