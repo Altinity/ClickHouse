@@ -8,6 +8,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG apt_archive="http://archive.ubuntu.com"
 
 # We shouldn't use `apt upgrade` to not change the upstream image. It's updated biweekly
+# Exception: targeted --only-upgrade for selected packages to address CVEs without a general upgrade.
 
 # user/group precreated explicitly with fixed uid/gid on purpose.
 # It is especially important for rootless containers: in that case entrypoint
@@ -27,7 +28,17 @@ RUN sed -i "s|http://archive.ubuntu.com|${apt_archive}|g" /etc/apt/sources.list 
         tzdata \
         wget \
         gpgv \
+    && apt-get install --yes --no-install-recommends --only-upgrade \
+        libgnutls30 \
+        libssl3 \
+        openssl \
+        libsystemd0 \
+        libudev1 \
+        libgcrypt20 \
+        sed \
+        liblzma5 \
     && busybox --install -s \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
 #docker-official-library:off
