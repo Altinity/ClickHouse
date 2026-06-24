@@ -249,61 +249,17 @@ ClickHouse/B199-S2 GC regression). Before/while running any soak:
 Until mitigated, run soaks with a smaller footprint (workers=2, smaller dataset) or a duration that
 fits the disk, and never leave a soak unattended without the disk-guard.
 
-### B13 — pool-format versioning design (operator-refined 2026-06-24)
+### LAYOUT / format-freeze — moved to a dedicated spec (2026-06-24)
 
-Refines B13. Per-object-class serialization, each independently versioned:
-- **blob / (future) packs** — own compact binary (CAREFUL: byte-order/endianness explicit; never host-native). Immutable.
-- **frequently read/rewritten metadata** (tree, ref/root-shard manifest, roots) — protobuf. (NB: `tree` is custom-binary today; moving it to protobuf is itself a new tree version — only NEW trees use it.)
-- **rarely-changed small files** (pool-meta, watermark, gc/state, retired-set) — JSON.
-
-Compatibility contract per object: **new reader ALWAYS reads old (decoders kept forever); old reader USUALLY reads new but FAILS-CLOSED on a version newer than it knows.** Requires a **writer_version + min_reader_version** pair, NOT today's single monotone `checkVersion(seen>current→fail)` (which wrongly fails on additive changes too): additive change ⇒ min_reader unchanged (old skips unknown — protobuf skip-unknown / envelope non-critical TLV / JSON ignore-unknown); breaking change ⇒ bump min_reader (old sees min_reader>self ⇒ fail-closed). Maps onto protobuf-additive + the B176 envelope critical/non-critical-TLV bit.
-
-**Immutable wrinkle:** `treeId = CityHash128(encoded)` (hash of ENCODED bytes) ⇒ a serialization change gives the same logical tree a DIFFERENT id ⇒ never re-encode existing trees (orphans the manifest ref); `max_pool_format` only controls what NEW objects are written as; old objects live forever and the decoder version-dispatches. (Confirm blob content-hash is over payload, not envelope, else an envelope change rekeys the blob — freeze that.)
-
-**Setting `max_content_addressable_pool_format`** (starts at 1) = a named compatibility level mapping ONE number → a SET of per-object WRITE versions, e.g. `1={blob:1,tree:1,ref:1,…}`, `2={blob:1,tree:2,ref:1,…}`. Reading always uses the version in the object's own header. Lets a user stay on the old write-format after upgrade (mixed-version safety). Parallels ClickHouse `compatibility` / `data_format_version`.
-
-**Negotiated write-floor — durable ROSTER, NOT liveness (corrected 2026-06-24).** The vote must NOT live in `ServerWatermark`: (1) watermarks are per-server-keyed → a server would have to LIST+GET every other server's hot/frequently-renewed watermark to learn the votes; (2) watermark = "alive right now" — wrong semantics: a server paused a day (idle) is not gone; auto-reaping its vote and migrating would return it to an unreadable pool. Format participation is **membership** (durable), not **liveness** (ephemeral). Keep a SINGLE durable pool-global **format roster** object — `{format_version, members:{<server_id>:{path, max_pool_format}}}` — ONE GET to read all votes, CAS to update own entry (off the hot path). **Write-floor = min(max_pool_format) over ROSTER MEMBERS** (not the live set). A server writes at `min(own_max, floor)`. A member STAYS a member (keeps the floor low) until DELIBERATELY removed — never auto-dropped for inactivity (a paused server's entry keeps the pool writing a format it can still read). The floor RISES to vN only when EVERY member's entry is ≥vN (i.e. all servers upgraded) AND a `fence_round`/grace barrier passed — the all-replicas-upgraded feature-gate. **No downgrade through a bump** (immutable objects can't be rewritten) — record explicitly. Roster is MUTABLE → NOT in the create-once `_pool_meta`; co-locate with `RootsRegistry` (already mutable pool-global CAS — this is the right "combine with the registry" answer, vs watermark) or a sibling object; Keeper (B101) can host it. Liveness (watermark) stays separate and GC-facing.
-
-| B200 | **Deliberate pool-member decommission for the format roster (NOT auto-reap).** The B13 write-floor = min(`max_pool_format`) over ROSTER MEMBERS, and membership is DURABLE: a member must stay until explicitly removed. A server idle/paused for a day is NOT gone — auto-reaping its vote (e.g. on watermark staleness) and migrating the pool would lock it out of an unreadable pool on return. So: (a) DEFAULT = never auto-remove a member for inactivity; (b) provide a DELIBERATE removal path (`SYSTEM DROP CONTENT ADDRESSED POOL MEMBER <server_id>` and/or `clickhouse-disks`) that drops a decommissioned server's roster entry (and any other per-server durable state); (c) ADVISORY surfacing of long-absent members (watermark stale ≫ grace) so an operator can DECIDE — never act automatically. A permanently-dead member never decommissioned pins the floor until removed — that is the SAFE default (a one-way-stuck upgrade is preferable to locking a returning server out of its data). This is DURABLE membership, distinct from the ephemeral GC-facing watermark liveness. Keeper (B101): ephemeral nodes give liveness, but the format roster stays durable. | Release-gate dependency of B13 (versioned rollout): without a deliberate-removal path a dead member one-way-blocks format upgrade; an auto-reap default would instead lock out paused members | format-roster object (co-located with `RootsRegistry`?); `SYSTEM`/`clickhouse-disks` decommission command; advisory absent-member report (reads watermark staleness, acts on nothing); relates to B197 (SYSTEM cmds), B129 (registry pruning), B167a (`farewell`) |
-
-### Layout-gate decisions (operator-confirmed 2026-06-24)
-
-Decisions on the group-A (layout/format-freeze) release gates:
-
-- **B164b (journal bound) — two settings, no side-spill.** `max_unprocessed_journal_records_to_throw`
-  (HARD: publish fails fail-closed) + `max_unprocessed_journal_records_to_delay` (SOFT: backpressure).
-  The delay lives in the per-shard `mutateShard`/publish CAS path: on re-read, if the target shard's
-  journal length > soft, pace before retry — BOUNDED (∝ over-soft, capped ~0.5–1s; NOT until next GC
-  round). Implement as a paced wait (cv-timeout / token-bucket), not a naive sleep (it's deliberate
-  flow-control, not a race fix). Hard-throw is the real safety; pair with a journal-length metric +
-  alarm (B99). Real throughput fix = map-reduce GC (B178): faster fold → faster trim → journal drains.
-  Side-spill/rollover REJECTED.
-- **B176 (gc/snap → protobuf):** mutable + hot (every round, O(pool)) → bump+rewrite self-migrates, but
-  CAVEATS: streaming (length-delimited; never materialize the whole snap → B165 OOM), compression
-  (zstd, with B149), deterministic ordering (stable bytes / golden tests; preserve the fold-cursor,
-  `GC_SNAP_VERSION` B140-fix). Measure protobuf overhead on the hot path.
-- **B176 (envelope) — REVIEW TASK + decisions:** audit the 96B core + TLVs (provenance 0x0001
-  diagnostic-only "no protocol decision reads it"; intended_ref 0x0002) — per field decide core / TLV /
-  S3-object-metadata, and who reads it/why. Decisions so far:
-  * `ca_mtime`: today a magic `.ca_mtime` string key in `RefPayload.mutable_files` (publish wall-clock
-    for getLastModified, carried over on rename). Does NOT belong in the envelope (envelope =
-    per-immutable-object; mtime = per-ref-publish, mutable). Promote to a TYPED `RefPayload.published_at_ms`
-    protobuf field (right layer already; just de-stringly it).
-  * S3 object user-metadata channel EXISTS (`ObjectMeta` map on every put; `HeadResult.attributes` read
-    back) but is largely unused (only ETag→Token is load-bearing today) AND `LocalObjectStorage` DROPS
-    it (B167b) → use S3-metadata ONLY for optional/diagnostic data cheaply readable at HEAD (e.g.
-    provenance), NEVER for load-bearing fields. 
-  * Header size: 96 is the fixed CORE ("never grow the core; new fields → TLV"); blobs already pad to
-    `blob_header_len`=256 (tunable, per-pool, set at creation, immutable after) → ~160B TLV room +
-    constant payload offset ALREADY. Decision: keep core=96, take headroom via TLV + choose a generous
-    `blob_header_len` (256 or 512) BEFORE freeze — do NOT grow the core.
-- **B97 (packs) — IN SCOPE, minimal working support.** Promote from "reserve only" to a minimal
-  producer: pack the small per-part files (marks/indices/checksums) into one pack object, emit
-  `PackSlice` TreeEntries, locate/read slices. This ALSO delivers B10 (part-open ≈ 1 GET) — one
-  mechanism closes the layout-freeze (PackSlice exercised/frozen-by-use) AND the cost item. **B96
-  (snap_shards>1) stays DEFERRED** (map-reduce GC B178 territory).
-- **B92 (adopt tree_size=0) — FIX (must).** Carry `tree_size` on the adopt/relink wire (sender knows
-  it) → correct size, no inconsistency.
-- **B8/B64/B1 — full MergeTree parity EXCEPT `Database Engine=Ordinary` (obsolete).** Projections (B64),
-  partition ops (B8), replicated (B1) are HARD correctness gates (not "gate off"); B31 capability-gate
-  rejects ONLY Ordinary-engine databases and supports the rest. Larger test matrix accepted.
+The detailed format/serialization design (formerly the `B13 — pool-format versioning design` and
+`Layout-gate decisions` fragments that lived here) is now in
+`docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.md`. It covers: the
+encoding taxonomy (hashed → canonical binary; mutable large/complex → protobuf; mutable tiny/flat →
+JSON), dropping packs in favor of tree-inline of the eager part files (`PackSlice` reserved-unused),
+the `writer_version` + `min_reader_version` compatibility primitive with global generation numbering
+(replacing the monotone `checkVersion`), the generation-1 freeze checklist (envelope 96 B core + TLV
+critical bit, `blob_header_len = 256`, blob hash over payload, 2-byte versions), `ca_mtime` →
+`RefPayload.published_at_ms`, `gc-snap` → streaming protobuf, and the deferred-but-designed rollout
+machinery (`max_content_addressable_pool_format`, the durable roster co-located with `RootsRegistry`,
+and B200 deliberate decommission). The release-gate rows at the top of this file (B13, B176, B92,
+B97/B10/B96, B8/B64/B1) still point there.
