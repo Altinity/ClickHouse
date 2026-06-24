@@ -596,33 +596,27 @@ void ExportPartitionManifestUpdatingTask::removeStaleEntries(
     auto & entries_by_key
 )
 {
-    /// Called from poll() under M_task. Collect stale keys first, then kill and erase them
-    /// (killExportPart takes export_manifests_mutex; lock order M_task -> export_manifests_mutex).
-    std::vector<std::pair<std::string, std::string>> stale_keys; /// (composite key, transaction id)
-    for (const auto & entry : entries_by_key)
+    for (auto it = entries_by_key.begin(); it != entries_by_key.end();)
     {
-        const auto & key = entry.getCompositeKey();
+        const auto key = it->getCompositeKey();
         if (zk_children.contains(key))
+        {
+            ++it;
             continue;
-        stale_keys.emplace_back(key, entry.manifest.transaction_id);
-    }
+        }
 
-    for (const auto & [key, transaction_id] : stale_keys)
-    {
-        LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Export task {} was deleted, calling killExportPartition for transaction {}", key, transaction_id);
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Export task {} was deleted, calling killExportPartition for transaction {}", key, it->manifest.transaction_id);
 
         try
         {
-            storage.killExportPart(transaction_id);
+            storage.killExportPart(it->manifest.transaction_id);
         }
         catch (...)
         {
             tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
         }
 
-        auto it = entries_by_key.find(key);
-        if (it != entries_by_key.end())
-            entries_by_key.erase(it);
+        it = entries_by_key.erase(it);
     }
 }
 
@@ -671,7 +665,6 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
                 local_status_changes.pop();
                 continue;
             }
-            const std::string transaction_id = it->manifest.transaction_id;
 
             ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
             ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
@@ -709,7 +702,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
                 try
                 {
                     LOG_INFO(storage.log, "ExportPartition Manifest Updating task: killing export partition for task {}", key);
-                    storage.killExportPart(transaction_id);
+                    storage.killExportPart(it->manifest.transaction_id);
                 }
                 catch (...)
                 {

@@ -10118,8 +10118,7 @@ CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & 
     bool local_entry_pending = false;
     std::string local_composite_key;
     {
-        const auto model = export_read_model.get();
-        if (model)
+        if (const auto model = export_read_model.get())
         {
             const auto & by_transaction_id = model->get<ExportPartitionTaskEntryTagByTransactionId>();
             const auto entry = by_transaction_id.find(transaction_id);
