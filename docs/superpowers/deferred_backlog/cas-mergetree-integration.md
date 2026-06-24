@@ -167,3 +167,34 @@ Not feature bugs; they block long unattended soaks and obscure validation:
 
 Until fixed, run soaks with a smaller footprint (fewer workers / smaller dataset) or a duration that
 fits the disk, and keep a `df` disk-guard armed.
+
+### ROOT CAUSE of the soak disk-fill (A/B-confirmed 2026-06-24) — rustfs leak + un-wired reaper, NOT a GC/B199-S2 regression
+
+Operator suspected the B199-S2 precommit-inline-closure work introduced a GC reclaim bug (pre-S2 24h
+soaks were disk-clean; post-S2 soaks fill the host in ~60 min). **Disproven by controlled A/B** (same
+seed/workers/duration, isolating only the ClickHouse binary; rustfs beta.8 + harness held constant):
+
+| | A = pre-S2 (`f15ddf5c9ab`) | B = post-S2 (`72c342b74d1`) |
+|---|---|---|
+| 3w/15min | 2G disk, 164,672 deleted, 1.3K-obj pool | 2G disk, 162,813 deleted, 1.2K-obj pool |
+| 6w/25min | 6G disk, 295,124 deleted, pool 336K→136K | 5G disk, 321,019 deleted, pool 350K→147K |
+
+Pre-S2 and post-S2 are statistically identical — GC reclaims hard and keeps the logical pool bounded
+(<1GB) in BOTH. (The "rounds 42–77 deleted=0 then explode" trend is normal GC cadence — insert-heavy
+stages drop nothing, then drops/chaos arrive — present identically in A and B, not an S2 stall.)
+
+**Actual root cause — rustfs `1.0.0-beta.8` never frees storage (direct isolation test, no ClickHouse):**
+- DELETE-reclaim: put 300×4MB (+1200MB), deleted all 300 (listing→0) → `/data` stayed +1200MB (no reclaim).
+- OVERWRITE-leak: overwrote ONE key 300× with 4MB → listing=1 object, `/data` grew +1200MB (every stale
+  version retained).
+So any churn (the CA root-shard manifest is overwritten every mutation; GC deletes objects) grows rustfs
+`/data` monotonically — 100% binary-independent. The logical CA pool stays <1GB while physical disk balloons.
+
+**Operational gap:** `orphan_reaper.sh` exists specifically to reclaim the leaked `roots/<uuid>/` overwrite
+orphans, and `docker-compose.yml` claims `run_24h.sh` launches it — **but `run_24h.sh` does NOT invoke it**
+(`grep reaper scripts/run_24h.sh` → nothing). Every `run_24h.sh` soak ran with the leak unmitigated. rustfs
+has been pinned at beta.8 since 2026-06-13 (before the v4-clean 24h soak), so the difference from the
+clean-24h era is the reaper wiring (and run duration/load), not the ClickHouse code.
+
+**Fix:** wire `orphan_reaper.sh` (host `docker exec` loop on rustfs `…/test/roots`) into `run_24h.sh`; or
+upgrade rustfs to a release that reclaims; keep the `df` disk-guard. B199-S2 needs no change.
