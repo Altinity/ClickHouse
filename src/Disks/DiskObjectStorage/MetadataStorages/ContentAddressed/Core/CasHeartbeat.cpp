@@ -1,7 +1,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
+#include <cas_root_shard.pb.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 
 #include <chrono>
@@ -10,6 +13,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
 }
 }
@@ -20,34 +24,46 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint64_t HEARTBEAT_VERSION = 1;
+constexpr std::string_view HEARTBEAT_MAGIC = "CAHB";
 
 }
 
 String encodeHeartbeat(const Heartbeat & heartbeat)
 {
+    Cas::Proto::HeartbeatProto msg;
+    msg.set_server_id(u128ToBytesBE(heartbeat.server_id));
+    msg.set_heartbeat_seq(heartbeat.heartbeat_seq);
+    msg.set_created_at_ms(heartbeat.created_at_ms);
+
+    std::string body;
+    if (!msg.SerializeToString(&body))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: protobuf serialization failed");
+
     WriteBufferFromOwnString out;
-    JsonObjectWriter writer(out);
-    writer.field("format", "cas_heartbeat");
-    writer.field("version", HEARTBEAT_VERSION);
-    writer.field("server_id", u128ToHex(heartbeat.server_id));
-    writer.field("heartbeat_seq", heartbeat.heartbeat_seq);
-    writer.field("created_at_ms", heartbeat.created_at_ms);
-    writer.finalize();
+    Cas::writeFramingHeader(out, HEARTBEAT_MAGIC, Cas::currentWriterVersion(Cas::FormatId::Heartbeat));
+    writeString(body, out);
     return std::move(out.str());
 }
 
 Heartbeat decodeHeartbeat(std::string_view data)
 {
-    return decodeJsonGuarded("heartbeat", [&]
+    return decodeGuarded("heartbeat", [&]
     {
-        auto obj = parseJsonDocument(data, "cas_heartbeat", HEARTBEAT_VERSION, "heartbeat");
-        checkNoUnknownKeys(*obj, {"format", "version", "server_id", "heartbeat_seq", "created_at_ms"}, "heartbeat");
+        if (data.empty())
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS heartbeat: empty object");
+
+        ReadBufferFromMemory in(data.data(), data.size());
+        Cas::readFramingHeader(in, HEARTBEAT_MAGIC, "heartbeat");
+        const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
+
+        Cas::Proto::HeartbeatProto msg;
+        if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS heartbeat: protobuf parse failed");
 
         Heartbeat heartbeat;
-        heartbeat.server_id = requireHash(*obj, "server_id", "heartbeat");
-        heartbeat.heartbeat_seq = requireU64(*obj, "heartbeat_seq", "heartbeat");
-        heartbeat.created_at_ms = requireU64(*obj, "created_at_ms", "heartbeat");
+        heartbeat.server_id = u128FromBytesBE(msg.server_id(), "heartbeat server_id");
+        heartbeat.heartbeat_seq = msg.heartbeat_seq();
+        heartbeat.created_at_ms = msg.created_at_ms();
         return heartbeat;
     });
 }

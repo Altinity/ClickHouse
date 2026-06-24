@@ -41,6 +41,9 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
         case FormatId::Watermark:
         case FormatId::PoolMeta:
         case FormatId::Roster:
+        case FormatId::Heartbeat:
+        case FormatId::RootsRegistry:
+        case FormatId::GcOutcomes:
             return BASELINE;
     }
     throw Exception(ErrorCodes::LOGICAL_ERROR, "CasFormat: unknown FormatId {}", static_cast<int>(id));
@@ -98,11 +101,6 @@ FramingHeader readFramingHeader(ReadBuffer & in, std::string_view expected_magic
     readBinaryLittleEndian(h.min_reader_version, in);
     gateOnRead(h.min_reader_version, what);
     return h;
-}
-
-bool tolerateUnknownKeys(uint16_t writer_version)
-{
-    return writer_version > G_BUILD;
 }
 
 }

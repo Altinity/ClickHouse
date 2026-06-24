@@ -152,6 +152,10 @@ TEST(CasGcFormats, HeartbeatRoundTrip)
                  .heartbeat_seq = 42,
                  .created_at_ms = 1234567890123};
     auto bytes = encodeHeartbeat(hb);
+    /// Protobuf framing: CAHB magic, not JSON.
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes.substr(0, 4), "CAHB");
+    EXPECT_NE(bytes.front(), '{');
     auto d = decodeHeartbeat(bytes);
     EXPECT_EQ(d.server_id, hexToU128("000102030405060708090a0b0c0d0e0f"));
     EXPECT_EQ(d.heartbeat_seq, 42u);
@@ -170,7 +174,10 @@ TEST(CasGcFormats, OutcomeLogRoundTrip)
     log.entries.push_back({ObjectKind::Tree, hexToU128("dd00000000000000000000000000000d"),
                            Token{"9", TokenType::Emulated}, OutcomeKind::Absent});
     auto bytes = encodeOutcomeLog(log);
-    EXPECT_NE(bytes.find("\"format\":\"cas_gc_outcomes\""), String::npos);
+    /// Protobuf framing: CAGO magic, not JSON.
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes.substr(0, 4), "CAGO");
+    EXPECT_NE(bytes.front(), '{');
     auto d = decodeOutcomeLog(bytes);
     ASSERT_EQ(d.entries.size(), 4u);
     EXPECT_EQ(d.entries[0].kind, ObjectKind::Tree);
@@ -192,40 +199,7 @@ TEST(CasGcFormats, EmptyOutcomeLogRoundTrips)
     EXPECT_TRUE(d.entries.empty());
 }
 
-/// ---------- validation throw-paths (strict JSON) ----------
-
-namespace
-{
-
-/// Shared corruption matrix for a JSON codec: the same fail-closed contract applies to every
-/// non-hashed metadata object, so each codec's validation test just supplies the decode function and
-/// a known-good document to mutate.
-template <typename Decode>
-void expectStrictJsonContract(Decode && decode, const String & expected_format, uint64_t current_version = 1)
-{
-    const String version_str = std::to_string(current_version);
-    /// Malformed JSON.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(String("{not json")); });
-    /// Trailing junk after an otherwise-valid document (the JSON analogue of the binary codecs'
-    /// requireNoTrailingBytes guard — a half-written / spliced object must not silently decode).
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decode(R"({"format":")" + expected_format + R"(","version":)" + version_str + "}trailing"); });
-    /// Top-level value not an object.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(String("[]")); });
-    /// Wrong format value.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decode(R"({"format":"cas_wrong","version":)" + version_str + "}"); });
-    /// Missing the format key entirely.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(R"({"version":)" + version_str + "}"); });
-    /// version as a string (wrong type).
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decode(R"({"format":")" + expected_format + R"(","version":")" + version_str + R"("})"); });
-    /// Future version => UNKNOWN_FORMAT_VERSION (fail closed on the future, never corruption).
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [&] { decode(R"({"format":")" + expected_format + R"(","version":)" + std::to_string(current_version + 1) + "}"); });
-}
-
-}
+/// ---------- validation throw-paths (protobuf framing) ----------
 
 TEST(CasGcFormats, GcStateValidation)
 {
@@ -265,56 +239,49 @@ TEST(CasGcFormats, RetiredSetValidation)
 
 TEST(CasGcFormats, OutcomeLogValidation)
 {
-    expectStrictJsonContract([](const String & s) { return decodeOutcomeLog(s); }, "cas_gc_outcomes");
-
-    EXPECT_TRUE(encodeOutcomeLog(OutcomeLog{}).contains(R"("format":"cas_gc_outcomes")"));
-
-    const String entry = R"({"kind":"tree","hash":"aa00000000000000000000000000000a","token":"etag-1","token_type":"etag","outcome":"deleted"})";
-
-    /// Bad enum: unknown outcome.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
-        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"x","token_type":"etag","outcome":"bogus"}]})"); });
-    /// Bad enum: unknown kind.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
-        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"banana","hash":"aa00000000000000000000000000000a","token":"x","token_type":"etag","outcome":"deleted"}]})"); });
-    /// Bad enum: unknown token_type.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
-        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"x","token_type":"weird","outcome":"deleted"}]})"); });
-    /// Unknown extra key inside an entry.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
-        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"x","token_type":"etag","outcome":"deleted","x":1}]})"); });
-    /// Missing a required field inside an entry (no token_type).
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
-        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"x","outcome":"deleted"}]})"); });
-    /// Bad hash hex.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(
-        R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"nothex","token":"x","token_type":"etag","outcome":"deleted"}]})"); });
-    /// Unknown extra key at the top level.
+    /// Empty / garbage bytes => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(String("")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
+    /// Bad magic (not CAGO) => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(String("CAHB\x01\x00\x01\x00", 8)); });
+    /// Future min_reader => UNKNOWN_FORMAT_VERSION (fail closed on the future).
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [] { decodeOutcomeLog(String("CAGO\x02\x00\x02\x00", 8)); });
+    /// Encoding is binary (framing magic CAGO), not JSON.
+    {
+        const String bytes = encodeOutcomeLog(OutcomeLog{});
+        ASSERT_GE(bytes.size(), 8u);
+        EXPECT_EQ(bytes.substr(0, 4), "CAGO");
+        EXPECT_NE(bytes.front(), '{');
+    }
+    /// An entry with an invalid outcome value (0 is the proto3 default / unset) => CORRUPTED_DATA.
+    /// GcOutcomeLogProto.entries is field 1 (length-delimited) => tag 0x0A; an empty sub-message
+    /// has all fields at their proto3 defaults (0), including outcome=0 which is not a valid OutcomeKind.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeOutcomeLog(R"({"format":"cas_gc_outcomes","version":1,"entries":[],"x":1})"); });
-
-    /// Sanity: the canonical entry round-trips through decode without throwing.
-    EXPECT_NO_THROW(decodeOutcomeLog(R"({"format":"cas_gc_outcomes","version":1,"entries":[)" + entry + "]}"));
+        [] { decodeOutcomeLog(String("CAGO\x01\x00\x01\x00\x0a\x00", 10)); });
 }
 
 TEST(CasGcFormats, HeartbeatValidation)
 {
-    expectStrictJsonContract([](const String & s) { return decodeHeartbeat(s); }, "cas_heartbeat");
-
-    EXPECT_TRUE(encodeHeartbeat(Heartbeat{}).contains(R"("format":"cas_heartbeat")"));
-
-    /// Missing a required field.
+    /// Empty / garbage bytes => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeHeartbeat(String("")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeHeartbeat(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
+    /// Bad magic (not CAHB) => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeHeartbeat(String("CAGO\x01\x00\x01\x00", 8)); });
+    /// Future min_reader => UNKNOWN_FORMAT_VERSION (fail closed on the future).
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [] { decodeHeartbeat(String("CAHB\x02\x00\x02\x00", 8)); });
+    /// Encoding is binary (framing magic CAHB), not JSON.
+    {
+        const String bytes = encodeHeartbeat(Heartbeat{});
+        ASSERT_GE(bytes.size(), 8u);
+        EXPECT_EQ(bytes.substr(0, 4), "CAHB");
+        EXPECT_NE(bytes.front(), '{');
+    }
+    /// A server_id proto bytes field that is not exactly 16 bytes => CORRUPTED_DATA (post-parse).
+    /// Build a CAHB-framed body where field 1 (server_id) has a 5-byte value: tag 0x0A, length 0x05, 5 bytes.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeHeartbeat(R"({"format":"cas_heartbeat","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","heartbeat_seq":7})"); });
-    /// Wrong type for a numeric field.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeHeartbeat(R"({"format":"cas_heartbeat","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","heartbeat_seq":"7","created_at_ms":9})"); });
-    /// Bad hash hex for server_id.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeHeartbeat(R"({"format":"cas_heartbeat","version":1,"server_id":"nothex","heartbeat_seq":7,"created_at_ms":9})"); });
-    /// Unknown extra key.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeHeartbeat(R"({"format":"cas_heartbeat","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","heartbeat_seq":7,"created_at_ms":9,"x":1})"); });
+        [] { decodeHeartbeat(String("CAHB\x01\x00\x01\x00\x0a\x05hello", 13)); });
 }
 
 TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
@@ -326,24 +293,44 @@ TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
     registry.fence_round = 2;
     registry.namespaces = {"srv1/tbl", "srv2/tbl2"};
     const String bytes = encodeRootsRegistry(registry);
-    EXPECT_NE(bytes.find("\"format\":\"cas_roots_registry\""), String::npos);
+    /// Protobuf framing: CARR magic, not JSON.
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes.substr(0, 4), "CARR");
+    EXPECT_NE(bytes.front(), '{');
     const RootsRegistry d = decodeRootsRegistry(bytes);
     EXPECT_EQ(d.registry_version, 3u);
     EXPECT_EQ(d.fence_round, 2u);
     EXPECT_EQ(d.namespaces, registry.namespaces);
     EXPECT_EQ(encodeRootsRegistry(d), bytes);                    /// byte-stable re-encode
 
-    expectStrictJsonContract([](const String & s) { return decodeRootsRegistry(s); }, "cas_roots_registry");
-
-    /// codec-specific rows: non-string / empty / duplicate namespace entries fail closed
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(
-        R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":[7]})"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(
-        R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":[""]})"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(
-        R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":["a","a"]})"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(
-        R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":["a"],"extra":1})"); });
+    /// Empty / garbage bytes => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(String("")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
+    /// Bad magic (not CARR) => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(String("CAHB\x01\x00\x01\x00", 8)); });
+    /// Future min_reader => UNKNOWN_FORMAT_VERSION (fail closed on the future).
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [] { decodeRootsRegistry(String("CARR\x02\x00\x02\x00", 8)); });
+    /// codec-specific invariants: empty namespace entry fails closed (post-parse check).
+    {
+        RootsRegistry bad;
+        bad.registry_version = 1;
+        bad.namespaces.insert("");   /// empty namespace — insert bypasses post-parse guard
+        /// encodeRootsRegistry will serialize the empty string, then decodeRootsRegistry must reject it.
+        const String bad_bytes = encodeRootsRegistry(bad);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(bad_bytes); });
+    }
+    /// duplicate namespace entries fail closed (post-parse check).
+    /// We can't produce a duplicate via the normal encode path (set<> dedupes), so craft the proto
+    /// bytes directly: CARR framing + a RootsRegistryProto body with two identical namespaces.
+    /// RootsRegistryProto.namespaces is field 3 (string repeated) => tag 0x1A.
+    /// "a" => tag 0x1A, len 0x01, 'a' (3 bytes per entry).
+    {
+        const String body("\x1a\x01\x61\x1a\x01\x61", 6);   /// two "a" entries
+        String framed("CARR\x01\x00\x01\x00", 8);
+        framed += body;
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(framed); });
+    }
 }
 
 /// Verify that `encodeGcSnap` produces zstd-compressed output (version 3, codec byte 1) and that
@@ -380,69 +367,72 @@ TEST(CasGcSnapCodec, ZstdRoundTripAndShrinks)
 }
 
 /// ===================================================================================
-/// R10 strict-JSON encoder goldens (remaining JSON codecs: heartbeat, roots-registry, outcome-log).
-/// The watermark, pool-meta, and retired-set goldens were removed when those codecs moved to protobuf
-/// (Plan 3c). Protobuf framing-header goldens for the new codecs are in CasPoolMeta/CasWatermark/
-/// CasGcFormats round-trip tests above.
+/// Protobuf framing-header goldens for heartbeat, roots-registry, gc-outcomes (Plan 3c-tail).
+/// These replace the JSON goldens removed when the codecs moved to protobuf.
+/// Protobuf framing-header goldens for pool-meta, watermark, gc-state, retired-set (Plan 3c).
+/// Pin the framing magic bytes and verify binary (not JSON) encoding for each codec.
 /// ===================================================================================
 
-namespace
-{
-constexpr std::string_view GOLDEN_HEARTBEAT =
-    R"({"format":"cas_heartbeat","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","heartbeat_seq":42,"created_at_ms":1234567890123})";
-constexpr std::string_view GOLDEN_ROOTS_REGISTRY =
-    R"({"format":"cas_roots_registry","version":1,"registry_version":5,"fence_round":2,"namespaces":["alpha","beta","gamma/sub"]})";
-constexpr std::string_view GOLDEN_ROOTS_REGISTRY_EMPTY =
-    R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":[]})";
-constexpr std::string_view GOLDEN_OUTCOME_LOG =
-    R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"etag-1","token_type":"etag","outcome":"deleted"},{"kind":"blob","hash":"bb00000000000000000000000000000b","token":"7","token_type":"emulated","outcome":"spared"}]})";
-constexpr std::string_view GOLDEN_OUTCOME_LOG_EMPTY =
-    R"({"format":"cas_gc_outcomes","version":1,"entries":[]})";
-}
-
-TEST(CasJsonGolden, Heartbeat)
+TEST(CasProtobufFramingGolden, HeartbeatFramingMagic)
 {
     const Heartbeat hb{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
                        .heartbeat_seq = 42, .created_at_ms = 1234567890123};
-    EXPECT_EQ(encodeHeartbeat(hb), GOLDEN_HEARTBEAT);
+    const String bytes = encodeHeartbeat(hb);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes.substr(0, 4), "CAHB");
+    EXPECT_NE(bytes.front(), '{');   // not JSON
+    const Heartbeat d = decodeHeartbeat(bytes);
+    EXPECT_EQ(d.server_id, hb.server_id);
+    EXPECT_EQ(d.heartbeat_seq, 42u);
+    EXPECT_EQ(d.created_at_ms, 1234567890123u);
+    /// Zero heartbeat round-trips.
+    const Heartbeat zero{};
+    EXPECT_EQ(decodeHeartbeat(encodeHeartbeat(zero)).heartbeat_seq, 0u);
 }
 
-TEST(CasJsonGolden, RootsRegistry)
+TEST(CasProtobufFramingGolden, RootsRegistryFramingMagic)
 {
     RootsRegistry registry;
     registry.registry_version = 5;
     registry.fence_round = 2;
     registry.namespaces = {"alpha", "beta", "gamma/sub"};
-    EXPECT_EQ(encodeRootsRegistry(registry), GOLDEN_ROOTS_REGISTRY);
+    const String bytes = encodeRootsRegistry(registry);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes.substr(0, 4), "CARR");
+    EXPECT_NE(bytes.front(), '{');   // not JSON
+    const RootsRegistry d = decodeRootsRegistry(bytes);
+    EXPECT_EQ(d.registry_version, 5u);
+    EXPECT_EQ(d.fence_round, 2u);
+    EXPECT_EQ(d.namespaces, registry.namespaces);
+    EXPECT_EQ(encodeRootsRegistry(d), bytes);   // byte-stable
+    /// Empty namespaces round-trips.
+    RootsRegistry empty;
+    empty.registry_version = 1;
+    empty.fence_round = 0;
+    EXPECT_TRUE(decodeRootsRegistry(encodeRootsRegistry(empty)).namespaces.empty());
 }
 
-TEST(CasJsonGolden, RootsRegistryEmptyNamespaces)
-{
-    RootsRegistry registry;
-    registry.registry_version = 1;
-    registry.fence_round = 0;
-    EXPECT_EQ(encodeRootsRegistry(registry), GOLDEN_ROOTS_REGISTRY_EMPTY);
-}
-
-TEST(CasJsonGolden, OutcomeLog)
+TEST(CasProtobufFramingGolden, GcOutcomesFramingMagic)
 {
     OutcomeLog log;
     log.entries.push_back({ObjectKind::Tree, hexToU128("aa00000000000000000000000000000a"),
                            Token{"etag-1", TokenType::ETag}, OutcomeKind::Deleted});
     log.entries.push_back({ObjectKind::Blob, hexToU128("bb00000000000000000000000000000b"),
                            Token{"7", TokenType::Emulated}, OutcomeKind::Spared});
-    EXPECT_EQ(encodeOutcomeLog(log), GOLDEN_OUTCOME_LOG);
+    const String bytes = encodeOutcomeLog(log);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes.substr(0, 4), "CAGO");
+    EXPECT_NE(bytes.front(), '{');   // not JSON
+    const OutcomeLog d = decodeOutcomeLog(bytes);
+    ASSERT_EQ(d.entries.size(), 2u);
+    EXPECT_EQ(d.entries[0].kind, ObjectKind::Tree);
+    EXPECT_EQ(d.entries[0].hash, hexToU128("aa00000000000000000000000000000a"));
+    EXPECT_EQ(d.entries[0].outcome, OutcomeKind::Deleted);
+    EXPECT_EQ(d.entries[1].outcome, OutcomeKind::Spared);
+    EXPECT_EQ(encodeOutcomeLog(d), bytes);   // byte-stable
+    /// Empty log round-trips.
+    EXPECT_TRUE(decodeOutcomeLog(encodeOutcomeLog(OutcomeLog{})).entries.empty());
 }
-
-TEST(CasJsonGolden, OutcomeLogEmpty)
-{
-    EXPECT_EQ(encodeOutcomeLog(OutcomeLog{}), GOLDEN_OUTCOME_LOG_EMPTY);
-}
-
-/// ===================================================================================
-/// Protobuf framing-header goldens for pool-meta, watermark, gc-state, retired-set (Plan 3c).
-/// Pin the framing magic bytes and verify binary (not JSON) encoding for each new codec.
-/// ===================================================================================
 
 TEST(CasProtobufFramingGolden, PoolMetaFramingMagic)
 {

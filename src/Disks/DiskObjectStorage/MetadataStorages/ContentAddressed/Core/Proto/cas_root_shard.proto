@@ -125,6 +125,40 @@ message GcStateProto {
   repeated FenceVersionEntryProto fence_version = 7;
 }
 
+// Build heartbeat (builds/<build_id>). Magic CAHB, FormatId::Heartbeat.
+// server_id: raw 16 bytes (UInt128, big-endian).
+message HeartbeatProto {
+  bytes  server_id      = 1;  // raw 16 bytes (UInt128, big-endian)
+  uint64 heartbeat_seq  = 2;  // strictly monotone within one build
+  uint64 created_at_ms  = 3;  // DIAGNOSTIC ONLY — no protocol decision reads writer clocks
+}
+
+// Namespace registry (gc/registry). Magic CARR, FormatId::RootsRegistry.
+// namespaces: sorted repeated string (deterministic; no proto map<>).
+message RootsRegistryProto {
+  uint64 registry_version = 1;  // monotone, CAS-carried
+  uint64 fence_round      = 2;  // written only by GC; monotone
+  repeated string namespaces = 3;  // sorted ascending for byte-determinism
+}
+
+// One entry inside a GcOutcomeLogProto.
+// kind: 1=blob, 2=tree (mirrors ObjectKind enum).
+// token_type: 1=etag, 2=generation, 3=emulated (mirrors TokenType enum).
+// outcome: 1=deleted, 2=absent, 3=replaced, 4=spared (mirrors OutcomeKind enum).
+message GcOutcomeEntryProto {
+  uint32 kind        = 1;
+  bytes  hash        = 2;  // raw 16 bytes (UInt128, big-endian)
+  string token_value = 3;
+  uint32 token_type  = 4;
+  uint32 outcome     = 5;
+}
+
+// Retire outcome log (gc/outcomes/<round>.<fence_seq>/<snap_shard>). Magic CAGO, FormatId::GcOutcomes.
+// Entries are in insertion order (the original JSON encoder kept insertion order).
+message GcOutcomeLogProto {
+  repeated GcOutcomeEntryProto entries = 1;
+}
+
 // One condemned object inside a RetiredSetProto.
 // kind: 1=blob, 2=tree (mirrors ObjectKind enum).
 // token_type: 1=etag, 2=generation, 3=emulated (mirrors TokenType enum).
