@@ -214,12 +214,15 @@ blob:  [ 256-B header: "CABL" + ver + incarnation-zone ][ payload = raw file byt
 tree:  [ 256-B header: "CATR" + ver + incarnation-zone ][ catalog ][ inline-data section ]
 ```
 
-- **One header for both.** The 96-byte fixed LE core (frozen — *never grow the core*; new fields go in
-  TLVs) plus TLV extensions, padded to **`blob_header_len = 256`** for **both** blob and tree (was
-  blob-only) — a constant payload offset, no per-object header read. The **magic distinguishes the
-  type** (`CABL` = blob, `CATR` = tree), so the old `kind` enum field is dropped. The header is the
-  **incarnation zone** — `domain_id`, `incarnation_tag`, `build_id`, optional `provenance`/`intended_ref`
-  TLVs — and is **excluded from identity**.
+- **One header for both.** A **fixed, tightly-packed LE core** (exact size fixed at freeze — *never
+  grow it*; new fields go in TLVs) plus TLV extensions, padded to **`blob_header_len = 256`** for
+  **both** blob and tree (was blob-only) — a constant payload offset, no per-object header read. The
+  **magic distinguishes the type** (`CABL` = blob, `CATR` = tree), so the old `kind` enum byte is
+  dropped; that byte and the former pack `index_len` slot are **reclaimed by shifting fields left — no
+  vestigial pad**. (The header is stream-parsed via `ReadBuffer`, so serialized-field alignment is
+  irrelevant; the interim pack-removal commit kept a byte-preserving zero pad, repacked away here.) The
+  header is the **incarnation zone** — `domain_id`, `incarnation_tag`, `build_id`, optional
+  `provenance`/`intended_ref` TLVs — and is **excluded from identity**.
 - **Identity = content, computed by a frozen rule, independent of serialization:**
   - `blobId = H(payload)` — the raw file content hash (a Merkle leaf). The header also stores this id,
     which doubles as a bit-rot check on read.
@@ -280,8 +283,8 @@ are **outside** identity, so they evolve freely.
 7. **Error-code unification:** "future format version" and "unknown critical TLV" throw
    **`UNKNOWN_FORMAT_VERSION`** everywhere (the header decode currently throws `NOT_IMPLEMENTED`).
 
-**Pre-freeze checklist (lock before first release):** the single header (magic set `CABL`/`CATR`, 96-B
-core, `blob_header_len = 256` for both); version field width (2 B); the Merkle `treeId` rule
+**Pre-freeze checklist (lock before first release):** the single header (magic set `CABL`/`CATR`, the
+tightly-packed core size, `blob_header_len = 256` for both); version field width (2 B); the Merkle `treeId` rule
 `(name, kind, child_hash)` and the blob-hash-over-payload domain; the catalog-first/inline-last tree
 layout; packs fully removed (no reserved slot); the taxonomy; the `format_id` set; the one error code.
 
@@ -331,9 +334,10 @@ A small, focused module instead of per-codec ad-hoc version handling:
 - **`CasCodecUtil.h`**: drop the monotone `checkVersion`; `parseJsonDocument` calls `gateOnRead` and
   applies the version-aware unknown-key rule; the UInt128 LE/BE helpers stay.
 - **`CasEnvelope.{h,cpp}`** (the shared object header): one header for blob and tree; magic
-  `CABL`/`CATR` (drop the `kind` enum, incl. `ObjectKind::Pack`); **remove the pack `index_len` and the
-  pack branch of `payloadOffset`**; pad **both** to `blob_header_len = 256`; formalize the TLV critical
-  bit as the additive axis; unify the future-format error to `UNKNOWN_FORMAT_VERSION`; assert the
+  `CABL`/`CATR` (drop the `kind` enum); **repack the core hole-free** — reclaim the dropped `kind` byte
+  and the former `index_len` zero pad by shifting fields left (set the new exact core size /
+  `header_hash` offset); pad **both** to `blob_header_len = 256`; formalize the TLV critical bit as the
+  additive axis; unify the future-format error to `UNKNOWN_FORMAT_VERSION`; assert the
   blob-hash-over-payload invariant.
 - **`CasTreeCodec.{h,cpp}`**: **`treeId` becomes the Merkle rule** over `(name, kind, child_hash)`
   (replaces `CityHash128(encoded)`); the on-disk payload becomes catalog-first / inline-data-last; drop
