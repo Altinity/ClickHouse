@@ -59,14 +59,16 @@ generation 1; it is not a migration of existing bytes.
 
 ```
 Is the object content-addressed (its key is its content hash)?
-  ├─ yes →  canonical BINARY        (blob, tree)
-  └─ no  →  large or structurally complex (nested/repeated, grows with the pool)?
-              ├─ yes →  PROTOBUF    (root-shard manifest + journal, gc-snap)
-              └─ no  →  JSON        (pool-meta, watermark, gc-state, retired-set*)
+  ├─ yes →  canonical BINARY  (blob, tree)
+  └─ no  →  HOT (written/read per-operation or per-GC-round), OR large, OR structurally complex?
+              ├─ yes →  PROTOBUF  (manifest + journal, gc-snap, gc-state, retired-set, watermark)
+              └─ no  →  JSON      (control-plane only, touched rarely: pool-meta, roster)
 ```
 
-`*` retired-set: JSON while it is a small bounded list; promote to protobuf only if profiling shows it
-growing large (YAGNI — keep JSON now).
+JSON is reserved for the **rarely-touched control plane** — objects written once at creation or on a
+rare control event, never per-operation. Everything on a hot path goes to protobuf even when it is
+tiny (e.g. `gc-state`, `watermark`): the per-object protobuf overhead is trivial, and one mechanism
+for all hot objects is cleaner than a size cutoff.
 
 ## Why each branch
 
@@ -76,12 +78,14 @@ growing large (YAGNI — keep JSON now).
   tree object carries **raw inline payload** (small part files) in a catalog-first / data-last layout
   that is a natural custom-binary structure; (3) a blob is raw file bytes anyway. Determinism is a
   property we get for free from the Merkle rule, not a reason to pick binary.
-- **Mutable + large/complex ⇒ protobuf.** Never hashed, so non-canonical wire output is harmless.
-  Protobuf gives free **skip-unknown** (the engine of additive evolution) and avoids the two problems
-  §4 found with JSON here: parse/serialize cost on the hot path, and unreadable codec code as the
-  schema grows.
-- **Mutable + tiny/flat/rare ⇒ JSON.** The operator's incident surface — inspectable with plain S3
-  tooling, small and simple enough that JSON's cost and ugliness never materialize.
+- **Mutable + hot, large, or complex ⇒ protobuf.** Never hashed, so non-canonical wire output is
+  harmless. Protobuf gives free **skip-unknown** (the engine of additive evolution) and avoids the two
+  problems §4 found with JSON here: parse/serialize cost on the hot path, and unreadable codec code as
+  the schema grows. **"Hot" (per-operation or per-GC-round) is a trigger on its own**, even for tiny
+  objects — the §4 lesson was specifically that JSON on a hot path is a bottleneck.
+- **Mutable, control-plane, rarely touched ⇒ JSON.** Only objects written at creation or on a rare
+  control event (`pool-meta`, the deferred `roster`). They are the operator's incident surface —
+  inspectable with plain S3 tooling — and small/simple, so JSON's cost never materializes.
 
 ## Drop packs — inline the eager part files into the tree
 
@@ -105,11 +109,14 @@ A size threshold drives inline-vs-blob (a large `primary.idx` may stay a blob); 
 list are tuning details, not freeze decisions. **Placement does not affect identity** (Part III), so
 inline↔blob is a free storage choice.
 
-**Freeze consequence:** `Placement` value `3` (`PackSlice`) is **permanently reserved and unused** —
-never reassign it. The dead `PackSlice` branches in `CasFsck`, `CasGc`, `CasStore`, `CasBuild`,
-`CasRootShardCodec`, `CasClosureWalk`, `CasPlacement` are removed (a `PackSlice` value on read is
-`CORRUPTED_DATA` — it can never legitimately exist). B97, B10, and the B96 "snap_shards>1" tangent
-leave the release scope.
+**Freeze consequence — remove packs from the code entirely.** Packs were never produced (the writer
+only ever stages `Blob`), so there is **no on-disk data** with `placement = 3` and nothing to stay
+compatible with. We therefore delete all pack code — the `Placement::PackSlice` value, the
+`ObjectKind::Pack` envelope kind, the pack `index_len`/`payloadOffset` logic, and the dead `PackSlice`
+branches in `CasFsck`, `CasGc`, `CasStore`, `CasBuild`, `CasRootShardCodec`, `CasClosureWalk`,
+`CasPlacement`, `CasTreeCodec`. **No reserved-but-unused slot** (YAGNI; a future use of value 3 would
+be a new tree format version anyway, and no released bytes ever held it). B97, B10, and the B96
+"snap_shards>1" tangent leave the release scope.
 
 ---
 
@@ -186,7 +193,7 @@ The concept (`format_id` + `writer_version` + `min_reader_version`) is uniform; 
   manifest and the **length-delimited streaming** gc-snap. Additive = a new field number (skip-unknown
   native). Discipline: no `map<>`, pinned field order — for **diffability** and golden tests, not
   correctness (never hashed).
-- **JSON (pool-meta, watermark, gc-state).** Keys `"format"`, `"writer_version"`,
+- **JSON (pool-meta, roster).** Keys `"format"`, `"writer_version"`,
   `"min_reader_version"`. Unknown-key handling is **version-aware**: strict for a same-or-older object
   (`writer_version ≤ G_build` and an unknown key → `CORRUPTED_DATA`, preserving incident-surface
   safety), but unknown keys are **allowed when `writer_version > G_build`** (forward additions —
@@ -259,18 +266,21 @@ are **outside** identity, so they evolve freely.
 3. **gc-snap → protobuf** (B176): length-delimited **streaming** (never materialize the whole snap —
    B165 OOM), zstd compression (with B149), deterministic record ordering (golden-tested), preserving
    the fold cursor and the `GC_SNAP_VERSION` B140 fix. Measure protobuf overhead on the hot path.
-4. **JSON objects** (pool-meta, watermark, gc-state): adopt the version-aware header; otherwise
-   unchanged.
-5. **S3 object user-metadata** (`ObjectMeta`/`HeadResult.attributes`): only for **optional/diagnostic**
+4. **Other mutable objects → protobuf** (hot-path rule): `gc-state` and `watermark` (tiny — framing
+   header, single message); `retired-set` (length-delimited streaming like gc-snap, since it grows).
+   These move off JSON because they are written per-GC-round / per-heartbeat.
+5. **JSON objects** (`pool-meta`, and the deferred `roster`): version-aware header; the rarely-touched
+   control-plane surface, kept human-inspectable.
+6. **S3 object user-metadata** (`ObjectMeta`/`HeadResult.attributes`): only for **optional/diagnostic**
    data cheaply read at HEAD (e.g. provenance), **never load-bearing** — `LocalObjectStorage` drops it
    (B167b).
-6. **Error-code unification:** "future format version" and "unknown critical TLV" throw
+7. **Error-code unification:** "future format version" and "unknown critical TLV" throw
    **`UNKNOWN_FORMAT_VERSION`** everywhere (the header decode currently throws `NOT_IMPLEMENTED`).
 
 **Pre-freeze checklist (lock before first release):** the single header (magic set `CABL`/`CATR`, 96-B
 core, `blob_header_len = 256` for both); version field width (2 B); the Merkle `treeId` rule
 `(name, kind, child_hash)` and the blob-hash-over-payload domain; the catalog-first/inline-last tree
-layout; `PackSlice` reserved; the taxonomy; the `format_id` set; the one error code.
+layout; packs fully removed (no reserved slot); the taxonomy; the `format_id` set; the one error code.
 
 ---
 
@@ -318,13 +328,14 @@ A small, focused module instead of per-codec ad-hoc version handling:
 - **`CasCodecUtil.h`**: drop the monotone `checkVersion`; `parseJsonDocument` calls `gateOnRead` and
   applies the version-aware unknown-key rule; the UInt128 LE/BE helpers stay.
 - **`CasEnvelope.{h,cpp}`** (the shared object header): one header for blob and tree; magic
-  `CABL`/`CATR` (drop the `kind` enum); pad **both** to `blob_header_len = 256`; formalize the TLV
-  critical bit as the additive axis; unify the future-format error to `UNKNOWN_FORMAT_VERSION`; assert
-  the blob-hash-over-payload invariant.
+  `CABL`/`CATR` (drop the `kind` enum, incl. `ObjectKind::Pack`); **remove the pack `index_len` and the
+  pack branch of `payloadOffset`**; pad **both** to `blob_header_len = 256`; formalize the TLV critical
+  bit as the additive axis; unify the future-format error to `UNKNOWN_FORMAT_VERSION`; assert the
+  blob-hash-over-payload invariant.
 - **`CasTreeCodec.{h,cpp}`**: **`treeId` becomes the Merkle rule** over `(name, kind, child_hash)`
   (replaces `CityHash128(encoded)`); the on-disk payload becomes catalog-first / inline-data-last; drop
-  the `CATR` payload header (magic now lives in the shared header) and the `PackSlice` placement
-  (reserve value 3); the writer chooses `Inline` for eager files below the threshold.
+  the `CATR` payload header (magic now lives in the shared header) and **delete** the `PackSlice`
+  placement entirely; the writer chooses `Inline` for eager files below the threshold.
 - **`CasRootShardCodec.{h,cpp}`**: framing header; `published_at_ms` typed field; `tree_size` on
   adopt/relink (B92).
 - **`CasGcSnap.{h,cpp}`**: binary → streaming protobuf with the framing header.
