@@ -308,11 +308,10 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         header.build_id = build_id;
         header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
         if (kind == ObjectKind::Blob)
-        {
             header.intended_ref = info.intended_ref;
-            header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
-        }
-        /// Trees use natural header length (no pad) — pad_to_header_len stays 0.
+        /// Both blobs and trees pad to the pool's fixed header length, so every object's payload starts
+        /// at a constant offset (a constant-shift locate for blobs; uniform layout for trees).
+        header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
         try
         {
             return encodeEnvelopeHeader(header);

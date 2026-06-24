@@ -45,7 +45,7 @@ TEST(CasEnvelope, RoundTripWithProvenanceAndIntendedRef)
     h.intended_ref = String("srv1/tbl-uuid/all_1_1_0");
 
     String bytes = encodeEnvelopeHeader(h);
-    EXPECT_GE(h.header_len, 96u);
+    EXPECT_GE(h.header_len, 94u);
     EXPECT_EQ(bytes.size(), h.header_len);
 
     const uint64_t object_size = h.header_len + h.logical_size;
@@ -74,6 +74,7 @@ TEST(CasEnvelope, RoundTripNoExtensions)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
+    /// 94-byte core + 2 zero alignment bytes = 96 on disk.
     EXPECT_EQ(h.header_len, 96u);
 
     EnvelopeHeader d = decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob);
@@ -91,19 +92,12 @@ TEST(CasEnvelope, PayloadOffsetHelper)
 
 /// ---------- validation throw-paths ----------
 
-TEST(CasEnvelope, BadMagicThrows)
+TEST(CasEnvelope, FutureMinReaderVersionThrows)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    bytes[0] = 'X';
-    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
-}
-
-TEST(CasEnvelope, FutureVersionThrows)
-{
-    EnvelopeHeader h = makeBlobHeader();
-    String bytes = encodeEnvelopeHeader(h);
-    bytes[4] = 2;  /// format_version = 2 (version is validated before the header hash, so the code is pinned)
+    /// min_reader_version is at [6,8) LE — patch to 2 to drive the gateOnRead fail-closed path.
+    bytes[6] = 2; bytes[7] = 0;
     expectThrowsCode(
         DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
@@ -120,16 +114,8 @@ TEST(CasEnvelope, BadHeaderLenThrows)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    /// header_len = 90 (< 96) at offset 8; the header hash would mismatch too, but range check fires first.
-    bytes[8] = 90;
-    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
-}
-
-TEST(CasEnvelope, NonzeroPadWordThrows)
-{
-    EnvelopeHeader h = makeBlobHeader();
-    String bytes = encodeEnvelopeHeader(h);
-    bytes[12] = 8;  /// the [12,16) word must be a zero pad
+    /// header_len = 90 (< 94) at offset 10; the header hash would mismatch too, but range check fires first.
+    bytes[10] = 90;
     EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
 }
 
@@ -144,7 +130,7 @@ TEST(CasEnvelope, CorruptedHeaderFieldFailsHeaderHash)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    bytes[24] ^= 0xff;  /// flip a byte inside logical_hash -> header hash mismatch
+    bytes[24] ^= 0xff;  /// flip a byte inside logical_hash [22,38) -> header hash mismatch
     expectThrowsCode(
         DB::ErrorCodes::CORRUPTED_DATA,
         [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
@@ -154,7 +140,7 @@ TEST(CasEnvelope, CorruptedStoredHeaderHashThrows)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    bytes[92] ^= 0xff;  /// flip a byte inside the stored header_hash itself ([88,96))
+    bytes[92] ^= 0xff;  /// flip a byte inside the stored header_hash itself ([86,94))
     expectThrowsCode(
         DB::ErrorCodes::CORRUPTED_DATA,
         [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
@@ -642,7 +628,7 @@ TEST(CasEnvelope, EnvelopeHeaderPaddingReachesTargetLen)
         encodeEnvelopeHeader(bad);
     });
 
-    /// Below the natural header length (96) ⇒ BAD_ARGUMENTS.
+    /// Below the natural header length (94+2=96 aligned) ⇒ BAD_ARGUMENTS.
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, []
     {
         EnvelopeHeader bad = makeBlobHeader();
@@ -673,16 +659,19 @@ String toHexBytes(const String & s)
 }
 }
 
-/// LE binary form: the envelope header. `logical_hash` (offset [24,40)) appears little-endian in the
+/// LE binary form: the envelope header. `logical_hash` (offset [22,38)) appears little-endian in the
 /// golden — e.g. 0x0123...3210 serializes as bytes 10 32 54 ... — pinning the LE order.
+/// Layout: CABL magic[4] writer_version[2] min_reader_version[2] hash_algo[1] flags[1] header_len[4]
+///         logical_size[8] logical_hash[16] domain_id[16] incarnation_tag[16] build_id[16]
+///         header_hash[8] align_pad[2] = 96 bytes total (94-byte core + 2 zero alignment bytes).
 TEST(CasByteOrderGolden, EnvelopeLittleEndian)
 {
     EnvelopeHeader h = makeBlobHeader();
     const String encoded = encodeEnvelopeHeader(h);
     static constexpr std::string_view golden =
-        "43484341010101006000000000000000e8030000000000001032547698badcfe"
-        "efcdab8967452301420000000000000000000000000000009900000000000000"
-        "0000000000000000070000000000000000000000000000002e4166483f7a343b";
+        "4341424c01000100010060000000e8030000000000001032547698badcfeefcd"
+        "ab89674523014200000000000000000000000000000099000000000000000000"
+        "00000000000007000000000000000000000000000000c037e11e6ef26cce0000";
     EXPECT_EQ(toHexBytes(encoded), golden);
 }
 

@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
@@ -24,22 +25,29 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint8_t FORMAT_VERSION = 1;
-/// 96 is the EXACT packed size of the v1 core fields, not a round number:
-///   magic[4] + format_version/kind/hash_algo/flags[4] + header_len[4] + pad[4]
-///   + logical_size[8] + four u128s (logical_hash, domain_id, incarnation_tag, build_id)[64]
-///   + header_hash[8] = 96.
-/// The [12,16) word is a fixed zero pad that keeps logical_size 8-byte aligned and the four u128s on
-/// natural 16-byte boundaries; it is written zero and verified zero on decode.
-/// It is 8-aligned (12*8) AND 16-aligned (6*16), so the four u128s sit on natural 16-byte boundaries
-/// with zero padding. The core is never grown: new fields go into the [96, header_len) TLV extensions
-/// (forward-compatible), and a fixed per-pool header length — used so every blob's payload starts at a
-/// constant offset for an O(1) `locate` — is set independently via `pad_to_header_len` / blob_header_len.
-/// Rounding the core up to 128/256 would only waste bytes per object with no benefit.
-constexpr uint32_t CORE_HEADER_LEN = 96;
+/// 94 is the EXACT packed size of the v1 core fields (hole-free; the kind byte and the old index_len
+/// pad word are gone — kind is encoded by the magic):
+///   magic[4] + writer_version[2] + min_reader_version[2] + hash_algo[1] + flags[1] + header_len[4]
+///   + logical_size[8] + four u128s[64] + header_hash[8] = 94.
+/// The core is never grown: new fields go into the [94, header_len) TLV extensions. header_len is
+/// padded up to an 8-byte multiple; a fixed per-pool header length is set via pad_to_header_len.
+constexpr uint32_t CORE_HEADER_LEN = 94;
 constexpr uint32_t MAX_HEADER_LEN = 16384;
-constexpr size_t HEADER_HASH_OFFSET = 88;
+constexpr size_t HEADER_HASH_OFFSET = 86;
 constexpr size_t HEADER_HASH_LEN = 8;
+
+constexpr std::string_view MAGIC_BLOB = "CABL";
+constexpr std::string_view MAGIC_TREE = "CATR";
+
+std::string_view magicFor(ObjectKind kind)
+{
+    return kind == ObjectKind::Blob ? MAGIC_BLOB : MAGIC_TREE;
+}
+
+FormatId formatIdFor(ObjectKind kind)
+{
+    return kind == ObjectKind::Blob ? FormatId::Blob : FormatId::Tree;
+}
 
 constexpr uint8_t FLAG_HAS_CRITICAL_EXTENSION = 0x01;
 
@@ -147,22 +155,22 @@ String encodeEnvelopeHeader(EnvelopeHeader & header)
     {
         WriteBufferFromString out_buf(out);
 
-        writeString("CHCA", out_buf);                                       /// [0,4) magic
-        writeBinaryLittleEndian(FORMAT_VERSION, out_buf);                   /// [4]   format_version
-        writeBinaryLittleEndian(static_cast<uint8_t>(header.kind), out_buf); /// [5]  kind
-        writeBinaryLittleEndian(header.hash_algo, out_buf);                 /// [6]   hash_algo
+        const WriterStamp stamp = currentWriterVersion(formatIdFor(header.kind));
+        writeString(magicFor(header.kind), out_buf);                        /// [0,4)  magic (encodes kind)
+        writeBinaryLittleEndian(stamp.writer_version, out_buf);             /// [4,6)  writer_version
+        writeBinaryLittleEndian(stamp.min_reader_version, out_buf);         /// [6,8)  min_reader_version
+        writeBinaryLittleEndian(header.hash_algo, out_buf);                 /// [8]    hash_algo
         writeBinaryLittleEndian(
-            static_cast<uint8_t>(critical ? FLAG_HAS_CRITICAL_EXTENSION : 0), out_buf); /// [7] flags
-        writeBinaryLittleEndian(header_len, out_buf);                       /// [8,12)  header_len
-        writeBinaryLittleEndian(static_cast<uint32_t>(0), out_buf);         /// [12,16) zero pad (alignment)
-        writeBinaryLittleEndian(header.logical_size, out_buf);              /// [16,24) logical_size
-        writeU128LE(out_buf, header.logical_hash);                          /// [24,40)
-        writeU128LE(out_buf, header.domain_id);                             /// [40,56)
-        writeU128LE(out_buf, header.incarnation_tag);                       /// [56,72)
-        writeU128LE(out_buf, header.build_id);                              /// [72,88)
-        writeBinaryLittleEndian(static_cast<uint64_t>(0), out_buf);         /// [88,96) header_hash placeholder (zeroed)
+            static_cast<uint8_t>(critical ? FLAG_HAS_CRITICAL_EXTENSION : 0), out_buf); /// [9] flags
+        writeBinaryLittleEndian(header_len, out_buf);                       /// [10,14) header_len
+        writeBinaryLittleEndian(header.logical_size, out_buf);              /// [14,22) logical_size
+        writeU128LE(out_buf, header.logical_hash);                          /// [22,38)
+        writeU128LE(out_buf, header.domain_id);                             /// [38,54)
+        writeU128LE(out_buf, header.incarnation_tag);                       /// [54,70)
+        writeU128LE(out_buf, header.build_id);                              /// [70,86)
+        writeBinaryLittleEndian(static_cast<uint64_t>(0), out_buf);         /// [86,94) header_hash (zeroed)
 
-        writeString(ext, out_buf);                                          /// [96, header_len) TLV extensions
+        writeString(ext, out_buf);                                          /// [94, header_len) TLV extensions
         out_buf.finalize();
     }
 
@@ -183,39 +191,36 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
     {
         ReadBufferFromMemory in(head_bytes.data(), head_bytes.size());
 
-        /// [0,4) magic
-        if (readFixedBytes(in, 4) != "CHCA")
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CHCA envelope: bad magic");
-
-        /// [4] format_version
-        uint8_t format_version = 0;
-        readBinaryLittleEndian(format_version, in);
-        checkVersion(FORMAT_VERSION, format_version, "CHCA envelope");
-
         EnvelopeHeader h;
 
-        /// [5] kind
-        uint8_t kind_byte = 0;
-        readBinaryLittleEndian(kind_byte, in);
-        if (kind_byte != static_cast<uint8_t>(ObjectKind::Blob)
-            && kind_byte != static_cast<uint8_t>(ObjectKind::Tree))
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CHCA envelope: unknown kind {}", kind_byte);
-        h.kind = static_cast<ObjectKind>(kind_byte);
+        /// [0,4) magic encodes the kind.
+        const String magic = readFixedBytes(in, 4);
+        if (magic == MAGIC_BLOB)
+            h.kind = ObjectKind::Blob;
+        else if (magic == MAGIC_TREE)
+            h.kind = ObjectKind::Tree;
+        else
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CHCA envelope: bad magic");
         if (h.kind != expected_kind)
             throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
                 "CHCA envelope: kind {} does not match expected {}",
-                static_cast<int>(kind_byte), static_cast<int>(expected_kind));
+                static_cast<int>(h.kind), static_cast<int>(expected_kind));
 
-        /// [6] hash_algo
+        /// [4,6) writer_version, [6,8) min_reader_version — fail closed on a future object.
+        readBinaryLittleEndian(h.writer_version, in);
+        readBinaryLittleEndian(h.min_reader_version, in);
+        gateOnRead(h.min_reader_version, "CHCA envelope");
+
+        /// [8] hash_algo
         readBinaryLittleEndian(h.hash_algo, in);
 
-        /// [7] flags
+        /// [9] flags
         uint8_t flags = 0;
         readBinaryLittleEndian(flags, in);
         const bool has_critical = (flags & FLAG_HAS_CRITICAL_EXTENSION) != 0;
         h.flags_has_critical_extension = has_critical;
 
-        /// [8,12) header_len
+        /// [10,14) header_len
         uint32_t header_len = 0;
         readBinaryLittleEndian(header_len, in);
         if (header_len < CORE_HEADER_LEN || header_len > MAX_HEADER_LEN || (header_len % 8) != 0)
@@ -225,23 +230,16 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
                 "CHCA envelope: header_len {} exceeds provided bytes {}", header_len, head_bytes.size());
         h.header_len = header_len;
 
-        /// [12,16) zero pad (alignment). Must be zero.
-        uint32_t pad_word = 0;
-        readBinaryLittleEndian(pad_word, in);
-        if (pad_word != 0)
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                "CHCA envelope: header pad word must be 0, got {}", pad_word);
-
-        /// [16,24) logical_size
+        /// [14,22) logical_size
         readBinaryLittleEndian(h.logical_size, in);
 
-        /// [24,40) [40,56) [56,72) [72,88)
+        /// [22,38) [38,54) [54,70) [70,86)
         h.logical_hash = readU128LE(in);
         h.domain_id = readU128LE(in);
         h.incarnation_tag = readU128LE(in);
         h.build_id = readU128LE(in);
 
-        /// [88,96) header_hash
+        /// [86,94) header_hash
         uint64_t stored_header_hash = 0;
         readBinaryLittleEndian(stored_header_hash, in);
 
@@ -265,7 +263,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
                 "CHCA envelope: size mismatch (header_len {} + logical_size {} = {}, object_size {})",
                 header_len, h.logical_size, expected_object_size, object_size);
 
-        /// [96, header_len) TLV extensions. Encode pads the area to 8-alignment with zero bytes; a valid
+        /// [94, header_len) TLV extensions. Encode pads the area to 8-alignment with zero bytes; a valid
         /// TLV type is never 0, so a zero type marks the start of alignment padding (which must be all
         /// zero and shorter than a minimal 4-byte TLV header).
         bool saw_unknown_critical = false;

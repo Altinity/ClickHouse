@@ -10,9 +10,10 @@ namespace DB::Cas
 {
 
 /// The CHCA object envelope — protocol spec §3.1. Every blob and tree object on storage begins
-/// with this fixed 96-byte little-endian core header, optionally followed by TLV extensions up to
+/// with this fixed 94-byte little-endian core header, optionally followed by TLV extensions up to
 /// header_len, then the payload. The header is the "incarnation zone": excluded from logical_hash,
-/// it may differ between incarnations of the same logical object.
+/// it may differ between incarnations of the same logical object. The 4-byte magic encodes the
+/// kind: `CABL` for blobs, `CATR` for trees; there is no separate kind byte.
 
 enum class ObjectKind : uint8_t
 {
@@ -43,6 +44,8 @@ struct EnvelopeHeader
 {
     ObjectKind kind = ObjectKind::Blob;
     uint8_t hash_algo = 1;             /// 1 = cityHash128
+    uint16_t writer_version = 0;       /// set by decode; encode derives it from `kind` via CasFormat
+    uint16_t min_reader_version = 0;   /// set by decode; encode derives it from `kind` via CasFormat
     /// Bytes covered by logical_hash = [header_len, EOF) = object_size - header_len, UNIFORMLY for
     /// all kinds (spec §3.1).
     uint64_t logical_size = 0;
@@ -73,9 +76,9 @@ String encodeEnvelopeHeader(EnvelopeHeader & header);
 
 /// Validates and decodes the header. Every validation row of the spec table is one throw-path:
 ///   bad magic / wrong kind / bad header_len                                  -> CORRUPTED_DATA
-///   future format_version / unknown critical extension                       -> NOT_IMPLEMENTED
+///   future min_reader_version / unknown critical extension                   -> UNKNOWN_FORMAT_VERSION
 ///   size arithmetic mismatch / header_hash
-///   mismatch (CityHash64 over the 96 core-header bytes, field zeroed)        -> CORRUPTED_DATA
+///   mismatch (CityHash64 over the 94 core-header bytes, field zeroed)        -> CORRUPTED_DATA
 EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object_size, ObjectKind expected_kind);
 
 /// Payload starts right after the header.
