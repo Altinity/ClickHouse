@@ -121,6 +121,30 @@ format changes. The 6 h soak is the end-to-end validation — see the SOAK secti
 the operator's docker-safety constraint (another debug session owns containers on this host), the soak
 is run/prepared with a unique compose project and never touches foreign containers.
 
+## SOAK status
+- Full `clickhouse` server build: ✅ exit 0 (all format changes compile in the server).
+- Docker landscape: only foreign container = `archeology-clickhouse-1` (operator's debug session,
+  compose project `archeology`) — NEVER touched. ca-soak scripts use bare `docker compose` (project
+  `ca-soak`, isolated); no `docker system prune`/unscoped teardown anywhere — verified.
+- **SOAK BLOCKED — environmental, NOT a code regression.** The runtime smoke could not bring ch1 up:
+  the operator's `archeology-clickhouse-1` holds host port **8123**, and ca-soak's ch1 binds 8123 →
+  "Bind for 0.0.0.0:8123 failed: port is already allocated". ch1 never started, so the new-format
+  binary's CA *runtime* is NOT yet validated (build + unit tests ARE green).
+- Tried an untracked `docker-compose.override.yml` remapping ch1→18123/19000, but **docker-compose
+  MERGES `ports` lists (append, not replace)** → ch1 still tried 8123 and failed again. (To remap
+  cleanly: edit the base compose ch1 `ports`, or use a `!reset` override, or make the harness ch1 port
+  configurable — small follow-up.)
+- **Cleaned up scoped each time** (`docker compose down -v`, project `ca-soak` only); override removed;
+  **`archeology-clickhouse-1` confirmed Up/healthy throughout — never touched.** No `prune`, no foreign
+  teardown.
+- **Remediation for the 6 h soak (operator, morning):** free host 8123 (stop archeology, the operator's
+  call) OR remap ca-soak's ch1 base ports + the localhost:8123 refs in the harness scripts, then
+  `cd utils/ca-soak && bash scripts/run_phase1.sh` (chaos/recovery, scoped). Monitor: correctness
+  (`dump_cas_metrics.py`, `system.content_addressed_*`), disk (`disk_watchdog.sh` + the rustfs
+  no-reclaim caveat → `orphan_reaper.sh`), CPU/RSS (`memory.xml` cap + per-node RSS metric). Validation
+  to date: server compiles (exit 0) + full unit sweep green (baseline-only red). Runtime soak pending
+  the port unblock.
+
 ## Event timeline (append-only)
 
 - 2026-06-24: Phase-1 2a/2b/2c landed + reviewed green (sweep 370/1-baseline). 2d implemented
