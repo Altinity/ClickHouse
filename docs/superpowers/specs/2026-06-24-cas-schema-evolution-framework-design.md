@@ -348,13 +348,15 @@ A small, focused module instead of per-codec ad-hoc version handling:
 - **`CasGcSnap.{h,cpp}`**: binary → streaming protobuf with the framing header.
 - Part-writer (`ContentAddressedTransaction.cpp`): the inline-vs-blob placement decision for part
   files.
-- **`CasBuild.{h,cpp}`** (follow-on, enabled by Merkle): the precommit part-build gets two
-  simplifications from the same fold over children. (1) **The `treeId` is computed directly from the
-  collected entries — no serialize-the-catalog-then-hash step** (today it hashes `encodeTree(...)`
-  output); the address is known before the bytes are laid out. (2) **The dependency closure falls out
+- **`CasBuild.{h,cpp}`** — two simplifications from the same fold over children. (1) **The `treeId` is
+  computed directly from the collected entries — no serialize-the-catalog-then-hash step** (it used to
+  hash `encodeTree(...)` output); the address is known before the bytes are laid out. **DONE in
+  sub-plan 2a** (`stageTree` now uses `merkleTreeId(entries)`). (2) **The dependency closure falls out
   of that same enumeration** — `(name, kind, child_hash)` over the catalog *is* the dep set, so the
-  per-placement dep-tracking branches collapse into one walk ("collect each `Blob`/`Subtree`
-  `child_hash`"), with packs already removed. Realize this after the tree codec lands.
+  per-placement dep-tracking branches (the `W-TREE-BUILD` loop + `deps` set) collapse into one walk,
+  with packs already removed. This touches precommit-closure correctness (B188/B199), so it is
+  **scheduled as sub-plan 2e, after the tree layout (2c) lands** — isolated from the format-freeze
+  churn and reviewed on its own.
 
 Each codec keeps **golden byte tests** (encode-stability) and a **cross-version read test**: write a
 generation-1 object, assert a simulated `G_build = 0` reader fail-closes and a `G_build ≥ 1` reader
