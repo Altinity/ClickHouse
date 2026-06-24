@@ -64,8 +64,9 @@ Packs already removed (pre-story, `1a8188bce8f`). Pack removal closed B97/B10/B9
   interchange format), already versioned+zstd+deterministic binary; converting is highest-risk/lowest-value
   in Plan 3 and it's already binary (not part of the JSON cleanup). B176 stays open as a consistency-only
   follow-up. Rationale in spec Part III.3. (B165 OOM "streaming" gap is a separate memory concern.)
-- 3c (pool-meta/watermark/gc-state/retired-set JSON → protobuf) — ✅ Tasks 1-4 landed (commits
-  `cba22ac063f`,`371909bf3d6`,`2acae7a7674`,`a96ef07ac4f`); sweep 375/1-baseline. Combined review ⏳.
+- 3c (pool-meta/watermark/gc-state/retired-set JSON → protobuf) — ✅ DONE + reviewed (commits
+  `cba22ac063f`,`371909bf3d6`,`2acae7a7674`,`a96ef07ac4f`,`13f72d3ab9f`); sweep 376/1-baseline. Review
+  found + fixed a `map<>` determinism violation in GcStateProto (→ sorted repeated).
 - **3c-tail (NEW — scope gap found by the 3c implementer):** the JSON codec family has MORE callers than
   the 4 planned objects — `CasHeartbeat`, `CasRootsRegistry`, `CasGcOutcomes` still use the JSON helpers,
   and `CasGcSnap` uses the monotone `checkVersion`. So the JSON-family deletion (orig 3c Task 5) is
