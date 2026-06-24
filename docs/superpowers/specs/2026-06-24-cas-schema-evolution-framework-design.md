@@ -264,8 +264,8 @@ are **outside** identity, so they evolve freely.
    hashed objects this is carried in the 256-B header above; the magic is the `format_id`.
 2. **Manifest.** Protobuf + the framing header. `ca_mtime` moves from the magic `.ca_mtime` string key
    in `RefPayload.mutable_files` to a **typed `RefPayload.published_at_ms`** field — done as part of
-   generation 1 (pre-release, no migration). (B92: also carry `tree_size` correctly on the
-   adopt/relink wire so the field stops being written as 0.)
+   generation 1 (pre-release, no migration). (B92 — fixing the adopt/relink `tree_size=0` — is a
+   **separate iteration**, not this effort.)
 3. **gc-snap → protobuf** (B176): length-delimited **streaming** (never materialize the whole snap —
    B165 OOM), zstd compression (with B149), deterministic record ordering (golden-tested), preserving
    the fold cursor and the `GC_SNAP_VERSION` B140 fix. Measure protobuf overhead on the hot path.
@@ -339,8 +339,8 @@ A small, focused module instead of per-codec ad-hoc version handling:
   (replaces `CityHash128(encoded)`); the on-disk payload becomes catalog-first / inline-data-last; drop
   the `CATR` payload header (magic now lives in the shared header) and **delete** the `PackSlice`
   placement entirely; the writer chooses `Inline` for eager files below the threshold.
-- **`CasRootShardCodec.{h,cpp}`**: framing header; `published_at_ms` typed field; `tree_size` on
-  adopt/relink (B92).
+- **`CasRootShardCodec.{h,cpp}`**: framing header; `published_at_ms` typed field. (B92 `tree_size` fix
+  is a separate iteration.)
 - **`CasGcSnap.{h,cpp}`**: binary → streaming protobuf with the framing header.
 - Part-writer (`ContentAddressedTransaction.cpp`): the inline-vs-blob placement decision for part
   files.
@@ -363,8 +363,9 @@ blobs, and with a different serialization, must produce the **same** `treeId`.
 
 - **B164b** (journal-length bound) and **B147** (zstd object compression, decode cache) — cost items,
   tracked separately; they touch bytes only incidentally.
-- Building any actual generation-2 format beyond the `published_at_ms`/`tree_size` work. The framework
-  makes future versions painless; this spec does not invent them.
+- Building any actual future-generation format beyond what this spec freezes. The framework makes
+  future versions painless; this spec does not invent them.
+- **B92** (adopt/relink `tree_size=0` fix) — a separate iteration, not this effort.
 - Implementing the roster / setting / decommission (Part IV is designed, not built).
 
 # Risks / open items
