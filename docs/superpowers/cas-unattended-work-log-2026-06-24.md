@@ -89,6 +89,38 @@ Packs already removed (pre-story, `1a8188bce8f`). Pack removal closed B97/B10/B9
   `clickhouse.cas.format`) is DEFERRED to grooming (broad sed; low value/high churn right before the
   validation soak). **PHASE 1 (format-freeze story) substantively COMPLETE.**
 
+## MORNING SUMMARY (2026-06-25)
+
+**Done + reviewed + unit-green + full server compiles (exit 0):**
+- **PHASE 1 — the entire schema-evolution / format-freeze story.** `CasFormat` foundation
+  (writer_version/min_reader_version, global generation, `gateOnRead`, framing header); Merkle `treeId`
+  (identity decoupled from serialization/placement); one-header envelope (`CABL`/`CATR`, 94-byte
+  hole-free core, both blob+tree padded to `blob_header_len`=256); tree catalog-first/inline-last
+  payload; part-writer eager-file inlining (≈1-GET part open); manifest on the framing header + typed
+  `published_at_ms`; **all 7 mutable JSON objects → protobuf and the entire JSON codec family +
+  monotone `checkVersion` + `CasEnumStrings.h` deleted** → exactly two encodings (binary hashed +
+  protobuf mutable). Packs removed (B97/B10/B96 closed). One normative proto doc header.
+- ~20 commits on `cas-vfs-path-mapping`, each with a fresh-subagent implement + combined spec/quality
+  review + fix loop. Full unit sweep: only the known baseline red `CaWiringOps.FreezeViaHardLinksIntoShadow`.
+
+**Deliberately deferred (with rationale):**
+- **gc-snap → protobuf (B176)** — GC-internal, already versioned+zstd+deterministic binary; highest-risk/
+  lowest-interchange-value; stays open.
+- **proto file/package rename** (`cas_root_shard.proto`→`cas_format.proto`) — cosmetic broad sed; the
+  normative doc header is already in place.
+
+**Remaining queue (NOT done — honest deferral at the tail of an exhausted context window):**
+- **Group-A correctness gates B8/B64/B1** (partition ops / projection attach / replicated commit) —
+  LARGE features; each warrants its own session. **B164b** (journal bound, 2 settings) + **B92** (adopt
+  tree_size on the wire) — smaller, ready to pick up next. **B194** (`GcSnap::stripTree` O(N×M)) — a
+  contained GC perf fix.
+- 3c-tail doc-comment nits + the cosmetic proto rename (grooming follow-ups; in Findings above).
+
+**Validation status:** unit tests green; **full `clickhouse` server build succeeded (exit 0)** with all
+format changes. The 6 h soak is the end-to-end validation — see the SOAK section below for status. Given
+the operator's docker-safety constraint (another debug session owns containers on this host), the soak
+is run/prepared with a unique compose project and never touches foreign containers.
+
 ## Event timeline (append-only)
 
 - 2026-06-24: Phase-1 2a/2b/2c landed + reviewed green (sweep 370/1-baseline). 2d implemented

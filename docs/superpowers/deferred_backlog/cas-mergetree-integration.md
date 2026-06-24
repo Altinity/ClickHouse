@@ -22,14 +22,25 @@ Source design: `../specs/2026-06-10-ca-incarnation-store-design.md` (incarnation
 
 Curated from the full inventory by impact lens. HARD = true gate; MED = strongly advised. IDs reference the rows below / the archive.
 
-**A. LAYOUT / format-freeze (post-release change = migration):**
-- B13 pool format-version + migration/mixed-version/downgrade [HARD]
-- B164b journal bound on the root-shard manifest (unbounded journal → manifest bloat) [HARD]
-- B176 blob-envelope TLV + gc/snap codec freeze (lock the extension area) [HARD-decision]
-- B97 packs / B96 snap_shards>1 — ship DISABLED but reserve the format slots; don't reuse field numbers [HARD-decision]
-- B10 footer-packing / one-GET part open — layout change; decide ship-now-or-never [DECISION]
-- B92 adopt-path tree_size=0 — fix before the field is load-bearing [MED]
-- B8/B64/B1 partition ops (REPLACE_RANGE/MOVE) + projection attach + replicated commit [HARD if in release surface]
+**A. LAYOUT / format-freeze (post-release change = migration):** — STATUS 2026-06-25 (overnight run;
+see `docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.md` +
+`docs/superpowers/cas-unattended-work-log-2026-06-24.md`; branch `cas-vfs-path-mapping`).
+- ✅ **B13 DONE** — the whole schema-evolution framework landed: `CasFormat` (writer_version/
+  min_reader_version, global generation, `gateOnRead`, framing header), Merkle `treeId`, one-header
+  envelope (CABL/CATR, 94-byte hole-free core, `blob_header_len`=256), manifest framing +
+  `published_at_ms`. Unit-green; full server builds.
+- ✅ **B176 envelope DONE** (2b — TLV critical bit, hole-free core). ⛔ **B176 gc-snap→protobuf DEFERRED**
+  (GC-internal, already versioned+zstd+deterministic binary; lowest-value/highest-risk; stays open).
+- ✅ **B97/B96/B10 DONE** — packs removed entirely (no reserved slots); one-GET part open delivered via
+  tree-inline of eager files (2d). B96 snap_shards>1 stays deferred (map-reduce GC territory).
+- ✅ **Two-encodings / abandon-JSON DONE** — all 7 mutable JSON objects → protobuf; JSON codec family +
+  monotone `checkVersion` + `CasEnumStrings.h` deleted.
+- ⏳ **B164b journal bound** [HARD] — REMAINING (two settings: `..._to_throw` hard + `..._to_delay` paced).
+- ⏳ **B92 adopt-path tree_size=0** [MED] — REMAINING (carry tree_size on the adopt/relink wire).
+- ⏳ **B8/B64/B1 partition ops / projection attach / replicated commit** [HARD] — REMAINING; LARGE
+  correctness features, each warrants a dedicated session (not night-tail work).
+- ⏳ cosmetic: rename `cas_root_shard.proto`→`cas_format.proto`, package `DB.Cas.Proto`→
+  `clickhouse.cas.format` (broad sed; deferred from 3d). + the 3c-tail doc-comment nits (see work log).
 
 **B. COST / bill control (S3 requests, storage, egress):**
 - B148 HEAD storm (resolveRef per warm hit + retire per candidate/round) — dominant request bill [HARD]
