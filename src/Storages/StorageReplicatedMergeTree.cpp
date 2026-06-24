@@ -10109,17 +10109,16 @@ CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & 
     bool local_entry_found = false;
     bool local_entry_pending = false;
     std::string local_composite_key;
+
+    if (const auto model = export_read_model.get())
     {
-        if (const auto model = export_read_model.get())
+        const auto & by_transaction_id = model->get<ExportPartitionTaskEntryTagByTransactionId>();
+        const auto entry = by_transaction_id.find(transaction_id);
+        if (entry != by_transaction_id.end())
         {
-            const auto & by_transaction_id = model->get<ExportPartitionTaskEntryTagByTransactionId>();
-            const auto entry = by_transaction_id.find(transaction_id);
-            if (entry != by_transaction_id.end())
-            {
-                local_entry_found = true;
-                local_entry_pending = entry->status == ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING;
-                local_composite_key = entry->getCompositeKey();
-            }
+            local_entry_found = true;
+            local_entry_pending = entry->status == ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING;
+            local_composite_key = entry->getCompositeKey();
         }
     }
 
