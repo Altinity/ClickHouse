@@ -66,10 +66,11 @@ TEST(CasTreeId, OrderDoesNotAffectId)
 
 TEST(CasTreeId, NameBindsTheMapping)
 {
-    const UInt128 h1 = 0xaaaa, h2 = 0xbbbb;
-    /// Same hashes, swapped names => a different directory => a different id.
-    std::vector<TreeEntry> a = {blobEntry("a", h1, 1), blobEntry("b", h2, 1)};
-    std::vector<TreeEntry> b = {blobEntry("a", h2, 1), blobEntry("b", h1, 1)};
+    const UInt128 h = 0xabcd;
+    /// Same single child hash, different name => different directory => different id. FAILS if the
+    /// name bytes are omitted from the Merkle input (the fixed-width fields would be identical).
+    std::vector<TreeEntry> a = {blobEntry("a", h, 1)};
+    std::vector<TreeEntry> b = {blobEntry("b", h, 1)};
     EXPECT_NE(merkleTreeId(a).string(), merkleTreeId(b).string());
 }
 

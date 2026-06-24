@@ -26,19 +26,21 @@ namespace
 
 constexpr uint8_t TREE_VERSION = 1;
 
+void sortAndCheckDuplicateNames(std::vector<TreeEntry> & entries)
+{
+    std::sort(entries.begin(), entries.end(),
+        [](const TreeEntry & a, const TreeEntry & b) { return a.name < b.name; });
+    for (size_t i = 1; i < entries.size(); ++i)
+        if (entries[i].name == entries[i - 1].name)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "CAS tree: duplicate entry name '{}'", entries[i].name);
+}
+
 }
 
 String encodeTree(std::vector<TreeEntry> entries)
 {
-    std::sort(entries.begin(), entries.end(),
-        [](const TreeEntry & a, const TreeEntry & b) { return a.name < b.name; });
-
-    for (size_t i = 1; i < entries.size(); ++i)
-    {
-        if (entries[i].name == entries[i - 1].name)
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "CAS tree: duplicate entry name '{}'", entries[i].name);
-    }
+    sortAndCheckDuplicateNames(entries);
 
     WriteBufferFromOwnString out;
     writeString("CATR", out);
@@ -124,15 +126,7 @@ std::vector<TreeEntry> decodeTree(std::string_view data)
 
 TreeId merkleTreeId(std::vector<TreeEntry> entries)
 {
-    std::sort(entries.begin(), entries.end(),
-        [](const TreeEntry & a, const TreeEntry & b) { return a.name < b.name; });
-
-    for (size_t i = 1; i < entries.size(); ++i)
-    {
-        if (entries[i].name == entries[i - 1].name)
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "CAS tree: duplicate entry name '{}'", entries[i].name);
-    }
+    sortAndCheckDuplicateNames(entries);
 
     /// Canonical, frozen Merkle input. node_kind domain-separates a file leaf from a subtree node so a
     /// blob hash and a child tree id under the same name can never collide (RFC 6962-style separation).
@@ -144,11 +138,12 @@ TreeId merkleTreeId(std::vector<TreeEntry> entries)
     {
         writeBinaryLittleEndian(static_cast<uint16_t>(e.name.size()), buf);
         writeString(e.name, buf);
-        const uint8_t node_kind = (e.placement == Placement::Subtree) ? 1 : 0;   /// 0 = file, 1 = subtree
+        /// Frozen Merkle rule v1: Inline and Blob are both file leaves (node_kind=0); only Subtree is 1.
+        /// A future non-subtree Placement must still map to 0 here, or bump the rule version byte above.
+        const uint8_t node_kind = (e.placement == Placement::Subtree) ? 1 : 0;
         writeBinaryLittleEndian(node_kind, buf);
         writeU128LE(buf, e.file_hash);
     }
-    buf.finalize();
 
     const auto hash = CityHash_v1_0_2::CityHash128(buf.str().data(), buf.str().size());
     return TreeId(getHexUIntLowercase(hash));
