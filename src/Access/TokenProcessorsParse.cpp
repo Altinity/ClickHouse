@@ -41,13 +41,6 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
     {
         return std::make_unique<GoogleTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim);
     }
-<<<<<<< HEAD
-    else if (provider_type == "azure")
-    {
-        return std::make_unique<AzureTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim);
-    }
-=======
->>>>>>> 59bfcc082dc (Merge pull request #1784 from Altinity/fix/antalya-26.3/oauth-fix-azure)
     else if (provider_type == "openid")
     {
         auto verifier_leeway = config.getUInt64(prefix + ".verifier_leeway", 60);
@@ -115,7 +108,6 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
 
         const String default_jwks_uri = "https://login.microsoftonline.com/" + tenant_id + "/discovery/v2.0/keys";
         const String jwks_uri = config.getString(prefix + ".jwks_uri", default_jwks_uri);
-        require_allowed_url(jwks_uri, "jwks_uri");
 
         /// `expected_issuer` is auto-derived from `tenant_id` since the v2.0 issuer URL is fully
         /// determined by the tenant. Users can still override -- typically for v1.0 tokens
@@ -131,7 +123,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
                         processor_name);
 
         return std::make_unique<JwksJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
-                                                  issuer, expected_audience, expected_typ, allow_no_expiration,
+                                                  issuer, expected_audience, allow_no_expiration,
                                                   config.getString(prefix + ".claims", ""),
                                                   config.getUInt64(prefix + ".verifier_leeway", 60),
                                                   jwks_uri,

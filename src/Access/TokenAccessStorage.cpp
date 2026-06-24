@@ -560,24 +560,6 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     /// Pipeline: incoming group --(roles_mapping)--> mapped name --(roles_filter)--> kept/dropped --(roles_transform)--> CH role name.
     /// Each stage is independent and optional; groups absent from `roles_mapping` pass through unchanged.
     std::set<String> external_roles;
-<<<<<<< HEAD
-    if (roles_filter.has_value() && roles_filter.value().ok())
-    {
-        LOG_TRACE(getLogger(), "{}: External role filter found, applying only matching groups", getStorageName());
-        for (const auto & group: token_credentials.getGroups()) {
-            if (RE2::FullMatch(group, roles_filter.value()))
-            {
-                String transformed_group = group;
-                if (roles_transform_pattern.has_value() && roles_transform_replacement.has_value())
-                {
-                    transformed_group = applyTransform(group, roles_transform_pattern.value(), roles_transform_replacement.value(), roles_transform_global);
-                    LOG_TRACE(getLogger(), "{}: Transformed group '{}' to '{}'", getStorageName(), group, transformed_group);
-                }
-                external_roles.insert(transformed_group);
-                LOG_TRACE(getLogger(), "{}: Granted role (group) {} to user", getStorageName(), transformed_group);
-            }
-        }
-=======
 
     /// Defensive: a broken filter regex must NEVER fall through to the permissive
     /// "grant everything that survives the rest of the pipeline" branch. Parse-time
@@ -590,7 +572,6 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
                   "{}: Configured 'roles_filter' is invalid ('{}'); refusing to map any "
                   "external roles for user '{}' to avoid granting all token groups.",
                   getStorageName(), roles_filter->error(), credentials.getUserName());
->>>>>>> 59bfcc082dc (Merge pull request #1784 from Altinity/fix/antalya-26.3/oauth-fix-azure)
     }
     else
     {
@@ -657,7 +638,7 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     }
 
     if (id)
-        return AuthResult{ .user_id = *id, .authentication_data = AuthenticationData(AuthenticationType::JWT) };
+        return AuthResult{ .user_id = *id, .authentication_data = AuthenticationData(AuthenticationType::JWT), .user_name = credentials.getUserName() };
     return std::nullopt;
 }
 
