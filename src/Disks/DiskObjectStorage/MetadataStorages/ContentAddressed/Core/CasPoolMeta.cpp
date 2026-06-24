@@ -1,7 +1,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <cas_root_shard.pb.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
 
@@ -21,7 +25,7 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint64_t POOL_META_VERSION = 1;
+constexpr std::string_view POOL_META_MAGIC = "CAPM";
 
 /// Pool-wide constant invariants, enforced in two contexts with different error codes:
 ///   - at creation, a bad value is the CALLER's config mistake => BAD_ARGUMENTS;
@@ -51,33 +55,42 @@ UInt128 mintPoolId()
 
 String encodePoolMeta(const PoolMeta & pm)
 {
+    Cas::Proto::PoolMetaProto msg;
+    msg.set_pool_id(u128ToBytesBE(pm.pool_id));
+    msg.set_root_shards(pm.root_shards);
+    msg.set_blob_header_len(pm.blob_header_len);
+
+    std::string body;
+    if (!msg.SerializeToString(&body))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS pool meta: protobuf serialization failed");
+
     WriteBufferFromOwnString out;
-    JsonObjectWriter writer(out);
-    writer.field("format", "cas_pool_meta");
-    writer.field("version", POOL_META_VERSION);
-    writer.field("pool_id", u128ToHex(pm.pool_id));
-    writer.field("root_shards", pm.root_shards);
-    writer.field("blob_header_len", pm.blob_header_len);
-    writer.finalize();
+    Cas::writeFramingHeader(out, POOL_META_MAGIC, Cas::currentWriterVersion(Cas::FormatId::PoolMeta));
+    writeString(body, out);
     return std::move(out.str());
 }
 
 PoolMeta decodePoolMeta(std::string_view data)
 {
-    return decodeJsonGuarded("pool meta", [&]
-    {
-        auto obj = parseJsonDocument(data, "cas_pool_meta", POOL_META_VERSION, "pool meta");
-        checkNoUnknownKeys(*obj, {"format", "version", "pool_id", "root_shards", "blob_header_len"}, "pool meta");
+    if (data.empty())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: empty object");
 
-        PoolMeta pm;
-        pm.pool_id = requireHash(*obj, "pool_id", "pool meta");
-        pm.root_shards = requireU64(*obj, "root_shards", "pool meta");
-        pm.blob_header_len = requireU64(*obj, "blob_header_len", "pool meta");
+    ReadBufferFromMemory in(data.data(), data.size());
+    Cas::readFramingHeader(in, POOL_META_MAGIC, "pool meta");
+    const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
 
-        /// A persisted object violating the constant invariants is corruption, not a config error.
-        validateConstants(pm.root_shards, pm.blob_header_len, ErrorCodes::CORRUPTED_DATA, "pool meta");
-        return pm;
-    });
+    Cas::Proto::PoolMetaProto msg;
+    if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: protobuf parse failed");
+
+    PoolMeta pm;
+    pm.pool_id = u128FromBytesBE(msg.pool_id(), "pool meta pool_id");
+    pm.root_shards = msg.root_shards();
+    pm.blob_header_len = msg.blob_header_len();
+
+    /// A persisted object violating the constant invariants is corruption, not a config error.
+    validateConstants(pm.root_shards, pm.blob_header_len, ErrorCodes::CORRUPTED_DATA, "pool meta");
+    return pm;
 }
 
 PoolMeta PoolMeta::createOrValidate(Backend & backend, const Layout & layout, uint64_t root_shards, uint64_t blob_header_len)

@@ -63,8 +63,67 @@ message JournalRecord {
 
 message RootShardManifest {
   reserved 1;                         // was codec_version; version is now in the CasFormat framing header
+  reserved "codec_version";           // 3a nit: reserve the name too so it is never reused
   uint64 shard_version = 2;
   uint64 fence_round = 3;
   map<string, RefPayload> refs = 4;
   repeated JournalRecord journal = 5; // insertion order preserved
+}
+
+// Pool-wide identity and constants (_pool_meta). Magic CAPM, FormatId::PoolMeta.
+// Framing header ([CAPM][writer:u16][min_reader:u16]) is prepended; the proto body follows.
+message PoolMetaProto {
+  bytes  pool_id         = 1;  // raw 16 bytes (UInt128, big-endian); minted once at creation
+  uint64 root_shards     = 2;  // must be >= 1
+  uint64 blob_header_len = 3;  // 8-aligned, in [96, 16384]
+}
+
+// Per-server build watermark (_watermark under roots/<server-hex>/). Magic CAWM, FormatId::Watermark.
+// min_active == UINT64_MAX encodes the "retired" sentinel (farewell epoch).
+message WatermarkProto {
+  bytes  server_id  = 1;  // raw 16 bytes (UInt128, big-endian)
+  uint64 epoch      = 2;
+  uint64 min_active = 3;  // UINT64_MAX (0xFFFFFFFFFFFFFFFF) = retired sentinel
+  uint64 seq        = 4;
+}
+
+// GC lease embedded inside GcStateProto.
+message GcLeaseProto {
+  bytes  owner = 1;  // raw 16 bytes (UInt128, big-endian); 0 = never held
+  uint64 seq   = 2;
+}
+
+// One inner entry of fence_version: a map from "ns/shard" string to uint64 version.
+message FenceVersionInnerProto {
+  map<string, uint64> shards = 1;
+}
+
+// GC controller state (gc/state). Magic CAGT, FormatId::GcState.
+// fence_version maps round (uint64) to FenceVersionInnerProto.
+message GcStateProto {
+  uint64 round              = 1;
+  uint64 fence_seq          = 2;
+  uint64 snap_shards        = 3;  // must be >= 1
+  uint64 snap_generation    = 4;
+  uint64 snap_pruned_through = 5;
+  GcLeaseProto lease        = 6;
+  map<uint64, FenceVersionInnerProto> fence_version = 7;
+}
+
+// One condemned object inside a RetiredSetProto.
+// kind: 1=blob, 2=tree (mirrors ObjectKind enum).
+// token_type: 1=etag, 2=generation, 3=emulated (mirrors TokenType enum).
+message RetiredEntryProto {
+  uint32 kind        = 1;
+  bytes  hash        = 2;  // raw 16 bytes (UInt128, big-endian)
+  string token_value = 3;
+  uint32 token_type  = 4;
+  uint64 size        = 5;
+}
+
+// Retired-object set (gc/retired/<round>.<fence_seq>/<shard>). Magic CART, FormatId::RetiredSet.
+// Entries are sorted deterministically (kind, hash-BE, token_value, token_type, size) before
+// serialization so the encoded bytes are stable.
+message RetiredSetProto {
+  repeated RetiredEntryProto entries = 1;
 }
