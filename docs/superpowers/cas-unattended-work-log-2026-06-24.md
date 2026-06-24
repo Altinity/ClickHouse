@@ -60,8 +60,12 @@ Packs already removed (pre-story, `1a8188bce8f`). Pack removal closed B97/B10/B9
 
 ## Plan 3 sub-status
 - 3a (manifest framing + published_at_ms) — ✅ landed + reviewed (commit `889a6cb7de1`); sweep 374 (373/1-baseline). Deferred trivial: add `reserved "codec_version";` to cas_root_shard.proto (fold into 3b — same file).
-- 3b (gc-snap → streaming protobuf) — ⏳ next.
-- 3c (gc-state/retired-set/watermark/pool-meta → protobuf; delete JSON family + tolerateUnknownKeys + monotone checkVersion) — ⏳.
+- 3b (gc-snap → protobuf) — ⛔ DEFERRED (unattended decision). gc-snap is GC-internal (not a cross-impl
+  interchange format), already versioned+zstd+deterministic binary; converting is highest-risk/lowest-value
+  in Plan 3 and it's already binary (not part of the JSON cleanup). B176 stays open as a consistency-only
+  follow-up. Rationale in spec Part III.3. (B165 OOM "streaming" gap is a separate memory concern.)
+- 3c (pool-meta/watermark/gc-state/retired-set JSON → protobuf; delete JSON codec family +
+  tolerateUnknownKeys + monotone checkVersion) — ⏳ next (freeze-critical: realizes "abandon JSON").
 - 3d (consolidate → cas_format.proto, package clickhouse.cas.format, doc header) — ⏳ last.
 
 ## Event timeline (append-only)

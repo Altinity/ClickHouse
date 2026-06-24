@@ -266,9 +266,20 @@ are **outside** identity, so they evolve freely.
    in `RefPayload.mutable_files` to a **typed `RefPayload.published_at_ms`** field — done as part of
    generation 1 (pre-release, no migration). (B92 — fixing the adopt/relink `tree_size=0` — is a
    **separate iteration**, not this effort.)
-3. **gc-snap → protobuf** (B176): length-delimited **streaming** (never materialize the whole snap —
-   B165 OOM), zstd compression (with B149), deterministic record ordering (golden-tested), preserving
-   the fold cursor and the `GC_SNAP_VERSION` B140 fix. Measure protobuf overhead on the hot path.
+3. **gc-snap → protobuf (B176) — DEFERRED (2026-06-24, unattended-run decision).** On review, gc-snap
+   is **GC-internal durable state, not a cross-implementation interchange format** (a third party
+   reimplementing CA reads the manifest/tree/blob, never another impl's GC snapshot), and its existing
+   codec already satisfies the substantive goals: versioned (`GC_SNAP_VERSION` + magic, fail-closed),
+   **zstd-compressed**, **deterministic** (ordered-map/-set iteration), and it carries the fold cursor
+   (B140 fix). Converting this large, GC-correctness-critical codec to streaming protobuf is the
+   highest-risk, lowest-interchange-value change in Plan 3 (a bug risks GC mis-deletion), and it is
+   **already binary** — it is NOT part of the "abandon JSON" cleanup. So gc-snap **keeps its current
+   versioned-binary+zstd codec**; the protobuf conversion is a deferred consistency-only follow-up
+   (B176 stays open). The only genuine gap — not materializing the whole body for very large snaps
+   (B165 OOM) — is a separate memory concern addressable within the binary codec, independent of
+   protobuf. The consolidated `cas_format.proto` therefore covers the **interchange** mutable objects
+   (manifest, pool-meta, watermark, roster); GC-internal `gc-state`/`retired-set` are converted off
+   JSON for the cleanup but their protobuf is GC-local, not an interchange contract.
 4. **Other mutable objects → protobuf** (hot-path rule): `gc-state` and `watermark` (tiny — framing
    header, single message); `retired-set` (length-delimited streaming like gc-snap, since it grows).
    These move off JSON because they are written per-GC-round / per-heartbeat.
