@@ -413,7 +413,9 @@ GcSnap decodeGcSnap(std::string_view data)
 
         uint8_t version = 0;
         readBinaryLittleEndian(version, in);
-        checkVersion(GC_SNAP_VERSION, version, "gc/snap");
+        if (version > GC_SNAP_VERSION)
+            throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
+                "CAS gc/snap: on-disk version {} is newer than this build supports (max {})", version, GC_SNAP_VERSION);
         if (version != GC_SNAP_VERSION)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: invalid version {}", version);
 
