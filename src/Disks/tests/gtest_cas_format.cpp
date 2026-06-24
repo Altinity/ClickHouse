@@ -59,3 +59,57 @@ TEST(CasFormat, GateOnReadFailsClosedOnFuture)
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
     }
 }
+
+TEST(CasFormat, FramingHeaderRoundTrip)
+{
+    DB::WriteBufferFromOwnString out;
+    writeFramingHeader(out, "CARS", WriterStamp{1, 1});
+    out.finalize();
+    const std::string bytes = out.str();
+    ASSERT_EQ(bytes.size(), FRAMING_HEADER_SIZE);
+
+    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
+    FramingHeader h = readFramingHeader(in, "CARS", "manifest");
+    EXPECT_EQ(h.writer_version, 1u);
+    EXPECT_EQ(h.min_reader_version, 1u);
+    /// Cursor is left at the body (here: end of buffer).
+    EXPECT_TRUE(in.eof());
+}
+
+TEST(CasFormat, FramingHeaderRejectsBadMagic)
+{
+    DB::WriteBufferFromOwnString out;
+    writeFramingHeader(out, "CARS", WriterStamp{1, 1});
+    out.finalize();
+    const std::string bytes = out.str();
+
+    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
+    try
+    {
+        readFramingHeader(in, "CAGS", "gc-snap");   // wrong expected magic
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
+}
+
+TEST(CasFormat, FramingHeaderGatesFutureMinReader)
+{
+    DB::WriteBufferFromOwnString out;
+    writeFramingHeader(out, "CARS", WriterStamp{/*writer=*/2, /*min_reader=*/2});  // a future object
+    out.finalize();
+    const std::string bytes = out.str();
+
+    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
+    try
+    {
+        readFramingHeader(in, "CARS", "manifest");
+        FAIL() << "expected UNKNOWN_FORMAT_VERSION";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
+    }
+}

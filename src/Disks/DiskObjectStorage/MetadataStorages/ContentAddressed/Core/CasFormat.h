@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
+#include <IO/ReadBuffer.h>
+#include <IO/WriteBuffer.h>
 
 namespace DB::Cas
 {
@@ -55,5 +57,24 @@ WriterStamp currentWriterVersion(FormatId id, uint16_t floor = G_BUILD);
 /// build understands (G_BUILD), fail closed with UNKNOWN_FORMAT_VERSION — never misread a future
 /// object. `what` names the object in the message.
 void gateOnRead(uint16_t min_reader_version, std::string_view what);
+
+/// A protobuf object is prefixed with this 8-byte framing header so its version is checked BEFORE the
+/// body is parsed (and so length-delimited streaming objects carry the version up front):
+///   [magic:4 bytes][writer_version:u16 LE][min_reader_version:u16 LE]
+constexpr size_t FRAMING_HEADER_SIZE = 8;
+
+/// Writes the framing header. `magic` must be exactly 4 bytes (BAD_ARGUMENTS otherwise).
+void writeFramingHeader(WriteBuffer & out, std::string_view magic, WriterStamp stamp);
+
+struct FramingHeader
+{
+    uint16_t writer_version;
+    uint16_t min_reader_version;
+};
+
+/// Reads + validates the framing header: a magic mismatch => CORRUPTED_DATA; then applies gateOnRead on
+/// min_reader_version (a future object => UNKNOWN_FORMAT_VERSION). Returns the versions and leaves `in`
+/// positioned at the body. `expected_magic` must be 4 bytes.
+FramingHeader readFramingHeader(ReadBuffer & in, std::string_view expected_magic, std::string_view what);
 
 }
