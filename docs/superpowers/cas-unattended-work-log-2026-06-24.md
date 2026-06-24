@@ -28,9 +28,9 @@ Spec: `docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.m
 | 2a | Merkle `treeId` (decouple identity from serialization/placement) | ✅ landed + reviewed |
 | 2b | Envelope one-header (`CABL`/`CATR`, 94-byte hole-free core, CasFormat versions) | ✅ landed + reviewed |
 | 2c | Tree catalog-first / inline-data-last payload (drop CATR payload header) | ✅ landed + reviewed |
-| 2d | Part-writer eager-file inlining (one-GET part open; .bin/.mrk/primary.idx stay blob) | ✅ landed; spec-review ✅; code-quality review in progress |
-| 2e | `CasBuild` dependency-closure collapse into the Merkle-fold walk (pure refactor) | ⏳ pending |
-| Plan 3 | Mutable encodings → protobuf: manifest framing + `published_at_ms`; gc-snap→streaming protobuf; gc-state/retired-set/watermark/pool-meta→protobuf; ONE `cas_format.proto`; delete JSON codec family + `tolerateUnknownKeys` + monotone `checkVersion` | ⏳ pending (will decompose 3a/3b/3c) |
+| 2d | Part-writer eager-file inlining (one-GET part open; .bin/.mrk/primary.idx stay blob) | ✅ landed + reviewed (commits `c623713479f`,`27c5f790d19`,`be4d073fc99`) |
+| Plan 3 | Mutable encodings → protobuf: manifest framing + `published_at_ms`; gc-snap→streaming protobuf; gc-state/retired-set/watermark/pool-meta→protobuf; ONE `cas_format.proto`; delete JSON codec family + `tolerateUnknownKeys` + monotone `checkVersion` | ⏳ IN PROGRESS — prioritized ahead of 2e (freeze-critical); decompose 3a/3b/3c |
+| 2e | `CasBuild` dependency-closure collapse into the Merkle-fold walk (pure refactor) | ⏳ pending — reordered AFTER Plan 3 (non-freeze polish; subtle precommit-closure change, brainstorm needed) |
 
 Packs already removed (pre-story, `1a8188bce8f`). Pack removal closed B97/B10/B96.
 
@@ -57,6 +57,12 @@ Packs already removed (pre-story, `1a8188bce8f`). Pack removal closed B97/B10/B9
 - (none yet)
 
 ---
+
+## Plan 3 sub-status
+- 3a (manifest framing + published_at_ms) — ✅ landed + reviewed (commit `889a6cb7de1`); sweep 374 (373/1-baseline). Deferred trivial: add `reserved "codec_version";` to cas_root_shard.proto (fold into 3b — same file).
+- 3b (gc-snap → streaming protobuf) — ⏳ next.
+- 3c (gc-state/retired-set/watermark/pool-meta → protobuf; delete JSON family + tolerateUnknownKeys + monotone checkVersion) — ⏳.
+- 3d (consolidate → cas_format.proto, package clickhouse.cas.format, doc header) — ⏳ last.
 
 ## Event timeline (append-only)
 
