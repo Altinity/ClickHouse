@@ -96,4 +96,9 @@ FramingHeader readFramingHeader(ReadBuffer & in, std::string_view expected_magic
     return h;
 }
 
+bool tolerateUnknownKeys(uint16_t writer_version)
+{
+    return writer_version > G_BUILD;
+}
+
 }

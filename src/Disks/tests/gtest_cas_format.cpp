@@ -113,3 +113,12 @@ TEST(CasFormat, FramingHeaderGatesFutureMinReader)
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
     }
 }
+
+TEST(CasFormat, TolerateUnknownKeysOnlyForFutureWriter)
+{
+    /// Same-or-older object: an unknown key is corruption -> strict (do NOT tolerate).
+    EXPECT_FALSE(tolerateUnknownKeys(/*writer_version=*/1));
+    EXPECT_FALSE(tolerateUnknownKeys(G_BUILD));
+    /// Future writer: unknown keys are forward additions -> tolerate (ignore them).
+    EXPECT_TRUE(tolerateUnknownKeys(G_BUILD + 1));
+}

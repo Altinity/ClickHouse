@@ -77,4 +77,10 @@ struct FramingHeader
 /// positioned at the body. `expected_magic` must be 4 bytes.
 FramingHeader readFramingHeader(ReadBuffer & in, std::string_view expected_magic, std::string_view what);
 
+/// The version-aware JSON unknown-key rule. A JSON metadata object is strict at or below this build's
+/// generation (an unknown key is CORRUPTED_DATA — the incident-surface safety), but unknown keys are
+/// tolerated (ignored) when the object is from a FUTURE writer (`writer_version > G_BUILD`), where
+/// those keys are forward additions. The caller still applies gateOnRead on min_reader_version first.
+bool tolerateUnknownKeys(uint16_t writer_version);
+
 }
