@@ -341,6 +341,12 @@ A small, focused module instead of per-codec ad-hoc version handling:
 - **`CasGcSnap.{h,cpp}`**: binary → streaming protobuf with the framing header.
 - Part-writer (`ContentAddressedTransaction.cpp`): the inline-vs-blob placement decision for part
   files.
+- **`CasBuild.{h,cpp}`** (follow-on, enabled by Merkle): the precommit dependency-closure builder can
+  collapse its per-placement dep-tracking branches into a **single catalog walk** — the very child
+  enumeration the Merkle `treeId` rule performs over `(name, kind, child_hash)` *is* the tree's
+  dependency set. With packs already removed, the closure reduces to "collect each `Blob`/`Subtree`
+  `child_hash` from the catalog", no special-casing — one traversal that both computes the id and
+  yields the deps. Realize this after the tree codec lands.
 
 Each codec keeps **golden byte tests** (encode-stability) and a **cross-version read test**: write a
 generation-1 object, assert a simulated `G_build = 0` reader fail-closes and a `G_build ≥ 1` reader
