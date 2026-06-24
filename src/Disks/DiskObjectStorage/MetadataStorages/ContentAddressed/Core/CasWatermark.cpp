@@ -1,7 +1,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <cas_root_shard.pb.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 
 #include <limits>
@@ -10,6 +14,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
 }
 }
@@ -20,61 +25,47 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint64_t WATERMARK_VERSION = 1;
-
-/// min_active = UINT64_MAX (written by farewell) is the retired sentinel. It cannot ride as a JSON
-/// number — the codec parses integers as Int64 — so it is encoded as this string instead.
-constexpr std::string_view RETIRED_SENTINEL = "retired";
+constexpr std::string_view WATERMARK_MAGIC = "CAWM";
 
 }
 
 String encodeServerWatermark(const ServerWatermark & w)
 {
+    Cas::Proto::WatermarkProto msg;
+    msg.set_server_id(u128ToBytesBE(w.server_id));
+    msg.set_epoch(w.epoch);
+    msg.set_min_active(w.min_active);   // UINT64_MAX encodes the retired sentinel directly
+    msg.set_seq(w.seq);
+
+    std::string body;
+    if (!msg.SerializeToString(&body))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS watermark: protobuf serialization failed");
+
     WriteBufferFromOwnString out;
-    JsonObjectWriter writer(out);
-    writer.field("format", "cas_server_watermark");
-    writer.field("version", WATERMARK_VERSION);
-    writer.field("server_id", u128ToHex(w.server_id));
-    writer.field("epoch", w.epoch);
-    /// min_active is conditional: the retired sentinel rides as a string, a live value as a number.
-    if (w.min_active == std::numeric_limits<uint64_t>::max())
-        writer.field("min_active", RETIRED_SENTINEL);
-    else
-        writer.field("min_active", w.min_active);
-    writer.field("seq", w.seq);
-    writer.finalize();
+    Cas::writeFramingHeader(out, WATERMARK_MAGIC, Cas::currentWriterVersion(Cas::FormatId::Watermark));
+    writeString(body, out);
     return std::move(out.str());
 }
 
 ServerWatermark decodeServerWatermark(std::string_view data)
 {
-    return decodeJsonGuarded("watermark", [&]
-    {
-        auto obj = parseJsonDocument(data, "cas_server_watermark", WATERMARK_VERSION, "watermark");
-        checkNoUnknownKeys(*obj, {"format", "version", "server_id", "epoch", "min_active", "seq"}, "watermark");
+    if (data.empty())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS watermark: empty object");
 
-        ServerWatermark w;
-        w.server_id = requireHash(*obj, "server_id", "watermark");
-        w.epoch = requireU64(*obj, "epoch", "watermark");
+    ReadBufferFromMemory in(data.data(), data.size());
+    Cas::readFramingHeader(in, WATERMARK_MAGIC, "watermark");
+    const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
 
-        /// min_active is the retired sentinel (UINT64_MAX) when it is the "retired" string, else a
-        /// live JSON number; any other string is corruption.
-        const auto min_active_var = requireKey(*obj, "min_active", "watermark");
-        if (min_active_var.type() == typeid(String))
-        {
-            if (min_active_var.extract<String>() != RETIRED_SENTINEL)
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS watermark: key 'min_active' string must be '{}'", RETIRED_SENTINEL);
-            w.min_active = std::numeric_limits<uint64_t>::max();
-        }
-        else
-        {
-            w.min_active = requireU64Var(min_active_var, "min_active", "watermark");
-        }
+    Cas::Proto::WatermarkProto msg;
+    if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS watermark: protobuf parse failed");
 
-        w.seq = requireU64(*obj, "seq", "watermark");
-        return w;
-    });
+    ServerWatermark w;
+    w.server_id = u128FromBytesBE(msg.server_id(), "watermark server_id");
+    w.epoch = msg.epoch();
+    w.min_active = msg.min_active();   // UINT64_MAX is the retired sentinel
+    w.seq = msg.seq();
+    return w;
 }
 
 WatermarkKeeper::WatermarkKeeper(BackendPtr backend_, const Layout & layout_, UInt128 server_id_, uint64_t epoch_,
