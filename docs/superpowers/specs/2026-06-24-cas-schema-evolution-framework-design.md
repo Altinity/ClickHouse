@@ -230,7 +230,10 @@ tree:  [ 256-B header: "CATR" + ver + incarnation-zone ][ catalog ][ inline-data
     and IPFS's `Tsize` is a known reproducibility wart). **No `placement`** — an inline file and a
     standalone blob with the same content contribute the same `child_hash`, so inline↔blob never
     changes `treeId`. This is exactly Git's tree model (`mode`+`name`+`hash`, sorted, no size); the
-    storage layer (inline/blob, like Git loose/packed) lives **below** the identity layer.
+    storage layer (inline/blob, like Git loose/packed) lives **below** the identity layer. Because the
+    id is a **fold over the children**, a writer computes it **directly from the entries, without
+    serializing the catalog** — a part's address (and a dedup/existence check) is known before, and
+    independent of, laying out its bytes; serialization is a separate later step.
   - **Merkle rule frozen by convention.** Changing what enters the identity hash only loses dedup
     across the boundary (logically-identical trees get different ids → stored twice — a benign
     duplicate, never a correctness or readability problem). A reader never recomputes `treeId` to use a
@@ -341,12 +344,13 @@ A small, focused module instead of per-codec ad-hoc version handling:
 - **`CasGcSnap.{h,cpp}`**: binary → streaming protobuf with the framing header.
 - Part-writer (`ContentAddressedTransaction.cpp`): the inline-vs-blob placement decision for part
   files.
-- **`CasBuild.{h,cpp}`** (follow-on, enabled by Merkle): the precommit dependency-closure builder can
-  collapse its per-placement dep-tracking branches into a **single catalog walk** — the very child
-  enumeration the Merkle `treeId` rule performs over `(name, kind, child_hash)` *is* the tree's
-  dependency set. With packs already removed, the closure reduces to "collect each `Blob`/`Subtree`
-  `child_hash` from the catalog", no special-casing — one traversal that both computes the id and
-  yields the deps. Realize this after the tree codec lands.
+- **`CasBuild.{h,cpp}`** (follow-on, enabled by Merkle): the precommit part-build gets two
+  simplifications from the same fold over children. (1) **The `treeId` is computed directly from the
+  collected entries — no serialize-the-catalog-then-hash step** (today it hashes `encodeTree(...)`
+  output); the address is known before the bytes are laid out. (2) **The dependency closure falls out
+  of that same enumeration** — `(name, kind, child_hash)` over the catalog *is* the dep set, so the
+  per-placement dep-tracking branches collapse into one walk ("collect each `Blob`/`Subtree`
+  `child_hash`"), with packs already removed. Realize this after the tree codec lands.
 
 Each codec keeps **golden byte tests** (encode-stability) and a **cross-version read test**: write a
 generation-1 object, assert a simulated `G_build = 0` reader fail-closes and a `G_build ≥ 1` reader
