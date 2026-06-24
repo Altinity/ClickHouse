@@ -1,6 +1,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
+#include <cas_root_shard.pb.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 
 namespace DB
@@ -8,6 +12,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -16,59 +21,55 @@ namespace DB::Cas
 
 namespace
 {
-constexpr uint64_t ROOTS_REGISTRY_VERSION = 1;
+constexpr std::string_view ROOTS_REGISTRY_MAGIC = "CARR";
 }
 
 String encodeRootsRegistry(const RootsRegistry & registry)
 {
-    WriteBufferFromOwnString out;
-    JsonObjectWriter writer(out);
-    writer.field("format", "cas_roots_registry");
-    writer.field("version", ROOTS_REGISTRY_VERSION);
-    writer.field("registry_version", registry.registry_version);
-    writer.field("fence_round", registry.fence_round);
-
-    /// `namespaces` is a JSON array, not a flat field: open it through beginValueField and write the
-    /// (comma-separated, no whitespace) string elements by hand.
-    writer.beginValueField("namespaces");
-    writeChar('[', out);
-    bool first = true;
+    Cas::Proto::RootsRegistryProto msg;
+    msg.set_registry_version(registry.registry_version);
+    msg.set_fence_round(registry.fence_round);
+    /// `registry.namespaces` is a std::set<String> => already sorted ascending.
     for (const String & ns : registry.namespaces)
-    {
-        if (!first)
-            writeChar(',', out);
-        first = false;
-        writeJsonString(ns, out);
-    }
-    writeChar(']', out);
-    writer.finalize();
+        msg.add_namespaces(ns);
+
+    std::string body;
+    if (!msg.SerializeToString(&body))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS roots registry: protobuf serialization failed");
+
+    WriteBufferFromOwnString out;
+    Cas::writeFramingHeader(out, ROOTS_REGISTRY_MAGIC, Cas::currentWriterVersion(Cas::FormatId::RootsRegistry));
+    writeString(body, out);
     return std::move(out.str());
 }
 
 RootsRegistry decodeRootsRegistry(std::string_view data)
 {
-    return decodeJsonGuarded("roots registry", [&]
+    return decodeGuarded("roots registry", [&]
     {
-        auto obj = parseJsonDocument(data, "cas_roots_registry", ROOTS_REGISTRY_VERSION, "roots registry");
-        checkNoUnknownKeys(*obj,
-            {"format", "version", "registry_version", "fence_round", "namespaces"}, "roots registry");
+        if (data.empty())
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS roots registry: empty object");
+
+        ReadBufferFromMemory in(data.data(), data.size());
+        Cas::readFramingHeader(in, ROOTS_REGISTRY_MAGIC, "roots registry");
+        const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
+
+        Cas::Proto::RootsRegistryProto msg;
+        if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS roots registry: protobuf parse failed");
 
         RootsRegistry registry;
-        registry.registry_version = requireU64(*obj, "registry_version", "roots registry");
-        registry.fence_round = requireU64(*obj, "fence_round", "roots registry");
+        registry.registry_version = msg.registry_version();
+        registry.fence_round = msg.fence_round();
 
-        const auto namespaces = requireArray(*obj, "namespaces", "roots registry");
-        for (size_t i = 0; i < namespaces->size(); ++i)
+        /// Post-parse invariants (preserved from JSON era): each namespace is non-empty and unique.
+        for (int i = 0; i < msg.namespaces_size(); ++i)
         {
-            const auto var = namespaces->get(static_cast<unsigned int>(i));
-            if (var.type() != typeid(String))
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS roots registry: namespaces[{}] must be a string", i);
-            String ns = var.extract<String>();
+            const String & ns = msg.namespaces(i);
             if (ns.empty())
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS roots registry: namespaces[{}] is empty", i);
-            if (!registry.namespaces.insert(std::move(ns)).second)
+            if (!registry.namespaces.insert(ns).second)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS roots registry: duplicate namespace entry at index {}", i);
         }
