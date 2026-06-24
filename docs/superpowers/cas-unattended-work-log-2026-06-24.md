@@ -73,7 +73,11 @@ Packs already removed (pre-story, `1a8188bce8f`). Pack removal closed B97/B10/B9
   BLOCKED until those convert. 3c-tail: convert heartbeat/roots-registry/gc-outcomes → protobuf
   (framing pattern); replace gc-snap's `checkVersion` with an inline version check; THEN delete the JSON
   family + `checkVersion` + `tolerateUnknownKeys`. ⏳
-- 3d (consolidate → cas_format.proto, package clickhouse.cas.format, doc header) — ⏳ last.
+- 3c-tail (heartbeat/roots-registry/gc-outcomes → protobuf; gc-snap inline version check; DELETE the
+  JSON codec family + checkVersion + tolerateUnknownKeys + CasEnumStrings.h) — ✅ landed (commits
+  `6e89ba049f4`,`ae5bcf57f2c`,`2b54311e2d4`,`b96ed1b15f0`,`53a8d42da81`); sweep 372/1-baseline. Combined
+  review ⏳. **MILESTONE: JSON fully abandoned — two encodings (binary hashed + protobuf mutable).**
+- 3d (consolidate → cas_format.proto, package clickhouse.cas.format, doc header) — ⏳ last of Plan 3.
 
 ## Event timeline (append-only)
 
