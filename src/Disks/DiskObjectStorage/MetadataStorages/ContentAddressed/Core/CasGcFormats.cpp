@@ -83,14 +83,21 @@ String encodeGcState(const GcState & state)
     lease->set_owner(u128ToBytesBE(state.lease.owner));
     lease->set_seq(state.lease.seq);
 
-    auto & fv = *msg.mutable_fence_version();
+    /// fence_version is `repeated` (spec bans new proto map<> for byte-determinism). Emit entries
+    /// in deterministic order: rounds ascending, shards within each entry sorted by name ascending.
+    /// `state.fence_version` is a std::map<uint64, std::map<String, uint64>>, so iterating it already
+    /// yields rounds (and inner shard names) in ascending order — no explicit sort needed.
     for (const auto & [round, inner] : state.fence_version)
     {
-        Cas::Proto::FenceVersionInnerProto inner_proto;
-        auto & shards = *inner_proto.mutable_shards();
+        auto * entry = msg.add_fence_version();
+        entry->set_round(round);
+        auto * inner_proto = entry->mutable_inner();
         for (const auto & [shard, version] : inner)
-            shards[shard] = version;
-        fv[round] = std::move(inner_proto);
+        {
+            auto * shard_proto = inner_proto->add_shards();
+            shard_proto->set_shard_name(shard);
+            shard_proto->set_version(version);
+        }
     }
 
     std::string body;
@@ -128,12 +135,12 @@ GcState decodeGcState(std::string_view data)
     state.lease.owner = u128FromBytesBE(msg.lease().owner(), "gc/state lease owner");
     state.lease.seq = msg.lease().seq();
 
-    for (const auto & [round, inner_proto] : msg.fence_version())
+    for (const auto & entry : msg.fence_version())
     {
         std::map<String, uint64_t> inner;
-        for (const auto & [shard, version] : inner_proto.shards())
-            inner[shard] = version;
-        state.fence_version[round] = std::move(inner);
+        for (const auto & shard_proto : entry.inner().shards())
+            inner[shard_proto.shard_name()] = shard_proto.version();
+        state.fence_version[entry.round()] = std::move(inner);
     }
 
     return state;

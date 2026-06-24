@@ -255,6 +255,12 @@ TEST(CasGcFormats, RetiredSetValidation)
         EXPECT_EQ(bytes.substr(0, 4), "CART");
         EXPECT_NE(bytes.front(), '{');
     }
+    /// An entry whose kind is the proto3 default (0 / omitted) must be rejected: objectKindFromProto(0)
+    /// throws CORRUPTED_DATA. Craft a CART-framed body with one RetiredEntryProto left at defaults:
+    /// RetiredSetProto.entries is field 1 (length-delimited) => tag 0x0A, length 0x00 (empty sub-message
+    /// => kind defaults to 0).
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { decodeRetiredSet(String("CART\x01\x00\x01\x00\x0a\x00", 10)); });
 }
 
 TEST(CasGcFormats, OutcomeLogValidation)

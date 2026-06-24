@@ -93,13 +93,28 @@ message GcLeaseProto {
   uint64 seq   = 2;
 }
 
-// One inner entry of fence_version: a map from "ns/shard" string to uint64 version.
+// One shard entry of fence_version inner map: "ns/shard" -> uint64 version.
+// Spec bans new proto map<> for byte-determinism; we use sorted repeated instead
+// (a proto map<string,uint64> and repeated{key=1,value=2} share the same wire shape).
+message FenceVersionShardProto {
+  string shard_name = 1;
+  uint64 version    = 2;
+}
+
+// Inner map of fence_version: list of shard entries, sorted by shard_name ascending.
 message FenceVersionInnerProto {
-  map<string, uint64> shards = 1;
+  repeated FenceVersionShardProto shards = 1;
+}
+
+// One outer entry of fence_version: round -> inner shard map.
+message FenceVersionEntryProto {
+  uint64 round                 = 1;
+  FenceVersionInnerProto inner = 2;
 }
 
 // GC controller state (gc/state). Magic CAGT, FormatId::GcState.
-// fence_version maps round (uint64) to FenceVersionInnerProto.
+// fence_version is a list of (round, inner) entries, sorted by round ascending,
+// and within each, shards sorted by shard_name ascending — for byte-determinism.
 message GcStateProto {
   uint64 round              = 1;
   uint64 fence_seq          = 2;
@@ -107,7 +122,7 @@ message GcStateProto {
   uint64 snap_generation    = 4;
   uint64 snap_pruned_through = 5;
   GcLeaseProto lease        = 6;
-  map<uint64, FenceVersionInnerProto> fence_version = 7;
+  repeated FenceVersionEntryProto fence_version = 7;
 }
 
 // One condemned object inside a RetiredSetProto.
