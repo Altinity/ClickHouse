@@ -200,7 +200,8 @@ void publishWiredPart(
     build->putBlob(idOf("payload-B"), DB::Cas::BlobSource::fromString("payload-B"));
     auto tree = build->putTree({wiringBlobEntry("data.bin", "payload-A"), wiringBlobEntry("p.proj/data.bin", "payload-B")});
     DB::Cas::RefPayload payload;
-    payload.mutable_files = {{"uuid.txt", "u-123"}, {"metadata_version.txt", "5"}, {".ca_mtime", "1700000000"}};
+    payload.mutable_files = {{"uuid.txt", "u-123"}, {"metadata_version.txt", "5"}};
+    payload.published_at_ms = 1700000000ULL * 1000;   /// epoch ms; getLastModified divides by 1000
     build->publish(ns, ref, tree, std::move(payload));
 }
 
@@ -220,8 +221,8 @@ TEST(CaWiringRead, ResolvesPublishedPart)
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_9_9_9"));
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-2"));
 
-    /// Part dir listing: nested keys collapse to their first component; reserved payload keys
-    /// (.ca_mtime) never surface; mutable files DO surface.
+    /// Part dir listing: nested keys collapse to their first component; the publish stamp
+    /// (published_at_ms typed field) never surfaces as a dir entry; mutable files DO surface.
     auto names = storage->listDirectory("uui/uuid-1/all_1_1_0");
     std::sort(names.begin(), names.end());
     EXPECT_EQ(names, (std::vector<std::string>{"data.bin", "metadata_version.txt", "p.proj", "uuid.txt"}));
@@ -248,7 +249,7 @@ TEST(CaWiringRead, ResolvesPublishedPart)
     ASSERT_EQ(mobj.size(), 1u);
     EXPECT_TRUE(mobj[0].remote_path.empty());   /// sized placeholder; bytes ride prepareInManifestRead
 
-    /// The publish stamp (.ca_mtime) backs getLastModified for the part dir and its files.
+    /// The typed publish stamp (published_at_ms epoch ms) backs getLastModified for the part dir and its files.
     EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 1700000000);
     EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0/data.bin").epochTime(), 1700000000);
 }
@@ -1197,20 +1198,21 @@ TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
         [&] { ro->adoptPart("uuid-1", "tmp-fetch", std::string(32, '0'), {}); });
 }
 
-TEST(CaWiringRead, CorruptCaMtimeStampFailsClosed)
+TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)
 {
+    /// A ref published without a stamp (published_at_ms == 0, the default) must return the epoch
+    /// (Poco::Timestamp(0)) rather than throwing: stamps only feed cleanup TTLs and system tables,
+    /// so a missing stamp is harmless.
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
     writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "x");
     tx->commit(DB::NoCommitOptions{});
 
-    /// Corrupt the reserved publish stamp. getLastModified must surface a typed CORRUPTED_DATA rather
-    /// than leaking a bare std::invalid_argument/out_of_range out of the underlying integer parse.
+    /// Ensure published_at_ms is unset (the default is 0).
     storage->store()->updateRefPayload(storage->liveNamespace("uuid-1"), "all_1_1_0",
-        [](DB::Cas::RefPayload & payload) { payload.mutable_files[".ca_mtime"] = "not-a-number"; });
+        [](DB::Cas::RefPayload & payload) { payload.published_at_ms = 0; });
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { storage->getLastModified("uui/uuid-1/all_1_1_0"); });
+    EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 0);
 }
 
 // #4: root_shards is plumbed through the ctor to pool creation (creation-time

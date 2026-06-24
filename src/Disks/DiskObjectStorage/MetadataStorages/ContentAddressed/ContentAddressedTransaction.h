@@ -31,7 +31,7 @@ bool partFileMustStayBlob(std::string_view file_name);
 ///
 /// T3 state: writeFile (content blobs through a spill+hash buffer into Build::putBlob; mutable
 /// per-part bytes staged; verbatim namespace files durable on finalize) + commit (one
-/// putTree+publish per staged part, with the reserved .ca_mtime publish stamp) + destructor
+/// putTree+publish per staged part, with the typed `published_at_ms` stamp) + destructor
 /// abandon. Remaining operations land task by task (T5 carry-forward/renames, T6 removals, T7
 /// detached/ATTACH/FREEZE, T8 read-your-writes) — each with wiring tests; the SQL suites gate the
 /// completed milestone (T13).

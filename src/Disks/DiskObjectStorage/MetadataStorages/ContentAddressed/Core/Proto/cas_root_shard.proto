@@ -7,19 +7,21 @@ package DB.Cas.Proto;
 // Introspect a raw manifest offline with:
 //   protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto < manifest.bin
 //
+// VERSION + FAIL-CLOSED GATING: version and fail-closed reader gating now live in the CasFormat
+// framing header ([magic CARS][writer:u16][min_reader:u16]) prepended to every serialized manifest;
+// see `CasFormat.h`. The in-message codec_version field (field 1) has been removed (reserved 1).
+//
 // SCHEMA EVOLUTION RULES (read before editing):
 //  * The wire format is keyed by field NUMBER, not name. Two ways to evolve:
-//    1. ADDITIVE + safe-to-ignore (e.g. a new optional sidecar): give it a NEW field number and do
-//       NOT bump codec_version. Old readers skip the unknown field; new readers reading old data get
-//       the default. Old and new binaries interoperate automatically.
+//    1. ADDITIVE + safe-to-ignore (e.g. a new optional sidecar): give it a NEW field number — old
+//       readers skip the unknown field; new readers reading old data get the default. Old and new
+//       binaries interoperate automatically.
 //    2. BREAKING / unsafe-to-ignore (reinterpreting an existing field, a new mandatory invariant, a
-//       change where an old reader silently ignoring the new data would be WRONG): BUMP
-//       codec_version. The decoder fails closed on a codec_version it does not know
-//       (`> CODEC_VERSION_PROTOBUF -> NOT_IMPLEMENTED`), so old binaries refuse rather than mis-read.
+//       change where an old reader silently ignoring the new data would be WRONG): bump the
+//       CasFormat framing header's min_reader_version (via a new FormatChangePoint in CasFormat.cpp)
+//       so old binaries refuse rather than mis-read.
 //  * NEVER reuse or change the TYPE of an existing field number. To drop a field, `reserved <n>;` its
 //    number (and `reserved "<name>";`) so it is never reused.
-//  * proto3 silently ignores unknown fields (unlike the old strict-JSON decode) — codec_version is
-//    the deliberate "an old reader must STOP here" signal for the cases where silence would be wrong.
 
 // Serialized form of a single DB.Cas.TreeEntry for closure storage.
 // Only the fields needed by the GC walk are serialized; name/inline_bytes are
@@ -42,6 +44,7 @@ message RefPayload {
   uint64 tree_size = 2;
   map<string, string> mutable_files = 3;
   reserved 4;                             // was `closure` (B199-S2); moved to JournalRecord.closure
+  uint64 published_at_ms = 5;             // publish wall-clock (epoch ms) for getLastModified; replaces the .ca_mtime mutable_files key
 }
 
 enum JournalOp {
@@ -59,7 +62,7 @@ message JournalRecord {
 }
 
 message RootShardManifest {
-  uint32 codec_version = 1;           // = 1 (protobuf is the only format); 0 or > current -> reject
+  reserved 1;                         // was codec_version; version is now in the CasFormat framing header
   uint64 shard_version = 2;
   uint64 fence_round = 3;
   map<string, RefPayload> refs = 4;

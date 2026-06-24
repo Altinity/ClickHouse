@@ -441,6 +441,7 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
         .tree_id = TreeId(u128ToHex(payload.tree_id)),
         .tree_size = payload.tree_size,
         .mutable_files = payload.mutable_files,
+        .published_at_ms = payload.published_at_ms,
     };
 }
 
@@ -551,6 +552,7 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
                 .tree_id = TreeId(u128ToHex(payload.tree_id)),
                 .tree_size = payload.tree_size,
                 .mutable_files = payload.mutable_files,
+                .published_at_ms = payload.published_at_ms,
             });
         }
     }

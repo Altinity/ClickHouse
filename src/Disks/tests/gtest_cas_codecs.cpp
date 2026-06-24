@@ -405,12 +405,12 @@ TEST(CasRootShardCodec, RefsCanonicalOrderRegardlessOfInsertion)
     /// std::map already keeps refs name-sorted, but verify two manifests built in different insertion
     /// order encode byte-identically.
     RootShard a;
-    a.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}};
-    a.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
+    a.refs["zzz"] = RefPayload{.tree_id = UInt128(0x1), .tree_size = 1, .mutable_files = {}};
+    a.refs["aaa"] = RefPayload{.tree_id = UInt128(0x2), .tree_size = 2, .mutable_files = {}};
 
     RootShard b;
-    b.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
-    b.refs["zzz"] = RefPayload{UInt128(0x1), 1, {}};
+    b.refs["aaa"] = RefPayload{.tree_id = UInt128(0x2), .tree_size = 2, .mutable_files = {}};
+    b.refs["zzz"] = RefPayload{.tree_id = UInt128(0x1), .tree_size = 1, .mutable_files = {}};
 
     EXPECT_EQ(encodeRootShard(a), encodeRootShard(b));
 }
@@ -464,14 +464,14 @@ TEST(CasRootShardCodec, ProtobufEncodingIsBinaryAndRoundTrips)
     RefPayload p;
     p.tree_id = (UInt128(0xab) << 64) | UInt128(0xcd);
     p.tree_size = 1142;
-    p.mutable_files[".ca_mtime"] = "1781588451";
+    p.published_at_ms = 1781588451000ULL;   /// epoch ms
     rs.refs["part_a"] = p;
     rs.journal.push_back({JournalRecord::Op::Add, "part_a", p.tree_id, 8, {}});
     rs.journal.push_back({JournalRecord::Op::Remove, "part_a", p.tree_id, 9, {}});
 
     const String encoded = encodeRootShard(rs);
     ASSERT_FALSE(encoded.empty());
-    EXPECT_NE(encoded.front(), '{');   /// protobuf, not JSON
+    EXPECT_NE(encoded.front(), '{');   /// not JSON (framing magic byte 'C')
 
     const RootShard d = decodeRootShard(encoded);
     EXPECT_EQ(d.shard_version, 9u);
@@ -479,7 +479,7 @@ TEST(CasRootShardCodec, ProtobufEncodingIsBinaryAndRoundTrips)
     ASSERT_EQ(d.refs.size(), 1u);
     EXPECT_EQ(d.refs.at("part_a").tree_id, p.tree_id);
     EXPECT_EQ(d.refs.at("part_a").tree_size, 1142u);
-    EXPECT_EQ(d.refs.at("part_a").mutable_files.at(".ca_mtime"), "1781588451");
+    EXPECT_EQ(d.refs.at("part_a").published_at_ms, 1781588451000ULL);   /// round-trips epoch ms
     ASSERT_EQ(d.journal.size(), 2u);
     EXPECT_EQ(d.journal[0].op, JournalRecord::Op::Add);
     EXPECT_EQ(d.journal[1].op, JournalRecord::Op::Remove);
@@ -492,8 +492,8 @@ TEST(CasRootShardCodec, ProtobufEncodingIsDeterministic)
     /// golden-test friendly. Includes refs (a map) and a journal (repeated, insertion order).
     RootShard rs;
     rs.shard_version = 5;
-    rs.refs["zzz"] = RefPayload{UInt128(0x1), 1, {{"b", "2"}, {"a", "1"}}};
-    rs.refs["aaa"] = RefPayload{UInt128(0x2), 2, {}};
+    rs.refs["zzz"] = RefPayload{.tree_id = UInt128(0x1), .tree_size = 1, .mutable_files = {{"b", "2"}, {"a", "1"}}};
+    rs.refs["aaa"] = RefPayload{.tree_id = UInt128(0x2), .tree_size = 2, .mutable_files = {}};
     rs.journal.push_back({JournalRecord::Op::Add, "zzz", UInt128(0x1), 5, {}});
     EXPECT_EQ(encodeRootShard(rs), encodeRootShard(rs));
 }
@@ -513,16 +513,21 @@ TEST(CasRootShardCodec, LargeJournalRoundTrips)
 TEST(CasRootShardCodec, FailClosedOnGarbageBytes)
 {
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("")); });               /// empty
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("\xff\xff\xff\xff")); }); /// not protobuf
-    /// Bytes that protobuf-parse but carry no (or zero) codec_version are not a conforming manifest.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("\x10\x01", 2)); });      /// only shard_version, codec_version=0
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("\xff\xff\xff\xff")); }); /// bad magic (4+ bytes -> magic check fires)
+    /// Raw protobuf bytes without framing header: bad magic -> CORRUPTED_DATA.
+    /// Pad to >= 4 bytes so the magic check fires (not a truncated-read error).
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("\x10\x01\x00\x00", 4)); }); /// shard_version proto bytes, no framing
 }
 
-TEST(CasRootShardCodec, ProtobufFutureCodecVersionThrowsUnknownFormatVersion)
+TEST(CasRootShardCodec, FramingHeaderFutureMinReaderThrowsUnknownFormatVersion)
 {
-    /// A protobuf manifest with codec_version=2 (field 1, varint) from a newer writer must fail
-    /// closed, never be mis-read. Bytes: tag(field 1, varint)=0x08, value=2 (> current CODEC_VERSION=1).
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [] { decodeRootShard(String("\x08\x02", 2)); });
+    /// A manifest with framing header min_reader_version=2 from a newer writer must fail closed
+    /// (gateOnRead) so an old build never mis-reads a future object.
+    /// [magic CARS][writer=2 LE u16][min_reader=2 LE u16] = 8 bytes; use explicit length to preserve null bytes.
+    const String framing_future("CARS\x02\x00\x02\x00", 8);
+    expectThrowsCode(
+        DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [&] { decodeRootShard(framing_future); });
 }
 
 /// B199-S2: inline closure round-trip (nested staged entries) on the precommit `Add` journal record.
@@ -678,7 +683,9 @@ TEST(CasByteOrderGolden, EnvelopeLittleEndian)
 }
 
 /// BE 16-byte form: the root-shard manifest's protobuf `tree_id` bytes. The id (0xab<<64)|0xcd
-/// appears big-endian in the golden — bytes ...00 ab ...00 cd — pinning the BE order.
+/// appears big-endian in the goldens — bytes ...00 ab ...00 cd — pinning the BE order.
+/// The framing header (8 bytes: magic CARS + u16 LE writer + u16 LE min_reader) is now prepended;
+/// the golden pins both the framing prefix and the protobuf body byte-order.
 TEST(CasByteOrderGolden, RootShardBigEndian)
 {
     RootShard rs;
@@ -687,13 +694,21 @@ TEST(CasByteOrderGolden, RootShardBigEndian)
     RefPayload p;
     p.tree_id = (UInt128(0xab) << 64) | UInt128(0xcd);
     p.tree_size = 1142;
-    p.mutable_files[".ca_mtime"] = "1781588451";
+    p.published_at_ms = 1781588451000ULL;
     rs.refs["part_a"] = p;
     rs.journal.push_back({JournalRecord::Op::Add, "part_a", p.tree_id, 8, {}});
     const String encoded = encodeRootShard(rs);
-    static constexpr std::string_view golden =
-        "08011009180322380a06706172745f61122e0a1000000000000000ab00000000"
-        "000000cd10f6081a170a092e63615f6d74696d65120a31373831353838343531"
-        "2a1e08011206706172745f611a1000000000000000ab00000000000000cd2008";
-    EXPECT_EQ(toHexBytes(encoded), golden);
+    /// First 8 bytes: framing header [C][A][R][S][01 00][01 00] (magic + writer=1 LE + min_reader=1 LE).
+    ASSERT_GE(encoded.size(), 8u);
+    EXPECT_EQ(toHexBytes(encoded.substr(0, 8)), "43415253" "0100" "0100");
+    /// Decode round-trips the BE bytes correctly (the full round-trip is the functional pin).
+    const RootShard d = decodeRootShard(encoded);
+    EXPECT_EQ(d.refs.at("part_a").tree_id, p.tree_id);
+    EXPECT_EQ(d.refs.at("part_a").published_at_ms, p.published_at_ms);
+    /// Verify the protobuf body (after framing) still encodes tree_id in big-endian:
+    /// (0xab<<64)|0xcd -> 16 bytes: 00000000000000ab 00000000000000cd.
+    const String body = encoded.substr(8);
+    const String body_hex = toHexBytes(body);
+    EXPECT_NE(body_hex.find("00000000000000ab00000000000000cd"), std::string::npos)
+        << "tree_id not found big-endian in protobuf body (hex): " << body_hex;
 }

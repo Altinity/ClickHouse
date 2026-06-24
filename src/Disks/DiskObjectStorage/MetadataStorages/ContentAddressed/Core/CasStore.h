@@ -60,6 +60,7 @@ struct Resolved
     TreeId tree_id;
     uint64_t tree_size = 0;
     std::map<String, String> mutable_files;
+    uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
 };
 
 struct BlobLocation

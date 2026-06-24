@@ -20,8 +20,10 @@ namespace DB::Cas
 /// content-addressed, so byte-determinism is not a correctness requirement; the encoder still
 /// serializes deterministically (name-sorted refs via std::map; journal in insertion order). `refs`
 /// maps ref name → its tree + per-ref mutable sidecar files; `journal` is the reachability-delta list
-/// (`op`: add | remove). Fail-closed decode (unknown/missing required field / wrong type / bad hash
-/// length / bad enum => CORRUPTED_DATA; a future `codec_version` => NOT_IMPLEMENTED). Introspect a raw
+/// (`op`: add | remove). Version and fail-closed gating live in the `CasFormat` framing header
+/// (`[magic CARS][writer:u16][min_reader:u16]`) prepended before the protobuf body; `decodeRootShard`
+/// reads and gates the header BEFORE parsing the protobuf body. Fail-closed decode (unknown/missing
+/// required field / wrong type / bad hash length / bad enum => CORRUPTED_DATA). Introspect a raw
 /// manifest offline with `protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto`.
 
 /// One tree node of a precommit's inline closure: the node's tree hash and its staged entries.
@@ -43,6 +45,7 @@ struct RefPayload
     UInt128 tree_id{};
     uint64_t tree_size = 0;
     std::map<String, String> mutable_files;
+    uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
     bool operator==(const RefPayload &) const = default;
 };
 
@@ -70,10 +73,10 @@ struct RootShard
 /// journal is preserved in insertion order; mutable files within a ref are name-sorted (std::map).
 String encodeRootShard(const RootShard & root);
 
-/// Decodes a manifest. Throws CORRUPTED_DATA on malformed protobuf, a bad enum (`JournalOp`
-/// unspecified), a wrong-length hash, or any field-level inconsistency; a future `codec_version`
-/// throws (see the version gate in the .cpp). (The wire format is protobuf — `RootShardManifest` in
-/// `Proto/cas_root_shard.proto`, B164a — not the pre-B164a strict JSON this comment once described.)
+/// Decodes a manifest. First reads and gates the `CasFormat` framing header (`[magic CARS][writer:u16]
+/// [min_reader:u16]`), then parses the protobuf body. Throws CORRUPTED_DATA on bad magic, malformed
+/// protobuf, a bad enum (`JournalOp` unspecified), a wrong-length hash, or any field-level
+/// inconsistency; UNKNOWN_FORMAT_VERSION when `min_reader` exceeds this build's `G_BUILD`.
 RootShard decodeRootShard(std::string_view data);
 
 }

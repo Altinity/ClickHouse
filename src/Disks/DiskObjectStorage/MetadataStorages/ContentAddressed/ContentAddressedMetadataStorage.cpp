@@ -39,7 +39,7 @@ namespace
 {
 
 /// Wiring-reserved RefPayload.mutable_files keys (never real MergeTree files — dot-prefixed).
-/// `.ca_mtime` carries the publish wall-clock (decimal seconds) for getLastModified.
+/// The publish wall-clock is now carried by the typed `RefPayload.published_at_ms` field (epoch ms).
 bool isReservedMutableName(const std::string & name)
 {
     return name.starts_with(".ca_");
@@ -649,26 +649,19 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
 Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::string & path) const
 {
     /// Timestamps are DERIVED for content addressing: the part's publish wall-clock, stamped by
-    /// the transaction into the reserved `.ca_mtime` payload key (decimal seconds). Every shape
-    /// (part dir, detached part dir, projection dir, part file) reports its part's stamp; a part
-    /// published without a stamp reports the epoch (harmless: stamps only feed cleanup TTLs and
-    /// system tables).
+    /// the transaction into the typed `RefPayload.published_at_ms` field (epoch milliseconds).
+    /// Every shape (part dir, detached part dir, projection dir, part file) reports its part's
+    /// stamp; a part published without a stamp (published_at_ms == 0) reports the epoch (harmless:
+    /// stamps only feed cleanup TTLs and system tables).
     auto resolve_stamp = [&](const Route & r) -> Poco::Timestamp
     {
         auto resolved = store()->resolveRef(r.ns, r.ref, /*allow_stale=*/true);
         if (!resolved)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-        auto it = resolved->mutable_files.find(".ca_mtime");
-        if (it == resolved->mutable_files.end())
+        if (resolved->published_at_ms == 0)
             return Poco::Timestamp(0);
-        /// `.ca_mtime` is our own decimal-seconds stamp; a value that is not parseable as such is
-        /// payload corruption. std::stoull would throw a bare std::exception (uncategorized) — surface
-        /// it as a typed, well-described CORRUPTED_DATA instead of masking it or leaking std::out_of_range.
-        UInt64 epoch_seconds = 0;
-        if (!tryParse<UInt64>(epoch_seconds, it->second))
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "ContentAddressed: .ca_mtime stamp for {} is not a valid epoch-seconds value: '{}'", path, it->second);
-        return Poco::Timestamp::fromEpochTime(static_cast<time_t>(epoch_seconds));
+        /// published_at_ms is epoch milliseconds; Poco::Timestamp::fromEpochTime takes seconds.
+        return Poco::Timestamp::fromEpochTime(static_cast<time_t>(resolved->published_at_ms / 1000));
     };
 
     if (auto p = ContentAddressed::parsePartFilePath(path))
@@ -1027,7 +1020,7 @@ bool ContentAddressedMetadataStorage::adoptPart(
     }
     Cas::RefPayload payload;
     payload.mutable_files = mutable_files;
-    payload.mutable_files[".ca_mtime"] = std::to_string(static_cast<uint64_t>(::time(nullptr)));
+    payload.published_at_ms = static_cast<uint64_t>(::time(nullptr)) * 1000;
     /// tree_size is not carried on the wire (B92: the adopt path publishes 0 until the size is
     /// recovered; no read path consumes it yet).
     /// B171: protect the adopted closure via a build-root precommit before the fail-closed publish,

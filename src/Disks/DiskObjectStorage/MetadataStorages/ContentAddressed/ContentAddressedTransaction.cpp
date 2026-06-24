@@ -154,7 +154,8 @@ bool ContentAddressedTransaction::republishRef(
     build->adoptEvidence(tree_evidence);
     Cas::RefPayload payload;
     payload.tree_size = resolved->tree_size;
-    payload.mutable_files = resolved->mutable_files;   /// the .ca_mtime stamp carries over (a rename is not a new part)
+    payload.mutable_files = resolved->mutable_files;
+    payload.published_at_ms = resolved->published_at_ms;   /// the publish stamp carries over (a rename is not a new part)
     /// B190 precommit-first: protect the adopted closure via a build-root precommit BEFORE the
     /// fail-closed publish. The publish gate (checkAndResolveDeps) re-proves the tree dep at publish time.
     build->precommit(resolved->tree_id);
@@ -277,7 +278,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
 
     Cas::RefPayload payload;
     payload.mutable_files = st.mutable_files;
-    payload.mutable_files[".ca_mtime"] = std::to_string(static_cast<uint64_t>(::time(nullptr)));
+    payload.published_at_ms = static_cast<uint64_t>(::time(nullptr)) * 1000;
 
     st.build->precommit(tree);                       /// closure now reachable from a durable build root
 

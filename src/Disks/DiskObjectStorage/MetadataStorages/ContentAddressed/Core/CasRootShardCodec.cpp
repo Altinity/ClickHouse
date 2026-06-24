@@ -1,9 +1,13 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 /// Included by basename via clickhouse_cas_proto's SYSTEM include dir so the generated header's
 /// reserved identifiers don't trip -Weverything -Werror (same idiom as clickhouse_grpc_protos).
 #include <cas_root_shard.pb.h>
 #include <Common/Exception.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <cstdint>
@@ -13,7 +17,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
-    extern const int UNKNOWN_FORMAT_VERSION;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -23,10 +27,9 @@ namespace DB::Cas
 namespace
 {
 
-/// The only on-disk manifest format is protobuf (B164a). There is no JSON back-compat: a fresh pool
-/// is always protobuf, and `codec_version` is the fail-closed gate for future breaking changes (see
-/// the schema-evolution rules in cas_root_shard.proto).
-constexpr uint32_t CODEC_VERSION = 1;
+/// The CARS (CA Root Shard) framing magic: prepended before the protobuf body so the framing header
+/// (version + fail-closed gating) is read BEFORE the body is parsed.
+constexpr std::string_view MANIFEST_MAGIC = "CARS";
 
 /// UInt128 <-> 16 raw bytes, big-endian: routed through the named, FROZEN-byte-order helpers
 /// `u128ToBytesBE` / `u128FromBytesBE` in `CasCodecUtil.h` (the bodies were moved there verbatim).
@@ -104,7 +107,6 @@ ClosureNode decodeClosureNode(const Cas::Proto::ClosureNodeProto & pn)
 String encodeRootShard(const RootShard & root)
 {
     Cas::Proto::RootShardManifest msg;
-    msg.set_codec_version(CODEC_VERSION);
     msg.set_shard_version(root.shard_version);
     msg.set_fence_round(root.fence_round);
 
@@ -117,6 +119,7 @@ String encodeRootShard(const RootShard & root)
         auto & mf = *p.mutable_mutable_files();
         for (const auto & [k, v] : payload.mutable_files)
             mf[k] = v;
+        p.set_published_at_ms(payload.published_at_ms);
         refs[name] = std::move(p);
     }
 
@@ -133,15 +136,20 @@ String encodeRootShard(const RootShard & root)
 
     /// Deterministic serialization (sorts map<> entries) so golden tests are stable. Correctness
     /// does not need it - the manifest is CAS-by-token, not content-addressed.
-    std::string out;
+    std::string body;
     {
-        google::protobuf::io::StringOutputStream zos(&out);
+        google::protobuf::io::StringOutputStream zos(&body);
         google::protobuf::io::CodedOutputStream cos(&zos);
         cos.SetSerializationDeterministic(true);
         if (!msg.SerializeToCodedStream(&cos))
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: protobuf serialize failed");
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS root shard: protobuf serialization failed");
     }
-    return out;
+
+    /// Prepend the framing header so the version is checked BEFORE the body is parsed.
+    WriteBufferFromOwnString out;
+    Cas::writeFramingHeader(out, MANIFEST_MAGIC, Cas::currentWriterVersion(Cas::FormatId::Manifest));
+    writeString(body, out);
+    return std::move(out.str());
 }
 
 RootShard decodeRootShard(std::string_view data)
@@ -149,14 +157,15 @@ RootShard decodeRootShard(std::string_view data)
     if (data.empty())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: empty manifest");
 
+    /// Read and gate the framing header BEFORE parsing the protobuf body: validates magic and
+    /// gateOnRead(min_reader_version) so a future object from a newer writer fails closed.
+    ReadBufferFromMemory in(data.data(), data.size());
+    Cas::readFramingHeader(in, MANIFEST_MAGIC, "root shard");
+    const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
+
     Cas::Proto::RootShardManifest msg;
-    if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
+    if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: protobuf parse failed");
-    /// A valid encoder always sets codec_version >= 1; a zero value means the bytes are not a
-    /// conforming manifest (e.g. random bytes that happened to protobuf-parse). Fail closed.
-    if (msg.codec_version() == 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: missing or zero codec_version");
-    checkVersion(CODEC_VERSION, msg.codec_version(), "root shard");
 
     RootShard root;
     root.shard_version = msg.shard_version();
@@ -169,6 +178,7 @@ RootShard decodeRootShard(std::string_view data)
         payload.tree_size = p.tree_size();
         for (const auto & [k, v] : p.mutable_files())
             payload.mutable_files[k] = v;
+        payload.published_at_ms = p.published_at_ms();
         root.refs[name] = std::move(payload);
     }
 
