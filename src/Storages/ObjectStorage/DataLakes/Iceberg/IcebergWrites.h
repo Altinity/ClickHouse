@@ -92,11 +92,8 @@ void generateManifestFile(
     Int64 partition_spec_id,
     WriteBuffer & buf,
     Iceberg::FileContentType content_type,
-<<<<<<< HEAD
-    std::optional<Int64> user_defined_sequence_number = std::nullopt);
-=======
+    std::optional<Int64> user_defined_sequence_number = std::nullopt,
     const std::vector<IcebergSerializedFileStats> & per_file_stats = {});
->>>>>>> 9a9645c97cc (Merge pull request #1718 from Altinity/feature/antalya-26.3/apassos-3)
 
 void generateManifestList(
     const Iceberg::IcebergPathResolver & path_resolver,

@@ -427,11 +427,8 @@ void generateManifestFile(
     Int64 partition_spec_id,
     WriteBuffer & buf,
     Iceberg::FileContentType content_type,
-<<<<<<< HEAD
-    std::optional<Int64> user_defined_sequence_number)
-=======
+    std::optional<Int64> user_defined_sequence_number,
     const std::vector<IcebergSerializedFileStats> & per_file_stats)
->>>>>>> 9a9645c97cc (Merge pull request #1718 from Altinity/feature/antalya-26.3/apassos-3)
 {
     Int32 version = metadata->getValue<Int32>(Iceberg::f_format_version);
     String schema_representation;
@@ -524,19 +521,11 @@ void generateManifestFile(
                 auto schema_element = arr.schema()->leafAt(0);
                 for (const auto & [k, v] : entries)
                 {
-<<<<<<< HEAD
-                    avro::GenericDatum record_datum(schema_element);
-                    auto & record = record_datum.value<avro::GenericRecord>();
-                    record.field(Iceberg::f_key) = static_cast<Int32>(field_id);
-                    record.field(Iceberg::f_value) = dump_function(field_id, value);
-                    record_values.value().push_back(record_datum);
-=======
                     avro::GenericDatum item(schema_element);
                     auto & item_rec = item.value<avro::GenericRecord>();
                     item_rec.field(Iceberg::f_key) = avro::GenericDatum(k);
                     item_rec.field(Iceberg::f_value) = avro::GenericDatum(v);
                     arr.value().push_back(item);
->>>>>>> 9a9645c97cc (Merge pull request #1718 from Altinity/feature/antalya-26.3/apassos-3)
                 }
             };
 
@@ -563,29 +552,6 @@ void generateManifestFile(
             write_bytes_map(pf.lower_bounds, Iceberg::f_lower_bounds);
             write_bytes_map(pf.upper_bounds, Iceberg::f_upper_bounds);
 
-<<<<<<< HEAD
-            std::unordered_map<size_t, size_t> field_id_to_column_index;
-            auto field_ids = data_file_statistics->getFieldIds();
-            for (size_t i = 0; i < field_ids.size(); ++i)
-                field_id_to_column_index[field_ids[i]] = i;
-
-            auto dump_fields = [&](size_t field_id, Field value)
-            { return dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_column_index.at(field_id)]); };
-
-            auto lower_statistics = data_file_statistics->getLowerBounds();
-            if (canWriteStatistics(lower_statistics, field_id_to_column_index, sample_block))
-            {
-                set_fields(lower_statistics, Iceberg::f_lower_bounds, dump_fields);
-            }
-            auto upper_statistics = data_file_statistics->getUpperBounds();
-            if (canWriteStatistics(upper_statistics, field_id_to_column_index, sample_block))
-            {
-                set_fields(upper_statistics, Iceberg::f_upper_bounds, dump_fields);
-            }
-        }
-        data_file.field(Iceberg::f_record_count) = avro::GenericDatum(static_cast<Int64>(data_file_row_counts[file_idx]));
-        data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(static_cast<Int64>(data_file_byte_counts[file_idx]));
-=======
             data_file.field(Iceberg::f_record_count) = avro::GenericDatum(pf.record_count);
             data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(pf.file_size_in_bytes);
         }
@@ -646,7 +612,6 @@ void generateManifestFile(
                 data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(summary->getValue<Int64>(Iceberg::f_added_files_size));
             }
         }
->>>>>>> 9a9645c97cc (Merge pull request #1718 from Altinity/feature/antalya-26.3/apassos-3)
         avro::GenericRecord & partition_record = data_file.field("partition").value<avro::GenericRecord>();
         for (size_t i = 0; i < partition_columns.size(); ++i)
         {

@@ -119,9 +119,6 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     }
 
     metadata.setConstraints(constraints_);
-<<<<<<< HEAD
-    metadata.setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
-=======
 
     if (configuration->partition_strategy)
     {
@@ -129,7 +126,6 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     }
 
     setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
->>>>>>> 9a9645c97cc (Merge pull request #1718 from Altinity/feature/antalya-26.3/apassos-3)
         metadata.columns,
         context_,
         /* format_settings */std::nullopt,

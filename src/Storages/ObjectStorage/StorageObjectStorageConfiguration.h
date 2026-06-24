@@ -18,11 +18,8 @@
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <optional>
 #include <Databases/DataLake/StorageCredentials.h>
-<<<<<<< HEAD
 #include <Storages/MergeTree/BackgroundJobsAssignee.h>
-=======
 #include <Storages/ObjectStorage/ObjectStorageFilePathGenerator.h>
->>>>>>> 9a9645c97cc (Merge pull request #1718 from Altinity/feature/antalya-26.3/apassos-3)
 
 namespace DB
 {

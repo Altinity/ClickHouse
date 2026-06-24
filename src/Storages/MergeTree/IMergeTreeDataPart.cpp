@@ -341,32 +341,6 @@ String IMergeTreeDataPart::MinMaxIndex::getFileColumnName(const String & column_
     return stream_name;
 }
 
-<<<<<<< HEAD
-IMergeTreeDataPart::MinMaxIndexPtr IMergeTreeDataPart::getMinMaxIndex() const
-{
-    std::lock_guard lock(minmax_idx_mutex);
-
-    if (minmax_idx)
-        return minmax_idx;
-
-    if (is_temp || isEmpty())
-    {
-        minmax_idx = std::make_shared<MinMaxIndex>();
-    }
-    else
-    {
-        minmax_idx = std::make_shared<MinMaxIndex>();
-        minmax_idx->load(*this);
-    }
-
-    return minmax_idx;
-}
-
-void IMergeTreeDataPart::setMinMaxIndex(MinMaxIndexPtr minmax_index) const
-{
-    std::lock_guard lock(minmax_idx_mutex);
-    minmax_idx = std::move(minmax_index);
-=======
 Block IMergeTreeDataPart::MinMaxIndex::getBlock(const MergeTreeData & data) const
 {
     if (!initialized)
@@ -401,7 +375,32 @@ Block IMergeTreeDataPart::MinMaxIndex::getBlock(const MergeTreeData & data) cons
     }
 
     return block;
->>>>>>> 9a9645c97cc (Merge pull request #1718 from Altinity/feature/antalya-26.3/apassos-3)
+}
+
+IMergeTreeDataPart::MinMaxIndexPtr IMergeTreeDataPart::getMinMaxIndex() const
+{
+    std::lock_guard lock(minmax_idx_mutex);
+
+    if (minmax_idx)
+        return minmax_idx;
+
+    if (is_temp || isEmpty())
+    {
+        minmax_idx = std::make_shared<MinMaxIndex>();
+    }
+    else
+    {
+        minmax_idx = std::make_shared<MinMaxIndex>();
+        minmax_idx->load(*this);
+    }
+
+    return minmax_idx;
+}
+
+void IMergeTreeDataPart::setMinMaxIndex(MinMaxIndexPtr minmax_index) const
+{
+    std::lock_guard lock(minmax_idx_mutex);
+    minmax_idx = std::move(minmax_index);
 }
 
 void IMergeTreeDataPart::incrementStateMetric(MergeTreeDataPartState state_) const

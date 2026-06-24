@@ -181,14 +181,12 @@ public:
 
     void drop(ContextPtr context) override;
 
-<<<<<<< HEAD
-=======
     std::optional<String> partitionKey(ContextPtr) const override;
     std::optional<String> sortingKey(ContextPtr) const override;
 
     Poco::JSON::Object::Ptr getMetadataJSON(ContextPtr local_context) const;
 
->>>>>>> 9a9645c97cc (Merge pull request #1718 from Altinity/feature/antalya-26.3/apassos-3)
+
 private:
     static Iceberg::PersistentTableComponents initializePersistentTableComponents(
         ObjectStoragePtr object_storage,
@@ -209,8 +207,6 @@ private:
     getRelevantDataSnapshotFromTableStateSnapshot(Iceberg::TableStateSnapshot table_state_snapshot, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getRelevantState(const ContextPtr & context, bool force_fetch_latest_metadata = false) const;
 
-<<<<<<< HEAD
-=======
     std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
     KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
 
@@ -236,7 +232,7 @@ private:
         const String & blob_storage_namespace_name,
         ContextPtr context);
 
->>>>>>> 9a9645c97cc (Merge pull request #1718 from Altinity/feature/antalya-26.3/apassos-3)
+
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
     const DB::Iceberg::PersistentTableComponents persistent_components;
