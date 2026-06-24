@@ -580,6 +580,9 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
         std::swap(status_changes, local_status_changes);
     }
 
+    /// Take a snapshot of all status changes. If an exception is thrown, we will requeue the whole batch.
+    const std::queue<std::string> batch = local_status_changes;
+
     try
     {
         /// M_task: serializes this against poll(). We copy the current read-model into a private
@@ -679,26 +682,24 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
     {
         tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
 
-        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: exception thrown while handling status changes, enqueuing remaining status changes back to the status_changes queue. Number of remaining status changes: {}", local_status_changes.size());
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: exception thrown while handling status changes; nothing was published, requeuing the whole batch. Batch size: {}", batch.size());
 
         std::lock_guard lock(status_changes_mutex);
 
-        /// It is possible that an exception is thrown while handling the status. In this scenario
-        /// we need to enqueue the remaining status changes back to the status_changes queue not to lose them.
-        /// The other solution to this problem would be to ignore it and schedule a poll - maybe it is simpler?
-        if (!local_status_changes.empty())
+        /// upon exception, requeue the whole batch
+        if (!batch.empty())
         {
-            // Prepend remaining items before any newly-arrived items
+            std::queue<std::string> requeued = batch;
             while (!status_changes.empty())
             {
-                local_status_changes.push(std::move(status_changes.front()));
+                requeued.push(std::move(status_changes.front()));
                 status_changes.pop();
             }
 
-            std::swap(status_changes, local_status_changes);
+            std::swap(status_changes, requeued);
         }
 
-        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: The new number of pending status after enqueueing unprocessed ones is {}", status_changes.size());
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: pending status changes after requeue: {}", status_changes.size());
 
         throw;
     }
