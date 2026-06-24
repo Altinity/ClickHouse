@@ -83,6 +83,13 @@ std::vector<TreeEntry> decodeTree(std::string_view data)
         struct Pending { size_t offset; size_t length; };
         std::vector<TreeEntry> entries;
         std::vector<Pending> inline_slices;          /// index-aligned with Inline entries
+
+        /// A count larger than the remaining buffer could possibly encode is corruption. Bound the
+        /// reserve so a junk count can't trigger a huge allocation (std::bad_alloc escapes decodeGuarded).
+        constexpr size_t MIN_ENTRY_BYTES = 27;   /// name_len(2)+placement(1)+file_hash(16)+file_size(8)
+        if (static_cast<uint64_t>(count) > in.available() / MIN_ENTRY_BYTES + 1)
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+                "CAS tree: entry count {} exceeds what the {}-byte buffer can encode", count, in.available());
         entries.reserve(count);
 
         for (uint32_t i = 0; i < count; ++i)

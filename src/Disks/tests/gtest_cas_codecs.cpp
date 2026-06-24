@@ -320,12 +320,13 @@ TEST(CasTreeCodec, HugeInlineLengthThrowsCorruptedData)
 
 TEST(CasTreeCodec, CorruptedCountThrows)
 {
-    /// The new payload starts with a u32 entry_count (no magic). Corrupting the count byte makes the
-    /// decoder attempt to read far more entries than exist, hitting a truncated-buffer throw.
+    /// The new payload starts with a u32 entry_count (no magic). A junk count of 0xFFFFFFFF far exceeds
+    /// what the buffer could possibly encode; the decoder's count-vs-buffer guard rejects it as
+    /// CORRUPTED_DATA before any reserve, so a junk count can't trigger a huge allocation.
     auto entries = sampleEntries();
     String encoded = encodeTree(entries);
-    encoded[0] = static_cast<char>(0xFF);   /// count now reads as a huge number; buffer exhausted -> throw
-    EXPECT_THROW(decodeTree(encoded), DB::Exception);
+    encoded[0] = encoded[1] = encoded[2] = encoded[3] = static_cast<char>(0xFF);   /// entry_count = 0xFFFFFFFF
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeTree(encoded); });
 }
 
 TEST(CasTreeCodec, EmptyTreeRoundTrips)
