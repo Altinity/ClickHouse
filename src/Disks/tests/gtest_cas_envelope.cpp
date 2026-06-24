@@ -98,13 +98,11 @@ TEST(CasEnvelope, BadMagicThrows)
 
 TEST(CasEnvelope, FutureMinReaderFailsClosed)
 {
-    /// Hand-patch min_reader_version at [6,8) to a future value (2) and recompute the header_hash so
-    /// the gate (not the hash check) is what fires.
+    /// Hand-patch min_reader_version at [6,8) to a future value (2). The gate at min_reader is checked
+    /// BEFORE the header_hash, so decode deterministically throws UNKNOWN_FORMAT_VERSION (the hash
+    /// mismatch from the un-recomputed patch is never reached).
     std::string obj = buildObject(ObjectKind::Blob, 0x1, "p");
     obj[6] = 2; obj[7] = 0;                                    // min_reader_version = 2 (LE)
-    // recompute header_hash over [0,94) with [86,94) zeroed (see Step 4 for the exact offsets)
-    // — done in the test via the same CityHash64 the codec uses; for simplicity the codec exposes
-    // nothing, so instead corrupt-and-expect either gate OR hash mismatch is acceptable here:
     try
     {
         decodeEnvelopeHeader(obj, obj.size(), ObjectKind::Blob);
@@ -112,8 +110,7 @@ TEST(CasEnvelope, FutureMinReaderFailsClosed)
     }
     catch (const DB::Exception & e)
     {
-        EXPECT_TRUE(e.code() == DB::ErrorCodes::UNKNOWN_FORMAT_VERSION
-                 || e.code() == DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
     }
 }
 

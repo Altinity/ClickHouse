@@ -15,6 +15,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
     extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
@@ -41,12 +42,24 @@ constexpr std::string_view MAGIC_TREE = "CATR";
 
 std::string_view magicFor(ObjectKind kind)
 {
-    return kind == ObjectKind::Blob ? MAGIC_BLOB : MAGIC_TREE;
+    switch (kind)
+    {
+        case ObjectKind::Blob: return MAGIC_BLOB;
+        case ObjectKind::Tree: return MAGIC_TREE;
+    }
+    throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
+        "CHCA envelope: unexpected ObjectKind {}", static_cast<int>(kind));
 }
 
 FormatId formatIdFor(ObjectKind kind)
 {
-    return kind == ObjectKind::Blob ? FormatId::Blob : FormatId::Tree;
+    switch (kind)
+    {
+        case ObjectKind::Blob: return FormatId::Blob;
+        case ObjectKind::Tree: return FormatId::Tree;
+    }
+    throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
+        "CHCA envelope: unexpected ObjectKind {}", static_cast<int>(kind));
 }
 
 constexpr uint8_t FLAG_HAS_CRITICAL_EXTENSION = 0x01;
@@ -56,7 +69,7 @@ constexpr uint16_t TLV_INTENDED_REF = 0x0002;
 /// An arbitrary unknown type used (test-only) to exercise the critical fail-closed path.
 constexpr uint16_t TLV_UNKNOWN_CRITICAL = 0x7f01;
 
-/// header_hash = CityHash64 over the 96 core-header bytes with the [88, 96) field itself zeroed —
+/// header_hash = CityHash64 over the 94 core-header bytes with the [86, 94) field itself zeroed —
 /// the hash family the rest of ClickHouse uses for checksums. A diagnostics-quality check, not a
 /// safety dependency: every load-bearing header field is independently re-verified (spec §3.1).
 uint64_t computeHeaderHash(const char * core_header_with_hash_zeroed)
@@ -174,7 +187,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header)
         out_buf.finalize();
     }
 
-    /// Compute the hash over [0,96) with the header_hash field zeroed (it already is), then patch it in.
+    /// Compute the hash over [0,94) with the header_hash field zeroed (it already is), then patch it in.
     const uint64_t header_hash = computeHeaderHash(out.data());
     unalignedStoreLittleEndian<uint64_t>(out.data() + HEADER_HASH_OFFSET, header_hash);
 
@@ -243,7 +256,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
         uint64_t stored_header_hash = 0;
         readBinaryLittleEndian(stored_header_hash, in);
 
-        /// Verify the hash over [0,96) with the header_hash field zeroed.
+        /// Verify the hash over [0,94) with the header_hash field zeroed.
         {
             std::array<char, CORE_HEADER_LEN> core{};
             std::memcpy(core.data(), head_bytes.data(), CORE_HEADER_LEN);
