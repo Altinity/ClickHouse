@@ -91,11 +91,8 @@ namespace Setting
     extern const SettingsBool table_engine_read_through_distributed_cache;
     extern const SettingsUInt64 s3_path_filter_limit;
     extern const SettingsBool use_parquet_metadata_cache;
-<<<<<<< HEAD
-=======
     extern const SettingsBool input_format_parquet_use_native_reader_v3;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
->>>>>>> 8c8b170f4cc (Merge pull request #1687 from Altinity/feature/antalya-26.3/pr-1414-1)
 }
 
 namespace ErrorCodes
@@ -658,17 +655,13 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     ObjectInfoPtr object_info;
     auto query_settings = configuration->getQuerySettings(context_);
 
-<<<<<<< HEAD
     QueryConditionCachePtr query_condition_cache;
     if (format_filter_info && format_filter_info->condition_hash)
         query_condition_cache = Context::getGlobalContextInstance()->getQueryConditionCache();
 
-    while (true)
-=======
     bool not_a_path = false;
 
-    do
->>>>>>> 8c8b170f4cc (Merge pull request #1687 from Altinity/feature/antalya-26.3/pr-1414-1)
+    while (true)
     {
         not_a_path = false;
         object_info = file_iterator->next(processor);
@@ -711,7 +704,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             else
                 object_info->setObjectMetadata(object_storage->getObjectMetadata(path, with_tags));
         }
-<<<<<<< HEAD
 
         if (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0
             && object_info->getObjectMetadata()->is_size_known)
@@ -754,15 +746,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         }
         break;
     }
-=======
-    }
-    while (not_a_path
-           || (query_settings.skip_empty_files
-               && object_info->getObjectMetadata()->size_bytes == 0
-               && object_info->getObjectMetadata()->is_size_known));
 
     ProfileEvents::increment(ProfileEvents::ObjectStorageClusterProcessedTasks);
->>>>>>> 8c8b170f4cc (Merge pull request #1687 from Altinity/feature/antalya-26.3/pr-1414-1)
 
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
