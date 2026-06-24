@@ -1,6 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPlacement.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
@@ -14,7 +13,6 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
-    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -23,8 +21,6 @@ namespace DB::Cas
 
 namespace
 {
-
-constexpr uint8_t TREE_VERSION = 1;
 
 void sortAndCheckDuplicateNames(std::vector<TreeEntry> & entries)
 {
@@ -42,11 +38,20 @@ String encodeTree(std::vector<TreeEntry> entries)
 {
     sortAndCheckDuplicateNames(entries);
 
-    WriteBufferFromOwnString out;
-    writeString("CATR", out);
-    writeBinaryLittleEndian(TREE_VERSION, out);
-    writeBinaryLittleEndian(static_cast<uint32_t>(entries.size()), out);
+    /// First pass: assign each Inline entry a contiguous (offset,length) within the data section.
+    String data;
+    {
+        WriteBufferFromString data_buf(data);
+        for (const auto & e : entries)
+            if (e.placement == Placement::Inline)
+                writeString(e.inline_bytes, data_buf);
+        data_buf.finalize();
+    }
 
+    WriteBufferFromOwnString out;
+    writeBinaryLittleEndian(static_cast<uint32_t>(entries.size()), out);   /// entry_count
+
+    uint64_t running_offset = 0;
     for (const auto & e : entries)
     {
         writeBinaryLittleEndian(static_cast<uint16_t>(e.name.size()), out);
@@ -54,17 +59,15 @@ String encodeTree(std::vector<TreeEntry> entries)
         writeBinaryLittleEndian(static_cast<uint8_t>(e.placement), out);
         writeU128LE(out, e.file_hash);
         writeBinaryLittleEndian(e.file_size, out);
-
-        visitPlacement(e.placement,
-            [&] {   /// Inline: write inline byte-count then the bytes
-                writeBinaryLittleEndian(static_cast<uint32_t>(e.inline_bytes.size()), out);
-                writeString(e.inline_bytes, out);
-            },
-            [&] {},   /// Blob: no extra fields
-            [&] {}    /// Subtree: no extra fields
-        );
+        if (e.placement == Placement::Inline)
+        {
+            writeBinaryLittleEndian(running_offset, out);                  /// data_offset
+            writeBinaryLittleEndian(static_cast<uint64_t>(e.inline_bytes.size()), out); /// data_length
+            running_offset += e.inline_bytes.size();
+        }
     }
 
+    writeString(data, out);                                                /// DATA section
     return std::move(out.str());
 }
 
@@ -74,17 +77,12 @@ std::vector<TreeEntry> decodeTree(std::string_view data)
     {
         ReadBufferFromMemory in(data.data(), data.size());
 
-        if (readFixedBytes(in, 4) != "CATR")
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS tree: bad magic");
-
-        uint8_t version = 0;
-        readBinaryLittleEndian(version, in);
-        checkVersion(TREE_VERSION, version, "tree");
-
         uint32_t count = 0;
         readBinaryLittleEndian(count, in);
 
+        struct Pending { size_t offset; size_t length; };
         std::vector<TreeEntry> entries;
+        std::vector<Pending> inline_slices;          /// index-aligned with Inline entries
         entries.reserve(count);
 
         for (uint32_t i = 0; i < count; ++i)
@@ -96,8 +94,6 @@ std::vector<TreeEntry> decodeTree(std::string_view data)
 
             uint8_t placement = 0;
             readBinaryLittleEndian(placement, in);
-            /// Only Inline(1), Blob(2), Subtree(3) are valid; any other value can never legitimately
-            /// exist and must fail closed.
             if (placement != static_cast<uint8_t>(Placement::Inline)
                 && placement != static_cast<uint8_t>(Placement::Blob)
                 && placement != static_cast<uint8_t>(Placement::Subtree))
@@ -107,17 +103,32 @@ std::vector<TreeEntry> decodeTree(std::string_view data)
             e.file_hash = readU128LE(in);
             readBinaryLittleEndian(e.file_size, in);
 
-            visitPlacement(e.placement,
-                [&] {   /// Inline: read byte-count then the bytes
-                    uint32_t len = 0;
-                    readBinaryLittleEndian(len, in);
-                    e.inline_bytes = readFixedBytes(in, len);
-                },
-                [&] {},   /// Blob: no extra fields
-                [&] {}    /// Subtree: no extra fields
-            );
-
+            if (e.placement == Placement::Inline)
+            {
+                uint64_t off = 0;
+                uint64_t len = 0;
+                readBinaryLittleEndian(off, in);
+                readBinaryLittleEndian(len, in);
+                inline_slices.push_back({static_cast<size_t>(off), static_cast<size_t>(len)});
+            }
             entries.push_back(std::move(e));
+        }
+
+        /// The DATA section is the remainder. Slice each Inline entry's bytes out of it; an out-of-range
+        /// (offset+length) is corruption.
+        const size_t data_start = in.count();
+        const std::string_view data_section = data.substr(data_start);
+        size_t slice_idx = 0;
+        for (auto & e : entries)
+        {
+            if (e.placement != Placement::Inline)
+                continue;
+            const Pending & p = inline_slices[slice_idx++];
+            if (p.offset > data_section.size() || p.length > data_section.size() - p.offset)
+                throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+                    "CAS tree: inline slice [{}, {}) overruns data section of {} bytes",
+                    p.offset, p.offset + p.length, data_section.size());
+            e.inline_bytes = String(data_section.substr(p.offset, p.length));
         }
 
         return entries;

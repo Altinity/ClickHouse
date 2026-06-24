@@ -274,11 +274,11 @@ TEST(CasTreeCodec, UnknownPlacementOnDecodeThrows)
 {
     auto entries = sampleEntries();
     String encoded = encodeTree(entries);
-    /// Corrupt the placement byte of the first entry. Layout: "CATR"(4) ver(1) count(4) then
-    /// per entry: name_len(2) name placement(1) ...
-    /// First entry name is the smallest: "data.bin" (8 chars). placement byte at 9+2+8 = ... compute:
-    /// header = 4+1+4 = 9; name_len(2) at 9; name 8 bytes at 11; placement at 19.
-    encoded[19] = 99;
+    /// Corrupt the placement byte of the first entry. New payload layout: count(4) then per entry:
+    /// name_len(2) name placement(1) ...
+    /// First entry name is the smallest: "data.bin" (8 chars).
+    /// count(4) + name_len(2) + name(8) = 14; placement byte at 14.
+    encoded[14] = 99;
     EXPECT_THROW(decodeTree(encoded), DB::Exception);
 }
 
@@ -292,25 +292,24 @@ TEST(CasTreeCodec, TruncatedBufferThrows)
 
 TEST(CasTreeCodec, HugeInlineLengthThrowsCorruptedData)
 {
-    /// A corrupted u32 inline-bytes length field must be rejected by the bounds check in
-    /// `readFixedBytes` BEFORE any allocation: without that check, a single flipped length field
-    /// would transiently allocate up to 4 GiB, surfacing as MEMORY_LIMIT_EXCEEDED under a memory
-    /// tracker instead of the pinned CORRUPTED_DATA (and this test would take noticeably longer).
+    /// A corrupted data_length field must be rejected by the inline-slice bounds check in `decodeTree`
+    /// before any allocation: the decoder checks (offset+length) against the data section size and throws
+    /// CORRUPTED_DATA rather than silently allocating gigabytes.
     std::vector<TreeEntry> entries = {inlineEntry("f", "hello")};
     String encoded = encodeTree(entries);
 
-    /// CATR layout (see `encodeTree`): magic(4) ver(1) count(4) = 9 bytes of header, then for the
-    /// single entry: name_len(2) name(1, "f") placement(1) file_hash(16) file_size(8); the u32
-    /// little-endian inline_bytes length therefore sits at offset 9 + 2 + 1 + 1 + 16 + 8 = 37.
-    constexpr size_t len_offset = 9 + 2 + 1 + 1 + 16 + 8;
-    ASSERT_LE(len_offset + 4, encoded.size());
-    /// Sanity: the bytes at the computed offset hold the known length of "hello" (5, LE).
+    /// New catalog-first layout (see `encodeTree`): count(4) then for the single entry:
+    /// name_len(2) name(1, "f") placement(1) file_hash(16) file_size(8) data_offset(8) data_length(8).
+    /// data_length sits at offset 4 + 2 + 1 + 1 + 16 + 8 + 8 = 40.
+    constexpr size_t len_offset = 4 + 2 + 1 + 1 + 16 + 8 + 8;
+    ASSERT_LE(len_offset + 8, encoded.size());
+    /// Sanity: the bytes at the computed offset hold the known length of "hello" (5, LE u64).
     ASSERT_EQ(static_cast<unsigned char>(encoded[len_offset]), 5u);
     ASSERT_EQ(static_cast<unsigned char>(encoded[len_offset + 1]), 0u);
     ASSERT_EQ(static_cast<unsigned char>(encoded[len_offset + 2]), 0u);
     ASSERT_EQ(static_cast<unsigned char>(encoded[len_offset + 3]), 0u);
 
-    /// Patch the length to ~4 GiB (0xFFFFFFF0 little-endian).
+    /// Patch the length to ~4 GiB (0xFFFFFFF0 little-endian u64).
     encoded[len_offset] = static_cast<char>(0xF0);
     encoded[len_offset + 1] = static_cast<char>(0xFF);
     encoded[len_offset + 2] = static_cast<char>(0xFF);
@@ -319,11 +318,13 @@ TEST(CasTreeCodec, HugeInlineLengthThrowsCorruptedData)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeTree(encoded); });
 }
 
-TEST(CasTreeCodec, BadMagicThrows)
+TEST(CasTreeCodec, CorruptedCountThrows)
 {
+    /// The new payload starts with a u32 entry_count (no magic). Corrupting the count byte makes the
+    /// decoder attempt to read far more entries than exist, hitting a truncated-buffer throw.
     auto entries = sampleEntries();
     String encoded = encodeTree(entries);
-    encoded[0] = 'X';
+    encoded[0] = static_cast<char>(0xFF);   /// count now reads as a huge number; buffer exhausted -> throw
     EXPECT_THROW(decodeTree(encoded), DB::Exception);
 }
 
