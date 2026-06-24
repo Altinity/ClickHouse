@@ -48,6 +48,9 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
 
 WriterStamp currentWriterVersion(FormatId id, uint16_t floor)
 {
+    if (floor == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "CasFormat: write floor must be >= 1, got 0");
     const auto cps = changePoints(id);
     /// Newest change-point with generation <= floor (cps is oldest-first, non-empty, gen[0] == 1).
     const FormatChangePoint * chosen = &cps.front();
@@ -87,7 +90,8 @@ FramingHeader readFramingHeader(ReadBuffer & in, std::string_view expected_magic
     in.readStrict(got, 4);
     if (std::string_view(got, 4) != expected_magic)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS {}: bad framing magic (expected '{}')", what, expected_magic);
+            "CAS {}: bad framing magic (got '{}', expected '{}')",
+            what, std::string_view(got, 4), expected_magic);
 
     FramingHeader h{};
     readBinaryLittleEndian(h.writer_version, in);

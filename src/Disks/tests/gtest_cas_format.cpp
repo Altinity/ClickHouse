@@ -8,6 +8,7 @@ namespace DB::ErrorCodes
 {
     extern const int UNKNOWN_FORMAT_VERSION;
     extern const int CORRUPTED_DATA;
+    extern const int BAD_ARGUMENTS;
 }
 
 using namespace DB::Cas;
@@ -121,4 +122,23 @@ TEST(CasFormat, TolerateUnknownKeysOnlyForFutureWriter)
     EXPECT_FALSE(tolerateUnknownKeys(G_BUILD));
     /// Future writer: unknown keys are forward additions -> tolerate (ignore them).
     EXPECT_TRUE(tolerateUnknownKeys(G_BUILD + 1));
+}
+
+TEST(CasFormat, CurrentWriterVersionRejectsFloorZero)
+{
+    try
+    {
+        currentWriterVersion(FormatId::Blob, 0);
+        FAIL() << "expected BAD_ARGUMENTS";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::BAD_ARGUMENTS);
+    }
+}
+
+TEST(CasFormat, FramingHeaderRejectsTruncatedBuffer)
+{
+    DB::ReadBufferFromMemory in("CAR", 3);  // 3 bytes < FRAMING_HEADER_SIZE
+    EXPECT_THROW(readFramingHeader(in, "CARS", "manifest"), DB::Exception);
 }
