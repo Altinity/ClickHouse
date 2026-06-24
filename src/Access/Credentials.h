@@ -9,6 +9,9 @@
 #endif
 
 #include <base/types.h>
+#include <chrono>
+#include <optional>
+#include <set>
 
 namespace Poco::Net
 {
@@ -135,6 +138,28 @@ private:
 class MySQLNative41Credentials : public CredentialsWithScramble
 {
     using CredentialsWithScramble::CredentialsWithScramble;
+};
+
+class TokenCredentials : public Credentials
+{
+public:
+    explicit TokenCredentials(const String & token_)
+        : token(token_)
+    {
+        is_ready = true;
+    }
+
+    void setUserName(const String & user_name_) { user_name = user_name_; }
+    void setGroups(const std::set<String> & groups_) { groups = groups_; }
+    const std::set<String> & getGroups() const { return groups; }
+    void setExpiresAt(const std::chrono::system_clock::time_point & expires_at_) { expires_at = expires_at_; }
+    std::optional<std::chrono::system_clock::time_point> getExpiresAt() const { return expires_at; }
+    const String & getToken() const { return token; }
+
+private:
+    String token;
+    std::set<String> groups;
+    std::optional<std::chrono::system_clock::time_point> expires_at;
 };
 
 #if USE_SSH

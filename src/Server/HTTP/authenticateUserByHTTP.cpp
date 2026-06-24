@@ -87,6 +87,7 @@ bool authenticateUserByHTTP(
     bool has_credentials_in_query_params = params.has("user") || params.has("password");
 
     std::string spnego_challenge;
+    std::string bearer_token;
 #if USE_SSL
     X509Certificate::Subjects certificate_subjects;
 #endif
@@ -164,6 +165,10 @@ bool authenticateUserByHTTP(
             if (spnego_challenge.empty())
                 throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: SPNEGO challenge is empty");
         }
+        else if (Poco::icompare(scheme, "Bearer") == 0)
+        {
+            bearer_token = auth_info;
+        }
         else
         {
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: '{}' HTTP Authorization scheme is not supported", scheme);
@@ -221,12 +226,10 @@ bool authenticateUserByHTTP(
         }
     }
 #endif
-<<<<<<< HEAD
-=======
     else if (!bearer_token.empty())
     {
         const auto & access_control = global_context->getAccessControl();
-        if (!access_control.isTokenAuthEnabled())
+        if (!access_control.getExternalAuthenticators().isTokenAuthEnabled())
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Token authentication is disabled");
 
         const auto token_credentials = TokenCredentials(bearer_token);
@@ -245,7 +248,6 @@ bool authenticateUserByHTTP(
 
         current_credentials = std::make_unique<TokenCredentials>(token_credentials);
     }
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
     else // I.e., now using user name and password strings ("Basic").
     {
         if (!current_credentials)

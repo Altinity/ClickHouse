@@ -37,7 +37,9 @@ class ExternalAuthenticators
 {
 public:
     void reset();
-    void setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log);
+    void setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log, bool token_auth_enabled_);
+
+    bool isTokenAuthEnabled() const;
 
     /// Returns true if a token processor with the given name is currently
     /// configured. Used by `Session::checkIfUserIsStillValid` to terminate
@@ -52,8 +54,6 @@ public:
     bool checkKerberosCredentials(const String & realm, const GSSAcceptorContext & credentials) const;
     bool checkHTTPBasicCredentials(const String & server, const BasicCredentials & credentials, const ClientInfo & client_info, SettingsChanges & settings) const;
 
-<<<<<<< HEAD
-=======
     /// `prime_cache_on_success` controls whether a successful validation populates the
     /// token cache. Per-user authentication paths (the chain reached from
     /// `Session::authenticate`) leave this at the default `true` -- their result is
@@ -69,8 +69,6 @@ public:
                                const String & processor_name = "",
                                const String & jwt_claims = "",
                                bool prime_cache_on_success = true) const;
-
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
     GSSAcceptorContext::Params getKerberosParams() const;
 
 private:
@@ -92,8 +90,6 @@ private:
     mutable LDAPCaches ldap_caches TSA_GUARDED_BY(mutex) ;
     std::optional<GSSAcceptorContext::Params> kerberos_params TSA_GUARDED_BY(mutex) ;
     std::unordered_map<String, HTTPAuthClientParams> http_auth_servers TSA_GUARDED_BY(mutex) ;
-<<<<<<< HEAD
-=======
     /// Ordered (std::map, not unordered_map) so that the auto-discovery
     /// dispatch order in `checkTokenCredentials` is deterministic across
     /// process runs. Without an ordering, the iteration order of
@@ -145,7 +141,6 @@ private:
     /// validation AND any per-user `jwt_claims` policy have accepted the token.
     void primeTokenCache(const ITokenProcessor & processor,
                          const TokenCredentials & credentials) const TSA_REQUIRES(mutex);
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
 
     void resetImpl() TSA_REQUIRES(mutex);
 };

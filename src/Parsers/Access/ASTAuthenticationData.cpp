@@ -116,11 +116,6 @@ void ASTAuthenticationData::formatImpl(WriteBuffer & ostr, const FormatSettings 
             }
             case AuthenticationType::JWT:
             {
-<<<<<<< HEAD
-                prefix = "CLAIMS";
-                parameter = true;
-                break;
-=======
                 /// JWT carries two independent optional clauses (PROCESSOR and
                 /// CLAIMS), so it does not fit the single-prefix/single-parameter
                 /// shape the rest of this function uses. Emit directly here and
@@ -144,7 +139,6 @@ void ASTAuthenticationData::formatImpl(WriteBuffer & ostr, const FormatSettings 
                     formatValidUntil(*valid_until, ostr, settings);
 
                 return;
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
             }
             case AuthenticationType::LDAP:
             {

@@ -79,6 +79,12 @@ public:
     const String & getHTTPAuthenticationServerName() const { return http_auth_server_name; }
     void setHTTPAuthenticationServerName(const String & name) { http_auth_server_name = name; }
 
+    const String & getTokenProcessorName() const { return token_processor_name; }
+    void setTokenProcessorName(const String & name) { token_processor_name = name; }
+
+    const String & getJWTClaims() const { return jwt_claims; }
+    void setJWTClaims(const String & claims) { jwt_claims = claims; }
+
     time_t getValidUntil() const { return valid_until; }
     void setValidUntil(time_t valid_until_) { valid_until = valid_until_; }
 
@@ -121,6 +127,8 @@ private:
     String http_auth_server_name;
     HTTPAuthenticationScheme http_auth_scheme = HTTPAuthenticationScheme::BASIC;
     time_t valid_until = 0;
+    String token_processor_name;
+    String jwt_claims;
 };
 
 }

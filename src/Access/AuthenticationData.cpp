@@ -420,9 +420,6 @@ boost::intrusive_ptr<ASTAuthenticationData> AuthenticationData::toAST() const
         }
         case AuthenticationType::JWT:
         {
-<<<<<<< HEAD
-            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "JWT is available only in ClickHouse Cloud");
-=======
             /// Round-trip into the same shape the parser produces: PROCESSOR
             /// child first (when set), CLAIMS child after (when set), with the
             /// AST flags telling the formatter which slot is which.
@@ -440,7 +437,6 @@ boost::intrusive_ptr<ASTAuthenticationData> AuthenticationData::toAST() const
                 node->children.push_back(make_intrusive<ASTLiteral>(claims));
             }
             break;
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
         }
         case AuthenticationType::KERBEROS:
         {
@@ -718,8 +714,6 @@ AuthenticationData AuthenticationData::fromAST(const ASTAuthenticationData & que
         auth_data.setHTTPAuthenticationServerName(server);
         auth_data.setHTTPAuthenticationScheme(scheme);
     }
-<<<<<<< HEAD
-=======
 #if USE_JWT_CPP
     else if (query.type == AuthenticationType::JWT)
     {
@@ -749,7 +743,6 @@ AuthenticationData AuthenticationData::fromAST(const ASTAuthenticationData & que
         }
     }
 #endif
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
     else
     {
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected ASTAuthenticationData structure");

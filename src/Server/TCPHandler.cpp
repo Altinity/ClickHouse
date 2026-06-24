@@ -1962,6 +1962,10 @@ void TCPHandler::receiveHello()
     if (is_ssh_based_auth)
         user.erase(0, std::string_view(EncodedUserInfo::SSH_KEY_AUTHENTICAION_MARKER).size());
 
+    is_jwt_based_auth = user.starts_with(EncodedUserInfo::JWT_AUTHENTICAION_MARKER);
+    if (is_jwt_based_auth)
+        user.erase(0, std::string_view(EncodedUserInfo::JWT_AUTHENTICAION_MARKER).size());
+
     session = makeSession();
     const auto & client_info = session->getClientInfo();
 
@@ -2049,12 +2053,10 @@ void TCPHandler::receiveHello()
     }
 #endif
 
-<<<<<<< HEAD
-=======
     if (is_jwt_based_auth)
     {
         const auto & access_control = server.context()->getAccessControl();
-        if (!access_control.isTokenAuthEnabled())
+        if (!access_control.getExternalAuthenticators().isTokenAuthEnabled())
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Token authentication is disabled");
 
         auto credentials = TokenCredentials(password);
@@ -2073,7 +2075,7 @@ void TCPHandler::receiveHello()
         return;
     }
 
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
+
     session->authenticate(user, password, getClientAddress(client_info), socket().peerAddress());
 }
 

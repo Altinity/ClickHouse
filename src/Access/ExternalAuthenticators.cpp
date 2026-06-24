@@ -293,9 +293,6 @@ void ExternalAuthenticators::reset()
     resetImpl();
 }
 
-<<<<<<< HEAD
-void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log)
-=======
 /// Parse all token processors as an all-or-nothing operation.
 ///
 /// Throws if ANY processor fails to parse. The caller is expected to react by
@@ -347,10 +344,11 @@ bool ExternalAuthenticators::hasTokenProcessor(const String & name) const
 }
 
 void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log, bool token_auth_enabled_)
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
 {
     std::lock_guard lock(mutex);
     resetImpl();
+
+    token_auth_enabled = token_auth_enabled_;
 
     Poco::Util::AbstractConfiguration::Keys all_keys;
     config.keys("", all_keys);
@@ -360,6 +358,7 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
     std::size_t http_auth_server_keys_count = 0;
 
     const String http_auth_servers_config = "http_authentication_servers";
+    const String token_processors_config = "token_processors";
 
     for (auto key : all_keys)
     {
@@ -437,8 +436,6 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
     {
         tryLogCurrentException(log, "Could not parse Kerberos section");
     }
-<<<<<<< HEAD
-=======
 
     if (token_auth_enabled)
     {
@@ -459,7 +456,6 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
     }
     else
         LOG_INFO(log, "Token authentication is disabled, skipping token processors configuration");
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
 }
 
 static UInt128 computeParamsHash(const LDAPClient::Params & params, const LDAPClient::RoleSearchParamsList * role_search_params)
@@ -638,8 +634,6 @@ HTTPAuthClientParams ExternalAuthenticators::getHTTPAuthenticationParams(const S
     return it->second;
 }
 
-<<<<<<< HEAD
-=======
 bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProcessor & processor,
                                                               TokenCredentials & credentials) const
 {
@@ -875,7 +869,6 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
     return false;
 }
 
->>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
 bool ExternalAuthenticators::checkHTTPBasicCredentials(
     const String & server, const BasicCredentials & credentials, const ClientInfo & client_info, SettingsChanges & settings) const
 {
