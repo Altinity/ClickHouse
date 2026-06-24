@@ -329,16 +329,11 @@ Authentication::CredentialsCheckResult Authentication::areCredentialsValid(
     const ClientInfo & client_info,
     SettingsChanges & settings)
 {
-<<<<<<< HEAD
-    if (!credentials.isReady())
-        return CredentialsCheckResult::Fail;
-=======
     /// It is OK for TokenCredentials to be not ready:
     /// When auth request happens, we do not even know the username.
     /// Token is resolved a bit later and the user information will be put in credentials
     if (!typeid_cast<const TokenCredentials *>(&credentials) && !credentials.isReady())
-        return false;
->>>>>>> d742d0a78ce (Merge pull request #1430 from Altinity/backports/antalya-26.1/1078)
+        return CredentialsCheckResult::Fail;
 
     if (const auto * gss_acceptor_context = typeid_cast<const GSSAcceptorContext *>(&credentials))
     {
@@ -388,12 +383,13 @@ Authentication::CredentialsCheckResult Authentication::areCredentialsValid(
     if (const auto * token_credentials = typeid_cast<const TokenCredentials *>(&credentials))
     {
         if (authentication_method.getType() != AuthenticationType::JWT)
-            return false;
+            return CredentialsCheckResult::Fail;
 
         return external_authenticators.checkTokenCredentials(
-            *token_credentials,
-            authentication_method.getTokenProcessorName(),
-            authentication_method.getJWTClaims());
+                   *token_credentials,
+                   authentication_method.getTokenProcessorName(),
+                   authentication_method.getJWTClaims())
+                   ? CredentialsCheckResult::Success : CredentialsCheckResult::Fail;
     }
 
     if ([[maybe_unused]] const auto * always_allow_credentials = typeid_cast<const AlwaysAllowCredentials *>(&credentials))

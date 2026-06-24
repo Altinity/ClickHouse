@@ -2054,9 +2054,6 @@ void TCPHandler::receiveHello()
     }
 #endif
 
-<<<<<<< HEAD
-    session->authenticate(user, password, getClientAddress(client_info), socket().peerAddress());
-=======
     if (is_jwt_based_auth)
     {
         const auto & access_control = server.context()->getAccessControl();
@@ -2074,8 +2071,7 @@ void TCPHandler::receiveHello()
         return;
     }
 
-    session->authenticate(user, password, getClientAddress(client_info));
->>>>>>> d742d0a78ce (Merge pull request #1430 from Altinity/backports/antalya-26.1/1078)
+    session->authenticate(user, password, getClientAddress(client_info), socket().peerAddress());
 }
 
 

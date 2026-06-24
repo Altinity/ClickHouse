@@ -312,11 +312,8 @@ private:
     std::atomic_bool allow_beta_tier_settings = true;
     std::atomic_bool enable_user_name_access_type = true;
     std::atomic_bool enable_read_write_grants = false;
-<<<<<<< HEAD
     std::atomic_bool allow_impersonate_user = false;
-=======
     std::atomic_bool enable_token_auth = true;
->>>>>>> d742d0a78ce (Merge pull request #1430 from Altinity/backports/antalya-26.1/1078)
 };
 
 }

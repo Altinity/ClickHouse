@@ -11,11 +11,8 @@
 #include <Common/Exception.h>
 #include <Common/quoteString.h>
 #include <Common/callOnce.h>
-<<<<<<< HEAD
 #include <base/scope_guard.h>
-=======
 #include "Access/Common/AuthenticationType.h"
->>>>>>> d742d0a78ce (Merge pull request #1430 from Altinity/backports/antalya-26.1/1078)
 #include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
 #include <Parsers/parseIdentifierOrStringLiteral.h>
@@ -38,11 +35,8 @@ namespace ErrorCodes
     extern const int ACCESS_ENTITY_NOT_FOUND;
     extern const int ACCESS_STORAGE_READONLY;
     extern const int ACCESS_STORAGE_DOESNT_ALLOW_BACKUP;
-<<<<<<< HEAD
     extern const int REQUIRED_SECOND_FACTOR;
-=======
     extern const int AUTHENTICATION_FAILED;
->>>>>>> d742d0a78ce (Merge pull request #1430 from Altinity/backports/antalya-26.1/1078)
     extern const int WRONG_PASSWORD;
     extern const int IP_ADDRESS_NOT_ALLOWED;
     extern const int LOGICAL_ERROR;

@@ -235,11 +235,8 @@ if (TARGET ch_rust::wasmtime)
 endif()
 
 set (USE_YTSAURUS 1)
-<<<<<<< HEAD
-=======
 if (TARGET ch_contrib::jwt-cpp)
     set(USE_JWT_CPP 1)
 endif()
->>>>>>> d742d0a78ce (Merge pull request #1430 from Altinity/backports/antalya-26.1/1078)
 
 set(SOURCE_DIR ${PROJECT_SOURCE_DIR})
