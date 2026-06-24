@@ -60,15 +60,19 @@ generation 1; it is not a migration of existing bytes.
 ```
 Is the object content-addressed (its key is its content hash)?
   ├─ yes →  canonical BINARY  (blob, tree)
-  └─ no  →  HOT (written/read per-operation or per-GC-round), OR large, OR structurally complex?
-              ├─ yes →  PROTOBUF  (manifest + journal, gc-snap, gc-state, retired-set, watermark)
-              └─ no  →  JSON      (control-plane only, touched rarely: pool-meta, roster)
+  └─ no  →  PROTOBUF          (EVERY mutable object: manifest + journal, gc-snap, gc-state,
+                               retired-set, watermark, pool-meta, roster)
 ```
 
-JSON is reserved for the **rarely-touched control plane** — objects written once at creation or on a
-rare control event, never per-operation. Everything on a hot path goes to protobuf even when it is
-tiny (e.g. `gc-state`, `watermark`): the per-object protobuf overhead is trivial, and one mechanism
-for all hot objects is cleaner than a size cutoff.
+**Two encodings only — JSON is abandoned (2026-06-24).** An earlier draft kept JSON for "rarely-touched
+control-plane" objects, but once the hot-path rule moved `gc-state`/`retired-set`/`watermark` to
+protobuf, the only JSON object left in the release was `pool-meta` (the future `roster` is deferred to
+Part IV). Carrying the whole JSON codec family (`JsonObjectWriter`, the `require*`/`checkNoUnknownKeys`
+helpers, `parseJsonDocument`, the version-aware unknown-key rule, `tolerateUnknownKeys`) for one tiny
+create-once object is not worth the special-case surface. The "human-inspectable with plain S3 tools"
+benefit had already evaporated — every other mutable object needs decode tooling — so `pool-meta`
+joins the rest as protobuf. If a plain-readable touch is ever wanted, that is **B180** (a tiny static
+human-readable pool *breadcrumb*), not a versioned JSON codec.
 
 ## Why each branch
 
@@ -78,14 +82,11 @@ for all hot objects is cleaner than a size cutoff.
   tree object carries **raw inline payload** (small part files) in a catalog-first / data-last layout
   that is a natural custom-binary structure; (3) a blob is raw file bytes anyway. Determinism is a
   property we get for free from the Merkle rule, not a reason to pick binary.
-- **Mutable + hot, large, or complex ⇒ protobuf.** Never hashed, so non-canonical wire output is
-  harmless. Protobuf gives free **skip-unknown** (the engine of additive evolution) and avoids the two
-  problems §4 found with JSON here: parse/serialize cost on the hot path, and unreadable codec code as
-  the schema grows. **"Hot" (per-operation or per-GC-round) is a trigger on its own**, even for tiny
-  objects — the §4 lesson was specifically that JSON on a hot path is a bottleneck.
-- **Mutable, control-plane, rarely touched ⇒ JSON.** Only objects written at creation or on a rare
-  control event (`pool-meta`, the deferred `roster`). They are the operator's incident surface —
-  inspectable with plain S3 tooling — and small/simple, so JSON's cost never materializes.
+- **Mutable ⇒ protobuf (all of them).** Never hashed, so non-canonical wire output is harmless.
+  Protobuf gives free **skip-unknown** (the engine of additive evolution) and avoids the two problems
+  §4 found with JSON: parse/serialize cost on the hot path, and unreadable codec code as the schema
+  grows. Even the tiny create-once objects (`pool-meta`) use protobuf — one mechanism for every mutable
+  object beats a special-case codec for one or two of them (see the "JSON abandoned" note above).
 
 ## Drop packs — inline the eager part files into the tree
 
@@ -193,12 +194,8 @@ The concept (`format_id` + `writer_version` + `min_reader_version`) is uniform; 
   manifest and the **length-delimited streaming** gc-snap. Additive = a new field number (skip-unknown
   native). Discipline: no `map<>`, pinned field order — for **diffability** and golden tests, not
   correctness (never hashed).
-- **JSON (pool-meta, roster).** Keys `"format"`, `"writer_version"`,
-  `"min_reader_version"`. Unknown-key handling is **version-aware**: strict for a same-or-older object
-  (`writer_version ≤ G_build` and an unknown key → `CORRUPTED_DATA`, preserving incident-surface
-  safety), but unknown keys are **allowed when `writer_version > G_build`** (forward additions —
-  ignore them). Any field addition bumps `writer_version`, so the two cases never overlap. Replaces the
-  unconditional `checkNoUnknownKeys` + monotone `checkVersion`.
+  (There is no JSON branch — JSON is abandoned. `pool-meta` and the future `roster` are protobuf and use
+  the same framing header as the manifest and gc-snap.)
 
 ---
 
@@ -275,8 +272,10 @@ are **outside** identity, so they evolve freely.
 4. **Other mutable objects → protobuf** (hot-path rule): `gc-state` and `watermark` (tiny — framing
    header, single message); `retired-set` (length-delimited streaming like gc-snap, since it grows).
    These move off JSON because they are written per-GC-round / per-heartbeat.
-5. **JSON objects** (`pool-meta`, and the deferred `roster`): version-aware header; the rarely-touched
-   control-plane surface, kept human-inspectable.
+5. **`pool-meta` → protobuf** (+ the framing header), and **delete the JSON codec family** — the
+   `CasCodecUtil` `require*`/`checkNoUnknownKeys`/`parseJsonDocument`/`JsonObjectWriter` helpers and the
+   now-dead `tolerateUnknownKeys` (Plan 1). The deferred `roster` will be protobuf when built. No JSON
+   objects remain.
 6. **S3 object user-metadata** (`ObjectMeta`/`HeadResult.attributes`): only for **optional/diagnostic**
    data cheaply read at HEAD (e.g. provenance), **never load-bearing** — `LocalObjectStorage` drops it
    (B167b).
@@ -331,8 +330,11 @@ A small, focused module instead of per-codec ad-hoc version handling:
   (`generation → min_reader`); `currentWriterVersion(class, write_floor)`; the single
   `gateOnRead(format_id, min_reader, G_build)` that replaces `checkVersion`; the framing-header
   read/write helpers (`[magic][writer:u16][min_reader:u16]`) for the protobuf class.
-- **`CasCodecUtil.h`**: drop the monotone `checkVersion`; `parseJsonDocument` calls `gateOnRead` and
-  applies the version-aware unknown-key rule; the UInt128 LE/BE helpers stay.
+- **`CasCodecUtil.h`**: **delete the entire JSON codec family** (`JsonObjectWriter`, the
+  `require*`/`requireU64`/`checkNoUnknownKeys`/`parseJsonDocument`/`decodeJsonGuarded` helpers) and the
+  monotone `checkVersion` once their last caller is gone; the UInt128 LE/BE binary helpers + the
+  `decodeGuarded`/`readFixedBytes` binary helpers stay. Also delete the now-dead `tolerateUnknownKeys`
+  from `CasFormat` (Plan 1).
 - **`CasEnvelope.{h,cpp}`** (the shared object header): one header for blob and tree; magic
   `CABL`/`CATR` (drop the `kind` enum); **repack the core hole-free** — reclaim the dropped `kind` byte
   and the former `index_len` zero pad by shifting fields left (set the new exact core size /
