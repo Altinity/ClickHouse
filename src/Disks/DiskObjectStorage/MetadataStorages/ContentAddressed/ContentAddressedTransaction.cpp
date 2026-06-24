@@ -14,6 +14,7 @@
 #include <Common/getRandomASCIIString.h>
 #include <Common/logger_useful.h>
 #include <base/hex.h>
+#include <base/scope_guard.h>
 #include <city.h>
 #include <ctime>
 
@@ -616,6 +617,8 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     return std::make_unique<ContentAddressed::CaInlineWriteBuffer>(
         [this, route = *r](std::string bytes)
         {
+            /// Hash via the SAME hex round-trip the blob path (CaContentWriteBuffer) uses, so an inline file
+            /// and a standalone blob of identical content get the same file_hash (inline == blob for treeId).
             const UInt128 hash = Cas::hexToU128(
                 getHexUIntLowercase(CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size())));
             if (bytes.size() <= INLINE_CAP)
@@ -644,7 +647,13 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                     tmp.write(bytes.data(), bytes.size());
                     tmp.finalize();
                 }
+                /// Until stageBlobPartFile takes ownership, WE own the temp file — mirror the blob path,
+                /// where CaContentWriteBuffer's dtor removes it unless the callback succeeded. If
+                /// stageBlobPartFile throws, drop the orphan instead of leaking it into scratch.
+                bool staged = false;
+                SCOPE_EXIT({ if (!staged) { std::error_code ec; std::filesystem::remove(temp_path, ec); } });
                 stageBlobPartFile(route, hash, bytes.size(), temp_path);
+                staged = true;
             }
         });
 }

@@ -9,6 +9,8 @@ TEST(CaInlinePlacement, ColumnAndMarkFilesStayBlob)
     EXPECT_TRUE(partFileMustStayBlob("data.mrk"));
     EXPECT_TRUE(partFileMustStayBlob("data.mrk2"));
     EXPECT_TRUE(partFileMustStayBlob("data.mrk3"));
+    EXPECT_TRUE(partFileMustStayBlob("data.cmrk"));
+    EXPECT_TRUE(partFileMustStayBlob("data.cmrk2"));
     EXPECT_TRUE(partFileMustStayBlob("data.cmrk3"));
     EXPECT_TRUE(partFileMustStayBlob("primary.idx"));   // potentially large; stays blob (follow-up tuning)
 }
