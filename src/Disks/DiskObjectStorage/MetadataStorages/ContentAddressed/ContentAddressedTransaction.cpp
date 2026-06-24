@@ -4,13 +4,17 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <IO/WriteBufferFromFile.h>
 #include <IO/copyData.h>
 #include <algorithm>
 #include <filesystem>
 #include <unordered_set>
 #include <Common/Exception.h>
 #include <Common/HashTable/Hash.h>
+#include <Common/getRandomASCIIString.h>
 #include <Common/logger_useful.h>
+#include <base/hex.h>
+#include <city.h>
 #include <ctime>
 
 namespace DB::ContentAddressed
@@ -56,6 +60,11 @@ namespace
     /// M-W skeleton (plan 2026-06-12, T2): the write path lands task by task (T3-T9).
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ContentAddressedTransaction::{} not wired yet (M-W)", op);
 }
+
+/// Inline candidates above this size spill to a blob instead of riding the tree object — a tuning
+/// knob (could become a disk setting later). Keeps the tree object bounded against an unexpectedly
+/// large eager file.
+constexpr size_t INLINE_CAP = 1024 * 1024;   /// 1 MiB
 
 }
 
@@ -509,6 +518,26 @@ void ContentAddressedTransaction::createMetadataFile(const std::string &, const 
     notYet("createMetadataFile");
 }
 
+void ContentAddressedTransaction::stageBlobPartFile(
+    const ContentAddressedMetadataStorage::Route & route,
+    const UInt128 & hash, size_t size, const std::string & temp_path)
+{
+    /// B188: do NOT upload here. Record the pending blob (uploaded post-precommit in publishStaging)
+    /// and a tokenless dep so stageTree's W-TREE-BUILD check passes; putBlob later overwrites it with
+    /// the tokened dep. The temp file is kept (the transaction owns it).
+    auto & st = stagingFor(route);
+    st.pending_blobs.push_back({hash, temp_path, size});
+    buildFor(route, st).recordPendingBlobDep(hash, size);
+
+    Cas::TreeEntry entry;
+    entry.name = route.file;
+    entry.placement = Cas::Placement::Blob;
+    entry.file_hash = hash;
+    entry.file_size = size;
+    std::erase_if(st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+    st.entries.push_back(std::move(entry));
+}
+
 std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     const std::string & path, size_t buf_size, WriteMode mode, const WriteSettings & settings)
 {
@@ -564,31 +593,59 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             });
     }
 
-    /// A CONTENT part file: spill + hash into a local temp file, then stage the blob as PENDING
-    /// (B188 precommit-first). The blob is NOT uploaded here; publishStaging uploads it post-precommit.
-    /// recordPendingBlobDep lets stageTree's W-TREE-BUILD check pass without any pool op at staging time.
-    return std::make_unique<ContentAddressed::CaContentWriteBuffer>(
-        metadata_storage.scratchPath(),
-        buf_size,
-        settings.use_adaptive_write_buffer,
-        settings.adaptive_write_buffer_initial_size,
-        [this, route = *r](const std::string & hash_hex, size_t size, const std::string & temp_path)
-        {
-            auto & st = stagingFor(route);
-            const UInt128 hash = Cas::hexToU128(hash_hex);
-            /// B188: do NOT upload here. Record the pending blob (uploaded post-precommit in
-            /// publishStaging) and a tokenless dep so stageTree's W-TREE-BUILD check passes; putBlob
-            /// later overwrites it with the tokened dep. The temp file is kept (transaction owns it).
-            st.pending_blobs.push_back({hash, temp_path, size});
-            buildFor(route, st).recordPendingBlobDep(hash, size);
+    /// A CONTENT part file that must stay a blob (per-column data/marks, primary.idx): spill + hash
+    /// into a local temp file, then stage the blob as PENDING (B188 precommit-first). The blob is NOT
+    /// uploaded here; publishStaging uploads it post-precommit. recordPendingBlobDep (inside
+    /// stageBlobPartFile) lets stageTree's W-TREE-BUILD check pass without any pool op at staging time.
+    if (ContentAddressed::partFileMustStayBlob(r->file))
+    {
+        return std::make_unique<ContentAddressed::CaContentWriteBuffer>(
+            metadata_storage.scratchPath(),
+            buf_size,
+            settings.use_adaptive_write_buffer,
+            settings.adaptive_write_buffer_initial_size,
+            [this, route = *r](const std::string & hash_hex, size_t size, const std::string & temp_path)
+            {
+                stageBlobPartFile(route, Cas::hexToU128(hash_hex), size, temp_path);
+            });
+    }
 
-            Cas::TreeEntry entry;
-            entry.name = route.file;
-            entry.placement = Cas::Placement::Blob;
-            entry.file_hash = hash;
-            entry.file_size = size;
-            std::erase_if(st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
-            st.entries.push_back(std::move(entry));
+    /// Inline candidate (small eager metadata): buffer in memory, decide at finalize. <= INLINE_CAP
+    /// rides the single tree object as an Inline entry (one-GET part open, B10/B97); an oversized
+    /// candidate spills to a blob (the safety net).
+    return std::make_unique<ContentAddressed::CaInlineWriteBuffer>(
+        [this, route = *r](std::string bytes)
+        {
+            const UInt128 hash = Cas::hexToU128(
+                getHexUIntLowercase(CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size())));
+            if (bytes.size() <= INLINE_CAP)
+            {
+                auto & st = stagingFor(route);
+                Cas::TreeEntry entry;
+                entry.name = route.file;
+                entry.placement = Cas::Placement::Inline;
+                entry.file_hash = hash;            /// content hash — inline == blob for the Merkle id
+                entry.file_size = bytes.size();
+                entry.inline_bytes = std::move(bytes);
+                std::erase_if(st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+                st.entries.push_back(std::move(entry));
+            }
+            else
+            {
+                /// Safety fallback: an unexpectedly large candidate spills to a blob (preserves the
+                /// invariant that big files are not held inline). Write the buffered bytes to a unique
+                /// local temp file (same scratchPath + random-name scheme as CaContentWriteBuffer), then
+                /// stage exactly like a streaming blob.
+                std::filesystem::create_directories(metadata_storage.scratchPath());
+                const std::string temp_path =
+                    metadata_storage.scratchPath() + "/inline_overflow_" + getRandomASCIIString(32) + ".tmp";
+                {
+                    WriteBufferFromFile tmp(temp_path);
+                    tmp.write(bytes.data(), bytes.size());
+                    tmp.finalize();
+                }
+                stageBlobPartFile(route, hash, bytes.size(), temp_path);
+            }
         });
 }
 

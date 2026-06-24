@@ -29,6 +29,14 @@ void writeFileTx(DB::IMetadataTransaction & tx, const std::string & path, const 
     buf->finalize();
 }
 
+const DB::Cas::TreeEntry * findByName(const std::vector<DB::Cas::TreeEntry> & entries, const std::string & name)
+{
+    for (const auto & e : entries)
+        if (e.name == name)
+            return &e;
+    return nullptr;
+}
+
 }
 
 /// B151: a freshly-written part is PUBLISHED at the (lock-free) tmp->final rename, so the final ref
@@ -101,4 +109,34 @@ TEST(CaTransactionLockScope, CommittedRefMoveDoesNotSpuriouslyPublish)
     }
     EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/delete_tmp_all_2_2_0"));
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
+}
+
+/// Plan 2d: a small eager metadata file (checksums.txt) is staged INLINE — it rides the single tree
+/// object (one-GET part open) — while per-column data (data.bin) stays a standalone Blob (preserving
+/// column-read selectivity). The inlined file is still readable through the normal read path.
+TEST(CaTransactionInlining, EagerFileInlinedDataBinBlobbed)
+{
+    auto storage = openTxStorage();
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, "uui/uuid-9/tmp_insert_all_1_1_0/checksums.txt", "the-checksums");
+    writeFileTx(*tx, "uui/uuid-9/tmp_insert_all_1_1_0/data.bin", std::string(50000, 'D'));
+    tx->moveDirectory("uui/uuid-9/tmp_insert_all_1_1_0", "uui/uuid-9/all_1_1_0");
+    tx->commit(DB::NoCommitOptions{});
+
+    /// Resolve the published part to its tree and inspect placements (the Store read API, as in
+    /// gtest_cas_store.cpp: resolveRef -> readTree).
+    const auto ns = storage->liveNamespace("uuid-9");
+    const auto resolved = storage->store()->resolveRef(ns, "all_1_1_0");
+    ASSERT_TRUE(resolved.has_value());
+    const auto entries = storage->store()->readTree(resolved->tree_id);
+
+    const auto * checksums = findByName(entries, "checksums.txt");
+    const auto * databin   = findByName(entries, "data.bin");
+    ASSERT_TRUE(checksums && databin);
+    EXPECT_EQ(checksums->placement, DB::Cas::Placement::Inline);
+    EXPECT_EQ(checksums->inline_bytes, "the-checksums");
+    EXPECT_EQ(databin->placement, DB::Cas::Placement::Blob);
+
+    /// And the inlined file is still readable through the normal read path.
+    EXPECT_EQ(storage->getFileSize("uui/uuid-9/all_1_1_0/checksums.txt"), 13u);
 }
