@@ -478,8 +478,16 @@ void ExportPartitionManifestUpdatingTask::poll()
                 {
                     local_entry->status = *status;
                     if (local_entry->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+                    {
                         /// terminal now - we no longer need to keep the data parts alive
                         local_entry->part_references.clear();
+
+                        /// looks like we missed a status change event, we should kill local operations.
+                        if (local_entry->status == ExportReplicatedMergeTreePartitionTaskEntry::Status::KILLED)
+                        {
+                            storage.killExportPart(local_entry->manifest.transaction_id);
+                        }
+                    }
                 }
             }
             LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: already exists", key);
