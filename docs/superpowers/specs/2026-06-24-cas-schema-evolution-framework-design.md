@@ -348,6 +348,19 @@ A small, focused module instead of per-codec ad-hoc version handling:
 - **`CasRootShardCodec.{h,cpp}`**: framing header; `published_at_ms` typed field. (B92 `tree_size` fix
   is a separate iteration.)
 - **`CasGcSnap.{h,cpp}`**: binary → streaming protobuf with the framing header.
+- **One normative proto library — `Core/Proto/cas_format.proto`** (Plan 3): a single self-contained
+  `proto3` file, one package (`clickhouse.cas.format`), defining **every** mutable-object message as a
+  separate type — `RootShard`+`Journal` (merged from `cas_root_shard.proto`), `GcSnap`, `GcState`,
+  `RetiredSet`, `Watermark`, `PoolMeta`, (future `Roster`). NOT one union message: each object is
+  stored standalone and identified by its key + framing magic, so a `oneof` wrapper would only couple
+  unrelated objects. No `import` of other ClickHouse protos, explicit field numbers, no `reserved`
+  (pre-release), no `map<>` (deterministic field order — use `repeated` key-value sub-messages). The
+  file header documents the two things protobuf can't express: the 8-byte framing header
+  `[magic:4][writer:u16][min_reader:u16]` + each object's magic, and the writer/min_reader evolution
+  contract. This makes the `.proto` the **portable normative spec** for the mutable side — a third
+  party (Python/Java/Go) compiles one file to reimplement CAS reads/writes. (The binary/hashed formats
+  — blob/tree envelope + the Merkle `treeId` rule — are normative in THIS design doc, cross-referenced
+  from the proto header.)
 - Part-writer (`ContentAddressedTransaction.cpp`): the inline-vs-blob placement decision for part
   files.
 - **`CasBuild.{h,cpp}`** — two simplifications from the same fold over children. (1) **The `treeId` is
