@@ -1,11 +1,27 @@
 syntax = "proto3";
 package DB.Cas.Proto;
 
-// Binary codec for the CA RootShard manifest (B164a). Replaces the JSON encoding on the hot CA
-// write path. The manifest is CAS-by-token (not content-addressed), so byte-determinism is not a
-// correctness requirement; the encoder still serializes deterministically for stable golden tests.
-// Introspect a raw manifest offline with:
-//   protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto < manifest.bin
+// ===========================================================================================
+// NORMATIVE protobuf schema for EVERY mutable content-addressed (CA) object. This single file is
+// the portable contract: a third party reimplementing CA reads/writes (Python/Java/Go) compiles it
+// to get all message types. (Hashed/immutable objects — the blob/tree envelope + the Merkle treeId
+// rule — are NOT protobuf; they are normative in the design doc
+// docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.md.)
+// NOTE (cleanup pending): the file is still named cas_root_shard.proto / package DB.Cas.Proto for
+// history; a grooming step renames it to cas_format.proto / package clickhouse.cas.format.
+//
+// FRAMING (the part protobuf can't express): every serialized message below is stored PREFIXED with
+// an 8-byte CasFormat framing header — [magic:4][writer_version:u16 LE][min_reader_version:u16 LE]
+// (see CasFormat.h). The reader validates the magic, then gateOnReads min_reader_version (fail-closed,
+// UNKNOWN_FORMAT_VERSION, if newer than this build), THEN parses the protobuf body. Per-object magic:
+//   RootShardManifest "CARS" | PoolMetaProto "CAPM" | WatermarkProto "CAWM" | GcStateProto "CAGT"
+//   RetiredSetProto "CART" | HeartbeatProto "CAHB" | RootsRegistryProto "CARR" | GcOutcomeLogProto "CAGO"
+// (gc-snap stays a versioned binary+zstd codec — GC-internal, not an interchange format; B176 defers
+// its protobuf conversion.)
+// Introspect a raw object offline (strip the 8-byte framing header first):
+//   tail -c +9 manifest.bin | protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto
+// None of these objects is content-addressed, so byte-determinism is not a correctness requirement;
+// the encoders still serialize deterministically (sorted repeated, no proto map<>) for stable goldens.
 //
 // VERSION + FAIL-CLOSED GATING: version and fail-closed reader gating now live in the CasFormat
 // framing header ([magic CARS][writer:u16][min_reader:u16]) prepended to every serialized manifest;

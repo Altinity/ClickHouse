@@ -83,7 +83,11 @@ Packs already removed (pre-story, `1a8188bce8f`). Pack removal closed B97/B10/B9
   JSON codec family + checkVersion + tolerateUnknownKeys + CasEnumStrings.h) — ✅ landed (commits
   `6e89ba049f4`,`ae5bcf57f2c`,`2b54311e2d4`,`b96ed1b15f0`,`53a8d42da81`); sweep 372/1-baseline. Combined
   review ⏳. **MILESTONE: JSON fully abandoned — two encodings (binary hashed + protobuf mutable).**
-- 3d (consolidate → cas_format.proto, package clickhouse.cas.format, doc header) — ⏳ last of Plan 3.
+- 3d (normative proto doc header) — ✅ added the library-level header to the proto (all 8 mutable
+  messages, the framing/magic table, the evolution contract, the binary-objects cross-ref). The
+  cosmetic file/package RENAME (`cas_root_shard.proto`→`cas_format.proto`, `DB.Cas.Proto`→
+  `clickhouse.cas.format`) is DEFERRED to grooming (broad sed; low value/high churn right before the
+  validation soak). **PHASE 1 (format-freeze story) substantively COMPLETE.**
 
 ## Event timeline (append-only)
 
