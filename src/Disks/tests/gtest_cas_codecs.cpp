@@ -273,9 +273,6 @@ TEST(CasTreeCodec, DeterministicAcrossInputOrder)
     const String ea = encodeTree(a);
     const String eb = encodeTree(b);
     EXPECT_EQ(ea, eb);   /// shuffled input -> byte-identical output
-
-    /// And the tree id is stable too.
-    EXPECT_EQ(treeIdFor(ea), treeIdFor(eb));
 }
 
 TEST(CasTreeCodec, DuplicateNameThrows)

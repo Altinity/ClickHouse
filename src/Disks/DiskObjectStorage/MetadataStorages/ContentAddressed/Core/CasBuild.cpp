@@ -553,8 +553,10 @@ TreeId Build::stageTree(std::vector<TreeEntry> entries)
         );
     }
 
+    /// Identity is the Merkle id over the logical children (independent of serialization/placement);
+    /// the encoded payload below is just the on-disk representation, retained for re-upload.
+    const TreeId id = merkleTreeId(entries);
     const String encoded = encodeTree(std::move(entries));   /// canonical sort + duplicate-name check
-    const TreeId id = treeIdFor(encoded);
     const UInt128 logical_hash = hexToU128(id.string());
 
     /// RETAIN the encoded payload: trees are always re-creatable during the gate's W-REVALIDATE

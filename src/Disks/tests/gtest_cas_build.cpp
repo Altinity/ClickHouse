@@ -1051,7 +1051,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     /// then on a FRESH build over a FRESH counting backend adoptEvidence a Subtree entry pointing at it
     /// and assert ZERO backend ops — same tokenless-no-IO contract as the Blob case. We re-derive the
     /// child tree id deterministically by re-encoding the single-blob tree.
-    const TreeId child_tree = treeIdFor(encodeTree({entry}));
+    const TreeId child_tree = merkleTreeId({entry});
     {
         auto counting2 = std::make_shared<LocalCountingBackend>(raw);
         auto s2 = Store::open(counting2, PoolConfig{.pool_prefix = "p"});

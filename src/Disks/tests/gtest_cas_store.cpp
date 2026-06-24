@@ -447,8 +447,8 @@ TEST(CasStore, ReadTreeFailsClosed)
         entries.push_back(TreeEntry{
             .name = "f", .placement = Placement::Inline, .file_hash = {},
             .file_size = 3, .inline_bytes = "abc"});
+        const TreeId real_id = merkleTreeId(entries);
         const String encoded = encodeTree(entries);
-        const TreeId real_id = treeIdFor(encoded);
 
         EnvelopeHeader header;
         header.kind = ObjectKind::Tree;

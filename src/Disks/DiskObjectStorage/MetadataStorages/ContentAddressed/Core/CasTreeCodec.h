@@ -39,7 +39,12 @@ String encodeTree(std::vector<TreeEntry> entries);
 /// a truncated buffer.
 std::vector<TreeEntry> decodeTree(std::string_view data);
 
-/// The tree's logical id = cityHash128 of the encoded payload (same hashing the PoC uses for content).
-TreeId treeIdFor(const String & encoded);
+/// The tree's logical id — a MERKLE hash over the logical children only: for each entry, sorted by
+/// name, the canonical input is (name, node_kind{file|subtree}, child_hash). It DELIBERATELY excludes
+/// file_size, placement (Inline vs Blob) and inline bytes, so identity is independent of serialization
+/// and storage layout (an inline file and a standalone blob with the same content yield the same id).
+/// The rule is frozen by convention (changing it only loses dedup across the boundary; readers never
+/// recompute it — `treeId` is an address). Rejects duplicate names (BAD_ARGUMENTS).
+TreeId merkleTreeId(std::vector<TreeEntry> entries);
 
 }

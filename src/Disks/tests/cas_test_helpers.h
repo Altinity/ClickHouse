@@ -75,8 +75,7 @@ inline DB::ObjectStoragePtr makeLocalObjectStorageForTest()
 /// These produce objects through the SAME codecs the Store reads — the documented on-storage
 /// interface, not white-box pokes — so a test asserts a real round trip across the format boundary.
 
-/// CityHash128 of bytes, composed into the canonical lowercase-hex id (identical composition to
-/// `Cas::treeIdFor`, via `getHexUIntLowercase` over the cityhash `uint128`).
+/// CityHash128 of bytes, composed into the canonical lowercase-hex id.
 inline String hexOf(const String & bytes)
 {
     return getHexUIntLowercase(CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size()));
@@ -123,8 +122,8 @@ inline DB::Cas::TreeId writeTreeRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     std::vector<DB::Cas::TreeEntry> entries, const DB::UInt128 & domain_id)
 {
+    const DB::Cas::TreeId id = DB::Cas::merkleTreeId(entries);
     const String encoded = DB::Cas::encodeTree(std::move(entries));
-    const DB::Cas::TreeId id = DB::Cas::treeIdFor(encoded);
 
     DB::Cas::EnvelopeHeader header;
     header.kind = DB::Cas::ObjectKind::Tree;

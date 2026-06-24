@@ -122,9 +122,35 @@ std::vector<TreeEntry> decodeTree(std::string_view data)
     });
 }
 
-TreeId treeIdFor(const String & encoded)
+TreeId merkleTreeId(std::vector<TreeEntry> entries)
 {
-    const auto hash = CityHash_v1_0_2::CityHash128(encoded.data(), encoded.size());
+    std::sort(entries.begin(), entries.end(),
+        [](const TreeEntry & a, const TreeEntry & b) { return a.name < b.name; });
+
+    for (size_t i = 1; i < entries.size(); ++i)
+    {
+        if (entries[i].name == entries[i - 1].name)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "CAS tree: duplicate entry name '{}'", entries[i].name);
+    }
+
+    /// Canonical, frozen Merkle input. node_kind domain-separates a file leaf from a subtree node so a
+    /// blob hash and a child tree id under the same name can never collide (RFC 6962-style separation).
+    WriteBufferFromOwnString buf;
+    writeString("CAMT", buf);                                       /// domain tag
+    writeBinaryLittleEndian(static_cast<uint8_t>(1), buf);          /// Merkle rule version (in-hash only)
+    writeBinaryLittleEndian(static_cast<uint32_t>(entries.size()), buf);
+    for (const auto & e : entries)
+    {
+        writeBinaryLittleEndian(static_cast<uint16_t>(e.name.size()), buf);
+        writeString(e.name, buf);
+        const uint8_t node_kind = (e.placement == Placement::Subtree) ? 1 : 0;   /// 0 = file, 1 = subtree
+        writeBinaryLittleEndian(node_kind, buf);
+        writeU128LE(buf, e.file_hash);
+    }
+    buf.finalize();
+
+    const auto hash = CityHash_v1_0_2::CityHash128(buf.str().data(), buf.str().size());
     return TreeId(getHexUIntLowercase(hash));
 }
 
