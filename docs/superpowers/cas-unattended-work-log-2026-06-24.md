@@ -54,7 +54,13 @@ Packs already removed (pre-story, `1a8188bce8f`). Pack removal closed B97/B10/B9
 
 ## Findings / problems (append-only)
 
-- (none yet)
+- **3c-tail review nits (defer to grooming, doc-only, no behavior bug):** (1) stale "STRICT JSON" doc
+  comments still in `CasHeartbeat.h`, `CasRootsRegistry.h`, `CasGcOutcomes.h` (these objects are now
+  protobuf — update to the framing/`protoc --decode` description); (2) misleading test comment on
+  `OutcomeLogValidation` (the empty-submessage test actually trips kind=0 first, not outcome=0 — fix
+  comment, optionally add isolated outcome=0/token_type=0 crafted tests); (3) Minor: `objectKindToProto`
+  /`FromProto` duplicated in `CasGcOutcomes.cpp` vs `CasGcFormats.cpp` (anon-namespace; could share via a
+  header — future cleanup). Code itself reviewed ✅ (invariants preserved, deletion gate clean).
 
 ---
 
