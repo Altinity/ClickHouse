@@ -241,11 +241,8 @@ namespace ErrorCodes
     extern const int DISTRIBUTED_TOO_MANY_PENDING_BYTES;
     extern const int ARGUMENT_OUT_OF_BOUND;
     extern const int TOO_LARGE_DISTRIBUTED_DEPTH;
-<<<<<<< HEAD
     extern const int ALL_CONNECTION_TRIES_FAILED;
-=======
     extern const int SUPPORT_IS_DISABLED;
->>>>>>> 4da6d93bd60 (Merge pull request #1442 from Altinity/frontport/antalya-26.1/hybrid_table)
 }
 
 namespace ActionLocks
@@ -1365,36 +1362,10 @@ void StorageDistributed::read(
             is_remote_function,
             additional_query_infos);
 
-<<<<<<< HEAD
-    auto shard_filter_generator = ClusterProxy::getShardFilterGeneratorForCustomKey(
-        *modified_query_info.getCluster(), local_context, getInMemoryMetadataPtr(local_context, false)->columns);
-
-    ClusterProxy::executeQuery(
-        query_plan,
-        header,
-        processed_stage,
-        remote_storage,
-        remote_table_function_ptr,
-        select_stream_factory,
-        log,
-        local_context,
-        modified_query_info,
-        sharding_key_expr,
-        sharding_key_column_name,
-        *distributed_settings,
-        shard_filter_generator,
-        is_remote_function);
-
-    /// This is possible when skip_unavailable_shards is enabled and all shards were skipped
-    /// (e.g., every shard had a missing table with no remote replicas).
-    if (!query_plan.isInitialized())
-        throw Exception(ErrorCodes::ALL_CONNECTION_TRIES_FAILED, "No available shards to query");
-=======
         /// This is a bug, it is possible only when there is no shards to query, and this is handled earlier.
         if (!query_plan.isInitialized())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Pipeline is not initialized");
     }
->>>>>>> 4da6d93bd60 (Merge pull request #1442 from Altinity/frontport/antalya-26.1/hybrid_table)
 }
 
 

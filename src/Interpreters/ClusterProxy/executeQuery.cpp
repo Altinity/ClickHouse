@@ -378,8 +378,8 @@ void executeQuery(
     new_context->increaseDistributedDepth();
 
     const size_t shards = cluster->getShardCount();
-<<<<<<< HEAD
     ProfileEvents::increment(ProfileEvents::Shards, shards);
+    const bool has_additional_query_infos = !additional_query_infos.empty();
 
     /// Tracker is shared between local-missing-table skip path in SelectStreamFactory and
     /// remote unavailable-shard skip path in ReadFromRemote so max_skip_unavailable_shards_num
@@ -395,9 +395,6 @@ void executeQuery(
                 unavailable_shard_tracker = std::make_shared<UnavailableShardTracker>(shards, max_num, max_ratio);
         }
     }
-=======
-    const bool has_additional_query_infos = !additional_query_infos.empty();
->>>>>>> 4da6d93bd60 (Merge pull request #1442 from Altinity/frontport/antalya-26.1/hybrid_table)
 
     if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
     {
