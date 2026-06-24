@@ -121,10 +121,11 @@ TEST(CasPoolMeta, FailClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    b->putIfAbsent(layout.poolMetaKey(),
-        R"({"format":"cas_pool_meta","version":2,"pool_id":"00000000000000000000000000000001","root_shards":8,"blob_header_len":256})");
+    /// A future object (framing magic CAPM + min_reader=2) must fail closed with UNKNOWN_FORMAT_VERSION.
+    b->putIfAbsent(layout.poolMetaKey(), String("CAPM\x02\x00\x02\x00", 8));
     expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { PoolMeta::createOrValidate(*b, layout, 8, 256); });
+    /// Garbage bytes => CORRUPTED_DATA.
     auto b2 = std::make_shared<InMemoryBackend>();
     b2->putIfAbsent(layout.poolMetaKey(), "garbage");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
@@ -139,7 +140,10 @@ TEST(CasPoolMeta, RoundTripAndReadability)
     pm.blob_header_len = 256;
 
     const String encoded = encodePoolMeta(pm);
-    EXPECT_NE(encoded.find(R"("format":"cas_pool_meta")"), String::npos);
+    /// Protobuf framing: starts with CAPM magic (not JSON).
+    ASSERT_GE(encoded.size(), 8u);
+    EXPECT_EQ(encoded.substr(0, 4), "CAPM");
+    EXPECT_NE(encoded.front(), '{');
 
     PoolMeta decoded = decodePoolMeta(encoded);
     EXPECT_EQ(decoded.pool_id, pm.pool_id);
@@ -173,25 +177,21 @@ TEST(CasPoolMeta, RejectsBadConstantsOnDecode)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    /// good format/version, but blob_header_len violates the 8-alignment invariant => corruption.
-    b->putIfAbsent(layout.poolMetaKey(),
-        R"({"format":"cas_pool_meta","version":1,"pool_id":"00000000000000000000000000000001","root_shards":8,"blob_header_len":100})");
+    /// Encode a PoolMeta with blob_header_len=100 (not 8-aligned); decode must reject it as CORRUPTED_DATA.
+    PoolMeta bad_pm;
+    bad_pm.pool_id = hexToU128("00000000000000000000000000000001");
+    bad_pm.root_shards = 8;
+    bad_pm.blob_header_len = 100;   /// violates 8-alignment invariant
+    b->putIfAbsent(layout.poolMetaKey(), encodePoolMeta(bad_pm));
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { PoolMeta::createOrValidate(*b, layout, 8, 256); });
 }
 
-TEST(CasPoolMeta, DecodeMissingKeyAndUnknownKey)
+TEST(CasPoolMeta, DecodeGarbageFails)
 {
-    /// missing pool_id
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
-    {
-        decodePoolMeta(R"({"format":"cas_pool_meta","version":1,"root_shards":8,"blob_header_len":256})");
-    });
-    /// an extra unknown key
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
-    {
-        decodePoolMeta(R"({"format":"cas_pool_meta","version":1,"pool_id":"00000000000000000000000000000001","root_shards":8,"blob_header_len":256,"extra":1})");
-    });
+    /// Any non-CAPM framing byte sequence => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodePoolMeta(String("garbage")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodePoolMeta(String("")); });
 }
 
 TEST(CasPoolMeta, ConcurrentCreateRace)

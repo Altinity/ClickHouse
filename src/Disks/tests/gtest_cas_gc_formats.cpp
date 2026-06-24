@@ -53,15 +53,15 @@ TEST(CasGcFormats, GcStateSnapPrunedThroughRoundTrip)
     EXPECT_EQ(d.snap_pruned_through, 38u);
 }
 
-TEST(CasGcFormats, GcStateSnapPrunedThroughBackCompatDefaultsZero)
+TEST(CasGcFormats, GcStateSnapPrunedThroughDefaultsZero)
 {
-    /// An old gc/state written before B174 has no "snap_pruned_through" key — it must decode to 0,
-    /// not throw on the strict unknown-key check (the key is optional on read).
-    const String old_state =
-        R"({"format":"cas_gc_state","version":3,"round":1,"fence_seq":0,"snap_shards":1,)"
-        R"("snap_generation":5,"lease":{"owner":"00000000000000000000000000000000","seq":0},)"
-        R"("fence_version":{}})";
-    auto d = decodeGcState(old_state);
+    /// snap_pruned_through defaults to 0 when omitted (proto3 zero-value default).
+    GcState s;
+    s.snap_shards = 1;
+    s.snap_generation = 5;
+    s.round = 1;
+    s.snap_pruned_through = 0;
+    auto d = decodeGcState(encodeGcState(s));
     EXPECT_EQ(d.snap_pruned_through, 0u);
     EXPECT_EQ(d.snap_generation, 5u);
 }
@@ -82,13 +82,15 @@ TEST(CasGcFormats, GcHeartbeatRoundTrip)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcHeartbeat(String("short")); });
 }
 
-TEST(CasGcFormats, GcStateV3DefaultsAndReadability)
+TEST(CasGcFormats, GcStateV3DefaultsAndEncodingIsBinary)
 {
     GcState s;
     EXPECT_EQ(s.snap_shards, 1u);                /// default 1 (the GC constant)
     auto bytes = encodeGcState(s);
-    EXPECT_NE(bytes.find("\"format\":\"cas_gc_state\""), String::npos);
-    EXPECT_NE(bytes.find("\"version\":3"), String::npos);
+    ASSERT_GE(bytes.size(), 8u);
+    /// Protobuf framing: CAGT magic + u16 LE writer + u16 LE min_reader.
+    EXPECT_EQ(bytes.substr(0, 4), "CAGT");
+    EXPECT_NE(bytes.front(), '{');               /// not JSON
     auto d = decodeGcState(bytes);
     EXPECT_EQ(d.round, 0u);
     EXPECT_TRUE(d.fence_version.empty());
@@ -97,22 +99,22 @@ TEST(CasGcFormats, GcStateV3DefaultsAndReadability)
 
 TEST(CasGcFormats, GcStateV3Validation)
 {
-    /// future version => UNKNOWN_FORMAT_VERSION; v1/v2 (old CAGS) => CORRUPTED_DATA (unreleased, no compat);
-    /// unknown top-level key, unknown lease key, non-numeric fence_version round key => CORRUPTED_DATA.
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":4,"round":0,"fence_seq":0,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"fence_version":{}})"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":1,"round":1,"fence_seq":1})"); });
-    /// v2 with old folded_cursor key => CORRUPTED_DATA (version mismatch)
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":2,"round":0,"fence_seq":0,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{}})"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":3,"round":0,"fence_seq":0,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0,"extra":1},"fence_version":{}})"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":3,"round":0,"fence_seq":0,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"fence_version":{"notanumber":{}}})"); });
-    /// snap_shards == 0 is an invariant violation => CORRUPTED_DATA
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":3,"round":0,"fence_seq":0,"snap_shards":0,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"fence_version":{}})"); });
+    /// Empty / garbage => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
+    /// Bad magic (not CAGT) => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("CAGS\x01\x00\x01\x00", 8)); });
+    /// Future min_reader => UNKNOWN_FORMAT_VERSION (fail closed on the future).
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [] { decodeGcState(String("CAGT\x02\x00\x02\x00", 8)); });
+    /// snap_shards == 0 is an invariant violation => CORRUPTED_DATA (post-parse check).
+    /// GcStateProto wire format: field 3 (snap_shards) tag byte is 0x18, value byte 0x01 for snap_shards=1.
+    /// An all-zero proto body with valid framing has snap_shards=0 (proto3 default) => CORRUPTED_DATA.
+    {
+        /// 8-byte CAGT framing + empty proto body = snap_shards defaults to 0 in proto3.
+        const String framing_only("CAGT\x01\x00\x01\x00", 8);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(framing_only); });
+    }
 }
 
 TEST(CasGcFormats, RetiredSetRoundTrip)
@@ -227,78 +229,32 @@ void expectStrictJsonContract(Decode && decode, const String & expected_format, 
 
 TEST(CasGcFormats, GcStateValidation)
 {
-    expectStrictJsonContract([](const String & s) { return decodeGcState(s); }, "cas_gc_state", /*current_version*/ 3);
-
-    /// Readability pin: the encoded document carries the compact format marker.
-    EXPECT_TRUE(encodeGcState(GcState{}).contains(R"("format":"cas_gc_state")"));
-
-    /// Missing a required field (no snap_generation).
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":3,"round":7,"fence_seq":3,"snap_shards":1,"lease":{"owner":"00000000000000000000000000000000","seq":0},"fence_version":{}})"); });
-    /// Wrong type for a numeric field.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":3,"round":"7","fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"fence_version":{}})"); });
-    /// Old v2 document with folded_cursor key => CORRUPTED_DATA (version mismatch, not unknown key).
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":2,"round":7,"fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"folded_cursor":{},"fence_version":{}})"); });
-    /// Unknown extra key in a v3 document.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":3,"round":7,"fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"fence_version":{},"x":1})"); });
-    /// Non-canonical fence_version round key ("07" parses to 7 but re-encodes as "7" — aliasing).
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":3,"round":7,"fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"fence_version":{"07":{}}})"); });
-    /// fence_version round value not an object.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(
-        R"({"format":"cas_gc_state","version":3,"round":7,"fence_seq":3,"snap_shards":1,"snap_generation":0,"lease":{"owner":"00000000000000000000000000000000","seq":0},"fence_version":{"7":4}})"); });
+    /// Empty / garbage / bad magic => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("CART\x01\x00\x01\x00", 8)); });
+    /// Future min_reader => UNKNOWN_FORMAT_VERSION.
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [] { decodeGcState(String("CAGT\x02\x00\x02\x00", 8)); });
 }
 
 TEST(CasGcFormats, RetiredSetValidation)
 {
-    expectStrictJsonContract([](const String & s) { return decodeRetiredSet(s); }, "cas_retired_set");
-
-    EXPECT_TRUE(encodeRetiredSet(RetiredSet{}).contains(R"("format":"cas_retired_set")"));
-
-    const String entry = R"({"kind":"blob","hash":"000102030405060708090a0b0c0d0e0f","token":"e","token_type":"etag","size":1})";
-
-    /// Missing a required field inside an entry.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[{"kind":"blob"}]})"); });
-    /// Unknown extra key inside an entry.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    /// Empty / garbage bytes => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRetiredSet(String("")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRetiredSet(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
+    /// Bad magic (not CART) => CORRUPTED_DATA.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRetiredSet(String("CAGT\x01\x00\x01\x00", 8)); });
+    /// Future min_reader => UNKNOWN_FORMAT_VERSION (fail closed on the future).
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [] { decodeRetiredSet(String("CART\x02\x00\x02\x00", 8)); });
+    /// Encoding is binary (framing magic CART), not JSON.
     {
-        decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)"
-            + String(R"({"kind":"blob","hash":"000102030405060708090a0b0c0d0e0f","token":"e","token_type":"etag","size":1,"x":1})") + "]}");
-    });
-    /// Wrong type: size as a string.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
-    {
-        decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)"
-            + String(R"({"kind":"blob","hash":"000102030405060708090a0b0c0d0e0f","token":"e","token_type":"etag","size":"1"})") + "]}");
-    });
-    /// Bad enum: unknown kind.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
-    {
-        decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)"
-            + String(R"({"kind":"banana","hash":"000102030405060708090a0b0c0d0e0f","token":"e","token_type":"etag","size":1})") + "]}");
-    });
-    /// Bad enum: unknown token_type.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
-    {
-        decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)"
-            + String(R"({"kind":"blob","hash":"000102030405060708090a0b0c0d0e0f","token":"e","token_type":"weird","size":1})") + "]}");
-    });
-    /// Bad hash hex.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
-    {
-        decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)"
-            + String(R"({"kind":"blob","hash":"nothex","token":"e","token_type":"etag","size":1})") + "]}");
-    });
-    /// Unknown extra key at the top level.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[],"x":1})"); });
-
-    /// Sanity: the canonical entry round-trips through decode without throwing.
-    EXPECT_NO_THROW(decodeRetiredSet(R"({"format":"cas_retired_set","version":1,"entries":[)" + entry + "]}"));
+        const String bytes = encodeRetiredSet(RetiredSet{});
+        ASSERT_GE(bytes.size(), 8u);
+        EXPECT_EQ(bytes.substr(0, 4), "CART");
+        EXPECT_NE(bytes.front(), '{');
+    }
 }
 
 TEST(CasGcFormats, OutcomeLogValidation)
@@ -418,47 +374,24 @@ TEST(CasGcSnapCodec, ZstdRoundTripAndShrinks)
 }
 
 /// ===================================================================================
-/// R10 strict-JSON encoder goldens. These pin the EXACT bytes a fixed instance of each strict-JSON
-/// metadata encoder emits, so routing the encoders through `JsonObjectWriter` cannot move a single
-/// byte. The literals were captured by running each encoder BEFORE the R10 refactor.
+/// R10 strict-JSON encoder goldens (remaining JSON codecs: heartbeat, roots-registry, outcome-log).
+/// The watermark, pool-meta, and retired-set goldens were removed when those codecs moved to protobuf
+/// (Plan 3c). Protobuf framing-header goldens for the new codecs are in CasPoolMeta/CasWatermark/
+/// CasGcFormats round-trip tests above.
 /// ===================================================================================
 
 namespace
 {
-constexpr std::string_view GOLDEN_WATERMARK_LIVE =
-    R"({"format":"cas_server_watermark","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","epoch":7,"min_active":42,"seq":3})";
-constexpr std::string_view GOLDEN_WATERMARK_RETIRED =
-    R"({"format":"cas_server_watermark","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","epoch":7,"min_active":"retired","seq":9})";
 constexpr std::string_view GOLDEN_HEARTBEAT =
     R"({"format":"cas_heartbeat","version":1,"server_id":"000102030405060708090a0b0c0d0e0f","heartbeat_seq":42,"created_at_ms":1234567890123})";
-constexpr std::string_view GOLDEN_POOL_META =
-    R"({"format":"cas_pool_meta","version":1,"pool_id":"000102030405060708090a0b0c0d0e0f","root_shards":16,"blob_header_len":96})";
 constexpr std::string_view GOLDEN_ROOTS_REGISTRY =
     R"({"format":"cas_roots_registry","version":1,"registry_version":5,"fence_round":2,"namespaces":["alpha","beta","gamma/sub"]})";
 constexpr std::string_view GOLDEN_ROOTS_REGISTRY_EMPTY =
     R"({"format":"cas_roots_registry","version":1,"registry_version":1,"fence_round":0,"namespaces":[]})";
-constexpr std::string_view GOLDEN_RETIRED_SET =
-    R"({"format":"cas_retired_set","version":1,"entries":[{"kind":"blob","hash":"000102030405060708090a0b0c0d0e0f","token":"etag-1","token_type":"etag","size":1234},{"kind":"tree","hash":"ffffffffffffffffffffffffffffffff","token":"42","token_type":"emulated","size":0}]})";
-constexpr std::string_view GOLDEN_RETIRED_SET_EMPTY =
-    R"({"format":"cas_retired_set","version":1,"entries":[]})";
 constexpr std::string_view GOLDEN_OUTCOME_LOG =
     R"({"format":"cas_gc_outcomes","version":1,"entries":[{"kind":"tree","hash":"aa00000000000000000000000000000a","token":"etag-1","token_type":"etag","outcome":"deleted"},{"kind":"blob","hash":"bb00000000000000000000000000000b","token":"7","token_type":"emulated","outcome":"spared"}]})";
 constexpr std::string_view GOLDEN_OUTCOME_LOG_EMPTY =
     R"({"format":"cas_gc_outcomes","version":1,"entries":[]})";
-}
-
-TEST(CasJsonGolden, ServerWatermarkLive)
-{
-    const ServerWatermark w{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                            .epoch = 7, .min_active = 42, .seq = 3};
-    EXPECT_EQ(encodeServerWatermark(w), GOLDEN_WATERMARK_LIVE);
-}
-
-TEST(CasJsonGolden, ServerWatermarkRetired)
-{
-    const ServerWatermark w{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                            .epoch = 7, .min_active = std::numeric_limits<uint64_t>::max(), .seq = 9};
-    EXPECT_EQ(encodeServerWatermark(w), GOLDEN_WATERMARK_RETIRED);
 }
 
 TEST(CasJsonGolden, Heartbeat)
@@ -466,13 +399,6 @@ TEST(CasJsonGolden, Heartbeat)
     const Heartbeat hb{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
                        .heartbeat_seq = 42, .created_at_ms = 1234567890123};
     EXPECT_EQ(encodeHeartbeat(hb), GOLDEN_HEARTBEAT);
-}
-
-TEST(CasJsonGolden, PoolMeta)
-{
-    const PoolMeta pm{.pool_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                      .root_shards = 16, .blob_header_len = 96};
-    EXPECT_EQ(encodePoolMeta(pm), GOLDEN_POOL_META);
 }
 
 TEST(CasJsonGolden, RootsRegistry)
@@ -492,21 +418,6 @@ TEST(CasJsonGolden, RootsRegistryEmptyNamespaces)
     EXPECT_EQ(encodeRootsRegistry(registry), GOLDEN_ROOTS_REGISTRY_EMPTY);
 }
 
-TEST(CasJsonGolden, RetiredSet)
-{
-    RetiredSet rs;
-    rs.entries.push_back({ObjectKind::Blob, hexToU128("000102030405060708090a0b0c0d0e0f"),
-                          Token{"etag-1", TokenType::ETag}, 1234});
-    rs.entries.push_back({ObjectKind::Tree, hexToU128("ffffffffffffffffffffffffffffffff"),
-                          Token{"42", TokenType::Emulated}, 0});
-    EXPECT_EQ(encodeRetiredSet(rs), GOLDEN_RETIRED_SET);
-}
-
-TEST(CasJsonGolden, RetiredSetEmpty)
-{
-    EXPECT_EQ(encodeRetiredSet(RetiredSet{}), GOLDEN_RETIRED_SET_EMPTY);
-}
-
 TEST(CasJsonGolden, OutcomeLog)
 {
     OutcomeLog log;
@@ -520,4 +431,146 @@ TEST(CasJsonGolden, OutcomeLog)
 TEST(CasJsonGolden, OutcomeLogEmpty)
 {
     EXPECT_EQ(encodeOutcomeLog(OutcomeLog{}), GOLDEN_OUTCOME_LOG_EMPTY);
+}
+
+/// ===================================================================================
+/// Protobuf framing-header goldens for pool-meta, watermark, gc-state, retired-set (Plan 3c).
+/// Pin the framing magic bytes and verify binary (not JSON) encoding for each new codec.
+/// ===================================================================================
+
+TEST(CasProtobufFramingGolden, PoolMetaFramingMagic)
+{
+    const PoolMeta pm{.pool_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
+                      .root_shards = 16, .blob_header_len = 96};
+    const String bytes = encodePoolMeta(pm);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes.substr(0, 4), "CAPM");
+    EXPECT_NE(bytes.front(), '{');   // not JSON
+    /// Round-trips correctly.
+    const PoolMeta d = decodePoolMeta(bytes);
+    EXPECT_EQ(d.pool_id, pm.pool_id);
+    EXPECT_EQ(d.root_shards, 16u);
+    EXPECT_EQ(d.blob_header_len, 96u);
+}
+
+TEST(CasProtobufFramingGolden, WatermarkFramingMagicAndRetiredSentinel)
+{
+    /// Live watermark.
+    {
+        const ServerWatermark w{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
+                                .epoch = 7, .min_active = 42, .seq = 3};
+        const String bytes = encodeServerWatermark(w);
+        ASSERT_GE(bytes.size(), 8u);
+        EXPECT_EQ(bytes.substr(0, 4), "CAWM");
+        EXPECT_NE(bytes.front(), '{');
+        const ServerWatermark d = decodeServerWatermark(bytes);
+        EXPECT_EQ(d.server_id, w.server_id);
+        EXPECT_EQ(d.epoch, 7u);
+        EXPECT_EQ(d.min_active, 42u);
+        EXPECT_EQ(d.seq, 3u);
+    }
+    /// Retired sentinel (UINT64_MAX) round-trips.
+    {
+        const ServerWatermark w{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
+                                .epoch = 7, .min_active = std::numeric_limits<uint64_t>::max(), .seq = 9};
+        const String bytes = encodeServerWatermark(w);
+        const ServerWatermark d = decodeServerWatermark(bytes);
+        EXPECT_EQ(d.min_active, std::numeric_limits<uint64_t>::max());
+        EXPECT_EQ(d.seq, 9u);
+    }
+}
+
+TEST(CasProtobufFramingGolden, GcStateFramingMagic)
+{
+    GcState s;
+    s.round = 7;
+    s.fence_seq = 3;
+    s.snap_shards = 2;
+    s.snap_generation = 12;
+    const String bytes = encodeGcState(s);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes.substr(0, 4), "CAGT");
+    EXPECT_NE(bytes.front(), '{');
+    const GcState d = decodeGcState(bytes);
+    EXPECT_EQ(d.round, 7u);
+    EXPECT_EQ(d.snap_shards, 2u);
+}
+
+TEST(CasProtobufFramingGolden, RetiredSetFramingMagic)
+{
+    RetiredSet rs;
+    rs.entries.push_back({ObjectKind::Blob, hexToU128("000102030405060708090a0b0c0d0e0f"),
+                          Token{"etag-1", TokenType::ETag}, 1234});
+    rs.entries.push_back({ObjectKind::Tree, hexToU128("ffffffffffffffffffffffffffffffff"),
+                          Token{"42", TokenType::Emulated}, 0});
+    const String bytes = encodeRetiredSet(rs);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes.substr(0, 4), "CART");
+    EXPECT_NE(bytes.front(), '{');
+    const RetiredSet d = decodeRetiredSet(bytes);
+    ASSERT_EQ(d.entries.size(), 2u);
+    /// Order after sort (Blob < Tree by kind).
+    EXPECT_EQ(d.entries[0].kind, ObjectKind::Blob);
+    EXPECT_EQ(d.entries[0].token.value, "etag-1");
+    EXPECT_EQ(d.entries[1].kind, ObjectKind::Tree);
+    EXPECT_EQ(d.entries[1].token.value, "42");
+}
+
+TEST(CasProtobufFramingGolden, PoolMetaFailClosedOnGarbage)
+{
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodePoolMeta(String("")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodePoolMeta(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [] { decodePoolMeta(String("CAPM\x02\x00\x02\x00", 8)); });
+}
+
+TEST(CasProtobufFramingGolden, WatermarkFailClosedOnGarbage)
+{
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeServerWatermark(String("")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeServerWatermark(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [] { decodeServerWatermark(String("CAWM\x02\x00\x02\x00", 8)); });
+}
+
+TEST(CasPoolMeta, ConstantInvariantsPostParse)
+{
+    /// `encodePoolMeta` serializes whatever is in the struct without validation, so we can build
+    /// structs with invalid constants and verify that `decodePoolMeta` rejects them as CORRUPTED_DATA.
+
+    /// root_shards == 0 => CORRUPTED_DATA.
+    {
+        PoolMeta bad;
+        bad.pool_id = UInt128(1);
+        bad.root_shards = 0;
+        bad.blob_header_len = 96;
+        const String bytes = encodePoolMeta(bad);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePoolMeta(bytes); });
+    }
+    /// blob_header_len not 8-aligned => CORRUPTED_DATA.
+    {
+        PoolMeta bad;
+        bad.pool_id = UInt128(1);
+        bad.root_shards = 1;
+        bad.blob_header_len = 97;   /// not 8-aligned
+        const String bytes = encodePoolMeta(bad);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePoolMeta(bytes); });
+    }
+    /// blob_header_len < 96 => CORRUPTED_DATA.
+    {
+        PoolMeta bad;
+        bad.pool_id = UInt128(1);
+        bad.root_shards = 1;
+        bad.blob_header_len = 88;   /// < 96
+        const String bytes = encodePoolMeta(bad);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePoolMeta(bytes); });
+    }
+    /// blob_header_len > 16384 => CORRUPTED_DATA.
+    {
+        PoolMeta bad;
+        bad.pool_id = UInt128(1);
+        bad.root_shards = 1;
+        bad.blob_header_len = 32768;   /// > 16384
+        const String bytes = encodePoolMeta(bad);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePoolMeta(bytes); });
+    }
 }
