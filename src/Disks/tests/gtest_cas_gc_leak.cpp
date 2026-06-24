@@ -23,8 +23,8 @@ extern const int ABORTED;
 /// sees orphaned blobs (zero trees; dangling=0, so INV-NO-LOSS holds — a space leak, not data loss).
 ///
 /// ROOT CAUSE (CasGc.cpp foldShardRecords, the once-per-tree expansion at :732-797): a tree's child
-/// blob/pack edges are recorded into the durable snap ONLY by EXPANDING the tree — reading the tree
-/// object on the first folded `Add` and calling addTreeEdge/addPackEdge per entry. When that read
+/// blob edges are recorded into the durable snap ONLY by EXPANDING the tree — reading the tree
+/// object on the first folded `Add` and calling addTreeEdge per entry. When that read
 /// throws FILE_DOESNT_EXIST and a later record for the SAME ref proves the edge was displaced
 /// (`displaced_later`, :760-770), the branch sets `tree_present = false` and SKIPS the whole
 /// expansion block (:776-796): no edges are added and the tree is never markExpanded. Consequently:

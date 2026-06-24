@@ -27,7 +27,7 @@ enum class CasEventType
     CorruptDangle, CorruptDecode, SnapJournalIncoherent, Exception,
 };
 
-enum class CasEventObjectKind { None, Blob, Tree, Pack, Root, Snap };
+enum class CasEventObjectKind { None, Blob, Tree, Root, Snap };
 
 /// Map an internal `ObjectKind` to the audit-log `CasEventObjectKind`. Single source for the mapping
 /// previously open-coded as a ternary at each emission site.
@@ -37,7 +37,6 @@ inline CasEventObjectKind toEventKind(ObjectKind kind)
     {
         case ObjectKind::Blob: return CasEventObjectKind::Blob;
         case ObjectKind::Tree: return CasEventObjectKind::Tree;
-        case ObjectKind::Pack: return CasEventObjectKind::Pack;
     }
 }
 

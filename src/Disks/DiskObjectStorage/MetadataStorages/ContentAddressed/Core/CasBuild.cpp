@@ -468,10 +468,6 @@ void Build::adoptEvidence(const TreeEntry & entry)
             deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}] =
                 DepEntry{ObjectKind::Blob, std::nullopt, view_round, entry.file_size};
         },
-        [&] {   /// PackSlice: tokenless dep keyed by pack_hash
-            deps[{static_cast<uint8_t>(ObjectKind::Pack), entry.pack_hash}] =
-                DepEntry{ObjectKind::Pack, std::nullopt, view_round, entry.pack_length};
-        },
         [&] {   /// Subtree: tokenless dep keyed by file_hash (child tree id)
             deps[{static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}] =
                 DepEntry{ObjectKind::Tree, std::nullopt, view_round, entry.file_size};
@@ -547,12 +543,6 @@ TreeId Build::stageTree(std::vector<TreeEntry> entries)
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
                         "stageTree: child blob {} not in dependency set (W-TREE-BUILD)",
                         u128ToHex(entry.file_hash));
-            },
-            [&] {   /// PackSlice: must already be in the dep set (keyed by pack_hash)
-                if (!deps.contains({static_cast<uint8_t>(ObjectKind::Pack), entry.pack_hash}))
-                    throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "stageTree: child pack {} not in dependency set (W-TREE-BUILD)",
-                        u128ToHex(entry.pack_hash));
             },
             [&] {   /// Subtree: child tree must already be in the dep set
                 if (!deps.contains({static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}))
@@ -886,7 +876,7 @@ void Build::checkAndResolveDeps()
                     if (kind == ObjectKind::Tree && retained_trees.contains(hash))
                         recreateTree(hash);
                     else
-                        /// No source bytes at the gate (blob/pack with condemned own token) →
+                        /// No source bytes at the gate (blob with condemned own token) →
                         /// retryable ABORTED. The outer INSERT retry re-uploads from source. (INV-1)
                         throw Exception(ErrorCodes::ABORTED,
                             "checkAndResolveDeps: condemned dep {} has no retained payload; retry the operation (INV-1)",

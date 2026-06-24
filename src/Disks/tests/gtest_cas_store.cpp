@@ -325,10 +325,10 @@ TEST(CasStore, ResolveReadLocateRoundTrip)
     std::vector<TreeEntry> entries;
     entries.push_back(TreeEntry{
         .name = "data.bin", .placement = Placement::Blob, .file_hash = u128Of("hello world"),
-        .file_size = 11, .inline_bytes = "", .pack_hash = {}, .pack_offset = 0, .pack_length = 0});
+        .file_size = 11, .inline_bytes = ""});
     entries.push_back(TreeEntry{
         .name = "small.txt", .placement = Placement::Inline, .file_hash = {},
-        .file_size = 5, .inline_bytes = "tiny\n", .pack_hash = {}, .pack_offset = 0, .pack_length = 0});
+        .file_size = 5, .inline_bytes = "tiny\n"});
     auto tree = writeTreeRaw(*b, layout, entries, dom);
 
     RootShard root;
@@ -446,7 +446,7 @@ TEST(CasStore, ReadTreeFailsClosed)
         std::vector<TreeEntry> entries;
         entries.push_back(TreeEntry{
             .name = "f", .placement = Placement::Inline, .file_hash = {},
-            .file_size = 3, .inline_bytes = "abc", .pack_hash = {}, .pack_offset = 0, .pack_length = 0});
+            .file_size = 3, .inline_bytes = "abc"});
         const String encoded = encodeTree(entries);
         const TreeId real_id = treeIdFor(encoded);
 

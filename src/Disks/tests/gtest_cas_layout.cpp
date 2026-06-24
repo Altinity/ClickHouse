@@ -9,7 +9,6 @@ TEST(CasLayout, KeyShapes)
     Layout l{"p"};
     EXPECT_EQ(l.blobKey(BlobId{"00aabb"}), "p/blobs/00/00aabb");
     EXPECT_EQ(l.treeKey(TreeId{"ffee01"}), "p/trees/ff/ffee01");
-    EXPECT_EQ(l.packKey(PackId{"0102aa"}), "p/packs/01/0102aa");
     EXPECT_EQ(l.gcStateKey(), "p/gc/state");
     EXPECT_EQ(l.retiredKey(4, 9, 1), "p/gc/retired/4.9/1");
     EXPECT_EQ(l.outcomesKey(4, 9, 1), "p/gc/outcomes/4.9/1");

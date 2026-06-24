@@ -45,7 +45,7 @@ uint64_t cursorOf(const std::map<uint64_t, GcSnap> & snap, const String & cursor
 uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len)
 {
     if (kind != ObjectKind::Blob)
-        return object_size;   /// trees/packs account whole-object (sizes are GC bookkeeping)
+        return object_size;   /// trees account whole-object (sizes are GC bookkeeping)
     if (object_size < blob_header_len)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS gc retire: blob object of {} bytes is smaller than the pool's fixed blob header ({} bytes)",
@@ -365,7 +365,7 @@ Gc::RecheckResult Gc::recheck(const GcState & state, std::map<uint64_t, GcSnap> 
             else
             {
                 /// ==================== THE SINGLE CONTENT-DELETE SITE ====================
-                /// The ONLY place Cas::Gc ever deletes a content object (blob/tree/pack), and the
+                /// The ONLY place Cas::Gc ever deletes a content object (blob/tree), and the
                 /// only reachability delete in the whole core. All four gates of INV-NO-LOSS hold
                 /// here, in order:
                 ///   1. the retire entry is DURABLE (written/adopted by R2 before .round advanced);
@@ -590,7 +590,7 @@ void Gc::cascadeAndPersist(GcState & state, Token & state_token, std::map<uint64
             });
     }
 
-    /// P9: forget every confirmed-gone node (trees AND blobs/packs) from `known`, so the next
+    /// P9: forget every confirmed-gone node (trees AND blobs) from `known`, so the next
     /// round's stateless candidate scan no longer re-derives — and re-HEAD-404s — them. This is the
     /// PRIMARY prune site: a node deleted in round R is out of `known` before R's retired sets drop,
     /// keeping `known` tight by construction. Orthogonal to stripTree above (which clears a deleted
@@ -1410,10 +1410,6 @@ std::vector<Candidate> Gc::foldShardRecords(std::map<uint64_t, GcSnap> & snap, c
                             break;
                         case Placement::Subtree:
                             shard_for(entry.file_hash).addTreeEdge(parent_tree, ObjectKind::Tree, entry.file_hash);
-                            ++out_edges;
-                            break;
-                        case Placement::PackSlice:
-                            shard_for(entry.pack_hash).addPackEdge(parent_tree, entry.pack_hash);
                             ++out_edges;
                             break;
                         case Placement::Inline:

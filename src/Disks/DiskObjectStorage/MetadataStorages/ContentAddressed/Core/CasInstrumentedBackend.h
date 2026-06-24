@@ -15,10 +15,9 @@ namespace DB::Cas
 /// Motivation: `part_log` shows `put=0` because PUTs ride a background threadpool, so we need a
 /// backend-level chokepoint to attribute the S3 op-count (PUTs/HEADs/404s/412s/LISTs) by CA op type.
 
-/// Namespace of a CA key, classified by substring of the key path (8 classes).
+/// Namespace of a CA key, classified by substring of the key path (7 classes).
 ///   <prefix>/blobs/..   → Blob
 ///   <prefix>/trees/..   → Tree
-///   <prefix>/packs/..   → Pack
 ///   <prefix>/roots/<server-hex>/_watermark     → Server  (checked before the generic /roots/)
 ///   <prefix>/roots/<server-hex>/_precommits/.. → Build   (checked before the generic /roots/)
 ///   <prefix>/roots/..   → Root  (incl. /roots/<ns>/_files/ and mountpoint objects)
@@ -29,14 +28,13 @@ enum class CasNs : uint8_t
 {
     Blob = 0,
     Tree,
-    Pack,
     Root,
     Gc,
     Build,
     Server,
     Other,
 };
-static constexpr size_t CAS_NS_COUNT = 8;
+static constexpr size_t CAS_NS_COUNT = 7;
 
 /// Operation + outcome class (10 classes), mapped from the Backend method and its return value.
 ///   putIfAbsent / putIfAbsentStream finalize → Done ⇒ Put ; PreconditionFailed ⇒ PutDedup

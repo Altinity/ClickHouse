@@ -30,7 +30,6 @@ enum class EdgeKind : uint8_t
 {
     Root = 1,
     Tree = 2,
-    Pack = 3,
 };
 
 struct Candidate
@@ -61,7 +60,6 @@ public:
     /// its in-degree transitioned to 0. A same-target duplicate add is a no-op (empty result).
     std::vector<Candidate> addRootEdge(const String & root_shard, const String & part_name, const UInt128 & tree);
     void addTreeEdge(const UInt128 & parent_tree, ObjectKind child_kind, const UInt128 & child_hash);
-    void addPackEdge(const UInt128 & parent_tree, const UInt128 & pack_hash);
 
     /// Removes the (root_shard, part_name) edge if present; returns the target as a candidate if its
     /// in-degree transitioned to 0. Missing edge => no-op (idempotent replay).
@@ -96,7 +94,7 @@ private:
         UInt128 target_hash{};
         String root_shard;        /// Root only
         String part_name;         /// Root only
-        UInt128 parent_tree{};    /// Tree/Pack only
+        UInt128 parent_tree{};    /// Tree only
     };
     using NodeKey = std::pair<uint8_t, UInt128>;
 

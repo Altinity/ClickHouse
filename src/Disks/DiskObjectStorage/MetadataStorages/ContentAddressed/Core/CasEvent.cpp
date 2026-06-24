@@ -77,7 +77,6 @@ String toString(CasEventObjectKind kind)
         case CasEventObjectKind::None: return "none";
         case CasEventObjectKind::Blob: return "blob";
         case CasEventObjectKind::Tree: return "tree";
-        case CasEventObjectKind::Pack: return "pack";
         case CasEventObjectKind::Root: return "root";
         case CasEventObjectKind::Snap: return "snap";
     }

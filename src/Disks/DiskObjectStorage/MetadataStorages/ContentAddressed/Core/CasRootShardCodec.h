@@ -27,9 +27,8 @@ namespace DB::Cas
 /// One tree node of a precommit's inline closure: the node's tree hash and its staged entries.
 /// Rides the precommit-namespace journal `Add` record (B199-S2): it survives the commit/abandon
 /// `refs.erase` and is trimmed only after GC folds it.
-/// Only placement/file_hash/file_size/pack_hash are serialized (the closure only feeds the GC walk;
-/// name/inline_bytes/pack_offset/pack_length are NOT needed and intentionally omitted — decode sets
-/// them to their defaults).
+/// Only placement/file_hash/file_size are serialized (the closure only feeds the GC walk;
+/// name/inline_bytes are NOT needed and intentionally omitted — decode sets them to their defaults).
 struct ClosureNode
 {
     UInt128 tree_hash{};

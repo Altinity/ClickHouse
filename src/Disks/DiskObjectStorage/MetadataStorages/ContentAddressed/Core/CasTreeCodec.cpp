@@ -59,11 +59,6 @@ String encodeTree(std::vector<TreeEntry> entries)
                 writeString(e.inline_bytes, out);
             },
             [&] {},   /// Blob: no extra fields
-            [&] {   /// PackSlice: write pack_hash, offset, length
-                writeU128LE(out, e.pack_hash);
-                writeBinaryLittleEndian(e.pack_offset, out);
-                writeBinaryLittleEndian(e.pack_length, out);
-            },
             [&] {}    /// Subtree: no extra fields
         );
     }
@@ -99,7 +94,11 @@ std::vector<TreeEntry> decodeTree(std::string_view data)
 
             uint8_t placement = 0;
             readBinaryLittleEndian(placement, in);
-            if (placement < 1 || placement > 4)
+            /// Only Inline(1), Blob(2), Subtree(3) are valid; any other value can never legitimately
+            /// exist and must fail closed.
+            if (placement != static_cast<uint8_t>(Placement::Inline)
+                && placement != static_cast<uint8_t>(Placement::Blob)
+                && placement != static_cast<uint8_t>(Placement::Subtree))
                 throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS tree: unknown placement {}", placement);
             e.placement = static_cast<Placement>(placement);
 
@@ -113,11 +112,6 @@ std::vector<TreeEntry> decodeTree(std::string_view data)
                     e.inline_bytes = readFixedBytes(in, len);
                 },
                 [&] {},   /// Blob: no extra fields
-                [&] {   /// PackSlice: read pack_hash, offset, length
-                    e.pack_hash = readU128LE(in);
-                    readBinaryLittleEndian(e.pack_offset, in);
-                    readBinaryLittleEndian(e.pack_length, in);
-                },
                 [&] {}    /// Subtree: no extra fields
             );
 

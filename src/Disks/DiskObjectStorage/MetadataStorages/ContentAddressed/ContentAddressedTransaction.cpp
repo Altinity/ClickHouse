@@ -247,7 +247,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     st.build->precommit(tree);                       /// closure now reachable from a durable build root
 
     /// B189: build the set of blob hashes actually referenced by the staged tree. Only
-    /// Placement::Blob entries represent pending content uploads — Subtree/PackSlice/Inline are
+    /// Placement::Blob entries represent pending content uploads — Subtree/Inline are
     /// not pending blobs. A pending_blob whose hash is NOT in this set had its tree entry removed
     /// by unlinkFile/replaceFile and must not be uploaded (it is an orphan). Its temp file is
     /// still cleaned by cleanupPendingTempFiles at commit end.

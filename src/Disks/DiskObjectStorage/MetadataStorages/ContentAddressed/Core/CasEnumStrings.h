@@ -29,7 +29,6 @@ inline std::string_view objectKindToString(ObjectKind kind)
     {
         case ObjectKind::Blob: return "blob";
         case ObjectKind::Tree: return "tree";
-        case ObjectKind::Pack: return "pack";
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS codec: invalid object kind {}", static_cast<int>(kind));
 }
@@ -40,8 +39,6 @@ inline ObjectKind objectKindFromString(std::string_view s, std::string_view what
         return ObjectKind::Blob;
     if (s == "tree")
         return ObjectKind::Tree;
-    if (s == "pack")
-        return ObjectKind::Pack;
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: invalid object kind '{}'", what, s);
 }
 

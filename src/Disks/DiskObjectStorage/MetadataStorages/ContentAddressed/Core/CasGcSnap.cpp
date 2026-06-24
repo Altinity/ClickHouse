@@ -54,7 +54,6 @@ EdgeKind edgeKindFromByte(uint8_t b)
     {
         case static_cast<uint8_t>(EdgeKind::Root): return EdgeKind::Root;
         case static_cast<uint8_t>(EdgeKind::Tree): return EdgeKind::Tree;
-        case static_cast<uint8_t>(EdgeKind::Pack): return EdgeKind::Pack;
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: invalid edge kind byte {}", static_cast<int>(b));
 }
@@ -65,7 +64,6 @@ ObjectKind objectKindFromByte(uint8_t b)
     {
         case static_cast<uint8_t>(ObjectKind::Blob): return ObjectKind::Blob;
         case static_cast<uint8_t>(ObjectKind::Tree): return ObjectKind::Tree;
-        case static_cast<uint8_t>(ObjectKind::Pack): return ObjectKind::Pack;
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/snap: invalid object kind byte {}", static_cast<int>(b));
 }
@@ -95,8 +93,6 @@ String GcSnap::edgeIdFor(const EdgeRec & rec)
         case EdgeKind::Tree:
             return "T|" + u128ToHex(rec.parent_tree) + "|" + std::to_string(static_cast<int>(rec.target_kind))
                 + "|" + u128ToHex(rec.target_hash);
-        case EdgeKind::Pack:
-            return "P|" + u128ToHex(rec.parent_tree) + "|" + u128ToHex(rec.target_hash);
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA,
         "CAS gc/snap: invalid edge kind {}", static_cast<int>(rec.edge_kind));
@@ -104,7 +100,7 @@ String GcSnap::edgeIdFor(const EdgeRec & rec)
 
 void GcSnap::addEdge(EdgeRec rec)
 {
-    /// Set-semantics insert for edges whose canonical id INCLUDES the target (Tree/Pack): a
+    /// Set-semantics insert for edges whose canonical id INCLUDES the target (Tree): a
     /// duplicate id always carries the SAME target, so a different-target duplicate is impossible
     /// by construction and a duplicate add is a pure no-op. Root edges (target NOT in the id)
     /// have last-op-wins semantics per spec §7 and are handled in addRootEdge, not here.
@@ -155,16 +151,6 @@ void GcSnap::addTreeEdge(const UInt128 & parent_tree, ObjectKind child_kind, con
     rec.edge_kind = EdgeKind::Tree;
     rec.target_kind = child_kind;
     rec.target_hash = child_hash;
-    rec.parent_tree = parent_tree;
-    addEdge(std::move(rec));
-}
-
-void GcSnap::addPackEdge(const UInt128 & parent_tree, const UInt128 & pack_hash)
-{
-    EdgeRec rec;
-    rec.edge_kind = EdgeKind::Pack;
-    rec.target_kind = ObjectKind::Pack;
-    rec.target_hash = pack_hash;
     rec.parent_tree = parent_tree;
     addEdge(std::move(rec));
 }
@@ -341,11 +327,6 @@ GcSnap GcSnap::decodeSnapFields(ReadBuffer & body)
         readBinaryLittleEndian(target_kind_byte, body);
         rec.target_kind = objectKindFromByte(target_kind_byte);
         rec.target_hash = readU128LE(body);
-
-        if (rec.edge_kind == EdgeKind::Pack && rec.target_kind != ObjectKind::Pack)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS gc/snap: pack edge target_kind must be 'pack', got {}",
-                static_cast<int>(rec.target_kind));
 
         const String id = GcSnap::edgeIdFor(rec);
         if (snap.edges.contains(id))

@@ -159,7 +159,7 @@ private:
     /// blob payloads are not retained (hence the ABORTED branch in checkAndResolveDeps for a lost blob).
     void recreateTree(const UInt128 & hash);
 
-    /// Map (kind, hash) to its object key per kind (blob/tree/pack).
+    /// Map (kind, hash) to its object key per kind (blob/tree).
     String keyFor(ObjectKind kind, const UInt128 & hash) const;
 
     /// B199-S2 Task 4: build the inline closure of a staged manifest tree from the in-memory retained

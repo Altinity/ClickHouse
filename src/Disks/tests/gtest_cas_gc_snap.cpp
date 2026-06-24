@@ -122,15 +122,15 @@ TEST(CasGcSnap, StripTreeReturnsNewlyZeroChildren)
     GcSnap snap;
     const UInt128 T = hexToU128("aa00000000000000000000000000000a");
     const UInt128 B = hexToU128("bb00000000000000000000000000000b");
-    const UInt128 P = hexToU128("cc00000000000000000000000000000c");
+    const UInt128 C = hexToU128("cc00000000000000000000000000000c");
     snap.markExpanded(T);
     snap.addTreeEdge(T, ObjectKind::Blob, B);
-    snap.addPackEdge(T, P);
+    snap.addTreeEdge(T, ObjectKind::Tree, C);
     auto freed = snap.stripTree(T);
-    ASSERT_EQ(freed.size(), 2u);                               /// B and P both newly zero
+    ASSERT_EQ(freed.size(), 2u);                               /// B and C both newly zero
     EXPECT_FALSE(snap.isExpanded(T));
     EXPECT_EQ(snap.inDegree(ObjectKind::Blob, B), 0u);
-    EXPECT_EQ(snap.inDegree(ObjectKind::Pack, P), 0u);
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, C), 0u);
     /// idempotent replay: a second strip is a no-op
     EXPECT_TRUE(snap.stripTree(T).empty());
 }
@@ -200,7 +200,6 @@ TEST(CasGcSnap, CodecRoundTripDeterministicAndStrict)
     snap.addRootEdge("srv1/tbl/0", "part_1", T);
     snap.markExpanded(T);
     snap.addTreeEdge(T, ObjectKind::Blob, B);
-    snap.addPackEdge(T, hexToU128("cc00000000000000000000000000000c"));
     auto bytes = encodeGcSnap(snap);
     auto d = decodeGcSnap(bytes);
     EXPECT_EQ(d.snap_shard, 2u);
@@ -211,8 +210,8 @@ TEST(CasGcSnap, CodecRoundTripDeterministicAndStrict)
     EXPECT_EQ(encodeGcSnap(d), bytes);                          /// byte-stable re-encode
 }
 
-/// A thorough non-trivial round-trip: many distinct hashes across all three edge kinds, multiple
-/// root edges, tree+pack children, expansion markers, and known nodes that carry zero in-degree
+/// A thorough non-trivial round-trip: many distinct hashes across both edge kinds, multiple
+/// root edges, tree+subtree children, expansion markers, and known nodes that carry zero in-degree
 /// (so the known set is NOT merely the edge-target closure). The decoded snap must agree with the
 /// original on EVERY observable (counts, in-degrees, expansion, known, zero-in-degree candidates),
 /// and the re-encode must be byte-identical (canonical, deterministic ordering).
@@ -227,8 +226,6 @@ TEST(CasGcSnap, CodecRoundTripNonTrivial)
     const UInt128 T3 = hexToU128("ac00000000000000000000000000000a");
     const UInt128 B1 = hexToU128("bb00000000000000000000000000000b");
     const UInt128 B2 = hexToU128("bc00000000000000000000000000000b");
-    const UInt128 P1 = hexToU128("cc00000000000000000000000000000c");
-    const UInt128 P2 = hexToU128("cd00000000000000000000000000000c");
     const UInt128 SUB = hexToU128("dd00000000000000000000000000000d");   /// tree-as-tree-child (subtree)
 
     /// Root edges (last-op-wins id = (root_shard, part_name)).
@@ -236,16 +233,14 @@ TEST(CasGcSnap, CodecRoundTripNonTrivial)
     snap.addRootEdge("srv1/tbl/0", "part_2", T2);
     snap.addRootEdge("srv2/tbl/1", "part_1", T1);                /// T1 shared by two refs => indeg 2
 
-    /// Tree children: blobs, a packed slice via a pack edge, and a subtree (tree child of a tree).
+    /// Tree children: blobs and a subtree (tree child of a tree).
     snap.markExpanded(T1);
     snap.addTreeEdge(T1, ObjectKind::Blob, B1);
     snap.addTreeEdge(T1, ObjectKind::Blob, B2);
     snap.addTreeEdge(T1, ObjectKind::Tree, SUB);                 /// subtree edge
-    snap.addPackEdge(T1, P1);
 
     snap.markExpanded(T2);
     snap.addTreeEdge(T2, ObjectKind::Blob, B1);                 /// B1 shared across T1 and T2 => indeg 2
-    snap.addPackEdge(T2, P2);
 
     /// T3 becomes a known node with zero in-degree: it was a root target, then displaced (the
     /// edge removed). `known` survives a zero-in-degree transition, so T3 is a retire candidate.
@@ -259,8 +254,6 @@ TEST(CasGcSnap, CodecRoundTripNonTrivial)
     EXPECT_EQ(snap.inDegree(ObjectKind::Blob, B1), 2u);
     EXPECT_EQ(snap.inDegree(ObjectKind::Blob, B2), 1u);
     EXPECT_EQ(snap.inDegree(ObjectKind::Tree, SUB), 1u);
-    EXPECT_EQ(snap.inDegree(ObjectKind::Pack, P1), 1u);
-    EXPECT_EQ(snap.inDegree(ObjectKind::Pack, P2), 1u);
 
     auto bytes = encodeGcSnap(snap);
     auto d = decodeGcSnap(bytes);
@@ -276,8 +269,6 @@ TEST(CasGcSnap, CodecRoundTripNonTrivial)
     EXPECT_EQ(d.inDegree(ObjectKind::Blob, B1), 2u);
     EXPECT_EQ(d.inDegree(ObjectKind::Blob, B2), 1u);
     EXPECT_EQ(d.inDegree(ObjectKind::Tree, SUB), 1u);
-    EXPECT_EQ(d.inDegree(ObjectKind::Pack, P1), 1u);
-    EXPECT_EQ(d.inDegree(ObjectKind::Pack, P2), 1u);
 
     /// Known set survives, including the zero-in-degree node T3.
     EXPECT_TRUE(d.isKnown(ObjectKind::Tree, T1));
@@ -286,8 +277,6 @@ TEST(CasGcSnap, CodecRoundTripNonTrivial)
     EXPECT_TRUE(d.isKnown(ObjectKind::Tree, SUB));
     EXPECT_TRUE(d.isKnown(ObjectKind::Blob, B1));
     EXPECT_TRUE(d.isKnown(ObjectKind::Blob, B2));
-    EXPECT_TRUE(d.isKnown(ObjectKind::Pack, P1));
-    EXPECT_TRUE(d.isKnown(ObjectKind::Pack, P2));
 
     /// Expansion markers survive.
     EXPECT_TRUE(d.isExpanded(T1));
@@ -309,8 +298,8 @@ TEST(CasGcSnap, CodecRoundTripNonTrivial)
     EXPECT_EQ(encodeGcSnap(decodeGcSnap(bytes)), bytes);
 }
 
-/// Fail-closed binary decode: bad magic, truncated input, bad enum bytes, a pack edge whose
-/// target kind is not pack, a duplicate edge id, and a future version => the pinned typed errors.
+/// Fail-closed binary decode: bad magic, truncated input, bad enum bytes, a duplicate edge id,
+/// and a future version => the pinned typed errors.
 TEST(CasGcSnap, DecodeFailClosed)
 {
     /// A valid encoded snap to mutate.
@@ -321,7 +310,6 @@ TEST(CasGcSnap, DecodeFailClosed)
     snap.addRootEdge("s/0", "p1", T);
     snap.markExpanded(T);
     snap.addTreeEdge(T, ObjectKind::Blob, B);
-    snap.addPackEdge(T, hexToU128("cc00000000000000000000000000000c"));
     const String good = encodeGcSnap(snap);
 
     /// Empty / too-short input is corruption (truncated).
@@ -378,13 +366,13 @@ TEST(CasGcSnap, DecodeFailClosedBinaryFields)
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcSnap(w.buf); });
     }
 
-    /// Pack edge whose target_kind is not pack.
+    /// Invalid edge-kind byte (3 — no longer a valid EdgeKind after pack removal).
     {
         SnapWriter w; w.header();
         w.u32(1);
-        w.u8(3);             /// EdgeKind::Pack
+        w.u8(3);             /// bogus edge kind
         w.hash(T);           /// parent_tree
-        w.u8(1);             /// target_kind = Blob (must be Pack)
+        w.u8(1);             /// target_kind = Blob
         w.hash(B);           /// target_hash
         w.u32(0);            /// expanded
         w.u32(0);            /// known
@@ -442,7 +430,7 @@ TEST(CasGcSnap, CursorIsPartOfSnapIdentity)
 }
 
 /// The binary encoding is materially smaller than the previous JSON form for a realistic snap —
-/// the motivating win (less parse/serialize CPU and a smaller S3 blob). A blob/tree/pack edge in
+/// the motivating win (less parse/serialize CPU and a smaller S3 blob). A blob/tree edge in
 /// JSON cost ~150-200 bytes (hex hashes + key names); binary costs ~33-50 bytes.
 TEST(CasGcSnap, BinaryEncodingIsCompact)
 {

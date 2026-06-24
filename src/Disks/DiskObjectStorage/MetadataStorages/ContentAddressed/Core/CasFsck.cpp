@@ -99,18 +99,6 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
                 ++report.total_blob_refs;
                 report.referenced_logical_bytes += e.file_size;
             }
-            else if (e.placement == Placement::PackSlice)
-            {
-                /// Packs are M-F (not produced yet); the producing-path regression test lands with
-                /// them. A slice's liveness keeps the whole pack object reachable, keyed by pack_hash.
-                const String pkey = layout.packKey(PackId(u128ToHex(e.pack_hash)));
-                if (detail)
-                    reachable[pkey].push_back(label);
-                else
-                    reachable.try_emplace(pkey);
-                ++report.total_blob_refs;
-                report.referenced_logical_bytes += e.file_size;
-            }
             /// Placement::Subtree yields an edge here too, but the child tree itself is recorded by
             /// `on_tree` when `closureWalk` recurses into it — nothing to account for the edge.
         };
@@ -135,14 +123,12 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
     std::unordered_map<String, uint64_t> present;
     listAll(backend, layout.blobsPrefix(), present, on_progress, deadline, "listing blobs");
     listAll(backend, layout.treesPrefix(), present, on_progress, deadline, "listing trees");
-    listAll(backend, layout.packsPrefix(), present, on_progress, deadline, "listing packs");
     for (const auto & [_, sz] : present)
         report.physical_bytes += sz;
 
     auto kindOf = [&](const String & key)
     {
         if (key.starts_with(layout.blobsPrefix())) return ObjectKind::Blob;
-        if (key.starts_with(layout.packsPrefix())) return ObjectKind::Pack;
         return ObjectKind::Tree;
     };
 

@@ -116,7 +116,7 @@ public:
     /// ---- read side (spec §6) ----
     std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false);
     std::vector<TreeEntry> readTree(const TreeId & id);           /// validates envelope, kind, key↔hash
-    BlobLocation locate(const TreeEntry & entry) const;           /// Blob/PackSlice placements only
+    BlobLocation locate(const TreeEntry & entry) const;           /// Blob placement only
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
     /// Registered namespaces with the given prefix (one registry GET; opaque strings, sorted).
     /// Dropped namespaces linger registered until full GC (M-F) — visible-but-empty, never wrong.

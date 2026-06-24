@@ -517,8 +517,8 @@ std::vector<TreeEntry> Store::readTree(const TreeId & id)
 BlobLocation Store::locate(const TreeEntry & entry) const
 {
     /// A ranged read into the content object: the payload starts at a constant offset for blobs
-    /// (the pool's fixed blob_header_len — no per-object header read), and at the slice offset for
-    /// pack slices. Inline/Subtree carry no standalone object location.
+    /// (the pool's fixed blob_header_len — no per-object header read). Inline/Subtree carry no
+    /// standalone object location.
     switch (entry.placement)
     {
         case Placement::Blob:
@@ -526,13 +526,6 @@ BlobLocation Store::locate(const TreeEntry & entry) const
                 .key = pool_layout.blobKey(BlobId(u128ToHex(entry.file_hash))),
                 .offset = meta.blob_header_len,
                 .length = entry.file_size,
-            };
-        case Placement::PackSlice:
-            /// Encoded and validated from day one; produced by nobody until packing lands in M-F.
-            return BlobLocation{
-                .key = pool_layout.packKey(PackId(u128ToHex(entry.pack_hash))),
-                .offset = entry.pack_offset,
-                .length = entry.pack_length,
             };
         case Placement::Inline:
         case Placement::Subtree:

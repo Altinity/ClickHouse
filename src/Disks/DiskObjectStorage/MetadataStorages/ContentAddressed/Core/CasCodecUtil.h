@@ -30,7 +30,7 @@ namespace DB::Cas
 {
 
 /// Encoding split (spec §4, decision 2026-06-11). Objects whose bytes are identity (the CHCA
-/// envelope, the canonical tree payload, blob/pack payloads) are BINARY: the codecs use the
+/// envelope, the canonical tree payload, blob payloads) are BINARY: the codecs use the
 /// standard IO helpers — `writeBinaryLittleEndian` / `readBinaryLittleEndian` over `WriteBuffer` /
 /// `ReadBuffer` — for every field; little-endian, byte-exact (it IS pool format v2). Every
 /// NON-HASHED metadata object (root manifests, gc/state, retired sets, heartbeats, _pool_meta,
@@ -53,7 +53,7 @@ inline void writeU128LE(WriteBuffer & out, const UInt128 & v) { writeBinaryLittl
 inline UInt128 readU128LE(ReadBuffer & in) { UInt128 v; readBinaryLittleEndian(v, in); return v; }
 
 /// BE 16-byte form — used by the root-shard manifest's protobuf `bytes` fields (`tree_id`,
-/// `tree_hash`, `file_hash`, `pack_hash`). Body copied VERBATIM from the former hand-rolled
+/// `tree_hash`, `file_hash`). Body copied VERBATIM from the former hand-rolled
 /// `u128ToBytes` / `u128FromBytes` in `CasRootShardCodec.cpp` so the bytes are unchanged.
 inline std::string u128ToBytesBE(const UInt128 & v)
 {

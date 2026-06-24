@@ -23,7 +23,6 @@ namespace DB::Cas
 /// Every key is built from a pool prefix and a stable path sub-tree (POOL = pool prefix, S = 2-char shard, ID = full id):
 ///   - content objects:  POOL/blobs/S/ID
 ///   - tree objects:     POOL/trees/S/ID
-///   - pack objects:     POOL/packs/S/ID
 ///   - root manifests:   POOL/roots/NAMESPACE/SHARD_NUMBER
 ///   - verbatim files:   POOL/roots/NAMESPACE/_files/FILE_NAME
 ///   - GC snapshots:     POOL/gc/snap/GENERATION/SNAP_SHARD
@@ -52,11 +51,6 @@ public:
     String treeKey(const TreeId & id) const
     {
         return shardedKey("trees", id.string());
-    }
-
-    String packKey(const PackId & id) const
-    {
-        return shardedKey("packs", id.string());
     }
 
     /// The namespace registry (design §5.3): authoritative namespace universe, CAS-appended on
@@ -156,7 +150,6 @@ public:
     /// Prefixes that cover every content object of one kind (raw object listing for fsck).
     String blobsPrefix() const { return prefix + "/blobs/"; }
     String treesPrefix() const { return prefix + "/trees/"; }
-    String packsPrefix() const { return prefix + "/packs/"; }
 
     /// Retired-set key: <prefix>/gc/retired/<round>.<fence_seq>/<shard>
     String retiredKey(uint64_t round, uint64_t fence_seq, uint64_t shard) const
@@ -260,7 +253,7 @@ private:
     }
 };
 
-/// The object key for a (kind, hash) — the single kind→key-shape mapping (blobs/trees/packs).
+/// The object key for a (kind, hash) — the single kind→key-shape mapping (blobs/trees).
 /// Shared by `Build` (the publish gate's observe/resurrect) and `Gc` (the retire HEAD and the
 /// exact-token delete): both sides MUST address the same object the same way.
 inline String objectKey(const Layout & layout, ObjectKind kind, const UInt128 & hash)
@@ -272,8 +265,6 @@ inline String objectKey(const Layout & layout, ObjectKind kind, const UInt128 & 
             return layout.blobKey(BlobId(id));
         case ObjectKind::Tree:
             return layout.treeKey(TreeId(id));
-        case ObjectKind::Pack:
-            return layout.packKey(PackId(id));
     }
     throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "objectKey: unknown ObjectKind {}", static_cast<uint8_t>(kind));
 }

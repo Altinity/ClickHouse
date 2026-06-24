@@ -165,7 +165,7 @@ TEST(CasGcFormats, OutcomeLogRoundTrip)
                            Token{"7", TokenType::Emulated}, OutcomeKind::Spared});
     log.entries.push_back({ObjectKind::Blob, hexToU128("cc00000000000000000000000000000c"),
                            Token{"8", TokenType::Emulated}, OutcomeKind::Replaced});
-    log.entries.push_back({ObjectKind::Pack, hexToU128("dd00000000000000000000000000000d"),
+    log.entries.push_back({ObjectKind::Tree, hexToU128("dd00000000000000000000000000000d"),
                            Token{"9", TokenType::Emulated}, OutcomeKind::Absent});
     auto bytes = encodeOutcomeLog(log);
     EXPECT_NE(bytes.find("\"format\":\"cas_gc_outcomes\""), String::npos);

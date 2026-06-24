@@ -58,7 +58,6 @@ TEST(CasEnvelope, RoundTripWithProvenanceAndIntendedRef)
     EXPECT_EQ(d.domain_id, h.domain_id);
     EXPECT_EQ(d.incarnation_tag, h.incarnation_tag);
     EXPECT_EQ(d.build_id, h.build_id);
-    EXPECT_EQ(d.index_len, 0u);
     EXPECT_EQ(d.header_len, h.header_len);
 
     ASSERT_TRUE(d.provenance.has_value());
@@ -85,45 +84,9 @@ TEST(CasEnvelope, RoundTripNoExtensions)
 TEST(CasEnvelope, PayloadOffsetHelper)
 {
     EnvelopeHeader h = makeBlobHeader();
-    h.kind = ObjectKind::Pack;
-    h.index_len = 32;
-    h.logical_size = 32 + 968;   /// logical_size covers [header_len, EOF): index (32) + payload (968)
     String bytes = encodeEnvelopeHeader(h);
-    EnvelopeHeader d = decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Pack);
-    EXPECT_EQ(payloadOffset(d), static_cast<uint64_t>(d.header_len) + d.index_len);
-}
-
-TEST(CasEnvelope, PackSizeArithmeticPerFrozenSpec)
-{
-    /// Pins the frozen-spec pack arithmetic (spec §3.1): logical_size = object_size - header_len
-    /// UNIFORMLY — for a pack with an I-byte index and a P-byte payload region,
-    /// logical_size = I + P and object_size = header_len + I + P (NO extra index_len term).
-    constexpr uint64_t I = 64;
-    constexpr uint64_t P = 5000;
-
-    EnvelopeHeader h = makeBlobHeader();
-    h.kind = ObjectKind::Pack;
-    h.index_len = I;
-    h.logical_size = I + P;
-    String bytes = encodeEnvelopeHeader(h);
-
-    /// The correct object size decodes...
-    EnvelopeHeader d = decodeEnvelopeHeader(bytes, h.header_len + I + P, ObjectKind::Pack);
-    EXPECT_EQ(d.logical_size, I + P);
-    EXPECT_EQ(d.index_len, I);
-    EXPECT_EQ(payloadOffset(d), static_cast<uint64_t>(d.header_len) + I);
-
-    /// ... while the rejected reading (object_size = header_len + index_len + logical_size,
-    /// i.e. logical_size excluding the index) must throw.
-    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + I + h.logical_size, ObjectKind::Pack), DB::Exception);
-
-    /// index_len larger than logical_size is structurally impossible and must throw.
-    EnvelopeHeader bad = makeBlobHeader();
-    bad.kind = ObjectKind::Pack;
-    bad.index_len = 100;
-    bad.logical_size = 50;
-    String bad_bytes = encodeEnvelopeHeader(bad);
-    EXPECT_THROW(decodeEnvelopeHeader(bad_bytes, bad.header_len + bad.logical_size, ObjectKind::Pack), DB::Exception);
+    EnvelopeHeader d = decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob);
+    EXPECT_EQ(payloadOffset(d), static_cast<uint64_t>(d.header_len));
 }
 
 /// ---------- validation throw-paths ----------
@@ -162,11 +125,11 @@ TEST(CasEnvelope, BadHeaderLenThrows)
     EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
 }
 
-TEST(CasEnvelope, NonzeroIndexLenOnBlobThrows)
+TEST(CasEnvelope, NonzeroPadWordThrows)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    bytes[12] = 8;  /// index_len = 8 on a blob
+    bytes[12] = 8;  /// the [12,16) word must be a zero pad
     EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
 }
 
@@ -240,19 +203,6 @@ TreeEntry blobEntry(const String & name, UInt128 hash, uint64_t size)
     return e;
 }
 
-TreeEntry packSliceEntry(const String & name, UInt128 hash, uint64_t size, UInt128 pack, uint64_t off, uint64_t len)
-{
-    TreeEntry e;
-    e.name = name;
-    e.placement = Placement::PackSlice;
-    e.file_hash = hash;
-    e.file_size = size;
-    e.pack_hash = pack;
-    e.pack_offset = off;
-    e.pack_length = len;
-    return e;
-}
-
 TreeEntry subtreeEntry(const String & name, UInt128 child_tree, uint64_t tree_size)
 {
     TreeEntry e;
@@ -268,8 +218,6 @@ std::vector<TreeEntry> sampleEntries()
     return {
         inlineEntry("primary.idx", "0123456789"),
         blobEntry("data.bin", (UInt128(0xaaaa) << 64) | UInt128(0xbbbb), 4096),
-        packSliceEntry("small.mrk", (UInt128(0xccc) << 64) | UInt128(0xddd), 64,
-                       (UInt128(0xeee) << 64) | UInt128(0xfff), 12345, 64),
         subtreeEntry("nested", (UInt128(0x1) << 64) | UInt128(0x2), 200),
     };
 }
@@ -282,7 +230,7 @@ TEST(CasTreeCodec, RoundTripAllPlacements)
     const String encoded = encodeTree(entries);
     const auto decoded = decodeTree(encoded);
 
-    ASSERT_EQ(decoded.size(), 4u);
+    ASSERT_EQ(decoded.size(), 3u);
 
     /// decoded is sorted by name byte-wise
     std::vector<String> names;
@@ -303,13 +251,6 @@ TEST(CasTreeCodec, RoundTripAllPlacements)
             EXPECT_EQ(e.placement, Placement::Blob);
             EXPECT_EQ(e.file_hash, (UInt128(0xaaaa) << 64) | UInt128(0xbbbb));
             EXPECT_EQ(e.file_size, 4096u);
-        }
-        else if (e.name == "small.mrk")
-        {
-            EXPECT_EQ(e.placement, Placement::PackSlice);
-            EXPECT_EQ(e.pack_hash, (UInt128(0xeee) << 64) | UInt128(0xfff));
-            EXPECT_EQ(e.pack_offset, 12345u);
-            EXPECT_EQ(e.pack_length, 64u);
         }
         else if (e.name == "nested")
         {

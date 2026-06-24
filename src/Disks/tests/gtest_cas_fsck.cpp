@@ -102,7 +102,7 @@ TEST(CasFsck, ProgressCallbackFiresAndIsObservational)
     const auto with_progress = runFsck(*store, /*detail=*/true,
         [&](std::string_view, uint64_t, uint64_t) { ++calls; });
 
-    EXPECT_GT(calls, 0u);   // at least the end-of-listAll calls (blobs/trees/packs) fire
+    EXPECT_GT(calls, 0u);   // at least the end-of-listAll calls (blobs/trees) fire
     EXPECT_EQ(with_progress.reachable, baseline.reachable);
     EXPECT_EQ(with_progress.dangling, baseline.dangling);
     EXPECT_EQ(with_progress.unreachable, baseline.unreachable);

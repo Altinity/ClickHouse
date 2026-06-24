@@ -1071,28 +1071,6 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
         EXPECT_EQ(counting2->stream_puts, 0u) << "adoptEvidence(Subtree) must not PUT to the backend";
         EXPECT_EQ(counting2->gets, 0u) << "adoptEvidence(Subtree) must not GET from the backend";
     }
-
-    /// PackSlice branch: a hand-built PackSlice entry (no end-to-end pack object needed — adoptEvidence
-    /// records the dep by pack_hash without touching the backend). Assert no-throw and zero backend ops.
-    {
-        auto counting3 = std::make_shared<LocalCountingBackend>(raw);
-        auto s3 = Store::open(counting3, PoolConfig{.pool_prefix = "p"});
-        auto build3 = s3->startBuild({});
-
-        TreeEntry pack_entry;
-        pack_entry.name = "packed";
-        pack_entry.placement = Placement::PackSlice;
-        pack_entry.pack_hash = u128Of("b188-pack");
-        pack_entry.pack_length = 64;
-
-        counting3->heads = 0;
-        counting3->stream_puts = 0;
-        counting3->gets = 0;
-        EXPECT_NO_THROW(build3->adoptEvidence(pack_entry));
-        EXPECT_EQ(counting3->heads, 0u) << "adoptEvidence(PackSlice) must not HEAD the backend";
-        EXPECT_EQ(counting3->stream_puts, 0u) << "adoptEvidence(PackSlice) must not PUT to the backend";
-        EXPECT_EQ(counting3->gets, 0u) << "adoptEvidence(PackSlice) must not GET from the backend";
-    }
 }
 
 TEST(CasBuild, StageTreeRetainsAndDefersUpload)

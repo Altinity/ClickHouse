@@ -62,7 +62,6 @@ Placement placementFromProto(uint32_t v, std::string_view what)
     {
         case static_cast<uint32_t>(Placement::Inline):    return Placement::Inline;
         case static_cast<uint32_t>(Placement::Blob):      return Placement::Blob;
-        case static_cast<uint32_t>(Placement::PackSlice): return Placement::PackSlice;
         case static_cast<uint32_t>(Placement::Subtree):   return Placement::Subtree;
         default:
             throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -80,8 +79,6 @@ Cas::Proto::ClosureNodeProto encodeClosureNode(const ClosureNode & node)
         pe->set_placement(placementToProto(e.placement));
         pe->set_file_hash(u128ToBytesBE(e.file_hash));
         pe->set_file_size(e.file_size);
-        if (e.placement == Placement::PackSlice)
-            pe->set_pack_hash(u128ToBytesBE(e.pack_hash));
     }
     return pn;
 }
@@ -97,11 +94,6 @@ ClosureNode decodeClosureNode(const Cas::Proto::ClosureNodeProto & pn)
         e.placement = placementFromProto(pe.placement(), "closure node entry");
         e.file_hash = u128FromBytesBE(pe.file_hash(), "closure node entry file_hash");
         e.file_size = pe.file_size();
-        /// Symmetric with encode (which always writes pack_hash for PackSlice): decode it
-        /// unconditionally so u128FromBytesBE fails closed (CORRUPTED_DATA) on an absent/short
-        /// field, rather than silently zero-filling and losing a GC pack-edge.
-        if (e.placement == Placement::PackSlice)
-            e.pack_hash = u128FromBytesBE(pe.pack_hash(), "closure node entry pack_hash");
         node.entries.push_back(std::move(e));
     }
     return node;

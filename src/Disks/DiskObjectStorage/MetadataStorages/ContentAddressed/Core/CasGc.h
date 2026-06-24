@@ -13,7 +13,7 @@ namespace DB::Cas
 
 /// The logical (GC-bookkeeping) size of a retired object: blobs subtract the pool's fixed
 /// blob_header_len (a blob OBJECT smaller than the fixed header is corrupt — CORRUPTED_DATA,
-/// fail closed, never a wrapped-around size); trees/packs account whole-object. Sizes feed
+/// fail closed, never a wrapped-around size); trees account whole-object. Sizes feed
 /// cost/health accounting only — no protocol decision ever reads them.
 uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len);
 
@@ -216,7 +216,7 @@ private:
         std::map<uint64_t, OutcomeLog> outcomes;   /// snap_shard -> the durable outcome log
         std::vector<UInt128> deleted_trees;
         std::vector<Candidate> deleted_nodes;      /// P9: EVERY confirmed-gone node (trees AND
-                                                   /// blobs/packs); the cascade forgets each from `known`.
+                                                   /// blobs); the cascade forgets each from `known`.
         bool fence_window_records_folded = false;  /// the recheck's fold-through-fence saw records
     };
 

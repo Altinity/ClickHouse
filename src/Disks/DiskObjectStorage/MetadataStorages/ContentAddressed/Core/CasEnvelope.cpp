@@ -26,9 +26,11 @@ namespace
 
 constexpr uint8_t FORMAT_VERSION = 1;
 /// 96 is the EXACT packed size of the v1 core fields, not a round number:
-///   magic[4] + format_version/kind/hash_algo/flags[4] + header_len[4] + index_len[4]
+///   magic[4] + format_version/kind/hash_algo/flags[4] + header_len[4] + pad[4]
 ///   + logical_size[8] + four u128s (logical_hash, domain_id, incarnation_tag, build_id)[64]
 ///   + header_hash[8] = 96.
+/// The [12,16) word is a fixed zero pad that keeps logical_size 8-byte aligned and the four u128s on
+/// natural 16-byte boundaries; it is written zero and verified zero on decode.
 /// It is 8-aligned (12*8) AND 16-aligned (6*16), so the four u128s sit on natural 16-byte boundaries
 /// with zero padding. The core is never grown: new fields go into the [96, header_len) TLV extensions
 /// (forward-compatible), and a fixed per-pool header length — used so every blob's payload starts at a
@@ -152,7 +154,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header)
         writeBinaryLittleEndian(
             static_cast<uint8_t>(critical ? FLAG_HAS_CRITICAL_EXTENSION : 0), out_buf); /// [7] flags
         writeBinaryLittleEndian(header_len, out_buf);                       /// [8,12)  header_len
-        writeBinaryLittleEndian(header.index_len, out_buf);                 /// [12,16) index_len
+        writeBinaryLittleEndian(static_cast<uint32_t>(0), out_buf);         /// [12,16) zero pad (alignment)
         writeBinaryLittleEndian(header.logical_size, out_buf);              /// [16,24) logical_size
         writeU128LE(out_buf, header.logical_hash);                          /// [24,40)
         writeU128LE(out_buf, header.domain_id);                             /// [40,56)
@@ -196,8 +198,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
         uint8_t kind_byte = 0;
         readBinaryLittleEndian(kind_byte, in);
         if (kind_byte != static_cast<uint8_t>(ObjectKind::Blob)
-            && kind_byte != static_cast<uint8_t>(ObjectKind::Tree)
-            && kind_byte != static_cast<uint8_t>(ObjectKind::Pack))
+            && kind_byte != static_cast<uint8_t>(ObjectKind::Tree))
             throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CHCA envelope: unknown kind {}", kind_byte);
         h.kind = static_cast<ObjectKind>(kind_byte);
         if (h.kind != expected_kind)
@@ -224,11 +225,12 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
                 "CHCA envelope: header_len {} exceeds provided bytes {}", header_len, head_bytes.size());
         h.header_len = header_len;
 
-        /// [12,16) index_len
-        readBinaryLittleEndian(h.index_len, in);
-        if (h.kind != ObjectKind::Pack && h.index_len != 0)
+        /// [12,16) zero pad (alignment). Must be zero.
+        uint32_t pad_word = 0;
+        readBinaryLittleEndian(pad_word, in);
+        if (pad_word != 0)
             throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                "CHCA envelope: index_len must be 0 for kind {}", static_cast<int>(kind_byte));
+                "CHCA envelope: header pad word must be 0, got {}", pad_word);
 
         /// [16,24) logical_size
         readBinaryLittleEndian(h.logical_size, in);
@@ -256,16 +258,12 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
         }
 
         /// Size arithmetic (uniform for ALL kinds, spec §3.1): header_len + logical_size == object_size.
-        /// logical_size covers [header_len, EOF); for packs that INCLUDES the index
-        /// (logical_size = index_len + payload_region_size).
+        /// logical_size covers [header_len, EOF).
         const uint64_t expected_object_size = static_cast<uint64_t>(header_len) + h.logical_size;
         if (expected_object_size != object_size)
             throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
                 "CHCA envelope: size mismatch (header_len {} + logical_size {} = {}, object_size {})",
                 header_len, h.logical_size, expected_object_size, object_size);
-        if (h.index_len > h.logical_size)
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                "CHCA envelope: index_len {} exceeds logical_size {}", h.index_len, h.logical_size);
 
         /// [96, header_len) TLV extensions. Encode pads the area to 8-alignment with zero bytes; a valid
         /// TLV type is never 0, so a zero type marks the start of alignment padding (which must be all

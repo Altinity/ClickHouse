@@ -2,7 +2,7 @@
 
 namespace ProfileEvents
 {
-/// B168 P0: the 80 CA per-namespace S3 op events (8 namespaces × 10 ops). Declared in ProfileEvents.cpp.
+/// B168 P0: the 70 CA per-namespace S3 op events (7 namespaces × 10 ops). Declared in ProfileEvents.cpp.
 extern const Event CasBlobPut;
 extern const Event CasBlobPutDedup;
 extern const Event CasBlobOverwrite;
@@ -24,17 +24,6 @@ extern const Event CasTreeHeadMiss;
 extern const Event CasTreeGet;
 extern const Event CasTreeDelete;
 extern const Event CasTreeList;
-
-extern const Event CasPackPut;
-extern const Event CasPackPutDedup;
-extern const Event CasPackOverwrite;
-extern const Event CasPackCas;
-extern const Event CasPackCasConflict;
-extern const Event CasPackHead;
-extern const Event CasPackHeadMiss;
-extern const Event CasPackGet;
-extern const Event CasPackDelete;
-extern const Event CasPackList;
 
 extern const Event CasRootPut;
 extern const Event CasRootPutDedup;
@@ -107,10 +96,6 @@ static const ProfileEvents::Event cas_event_table[CAS_NS_COUNT][CAS_OP_COUNT] =
                   ProfileEvents::CasTreeCas, ProfileEvents::CasTreeCasConflict, ProfileEvents::CasTreeHead,
                   ProfileEvents::CasTreeHeadMiss, ProfileEvents::CasTreeGet, ProfileEvents::CasTreeDelete,
                   ProfileEvents::CasTreeList},
-    /* Pack   */ {ProfileEvents::CasPackPut, ProfileEvents::CasPackPutDedup, ProfileEvents::CasPackOverwrite,
-                  ProfileEvents::CasPackCas, ProfileEvents::CasPackCasConflict, ProfileEvents::CasPackHead,
-                  ProfileEvents::CasPackHeadMiss, ProfileEvents::CasPackGet, ProfileEvents::CasPackDelete,
-                  ProfileEvents::CasPackList},
     /* Root   */ {ProfileEvents::CasRootPut, ProfileEvents::CasRootPutDedup, ProfileEvents::CasRootOverwrite,
                   ProfileEvents::CasRootCas, ProfileEvents::CasRootCasConflict, ProfileEvents::CasRootHead,
                   ProfileEvents::CasRootHeadMiss, ProfileEvents::CasRootGet, ProfileEvents::CasRootDelete,
@@ -139,8 +124,6 @@ CasNs classifyCasNs(const String & key)
         return CasNs::Blob;
     if (key.find("/trees/") != String::npos)
         return CasNs::Tree;
-    if (key.find("/packs/") != String::npos)
-        return CasNs::Pack;
     /// Phase 6: a server's mutable control state lives under its own `roots/<server-hex>/` subtree —
     /// the watermark at `.../_watermark` and the precommit shards under `.../_precommits/`. Both are
     /// key-wise under `/roots/`, so classify them by their distinguishing suffix/segment BEFORE the

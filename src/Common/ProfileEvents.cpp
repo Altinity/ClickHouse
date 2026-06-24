@@ -759,16 +759,6 @@ The server successfully detected this situation and will download merged part fr
     M(CasTreeGet,        "CA tree get S3 ops", ValueType::Number) \
     M(CasTreeDelete,     "CA tree delete S3 ops", ValueType::Number) \
     M(CasTreeList,       "CA tree list S3 ops", ValueType::Number) \
-    M(CasPackPut,        "CA pack put S3 ops", ValueType::Number) \
-    M(CasPackPutDedup,   "CA pack put-dedup S3 ops", ValueType::Number) \
-    M(CasPackOverwrite,  "CA pack overwrite S3 ops", ValueType::Number) \
-    M(CasPackCas,        "CA pack cas S3 ops", ValueType::Number) \
-    M(CasPackCasConflict,"CA pack cas-conflict S3 ops", ValueType::Number) \
-    M(CasPackHead,       "CA pack head S3 ops", ValueType::Number) \
-    M(CasPackHeadMiss,   "CA pack head-miss S3 ops", ValueType::Number) \
-    M(CasPackGet,        "CA pack get S3 ops", ValueType::Number) \
-    M(CasPackDelete,     "CA pack delete S3 ops", ValueType::Number) \
-    M(CasPackList,       "CA pack list S3 ops", ValueType::Number) \
     M(CasRootPut,        "CA root put S3 ops", ValueType::Number) \
     M(CasRootPutDedup,   "CA root put-dedup S3 ops", ValueType::Number) \
     M(CasRootOverwrite,  "CA root overwrite S3 ops", ValueType::Number) \

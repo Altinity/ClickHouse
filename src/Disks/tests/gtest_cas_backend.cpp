@@ -270,7 +270,6 @@ TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     /// Namespace classification by substring.
     EXPECT_EQ(classifyCasNs("pool/blobs/ab/abcdef"), CasNs::Blob);
     EXPECT_EQ(classifyCasNs("pool/trees/00/deadbeef"), CasNs::Tree);
-    EXPECT_EQ(classifyCasNs("pool/packs/p1"), CasNs::Pack);
     EXPECT_EQ(classifyCasNs("pool/gc/registry"), CasNs::Gc);   /// registry relocated roots/_registry -> gc/registry (design §5.3)
     EXPECT_EQ(classifyCasNs("pool/roots/default/_files/x"), CasNs::Root);
     EXPECT_EQ(classifyCasNs("pool/gc/state"), CasNs::Gc);

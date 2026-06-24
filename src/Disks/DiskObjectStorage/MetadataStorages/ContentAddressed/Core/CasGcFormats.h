@@ -66,7 +66,7 @@ struct RetiredEntry
 ///   {"format":"cas_retired_set","version":1,
 ///    "entries":[{"kind":"blob","hash":"<32 lowercase hex>","token":"etag-1",
 ///                "token_type":"etag","size":1234}]}
-/// kind: "blob" | "tree" | "pack"; token_type: "etag" | "generation" | "emulated".
+/// kind: "blob" | "tree"; token_type: "etag" | "generation" | "emulated".
 struct RetiredSet
 {
     std::vector<RetiredEntry> entries;

@@ -1209,14 +1209,13 @@ TEST(CasGcRetire, BlobHeaderUnderflowFailsClosed)
 {
     /// retiredLogicalSize unit rows: blobs subtract the pool's fixed blob_header_len (the size in a
     /// retire entry is GC bookkeeping over PAYLOAD bytes); a blob OBJECT smaller than the fixed
-    /// header is corrupt => CORRUPTED_DATA (fail closed, never a wrapped-around size); trees/packs
+    /// header is corrupt => CORRUPTED_DATA (fail closed, never a wrapped-around size); trees
     /// account whole-object. Direct unit rows because a BLOB candidate cannot be constructed
     /// through a real round before Task 9 lands: a blob stays pinned by its parent tree's edge
     /// until the cascade strips it.
     EXPECT_EQ(retiredLogicalSize(ObjectKind::Blob, 300, 256), 44u);
     EXPECT_EQ(retiredLogicalSize(ObjectKind::Blob, 256, 256), 0u);     /// empty payload is legal
     EXPECT_EQ(retiredLogicalSize(ObjectKind::Tree, 100, 256), 100u);   /// whole-object
-    EXPECT_EQ(retiredLogicalSize(ObjectKind::Pack, 100, 256), 100u);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { retiredLogicalSize(ObjectKind::Blob, 100, 256); });
 }
 

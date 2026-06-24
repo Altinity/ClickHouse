@@ -8,7 +8,7 @@ namespace DB::Cas
 namespace
 {
 /// Recursive DFS carrying the shared `seen` set so a tree reachable via several paths is expanded
-/// once. Matches CasFsck.cpp's placement handling: Blob/PackSlice yield an edge; Subtree yields an
+/// once. Matches CasFsck.cpp's placement handling: Blob yields an edge; Subtree yields an
 /// edge AND recurses into the child tree; Inline carries its bytes in the payload — no object/edge.
 void closureWalkImpl(const UInt128 & node, const EntriesOf & entries_of, const OnTree & on_tree,
                      const OnEdge & on_edge, std::set<UInt128> & seen)
@@ -21,7 +21,6 @@ void closureWalkImpl(const UInt128 & node, const EntriesOf & entries_of, const O
         switch (entry.placement)
         {
             case Placement::Blob:
-            case Placement::PackSlice:
                 on_edge(node, entry);
                 break;
             case Placement::Subtree:

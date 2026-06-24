@@ -47,7 +47,6 @@ namespace DB::Cas
 /// Ids are 32-char lowercase hex of a 128-bit hash. Envelope/codecs store the raw 16 bytes (LE).
 CAS_STRONG_STRING(BlobId)
 CAS_STRONG_STRING(TreeId)
-CAS_STRONG_STRING(PackId)
 
 /// Opaque namespace under which root manifests live. The core never interprets its contents:
 /// the wiring composes strings like "srv1/<table_uuid>" or "shadow/<backup>/<table_uuid>".
@@ -96,7 +95,6 @@ inline UInt128 hexToU128(const String & hex)
 
 CAS_STRONG_STRING_HASH(BlobId)
 CAS_STRONG_STRING_HASH(TreeId)
-CAS_STRONG_STRING_HASH(PackId)
 CAS_STRONG_STRING_HASH(RootNamespace)
 
 #undef CAS_STRONG_STRING_HASH
