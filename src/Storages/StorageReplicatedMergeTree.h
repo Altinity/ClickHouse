@@ -530,7 +530,7 @@ private:
 
     /// Immutable snapshot republished after each writer batch (part_references stripped). Readers
     /// (system table, scheduler, KILL) get() a consistent version with no lock and no ZooKeeper.
-    MultiVersion<ExportPartitionTaskEntriesContainer> export_read_model;
+    MultiVersion<ExportPartitionTaskEntriesContainer> export_partition_manifests;
     /// A thread that removes old parts, log entries, and blocks.
     ReplicatedMergeTreeCleanupThread cleanup_thread;
 

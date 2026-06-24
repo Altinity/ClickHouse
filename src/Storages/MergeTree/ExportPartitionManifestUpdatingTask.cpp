@@ -241,7 +241,7 @@ ExportPartitionManifestUpdatingTask::ExportPartitionManifestUpdatingTask(Storage
 
 std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::getPartitionExportsInfo() const
 {
-    const auto model = storage.export_read_model.get();
+    const auto model = storage.export_partition_manifests.get();
 
     if (!model)
         return {};
@@ -312,7 +312,7 @@ void ExportPartitionManifestUpdatingTask::poll()
         /// it atomically via export_read_model.set() at the end. Readers never see partial updates.
         std::lock_guard task_guard(background_task_serialization_mutex);
 
-        const auto current_model = storage.export_read_model.get();
+        const auto current_model = storage.export_partition_manifests.get();
 
         auto working_model = current_model
             ? std::make_unique<ExportPartitionTaskEntriesContainer>(*current_model)
@@ -459,7 +459,7 @@ void ExportPartitionManifestUpdatingTask::poll()
 
         /// Publish the updated copy atomically. `working_model` is moved out here, so
         /// `entries_by_key` (a reference into it) must not be used afterwards.
-        storage.export_read_model.set(std::move(working_model));
+        storage.export_partition_manifests.set(std::move(working_model));
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating task: finished polling for new entries. Number of entries: {}", entries_count);
     }
@@ -596,7 +596,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", local_status_changes.size());
 
-        const auto current_model = storage.export_read_model.get();
+        const auto current_model = storage.export_partition_manifests.get();
         auto working_model = current_model
             ? std::make_unique<ExportPartitionTaskEntriesContainer>(*current_model)
             : std::make_unique<ExportPartitionTaskEntriesContainer>();
@@ -676,7 +676,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
         /// Publish this batch's status transitions to readers. `working_model` is moved out here,
         /// so `entries_by_key` (a reference into it) must not be used afterwards.
         if (had_changes)
-            storage.export_read_model.set(std::move(working_model));
+            storage.export_partition_manifests.set(std::move(working_model));
     }
     catch (...)
     {

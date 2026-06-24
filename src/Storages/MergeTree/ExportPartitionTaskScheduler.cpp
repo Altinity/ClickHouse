@@ -80,7 +80,7 @@ void ExportPartitionTaskScheduler::run()
     /// Hold the published snapshot for the whole pass and iterate it directly (sorted by
     /// create_time). It is immutable and the shared_ptr copy never blocks the writer. The scheduler
     /// is a pure reader; status converges via the status watch -> handleStatusChanges and poll().
-    const auto model = storage.export_read_model.get();
+    const auto model = storage.export_partition_manifests.get();
     if (!model)
         return;
 

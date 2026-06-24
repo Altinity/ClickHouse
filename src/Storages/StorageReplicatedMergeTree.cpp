@@ -477,7 +477,7 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     , merge_strategy_picker(*this)
     , queue(*this, merge_strategy_picker)
     , fetcher(*this)
-    , export_read_model(std::make_unique<const ExportPartitionTaskEntriesContainer>())
+    , export_partition_manifests(std::make_unique<const ExportPartitionTaskEntriesContainer>())
     , cleanup_thread(*this)
     , deduplication_hashes_cache(*this, "deduplication_hashes")
     , async_block_ids_cache(*this, "async_blocks")
@@ -6129,7 +6129,7 @@ void StorageReplicatedMergeTree::shutdown(bool)
         std::lock_guard lock(data_parts_exchange_ptr->rwlock);
     }
 
-    export_read_model.set(std::make_unique<const ExportPartitionTaskEntriesContainer>());
+    export_partition_manifests.set(std::make_unique<const ExportPartitionTaskEntriesContainer>());
 
     {
         std::lock_guard lock(export_manifests_mutex);
@@ -10110,7 +10110,7 @@ CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & 
     bool local_entry_pending = false;
     std::string local_composite_key;
 
-    if (const auto model = export_read_model.get())
+    if (const auto model = export_partition_manifests.get())
     {
         const auto & by_transaction_id = model->get<ExportPartitionTaskEntryTagByTransactionId>();
         const auto entry = by_transaction_id.find(transaction_id);
