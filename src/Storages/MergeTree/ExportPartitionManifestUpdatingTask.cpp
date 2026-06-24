@@ -37,9 +37,7 @@ namespace FailPoints
 
 namespace
 {
-    /// Work item describing a commit-recovery attempt that has been deferred out of
-    /// the `poll()` critical section. Captures everything by value so it can be
-    /// executed safely after the M_task critical section has been released.
+    /// Describes pending commits
     struct CommitRecoveryWork
     {
         ExportReplicatedMergeTreePartitionManifest metadata;
@@ -47,17 +45,9 @@ namespace
         StoragePtr destination_storage;
         ContextPtr context;
     };
+
     /// Fetch all per-replica last_exception leaves under <entry_path>/last_exception and build
-    /// a fresh map keyed by replica name. The map key prefers the unescaped `replica` field
-    /// embedded in the JSON payload; if it is missing or empty, the leaf name is unescaped as
-    /// a fallback.
-    ///
-    /// An empty result means "nothing actionable": either the parent getChildren failed (ZK
-    /// glitch), the container has no children yet (no replica has reported), or every leaf
-    /// fetch came back ZNONODE / malformed. Callers MUST skip the assignment in that case to
-    /// preserve the in-memory mirror across transient errors. This is safe because per-replica
-    /// leaves are never individually removed — the entire entry path is wiped recursively when
-    /// a task is cleaned up, which is handled separately by removeStaleEntries.
+    /// a fresh map keyed by replica name.
     std::map<String, LastExceptionEntry> readLastExceptionPerReplica(
         const zkutil::ZooKeeperPtr & zk,
         const std::filesystem::path & entry_path,
@@ -85,8 +75,6 @@ namespace
         for (const auto & child : children)
             paths.emplace_back(container_path / child);
 
-        /// One MULTI_READ when supported, parallel async gets otherwise. See
-        /// ZooKeeper::multiRead in src/Common/ZooKeeper/ZooKeeper.h.
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet, paths.size());
         auto responses = zk->tryGet(paths);
@@ -127,19 +115,8 @@ namespace
         return out;
     }
 
-    /*
-        Enforce the PENDING task timeout and recover non-committed exports that have already
-        exported all parts. Entries are never removed for age — `system.replicated_partition_exports`
-        is append-only history, so the entry always stays in the in-memory container: a KILLED
-        transition is driven by the status watch, and a deferred commit is handled by the caller
-        after the lock is released.
 
-        Side outputs:
-        - `deferred_commits`: when a PENDING entry has all parts processed but the export was
-          never committed, this function appends a CommitRecoveryWork item to be executed by
-          the caller after releasing the storage-wide mutex. The actual commit() call (which
-          performs network I/O to the destination catalog and S3) MUST NOT run under the lock.
-    */
+    /// collects pending commits and kills tasks that have timed out
     void tryCleanup(
         const zkutil::ZooKeeperPtr & zk,
         const std::string & entry_path,
@@ -245,14 +222,7 @@ namespace
                     return;
                 }
 
-                /// A replica exported the last part but the commit never landed. Run commit()
-                /// outside M_task: it does network I/O (REST catalog + S3, up to
-                /// MAX_TRANSACTION_RETRIES=100) and must not block the other background task.
-                ///
-                /// The outer poll() loop stays on the normal path: it will call addTask() so the
-                /// in-memory container reflects the PENDING entry. The status watch registered by
-                /// poll() will transition the local entry to COMPLETED/FAILED once the deferred
-                /// commit (or a peer's commit) updates /status in ZooKeeper.
+                /// A replica exported the last part but the commit never landed
                 deferred_commits.push_back(CommitRecoveryWork{
                     .metadata = metadata,
                     .entry_path = entry_path,
@@ -329,10 +299,7 @@ void ExportPartitionManifestUpdatingTask::poll()
     /// across replicas: only the replica holding it walks `tryCleanup` (task-timeout
     /// enforcement + commit recovery). It MUST outlive the deferred-commit loop below; otherwise a peer
     /// replica's next poll() could acquire it and race us on the same commit-recovery work,
-    /// duplicating REST-catalog round-trips and snapshot writes. The EphemeralNodeHolder
-    /// destructor removes the node, so we declare it at function scope and let it die
-    /// at the end of poll() - after all deferred commits have completed.
-    /// Acquired here (no mutex needed - it is just a ZK ephemeral create).
+    /// duplicating REST-catalog round-trips and snapshot writes.
     auto cleanup_lock = zkutil::EphemeralNodeHolder::tryCreate(cleanup_lock_path, *zk, storage.replica_name);
     if (cleanup_lock)
     {
@@ -385,7 +352,6 @@ void ExportPartitionManifestUpdatingTask::poll()
             auto last_exception_per_replica = readLastExceptionPerReplica(
                 zk, fs::path(entry_path), key, storage.log.load());
 
-            /// Plain lookup is safe: poll() is the sole mutator while holding M_task.
             /// If the zk entry has been replaced with export_merge_tree_partition_force_export, checking only for the export key is not enough
             /// we need to make sure it is the same transaction id. If it is not, it needs to be replaced.
             const auto local_entry = entries_by_key.find(key);
@@ -487,7 +453,6 @@ void ExportPartitionManifestUpdatingTask::poll()
             
         }
 
-        /// Remove entries that were deleted by someone else
         removeStaleEntries(zk_children, entries_by_key);
 
         const auto entries_count = entries_by_key.size();
@@ -498,23 +463,10 @@ void ExportPartitionManifestUpdatingTask::poll()
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating task: finished polling for new entries. Number of entries: {}", entries_count);
     }
-    /// M_task released here. The catalog round-trips below run without any lock, so readers and
-    /// handleStatusChanges() are not blocked by them.
-    ///
-    /// `cleanup_lock` (the ZK ephemeral node) is INTENTIONALLY still held here and is only
-    /// destructed at end of function. This preserves the existing cross-replica invariant:
-    /// at any moment only one replica is performing commit recovery for a given table, so
-    /// peer replicas will not race us on the same `commit()` calls below.
-    ///
-    /// Shutdown safety: this function runs on a BackgroundSchedulePool task that
-    /// `StorageReplicatedMergeTree::shutdown()` deactivates before publishing an empty
-    /// `export_read_model`. Deactivation waits for the currently-running invocation (this very call)
-    /// to return before proceeding, so the deferred commits below complete (or throw) before
-    /// any teardown observes an empty read-model. All work items capture their inputs by value, so
-    /// they are independent from container state.
 
     const auto log_ptr = storage.log.load();
 
+    /// Execute pending commits
     for (const auto & work : deferred_commits)
     {
         /// A replica exported the last part but the commit never landed. Try to fix it.
@@ -529,10 +481,7 @@ void ExportPartitionManifestUpdatingTask::poll()
                 "Caught exception while committing export for {}: {}",
                 work.entry_path, e.message());
 
-            /// Bump commit-attempts counter; transition to FAILED once the budget is exhausted.
-            /// This is the primary retry path for the commit phase — handlePartExportSuccess
-            /// only fires once (on the last part's completion); subsequent retries come from here.
-            const bool became_failed = ExportPartitionUtils::handleCommitFailure(
+            const bool exceeded_commimt_max_retries = ExportPartitionUtils::handleCommitFailure(
                 zk,
                 work.entry_path,
                 work.metadata.max_retries,
@@ -540,7 +489,7 @@ void ExportPartitionManifestUpdatingTask::poll()
                 e.message(),
                 log_ptr);
 
-            if (became_failed)
+            if (exceeded_commimt_max_retries)
             {
                 LOG_WARNING(log_ptr,
                     "ExportPartition Manifest Updating Task: "
@@ -689,12 +638,6 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 
             LOG_INFO(storage.log, "ExportPartition Manifest Updating task: status changed for task {}. New status: {}", key, magic_enum::enum_name(*new_status).data());
 
-            /// Refresh last_exception leaves too (ZooKeeper read, lock-free). Status transitions to
-            /// FAILED (via commit budget) and KILLED (via timeout) atomically write a per-replica
-            /// leaf in the same multi, so reading them here ensures the system table surfaces the
-            /// cause together with the visible state change. No new watch is added — this piggybacks
-            /// on the existing status watch. An empty result means "nothing actionable" and leaves
-            /// the previous snapshot intact.
             auto fetched = readLastExceptionPerReplica(
                 zk, fs::path(storage.zookeeper_path) / "exports" / key, key, storage.log.load());
 
