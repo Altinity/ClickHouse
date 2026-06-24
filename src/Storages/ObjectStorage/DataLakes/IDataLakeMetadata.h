@@ -17,13 +17,9 @@
 #include <Storages/ObjectStorage/DataLakes/DataLakeTableStateSnapshot.h>
 #include <Storages/MutationCommands.h>
 #include <Storages/prepareReadingFromFormat.h>
-<<<<<<< HEAD
 #include <Disks/DiskType.h>
 #include <IO/WriteBuffer.h>
-=======
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
-
->>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
 
 namespace DataLake
 {

@@ -576,8 +576,6 @@ def test_cluster_default_expression(started_cluster):
     assert result == expected_result
 
 
-<<<<<<< HEAD
-=======
 def test_graceful_shutdown(started_cluster):
     node = started_cluster.instances["s0_0_0"]
     node_to_shutdown = started_cluster.instances["s0_1_0"]
@@ -692,7 +690,7 @@ def test_remote_no_hedged(started_cluster):
     assert TSV(pure_s3) == TSV(s3_distributed)
 
 
->>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
+
 @pytest.mark.parametrize("allow_experimental_analyzer", [0, 1])
 @pytest.mark.parametrize("use_partition_strategy", [False, True])
 def test_hive_partitioning(started_cluster, allow_experimental_analyzer, use_partition_strategy):

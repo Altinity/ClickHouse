@@ -78,11 +78,8 @@ def started_cluster():
                 "configs/access.xml",
                 "configs/users.xml",
                 "configs/s3_retry.xml",
-<<<<<<< HEAD
                 "configs/sync_insert.xml",
-=======
                 "configs/lock_object_storage_task_distribution_ms.xml",
->>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
             ],
         )
         cluster.add_instance(
@@ -139,11 +136,8 @@ def started_cluster():
                 "configs/users.xml",
                 "configs/s3_retry.xml",
                 "configs/process_archives_as_whole_with_cluster.xml",
-<<<<<<< HEAD
                 "configs/sync_insert.xml",
-=======
                 "configs/lock_object_storage_task_distribution_ms.xml",
->>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
             ],
         )
         cluster.add_instance(

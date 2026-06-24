@@ -1054,16 +1054,12 @@ void RemoteQueryExecutor::setProfileInfoCallback(ProfileInfoCallback callback)
     profile_info_callback = std::move(callback);
 }
 
-<<<<<<< HEAD
-bool RemoteQueryExecutor::needToSkipUnavailableShard()
-=======
 bool RemoteQueryExecutor::skipUnavailableShards() const
 {
     return context->getSettingsRef()[Setting::skip_unavailable_shards];
 }
 
 bool RemoteQueryExecutor::needToSkipUnavailableShard() const
->>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
 {
     if (context->getSettingsRef()[Setting::skip_unavailable_shards] && (0 == connections->size()))
     {

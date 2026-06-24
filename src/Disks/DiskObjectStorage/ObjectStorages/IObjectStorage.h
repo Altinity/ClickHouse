@@ -188,15 +188,12 @@ struct RelativePathWithMetadata
 
     std::string getFileName() const { return std::filesystem::path(relative_path).filename(); }
     std::string getPath() const { return relative_path; }
-<<<<<<< HEAD
-=======
 
     void setFileMetaInfo(std::optional<DataFileMetaInfoPtr> file_meta_info_ ) { file_meta_info = file_meta_info_; }
     std::optional<DataFileMetaInfoPtr> getFileMetaInfo() const { return file_meta_info; }
 
     const CommandInTaskResponse & getCommand() const { return command; }
     std::string getFileNameWithoutExtension() const { return std::filesystem::path(relative_path).stem(); }
->>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
 };
 
 struct ObjectKeyWithMetadata

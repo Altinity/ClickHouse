@@ -62,15 +62,12 @@ namespace fs = std::filesystem;
 namespace ProfileEvents
 {
     extern const Event EngineFileLikeReadFiles;
-<<<<<<< HEAD
     extern const Event ObjectStorageListedObjects;
     extern const Event ObjectStorageGlobFilteredObjects;
     extern const Event ObjectStoragePredicateFilteredObjects;
     extern const Event ObjectStorageReadObjects;
-=======
     extern const Event ObjectStorageClusterProcessedTasks;
     extern const Event ObjectStorageClusterWaitingMicroseconds;
->>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
 }
 
 namespace CurrentMetrics
@@ -93,12 +90,8 @@ namespace Setting
     extern const SettingsBool cluster_function_process_archive_on_multiple_nodes;
     extern const SettingsBool table_engine_read_through_distributed_cache;
     extern const SettingsUInt64 s3_path_filter_limit;
-<<<<<<< HEAD
     extern const SettingsBool use_parquet_metadata_cache;
-=======
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
-    extern const SettingsBool use_object_storage_list_objects_cache;
->>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
 }
 
 namespace ErrorCodes
@@ -661,17 +654,13 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     ObjectInfoPtr object_info;
     auto query_settings = configuration->getQuerySettings(context_);
 
-<<<<<<< HEAD
     QueryConditionCachePtr query_condition_cache;
     if (format_filter_info && format_filter_info->condition_hash)
         query_condition_cache = Context::getGlobalContextInstance()->getQueryConditionCache();
 
-    while (true)
-=======
     bool not_a_path = false;
 
     do
->>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
     {
         not_a_path = false;
         object_info = file_iterator->next(processor);
@@ -714,11 +703,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             else
                 object_info->setObjectMetadata(object_storage->getObjectMetadata(path, with_tags));
         }
-<<<<<<< HEAD
-
-        if (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0
-            && object_info->getObjectMetadata()->is_size_known)
-            continue;
 
         if (query_condition_cache && !object_info->file_bucket_info)
         {
@@ -742,7 +726,10 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     object_info->getFileName());
 
                 if (matching_row_groups.empty())
+                {
+                    not_a_path = true;
                     continue;
+                }
 
                 auto file_bucket_info = FormatFactory::instance().getFileBucketInfo(
                     object_info->getFileFormat().value_or(configuration->format));
@@ -750,19 +737,18 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 {
                     auto filtered = file_bucket_info->filterByMatchingRowGroups(matching_row_groups);
                     if (!filtered)
+                    {
+                        not_a_path = true;
                         continue;
+                    }
                     object_info->file_bucket_info = std::move(filtered);
                 }
             }
         }
-        break;
     }
-=======
-    }
-    while (not_a_path || (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0));
+    while (not_a_path || (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0 && object_info->getObjectMetadata()->is_size_known));
 
     ProfileEvents::increment(ProfileEvents::ObjectStorageClusterProcessedTasks);
->>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
 
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
