@@ -1,17 +1,22 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnumStrings.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <cas_root_shard.pb.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
-#include <charconv>
+#include <algorithm>
 
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -21,34 +26,44 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint64_t GC_STATE_VERSION = 3;   /// v3: folded_cursor moved from gc/state into the snap (B140-dangle fix)
-constexpr uint64_t RETIRED_SET_VERSION = 1;
+constexpr std::string_view GC_STATE_MAGIC  = "CAGT";
+constexpr std::string_view RETIRED_SET_MAGIC = "CART";
 
-/// Writes a `{"key":u64,...}` object from a string-keyed map (used for the inner fence_version
-/// objects). The keys are "ns/shard" strings — data, so they go through the escaping writer.
-void writeU64MapObject(WriteBuffer & out, const std::map<String, uint64_t> & map)
+/// ObjectKind <-> uint32 for the RetiredEntryProto.kind field (mirrors the enum values).
+uint32_t objectKindToProto(ObjectKind kind)
 {
-    writeChar('{', out);
-    bool first = true;
-    for (const auto & [key, value] : map)
-    {
-        if (!first)
-            writeChar(',', out);
-        first = false;
-        writeJsonKey(out, key);
-        writeIntText(value, out);
-    }
-    writeChar('}', out);
+    return static_cast<uint32_t>(kind);
 }
 
-/// Reads a `{"key":u64,...}` object into a map; every value must be a strict u64 (the same
-/// rejection set as requireU64).
-std::map<String, uint64_t> u64MapFromObject(const Poco::JSON::Object & obj, std::string_view what)
+ObjectKind objectKindFromProto(uint32_t v, std::string_view what)
 {
-    std::map<String, uint64_t> result;
-    for (const auto & [key, value] : obj)
-        result[key] = requireU64Var(value, key, what);
-    return result;
+    switch (v)
+    {
+        case static_cast<uint32_t>(ObjectKind::Blob): return ObjectKind::Blob;
+        case static_cast<uint32_t>(ObjectKind::Tree): return ObjectKind::Tree;
+        default:
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: invalid object kind {} in retired entry", what, v);
+    }
+}
+
+/// TokenType <-> uint32 for the RetiredEntryProto.token_type field (mirrors the enum values).
+uint32_t tokenTypeToProto(TokenType t)
+{
+    return static_cast<uint32_t>(t);
+}
+
+TokenType tokenTypeFromProto(uint32_t v, std::string_view what)
+{
+    switch (v)
+    {
+        case static_cast<uint32_t>(TokenType::ETag):       return TokenType::ETag;
+        case static_cast<uint32_t>(TokenType::Generation): return TokenType::Generation;
+        case static_cast<uint32_t>(TokenType::Emulated):   return TokenType::Emulated;
+        default:
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: invalid token type {} in retired entry", what, v);
+    }
 }
 
 }
@@ -56,157 +71,146 @@ std::map<String, uint64_t> u64MapFromObject(const Poco::JSON::Object & obj, std:
 String encodeGcState(const GcState & state)
 {
     chassert(state.snap_shards >= 1);   /// catch a zeroed GC constant at the write site
-    WriteBufferFromOwnString out;
-    writeCString("{", out);
-    writeJsonKey(out, "format");
-    writeJsonString("cas_gc_state", out);
-    writeChar(',', out);
-    writeJsonKey(out, "version");
-    writeIntText(GC_STATE_VERSION, out);
-    writeChar(',', out);
-    writeJsonKey(out, "round");
-    writeIntText(state.round, out);
-    writeChar(',', out);
-    writeJsonKey(out, "fence_seq");
-    writeIntText(state.fence_seq, out);
-    writeChar(',', out);
-    writeJsonKey(out, "snap_shards");
-    writeIntText(state.snap_shards, out);
-    writeChar(',', out);
-    writeJsonKey(out, "snap_generation");
-    writeIntText(state.snap_generation, out);
-    writeChar(',', out);
-    writeJsonKey(out, "snap_pruned_through");
-    writeIntText(state.snap_pruned_through, out);
-    writeChar(',', out);
-    writeJsonKey(out, "lease");
-    writeChar('{', out);
-    writeJsonKey(out, "owner");
-    writeJsonString(u128ToHex(state.lease.owner), out);
-    writeChar(',', out);
-    writeJsonKey(out, "seq");
-    writeIntText(state.lease.seq, out);
-    writeChar('}', out);
-    writeChar(',', out);
-    writeJsonKey(out, "fence_version");
-    writeChar('{', out);
-    bool first = true;
+
+    Cas::Proto::GcStateProto msg;
+    msg.set_round(state.round);
+    msg.set_fence_seq(state.fence_seq);
+    msg.set_snap_shards(state.snap_shards);
+    msg.set_snap_generation(state.snap_generation);
+    msg.set_snap_pruned_through(state.snap_pruned_through);
+
+    auto * lease = msg.mutable_lease();
+    lease->set_owner(u128ToBytesBE(state.lease.owner));
+    lease->set_seq(state.lease.seq);
+
+    auto & fv = *msg.mutable_fence_version();
     for (const auto & [round, inner] : state.fence_version)
     {
-        if (!first)
-            writeChar(',', out);
-        first = false;
-        writeJsonKey(out, std::to_string(round));
-        writeU64MapObject(out, inner);
+        Cas::Proto::FenceVersionInnerProto inner_proto;
+        auto & shards = *inner_proto.mutable_shards();
+        for (const auto & [shard, version] : inner)
+            shards[shard] = version;
+        fv[round] = std::move(inner_proto);
     }
-    writeChar('}', out);
-    writeChar('}', out);
+
+    std::string body;
+    if (!msg.SerializeToString(&body))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS gc/state: protobuf serialization failed");
+
+    WriteBufferFromOwnString out;
+    Cas::writeFramingHeader(out, GC_STATE_MAGIC, Cas::currentWriterVersion(Cas::FormatId::GcState));
+    writeString(body, out);
     return std::move(out.str());
 }
 
 GcState decodeGcState(std::string_view data)
 {
-    return decodeJsonGuarded("gc/state", [&]
+    if (data.empty())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: empty object");
+
+    ReadBufferFromMemory in(data.data(), data.size());
+    Cas::readFramingHeader(in, GC_STATE_MAGIC, "gc/state");
+    const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
+
+    Cas::Proto::GcStateProto msg;
+    if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: protobuf parse failed");
+
+    GcState state;
+    state.round = msg.round();
+    state.fence_seq = msg.fence_seq();
+    state.snap_shards = msg.snap_shards();
+    if (state.snap_shards == 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: snap_shards must be >= 1");
+    state.snap_generation = msg.snap_generation();
+    state.snap_pruned_through = msg.snap_pruned_through();
+
+    state.lease.owner = u128FromBytesBE(msg.lease().owner(), "gc/state lease owner");
+    state.lease.seq = msg.lease().seq();
+
+    for (const auto & [round, inner_proto] : msg.fence_version())
     {
-        auto obj = parseJsonDocument(data, "cas_gc_state", GC_STATE_VERSION, "gc/state");
-        checkNoUnknownKeys(*obj,
-            {"format", "version", "round", "fence_seq", "snap_shards", "snap_generation",
-             "snap_pruned_through", "lease", "fence_version"}, "gc/state");
+        std::map<String, uint64_t> inner;
+        for (const auto & [shard, version] : inner_proto.shards())
+            inner[shard] = version;
+        state.fence_version[round] = std::move(inner);
+    }
 
-        GcState state;
-        state.round = requireU64(*obj, "round", "gc/state");
-        state.fence_seq = requireU64(*obj, "fence_seq", "gc/state");
-        state.snap_shards = requireU64(*obj, "snap_shards", "gc/state");
-        if (state.snap_shards == 0)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: snap_shards must be >= 1");
-        state.snap_generation = requireU64(*obj, "snap_generation", "gc/state");
-        if (obj->has("snap_pruned_through"))
-            state.snap_pruned_through = requireU64(*obj, "snap_pruned_through", "gc/state");
-
-        auto lease = requireObject(*obj, "lease", "gc/state");
-        checkNoUnknownKeys(*lease, {"owner", "seq"}, "gc/state lease");
-        state.lease.owner = requireHash(*lease, "owner", "gc/state lease");
-        state.lease.seq = requireU64(*lease, "seq", "gc/state lease");
-
-        auto fences = requireObject(*obj, "fence_version", "gc/state");
-        for (const auto & [round_str, inner_var] : *fences)
-        {
-            uint64_t round = 0;
-            const auto [end, ec] = std::from_chars(round_str.data(), round_str.data() + round_str.size(), round);
-            if (ec != std::errc() || end != round_str.data() + round_str.size() || round_str.empty())
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS gc/state: non-numeric fence_version round key '{}'", round_str);
-            /// Canonical-form check: "07" parses to 7 but would re-encode as "7" — two keys aliasing
-            /// one round inside a persisted object is corruption, not a tolerable spelling.
-            if (std::to_string(round) != round_str)
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS gc/state: non-canonical fence_version round key '{}'", round_str);
-            if (inner_var.type() != typeid(Poco::JSON::Object::Ptr))
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS gc/state: fence_version value for round '{}' must be an object", round_str);
-            state.fence_version[round]
-                = u64MapFromObject(*inner_var.extract<Poco::JSON::Object::Ptr>(), "gc/state fence_version");
-        }
-        return state;
-    });
+    return state;
 }
 
 String encodeRetiredSet(const RetiredSet & set)
 {
-    WriteBufferFromOwnString out;
-    JsonObjectWriter writer(out);
-    writer.field("format", "cas_retired_set");
-    writer.field("version", RETIRED_SET_VERSION);
+    Cas::Proto::RetiredSetProto msg;
 
-    /// `entries` is an array of flat objects: open it through beginValueField, then write each entry
-    /// with its own JsonObjectWriter (same separator/escaping rules).
-    writer.beginValueField("entries");
-    writeChar('[', out);
-    bool first = true;
-    for (const auto & entry : set.entries)
+    /// Sort entries deterministically (kind, hash-BE, token_value, token_type, size) so the
+    /// encoded bytes are stable across encodes — mirrors the JSON encoder's ordered iteration.
+    std::vector<const RetiredEntry *> sorted;
+    sorted.reserve(set.entries.size());
+    for (const auto & e : set.entries)
+        sorted.push_back(&e);
+
+    std::sort(sorted.begin(), sorted.end(), [](const RetiredEntry * a, const RetiredEntry * b)
     {
-        if (!first)
-            writeChar(',', out);
-        first = false;
+        if (a->kind != b->kind)
+            return static_cast<uint8_t>(a->kind) < static_cast<uint8_t>(b->kind);
+        const std::string ha = u128ToBytesBE(a->hash);
+        const std::string hb = u128ToBytesBE(b->hash);
+        if (ha != hb)
+            return ha < hb;
+        if (a->token.value != b->token.value)
+            return a->token.value < b->token.value;
+        if (a->token.type != b->token.type)
+            return static_cast<uint8_t>(a->token.type) < static_cast<uint8_t>(b->token.type);
+        return a->size < b->size;
+    });
 
-        JsonObjectWriter entry_writer(out);
-        entry_writer.field("kind", objectKindToString(entry.kind));
-        entry_writer.field("hash", u128ToHex(entry.hash));
-        entry_writer.field("token", entry.token.value);
-        entry_writer.field("token_type", tokenTypeToString(entry.token.type));
-        entry_writer.field("size", entry.size);
-        entry_writer.finalize();
+    for (const auto * ep : sorted)
+    {
+        auto * pe = msg.add_entries();
+        pe->set_kind(objectKindToProto(ep->kind));
+        pe->set_hash(u128ToBytesBE(ep->hash));
+        pe->set_token_value(ep->token.value);
+        pe->set_token_type(tokenTypeToProto(ep->token.type));
+        pe->set_size(ep->size);
     }
-    writeChar(']', out);
-    writer.finalize();
+
+    std::string body;
+    if (!msg.SerializeToString(&body))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS retired set: protobuf serialization failed");
+
+    WriteBufferFromOwnString out;
+    Cas::writeFramingHeader(out, RETIRED_SET_MAGIC, Cas::currentWriterVersion(Cas::FormatId::RetiredSet));
+    writeString(body, out);
     return std::move(out.str());
 }
 
 RetiredSet decodeRetiredSet(std::string_view data)
 {
-    return decodeJsonGuarded("retired set", [&]
+    if (data.empty())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS retired set: empty object");
+
+    ReadBufferFromMemory in(data.data(), data.size());
+    Cas::readFramingHeader(in, RETIRED_SET_MAGIC, "retired set");
+    const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
+
+    Cas::Proto::RetiredSetProto msg;
+    if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS retired set: protobuf parse failed");
+
+    RetiredSet set;
+    set.entries.reserve(static_cast<size_t>(msg.entries_size()));
+    for (const auto & pe : msg.entries())
     {
-        auto obj = parseJsonDocument(data, "cas_retired_set", RETIRED_SET_VERSION, "retired set");
-        checkNoUnknownKeys(*obj, {"format", "version", "entries"}, "retired set");
-
-        auto entries = requireArray(*obj, "entries", "retired set");
-
-        RetiredSet set;
-        for (size_t i = 0; i < entries->size(); ++i)
-        {
-            auto entry_obj = requireObjectAt(*entries, i, "retired set");
-            checkNoUnknownKeys(*entry_obj, {"kind", "hash", "token", "token_type", "size"}, "retired set entry");
-
-            RetiredEntry entry;
-            entry.kind = objectKindFromString(requireString(*entry_obj, "kind", "retired set"), "retired set");
-            entry.hash = requireHash(*entry_obj, "hash", "retired set");
-            entry.token.value = requireString(*entry_obj, "token", "retired set");
-            entry.token.type = tokenTypeFromString(requireString(*entry_obj, "token_type", "retired set"), "retired set");
-            entry.size = requireU64(*entry_obj, "size", "retired set");
-            set.entries.push_back(std::move(entry));
-        }
-        return set;
-    });
+        RetiredEntry entry;
+        entry.kind = objectKindFromProto(pe.kind(), "retired set");
+        entry.hash = u128FromBytesBE(pe.hash(), "retired set hash");
+        entry.token.value = pe.token_value();
+        entry.token.type = tokenTypeFromProto(pe.token_type(), "retired set");
+        entry.size = pe.size();
+        set.entries.push_back(std::move(entry));
+    }
+    return set;
 }
 
 String encodeGcHeartbeat(const GcHeartbeat & hb)
