@@ -43,16 +43,13 @@ private:
         auto & entries_by_key
     );
 
-    /// Republish export_read_model as a fresh immutable copy (part_references stripped). Called
-    /// under M_task at the end of each poll() / handleStatusChanges() batch.
-    void publishReadModel();
-
     std::mutex status_changes_mutex;
     std::queue<std::string> status_changes;
 
-    /// M_task: serializes poll() and handleStatusChanges() and is the sole guard of the
-    /// writer-private authoritative container. Held across ZooKeeper I/O; no reader takes it
-    /// (readers use export_read_model). Lock ordering: this -> export_manifests_mutex.
+    /// M_task: serializes poll() and handleStatusChanges(). Each builds a private mutable copy of
+    /// the current read-model, mutates it, and atomically publishes it via export_read_model.set().
+    /// Held across ZooKeeper I/O; no reader takes it (readers use export_read_model.get()).
+    /// Lock ordering: this -> export_manifests_mutex.
     std::mutex background_task_serialization_mutex;
 };
 

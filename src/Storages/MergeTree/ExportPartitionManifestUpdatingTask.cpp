@@ -269,20 +269,6 @@ ExportPartitionManifestUpdatingTask::ExportPartitionManifestUpdatingTask(Storage
 {
 }
 
-void ExportPartitionManifestUpdatingTask::publishReadModel()
-{
-    /// Called under M_task. part_references are not copied: the published version is informational
-    /// only, and parts must be pinned solely by the authoritative container.
-    auto model = std::make_unique<ExportPartitionTaskEntriesContainer>();
-    for (const auto & entry : storage.export_merge_tree_partition_task_entries_by_key)
-    {
-        ExportReplicatedMergeTreePartitionTaskEntry copy = entry;
-        copy.part_references.clear(); /// never pin parts inside a published version
-        model->insert(std::move(copy));
-    }
-    storage.export_read_model.set(std::move(model));
-}
-
 std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::getPartitionExportsInfo() const
 {
     const auto model = storage.export_read_model.get();
@@ -354,12 +340,20 @@ void ExportPartitionManifestUpdatingTask::poll()
     }
 
     {
-        /// M_task: serializes poll() vs handleStatusChanges() and guards the authoritative
-        /// container across the ZooKeeper reads below. Readers use the read-model we republish at
-        /// the end of this block.
+        /// M_task: serializes poll() vs handleStatusChanges(). We copy the current read-model into a
+        /// private mutable container, mutate that copy across the ZooKeeper reads below, and publish
+        /// it atomically via export_read_model.set() at the end. Readers never see partial updates.
         std::lock_guard task_guard(background_task_serialization_mutex);
 
-        LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), storage.export_merge_tree_partition_task_entries_by_key.size());
+        const auto current_model = storage.export_read_model.get();
+
+        auto working_model = current_model
+            ? std::make_unique<ExportPartitionTaskEntriesContainer>(*current_model)
+            : std::make_unique<ExportPartitionTaskEntriesContainer>();
+
+        auto & entries_by_key = working_model->get<ExportPartitionTaskEntryTagByCompositeKey>();
+
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), entries_by_key.size());
 
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildrenWatch);
@@ -369,8 +363,6 @@ void ExportPartitionManifestUpdatingTask::poll()
         const std::unordered_set<std::string> zk_children(children.begin(), children.end());
 
         const auto now = time(nullptr);
-
-        auto & entries_by_key = storage.export_merge_tree_partition_task_entries_by_key;
 
         /// Load new entries
         /// If we have the cleanup lock, also remove stale entries from zk and local
@@ -498,9 +490,13 @@ void ExportPartitionManifestUpdatingTask::poll()
         /// Remove entries that were deleted by someone else
         removeStaleEntries(zk_children, entries_by_key);
 
-        publishReadModel();
+        const auto entries_count = entries_by_key.size();
 
-        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: finished polling for new entries. Number of entries: {}", entries_by_key.size());
+        /// Publish the updated copy atomically. `working_model` is moved out here, so
+        /// `entries_by_key` (a reference into it) must not be used afterwards.
+        storage.export_read_model.set(std::move(working_model));
+
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: finished polling for new entries. Number of entries: {}", entries_count);
     }
     /// M_task released here. The catalog round-trips below run without any lock, so readers and
     /// handleStatusChanges() are not blocked by them.
@@ -511,11 +507,11 @@ void ExportPartitionManifestUpdatingTask::poll()
     /// peer replicas will not race us on the same `commit()` calls below.
     ///
     /// Shutdown safety: this function runs on a BackgroundSchedulePool task that
-    /// `StorageReplicatedMergeTree::shutdown()` deactivates before clearing the entry
-    /// container. Deactivation waits for the currently-running invocation (this very call)
+    /// `StorageReplicatedMergeTree::shutdown()` deactivates before publishing an empty
+    /// `export_read_model`. Deactivation waits for the currently-running invocation (this very call)
     /// to return before proceeding, so the deferred commits below complete (or throw) before
-    /// any teardown observes empty `export_merge_tree_partition_task_entries`. All work
-    /// items capture their inputs by value, so they are independent from container state.
+    /// any teardown observes an empty read-model. All work items capture their inputs by value, so
+    /// they are independent from container state.
 
     const auto log_ptr = storage.log.load();
 
@@ -637,14 +633,22 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 
     try
     {
-        /// M_task: serializes this against poll() and guards the authoritative container across the
-        /// ZooKeeper reads below. Readers use the read-model we republish at the end of this batch.
+        /// M_task: serializes this against poll(). We copy the current read-model into a private
+        /// mutable container, apply this batch's status transitions to that copy across the ZooKeeper
+        /// reads below, and publish it atomically via export_read_model.set() at the end. Readers
+        /// never see partial updates.
         std::lock_guard task_guard(background_task_serialization_mutex);
         auto zk = storage.getZooKeeper();
 
         const bool had_changes = !local_status_changes.empty();
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", local_status_changes.size());
+
+        const auto current_model = storage.export_read_model.get();
+        auto working_model = current_model
+            ? std::make_unique<ExportPartitionTaskEntriesContainer>(*current_model)
+            : std::make_unique<ExportPartitionTaskEntriesContainer>();
+        auto & entries_by_key = working_model->get<ExportPartitionTaskEntryTagByCompositeKey>();
 
         while (!local_status_changes.empty())
         {
@@ -657,10 +661,8 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
                     "Failpoint: simulating exception during status change handling for key {}", key);
             });
 
-            /// Holding M_task (sole mutator), the iterator stays valid across the ZooKeeper reads
-            /// and killExportPart below (killExportPart touches only export_manifests_mutex).
-            const auto it = storage.export_merge_tree_partition_task_entries_by_key.find(key);
-            if (it == storage.export_merge_tree_partition_task_entries_by_key.end())
+            const auto it = entries_by_key.find(key);
+            if (it == entries_by_key.end())
             {
                 local_status_changes.pop();
                 continue;
@@ -725,9 +727,10 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             local_status_changes.pop();
         }
 
-        /// Publish this batch's status transitions to readers.
+        /// Publish this batch's status transitions to readers. `working_model` is moved out here,
+        /// so `entries_by_key` (a reference into it) must not be used afterwards.
         if (had_changes)
-            publishReadModel();
+            storage.export_read_model.set(std::move(working_model));
     }
     catch (...)
     {

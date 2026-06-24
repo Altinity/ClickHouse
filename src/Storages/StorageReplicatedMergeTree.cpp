@@ -477,9 +477,6 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     , merge_strategy_picker(*this)
     , queue(*this, merge_strategy_picker)
     , fetcher(*this)
-    , export_merge_tree_partition_task_entries_by_key(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByCompositeKey>())
-    , export_merge_tree_partition_task_entries_by_transaction_id(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByTransactionId>())
-    , export_merge_tree_partition_task_entries_by_create_time(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByCreateTime>())
     , export_read_model(std::make_unique<const ExportPartitionTaskEntriesContainer>())
     , cleanup_thread(*this)
     , deduplication_hashes_cache(*this, "deduplication_hashes")
@@ -6132,12 +6129,7 @@ void StorageReplicatedMergeTree::shutdown(bool)
         std::lock_guard lock(data_parts_exchange_ptr->rwlock);
     }
 
-    {
-        /// Export tasks were deactivate()d above, so no writer is running. Clear the container and
-        /// publish an empty read-model so late readers observe no tasks.
-        export_merge_tree_partition_task_entries.clear();
-        export_read_model.set(std::make_unique<const ExportPartitionTaskEntriesContainer>());
-    }
+    export_read_model.set(std::make_unique<const ExportPartitionTaskEntriesContainer>());
 
     {
         std::lock_guard lock(export_manifests_mutex);
