@@ -290,7 +290,8 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
     if (!model)
         return {};
 
-    std::vector<ReplicatedPartitionExportInfo> infos(model->size());
+    std::vector<ReplicatedPartitionExportInfo> infos;
+    infos.reserve(model->size());
 
     for (const auto & entry : model->get<ExportPartitionTaskEntryTagByCompositeKey>())
     {
