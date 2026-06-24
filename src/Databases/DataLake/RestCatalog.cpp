@@ -1177,21 +1177,21 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
         request_body->set("identifier", identifier);
     }
 
-    if (new_snapshot->has("parent-snapshot-id"))
     {
-        auto parent_snapshot_id = new_snapshot->getValue<Int64>("parent-snapshot-id");
+        /// Always assert on `main` so concurrent commits CAS; omitting `snapshot-id` asserts the ref is absent.
+        Poco::JSON::Object::Ptr requirement = new Poco::JSON::Object;
+        requirement->set("type", "assert-ref-snapshot-id");
+        requirement->set("ref", "main");
+
+        Int64 parent_snapshot_id = new_snapshot->has("parent-snapshot-id")
+            ? new_snapshot->getValue<Int64>("parent-snapshot-id") : -1;
         if (parent_snapshot_id != -1)
-        {
-            Poco::JSON::Object::Ptr requirement = new Poco::JSON::Object;
-            requirement->set("type", "assert-ref-snapshot-id");
-            requirement->set("ref", "main");
             requirement->set("snapshot-id", parent_snapshot_id);
 
-            Poco::JSON::Array::Ptr requirements = new Poco::JSON::Array;
-            requirements->add(requirement);
+        Poco::JSON::Array::Ptr requirements = new Poco::JSON::Array;
+        requirements->add(requirement);
 
-            request_body->set("requirements", requirements);
-        }
+        request_body->set("requirements", requirements);
     }
 
     {
