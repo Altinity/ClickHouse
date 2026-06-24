@@ -13,6 +13,31 @@
 #include <Common/logger_useful.h>
 #include <ctime>
 
+namespace DB::ContentAddressed
+{
+
+namespace
+{
+
+bool hasSuffix(std::string_view s, std::string_view suffix)
+{
+    return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
+}
+
+}
+
+bool partFileMustStayBlob(std::string_view file_name)
+{
+    if (file_name == "primary.idx")
+        return true;
+    for (std::string_view suffix : {".bin", ".mrk", ".mrk2", ".mrk3", ".cmrk", ".cmrk2", ".cmrk3"})
+        if (hasSuffix(file_name, suffix))
+            return true;
+    return false;
+}
+
+}
+
 namespace DB
 {
 

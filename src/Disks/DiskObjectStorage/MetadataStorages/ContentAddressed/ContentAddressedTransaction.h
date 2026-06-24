@@ -8,11 +8,23 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace DB
 {
+
+namespace ContentAddressed
+{
+
+/// Part files that must NOT be inlined into the tree: per-column data (`.bin`) and marks (`.mrk*`/
+/// `.cmrk*`) — inlining them would force a full-part fetch and destroy column-read selectivity — plus
+/// `primary.idx`, which can be large (a size-threshold inlining of small primary.idx is a follow-up).
+/// Everything else (the small eager metadata files) is an inline candidate, subject to INLINE_CAP.
+bool partFileMustStayBlob(std::string_view file_name);
+
+}
 
 /// The M-W write-path wiring: accumulates ClickHouse operations and maps them to ONE Cas::Build
 /// per written part at commit (design 2026-06-11 section 4; plan D-W2).
