@@ -1,7 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Common/Exception.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
 
 namespace DB
 {
@@ -9,8 +7,6 @@ namespace ErrorCodes
 {
     extern const int UNKNOWN_FORMAT_VERSION;
     extern const int LOGICAL_ERROR;
-    extern const int BAD_ARGUMENTS;
-    extern const int CORRUPTED_DATA;
 }
 }
 
@@ -49,58 +45,52 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
     throw Exception(ErrorCodes::LOGICAL_ERROR, "CasFormat: unknown FormatId {}", static_cast<int>(id));
 }
 
-WriterStamp currentWriterVersion(FormatId id, uint16_t floor)
+uint32_t magicFor(FormatId id)
 {
-    if (floor == 0)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "CasFormat: write floor must be >= 1, got 0");
-    const auto cps = changePoints(id);
-    /// Newest change-point with generation <= floor (cps is oldest-first, non-empty, gen[0] == 1).
-    const FormatChangePoint * chosen = &cps.front();
-    for (const auto & cp : cps)
+    /// Each magic is 4 ASCII bytes stored as little-endian fixed32.
+    /// "CABL" = 0x4C424143, "CATR" = 0x52544143, etc.
+    switch (id)
     {
-        if (cp.generation <= floor)
-            chosen = &cp;
-        else
+        case FormatId::Blob:          return 0x4C424143u; /// "CABL"
+        case FormatId::Tree:          return 0x52544143u; /// "CATR"
+        case FormatId::Manifest:      return 0x53524143u; /// "CARS"
+        case FormatId::PoolMeta:      return 0x4D504143u; /// "CAPM"
+        case FormatId::Watermark:     return 0x4D574143u; /// "CAWM"
+        case FormatId::GcState:       return 0x54474143u; /// "CAGT"
+        case FormatId::RetiredSet:    return 0x54524143u; /// "CART"
+        case FormatId::Heartbeat:     return 0x42484143u; /// "CAHB"
+        case FormatId::RootsRegistry: return 0x52524143u; /// "CARR"
+        case FormatId::GcOutcomes:    return 0x4F474143u; /// "CAGO"
+        case FormatId::GcSnap:
+        case FormatId::Roster:
             break;
     }
-    return {chosen->generation, chosen->min_reader};
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "CasFormat: no magic defined for FormatId {}", static_cast<int>(id));
 }
 
-void gateOnRead(uint16_t min_reader_version, std::string_view what)
+uint32_t currentWriterVersion()
 {
-    if (min_reader_version > G_BUILD)
+    return G_BUILD;
+}
+
+uint32_t currentCompatibilityVersion()
+{
+    /// Pre-roster: stamp G_BUILD as the compatibility floor on every object written.
+    return G_BUILD;
+}
+
+void checkCompatibility(uint32_t compatibility_version, std::string_view what)
+{
+    if (compatibility_version > G_BUILD)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
             "CAS {}: object requires reader generation {} but this build supports at most {}",
-            what, min_reader_version, G_BUILD);
+            what, compatibility_version, G_BUILD);
 }
 
-void writeFramingHeader(WriteBuffer & out, std::string_view magic, WriterStamp stamp)
+void gateOnRead(uint32_t compatibility_version, std::string_view what)
 {
-    if (magic.size() != 4)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "CasFormat: framing magic must be 4 bytes, got {}", magic.size());
-    out.write(magic.data(), 4);
-    writeBinaryLittleEndian(stamp.writer_version, out);
-    writeBinaryLittleEndian(stamp.min_reader_version, out);
-}
-
-FramingHeader readFramingHeader(ReadBuffer & in, std::string_view expected_magic, std::string_view what)
-{
-    if (expected_magic.size() != 4)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "CasFormat: expected magic must be 4 bytes, got {}", expected_magic.size());
-
-    char got[4];
-    in.readStrict(got, 4);
-    if (std::string_view(got, 4) != expected_magic)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS {}: bad framing magic (got '{}', expected '{}')",
-            what, std::string_view(got, 4), expected_magic);
-
-    FramingHeader h{};
-    readBinaryLittleEndian(h.writer_version, in);
-    readBinaryLittleEndian(h.min_reader_version, in);
-    gateOnRead(h.min_reader_version, what);
-    return h;
+    checkCompatibility(compatibility_version, what);
 }
 
 }

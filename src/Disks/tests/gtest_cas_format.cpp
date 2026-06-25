@@ -1,14 +1,11 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Common/Exception.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/ReadBufferFromMemory.h>
 
 namespace DB::ErrorCodes
 {
     extern const int UNKNOWN_FORMAT_VERSION;
-    extern const int CORRUPTED_DATA;
-    extern const int BAD_ARGUMENTS;
+    extern const int LOGICAL_ERROR;
 }
 
 using namespace DB::Cas;
@@ -28,32 +25,23 @@ TEST(CasFormat, ChangePointsExistForEveryClass)
     }
 }
 
-TEST(CasFormat, CurrentWriterVersionIsGen1Baseline)
+TEST(CasFormat, CurrentVersionsAreGBuild)
 {
-    auto s = currentWriterVersion(FormatId::Tree);
-    EXPECT_EQ(s.writer_version, 1u);
-    EXPECT_EQ(s.min_reader_version, 1u);
+    EXPECT_EQ(currentWriterVersion(), G_BUILD);
+    EXPECT_EQ(currentCompatibilityVersion(), G_BUILD);
 }
 
-TEST(CasFormat, CurrentWriterVersionPicksNewestAtOrBelowFloor)
+TEST(CasFormat, CheckCompatibilityPassesWhenKnown)
 {
-    /// With only generation 1 defined, any floor >= 1 yields {1,1}.
-    auto s = currentWriterVersion(FormatId::Manifest, /*floor=*/5);
-    EXPECT_EQ(s.writer_version, 1u);
-    EXPECT_EQ(s.min_reader_version, 1u);
+    EXPECT_NO_THROW(checkCompatibility(1u, "tree"));
+    EXPECT_NO_THROW(checkCompatibility(G_BUILD, "tree"));
 }
 
-TEST(CasFormat, GateOnReadPassesWhenKnown)
-{
-    EXPECT_NO_THROW(gateOnRead(/*min_reader=*/1, "tree"));
-    EXPECT_NO_THROW(gateOnRead(G_BUILD, "tree"));
-}
-
-TEST(CasFormat, GateOnReadFailsClosedOnFuture)
+TEST(CasFormat, CheckCompatibilityFailsClosedOnFuture)
 {
     try
     {
-        gateOnRead(G_BUILD + 1, "tree");
+        checkCompatibility(G_BUILD + 1, "tree");
         FAIL() << "expected UNKNOWN_FORMAT_VERSION";
     }
     catch (const DB::Exception & e)
@@ -62,76 +50,71 @@ TEST(CasFormat, GateOnReadFailsClosedOnFuture)
     }
 }
 
-TEST(CasFormat, FramingHeaderRoundTrip)
+TEST(CasFormat, MagicForEachMutableObjectClass)
 {
-    DB::WriteBufferFromOwnString out;
-    writeFramingHeader(out, "CARS", WriterStamp{1, 1});
-    out.finalize();
-    const std::string bytes = out.str();
-    ASSERT_EQ(bytes.size(), FRAMING_HEADER_SIZE);
+    /// The per-type magic is the 4 ASCII bytes stored as little-endian uint32.
+    /// Verify each magic encodes the documented ASCII string.
+    auto le32toStr = [](uint32_t v) -> std::string
+    {
+        char buf[4];
+        buf[0] = static_cast<char>(v & 0xFF);
+        buf[1] = static_cast<char>((v >> 8) & 0xFF);
+        buf[2] = static_cast<char>((v >> 16) & 0xFF);
+        buf[3] = static_cast<char>((v >> 24) & 0xFF);
+        return std::string(buf, 4);
+    };
 
-    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
-    FramingHeader h = readFramingHeader(in, "CARS", "manifest");
-    EXPECT_EQ(h.writer_version, 1u);
-    EXPECT_EQ(h.min_reader_version, 1u);
-    /// Cursor is left at the body (here: end of buffer).
-    EXPECT_TRUE(in.eof());
+    EXPECT_EQ(le32toStr(magicFor(FormatId::Blob)),          "CABL");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::Tree)),          "CATR");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::Manifest)),      "CARS");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::PoolMeta)),      "CAPM");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::Watermark)),     "CAWM");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::GcState)),       "CAGT");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::RetiredSet)),    "CART");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::Heartbeat)),     "CAHB");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::RootsRegistry)), "CARR");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::GcOutcomes)),    "CAGO");
 }
 
-TEST(CasFormat, FramingHeaderRejectsBadMagic)
+TEST(CasFormat, MagicForUndefinedClassThrowsLogicalError)
 {
-    DB::WriteBufferFromOwnString out;
-    writeFramingHeader(out, "CARS", WriterStamp{1, 1});
-    out.finalize();
-    const std::string bytes = out.str();
-
-    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
+    /// GcSnap and Roster have no mutable protobuf magic defined — they must throw LOGICAL_ERROR.
     try
     {
-        readFramingHeader(in, "CAGS", "gc-snap");   // wrong expected magic
-        FAIL() << "expected CORRUPTED_DATA";
+        magicFor(FormatId::GcSnap);
+        FAIL() << "expected LOGICAL_ERROR";
     }
     catch (const DB::Exception & e)
     {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
     }
-}
-
-TEST(CasFormat, FramingHeaderGatesFutureMinReader)
-{
-    DB::WriteBufferFromOwnString out;
-    writeFramingHeader(out, "CARS", WriterStamp{/*writer=*/2, /*min_reader=*/2});  // a future object
-    out.finalize();
-    const std::string bytes = out.str();
-
-    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
     try
     {
-        readFramingHeader(in, "CARS", "manifest");
-        FAIL() << "expected UNKNOWN_FORMAT_VERSION";
+        magicFor(FormatId::Roster);
+        FAIL() << "expected LOGICAL_ERROR";
     }
     catch (const DB::Exception & e)
     {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
     }
 }
 
-
-TEST(CasFormat, CurrentWriterVersionRejectsFloorZero)
+TEST(CasFormat, MagicsAreDistinct)
 {
-    try
-    {
-        currentWriterVersion(FormatId::Blob, 0);
-        FAIL() << "expected BAD_ARGUMENTS";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::BAD_ARGUMENTS);
-    }
-}
-
-TEST(CasFormat, FramingHeaderRejectsTruncatedBuffer)
-{
-    DB::ReadBufferFromMemory in("CAR", 3);  // 3 bytes < FRAMING_HEADER_SIZE
-    EXPECT_THROW(readFramingHeader(in, "CARS", "manifest"), DB::Exception);
+    /// All per-type magics must be unique — a collision would make bad-magic detection useless.
+    const uint32_t magics[] = {
+        magicFor(FormatId::Blob),
+        magicFor(FormatId::Tree),
+        magicFor(FormatId::Manifest),
+        magicFor(FormatId::PoolMeta),
+        magicFor(FormatId::Watermark),
+        magicFor(FormatId::GcState),
+        magicFor(FormatId::RetiredSet),
+        magicFor(FormatId::Heartbeat),
+        magicFor(FormatId::RootsRegistry),
+        magicFor(FormatId::GcOutcomes),
+    };
+    for (size_t i = 0; i < std::size(magics); ++i)
+        for (size_t j = i + 1; j < std::size(magics); ++j)
+            EXPECT_NE(magics[i], magics[j]) << "duplicate magic at indices " << i << " and " << j;
 }
