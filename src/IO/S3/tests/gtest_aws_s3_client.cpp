@@ -603,7 +603,6 @@ TEST(IOTestAwsS3Client, AssumeRole)
     }
 }
 
-<<<<<<< HEAD
 TEST(IOTestAwsS3Client, WebIdentityConfiguredFromEnvironment)
 {
     constexpr const char * k_role = "AWS_ROLE_ARN";
@@ -683,7 +682,8 @@ TEST(IOTestAwsS3Client, WrongSigningRegionBadRequest)
         response.set("x-amz-bucket-region", "ap-south-1");
         EXPECT_FALSE(DB::S3::isS3WrongSigningRegionBadRequest(404, response));
     }
-=======
+}
+
 TEST(IOTestAwsS3Client, ClientCacheRegistryGetOrCreateCacheForKey)
 {
     auto & registry = DB::S3::ClientCacheRegistry::instance();
@@ -806,7 +806,6 @@ TEST(IOTestAwsS3Client, TwoClientsWithSharedCacheUnregisterRefcount)
     client1.reset();
     client2.reset();
     // If refcount was wrong, unregisterClient would throw when the second client is destroyed
->>>>>>> d5682cc12a8 (Merge pull request #1807 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-96802)
 }
 
 #endif
