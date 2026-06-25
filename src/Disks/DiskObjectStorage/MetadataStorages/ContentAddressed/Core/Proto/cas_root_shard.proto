@@ -10,34 +10,39 @@ package DB.Cas.Proto;
 // NOTE (cleanup pending): the file is still named cas_root_shard.proto / package DB.Cas.Proto for
 // history; a grooming step renames it to cas_format.proto / package clickhouse.cas.format.
 //
-// FRAMING (the part protobuf can't express): every serialized message below is stored PREFIXED with
-// an 8-byte CasFormat framing header — [magic:4][writer_version:u16 LE][min_reader_version:u16 LE]
-// (see CasFormat.h). The reader validates the magic, then gateOnReads min_reader_version (fail-closed,
-// UNKNOWN_FORMAT_VERSION, if newer than this build), THEN parses the protobuf body. Per-object magic:
+// CONVERGED HEADER MODEL (2026-06-25): every mutable object carries a CasHeader as field 1.
+// The object is PURE PROTOBUF — no binary prefix, decodable directly with protoc:
+//   protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto < manifest.bin
+// Per-object magic (4 ASCII bytes as little-endian fixed32):
 //   RootShardManifest "CARS" | PoolMetaProto "CAPM" | WatermarkProto "CAWM" | GcStateProto "CAGT"
 //   RetiredSetProto "CART" | HeartbeatProto "CAHB" | RootsRegistryProto "CARR" | GcOutcomeLogProto "CAGO"
 // (gc-snap stays a versioned binary+zstd codec — GC-internal, not an interchange format; B176 defers
 // its protobuf conversion.)
-// Introspect a raw object offline (strip the 8-byte framing header first):
-//   tail -c +9 manifest.bin | protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto
-// None of these objects is content-addressed, so byte-determinism is not a correctness requirement;
-// the encoders still serialize deterministically (sorted repeated, no proto map<>) for stable goldens.
-//
-// VERSION + FAIL-CLOSED GATING: version and fail-closed reader gating now live in the CasFormat
-// framing header ([magic CARS][writer:u16][min_reader:u16]) prepended to every serialized manifest;
-// see `CasFormat.h`. The in-message codec_version field (field 1) has been removed (reserved 1).
 //
 // SCHEMA EVOLUTION RULES (read before editing):
-//  * The wire format is keyed by field NUMBER, not name. Two ways to evolve:
-//    1. ADDITIVE + safe-to-ignore (e.g. a new optional sidecar): give it a NEW field number — old
-//       readers skip the unknown field; new readers reading old data get the default. Old and new
-//       binaries interoperate automatically.
-//    2. BREAKING / unsafe-to-ignore (reinterpreting an existing field, a new mandatory invariant, a
-//       change where an old reader silently ignoring the new data would be WRONG): bump the
-//       CasFormat framing header's min_reader_version (via a new FormatChangePoint in CasFormat.cpp)
-//       so old binaries refuse rather than mis-read.
+//  * Safe-additive (new optional sidecar, safe to ignore): give it a NEW field number — old readers
+//    skip the unknown field; new readers reading old data get the default. Old and new binaries
+//    interoperate automatically. Do NOT bump compatibility_version for additive changes.
+//  * Unsafe / breaking (reinterpreting an existing field, a new mandatory invariant, a change where
+//    an old reader silently ignoring the new data would be WRONG): write-down-to-floor:
+//      1. Bump compatibility_version in the new object (via currentCompatibilityVersion() bump).
+//      2. In the decoder, branch on compatibility_version: new arm handles the new schema; old arm
+//         handles the old schema. Both arms MUST be correct.
+//      3. Once all readers are on the new floor (i.e. the floor rises past the compatibility_version
+//         of the old arm), prune the old arm and its dead code.
 //  * NEVER reuse or change the TYPE of an existing field number. To drop a field, `reserved <n>;` its
 //    number (and `reserved "<name>";`) so it is never reused.
+//  * VERSION + FAIL-CLOSED GATING: reader checks magic (CORRUPTED_DATA on mismatch), then
+//    compatibility_version > G_BUILD → UNKNOWN_FORMAT_VERSION (fail-closed on future objects).
+
+// CasHeader is field 1 of every mutable object. magic is a per-type 4-ASCII-byte constant stored
+// as a little-endian fixed32 (e.g. "CARS" → 0x53524143). writer_version and compatibility_version
+// match the C++ constants in CasFormat.h (currentWriterVersion() / currentCompatibilityVersion()).
+message CasHeader {
+  fixed32 magic               = 1;  // per-type 4-ASCII-byte constant (see table above)
+  uint32  writer_version      = 2;  // forensic: the build/generation that wrote this
+  uint32  compatibility_version = 3; // functional: the floor targeted; reader dispatches + fail-closes
+}
 
 // Serialized form of a single DB.Cas.TreeEntry for closure storage.
 // Only the fields needed by the GC walk are serialized; name/inline_bytes are
@@ -77,30 +82,37 @@ message JournalRecord {
   repeated ClosureNodeProto closure = 5;  // NEW (B199-S2); populated only on precommit-ns Add records
 }
 
+// Root shard manifest (the per-namespace versioned ref store). Magic CARS, FormatId::Manifest.
+// CasHeader is field 1; existing fields renumbered from 2 to free field 1.
+// (Pre-release: field renumbering is safe — no on-disk data exists under the old numbering.)
 message RootShardManifest {
-  reserved 1;                         // was codec_version; version is now in the CasFormat framing header
-  reserved "codec_version";           // 3a nit: reserve the name too so it is never reused
-  uint64 shard_version = 2;
-  uint64 fence_round = 3;
+  CasHeader header      = 1;          // magic=CARS; set by encoder, checked by decoder
+  reserved "codec_version";           // old name; reserved so it is never reused
+  uint64 shard_version  = 2;
+  uint64 fence_round    = 3;
   map<string, RefPayload> refs = 4;
   repeated JournalRecord journal = 5; // insertion order preserved
 }
 
 // Pool-wide identity and constants (_pool_meta). Magic CAPM, FormatId::PoolMeta.
-// Framing header ([CAPM][writer:u16][min_reader:u16]) is prepended; the proto body follows.
+// CasHeader is field 1; existing fields renumbered from 2 to free field 1.
 message PoolMetaProto {
-  bytes  pool_id         = 1;  // raw 16 bytes (UInt128, big-endian); minted once at creation
-  uint64 root_shards     = 2;  // must be >= 1
-  uint64 blob_header_len = 3;  // 8-aligned, in [96, 16384]
+  CasHeader header              = 1;  // magic=CAPM; set by encoder, checked by decoder
+  bytes  pool_id                = 2;  // raw 16 bytes (UInt128, big-endian); minted once at creation
+  uint64 root_shards            = 3;  // must be >= 1
+  uint64 blob_header_len        = 4;  // 8-aligned, in [96, 16384]
+  uint64 min_reader_generation  = 5;  // startup gate: if G_BUILD < min_reader_generation => UNKNOWN_FORMAT_VERSION
 }
 
 // Per-server build watermark (_watermark under roots/<server-hex>/). Magic CAWM, FormatId::Watermark.
+// CasHeader is field 1; existing fields renumbered from 2 to free field 1.
 // min_active == UINT64_MAX encodes the "retired" sentinel (farewell epoch).
 message WatermarkProto {
-  bytes  server_id  = 1;  // raw 16 bytes (UInt128, big-endian)
-  uint64 epoch      = 2;
-  uint64 min_active = 3;  // UINT64_MAX (0xFFFFFFFFFFFFFFFF) = retired sentinel
-  uint64 seq        = 4;
+  CasHeader header  = 1;          // magic=CAWM; set by encoder, checked by decoder
+  bytes  server_id  = 2;          // raw 16 bytes (UInt128, big-endian)
+  uint64 epoch      = 3;
+  uint64 min_active = 4;          // UINT64_MAX (0xFFFFFFFFFFFFFFFF) = retired sentinel
+  uint64 seq        = 5;
 }
 
 // GC lease embedded inside GcStateProto.
@@ -129,32 +141,38 @@ message FenceVersionEntryProto {
 }
 
 // GC controller state (gc/state). Magic CAGT, FormatId::GcState.
+// CasHeader is field 1; existing fields renumbered from 2 to free field 1.
 // fence_version is a list of (round, inner) entries, sorted by round ascending,
 // and within each, shards sorted by shard_name ascending — for byte-determinism.
 message GcStateProto {
-  uint64 round              = 1;
-  uint64 fence_seq          = 2;
-  uint64 snap_shards        = 3;  // must be >= 1
-  uint64 snap_generation    = 4;
-  uint64 snap_pruned_through = 5;
-  GcLeaseProto lease        = 6;
-  repeated FenceVersionEntryProto fence_version = 7;
+  CasHeader header              = 1;  // magic=CAGT; set by encoder, checked by decoder
+  uint64 round                  = 2;
+  uint64 fence_seq              = 3;
+  uint64 snap_shards            = 4;  // must be >= 1
+  uint64 snap_generation        = 5;
+  uint64 snap_pruned_through    = 6;
+  GcLeaseProto lease            = 7;
+  repeated FenceVersionEntryProto fence_version = 8;
 }
 
 // Build heartbeat (builds/<build_id>). Magic CAHB, FormatId::Heartbeat.
+// CasHeader is field 1; existing fields renumbered from 2 to free field 1.
 // server_id: raw 16 bytes (UInt128, big-endian).
 message HeartbeatProto {
-  bytes  server_id      = 1;  // raw 16 bytes (UInt128, big-endian)
-  uint64 heartbeat_seq  = 2;  // strictly monotone within one build
-  uint64 created_at_ms  = 3;  // DIAGNOSTIC ONLY — no protocol decision reads writer clocks
+  CasHeader header          = 1;  // magic=CAHB; set by encoder, checked by decoder
+  bytes  server_id          = 2;  // raw 16 bytes (UInt128, big-endian)
+  uint64 heartbeat_seq      = 3;  // strictly monotone within one build
+  uint64 created_at_ms      = 4;  // DIAGNOSTIC ONLY — no protocol decision reads writer clocks
 }
 
 // Namespace registry (gc/registry). Magic CARR, FormatId::RootsRegistry.
+// CasHeader is field 1; existing fields renumbered from 2 to free field 1.
 // namespaces: sorted repeated string (deterministic; no proto map<>).
 message RootsRegistryProto {
-  uint64 registry_version = 1;  // monotone, CAS-carried
-  uint64 fence_round      = 2;  // written only by GC; monotone
-  repeated string namespaces = 3;  // sorted ascending for byte-determinism
+  CasHeader header            = 1;  // magic=CARR; set by encoder, checked by decoder
+  uint64 registry_version     = 2;  // monotone, CAS-carried
+  uint64 fence_round          = 3;  // written only by GC; monotone
+  repeated string namespaces  = 4;  // sorted ascending for byte-determinism
 }
 
 // One entry inside a GcOutcomeLogProto.
@@ -170,9 +188,11 @@ message GcOutcomeEntryProto {
 }
 
 // Retire outcome log (gc/outcomes/<round>.<fence_seq>/<snap_shard>). Magic CAGO, FormatId::GcOutcomes.
+// CasHeader is field 1; existing field renumbered from 1 to free field 1.
 // Entries are in insertion order (the original JSON encoder kept insertion order).
 message GcOutcomeLogProto {
-  repeated GcOutcomeEntryProto entries = 1;
+  CasHeader header                         = 1;  // magic=CAGO; set by encoder, checked by decoder
+  repeated GcOutcomeEntryProto entries     = 2;
 }
 
 // One condemned object inside a RetiredSetProto.
@@ -187,8 +207,10 @@ message RetiredEntryProto {
 }
 
 // Retired-object set (gc/retired/<round>.<fence_seq>/<shard>). Magic CART, FormatId::RetiredSet.
+// CasHeader is field 1; existing field renumbered from 1 to free field 1.
 // Entries are sorted deterministically (kind, hash-BE, token_value, token_type, size) before
 // serialization so the encoded bytes are stable.
 message RetiredSetProto {
-  repeated RetiredEntryProto entries = 1;
+  CasHeader header                      = 1;  // magic=CART; set by encoder, checked by decoder
+  repeated RetiredEntryProto entries    = 2;
 }
