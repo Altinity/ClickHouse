@@ -119,13 +119,12 @@ TEST(CasPoolMeta, CreateThenReopen)
 
 TEST(CasPoolMeta, FailClosed)
 {
-    auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    /// A future object (framing magic CAPM + min_reader=2) must fail closed with UNKNOWN_FORMAT_VERSION.
-    b->putIfAbsent(layout.poolMetaKey(), String("CAPM\x02\x00\x02\x00", 8));
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [&] { PoolMeta::createOrValidate(*b, layout, 8, 256); });
-    /// Garbage bytes => CORRUPTED_DATA.
+    /// Garbage bytes that are not a valid protobuf pool-meta => CORRUPTED_DATA (createOrValidate path).
+    /// The converged-header future-compat fail-closed (compatibility_version > G_BUILD =>
+    /// UNKNOWN_FORMAT_VERSION) is covered at the codec level by CasHeaderGolden.PoolMetaFailClosedOnGarbage;
+    /// a future object is now a VALID protobuf with a higher header.compatibility_version, not a magic
+    /// prefix, so it cannot be hand-crafted here without the proto headers.
     auto b2 = std::make_shared<InMemoryBackend>();
     b2->putIfAbsent(layout.poolMetaKey(), "garbage");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
@@ -140,9 +139,10 @@ TEST(CasPoolMeta, RoundTripAndReadability)
     pm.blob_header_len = 256;
 
     const String encoded = encodePoolMeta(pm);
-    /// Protobuf framing: starts with CAPM magic (not JSON).
+    /// Pure protobuf (not JSON); the CAPM magic is the CasHeader.magic fixed32 field (little-endian,
+    /// so the 4 bytes read "CAPM"), carried INSIDE the message, not at byte 0.
     ASSERT_GE(encoded.size(), 8u);
-    EXPECT_EQ(encoded.substr(0, 4), "CAPM");
+    EXPECT_NE(encoded.find(String("CAPM")), String::npos);
     EXPECT_NE(encoded.front(), '{');
 
     PoolMeta decoded = decodePoolMeta(encoded);
