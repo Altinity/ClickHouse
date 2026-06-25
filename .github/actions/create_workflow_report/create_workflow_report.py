@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 import argparse
+import html
 import os
+import sys
 import time
 from pathlib import Path
 from itertools import combinations
 import json
 from datetime import datetime
+from datetime import timezone
 from functools import lru_cache
 from glob import glob
 import urllib.parse
 import re
+import subprocess
 
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader
@@ -29,6 +33,7 @@ GITHUB_REPO = "Altinity/ClickHouse"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
 
 CVE_SEVERITY_ORDER = {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
+
 
 def _is_clickhouse_memory_limit_error(exc: BaseException) -> bool:
     if isinstance(exc, ServerException) and getattr(exc, "code", None) == 241:
@@ -167,6 +172,209 @@ def get_run_details(run_id: str) -> dict:
         )
 
     return response.json()
+
+
+def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> pd.DataFrame:
+    if len(df) == 0:
+        return pd.DataFrame(columns=["pr_number", "pr_name", "pr_labels"])
+    if not GITHUB_TOKEN:
+        raise Exception("GITHUB_TOKEN is required to fetch PR titles and labels")
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    rows = []
+    for pr_number in df["pr_number"].tolist():
+        response = requests.get(
+            f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
+            headers=headers,
+        )
+        if response.status_code != 200:
+            raise Exception(
+                f"Failed to fetch pull request info: {response.status_code} {response.text}"
+            )
+        pr = response.json()
+        label_names = [l["name"] for l in pr.get("labels", [])]
+        # Escape at collection time so untrusted PR data cannot inject HTML
+        # regardless of how columns are later rendered.
+        rows.append(
+            {
+                "pr_name": html.escape(str(pr.get("title", "")), quote=True),
+                "pr_number": pr_number,
+                "pr_labels": html.escape(", ".join(sorted(label_names)), quote=True),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _git_rev_parse(ref: str, cwd: str | None) -> str | None:
+    p = subprocess.run(
+        ["git", "rev-parse", "--verify", ref],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        return None
+    return p.stdout.strip()
+
+
+def _git_is_ancestor(ancestor: str, descendant: str, cwd: str | None) -> bool:
+    p = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=cwd,
+        capture_output=True,
+    )
+    return p.returncode == 0
+
+
+def _git_log_merge_prs(
+    baseline: str, branch_ref: str, cwd: str | None, repo: str
+) -> pd.DataFrame:
+    p = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.quotepath=false",
+            "log",
+            f"{baseline}..{branch_ref}",
+            "--merges",
+            "--format=%H%x09%s",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    rows = []
+    for line in p.stdout.splitlines():
+        if not line.strip():
+            continue
+        sha, subject = line.split("\t", 1)
+        m = re.match(
+            r"Merge pull request #(\d+) from ([^/\s]+)/", subject, re.IGNORECASE
+        )
+        if not m:
+            continue
+        pr_number, head_owner = int(m.group(1)), m.group(2)
+        if head_owner.lower() != repo.split("/")[0].lower():
+            continue
+        rows.append(
+            {
+                "pr_number": pr_number,
+                "merge_commit_sha": sha,
+                "merge_subject": subject,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=["pr_number", "merge_commit_sha", "merge_subject"])
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates(subset=["pr_number"], keep="first")
+    return df
+
+
+def _find_release_baseline(
+    branch_ref: str, repo: str, cwd: str | None
+) -> tuple[str | None, str | None]:
+    if not GITHUB_TOKEN:
+        return None, None
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    response = requests.get(
+        f"https://api.github.com/repos/{repo}/releases?per_page=100",
+        headers=headers,
+    )
+    if response.status_code != 200:
+        raise Exception(
+            f"GitHub API request failed: {response.status_code} {response.text}"
+        )
+    for rel in response.json():
+        if rel.get("draft"):
+            continue
+        tag_name = rel.get("tag_name")
+        if not tag_name:
+            continue
+        tag_sha = _git_rev_parse(tag_name, cwd)
+        if not tag_sha:
+            continue
+        if not _git_is_ancestor(tag_sha, branch_ref, cwd):
+            continue
+        return tag_name, tag_sha
+    return None, None
+
+
+def _find_rebase_baseline(branch_ref: str, cwd: str | None) -> str | None:
+    p = subprocess.run(
+        [
+            "git",
+            "log",
+            branch_ref,
+            "--reverse",
+            "-i",
+            "-E",
+            "--grep=^Rebase CICD",
+            "--grep=Merge pull request .*rebase-cicd",
+            "--grep=Merge pull request .*from Altinity/rebase/",
+            "--format=%H",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        return None
+    lines = [ln for ln in p.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    return lines[0]
+
+
+def get_prs_in_release_dataframe(
+    branch_ref: str = "HEAD",
+    *,
+    repo: str = GITHUB_REPO,
+    cwd: str,
+) -> pd.DataFrame:
+    f"""
+    PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
+    Release tag on this history, or after the oldest rebase bootstrap if no such tag exists.
+    Only merge commits whose subject has from <repo_owner>/ (e.g. from Altinity/) are included.
+    Columns: pr_number, pr_name, labels. Omits PRs labeled cicd.
+    """
+    branch_sha = _git_rev_parse(branch_ref, cwd)
+    if not branch_sha:
+        raise Exception(f"Cannot resolve branch ref: {branch_ref!r}")
+
+    # CI often checks out with --depth=1 and --no-tags; fetch enough history and tags once.
+    subprocess.run(
+        ["git", "fetch", "--tags", "origin"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    baseline_ref, baseline_sha = _find_release_baseline(branch_ref, repo, cwd)
+    if not baseline_sha:
+        # If no release tag, try to find rebase commit 200 commits back.
+        subprocess.run(
+            ["git", "fetch", "--deepen=200", "origin", branch_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        rebase_sha = _find_rebase_baseline(branch_ref, cwd)
+        if not rebase_sha:
+            raise Exception(
+                "No release tag on this branch and no rebase bootstrap merge found"
+            )
+        baseline_sha = rebase_sha
+
+    df = _git_log_merge_prs(baseline_sha, branch_ref, cwd, repo)
+    return _enrich_prs_in_release_merge_prs(df, repo)
 
 
 def _checks_latest_test_status_cte(commit_sha: str, branch_name: str) -> str:
@@ -602,6 +810,19 @@ def url_to_html_link(url: str) -> str:
     return f'<a href="{url}">{text}</a>'
 
 
+def format_pr_labels_with_verification(labels: str) -> str:
+    """Format the PR labels with verification.
+
+    Expects ``labels`` to be already HTML-escaped at collection time
+    (see _enrich_prs_in_release_merge_prs).
+    """
+    labels_list = labels.split(", ")
+    if "verified" in labels_list:
+        return labels
+    else:
+        return f'<span style="font-weight: bold; color: red;">{labels} (missing verification)</span>'
+
+
 def format_test_name_for_linewrap(text: str) -> str:
     """Tweak the test name to improve line wrapping."""
     return f'<span style="line-break: anywhere;">{text}</span>'
@@ -622,25 +843,44 @@ def format_test_status(text: str) -> str:
 
 
 def format_results_as_html_table(results) -> str:
+    if not isinstance(results, pd.DataFrame):
+        return results
+
     if len(results) == 0:
         return "<p>Nothing to report</p>"
-    results.columns = [col.replace("_", " ").title() for col in results.columns]
+
+    results = results.copy()
+
+    def format_col_name(col_name: str) -> str:
+        return col_name.replace("_", " ").title().replace("Pr ", "PR ")
+
+    results.columns = [format_col_name(col) for col in results.columns]
+
+    # NOTE: to_html is called with escape=False, so any new column carrying
+    # untrusted text must either be HTML-escaped at collection time or have an
+    # explicit formatter below that escapes it.
+    formatters = {
+        "Results Link": url_to_html_link,
+        "Test Name": format_test_name_for_linewrap,
+        "Test Status": format_test_status,
+        "Job Status": format_test_status,
+        "Status": format_test_status,
+        "Message": lambda m: m.replace("\n", " "),
+        "Identifier": lambda i: url_to_html_link(
+            "https://nvd.nist.gov/vuln/detail/" + i
+        ),
+        "Severity": lambda s: (
+            f'<span data-sort="{CVE_SEVERITY_ORDER.get(str(s).lower(), 6)}">{s}</span>'
+        ),
+        "PR Number": lambda n: url_to_html_link(
+            f"https://github.com/{GITHUB_REPO}/pull/{n}"
+        ),
+        "PR Labels": format_pr_labels_with_verification,
+    }
+
     html = results.to_html(
         index=False,
-        formatters={
-            "Results Link": url_to_html_link,
-            "Test Name": format_test_name_for_linewrap,
-            "Test Status": format_test_status,
-            "Job Status": format_test_status,
-            "Status": format_test_status,
-            "Message": lambda m: m.replace("\n", " "),
-            "Identifier": lambda i: url_to_html_link(
-                "https://nvd.nist.gov/vuln/detail/" + i
-            ),
-            "Severity": lambda s: (
-                f'<span data-sort="{CVE_SEVERITY_ORDER.get(str(s).lower(), 6)}">{s}</span>'
-            ),
-        },
+        formatters=formatters,
         escape=False,
         border=0,
         classes=["test-results-table"],
@@ -816,7 +1056,8 @@ def create_workflow_report(
         settings={"use_numpy": True},
     )
 
-    fail_results = {
+    results_dfs = {
+        "prs_in_release": [],
         "job_statuses": get_commit_statuses(commit_sha),
         "checks_fails": get_checks_fails(db_client, commit_sha, branch_name),
         "checks_known_fails": [],
@@ -826,8 +1067,15 @@ def create_workflow_report(
         "docker_images_cves": [],
     }
 
+    if pr_number == 0 and not mark_preview:
+        try:
+            prs_df = get_prs_in_release_dataframe(branch_name, cwd=os.getcwd())
+            results_dfs["prs_in_release"] = prs_df
+        except Exception as e:
+            print(f"Error in get_prs_in_release_dataframe: {e}")
+
     try:
-        fail_results["docker_images_cves"] = (
+        results_dfs["docker_images_cves"] = (
             [] if not check_cves else get_cves(pr_number, commit_sha, branch_name)
         )
     except Exception as e:
@@ -835,7 +1083,7 @@ def create_workflow_report(
 
     # get_cves returns ... in the case where no Grype result files were found.
     # This might occur when run in preview mode.
-    cves_not_checked = not check_cves or fail_results["docker_images_cves"] is ...
+    cves_not_checked = not check_cves or results_dfs["docker_images_cves"] is ...
 
     if known_fails_file_path:
         if not os.path.exists(known_fails_file_path):
@@ -843,7 +1091,7 @@ def create_workflow_report(
         else:
             known_fails = get_broken_tests_rules(known_fails_file_path)
 
-            fail_results["checks_known_fails"] = get_checks_known_fails(
+            results_dfs["checks_known_fails"] = get_checks_known_fails(
                 db_client, commit_sha, branch_name, known_fails
             )
 
@@ -855,24 +1103,24 @@ def create_workflow_report(
             pr_info_html = f"""<a href="https://github.com/{GITHUB_REPO}/pull/{pr_info["number"]}">
                     #{pr_info.get("number")} ({pr_info.get("base", {}).get('ref')} <- {pr_info.get("head", {}).get('ref')})  {pr_info.get("title")}
                     </a>"""
-            fail_results["pr_new_fails"] = get_new_fails_this_pr(
+            results_dfs["pr_new_fails"] = get_new_fails_this_pr(
                 db_client,
                 pr_info,
-                fail_results["checks_fails"],
-                fail_results["regression_fails"],
+                results_dfs["checks_fails"],
+                results_dfs["regression_fails"],
             )
         except Exception as e:
             pr_info_html = e
             pr_info = {}
 
-    fail_results["job_statuses"] = backfill_skipped_statuses(
-        fail_results["job_statuses"], pr_number, branch_name, commit_sha
+    results_dfs["job_statuses"] = backfill_skipped_statuses(
+        results_dfs["job_statuses"], pr_number, branch_name, commit_sha
     )
 
     high_cve_count = 0
-    if not cves_not_checked and len(fail_results["docker_images_cves"]) > 0:
+    if not cves_not_checked and len(results_dfs["docker_images_cves"]) > 0:
         high_cve_count = (
-            fail_results["docker_images_cves"]["severity"]
+            results_dfs["docker_images_cves"]["severity"]
             .str.lower()
             .isin(("high", "critical"))
             .sum()
@@ -893,43 +1141,53 @@ def create_workflow_report(
         "workflow_id": run_id,
         "commit_sha": commit_sha,
         "base_sha": "" if pr_number == 0 else pr_info.get("base", {}).get("sha"),
-        "date": f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        "date": f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
         "is_preview": mark_preview,
         "counts": {
-            "jobs_status": f"{sum(fail_results['job_statuses']['job_status'].value_counts().get(x, 0) for x in ('failure', 'error'))} fail/error",
-            "checks_errors": len(fail_results["checks_errors"]),
-            "checks_new_fails": len(fail_results["checks_fails"]),
-            "regression_new_fails": len(fail_results["regression_fails"]),
+            "jobs_status": f"{sum(results_dfs['job_statuses']['job_status'].value_counts().get(x, 0) for x in ('failure', 'error'))} fail/error",
+            "checks_errors": len(results_dfs["checks_errors"]),
+            "checks_new_fails": len(results_dfs["checks_fails"]),
+            "regression_new_fails": len(results_dfs["regression_fails"]),
             "cves": "N/A" if cves_not_checked else f"{high_cve_count} high/critical",
             "checks_known_fails": (
-                "N/A" if not known_fails else len(fail_results["checks_known_fails"])
+                "N/A" if not known_fails else len(results_dfs["checks_known_fails"])
             ),
-            "pr_new_fails": len(fail_results["pr_new_fails"]),
+            "pr_new_fails": len(results_dfs["pr_new_fails"]),
+            "prs_in_release": (
+                "N/A"
+                if mark_preview or pr_number != 0
+                else len(results_dfs["prs_in_release"])
+            ),
         },
         "build_report_links": get_build_report_links(
-            fail_results["job_statuses"], pr_number, branch_name, commit_sha
+            results_dfs["job_statuses"], pr_number, branch_name, commit_sha
+        ),
+        "prs_in_release_html": (
+            "<p>PR details are not loaded during preview.</p>"
+            if mark_preview or pr_number != 0
+            else format_results_as_html_table(results_dfs["prs_in_release"])
         ),
         "ci_jobs_status_html": format_results_as_html_table(
-            fail_results["job_statuses"]
+            results_dfs["job_statuses"]
         ),
         "checks_errors_html": format_results_as_html_table(
-            fail_results["checks_errors"]
+            results_dfs["checks_errors"]
         ),
-        "checks_fails_html": format_results_as_html_table(fail_results["checks_fails"]),
+        "checks_fails_html": format_results_as_html_table(results_dfs["checks_fails"]),
         "regression_fails_html": format_results_as_html_table(
-            fail_results["regression_fails"]
+            results_dfs["regression_fails"]
         ),
         "docker_images_cves_html": (
             "<p>Not Checked</p>"
             if cves_not_checked
-            else format_results_as_html_table(fail_results["docker_images_cves"])
+            else format_results_as_html_table(results_dfs["docker_images_cves"])
         ),
         "checks_known_fails_html": (
             "<p>Not Checked</p>"
             if not known_fails
-            else format_results_as_html_table(fail_results["checks_known_fails"])
+            else format_results_as_html_table(results_dfs["checks_known_fails"])
         ),
-        "new_fails_html": format_results_as_html_table(fail_results["pr_new_fails"]),
+        "new_fails_html": format_results_as_html_table(results_dfs["pr_new_fails"]),
     }
 
     # Render the template with the context
