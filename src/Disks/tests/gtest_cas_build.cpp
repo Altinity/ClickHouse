@@ -1112,7 +1112,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     PoolConfig cfg;
     cfg.pool_prefix = "p";
     cfg.server_id = UInt128(0xAB);
-    cfg.background_heartbeats = false;
+    cfg.background_watermark = false;
     const String content = "shared-content";
     BlobId h;
     Token h_token0;
@@ -1187,7 +1187,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     /// so we assert directly on H's presence + content rather than on the aggregate counter.
     const auto driveRoundAndAssertHSpared = [&](int round_no)
     {
-        /// A LIVE server renews its watermark continuously (a background thread every ~heartbeat_period
+        /// A LIVE server renews its watermark continuously (a background thread every ~watermark_renew_period
         /// in production). Renew once per GC round so B's watermark seq ADVANCES between rounds: that is
         /// precisely what distinguishes a live server from a crashed one. (Without this, B's seq freezes
         /// and the GC's K=2 frozen-seq crash detector correctly declares B dead and RECLAIMS B's

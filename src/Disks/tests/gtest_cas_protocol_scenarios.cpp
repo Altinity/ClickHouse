@@ -338,7 +338,7 @@ TEST(CasProtocol, WedgedHeartbeatCondemnedBlobDepAbortsRetryable)
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    auto build = s->startBuild({});   /// background_heartbeats=false by config; never renewed
+    auto build = s->startBuild({});   /// background_watermark=false by config; never renewed
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
 

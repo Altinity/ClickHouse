@@ -295,7 +295,7 @@ void ContentAddressedMetadataStorage::startup()
         return;
 
     /// Observe-only mode (the disk's <readonly> config): skip the probe (a probe write would fail on
-    /// a read-only backend), run no heartbeats, start no GC, and fail the mutating surface closed.
+    /// a read-only backend), run no watermark, start no GC, and fail the mutating surface closed.
     read_only = object_storage->isReadOnly();
 
     /// Native mode rides real conditional ops (probed fail-closed by Store::open); Local object
@@ -352,7 +352,7 @@ void ContentAddressedMetadataStorage::startup()
     Cas::PoolConfig pool_config;
     pool_config.pool_prefix = pool_prefix;
     pool_config.server_id = serverIdToU128(server_id);
-    pool_config.background_heartbeats = (context != nullptr) && !read_only;
+    pool_config.background_watermark = (context != nullptr) && !read_only;
     pool_config.read_only = read_only;
     /// Creation-time only (the pool is authoritative on reopen): widening the shard fanout spreads
     /// manifest CAS writes across more keys, reducing per-key congestion + per-key overwrite-orphan

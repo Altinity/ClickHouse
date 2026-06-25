@@ -27,7 +27,7 @@ namespace DB::Cas
 struct PoolConfig
 {
     String pool_prefix;
-    UInt128 server_id{};                      /// provenance + heartbeats
+    UInt128 server_id{};                      /// provenance + watermark
     uint64_t root_shards = 8;                 /// creation-time only; pool is authoritative on reopen
     uint64_t blob_header_len = 256;           /// creation-time only; ditto
     /// P1 (dedup cache): byte ceiling for the per-disk known-present blob-hash LRU set. 0 disables the
@@ -45,8 +45,8 @@ struct PoolConfig
     uint64_t gc_snap_generations_to_keep = 3;
     uint64_t manifest_soft_limit = 16ULL << 20;
     uint64_t manifest_hard_limit = 64ULL << 20;
-    std::chrono::milliseconds heartbeat_period{5000};
-    bool background_heartbeats = false;       /// tests drive renewOnce explicitly
+    std::chrono::milliseconds watermark_renew_period{5000};
+    bool background_watermark = false;       /// tests drive renewOnce explicitly
     bool read_only = false;                   /// observe-only open: skip the mutating capability probe; reads only
 
     /// Pillar B bounded-TTL decode cache: a staleness-tolerant caller (allow_stale=true) may reuse a
@@ -107,7 +107,7 @@ public:
     /// Test/assertion accessor for the next-to-allocate build_seq under the lock.
     uint64_t peekNextBuildSeq();
     /// Renew the per-server watermark once (bump seq, refresh min_active from the live active set).
-    /// In production this is driven by the background renewer (background_heartbeats); tests with the
+    /// In production this is driven by the background renewer (background_watermark); tests with the
     /// renewer disabled drive it explicitly to make a finished build's floor advance durable.
     void renewWatermarkOnce();
 

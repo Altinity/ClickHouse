@@ -77,7 +77,7 @@ TEST(CasStore, MinActiveTracksInFlightBuilds)
     DB::Cas::PoolConfig cfg;
     cfg.pool_prefix = "pool";
     cfg.server_id = DB::UInt128(1);
-    cfg.background_heartbeats = false;
+    cfg.background_watermark = false;
     auto store = DB::Cas::Store::open(backend, cfg);
 
     ASSERT_EQ(store->minActive(), store->peekNextBuildSeq());   /// no builds: floor == next seq
@@ -96,7 +96,7 @@ TEST(CasStore, BuildSeqIsStrictlyMonotone)
     DB::Cas::PoolConfig cfg;
     cfg.pool_prefix = "pool";
     cfg.server_id = DB::UInt128(1);
-    cfg.background_heartbeats = false;
+    cfg.background_watermark = false;
     auto store = DB::Cas::Store::open(backend, cfg);
     auto a = store->startBuild({});
     auto sa = a->buildSeq();

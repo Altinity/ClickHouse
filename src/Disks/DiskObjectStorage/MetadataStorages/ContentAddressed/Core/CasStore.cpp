@@ -110,8 +110,8 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
             store->pool_backend, store->pool_layout, store->config.server_id, store->process_epoch,
             [raw] { return raw->minActive(); });
         store->watermark->start();
-        if (store->config.background_heartbeats)
-            store->watermark->startBackground(store->config.heartbeat_period);
+        if (store->config.background_watermark)
+            store->watermark->startBackground(store->config.watermark_renew_period);
     }
 
     return store;
