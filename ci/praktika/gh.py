@@ -871,6 +871,7 @@ class GH:
         Result.Status.DROPPED: Result.GHStatus.ERROR,
         Result.Status.UNKNOWN: Result.GHStatus.FAILURE,
         Result.Status.XFAIL: Result.GHStatus.SUCCESS,
+        Result.Status.BROKEN: Result.GHStatus.SUCCESS,
         Result.Status.XPASS: Result.GHStatus.FAILURE,
     }
 
