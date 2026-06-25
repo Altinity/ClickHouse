@@ -18,31 +18,12 @@
 #include <Backups/IBackup.h>
 #include <Backups/RestorerFromBackup.h>
 #include <Columns/ColumnAggregateFunction.h>
-<<<<<<< HEAD
 #include <Compression/CompressedReadBuffer.h>
-=======
-#include <Common/Config/ConfigHelper.h>
-#include <Common/CurrentMetrics.h>
-#include <Common/Increment.h>
-#include <Common/ProfileEventsScope.h>
-#include <Common/Stopwatch.h>
-#include <Common/StringUtils.h>
-#include <Common/ThreadFuzzer.h>
-#include <Common/escapeForFileName.h>
-#include <Common/noexcept_scope.h>
-#include <Common/quoteString.h>
-#include <Common/typeid_cast.h>
-#include <Common/thread_local_rng.h>
 #include "Storages/MergeTree/ExportPartTask.h"
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Processors/QueryPlan/QueryPlan.h>
-#include <Core/BackgroundSchedulePool.h>
-#include <Core/Settings.h>
-#include <Core/ServerSettings.h>
-#include <Storages/MergeTree/RangesInDataPart.h>
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 #include <Compression/CompressionFactory.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <Core/QueryProcessingStage.h>
@@ -122,7 +103,6 @@
 #include <Storages/Statistics/ConditionSelectivityEstimator.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/VirtualColumnUtils.h>
-<<<<<<< HEAD
 #include <Common/Config/ConfigHelper.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Increment.h>
@@ -141,12 +121,7 @@
 #include <Common/scope_guard_safe.h>
 #include <Common/thread_local_rng.h>
 #include <Common/typeid_cast.h>
-=======
-#include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
-#include <QueryPipeline/QueryPipelineBuilder.h>
-#include <Storages/MergeTree/MergeTreeIndexGranularityAdaptive.h>
 #include <Functions/generateSnowflakeID.h>
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 
 #include <boost/algorithm/string/join.hpp>
 
@@ -266,10 +241,8 @@ namespace Setting
     extern const SettingsUInt64 max_table_size_to_drop;
     extern const SettingsBool use_statistics;
     extern const SettingsBool use_statistics_cache;
-<<<<<<< HEAD
     extern const SettingsBool use_partition_pruning;
     extern const SettingsBool use_skip_indexes;
-=======
     extern const SettingsBool allow_experimental_export_merge_tree_part;
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
     extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
@@ -277,7 +250,6 @@ namespace Setting
     extern const SettingsBool output_format_parquet_parallel_encoding;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 }
 
 namespace MergeTreeSetting
@@ -5130,17 +5102,11 @@ void MergeTreeData::changeSettings(
         }
 
         setInMemoryMetadata(new_metadata);
-<<<<<<< HEAD
-
-        if (has_storage_policy_changed)
-            startBackgroundMovesIfNeeded();
 
         if (has_refresh_statistics_interval_changed)
         {
             startStatisticsCache();
         }
-=======
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
     }
 }
 
@@ -10005,12 +9971,9 @@ void MergeTreeData::writePartLog(
     const DataPartsVector & source_parts,
     const MergeListEntry * merge_entry,
     std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters,
-<<<<<<< HEAD
     const Strings & mutation_ids,
-    const std::map<String, UInt64> & projections_duration_ms)
-=======
+    const std::map<String, UInt64> & projections_duration_ms,
     const ExportsListEntry * exports_entry)
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 try
 {
     auto table_id = getStorageID();

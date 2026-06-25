@@ -346,46 +346,7 @@ HiveStylePartitionStrategy::HiveStylePartitionStrategy(
     cacheDeterministicActions(cached_result, actions_with_column);
 }
 
-<<<<<<< HEAD
-std::string HiveStylePartitionStrategy::getPathForRead(const std::string & prefix)
-{
-    return prefix + "**." + Poco::toLower(file_format);
-}
-
-std::string HiveStylePartitionStrategy::getPathForWrite(
-    const std::string & prefix,
-    const std::string & partition_key)
-{
-    std::string path;
-
-    if (!prefix.empty())
-    {
-        path += prefix;
-        if (path.back() != '/')
-        {
-            path += '/';
-        }
-    }
-
-    /// Not adding '/' because buildExpressionHive() always adds a trailing '/'
-    path += partition_key;
-
-    /*
-     * File extension is toLower(format)
-     * This isn't ideal, but I guess multiple formats can be specified and introduced.
-     * So I think it is simpler to keep it this way.
-     *
-     * Or perhaps implement something like `IInputFormat::getFileExtension()`
-     */
-    path += std::to_string(generateSnowflakeID()) + "." + Poco::toLower(file_format);
-
-    return path;
-}
-
 ColumnPtr HiveStylePartitionStrategy::computePartitionKey(const Chunk & chunk) const
-=======
-ColumnPtr HiveStylePartitionStrategy::computePartitionKey(const Chunk & chunk)
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 {
     auto actions_with_column = getCachedOrBuildActions(
         cached_result,

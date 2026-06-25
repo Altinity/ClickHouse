@@ -18,13 +18,10 @@ columns
 columns
 creator_info
 creator_info
-<<<<<<< HEAD
 deduplication_hashes
 deduplication_hashes
-=======
 exports
 exports
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 failed_parts
 failed_parts
 flags

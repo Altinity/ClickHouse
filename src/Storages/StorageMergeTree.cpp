@@ -133,11 +133,8 @@ namespace ErrorCodes
     extern const int TABLE_IS_READ_ONLY;
     extern const int TOO_MANY_PARTS;
     extern const int PART_IS_LOCKED;
-<<<<<<< HEAD
     extern const int PART_IS_TEMPORARILY_LOCKED;
-=======
     extern const int INCOMPATIBLE_COLUMNS;
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 }
 
 namespace ActionLocks

@@ -902,7 +902,6 @@ void StorageObjectStorage::checkAlterIsPossible(const AlterCommands & commands, 
     configuration->checkAlterIsPossible(object_storage, context, commands);
 }
 
-<<<<<<< HEAD
 void StorageObjectStorage::startup()
 {
     if (configuration->isBackgroundExecutable())
@@ -923,6 +922,5 @@ bool StorageObjectStorage::scheduleDataProcessingJob(BackgroundJobsAssignee & as
     return configuration->scheduleDataProcessingJob(assignee, *this);
 }
 
-=======
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
+
 }

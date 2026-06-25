@@ -665,11 +665,8 @@
     M(1002, UNKNOWN_EXCEPTION) \
     M(1003, SSH_EXCEPTION) \
     M(1004, STARTUP_SCRIPTS_ERROR) \
-<<<<<<< HEAD
     M(1005, STALE_VERSION) \
-=======
-    M(1005, PENDING_MUTATIONS_NOT_ALLOWED) \
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
+    M(1006, PENDING_MUTATIONS_NOT_ALLOWED) \
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -686,7 +683,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
-    constexpr ErrorCode END = 1005;
+    constexpr ErrorCode END = 1006;
     ErrorPairHolder values[END + 1]{};
 
     struct ErrorCodesNames

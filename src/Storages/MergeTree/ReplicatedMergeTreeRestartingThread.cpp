@@ -197,11 +197,8 @@ bool ReplicatedMergeTreeRestartingThread::runImpl()
     storage.async_block_ids_cache.start();
     storage.part_check_thread.start();
 
-<<<<<<< HEAD
     if (storage.getContext()->getServerSettings()[ServerSetting::insert_deduplication_version].value != InsertDeduplicationVersions::OLD_SEPARATE_HASHES)
         storage.deduplication_hashes_cache.start();
-=======
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 
     LOG_DEBUG(log, "Table started successfully");
     return true;

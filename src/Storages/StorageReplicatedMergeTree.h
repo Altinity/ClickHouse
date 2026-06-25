@@ -1,7 +1,5 @@
 #pragma once
 
-<<<<<<< HEAD
-=======
 #include <atomic>
 #include <expected>
 
@@ -21,7 +19,6 @@
 #include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <DataTypes/DataTypesNumber.h>
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 #include <Interpreters/Cluster.h>
 #include <Interpreters/PartLog.h>
 #include <Parsers/SyncReplicaMode.h>

@@ -120,12 +120,9 @@
 #if USE_ICU
 #   include <Storages/System/StorageSystemUnicode.h>
 #endif
-<<<<<<< HEAD
 #include <Storages/System/StorageSystemWasmModules.h>
 
-=======
 #include <Storages/System/StorageSystemExports.h>
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 #include <Interpreters/Context.h>
 
 #include <Poco/Util/LayeredConfiguration.h>

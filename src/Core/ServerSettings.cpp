@@ -1568,13 +1568,8 @@ The policy on how to perform a scheduling of CPU slots specified by `concurrent_
     ```xml
     <skip_check_for_incorrect_settings>1</skip_check_for_incorrect_settings>
     ```
-<<<<<<< HEAD
-    )", 0)
-=======
     )", 0) \
-    DECLARE(Bool, enable_experimental_export_merge_tree_partition_feature, false, "Enable export replicated merge tree partition feature. It is experimental and not yet ready for production use.", 0) \
-    DECLARE(UInt64, input_format_parquet_metadata_cache_max_size, 500000000, "Maximum size of parquet file metadata cache", 0)
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
+    DECLARE(Bool, enable_experimental_export_merge_tree_partition_feature, false, "Enable export replicated merge tree partition feature. It is experimental and not yet ready for production use.", 0)
 
 /// Settings with a path are server settings with at least one layer of nesting that have a fixed structure (no lists, lists, enumerations, repetitions, ...).
 #define LIST_OF_SERVER_SETTINGS_WITH_PATH(DECLARE, ALIAS) \

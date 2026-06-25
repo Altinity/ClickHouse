@@ -91,15 +91,9 @@ struct WildcardPartitionStrategy : IPartitionStrategy
 {
     WildcardPartitionStrategy(KeyDescription partition_key_description_, const Block & sample_block_, ContextPtr context_);
 
-<<<<<<< HEAD
     ColumnPtr computePartitionKey(const Chunk & chunk) const override;
-    std::string getPathForRead(const std::string & prefix) override;
-    std::string getPathForWrite(const std::string & prefix, const std::string & partition_key) override;
-=======
-    ColumnPtr computePartitionKey(const Chunk & chunk) override;
 
     ColumnPtr computePartitionKey(Block & block) override;
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 };
 
 /*
@@ -116,15 +110,9 @@ struct HiveStylePartitionStrategy : IPartitionStrategy
         const std::string & file_format_,
         bool partition_columns_in_data_file_);
 
-<<<<<<< HEAD
     ColumnPtr computePartitionKey(const Chunk & chunk) const override;
-    std::string getPathForRead(const std::string & prefix) override;
-    std::string getPathForWrite(const std::string & prefix, const std::string & partition_key) override;
-=======
-    ColumnPtr computePartitionKey(const Chunk & chunk) override;
 
     ColumnPtr computePartitionKey(Block & block) override;
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 
     ColumnRawPtrs getFormatChunkColumns(const Chunk & chunk) override;
     Block getFormatHeader() override;

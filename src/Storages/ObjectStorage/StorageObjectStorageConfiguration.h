@@ -16,13 +16,10 @@
 #include <Storages/StorageFactory.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
-<<<<<<< HEAD
 #include <optional>
 #include <Databases/DataLake/StorageCredentials.h>
 #include <Storages/MergeTree/BackgroundJobsAssignee.h>
-=======
 #include <Storages/ObjectStorage/ObjectStorageFilePathGenerator.h>
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 
 namespace DB
 {
@@ -81,13 +78,10 @@ public:
         std::string path;
 
         bool hasPartitionWildcard() const;
-<<<<<<< HEAD
         bool hasSchemaHashWildcard() const;
         bool hasGlobsIgnorePlaceholders() const;
-=======
         bool hasExportFilenameWildcard() const;
         bool hasGlobsIgnorePartitionWildcard() const;
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
         bool hasGlobs() const;
         std::string cutGlobs(bool supports_partial_prefix) const;
     };

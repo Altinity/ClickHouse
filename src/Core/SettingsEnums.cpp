@@ -472,7 +472,6 @@ IMPLEMENT_SETTING_ENUM(DeduplicateInsertSelectMode, ErrorCodes::BAD_ARGUMENTS,
      {"disable", DeduplicateInsertSelectMode::DISABLE},
      {"enable_even_for_bad_queries", DeduplicateInsertSelectMode::ENABLE_EVEN_FOR_BAD_QUERIES}})
 
-<<<<<<< HEAD
 IMPLEMENT_SETTING_ENUM(DeduplicateInsertMode, ErrorCodes::BAD_ARGUMENTS,
     {{"backward_compatible_choice", DeduplicateInsertMode::BACKWARD_COMPATIBLE_CHOICE},
      {"enable", DeduplicateInsertMode::ENABLE},
@@ -492,8 +491,7 @@ IMPLEMENT_SETTING_ENUM(S3UriStyle, ErrorCodes::BAD_ARGUMENTS,
     {{"auto", S3UriStyle::AUTO},
      {"path", S3UriStyle::PATH},
      {"virtual_hosted", S3UriStyle::VIRTUAL_HOSTED}})
-=======
+
 IMPLEMENT_SETTING_AUTO_ENUM(MergeTreePartExportFileAlreadyExistsPolicy, ErrorCodes::BAD_ARGUMENTS);
->>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 
 }
