@@ -36,6 +36,7 @@ class CIDB:
         Result.Status.DROPPED: "dropped",
         Result.Status.UNKNOWN: "failure",
         Result.Status.XFAIL: "success",
+        Result.Status.BROKEN: "success",
         Result.Status.XPASS: "failure",
     }
 
