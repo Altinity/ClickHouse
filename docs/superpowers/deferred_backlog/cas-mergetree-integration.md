@@ -47,6 +47,10 @@ see `docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.md`
 - B149 + B147(part-2) + B168(P3–P8) op-count-reduction program (resident snap, decode cache, zstd, delta fold/upload) [HARD]
 - B196 cap s3_max_connections to backend permits (config-only; kills 503+retry+reset storm) [HARD, cheap]
 - B158 root-shard fan-out vs per-object permit cap (raise root_shards / cut op-count) [HARD]
+- B201 (DRAFT) GC discovery via LIST + per-shard token(ETag)-diff + lazy fence/trim — cuts the
+  O(ns×shards) per-round HEAD/GET fan-out to ~O(pages) LIST + GET-only-changed; the enabler that lets
+  B158/P5 widen root_shards without multiplying GC reads. Needs verification (token=ETag, LIST
+  consistency on RustFS/local, lazy-fence TLA+). See the B201 draft block below.
 - B194 stripTree O(N×M) [MED]; B111 RENAME=one Build/part [MED]; B98 huge-blob resurrect via GET+PUT [MED]; B121 per-blob-GET read cost on large parts [MED]
 - Storage-reclaim validation on REAL S3 (GC deletes correctly; confirm the prod store actually reclaims — rustfs beta.8 does not) [HARD]
 
@@ -274,3 +278,84 @@ critical bit, `blob_header_len = 256`, blob hash over payload, 2-byte versions),
 machinery (`max_content_addressable_pool_format`, the durable roster co-located with `RootsRegistry`,
 and B200 deliberate decommission). The release-gate rows at the top of this file (B13, B176, B92,
 B97/B10/B96, B8/B64/B1) still point there.
+
+### B201 (DRAFT — needs careful verification) — GC discovery via LIST + per-shard token(ETag)-diff
+
+**Status: PROPOSAL, NOT verified.** Sharpens/unifies **B168 P5/P6/P7** (widen shards / dirty-only fence /
+audit mutation LISTs) and the **B178 prereq** ("per-shard `last_folded` token") into one concrete
+discovery mechanism. Relates to **B148** (HEAD-storm), **B158** (write-path root-shard fanout / 503),
+**B147** (resident snap), **B178** (map-reduce GC), **B185** (rustfs read-after-write). Branch context:
+`cas-vfs-path-mapping`. Every number/claim below is to be re-checked before any implementation.
+
+**Problem.** GC per round enumerates the registry's namespaces × `root_shards` (default 8) and
+`readShard`s EVERY shard = a `head()` + `get()` each, plus R3 writes a fence into EVERY shard
+(minting fence-only manifests for absent ones) + trim rewrites. So a round is O(ns×shards) reads AND
+writes even when nothing changed (B171 soak: ~1355 manifest reads/round, ~1.2s floor on empty rounds).
+This is the "GC greedily walks every shard" cost, and it MULTIPLIES if B158/P5 raises `root_shards`.
+
+**Proposed mechanism.**
+1. The shard-key UNIVERSE is already known from the registry (`CasGc.cpp:1657`) — `root_shards` is a
+   pool constant; all shard manifests live under one prefix `POOL/roots/<ns>/<shard>` (`CasLayout.h:70`).
+2. Replace the per-shard `head()` discovery with ONE paginated `LIST` over `POOL/roots/` (≤1000
+   keys/page) returning each shard manifest key + its **token (ETag)**.
+3. Store the per-shard **`last_folded` token** in the durable snap (next to `folded_cursor` — the snap
+   is rewritten every round anyway, so NO new write/object).
+4. `get()`+fold ONLY shards whose listed token != `last_folded`. Idle pool: O(ceil(ns×shards/1000))
+   LIST, **0** body GETs, 0 HEADs. Active: LIST + GET of only the changed shards.
+
+**Why it's (claimed) correct — token-diff soundness.** `Backend` pins: `head(k).token == prior token
+⟹ bytes unchanged` (`CasBackend.h:113-118`; S3 ETag is content-derived). So *token unchanged ⟺ manifest
+bytes identical ⟺ same journal ⟹ provably nothing new to fold* → SOUND skip. The only hazard is
+**under-read** (a committed-but-unfolded ref missed → a wrong delete). Guards: (a) universe from the
+registry, NOT from LIST, so a LIST omission can't hide a KNOWN shard; RULE: "not confirmed
+token-unchanged ⟹ must read" (missing/ambiguous degrades to today's behavior — safe). (b) the existing
+full-sweep backstop (B94/B140) catches any drift. (c) over-read is always safe (fold a clean shard =
+no-op).
+
+**Correctness DEPENDENCY (the part to nail + model in TLA+):** under-read safety requires the token a
+round observes to be FRESH — i.e. **strongly-consistent LIST/ETag**. S3 LIST is strongly consistent
+(since Dec 2020) ✓; **RustFS and `LocalObjectStorage` MUST be verified** (does LIST return ETag? is it
+read-after-write consistent? is the listed ETag == `head()`/`casPut` token for the SAME object,
+incl. the multipart-ETag caveat — manifests are small single-part so ETag==MD5, but confirm). If a
+backend's LIST is weak, fall back to HEAD for ambiguous shards. Overlaps with B185 (rustfs RaW).
+
+**Effectiveness coupling (correctness-adjacent): GC must STOP rewriting idle shards**, else its OWN
+R3-fence + trim writes bump the token every round and token-diff never skips. So this MUST be paired
+with **lazy fence** (pool-global monotone fence-epoch + per-shard fence ONLY on shards with pending
+records — i.e. the ones token-diff already flagged) and **lazy trim** (skip shards with nothing
+≤cursor to drop). WITHOUT the lazy pair: LIST still replaces N HEAD with O(pages) LIST for the token
+fetch, but the body-GET savings evaporate (GC re-reads everything it just fenced). **Lazy fence is the
+delicate piece** — the fence is load-bearing for the fold-through-fence no-return argument; making it
+lazy must preserve that recheck covers any racing publish. NOT to be hand-waved → re-derive in TLA+
+(the same model that covers `fold-through-fence`). This is the main risk.
+
+**Backend interface change.** `ListedKey {key, size}` (`CasBackend.h:74`) must gain `token` (S3
+ListObjectsV2 already returns ETag; in-memory/local backends already mint a token — populate it in
+their `list()` consistently with their `head()`).
+
+**Cost sketch (re-verify on real numbers).** Per round: today O(ns×shards)·(HEAD+GET) + O(ns×shards)
+fence-writes. Proposed: O(ceil(ns×shards/1000)) LIST + O(changed)·GET + O(changed) fence-writes. S3
+pricing: HEAD $0.0004/1k, LIST $0.005/1k (LIST = 12.5×HEAD; break-even at 12.5 shards). So per single
+namespace at 8 shards a LIST is a ~wash (slightly worse); the win is (a) ONE LIST over `roots/` for the
+WHOLE pool (all ns×shards under one prefix) → 10-100× fewer requests, (b) eliminating per-shard body
+GETs for unchanged shards (the dominant cost on a quiet pool), (c) 1 RTT vs a HEAD-storm fan-out
+(dodges the B148/B158 503 storm), and (d) it makes B158/P5 "widen root_shards" FREE for GC (more shards
+no longer multiply GC reads).
+
+**OPEN QUESTIONS / must-verify before implementing:**
+1. Token identity: is the `ListObjectsV2` ETag byte-equal to our `Token` (`casPut`/`head` token) for a
+   manifest? Multipart-ETag caveat (manifests are small/single-part — confirm they never go multipart).
+2. RustFS: does `list()` return ETag, and is LIST read-after-write consistent? `LocalObjectStorage`:
+   does its `list()` expose a token == its `head()` token (B167b drops metadata — check the token path)?
+3. Lazy-fence correctness: re-derive the fold-through-fence no-return argument with a pool-global epoch
+   + per-shard lazy fence; prove recheck still covers a racing publish (TLA+).
+4. `last_folded` token persistence in the snap: interaction with the B140 fold-cursor coherence
+   invariant (`assertSnapJournalCoherent`) — the token and the cursor must advance together.
+5. Does the LIST over `roots/` need to filter `_files/` (verbatim) entries (`CasLayout.h:94`)? Yes —
+   key-pattern filter; cheap.
+6. Relationship to B178 map-reduce: this is the single-leader incremental form; B178's MAP dirty-scan
+   would reuse the SAME per-shard token-diff. Land this first (smaller), B178 builds on it.
+
+**Where it plugs in:** `CasBackend.h` (`ListedKey.token`); each backend's `list()`; `CasGcSnap.*`
+(per-shard `last_folded` token field); `CasGc.cpp` (fold discovery via LIST+diff; lazy fence in R3;
+lazy trim); `CasStore::readShard` (unchanged for the read path). Prereq for / merges with B168 P5/P6/P7.
