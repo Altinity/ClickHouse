@@ -55,8 +55,13 @@ The heartbeat has **no live reader**, so deleting it changes no current GC decis
   **CORRECTION (grounded 2026-06-26): KEEP `heartbeat_period` and `background_heartbeats` in `PoolConfig`
   — they are SHARED with the watermark** (`CasStore.cpp:114-115` drives `watermark->startBackground`
   with them; `ContentAddressedMetadataStorage.cpp:355` sets `background_heartbeats`). Removing them
-  would break the watermark's background renewal. Optional follow-up: rename to
-  `watermark_renew_period` / `background_watermark` for clarity (not required; out of scope here).
+  would break the watermark's background renewal. **In scope (operator, 2026-06-26): RENAME them** to
+  `watermark_renew_period` / `background_watermark` (they drive the watermark, not a heartbeat), and
+  **purge all residual server/build-heartbeat naming** from code + comments (`CasStore.h` `PoolConfig`,
+  `CasSingleWriterSlot.h` doc which now has a single user, the `ContentAddressedMetadataStorage.cpp`
+  "run no heartbeats" comment) — keeping ONLY the GC-lease names (`GcHeartbeat`, `gc/hb`,
+  `GcLeaseHeartbeat`, `gc_lease_heartbeat`). The keys are code-set (`ContentAddressedMetadataStorage.cpp:355`),
+  not XML-parsed, so this is a code-only rename — no config XML changes.
 - `Core/CasLayout.h` — `buildHeartbeatKey` + the `builds/` prefix documentation line (the whole
   `POOL/builds/` namespace is gone).
 - Proto `Core/Proto/cas_root_shard.proto` — the `HeartbeatProto` message.

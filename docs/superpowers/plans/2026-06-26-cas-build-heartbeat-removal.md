@@ -4,7 +4,7 @@
 
 **Goal:** Delete the per-build heartbeat object (`builds/<build_id>`) and all its machinery — it is written but never read; in-flight sparing is already done by the watermark `min_active` + precommit-set.
 
-**Architecture:** Staged deletion. Task 1 = pre-flight confirmations (no code). Task 2 = unwire `Build`/`Store` from `HeartbeatKeeper` (keep the files, fix test call sites) → build+sweep green. Task 3 = delete the now-unreferenced heartbeat code (files, `builds/` namespace, `HeartbeatProto`/`CAHB`/`FormatId::Heartbeat`, the `CasEventType::Heartbeat` enumerator, the `builds/` instrumentation, the dedicated gtests) → build+sweep green. Task 4 = grep-gate + final sweep. Task 5 = docker-safe scoped soak.
+**Architecture:** Staged deletion. Task 1 = pre-flight confirmations (no code). Task 2 = unwire `Build`/`Store` from `HeartbeatKeeper` (keep the files, fix test call sites) → build+sweep green. Task 3 = delete the now-unreferenced heartbeat code (files, `builds/` namespace, `HeartbeatProto`/`CAHB`/`FormatId::Heartbeat`, the `CasEventType::Heartbeat` enumerator, the `builds/` instrumentation, the dedicated gtests) → build+sweep+grep-gate green. Task 4 = rename the watermark-shared config keys (`heartbeat_period`→`watermark_renew_period`, `background_heartbeats`→`background_watermark`) + purge residual heartbeat naming (keep only GC-lease `gc/hb`). Task 5 = the load-bearing `min_active` sparing test. Task 6 = docker-safe scoped soak.
 
 **Tech Stack:** C++ (ClickHouse), protobuf, gtest (`unit_tests_dbms`), ninja. Allman braces, `-Werror`.
 
@@ -159,7 +159,53 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 4: Confirm in-flight sparing coverage (the load-bearing test)
+### Task 4: Rename the watermark config keys + purge residual heartbeat naming
+
+**Files:** `Core/CasStore.h`, `Core/CasStore.cpp`, `ContentAddressedMetadataStorage.cpp`, `Core/CasSingleWriterSlot.h`. **The keys are code-set, not XML-parsed — no config XML changes.** Do NOT touch the GC-lease names (`GcHeartbeat`, `gc/hb`, `GcLeaseHeartbeat`, `gc_lease_heartbeat`).
+
+- [ ] **Step 1: Rename the `PoolConfig` keys (`CasStore.h:48-49`)**
+
+`std::chrono::milliseconds heartbeat_period{5000};` → `std::chrono::milliseconds watermark_renew_period{5000};`
+`bool background_heartbeats = false;` → `bool background_watermark = false;`
+Update the `:30` comment `/// provenance + heartbeats` → `/// provenance` and the `:110` comment referencing `background_heartbeats` → `background_watermark`.
+
+- [ ] **Step 2: Update the usages**
+
+`CasStore.cpp:114-115`: `if (config.background_watermark) store->watermark->startBackground(config.watermark_renew_period);`
+`ContentAddressedMetadataStorage.cpp:355`: `pool_config.background_watermark = (context != nullptr) && !read_only;`
+`ContentAddressedMetadataStorage.cpp:298` comment: reword "run no heartbeats" → "run no background watermark renewal".
+
+- [ ] **Step 3: Simplify `CasSingleWriterSlot.h` doc (now a single user)**
+
+The class doc (`:16-45,84`) contrasts "watermark vs heartbeat" as two users. After the heartbeat is gone, the slot has ONE user (the watermark). Reword the doc to drop the heartbeat contrast (e.g. the `slot_name_`/`terminal_verb_` are still generic, but the examples should reference only the watermark). Keep the class generic (no functional change) — this is a comment-only cleanup.
+
+- [ ] **Step 4: Build + sweep + grep gate + commit**
+
+Run: `cd build && ninja unit_tests_dbms > cas_hbrm_build.log 2>&1; tail -3 cas_hbrm_build.log && ./src/unit_tests_dbms --gtest_filter='Cas*:Ca*' > cas_hbrm_sweep.log 2>&1; grep -E '\[  PASSED  \]|\[  FAILED  \]' cas_hbrm_sweep.log | tail -6`
+Expected: clean; only the baseline red.
+
+Grep gate: `grep -rni "heartbeat" src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ | grep -v -E "GcHeartbeat|gc/hb|GcLeaseHeartbeat|gc_lease_heartbeat"`
+Expected: **empty** — the only surviving "heartbeat" mentions are the GC-lease ones.
+
+```bash
+git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.cpp \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasSingleWriterSlot.h
+git commit -m "CA: rename watermark config keys + purge residual heartbeat naming
+
+heartbeat_period -> watermark_renew_period, background_heartbeats ->
+background_watermark (they drive the watermark renewer, not a heartbeat).
+Reword CasSingleWriterSlot doc to its single remaining user (watermark) and the
+'run no heartbeats' comment. Keep only the GC-lease names (gc/hb,
+GcLeaseHeartbeat). Code-only rename; keys are code-set, no config XML.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 5: Confirm in-flight sparing coverage (the load-bearing test)
 
 **Files:** a CA GC/build gtest (extend an existing one or add a case) — likely `src/Disks/tests/gtest_cas_build.cpp` or `gtest_cas_gc_round.cpp`.
 
@@ -187,7 +233,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 5: Docker-safe scoped soak (final validation)
+### Task 6: Docker-safe scoped soak (final validation)
 
 **Files:** none — validation only. **DOCKER SAFETY:** another debug session owns containers on this host (compose project `archeology`, container `archeology-clickhouse-1` holds host port 8123). NEVER touch foreign containers; only the `ca-soak` compose project; no `docker system prune`, no unscoped `down`. The harness scripts are scoped to project `ca-soak`. If host port 8123 is occupied, the soak cannot bring up ch1 (known env block) — record and skip rather than fight it.
 
