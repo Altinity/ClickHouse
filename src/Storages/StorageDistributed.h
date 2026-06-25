@@ -171,7 +171,6 @@ public:
     void setHybridLayout(std::vector<HybridSegment> segments_);
     void setCachedColumnsToCast(ColumnsDescription columns);
 
-<<<<<<< HEAD
     using WatermarkParams = std::map<String, String>;
 
     static constexpr std::string_view HYBRID_WATERMARK_PREFIX = "hybrid_watermark_";
@@ -181,8 +180,7 @@ public:
 
     void loadHybridWatermarkParams(SettingsChanges & changes);
 
-=======
->>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
+
     /// Getter methods for ClusterProxy::executeQuery
     StorageID getRemoteStorageID() const { return remote_storage; }
     ColumnsDescription getColumnsToCast() const;
@@ -326,11 +324,9 @@ private:
 
     bool is_remote_function;
 
-<<<<<<< HEAD
     MultiVersion<WatermarkParams> hybrid_watermark_params;
 
-=======
->>>>>>> b9bc9dd22c6 (Merge 0b3d34be49e71c7e6b2e19d42a518428bdcc96dc into e9c8a0269dee561e67f2de71118bc18289bf170b)
+
     /// Additional filter expression for Hybrid engine
     ASTPtr base_segment_predicate;
 
