@@ -45,7 +45,7 @@ TEST(CasEnvelope, BlobRoundTrip)
     EXPECT_EQ(h.logical_size, payload.size());
     EXPECT_EQ(h.logical_hash, UInt128(0xdead));
     EXPECT_EQ(h.writer_version, 1u);
-    EXPECT_EQ(h.min_reader_version, 1u);
+    EXPECT_EQ(h.compatibility_version, 1u);
     /// payload starts right after header
     EXPECT_EQ(obj.substr(payloadOffset(h)), payload);
 }
@@ -96,13 +96,13 @@ TEST(CasEnvelope, BadMagicThrows)
     }
 }
 
-TEST(CasEnvelope, FutureMinReaderFailsClosed)
+TEST(CasEnvelope, FutureCompatibilityVersionFailsClosed)
 {
-    /// Hand-patch min_reader_version at [6,8) to a future value (2). The gate at min_reader is checked
-    /// BEFORE the header_hash, so decode deterministically throws UNKNOWN_FORMAT_VERSION (the hash
-    /// mismatch from the un-recomputed patch is never reached).
+    /// Hand-patch compatibility_version at [6,8) (same wire position, formerly named min_reader_version)
+    /// to a future value (2). The gate is checked BEFORE the header_hash, so decode deterministically
+    /// throws UNKNOWN_FORMAT_VERSION (the hash mismatch from the un-recomputed patch is never reached).
     std::string obj = buildObject(ObjectKind::Blob, 0x1, "p");
-    obj[6] = 2; obj[7] = 0;                                    // min_reader_version = 2 (LE)
+    obj[6] = 2; obj[7] = 0;                                    // compatibility_version = 2 (LE)
     try
     {
         decodeEnvelopeHeader(obj, obj.size(), ObjectKind::Blob);

@@ -14,6 +14,14 @@ namespace DB::Cas
 /// header_len, then the payload. The header is the "incarnation zone": excluded from logical_hash,
 /// it may differ between incarnations of the same logical object. The 4-byte magic encodes the
 /// kind: `CABL` for blobs, `CATR` for trees; there is no separate kind byte.
+///
+/// The binary core layout (all little-endian):
+///   magic[4] + writer_version[2] + compatibility_version[2] + hash_algo[1] + flags[1] + header_len[4]
+///   + logical_size[8] + four u128s[64] + header_hash[8] = 94 bytes.
+/// compatibility_version (formerly named min_reader_version) encodes the write-down-to-floor for
+/// the tree payload format: a reader must fail-closed if compatibility_version > G_BUILD.
+/// For blobs the payload is raw data; compatibility_version still follows the same rule.
+/// (Aligned with the converged header model 2026-06-25.)
 
 enum class ObjectKind : uint8_t
 {
@@ -43,9 +51,12 @@ struct Provenance
 struct EnvelopeHeader
 {
     ObjectKind kind = ObjectKind::Blob;
-    uint8_t hash_algo = 1;             /// 1 = cityHash128
-    uint16_t writer_version = 0;       /// set by decode; encode derives it from `kind` via CasFormat
-    uint16_t min_reader_version = 0;   /// set by decode; encode derives it from `kind` via CasFormat
+    uint8_t hash_algo = 1;                  /// 1 = cityHash128
+    uint16_t writer_version = 0;            /// set by decode; encode derives it from `kind` via CasFormat
+    uint16_t compatibility_version = 0;     /// set by decode; encode derives it from `kind` via CasFormat
+                                            /// (write-down-to-floor: for trees, stamp the floor the payload
+                                            ///  targets; blobs carry raw payload and do not branch on this.
+                                            ///  No tree-format-v2 exists yet — always G_BUILD for now.)
     /// Bytes covered by logical_hash = [header_len, EOF) = object_size - header_len, UNIFORMLY for
     /// all kinds (spec §3.1).
     uint64_t logical_size = 0;
@@ -76,7 +87,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header);
 
 /// Validates and decodes the header. Every validation row of the spec table is one throw-path:
 ///   bad magic / wrong kind / bad header_len                                  -> CORRUPTED_DATA
-///   future min_reader_version / unknown critical extension                   -> UNKNOWN_FORMAT_VERSION
+///   future compatibility_version / unknown critical extension                -> UNKNOWN_FORMAT_VERSION
 ///   size arithmetic mismatch / header_hash
 ///   mismatch (CityHash64 over the 94 core-header bytes, field zeroed)        -> CORRUPTED_DATA
 EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object_size, ObjectKind expected_kind);

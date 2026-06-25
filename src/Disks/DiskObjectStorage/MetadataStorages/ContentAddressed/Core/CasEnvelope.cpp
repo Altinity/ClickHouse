@@ -28,8 +28,10 @@ namespace
 
 /// 94 is the EXACT packed size of the v1 core fields (hole-free; the kind byte and the old index_len
 /// pad word are gone — kind is encoded by the magic):
-///   magic[4] + writer_version[2] + min_reader_version[2] + hash_algo[1] + flags[1] + header_len[4]
+///   magic[4] + writer_version[2] + compatibility_version[2] + hash_algo[1] + flags[1] + header_len[4]
 ///   + logical_size[8] + four u128s[64] + header_hash[8] = 94.
+/// The slot at [6,8) was formerly named `min_reader_version`; now `compatibility_version`. Same wire
+/// position and width; reader check unchanged (> G_BUILD → UNKNOWN_FORMAT_VERSION).
 /// The core is never grown: new fields go into the [94, header_len) TLV extensions. header_len is
 /// padded up to an 8-byte multiple; a fixed per-pool header length is set via pad_to_header_len.
 constexpr uint32_t CORE_HEADER_LEN = 94;
@@ -46,17 +48,6 @@ std::string_view magicFor(ObjectKind kind)
     {
         case ObjectKind::Blob: return MAGIC_BLOB;
         case ObjectKind::Tree: return MAGIC_TREE;
-    }
-    throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
-        "CHCA envelope: unexpected ObjectKind {}", static_cast<int>(kind));
-}
-
-FormatId formatIdFor(ObjectKind kind)
-{
-    switch (kind)
-    {
-        case ObjectKind::Blob: return FormatId::Blob;
-        case ObjectKind::Tree: return FormatId::Tree;
     }
     throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
         "CHCA envelope: unexpected ObjectKind {}", static_cast<int>(kind));
@@ -168,10 +159,9 @@ String encodeEnvelopeHeader(EnvelopeHeader & header)
     {
         WriteBufferFromString out_buf(out);
 
-        const WriterStamp stamp = currentWriterVersion(formatIdFor(header.kind));
-        writeString(magicFor(header.kind), out_buf);                        /// [0,4)  magic (encodes kind)
-        writeBinaryLittleEndian(stamp.writer_version, out_buf);             /// [4,6)  writer_version
-        writeBinaryLittleEndian(stamp.min_reader_version, out_buf);         /// [6,8)  min_reader_version
+        writeString(magicFor(header.kind), out_buf);                                          /// [0,4)  magic (encodes kind)
+        writeBinaryLittleEndian(static_cast<uint16_t>(currentWriterVersion()), out_buf);       /// [4,6)  writer_version
+        writeBinaryLittleEndian(static_cast<uint16_t>(currentCompatibilityVersion()), out_buf); /// [6,8)  compatibility_version
         writeBinaryLittleEndian(header.hash_algo, out_buf);                 /// [8]    hash_algo
         writeBinaryLittleEndian(
             static_cast<uint8_t>(critical ? FLAG_HAS_CRITICAL_EXTENSION : 0), out_buf); /// [9] flags
@@ -219,10 +209,10 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
                 "CHCA envelope: kind {} does not match expected {}",
                 static_cast<int>(h.kind), static_cast<int>(expected_kind));
 
-        /// [4,6) writer_version, [6,8) min_reader_version — fail closed on a future object.
+        /// [4,6) writer_version, [6,8) compatibility_version — fail closed on a future object.
         readBinaryLittleEndian(h.writer_version, in);
-        readBinaryLittleEndian(h.min_reader_version, in);
-        gateOnRead(h.min_reader_version, "CHCA envelope");
+        readBinaryLittleEndian(h.compatibility_version, in);
+        gateOnRead(static_cast<uint32_t>(h.compatibility_version), "CHCA envelope");
 
         /// [8] hash_algo
         readBinaryLittleEndian(h.hash_algo, in);
