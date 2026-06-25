@@ -50,9 +50,13 @@ The heartbeat has **no live reader**, so deleting it changes no current GC decis
   `stopBackground()` + `discard()` (`:1109-1110`); the heartbeat text in the `startBuild` / `abandon`
   `CasEvent` emissions. `abandon()` remains (it still retires the build_seq / drops staging); only its
   heartbeat calls go.
-- `Core/CasStore.{h,cpp}` — `createBuild` stops constructing the `HeartbeatKeeper` (`:267`); the `Build`
-  ctor drops the parameter; remove `heartbeat_period` and `background_heartbeats` from `PoolConfig`
-  (and any disk-config parse of them).
+- `Core/CasStore.{h,cpp}` — `createBuild` stops constructing the `HeartbeatKeeper` (`:267`) and drops
+  the heartbeat-keeper `startBackground` (`:269-270`); the `Build` ctor drops the parameter.
+  **CORRECTION (grounded 2026-06-26): KEEP `heartbeat_period` and `background_heartbeats` in `PoolConfig`
+  — they are SHARED with the watermark** (`CasStore.cpp:114-115` drives `watermark->startBackground`
+  with them; `ContentAddressedMetadataStorage.cpp:355` sets `background_heartbeats`). Removing them
+  would break the watermark's background renewal. Optional follow-up: rename to
+  `watermark_renew_period` / `background_watermark` for clarity (not required; out of scope here).
 - `Core/CasLayout.h` — `buildHeartbeatKey` + the `builds/` prefix documentation line (the whole
   `POOL/builds/` namespace is gone).
 - Proto `Core/Proto/cas_root_shard.proto` — the `HeartbeatProto` message.
@@ -95,9 +99,10 @@ The heartbeat has **no live reader**, so deleting it changes no current GC decis
 - **`abandon()` after heartbeat removal:** confirm `abandon()` still correctly retires the build_seq /
   drops staging without the heartbeat discard — i.e. the seq-retire is not entangled with
   `heartbeat->discard()`. (Map during implementation; they are separate today.)
-- **Config removal:** if `heartbeat_period`/`background_heartbeats` appear in any sample/soak disk
-  config XML, remove them too so config parsing does not reject unknown keys (or warn) — check
-  `utils/ca-soak/configs/`.
+- **`CasEventType::Heartbeat` is the DEFAULT of `CasEvent::type`** (`CasEvent.h:45`) and is never
+  emitted (startBuild emits `BuildStart`). Removing the enumerator requires repointing that default to
+  another enumerator (e.g. `BlobPut`) — every emit sets `.type` explicitly, so the default is cosmetic.
+- **Config keys stay** (watermark-shared — see the corrected removal map); no config-XML removal needed.
 - No migration concern (pre-release).
 
 ## Verification (definition of done)
