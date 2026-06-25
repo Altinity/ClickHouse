@@ -241,15 +241,11 @@ def test_restart_nodes_during_export(cluster):
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2021") != f'0\n', "Export of partition 2021 did not resume after crash"
 
 
-<<<<<<< HEAD
-def test_kill_export(cluster):
-=======
 @pytest.mark.parametrize(
     "system_table_prefer_remote_information", ['0', '1']
 )
 def test_kill_export(cluster, system_table_prefer_remote_information):
     skip_if_remote_database_disk_enabled(cluster)
->>>>>>> 664f99e7e2d (Merge pull request #1402 from Altinity/26_1_export_improvements_test)
     node = cluster.instances["replica1"]
     node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
