@@ -882,6 +882,15 @@ void IcebergMetadata::createInitial(
             = configuration_ptr->getTypeName() + "://" + configuration_ptr->getNamespace() + "/" + configuration_ptr->getRawPath().path;
     auto [metadata_content_object, metadata_content] = createEmptyMetadataFile(
         location_path, *columns, partition_by, order_by, local_context, configuration_ptr->getDataLakeSettings()[DataLakeStorageSetting::iceberg_format_version]);
+
+    /// Transactional catalogs write the canonical metadata file themselves
+    if (catalog && catalog->isTransactional())
+    {
+        const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id_.getTableName());
+        catalog->createTable(namespace_name, table_name, /* new_metadata_path */ "", metadata_content_object);
+        return;
+    }
+
     auto compression_method_str = local_context->getSettingsRef()[Setting::iceberg_metadata_compression_method].value;
     auto compression_method = chooseCompressionMethod(compression_method_str, compression_method_str);
 
@@ -889,10 +898,7 @@ void IcebergMetadata::createInitial(
     if (!compression_suffix.empty())
         compression_suffix = "." + compression_suffix;
 
-    auto table_uuid = metadata_content_object->getValue<String>(Iceberg::f_table_uuid);
-    auto metadata_file_name = (catalog && catalog->isTransactional())
-        ? fmt::format("v1-{}{}.metadata.json", table_uuid, compression_suffix)
-        : fmt::format("v1{}.metadata.json", compression_suffix);
+    auto metadata_file_name = fmt::format("v1{}.metadata.json", compression_suffix);
     auto filename = fmt::format("{}metadata/{}", configuration_ptr->getRawPath().path, metadata_file_name);
 
     try
