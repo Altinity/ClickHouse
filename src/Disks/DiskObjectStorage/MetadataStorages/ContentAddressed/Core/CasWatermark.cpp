@@ -3,9 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <cas_root_shard.pb.h>
-#include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 
 #include <limits>
@@ -22,29 +19,25 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-namespace
-{
-
-constexpr std::string_view WATERMARK_MAGIC = "CAWM";
-
-}
-
 String encodeServerWatermark(const ServerWatermark & w)
 {
     Cas::Proto::WatermarkProto msg;
+
+    /// Set CasHeader as field 1 (pure protobuf — no binary prefix).
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::Watermark));
+    hdr->set_writer_version(currentWriterVersion());
+    hdr->set_compatibility_version(currentCompatibilityVersion());
+
     msg.set_server_id(u128ToBytesBE(w.server_id));
     msg.set_epoch(w.epoch);
     msg.set_min_active(w.min_active);   // UINT64_MAX encodes the retired sentinel directly
     msg.set_seq(w.seq);
 
-    std::string body;
-    if (!msg.SerializeToString(&body))
+    std::string out;
+    if (!msg.SerializeToString(&out))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS watermark: protobuf serialization failed");
-
-    WriteBufferFromOwnString out;
-    Cas::writeFramingHeader(out, WATERMARK_MAGIC, Cas::currentWriterVersion(Cas::FormatId::Watermark));
-    writeString(body, out);
-    return std::move(out.str());
+    return out;
 }
 
 ServerWatermark decodeServerWatermark(std::string_view data)
@@ -52,13 +45,17 @@ ServerWatermark decodeServerWatermark(std::string_view data)
     if (data.empty())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS watermark: empty object");
 
-    ReadBufferFromMemory in(data.data(), data.size());
-    Cas::readFramingHeader(in, WATERMARK_MAGIC, "watermark");
-    const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
-
+    /// Parse the whole message directly (pure protobuf, no binary prefix).
     Cas::Proto::WatermarkProto msg;
-    if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+    if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS watermark: protobuf parse failed");
+
+    /// Check magic then compatibility_version BEFORE reading any other fields.
+    if (msg.header().magic() != magicFor(FormatId::Watermark))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS watermark: bad magic (got 0x{:08x}, expected 0x{:08x})",
+            msg.header().magic(), magicFor(FormatId::Watermark));
+    checkCompatibility(msg.header().compatibility_version(), "watermark");
 
     ServerWatermark w;
     w.server_id = u128FromBytesBE(msg.server_id(), "watermark server_id");

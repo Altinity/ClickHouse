@@ -3,9 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <cas_root_shard.pb.h>
-#include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
 
@@ -16,6 +13,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -24,8 +22,6 @@ namespace DB::Cas
 
 namespace
 {
-
-constexpr std::string_view POOL_META_MAGIC = "CAPM";
 
 /// Pool-wide constant invariants, enforced in two contexts with different error codes:
 ///   - at creation, a bad value is the CALLER's config mistake => BAD_ARGUMENTS;
@@ -56,18 +52,22 @@ UInt128 mintPoolId()
 String encodePoolMeta(const PoolMeta & pm)
 {
     Cas::Proto::PoolMetaProto msg;
+
+    /// Set CasHeader as field 1 (pure protobuf — no binary prefix).
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::PoolMeta));
+    hdr->set_writer_version(currentWriterVersion());
+    hdr->set_compatibility_version(currentCompatibilityVersion());
+
     msg.set_pool_id(u128ToBytesBE(pm.pool_id));
     msg.set_root_shards(pm.root_shards);
     msg.set_blob_header_len(pm.blob_header_len);
+    msg.set_min_reader_generation(pm.min_reader_generation);
 
-    std::string body;
-    if (!msg.SerializeToString(&body))
+    std::string out;
+    if (!msg.SerializeToString(&out))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS pool meta: protobuf serialization failed");
-
-    WriteBufferFromOwnString out;
-    Cas::writeFramingHeader(out, POOL_META_MAGIC, Cas::currentWriterVersion(Cas::FormatId::PoolMeta));
-    writeString(body, out);
-    return std::move(out.str());
+    return out;
 }
 
 PoolMeta decodePoolMeta(std::string_view data)
@@ -75,21 +75,33 @@ PoolMeta decodePoolMeta(std::string_view data)
     if (data.empty())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: empty object");
 
-    ReadBufferFromMemory in(data.data(), data.size());
-    Cas::readFramingHeader(in, POOL_META_MAGIC, "pool meta");
-    const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
-
+    /// Parse the whole message directly (pure protobuf, no binary prefix).
     Cas::Proto::PoolMetaProto msg;
-    if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+    if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: protobuf parse failed");
+
+    /// Check magic then compatibility_version BEFORE reading any other fields.
+    if (msg.header().magic() != magicFor(FormatId::PoolMeta))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS pool meta: bad magic (got 0x{:08x}, expected 0x{:08x})",
+            msg.header().magic(), magicFor(FormatId::PoolMeta));
+    checkCompatibility(msg.header().compatibility_version(), "pool meta");
 
     PoolMeta pm;
     pm.pool_id = u128FromBytesBE(msg.pool_id(), "pool meta pool_id");
     pm.root_shards = msg.root_shards();
     pm.blob_header_len = msg.blob_header_len();
+    pm.min_reader_generation = msg.min_reader_generation();
 
     /// A persisted object violating the constant invariants is corruption, not a config error.
     validateConstants(pm.root_shards, pm.blob_header_len, ErrorCodes::CORRUPTED_DATA, "pool meta");
+
+    /// Startup gate: if min_reader_generation > G_BUILD, this binary is too old to open the pool.
+    if (G_BUILD < pm.min_reader_generation)
+        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
+            "CAS pool meta: pool requires reader generation {} but this build supports at most {}",
+            pm.min_reader_generation, G_BUILD);
+
     return pm;
 }
 
@@ -110,6 +122,7 @@ PoolMeta PoolMeta::createOrValidate(Backend & backend, const Layout & layout, ui
     pm.pool_id = mintPoolId();
     pm.root_shards = root_shards;
     pm.blob_header_len = blob_header_len;
+    pm.min_reader_generation = 0;   /// pre-release: no minimum reader generation required
 
     if (backend.casPut(key, encodePoolMeta(pm), /*expected*/ std::nullopt).outcome == CasOutcome::Committed)
         return pm;

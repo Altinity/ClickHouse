@@ -5,9 +5,6 @@
 /// reserved identifiers don't trip -Weverything -Werror (same idiom as clickhouse_grpc_protos).
 #include <cas_root_shard.pb.h>
 #include <Common/Exception.h>
-#include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/WriteHelpers.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <cstdint>
@@ -26,13 +23,6 @@ namespace DB::Cas
 
 namespace
 {
-
-/// The CARS (CA Root Shard) framing magic: prepended before the protobuf body so the framing header
-/// (version + fail-closed gating) is read BEFORE the body is parsed.
-constexpr std::string_view MANIFEST_MAGIC = "CARS";
-
-/// UInt128 <-> 16 raw bytes, big-endian: routed through the named, FROZEN-byte-order helpers
-/// `u128ToBytesBE` / `u128FromBytesBE` in `CasCodecUtil.h` (the bodies were moved there verbatim).
 
 Cas::Proto::JournalOp journalOpToProto(JournalRecord::Op op)
 {
@@ -107,6 +97,13 @@ ClosureNode decodeClosureNode(const Cas::Proto::ClosureNodeProto & pn)
 String encodeRootShard(const RootShard & root)
 {
     Cas::Proto::RootShardManifest msg;
+
+    /// Set CasHeader as field 1 (pure protobuf — no binary prefix).
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::Manifest));
+    hdr->set_writer_version(currentWriterVersion());
+    hdr->set_compatibility_version(currentCompatibilityVersion());
+
     msg.set_shard_version(root.shard_version);
     msg.set_fence_round(root.fence_round);
 
@@ -136,20 +133,15 @@ String encodeRootShard(const RootShard & root)
 
     /// Deterministic serialization (sorts map<> entries) so golden tests are stable. Correctness
     /// does not need it - the manifest is CAS-by-token, not content-addressed.
-    std::string body;
+    std::string out;
     {
-        google::protobuf::io::StringOutputStream zos(&body);
+        google::protobuf::io::StringOutputStream zos(&out);
         google::protobuf::io::CodedOutputStream cos(&zos);
         cos.SetSerializationDeterministic(true);
         if (!msg.SerializeToCodedStream(&cos))
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS root shard: protobuf serialization failed");
     }
-
-    /// Prepend the framing header so the version is checked BEFORE the body is parsed.
-    WriteBufferFromOwnString out;
-    Cas::writeFramingHeader(out, MANIFEST_MAGIC, Cas::currentWriterVersion(Cas::FormatId::Manifest));
-    writeString(body, out);
-    return std::move(out.str());
+    return out;
 }
 
 RootShard decodeRootShard(std::string_view data)
@@ -157,15 +149,17 @@ RootShard decodeRootShard(std::string_view data)
     if (data.empty())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: empty manifest");
 
-    /// Read and gate the framing header BEFORE parsing the protobuf body: validates magic and
-    /// gateOnRead(min_reader_version) so a future object from a newer writer fails closed.
-    ReadBufferFromMemory in(data.data(), data.size());
-    Cas::readFramingHeader(in, MANIFEST_MAGIC, "root shard");
-    const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
-
+    /// Parse the whole message directly (pure protobuf, no binary prefix).
     Cas::Proto::RootShardManifest msg;
-    if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+    if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS root shard: protobuf parse failed");
+
+    /// Check magic then compatibility_version BEFORE reading any other fields.
+    if (msg.header().magic() != magicFor(FormatId::Manifest))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS root shard: bad magic (got 0x{:08x}, expected 0x{:08x})",
+            msg.header().magic(), magicFor(FormatId::Manifest));
+    checkCompatibility(msg.header().compatibility_version(), "root shard");
 
     RootShard root;
     root.shard_version = msg.shard_version();

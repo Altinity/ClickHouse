@@ -2,9 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <cas_root_shard.pb.h>
-#include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 
 #include <chrono>
@@ -21,28 +18,24 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-namespace
-{
-
-constexpr std::string_view HEARTBEAT_MAGIC = "CAHB";
-
-}
-
 String encodeHeartbeat(const Heartbeat & heartbeat)
 {
     Cas::Proto::HeartbeatProto msg;
+
+    /// Set CasHeader as field 1 (pure protobuf — no binary prefix).
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::Heartbeat));
+    hdr->set_writer_version(currentWriterVersion());
+    hdr->set_compatibility_version(currentCompatibilityVersion());
+
     msg.set_server_id(u128ToBytesBE(heartbeat.server_id));
     msg.set_heartbeat_seq(heartbeat.heartbeat_seq);
     msg.set_created_at_ms(heartbeat.created_at_ms);
 
-    std::string body;
-    if (!msg.SerializeToString(&body))
+    std::string out;
+    if (!msg.SerializeToString(&out))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: protobuf serialization failed");
-
-    WriteBufferFromOwnString out;
-    Cas::writeFramingHeader(out, HEARTBEAT_MAGIC, Cas::currentWriterVersion(Cas::FormatId::Heartbeat));
-    writeString(body, out);
-    return std::move(out.str());
+    return out;
 }
 
 Heartbeat decodeHeartbeat(std::string_view data)
@@ -52,13 +45,17 @@ Heartbeat decodeHeartbeat(std::string_view data)
         if (data.empty())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS heartbeat: empty object");
 
-        ReadBufferFromMemory in(data.data(), data.size());
-        Cas::readFramingHeader(in, HEARTBEAT_MAGIC, "heartbeat");
-        const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
-
+        /// Parse the whole message directly (pure protobuf, no binary prefix).
         Cas::Proto::HeartbeatProto msg;
-        if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+        if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS heartbeat: protobuf parse failed");
+
+        /// Check magic then compatibility_version BEFORE reading any other fields.
+        if (msg.header().magic() != magicFor(FormatId::Heartbeat))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS heartbeat: bad magic (got 0x{:08x}, expected 0x{:08x})",
+                msg.header().magic(), magicFor(FormatId::Heartbeat));
+        checkCompatibility(msg.header().compatibility_version(), "heartbeat");
 
         Heartbeat heartbeat;
         heartbeat.server_id = u128FromBytesBE(msg.server_id(), "heartbeat server_id");

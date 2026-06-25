@@ -6,7 +6,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <cas_root_shard.pb.h>
 #include <limits>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
@@ -87,10 +89,8 @@ TEST(CasGcFormats, GcStateV3DefaultsAndEncodingIsBinary)
     GcState s;
     EXPECT_EQ(s.snap_shards, 1u);                /// default 1 (the GC constant)
     auto bytes = encodeGcState(s);
-    ASSERT_GE(bytes.size(), 8u);
-    /// Protobuf framing: CAGT magic + u16 LE writer + u16 LE min_reader.
-    EXPECT_EQ(bytes.substr(0, 4), "CAGT");
-    EXPECT_NE(bytes.front(), '{');               /// not JSON
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_NE(bytes.front(), '{');               /// not JSON (pure protobuf with CasHeader)
     auto d = decodeGcState(bytes);
     EXPECT_EQ(d.round, 0u);
     EXPECT_TRUE(d.fence_version.empty());
@@ -102,18 +102,36 @@ TEST(CasGcFormats, GcStateV3Validation)
     /// Empty / garbage => CORRUPTED_DATA.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    /// Bad magic (not CAGT) => CORRUPTED_DATA.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("CAGS\x01\x00\x01\x00", 8)); });
-    /// Future min_reader => UNKNOWN_FORMAT_VERSION (fail closed on the future).
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [] { decodeGcState(String("CAGT\x02\x00\x02\x00", 8)); });
-    /// snap_shards == 0 is an invariant violation => CORRUPTED_DATA (post-parse check).
-    /// GcStateProto wire format: field 3 (snap_shards) tag byte is 0x18, value byte 0x01 for snap_shards=1.
-    /// An all-zero proto body with valid framing has snap_shards=0 (proto3 default) => CORRUPTED_DATA.
+    /// Bad magic (wrong FormatId in CasHeader) => CORRUPTED_DATA.
     {
-        /// 8-byte CAGT framing + empty proto body = snap_shards defaults to 0 in proto3.
-        const String framing_only("CAGT\x01\x00\x01\x00", 8);
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(framing_only); });
+        Proto::GcStateProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::RetiredSet));   /// CART != CAGT
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        msg.set_snap_shards(1);
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
+    }
+    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION (fail closed on the future).
+    {
+        Proto::GcStateProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::GcState));
+        hdr->set_compatibility_version(G_BUILD + 1);
+        msg.set_snap_shards(1);
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeGcState(bytes); });
+    }
+    /// snap_shards == 0 is an invariant violation => CORRUPTED_DATA (post-parse check).
+    /// A GcStateProto with valid CasHeader but snap_shards=0 (proto3 default / explicitly zero).
+    {
+        Proto::GcStateProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::GcState));
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        /// snap_shards defaults to 0 in proto3 — don't set it.
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
     }
 }
 
@@ -152,10 +170,8 @@ TEST(CasGcFormats, HeartbeatRoundTrip)
                  .heartbeat_seq = 42,
                  .created_at_ms = 1234567890123};
     auto bytes = encodeHeartbeat(hb);
-    /// Protobuf framing: CAHB magic, not JSON.
-    ASSERT_GE(bytes.size(), 8u);
-    EXPECT_EQ(bytes.substr(0, 4), "CAHB");
-    EXPECT_NE(bytes.front(), '{');
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_NE(bytes.front(), '{');   /// not JSON (pure protobuf with CasHeader)
     auto d = decodeHeartbeat(bytes);
     EXPECT_EQ(d.server_id, hexToU128("000102030405060708090a0b0c0d0e0f"));
     EXPECT_EQ(d.heartbeat_seq, 42u);
@@ -174,10 +190,8 @@ TEST(CasGcFormats, OutcomeLogRoundTrip)
     log.entries.push_back({ObjectKind::Tree, hexToU128("dd00000000000000000000000000000d"),
                            Token{"9", TokenType::Emulated}, OutcomeKind::Absent});
     auto bytes = encodeOutcomeLog(log);
-    /// Protobuf framing: CAGO magic, not JSON.
-    ASSERT_GE(bytes.size(), 8u);
-    EXPECT_EQ(bytes.substr(0, 4), "CAGO");
-    EXPECT_NE(bytes.front(), '{');
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_NE(bytes.front(), '{');   /// not JSON (pure protobuf with CasHeader)
     auto d = decodeOutcomeLog(bytes);
     ASSERT_EQ(d.entries.size(), 4u);
     EXPECT_EQ(d.entries[0].kind, ObjectKind::Tree);
@@ -199,17 +213,33 @@ TEST(CasGcFormats, EmptyOutcomeLogRoundTrips)
     EXPECT_TRUE(d.entries.empty());
 }
 
-/// ---------- validation throw-paths (protobuf framing) ----------
+/// ---------- validation throw-paths (CasHeader-based, pure protobuf) ----------
 
 TEST(CasGcFormats, GcStateValidation)
 {
-    /// Empty / garbage / bad magic => CORRUPTED_DATA.
+    /// Empty / garbage / bad protobuf => CORRUPTED_DATA.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeGcState(String("CART\x01\x00\x01\x00", 8)); });
-    /// Future min_reader => UNKNOWN_FORMAT_VERSION.
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [] { decodeGcState(String("CAGT\x02\x00\x02\x00", 8)); });
+    /// Wrong magic (CART magic in a CAGT-expecting decoder) => CORRUPTED_DATA.
+    {
+        Proto::GcStateProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::RetiredSet));   /// CART
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        msg.set_snap_shards(1);
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
+    }
+    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION.
+    {
+        Proto::GcStateProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::GcState));
+        hdr->set_compatibility_version(G_BUILD + 1);
+        msg.set_snap_shards(1);
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeGcState(bytes); });
+    }
 }
 
 TEST(CasGcFormats, RetiredSetValidation)
@@ -217,24 +247,41 @@ TEST(CasGcFormats, RetiredSetValidation)
     /// Empty / garbage bytes => CORRUPTED_DATA.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRetiredSet(String("")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRetiredSet(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    /// Bad magic (not CART) => CORRUPTED_DATA.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRetiredSet(String("CAGT\x01\x00\x01\x00", 8)); });
-    /// Future min_reader => UNKNOWN_FORMAT_VERSION (fail closed on the future).
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [] { decodeRetiredSet(String("CART\x02\x00\x02\x00", 8)); });
-    /// Encoding is binary (framing magic CART), not JSON.
+    /// Bad magic (wrong FormatId in CasHeader) => CORRUPTED_DATA.
+    {
+        Proto::RetiredSetProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::GcState));   /// CAGT != CART
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRetiredSet(bytes); });
+    }
+    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION (fail closed on the future).
+    {
+        Proto::RetiredSetProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::RetiredSet));
+        hdr->set_compatibility_version(G_BUILD + 1);
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRetiredSet(bytes); });
+    }
+    /// Encoding is binary (pure protobuf with CasHeader), not JSON.
     {
         const String bytes = encodeRetiredSet(RetiredSet{});
-        ASSERT_GE(bytes.size(), 8u);
-        EXPECT_EQ(bytes.substr(0, 4), "CART");
+        ASSERT_FALSE(bytes.empty());
         EXPECT_NE(bytes.front(), '{');
     }
-    /// An entry whose kind is the proto3 default (0 / omitted) must be rejected: objectKindFromProto(0)
-    /// throws CORRUPTED_DATA. Craft a CART-framed body with one RetiredEntryProto left at defaults:
-    /// RetiredSetProto.entries is field 1 (length-delimited) => tag 0x0A, length 0x00 (empty sub-message
-    /// => kind defaults to 0).
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeRetiredSet(String("CART\x01\x00\x01\x00\x0a\x00", 10)); });
+    /// An entry whose kind is the proto3 default (0 / omitted) must be rejected.
+    /// Build a valid RetiredSetProto with correct CasHeader but an entry with kind=0.
+    {
+        Proto::RetiredSetProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::RetiredSet));
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        msg.add_entries();  /// default entry: kind=0 which is invalid
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRetiredSet(bytes); });
+    }
 }
 
 TEST(CasGcFormats, OutcomeLogValidation)
@@ -242,23 +289,40 @@ TEST(CasGcFormats, OutcomeLogValidation)
     /// Empty / garbage bytes => CORRUPTED_DATA.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(String("")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    /// Bad magic (not CAGO) => CORRUPTED_DATA.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(String("CAHB\x01\x00\x01\x00", 8)); });
-    /// Future min_reader => UNKNOWN_FORMAT_VERSION (fail closed on the future).
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [] { decodeOutcomeLog(String("CAGO\x02\x00\x02\x00", 8)); });
-    /// Encoding is binary (framing magic CAGO), not JSON.
+    /// Bad magic (wrong FormatId in CasHeader) => CORRUPTED_DATA.
+    {
+        Proto::GcOutcomeLogProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::Heartbeat));   /// CAHB != CAGO
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(bytes); });
+    }
+    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION (fail closed on the future).
+    {
+        Proto::GcOutcomeLogProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::GcOutcomes));
+        hdr->set_compatibility_version(G_BUILD + 1);
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeOutcomeLog(bytes); });
+    }
+    /// Encoding is binary (pure protobuf with CasHeader), not JSON.
     {
         const String bytes = encodeOutcomeLog(OutcomeLog{});
-        ASSERT_GE(bytes.size(), 8u);
-        EXPECT_EQ(bytes.substr(0, 4), "CAGO");
+        ASSERT_FALSE(bytes.empty());
         EXPECT_NE(bytes.front(), '{');
     }
     /// An entry with an invalid outcome value (0 is the proto3 default / unset) => CORRUPTED_DATA.
-    /// GcOutcomeLogProto.entries is field 1 (length-delimited) => tag 0x0A; an empty sub-message
-    /// has all fields at their proto3 defaults (0), including outcome=0 which is not a valid OutcomeKind.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeOutcomeLog(String("CAGO\x01\x00\x01\x00\x0a\x00", 10)); });
+    {
+        Proto::GcOutcomeLogProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::GcOutcomes));
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        msg.add_entries();  /// default entry: outcome=0 which is invalid
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(bytes); });
+    }
 }
 
 TEST(CasGcFormats, HeartbeatValidation)
@@ -266,22 +330,40 @@ TEST(CasGcFormats, HeartbeatValidation)
     /// Empty / garbage bytes => CORRUPTED_DATA.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeHeartbeat(String("")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeHeartbeat(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    /// Bad magic (not CAHB) => CORRUPTED_DATA.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeHeartbeat(String("CAGO\x01\x00\x01\x00", 8)); });
-    /// Future min_reader => UNKNOWN_FORMAT_VERSION (fail closed on the future).
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [] { decodeHeartbeat(String("CAHB\x02\x00\x02\x00", 8)); });
-    /// Encoding is binary (framing magic CAHB), not JSON.
+    /// Bad magic (wrong FormatId in CasHeader) => CORRUPTED_DATA.
+    {
+        Proto::HeartbeatProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::GcOutcomes));   /// CAGO != CAHB
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
+    }
+    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION (fail closed on the future).
+    {
+        Proto::HeartbeatProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::Heartbeat));
+        hdr->set_compatibility_version(G_BUILD + 1);
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeHeartbeat(bytes); });
+    }
+    /// Encoding is binary (pure protobuf with CasHeader), not JSON.
     {
         const String bytes = encodeHeartbeat(Heartbeat{});
-        ASSERT_GE(bytes.size(), 8u);
-        EXPECT_EQ(bytes.substr(0, 4), "CAHB");
+        ASSERT_FALSE(bytes.empty());
         EXPECT_NE(bytes.front(), '{');
     }
     /// A server_id proto bytes field that is not exactly 16 bytes => CORRUPTED_DATA (post-parse).
-    /// Build a CAHB-framed body where field 1 (server_id) has a 5-byte value: tag 0x0A, length 0x05, 5 bytes.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [] { decodeHeartbeat(String("CAHB\x01\x00\x01\x00\x0a\x05hello", 13)); });
+    {
+        Proto::HeartbeatProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::Heartbeat));
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        msg.set_server_id("hello");  /// 5 bytes, not 16 — invalid
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
+    }
 }
 
 TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
@@ -293,10 +375,8 @@ TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
     registry.fence_round = 2;
     registry.namespaces = {"srv1/tbl", "srv2/tbl2"};
     const String bytes = encodeRootsRegistry(registry);
-    /// Protobuf framing: CARR magic, not JSON.
-    ASSERT_GE(bytes.size(), 8u);
-    EXPECT_EQ(bytes.substr(0, 4), "CARR");
-    EXPECT_NE(bytes.front(), '{');
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_NE(bytes.front(), '{');   /// not JSON (pure protobuf with CasHeader)
     const RootsRegistry d = decodeRootsRegistry(bytes);
     EXPECT_EQ(d.registry_version, 3u);
     EXPECT_EQ(d.fence_round, 2u);
@@ -306,11 +386,24 @@ TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
     /// Empty / garbage bytes => CORRUPTED_DATA.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(String("")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    /// Bad magic (not CARR) => CORRUPTED_DATA.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(String("CAHB\x01\x00\x01\x00", 8)); });
-    /// Future min_reader => UNKNOWN_FORMAT_VERSION (fail closed on the future).
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [] { decodeRootsRegistry(String("CARR\x02\x00\x02\x00", 8)); });
+    /// Bad magic (wrong FormatId in CasHeader) => CORRUPTED_DATA.
+    {
+        Proto::RootsRegistryProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::Heartbeat));   /// CAHB != CARR
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        std::string bad_bytes; msg.SerializeToString(&bad_bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(bad_bytes); });
+    }
+    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION (fail closed on the future).
+    {
+        Proto::RootsRegistryProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::RootsRegistry));
+        hdr->set_compatibility_version(G_BUILD + 1);
+        std::string bad_bytes; msg.SerializeToString(&bad_bytes);
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRootsRegistry(bad_bytes); });
+    }
     /// codec-specific invariants: empty namespace entry fails closed (post-parse check).
     {
         RootsRegistry bad;
@@ -321,15 +414,16 @@ TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(bad_bytes); });
     }
     /// duplicate namespace entries fail closed (post-parse check).
-    /// We can't produce a duplicate via the normal encode path (set<> dedupes), so craft the proto
-    /// bytes directly: CARR framing + a RootsRegistryProto body with two identical namespaces.
-    /// RootsRegistryProto.namespaces is field 3 (string repeated) => tag 0x1A.
-    /// "a" => tag 0x1A, len 0x01, 'a' (3 bytes per entry).
+    /// Craft a RootsRegistryProto with valid CasHeader + two duplicate namespaces.
     {
-        const String body("\x1a\x01\x61\x1a\x01\x61", 6);   /// two "a" entries
-        String framed("CARR\x01\x00\x01\x00", 8);
-        framed += body;
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(framed); });
+        Proto::RootsRegistryProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::RootsRegistry));
+        hdr->set_compatibility_version(currentCompatibilityVersion());
+        msg.add_namespaces("a");
+        msg.add_namespaces("a");   /// duplicate
+        std::string dup_bytes; msg.SerializeToString(&dup_bytes);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(dup_bytes); });
     }
 }
 
@@ -367,20 +461,23 @@ TEST(CasGcSnapCodec, ZstdRoundTripAndShrinks)
 }
 
 /// ===================================================================================
-/// Protobuf framing-header goldens for heartbeat, roots-registry, gc-outcomes (Plan 3c-tail).
-/// These replace the JSON goldens removed when the codecs moved to protobuf.
-/// Protobuf framing-header goldens for pool-meta, watermark, gc-state, retired-set (Plan 3c).
-/// Pin the framing magic bytes and verify binary (not JSON) encoding for each codec.
+/// CasHeader round-trip goldens — confirm CasHeader is field 1 of each mutable object,
+/// magic + writer_version + compatibility_version are all stamped correctly.
 /// ===================================================================================
 
-TEST(CasProtobufFramingGolden, HeartbeatFramingMagic)
+TEST(CasHeaderGolden, HeartbeatCasHeaderRoundTrips)
 {
     const Heartbeat hb{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
                        .heartbeat_seq = 42, .created_at_ms = 1234567890123};
     const String bytes = encodeHeartbeat(hb);
-    ASSERT_GE(bytes.size(), 8u);
-    EXPECT_EQ(bytes.substr(0, 4), "CAHB");
+    ASSERT_FALSE(bytes.empty());
     EXPECT_NE(bytes.front(), '{');   // not JSON
+    /// Parse raw to check CasHeader
+    Proto::HeartbeatProto msg;
+    ASSERT_TRUE(msg.ParseFromString(bytes));
+    EXPECT_EQ(msg.header().magic(), magicFor(FormatId::Heartbeat));
+    EXPECT_EQ(msg.header().writer_version(), currentWriterVersion());
+    EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
     const Heartbeat d = decodeHeartbeat(bytes);
     EXPECT_EQ(d.server_id, hb.server_id);
     EXPECT_EQ(d.heartbeat_seq, 42u);
@@ -390,16 +487,20 @@ TEST(CasProtobufFramingGolden, HeartbeatFramingMagic)
     EXPECT_EQ(decodeHeartbeat(encodeHeartbeat(zero)).heartbeat_seq, 0u);
 }
 
-TEST(CasProtobufFramingGolden, RootsRegistryFramingMagic)
+TEST(CasHeaderGolden, RootsRegistryCasHeaderRoundTrips)
 {
     RootsRegistry registry;
     registry.registry_version = 5;
     registry.fence_round = 2;
     registry.namespaces = {"alpha", "beta", "gamma/sub"};
     const String bytes = encodeRootsRegistry(registry);
-    ASSERT_GE(bytes.size(), 8u);
-    EXPECT_EQ(bytes.substr(0, 4), "CARR");
+    ASSERT_FALSE(bytes.empty());
     EXPECT_NE(bytes.front(), '{');   // not JSON
+    Proto::RootsRegistryProto msg;
+    ASSERT_TRUE(msg.ParseFromString(bytes));
+    EXPECT_EQ(msg.header().magic(), magicFor(FormatId::RootsRegistry));
+    EXPECT_EQ(msg.header().writer_version(), currentWriterVersion());
+    EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
     const RootsRegistry d = decodeRootsRegistry(bytes);
     EXPECT_EQ(d.registry_version, 5u);
     EXPECT_EQ(d.fence_round, 2u);
@@ -412,7 +513,7 @@ TEST(CasProtobufFramingGolden, RootsRegistryFramingMagic)
     EXPECT_TRUE(decodeRootsRegistry(encodeRootsRegistry(empty)).namespaces.empty());
 }
 
-TEST(CasProtobufFramingGolden, GcOutcomesFramingMagic)
+TEST(CasHeaderGolden, GcOutcomesCasHeaderRoundTrips)
 {
     OutcomeLog log;
     log.entries.push_back({ObjectKind::Tree, hexToU128("aa00000000000000000000000000000a"),
@@ -420,9 +521,13 @@ TEST(CasProtobufFramingGolden, GcOutcomesFramingMagic)
     log.entries.push_back({ObjectKind::Blob, hexToU128("bb00000000000000000000000000000b"),
                            Token{"7", TokenType::Emulated}, OutcomeKind::Spared});
     const String bytes = encodeOutcomeLog(log);
-    ASSERT_GE(bytes.size(), 8u);
-    EXPECT_EQ(bytes.substr(0, 4), "CAGO");
+    ASSERT_FALSE(bytes.empty());
     EXPECT_NE(bytes.front(), '{');   // not JSON
+    Proto::GcOutcomeLogProto msg;
+    ASSERT_TRUE(msg.ParseFromString(bytes));
+    EXPECT_EQ(msg.header().magic(), magicFor(FormatId::GcOutcomes));
+    EXPECT_EQ(msg.header().writer_version(), currentWriterVersion());
+    EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
     const OutcomeLog d = decodeOutcomeLog(bytes);
     ASSERT_EQ(d.entries.size(), 2u);
     EXPECT_EQ(d.entries[0].kind, ObjectKind::Tree);
@@ -434,31 +539,39 @@ TEST(CasProtobufFramingGolden, GcOutcomesFramingMagic)
     EXPECT_TRUE(decodeOutcomeLog(encodeOutcomeLog(OutcomeLog{})).entries.empty());
 }
 
-TEST(CasProtobufFramingGolden, PoolMetaFramingMagic)
+TEST(CasHeaderGolden, PoolMetaCasHeaderRoundTrips)
 {
     const PoolMeta pm{.pool_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                      .root_shards = 16, .blob_header_len = 96};
+                      .root_shards = 16, .blob_header_len = 96, .min_reader_generation = 0};
     const String bytes = encodePoolMeta(pm);
-    ASSERT_GE(bytes.size(), 8u);
-    EXPECT_EQ(bytes.substr(0, 4), "CAPM");
+    ASSERT_FALSE(bytes.empty());
     EXPECT_NE(bytes.front(), '{');   // not JSON
+    Proto::PoolMetaProto msg;
+    ASSERT_TRUE(msg.ParseFromString(bytes));
+    EXPECT_EQ(msg.header().magic(), magicFor(FormatId::PoolMeta));
+    EXPECT_EQ(msg.header().writer_version(), currentWriterVersion());
+    EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
     /// Round-trips correctly.
     const PoolMeta d = decodePoolMeta(bytes);
     EXPECT_EQ(d.pool_id, pm.pool_id);
     EXPECT_EQ(d.root_shards, 16u);
     EXPECT_EQ(d.blob_header_len, 96u);
+    EXPECT_EQ(d.min_reader_generation, 0u);
 }
 
-TEST(CasProtobufFramingGolden, WatermarkFramingMagicAndRetiredSentinel)
+TEST(CasHeaderGolden, WatermarkCasHeaderAndRetiredSentinel)
 {
     /// Live watermark.
     {
         const ServerWatermark w{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
                                 .epoch = 7, .min_active = 42, .seq = 3};
         const String bytes = encodeServerWatermark(w);
-        ASSERT_GE(bytes.size(), 8u);
-        EXPECT_EQ(bytes.substr(0, 4), "CAWM");
+        ASSERT_FALSE(bytes.empty());
         EXPECT_NE(bytes.front(), '{');
+        Proto::WatermarkProto msg;
+        ASSERT_TRUE(msg.ParseFromString(bytes));
+        EXPECT_EQ(msg.header().magic(), magicFor(FormatId::Watermark));
+        EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
         const ServerWatermark d = decodeServerWatermark(bytes);
         EXPECT_EQ(d.server_id, w.server_id);
         EXPECT_EQ(d.epoch, 7u);
@@ -476,7 +589,7 @@ TEST(CasProtobufFramingGolden, WatermarkFramingMagicAndRetiredSentinel)
     }
 }
 
-TEST(CasProtobufFramingGolden, GcStateFramingMagic)
+TEST(CasHeaderGolden, GcStateCasHeaderRoundTrips)
 {
     GcState s;
     s.round = 7;
@@ -484,15 +597,18 @@ TEST(CasProtobufFramingGolden, GcStateFramingMagic)
     s.snap_shards = 2;
     s.snap_generation = 12;
     const String bytes = encodeGcState(s);
-    ASSERT_GE(bytes.size(), 8u);
-    EXPECT_EQ(bytes.substr(0, 4), "CAGT");
+    ASSERT_FALSE(bytes.empty());
     EXPECT_NE(bytes.front(), '{');
+    Proto::GcStateProto msg;
+    ASSERT_TRUE(msg.ParseFromString(bytes));
+    EXPECT_EQ(msg.header().magic(), magicFor(FormatId::GcState));
+    EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
     const GcState d = decodeGcState(bytes);
     EXPECT_EQ(d.round, 7u);
     EXPECT_EQ(d.snap_shards, 2u);
 }
 
-TEST(CasProtobufFramingGolden, RetiredSetFramingMagic)
+TEST(CasHeaderGolden, RetiredSetCasHeaderRoundTrips)
 {
     RetiredSet rs;
     rs.entries.push_back({ObjectKind::Blob, hexToU128("000102030405060708090a0b0c0d0e0f"),
@@ -500,9 +616,12 @@ TEST(CasProtobufFramingGolden, RetiredSetFramingMagic)
     rs.entries.push_back({ObjectKind::Tree, hexToU128("ffffffffffffffffffffffffffffffff"),
                           Token{"42", TokenType::Emulated}, 0});
     const String bytes = encodeRetiredSet(rs);
-    ASSERT_GE(bytes.size(), 8u);
-    EXPECT_EQ(bytes.substr(0, 4), "CART");
+    ASSERT_FALSE(bytes.empty());
     EXPECT_NE(bytes.front(), '{');
+    Proto::RetiredSetProto msg;
+    ASSERT_TRUE(msg.ParseFromString(bytes));
+    EXPECT_EQ(msg.header().magic(), magicFor(FormatId::RetiredSet));
+    EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
     const RetiredSet d = decodeRetiredSet(bytes);
     ASSERT_EQ(d.entries.size(), 2u);
     /// Order after sort (Blob < Tree by kind).
@@ -512,20 +631,36 @@ TEST(CasProtobufFramingGolden, RetiredSetFramingMagic)
     EXPECT_EQ(d.entries[1].token.value, "42");
 }
 
-TEST(CasProtobufFramingGolden, PoolMetaFailClosedOnGarbage)
+TEST(CasHeaderGolden, PoolMetaFailClosedOnGarbage)
 {
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodePoolMeta(String("")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodePoolMeta(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [] { decodePoolMeta(String("CAPM\x02\x00\x02\x00", 8)); });
+    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION.
+    {
+        Proto::PoolMetaProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::PoolMeta));
+        hdr->set_compatibility_version(G_BUILD + 1);
+        msg.set_root_shards(1);
+        msg.set_blob_header_len(96);
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodePoolMeta(bytes); });
+    }
 }
 
-TEST(CasProtobufFramingGolden, WatermarkFailClosedOnGarbage)
+TEST(CasHeaderGolden, WatermarkFailClosedOnGarbage)
 {
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeServerWatermark(String("")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeServerWatermark(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [] { decodeServerWatermark(String("CAWM\x02\x00\x02\x00", 8)); });
+    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION.
+    {
+        Proto::WatermarkProto msg;
+        auto * hdr = msg.mutable_header();
+        hdr->set_magic(magicFor(FormatId::Watermark));
+        hdr->set_compatibility_version(G_BUILD + 1);
+        std::string bytes; msg.SerializeToString(&bytes);
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeServerWatermark(bytes); });
+    }
 }
 
 TEST(CasPoolMeta, ConstantInvariantsPostParse)
@@ -568,5 +703,45 @@ TEST(CasPoolMeta, ConstantInvariantsPostParse)
         bad.blob_header_len = 32768;   /// > 16384
         const String bytes = encodePoolMeta(bad);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePoolMeta(bytes); });
+    }
+}
+
+/// ===================================================================================
+/// Task 5: pool-meta min_reader_generation startup gate
+/// ===================================================================================
+
+TEST(CasPoolMeta, MinReaderGenerationGate)
+{
+    /// A pool-meta with min_reader_generation == G_BUILD opens fine.
+    {
+        PoolMeta pm;
+        pm.pool_id = UInt128(42);
+        pm.root_shards = 1;
+        pm.blob_header_len = 96;
+        pm.min_reader_generation = G_BUILD;   /// at-floor: OK
+        const String bytes = encodePoolMeta(pm);
+        const PoolMeta d = decodePoolMeta(bytes);
+        EXPECT_EQ(d.min_reader_generation, G_BUILD);
+    }
+    /// A pool-meta with min_reader_generation == 0 (default) opens fine.
+    {
+        PoolMeta pm;
+        pm.pool_id = UInt128(43);
+        pm.root_shards = 1;
+        pm.blob_header_len = 96;
+        pm.min_reader_generation = 0;
+        const String bytes = encodePoolMeta(pm);
+        const PoolMeta d = decodePoolMeta(bytes);
+        EXPECT_EQ(d.min_reader_generation, 0u);
+    }
+    /// A pool-meta with min_reader_generation > G_BUILD => UNKNOWN_FORMAT_VERSION.
+    {
+        PoolMeta pm;
+        pm.pool_id = UInt128(44);
+        pm.root_shards = 1;
+        pm.blob_header_len = 96;
+        pm.min_reader_generation = G_BUILD + 1;   /// above the floor: this build is too old
+        const String bytes = encodePoolMeta(pm);
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodePoolMeta(bytes); });
     }
 }

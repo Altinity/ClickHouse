@@ -3,9 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <cas_root_shard.pb.h>
-#include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
 #include <algorithm>
@@ -24,9 +21,6 @@ namespace DB::Cas
 
 namespace
 {
-
-constexpr std::string_view GC_STATE_MAGIC  = "CAGT";
-constexpr std::string_view RETIRED_SET_MAGIC = "CART";
 
 /// ObjectKind <-> uint32 for the RetiredEntryProto.kind field (mirrors the enum values).
 uint32_t objectKindToProto(ObjectKind kind)
@@ -72,6 +66,13 @@ String encodeGcState(const GcState & state)
     chassert(state.snap_shards >= 1);   /// catch a zeroed GC constant at the write site
 
     Cas::Proto::GcStateProto msg;
+
+    /// Set CasHeader as field 1 (pure protobuf — no binary prefix).
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::GcState));
+    hdr->set_writer_version(currentWriterVersion());
+    hdr->set_compatibility_version(currentCompatibilityVersion());
+
     msg.set_round(state.round);
     msg.set_fence_seq(state.fence_seq);
     msg.set_snap_shards(state.snap_shards);
@@ -99,14 +100,10 @@ String encodeGcState(const GcState & state)
         }
     }
 
-    std::string body;
-    if (!msg.SerializeToString(&body))
+    std::string out;
+    if (!msg.SerializeToString(&out))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS gc/state: protobuf serialization failed");
-
-    WriteBufferFromOwnString out;
-    Cas::writeFramingHeader(out, GC_STATE_MAGIC, Cas::currentWriterVersion(Cas::FormatId::GcState));
-    writeString(body, out);
-    return std::move(out.str());
+    return out;
 }
 
 GcState decodeGcState(std::string_view data)
@@ -114,13 +111,17 @@ GcState decodeGcState(std::string_view data)
     if (data.empty())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: empty object");
 
-    ReadBufferFromMemory in(data.data(), data.size());
-    Cas::readFramingHeader(in, GC_STATE_MAGIC, "gc/state");
-    const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
-
+    /// Parse the whole message directly (pure protobuf, no binary prefix).
     Cas::Proto::GcStateProto msg;
-    if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+    if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: protobuf parse failed");
+
+    /// Check magic then compatibility_version BEFORE reading any other fields.
+    if (msg.header().magic() != magicFor(FormatId::GcState))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS gc/state: bad magic (got 0x{:08x}, expected 0x{:08x})",
+            msg.header().magic(), magicFor(FormatId::GcState));
+    checkCompatibility(msg.header().compatibility_version(), "gc/state");
 
     GcState state;
     state.round = msg.round();
@@ -148,6 +149,12 @@ GcState decodeGcState(std::string_view data)
 String encodeRetiredSet(const RetiredSet & set)
 {
     Cas::Proto::RetiredSetProto msg;
+
+    /// Set CasHeader as field 1 (pure protobuf — no binary prefix).
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::RetiredSet));
+    hdr->set_writer_version(currentWriterVersion());
+    hdr->set_compatibility_version(currentCompatibilityVersion());
 
     /// Sort entries deterministically (kind, hash-BE, token_value, token_type, size) so the
     /// encoded bytes are stable across encodes — mirrors the JSON encoder's ordered iteration.
@@ -181,14 +188,10 @@ String encodeRetiredSet(const RetiredSet & set)
         pe->set_size(ep->size);
     }
 
-    std::string body;
-    if (!msg.SerializeToString(&body))
+    std::string out;
+    if (!msg.SerializeToString(&out))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS retired set: protobuf serialization failed");
-
-    WriteBufferFromOwnString out;
-    Cas::writeFramingHeader(out, RETIRED_SET_MAGIC, Cas::currentWriterVersion(Cas::FormatId::RetiredSet));
-    writeString(body, out);
-    return std::move(out.str());
+    return out;
 }
 
 RetiredSet decodeRetiredSet(std::string_view data)
@@ -196,13 +199,17 @@ RetiredSet decodeRetiredSet(std::string_view data)
     if (data.empty())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS retired set: empty object");
 
-    ReadBufferFromMemory in(data.data(), data.size());
-    Cas::readFramingHeader(in, RETIRED_SET_MAGIC, "retired set");
-    const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
-
+    /// Parse the whole message directly (pure protobuf, no binary prefix).
     Cas::Proto::RetiredSetProto msg;
-    if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+    if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS retired set: protobuf parse failed");
+
+    /// Check magic then compatibility_version BEFORE reading any other fields.
+    if (msg.header().magic() != magicFor(FormatId::RetiredSet))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS retired set: bad magic (got 0x{:08x}, expected 0x{:08x})",
+            msg.header().magic(), magicFor(FormatId::RetiredSet));
+    checkCompatibility(msg.header().compatibility_version(), "retired set");
 
     RetiredSet set;
     set.entries.reserve(static_cast<size_t>(msg.entries_size()));

@@ -19,9 +19,10 @@ namespace DB::Cas
 /// `domain_id`, so it must be stable for the lifetime of the pool.
 struct PoolMeta
 {
-    UInt128 pool_id{};            /// minted at creation; doubles as the envelope domain_id
+    UInt128 pool_id{};                      /// minted at creation; doubles as the envelope domain_id
     uint64_t root_shards = 0;
     uint64_t blob_header_len = 0;
+    uint64_t min_reader_generation = 0;     /// startup gate: if G_BUILD < min_reader_generation => UNKNOWN_FORMAT_VERSION
 
     /// GET `_pool_meta`; absent => mint `pool_id` (`thread_local_rng`) and `casPut(expected=nullopt)` —
     /// a racing creator loses the CAS, re-reads, and validates like a reopen. Present => strict parse.

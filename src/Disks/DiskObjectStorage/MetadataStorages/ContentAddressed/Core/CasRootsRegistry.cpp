@@ -2,9 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <cas_root_shard.pb.h>
-#include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 
 namespace DB
@@ -19,28 +16,26 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-namespace
-{
-constexpr std::string_view ROOTS_REGISTRY_MAGIC = "CARR";
-}
-
 String encodeRootsRegistry(const RootsRegistry & registry)
 {
     Cas::Proto::RootsRegistryProto msg;
+
+    /// Set CasHeader as field 1 (pure protobuf — no binary prefix).
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::RootsRegistry));
+    hdr->set_writer_version(currentWriterVersion());
+    hdr->set_compatibility_version(currentCompatibilityVersion());
+
     msg.set_registry_version(registry.registry_version);
     msg.set_fence_round(registry.fence_round);
     /// `registry.namespaces` is a std::set<String> => already sorted ascending.
     for (const String & ns : registry.namespaces)
         msg.add_namespaces(ns);
 
-    std::string body;
-    if (!msg.SerializeToString(&body))
+    std::string out;
+    if (!msg.SerializeToString(&out))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS roots registry: protobuf serialization failed");
-
-    WriteBufferFromOwnString out;
-    Cas::writeFramingHeader(out, ROOTS_REGISTRY_MAGIC, Cas::currentWriterVersion(Cas::FormatId::RootsRegistry));
-    writeString(body, out);
-    return std::move(out.str());
+    return out;
 }
 
 RootsRegistry decodeRootsRegistry(std::string_view data)
@@ -50,13 +45,17 @@ RootsRegistry decodeRootsRegistry(std::string_view data)
         if (data.empty())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS roots registry: empty object");
 
-        ReadBufferFromMemory in(data.data(), data.size());
-        Cas::readFramingHeader(in, ROOTS_REGISTRY_MAGIC, "roots registry");
-        const std::string_view body = data.substr(Cas::FRAMING_HEADER_SIZE);
-
+        /// Parse the whole message directly (pure protobuf, no binary prefix).
         Cas::Proto::RootsRegistryProto msg;
-        if (!msg.ParseFromArray(body.data(), static_cast<int>(body.size())))
+        if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS roots registry: protobuf parse failed");
+
+        /// Check magic then compatibility_version BEFORE reading any other fields.
+        if (msg.header().magic() != magicFor(FormatId::RootsRegistry))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS roots registry: bad magic (got 0x{:08x}, expected 0x{:08x})",
+                msg.header().magic(), magicFor(FormatId::RootsRegistry));
+        checkCompatibility(msg.header().compatibility_version(), "roots registry");
 
         RootsRegistry registry;
         registry.registry_version = msg.registry_version();
