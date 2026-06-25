@@ -631,9 +631,6 @@ bool StorageObjectStorage::optimize(
 
 bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
 {
-<<<<<<< HEAD
-    if (!configuration->partition_strategy)
-=======
     if (isDataLake())
     {
         /// We did configuration->update() in constructor,
@@ -649,8 +646,7 @@ bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
         return configuration->getExternalMetadata()->supportsImport(local_context);
     }
 
-    if (!configuration->getPartitionStrategy())
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
+    if (!configuration->partition_strategy)
         return false;
 
     if (configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::WILDCARD)

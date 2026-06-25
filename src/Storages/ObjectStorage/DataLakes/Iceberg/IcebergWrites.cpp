@@ -416,9 +416,7 @@ void generateManifestFile(
     const std::vector<String> & partition_columns,
     const std::vector<Field> & partition_values,
     const std::vector<DataTypePtr> & partition_types,
-    const std::vector<IcebergPathFromMetadata> & data_file_names,
-    const std::vector<UInt64> & data_file_row_counts,
-    const std::vector<UInt64> & data_file_byte_counts,
+    const std::vector<String> & data_file_names,
     const std::optional<DataFileStatistics> & data_file_statistics,
     SharedHeader sample_block,
     Poco::JSON::Object::Ptr new_snapshot,
@@ -427,11 +425,7 @@ void generateManifestFile(
     Int64 partition_spec_id,
     WriteBuffer & buf,
     Iceberg::FileContentType content_type,
-<<<<<<< HEAD
-    std::optional<Int64> user_defined_sequence_number)
-=======
     const std::vector<IcebergSerializedFileStats> & per_file_stats)
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
 {
     Int32 version = metadata->getValue<Int32>(Iceberg::f_format_version);
     String schema_representation;
@@ -504,7 +498,7 @@ void generateManifestFile(
         avro::GenericRecord & data_file = manifest.field(Iceberg::f_data_file).value<avro::GenericRecord>();
         if (version > 1)
             data_file.field(Iceberg::f_content) = avro::GenericDatum(static_cast<Int32>(content_type));
-        data_file.field(Iceberg::f_file_path) = avro::GenericDatum(data_file_name.serialize());
+        data_file.field(Iceberg::f_file_path) = avro::GenericDatum(data_file_name);
         data_file.field(Iceberg::f_file_format) = avro::GenericDatum(format);
 
         /// vibe coded - needs extra attention
@@ -532,35 +526,6 @@ void generateManifestFile(
                 }
             };
 
-<<<<<<< HEAD
-            auto statistics = data_file_statistics->getColumnSizes();
-            set_fields(statistics, Iceberg::f_column_sizes, [](size_t, size_t value) { return static_cast<Int64>(value); });
-
-            statistics = data_file_statistics->getNullCounts();
-            set_fields(statistics, Iceberg::f_null_value_counts, [](size_t, size_t value) { return static_cast<Int64>(value); });
-
-            std::unordered_map<size_t, size_t> field_id_to_column_index;
-            auto field_ids = data_file_statistics->getFieldIds();
-            for (size_t i = 0; i < field_ids.size(); ++i)
-                field_id_to_column_index[field_ids[i]] = i;
-
-            auto dump_fields = [&](size_t field_id, Field value)
-            { return dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_column_index.at(field_id)]); };
-
-            auto lower_statistics = data_file_statistics->getLowerBounds();
-            if (canWriteStatistics(lower_statistics, field_id_to_column_index, sample_block))
-            {
-                set_fields(lower_statistics, Iceberg::f_lower_bounds, dump_fields);
-            }
-            auto upper_statistics = data_file_statistics->getUpperBounds();
-            if (canWriteStatistics(upper_statistics, field_id_to_column_index, sample_block))
-            {
-                set_fields(upper_statistics, Iceberg::f_upper_bounds, dump_fields);
-            }
-        }
-        data_file.field(Iceberg::f_record_count) = avro::GenericDatum(static_cast<Int64>(data_file_row_counts[file_idx]));
-        data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(static_cast<Int64>(data_file_byte_counts[file_idx]));
-=======
             auto write_bytes_map = [&](const std::vector<std::pair<Int32, std::vector<uint8_t>>> & entries, const String & field_name)
             {
                 if (entries.empty())
@@ -644,7 +609,6 @@ void generateManifestFile(
                 data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(summary->getValue<Int64>(Iceberg::f_added_files_size));
             }
         }
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
         avro::GenericRecord & partition_record = data_file.field("partition").value<avro::GenericRecord>();
         for (size_t i = 0; i < partition_columns.size(); ++i)
         {
@@ -1240,8 +1204,6 @@ bool IcebergStorageSink::initializeMetadata()
                     partition_key,
                     partitioner ? partitioner->getResultTypes() : std::vector<DataTypePtr>{},
                     writer.getDataFiles(),
-                    writer.getDataFileRowCounts(),
-                    writer.getDataFileByteCounts(),
                     writer.getResultStatistics(),
                     sample_block,
                     new_snapshot,

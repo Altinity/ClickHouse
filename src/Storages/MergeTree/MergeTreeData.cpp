@@ -18,25 +18,9 @@
 #include <Backups/IBackup.h>
 #include <Backups/RestorerFromBackup.h>
 #include <Columns/ColumnAggregateFunction.h>
-<<<<<<< HEAD
 #include <Compression/CompressedReadBuffer.h>
-#include "Storages/MergeTree/ExportPartTask.h"
-=======
-#include <Common/Config/ConfigHelper.h>
-#include <Common/CurrentMetrics.h>
-#include <Common/Increment.h>
-#include <Common/ProfileEventsScope.h>
-#include <Common/Stopwatch.h>
-#include <Common/StringUtils.h>
-#include <Common/ThreadFuzzer.h>
-#include <Common/escapeForFileName.h>
-#include <Common/noexcept_scope.h>
-#include <Common/quoteString.h>
-#include <Common/typeid_cast.h>
-#include <Common/thread_local_rng.h>
 #include <Storages/MergeTree/ExportPartTask.h>
 #include <Storages/MergeTree/ExportPartitionUtils.h>
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
@@ -114,18 +98,12 @@
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
 #include <Storages/MergeTree/PrimaryIndexCache.h>
-<<<<<<< HEAD
 #include <Storages/MergeTree/RangesInDataPart.h>
-=======
-#include <Storages/Statistics/ConditionSelectivityEstimator.h>
-#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
 #include <Storages/MergeTree/checkDataPart.h>
 #include <Storages/MutationCommands.h>
 #include <Storages/Statistics/ConditionSelectivityEstimator.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/VirtualColumnUtils.h>
-<<<<<<< HEAD
 #include <Common/Config/ConfigHelper.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Increment.h>
@@ -144,13 +122,8 @@
 #include <Common/scope_guard_safe.h>
 #include <Common/thread_local_rng.h>
 #include <Common/typeid_cast.h>
-=======
-#include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
-#include <QueryPipeline/QueryPipelineBuilder.h>
-#include <Storages/MergeTree/MergeTreeIndexGranularityAdaptive.h>
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
 #include <Functions/generateSnowflakeID.h>
 
 #include <boost/algorithm/string/join.hpp>
@@ -6933,13 +6906,11 @@ void MergeTreeData::exportPartToTable(
         }
         else
         {
-            /// ever since Anton introduced swarms, object storage instances are always a StorageObjectStorageCluster
-            auto * object_storage = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
+            auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
 
-            /// in theory this should never happen, but just in case
             if (!object_storage)
             {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorageCluster", dest_storage->getName());
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorage", dest_storage->getName());
             }
 
             auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));

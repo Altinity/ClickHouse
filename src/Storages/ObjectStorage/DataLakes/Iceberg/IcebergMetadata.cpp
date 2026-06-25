@@ -1408,14 +1408,18 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 
     CompressionMethod metadata_compression_method = persistent_components.metadata_compression_method;
 
-    auto [metadata_name, storage_metadata_name] = filename_generator.generateMetadataName();
+    auto metadata_file_info = filename_generator.generateMetadataPathWithInfo();
+    const auto metadata_file_path = metadata_file_info.path;
+    String storage_metadata_name = persistent_components.path_resolver.resolve(metadata_file_path);
 
     Int64 parent_snapshot = -1;
     if (metadata->has(Iceberg::f_current_snapshot_id))
         parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
 
-    auto [new_snapshot, manifest_list_name, storage_manifest_list_name] = MetadataGenerator(metadata).generateNextMetadata(
-        filename_generator, metadata_name, parent_snapshot, total_data_files, total_rows, total_chunks_size, total_data_files, /* added_delete_files */0, /* num_deleted_rows */0);
+    auto metadata_result = MetadataGenerator(metadata).generateNextMetadata(
+        filename_generator, metadata_file_path, parent_snapshot, total_data_files, total_rows, total_chunks_size, total_data_files, /* added_delete_files */0, /* num_deleted_rows */0);
+    auto & new_snapshot = metadata_result.snapshot;
+    String storage_manifest_list_name = persistent_components.path_resolver.resolve(metadata_result.manifest_list_path);
 
     /// Embed the stable transaction identifier in the snapshot summary so that a retry after crash
     /// can detect the commit already happened by scanning the live snapshots array, without extra S3
@@ -1516,9 +1520,9 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     try
     {
         {
-            auto result = filename_generator.generateManifestEntryName();
-            manifest_entry_name = result.path_in_metadata;
-            storage_manifest_entry_name = result.path_in_storage;
+            auto manifest_entry_path = filename_generator.generateManifestEntryName();
+            manifest_entry_name = manifest_entry_path.serialize();
+            storage_manifest_entry_name = persistent_components.path_resolver.resolve(manifest_entry_path);
         }
 
         auto buffer_manifest_entry = object_storage->writeObject(
@@ -1562,7 +1566,16 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
             try
             {
                 generateManifestList(
-                    filename_generator, metadata, object_storage, context, {manifest_entry_name}, new_snapshot, manifest_lengths, *buffer_manifest_list, Iceberg::FileContentType::DATA, true);
+                    persistent_components.path_resolver,
+                    metadata,
+                    object_storage,
+                    context,
+                    {Iceberg::IcebergPathFromMetadata::deserialize(manifest_entry_name)},
+                    new_snapshot,
+                    {static_cast<Int64>(manifest_lengths)},
+                    *buffer_manifest_list,
+                    Iceberg::FileContentType::DATA,
+                    true);
                 buffer_manifest_list->finalize();
             }
             catch (...)
@@ -1578,11 +1591,12 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
             std::string json_representation = removeEscapedSlashes(oss.str());
 
             LOG_DEBUG(log, "Writing new metadata file {}", storage_metadata_name);
-            auto hint = filename_generator.generateVersionHint();
+            auto hint_path = filename_generator.generateVersionHint();
+            String hint_storage_path = persistent_components.path_resolver.resolve(hint_path);
             if (!writeMetadataFileAndVersionHint(
                     storage_metadata_name,
                     json_representation,
-                    hint.path_in_storage,
+                    hint_storage_path,
                     storage_metadata_name,
                     object_storage,
                     context,
@@ -1598,9 +1612,9 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 
             if (catalog)
             {
-                String catalog_filename = metadata_name;
+                String catalog_filename = metadata_file_path.serialize();
                 if (!catalog_filename.starts_with(blob_storage_type_name))
-                    catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_name;
+                    catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_file_path.serialize();
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
                 if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))

@@ -37,19 +37,9 @@ public:
 
     UInt64 getResultBytes() const;
 
-    const std::vector<Iceberg::IcebergPathFromMetadata> & getDataFiles() const
+    const std::vector<String> & getDataFiles() const
     {
         return data_file_names;
-    }
-
-    const std::vector<UInt64> & getDataFileRowCounts() const
-    {
-        return data_file_row_counts;
-    }
-
-    const std::vector<UInt64> & getDataFileByteCounts() const
-    {
-        return data_file_byte_counts;
     }
 
     const DataFileStatistics & getResultStatistics() const
@@ -57,36 +47,14 @@ public:
         return aggregate_stats;
     }
 
-<<<<<<< HEAD
-    const std::vector<DataFileStatisticsPtr> & getPerFileStatistics() const
-    {
-        return completed_file_stats;
-    }
-=======
     /// Returns one entry per written data file, with the accurate row count, byte size,
     /// and per-file column statistics collected during finalization.
     /// Must be called only after finalize().
     std::vector<IcebergDataFileEntry> getDataFileEntries() const;
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
 
 private:
     UInt64 max_data_file_num_rows;
     UInt64 max_data_file_num_bytes;
-<<<<<<< HEAD
-    Poco::JSON::Array::Ptr schema;
-    DataFileStatistics stats;
-    DataFileStatisticsPtr current_file_stats;
-    std::vector<DataFileStatisticsPtr> completed_file_stats;
-    /// Pre-built ColumnMapper for `startNewFile`. Traversing the Iceberg schema is invariant
-    /// for the lifetime of the writer, so we compute the mapping once and reuse it across
-    /// every rolled-over data file instead of recomputing it on each rollover.
-    ColumnMapperPtr column_mapper;
-    std::optional<size_t> current_file_num_rows = std::nullopt;
-    std::optional<size_t> current_file_num_bytes = std::nullopt;
-    std::vector<Iceberg::IcebergPathFromMetadata> data_file_names;
-    std::vector<UInt64> data_file_row_counts;
-    std::vector<UInt64> data_file_byte_counts;
-=======
     DataFileStatistics aggregate_stats;   /// accumulates across all files
     DataFileStatistics current_file_stats; /// accumulates for the current file only
     std::optional<size_t> current_file_num_rows = std::nullopt;
@@ -95,7 +63,6 @@ private:
     std::vector<Int64> per_file_record_counts;
     std::vector<Int64> per_file_byte_sizes;
     std::vector<DataFileStatistics> per_file_stats_list;
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
     std::unique_ptr<WriteBufferFromFileBase> buffer;
     OutputFormatPtr output_format;
     FileNamesGenerator & filename_generator;

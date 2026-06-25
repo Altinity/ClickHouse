@@ -6,11 +6,8 @@
 #include <Core/Field.h>
 #include <Core/NamesAndTypes.h>
 #include <Core/Types.h>
-<<<<<<< HEAD
-=======
 #include <Core/Range.h>
 #include <DataTypes/IDataType.h>
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
 #include <Databases/DataLake/ICatalog.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Formats/FormatParserSharedResources.h>

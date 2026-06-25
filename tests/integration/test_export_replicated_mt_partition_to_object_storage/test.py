@@ -13,65 +13,6 @@ from helpers.export_partition_helpers import (
 from helpers.network import PartitionManager
 
 
-<<<<<<< HEAD
-def wait_for_export_status(
-    node,
-    mt_table: str,
-    s3_table: str,
-    partition_id: str,
-    expected_status: str = "COMPLETED",
-    timeout: int = 30,
-    poll_interval: float = 0.5,
-):
-    start_time = time.time()
-    last_status = None
-    while time.time() - start_time < timeout:
-        status = node.query(
-            f"""
-            SELECT status FROM system.replicated_partition_exports
-            WHERE source_table = '{mt_table}'
-                AND destination_table = '{s3_table}'
-                AND partition_id = '{partition_id}'
-            """
-        ).strip()
-        
-        last_status = status
-
-        if status and status == expected_status:
-            return status
-
-        time.sleep(poll_interval)
-
-    raise TimeoutError(
-        f"Export status did not reach '{expected_status}' within {timeout}s. Last status: '{last_status}'")
-
-
-def wait_for_export_to_start(
-    node,
-    mt_table: str,
-    s3_table: str,
-    partition_id: str,
-    timeout: int = 10,
-    poll_interval: float = 0.2,
-):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        count = node.query(
-            f"""
-            SELECT count() FROM system.replicated_partition_exports
-            WHERE source_table = '{mt_table}'
-              AND destination_table = '{s3_table}'
-              AND partition_id = '{partition_id}'
-            """
-        ).strip()
-        
-        if count != '0':
-            return True
-        
-        time.sleep(poll_interval)
-    
-    raise TimeoutError(f"Export did not start within {timeout}s. ")
-=======
 
 def skip_if_remote_database_disk_enabled(cluster):
     """Skip test if any instance in the cluster has remote database disk enabled.
@@ -82,7 +23,6 @@ def skip_if_remote_database_disk_enabled(cluster):
     for instance in cluster.instances.values():
         if instance.with_remote_database_disk:
             pytest.skip("Test cannot run with remote database disk enabled (db disk), as it blocks MinIO which stores database metadata")
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
 
 
 @pytest.fixture(scope="module")
@@ -180,11 +120,8 @@ def create_s3_table(node, s3_table):
 
 
 def create_tables_and_insert_data(node, mt_table, s3_table, replica_name):
-<<<<<<< HEAD
-=======
     node.query(f"DROP TABLE IF EXISTS {mt_table} SYNC")
     # enable_block_number_column and enable_block_offset_column are needed for patch parts support
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
     node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple() SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1")
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
 

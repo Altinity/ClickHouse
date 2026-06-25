@@ -181,20 +181,9 @@ public:
 
     void drop(ContextPtr context) override;
 
-<<<<<<< HEAD
-=======
-    ObjectIterator createIcebergKeysIterator(
-        Strings && data_files_,
-        ObjectStoragePtr,
-        IDataLakeMetadata::FileProgressCallback callback_,
-        ContextPtr local_context);
-
-    std::optional<String> partitionKey(ContextPtr) const override;
-    std::optional<String> sortingKey(ContextPtr) const override;
-
     Poco::JSON::Object::Ptr getMetadataJSON(ContextPtr local_context) const;
 
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
+
 private:
     static Iceberg::PersistentTableComponents initializePersistentTableComponents(
         ObjectStoragePtr object_storage,
@@ -214,11 +203,6 @@ private:
     Iceberg::IcebergDataSnapshotPtr
     getRelevantDataSnapshotFromTableStateSnapshot(Iceberg::TableStateSnapshot table_state_snapshot, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getRelevantState(const ContextPtr & context, bool force_fetch_latest_metadata = false) const;
-
-<<<<<<< HEAD
-=======
-    std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
-    KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
 
     bool commitImportPartitionTransactionImpl(
         FileNamesGenerator & filename_generator,
@@ -242,7 +226,7 @@ private:
         const String & blob_storage_namespace_name,
         ContextPtr context);
 
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
+
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
     const DB::Iceberg::PersistentTableComponents persistent_components;

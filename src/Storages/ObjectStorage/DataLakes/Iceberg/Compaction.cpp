@@ -439,30 +439,16 @@ void writeMetadataFiles(
             if (!snapshot)
                 continue;
 
-            std::vector<Iceberg::IcebergPathFromMetadata> data_files_vec(data_filenames.begin(), data_filenames.end());
-            std::vector<UInt64> file_row_counts;
-            std::vector<UInt64> file_byte_counts;
-            for (const auto & path : data_files_vec)
-            {
-                if (auto it = patched_path_to_data_file.find(path); it != patched_path_to_data_file.end())
-                {
-                    file_row_counts.push_back(it->second->new_records_count);
-                    file_byte_counts.push_back(it->second->new_bytes_count);
-                }
-                else
-                {
-                    file_row_counts.push_back(0);
-                    file_byte_counts.push_back(0);
-                }
-            }
+            std::vector<String> data_files_vec;
+            data_files_vec.reserve(data_filenames.size());
+            for (const auto & path : data_filenames)
+                data_files_vec.push_back(path.serialize());
             generateManifestFile(
                 metadata_object,
                 partition_columns,
                 plan.partition_encoder.getPartitionValue(grouped_by_manifest_files_partitions[manifest_entry]),
                 ChunkPartitioner(fields_from_partition_spec, current_schema->getArray(Iceberg::f_fields), context, sample_block_).getResultTypes(),
                 data_files_vec,
-                file_row_counts,
-                file_byte_counts,
                 manifest_entry->statistics,
                 sample_block_,
                 snapshot,

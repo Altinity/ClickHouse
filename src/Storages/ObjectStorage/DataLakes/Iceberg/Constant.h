@@ -137,7 +137,6 @@ DEFINE_ICEBERG_FIELD_ALIAS(metadata_log, metadata-log);
 DEFINE_ICEBERG_FIELD_ALIAS(partition_statistics, partition-statistics);
 DEFINE_ICEBERG_FIELD_ALIAS(statistics_path, statistics-path);
 DEFINE_ICEBERG_FIELD_ALIAS(metadata_sequence_number, sequence-number);
-<<<<<<< HEAD
 DEFINE_ICEBERG_FIELD_ALIAS(min_snapshots_to_keep, history.expire.min-snapshots-to-keep);
 DEFINE_ICEBERG_FIELD_ALIAS(max_snapshot_age_ms, history.expire.max-snapshot-age-ms);
 DEFINE_ICEBERG_FIELD_ALIAS(max_ref_age_ms, history.expire.max-ref-age-ms);
@@ -145,9 +144,7 @@ DEFINE_ICEBERG_FIELD_ALIAS(max_ref_age_ms, history.expire.max-ref-age-ms);
 DEFINE_ICEBERG_FIELD_ALIAS(ref_min_snapshots_to_keep, min-snapshots-to-keep);
 DEFINE_ICEBERG_FIELD_ALIAS(ref_max_snapshot_age_ms, max-snapshot-age-ms);
 DEFINE_ICEBERG_FIELD_ALIAS(ref_max_ref_age_ms, max-ref-age-ms);
-=======
 DEFINE_ICEBERG_FIELD_ALIAS(clickhouse_export_partition_transaction_id, clickhouse.export-partition-transaction-id);
->>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
 /// These are compound fields like `data_file.file_path`, we use prefix 'c_' to distinguish them.
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, file_path);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, file_format);
