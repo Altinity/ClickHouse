@@ -29,6 +29,9 @@ BINARY_DOCKER_COMMAND = (
     f"+--volume=.:/ClickHouse"
     '+--env=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"+--env=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"'
 )
+BINARY_DOCKER_COMMAND_SANITIZER = (
+    BINARY_DOCKER_COMMAND + "+--security-opt seccomp=unconfined"
+)
 
 if Utils.is_arm():
     docker_sock_mount = "--volume=/var/run:/run/host:ro"
@@ -79,6 +82,19 @@ common_build_job_config = Job.Config(
     requires=[],
     command='python3 ./ci/jobs/build_clickhouse.py --build-type "{PARAMETER}"',
     run_in_docker=BINARY_DOCKER_COMMAND,
+    timeout=3600 * 4,
+    digest_config=build_digest_config,
+    needs_submodules=True,
+)
+
+# TSan and MSan builds need seccomp disabled so the sanitizer runtimes can manage
+# their address-space layout inside the build container.
+common_sanitizer_build_job_config = Job.Config(
+    name=JobNames.BUILD,
+    runs_on=[],  # from parametrize()
+    requires=[],
+    command='python3 ./ci/jobs/build_clickhouse.py --build-type "{PARAMETER}"',
+    run_in_docker=BINARY_DOCKER_COMMAND_SANITIZER,
     timeout=3600 * 4,
     digest_config=build_digest_config,
     needs_submodules=True,
@@ -269,24 +285,6 @@ class JobConfigs:
             runs_on=RunnerLabels.BUILDER_AMD,
         ),
         Job.ParamSet(
-            parameter=BuildTypes.AMD_TSAN,
-            provides=[
-                ArtifactNames.CH_AMD_TSAN,
-                ArtifactNames.DEB_AMD_TSAN,
-                ArtifactNames.UNITTEST_AMD_TSAN,
-            ],
-            runs_on=RunnerLabels.BUILDER_AMD,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.AMD_MSAN,
-            provides=[
-                ArtifactNames.CH_AMD_MSAN,
-                ArtifactNames.DEB_AMD_MSAN,
-                ArtifactNames.UNITTEST_AMD_MSAN,
-            ],
-            runs_on=RunnerLabels.BUILDER_AMD,
-        ),
-        Job.ParamSet(
             parameter=BuildTypes.AMD_BINARY,
             provides=[ArtifactNames.CH_AMD_BINARY],
             runs_on=RunnerLabels.BUILDER_AMD,
@@ -305,6 +303,40 @@ class JobConfigs:
             runs_on=RunnerLabels.ARM_LARGE,
         ),
         Job.ParamSet(
+            parameter=BuildTypes.ARM_UBSAN,
+            provides=[ArtifactNames.CH_ARM_UBSAN, ArtifactNames.DEB_ARM_UBSAN],
+            runs_on=RunnerLabels.ARM_LARGE,
+        ),
+        Job.ParamSet(
+            parameter=BuildTypes.ARM_BINARY,
+            provides=[ArtifactNames.CH_ARM_BINARY],
+            runs_on=RunnerLabels.BUILDER_AMD,
+        ),
+    ) + common_sanitizer_build_job_config.set_post_hooks(
+        post_hooks=[
+            # "python3 ./ci/jobs/scripts/job_hooks/build_master_head_hook.py",
+            # "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
+        ],
+    ).parametrize(
+        Job.ParamSet(
+            parameter=BuildTypes.AMD_TSAN,
+            provides=[
+                ArtifactNames.CH_AMD_TSAN,
+                ArtifactNames.DEB_AMD_TSAN,
+                ArtifactNames.UNITTEST_AMD_TSAN,
+            ],
+            runs_on=RunnerLabels.BUILDER_AMD,
+        ),
+        Job.ParamSet(
+            parameter=BuildTypes.AMD_MSAN,
+            provides=[
+                ArtifactNames.CH_AMD_MSAN,
+                ArtifactNames.DEB_AMD_MSAN,
+                ArtifactNames.UNITTEST_AMD_MSAN,
+            ],
+            runs_on=RunnerLabels.BUILDER_AMD,
+        ),
+        Job.ParamSet(
             parameter=BuildTypes.ARM_TSAN,
             provides=[
                 ArtifactNames.CH_ARM_TSAN,
@@ -316,16 +348,6 @@ class JobConfigs:
             parameter=BuildTypes.ARM_MSAN,
             provides=[ArtifactNames.CH_ARM_MSAN, ArtifactNames.DEB_ARM_MSAN],
             runs_on=RunnerLabels.ARM_LARGE,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.ARM_UBSAN,
-            provides=[ArtifactNames.CH_ARM_UBSAN, ArtifactNames.DEB_ARM_UBSAN],
-            runs_on=RunnerLabels.ARM_LARGE,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.ARM_BINARY,
-            provides=[ArtifactNames.CH_ARM_BINARY],
-            runs_on=RunnerLabels.BUILDER_AMD,
         ),
     )
     coverage_build_jobs = common_build_job_config.parametrize(
