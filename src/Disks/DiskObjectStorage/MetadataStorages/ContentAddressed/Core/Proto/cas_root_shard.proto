@@ -15,7 +15,7 @@ package DB.Cas.Proto;
 //   protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto < manifest.bin
 // Per-object magic (4 ASCII bytes as little-endian fixed32):
 //   RootShardManifest "CARS" | PoolMetaProto "CAPM" | WatermarkProto "CAWM" | GcStateProto "CAGT"
-//   RetiredSetProto "CART" | HeartbeatProto "CAHB" | RootsRegistryProto "CARR" | GcOutcomeLogProto "CAGO"
+//   RetiredSetProto "CART" | RootsRegistryProto "CARR" | GcOutcomeLogProto "CAGO"
 // (gc-snap stays a versioned binary+zstd codec — GC-internal, not an interchange format; B176 defers
 // its protobuf conversion.)
 //
@@ -153,16 +153,6 @@ message GcStateProto {
   uint64 snap_pruned_through    = 6;
   GcLeaseProto lease            = 7;
   repeated FenceVersionEntryProto fence_version = 8;
-}
-
-// Build heartbeat (builds/<build_id>). Magic CAHB, FormatId::Heartbeat.
-// CasHeader is field 1; existing fields renumbered from 2 to free field 1.
-// server_id: raw 16 bytes (UInt128, big-endian).
-message HeartbeatProto {
-  CasHeader header          = 1;  // magic=CAHB; set by encoder, checked by decoder
-  bytes  server_id          = 2;  // raw 16 bytes (UInt128, big-endian)
-  uint64 heartbeat_seq      = 3;  // strictly monotone within one build
-  uint64 created_at_ms      = 4;  // DIAGNOSTIC ONLY — no protocol decision reads writer clocks
 }
 
 // Namespace registry (gc/registry). Magic CARR, FormatId::RootsRegistry.

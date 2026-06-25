@@ -47,17 +47,6 @@ extern const Event CasGcGet;
 extern const Event CasGcDelete;
 extern const Event CasGcList;
 
-extern const Event CasBuildPut;
-extern const Event CasBuildPutDedup;
-extern const Event CasBuildOverwrite;
-extern const Event CasBuildCas;
-extern const Event CasBuildCasConflict;
-extern const Event CasBuildHead;
-extern const Event CasBuildHeadMiss;
-extern const Event CasBuildGet;
-extern const Event CasBuildDelete;
-extern const Event CasBuildList;
-
 extern const Event CasServerPut;
 extern const Event CasServerPutDedup;
 extern const Event CasServerOverwrite;
@@ -104,10 +93,6 @@ static const ProfileEvents::Event cas_event_table[CAS_NS_COUNT][CAS_OP_COUNT] =
                   ProfileEvents::CasGcCas, ProfileEvents::CasGcCasConflict, ProfileEvents::CasGcHead,
                   ProfileEvents::CasGcHeadMiss, ProfileEvents::CasGcGet, ProfileEvents::CasGcDelete,
                   ProfileEvents::CasGcList},
-    /* Build  */ {ProfileEvents::CasBuildPut, ProfileEvents::CasBuildPutDedup, ProfileEvents::CasBuildOverwrite,
-                  ProfileEvents::CasBuildCas, ProfileEvents::CasBuildCasConflict, ProfileEvents::CasBuildHead,
-                  ProfileEvents::CasBuildHeadMiss, ProfileEvents::CasBuildGet, ProfileEvents::CasBuildDelete,
-                  ProfileEvents::CasBuildList},
     /* Server */ {ProfileEvents::CasServerPut, ProfileEvents::CasServerPutDedup, ProfileEvents::CasServerOverwrite,
                   ProfileEvents::CasServerCas, ProfileEvents::CasServerCasConflict, ProfileEvents::CasServerHead,
                   ProfileEvents::CasServerHeadMiss, ProfileEvents::CasServerGet, ProfileEvents::CasServerDelete,
@@ -131,13 +116,11 @@ CasNs classifyCasNs(const String & key)
     if (key.ends_with("/_watermark"))
         return CasNs::Server;
     if (key.find("/_precommits/") != String::npos)
-        return CasNs::Build;
+        return CasNs::Server;
     if (key.find("/roots/") != String::npos)
         return CasNs::Root;
     if (key.find("/gc/") != String::npos)
         return CasNs::Gc;
-    if (key.find("/builds/") != String::npos)
-        return CasNs::Build;
     return CasNs::Other;
 }
 

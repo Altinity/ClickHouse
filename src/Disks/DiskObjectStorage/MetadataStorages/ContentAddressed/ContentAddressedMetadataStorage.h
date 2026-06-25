@@ -192,7 +192,7 @@ private:
     String pool_uuid;
     std::unique_ptr<ContentAddressed::CasGcScheduler> gc_scheduler;
     /// Derived from object_storage->isReadOnly() at startup (the disk's <readonly> config). When set:
-    /// the probe is skipped, no heartbeats, no GC scheduler, and the mutating surface fails closed.
+    /// the probe is skipped, no watermark, no GC scheduler, and the mutating surface fails closed.
     bool read_only = false;
     /// Joined in front of core keys for DIRECT object_storage reads. The Emulated (Local) backend
     /// maps bare pool keys under getCommonKeyPrefix; Native passes keys through - this member

@@ -85,11 +85,7 @@ Build::Build(StorePtr store_, UInt128 build_id_,
 
 Build::~Build()
 {
-    /// Crash semantics: the Build dtor takes no special action on the heartbeat. If the build was not
-    /// abandoned, the heartbeat keeper's own dtor stops its background thread WITHOUT discarding the
-    /// key, so the uploads become debris that full GC reclaims under the heartbeat rules (spec §5).
-    /// abandon() is the only path that proactively discards.
-    /// Retire our build_seq from the Store's active set so the GC watermark floor (minActive) can
+    /// Crash semantics: the Build dtor retires the build_seq so the GC watermark floor (minActive) can
     /// advance even if neither publish nor abandon ran (idempotent — safe if already retired).
     store->retireBuildSeq(build_seq);
 }

@@ -123,9 +123,9 @@ public:
     /// DELETE-SITE AUDIT (closeout invariant; grep `deleteExact` under Core/): the recheck holds
     /// the ONLY content (reachability) delete in the whole core, behind the four INV-NO-LOSS
     /// gates. Every other deleteExact caller removes a non-content object it owns: the recheck's
-    /// retired-set drop and the resume path (GC metadata), HeartbeatKeeper discard (its own
-    /// heartbeat), dropNamespace (verbatim files, never content-addressed), and the capability
-    /// probe (throwaway probe keys). Adding a second content-delete site is a protocol defect.
+    /// retired-set drop and the resume path (GC metadata), dropNamespace (verbatim files, never
+    /// content-addressed), and the capability probe (throwaway probe keys). Adding a second
+    /// content-delete site is a protocol defect.
 
 private:
     /// Lease acquire/renew/steal per the documented observation protocol. On success `state` holds

@@ -27,7 +27,6 @@ namespace DB::Cas
 ///   - verbatim files:   POOL/roots/NAMESPACE/_files/FILE_NAME
 ///   - GC snapshots:     POOL/gc/snap/GENERATION/SNAP_SHARD
 ///   - other GC state:   POOL/gc/...
-///   - build heartbeats: POOL/builds/S/BUILD_ID
 ///   - pool metadata:    POOL/_pool_meta
 ///
 /// NAMESPACE is opaque to the core: the wiring composes strings like "srv1/<table_uuid>" or
@@ -175,12 +174,6 @@ public:
     String checkpointKey(uint64_t version) const
     {
         return prefix + "/gc/checkpoint/" + std::to_string(version);
-    }
-
-    /// Build heartbeat key.
-    String buildHeartbeatKey(const String & build_id) const
-    {
-        return shardedKey("builds", build_id);
     }
 
     /// Per-server watermark key, under the server's own `roots/<server-hex>/` subtree (Phase 6):

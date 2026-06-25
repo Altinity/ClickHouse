@@ -16,7 +16,7 @@ TEST(CasFormat, ChangePointsExistForEveryClass)
     for (auto id : {FormatId::Blob, FormatId::Tree, FormatId::Manifest, FormatId::GcSnap,
                     FormatId::GcState, FormatId::RetiredSet, FormatId::Watermark,
                     FormatId::PoolMeta, FormatId::Roster,
-                    FormatId::Heartbeat, FormatId::RootsRegistry, FormatId::GcOutcomes})
+                    FormatId::RootsRegistry, FormatId::GcOutcomes})
     {
         auto cps = changePoints(id);
         ASSERT_FALSE(cps.empty());
@@ -71,7 +71,6 @@ TEST(CasFormat, MagicForEachMutableObjectClass)
     EXPECT_EQ(le32toStr(magicFor(FormatId::Watermark)),     "CAWM");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcState)),       "CAGT");
     EXPECT_EQ(le32toStr(magicFor(FormatId::RetiredSet)),    "CART");
-    EXPECT_EQ(le32toStr(magicFor(FormatId::Heartbeat)),     "CAHB");
     EXPECT_EQ(le32toStr(magicFor(FormatId::RootsRegistry)), "CARR");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcOutcomes)),    "CAGO");
 }
@@ -110,7 +109,6 @@ TEST(CasFormat, MagicsAreDistinct)
         magicFor(FormatId::Watermark),
         magicFor(FormatId::GcState),
         magicFor(FormatId::RetiredSet),
-        magicFor(FormatId::Heartbeat),
         magicFor(FormatId::RootsRegistry),
         magicFor(FormatId::GcOutcomes),
     };

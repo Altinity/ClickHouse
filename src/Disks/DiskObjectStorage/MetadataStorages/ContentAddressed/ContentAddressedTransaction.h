@@ -85,7 +85,7 @@ protected:
 
 private:
     /// One part being assembled by this transaction (D-W2: ONE Cas::Build per written part,
-    /// opened lazily at the FIRST staged write — W-HEARTBEAT requires the heartbeat durable
+    /// opened lazily at the FIRST staged write — W-ANCHOR requires the watermark durable
     /// before the first PUT, and buffer finalize uploads immediately).
     struct PartStaging
     {

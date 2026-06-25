@@ -13,7 +13,7 @@ namespace DB::Cas
 
 /// Per-server build watermark (spec 2026-06-16-ca-build-watermark): one object per server under
 /// roots/<server-hex>/_watermark (Phase 6), renewed async ~2s off the write path, anchored synchronously
-/// before the first object PUT. Strict JSON, fail-closed decode (mirrors CasHeartbeat encoding split).
+/// before the first object PUT. Strict JSON, fail-closed decode.
 ///
 /// Non-hashed metadata object => STRICT JSON ("cas_server_watermark" v1):
 ///   {"format":"cas_server_watermark","version":1,"server_id":"<32 lowercase hex>",
@@ -40,9 +40,8 @@ ServerWatermark decodeServerWatermark(std::string_view data);
 /// can already exist from a prior process incarnation — start CLAIMS it (HEAD → putIfAbsent if
 /// absent, else putOverwrite against the observed token) for the new epoch. There is a single
 /// writer per server_id, so any precondition failure during renewal means a foreign touch — fail
-/// closed with an exception, never re-mint. A `SingleWriterSlot` (shared with `HeartbeatKeeper`),
-/// but it anchors a per-server slot instead of a per-build one, and farewell retires the epoch
-/// (min_active = UINT64_MAX) rather than deleting the object.
+/// closed with an exception, never re-mint. Uses `SingleWriterSlot` to manage the CAS claim cycle;
+/// farewell retires the epoch (min_active = UINT64_MAX) rather than deleting the object.
 class WatermarkKeeper final : public SingleWriterSlot
 {
 public:

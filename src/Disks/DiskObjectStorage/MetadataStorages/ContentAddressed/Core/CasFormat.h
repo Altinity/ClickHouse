@@ -26,9 +26,8 @@ enum class FormatId : uint16_t
     Watermark = 7,
     PoolMeta = 8,
     Roster = 9,
-    Heartbeat = 10,
-    RootsRegistry = 11,
-    GcOutcomes = 12,
+    RootsRegistry = 10,
+    GcOutcomes = 11,
 };
 
 /// Per-type magic: the 4 ASCII bytes of each object class encoded as a little-endian uint32. Used in

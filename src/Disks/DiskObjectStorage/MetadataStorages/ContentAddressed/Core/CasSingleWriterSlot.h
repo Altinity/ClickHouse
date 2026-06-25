@@ -12,38 +12,35 @@
 namespace DB::Cas
 {
 
-/// Durable single-writer-slot state machine shared by the per-server build watermark
-/// (`CasWatermark.h`, `WatermarkKeeper`) and the per-build heartbeat (`CasHeartbeat.h`,
-/// `HeartbeatKeeper`). Both anchor a key that has EXACTLY ONE writer, renew it asynchronously off
-/// the write path, and end with a terminal op; any precondition failure during renewal means a
-/// foreign touch — fail closed with an exception, never re-mint.
+/// Durable single-writer-slot state machine used by the per-server build watermark
+/// (`CasWatermark.h`, `WatermarkKeeper`): anchors a key that has EXACTLY ONE writer, renews it
+/// asynchronously off the write path, and ends with a terminal op; any precondition failure during
+/// renewal means a foreign touch — fail closed with an exception, never re-mint.
 ///
 /// This base owns the common machinery (the `seq`/`last_token`/`dead` state, the renewal thread and
 /// its loop, `renewOnce`/`startBackground`/`stopBackground`/`lastRenewTime`, and the start/terminal
-/// bookkeeping). The noun ("watermark"/"heartbeat") and verb ("farewell"/"discard") used in every
-/// fail-closed message are passed to the base constructor. The two keepers differ further ONLY in
-/// EXPLICIT policy hooks:
+/// bookkeeping). The noun ("watermark") and verb ("farewell") used in every fail-closed message are
+/// passed to the base constructor. Subclasses differ ONLY in EXPLICIT policy hooks:
 ///   - `prepareRenew`     — runs OFF the state lock before each body encode, returning a per-call
-///                          payload (the watermark reads `min_active` from a Store callback here;
-///                          the heartbeat needs nothing). Keeping it off `state_mutex` is load-bearing:
-///                          the watermark callback reaches into the Store's own lock.
+///                          payload (the watermark reads `min_active` from a Store callback here).
+///                          Keeping it off `state_mutex` is load-bearing: the watermark callback
+///                          reaches into the Store's own lock.
 ///   - `encodeBody`       — builds the slot's exact JSON bytes for a given `seq` and payload;
 ///   - `claim`            — the slot-specific anchor sequence in `start` (the watermark's
-///                          head→putIfAbsent/putOverwrite dance vs the heartbeat's pure putIfAbsent),
-///                          returning the token we now hold;
-///   - `terminate`        — the terminal op (the watermark's retiring putOverwrite vs the heartbeat's
-///                          deleteExact), run under the state lock after `dead` is set, owning its own
-///                          fail-closed throws and final bookkeeping.
+///                          head→putIfAbsent/putOverwrite dance), returning the token we now hold;
+///   - `terminate`        — the terminal op (the watermark's retiring putOverwrite), run under the
+///                          state lock after `dead` is set, owning its own fail-closed throws and
+///                          final bookkeeping.
 ///
 /// Every observable op (the JSON body bytes, the anchor put sequence, the renew cadence, the
-/// foreign-touch fail-close conditions and message wording, the stop semantics) stays IDENTICAL to
-/// the pre-merge keepers — the hooks reproduce each keeper's exact behavior, with no conditional in
-/// the base that blurs the single-writer/fail-closed contract.
+/// foreign-touch fail-close conditions and message wording, the stop semantics) is reproduced
+/// exactly by the subclass hooks, with no conditionals in the base that would blur the
+/// single-writer/fail-closed contract.
 class SingleWriterSlot
 {
 public:
-    /// `slot_name_` is the noun in every message ("watermark"/"heartbeat"); `terminal_verb_` is the
-    /// verb used in the start/renew/terminal guards ("farewell"/"discard").
+    /// `slot_name_` is the noun in every message ("watermark"); `terminal_verb_` is the
+    /// verb used in the start/renew/terminal guards ("farewell").
     SingleWriterSlot(
         BackendPtr backend_, String key_, std::string_view slot_name_, std::string_view terminal_verb_,
         std::string_view logger_name_);
@@ -80,8 +77,8 @@ protected:
 
     /// Runs the slot's terminal op against the held `last_token`. Called under `state_mutex` with
     /// `dead` already set (so renewal can never race it). Owns its own fail-closed throws and final
-    /// bookkeeping (the watermark bumps seq/last_token/last_renew_time on its retiring putOverwrite;
-    /// the heartbeat's delete keeps none of it). May throw — `dead` stays set regardless.
+    /// bookkeeping (the watermark bumps seq/last_token/last_renew_time on its retiring putOverwrite).
+    /// May throw — `dead` stays set regardless.
     virtual void terminate() = 0;
 
     /// Anchors the slot for seq=1 — durable when `doStart` returns. Subclasses expose this under their

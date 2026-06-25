@@ -13,7 +13,6 @@ TEST(CasLayout, KeyShapes)
     EXPECT_EQ(l.retiredKey(4, 9, 1), "p/gc/retired/4.9/1");
     EXPECT_EQ(l.outcomesKey(4, 9, 1), "p/gc/outcomes/4.9/1");
     EXPECT_EQ(l.checkpointKey(12), "p/gc/checkpoint/12");
-    EXPECT_EQ(l.buildHeartbeatKey("deadbeef00"), "p/builds/de/deadbeef00");
     EXPECT_EQ(l.poolMetaKey(), "p/_pool_meta");
 }
 

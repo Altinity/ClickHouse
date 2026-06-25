@@ -779,16 +779,6 @@ The server successfully detected this situation and will download merged part fr
     M(CasGcGet,          "CA gc get S3 ops", ValueType::Number) \
     M(CasGcDelete,       "CA gc delete S3 ops", ValueType::Number) \
     M(CasGcList,         "CA gc list S3 ops", ValueType::Number) \
-    M(CasBuildPut,       "CA build put S3 ops", ValueType::Number) \
-    M(CasBuildPutDedup,  "CA build put-dedup S3 ops", ValueType::Number) \
-    M(CasBuildOverwrite, "CA build overwrite S3 ops", ValueType::Number) \
-    M(CasBuildCas,       "CA build cas S3 ops", ValueType::Number) \
-    M(CasBuildCasConflict,"CA build cas-conflict S3 ops", ValueType::Number) \
-    M(CasBuildHead,      "CA build head S3 ops", ValueType::Number) \
-    M(CasBuildHeadMiss,  "CA build head-miss S3 ops", ValueType::Number) \
-    M(CasBuildGet,       "CA build get S3 ops", ValueType::Number) \
-    M(CasBuildDelete,    "CA build delete S3 ops", ValueType::Number) \
-    M(CasBuildList,      "CA build list S3 ops", ValueType::Number) \
     M(CasServerPut,      "CA server put S3 ops", ValueType::Number) \
     M(CasServerPutDedup, "CA server put-dedup S3 ops", ValueType::Number) \
     M(CasServerOverwrite,"CA server overwrite S3 ops", ValueType::Number) \

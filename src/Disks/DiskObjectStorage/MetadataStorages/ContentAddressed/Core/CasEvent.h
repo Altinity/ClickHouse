@@ -22,7 +22,7 @@ enum class CasEventType
     GcFoldBegin, GcFoldEnd, GcRetireObserve, GcRetireDecision, GcRecheckVerdict,
     GcFence, GcSnapPersist, GcCursorAdvance, GcTrim, GcLeaseAcquire, GcLeaseSteal, GcLeaseHeartbeat,
     BuildStart, BuildPublish, BuildAbort, Precommit, PrecommitRemoved, PrecommitReclaim,
-    GateRevalidate, GateResurrect, WatermarkRenew, Heartbeat,
+    GateRevalidate, GateResurrect, WatermarkRenew,
     RefResolve, ReadMissing, DanglingAccess,
     CorruptDangle, CorruptDecode, SnapJournalIncoherent, Exception,
 };
@@ -42,7 +42,7 @@ inline CasEventObjectKind toEventKind(ObjectKind kind)
 
 struct CasEvent
 {
-    CasEventType type = CasEventType::Heartbeat;
+    CasEventType type = CasEventType::BlobPut;
     String namespace_;          /// roots/<ns> (empty if N/A)
     String ref_name;            /// the ref name — a mutable directory handle, git-style (empty if N/A)
     CasEventObjectKind object_kind = CasEventObjectKind::None;

@@ -81,8 +81,8 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
     /// backstop for aborted/exception-unwound transactions whose publishStaging never ran.
     cleanupPendingTempFiles();
 
-    /// An uncommitted transaction's uploads become heartbeat-gated debris (W-HEARTBEAT): abandon
-    /// every still-open Build so its heartbeat is discarded. Replaces the PoC's pin machinery.
+    /// An uncommitted transaction's uploads become min_active-spared debris: abandon every
+    /// still-open Build so its build_seq is retired. Replaces the PoC's pin machinery.
     if (committed)
         return;
 

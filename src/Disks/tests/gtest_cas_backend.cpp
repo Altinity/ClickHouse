@@ -273,10 +273,9 @@ TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     EXPECT_EQ(classifyCasNs("pool/gc/registry"), CasNs::Gc);   /// registry relocated roots/_registry -> gc/registry (design §5.3)
     EXPECT_EQ(classifyCasNs("pool/roots/default/_files/x"), CasNs::Root);
     EXPECT_EQ(classifyCasNs("pool/gc/state"), CasNs::Gc);
-    EXPECT_EQ(classifyCasNs("pool/builds/b7"), CasNs::Build);   /// build heartbeats
     /// Phase 6: server control state lives under roots/<server-hex>/; classified by suffix/segment.
     EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_watermark"), CasNs::Server);
-    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_precommits/3"), CasNs::Build);
+    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_precommits/3"), CasNs::Server);
     EXPECT_EQ(classifyCasNs("pool/_pool_meta"), CasNs::Other);
 
     auto inner = std::make_shared<InMemoryBackend>();

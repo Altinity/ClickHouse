@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcSnap.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
@@ -164,20 +163,6 @@ TEST(CasGcFormats, EmptyRetiredSetRoundTrips)
     EXPECT_TRUE(d.entries.empty());
 }
 
-TEST(CasGcFormats, HeartbeatRoundTrip)
-{
-    Heartbeat hb{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                 .heartbeat_seq = 42,
-                 .created_at_ms = 1234567890123};
-    auto bytes = encodeHeartbeat(hb);
-    ASSERT_FALSE(bytes.empty());
-    EXPECT_NE(bytes.front(), '{');   /// not JSON (pure protobuf with CasHeader)
-    auto d = decodeHeartbeat(bytes);
-    EXPECT_EQ(d.server_id, hexToU128("000102030405060708090a0b0c0d0e0f"));
-    EXPECT_EQ(d.heartbeat_seq, 42u);
-    EXPECT_EQ(d.created_at_ms, 1234567890123u);
-}
-
 TEST(CasGcFormats, OutcomeLogRoundTrip)
 {
     OutcomeLog log;
@@ -293,7 +278,7 @@ TEST(CasGcFormats, OutcomeLogValidation)
     {
         Proto::GcOutcomeLogProto msg;
         auto * hdr = msg.mutable_header();
-        hdr->set_magic(magicFor(FormatId::Heartbeat));   /// CAHB != CAGO
+        hdr->set_magic(magicFor(FormatId::Blob));   /// CABL != CAGO
         hdr->set_compatibility_version(currentCompatibilityVersion());
         std::string bytes; msg.SerializeToString(&bytes);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(bytes); });
@@ -325,47 +310,6 @@ TEST(CasGcFormats, OutcomeLogValidation)
     }
 }
 
-TEST(CasGcFormats, HeartbeatValidation)
-{
-    /// Empty / garbage bytes => CORRUPTED_DATA.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeHeartbeat(String("")); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeHeartbeat(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    /// Bad magic (wrong FormatId in CasHeader) => CORRUPTED_DATA.
-    {
-        Proto::HeartbeatProto msg;
-        auto * hdr = msg.mutable_header();
-        hdr->set_magic(magicFor(FormatId::GcOutcomes));   /// CAGO != CAHB
-        hdr->set_compatibility_version(currentCompatibilityVersion());
-        std::string bytes; msg.SerializeToString(&bytes);
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
-    }
-    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION (fail closed on the future).
-    {
-        Proto::HeartbeatProto msg;
-        auto * hdr = msg.mutable_header();
-        hdr->set_magic(magicFor(FormatId::Heartbeat));
-        hdr->set_compatibility_version(G_BUILD + 1);
-        std::string bytes; msg.SerializeToString(&bytes);
-        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeHeartbeat(bytes); });
-    }
-    /// Encoding is binary (pure protobuf with CasHeader), not JSON.
-    {
-        const String bytes = encodeHeartbeat(Heartbeat{});
-        ASSERT_FALSE(bytes.empty());
-        EXPECT_NE(bytes.front(), '{');
-    }
-    /// A server_id proto bytes field that is not exactly 16 bytes => CORRUPTED_DATA (post-parse).
-    {
-        Proto::HeartbeatProto msg;
-        auto * hdr = msg.mutable_header();
-        hdr->set_magic(magicFor(FormatId::Heartbeat));
-        hdr->set_compatibility_version(currentCompatibilityVersion());
-        msg.set_server_id("hello");  /// 5 bytes, not 16 — invalid
-        std::string bytes; msg.SerializeToString(&bytes);
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeHeartbeat(bytes); });
-    }
-}
-
 TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
 {
     /// The namespace registry (spec section 4, decision 2026-06-12): the authoritative namespace
@@ -390,7 +334,7 @@ TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
     {
         Proto::RootsRegistryProto msg;
         auto * hdr = msg.mutable_header();
-        hdr->set_magic(magicFor(FormatId::Heartbeat));   /// CAHB != CARR
+        hdr->set_magic(magicFor(FormatId::Blob));   /// CABL != CARR
         hdr->set_compatibility_version(currentCompatibilityVersion());
         std::string bad_bytes; msg.SerializeToString(&bad_bytes);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(bad_bytes); });
@@ -464,28 +408,6 @@ TEST(CasGcSnapCodec, ZstdRoundTripAndShrinks)
 /// CasHeader round-trip goldens — confirm CasHeader is field 1 of each mutable object,
 /// magic + writer_version + compatibility_version are all stamped correctly.
 /// ===================================================================================
-
-TEST(CasHeaderGolden, HeartbeatCasHeaderRoundTrips)
-{
-    const Heartbeat hb{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                       .heartbeat_seq = 42, .created_at_ms = 1234567890123};
-    const String bytes = encodeHeartbeat(hb);
-    ASSERT_FALSE(bytes.empty());
-    EXPECT_NE(bytes.front(), '{');   // not JSON
-    /// Parse raw to check CasHeader
-    Proto::HeartbeatProto msg;
-    ASSERT_TRUE(msg.ParseFromString(bytes));
-    EXPECT_EQ(msg.header().magic(), magicFor(FormatId::Heartbeat));
-    EXPECT_EQ(msg.header().writer_version(), currentWriterVersion());
-    EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
-    const Heartbeat d = decodeHeartbeat(bytes);
-    EXPECT_EQ(d.server_id, hb.server_id);
-    EXPECT_EQ(d.heartbeat_seq, 42u);
-    EXPECT_EQ(d.created_at_ms, 1234567890123u);
-    /// Zero heartbeat round-trips.
-    const Heartbeat zero{};
-    EXPECT_EQ(decodeHeartbeat(encodeHeartbeat(zero)).heartbeat_seq, 0u);
-}
 
 TEST(CasHeaderGolden, RootsRegistryCasHeaderRoundTrips)
 {
