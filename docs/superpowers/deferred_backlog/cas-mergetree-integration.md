@@ -359,3 +359,57 @@ no longer multiply GC reads).
 **Where it plugs in:** `CasBackend.h` (`ListedKey.token`); each backend's `list()`; `CasGcSnap.*`
 (per-shard `last_folded` token field); `CasGc.cpp` (fold discovery via LIST+diff; lazy fence in R3;
 lazy trim); `CasStore::readShard` (unchanged for the read path). Prereq for / merges with B168 P5/P6/P7.
+
+### B202 (DRAFT — proposal) — inline placement by SIZE only + make the threshold a disk setting
+
+**Status: PROPOSAL.** Refines the 2d part-writer inlining (`partFileMustStayBlob` predicate +
+`constexpr INLINE_CAP = 1 MiB` in `ContentAddressedTransaction.cpp`). Relates to B97/B10 (one-GET part
+open), B201 (GC discovery), 2d (`docs/superpowers/plans/2026-06-24-cas-2d-part-writer-inlining.md`).
+**No correctness/safety issue** — placement does NOT affect the Merkle `treeId` (2a), the read path
+already serves `Inline`, and an `Inline` file carries the same content-hash as the blob form would. It
+is purely a read-amplification-vs-request-count tradeoff.
+
+**Proposal (operator, 2026-06-26): drop the file-type predicate; decide purely by SIZE.** Everything
+smaller than ~512 KiB → `Inline` into the tree unconditionally; only files ≥ threshold stay `Blob`.
+Rationale: a <512 KiB `.bin`/`.mrk`/`primary.idx` fetched as its own object costs a full S3 GET
+(request + RTT) whose per-request overhead dominates the tiny payload — might as well inline it and open
+the whole (small) part in ~1 GET. Simpler than maintaining a hand-curated suffix list.
+
+**The tradeoff to weigh (perf, NOT safety) — column-read selectivity.** The current type-predicate
+keeps `.bin` (column data) and `.mrk*` (marks) as separate blobs precisely so a SELECTIVE query (e.g.
+3 of 200 columns) fetches only those columns' blobs, not the whole part. Pure-size inlining changes
+this:
+- **Small parts (tiny columns):** size-only inline is BETTER — all columns are <threshold, so opening
+  the part = ONE tree GET containing everything; a 3-of-200-column query reads them from the in-memory
+  tree with 0 extra GETs (vs 1 tree + 3 blob GETs today). The per-request overhead of separate tiny
+  blobs is the thing we avoid. Clear win.
+- **Wide parts with MEDIUM columns (~100–500 KiB) + highly selective queries:** size-only inline is
+  WORSE — the tree GET now drags ALL inlined column bytes (e.g. 200 × 300 KiB = 60 MiB) on EVERY part
+  open, even for a 1-column read. It also bloats the hot tree object + `tree_cache` (trees are read on
+  every part open). This is the selectivity-killer case the type-predicate was protecting.
+- Marks (`.mrk*`) are usually small; inlining them is mostly harmless. Column data (`.bin`) is the real
+  selectivity risk; `primary.idx` is read on most opens anyway (inlining it when small is fine).
+
+**Options (for the design pass):**
+1. **Pure size threshold** (operator's proposal): simplest; accept the wide-medium-selective regression
+   (arguably rare; CA targets analytical parts that are usually read broadly). Pick ~512 KiB.
+2. **Size threshold + keep a `.bin` carve-out** (hybrid): inline everything small EXCEPT `.bin` above a
+   smaller sub-threshold — protects selectivity on column data while still inlining marks/metadata/small
+   columns. Slightly less simple.
+3. Per-kind thresholds (eager-meta: high; `.bin`: low/zero) — most control, least simple.
+Recommendation to evaluate: start with (1) (measure selective-query read amplification on a wide part
+in the soak), fall back to (2) if the regression is real.
+
+**Configuration proposal (do regardless of which option).** Make the threshold a **disk setting**
+(e.g. `content_addressed_inline_max_bytes`, default ~512 KiB; 0 = never inline data files), replacing
+the `constexpr INLINE_CAP`. **Safe to make a plain runtime setting AND safe to change post-release:** the
+threshold affects only WHICH new objects are created (write-side), never the format or identity (Merkle
+`treeId` is placement-independent), so different servers may use different thresholds and it may change
+after the format freeze with zero compatibility impact. If option (2)/(3) is chosen, the carve-out /
+per-kind thresholds become additional settings.
+
+**Where it plugs in:** `ContentAddressedTransaction.cpp` (`writeFile` routing — replace
+`partFileMustStayBlob` + `INLINE_CAP` with the size check against the setting); `Core/CasStore.h`
+`PoolConfig` / the disk config parse (the new setting). Keep an absolute hard upper bound so a huge file
+is never held inline regardless of the setting (memory safety). Watch tree-object size / `tree_cache`
+footprint growth in the soak.
