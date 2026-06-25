@@ -154,3 +154,14 @@ is run/prepared with a unique compose project and never touches foreign containe
 
 ## Header-unification rework (planned 2026-06-25, interactive design pivot)
 - Converged header model: CasHeader protobuf field (mutable) + binary trio rename (hashed); magic + writer_version + compatibility_version everywhere; write-down-to-floor ser/de; pool-meta min_reader_generation startup gate; remove CasFormat binary framing helpers. SUPERSEDES the 3a/3c framing-header prefix. Plan: docs/superpowers/plans/2026-06-25-cas-header-unification-rework.md. Spec: Part II CONVERGED box.
+
+## Header-unification rework — DONE + reviewed (2026-06-25)
+- Landed: commits `a15f967`,`1864a5b`,`35f4bd8`,`219c9b6`. Converged header model implemented: mutable
+  objects pure protobuf with CasHeader field 1 (magic+writer_version+compatibility_version); hashed
+  envelope renamed min_reader_version→compatibility_version; CasFormat binary framing helpers removed;
+  pool-meta min_reader_generation startup gate. Build clean; sweep 373 (372/1-baseline).
+- Combined review ✅ spec + ✅ quality. CRITICAL CHECK PASSED: no post-parse invariant dropped in any of
+  the 8 codec rewrites (per-codec invariant table verified).
+- Grooming follow-ups (Minor, test-only, no behavior): (a) 3 CasHeader round-trip tests (GcState/
+  RetiredSet/Watermark) don't assert writer_version like the others; (b) envelope tests hardcode obj[6]=2
+  instead of G_BUILD+1 (latent test-rot if G_BUILD bumps); (c) uint32→uint16 envelope cast (fine, noted).
