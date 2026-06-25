@@ -151,3 +151,6 @@ is run/prepared with a unique compose project and never touches foreign containe
   (commits `c623713479f`, `27c5f790d19`); sweep 373/1-baseline; spec-compliance ✅. Code-quality review
   dispatched. Spec evolved mid-loop: JSON abandoned (two encodings); one normative `cas_format.proto`;
   `CasBuild` closure-collapse scheduled as 2e.
+
+## Header-unification rework (planned 2026-06-25, interactive design pivot)
+- Converged header model: CasHeader protobuf field (mutable) + binary trio rename (hashed); magic + writer_version + compatibility_version everywhere; write-down-to-floor ser/de; pool-meta min_reader_generation startup gate; remove CasFormat binary framing helpers. SUPERSEDES the 3a/3c framing-header prefix. Plan: docs/superpowers/plans/2026-06-25-cas-header-unification-rework.md. Spec: Part II CONVERGED box.
