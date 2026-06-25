@@ -165,3 +165,14 @@ is run/prepared with a unique compose project and never touches foreign containe
 - Grooming follow-ups (Minor, test-only, no behavior): (a) 3 CasHeader round-trip tests (GcState/
   RetiredSet/Watermark) don't assert writer_version like the others; (b) envelope tests hardcode obj[6]=2
   instead of G_BUILD+1 (latent test-rot if G_BUILD bumps); (c) uint32→uint16 envelope cast (fine, noted).
+
+## Build-heartbeat removal (2026-06-26) + a caught header-rework regression
+- builds/<build_id> heartbeat removed (Tasks 1-5): commits 6a19f82c29f (unwire), 3d576a37da3 (delete),
+  68facb2e79d (rename heartbeat_period->watermark_renew_period / background_heartbeats->background_watermark).
+  Build clean; in-flight sparing coverage via min_active confirmed adequate (no new test needed).
+- WHILE VERIFYING: found 2 LATENT-RED tests (CasPoolMeta.RoundTripAndReadability, .FailClosed) — stale
+  since the header-unification rework (219c9b6) moved pool-meta's magic into CasHeader (field 1) but
+  didn't update them; MISSED by that rework's implementer self-report AND my combined review (both said
+  '372/1-baseline' when it was really 3 red). Fixed in a separate commit; sweep back to 1-baseline.
+  PROCESS LESSON: trust the actual --gtest_filter FAILED list, not the agent's pass/fail COUNT claim.
+- Still owed: combined review of the heartbeat removal; Task 6 docker-safe soak (port 8123 gate).
