@@ -343,6 +343,7 @@ TEST(CasTreeCodec, EmptyTreeRoundTrips)
 /// ===================================================================================
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <cas_root_shard.pb.h>
 
 TEST(CasRootShardCodec, RoundTripRefsAndJournal)

@@ -359,7 +359,7 @@ TEST(CasProtocol, WedgedHeartbeatCondemnedBlobDepAbortsRetryable)
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 }
 
-TEST(CasProtocol, AbandonLeavesDebrisAndDropsHeartbeat)
+TEST(CasProtocol, AbandonLeavesDebrisAndDisables)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
@@ -368,13 +368,10 @@ TEST(CasProtocol, AbandonLeavesDebrisAndDropsHeartbeat)
     auto build = s->startBuild({});
     auto blob = build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
     const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
-    const String hb_key = s->layout().buildHeartbeatKey(u128ToHex(build->buildId()));
-    ASSERT_TRUE(b->head(hb_key).exists);
 
     build->abandon();
 
-    /// Heartbeat gone; the uploaded objects remain as debris; no manifest was touched.
-    EXPECT_FALSE(b->head(hb_key).exists);
+    /// Uploaded objects remain as debris (reaped by full GC via min_active); no manifest was touched.
     EXPECT_TRUE(b->head(s->layout().blobKey(blob.id)).exists);
     EXPECT_TRUE(b->head(s->layout().treeKey(tree)).exists);
     EXPECT_TRUE(s->listRefs(ns).empty());

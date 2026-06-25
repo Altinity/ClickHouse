@@ -1,6 +1,5 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 #include <functional>
 #include <map>
@@ -31,7 +30,7 @@ struct BlobRef
 class Build
 {
 public:
-    Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt128 build_id_,
+    Build(StorePtr store_, UInt128 build_id_,
           uint64_t build_seq_, uint64_t epoch_, BuildInfo info_);
     ~Build();
 
@@ -89,14 +88,14 @@ public:
     /// condemned-token scan) then writes the final ref under `ns`/`ref_name`.
     void publish(const RootNamespace & ns, const String & ref_name, const TreeId & tree, RefPayload payload);
 
-    /// Stop renewals and delete own heartbeat; uploads become debris (heartbeat-gated full-GC reclaim).
+    /// Retire seq so the GC watermark floor can advance; uploads become reclaimable debris (reaped by full GC via min_active).
     void abandon();
 
     UInt128 buildId() const { return build_id; }
     /// The strictly-increasing per-process build_seq (spec 2026-06-16). Stamped into object owner
     /// metadata (Task 8) and the GC watermark floor (minActive) tracks it across in-flight builds.
     uint64_t buildSeq() const { return build_seq; }
-    void renewHeartbeat();                                /// test hook == HeartbeatKeeper::renewOnce
+
 
 private:
     struct DepEntry
@@ -183,7 +182,6 @@ private:
     void requireAlive() const;                            /// throws LOGICAL_ERROR after abandon
 
     StorePtr store;
-    std::unique_ptr<HeartbeatKeeper> heartbeat;
     UInt128 build_id{};
     uint64_t build_seq{};                                 /// per-process monotone seq (spec 2026-06-16)
     uint64_t epoch{};                                     /// owning Store's process_epoch (stamped in Task 8)

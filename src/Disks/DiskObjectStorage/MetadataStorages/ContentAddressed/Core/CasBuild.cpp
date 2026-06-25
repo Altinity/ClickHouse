@@ -62,10 +62,9 @@ BlobSource BlobSource::fromString(String bytes)
     return source;
 }
 
-Build::Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt128 build_id_,
+Build::Build(StorePtr store_, UInt128 build_id_,
              uint64_t build_seq_, uint64_t epoch_, BuildInfo info_)
     : store(std::move(store_))
-    , heartbeat(std::move(heartbeat_))
     , build_id(build_id_)
     , build_seq(build_seq_)
     , epoch(epoch_)
@@ -79,7 +78,7 @@ Build::Build(StorePtr store_, std::unique_ptr<HeartbeatKeeper> heartbeat_, UInt1
         e.ref_name = info.intended_ref.value_or("");
         e.token = u128ToHex(build_id);
         e.outcome = "started";
-        e.reason = "startBuild: heartbeat durable; build in-flight";
+        e.reason = "startBuild: build in-flight";
         e.detail = {{"build_seq", std::to_string(build_seq)}, {"epoch", std::to_string(epoch)}};
     });
 }
@@ -99,12 +98,6 @@ void Build::requireAlive() const
 {
     if (!alive)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Build has been abandoned; no further operations allowed");
-}
-
-void Build::renewHeartbeat()
-{
-    requireAlive();
-    heartbeat->renewOnce();
 }
 
 BlobRef Build::putBlob(const BlobId & id, BlobSource source)
@@ -946,16 +939,6 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
     /// have 0 (the dep size) — acceptable GC bookkeeping in M-C2.
     payload.tree_size = retained_it != retained_trees.end() ? retained_it->second.size() : dep_it->second.size;
 
-    /// Heartbeat local-sanity (LIVENESS, never safety): if our heartbeat is stale by the local clock,
-    /// renew it once. With background_heartbeats=false and a fresh build the elapsed time is ~0, so this
-    /// never fires in tests — keep it non-flaky (no test depends on timing).
-    if (heartbeat)
-    {
-        const auto elapsed = std::chrono::steady_clock::now() - heartbeat->lastRenewTime();
-        if (elapsed > 3 * store->poolConfig().heartbeat_period)
-            heartbeat->renewOnce();
-    }
-
     /// W-REGISTER (spec §5, decision 2026-06-12): a namespace must be in `gc/registry` BEFORE its
     /// first manifest exists — that is what orders namespace CREATION against the GC fence. The
     /// returned registry fence_round is the GATE FLOOR for this publish: a brand-new namespace's
@@ -1106,18 +1089,16 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
 void Build::abandon()
 {
     requireAlive();
-    heartbeat->stopBackground();
-    heartbeat->discard();
     /// No longer in-flight: retire the seq so the GC watermark floor can advance (idempotent).
     store->retireBuildSeq(build_seq);
     alive = false;
-    /// B170: the build was abandoned (heartbeat discarded; its uploads become GC-reclaimable debris).
+    /// B170: the build was abandoned; its uploads become GC-reclaimable debris.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::BuildAbort;
         e.token = u128ToHex(build_id);
         e.outcome = "abandoned";
-        e.reason = "abandon: heartbeat discarded; uploads become reclaimable debris";
+        e.reason = "abandon: build abandoned; uploads become reclaimable debris (reaped by full GC via min_active)";
         e.detail = {{"build_seq", std::to_string(build_seq)}};
     });
 }

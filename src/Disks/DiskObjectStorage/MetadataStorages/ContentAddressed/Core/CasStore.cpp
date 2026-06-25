@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasHeartbeat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Common/Exception.h>
@@ -260,16 +259,7 @@ BuildPtr Store::startBuild(BuildInfo info)
     /// the Store-owned watermark renews — tracks in-flight builds.
     const uint64_t seq = allocateBuildSeq();
 
-    /// W-HEARTBEAT: the heartbeat must be durable BEFORE the build returns (and thus before any object
-    /// PUT). start does the durable-first putIfAbsent; background renewal is opt-in (tests drive
-    /// renewOnce explicitly). The per-build heartbeat is retained alongside the new per-server
-    /// watermark (it still gates full-GC debris); collapsing the two is a separate future cleanup.
-    auto keeper = std::make_unique<HeartbeatKeeper>(pool_backend, pool_layout, build_id, config.server_id);
-    keeper->start();
-    if (config.background_heartbeats)
-        keeper->startBackground(config.heartbeat_period);
-
-    return std::make_shared<Build>(shared_from_this(), std::move(keeper), build_id, seq, process_epoch, std::move(info));
+    return std::make_shared<Build>(shared_from_this(), build_id, seq, process_epoch, std::move(info));
 }
 
 std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & ns, uint64_t shard, bool allow_stale)

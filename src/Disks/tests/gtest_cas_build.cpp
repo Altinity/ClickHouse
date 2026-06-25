@@ -76,15 +76,6 @@ private:
 
 }
 
-TEST(CasBuild, StartBuildHeartbeatDurableFirst)
-{
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    auto build = s->startBuild({});
-    /// W-HEARTBEAT: the heartbeat object is durable when startBuild returns.
-    EXPECT_TRUE(b->head(s->layout().buildHeartbeatKey(u128ToHex(build->buildId()))).exists);
-}
-
 TEST(CasBuild, PutBlobWritesEnvelopeWithFixedHeader)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -688,7 +679,7 @@ TEST(CasBuild, AdoptFromTreeRecordsEvidence)
     EXPECT_NO_THROW(build->putTree({reuse_entry}));
 }
 
-TEST(CasBuild, AbandonDropsHeartbeatAndDisables)
+TEST(CasBuild, AbandonLeavesDebrisAndDisables)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
@@ -702,13 +693,9 @@ TEST(CasBuild, AbandonDropsHeartbeatAndDisables)
     entry.file_size = 4;
     const TreeId tree = build->putTree({entry});
 
-    const String heartbeat_key = s->layout().buildHeartbeatKey(u128ToHex(build->buildId()));
-    ASSERT_TRUE(b->head(heartbeat_key).exists);
-
     build->abandon();
 
-    /// Heartbeat key gone; objects still present (debris — full GC's job).
-    EXPECT_FALSE(b->head(heartbeat_key).exists);
+    /// Objects still present (debris — full GC's job via min_active).
     EXPECT_TRUE(b->head(s->layout().blobKey(blob_ref.id)).exists);
     EXPECT_TRUE(b->head(s->layout().treeKey(tree)).exists);
 
