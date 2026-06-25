@@ -123,6 +123,69 @@ be a new tree format version anyway, and no released bytes ever held it). B97, B
 
 # Part II — The compatibility primitive
 
+> ## ⭐ CONVERGED HEADER MODEL (2026-06-25) — supersedes the binary-framing-header description in the rest of Part II/III
+>
+> Every object — hashed or mutable — carries a **self-describing header** with the same three things,
+> and every codec follows the same **write-down-to-floor** evolution discipline. Only the *wire
+> encoding* of the header differs (because blobs are raw bytes and trees are hot-path binary).
+>
+> **The header trio (every object):**
+> - `magic` — type id + sanity ("am I parsing what I expect"); the `CA__` ASCII family (`CABL` blob,
+>   `CATR` tree, `CARS` manifest, `CAPM` pool-meta, `CAWM` watermark, `CAGT` gc-state, `CART`
+>   retired-set, `CAHB` heartbeat, `CARR` roots-registry, `CAGO` gc-outcomes). No CRC (integrity comes
+>   from S3 ETag + content-addressing for blob/tree; magic is sanity only).
+> - `writer_version` — **forensic**: which build/generation wrote it.
+> - `compatibility_version` — **functional**: the pool **floor** the writer targeted; the reader
+>   dispatches its decode on it and **fail-closes** if `compatibility_version > G_build`.
+>
+> **Two encodings, one concept:**
+> - **mutable objects → pure protobuf.** The trio lives in a `CasHeader` protobuf message embedded as
+>   **field 1** of each object message — NO binary prefix, fully `protoc`-decodable (the portability
+>   goal). `message CasHeader { fixed32 magic = 1; uint32 writer_version = 2; uint32 compatibility_version = 3; }`
+> - **hashed objects (blob, tree) → binary header.** The trio sits in the envelope core as binary
+>   fields (the 2b core already has the two u16 version slots — this is a rename of `min_reader_version`
+>   → `compatibility_version` + the discipline below). Payload stays raw (blob) / binary catalog+inline
+>   (tree); these are NOT protobuf (blob = raw file bytes, can exceed protobuf's 2 GB limit; tree = hot
+>   read path + catalog-first random access). `build_id` in the incarnation zone is the forensic writer.
+>
+> **Write-down-to-floor ser/de discipline (documented in every codec):** the writer targets the
+> negotiated `compatibility_version` (the pool floor = min over members) and emits the field-set valid
+> at that level, so an old reader is **never handed something it would silently mis-skip**:
+> ```
+> serialize(compatibility_version):
+>   if      (compatibility_version < 10)  emit the <10 field-set
+>   else if (compatibility_version < 20)  emit the <20 field-set
+>   else                                   emit the freshest
+> ```
+> - **Safe-additive change → no branch:** just add a new protobuf field number; old readers skip it.
+>   This is the common case and needs no ceremony or floor-wait.
+> - **Unsafe/replacing change (or new binary format) → a branch:** keep emitting the old-compatible
+>   field-set until the floor rises (all members upgraded), then switch. The branch ladder is **bounded**
+>   — prune the `<10` arm once the floor is permanently ≥ 10 (after a completed upgrade cycle).
+> - For **trees**, the branch is identity-free: `treeId` is Merkle over logical children, so the same
+>   logical tree at any `compatibility_version` dedups to one id.
+>
+> **Reader rule (both encodings):** check `magic` (mismatch → `CORRUPTED_DATA`); then
+> `compatibility_version > G_build` ⇒ `UNKNOWN_FORMAT_VERSION` (fail-closed — for protobuf this is a
+> cheap post-parse check, safe because parsing has no side effects and we gate *before using* the data);
+> then interpret the body per `compatibility_version`.
+>
+> **Pool-level gate:** `pool-meta` carries `min_reader_generation`; a client **refuses to open the pool
+> at startup** if `G_build < min_reader_generation` (clean "you're too old, upgrade" UX). Bumped only on
+> a genuine breaking change, after all members upgraded. The per-object `compatibility_version` check is
+> the defensive backstop; this startup gate is the primary, friendly one.
+>
+> **Consequences for what landed tonight (the rework, see the 2026-06-25 plan):** the `CasFormat`
+> binary **framing-header** helpers (`writeFramingHeader`/`readFramingHeader`, the 8-byte prefix on the
+> protobuf objects from 3a/3c) are **removed** — replaced by the `CasHeader` protobuf field; per-object
+> `min_reader_version` is replaced by `compatibility_version`; `gateOnRead` becomes a post-parse
+> compat check. The hashed envelope keeps its binary header (rename + discipline). The
+> `max_content_addressable_pool_format` write-floor / roster stays **deferred** (pre-release:
+> `compatibility_version` = the current generation, no branching yet).
+>
+> The subsections below (`writer_version`/`min_reader_version`, the framing header) are the prior
+> iteration, kept for context; where they conflict, THIS box wins.
+
 ## Three numbers
 
 - **`writer_version`** — the global format generation the object was written at.
