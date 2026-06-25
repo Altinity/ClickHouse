@@ -975,16 +975,24 @@ IcebergStorageSink::IcebergStorageSink(
     , data_lake_settings(configuration_->getDataLakeSettings())
     , write_format(configuration_->getFormat())
 {
-    auto [last_version, metadata_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
-        object_storage,
-        persistent_table_components.table_path,
-        data_lake_settings,
-        persistent_table_components.metadata_cache,
-        context_,
-        log.get(),
-        persistent_table_components.table_uuid,
-        persistent_table_components.metadata_compression_method,
-        true);
+    Iceberg::MetadataFileWithInfo latest_metadata_file_info;
+    if (catalog && catalog->isTransactional())
+        latest_metadata_file_info = Iceberg::getMetadataFileAndVersion(
+            DataLake::getMetadataLocationFromCatalog(catalog, table_id.getTableName(), persistent_table_components.table_path, context_));
+    else
+    {
+        latest_metadata_file_info = getLatestOrExplicitMetadataFileAndVersion(
+            object_storage,
+            persistent_table_components.table_path,
+            data_lake_settings,
+            persistent_table_components.metadata_cache,
+            context_,
+            log.get(),
+            persistent_table_components.table_uuid,
+            persistent_table_components.metadata_compression_method,
+            true);
+    }
+    auto [last_version, metadata_path, compression_method] = latest_metadata_file_info;
 
     metadata = getMetadataJSONObject(
         metadata_path,
@@ -1247,17 +1255,26 @@ bool IcebergStorageSink::initializeMetadata()
             /// with iceberg_metadata_file_path (e.g. for time-travel reads), the retry
             /// loop must still discover the real latest version to advance past it.
             /// Otherwise the loop keeps regenerating the same target version and fails.
-            auto [last_version, metadata_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
-                object_storage,
-                persistent_table_components.table_path,
-                data_lake_settings,
-                persistent_table_components.metadata_cache,
-                context,
-                getLogger("IcebergWrites").get(),
-                persistent_table_components.table_uuid,
-                persistent_table_components.metadata_compression_method,
-                /* force_fetch_latest_metadata */ true,
-                /* ignore_explicit_metadata_file_path */ true);
+            Iceberg::MetadataFileWithInfo latest_metadata_file_info;
+            if (catalog && catalog->isTransactional())
+                latest_metadata_file_info = Iceberg::getMetadataFileAndVersion(
+                    DataLake::getMetadataLocationFromCatalog(catalog, table_id.getTableName(), persistent_table_components.table_path, context));
+            else
+            {
+                latest_metadata_file_info = getLatestOrExplicitMetadataFileAndVersion(
+                    object_storage,
+                    persistent_table_components.table_path,
+                    data_lake_settings,
+                    persistent_table_components.metadata_cache,
+                    context,
+                    getLogger("IcebergWrites").get(),
+                    persistent_table_components.table_uuid,
+                    persistent_table_components.metadata_compression_method,
+                    /* force_fetch_latest_metadata */ true,
+                    /* ignore_explicit_metadata_file_path */ true);
+            }
+
+            auto [last_version, metadata_path, compression_method] = latest_metadata_file_info;
 
             LOG_DEBUG(log, "Rereading metadata file {} with version {}", metadata_path, last_version);
 
@@ -1360,32 +1377,34 @@ bool IcebergStorageSink::initializeMetadata()
         }
 
         {
-            std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-            Poco::JSON::Stringifier::stringify(metadata, oss, 4);
-            std::string json_representation = removeEscapedSlashes(oss.str());
+            const bool transactional_catalog = (catalog != nullptr && catalog->isTransactional());
+            if (!transactional_catalog)
+            {
+                std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+                Poco::JSON::Stringifier::stringify(metadata, oss, 4);
+                std::string json_representation = removeEscapedSlashes(oss.str());
 
-            fiu_do_on(FailPoints::iceberg_writes_cleanup,
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failpoint for cleanup enabled");
-            });
+                fiu_do_on(FailPoints::iceberg_writes_cleanup,
+                {
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failpoint for cleanup enabled");
+                });
 
-            LOG_DEBUG(log, "Writing new metadata file {}", metadata_info.path);
-            auto hint_path = filename_generator.generateVersionHint();
-            if (!writeMetadataFileAndVersionHint(
-                    persistent_table_components.path_resolver,
-                    metadata_info,
-                    json_representation,
-                    hint_path,
-                    object_storage,
-                    context,
-                    data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
-            {
-                LOG_DEBUG(log, "Failed to write metadata {}, retrying", metadata_info.path);
-                cleanup(true);
-                return false;
-            }
-            else
-            {
+                LOG_DEBUG(log, "Writing new metadata file {}", metadata_info.path);
+                auto hint_path = filename_generator.generateVersionHint();
+                if (!writeMetadataFileAndVersionHint(
+                        persistent_table_components.path_resolver,
+                        metadata_info,
+                        json_representation,
+                        hint_path,
+                        object_storage,
+                        context,
+                        data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+                {
+                    LOG_DEBUG(log, "Failed to write metadata {}, retrying", metadata_info.path);
+                    cleanup(true);
+                    return false;
+                }
+
                 LOG_DEBUG(log, "Metadata file {} written", metadata_info.path);
             }
 

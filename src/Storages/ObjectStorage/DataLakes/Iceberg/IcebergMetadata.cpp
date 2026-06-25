@@ -712,9 +712,12 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
         context, {}, new_snapshot, {}, *buf, Iceberg::FileContentType::DATA, /*use_previous_snapshots=*/false);
     buf->finalize();
 
-    String metadata_content = dumpMetadataObjectToString(metadata_object);
-    writeMessageToFile(metadata_content, path_resolver.resolve(metadata_info.path), object_storage,
-        context, "*", "", persistent_components.metadata_compression_method);
+    if (!is_transactional)
+    {
+        String metadata_content = dumpMetadataObjectToString(metadata_object);
+        writeMessageToFile(metadata_content, path_resolver.resolve(metadata_info.path), object_storage,
+            context, "*", "", persistent_components.metadata_compression_method);
+    }
 
     if (catalog)
     {
@@ -1431,11 +1434,7 @@ SinkToStoragePtr IcebergMetadata::write(
 void IcebergMetadata::drop(ContextPtr context)
 {
     if (context->getSettingsRef()[Setting::data_lake_delete_data_on_drop].value)
-    {
-        auto files = listFiles(*object_storage, persistent_components.table_path, persistent_components.table_path, "");
-        for (const auto & file : files)
-            object_storage->removeObjectIfExists(StoredObject(file));
-    }
+        purgeTableDataFiles(*object_storage, persistent_components.table_path);
 }
 
 ColumnMapperPtr IcebergMetadata::getColumnMapperForObject(ObjectInfoPtr object_info) const
@@ -1690,20 +1689,8 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
         {
             MetadataFileWithInfo latest_metadata_file_info;
             if (catalog && catalog->isTransactional())
-            {
-                const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                DataLake::TableMetadata table_metadata = DataLake::TableMetadata().withLocation().withDataLakeSpecificProperties();
-                catalog->getTableMetadata(namespace_name, table_name, context, table_metadata);
-
-                auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
-                if (!table_specific_properties.has_value() || table_specific_properties->iceberg_metadata_file_location.empty())
-                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Catalog didn't return iceberg metadata location for table {}.{}", namespace_name, table_name);
-
-                String metadata_path = table_metadata.getMetadataLocation(table_specific_properties->iceberg_metadata_file_location);
-                if (!metadata_path.starts_with(persistent_components.table_path))
-                    metadata_path = std::filesystem::path(persistent_components.table_path) / metadata_path;
-                latest_metadata_file_info = Iceberg::getMetadataFileAndVersion(metadata_path);
-            }
+                latest_metadata_file_info = Iceberg::getMetadataFileAndVersion(
+                    DataLake::getMetadataLocationFromCatalog(catalog, table_id.getTableName(), persistent_components.table_path, context));
             else
             {
                 latest_metadata_file_info = getLatestOrExplicitMetadataFileAndVersion(

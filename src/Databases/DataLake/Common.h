@@ -1,11 +1,14 @@
 #pragma once
 
+#include <memory>
 #include <Core/NamesAndTypes.h>
 #include <Core/Types.h>
 #include <Interpreters/Context_fwd.h>
 
 namespace DataLake
 {
+
+class ICatalog;
 
 String trim(const String & str);
 
@@ -24,5 +27,12 @@ String constructTableLocation(
     const String & storage_endpoint,
     const String & namespace_name,
     const String & table_name);
+
+/// Ask a transactional catalog for the current metadata file location of a table
+String getMetadataLocationFromCatalog(
+    const std::shared_ptr<ICatalog> & catalog,
+    const String & full_table_name,
+    const String & table_path,
+    DB::ContextPtr context);
 
 }

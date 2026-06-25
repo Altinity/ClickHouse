@@ -1,4 +1,7 @@
 #include <Databases/DataLake/Common.h>
+#include <Databases/DataLake/ICatalog.h>
+
+#include <filesystem>
 
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
@@ -23,6 +26,7 @@ namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
 extern const int DATALAKE_DATABASE_ERROR;
+extern const int LOGICAL_ERROR;
 }
 
 namespace DataLake
@@ -199,6 +203,26 @@ String constructTableLocation(
     if (path.empty())
         return fmt::format("{}://{}/{}/{}", location_scheme, authority, namespace_name, table_name);
     return fmt::format("{}://{}/{}/{}/{}", location_scheme, authority, path, namespace_name, table_name);
+}
+
+String getMetadataLocationFromCatalog(
+    const std::shared_ptr<ICatalog> & catalog,
+    const String & full_table_name,
+    const String & table_path,
+    DB::ContextPtr context)
+{
+    const auto & [namespace_name, table_name] = parseTableName(full_table_name);
+    TableMetadata table_metadata = TableMetadata().withLocation().withDataLakeSpecificProperties();
+    catalog->getTableMetadata(namespace_name, table_name, context, table_metadata);
+
+    auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
+    if (!table_specific_properties.has_value() || table_specific_properties->iceberg_metadata_file_location.empty())
+        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Catalog didn't return iceberg metadata location for table {}.{}", namespace_name, table_name);
+
+    String metadata_path = table_metadata.getMetadataLocation(table_specific_properties->iceberg_metadata_file_location);
+    if (!metadata_path.starts_with(table_path))
+        metadata_path = std::filesystem::path(table_path) / metadata_path;
+    return metadata_path;
 }
 
 }

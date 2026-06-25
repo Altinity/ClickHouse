@@ -51,6 +51,7 @@
 #include <Parsers/ASTFunction.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
+#include <Storages/ObjectStorage/DataLakes/Common/Common.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
@@ -778,12 +779,35 @@ bool GlueCatalog::updateMetadata(const String & namespace_name, const String & t
     return true;
 }
 
-void GlueCatalog::dropTable(const String & namespace_name, const String & table_name, bool /*purge*/) const
+void GlueCatalog::dropTable(const String & namespace_name, const String & table_name, bool purge) const
 {
     if (!isNamespaceAllowed(namespace_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to drop table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
+
+    std::optional<ObjectStorageWithPath> storage_with_path_for_purge;
+    if (purge)
+    {
+        try
+        {
+            TableMetadata table_metadata;
+            table_metadata.withLocation();
+            if (tryGetTableMetadata(namespace_name, table_name, getContext(), table_metadata) && table_metadata.hasLocation())
+                storage_with_path_for_purge = createObjectStorageForEarlyTableAccess(table_metadata.getLocation(), table_metadata);
+            else
+                LOG_WARNING(
+                    log,
+                    "Can not purge data files of dropped table {}.{}: location is unavailable in Glue metadata",
+                    namespace_name, table_name);
+        }
+        catch (...)
+        {
+            DB::tryLogCurrentException(
+                log,
+                fmt::format("Could not resolve location to purge data files of dropped table {}.{}", namespace_name, table_name));
+        }
+    }
 
     Aws::Glue::Model::DeleteTableRequest request;
     request.SetDatabaseName(namespace_name);
@@ -802,6 +826,21 @@ void GlueCatalog::dropTable(const String & namespace_name, const String & table_
             DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
             "Can not delete table from glue catalog: {}",
             response.GetError().GetMessage());
+
+    if (storage_with_path_for_purge.has_value())
+    {
+        const auto & storage_with_path = *storage_with_path_for_purge;
+        try
+        {
+            DB::purgeTableDataFiles(*storage_with_path.object_storage, storage_with_path.table_path);
+        }
+        catch (...)
+        {
+            DB::tryLogCurrentException(
+                log,
+                fmt::format("Could not purge data files of dropped table {}.{}", namespace_name, table_name));
+        }
+    }
 }
 
 bool GlueCatalog::isNamespaceAllowed(const std::string & namespace_) const

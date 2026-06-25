@@ -519,27 +519,31 @@ static bool writeMetadataFiles(
 
         if (write_metadata_json_file)
         {
-            std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-            Poco::JSON::Stringifier::stringify(metadata, oss, 4);
-            std::string json_representation = removeEscapedSlashes(oss.str());
-
-            fiu_do_on(FailPoints::iceberg_writes_cleanup,
+            const bool transactional_catalog = (catalog != nullptr && catalog->isTransactional());
+            if (!transactional_catalog)
             {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failpoint for cleanup enabled");
-            });
+                std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+                Poco::JSON::Stringifier::stringify(metadata, oss, 4);
+                std::string json_representation = removeEscapedSlashes(oss.str());
 
-            auto hint_path = filename_generator.generateVersionHint();
-            if (!writeMetadataFileAndVersionHint(
-                    path_resolver,
-                    metadata_info,
-                    json_representation,
-                    hint_path,
-                    object_storage,
-                    context,
-                    data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
-            {
-                cleanup();
-                return false;
+                fiu_do_on(FailPoints::iceberg_writes_cleanup,
+                {
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failpoint for cleanup enabled");
+                });
+
+                auto hint_path = filename_generator.generateVersionHint();
+                if (!writeMetadataFileAndVersionHint(
+                        path_resolver,
+                        metadata_info,
+                        json_representation,
+                        hint_path,
+                        object_storage,
+                        context,
+                        data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+                {
+                    cleanup();
+                    return false;
+                }
             }
 
             if (catalog)
@@ -584,17 +588,25 @@ void mutate(
         auto log = getLogger("IcebergMutations");
         /// Mutations must always operate on the actual latest metadata, regardless of
         /// any explicit iceberg_metadata_file_path set on the table (used for time-travel reads).
-        auto [last_version, metadata_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
-            object_storage,
-            persistent_table_components.table_path,
-            data_lake_settings,
-            persistent_table_components.metadata_cache,
-            context,
-            log.get(),
-            persistent_table_components.table_uuid,
-            persistent_table_components.metadata_compression_method,
-            /* force_fetch_latest_metadata */ true,
-            /* ignore_explicit_metadata_file_path */ true);
+        Iceberg::MetadataFileWithInfo latest_metadata_file_info;
+        if (catalog && catalog->isTransactional())
+            latest_metadata_file_info = Iceberg::getMetadataFileAndVersion(
+                DataLake::getMetadataLocationFromCatalog(catalog, storage_id.getTableName(), persistent_table_components.table_path, context));
+        else
+        {
+            latest_metadata_file_info = getLatestOrExplicitMetadataFileAndVersion(
+                object_storage,
+                persistent_table_components.table_path,
+                data_lake_settings,
+                persistent_table_components.metadata_cache,
+                context,
+                log.get(),
+                persistent_table_components.table_uuid,
+                persistent_table_components.metadata_compression_method,
+                /* force_fetch_latest_metadata */ true,
+                /* ignore_explicit_metadata_file_path */ true);
+        }
+        auto [last_version, metadata_path, compression_method] = latest_metadata_file_info;
 
         FileNamesGenerator filename_generator(persistent_table_components.path_resolver.getTableLocation(), false, CompressionMethod::None, write_format);
         filename_generator.setVersion(last_version + 1);
@@ -1413,22 +1425,26 @@ ExpireSnapshotsResult expireSnapshots(
 
         updateMetadataForExpiration(metadata, expired_ref_names, partition.retained_snapshots, partition.expired_snapshot_ids);
 
-        std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-        Poco::JSON::Stringifier::stringify(metadata, oss, 4);
-        std::string json_representation = removeEscapedSlashes(oss.str());
         auto metadata_info = filename_generator.generateMetadataPathWithInfo();
-        auto hint_path = filename_generator.generateVersionHint();
-        if (!writeMetadataFileAndVersionHint(
-                persistent_table_components.path_resolver,
-                metadata_info,
-                json_representation,
-                hint_path,
-                object_storage,
-                context,
-                data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+        const bool transactional_catalog = (catalog != nullptr && catalog->isTransactional());
+        if (!transactional_catalog)
         {
-            LOG_WARNING(log, "Metadata commit conflict during expire_snapshots, retrying ({} retries left)", max_retries);
-            continue;
+            std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+            Poco::JSON::Stringifier::stringify(metadata, oss, 4);
+            std::string json_representation = removeEscapedSlashes(oss.str());
+            auto hint_path = filename_generator.generateVersionHint();
+            if (!writeMetadataFileAndVersionHint(
+                    persistent_table_components.path_resolver,
+                    metadata_info,
+                    json_representation,
+                    hint_path,
+                    object_storage,
+                    context,
+                    data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+            {
+                LOG_WARNING(log, "Metadata commit conflict during expire_snapshots, retrying ({} retries left)", max_retries);
+                continue;
+            }
         }
 
         if (catalog)

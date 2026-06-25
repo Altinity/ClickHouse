@@ -39,4 +39,25 @@ std::vector<String> listFiles(
     LOG_TRACE(getLogger("DataLakeCommon"), "Listed {} files ({})", res.size(), fmt::join(res, ", "));
     return res;
 }
+
+void purgeTableDataFiles(IObjectStorage & object_storage, const String & table_path)
+{
+    /// An empty path would make the prefix empty and list (and delete) the whole bucket.
+    if (table_path.empty())
+    {
+        LOG_WARNING(getLogger("DataLakeCommon"), "Will notpurge table data: the table path is empty");
+        return;
+    }
+
+    auto files = listFiles(object_storage, table_path, /* prefix */ "", /* suffix */ "");
+    if (files.empty())
+        return;
+
+    StoredObjects objects;
+    objects.reserve(files.size());
+    for (auto & file : files)
+        objects.emplace_back(std::move(file));
+
+    object_storage.removeObjectsIfExist(objects);
+}
 }
