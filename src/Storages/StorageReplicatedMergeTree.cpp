@@ -10065,10 +10065,20 @@ CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & 
     /// Called from a query thread (KILL EXPORT PARTITION via InterpreterKillQueryQuery), which does not have a component set.
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::killExportPartition");
 
-    /// This is best-effort, even if we manage to set it to killed, it might be overwritten by a successful commit.
+    /// KILL is serialized against the commit phase via commit_lock (see below), so a kill that
+    /// succeeds cannot be overwritten by a concurrent commit.
 
     auto try_set_status_to_killed = [this](const zkutil::ZooKeeperPtr & zk, const std::string & status_path)
     {
+        /// Serialize against commit(): if a commit holds the lock, it is too late to cancel.
+        auto commit_lock = zkutil::EphemeralNodeHolder::tryCreate(
+            fs::path(status_path).parent_path() / "commit_lock", *zk, replica_name);
+        if (!commit_lock)
+        {
+            LOG_INFO(log, "Commit in progress, can not cancel export partition task");
+            return CancellationCode::CancelCannotBeSent;
+        }
+
         Coordination::Stat stat;
         std::string status_from_zk_string;
 
