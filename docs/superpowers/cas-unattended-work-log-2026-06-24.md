@@ -264,3 +264,18 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   DURATION=6h MAX_POOL_GB=40 SEED=20260626. Logs: soak_night2b.log, resources_night2b.log,
   disk_watchdog.log. Disk 403G free at launch; triple safety (du-pace / fail-closed / watchdog).
   Waiter bg93rhr1j fires on terminal marker or ~6.7h guard. Validates the night-2 binary end-to-end.
+
+## SOAK ATTEMPT 2 — RESULT: B204 fix VALIDATED; failed at ~5min on a SERVER DEATH (root cause unresolved)
+- GOOD: NO disk fill (485G free throughout) — the B204 du-probe + fail-closed throttle + watchdog WORK.
+  pool_bytes probe returns real values (13601 → 1.09GB over 5 ticks); throttle correctly 0 (pool « 40G).
+- FAILED at ~5min (warmup stage, op~28129, BEFORE chaos@8640s and BEFORE the compare_aggregates oracle):
+  burst of QUERY_WAS_CANCELLED on 8124 (ch2) + flood of ConnectionReset → a clickhouse-server process
+  DIED; fsck then hit 'No such container: ca-soak-ch1-1' → persistent-dangling → PHASE3 FAILED.
+- ROOT CAUSE UNRESOLVED. Likely OOM (aggressive warmup: 6 workers, 36-65KB rows, 1GB pool/5min) vs a
+  possible CA crash. CANNOT classify: ch err.log (logs/ch1/clickhouse-server.err.log, 4229 bytes — has
+  content) is syslog-owned 640, container gone, no passwordless sudo, dmesg unreadable. Evidence
+  PRESERVED on disk for a root/docker session. Recorded harness post-mortem gap as B205.
+- NEXT (needs fresh context + root for the err.log): read ch1 err.log to classify OOM-vs-crash; if OOM,
+  raise memory headroom / lower workers / lower insert rate; if CA crash, bisect (note: NOT yet shown to
+  be a night-2 regression — attempt-1 server logs were clean). Fix B205 first so the next run is
+  diagnosable. Did NOT start a 3rd soak (context exhausted; needs the err.log + fresh analysis).

@@ -444,3 +444,15 @@ heartbeat removal) ran clean. Pure soak-harness (`utils/ca-soak`) robustness gap
 reclaimed via scoped `docker compose down -v` (rustfs anon volume). FIX: (1) du-based probe, (2)
 fail-closed throttle, (3) wire the watchdog — then re-run. | Found night-2 soak | `soak/pool.py`,
 `soak/run.py compute_throttle`, `scripts/run_24h.sh` (wire disk_watchdog.sh). |
+
+### B205 (SOAK-HARNESS post-mortem gap, 2026-06-26 night-2) — crash evidence destroyed on failure
+On a soak failure, `run_24h.sh`'s EXIT trap runs `docker compose logs > COMPOSE_LOG` THEN `docker compose
+down -v`. In practice the containers are already gone by the time the trap fires (or removal races the
+log capture), so COMPOSE_LOG came out **0 bytes** — and `down -v` removes the containers, so no live
+`docker inspect`/`docker exec` post-mortem is possible. The per-node CH logs ARE bind-mounted+preserved
+(`logs/ch1,ch2/clickhouse-server*.log`) but are **syslog-owned (mode 640)** → unreadable without root.
+Net: a server crash mid-soak cannot be diagnosed by a non-root unattended session. FIX: (a) capture
+`docker compose logs` (and `docker inspect` exit/OOMKilled) BEFORE any teardown, into a mfilimonov-owned
+file; (b) on FAILURE, do NOT auto `down -v` — leave the stack up (or gate teardown behind a SUCCESS
+check) so the live containers can be inspected; (c) make the bind-mounted CH logs world-readable
+(`chmod`/`umask` in the container) so the driver can read them. | Found night-2 soak attempt-2 | `utils/ca-soak/scripts/run_24h.sh` (trap), the compose log perms. |
