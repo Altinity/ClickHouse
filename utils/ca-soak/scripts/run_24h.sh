@@ -33,7 +33,24 @@ chmod 777 "$LOGDIR/ch1" "$LOGDIR/ch2"
 
 docker compose down -v >/dev/null 2>&1; docker compose up -d
 WATCHDOG_PID=""
-trap 'docker compose logs --no-color > "$COMPOSE_LOG" 2>&1 || true; echo "preserved docker logs -> $COMPOSE_LOG"; kill $WATCHDOG_PID 2>/dev/null || true; docker compose down -v' EXIT
+SOAK_OK=0   # set to 1 only after a clean PHASE3 OK; the trap tears down ONLY on a happy finish.
+# EXIT trap: ALWAYS preserve evidence (compose logs + per-container inspect, captured while the
+# containers still exist) and stop the watchdog. Tear down (`down -v`) ONLY on a happy finish — on
+# ANY failure we leave the FULL stack (containers + volumes) UP so the crash can be diagnosed
+# (who/how/where: disk, OOM, CA exception). Manual teardown: `cd utils/ca-soak && docker compose down -v`.
+trap '
+  docker compose logs --no-color > "$COMPOSE_LOG" 2>&1 || true
+  docker compose ps -a >> "$COMPOSE_LOG" 2>&1 || true
+  for c in $(docker compose ps -aq 2>/dev/null); do docker inspect --format "{{.Name}} State={{.State.Status}} OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}" "$c" >> "$COMPOSE_LOG" 2>&1 || true; done
+  echo "preserved docker logs+state -> $COMPOSE_LOG"
+  kill $WATCHDOG_PID 2>/dev/null || true
+  if [ "$SOAK_OK" = 1 ]; then
+    echo "PHASE3 OK — tearing down (down -v)"; docker compose down -v
+  else
+    echo "SOAK DID NOT FINISH OK — leaving stack UP for inspection (containers + volumes preserved)."
+    echo "Inspect: docker compose -f utils/ca-soak/docker-compose.yml logs ch1 ; then: cd utils/ca-soak && docker compose down -v"
+  fi
+' EXIT
 
 # Wait for both replicas HTTP-healthy.
 for url in http://localhost:8123 http://localhost:8124; do
@@ -49,7 +66,8 @@ PYTHONPATH="$(pwd)" python3 -m soak.run \
   --seed "$SEED" --phase 3 --duration "$DURATION" --workers "$WORKERS" \
   --metrics "$METRICS" --max-pool-gb "$MAX_POOL_GB" ${NO_CHAOS:+--no-chaos}
 rc=$?
-if [ "$rc" -ne 0 ]; then echo "PHASE3 FAILED (rc=$rc)"; exit "$rc"; fi
+if [ "$rc" -ne 0 ]; then echo "PHASE3 FAILED (rc=$rc) — stack left UP for inspection (see trap)"; exit "$rc"; fi
+SOAK_OK=1   # happy finish — the EXIT trap will now tear down
 
 # Render the metrics curve (PNG if matplotlib is present, else a TSV).
 PYTHONPATH="$(pwd)" python3 scripts/plot.py "$METRICS" "${METRICS%.db}_curve.png" || true
