@@ -105,7 +105,7 @@ All under `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/` 
   ```
   Block-framed: target block 256 KiB, hard cap 1 MiB; per-`DataBlock` CRC32C; sparse footer index one `(min_key, max_key, offset)` per block; compression off by default; deterministic byte output. `RunMerger` is a k-way merge, memory `O(inputs * block_size)`.
 - `CasLayout.h`: add `String manifestKey(const ManifestId & id) const` = `<prefix>/roots/<ns>/_manifests/<writer_instance_id>/<build_sequence>/<aa>/<manifest_instance_id>.proto`; `checkNamespace` ALSO rejects any segment `== "_manifests"`.
-- `CasFormat.h`: add `FormatId::PartManifest = 12` (magic per [Magic Collision note](#magic-collision)), `FormatId::RunFile = 13` (magic "CARN"), `FormatId::GenerationSeal = 14` (magic "CAGN"). (Phase 1d deletes `Tree`/`GcSnap`.)
+- `CasFormat.h`: add `FormatId::PartManifest = 12` (magic per [Magic Collision note](#magic-collision)), `FormatId::RunFile = 13` (magic "CARN"), `FormatId::FoldSeal = 14` (magic "CAFS"), `FormatId::CompletionSeal = 15` (magic "CACS"). (The single `GenerationSeal`/"CAGN" is gone — rev. 15 splits the generation seal into the write-once `CasFoldSeal` and `CasCompletionSeal`. Neither "CAFS" nor "CACS" collides with an existing magic.) (Phase 1d deletes `Tree`/`GcSnap`.)
 
 ## File Structure {#file-structure}
 
@@ -183,7 +183,10 @@ struct ManifestRef
     }
 };
 
-/// The ONLY protocol identity GC uses (spec §Object Identity And Ownership): namespace-qualified.
+/// The protocol identity GC uses (spec §Object Identity And Ownership): namespace-qualified
+/// `ManifestId = (root_namespace_id, ManifestRef)`. It keys source edges / blob deltas / cleanup work
+/// and addressing — distinct from `ManifestSafetyId = (root_namespace, manifest_instance_id)`, which is
+/// a TLA+-abstraction-only term (Phase 0) and never appears in this code.
 /// Two namespaces may legally carry the same `ManifestRef` tuple without addressing the same object;
 /// keying source edges / blob deltas / cleanup work by `ManifestRef` alone is the modeled
 /// `SabotageKeyByRefNotId` hazard. Always key by `ManifestId`.
@@ -379,42 +382,47 @@ Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.cpp`
 - Modify: `src/Disks/tests/gtest_cas_format.cpp`
 
-**Interfaces produced:** `FormatId::PartManifest = 12`, `FormatId::RunFile = 13`, `FormatId::GenerationSeal = 14`; their magics and gen-1 change points.
+**Interfaces produced:** `FormatId::PartManifest = 12`, `FormatId::RunFile = 13`, `FormatId::FoldSeal = 14`, `FormatId::CompletionSeal = 15`; their magics and gen-1 change points.
 
-- [ ] **Step 1: Add the three enumerators to `CasFormat.h`.** Edit the `enum class FormatId` block; append after `GcOutcomes = 11`:
+- [ ] **Step 1: Add the four enumerators to `CasFormat.h`.** Edit the `enum class FormatId` block; append after `GcOutcomes = 11`:
 
 ```cpp
     GcOutcomes = 11,
     /// Phase 1a (CA GC root-local part-manifest redesign):
     PartManifest = 12,    /// immutable root-local part manifest body; magic "CAPT" (see plan note: "CAPM" is taken by PoolMeta)
     RunFile = 13,         /// dense block-framed sorted binary data-plane run; magic "CARN"
-    GenerationSeal = 14,  /// GC generation completeness/index seal; magic "CAGN"
+    /// rev. 15 splits the old single generation seal into two write-once phase seals:
+    FoldSeal = 14,        /// write-once gc/gen/<gen>/fold_seal (coverage + blob_target/cleanup runs); magic "CAFS"
+    CompletionSeal = 15,  /// write-once gc/gen/<gen>/completion_seal (fence/recheck/delete/trim + adoptable); magic "CACS"
 ```
 
-- [ ] **Step 2: Add magics in `CasFormat.cpp` `magicFor`.** In the `switch`, add three cases (before the trailing `throw`). Compute the little-endian uint32 of each 4-ASCII string:
+- [ ] **Step 2: Add magics in `CasFormat.cpp` `magicFor`.** In the `switch`, add four cases (before the trailing `throw`). Compute the little-endian uint32 of each 4-ASCII string:
   - "CAPT" = `'C'=0x43,'A'=0x41,'P'=0x50,'T'=0x54` => `0x54504143u`
   - "CARN" = `'C'=0x43,'A'=0x41,'R'=0x52,'N'=0x4E` => `0x4E524143u`
-  - "CAGN" = `'C'=0x43,'A'=0x41,'G'=0x47,'N'=0x4E` => `0x4E474143u`
+  - "CAFS" = `'C'=0x43,'A'=0x41,'F'=0x46,'S'=0x53` => `0x53464143u`
+  - "CACS" = `'C'=0x43,'A'=0x41,'C'=0x43,'S'=0x53` => `0x53434143u`
 
 ```cpp
-        case FormatId::GcOutcomes:    return 0x4F474143u; /// "CAGO"
-        case FormatId::PartManifest:  return 0x54504143u; /// "CAPT" (NOT "CAPM"; that is PoolMeta)
-        case FormatId::RunFile:       return 0x4E524143u; /// "CARN"
-        case FormatId::GenerationSeal:return 0x4E474143u; /// "CAGN"
+        case FormatId::GcOutcomes:     return 0x4F474143u; /// "CAGO"
+        case FormatId::PartManifest:   return 0x54504143u; /// "CAPT" (NOT "CAPM"; that is PoolMeta)
+        case FormatId::RunFile:        return 0x4E524143u; /// "CARN"
+        case FormatId::FoldSeal:       return 0x53464143u; /// "CAFS"
+        case FormatId::CompletionSeal: return 0x53434143u; /// "CACS"
 ```
 
-- [ ] **Step 3: Add the three to `changePoints` in `CasFormat.cpp`.** Append the new enumerators to the fall-through list that returns `BASELINE`:
+- [ ] **Step 3: Add the four to `changePoints` in `CasFormat.cpp`.** Append the new enumerators to the fall-through list that returns `BASELINE`:
 
 ```cpp
         case FormatId::RootsRegistry:
         case FormatId::GcOutcomes:
         case FormatId::PartManifest:
         case FormatId::RunFile:
-        case FormatId::GenerationSeal:
+        case FormatId::FoldSeal:
+        case FormatId::CompletionSeal:
             return BASELINE;
 ```
 
-- [ ] **Step 4: Extend `gtest_cas_format.cpp`.** (a) add the three ids to the `ChangePointsExistForEveryClass` loop; (b) add three `EXPECT_EQ(le32toStr(...), ...)` lines to `MagicForEachMutableObjectClass`; (c) add the three magics to the `MagicsAreDistinct` array. Apply these three edits:
+- [ ] **Step 4: Extend `gtest_cas_format.cpp`.** (a) add the four ids to the `ChangePointsExistForEveryClass` loop; (b) add four `EXPECT_EQ(le32toStr(...), ...)` lines to `MagicForEachMutableObjectClass`; (c) add the four magics to the `MagicsAreDistinct` array. Apply these three edits:
 
 In `ChangePointsExistForEveryClass`, extend the initializer list:
 ```cpp
@@ -422,24 +430,27 @@ In `ChangePointsExistForEveryClass`, extend the initializer list:
                     FormatId::GcState, FormatId::RetiredSet, FormatId::Watermark,
                     FormatId::PoolMeta, FormatId::Roster,
                     FormatId::RootsRegistry, FormatId::GcOutcomes,
-                    FormatId::PartManifest, FormatId::RunFile, FormatId::GenerationSeal})
+                    FormatId::PartManifest, FormatId::RunFile,
+                    FormatId::FoldSeal, FormatId::CompletionSeal})
 ```
 
 In `MagicForEachMutableObjectClass`, append after the `GcOutcomes` line:
 ```cpp
-    EXPECT_EQ(le32toStr(magicFor(FormatId::PartManifest)),   "CAPT");
-    EXPECT_EQ(le32toStr(magicFor(FormatId::RunFile)),        "CARN");
-    EXPECT_EQ(le32toStr(magicFor(FormatId::GenerationSeal)), "CAGN");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::PartManifest)),    "CAPT");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::RunFile)),         "CARN");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::FoldSeal)),        "CAFS");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::CompletionSeal)),  "CACS");
     /// Guard the documented collision: PartManifest must NOT reuse PoolMeta's "CAPM".
     EXPECT_NE(magicFor(FormatId::PartManifest), magicFor(FormatId::PoolMeta));
 ```
 
-In `MagicsAreDistinct`, append three entries to the `magics[]` array:
+In `MagicsAreDistinct`, append four entries to the `magics[]` array:
 ```cpp
         magicFor(FormatId::GcOutcomes),
         magicFor(FormatId::PartManifest),
         magicFor(FormatId::RunFile),
-        magicFor(FormatId::GenerationSeal),
+        magicFor(FormatId::FoldSeal),
+        magicFor(FormatId::CompletionSeal),
 ```
 
 - [ ] **Step 5: Run the format tests - must PASS.**
@@ -460,9 +471,10 @@ Expected (analyze `build/build.log` via subagent first):
 git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h \
         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.cpp \
         src/Disks/tests/gtest_cas_format.cpp
-git commit -m "CA GC phase1a: add FormatId PartManifest(12)/RunFile(13)/GenerationSeal(14) + magics
+git commit -m "CA GC phase1a: add FormatId PartManifest(12)/RunFile(13)/FoldSeal(14)/CompletionSeal(15) + magics
 
 PartManifest takes magic CAPT, not CAPM: CAPM is already PoolMeta's magic.
+rev. 15 splits the generation seal into FoldSeal (CAFS) + CompletionSeal (CACS); the single CAGN is gone.
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
@@ -1936,7 +1948,7 @@ Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
 - **Spec coverage - §S3 Layout:** `manifestKey` shape `<prefix>/roots/<ns>/_manifests/<writer_instance_id>/<build_sequence>/<aa>/<manifest_instance_id>.proto` with `<aa>` from `manifest_instance_id` is Task 7; `_manifests` rejected by `checkNamespace` is Task 7. Blob key is unchanged (not touched). ✓
 - **Spec coverage - §Backpressure And Journal Encoding:** the `RunFile`/`DataBlock`/`RunFooter` dense block-framed sorted run (RunHeader{magic,version,kind,key_schema,codec,block_size}; per-block CRC32C; sparse footer index; deterministic bytes; bounded `O(inputs*block_size)` merge) is Tasks 3-4; `PartManifest` `entries` reuse the same block-framed run (`kind = ManifestEntries`) rather than one length-prefixed protobuf per entry, per the spec's explicit instruction, in Task 5. The backpressure *thresholds* (OQ7) are enforced at publish time in Phase 1b, not here. ✓
 - **Resolved Open Questions honored:** OQ1 - `PartManifest` carries exactly ref/root_namespace_id/payload_digest/entries, no extra debug fields. OQ3 - no `DirectoryIndex` type defined (deferred). OQ5 - 256 KiB target / 1 MiB cap / CRC32C / sparse footer / compression off / fixed-width hashes / deterministic, all in `CasRunFile`. ✓
-- **Type-name consistency with the contract:** `ManifestRef`, `ManifestId`, `manifestAa`, `EntryPlacement{Inline=1,Blob=2}`, `ManifestEntry`, `PartManifest`, `encodePartManifest`/`decodePartManifest`, `refMatchesBody`/`manifestNamespaceMatches`, `RunKind{BlobInDegree=1,BlobDelta=2,SourceEdge=3,ManifestEntries=4,TargetShardDelta=5}`, `RunHeader`, `RunFileWriter`/`RunFileReader`/`RunMerger`, `Layout::manifestKey`, `FormatId::PartManifest=12`/`RunFile=13`/`GenerationSeal=14` - all match verbatim. The only deviation is the `PartManifest` **magic** ("CAPT" not "CAPM"), which is forced by a real collision and is flagged in [Magic Collision](#magic-collision); the **type name and enum value** are unchanged. ✓
+- **Type-name consistency with the contract:** `ManifestRef`, `ManifestId`, `manifestAa`, `EntryPlacement{Inline=1,Blob=2}`, `ManifestEntry`, `PartManifest`, `encodePartManifest`/`decodePartManifest`, `refMatchesBody`/`manifestNamespaceMatches`, `RunKind{BlobInDegree=1,BlobDelta=2,SourceEdge=3,ManifestEntries=4,TargetShardDelta=5}`, `RunHeader`, `RunFileWriter`/`RunFileReader`/`RunMerger`, `Layout::manifestKey`, `FormatId::PartManifest=12`/`RunFile=13`/`FoldSeal=14`/`CompletionSeal=15` - all match verbatim. The only deviation is the `PartManifest` **magic** ("CAPT" not "CAPM"), which is forced by a real collision and is flagged in [Magic Collision](#magic-collision); the **type name and enum value** are unchanged. ✓
 - **Placeholder scan:** every code step shows full code; every run step shows the exact command and the expected `[  PASSED  ]` (or `no placeholders`); Task 8 Step 3 greps for stubs. ✓
 - **Allman braces:** all shown C++ uses opening brace on its own line. ✓
 

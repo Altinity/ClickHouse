@@ -13,11 +13,11 @@ doc_type: reference
 
 **Goal:** Replace CA's content-addressed *tree* model and resident-snapshot GC with **root-local immutable part manifests** plus a **streaming, target-shardable blob-in-degree GC**, with each behavior-changing phase gated on a green TLA+ model extension.
 
-**Architecture:** Only **blobs** stay content-addressed. Each part becomes one immutable, single-owner, namespace-qualified **part manifest** (`ManifestId = (root_namespace_id, ManifestRef)`) whose body lists every path, inline payload, and blob reference. The root journal carries **compact owner transitions** (old/new `ManifestRef`), not transitive closures. GC folds owner transitions into **write-once blob in-degree generations** sealed by a `GenerationSeal`; there is no cascade, no tree expansion, no `children_by_tree`, no resident `GcSnap`. Default `gc_shards = 1`; an optional target-sharded reducer mode lets two replicas GC disjoint blob-hash shards concurrently.
+**Architecture:** Only **blobs** stay content-addressed. Each part becomes one immutable, single-owner, namespace-qualified **part manifest** whose body lists every path, inline payload, and blob reference. `ManifestId = (root_namespace_id, ManifestRef)` is the **protocol identity** (it keys edges, cleanup, and addressing); the distinct `ManifestSafetyId = (root_namespace_id, manifest_instance_id)` is a **TLA+-abstraction-only** term (see Phase 0). The root journal carries **one ordered `RootOwnerEvent` stream** (each event pairs an `old_binding`?/`new_binding`?, an `OwnerKind` of `Committed` or `Precommit`), not transitive closures. GC folds owner events into **write-once blob in-degree generations** sealed by two write-once phase seals, the `CasFoldSeal` and the `CasCompletionSeal`; there is no cascade, no tree expansion, no `children_by_tree`, no resident `GcSnap`. Default `gc_shards = 1`; an optional target-sharded reducer mode lets two replicas GC disjoint blob-hash shards concurrently.
 
 **Tech stack:** C++ (ClickHouse coding standards, Allman braces); Protobuf for the control plane; dense block-framed sorted binary runs (`RunFile`/`DataBlock`/`RunFooter`) for the hot data plane; TLA+ (TLC) for safety gates; gtest for unit oracles; `ci.praktika` for integration and chaos-soak.
 
-**Source spec:** `docs/superpowers/specs/2026-06-26-cas-gc-streaming-sharded-redesign-design.md` (rev. 13). All section references below are to that spec.
+**Source spec:** `docs/superpowers/specs/2026-06-26-cas-gc-streaming-sharded-redesign-design.md` (rev. 15). All section references below are to that spec.
 
 ---
 
@@ -122,7 +122,7 @@ Phase 0 ──gates──> 1a ──> 1b ┐
 - **Phase 0** gates everything (the model must hold + every negative control must break).
 - **Phase 1a** (formats/identity/layout) gates 1b, 1c, 1d.
 - **Phase 1b + 1c + 1d** are the non-behavior-preserving switch; 1d removes the old tree/snap/cascade machinery and is the first point the GC accounting changes.
-- **Phases 2, 3** optimize discovery / fence / trim; each needs a Phase-0-model extension proving the laziness is safe before its code.
+- **Phases 2, 3** optimize discovery and trim (only discovery and trim are lazy; the fence stays global); each needs a Phase-0-model extension proving the laziness is safe before its code.
 - **Phase 4** enables `gc_shards > 1`; needs the sharded-reducer model extension.
 - **Phase 5** is optional and last; needs the retire-token model extension.
 
@@ -145,14 +145,14 @@ Phase 0 ──gates──> 1a ──> 1b ┐
 
 **Phase 1b — build / precommit / promote**
 - Modify: `CA/Core/CasBuild.*` — `stageTree`→mint `ManifestId` + stream-write body; `PrecommitAdd` in target root; atomic `PromotePrecommit`; writer best-effort `_manifests` debris cleanup; caps + fail-closed.
-- Modify: `CA/Core/CasRootShardCodec.*` — `RootShard{shard_version, fence_round, refs, transitions, precommits, promotions}` carrying `RootRef{manifest_ref, mutable_files, published_at_ms}` plus the three record vectors `transitions` (`OwnerTransition`), `precommits` (`PrecommitTransition`), and `promotions` (`PromotePrecommit`, so `PromotePrecommit` is GC-foldable); remove `JournalRecord.closure`/`ClosureNodeProto`.
+- Modify: `CA/Core/CasRootShardCodec.*` — `RootShard{shard_version, fence_round, refs, journal}` carrying `RootRef{ref_name, manifest_ref, mutable_files, published_at_ms}` plus **one ordered** `std::vector<RootOwnerEvent> journal` (folded in `transition_version` order). A `RootOwnerEvent{transition_version, old_binding?, new_binding?}` carries `OwnerBinding{OwnerKind owner_kind; String ref_name; UInt128 build_id; ManifestRef manifest_ref}` where `OwnerKind` is `Committed` (ref_name set, build_id = 0) or `Precommit` (ref_name = final_ref_name, build_id set). Every owner change — create/abandon precommit, publish/drop/repoint committed, **promote** — is one `RootOwnerEvent`; a promote is `old {Precommit,…,T}` / `new {Committed,…,T}` (same `manifest_ref` T, an owner move with blob Δ = 0). Remove `JournalRecord.closure`/`ClosureNodeProto`.
 - Modify: `CA/ContentAddressedTransaction.cpp` — `republishRef`→publish a fresh destination manifest over the same blob hashes, then drop the source ref; `Atomic` rename stays a CA no-op.
 
 **Phase 1c — read path**
 - Modify: `CA/Core/CasStore.*` — `resolveRef`→`ManifestRef` + namespace + mutable payload; `readTree`→read part manifest via `CasLayout`, enforce `RefMatchesBody`/`ManifestNamespaceMatches`, serve path lookup + optional dir index; cache by `(ManifestId, token)`; fail-closed on a committed ref naming a missing manifest.
 
 **Phase 1d — GC fold / in-degree / retire / seal / orphan sweep + removals**
-- Create: `CA/Core/CasGenerationSeal.h` / `.cpp` — `GenerationSeal` encode/decode + coverage fields (per-`(ns,shard)` classification/token/cursor, parent gen, run-list checksums, fence positions, phase markers).
+- Create: `CA/Core/CasGenerationSeal.h` / `.cpp` — the two write-once phase seals, `CasFoldSeal` and `CasCompletionSeal`, encode/decode + coverage fields. `CasFoldSeal` (key `gc/gen/<gen>/fold_seal`, `FormatId::FoldSeal` magic "CAFS"): `{generation, parent_generation, per_ns_shard: map<String,ShardCoverage>, blob_target_runs: RunRef[], part_manifest_cleanup: RunRef[]}` where `ShardCoverage{uint8_t classification; Token folded_token; uint64_t folded_cursor}`. `CasCompletionSeal` (key `gc/gen/<gen>/completion_seal`, `FormatId::CompletionSeal` magic "CACS"): `{generation, fence_positions: map<String,uint64_t>, delete_outcomes: RunRef[], trim_cursors: map<String,uint64_t>, bool adoptable}`. Resume: completion_seal ⇒ done; else fold_seal ⇒ resume at recheck; else redo fold. (The old single `CasGenerationSeal` / "CAGN" is gone.)
 - Create: `CA/Core/CasBlobInDegree.h` / `.cpp` — streaming in-degree run merge over `CasRunFile`.
 - Create: `CA/Core/CasOrphanManifestSweep.h` / `.cpp` — per-namespace pre-precommit debris sweep.
 - Modify: `CA/Core/CasGc.*` — `fold` owner transitions→blob deltas; remove cascade; build the streaming in-degree generation; retire; seal; wire the sweep. Keep `gc_shards = 1`, all-shard fence, per-candidate `HEAD`.
@@ -162,7 +162,7 @@ Phase 0 ──gates──> 1a ──> 1b ┐
 
 **Phase 2** — Modify `CA/Core/CasGc.*` (discovery), root-shard token persistence (likely `CasRootShardCodec`/`CasGcFormats`), LIST probes (backend interface `CasObjectStorageBackend`/`CasBackend`).
 
-**Phase 3** — Modify `CA/Core/CasGc.*` (lazy fence/trim) + `CasGenerationSeal` (coverage for skipped shards).
+**Phase 3** — Modify `CA/Core/CasGc.*` (lazy trim; the fence stays global) + `CasFoldSeal`/`CasCompletionSeal` (coverage for skipped shards).
 
 **Phase 4** — Modify `CA/Core/CasGc.*` + new `CA/Core/CasGcShardPlan.h`/`.cpp` (mapper scatter / reducer ownership / coordinator); `CasGcScheduler.*` for replica shard ownership; config `gc_shards`.
 
@@ -178,9 +178,9 @@ Phase 0 ──gates──> 1a ──> 1b ┐
 | 1a | `2026-06-26-cas-gc-phase1a-identity-and-codecs.md` | `ManifestRef`/`ManifestId`, `PartManifestProto` codec, `RunFile` dense runs, `CasLayout` manifest key + `_manifests` reservation | Phase 0 green | 0 |
 | 1b | `2026-06-26-cas-gc-phase1b-build-precommit-promote.md` | mint `ManifestId`, write body, `PrecommitAdd` in target root, atomic `PromotePrecommit`, owner transitions, `republishRef`, writer debris cleanup | Phase 0 green | 1a |
 | 1c | `2026-06-26-cas-gc-phase1c-read-path.md` | `resolveRef`/`readTree` over part manifests, `RefMatchesBody`/`ManifestNamespaceMatches`, path lookup, cache | Phase 0 green | 1a |
-| 1d | `2026-06-26-cas-gc-phase1d-gc-fold-indegree-sweep.md` | fold→blob deltas, streaming in-degree generation, `GenerationSeal`, retire, orphan sweep; delete snap/trees/closure/cascade | Phase 0 green | 1a, 1b, 1c |
+| 1d | `2026-06-26-cas-gc-phase1d-gc-fold-indegree-sweep.md` | fold→blob deltas, streaming in-degree generation, `CasFoldSeal`/`CasCompletionSeal`, retire, orphan sweep; delete snap/trees/closure/cascade | Phase 0 green | 1a, 1b, 1c |
 | 2 | `2026-06-26-cas-gc-phase2-token-diff-discovery.md` | LIST token probes, persisted folded tokens+cursors, safe skip of unchanged shards | Phase-0 model ext. (skip-safety) green | 1d |
-| 3 | `2026-06-26-cas-gc-phase3-lazy-fence-trim.md` | model-proven lazy fence, trim below sealed coverage | Phase-0 model ext. (lazy-fence) green | 2 |
+| 3 | `2026-06-26-cas-gc-phase3-lazy-fence-trim.md` | model-proven lazy trim below sealed coverage (the fence stays global) | Phase-0 model ext. (lazy-trim) green | 2 |
 | 4 | `2026-06-26-cas-gc-phase4-target-sharded-reducers.md` | `gc_shards > 1`: mappers scatter by blob hash, disjoint reducers, coordinator, two-replica concurrency | Phase-0 model ext. (sharded reducers) green | 3 |
 | 5 | `2026-06-26-cas-gc-phase5-retire-token-opt.md` | optional: drop per-candidate `HEAD` after token-source proof | Phase-0 model ext. (retire-token) green | 4 |
 

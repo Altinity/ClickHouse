@@ -13,9 +13,9 @@ doc_type: reference
 
 **Goal:** Make GC `discover` skip an unchanged root shard's body read when the listed root token equals the persisted folded token, reading the body on any mismatch/missing/ambiguous/unsupported token, while never shrinking the registry namespace universe — proven safe by a Phase-0-model extension first.
 
-**Architecture:** The `gc/registry` stays the authority for the namespace universe; LIST is only an accelerator. Phase 1d already persists per-root-shard coverage inside `ShardCoverage{classification, folded_token, folded_cursor}` of the `GenerationSeal`. Phase 2 adds (a) a backend capability probe `supportsListTokens` (the LIST seam may or may not surface per-key tokens), (b) round-trip persistence of the folded root-shard token + cursor in `ShardCoverage`, and (c) the token-diff rule in `discover`: a listed root token equal to the persisted folded token ⇒ skip the body read; token missing/ambiguous/stale/unsupported ⇒ read the body; LIST never shrinks the registry universe; fail closed to body reads on any ambiguity.
+**Architecture:** The `gc/registry` stays the authority for the namespace universe; LIST is only an accelerator. Phase 1d already persists per-root-shard coverage inside `ShardCoverage{classification, folded_token, folded_cursor}` of the `CasFoldSeal` (the write-once `gc/gen/<gen>/fold_seal`, `FormatId::FoldSeal` = "CAFS", carrying `per_ns_shard: map<String, ShardCoverage>`). Phase 2 adds (a) a backend capability probe `supportsListTokens` (the LIST seam may or may not surface per-key tokens), (b) round-trip persistence of the folded root-shard token + cursor in `ShardCoverage`, and (c) the token-diff rule in `discover`: a listed root token equal to the persisted folded token ⇒ skip the body read; token missing/ambiguous/stale/unsupported ⇒ read the body; LIST never shrinks the registry universe; fail closed to body reads on any ambiguity. The `foldedTok` is advanced ONLY by the `CasFoldSeal` write at fold time; discovery only ever observes the listed token (`listedTok`) and compares it — it never advances the sealed folded token.
 
-**Token-diff skips ONLY the body read / re-fold, never the fence.** A token-unchanged shard's elided work is exactly its `discover`/`fold` body read and re-fold — its blob in-degree and delete decisions are already covered by the persisted folded state. The all-shard fence from Phase 1d is **unchanged and orthogonal** to token-diff: every shard in the fence universe is still fenced every round (a publish into one shard can protect blobs in any target shard, spec §Global Fence). Phase 2 touches only `discover`; it must not let any task elide, defer, or reuse a fence. (Lazy *fencing* is a separate, later concern and is explicitly NOT in scope here.)
+**Token-diff skips ONLY the body read / re-fold, never the fence.** A token-unchanged shard's elided work is exactly its `discover`/`fold` body read and re-fold — its blob in-degree and delete decisions are already covered by the persisted folded state. The fence is **ALWAYS global** (there is no lazy fence): the all-shard fence from Phase 1d is **unchanged and orthogonal** to token-diff, and every shard in the fence universe is still fenced every round (a publish into one shard can protect blobs in any target shard, spec §Global Fence). Phase 2 touches only `discover`; it must not let any task elide, defer, or reuse a fence. (Lazy *fencing* is explicitly NOT a thing — the fence is always global.)
 
 **Tech Stack:** TLA+ / TLC (`tla2tools.jar` at `tmp/tla2tools.jar`, OpenJDK 21) for the safety gate; C++ (ClickHouse coding standards, Allman braces) for the backend seam, `ShardCoverage` codec, and `CasGc` discovery; gtest (`unit_tests_dbms`, filter `Cas*:Ca*`) for unit oracles.
 
@@ -82,7 +82,7 @@ doc_type: reference
 
 ## Resolved Open Questions consumed here {#resolved-open-questions-consumed-here}
 
-- The model proves the *skip rule* only: skipping an unchanged shard (listed token == folded token) preserves `INV_NO_DANGLE`/`INV_NO_LOSS`; skipping a changed shard (token advanced) breaks `INV_NO_DANGLE`. On-wire token encoding (how a backend surfaces a per-key token through LIST) is a code concern, not modeled.
+- The model proves the *skip rule* only: skipping an unchanged shard (`listedTok = foldedTok`) preserves `INV_NO_DANGLE`/`INV_NO_LOSS`; skipping a changed shard (`listedTok # foldedTok`) breaks `INV_NO_DANGLE`. The model carries two distinct token variables — `listedTok` (what discovery observes from LIST; discovery MAY advance it) and `foldedTok` (the sealed folded token, advanced ONLY by the fold-seal write, NEVER by discovery). On-wire token encoding (how a backend surfaces a per-key token through LIST) is a code concern, not modeled.
 - Token capability (`supportsListTokens`) is modeled abstractly by a `TokenObservable` flag: when FALSE, every shard is force-read (no skip is ever taken), which is trivially safe; when TRUE, the skip rule applies. The code Task 2 ships the real probe; the model only needs to prove the rule under both observability modes.
 - LIST never shrinks the registry universe: the discover universe is `discoverUniverse()` (registry authority) unioned with any LIST-only additions, never a LIST-only intersection. This is the existing `discoverUniverse` contract (registry is authority); Phase 2 must not regress it.
 
@@ -90,10 +90,10 @@ doc_type: reference
 
 These names are produced by Phase 1d and consumed verbatim here. **Do not redefine them; reference them.**
 
-- `GenerationSeal{generation, parent_generation, per_ns_shard(ShardCoverage{classification, folded_token, folded_cursor}), ...}` — the write-once generation completeness record. Phase 2 persists, per root shard, the folded token + folded cursor inside `ShardCoverage`, and reads them back in `discover`.
-- `ShardCoverage{classification, folded_token, folded_cursor}` — the per-`(RootNamespace, shard)` coverage entry inside the seal. `classification` records how the shard was handled this round (read / skipped / minted); `folded_token` is the root-shard object token folded through; `folded_cursor` is the journal cursor folded through.
+- `CasFoldSeal{generation, parent_generation, per_ns_shard: map<String, ShardCoverage>, blob_target_runs: RunRef[], part_manifest_cleanup: RunRef[]}` — the write-once fold seal (`gc/gen/<gen>/fold_seal`, `FormatId::FoldSeal` = "CAFS"). Phase 2 persists, per root shard, the folded token + folded cursor inside `ShardCoverage`, and reads them back in `discover`. (The companion `CasCompletionSeal` at `gc/gen/<gen>/completion_seal` carries fence positions / delete outcomes / trim cursors / adoptable; Phase 2 does not touch it.)
+- `ShardCoverage{classification, folded_token, folded_cursor}` — the per-`(RootNamespace, shard)` coverage entry inside `CasFoldSeal.per_ns_shard`. `classification` records how the shard was handled this round (read / skipped / minted); `folded_token` is the root-shard object token folded through; `folded_cursor` is the journal cursor folded through.
 - `CasGc` round = `discover → fold → retire → fence → recheck → delete → trim` (the part-manifest model's round; no cascade step). Phase 2 changes only `discover`.
-- `CasLayout::generationSealKey(gen)` — key of the `GenerationSeal` object for a generation.
+- `CasLayout::foldSealKey(gen)` — key of the `CasFoldSeal` object for a generation (`gc/gen/<gen>/fold_seal`).
 - `CasBlobInDegree` — the streaming blob in-degree generation built from owner-transition manifest streams (Phase 1d). Phase 2 does not change it.
 
 ## File Structure {#file-structure}
@@ -105,7 +105,7 @@ All C++ paths under `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddress
 - **Create:** `docs/superpowers/models/CaGcRootLocalPartManifestCore_sab_skipchangedshard.cfg` — negative control (must VIOLATE `INV_NO_DANGLE`).
 - **Modify:** `CA/Core/CasBackend.h` — add `bool supportsListTokens()` to the `Backend` seam (Task 2).
 - **Modify:** the concrete backends that implement `Backend` (`CA/Core/CasInMemoryBackend.*`, `CA/Core/CasObjectStorageBackend.*`, `CA/Core/CasInstrumentedBackend.*`) — implement `supportsListTokens` (Task 2).
-- **Modify:** `CA/Core/CasGcFormats.*` (or the file Phase 1d placed `ShardCoverage` in — confirm from the Phase 1d ground-truth report; likely `CA/Core/CasGenerationSeal.*`) — add `folded_token`/`folded_cursor` round-trip to `ShardCoverage` if Phase 1d left either unwired (Task 3).
+- **Modify:** `CA/Core/CasGcFormats.*` (or the file Phase 1d placed `ShardCoverage` in — confirm from the Phase 1d ground-truth report; likely `CA/Core/CasFoldSeal.*`) — add `folded_token`/`folded_cursor` round-trip to `ShardCoverage` if Phase 1d left either unwired (Task 3).
 - **Modify:** `CA/Core/CasGc.*` — `discover` token-diff skip rule (Task 4); fail-closed fallback (Task 5).
 - **Create:** `src/Disks/tests/gtest_cas_gc_token_diff.cpp` — gtests `CasGcDiscovery` + `CasBackendListTokens` + `CasShardCoverageRoundTrip` (Tasks 2–5).
 
@@ -113,9 +113,9 @@ All C++ paths under `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddress
 
 CONSTANTS added to `CaGcRootLocalPartManifestCore.tla`: `EnableTokenDiff` (positive flag, gates the skip stage), `TokenObservable` (abstract `supportsListTokens`), `SabotageSkipChangedShard` (negative control).
 
-VARIABLES added: `foldedTok` (`[Namespaces -> 0..MaxToken]` the persisted folded root-shard token per namespace, the `ShardCoverage.folded_token` abstraction) and `rootTok` (`[Namespaces -> 0..MaxToken]` the live root-shard object token, advanced by any owner transition).
+VARIABLES added (the rev.15 token split): `listedTok` (`[Namespaces -> 0..MaxToken]` the live root-shard token discovery observes from LIST; advanced by any owner transition, and discovery MAY set it) and `foldedTok` (`[Namespaces -> 0..MaxToken]` the persisted folded root-shard token per namespace, the `ShardCoverage.folded_token` abstraction; advanced **ONLY** by the fold-seal write at fold time, **NEVER** by discovery). A shard's body read is skipped iff `listedTok = foldedTok`.
 
-Actions added: `GDiscoverSkip(n)` (skip a shard whose listed token equals the folded token) and `GDiscoverRead(n)` (read a shard's body and refresh the folded token). `SabotageSkipChangedShard` lets `GDiscoverSkip` fire when `rootTok[n] # foldedTok[n]`.
+Actions added: `GDiscoverSkip(n)` (skip a shard whose listed token equals the folded token — `listedTok[n] = foldedTok[n]`) and `GDiscoverRead(n)` (read a shard's body; the **fold-seal write** is the only thing that advances `foldedTok[n]` to `listedTok[n]`). `SabotageSkipChangedShard` lets `GDiscoverSkip` fire when `listedTok[n] # foldedTok[n]` ⇒ must violate `INV_NO_DANGLE`.
 
 ---
 
@@ -132,7 +132,7 @@ Actions added: `GDiscoverSkip(n)` (skip a shard whose listed token equals the fo
 
 **Interfaces:**
 - Consumes (from Phase 0): the module's existing `VARIABLES`, `vars` tuple, `Init`, `Next`, `INV_NO_DANGLE`, `INV_NO_LOSS`, `StateConstraint`, and the `cursor`/`fencePos`/`journal` GC pipeline (the round skeleton `discover → fold → retire → fence → recheck → delete → trim`).
-- Produces: `EnableTokenDiff`, `TokenObservable`, `SabotageSkipChangedShard` CONSTANTS; `foldedTok`, `rootTok` VARIABLES; `GDiscoverSkip`, `GDiscoverRead` actions; the proof that the skip rule preserves `INV_NO_DANGLE`/`INV_NO_LOSS`.
+- Produces: `EnableTokenDiff`, `TokenObservable`, `SabotageSkipChangedShard` CONSTANTS; `listedTok`, `foldedTok` VARIABLES (the rev.15 token split: `listedTok` is what discovery observes from LIST and MAY advance; `foldedTok` is the sealed folded token, advanced ONLY by the fold-seal write); `GDiscoverSkip`, `GDiscoverRead` actions; the proof that the skip rule (`listedTok = foldedTok` ⇒ skip) preserves `INV_NO_DANGLE`/`INV_NO_LOSS`, and that a sabotaged skip on `listedTok # foldedTok` breaks `INV_NO_DANGLE`.
 
 - [ ] **Step 1: Add the three CONSTANTS.** In `CaGcRootLocalPartManifestCore.tla`, extend the `CONSTANTS` block (append to the existing `Enable*` line group and the `Sabotage*` group):
 
@@ -145,58 +145,60 @@ CONSTANTS
     SabotageSkipChangedShard   \* skip a shard whose root token actually advanced (must dangle)
 ```
 
-- [ ] **Step 2: Add the two VARIABLES.** Append `foldedTok, rootTok` to the `VARIABLES` declaration and to the `vars` tuple. The `vars` tuple must list every variable or TLC rejects the spec, so add them at the end:
+- [ ] **Step 2: Add the two VARIABLES (the rev.15 token split).** Append `listedTok, foldedTok` to the `VARIABLES` declaration and to the `vars` tuple. `listedTok` is what discovery observes from LIST (the live root-shard token); `foldedTok` is the sealed folded token, advanced ONLY by the fold-seal write. The `vars` tuple must list every variable or TLC rejects the spec, so add them at the end:
 
 ```tla
 VARIABLES
     \* ... existing variables (present, tokOf, ..., mfCleanup, sweepEligible) ...
-    foldedTok,   \* [Namespaces -> Toks \cup {0}] persisted ShardCoverage.folded_token (last folded root token)
-    rootTok      \* [Namespaces -> Toks \cup {0}] live root-shard object token; any owner transition advances it
+    listedTok,   \* [Namespaces -> Toks \cup {0}] live root-shard token discovery observes from LIST; any owner transition advances it (discovery MAY set it)
+    foldedTok    \* [Namespaces -> Toks \cup {0}] persisted ShardCoverage.folded_token; advanced ONLY by the fold-seal write, NEVER by discovery
 
 vars == << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
            journal, blobIndeg, blobEdges, everEdged, seal, gcRound, gcPhase, roundOf, fencePos,
            cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, sweepEligible,
-           foldedTok, rootTok >>
+           listedTok, foldedTok >>
 ```
 
-- [ ] **Step 3: Initialise the two VARIABLES.** Append to `Init` (a fresh pool has no folded token and a zero live token):
+- [ ] **Step 3: Initialise the two VARIABLES.** Append to `Init` (a fresh pool has a zero live listed token and no folded token):
 
 ```tla
+    /\ listedTok = [n \in Namespaces |-> 0]
     /\ foldedTok = [n \in Namespaces |-> 0]
-    /\ rootTok = [n \in Namespaces |-> 0]
 ```
 
-- [ ] **Step 4: Advance `rootTok` on every owner transition.** Any action that appends an `OwnerTransition` to `journal[n]` (the Phase-0 `WPrecommitAdd`, `WPromote`, `WPublishCommitted`, `WDropRef`, `WRepoint`, `WAbandonPrecommit` actions) must also bump `rootTok[n]` so a body read can observe the new token. Add this conjunct to each such action's body, capped at `MaxToken` so `TypeOK` holds:
+- [ ] **Step 4: Advance `listedTok` on every owner transition (the LIST-observable live token).** Any action that appends an `OwnerTransition` to `journal[n]` (the Phase-0 `WPrecommitAdd`, `WPromote`, `WPublishCommitted`, `WDropRef`, `WRepoint`, `WAbandonPrecommit` actions) must also bump `listedTok[n]` so a body read / a later LIST can observe the new token. **It must NOT touch `foldedTok[n]`** — the sealed folded token is advanced only by the fold-seal write (`GDiscoverRead`). Add this conjunct to each such action's body, capped at `MaxToken` so `TypeOK` holds:
 
 ```tla
-    /\ rootTok' = [rootTok EXCEPT ![n] = IF rootTok[n] < MaxToken THEN rootTok[n] + 1 ELSE rootTok[n]]
+    /\ listedTok' = [listedTok EXCEPT ![n] = IF listedTok[n] < MaxToken THEN listedTok[n] + 1 ELSE listedTok[n]]
 ```
 
-Every other variable each such action previously left `UNCHANGED` must now also leave `foldedTok` unchanged: add `foldedTok` to each action's `UNCHANGED << ... >>` list (and remove `rootTok` from it, since the action now changes `rootTok`).
+Every other variable each such action previously left `UNCHANGED` must now also leave `foldedTok` unchanged: add `foldedTok` to each action's `UNCHANGED << ... >>` list (and remove `listedTok` from it, since the action now changes `listedTok`).
 
 - [ ] **Step 5: Add the discovery actions.** In the helpers/actions section (near the GC pipeline actions), add:
 
 ```tla
 \* The token-diff skip. A shard is skippable iff LIST surfaces a token (TokenObservable) AND the
-\* listed token equals the persisted folded token. A SAFE skip folds nothing and advances nothing:
-\* the durable folded state already covers every transition up to foldedTok[n]. The negative control
-\* SabotageSkipChangedShard drops the equality guard, skipping a shard whose root token advanced.
+\* observed listed token equals the persisted folded token (listedTok[n] = foldedTok[n]). A SAFE skip
+\* folds nothing and advances nothing: the durable folded state already covers every transition up to
+\* foldedTok[n]. The negative control SabotageSkipChangedShard drops the equality guard, skipping a
+\* shard whose listed token advanced past the folded token (listedTok[n] # foldedTok[n]).
 GDiscoverSkip(n) ==
     /\ EnableTokenDiff
     /\ TokenObservable
-    /\ (rootTok[n] = foldedTok[n] \/ SabotageSkipChangedShard)
-    /\ UNCHANGED vars        \* a skip reads nothing, folds nothing, advances no cursor or folded token
+    /\ (listedTok[n] = foldedTok[n] \/ SabotageSkipChangedShard)
+    /\ UNCHANGED vars        \* a skip reads nothing, folds nothing, advances no cursor, no listed or folded token
 
-\* The body read. Always legal; refreshes the persisted folded token to the live token so a later
-\* round may skip. The fold of the journal records it covers is the existing GFoldTransition; this
-\* action models ONLY the discovery decision and the folded-token refresh, leaving the fold pipeline
-\* (cursor/edges) to GFoldTransition.
+\* The body read + fold-seal write. Always legal; the FOLD-SEAL WRITE is the ONLY thing that advances
+\* the persisted folded token, bringing foldedTok[n] up to the listed token observed at fold time so a
+\* later round may skip. Discovery itself never advances foldedTok — only this seal write does. The fold
+\* of the journal records it covers is the existing GFoldTransition; this action models ONLY the discovery
+\* decision and the fold-seal folded-token write, leaving the fold pipeline (cursor/edges) to GFoldTransition.
 GDiscoverRead(n) ==
-    /\ foldedTok' = [foldedTok EXCEPT ![n] = rootTok[n]]
+    /\ foldedTok' = [foldedTok EXCEPT ![n] = listedTok[n]]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, seal, gcRound, gcPhase, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, sweepEligible,
-                    rootTok >>
+                    listedTok >>
 ```
 
 - [ ] **Step 6: Wire the actions into `Next`.** Add the two discovery disjuncts to the existing `Next == ... \/ ...` (do not remove existing disjuncts):
@@ -209,8 +211,8 @@ GDiscoverRead(n) ==
 - [ ] **Step 7: Add `TypeOK` clauses for the new variables.** Extend `TypeOK`:
 
 ```tla
+    /\ listedTok \in [Namespaces -> 0..MaxToken]
     /\ foldedTok \in [Namespaces -> 0..MaxToken]
-    /\ rootTok \in [Namespaces -> 0..MaxToken]
 ```
 
 - [ ] **Step 8: Write `stage5_tokendiff.cfg`** (must HOLD). Copy `CaGcRootLocalPartManifestCore_stage4.cfg`, then set `EnableTokenDiff = TRUE`, `TokenObservable = TRUE`, keep `SabotageSkipChangedShard = FALSE` (and every other `Sabotage* = FALSE`). Keep the same invariant lines as `stage4` plus the no-dangle/no-loss core. The cfg body (constants block elided to the deltas — copy the rest from `stage4.cfg` verbatim):
@@ -254,7 +256,7 @@ INVARIANT INV_NO_DANGLE
 - [ ] **Step 11: Run `sab_skipchangedshard` — must FAIL with `INV_NO_DANGLE`.**
 
 Run: `cd docs/superpowers/models && TLC_JAVA_OPTS=-Xmx24g ./run_gc_partmanifest.sh CaGcRootLocalPartManifestCore_sab_skipchangedshard`
-Expected: `Error: Invariant INV_NO_DANGLE is violated.` and a nonzero `exit=`. A zero exit is a gate failure (`UNEXPECTED PASS`): the sabotage did not reach a dangle, meaning the model cannot express a publish that the skip then misses — fix `GDiscoverSkip`/`rootTok` until the changed-shard skip drops a still-referenced manifest.
+Expected: `Error: Invariant INV_NO_DANGLE is violated.` and a nonzero `exit=`. A zero exit is a gate failure (`UNEXPECTED PASS`): the sabotage did not reach a dangle, meaning the model cannot express a publish (a `listedTok[n]` advance) that the skip then misses — fix `GDiscoverSkip`/`listedTok` until the changed-shard skip (`listedTok[n] # foldedTok[n]`) drops a still-referenced manifest.
 
 - [ ] **Step 12: Re-run the whole suite GREEN** (regression — Step 8's mechanical cfg edit must not have broken any pre-existing config). Use a subagent to analyze the combined log if it is long.
 
@@ -408,26 +410,26 @@ git commit -m "CA GC phase2: add supportsListTokens capability to the Backend se
 ### Task 3: Persist folded root-shard token + cursor in `ShardCoverage` (round-trip) {#task-3-persist-folded-root-shard-token-cursor-in-shardcoverage-round-trip}
 
 **Files:**
-- Modify: `CA/Core/CasGenerationSeal.*` (the file Phase 1d defined `GenerationSeal`/`ShardCoverage` in — confirm exact path from the Phase 1d ground-truth report; the overview's file map places it at `CA/Core/CasGenerationSeal.h`/`.cpp`).
+- Modify: `CA/Core/CasFoldSeal.*` (the file Phase 1d defined `CasFoldSeal`/`ShardCoverage` in — confirm exact path from the Phase 1d ground-truth report; the overview's file map places it at `CA/Core/CasFoldSeal.h`/`.cpp`).
 - Modify: `src/Disks/tests/gtest_cas_gc_token_diff.cpp`
 
 **Interfaces:**
-- Consumes: `ShardCoverage{classification, folded_token, folded_cursor}` and `GenerationSeal{generation, parent_generation, per_ns_shard, ...}` from Phase 1d, plus its `encodeGenerationSeal`/`decodeGenerationSeal` codec (confirm exact codec names from the Phase 1d report).
-- Produces: a verified round-trip — a `GenerationSeal` carrying a `ShardCoverage` with a non-zero `folded_token` (a `Token`) and `folded_cursor` (a `uint64_t`) encodes and decodes byte-stably.
+- Consumes: `ShardCoverage{classification, folded_token, folded_cursor}` and `CasFoldSeal{generation, parent_generation, per_ns_shard, blob_target_runs, part_manifest_cleanup}` from Phase 1d, plus its `encodeFoldSeal`/`decodeFoldSeal` codec (confirm exact codec names from the Phase 1d report).
+- Produces: a verified round-trip — a `CasFoldSeal` carrying a `ShardCoverage` with a non-zero `folded_token` (a `Token`) and `folded_cursor` (a `uint64_t`) encodes and decodes byte-stably.
 
 > **Note:** Phase 1d's contract already lists `folded_token` and `folded_cursor` as `ShardCoverage` fields. If the Phase 1d codec already encodes and decodes both, this task is a *characterization test only* (Steps 1, 7, 8 — assert the round-trip, no codec change). Only if the Phase 1d report shows either field is declared but not yet serialized do Steps 3–6 apply. Confirm from the report before editing the codec.
 
-- [ ] **Step 1: Write the failing test.** Append to `src/Disks/tests/gtest_cas_gc_token_diff.cpp` (add the `CasGenerationSeal.h` include at the top of the file):
+- [ ] **Step 1: Write the failing test.** Append to `src/Disks/tests/gtest_cas_gc_token_diff.cpp` (add the `CasFoldSeal.h` include at the top of the file):
 
 ```cpp
 // add near the top includes:
-// #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
+// #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFoldSeal.h>
 
 /// The token-diff skip reads folded_token + folded_cursor back out of the persisted ShardCoverage,
 /// so both must survive an encode/decode round-trip exactly.
 TEST(CasShardCoverageRoundTrip, FoldedTokenAndCursorSurviveEncodeDecode)
 {
-    GenerationSeal seal;
+    CasFoldSeal seal;
     seal.generation = 12;
     seal.parent_generation = 11;
 
@@ -438,8 +440,8 @@ TEST(CasShardCoverageRoundTrip, FoldedTokenAndCursorSurviveEncodeDecode)
 
     seal.per_ns_shard[{RootNamespace{"srv1/tbl"}, /*shard*/ 0}] = cov;   /// confirm key type from Phase 1d
 
-    const String bytes = encodeGenerationSeal(seal);
-    const GenerationSeal decoded = decodeGenerationSeal(bytes);
+    const String bytes = encodeFoldSeal(seal);
+    const CasFoldSeal decoded = decodeFoldSeal(bytes);
 
     const ShardCoverage & got = decoded.per_ns_shard.at({RootNamespace{"srv1/tbl"}, 0});
     EXPECT_EQ(got.folded_token, Token{"etag-abc"});
@@ -455,7 +457,7 @@ TEST(CasShardCoverageRoundTrip, FoldedTokenAndCursorSurviveEncodeDecode)
 Run: `cd build && ninja unit_tests_dbms > build_cas_phase2_t3.log 2>&1` then `build/src/unit_tests_dbms --gtest_filter='CasShardCoverageRoundTrip*' > test_cas_phase2_t3.log 2>&1`. Analyze both logs with a subagent.
 Expected: either a compile error (if a field is missing) or a FAIL on the `folded_token`/`folded_cursor` assertion (if the codec drops the field). If it PASSES immediately, Phase 1d already serializes both — this is then a passing characterization test; record that and skip to Step 7.
 
-- [ ] **Step 3: Add the fields to `ShardCoverage` if absent.** In `CasGenerationSeal.h`, ensure `ShardCoverage` declares both (only if the Phase 1d report shows they are missing):
+- [ ] **Step 3: Add the fields to `ShardCoverage` if absent.** In `CasFoldSeal.h`, ensure `ShardCoverage` declares both (only if the Phase 1d report shows they are missing):
 
 ```cpp
 struct ShardCoverage
@@ -467,7 +469,7 @@ struct ShardCoverage
 };
 ```
 
-- [ ] **Step 4: Encode both fields.** In `CasGenerationSeal.cpp`, inside the per-`ShardCoverage` branch of `encodeGenerationSeal`, write `folded_token` and `folded_cursor` (match the file's existing encoding style — the overview specifies generation seals are control-plane records, so follow Phase 1d's chosen envelope, e.g. its protobuf or strict-binary writer):
+- [ ] **Step 4: Encode both fields.** In `CasFoldSeal.cpp`, inside the per-`ShardCoverage` branch of `encodeFoldSeal`, write `folded_token` and `folded_cursor` (match the file's existing encoding style — the overview specifies fold seals are control-plane records, so follow Phase 1d's chosen envelope, e.g. its protobuf or strict-binary writer):
 
 ```cpp
     // within the loop over per_ns_shard, after writing `classification`:
@@ -475,7 +477,7 @@ struct ShardCoverage
     writeBinaryLittleEndian(cov.folded_cursor, out);
 ```
 
-- [ ] **Step 5: Decode both fields.** In `CasGenerationSeal.cpp`, the matching `decodeGenerationSeal` branch:
+- [ ] **Step 5: Decode both fields.** In `CasFoldSeal.cpp`, the matching `decodeFoldSeal` branch:
 
 ```cpp
     // within the per-shard decode, after reading `classification`:
@@ -490,14 +492,14 @@ Expected: `CasShardCoverageRoundTrip.FoldedTokenAndCursorSurviveEncodeDecode` PA
 
 - [ ] **Step 7: Guard against regression — run the existing seal/format tests.**
 
-Run: `build/src/unit_tests_dbms --gtest_filter='*GenerationSeal*:CasGcFormats*' > test_cas_phase2_t3d.log 2>&1`. Analyze with a subagent.
+Run: `build/src/unit_tests_dbms --gtest_filter='*FoldSeal*:CasGcFormats*' > test_cas_phase2_t3d.log 2>&1`. Analyze with a subagent.
 Expected: all PASS (the field addition must not break Phase 1d's own seal tests).
 
 - [ ] **Step 8: Commit.**
 
 ```bash
-git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h \
-        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.cpp \
+git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFoldSeal.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFoldSeal.cpp \
         src/Disks/tests/gtest_cas_gc_token_diff.cpp
 git commit -m "CA GC phase2: round-trip folded root-shard token + cursor in ShardCoverage"
 ```
@@ -512,7 +514,7 @@ git commit -m "CA GC phase2: round-trip folded root-shard token + cursor in Shar
 - Modify: `src/Disks/tests/gtest_cas_gc_token_diff.cpp`
 
 **Interfaces:**
-- Consumes: `discoverUniverse()` (registry authority for the namespace universe, `CasGc.h:272`); `shardsToVisit(ns)` (`CasGc.h:280`); `Backend::supportsListTokens()` (Task 2); `ShardCoverage.folded_token`/`folded_cursor` from the previously sealed `GenerationSeal` (Task 3, read via `CasLayout::generationSealKey`); `Backend::list` (`ListPage`) for the listed root-shard token; the round skeleton `discover → fold → ...`.
+- Consumes: `discoverUniverse()` (registry authority for the namespace universe, `CasGc.h:272`); `shardsToVisit(ns)` (`CasGc.h:280`); `Backend::supportsListTokens()` (Task 2); `ShardCoverage.folded_token`/`folded_cursor` from the previously sealed `CasFoldSeal` (Task 3, read via `CasLayout::foldSealKey`); `Backend::list` (`ListPage`) for the listed root-shard token; the round skeleton `discover → fold → ...`.
 - Produces: a `discover` that returns, per `(RootNamespace, shard)`, a decision `{Skip, Read}` such that **Skip** is taken iff `supportsListTokens()` AND a listed token for that shard's `rootShardKey` is present AND equals the sealed `ShardCoverage.folded_token`; otherwise **Read**. The discover universe is `discoverUniverse()` unioned with any LIST-only namespaces, never intersected with LIST.
 
 - [ ] **Step 1: Write the failing test (skip when equal).** Append to `gtest_cas_gc_token_diff.cpp`. Use the existing GC round test scaffold (`cas_test_helpers.h`, an `InMemoryBackend`-backed `Store`, a `Gc` — model it on `gtest_cas_gc_round.cpp`):
@@ -606,7 +608,7 @@ Expected: compile error — `Gc::DiscoverDecision` and `Gc::discoverDecisionsFor
 ```cpp
     // private helper in CasGc.cpp:
     std::map<std::pair<RootNamespace, uint64_t>, Gc::DiscoverDecision>
-    Gc::computeDiscoverDecisions(const GenerationSeal & sealed)
+    Gc::computeDiscoverDecisions(const CasFoldSeal & sealed)
     {
         std::map<std::pair<RootNamespace, uint64_t>, DiscoverDecision> out;
 
@@ -642,7 +644,7 @@ Expected: compile error — `Gc::DiscoverDecision` and `Gc::discoverDecisionsFor
     }
 ```
 
-Then wire the real `discover`/`fold` step so a **Skip** decision elides the body read (it folds nothing — the durable folded state already covers it) and a **Read** decision reads the body and re-folds (the existing fold path), refreshing the `ShardCoverage.folded_token`/`folded_cursor` the round seals (Task 3). Implement `discoverDecisionsForTest` as a thin write-free wrapper that loads the sealed `GenerationSeal` (via `CasLayout::generationSealKey(state.snap_generation)` or the Phase-1d seal pointer) and returns `computeDiscoverDecisions(sealed)`. Add the small helpers `listRootShardTokens` (a `Backend::list` sweep keeping `key -> token`), `GenerationSeal::find(ns, shard)`, and `tokensEqual` (token equality already exists in `CasToken.h` — reuse it; do not reinvent).
+Then wire the real `discover`/`fold` step so a **Skip** decision elides the body read (it folds nothing — the durable folded state already covers it) and a **Read** decision reads the body and re-folds (the existing fold path); the `ShardCoverage.folded_token`/`folded_cursor` are advanced only by the fold-seal write the round seals (Task 3 — never by discovery). Implement `discoverDecisionsForTest` as a thin write-free wrapper that loads the sealed `CasFoldSeal` (via `CasLayout::foldSealKey(state.snap_generation)` or the Phase-1d seal pointer) and returns `computeDiscoverDecisions(sealed)`. Add the small helpers `listRootShardTokens` (a `Backend::list` sweep keeping `key -> token`), `CasFoldSeal::find(ns, shard)`, and `tokensEqual` (token equality already exists in `CasToken.h` — reuse it; do not reinvent).
 
 - [ ] **Step 6: Run the tests to verify they pass.**
 
@@ -701,7 +703,7 @@ TEST(CasGcDiscovery, FailsClosedToReadWhenNoPriorCoverage)
 {
     auto store = DB::Cas::tests::makeInMemoryStore();
     // ... register namespace N shard S in the registry, publish into it, but do NOT run a round
-    //     (so no GenerationSeal has folded_token for (N, S) yet) ...
+    //     (so no CasFoldSeal has folded_token for (N, S) yet) ...
     Gc gc(store, DB::Cas::tests::u128Of(1));
     const auto decisions = gc.discoverDecisionsForTest();
     ASSERT_FALSE(decisions.empty());
@@ -809,6 +811,6 @@ git commit --allow-empty -m "CA GC phase2: token-diff discovery complete — gat
   - §Discovery rule (listed==folded ⇒ skip; missing/ambiguous/stale/unsupported ⇒ read; LIST never shrinks the universe; fail closed) → Task 4 helper + Task 5 hardening + `CasGcDiscovery.RegistryUniverseNeverShrunkByList`. ✓
   - Gate definition matches the overview (positive stage HOLDs; `_sab_*` VIOLATES; no `UNEXPECTED PASS`) → Task 1 Steps 9/11/12. ✓
 - **Placeholder scan:** every code step shows real code; every run step shows the exact command + expected output; the only "confirm from the Phase 1d report" notes are about *names produced by a dependency phase* (legitimate — Phase 1d owns `ShardCoverage`'s exact field/enum/codec spelling), and each carries the consuming intent so the implementer can reconcile. No TBD/TODO/"handle edge cases". ✓
-- **Type consistency:** `DiscoverDecision{Skip, Read}` and `discoverDecisionsForTest` are defined in Task 4 and reused unchanged in Tasks 5/6; `supportsListTokens` is defined in Task 2 and consumed in Tasks 4/5; `ShardCoverage.folded_token`/`folded_cursor` defined/round-tripped in Task 3 and consumed in Task 4; `computeDiscoverDecisions` defined in Task 4 and hardened in Task 5; the model's `EnableTokenDiff`/`TokenObservable`/`SabotageSkipChangedShard`/`foldedTok`/`rootTok`/`GDiscoverSkip`/`GDiscoverRead` are introduced in Task 1 only. ✓
-- **Contract discipline:** only Phase-1d canonical type names are used (`GenerationSeal`, `ShardCoverage{classification, folded_token, folded_cursor}`, `CasGc` round, `CasLayout::generationSealKey`, `CasBlobInDegree`); no invented sibling abstractions. ✓
+- **Type consistency:** `DiscoverDecision{Skip, Read}` and `discoverDecisionsForTest` are defined in Task 4 and reused unchanged in Tasks 5/6; `supportsListTokens` is defined in Task 2 and consumed in Tasks 4/5; `ShardCoverage.folded_token`/`folded_cursor` defined/round-tripped in Task 3 and consumed in Task 4; `computeDiscoverDecisions` defined in Task 4 and hardened in Task 5; the model's `EnableTokenDiff`/`TokenObservable`/`SabotageSkipChangedShard`/`listedTok`/`foldedTok`/`GDiscoverSkip`/`GDiscoverRead` are introduced in Task 1 only. The rev.15 token split keeps `listedTok` (discovery-observed, MAY advance) distinct from `foldedTok` (fold-seal-advanced only); skip is `listedTok = foldedTok`. ✓
+- **Contract discipline:** only Phase-1d canonical type names are used (`CasFoldSeal`, `ShardCoverage{classification, folded_token, folded_cursor}`, `CasGc` round, `CasLayout::foldSealKey`, `CasBlobInDegree`); no invented sibling abstractions, and no reference to the retired single `CasGenerationSeal`. ✓
 - **Dependency & gate ordering:** Task 1 (model) gates Tasks 2–6; Task 6 re-confirms the gate at phase exit; the plan depends on Phase 1d and consumes its contract verbatim. ✓

@@ -11,7 +11,7 @@ doc_type: reference
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax. This is the **R0 gate** for the whole redesign: no code task in any later phase may begin until this model's suite is green. Read `2026-06-26-cas-gc-redesign-overview.md` first.
 
-**Goal:** Author `CaGcRootLocalPartManifestCore.tla` + its `.cfg` suite so that the root-local part-manifest GC protocol is proved safe (`INV_NO_DANGLE`/`INV_NO_LOSS`/`INV_NO_RETURN`) and every one of the 22 negative controls produces the expected counterexample — before any production code is written.
+**Goal:** Author `CaGcRootLocalPartManifestCore.tla` + its `.cfg` suite so that the root-local part-manifest GC protocol is proved safe (`INV_NO_DANGLE`/`INV_NO_LOSS`/`INV_NO_RETURN`) and every one of the 23 negative controls produces the expected counterexample — before any production code is written.
 
 **Architecture:** A TLC model branched from `CaIncarnationCore.tla` (the proved delete-protocol core) plus the precommit rules of `CaBuildRootPrecommit.tla`. It drops the content-addressed-tree/cascade machinery (no `treeEdges`, `marker`, `pendCasc`, `Children`) and replaces it with unique `ManifestId`s, single ownership, owner transitions, and blob-only in-degree. The model is the executable form of the spec's §Safety Invariants and §Negative Controls.
 
@@ -38,8 +38,8 @@ doc_type: reference
 
 ## Resolved Open Questions consumed here {#resolved-open-questions-consumed-here}
 
-- The model defines the *protocol* objects only (identities, owner transitions, blob in-degree, generation seal coverage). On-wire encodings (OQ1/3/5/7 — `PartManifestProto` fields, block-run details, thresholds) are NOT modeled; they are Phase-1a concerns. The model DOES define the **fields the `GenerationSeal` must cover** (the `SabotageCutOverclaim` defense), so its coverage is provable.
-- `_manifests` placement (OQ2) and sweep-eligibility (OQ6) are modeled abstractly: a manifest object belongs to exactly one `(namespace, build-prefix)` and a build-prefix has a boolean `sweepEligible` derived from a durable watermark fact, never a frozen-seq heuristic.
+- The model defines the *protocol* objects only (identities, owner transitions, blob in-degree, seal coverage). On-wire encodings (OQ1/3/5/7 — `PartManifestProto` fields, block-run details, thresholds) are NOT modeled; they are Phase-1a concerns. The model splits seal coverage into two products — `foldSeal` (the fold classification/cursor coverage, where the `SabotageCutOverclaim` defense lives) and `completionSeal` (fence/recheck/delete/trim outcomes) — and DOES define the **fields each seal must cover**, so coverage is provable.
+- The safety identity modeled is `ManifestSafetyId = (namespace, manifest_instance_id)` (= `ManifestIds`); `_manifests` placement (OQ2) and sweep-eligibility (OQ6) are modeled abstractly via `mPrefix \in [ManifestIds -> BuildPrefixes]`: each manifest belongs to exactly one `BuildPrefixes` group, and `sweepEligible \in [BuildPrefixes -> BOOLEAN]` is derived from a durable watermark fact, never a frozen-seq heuristic.
 
 ## File Structure {#file-structure}
 
@@ -47,14 +47,14 @@ doc_type: reference
 - Create: `docs/superpowers/models/run_gc_partmanifest.sh` — wrapper (mirrors `run_tlc.sh` but hardcodes the new module).
 - Create: `docs/superpowers/models/CaGcRootLocalPartManifestCore_stage{0,1,2,3,4}.cfg` — positive stages (must HOLD).
 - Create: `docs/superpowers/models/CaGcRootLocalPartManifestCore_live.cfg` — liveness (`FairSpec`, must HOLD).
-- Create: `docs/superpowers/models/CaGcRootLocalPartManifestCore_sab_<rule>.cfg` × 22 — negative controls (must FAIL with the named invariant).
+- Create: `docs/superpowers/models/CaGcRootLocalPartManifestCore_sab_<rule>.cfg` × 23 — negative controls (must FAIL with the named invariant).
 - Create: `docs/superpowers/models/CaGcRootLocalPartManifestCore_RESULTS.md` — the green-suite ledger.
 
 ## Modeled Vocabulary (canonical names — later phases reference these) {#modeled-vocabulary-canonical-names-later-phases-reference-these}
 
-CONSTANTS: `Namespaces, Writers, Leaders, Blobs, ManifestInstances, Refs, Builds, Paths, MaxToken, MaxRound, MaxLog`, the `Enable*` flags (`EnablePrecommit, EnableMissingBody, EnableOrphanSweep, EnableMutablePayload`), and one `Sabotage*` per negative control (see [Negative Controls](#negative-controls-tasks)).
+CONSTANTS: `Namespaces, Writers, Leaders, Blobs, ManifestInstances, Refs, Builds, Paths, BuildPrefixes, MaxToken, MaxRound, MaxLog`, the `Enable*` flags (`EnablePrecommit, EnableMissingBody, EnableOrphanSweep, EnableMutablePayload`), and one `Sabotage*` per negative control (see [Negative Controls](#negative-controls-tasks)). The model's **safety identity** is `ManifestSafetyId = (namespace, manifest_instance_id)` (= the `ManifestIds` tuple `Namespaces \X ManifestInstances`), which every safety invariant ranges over; the **protocol identity** is `ManifestId = (root_namespace, ManifestRef)`. `writer_instance_id`/`build_sequence` are a locator + sweep-eligibility grouping, modeled as `mPrefix \in [ManifestIds -> BuildPrefixes]`.
 
-VARIABLES (roles): `present`/`tokOf`/`nextTok`/`deadTok` (blob objects + token history, as in `CaIncarnationCore`); `mBody` (`[ManifestId -> BOOLEAN]` manifest body present); `mEntries` (`[ManifestId -> [Paths -> Blobs ∪ {NoBlob}]]` the per-path blob refs a manifest body names); `mRef`/`mNs` (`[ManifestId -> ...]` the body's self-described ref/namespace, for `RefMatchesBody`/`ManifestNamespaceMatches`); `owner` (`[ManifestId -> {committed ref | precommit build | none}]`); `journal` (`[Namespaces -> Seq(OwnerTransition)]`); `mActiveEdges` (`[ManifestId -> [Paths -> Blobs ∪ {NoBlob}]]` the per-path edges actually emitted at activation — the `ManifestActivationMatchesEdges` oracle); `blobIndeg` (`[Blobs -> Nat]`) / `blobEdges` (`⊆ ManifestIds×Paths`, the folded active source edges); `seal` (per-generation `GenerationSeal` coverage); the GC pipeline vars carried from the core (`gcRound, gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView`); `mfCleanup` (part-manifest cleanup work keyed by `ManifestId`); `sweepEligible` (`[BuildPrefix -> BOOLEAN]`).
+VARIABLES (roles): `present`/`tokOf`/`nextTok`/`deadTok` (blob objects + token history, as in `CaIncarnationCore`); `mBody` (`[ManifestId -> BOOLEAN]` manifest body present); `mEntries` (`[ManifestId -> [Paths -> Blobs ∪ {NoBlob}]]` the per-path blob refs a manifest body names); `mRef`/`mNs` (`[ManifestId -> ...]` the body's self-described ref/namespace, for `RefMatchesBody`/`ManifestNamespaceMatches`); `owner` (`[ManifestId -> {committed ref | precommit build | none}]`); `journal` (`[Namespaces -> Seq(OwnerTransition)]`); `mActiveEdges` (`[ManifestId -> [Paths -> Blobs ∪ {NoBlob}]]` the per-path edges actually emitted at activation — the `ManifestActivationMatchesEdges` oracle); `blobIndeg` (`[Blobs -> Nat]`) / `blobEdges` (`⊆ ManifestIds×Paths`, the folded active source edges); two seals — `foldSeal` (per-(ns,shard) fold coverage: classification/folded_token/folded_cursor; the `SabotageCutOverclaim` defense lives here) and `completionSeal` (fence positions, recheck, delete outcomes, trim, adoptable); the GC pipeline vars carried from the core (`gcRound, gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView`); `mfCleanup` (part-manifest cleanup work keyed by `ManifestId`); `mPrefix` (`[ManifestIds -> BuildPrefixes]` each manifest's build-prefix); `sweepEligible` (`[BuildPrefixes -> BOOLEAN]` per-prefix orphan-sweep eligibility from a durable watermark fact).
 
 Actions composed into `Next`: `WStageManifest, WPrecommitAdd, WUploadBlob, WPromote, WPublishCommitted, WDropRef, WRepoint, WAbandonPrecommit, WMutableUpdate, WRepublishCrossNs, GStartRound, GFoldTransition, GRetireBlob, GRetireManifest, GFenceRegistry, GFenceShard, GRecheckDelete, GDeleteManifest, GOrphanSweep, Land, Trim`. `Spec == Init /\ [][Next]_vars`; `FairSpec` adds `WF_vars` on the GC pipeline + `Land` + `GOrphanSweep`.
 
@@ -102,6 +102,7 @@ EXTENDS Integers, Sequences, FiniteSets
 
 CONSTANTS
     Namespaces, Writers, Leaders, Blobs, ManifestInstances, Refs, Builds, Paths,
+    BuildPrefixes,                                    \* sweep-eligibility grouping (writer_instance_id/build_sequence locator)
     MaxToken, MaxRound, MaxLog,
     EnablePrecommit, EnableMissingBody, EnableOrphanSweep, EnableMutablePayload,
     \* one per negative control (Task 8-10); all FALSE in positive stages:
@@ -112,12 +113,22 @@ CONSTANTS
     SabotageRoundVisibilityEarly, SabotageNoFence, SabotageTrimUnincorporated,
     SabotageUncondDelete, SabotageReusedTag, SabotageBareNonce, SabotageKeyByRefNotId,
     SabotageAcceptNamespaceMismatch, SabotageAcceptRefMismatch,
-    SabotageMutableAsReachability, SabotagePromoteAfterMissingBody
+    SabotageMutableAsReachability, SabotagePromoteAfterMissingBody,
+    SabotageAdvancePastMissingBodyPrecommit
 
 \* A ManifestId is (namespace, manifest_instance_id). manifest_instance_id is drawn from
 \* ManifestInstances and is NEVER reused once visible (NoManifestIdReuse). Two namespaces may
 \* hold the same instance id; they are DIFFERENT ManifestIds (the SabotageKeyByRefNotId hazard).
 ManifestIds == Namespaces \X ManifestInstances
+\* ---- abstraction note: two identities ----
+\* The model's SAFETY identity is ManifestSafetyId = (namespace, manifest_instance_id) = the
+\* ManifestIds tuple above; it is what owner/blobEdges/cleanup key on and what every safety
+\* invariant ranges over. The PROTOCOL identity (on the wire) is ManifestId = (root_namespace,
+\* ManifestRef); writer_instance_id / build_sequence are a LOCATOR + sweep-eligibility grouping,
+\* modeled here as mPrefix \in [ManifestIds -> BuildPrefixes] with per-prefix sweepEligible. The
+\* model collapses the protocol ManifestId onto ManifestSafetyId (single visible binding per id),
+\* so "ManifestId" below names the safety identity unless the prose says protocol identity.
+ManifestSafetyId == ManifestIds   \* alias: the safety identity the invariants range over
 Toks == 1..MaxToken
 None == "none"
 NoBlob == "noblob"   \* per-path sentinel: that path has no blob entry (inline / absent)
@@ -127,6 +138,13 @@ NoBlob == "noblob"   \* per-path sentinel: that path has no blob entry (inline /
 \* MutablePayloadNotReachability require. mEntries[m] and mActiveEdges[m] are [Paths -> Blobs \cup {NoBlob}].
 BlobsOf(g) == { g[p] : p \in {q \in Paths : g[q] \in Blobs} }   \* set of blobs a per-path map references
 SrcEdges(m) == { <<m, p>> : p \in {q \in Paths : mActiveEdges[m][q] \in Blobs} }  \* active source edges of m
+\* A RootOwnerEvent (journal record) names an OLD manifest binding and a NEW one for one ref.
+\* Owner-move dispatch (rev.15) compares the two: SAME ManifestId on both sides => pure owner
+\* move (precommit->committed), NO blob deltas, NO mfCleanup. Different ids => a removal of old
+\* (-1 + mfCleanup) and/or an activation of new (+1). Helper predicates over a journal record e:
+OwnerMoveSameManifest(e) == e.old \in ManifestIds /\ e.new \in ManifestIds /\ e.old = e.new
+IsRemoval(e)             == e.old \in ManifestIds /\ (e.new \notin ManifestIds \/ e.new # e.old)
+IsActivation(e)          == e.new \in ManifestIds /\ (e.old \notin ManifestIds \/ e.old # e.new)
 
 VARIABLES
     present, tokOf, nextTok, deadTok,         \* blob objects (as in CaIncarnationCore)
@@ -134,14 +152,16 @@ VARIABLES
     owner, mActiveEdges,                       \* structural owner; per-path edges actually emitted at activation [Paths->Blobs∪{NoBlob}]
     journal,                                   \* [Namespaces -> Seq(OwnerTransition)]
     blobIndeg, blobEdges, everEdged,           \* folded blob in-degree; blobEdges ⊆ ManifestIds×Paths (folded active source edges); journal-known
-    seal,                                      \* per-round GenerationSeal coverage record
+    foldSeal,                                  \* per-(ns,shard) FOLD coverage: classification/folded_token/folded_cursor (SabotageCutOverclaim defense lives here)
+    completionSeal,                            \* per-round COMPLETION fence: fence positions, recheck, delete outcomes, trim, adoptable
     gcRound, gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion,
     retired, inflight, wView,                  \* GC pipeline (carried from core)
-    mfCleanup, sweepEligible                   \* part-manifest cleanup work; orphan-sweep eligibility
+    mfCleanup, mPrefix, sweepEligible          \* part-manifest cleanup work; per-manifest build-prefix; per-prefix orphan-sweep eligibility
 
 vars == << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
-           journal, blobIndeg, blobEdges, everEdged, seal, gcRound, gcPhase, roundOf, fencePos,
-           cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, sweepEligible >>
+           journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
+           roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
+           mfCleanup, mPrefix, sweepEligible >>
 
 \* ---- helpers (filled across tasks) ----
 NoOp == UNCHANGED vars
@@ -161,7 +181,11 @@ Init ==
     /\ blobIndeg = [b \in Blobs |-> 0]
     /\ blobEdges = {}
     /\ everEdged = {}
-    /\ seal = [r \in 0..MaxRound |-> [covered |-> {}, cut |-> [n \in Namespaces |-> 0]]]
+    \* foldSeal: per-(ns,shard) fold classification + folded_token + folded_cursor (the
+    \* SabotageCutOverclaim defense — a cut may not outrun the deltas it claims to cover):
+    /\ foldSeal = [r \in 0..MaxRound |-> [classified |-> {}, foldedCursor |-> [n \in Namespaces |-> 0]]]
+    \* completionSeal: per-round fence positions, recheck status, delete outcomes, trim base, adoptable:
+    /\ completionSeal = [r \in 0..MaxRound |-> [fenced |-> {}, rechecked |-> {}, deleted |-> {}, adoptable |-> FALSE]]
     /\ gcRound = 0
     /\ gcPhase = [l \in Leaders |-> "idle"]
     /\ roundOf = [l \in Leaders |-> 0]
@@ -173,7 +197,8 @@ Init ==
     /\ inflight = {}
     /\ wView = [w \in Writers |-> 0]
     /\ mfCleanup = {}
-    /\ sweepEligible = [n \in Namespaces |-> FALSE]
+    /\ mPrefix = [m \in ManifestIds |-> CHOOSE p \in BuildPrefixes : TRUE]   \* each manifest belongs to one build-prefix
+    /\ sweepEligible = [p \in BuildPrefixes |-> FALSE]   \* per-prefix eligibility from a durable watermark fact
 
 TypeOK ==
     /\ present \in [Blobs -> BOOLEAN]
@@ -185,6 +210,10 @@ TypeOK ==
     /\ blobIndeg \in [Blobs -> 0..(Cardinality(ManifestIds) * Cardinality(Blobs))]
     /\ cursor \in [Namespaces -> 0..MaxLog]
     /\ trimBase \in [Namespaces -> 0..MaxLog]
+    /\ foldSeal \in [0..MaxRound -> [classified : SUBSET ManifestIds, foldedCursor : [Namespaces -> 0..MaxLog]]]
+    /\ completionSeal \in [0..MaxRound -> [fenced : SUBSET Namespaces, rechecked : SUBSET Blobs, deleted : SUBSET Blobs, adoptable : BOOLEAN]]
+    /\ mPrefix \in [ManifestIds -> BuildPrefixes]
+    /\ sweepEligible \in [BuildPrefixes -> BOOLEAN]
 
 INV_JOURNAL_COVERAGE == \A n \in Namespaces : trimBase[n] <= cursor[n]
 
@@ -210,6 +239,7 @@ CONSTANTS
     ManifestInstances = {m1}
     Refs = {r1}
     Builds = {bd1}
+    BuildPrefixes = {bp1}
     MaxToken = 2
     MaxRound = 1
     MaxLog = 3
@@ -240,6 +270,7 @@ CONSTANTS
     SabotageAcceptRefMismatch = FALSE
     SabotageMutableAsReachability = FALSE
     SabotagePromoteAfterMissingBody = FALSE
+    SabotageAdvancePastMissingBodyPrecommit = FALSE
 CONSTRAINT StateConstraint
 INVARIANT TypeOK
 INVARIANT INV_JOURNAL_COVERAGE
@@ -291,8 +322,9 @@ WStageManifest(m, f) ==
     /\ mNs' = [mNs EXCEPT ![m] = IF SabotageAcceptNamespaceMismatch THEN CHOOSE n \in Namespaces : n # m[1] ELSE m[1]]
     /\ everEdged' = everEdged \cup {m[2]}
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, owner, mActiveEdges, journal, blobIndeg,
-                    blobEdges, seal, gcRound, gcPhase, roundOf, fencePos, cursor, trimBase,
-                    fenceVersion, retired, inflight, wView, mfCleanup, sweepEligible >>
+                    blobEdges, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
+                    cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
+                    mPrefix, sweepEligible >>
 ```
 Replace `Next == NoOp` with:
 ```tla
@@ -350,9 +382,9 @@ git commit -m "CA GC phase0: manifest identity + body validation + no-reuse (sta
 **Interfaces produced:** `WPrecommitAdd, WUploadBlob, WPromote, WPublishCommitted, WDropRef, WRepoint, WAbandonPrecommit`; `SingleManifestOwner, CommittedManifestBodyRequired, PrecommitMayReferenceMissingManifest, CommittedNoMissingBlob, PrecommitMayReferenceMissingBlob, INV_NO_DANGLE, INV_NO_LOSS, NoCommittedDangle`.
 
 - [ ] **Step 1: Add owner-transition actions.** Model the spec's §Build And Precommit Protocol. Each action appends an `OwnerTransition` record `[ver, ref, old, new]` to `journal[ns]`. Key rules:
-  - `WPrecommitAdd(m, bld)`: requires `EnablePrecommit`; sets `owner[m] = bld`; precommit **may** have `~mBody[m]` only when `EnableMissingBody` (the missing-body intent); records `mActiveEdges[m] = IF mBody[m] /\ BodyValid(m) THEN mEntries[m] ELSE [p \in Paths |-> NoBlob]` unless `SabotageMissingBodyActivated` forces `mEntries[m]` even when body absent.
+  - `WPrecommitAdd(m, bld)`: requires `EnablePrecommit`; sets `owner[m] = bld`; precommit **may** have `~mBody[m]` only when `EnableMissingBody` (the missing-body intent). A precommit ACTIVATES only when its body is present and valid: `mActiveEdges[m] = IF mBody[m] /\ BodyValid(m) THEN mEntries[m] ELSE [p \in Paths |-> NoBlob]` unless `SabotageMissingBodyActivated` forces `mEntries[m]` even when body absent. A missing-body precommit is **non-activated**: it emits no edges and its `+1` is deferred until the body becomes present (modeled in the fold via the missing-body barrier, below).
   - `WUploadBlob(b)`: mint a fresh token `nextTok[b]` (never the condemned one unless `SabotageReusedTag`); `present[b]=TRUE`.
-  - `WPromote(m, bld, ref)`: the **atomic** owner move. Single transition `owner[m]: bld -> ref`. Fail-closed gate: requires `mBody[m] /\ BodyValid(m) /\ (BlobsOf(mEntries[m]) \subseteq {b \in Blobs : present[b]})` unless `SabotageCommitSkipBlobReval`. If activation was missing-body, emit committed `+` edges here (set `mActiveEdges[m]=mEntries[m]`) unless `SabotagePromoteAfterMissingBody` keeps it a pure move. `SabotageSplitPromote` splits into remove-then-add with an interleaving gap.
+  - `WPromote(m, bld, ref)`: the **atomic, pure owner move** precommit→committed. Same `ManifestId`, blob Δ=0, **no new edges** — the activation `+1` was already emitted when the precommit's body arrived (or is still pending if non-activated). Single transition `owner[m]: bld -> ref`. Fail-closed gate, guarded **on activation**: requires `mBody[m] /\ BodyValid(m) /\ (BlobsOf(mEntries[m]) \subseteq {b \in Blobs : present[b]})` unless `SabotageCommitSkipBlobReval`. A non-activated (missing-body) precommit is therefore NOT promotable (control #22). The move emits no blob deltas and queues no `mfCleanup`. `SabotagePromoteAfterMissingBody` makes promote emit `+` edges after a missing-body precommit (treating the move as an activation that adds reachability that was never folded). `SabotageSplitPromote` splits the move into remove-then-add with an interleaving gap.
   - `WPublishCommitted(m, ref)`: direct committed publish (no precommit). Same fail-closed body+blob gate as promote.
   - `WDropRef(m)` / `WRepoint(mOld, mNew, ref)` / `WAbandonPrecommit(m)`: owner removals/replacements; each emits the paired old/new transition and queues `mfCleanup` for the removed id.
 
@@ -396,19 +428,27 @@ git commit -m "CA GC phase0: owner transitions + committed/precommit + promotion
 - Modify: `CaGcRootLocalPartManifestCore.tla`
 - Create: `CaGcRootLocalPartManifestCore_stage3.cfg`
 
-**Interfaces produced:** `GStartRound, GFoldTransition, GRetireBlob, GFenceRegistry, GFenceShard, GRecheckDelete, Land, Trim`; `ViewableRound`, `BlobInDegreeMatchesActiveManifests`, `FoldedThroughFence`, `seal` coverage, `MonotoneGC`.
+**Interfaces produced:** `GStartRound, GFoldTransition, GRetireBlob, GFenceRegistry, GFenceShard, GRecheckDelete, Land, Trim`; `ViewableRound`, `BlobInDegreeMatchesActiveManifests`, `FoldedThroughFence`, `foldSeal` coverage (fold), `completionSeal` (fence/recheck/trim), `MonotoneGC`.
 
 - [ ] **Step 1: Add the GC pipeline.** Port the proved tail of `CaIncarnationCore` (`GStartRound/GFenceRegistry/GFenceShard/GRecheckDelete/Land/Trim`) but replace tree expansion with blob-delta folding:
-  - `GFoldTransition(n)`: consume the next unfolded `journal[n]` record at `cursor[n]`. For an `old` id, require `mBody[old] /\ BodyValid(old)` (read the body while present), remove `SrcEdges(old)` from `blobEdges` (the `-1` deltas) and decrement `blobIndeg` accordingly, queue `mfCleanup`. For a `new` committed id, require `mBody[new] /\ BodyValid(new)` (`SabotageMissingCommittedEmpty` drops this and treats it as `{}`), set `mActiveEdges[new]=mEntries[new]`, add `SrcEdges(new)` to `blobEdges` (the `+1` deltas), and increment `blobIndeg`. For a `new` precommit id with absent body, emit nothing (record missing-body). Advance `cursor[n]`; update `seal[gcRound].cut[n]`. `SabotageCutOverclaim` jumps `cursor[n]` to `Len(journal[n])` while edges came from the cut.
+  - `GFoldTransition(n)`: consume the next unfolded `journal[n]` `RootOwnerEvent` at `cursor[n]`, **dispatching by comparing the event's old vs new manifest binding** (rev.15):
+    - **Owner move (same ManifestId):** when `OwnerMoveSameManifest(e)` (the event's `old` and `new` name the SAME `ManifestId` — a precommit→committed move), emit **NO** blob deltas and queue **NO** `mfCleanup`; only the owner kind changed. Advance the cursor.
+    - **Removal (`IsRemoval(e)`):** the old manifest is no longer owned — require `mBody[old] /\ BodyValid(old)` (read the body while present), remove `SrcEdges(old)` from `blobEdges` (the `−1` deltas), decrement `blobIndeg` accordingly, and queue `mfCleanup`.
+    - **Activation (`IsActivation(e)`):** the new manifest becomes active — require `mBody[new] /\ BodyValid(new)` (`SabotageMissingCommittedEmpty` drops this and treats it as `{}`), set `mActiveEdges[new]=mEntries[new]`, add `SrcEdges(new)` to `blobEdges` (the `+1` deltas), and increment `blobIndeg`.
+    - **Missing-body precommit barrier (rev.15 soundness fix):** an activation event whose `new` is a LIVE precommit with an absent body (`~mBody[new]`) does **NOT** advance `cursor[n]` and is not yet folded — the cursor advances only once the body becomes present (the precommit ACTIVATES and emits its `+1`) or the precommit binding is removed. Without this barrier the fold could advance past a not-yet-emitted `+1`, letting a later promote add reachability that was never folded. `SabotageAdvancePastMissingBodyPrecommit` removes the barrier (folds the live missing-body precommit as non-activated and moves on). `SabotageCutOverclaim` jumps `cursor[n]` (the foldSeal `foldedCursor`) to `Len(journal[n])` while edges came from the cut.
+    - On a fold step, write the **fold** result into `foldSeal[gcRound]` (classification + `foldedCursor[n]`); advance `cursor[n]`.
   - `GRetireBlob`: a blob with `blobIndeg[b] = 0 /\ present[b]` is retired with its exact token (per-candidate; `SabotageReusedTag`/`SabotageUncondDelete` belong to `Land`).
-  - `GFenceRegistry` then `GFenceShard(n)`: as in the core; `SabotageNoFence` skips the manifest fence write.
-  - `GRecheckDelete`: requires `FoldedThroughFence` (`SabotageNoRecheckFold` drops it); deletes a blob only if `blobIndeg[b]=0` still and token matches; spares otherwise.
+  - `GFenceRegistry` then `GFenceShard(n)`: as in the core; record fence positions into `completionSeal[gcRound].fenced`; `SabotageNoFence` skips the manifest fence write.
+  - `GRecheckDelete`: requires `FoldedThroughFence` (`SabotageNoRecheckFold` drops it); deletes a blob only if `blobIndeg[b]=0` still and token matches; spares otherwise; record into `completionSeal[gcRound].rechecked`/`.deleted`.
   - `Land`: exact-token blob delete message lands; `SabotageUncondDelete` ignores the token match; on any token stopping being current, add it to `deadTok[b]`.
-  - `Trim(n)`: only below `cursor[n]`; `SabotageTrimUnincorporated` trims below an unfolded transition.
+  - `Trim(n)`: only below `cursor[n]` (writes `completionSeal`); `SabotageTrimUnincorporated` trims below an unfolded transition.
 ```tla
 FoldedThroughFence == \A n \in Namespaces : cursor[n] >= fencePos[n]
-ViewableRound == ...   \* port from CaIncarnationCore: round R visible to writers only after all
-                       \* round-R retired sets AND mfCleanup bundles are durable; SabotageRoundVisibilityEarly breaks it
+\* ViewableRound governs the RETIRED-TOKEN view only: round R visible to writers after all round-R
+\* retired sets AND mfCleanup bundles are durable; SabotageRoundVisibilityEarly breaks it. (The
+\* foldSeal / completionSeal govern internal fold products and generation adoption — a separate
+\* visibility axis from the retired-token view, see the rev.15 visibility-split note.)
+ViewableRound == ...   \* port from CaIncarnationCore
 BlobInDegreeMatchesActiveManifests ==
     \A b \in Blobs :
         blobIndeg[b] = Cardinality({ e \in blobEdges : mActiveEdges[e[1]][e[2]] = b })
@@ -443,7 +483,7 @@ git commit -m "CA GC phase0: GC pipeline fold/retire/fence/recheck/delete/trim (
 
 - [ ] **Step 1: Add manifest cleanup + sweep + mutable update.**
   - `GRetireManifest` / `GDeleteManifest(m)`: a manifest body is deleted (exact-token) only after its owner-removal blob decrements are sealed into the generation. `SabotageDeleteBodyBeforeDecrements` deletes the body before the `-` deltas are durable.
-  - `GOrphanSweep(n)`: requires `EnableOrphanSweep`; deletes a staged-but-unowned manifest body in namespace `n` only if its build-prefix `sweepEligible` AND its id is absent from the sealed owner view; emits no blob deltas. `SabotageNoOrphanSweep` disables it (leak). `SabotageWholesalePrefixDelete` deletes the whole eligible prefix regardless of owner view. `SabotageFrozenSeqAuthority` sets `sweepEligible` from a frozen-seq heuristic instead of the durable watermark fact.
+  - `GOrphanSweep(n)`: requires `EnableOrphanSweep`; deletes a staged-but-unowned manifest body `m` in namespace `n` only if `sweepEligible[mPrefix[m]]` (its build-prefix is sweep-eligible) AND its id is absent from the sealed owner view; emits no blob deltas. `SabotageNoOrphanSweep` disables it (leak). `SabotageWholesalePrefixDelete` deletes the whole eligible build-prefix `{ x \in ManifestIds : mPrefix[x] = mPrefix[m] }` regardless of the sealed owner view. `SabotageFrozenSeqAuthority` sets `sweepEligible[p]` from a frozen-seq heuristic instead of the durable watermark fact.
   - `WMutableUpdate(m)`: requires `EnableMutablePayload`; changes only mutable per-ref payload — no owner transition, no blob delta, no id change. `SabotageMutableAsReachability` mints a new id / emits blob deltas.
 ```tla
 MutablePayloadNotReachability == TRUE   \* enforced by WMutableUpdate touching none of owner/blobEdges/ManifestIds;
@@ -452,7 +492,7 @@ ManifestActivationMatchesEdges ==
     \A m \in ManifestIds : (owner[m] # None) => (mActiveEdges[m] \subseteq mEntries[m] \/ ~mBody[m])
 OrphanManifestDebrisDrains ==        \* liveness: under FairSpec a staged-unowned eligible body is eventually deleted
     \A m \in ManifestIds :
-        (mBody[m] /\ owner[m] = None /\ sweepEligible[m[1]]) ~> (~mBody[m])
+        (mBody[m] /\ owner[m] = None /\ sweepEligible[mPrefix[m]]) ~> (~mBody[m])
 NoLeakForever == <>[](\A b \in Blobs : (blobIndeg[b] = 0 /\ present[b]) => FALSE)  \* refine: eventually no live zero-indeg present blob
 FairSpec == Spec /\ WF_vars(\E n \in Namespaces : GFoldTransition(n))
                  /\ WF_vars(\E l \in Leaders : GRecheckDelete(l))
@@ -482,7 +522,7 @@ git commit -m "CA GC phase0: manifest cleanup ordering + orphan sweep + liveness
 
 ### Negative Controls (Tasks 6–8) {#negative-controls-tasks-6-8}
 
-Each control is a `Sabotage* = TRUE` config that **must FAIL** with the named invariant. The model already contains the `IF Sabotage... THEN ...` branches added in Tasks 2–5. Each cfg = a copy of the smallest positive stage that exercises the rule, with exactly one `Sabotage* = TRUE` and the single targeted `INVARIANT` line (narrowing speeds the counterexample, per the `CaIncarnationCore` convention). The 22 controls map one-to-one to spec §Negative Controls.
+Each control is a `Sabotage* = TRUE` config that **must FAIL** with the named invariant. The model already contains the `IF Sabotage... THEN ...` branches added in Tasks 2–5. Each cfg = a copy of the smallest positive stage that exercises the rule, with exactly one `Sabotage* = TRUE` and the single targeted `INVARIANT` line (narrowing speeds the counterexample, per the `CaIncarnationCore` convention). The 23 controls map one-to-one to spec §Negative Controls.
 
 | # | Sabotage flag | Spec control | Base stage | Targeted INVARIANT (must be violated) |
 |---|---|---|---|---|
@@ -493,8 +533,8 @@ Each control is a `Sabotage* = TRUE` config that **must FAIL** with the named in
 | 5 | `SabotageCommitSkipBlobReval` | committed publish skips blob revalidation | stage2 | `INV_NO_DANGLE` |
 | 6 | `SabotagePrecommitlessProtect` | precommitless upload treated as protected | stage3 | `INV_NO_DANGLE` |
 | 7 | `SabotageNoOrphanSweep` | omit pre-precommit debris sweep | live | `OrphanManifestDebrisDrains` |
-| 8 | `SabotageWholesalePrefixDelete` | wholesale dead-prefix delete | stage4 | `INV_NO_DANGLE` |
-| 9 | `SabotageFrozenSeqAuthority` | frozen-seq/judged-dead as deletion authority | stage4 | `INV_NO_DANGLE` |
+| 8 | `SabotageWholesalePrefixDelete` | wholesale delete of a whole eligible `BuildPrefixes` group, ignoring the sealed owner view | stage4 | `INV_NO_DANGLE` |
+| 9 | `SabotageFrozenSeqAuthority` | set `sweepEligible[prefix]` from a frozen-seq heuristic, not a durable watermark | stage4 | `INV_NO_DANGLE` |
 | 10 | `SabotageMissingCommittedEmpty` | missing committed body treated as empty | stage3 | `INV_NO_LOSS` |
 | 11 | `SabotageDeleteBodyBeforeDecrements` | delete body before decrements durable | stage3 | `NoLeakForever` (live) |
 | 12 | `SabotageCutOverclaim` | cursor past unsealed deltas | stage3 | `INV_NO_DANGLE` |
@@ -508,7 +548,8 @@ Each control is a `Sabotage* = TRUE` config that **must FAIL** with the named in
 | 19 | `SabotageAcceptNamespaceMismatch` | accept body ns ≠ owning ns | stage2 | `INV_NO_DANGLE` |
 | 20 | `SabotageAcceptRefMismatch` | accept body ref ≠ journal ref | stage2 | `INV_NO_LOSS` |
 | 21 | `SabotageMutableAsReachability` | mutable update mints id / emits deltas | stage4 | `INV_NO_LOSS` |
-| 22 | `SabotagePromoteAfterMissingBody` | promote-as-move after missing-body | stage3 | `INV_NO_LOSS` |
+| 22 | `SabotagePromoteAfterMissingBody` | promote-as-move after missing-body (non-activated precommit cannot be promoted) | stage3 | `INV_NO_LOSS` |
+| 23 | `SabotageAdvancePastMissingBodyPrecommit` | fold advances past a live missing-body precommit (folds it as non-activated, moves on) so a later promote adds no edges | stage3 | `INV_NO_DANGLE` |
 
 ### Task 6: Negative controls 1–8 {#task-6-negative-controls-1-8}
 
@@ -532,13 +573,13 @@ Expected: each prints `Error: Invariant <NAME> is violated.` (or the temporal-pr
 - [ ] **Step 2: Run each — every one MUST FAIL** (loop as in Task 6, names `frozenseqauthority missingcommittedempty deletebodybeforedecrements cutoverclaim roundvisibilityearly nofence trimunincorporated`). `deletebodybeforedecrements` uses the `live` base + `PROPERTY NoLeakForever`.
 - [ ] **Step 3: Commit** `git commit -m "CA GC phase0: negative controls 9-15"`.
 
-### Task 8: Negative controls 16–22 {#task-8-negative-controls-16-22}
+### Task 8: Negative controls 16–23 {#task-8-negative-controls-16-23}
 
-**Files:** Create `CaGcRootLocalPartManifestCore_sab_{unconddelete,reusedtag,barenonce,keybyrefnotid,acceptnamespacemismatch,acceptrefmismatch,mutableasreachability,promoteaftermissingbody}.cfg`
+**Files:** Create `CaGcRootLocalPartManifestCore_sab_{unconddelete,reusedtag,barenonce,keybyrefnotid,acceptnamespacemismatch,acceptrefmismatch,mutableasreachability,promoteaftermissingbody,advancepastmissingbody}.cfg`
 
-- [ ] **Step 1: Write the 8 cfgs** per the table (`keybyrefnotid` uses `Namespaces = {n1, n2}` and `ManifestInstances = {m1}` so both namespaces share an instance id).
-- [ ] **Step 2: Run each — every one MUST FAIL** (loop, names `unconddelete reusedtag barenonce keybyrefnotid acceptnamespacemismatch acceptrefmismatch mutableasreachability promoteaftermissingbody`).
-- [ ] **Step 3: Commit** `git commit -m "CA GC phase0: negative controls 16-22 (all 22 controls reproduce)"`.
+- [ ] **Step 1: Write the 9 cfgs** per the table (`keybyrefnotid` uses `Namespaces = {n1, n2}` and `ManifestInstances = {m1}` so both namespaces share an instance id; `advancepastmissingbody` uses the `stage3` base with `EnablePrecommit = TRUE`, `EnableMissingBody = TRUE`, `SabotageAdvancePastMissingBodyPrecommit = TRUE`, single `INVARIANT INV_NO_DANGLE`).
+- [ ] **Step 2: Run each — every one MUST FAIL** (loop, names `unconddelete reusedtag barenonce keybyrefnotid acceptnamespacemismatch acceptrefmismatch mutableasreachability promoteaftermissingbody advancepastmissingbody`).
+- [ ] **Step 3: Commit** `git commit -m "CA GC phase0: negative controls 16-23 (all 23 controls reproduce)"`.
 
 ---
 
@@ -575,12 +616,12 @@ for s in stage0 stage1 stage2 stage3 stage4 live ; do ./run_gc_partmanifest.sh C
 for c in reusemanifestid twoowners splitpromote missingbodyactivated commitskipblobreval precommitlessprotect \
          noorphansweep wholesaleprefixdelete frozenseqauthority missingcommittedempty deletebodybeforedecrements \
          cutoverclaim roundvisibilityearly nofence trimunincorporated unconddelete reusedtag barenonce keybyrefnotid \
-         acceptnamespacemismatch acceptrefmismatch mutableasreachability promoteaftermissingbody ; do
+         acceptnamespacemismatch acceptrefmismatch mutableasreachability promoteaftermissingbody advancepastmissingbody ; do
   ./run_gc_partmanifest.sh CaGcRootLocalPartManifestCore_sab_$c && echo "UNEXPECTED PASS: $c"
 done
 ```
-- [ ] **Step 2: Write `RESULTS.md`** as a ledger table: one row per config with `result` (HOLD / VIOLATED `<Inv>`), `states generated`, `distinct states`, `wall time`. Mark the suite **GREEN** iff every stage/live/witness row is correct and all 22 `_sab_*` rows show their expected violation with **no** `UNEXPECTED PASS`. Use the analyze-via-subagent rule for any long log.
-- [ ] **Step 3: Verify the gate** — confirm: (a) `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN` HOLD in stage3/stage4; (b) all 22 controls reproduce; (c) liveness HOLDs; (d) witnesses are reachable.
+- [ ] **Step 2: Write `RESULTS.md`** as a ledger table: one row per config with `result` (HOLD / VIOLATED `<Inv>`), `states generated`, `distinct states`, `wall time`. Mark the suite **GREEN** iff every stage/live/witness row is correct and all 23 `_sab_*` rows show their expected violation with **no** `UNEXPECTED PASS`. Use the analyze-via-subagent rule for any long log.
+- [ ] **Step 3: Verify the gate** — confirm: (a) `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN` HOLD in stage3/stage4; (b) all 23 controls reproduce; (c) liveness HOLDs; (d) witnesses are reachable.
 - [ ] **Step 4: Commit** `git commit -m "CA GC phase0: green-suite ledger — R0 gate satisfied"`.
 
 ---
@@ -588,7 +629,7 @@ done
 ## Self-Review {#self-review}
 
 - **Spec coverage:** every entry in spec §Safety Invariants is a named invariant (Tasks 2–5); every entry in spec §Negative Controls is one row of the controls table (Tasks 6–8); §Backpressure/format encodings are explicitly out of scope here (Phase 1a). ✓
-- **Gate definition matches the overview:** stages/`live`/witnesses HOLD; 22 `_sab_*` VIOLATE; no `UNEXPECTED PASS`. ✓
+- **Gate definition matches the overview:** stages/`live`/witnesses HOLD; 23 `_sab_*` VIOLATE; no `UNEXPECTED PASS`. ✓
 - **No placeholders:** the wrapper, the module skeleton, `stage0`/`stage1` cfgs, and one representative sabotage branch per action are shown in full; the remaining cfgs are fully specified by the controls table (base stage + the single flag + the single invariant), which is data, not a vague instruction. The implementer reads `CaIncarnationCore.tla` for the action-writing idiom (referenced in Task 3/4). ✓
 
 **Gate for the rest of the redesign:** Phases 1a–1d may not start until this suite is GREEN.
