@@ -3,7 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 /// Included by basename via clickhouse_cas_proto's SYSTEM include dir so the generated header's
 /// reserved identifiers don't trip -Weverything -Werror (same idiom as clickhouse_grpc_protos).
-#include <cas_root_shard.pb.h>
+#include <cas_format.pb.h>
 #include <Common/Exception.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
@@ -20,6 +20,8 @@ namespace ErrorCodes
 
 namespace DB::Cas
 {
+
+namespace Proto = ::clickhouse::cas::format;
 
 namespace
 {

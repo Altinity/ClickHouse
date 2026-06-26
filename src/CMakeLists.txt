@@ -902,7 +902,7 @@ if (ENABLE_TESTS)
         clickhouse_common_zookeeper)
 
     if (TARGET clickhouse_cas_proto)
-        # Tests that include <cas_root_shard.pb.h> directly need the proto include path (SYSTEM PUBLIC).
+        # Tests that include <cas_format.pb.h> directly need the proto include path (SYSTEM PUBLIC).
         target_link_libraries(unit_tests_dbms PRIVATE clickhouse_cas_proto)
     endif ()
 

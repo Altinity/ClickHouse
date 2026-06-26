@@ -1,7 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
-#include <cas_root_shard.pb.h>
+#include <cas_format.pb.h>
 #include <Common/Exception.h>
 
 namespace DB
@@ -15,6 +15,8 @@ namespace ErrorCodes
 
 namespace DB::Cas
 {
+
+namespace Proto = ::clickhouse::cas::format;
 
 String encodeRootsRegistry(const RootsRegistry & registry)
 {

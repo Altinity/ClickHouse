@@ -2,7 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
-#include <cas_root_shard.pb.h>
+#include <cas_format.pb.h>
 #include <Common/Exception.h>
 
 #include <limits>
@@ -18,6 +18,8 @@ namespace ErrorCodes
 
 namespace DB::Cas
 {
+
+namespace Proto = ::clickhouse::cas::format;
 
 String encodeServerWatermark(const ServerWatermark & w)
 {

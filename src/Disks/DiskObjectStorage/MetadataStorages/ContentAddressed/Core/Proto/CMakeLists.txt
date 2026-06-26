@@ -1,4 +1,4 @@
-protobuf_generate_cpp(clickhouse_cas_proto_sources clickhouse_cas_proto_headers cas_root_shard.proto)
+protobuf_generate_cpp(clickhouse_cas_proto_sources clickhouse_cas_proto_headers cas_format.proto)
 
 add_library(clickhouse_cas_proto ${clickhouse_cas_proto_headers} ${clickhouse_cas_proto_sources})
 target_include_directories(clickhouse_cas_proto SYSTEM PUBLIC ${CMAKE_CURRENT_BINARY_DIR})

@@ -20,7 +20,7 @@ namespace DB::Cas
 {
 
 /// Binary codec helpers (Plan 3c-tail: JSON family removed — all mutable objects are now protobuf;
-/// see `CasFormat.h` + `cas_root_shard.proto`). Hashed/identity objects (envelope, tree payload,
+/// see `CasFormat.h` + `cas_format.proto`). Hashed/identity objects (envelope, tree payload,
 /// blob payloads, gc/snap) use the standard IO helpers directly — these named wrappers exist so a
 /// 128-bit serialization can never be mis-paired with the wrong byte order.
 

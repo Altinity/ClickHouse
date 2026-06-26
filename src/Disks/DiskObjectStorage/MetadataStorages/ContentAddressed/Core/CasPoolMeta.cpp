@@ -2,7 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
-#include <cas_root_shard.pb.h>
+#include <cas_format.pb.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
 
@@ -19,6 +19,8 @@ namespace ErrorCodes
 
 namespace DB::Cas
 {
+
+namespace Proto = ::clickhouse::cas::format;
 
 namespace
 {

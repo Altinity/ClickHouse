@@ -1,5 +1,5 @@
 syntax = "proto3";
-package DB.Cas.Proto;
+package clickhouse.cas.format;
 
 // ===========================================================================================
 // NORMATIVE protobuf schema for EVERY mutable content-addressed (CA) object. This single file is
@@ -7,12 +7,10 @@ package DB.Cas.Proto;
 // to get all message types. (Hashed/immutable objects — the blob/tree envelope + the Merkle treeId
 // rule — are NOT protobuf; they are normative in the design doc
 // docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.md.)
-// NOTE (cleanup pending): the file is still named cas_root_shard.proto / package DB.Cas.Proto for
-// history; a grooming step renames it to cas_format.proto / package clickhouse.cas.format.
 //
 // CONVERGED HEADER MODEL (2026-06-25): every mutable object carries a CasHeader as field 1.
 // The object is PURE PROTOBUF — no binary prefix, decodable directly with protoc:
-//   protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto < manifest.bin
+//   protoc --decode clickhouse.cas.format.RootShardManifest cas_format.proto < manifest.bin
 // Per-object magic (4 ASCII bytes as little-endian fixed32):
 //   RootShardManifest "CARS" | PoolMetaProto "CAPM" | WatermarkProto "CAWM" | GcStateProto "CAGT"
 //   RetiredSetProto "CART" | RootsRegistryProto "CARR" | GcOutcomeLogProto "CAGO"

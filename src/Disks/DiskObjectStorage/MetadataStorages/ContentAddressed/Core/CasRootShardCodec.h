@@ -15,7 +15,7 @@ namespace DB::Cas
 /// One manifest names a set of refs → their tree, plus the per-ref mutable sidecar files and
 /// an embedded reachability journal.
 ///
-/// Non-hashed metadata object => binary protobuf (`Proto/cas_root_shard.proto`, `RootShardManifest`,
+/// Non-hashed metadata object => binary protobuf (`Proto/cas_format.proto`, `RootShardManifest`,
 /// B164a; replaced the earlier strict-JSON encoding). The manifest is CAS-by-token, not
 /// content-addressed, so byte-determinism is not a correctness requirement; the encoder still
 /// serializes deterministically (name-sorted refs via std::map; journal in insertion order). `refs`
@@ -24,7 +24,7 @@ namespace DB::Cas
 /// (`[magic CARS][writer:u16][min_reader:u16]`) prepended before the protobuf body; `decodeRootShard`
 /// reads and gates the header BEFORE parsing the protobuf body. Fail-closed decode (unknown/missing
 /// required field / wrong type / bad hash length / bad enum => CORRUPTED_DATA). Introspect a raw
-/// manifest offline with `protoc --decode DB.Cas.Proto.RootShardManifest cas_root_shard.proto`.
+/// manifest offline with `protoc --decode clickhouse.cas.format.RootShardManifest cas_format.proto`.
 
 /// One tree node of a precommit's inline closure: the node's tree hash and its staged entries.
 /// Rides the precommit-namespace journal `Add` record (B199-S2): it survives the commit/abandon

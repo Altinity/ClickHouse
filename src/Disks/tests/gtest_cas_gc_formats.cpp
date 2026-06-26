@@ -7,7 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
-#include <cas_root_shard.pb.h>
+#include <cas_format.pb.h>
 #include <limits>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
@@ -20,6 +20,7 @@ extern const int UNKNOWN_FORMAT_VERSION;
 
 using namespace DB::Cas;
 using DB::Cas::tests::expectThrowsCode;
+namespace Proto = ::clickhouse::cas::format;
 
 /// ---------- round trips ----------
 
