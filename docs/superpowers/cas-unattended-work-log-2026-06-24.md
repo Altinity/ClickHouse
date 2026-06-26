@@ -295,3 +295,22 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   per-pool-dir du + df + docker system df every 5min → logs/soak_resmon_c.log), 12.5min heartbeat for
   active health checks. Healthy at launch (pool_bytes probe working, containers up). Field verified clean
   (no lingering procs). du-evidence will show WHERE disk goes (blobs/trees/roots/gc).
+
+## DISK EVIDENCE (attempt-3, 2026-06-26 ~05:32Z) — 'where does the disk go' (operator ask)
+- docker system df at ~12min into attempt-3 (pool=5.7G, healthy):
+    Images:        147.7 GB (130 images), 22.85 GB reclaimable — accumulated CH/rustfs/mc images across
+                   runs + likely the operator's archeology images. The dominant STATIC consumer.
+    Local Volumes:  44.5 GB (26 vols), 38.55 GB reclaimable (86%) — DANGLING anon volumes from
+                   interrupted soak runs. THIS is the '~140G that didn't return' after attempt-1 down -v.
+    Containers:    506 MB ; Build Cache: 1.7 GB.
+    Live rustfs pool (/data/test/soak_pool): 5.7 GB — BOUNDED (20G cap), healthy. B204 fix works.
+- INTERPRETATION: attempt-1's disk-to-0 was the UNBOUNDED rustfs pool (broken probe → no throttle)
+  growing on top of a ~190GB docker baseline (images+dangling volumes). The live pool itself is small +
+  bounded once the du-probe + throttle work (attempt-3 confirms).
+- RECLAIMABLE (operator's call — NOT auto-pruned per docker-safety; some images/volumes may belong to
+  the operator's archeology session): ~38.5GB dangling volumes + ~22.85GB images + 1.7GB build cache
+  ≈ 63GB reclaimable via 'docker volume prune' / 'docker image prune' / 'docker builder prune' (run
+  ONLY after confirming none are needed by the operator's session).
+- HARNESS NOTE: each soak run should 'docker compose down -v' on a HAPPY finish (now fixed) AND a
+  periodic 'docker volume prune -f' of OWN dangling vols would prevent the 38GB leak — but left to the
+  operator given shared-host docker-safety.
