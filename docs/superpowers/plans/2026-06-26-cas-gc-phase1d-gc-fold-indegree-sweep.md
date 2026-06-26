@@ -1,5 +1,5 @@
 ---
-description: "GC fold, streaming blob in-degree generation, orphan sweep, and removal of trees/snap/cascade."
+description: "GC fold over the RootOwnerEvent journal, streaming blob in-degree generation, fold/completion seals, orphan sweep, and removal of trees/snap/cascade."
 sidebar_label: "GC redesign — Phase 1d (GC core)"
 sidebar_position: 6
 slug: /superpowers/plans/2026-06-26-cas-gc-phase1d-gc-fold-indegree-sweep
@@ -11,11 +11,11 @@ doc_type: reference
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Read `2026-06-26-cas-gc-redesign-overview.md` first.
 
-**Goal:** Rewrite CA GC accounting so that owner transitions over root-local part manifests fold into a streaming **blob in-degree generation** sealed by a `GenerationSeal`, add a per-namespace orphan part-manifest sweep, and delete the content-addressed-tree / resident-`GcSnap` / cascade machinery — the first point CA GC behavior changes.
+**Goal:** Rewrite CA GC accounting so that the single ordered `RootOwnerEvent` journal over root-local part manifests folds into a streaming **blob in-degree generation** sealed by a write-once `CasFoldSeal` (and completed by a write-once `CasCompletionSeal`), add a per-namespace orphan part-manifest sweep, and delete the content-addressed-tree / resident-`GcSnap` / cascade machinery — the first point CA GC behavior changes.
 
-**Architecture:** GC reads ONE `PartManifest` per old/new owner named by a streamed `OwnerTransition`/`PrecommitTransition`/`PromotePrecommit`, emits `±1` blob deltas, and merges them with the prior in-degree run via `RunMerger` into a write-once generation; blob retire/fence/recheck keep the proved exact-token-delete tail; manifest bodies are deleted by exact token only AFTER their owner-removal decrements are sealed; an orphan sweep cleans pre-precommit `_manifests` debris per namespace. No tree objects, no `children_by_tree`, no `GcSnap`, no GC-side cascade.
+**Architecture:** GC reads the ONE ordered `RootOwnerEvent` stream (`transition_version` order) on each root shard and dispatches each event by comparing `old_binding.manifest_ref` with `new_binding.manifest_ref`: an **owner move** (equal refs, e.g. a promote) emits no blob delta and no part-manifest cleanup; a **true removal** (old present, the ref not owned afterwards) emits `−1` + cleanup; an **activation** (new present) emits `+1`, subject to the fold barrier. It reads ONE `PartManifest` per affected owner, merges the `±1` deltas with the prior in-degree run via `RunMerger` into a write-once generation, and seals what it folded in a `CasFoldSeal`; blob retire/fence/recheck keep the proved exact-token-delete tail and seal their result in a `CasCompletionSeal`; manifest bodies are deleted by exact token only AFTER their owner-removal decrements are sealed; an orphan sweep cleans pre-precommit `_manifests` debris per namespace. No tree objects, no `children_by_tree`, no `GcSnap`, no GC-side cascade.
 
-**Tech Stack:** C++ (ClickHouse coding standards, Allman braces); Protobuf for control-plane records (`GenerationSeal`, `GcState`, retired/outcome); dense block-framed sorted binary runs (`RunFile`/`DataBlock`/`RunFooter` via `RunMerger`) for the hot blob in-degree / blob-delta data plane; gtest for unit oracles (binary `build/src/unit_tests_dbms`); `ci.praktika` for chaos soak.
+**Tech Stack:** C++ (ClickHouse coding standards, Allman braces); Protobuf for control-plane records (`CasFoldSeal`, `CasCompletionSeal`, `GcState`, retired/outcome); dense block-framed sorted binary runs (`RunFile`/`DataBlock`/`RunFooter` via `RunMerger`) for the hot blob in-degree / blob-delta data plane; gtest for unit oracles (binary `build/src/unit_tests_dbms`); `ci.praktika` for chaos soak.
 
 ## Global Constraints {#global-constraints}
 
@@ -81,14 +81,38 @@ doc_type: reference
 - From `CA/Core/CasManifestCodec.h`: `PartManifest`, `ManifestEntry` (`path`, `placement = inline|blob`, `blob_hash`, `blob_size`, `inline_bytes`); `decodePartManifest(std::string_view) -> PartManifest`; `refMatchesBody(const ManifestRef & journal_ref, const PartManifest & body) -> bool`; `manifestNamespaceMatches(const RootNamespace & owning, const PartManifest & body) -> bool` (ref-first / namespace-first, exactly as Phase 1a emits them).
 - From `CA/Core/CasLayout.h`: `Layout::manifestKey(const ManifestId&) -> String` (added by 1a). Existing keys (verbatim, from `CasLayout.h`): `gcStateKey()` ⇒ `<prefix>/gc/state`; `rootsRegistryKey()` ⇒ `<prefix>/gc/registry`; `retiredKey(round,fence_seq,shard)` ⇒ `<prefix>/gc/retired/<round>.<fence_seq>/<shard>`; `outcomesKey(round,fence_seq,shard)` ⇒ `<prefix>/gc/outcomes/<round>.<fence_seq>/<shard>`; `blobKey(const BlobId&)` ⇒ `<prefix>/blobs/<aa>/<hash>`; private member `String prefix`.
 - From `CA/Core/CasRunFile.h` (1a): `RunFile`, `DataBlock`, `RunFooter`, `RunKind`, and a `RunMerger` that k-way-merges sorted runs by merge key. (Reader/writer/merge API is defined by 1a; this plan calls it.)
-- From `CA/Core/CasRootShardCodec.h` (reworked by 1b): `RootShard{... , std::vector<OwnerTransition> transitions, std::vector<PrecommitTransition> precommits, std::vector<PromotePrecommit> promotions, ...}`; `OwnerTransition{uint64_t transition_version; String ref_name; std::optional<ManifestRef> old_manifest; std::optional<ManifestRef> new_manifest;}`; `PrecommitTransition{uint64_t transition_version; UInt128 build_id; String final_ref_name; std::optional<ManifestRef> old_manifest; std::optional<ManifestRef> new_manifest;}`; `PromotePrecommit{uint64_t transition_version; UInt128 build_id; String final_ref_name; ManifestRef manifest;}`; `RootRef`. `decodeRootShard`/`encodeRootShard` from the same header. (1b emits `promotions` as a first-class third record vector so `PromotePrecommit` is GC-foldable.)
+- From `CA/Core/CasRootShardCodec.h` (reworked by 1b): the root journal is ONE ordered stream of `RootOwnerEvent` in `transition_version` order — there are NO separate `transitions`/`precommits`/`promotions` vectors.
+  ```cpp
+  enum class OwnerKind { Committed = 1, Precommit = 2 };
+  struct OwnerBinding
+  {
+      OwnerKind owner_kind;
+      String ref_name;
+      UInt128 build_id;
+      ManifestRef manifest_ref;
+  };
+  struct RootOwnerEvent
+  {
+      uint64_t transition_version;
+      std::optional<OwnerBinding> old_binding;
+      std::optional<OwnerBinding> new_binding;
+  };
+  struct RootShard
+  {
+      uint64_t shard_version;
+      uint64_t fence_round;
+      std::map<String, RootRef> refs;
+      std::vector<RootOwnerEvent> journal;   /// ONE ordered stream in transition_version order
+  };
+  ```
+  `decodeRootShard`/`encodeRootShard` and `RootRef` from the same header. A **promote** is one `RootOwnerEvent` whose `old_binding` = `{Precommit, final, build_id, T}` and `new_binding` = `{Committed, final, T}` with the SAME `transition_version` T and the SAME `manifest_ref` (an owner move, not a new body). (1b emits the single converged `journal` so GC folds owner events by comparing `old_binding.manifest_ref` to `new_binding.manifest_ref`.)
 - From `CA/Core/CasBackend.h` (verbatim seam): `Backend::get(key,Range={}) -> std::optional<GetResult>` (`GetResult{String bytes; Token token; ObjectMeta attributes;}`); `head(key) -> HeadResult{bool exists; uint64_t size; Token token;}`; `putIfAbsent(key,bytes,meta={}) -> PutResult{PutOutcome outcome; Token token;}` (`PutOutcome::Done|PreconditionFailed`); `casPut(key,bytes,std::optional<Token> expected,meta={}) -> CasResult{CasOutcome outcome; Token token;}` (`CasOutcome::Committed|Conflict`); `deleteExact(key,token) -> DeleteOutcome{Kind kind;}` (`Kind::Deleted|TokenMismatch|NotFound`); `list(prefix,cursor,limit) -> ListPage{std::vector<ListedKey> keys; String next_cursor;}` (`ListedKey{String key; uint64_t size;}`). Accessors: `store->backend()`, `store->layout()`, `store->poolConfig()`, `store->poolMeta()`, `store->readShard(ns,shard)` (returns `std::pair<RootShard, Token>`), `store->mutateShard(ns,shard,fn,&committed)`.
 
 **This phase EMITS:**
-- `CA/Core/CasGenerationSeal.h`/`.cpp` — `GenerationSeal` + coverage fields + codec (`FormatId::GenerationSeal`, magic `"CAGN"`); `Layout::generationSealKey`/`blobTargetRunKey`/`partManifestCleanupKey`; **removes** `Layout::gcSnapKey`.
+- `CA/Core/CasGenerationSeal.h`/`.cpp` — TWO write-once seal types: `CasFoldSeal` (`FormatId::FoldSeal`, magic `"CAFS"`, key `Layout::foldSealKey`) sealing the fold output, and `CasCompletionSeal` (`FormatId::CompletionSeal`, magic `"CACS"`, key `Layout::completionSealKey`) sealing fence/recheck/delete/trim; plus `Layout::blobTargetRunKey`/`partManifestCleanupKey`; **removes** `Layout::gcSnapKey`.
 - `CA/Core/CasBlobInDegree.h`/`.cpp` — streaming blob in-degree generation built by merging the prior in-degree run with scattered `±1` deltas via `RunMerger`.
 - `CA/Core/CasOrphanManifestSweep.h`/`.cpp` — per-namespace pre-precommit `_manifests` debris sweep.
-- `CA/Core/CasGc.*` — `fold` rewritten over owner transitions → blob deltas; remove `cascadeAndPersist`; remove `snap_shards==1` tree branch; keep `gc_shards=1`, all-shard fence, per-candidate `HEAD` in retire.
+- `CA/Core/CasGc.*` — `fold` rewritten over the ONE ordered `RootOwnerEvent` journal → blob deltas (owner-move ⇒ no delta/no cleanup, removal ⇒ −1+cleanup, activation ⇒ +1 subject to the fold barrier); remove `cascadeAndPersist`; remove `snap_shards==1` tree branch; keep `gc_shards=1`, all-shard fence, per-candidate `HEAD` in retire.
 - `CA/Core/CasFsck.*` — OQ8 read-only manifest audit (Task 9).
 - **Deletes:** `CA/Core/CasGcSnap.*`, `CA/Core/CasTreeCodec.*`, `CA/Core/CasClosureWalk.*`.
 
@@ -98,13 +122,13 @@ doc_type: reference
 
 ## File Structure {#file-structure}
 
-- Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h` / `.cpp` — the `GenerationSeal` type, coverage fields, codec, and the three new `Layout` keys.
+- Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h` / `.cpp` — the two write-once seal types (`CasFoldSeal` + `CasCompletionSeal`), their coverage fields, two codecs, and the new `Layout` keys (`foldSealKey`/`completionSealKey`/`blobTargetRunKey`/`partManifestCleanupKey`).
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h` / `.cpp` — streaming in-degree fold + zero-in-degree scan.
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h` / `.cpp` — per-namespace orphan sweep.
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h` / `.cpp` — `fold` rewrite, retire/fence/recheck adaptation, remove `cascadeAndPersist`/`assertSnapJournalCoherent`/snap members, wire the sweep + retire-visibility barrier.
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h` / `.cpp` — keep `GcState`/`RetiredSet`; drop `snap_*` fields that the new model no longer uses (see Task 1) and add the generation pointer.
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h` / `.cpp` — add `FormatId::GenerationSeal`; remove `FormatId::Tree` and `FormatId::GcSnap` (and their magics).
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h` — remove `gcSnapKey`; add the three generation keys (in `CasGenerationSeal` task, declared on `Layout`).
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h` / `.cpp` — add `FormatId::FoldSeal` and `FormatId::CompletionSeal`; remove `FormatId::Tree` and `FormatId::GcSnap` (and their magics).
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h` — remove `gcSnapKey`; add the generation keys `foldSealKey`/`completionSealKey`/`blobTargetRunKey`/`partManifestCleanupKey` (in `CasGenerationSeal` task, declared on `Layout`).
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h` / `.cpp` — OQ8 manifest audit.
 - Delete: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcSnap.h` / `.cpp`, `CasTreeCodec.h` / `.cpp`, `CasClosureWalk.h` / `.cpp`.
 - Modify (test infra): `src/Disks/tests/cas_test_helpers.h` — drop the `CasTreeCodec.h` include + `writeTreeRaw`; add `writeManifestRaw` + `injectBlobInDegreeGeneration`.
@@ -113,9 +137,9 @@ doc_type: reference
 
 ---
 
-### Task 1: `CasGenerationSeal` — type, coverage fields, codec, layout keys {#task-1-casgenerationseal-type-coverage-fields-codec-layout-keys}
+### Task 1: `CasFoldSeal` + `CasCompletionSeal` — two write-once seal types, coverage fields, codecs, layout keys {#task-1-casfoldseal-cascompletionseal-two-write-once-seal-types-coverage-fields-codecs-layout-keys}
 
-Realizes the `GenerationSeal` coverage that makes `SabotageCutOverclaim` (negative control #12) defensible: a sealed generation states, per `(namespace, shard)`, exactly what was folded (`classification`, `folded_token`, `folded_cursor`), its parent generation, the run-list checksums, fence positions, and phase markers. Enforces spec §Debuggability-And-Resume ("every durable generation must answer …") and §Safety-Invariants `JournalCoverage`.
+Realizes the split of the old single `GenerationSeal` into TWO write-once seals so the visibility boundary is explicit (spec rev. 15 §Visibility-Split): `CasFoldSeal` records what `fold` folded (per `(namespace, shard)`: `classification`, `folded_token`, `folded_cursor`), its parent generation, and the blob-target / part-manifest-cleanup run lists; `CasCompletionSeal` records what fence/recheck/delete/trim completed (fence positions, delete outcomes, trim cursors, and whether the generation is `adoptable`). `CasFoldSeal` makes `SabotageCutOverclaim` (negative control #12) defensible (the recheck proves the cursor never ran past the sealed deltas). Enforces spec §Debuggability-And-Resume ("every durable generation must answer …") and §Safety-Invariants `JournalCoverage`.
 
 **Files:**
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h`
@@ -130,12 +154,13 @@ Realizes the `GenerationSeal` coverage that makes `SabotageCutOverclaim` (negati
 - Produces (later tasks rely on these EXACT names/types):
   - `struct RunRef { String key; UInt128 checksum; };`
   - `struct ShardCoverage { uint8_t classification; Token folded_token; uint64_t folded_cursor; };`
-  - `struct PhaseMarkers { bool folded; bool retired; bool fenced; bool rechecked; bool deleted; bool trimmed; };`
-  - `struct GenerationSeal { uint64_t generation; uint64_t parent_generation; std::map<String, ShardCoverage> per_ns_shard; std::vector<RunRef> blob_target_runs; std::vector<RunRef> part_manifest_cleanup; std::map<String, uint64_t> fence_positions; PhaseMarkers markers; };`
-  - `String encodeGenerationSeal(const GenerationSeal &);` / `GenerationSeal decodeGenerationSeal(std::string_view);`
-  - `Layout::generationSealKey(uint64_t generation)`; `Layout::blobTargetRunKey(uint64_t generation, uint64_t shard, uint64_t seq)`; `Layout::partManifestCleanupKey(uint64_t generation, uint64_t owner_shard, uint64_t seq)`.
+  - `struct CasFoldSeal { uint64_t generation; uint64_t parent_generation; std::map<String, ShardCoverage> per_ns_shard; std::vector<RunRef> blob_target_runs; std::vector<RunRef> part_manifest_cleanup; };`
+  - `struct CasCompletionSeal { uint64_t generation; std::map<String, uint64_t> fence_positions; std::vector<RunRef> delete_outcomes; std::map<String, uint64_t> trim_cursors; bool adoptable; };`
+  - `String encodeFoldSeal(const CasFoldSeal &);` / `CasFoldSeal decodeFoldSeal(std::string_view);`
+  - `String encodeCompletionSeal(const CasCompletionSeal &);` / `CasCompletionSeal decodeCompletionSeal(std::string_view);`
+  - `Layout::foldSealKey(uint64_t generation)`; `Layout::completionSealKey(uint64_t generation)`; `Layout::blobTargetRunKey(uint64_t generation, uint64_t shard, uint64_t seq)`; `Layout::partManifestCleanupKey(uint64_t generation, uint64_t owner_shard, uint64_t seq)`.
 
-- [ ] **Step 1: Add `FormatId::GenerationSeal` and remove `Tree`/`GcSnap`.** In `CasFormat.h`, the enum currently reads (verbatim):
+- [ ] **Step 1: Add `FormatId::FoldSeal` + `FormatId::CompletionSeal` and remove `Tree`/`GcSnap`.** In `CasFormat.h`, the enum currently reads (verbatim):
 
 ```cpp
 enum class FormatId : uint16_t
@@ -154,7 +179,7 @@ enum class FormatId : uint16_t
 };
 ```
 
-Replace it with (remove `Tree`, remove `GcSnap`, append `GenerationSeal`; keep existing numeric values stable for the survivors since CA is pre-release and there is no on-disk compat to honor — the only rule is no two enumerators share a value):
+Replace it with (remove `Tree`, remove `GcSnap`, append `FoldSeal` and `CompletionSeal`; keep existing numeric values stable for the survivors since CA is pre-release and there is no on-disk compat to honor — the only rule is no two enumerators share a value):
 
 ```cpp
 enum class FormatId : uint16_t
@@ -168,17 +193,19 @@ enum class FormatId : uint16_t
     Roster = 9,
     RootsRegistry = 10,
     GcOutcomes = 11,
-    GenerationSeal = 12,
+    FoldSeal = 12,
+    CompletionSeal = 13,
 };
 ```
 
 In `CasFormat.cpp`, find the `magicFor` switch (the function returning the per-format magic, e.g. `0x4C424143u` for `Blob`). Delete the `case FormatId::Tree:` and `case FormatId::GcSnap:` arms, and add:
 
 ```cpp
-        case FormatId::GenerationSeal: return 0x4E474143u;  // "CAGN" little-endian
+        case FormatId::FoldSeal: return 0x53464143u;        // "CAFS" little-endian
+        case FormatId::CompletionSeal: return 0x53434143u;  // "CACS" little-endian
 ```
 
-- [ ] **Step 2: Add the three `Layout` keys and remove `gcSnapKey`.** In `CasLayout.h`, delete the existing `gcSnapKey` method (verbatim, to be removed):
+- [ ] **Step 2: Add the four `Layout` keys and remove `gcSnapKey`.** In `CasLayout.h`, delete the existing `gcSnapKey` method (verbatim, to be removed):
 
 ```cpp
     String gcSnapKey(uint64_t generation, uint64_t snap_shard) const
@@ -190,10 +217,16 @@ In `CasFormat.cpp`, find the `magicFor` switch (the function returning the per-f
 and add, next to `outcomesKey`:
 
 ```cpp
-    /// Per-generation completeness seal: <prefix>/gc/gen/<generation>/seal
-    String generationSealKey(uint64_t generation) const
+    /// Per-generation FOLD seal (write-once): <prefix>/gc/gen/<generation>/fold_seal
+    String foldSealKey(uint64_t generation) const
     {
-        return prefix + "/gc/gen/" + std::to_string(generation) + "/seal";
+        return prefix + "/gc/gen/" + std::to_string(generation) + "/fold_seal";
+    }
+
+    /// Per-generation COMPLETION seal (write-once): <prefix>/gc/gen/<generation>/completion_seal
+    String completionSealKey(uint64_t generation) const
+    {
+        return prefix + "/gc/gen/" + std::to_string(generation) + "/completion_seal";
     }
 
     /// One blob-target in-degree/delta run segment: <prefix>/gc/gen/<generation>/blob_target/<shard>/<seq>
@@ -211,7 +244,7 @@ and add, next to `outcomesKey`:
     }
 ```
 
-- [ ] **Step 3: Write the failing test.** Create `src/Disks/tests/gtest_cas_generation_seal.cpp`:
+- [ ] **Step 3: Write the failing test.** Create `src/Disks/tests/gtest_cas_generation_seal.cpp` (round-trips BOTH seal types):
 
 ```cpp
 #include <gtest/gtest.h>
@@ -223,27 +256,35 @@ using namespace DB::Cas;
 
 namespace
 {
-GenerationSeal sampleSeal()
+CasFoldSeal sampleFoldSeal()
 {
-    GenerationSeal seal;
+    CasFoldSeal seal;
     seal.generation = 7;
     seal.parent_generation = 6;
     seal.per_ns_shard["ns1/0"] = ShardCoverage{.classification = 2, .folded_token = Token{"tok-a"}, .folded_cursor = 42};
     seal.per_ns_shard["ns1/1"] = ShardCoverage{.classification = 1, .folded_token = Token{}, .folded_cursor = 0};
     seal.blob_target_runs.push_back(RunRef{.key = "gc/gen/7/blob_target/0/0", .checksum = DB::UInt128(0xABCDEF)});
     seal.part_manifest_cleanup.push_back(RunRef{.key = "gc/gen/7/part_manifest_cleanup/0/0", .checksum = DB::UInt128(0x1234)});
+    return seal;
+}
+
+CasCompletionSeal sampleCompletionSeal()
+{
+    CasCompletionSeal seal;
+    seal.generation = 7;
     seal.fence_positions["ns1/0"] = 99;
     seal.fence_positions["_registry"] = 100;
-    seal.markers = PhaseMarkers{.folded = true, .retired = true, .fenced = true,
-                                .rechecked = true, .deleted = true, .trimmed = false};
+    seal.delete_outcomes.push_back(RunRef{.key = "gc/outcomes/2.0/0", .checksum = DB::UInt128(0x55)});
+    seal.trim_cursors["ns1/0"] = 42;
+    seal.adoptable = true;
     return seal;
 }
 }
 
-TEST(CasGenerationSeal, RoundTripsAllFields)
+TEST(CasFoldSeal, RoundTripsAllFields)
 {
-    const GenerationSeal in = sampleSeal();
-    const GenerationSeal out = decodeGenerationSeal(encodeGenerationSeal(in));
+    const CasFoldSeal in = sampleFoldSeal();
+    const CasFoldSeal out = decodeFoldSeal(encodeFoldSeal(in));
 
     EXPECT_EQ(out.generation, in.generation);
     EXPECT_EQ(out.parent_generation, in.parent_generation);
@@ -255,38 +296,65 @@ TEST(CasGenerationSeal, RoundTripsAllFields)
     EXPECT_EQ(out.blob_target_runs[0].key, "gc/gen/7/blob_target/0/0");
     EXPECT_EQ(out.blob_target_runs[0].checksum, DB::UInt128(0xABCDEF));
     ASSERT_EQ(out.part_manifest_cleanup.size(), 1u);
-    EXPECT_EQ(out.fence_positions.at("_registry"), 100u);
-    EXPECT_TRUE(out.markers.deleted);
-    EXPECT_FALSE(out.markers.trimmed);
 }
 
-TEST(CasGenerationSeal, EncodingIsByteDeterministic)
+TEST(CasFoldSeal, EncodingIsByteDeterministic)
 {
-    const GenerationSeal in = sampleSeal();
-    EXPECT_EQ(encodeGenerationSeal(in), encodeGenerationSeal(in));
+    const CasFoldSeal in = sampleFoldSeal();
+    EXPECT_EQ(encodeFoldSeal(in), encodeFoldSeal(in));
 }
 
-TEST(CasGenerationSeal, RejectsEmptyAndBadMagic)
+TEST(CasFoldSeal, RejectsEmptyAndBadMagic)
 {
-    EXPECT_ANY_THROW(decodeGenerationSeal(""));
-    EXPECT_ANY_THROW(decodeGenerationSeal("not-a-seal"));
+    EXPECT_ANY_THROW(decodeFoldSeal(""));
+    EXPECT_ANY_THROW(decodeFoldSeal("not-a-seal"));
+    // A completion-seal blob must not decode as a fold seal (distinct magic CAFS vs CACS).
+    EXPECT_ANY_THROW(decodeFoldSeal(encodeCompletionSeal(sampleCompletionSeal())));
 }
 
-TEST(CasGenerationSeal, CoverageRecordsEveryDiscoveredShard)
+TEST(CasFoldSeal, CoverageRecordsEveryDiscoveredShard)
 {
     // Completeness: a seal that omits a shard the round visited is invalid input to recheck;
     // the codec preserves exactly the per_ns_shard map it was given (no silent drop).
-    GenerationSeal in = sampleSeal();
+    CasFoldSeal in = sampleFoldSeal();
     in.per_ns_shard["ns2/0"] = ShardCoverage{.classification = 0, .folded_token = Token{}, .folded_cursor = 0};
-    const GenerationSeal out = decodeGenerationSeal(encodeGenerationSeal(in));
+    const CasFoldSeal out = decodeFoldSeal(encodeFoldSeal(in));
     EXPECT_TRUE(out.per_ns_shard.contains("ns2/0"));
     EXPECT_EQ(out.per_ns_shard.size(), 3u);
+}
+
+TEST(CasCompletionSeal, RoundTripsAllFields)
+{
+    const CasCompletionSeal in = sampleCompletionSeal();
+    const CasCompletionSeal out = decodeCompletionSeal(encodeCompletionSeal(in));
+
+    EXPECT_EQ(out.generation, in.generation);
+    EXPECT_EQ(out.fence_positions.at("_registry"), 100u);
+    EXPECT_EQ(out.fence_positions.at("ns1/0"), 99u);
+    ASSERT_EQ(out.delete_outcomes.size(), 1u);
+    EXPECT_EQ(out.delete_outcomes[0].key, "gc/outcomes/2.0/0");
+    EXPECT_EQ(out.trim_cursors.at("ns1/0"), 42u);
+    EXPECT_TRUE(out.adoptable);
+}
+
+TEST(CasCompletionSeal, EncodingIsByteDeterministic)
+{
+    const CasCompletionSeal in = sampleCompletionSeal();
+    EXPECT_EQ(encodeCompletionSeal(in), encodeCompletionSeal(in));
+}
+
+TEST(CasCompletionSeal, RejectsEmptyAndBadMagic)
+{
+    EXPECT_ANY_THROW(decodeCompletionSeal(""));
+    EXPECT_ANY_THROW(decodeCompletionSeal("not-a-seal"));
+    // A fold-seal blob must not decode as a completion seal.
+    EXPECT_ANY_THROW(decodeCompletionSeal(encodeFoldSeal(sampleFoldSeal())));
 }
 ```
 
 - [ ] **Step 4: Run the test to verify it fails.**
 
-Run: `build/src/unit_tests_dbms --gtest_filter='CasGenerationSeal.*' 2>&1 | tee build/test_generation_seal.log` (after the build in Step 6 fails to compile, this confirms the type is missing). Expected at this point: **compile/link error** — `CasGenerationSeal.h` not found.
+Run: `build/src/unit_tests_dbms --gtest_filter='CasFoldSeal.*:CasCompletionSeal.*' 2>&1 | tee build/test_generation_seal.log` (after the build in Step 6 fails to compile, this confirms the types are missing). Expected at this point: **compile/link error** — `CasFoldSeal`/`CasCompletionSeal` not found.
 
 - [ ] **Step 5: Write the header.** Create `CasGenerationSeal.h`:
 
@@ -322,38 +390,48 @@ struct ShardCoverage
     uint64_t folded_cursor = 0;
 };
 
-/// Per-generation phase progress — the durable "what has happened" the round-visibility barrier and
-/// resume read (spec §Debuggability-And-Resume). Each flips true exactly when that phase is durable.
-struct PhaseMarkers
-{
-    bool folded = false;
-    bool retired = false;
-    bool fenced = false;
-    bool rechecked = false;
-    bool deleted = false;
-    bool trimmed = false;
-};
-
-/// The completeness + index record for one GC generation (spec §Round-Protocol "Fold output is sealed
-/// in a write-once generation seal"). Coarse: there is no object per edge/manifest/candidate.
-struct GenerationSeal
+/// The FOLD seal for one GC generation — write-once at <prefix>/gc/gen/<generation>/fold_seal (spec
+/// rev. 15 §Visibility-Split: "fold output is sealed in a write-once CasFoldSeal"). Coarse: there is no
+/// object per edge/manifest/candidate. Records exactly what `fold` folded; fence/recheck/delete/trim
+/// do NOT touch this object — they write the separate CasCompletionSeal.
+struct CasFoldSeal
 {
     uint64_t generation = 0;
     uint64_t parent_generation = 0;
     std::map<String, ShardCoverage> per_ns_shard;   /// "ns/shard" -> coverage
     std::vector<RunRef> blob_target_runs;           /// the blob in-degree run segments this gen sealed
     std::vector<RunRef> part_manifest_cleanup;      /// the part-manifest cleanup bundles this gen sealed
-    std::map<String, uint64_t> fence_positions;     /// "ns/shard" (+ "_registry") -> fenced version
-    PhaseMarkers markers;
 };
 
-String encodeGenerationSeal(const GenerationSeal & seal);
-GenerationSeal decodeGenerationSeal(std::string_view data);
+/// The COMPLETION seal for one GC generation — write-once at <prefix>/gc/gen/<generation>/completion_seal
+/// (spec rev. 15 §Visibility-Split). Records what fence/recheck/delete/trim completed; its presence is
+/// the durable "this generation is done" marker the resume rule reads (completion_seal ⇒ done).
+/// `adoptable` is the gate the internal reducer products + generation adoption are held behind, distinct
+/// from the retired-token view (published earlier behind the retire barrier — gc/state.round /
+/// ViewableRound).
+struct CasCompletionSeal
+{
+    uint64_t generation = 0;
+    std::map<String, uint64_t> fence_positions;     /// "ns/shard" (+ "_registry") -> fenced version
+    std::vector<RunRef> delete_outcomes;            /// the outcome-log segments this gen wrote
+    std::map<String, uint64_t> trim_cursors;        /// "ns/shard" -> the cursor trim ran to
+    bool adoptable = false;                         /// gen adoption gated on this (see §Visibility-Split)
+};
+
+String encodeFoldSeal(const CasFoldSeal & seal);
+CasFoldSeal decodeFoldSeal(std::string_view data);
+
+String encodeCompletionSeal(const CasCompletionSeal & seal);
+CasCompletionSeal decodeCompletionSeal(std::string_view data);
 
 }
 ```
 
-- [ ] **Step 6: Write the codec + build.** Create `CasGenerationSeal.cpp`. Use the same protobuf-with-`CasHeader` pattern `CasGcFormats.cpp` uses (a `Cas::Proto::GenerationSealProto` message — add it to the `.proto` alongside `GcStateProto`, fields: `header`, `generation`, `parent_generation`, repeated `per_ns_shard` entries `{key, classification, folded_token_type, folded_token_value, folded_cursor}`, repeated `blob_target_runs`/`part_manifest_cleanup` `{key, checksum_hi, checksum_lo}`, repeated `fence_positions` `{key, version}`, and a `markers` submessage of six bools). Encode sorts `per_ns_shard`/`fence_positions` by key and the run vectors by `key` so bytes are deterministic:
+- [ ] **Step 6: Write the two codecs + build.** Create `CasGenerationSeal.cpp`. Use the same protobuf-with-`CasHeader` pattern `CasGcFormats.cpp` uses, with TWO messages added to the `.proto` alongside `GcStateProto`:
+  - `Cas::Proto::FoldSealProto` — fields: `header`, `generation`, `parent_generation`, repeated `per_ns_shard` entries `{key, classification, folded_token_type, folded_token_value, folded_cursor}`, repeated `blob_target_runs`/`part_manifest_cleanup` `{key, checksum_hi, checksum_lo}`.
+  - `Cas::Proto::CompletionSealProto` — fields: `header`, `generation`, repeated `fence_positions` `{key, version}`, repeated `delete_outcomes` `{key, checksum_hi, checksum_lo}`, repeated `trim_cursors` `{key, version}`, `bool adoptable`.
+
+  Encode sorts `per_ns_shard`/`fence_positions`/`trim_cursors` by key and the run vectors by `key` so bytes are deterministic. There is NO shared `markers` submessage anymore — phase progress is conveyed by WHICH seal exists (fold_seal vs completion_seal), the resume rule below.
 
 ```cpp
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
@@ -366,11 +444,37 @@ namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
 namespace DB::Cas
 {
 
-String encodeGenerationSeal(const GenerationSeal & seal)
+namespace
 {
-    Cas::Proto::GenerationSealProto msg;
+void addRuns(auto * field, const std::vector<RunRef> & runs)
+{
+    std::vector<const RunRef *> sorted;
+    sorted.reserve(runs.size());
+    for (const auto & r : runs)
+        sorted.push_back(&r);
+    std::sort(sorted.begin(), sorted.end(), [](const RunRef * a, const RunRef * b) { return a->key < b->key; });
+    for (const RunRef * r : sorted)
+    {
+        auto * e = field->Add();
+        e->set_key(r->key);
+        e->set_checksum_hi(static_cast<uint64_t>(r->checksum >> 64));
+        e->set_checksum_lo(static_cast<uint64_t>(r->checksum));
+    }
+}
+
+void readRuns(const auto & field, std::vector<RunRef> & runs)
+{
+    for (const auto & e : field)
+        runs.push_back(RunRef{.key = e.key(),
+            .checksum = (DB::UInt128(e.checksum_hi()) << 64) | DB::UInt128(e.checksum_lo())});
+}
+}
+
+String encodeFoldSeal(const CasFoldSeal & seal)
+{
+    Cas::Proto::FoldSealProto msg;
     auto * hdr = msg.mutable_header();
-    hdr->set_magic(magicFor(FormatId::GenerationSeal));
+    hdr->set_magic(magicFor(FormatId::FoldSeal));
     hdr->set_writer_version(currentWriterVersion());
     hdr->set_compatibility_version(currentCompatibilityVersion());
 
@@ -386,55 +490,26 @@ String encodeGenerationSeal(const GenerationSeal & seal)
         e->set_folded_token_value(cov.folded_token.value);
         e->set_folded_cursor(cov.folded_cursor);
     }
-    auto addRuns = [](auto * field, const std::vector<RunRef> & runs)
-    {
-        std::vector<const RunRef *> sorted;
-        sorted.reserve(runs.size());
-        for (const auto & r : runs)
-            sorted.push_back(&r);
-        std::sort(sorted.begin(), sorted.end(), [](const RunRef * a, const RunRef * b) { return a->key < b->key; });
-        for (const RunRef * r : sorted)
-        {
-            auto * e = field->Add();
-            e->set_key(r->key);
-            e->set_checksum_hi(static_cast<uint64_t>(r->checksum >> 64));
-            e->set_checksum_lo(static_cast<uint64_t>(r->checksum));
-        }
-    };
     addRuns(msg.mutable_blob_target_runs(), seal.blob_target_runs);
     addRuns(msg.mutable_part_manifest_cleanup(), seal.part_manifest_cleanup);
-
-    for (const auto & [key, version] : seal.fence_positions)
-    {
-        auto * e = msg.add_fence_positions();
-        e->set_key(key);
-        e->set_version(version);
-    }
-    auto * m = msg.mutable_markers();
-    m->set_folded(seal.markers.folded);
-    m->set_retired(seal.markers.retired);
-    m->set_fenced(seal.markers.fenced);
-    m->set_rechecked(seal.markers.rechecked);
-    m->set_deleted(seal.markers.deleted);
-    m->set_trimmed(seal.markers.trimmed);
 
     return msg.SerializeAsString();
 }
 
-GenerationSeal decodeGenerationSeal(std::string_view data)
+CasFoldSeal decodeFoldSeal(std::string_view data)
 {
     if (data.empty())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS generation seal: empty object");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: empty object");
 
-    Cas::Proto::GenerationSealProto msg;
+    Cas::Proto::FoldSealProto msg;
     if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS generation seal: protobuf parse failed");
-    if (msg.header().magic() != magicFor(FormatId::GenerationSeal))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: protobuf parse failed");
+    if (msg.header().magic() != magicFor(FormatId::FoldSeal))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS generation seal: bad magic (got 0x{:08x}, expected 0x{:08x})",
-            msg.header().magic(), magicFor(FormatId::GenerationSeal));
+            "CAS fold seal: bad magic (got 0x{:08x}, expected 0x{:08x})",
+            msg.header().magic(), magicFor(FormatId::FoldSeal));
 
-    GenerationSeal seal;
+    CasFoldSeal seal;
     seal.generation = msg.generation();
     seal.parent_generation = msg.parent_generation();
     for (const auto & e : msg.per_ns_shard())
@@ -442,33 +517,74 @@ GenerationSeal decodeGenerationSeal(std::string_view data)
             .classification = static_cast<uint8_t>(e.classification()),
             .folded_token = Token{e.folded_token_value(), static_cast<TokenType>(e.folded_token_type())},
             .folded_cursor = e.folded_cursor()};
-    auto readRuns = [](const auto & field, std::vector<RunRef> & runs)
-    {
-        for (const auto & e : field)
-            runs.push_back(RunRef{.key = e.key(),
-                .checksum = (DB::UInt128(e.checksum_hi()) << 64) | DB::UInt128(e.checksum_lo())});
-    };
     readRuns(msg.blob_target_runs(), seal.blob_target_runs);
     readRuns(msg.part_manifest_cleanup(), seal.part_manifest_cleanup);
+    return seal;
+}
+
+String encodeCompletionSeal(const CasCompletionSeal & seal)
+{
+    Cas::Proto::CompletionSealProto msg;
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::CompletionSeal));
+    hdr->set_writer_version(currentWriterVersion());
+    hdr->set_compatibility_version(currentCompatibilityVersion());
+
+    msg.set_generation(seal.generation);
+    for (const auto & [key, version] : seal.fence_positions)
+    {
+        auto * e = msg.add_fence_positions();
+        e->set_key(key);
+        e->set_version(version);
+    }
+    addRuns(msg.mutable_delete_outcomes(), seal.delete_outcomes);
+    for (const auto & [key, version] : seal.trim_cursors)
+    {
+        auto * e = msg.add_trim_cursors();
+        e->set_key(key);
+        e->set_version(version);
+    }
+    msg.set_adoptable(seal.adoptable);
+
+    return msg.SerializeAsString();
+}
+
+CasCompletionSeal decodeCompletionSeal(std::string_view data)
+{
+    if (data.empty())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS completion seal: empty object");
+
+    Cas::Proto::CompletionSealProto msg;
+    if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS completion seal: protobuf parse failed");
+    if (msg.header().magic() != magicFor(FormatId::CompletionSeal))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS completion seal: bad magic (got 0x{:08x}, expected 0x{:08x})",
+            msg.header().magic(), magicFor(FormatId::CompletionSeal));
+
+    CasCompletionSeal seal;
+    seal.generation = msg.generation();
     for (const auto & e : msg.fence_positions())
         seal.fence_positions[e.key()] = e.version();
-    const auto & m = msg.markers();
-    seal.markers = PhaseMarkers{.folded = m.folded(), .retired = m.retired(), .fenced = m.fenced(),
-                                .rechecked = m.rechecked(), .deleted = m.deleted(), .trimmed = m.trimmed()};
+    readRuns(msg.delete_outcomes(), seal.delete_outcomes);
+    for (const auto & e : msg.trim_cursors())
+        seal.trim_cursors[e.key()] = e.version();
+    seal.adoptable = msg.adoptable();
     return seal;
 }
 
 }
 ```
 
+> **RESUME RULE (durable-state phase progress, replaces the old `PhaseMarkers`):** for a generation, if its `completion_seal` exists ⇒ the round is **done** (recheck/delete/trim completed); else if its `fold_seal` exists ⇒ **resume at recheck** (the fold output is durable, re-run fence→recheck→delete→trim idempotently); else ⇒ **redo the fold**. This is read by `tryResumeIncompleteRound` (Task 7), not from a bool field.
 > Note: the exact `Token` field names (`.value`, `.type`, `TokenType`) and the `cas_format.proto` additions follow the existing `CasToken.h` / `cas_format.proto`. If `Token` has no `type` field in the ground-truth header, drop `folded_token_type`/`set_folded_token_type` and the `TokenType` cast — keep only `.value`. Confirm against `CasToken.h` before writing.
 
-Build: `ninja -C build unit_tests_dbms > build/build.log 2>&1` (analyze `build/build.log` with a subagent; expect clean compile of the three changed files + the new ones).
+Build: `ninja -C build unit_tests_dbms > build/build.log 2>&1` (analyze `build/build.log` with a subagent; expect clean compile of the changed files + the new ones).
 
 - [ ] **Step 7: Run the test to verify it passes.**
 
-Run: `build/src/unit_tests_dbms --gtest_filter='CasGenerationSeal.*' 2>&1 | tee build/test_generation_seal.log`
-Expected: 4 tests PASS (analyze the log with a subagent).
+Run: `build/src/unit_tests_dbms --gtest_filter='CasFoldSeal.*:CasCompletionSeal.*' 2>&1 | tee build/test_generation_seal.log`
+Expected: 7 tests PASS (4 `CasFoldSeal` + 3 `CasCompletionSeal`; analyze the log with a subagent).
 
 - [ ] **Step 8: Commit.**
 
@@ -480,7 +596,7 @@ git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGe
         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.cpp \
         src/Disks/tests/gtest_cas_generation_seal.cpp \
         contrib/... # the cas_format.proto change if it lives under a generated dir; otherwise its source
-git commit -m "CA GC phase1d: GenerationSeal type + codec + coverage fields + layout keys"
+git commit -m "CA GC phase1d: CasFoldSeal + CasCompletionSeal write-once seal types + codecs + coverage fields + layout keys"
 ```
 
 ---
@@ -719,9 +835,9 @@ git commit -m "CA GC phase1d: streaming blob in-degree generation over RunFile/R
 
 ---
 
-### Task 3: `CasGc::fold` rewrite — owner transitions → blob deltas {#task-3-casgc-fold-rewrite-owner-transitions-blob-deltas}
+### Task 3: `CasGc::fold` rewrite — the ordered `RootOwnerEvent` journal → blob deltas {#task-3-casgc-fold-rewrite-the-ordered-rootownerevent-journal-blob-deltas}
 
-Realizes spec §Fold-Owner-Transitions. Enforces `BlobInDegreeMatchesActiveManifests` and `ManifestActivationMatchesEdges`; defends negative controls **#4** (missing-body precommit ⇒ no `+`), **#10** (missing committed body ⇒ fail closed, never empty), **#22** (promote-after-missing-body ⇒ committed `+`), and the `RefMatchesBody`/`ManifestNamespaceMatches` fail-closed checks (#19, #20). The Phase-0 model already proved these; this gtest is the C++ realization.
+Realizes spec rev. 15 §Fold-Owner-Transitions. `fold` iterates the ONE ordered `RootOwnerEvent` stream (in `transition_version` order) and dispatches each event by comparing `old_binding.manifest_ref` to `new_binding.manifest_ref`: **equal** (an owner move, e.g. a promote) ⇒ no blob delta, no part-manifest cleanup; **true removal** (old present, ref not owned afterwards) ⇒ `−1` + cleanup (an old precommit that was never activated contributes no edges); **activation** (new present) ⇒ `+1`, subject to the **fold barrier**. Enforces `BlobInDegreeMatchesActiveManifests` and `ManifestActivationMatchesEdges`; defends negative controls **#4** (missing-body precommit ⇒ no `+`), **#10** (missing committed body ⇒ fail closed, never empty), **#22** (promote-after-missing-body ⇒ committed `+`), **#23** (advancing past a live missing-body precommit ⇒ an under-protected committed ref / `INV_NO_DANGLE` — held by the fold barrier), and the `RefMatchesBody`/`ManifestNamespaceMatches` fail-closed checks (#19, #20). The Phase-0 model already proved these; this gtest is the C++ realization.
 
 **Files:**
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h`
@@ -730,9 +846,9 @@ Realizes spec §Fold-Owner-Transitions. Enforces `BlobInDegreeMatchesActiveManif
 - Test: `src/Disks/tests/gtest_cas_gc_fold.cpp`
 
 **Interfaces:**
-- Consumes: `RootShard{transitions, precommits, promotions}`, `OwnerTransition`, `PrecommitTransition`, `PromotePrecommit` (`CasRootShardCodec.h`); `ManifestId`/`ManifestRef` (`CasManifestId.h`); `PartManifest`/`decodePartManifest`/`refMatchesBody`/`manifestNamespaceMatches` (`CasManifestCodec.h`); `Layout::manifestKey` (`CasLayout.h`); `BlobDelta`/`foldDeltasIntoGeneration` (Task 2); `GenerationSeal`/`ShardCoverage` (Task 1).
-- Produces (replaces the old `FoldResult`): `struct FoldResult { GenerationSeal seal; std::vector<std::pair<RootNamespace, uint64_t>> root_shards; std::map<ManifestId, Token> mf_cleanup; };` and `FoldResult Gc::fold(GcState & state, Token & state_token);`.
-- New private helper: `void foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelta> & deltas, std::map<ManifestId, Token> & mf_cleanup, RoundReport & report);` — read ONE manifest, validate, emit `sign * 1` per blob entry; on `sign < 0` queue `mf_cleanup`.
+- Consumes: `RootShard{... , std::vector<RootOwnerEvent> journal}`, `RootOwnerEvent`, `OwnerBinding`, `OwnerKind` (`CasRootShardCodec.h`); `ManifestId`/`ManifestRef` (`CasManifestId.h`); `PartManifest`/`decodePartManifest`/`refMatchesBody`/`manifestNamespaceMatches` (`CasManifestCodec.h`); `Layout::manifestKey` (`CasLayout.h`); `BlobDelta`/`foldDeltasIntoGeneration` (Task 2); `CasFoldSeal`/`ShardCoverage` (Task 1).
+- Produces (replaces the old `FoldResult`): `struct FoldResult { CasFoldSeal fold_seal; std::vector<std::pair<RootNamespace, uint64_t>> root_shards; std::map<ManifestId, Token> mf_cleanup; };` and `FoldResult Gc::fold(GcState & state, Token & state_token);`.
+- New private helper: `bool foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelta> & deltas, std::map<ManifestId, Token> & mf_cleanup, RoundReport & report);` — read ONE manifest, validate, emit `sign * 1` per blob entry; on `sign < 0` queue `mf_cleanup`. Returns whether a body was read+validated (false ⇒ absent body).
 
 - [ ] **Step 1: Add `writeManifestRaw` to `cas_test_helpers.h`.** After `publishRaw` (the new owner-transition-based one introduced by 1b), add a manifest-body fixture mirroring what `Build` emits in 1b (it writes a `PartManifest` body via `decodePartManifest`'s inverse encoder):
 
@@ -756,7 +872,7 @@ inline DB::Cas::ManifestId writeManifestRaw(
 
 (Use the exact `PartManifest` field names and `encodePartManifest` signature from 1a's `CasManifestCodec.h`; adjust if they differ.)
 
-- [ ] **Step 2: Write the failing test.** Create `src/Disks/tests/gtest_cas_gc_fold.cpp` covering each spec case. Use a small `InMemoryBackend`, register a namespace, build a `RootShard` with a `transitions`/`precommits` vector, write manifest bodies with `writeManifestRaw`, run `fold`, then read the sealed in-degree run via `zeroInDegree`/the run reader and assert per-blob counts:
+- [ ] **Step 2: Write the failing test.** Create `src/Disks/tests/gtest_cas_gc_fold.cpp` covering each spec case. Use a small `InMemoryBackend`, register a namespace, build a `RootShard` whose `journal` is the ordered `RootOwnerEvent` stream, write manifest bodies with `writeManifestRaw`, run `fold`, then read the sealed in-degree run via `zeroInDegree`/the run reader and assert per-blob counts:
 
 ```cpp
 #include <gtest/gtest.h>
@@ -845,8 +961,35 @@ TEST(CasGcFold, PrecommitMissingBodyEmitsNoDelta)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
 }
 
-// Promote AFTER a missing-body precommit => committed +1 (control #22).
-TEST(CasGcFold, PromoteAfterMissingBodyEmitsCommittedPlusOne)
+// FOLD BARRIER (control #23): a LIVE precommit binding whose body is missing+invalid does NOT advance
+// the durable fold cursor past its activation RootOwnerEvent — `fold` re-reads it each round and advances
+// only when the body appears (+1) or the precommit is removed/reclaimed. If it advanced past the
+// missing-body precommit, a later promote (owner move, no delta) would leave the now-committed ref with
+// no sealed edges => INV_NO_DANGLE. So the cursor halts at the activation event until liveness resolves.
+TEST(CasGcFold, FoldBarrierHaltsCursorAtLiveMissingBodyPrecommit)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef ref{"srv-a", 1, DB::UInt128(0xAA)};
+    // Live precommit, body absent: the activation event is at version V.
+    const uint64_t v = addPrecommitTransition(*backend, store->layout(), ns, DB::UInt128(7), "tbl", std::nullopt, ref);
+    Gc gc(store, DB::UInt128(0xG1));
+    EXPECT_NO_THROW(gc.runRegularRound());      // no delta; cursor must NOT pass the missing-body precommit
+    EXPECT_LT(foldCursorOf(*backend, store->layout(), ns, 0), v);   // barrier: halted at the activation
+
+    // The body appears => the SAME activation event now folds +1 and the cursor advances past it.
+    writeManifestRaw(*backend, store->layout(), ns, ref, {blobEntry("a", DB::UInt128(1))});
+    gc.runRegularRound();
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
+    EXPECT_GE(foldCursorOf(*backend, store->layout(), ns, 0), v);   // barrier lifted by activation
+}
+
+// Promote AFTER a missing-body precommit => committed +1, but the +1 comes from the now-foldable
+// PrecommitAdd (the barrier held the cursor at it until the body appeared), NOT from the promote: the
+// promote RootOwnerEvent has old_binding.manifest_ref == new_binding.manifest_ref, so it is an OWNER
+// MOVE that emits NO delta (spec rev. 15 §Pure-Move-Promote, control #22).
+TEST(CasGcFold, PromoteAfterMissingBodyFoldsActivationNotPromote)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
@@ -854,11 +997,11 @@ TEST(CasGcFold, PromoteAfterMissingBodyEmitsCommittedPlusOne)
     const ManifestRef ref{"srv-a", 1, DB::UInt128(0xAA)};
     addPrecommitTransition(*backend, store->layout(), ns, DB::UInt128(7), "tbl", std::nullopt, ref);
     Gc gc(store, DB::UInt128(0xG1));
-    gc.runRegularRound();                       // missing-body activation: no delta
+    gc.runRegularRound();                       // missing-body activation: no delta; barrier holds cursor
     writeManifestRaw(*backend, store->layout(), ns, ref, {blobEntry("a", DB::UInt128(1))});  // body now present
-    promoteTransition(*backend, store->layout(), ns, DB::UInt128(7), "tbl", ref);
-    gc.runRegularRound();                       // promotion folds as committed add
-    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
+    promoteTransition(*backend, store->layout(), ns, DB::UInt128(7), "tbl", ref);   // promote: equal ref
+    gc.runRegularRound();                       // PrecommitAdd now folds +1; promote is a pure owner move
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);   // exactly one +1, not two
 }
 
 // Committed add naming a MISSING body (404) => fail-closed FOR THAT DECISION, never treated as empty
@@ -877,8 +1020,8 @@ TEST(CasGcFold, CommittedMissingBodyClampsCursorAndRecordsAnomaly)
     // No +1 was guessed for the missing committed body.
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
     // Cursor clamped below the unresolved decision so trim cannot pass it; it is retried next round.
-    const GenerationSeal sealed = decodeGenerationSeal(
-        backend->get(store->layout().generationSealKey(currentGenerationOf(*backend, store->layout())))->bytes);
+    const CasFoldSeal sealed = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(currentGenerationOf(*backend, store->layout())))->bytes);
     EXPECT_LT(sealed.per_ns_shard.at(cursorKeyForTest(ns, 0)).folded_cursor, v);
 }
 
@@ -899,6 +1042,28 @@ TEST(CasGcFold, RefOrNamespaceMismatchFailsClosed)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, ref);
     Gc gc(store, DB::UInt128(0xG1));
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]{ gc.runRegularRound(); });
+}
+
+// Pure-move promote: a precommit ALREADY activated with its body (folded +1 in a prior round) is
+// promoted. The promote RootOwnerEvent has old_binding.manifest_ref == new_binding.manifest_ref => it is
+// an OWNER MOVE: NO blob delta, NO part-manifest cleanup. The in-degree is unchanged and the body is
+// NOT queued for deletion (it is still owned, now under the committed ref).
+TEST(CasGcFold, PromoteOfActivatedPrecommitEmitsNoDelta)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef ref{"srv-a", 1, DB::UInt128(0xAA)};
+    writeManifestRaw(*backend, store->layout(), ns, ref, {blobEntry("a", DB::UInt128(1))});
+    addPrecommitTransition(*backend, store->layout(), ns, DB::UInt128(7), "tbl", std::nullopt, ref);
+    Gc gc(store, DB::UInt128(0xG1));
+    gc.runRegularRound();                       // precommit body present => +1
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
+
+    promoteTransition(*backend, store->layout(), ns, DB::UInt128(7), "tbl", ref);   // equal ref => owner move
+    gc.runRegularRound();                       // promote emits NO delta
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);   // unchanged, still pinned
+    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, ref})).exists);  // not condemned
 }
 
 // Owner-removal whose OLD body is gone at removal-fold => fail-closed anomaly: the fold must NOT
@@ -928,13 +1093,13 @@ TEST(CasGcFold, RemovalWithMissingOldBodyHaltsAtCursorAndRecordsAnomaly)
     // The anomaly is surfaced and the sealed cursor is CLAMPED below the unresolved removal, so trim
     // cannot pass it and the decrement is retried next round.
     EXPECT_TRUE(report.hasAnomaly(ns, /*shard*/0));
-    const GenerationSeal sealed = decodeGenerationSeal(
-        backend->get(store->layout().generationSealKey(currentGenerationOf(*backend, store->layout())))->bytes);
+    const CasFoldSeal sealed = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(currentGenerationOf(*backend, store->layout())))->bytes);
     EXPECT_LT(sealed.per_ns_shard.at(cursorKeyForTest(ns, 0)).folded_cursor, removal_version);
 }
 ```
 
-> The test-side transition helpers (`publishCommittedTransition`, `dropRefTransition`, `addPrecommitTransition`, `promoteTransition`, `openStoreForTest`, `inDegreeOf`) come from 1b/1c's test infra. If 1b did not provide them, add thin wrappers in `cas_test_helpers.h` that read-modify-CAS a `RootShard` to append the corresponding `OwnerTransition`/`PrecommitTransition`/`PromotePrecommit` and bump `shard_version` (mirroring the production `Build` path), and `inDegreeOf` that streams `blobTargetRunKey` of the current generation. The removal-anomaly test also needs: `dropRefTransition` returns the removal's `transition_version`; `deleteManifestBody(backend, layout, id)` exact-token-deletes a manifest body (HEAD then `deleteExact`); `currentGenerationOf`/`cursorKeyForTest` read the latest generation pointer and render `cursorKey(ns, shard)`; and `RoundReport::hasAnomaly(ns, shard)` reports whether `recordAnomaly` fired for that shard (add the `anomalies` vector + `recordAnomaly`/`hasAnomaly` to `RoundReport`).
+> The test-side transition helpers (`publishCommittedTransition`, `dropRefTransition`, `addPrecommitTransition`, `promoteTransition`, `openStoreForTest`, `inDegreeOf`, `foldCursorOf`) come from 1b/1c's test infra. If 1b did not provide them, add thin wrappers in `cas_test_helpers.h` that read-modify-CAS a `RootShard` to append the corresponding `RootOwnerEvent` to `journal` (in `transition_version` order) and bump `shard_version` (mirroring the production `Build` path): a committed publish appends `{old_binding=nullopt-or-prior-committed, new_binding={Committed, ref_name, build_id, new_ref}}`; a drop appends `{old_binding={...old...}, new_binding=nullopt}`; a precommit-add appends `{old, new={Precommit, final_ref, build_id, new_ref}}`; a **promote** appends ONE event with `old_binding={Precommit, final, build_id, T}` and `new_binding={Committed, final, T}` carrying the SAME `manifest_ref` (so `old_binding.manifest_ref == new_binding.manifest_ref` — an owner move). `inDegreeOf` streams `blobTargetRunKey` of the current generation; `foldCursorOf(backend, layout, ns, shard)` reads the latest fold seal and returns `per_ns_shard.at(cursorKey(ns,shard)).folded_cursor`. The barrier/anomaly tests also need: `addPrecommitTransition`/`publishCommittedTransition`/`dropRefTransition` return the event's `transition_version`; `deleteManifestBody(backend, layout, id)` exact-token-deletes a manifest body (HEAD then `deleteExact`); `currentGenerationOf`/`cursorKeyForTest` read the latest generation pointer and render `cursorKey(ns, shard)`; and `RoundReport::hasAnomaly(ns, shard)` reports whether `recordAnomaly` fired for that shard (add the `anomalies` vector + `recordAnomaly`/`hasAnomaly` to `RoundReport`).
 
 - [ ] **Step 2b: Run to verify it fails.**
 
@@ -945,30 +1110,45 @@ Expected: compile error (old `fold` signature) and/or test failures.
 
 ```cpp
     /// What one R1 fold produced. The blob deltas are sealed into a write-once generation BEFORE
-    /// retire; `seal` is the durable index, `root_shards` the discovered universe (for trim), and
+    /// retire; `fold_seal` is the durable index of WHAT WAS FOLDED (a CasFoldSeal; fence/recheck/delete/
+    /// trim write the separate CasCompletionSeal), `root_shards` the discovered universe (for trim), and
     /// `mf_cleanup` the part-manifest cleanup work keyed by ManifestId (owner-removed bodies whose
     /// exact-token delete is deferred until their decrements are sealed — spec §Retire / §Recheck).
     struct FoldResult
     {
-        GenerationSeal seal;
+        CasFoldSeal fold_seal;
         std::vector<std::pair<RootNamespace, uint64_t>> root_shards;
         std::map<ManifestId, Token> mf_cleanup;
     };
 
-    /// R1 (spec §Fold-Owner-Transitions): per changed root shard, stream OwnerTransition /
-    /// PrecommitTransition / PromotePrecommit in journal order; for each old/new manifest ref read ONE
-    /// PartManifest, validate RefMatchesBody + ManifestNamespaceMatches, and emit +1 (committed add /
-    /// precommit body-present / promote-after-missing-body) or -1 (owner removal) per blob entry.
+    /// R1 (spec rev. 15 §Fold-Owner-Transitions): per changed root shard, stream the ONE ordered
+    /// RootOwnerEvent journal in transition_version order and dispatch each event by comparing
+    /// old_binding.manifest_ref to new_binding.manifest_ref:
+    ///   - EQUAL (an owner move, e.g. a promote: Precommit->Committed at the SAME ref) => NO blob delta,
+    ///     NO part-manifest cleanup (the activating PrecommitAdd was folded earlier — see the fold barrier);
+    ///   - TRUE REMOVAL (old present, the ref not owned afterwards) => read the OLD body, emit -1 per blob
+    ///     entry + queue the body for cleanup (an old precommit that was never activated emitted no edges,
+    ///     so it contributes no -1);
+    ///   - ACTIVATION (new present) => read the NEW body, emit +1 per blob entry, SUBJECT TO THE FOLD
+    ///     BARRIER (below).
+    /// FOLD BARRIER: `fold` does NOT advance the durable fold cursor past a RootOwnerEvent that leaves a
+    /// LIVE precommit binding whose manifest body is not present+valid. It re-reads each round and advances
+    /// the cursor only on activation (+1, body appeared) or removal (the precommit was reclaimed/dropped —
+    /// fold may then collapse an add+remove of a never-activated precommit). This holds INV_NO_DANGLE
+    /// (control #23): advancing past a live missing-body precommit would let a later promote (owner move,
+    /// no delta) leave the now-committed ref with no sealed edges => an under-protected committed ref.
+    /// Liveness comes from the watermark precommit reclaim (a removal unblocks).
     /// 404 RULE (refined): a body that is PRESENT-but-invalid (ref/namespace mismatch) is genuine
     /// corruption => CORRUPTED_DATA (hard). A MISSING body (404) is handled by where it appears:
-    ///   - precommit `new` missing body  => no blob edges (legal; PrecommitMayReferenceMissingManifest);
-    ///   - committed/promoted `new` missing body, or an owner-removal `old` body missing at removal-fold
+    ///   - precommit activation `new` missing body  => no blob edges + barrier holds the cursor (legal;
+    ///     PrecommitMayReferenceMissingManifest) until the body appears or the precommit is reclaimed;
+    ///   - committed activation `new` missing body, or a true-removal `old` body missing at removal-fold
     ///     => fail-closed FOR THAT DECISION: clamp the shard's folded_cursor below the decision, record
     ///        the anomaly (surfaced to fsck), and stop folding THIS shard — never guess a delta, never
     ///        delete off a missing committed body. GC NEVER wedges the whole round on a 404: it records
     ///        and continues other shards (feedback_ca_gc_never_throw_on_404).
     /// Scattered deltas are merged with the prior in-degree run via foldDeltasIntoGeneration; the result
-    /// is sealed in a write-once GenerationSeal, then ONE gc/state CAS advances the generation pointer
+    /// is sealed in a write-once CasFoldSeal, then ONE gc/state CAS advances the generation pointer
     /// against state_token (threaded into retire, never re-read — the zombie-steal protection
     /// runRegularRound documents).
     FoldResult fold(GcState & state, Token & state_token);
@@ -1037,9 +1217,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
     bool folded_any = false;
     const uint64_t new_generation = state.snap_generation + 1;
 
-    result.seal.generation = new_generation;
-    result.seal.parent_generation = state.snap_generation;
-    result.seal.markers.folded = false;
+    result.fold_seal.generation = new_generation;
+    result.fold_seal.parent_generation = state.snap_generation;
 
     for (const auto & [ns, root_shard] : result.root_shards)
     {
@@ -1053,105 +1232,95 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
         cov.classification = 0;   /// refined below
 
         bool shard_changed = false;
-        /// A removal-fold whose old body is missing/invalid is an ANOMALY: a correctly-ordered protocol
-        /// keeps the old body present at removal-fold time because its delete is gated behind sealed
-        /// decrements (negative control #11), so a missing body here means we cannot resolve the -1. We
-        /// must NOT advance the fold cursor past such a removal, must NOT emit a partial/empty decrement,
-        /// and must NOT let trim pass that point — otherwise the referenced blobs are either silently
-        /// under-counted (leak) or, if we guessed, over-deleted. So: record the anomaly, CLAMP the
-        /// shard's folded_cursor to just below the unresolved removal, and stop folding THIS shard. GC
-        /// never wedges the whole round on this — other shards still fold (record-and-continue).
-        uint64_t resolved_through = root.shard_version;   /// folded_cursor we commit if nothing halts us
-        bool removal_anomaly = false;
-        auto haltAtRemoval = [&](uint64_t at_version, const ManifestId & gone, const char * what)
+        /// resolved_through is the cursor we commit. Two conditions CLAMP it just below an event (never
+        /// advancing past it), record an anomaly, and stop folding THIS shard — while OTHER shards still
+        /// fold (GC never wedges the round on a 404; feedback_ca_gc_never_throw_on_404):
+        ///   (a) a true-removal whose edge-bearing old body is missing at removal-fold — a correctly
+        ///       ordered protocol keeps that body present until its decrements are sealed (control #11),
+        ///       so a missing body means the -1 is unresolvable; we must not guess or skip it; and
+        ///   (b) the FOLD BARRIER (spec rev. 15 §Fold barrier, control #23) — a live create-precommit
+        ///       whose manifest body is not yet present is NON-ACTIVATING; we must not advance past it,
+        ///       so a later pure-move promote is always of an activated manifest. It activates (+1) when
+        ///       the body appears, or is dropped by a later reclaim/removal event. Liveness: the
+        ///       watermark precommit reclaim removes a stuck missing-body precommit and unblocks the cursor.
+        /// In both cases we must NOT emit a partial/empty delta and must NOT let trim pass that point.
+        uint64_t resolved_through = root.shard_version;   /// folded_cursor we commit if nothing clamps us
+        bool clamped = false;
+        auto clampBefore = [&](uint64_t at_version, const ManifestId & id, const char * what)
         {
-            report.recordAnomaly(ns, root_shard, gone, what);   /// surfaced (fsck / round report / log)
-            resolved_through = at_version - 1;                  /// cursor does not advance past the removal
-            removal_anomaly = true;
+            report.recordAnomaly(ns, root_shard, id, what);   /// surfaced (fsck / round report / log)
+            resolved_through = at_version - 1;                /// cursor does not advance past this event
+            clamped = true;
         };
 
-        /// Committed owner transitions in journal order.
-        for (const OwnerTransition & t : root.transitions)
+        /// ONE ordered RootOwnerEvent stream, transition_version order (spec rev. 15 §Fold Owner
+        /// Transitions). Dispatch each event by comparing old_binding.manifest_ref vs
+        /// new_binding.manifest_ref:
+        ///   - both present & EQUAL  => OWNER MOVE (e.g. a promote): no blob delta, no part-manifest
+        ///     cleanup (the manifest stays owned; only the owner kind changes);
+        ///   - old present, ref not owned afterwards (true removal) => -1 + cleanup (mirror only edges
+        ///     actually emitted: a never-activated precommit contributed none — control #4);
+        ///   - new present (activation) => +1, SUBJECT TO the fold barrier for a missing-body precommit.
+        for (const RootOwnerEvent & e : root.journal)
         {
-            if (t.transition_version <= cursor || t.transition_version > root.shard_version)
+            if (clamped)
+                break;   /// a prior clamp halted this shard; do not fold past it this round
+            if (e.transition_version <= cursor || e.transition_version > root.shard_version)
                 continue;
-            if (t.old_manifest)
+
+            const bool has_old = e.old_binding.has_value();
+            const bool has_new = e.new_binding.has_value();
+            if (has_old && has_new && e.old_binding->manifest_ref == e.new_binding->manifest_ref)
             {
-                const ManifestId old_id{ns, *t.old_manifest};
-                if (!foldManifestEdges(old_id, -1, deltas, result.mf_cleanup, report))
-                {
-                    /// Old body gone at removal-fold: do NOT skip silently, do NOT emit a partial -1.
-                    haltAtRemoval(t.transition_version, old_id, "committed owner-removal: old body missing at removal-fold");
-                    break;
-                }
-            }
-            if (t.new_manifest)
-            {
-                const ManifestId id{ns, *t.new_manifest};
-                /// A committed ref naming a MISSING body (404) is fail-closed FOR THIS DECISION: do not
-                /// guess a +1, do not advance the cursor past it, surface it to fsck — but do NOT throw
-                /// (a throw would wedge the whole round; feedback_ca_gc_never_throw_on_404). The cursor
-                /// clamp keeps INV_NO_DANGLE: a committed owner is never treated as having zero edges.
-                /// (A body that is PRESENT but invalid — ref/namespace mismatch — is genuine corruption
-                /// and foldManifestEdges throws CORRUPTED_DATA; that is a separate, hard failure.)
-                if (!foldManifestEdges(id, +1, deltas, result.mf_cleanup, report))
-                {
-                    haltAtRemoval(t.transition_version, id, "committed ref names a missing manifest body (CommittedManifestBodyRequired)");
-                    break;
-                }
-            }
-            shard_changed = true;
-        }
-        /// Precommit transitions + promotions (precommit body MAY be missing => no delta).
-        for (const PrecommitTransition & p : root.precommits)
-        {
-            if (removal_anomaly)
-                break;   /// a prior unresolved removal clamped the cursor; stop folding this shard
-            if (p.transition_version <= cursor || p.transition_version > root.shard_version)
+                /// OWNER MOVE (promote precommit -> committed): same manifest_ref, blob Δ = 0, no
+                /// cleanup. The activating +1 was folded earlier — the fold barrier guarantees the
+                /// create-precommit was activated (body present) before this move could be reached.
+                shard_changed = true;
                 continue;
-            if (p.old_manifest)
+            }
+
+            if (has_old)
             {
-                /// Removal of a precommit: mirror ONLY edges actually emitted at activation. If the
-                /// activation was missing-body (no edges), emit nothing (control #4 undercount guard).
-                const ManifestId old_id{ns, *p.old_manifest};
-                if (wasActivatedWithBody(state, old_id))   /// from the parent seal's activation record
+                /// True removal: mirror ONLY edges actually emitted at activation. A precommit that was
+                /// never activated (missing body) emitted none, so skip it (control #4 undercount guard).
+                const ManifestId old_id{ns, e.old_binding->manifest_ref};
+                const bool was_precommit = e.old_binding->owner_kind == OwnerKind::Precommit;
+                if (!was_precommit || wasActivatedWithBody(state, old_id))
                 {
                     if (!foldManifestEdges(old_id, -1, deltas, result.mf_cleanup, report))
                     {
-                        /// It WAS activated with a body (so it emitted +edges) but the body is gone at
-                        /// removal-fold: the matching -1 is unresolvable => same anomaly, fail closed.
-                        haltAtRemoval(p.transition_version, old_id, "precommit owner-removal: activated body missing at removal-fold");
+                        /// Edge-bearing old body gone at removal-fold: the matching -1 is unresolvable.
+                        /// Do NOT skip silently, do NOT emit a partial -1 (control #11): clamp + surface.
+                        clampBefore(e.transition_version, old_id, "owner-removal: edge-bearing old body missing at removal-fold");
                         break;
                     }
                 }
             }
-            if (p.new_manifest)
+
+            if (has_new)
             {
-                const ManifestId id{ns, *p.new_manifest};
-                const bool had_body = foldManifestEdges(id, +1, deltas, result.mf_cleanup, report);
-                recordActivation(result.seal, id, had_body);   /// ManifestActivationMatchesEdges oracle
-            }
-            shard_changed = true;
-        }
-        /// PromotePrecommit: same readable manifest => owner-only move, no delta; missing-body or
-        /// not-yet-active precommit => committed add (+1) after reading+validating the body (control #22).
-        for (const PromotePrecommit & pr : root.promotions)
-        {
-            if (removal_anomaly)
-                break;   /// a prior unresolved removal clamped the cursor; stop folding this shard
-            if (pr.transition_version <= cursor || pr.transition_version > root.shard_version)
-                continue;
-            const ManifestId id{ns, pr.manifest};
-            if (!wasActivatedWithBody(state, id))
-            {
-                /// Promote of a not-yet-active precommit whose body is MISSING (404) is fail-closed FOR
-                /// THIS DECISION (clamp + surface, never throw/wedge — same rule as a committed add). A
-                /// present-but-invalid body still throws inside foldManifestEdges.
+                const ManifestId id{ns, e.new_binding->manifest_ref};
+                const bool is_precommit = e.new_binding->owner_kind == OwnerKind::Precommit;
                 if (!foldManifestEdges(id, +1, deltas, result.mf_cleanup, report))
                 {
-                    haltAtRemoval(pr.transition_version, id, "promote names a missing manifest body (committed ref must never name a missing manifest)");
+                    /// Body missing (404). A present-but-invalid body — ref/namespace mismatch — instead
+                    /// throws CORRUPTED_DATA inside foldManifestEdges (a separate hard failure).
+                    if (is_precommit)
+                        /// FOLD BARRIER (rev. 15 §Fold barrier, control #23): a live create-precommit
+                        /// whose body is not yet present is NON-ACTIVATING. Clamp below it (do not advance
+                        /// the cursor past it); it activates (+1) when the body appears, or a later removal
+                        /// event drops it. This keeps a later pure-move promote always-of-an-activated
+                        /// manifest. Never throw/wedge (feedback_ca_gc_never_throw_on_404).
+                        clampBefore(e.transition_version, id, "fold barrier: live precommit body not yet present (non-activating)");
+                    else
+                        /// Committed/promoted new-binding naming a missing body is fail-closed FOR THIS
+                        /// DECISION: a committed owner is never treated as zero-edge
+                        /// (CommittedManifestBodyRequired / INV_NO_DANGLE). Clamp + surface, never wedge.
+                        clampBefore(e.transition_version, id, "committed/promoted ref names a missing manifest body (CommittedManifestBodyRequired)");
                     break;
                 }
+                if (is_precommit)
+                    recordActivation(result.fold_seal, id, /*activated=*/true);   /// ManifestActivationMatchesEdges
             }
             shard_changed = true;
         }
@@ -1161,7 +1330,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
         /// point and the unresolved decrement is retried (with the anomaly surfaced) next round.
         cov.folded_cursor = resolved_through;
         cov.classification = shard_changed ? 2 : 1;
-        result.seal.per_ns_shard[cursor_key] = cov;
+        result.fold_seal.per_ns_shard[cursor_key] = cov;
         if (shard_changed)
             folded_any = true;
 
@@ -1174,12 +1343,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 
     /// 3. Merge deltas into the new generation's blob in-degree run; seal it; advance the pointer.
     foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, /*shard*/0,
-                             std::move(deltas), result.seal.blob_target_runs);
+                             std::move(deltas), result.fold_seal.blob_target_runs);
     /// part-manifest cleanup bundle(s) — keyed by ManifestId; one bundle for gc_shards==1.
     writePartManifestCleanupBundle(backend, layout, new_generation, /*owner_shard*/0, result.mf_cleanup,
-                                   result.seal.part_manifest_cleanup);
-    result.seal.markers.folded = true;
-    backend.putIfAbsent(layout.generationSealKey(new_generation), encodeGenerationSeal(result.seal));
+                                   result.fold_seal.part_manifest_cleanup);
+    /// Write-once CasFoldSeal: its existence marks fold complete (no separate marker field). On
+    /// PreconditionFailed, adopt a byte-equal occupant as own crash-replay, else ABORTED.
+    backend.putIfAbsent(layout.foldSealKey(new_generation), encodeFoldSeal(result.fold_seal));
 
     state.snap_generation = new_generation;
     const CasResult fold_res = backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token);
@@ -1191,7 +1361,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token)
 }
 ```
 
-> The helpers `sealedCursorOf`, `wasActivatedWithBody`, `recordActivation`, `recordAnomaly`, `writePartManifestCleanupBundle` are small additions: `sealedCursorOf`/`wasActivatedWithBody` read the **parent** generation seal (`generationSealKey(state.snap_generation)`) loaded once at fold start; `recordActivation` stamps the activation bit into the new seal's `per_ns_shard` coverage (a per-`ManifestId` activation map can ride alongside, or reuse `ShardCoverage`); `recordAnomaly` (on `RoundReport`) records an unresolved removal (namespace/shard/ManifestId/reason) so the cursor-clamp is observable to fsck/logs (it never throws — surfacing, not wedging). The promotion loop reads `root.promotions` directly — 1b emits `PromotePrecommit` as a first-class third record vector (`RootShard.promotions`), per the canonical contract, so there is no `promotionsOf` helper and promotions are not folded into `precommits`. Keep the activation representation consistent with Task 5's recheck reader. The generation-seal write is `putIfAbsent` (write-once; on `PreconditionFailed` adopt the byte-equal occupant as own crash-replay, else `ABORTED` — same adoption rule retire uses).
+> The helpers `sealedCursorOf`, `wasActivatedWithBody`, `recordActivation`, `recordAnomaly`, `writePartManifestCleanupBundle` are small additions: `sealedCursorOf`/`wasActivatedWithBody` read the **parent** `CasFoldSeal` (`foldSealKey(state.snap_generation)`) loaded once at fold start; `recordActivation` stamps the activation bit into the new `CasFoldSeal`'s `per_ns_shard` coverage (a per-`ManifestId` activation map can ride alongside, or reuse `ShardCoverage`); `recordAnomaly` (on `RoundReport`) records a clamped event (namespace/shard/ManifestId/reason) so the cursor-clamp is observable to fsck/logs (it never throws — surfacing, not wedging). The fold reads the **single ordered `root.journal`** of `RootOwnerEvent`s; a promote is an owner-move event (`old_binding.manifest_ref == new_binding.manifest_ref`) handled inline — there is no separate `promotions` vector and no `promotionsOf` helper. Keep the activation representation consistent with Task 5's recheck reader. The `CasFoldSeal` write is `putIfAbsent` (write-once; on `PreconditionFailed` adopt the byte-equal occupant as own crash-replay, else `ABORTED` — same adoption rule retire uses).
 
 - [ ] **Step 5: Update `runRegularRound` in `CasGc.cpp`.** Remove the `assertSnapJournalCoherent(folded.snap, folded.root_shards);` call (lines 108-114) and the `cascadeAndPersist(...)` call (line 146). Change `fold`'s consumers: `retire`, `recheck`, `trim` now take the `FoldResult` (seal/root_shards/mf_cleanup) instead of `folded.snap`. Remove the `resident_snap`/`resident_generation` assignment at lines 162-163. The new tail reads:
 
