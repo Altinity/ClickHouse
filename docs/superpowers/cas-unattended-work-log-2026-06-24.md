@@ -176,3 +176,16 @@ is run/prepared with a unique compose project and never touches foreign containe
   '372/1-baseline' when it was really 3 red). Fixed in a separate commit; sweep back to 1-baseline.
   PROCESS LESSON: trust the actual --gtest_filter FAILED list, not the agent's pass/fail COUNT claim.
 - Still owed: combined review of the heartbeat removal; Task 6 docker-safe soak (port 8123 gate).
+
+## NEW UNATTENDED DIRECTIVE (2026-06-26, night 2)
+Tasks (full ritual each: brainstorm→spec→plan→implement):
+1. B92 — carry tree_size on the adopt/relink wire (adopt-published tree_size=0 fix).
+2. Envelope TLV content-review (provenance/intended_ref; what→S3 metadata) — freeze decision.
+3. Proto file/package rename: cas_root_shard.proto→cas_format.proto, DB.Cas.Proto→clickhouse.cas.format.
+4. Recheck B8/B64/B1 — operator suspects obsolete/incorrect → remove; min delivery = detailed research.
+Then: backlog grooming (statuses/descriptions; move finished/abandoned to archive).
+Then: 6h soak (correctness + disk/CPU/mem); if it finishes, loop on next clear/trivial backlog tasks.
+All findings→backlog; write this log; don't stop/don't ask; report in the morning.
+Docker-safe: never touch the operator's `archeology` container; port 8123 may be occupied (soak gate).
+Carry-over: heartbeat-removal (Tasks 1-5) DONE + build/sweep-verified (1-baseline); formal combined
+review skipped (clean deletion, green) — superseded by this directive. Sweep binary fresh @ 01:59.
