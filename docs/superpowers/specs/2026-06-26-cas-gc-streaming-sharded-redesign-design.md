@@ -1,392 +1,987 @@
 ---
-description: Design for a streaming target-sharded garbage collector based on root-ref closure deltas
-sidebar_label: CAS GC root-closure sharded redesign
+description: Design for a streaming GC based on root-local full-tree manifests and content-addressed blobs
+sidebar_label: CAS GC full-tree manifest redesign
 sidebar_position: 1
 slug: /superpowers/specs/2026-06-26-cas-gc-streaming-sharded-redesign-design
-title: CA GC root-closure target-sharded redesign design
+title: CA GC root-local full-tree manifest redesign design
 doc_type: reference
 ---
 
-# CA GC - root-closure delta, streaming target-sharded redesign - design {#ca-gc-root-closure-delta-streaming-target-sharded-redesign-design}
+# CA GC - root-local full-tree manifest redesign - design {#ca-gc-root-local-full-tree-manifest-redesign-design}
 
-**Status:** design (2026-06-26, rev. 5). Branch `codex-gc-proposal-2026-06-26`. **NOT behavior-preserving** - an algorithmic redesign of the GC round and the root-ref journal. CA is pre-release (zero persisted data, zero compat scaffolding). Every phase is gated on a green `TLA+` extension of `CaIncarnationCore.tla` before any code lands (requirement R0).
+**Status:** design (2026-06-26, rev. 8). Branch `codex-gc-proposal-2026-06-26`.
+**NOT behavior-preserving.** This is an architectural redesign of CA tree identity, build precommit,
+read-path tree resolution, and GC accounting. CA is pre-release, so no persisted-data compatibility
+path is required. Every behavior-changing phase is gated on a green `TLA+` model extension before code
+lands.
 
-This revision supersedes rev. 3's safe-but-heavy same-round cascade design. The new load-bearing decision is: **publish/remove/repoint records carry the fully expanded root-ref closure as a compact streamed delta**, so GC never owns tree-child expansion state and never performs cascade. Rev. 5 rejects memoized closure objects as a Phase-1 mechanism: journal-size backpressure plus a compact streaming protobuf journal is the simpler base design. This directly resolves the three design objections from the review: no resident `O(pool)` snap, no storm of small S3 GC-state objects, and no cross-round or same-round cascade machinery. It still keeps the Codex safety findings that matter: root-edge displacement is explicit, intermediate mapper products are non-authoritative until sealed, round visibility waits for all retired sets, the fence remains global, and exact-token delete is unchanged.
+The core change is now sharper than rev. 7: **only blobs remain content-addressed**. A root-local
+immutable tree object is not a folder node and does not point to child tree objects. It is a
+**full-tree manifest**: one immutable object containing the complete logical subtree, including all
+file paths, inline payloads, and blob references. Directories inside it are path prefixes or an
+optional internal index, not protocol objects.
 
-## Goal {#goal}
+This removes the last recursive tree walk from the GC protocol. A root/precommit owner transition
+names one full-tree manifest id. GC reads that one manifest object as a stream and emits blob deltas.
+There are no nested tree instance ids, no parent-child tree ownership, no tree expansion markers, no
+GC-side cascade state, and no full-closure root journal records.
 
-Replace the single-leader, whole-pool-resident GC with a **streaming, target-sharded** collector that is optimal per round and parallelizable across replicas, **without weakening any safety invariant**. Requirements, verbatim:
+## Goals {#goals}
 
-- **R0 - safety is non-negotiable and `TLA+`-provable.** No change may make the system less reliable under any delay, race, or failure. Over-delete (`INV_NO_RETURN`) and loss (`INV_NO_LOSS`/`INV_NO_DANGLE`) must be re-proven, not argued.
-- **R1 - each round optimal.** Operations per blob/tree ideally `O(in-degree-zeroed delta)`; memory ideally `O(1)`; journal operations ideally `O(changed RootShardManifest)`; snap access ideally exactly one streaming read and one write.
-- **R2 - shardable GC** (default 1 shard) so two replicas can run two GCs on disjoint shards in parallel.
-- **R3 - simple, reliable, debuggable.** Each GC's state legible at a glance; resumable from any point; every step idempotent and unambiguous.
+The design must satisfy the original requirements:
 
-Design decisions: **root-ref closure deltas** are the only source of target in-degree; root journals are stored as compact streamed protobuf records, not as one materialized repeated field; byte-based journal backpressure is the operational guard that lets GC catch up; target state is stored as streaming sorted generations; authoritative GC memory is `O(stream buffers)`; durable S3 state is coarse write-once objects; sharding is only across target reducers, with one global coordinator.
+- **R0: safety is non-negotiable and `TLA+`-provable.** No delay, race, duplicate worker, interrupted
+  attempt, stale view, or backend reorder may make the system less reliable. `INV_NO_DANGLE`,
+  `INV_NO_LOSS`, and `INV_NO_RETURN` must be proved, not argued.
+- **R1: each GC round is optimal.** Work is proportional to changed root owner transitions,
+  deactivated full-tree manifests, and blobs whose in-degree changes. Memory is bounded by stream
+  buffers. GC state is stored as coarse write-once objects.
+- **R2: target-shardable GC.** Default `gc_shards = 1`, with the option for different replicas to own
+  disjoint blob target shards.
+- **R3: simple, reliable, debuggable.** Durable state must explain what every round has folded,
+  retired, fenced, rechecked, deleted, and trimmed. Every step must be resumable and idempotent.
 
-## Ground truth - what the code does today {#ground-truth-what-the-code-does-today}
+Secondary design goals:
 
-(From a full read of `CasGc.{h,cpp}`, `CasGcSnap.{h,cpp}`, `CasObjectStorageBackend.cpp`, `CasStore.cpp`, `CasBuild.cpp`, `cas_format.proto`, `CasGcScheduler.cpp`, cross-checked against the Codex review.)
+- remove root-ref full-closure journal payloads;
+- remove content-addressed tree revival as a class of races;
+- remove nested static-folder protocol objects;
+- remove `TreeExpansionIndex`, `children_by_tree`, expansion markers, and cascade-wave state from GC;
+- keep exact-token delete and the global fence/recheck proof shape;
+- move precommit/build state into the target root prefix and make promotion an owner move.
 
-- **Round order** (`CasGc.h`): `fold -> retire -> fence -> recheck -> exact-token delete -> cascade -> trim`. The lease is **work-dedup only**; "the `TLA+` model proves the round safe with NO leadership assumption at all" - this property must be preserved.
-- **One global resident snap.** `snap_shards` is hard-pinned to 1: `Gc::fold` throws `NOT_IMPLEMENTED` for `snap_shards != 1`, specifically because root `last-op-wins` displacement across target shards is undesigned. The whole pool graph (`edges`, `known`, `indeg`, `expanded`, `children_by_tree`, `folded_cursor`) is resident on the leader. Memory is `O(pool)`.
-- **Cost model, stated precisely.** `Store::readShard` issues one backend `get` (returns its token); in the Native backend that `get` is internally `nativeHead` plus ranged GET. Separately, `Gc::retire` issues an explicit `backend.head` per zero-in-degree candidate, and `Gc::fence` does a read-before-CAS (`mutateShard` = read + `casPut`) per shard. The per-round floor is `O(S)`, `S = #namespaces * root_shards`: every shard manifest is read on four-to-five passes (`fold`, coherence guard, `recheck`, `trim`) and fenced unconditionally. There is no LIST token-diff.
-- **Cascade is safe only because it is in-round today.** `Gc::cascadeAndPersist` calls `stripTree` this round, drops the dead tree's child edges from the snap via `children_by_tree`, and clears the expansion marker before the round completes. A later `Add` of the same tree hash re-expands children. Deferring this strip is unsafe (`SabotageCascadeRace`).
-- **`JournalRecord.closure` already exists, but is not root-ref authority and not the desired wire shape.** `cas_format.proto` has `repeated ClosureNodeProto closure`. `CasBuild.cpp` populates it only for precommit-namespace `Add` records. Normal table `Add`, precommit `Remove`, `Store::dropRef`, and namespace-drop `Remove` records write an empty closure. Rev. 5 promotes the concept to root journal authority, but changes the payload from tree-shaped `ClosureNodeProto` records to a flat canonical closure-delta stream that GC can fold without another tree walk.
-- **Root manifests are currently whole-object protobufs.** `CasRootShardCodec.cpp` uses `RootShardManifest::ParseFromArray`, and `journal` is a `repeated JournalRecord`. That is fine for today's small manifests, but it is not the Phase-1 target: a root manifest carrying large closure deltas must be readable by a streaming record parser so GC can fold journal records without materializing all refs and all closure entries in memory.
-- **`recheck` rereads every fenced root shard through the fence window** before the single `deleteExact` site; it does not trust the pre-fence fold.
-- **Idempotency/resumability is already excellent**: exact-token deletes, write-once retired/outcome/snap paths with adopt-crashed-attempt, per-`(ns,shard)` cursors, crash-resume off durable retired sets. Preserve this machinery.
+## Protocol Boundary {#protocol-boundary}
 
-## Formal-model ground truth (`CaIncarnationCore.tla`) {#formal-model-ground-truth}
+This is not a local GC optimization. It changes the formal object model, the root journal contract,
+the read path, and the meaning of `fold`.
 
-The model already carries the scaffolding we need: per-shard `man[s]`/`cursor[s]`/`fencePos[s]`, multiple `Leaders`, a resident snap abstraction, and incarnation tokens (`tokOf`, `deadTok`, exact-token `Land`).
+The `TLA+` model must change because the current model treats trees as content hashes with `treeEdges`,
+`marker`, and a cascade action. Rev. 8 needs a new model branch with:
 
-- Active safety invariants: `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN`, `INV_JOURNAL_COVERAGE`; monotone `gc/state` and registry/fence positions.
-- `GRetire` is safe only for in-degree state already folded into `cursor`, and maps the retired token to the candidate's current `tokOf[h]` (this is what the per-candidate `HEAD` observes today).
-- `GRecheckDelete` requires `FoldedThroughFence == \A s : cursor[s] >= fencePos[s]`; the negative control `SabotageNoRecheckFold` breaks `INV_NO_DANGLE`. `GFenceRegistry` precedes `GFenceShard` (load-bearing; `SabotageFoldTimeUniverse` reproduces the fixed namespace-creation window).
-- `ViewableRound`: a writer may see round `R` only after all of round `R`'s retire entries are durable, not a subset.
-- `SabotageCutOverclaim`: any streaming/full-GC cut that advances cursors past incorporated state is unsafe.
-- `SabotageCascadeRace`: delayed cascade is unsafe because a stale tree-hash-keyed child decrement can strip a later-revived live tree.
+- random 128-bit `tree_instance_id` values for full-tree manifests;
+- root-local immutable full-tree manifest bodies;
+- no nested tree objects and no child tree edges;
+- `SingleManifestOwner` and `NoTreeIdReuse`;
+- precommit owners, committed owners, and atomic `PromotePrecommit`;
+- precommit-visible missing blob leaves;
+- blob in-degree derived only from active full-tree manifests;
+- manifest-delete work keyed by `tree_instance_id`;
+- namespace-scoped orphan manifest debris for objects written before `PrecommitAdd`;
+- the existing global registry/root fence and fold-through-fence recheck.
 
-The redesign must keep the proof hooks intact: authoritative folded state before `retire`; all retire entries durable before round visibility; global fence coverage before delete; exact-token delete; and no destructive action based on unsealed intermediate products. Rev. 5 removes the cascade action from the new model by changing what the journal means: target in-degree is derived directly from live root-ref closure deltas, not from GC-maintained tree-child edges.
-
-## Central principle - count root-ref closures, not tree-child edges {#central-principle-count-root-ref-closures}
-
-A live CA object is protected because it is in the closure of at least one live root ref. Therefore the cleanest authoritative count is:
-
-```
-indeg[o] = Cardinality({ root ref r : r is live and o in Closure(r.tree) })
-```
-
-where `Closure(tree)` is the sorted unique set of all protected content objects reachable from the tree, including the root tree itself and all descendant trees/blobs.
-
-With this definition:
-
-- Adding a root ref emits `+1` for every object in its closure.
-- Removing a root ref emits `-1` for exactly the same ref incarnation's closure.
-- Repointing a root ref emits `-old_closure` and `+new_closure` in one root-shard transition.
-- Deleting a tree object never changes in-degree, because tree-child edges are **not** authoritative GC state.
-
-So cascade disappears. When the last root ref to a subtree is removed, all objects in that subtree can become zero-in-degree in the same fold. The round does not need to delete the parent first and then propagate child decrements; the decrement already happened at the root-ref transition.
-
-This is **not** writer fanout into target shards. The write path writes one root-shard-local transition record (or one root manifest CAS containing that transition). GC later streams that closure-delta payload into target-keyed reducer runs. There are no `N` target-shard writes on publish.
-
-## Target data model {#target-data-model}
-
-### `RootTransitionRecord` - root journal payload with exact old/new closures {#root-transition-record}
-
-Conceptual record:
+The visible round skeleton intentionally stays close to the proved tail:
 
 ```
-(namespace, root_shard, ref_name, root_version) ->
-{
-    old?: { tree_hash, ref_epoch, closure_digest, closure_delta_payload },
-    new?: { tree_hash, ref_epoch, closure_digest, closure_delta_payload }
+discover -> fold -> retire -> fence -> recheck -> exact-token delete -> trim
+```
+
+What changes is `fold`. Today it folds root ref records into root edges, expands content-addressed
+trees, and later relies on cascade to remove child edges. Rev. 8 folds root owner transitions, reads a
+single root-local full-tree manifest object for each old/new owner, and emits blob deltas directly.
+There is no resident tree-child authority inside GC after the fold output is sealed.
+
+The following principles are unchanged and remain load-bearing:
+
+- exact-token delete;
+- global registry fence before root-shard fences;
+- fold-through-fence recheck before delete;
+- `ViewableRound` barrier before writers can observe retired tokens;
+- `deadTok` / no-return for blob tokens;
+- fail-closed publish and promotion gates;
+- registry as authority, with LIST only as an accelerator.
+
+## Ground Truth In The Current Code {#ground-truth-in-the-current-code}
+
+The current implementation has four load-bearing properties that the new design must preserve:
+
+- `CasGc.cpp` runs `fold -> retire -> fence -> recheck -> exact-token delete -> cascade -> trim`.
+  The lease is only work-dedup; the `TLA+` model proves safety without assuming a unique leader.
+- `Gc::fold` hard-pins `snap_shards = 1` because last-op-wins displacement is currently folded inside
+  one resident `GcSnap`. A target-sharded reducer cannot infer the old target of a root ref from the
+  new target alone.
+- `Gc::cascadeAndPersist` is safe today only because it removes child edges in the same round that
+  confirms the tree deletion, before the cursor advances. Deferring a content-hash-keyed child-edge
+  removal is the modeled `SabotageCascadeRace`: a later content-identical tree can reuse the same tree
+  hash.
+- `Build::precommit` currently uses a separate `<server_hex>/_precommits` namespace and populates
+  `JournalRecord.closure` with `ClosureNodeProto` records for staged trees. This was the B199-S2 fix:
+  GC must not have to read a vanished staged tree to learn the precommit closure.
+
+The current code also shows where rev. 8 cuts complexity:
+
+- `Build::stageTree` mints `TreeId` from a Merkle/content hash and retains encoded tree payload for
+  re-upload. Rev. 8 changes `TreeId` to a root-local full-tree manifest id; the optional payload digest
+  is only integrity/debug data.
+- `Store::readTree` assumes trees are global immutable content objects under `trees/<prefix>/<hash>`.
+  Rev. 8 reads full-tree manifests from the owning root prefix instead.
+- `RootShardManifest` is a whole-object protobuf with `refs` and repeated `JournalRecord`. Rev. 8
+  still wants the planned streaming protobuf migration, but the records are compact owner transitions,
+  not full closures.
+- `CasLayout` has global `blobKey` and `treeKey`. Rev. 8 keeps `blobKey` and replaces CA `treeKey`
+  with root-local full-tree manifest keys.
+
+## Formal Model Ground Truth {#formal-model-ground-truth}
+
+`CaIncarnationCore.tla` proves the core delete protocol:
+
+- `GRetire` records the exact current token of an in-degree-zero object.
+- `GFenceRegistry` precedes root-shard fences and closes namespace-creation races.
+- `GRecheckDelete` requires fold-through-fence before issuing the exact-token delete.
+- `ViewableRound` says a writer may observe round `R` only after all round-`R` retired sets are
+  durable.
+- `deadTok` prevents a deleted or overwritten token from becoming a valid dependency again.
+
+`CaBuildRootPrecommit.tla` proves the build-root/precommit fix:
+
+- a live precommit protects a build's staged structure;
+- a committed table ref is allowed only after a fail-closed full-closure presence recheck;
+- precommit may reference missing blobs, but a committed root may not;
+- reclaiming a precommit of a still-live but judged-dead build is safe only because `Commit` rechecks
+  all blob leaves before publishing.
+
+Rev. 8 keeps these proof obligations, but changes the tree model:
+
+- tree identities are no longer content hashes;
+- a full-tree manifest is a single-owner root-local object;
+- there is no tree-child protocol graph;
+- only blob objects are content-addressed, deduplicated, and shared across roots;
+- a full-tree manifest id is never reused after it becomes visible in any root journal.
+
+## Core Principle {#core-principle}
+
+There are only two protocol-level folder concepts:
+
+- **Dynamic folders** are root manifests. They have a mutable journal and own top-level full-tree
+  manifests through owner transitions.
+- **Static folders** are full-tree manifest objects. They are immutable and indivisible. Their body is
+  the complete subtree: every file path, every inline value, and every blob reference under that root.
+
+The reference graph is therefore:
+
+```
+dynamic root/precommit ref -> root-local full-tree manifest
+full-tree manifest         -> content-addressed blob
+```
+
+Directories inside a full-tree manifest are not separate objects. They are represented by path
+prefixes. If lookup/list performance needs it, the same manifest object may include an internal
+directory index, but that index is still part of the single immutable manifest payload.
+
+Only blobs are content-addressed. Full-tree manifests are not deduplicated by payload. If two parts
+have byte-identical logical metadata, they still get different manifest ids. The payload may carry a
+digest for corruption detection, but that digest is not identity and is never used as a GC key.
+
+This is the key simplification: stale work is keyed by a unique full-tree manifest id, not by a content
+hash that a future publish can revive.
+
+## Object Identity And Ownership {#object-identity-and-ownership}
+
+### Blob Identity {#blob-identity}
+
+Blob identity remains unchanged:
+
+```
+blob_hash = hash(blob_payload)
+key       = <pool>/blobs/<first2>/<blob_hash>
+```
+
+Blob payloads keep incarnation tokens. Exact-token delete remains the only destructive content delete
+authority. Blob dedup remains the main storage win.
+
+### Full-Tree Manifest Identity {#full-tree-manifest-identity}
+
+A full-tree manifest id is a random 128-bit value minted by the writer and unique within the owning
+root namespace:
+
+```
+tree_instance_id = random_u128
+```
+
+Writer id, build sequence, and build-local ordinal are debug/body fields, not safety identity. The
+requirements are:
+
+- no manifest id is derived from payload;
+- no visible manifest id is ever reused;
+- manifest objects are immutable write-once objects;
+- an id collision fails closed before any root journal transition becomes visible.
+
+The manifest body may include:
+
+```
+FullTreeManifestProto {
+    header
+    root_namespace_id
+    tree_instance_id
+    writer_id
+    build_seq
+    build_ordinal
+    payload_digest
+    repeated Entry entries
+    optional DirectoryIndex directory_index
+}
+
+Entry {
+    path
+    placement = inline | blob
+    blob_hash
+    blob_size
+    inline_bytes
+}
+```
+
+Entries are canonicalized by path. Duplicate paths are corruption. Duplicate blob hashes across
+different paths are allowed and must be folded by deterministic source edge ids such as
+`(tree_instance_id, path)`.
+
+`payload_digest` is an integrity check and a debug aid. It is not a storage key, not a dedup key, and
+not an in-degree key.
+
+### Manifest Ownership {#manifest-ownership}
+
+A visible full-tree manifest has at most one structural owner:
+
+- a committed root ref;
+- a precommit ref.
+
+There is no parent-tree owner because there are no nested tree objects. Promotion moves ownership from
+a precommit ref to a committed root ref. It must be one root-shard CAS transition, not "add table ref
+now, best-effort remove precommit later". The current two-namespace best-effort precommit removal is
+safe in the old model because duplicate edges only over-protect; this design chooses the simpler
+invariant instead: a manifest owner is singular and explicit.
+
+An implementation may represent the move as `old_owner -> new_owner` inside one journal record. It
+must not expose a state where neither owner exists.
+
+## S3 Layout {#s3-layout}
+
+Blobs stay global:
+
+```
+<pool>/blobs/<aa>/<blob_hash>
+```
+
+Root-local full-tree manifests live under the owning root prefix:
+
+```
+<pool>/roots/<root_namespace>/
+  <root_shard_number>
+  _files/...
+  _subtrees/<writer_id>/<build_seq>/<aa>/<tree_instance_id>.proto
+```
+
+`_subtrees` becomes a reserved segment, like `_files`. The name is kept because it describes the logical
+object: one immutable subtree manifest. It does not imply nested protocol objects.
+
+The `<writer_id>/<build_seq>` prefix is for cleanup and diagnostics only; `tree_instance_id` remains
+the random 128-bit safety identity. The `<aa>` fanout is derived from `tree_instance_id`, not from the
+payload digest.
+
+For the user's example namespace, the layout can be:
+
+```
+server/store/ab/uuid@cas@/
+  17
+  _files/...
+  _subtrees/srv-a/1042/7f/7f3a...c1.proto
+```
+
+where `17` is a root shard manifest and `_subtrees/srv-a/1042/7f/7f3a...c1.proto` is a root-local
+full-tree manifest staged by build sequence `1042`.
+
+Important: the build-scoped prefix is not a deletion authority. A manifest can remain live after the
+build sequence is below the watermark because promotion keeps the same manifest id and object. Cleanup
+must check liveness per manifest id against a sealed namespace owner view; it must never delete a whole
+build prefix blindly.
+
+## Root Journal Format {#root-journal-format}
+
+The root journal no longer carries transitive closures. It carries compact owner transitions:
+
+```
+OwnerTransition {
+    transition_version
+    ref_name
+    old_tree_instance_id?   // owner removed
+    new_tree_instance_id?   // owner added
+}
+
+PrecommitTransition {
+    transition_version
+    build_id
+    final_ref_name
+    old_tree_instance_id?
+    new_tree_instance_id?
+}
+
+PromotePrecommit {
+    transition_version
+    build_id
+    final_ref_name
+    tree_instance_id
 }
 ```
 
 Semantics:
 
-- create: `old = none`, `new = closure(new_tree, new_ref_epoch)`;
-- drop: `old = exact current closure(old_tree, old_ref_epoch)`, `new = none`;
-- repoint: both halves present in the same root-shard transition.
+- create precommit: `old = none`, `new = T`;
+- abandon/reclaim precommit: `old = T`, `new = none`;
+- publish new ref without precommit: `old = none`, `new = T`;
+- drop ref: `old = T`, `new = none`;
+- repoint ref: `old = T_old`, `new = T_new`;
+- promote precommit: owner moves from `precommit(build_id)` to `ref(final_ref_name)` with no blob-edge
+  change.
 
-`ref_epoch` is the root-ref incarnation, for example the root journal version that installed that tree. It is mandatory even when `tree_hash` is content-identical across two publishes. A stale remove for epoch `E1` must never be allowed to decrement epoch `E2`'s live closure.
+The current `JournalRecord{Add, Remove}` shape is insufficient for target-sharded streaming because
+the target reducer cannot infer the displaced old tree. The new journal must encode replace/move
+semantics at the root source. With that, rev. 5's durable `RootEdgeIndex` is no longer a required
+long-lived GC object: root-shard mappers can emit paired old/new deltas from one source transition.
 
-The remove/drop path obtains `old.closure_delta_payload` by reading the currently live root ref and expanding its tree **before** the CAS that removes the ref. If the CAS loses a race, the computed closure is discarded and the writer retries from the new root state. This avoids retaining `O(live closure)` metadata in `refs`, and it also avoids reading a condemned tree after the ref is gone.
-
-Implementation can encode this as a new replace-style proto record, or as adjacent `Remove`/`Add` records accepted by the same root-manifest CAS and sharing one `root_version`. The safety requirement is semantic: the old and new halves are one transition for `last-op-wins`, not two independent target-shard facts.
-
-### Flat canonical closure-delta payload {#flat-canonical-closure-delta-payload}
-
-The Phase-1 payload is not the current tree-shaped `repeated ClosureNodeProto`. It is a compact canonical delta stream:
-
-```
-ClosureDeltaPayload {
-    codec_version
-    closure_digest
-    repeated ClosureBlock
-}
-
-ClosureBlock {
-    object_kind          // blob or tree
-    sorted_hashes        // delta-coded / compressed UInt128 sequence
-    optional sizes       // only if needed for retire-token optimization or diagnostics
-}
-```
-
-The sign is derived from the `RootTransitionRecord` half: `old` blocks emit `-1`, `new` blocks emit `+1`. Entries are sorted and unique within one closure. GC folding consumes blocks as a stream of `(kind, hash, delta, ref_epoch)` tuples and never reconstructs the tree.
-
-This is deliberately inline journal data. Phase 1 does **not** introduce memoized closure objects keyed by `tree_hash`, and does **not** create a separate S3 object for each tree closure. If wide-table workloads later prove that inline journal bytes dominate, that is a new storage design with its own lifecycle and proof, not a hidden escape hatch in this protocol.
-
-### `RootEdgeIndex` - owns `last-op-wins`, keyed by root-edge identity {#root-edge-index}
-
-```
-(namespace, root_shard, ref_name) ->
-{
-    current_tree_hash?,
-    current_ref_epoch?,
-    current_closure_digest?,
-    root_journal_cursor,
-    manifest_token
-}
-```
-
-This remains the prerequisite for target sharding. A run keyed only by target cannot know which old target/closure to subtract on a re-pointed ref. `RootEdgeIndex` processes root transitions in root-journal order, verifies that `old` matches the currently recorded epoch (or fails closed), emits the paired closure deltas, and advances the root cursor only in the sealed generation commit.
-
-### `TargetInDegreeShard` - sorted by target key; reducers own it {#target-in-degree-shard}
-
-```
-(kind, hash) -> { known, indeg, last_observed_token?, last_observed_size? }
-```
-
-Input is a sorted stream of target deltas from root closures only. The reducer merge is:
-
-```
-old target run + sorted closure-delta stream -> new target run + zero-in-degree candidates
-```
-
-All entries for one target are contiguous, so in-degree falls out of the merge. With external sort/spill, memory is `O(1) + buffers`.
-
-### `RootManifestTokenIndex` - token-diff state, advanced with the cursor {#root-manifest-token-index}
-
-```
-root_shard_key -> { folded_cursor, folded_manifest_token }
-```
-
-`folded_cursor` and `folded_manifest_token` advance in one durable generation commit. A token-only update without incorporated journal state is forbidden (would match `SabotageCutOverclaim`).
-
-### No `TreeExpansionIndex`, no GC-side cascade state {#no-tree-expansion-index-no-gc-side-cascade-state}
-
-Rev. 3 needed `TreeExpansionIndex` to remember `children_by_tree` durably and to make "expanded marker durable iff child-edge add deltas durable" atomic. Rev. 5 deletes that entire obligation. GC does not store expansion markers, child-edge runs, cascade queues, or cascade wave markers. Closure correctness is a write-path/root-journal obligation instead.
-
-## Minimal S3 object layout - coarse objects only {#minimal-s3-object-layout}
-
-Authoritative durable state is:
-
-- existing mutable objects: `gc/state`, `gc/registry`, and root manifests;
-- root-manifest journal entries containing inline compressed sorted root-ref closure-delta blocks;
-- one write-once `gc/gen/<generation>/manifest` object containing the `input-seal`, parent generation, shard run list, root cursor/token table, target shard metadata, checksums, and completion phase markers;
-- large write-once target run files under `gc/gen/<generation>/target/`;
-- one compact round bundle per active target shard, or one bundle for `gc_shards = 1`, for `retired` and outcome entries.
-
-There are no permanent `jrnl[P]` micro-records, no object per edge, no object per candidate, no object per tree closure, no expansion files, and no cascade attempt files. Temporary mapper/reducer outputs are hidden under an attempt prefix, referenced by the generation manifest only after the `input-seal` is complete, and cleaned later as orphaned generation debris. They are not writer-visible protocol state.
-
-For the default `gc_shards = 1`, a non-empty GC round should create a bounded set of GC objects: one generation manifest, one or a few large target run files, and one round bundle. The closure-delta payloads are publish/remove journal data, not extra GC scratch state.
-
-`Gc` may keep bounded caches of recently read run pages, decoded root manifests, or closure-delta blocks. Those caches are never authoritative and have a fixed memory budget. There is no resident whole-pool `GcSnap` in any production phase.
-
-## Journal encoding and backpressure {#journal-encoding-and-backpressure}
-
-Phase 1 requires a streaming protobuf root-manifest/journal format. The current whole-object `RootShardManifest` shape is replaced by a record stream:
+The planned streaming protobuf migration still matters. A root manifest should be readable as a
+length-delimited record stream so GC can fold journal records without materializing the whole root
+manifest in memory:
 
 ```
 ManifestHeader
 RefRecord...
-JournalRecordHeader
-ClosureBlock...
-JournalRecordFooter
-...
+PrecommitRecord...
+OwnerTransitionRecord...
 ManifestFooter
 ```
 
-Each record is length-delimited protobuf. The normal `Store` path may materialize refs when it needs a point-in-time root view; GC fold uses a callback reader (`onRef`, `onJournalRecord`, `onClosureBlock`) and streams closure blocks directly into target-delta sorting/spill. This is the format-unification path for mutable CA objects; it is also what keeps Phase-1 GC memory from depending on root journal size.
+## Read Path Scope {#read-path-scope}
 
-Backpressure is operational, not a safety proof. Safety still comes from the rule that a root transition is visible only together with its exact closure delta and from the model-checked fold/fence/recheck/delete protocol. Backpressure prevents unbounded lag and must be byte-based:
+This redesign changes the query-hot read path.
 
-- `journal_unfolded_bytes` per root shard;
-- `root_manifest_encoded_bytes`;
-- `largest_single_transition_bytes`;
-- `closure_entries_per_transition`;
-- `gc_lag_rounds` / oldest folded cursor age for diagnostics.
+`Store::resolveRef` resolves a ref to a root-local `tree_instance_id` plus its owning root namespace.
+`Store::readTree` no longer reads `trees/<hash>`. It reads the full-tree manifest from the root prefix,
+then answers path lookup or directory listing from the manifest entries and optional directory index.
 
-When a limit is exceeded, writers fail closed or throttle before publishing more root transitions; they do not publish a root pointer without its closure delta. A single transition that exceeds `largest_single_transition_bytes` must fail before becoming visible, not after it has created a journal entry GC cannot process within memory/latency bounds.
+The old per-process tree decode cache shared by content hash becomes less useful because each publish
+uses a unique manifest id. That is an intentional tradeoff. The data that matters for storage and
+large reads is still blob-deduplicated; tree metadata is small, immutable, and can be cached by
+`(root_namespace, tree_instance_id, token)`.
 
-## Round protocol {#round-protocol}
+Planning must include:
 
-### 1. Discovery - registry is authority; LIST only accelerates; fail-closed {#discovery}
+- path lookup over a full manifest;
+- optional directory index for fast `listDirectory`-style operations;
+- bounded decode/cache memory;
+- fail-closed behavior when a committed ref names a missing manifest.
 
-The namespace-by-shard universe is always taken from `gc/registry`, never from LIST. A single paginated `LIST roots/` returning `(key, size, token)` is only an accelerator. Per registry shard:
+## Build And Precommit Protocol {#build-and-precommit-protocol}
 
-- listed token == persisted `folded_manifest_token` -> skip body read;
-- token absent / ambiguous / backend-weak / different -> read the manifest body and fold;
-- registry shard not returned by LIST -> ambiguous -> read/mint per current rules;
+Precommit should live in the target root prefix and follow the same ownership rules as committed refs.
+The only semantic relaxation is: **precommit may reference missing blobs; committed refs may not**.
+
+### Stage Full-Tree Manifest {#stage-full-tree-manifest}
+
+`Build::stageTree` changes from "compute Merkle `TreeId`" to "mint root-local full-tree manifest id".
+
+The writer builds one full-tree manifest:
+
+1. Resolve the complete logical subtree into canonical entries: full path, placement, blob hash/size or
+   inline bytes.
+2. Mint one random 128-bit `tree_instance_id`.
+3. Write the manifest object under `_subtrees/<writer_id>/<build_seq>/...`.
+4. Keep the encoded manifest payload in memory until the precommit root transition is durable.
+
+The manifest object named by a visible precommit must already exist. Blobs named by that manifest may
+still be absent.
+
+This is the replacement for `JournalRecord.closure`: the full-tree manifest itself is the durable
+staged structure. GC never needs a full closure copied into the root journal, and it never needs
+recursive reads to reconstruct a staged precommit.
+
+### Pre-Precommit Manifest Debris {#pre-precommit-manifest-debris}
+
+Manifest bodies are written before `PrecommitAdd`. If a build stops in that window, no owner
+transition names those manifest ids. Owner-driven GC would never read or delete them unless the
+protocol adds an explicit debris path.
+
+This section defines the build-side contract. The round-level cleanup algorithm is specified in
+[Orphan Manifest-Debris Sweep](#orphan-manifest-debris-sweep).
+
+Rev. 8 makes this a first-class liveness obligation:
+
+- writer abort does best-effort deletion of its own `_subtrees/<writer_id>/<build_seq>/` objects;
+- GC has a rare backstop sweep for build-scoped `_subtrees` objects whose build is below the server
+  watermark floor, retired, or judged dead by the same rules used for precommit reclaim;
+- the sweep is scoped to one root namespace at a time;
+- the sweep builds the active manifest-id set from that namespace's sealed root/precommit owner view;
+- the sweep deletes only dead-build manifest objects whose ids are absent from that namespace active
+  set;
+- every manifest delete is exact-token;
+- if the build was falsely judged dead and later tries to publish `PrecommitAdd`, it must first
+  re-check that the named manifest body still exists. A missing manifest makes `PrecommitAdd` fail
+  closed and the writer retries with a fresh manifest id.
+
+This is a space-liveness mechanism, not reader-facing correctness. A pre-precommit manifest has no root
+owner, so readers cannot reach it. The important rule is that the debris sweep must never treat
+"dead build prefix" as enough to delete. It needs a sealed per-namespace owner view and a per-object
+liveness check.
+
+The common case should be writer cleanup. The GC backstop is for stopped writers and must be bounded:
+one namespace, one dead build prefix, and a limited number of exact-token deletes per round.
+
+### Final Ref Name Requirement {#final-ref-name-requirement}
+
+The normal precommit path requires `final_ref_name` up front. In `MergeTree`, the output part name is
+known before the build: insert assigns it and merge/mutation knows its target. That lets
+`PrecommitAdd` live in the same root shard as the final committed ref, so `PromotePrecommit` is one
+root-shard CAS owner move.
+
+Rev. 8 deliberately does not include a GC-visible scratch-root fallback. A caller that cannot know
+`final_ref_name` must delay `PrecommitAdd` until the final name is known or get a separate modeled
+design. A hidden scratch precommit would double-write manifests and add another debris location to
+prove.
+
+### Precommit Add {#precommit-add}
+
+The precommit CAS is written to the same root namespace as the future committed ref. For a normal part
+publish, the precommit is placed in the same root shard as `final_ref_name`, so promotion can be atomic
+in one shard CAS.
+
+The precommit record:
+
+- names `build_id`;
+- names `final_ref_name`;
+- names the full-tree manifest id;
+- records enough build watermark identity to let GC reclaim abandoned precommits;
+- does not carry transitive closure.
+
+After `PrecommitAdd` is visible, GC treats the manifest as active. Its blob edges protect all currently
+present blobs in the manifest and also protect future uploads of the same blob hashes because the edge
+already exists in the target in-degree state.
+
+### Blob Uploads Under Precommit {#blob-uploads-under-precommit}
+
+The modeled order is:
+
+1. write the root-local full-tree manifest body;
+2. publish `PrecommitAdd`;
+3. upload or revalidate blob bodies;
+4. promote only after a fail-closed blob recheck.
+
+This order is possible because the manifest needs blob hashes and sizes, not necessarily blob bodies.
+It gives the blob upload path a structural precommit edge before a newly uploaded blob can become an
+in-degree-zero GC candidate.
+
+Uploading a blob before `PrecommitAdd` is allowed only as unprotected speculative debris. GC may delete
+it before the precommit appears. The writer must tolerate that by re-uploading from source or aborting
+at promotion. The system must never treat a precommitless upload as protected.
+
+The key invariant is:
+
+- precommit manifest body must exist before precommit is visible;
+- blob bodies may be missing while the owner is precommit;
+- a blob that is present and reachable from a live precommit must not be deleted;
+- a missing blob under precommit is not corruption.
+
+This matches the existing `CaBuildRootPrecommit.tla` split between build-root intent and committed
+reader-facing truth.
+
+### Promote Precommit {#promote-precommit}
+
+Commit promotion is a single root-shard CAS:
+
+1. Refresh retire view if the root shard or registry fence demands it.
+2. Revalidate every blob leaf listed in the precommit manifest.
+3. If any blob is absent or condemned and not recreatable from writer source, fail closed with
+   `ABORTED`.
+4. Atomically replace `precommit(build_id)` owner with `ref(final_ref_name)` owner.
+5. Append `PromotePrecommit` to the root journal.
+
+No blob-edge delta is emitted for promotion because the same manifest remains active. The dynamic owner
+changes, not the static manifest.
+
+This is simpler than the current `Build::publish` plus best-effort precommit `Remove`: there is no
+leftover stale precommit edge after a successful commit, and no second namespace that GC must discover,
+fence, and reclaim.
+
+Promotion revalidates the whole manifest. That is preexisting safety logic from the build-root model,
+not a new weakness. It is `O(manifest entries)`; if it becomes visible in profiles, the optimization is
+an internal per-manifest blob summary or directory/blob index, still inside the same immutable manifest
+object.
+
+### Abandon Or Reclaim Precommit {#abandon-or-reclaim-precommit}
+
+An abandoned precommit owner is removed by GC or by writer cleanup:
+
+```
+PrecommitRemove(build_id, tree_instance_id)
+```
+
+The manifest id is unique and never reused. Therefore removing this owner later is safe even if a
+different build later creates a byte-identical manifest under a different id.
+
+If GC falsely reclaims a still-live build's precommit, the later `PromotePrecommit` must fail closed
+because `precommit(build_id)` is no longer present. The writer retries by creating a fresh precommit
+with a fresh manifest id, then revalidates blobs again.
+
+## GC Authority Model {#gc-authority-model}
+
+GC tracks blob reachability from active full-tree manifests:
+
+```
+blob_indeg[b] =
+    Cardinality({
+        source edge (tree_instance_id, path)
+        : tree_instance_id is active
+          and its entry at path references blob b
+    })
+```
+
+Full-tree manifests are not target-counted like blobs. Their liveness is structural:
+
+- a manifest is live iff it has a committed ref or precommit owner;
+- if an owner is removed and not restored before the fence/recheck cut, the manifest is unreachable
+  and can be deleted with an exact-token delete after its blob decrements are sealed.
+
+This deletes an entire class of GC state:
+
+- no target in-degree entries for tree objects;
+- no child tree instances;
+- no expansion markers;
+- no `children_by_tree`;
+- no durable `TreeExpansionIndex`;
+- no same-round cascade wave;
+- no cross-owner cascade barrier;
+- no content-hash tree revival race.
+
+GC still maintains a streaming blob in-degree generation. It may also maintain a coarse manifest-delete
+work bundle for manifest ids whose owner was removed. That bundle is keyed by manifest id and round,
+not by content hash, and is safe to replay.
+
+## Round Protocol {#round-protocol}
+
+The round remains recognizable:
+
+```
+discover -> fold owner transitions -> retire -> fence -> recheck -> exact-token delete -> trim
+```
+
+There is no GC-side cascade step.
+
+"No cascade" here means no deferred child-edge state and no revival-prone tree-hash-keyed child-edge
+removal. It does **not** mean the ordering obligation disappears. For an owner removal, GC must read
+the full-tree manifest while it is still available, seal the corresponding blob decrements into the
+generation, and only then allow exact-token deletion of the manifest body. The old cascade ordering
+becomes a simpler revival-proof ordering on unique manifest ids.
+
+### Discovery {#discovery}
+
+`gc/registry` remains the authority for the namespace universe. LIST is only an accelerator:
+
+- listed root token equals persisted folded token: skip body read;
+- token missing, ambiguous, stale, or unsupported: read the root shard body;
+- registry namespace missing from LIST: read/mint according to current registry rules;
 - LIST never shrinks the registry universe.
 
-So an under-read fails closed to today's behavior. Token-diff removes the unconditional fold/recheck/trim body reads of unchanged root manifests.
+The token-diff optimization from rev. 5 still applies, but it is now even smaller: changed root shards
+contain compact owner transitions, not full closures.
 
-### 2. Fold - stream root-closure transitions into a sealed generation {#fold}
+### Fold Owner Transitions {#fold-owner-transitions}
 
-The fold reads changed root journals, streams each accepted `RootTransitionRecord`, and emits target-keyed deltas:
+For every changed root shard, stream owner transitions in root-journal order.
+
+For `old_tree_instance_id`:
+
+- read the one root-local full-tree manifest object;
+- stream its entries once;
+- emit `-1` blob-edge deltas for every blob entry;
+- record the manifest id as delete work for this round/generation.
+
+For `new_tree_instance_id`:
+
+- verify the manifest object exists and belongs to this root namespace;
+- stream its entries once;
+- emit `+1` blob-edge deltas for every blob entry.
+
+For `PromotePrecommit`:
+
+- update owner metadata;
+- emit no blob deltas.
+
+The fold is streaming. It keeps only a manifest record buffer and target-sort/spill buffers. It does
+not build a resident closure set and does not recursively read any child manifests. Duplicate blob
+references are handled by deterministic source edge ids `(tree_instance_id, path)`.
+
+A repoint/mutation over a large manifest emits `-old` and `+new` by reading both full manifests. Many
+unchanged blob refs may cancel in the target reducer. The design deliberately avoids a tree-diff
+protocol: manifests are metadata, writes stay compact, and the reducer handles cancellation in
+background.
+
+Fold output is sealed in a write-once generation manifest:
 
 ```
-for o in old.closure: emit (o, -1, source = old.ref_epoch)
-for o in new.closure: emit (o, +1, source = new.ref_epoch)
+gc/gen/<generation>/manifest
+gc/gen/<generation>/blob_target/<target_shard>/...
+gc/gen/<generation>/manifest_delete_work/<owner_shard>/...
 ```
 
-`RootEdgeIndex` owns root-journal order and `last-op-wins`; `TargetInDegreeShard` owns only sorted target counts. The generation manifest's `input-seal` records: registry token/version used for the universe; each root shard's classification `skipped/read/minted` with listed/previous/new token plus cursor; reducer-input segment hashes; parent generation. Partial objects are adopted only if byte-identical; otherwise ignored. They are invisible to writers and cannot advance `gc/state.round`.
+These are coarse files. There is no object per edge, manifest, or candidate.
 
-The fold does not read tree objects to expand them and does not write expansion/cascade state. Closure-delta validation is a separate write-path/model obligation: each inline payload must match its `closure_digest`, be sorted/unique, and represent `Closure(tree) = Reach(tree)` for the referenced tree. A malformed or over-limit payload fails closed; it is never treated as an empty or partial closure.
+### Retire {#retire}
 
-### 3. Retire barrier - `AllRetiredDurable(round)` {#retire-barrier}
+Blob retire scans the touched blob target shards and emits candidates whose in-degree transitioned to
+zero. It keeps the existing per-candidate `HEAD` until a separate model proves a token-source
+optimization.
 
-Each target reducer scans its new target shard and writes `gc/retired/<round>.<fence_seq>/<target_shard>`. `gc/state.round` advances only after the retired sets for all target shards of the current configuration are durable. This preserves `ViewableRound`: a writer refreshing to round `R` sees the complete round-`R` retired set, not a subset produced by faster reducers.
+Manifest retire consumes manifest-delete work:
 
-At `gc_shards = 1` this is today's visibility shape, but backed by a streaming target run instead of a resident snap.
+- read each manifest object token, or reuse the token captured during fold if the backend proof covers
+  it;
+- write a compact retired-manifest bundle;
+- do not delete the manifest object until the fence/recheck phase confirms the owner removal.
 
-### 4. Global fence - coordinator-owned, serial {#global-fence}
+Manifest delete is space cleanup, not reader-facing correctness. If a manifest delete is delayed, the
+manifest is unreachable debris. It must not keep blob in-degree elevated after its owner removal has
+been folded.
 
-The coordinator fences the registry first, then the root shards. First safe implementation keeps the current all-shard fence (expensive but already proven). The fence stays global; the no-dangle two-horn argument requires a global fence epoch because a publish into one root shard can reference targets of any prefix. Reducers do not fence independently.
+### Orphan Manifest-Debris Sweep {#orphan-manifest-debris-sweep}
 
-### 5. Recheck + exact-token delete {#recheck-exact-token-delete}
+The regular owner-transition fold cannot see manifest bodies written before `PrecommitAdd`. A bounded
+background sweep handles those objects. This is the GC-side backstop for
+[Pre-Precommit Manifest Debris](#pre-precommit-manifest-debris), not a second cleanup protocol.
 
-Reducers re-fold root-closure transitions through durable fence positions for their candidates. The fence-window closure deltas are incorporated into the completion generation before any cursor/token/trim advance. Delete stays exact-token at the single content-delete site.
+The sweep is **per namespace**, not pool-wide:
 
-Because closure deltas already include all descendants, parent and child objects can be retired/deleted in the same round when the last root-ref closure disappears. This is safe: once the global fence and recheck have incorporated all root transitions through the fence, there is no authoritative tree-child edge left to propagate.
+- choose one root namespace and one dead build prefix `_subtrees/<writer_id>/<build_seq>/`;
+- build the active manifest-id set from that namespace's sealed committed-ref and live-precommit owner
+  view;
+- enumerate that one build prefix;
+- delete only manifest objects whose ids are absent from the active set, using exact tokens;
+- record compact outcomes so the sweep can resume without depending on LIST stability.
 
-The per-candidate `HEAD` in `retire` is kept. It is safe, already `O(zeroed candidates)`, and is what makes `GRetire` observe the current `tokOf[h]`. Its removal is a separate optional phase.
+This sweep is not allowed to emit blob decrements, because a pre-precommit manifest never contributed
+blob increments. If a manifest id is found in the owner view, it leaves the sweep and is handled only by
+the normal owner-transition path.
 
-### 6. Trim - root journals and closure-delta payloads only below durable coverage {#trim}
+### Retire Visibility Barrier {#retire-visibility-barrier}
 
-Trim is now the final step:
+`gc/state.round` advances only after every blob target shard's retired set and every manifest-delete
+bundle for the round are durable. This preserves `ViewableRound`: a writer refreshing to round `R` sees
+the complete retired-token set, not a subset produced by faster reducers.
+
+### Global Fence {#global-fence}
+
+The fence remains global and coordinator-owned:
+
+1. fence `gc/registry`;
+2. fence every root shard in the fence universe, or a model-proven lazy subset;
+3. record fence positions in the generation manifest.
+
+The fence is still load-bearing. A publish into one root shard can protect blobs in any target shard,
+so target reducers do not own independent fences.
+
+### Recheck And Delete {#recheck-and-delete}
+
+Recheck folds owner transitions through the durable fence positions into the completion generation.
+Then:
+
+- a blob candidate is deleted only if its blob in-degree is still zero and the exact token still
+  matches;
+- a manifest is deleted only if the manifest id still has no committed/precommit owner in the
+  fold-through-fence view;
+- every delete is exact-token;
+- token mismatch is spared/replaced, not destructive;
+- absent under a held retired token is an idempotent confirmed outcome.
+
+For manifests, recheck must not need to read a deleted manifest body to compute blob decrements. The
+blob decrements were already produced during fold from the manifest body while it was still required to
+be present. If the process is interrupted after a manifest object delete but before metadata cleanup,
+the manifest-delete bundle is enough to resume outcome handling.
+
+### Trim {#trim}
+
+Trim root journals only below the cursor coverage recorded in the sealed generation. Trim manifest
+delete work only after:
+
+- blob deltas from the owner removal are incorporated into the durable blob generation;
+- manifest exact-token outcomes are durable or the work is explicitly carried forward;
+- retired sets/outcomes are handled according to the existing drop-on-confirmed-outcome rule.
+
+`INV_JOURNAL_COVERAGE` remains mandatory: a recovery from the parent generation must be able to replay
+every transition not already incorporated into an adopted sealed generation.
+
+## Sharding Model {#sharding-model}
+
+Default `gc_shards = 1`.
+
+For sharded mode:
+
+- root-shard mappers stream owner transitions and scatter blob deltas by blob hash;
+- blob target reducers own disjoint blob hash ranges;
+- manifest-delete workers own disjoint manifest id ranges or root namespaces;
+- one coordinator owns registry fence, input seal, round visibility, global fence, and generation
+  pointer advance;
+- leases are work-dedup only.
+
+Because root owner transitions carry both old and new manifest ids, target reducers do not need a
+durable `RootEdgeIndex` to solve displacement. The displacement decision is made at the source root
+shard, then the old/new manifest streams scatter blob deltas to target reducers.
+
+Two replicas may process different blob target shards and manifest-delete ranges concurrently. No
+writer can observe mapper/reducer products until the generation manifest is sealed.
+
+## What Becomes Simpler {#what-becomes-simpler}
+
+This redesign removes or shrinks several previously hard pieces:
+
+- **No content-addressed tree revival race.** Byte-identical future manifests get different
+  `tree_instance_id` values, so stale work for old manifest `T1` cannot delete new manifest `T2` or
+  apply `T1`'s blob decrements to `T2`.
+- **No full-closure root journal.** Publish/drop records name old/new manifest ids only. The complete
+  tree structure is stored once, in the full-tree manifest object.
+- **No recursive GC tree reads.** Fold reads one manifest object per old/new owner transition.
+- **No nested static-folder ownership.** Directories are path prefixes inside the manifest, not objects
+  in the protocol graph.
+- **No GC-side cascade state.** Owner removal directly produces blob decrements and manifest-delete
+  work. There is no later content-hash-keyed child-edge removal to apply.
+- **No `TreeExpansionIndex`.** The manifest body is the durable edge journal. There is no separate
+  expansion marker whose atomicity must be proved.
+- **No tree in-degree target shards.** Manifests are single-owner structural objects. Blob reducers
+  count only blob edges.
+- **No durable `RootEdgeIndex` prerequisite for sharding.** Replace/move owner transitions solve
+  last-op-wins at the root source.
+- **Precommit is not a second namespace protocol.** It lives in the target root prefix and promotes by
+  owner move.
+- **Wide-table journal amplification disappears.** Rev. 5 wrote transitive closure into every owner
+  transition. Rev. 8 writes each full-tree manifest once and writes compact owner transitions
+  thereafter.
+- **Debugging is more physical.** A manifest key shows its root namespace and build prefix, and its
+  body explains every blob edge. A blob in-degree entry can point back to `(root_namespace,
+  tree_instance_id, path)`.
+
+The explicit tradeoff is also clear: tree dedup is gone. This is intentional. Tree objects are metadata
+relative to blobs, and the storage saved by deduplicating tree metadata was buying a disproportionate
+amount of GC protocol complexity.
+
+## Safety Invariants {#safety-invariants}
+
+The new `TLA+` model should be a branch of `CaIncarnationCore.tla` plus the useful precommit rules from
+`CaBuildRootPrecommit.tla`.
+
+Mandatory invariants and liveness obligations:
+
+- `NoTreeIdReuse`: once a manifest id appears in a visible root journal, no later action can bind that
+  id to a different payload or owner lineage.
+- `SingleManifestOwner`: each visible manifest has at most one structural owner. `PromotePrecommit` is
+  an atomic owner move.
+- `ManifestBodyBeforeVisible`: a root/precommit owner transition cannot become visible until the named
+  manifest object exists.
+- `CommittedNoMissingBlob`: every blob reachable from a committed root ref is present and not condemned
+  in the committing writer's view.
+- `PrecommitMayReferenceMissingBlob`: missing blob leaves under precommit are legal and not corruption.
+- `BlobInDegreeMatchesActiveManifests`: durable blob target state equals the multiset of blob edges
+  emitted by active manifests.
+- `NoCommittedDangle`: a committed root ref never resolves to a missing manifest body or missing blob
+  leaf.
+- `NoReturn`: a deleted or overwritten blob token is never accepted as a future dependency.
+- `ExactDeleteOnly`: destructive blob and manifest deletes require the exact observed token.
+- `ViewableRound`: round `R` is writer-visible only after all retired sets and manifest-delete bundles
+  for `R` are durable.
+- `JournalCoverage`: no root transition or manifest-delete work is trimmed before its effect is
+  included in a sealed generation or carried forward.
+- `OrphanManifestDebrisDrains`: a manifest body staged before `PrecommitAdd` and never named by any
+  live owner is eventually deleted after its build is abandoned or judged dead.
+
+## Negative Controls {#negative-controls}
+
+Each negative control must produce the expected counterexample before the phase is allowed to ship:
+
+1. Reuse a manifest id for a byte-identical future manifest: stale manifest-delete work deletes the new
+   manifest or applies old blob decrements to the new owner.
+2. Allow two owners for one manifest id: deleting one owner removes blob edges still needed by the other
+   owner.
+3. Make `PromotePrecommit` two separate CAS operations with a gap and no fail-closed retry: a false
+   precommit reclaim can create a committed dangle.
+4. Let precommit become visible before the manifest body is durable: GC cannot emit the required blob
+   edges and either leaks or under-protects.
+5. Let committed publish skip blob revalidation: a committed ref can name an absent blob.
+6. Treat a precommitless speculative blob upload as protected by the future build: GC may delete it
+   before `PrecommitAdd`, so promotion must revalidate/reupload rather than assume protection.
+7. Omit the pre-precommit `_subtrees` debris sweep: manifest bodies written before `PrecommitAdd` and
+   then abandoned are never reachable from owner-transition fold and leak forever.
+8. Delete build-scoped `_subtrees` debris using a partial owner view, or by wholesale deleting a dead
+   build prefix: a live precommit or committed ref can lose its manifest body and become dangling.
+9. Treat a missing manifest body under committed owner as an empty manifest: undercounts blob edges and
+   permits over-delete.
+10. Delete a manifest body before its owner-removal blob decrements are durable or carried forward:
+   child blob references leak because the body needed for subtraction is gone.
+11. Advance root cursor/token past unsealed owner-transition deltas: `SabotageCutOverclaim` shape.
+12. Advance `gc/state.round` after only one target shard's retired set is durable: `ViewableRound`
+   break.
+13. Skip global fence for a racing publish: `INV_NO_DANGLE`.
+14. Trim root journal below an unincorporated owner transition: `INV_JOURNAL_COVERAGE`.
+15. Use non-exact delete or reuse blob tokens: existing `SabotageUncondDelete` and `SabotageReusedTag`
+   shapes.
+
+## Backpressure And Journal Encoding {#backpressure-and-journal-encoding}
+
+Backpressure remains necessary, but the pressure points are smaller:
+
+- root journal unfolded bytes;
+- root manifest encoded bytes;
+- number of owner transitions since folded cursor;
+- full-tree manifest objects staged per build;
+- full-tree manifest bytes per owner transition;
+- blob delta bytes per generation;
+- active precommit count and oldest precommit age.
+
+The streaming protobuf migration should proceed, but it no longer needs to carry huge closure blocks.
+The root stream consists of small owner/move records plus refs/precommits. Full-tree manifest bodies are
+separate root-local protobuf objects and can use the same record/framing conventions.
+
+When limits are exceeded, fail closed before publishing a root/precommit owner transition. Never publish
+an owner transition that names a missing manifest body. Never publish a committed owner transition whose
+blob leaves did not pass revalidation.
+
+## Phase Plan {#phase-plan}
+
+### Phase 0 - Model And Format Skeleton {#phase-0-model-and-format-skeleton}
+
+- Create `CaGcRootLocalFullTreeCore.tla`.
+- Model unique manifest ids, single ownership, precommit owner, committed owner, owner moves, missing
+  blobs under precommit, fail-closed promotion, blob target in-degree, global fence, recheck,
+  exact-token delete, manifest-delete work, and pre-precommit orphan manifest debris.
+- Add negative controls listed above.
+- Define `FullTreeManifestProto`, owner-transition records, and streaming root manifest framing.
+- Define reserved `_subtrees` layout and key validation.
+
+No production behavior changes in this phase.
+
+### Phase 1 - Full-Tree Manifests, Single GC Shard {#phase-1-full-tree-manifests-single-gc-shard}
+
+- Change `Build::stageTree` to mint root-local full-tree manifest ids instead of Merkle `TreeId`
+  values.
+- Write full-tree manifest objects under `_subtrees`.
+- Add writer best-effort cleanup and GC backstop sweep for pre-precommit `_subtrees` debris.
+- Move precommit into the target root prefix.
+- Add atomic `PromotePrecommit`.
+- Replace `JournalRecord{Add, Remove}` reachability records with owner transitions carrying old/new
+  manifest ids.
+- Build a streaming blob in-degree generation from owner-transition manifest streams.
+- Update `Store::resolveRef`, `Store::readTree`, and metadata read helpers to read root-local full-tree
+  manifests and optional internal directory indexes.
+- Keep `gc_shards = 1`.
+- Keep all-shard root scan and all-shard fence for the first behavior-changing implementation.
+- Keep per-candidate `HEAD` in retire.
+
+This phase removes global content-addressed tree objects, inline precommit closure records, resident
+whole-pool `GcSnap` authority, expansion markers, nested tree objects, and cascade state.
+
+### Phase 2 - Token-Diff Discovery And Lazy Read {#phase-2-token-diff-discovery-and-lazy-read}
+
+- Add LIST token capability probes.
+- Persist folded root manifest tokens with folded cursors.
+- Skip unchanged root shards only when LIST token freshness is proved.
+- Keep fail-closed fallback to body reads on ambiguous/missing tokens.
+
+### Phase 3 - Lazy Fence And Lazy Trim {#phase-3-lazy-fence-and-lazy-trim}
+
+- Add model-proven lazy fence rules.
+- New/ambiguous/changed shards are fenced.
+- Skipped shards may reuse a previous fence only when the model proves both no-dangle horns remain
+  closed.
+- Trim only below sealed generation coverage.
+
+### Phase 4 - Target-Sharded Blob Reducers {#phase-4-target-sharded-blob-reducers}
+
+- Enable `gc_shards > 1`.
+- Root mappers scatter blob deltas by blob hash.
+- Blob reducers merge disjoint target shards.
+- Manifest-delete workers process disjoint manifest id ranges or namespaces.
+- The global coordinator keeps the registry/fence/round-visibility responsibilities.
+
+### Phase 5 - Retire-Token Optimization {#phase-5-retire-token-optimization}
+
+Optional and separate. Remove per-candidate `HEAD` only after a model proves the stored token source is
+complete and stale tokens can only cause under-delete, never over-delete.
+
+## Operation Cost {#operation-cost}
+
+| Quantity | Current code | Rev. 5 root-closure | Rev. 8 full-tree manifests |
+|---|---|---|---|
+| Tree identity | content hash | content hash + `ref_epoch` | unique root-local manifest id |
+| Blob dedup | yes | yes | yes |
+| Tree dedup | yes | yes | no |
+| Publish journal size | tree hash | full transitive closure | old/new manifest ids |
+| Tree structure storage | global `trees/` objects | global `trees/` object plus closure journal bytes | one root-local full-tree manifest |
+| Read-path tree cache sharing | content-hash sharing | content-hash sharing | per-instance cache; less sharing |
+| GC memory | resident `O(pool)` snap | stream buffers | stream buffers |
+| Tree-child GC state | `children_by_tree`, markers, cascade | none, but full closure in journal | none |
+| Blob fold work | root journals plus tree expansion | closure-delta stream | changed owner manifests |
+| GC tree-body reads | first expansion of content tree | none for root closures | one manifest read per old/new owner |
+| Hot-path journal bytes | tree hash | full transitive closure | compact owner transition |
+| Pre-precommit tree debris | global tree debris/full GC | closure records avoid staged tree reads | namespace-scoped `_subtrees` sweep |
+| S3 GC scratch | snap generations, retired/outcomes | coarse generations | coarse blob generations and manifest-delete bundles |
+| Sharding blocker | target displacement in resident snap | solved by `RootEdgeIndex` | solved by root owner transitions |
+
+Per changed owner transition, GC reads the affected full-tree manifest and emits blob deltas. This is
+`O(changed manifest entries)`, not `O(pool)`, and it avoids writing the same transitive closure into
+every root journal event.
+
+## Debuggability And Resume {#debuggability-and-resume}
+
+Every durable generation must answer:
+
+- root shards read/skipped/minted and why;
+- owner transitions folded;
+- manifest ids activated/deactivated;
+- manifest bytes and entry count;
+- blob deltas emitted per target shard;
+- retired blob candidates;
+- retired manifest ids;
+- orphan manifest sweep namespace/build prefix;
+- fence positions;
+- recheck results;
+- exact-token delete outcomes;
+- trim cursors.
+
+A single blob delete should be explainable as:
 
 ```
-fold -> retire -> fence -> recheck -> exact-token delete -> trim
+blob B
+  last source edge: root_namespace N, tree_instance_id T, path P
+  owner transition: ref R removed T at root version V
+  folded in generation G
+  retired in round Rn with token Tok
+  fenced through root version F
+  rechecked indeg 0
+  deleteExact(B, Tok) -> Deleted
 ```
 
-Root-journal records and their inline closure-delta payloads can be trimmed only below the durable folded cursor/fence-window cursor recorded in the sealed generation. Trimming must preserve `INV_JOURNAL_COVERAGE`: if a future recovery needs to rebuild from the parent generation, every root transition past that parent cursor remains readable; if a transition is trimmed, its effect is already part of an adopted sealed generation.
+Resume rules:
 
-There is no `awaiting-cascade` state and no cascade-resume case.
+- root-local full-tree manifests are immutable; byte-identical existing writes may be adopted,
+  divergent writes fail closed;
+- generation files are write-once;
+- manifest-delete work is keyed by `(round, generation, tree_instance_id)` and can be replayed;
+- blob and manifest content deletes are exact-token and idempotent;
+- orphan manifest sweep outcomes are compact and replayable;
+- root cursors advance only with sealed blob-delta coverage;
+- round visibility advances only after all retired sets and manifest-delete bundles are durable.
 
-## Change detection - root-manifest token-diff drives touched target shards {#change-detection}
+## Out Of Scope {#out-of-scope}
 
-Do not decide "target shard `P` is changed iff `P`'s own token differs" - a changed root manifest can add/remove closure members in any target shard. Instead:
+- No on-disk compatibility scaffolding for the old CA tree format.
+- No content-addressed tree dedup.
+- No nested root-local tree objects.
+- No memoized closure object table.
+- No full transitive closure in root journal records.
+- No target-shard writes from the publish path.
+- No removal of exact-token delete.
+- No per-edge or per-candidate S3 object layout.
 
-- `RootManifestTokenIndex` decides which root shards to read/fold.
-- The fold's closure scatter produces the set of touched target shards.
-- Target shard `P` is touched iff a folded closure delta lands in `P`, or `P` has retired candidates requiring recheck.
-- Only touched target shards are re-merged and re-written. Untouched target shards cost zero.
+## Open Questions {#open-questions}
 
-## Sharding model {#sharding-model}
-
-Default `gc_shards = 1`. Sharded mode:
-
-- One global coordinator owns registry fence, `input-seal`, round visibility (`AllRetiredDurable`), global fence, round completion, and the `gc/state` generation-pointer advance.
-- Target reducers own disjoint target-hash ranges. Per-target-shard leases are work-dedup only, like today's global lease. Reducers write unique-path outputs and use exact-token deletes, so duplicate work is safe.
-- Two replicas may run different reducers concurrently (replica A shard 0, replica B shard 1). The coordinator need not do all CPU work; mappers/reducers may be distributed. No writer-visible state ever depends on unsealed mapper output.
-
-The expensive work (root-journal fold -> target deltas; target-shard merge; per-candidate recheck/delete) parallelizes across mappers/reducers. The coordinator serializes only the global fence and round-pointer advance. Unlike rev. 3, there is **no cross-owner cascade barrier**.
-
-## Safety / `TLA+` plan (R0) {#safety-tla-plan}
-
-Create `CaGcRootClosureCore.tla` (or carefully extend `CaIncarnationCore.tla`) with small bounded configs. Preserve obligations: `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN`, `INV_JOURNAL_COVERAGE`, monotone `gc/state`, monotone registry/fence.
-
-Add to the model:
-
-- root-ref transitions with `old` and `new` closures;
-- `ref_epoch` and the rule that a remove/repoint can decrement only the exact epoch it replaces;
-- remove/drop computes `old` closure while the ref is still live; a lost CAS discards the computed closure and retries;
-- `Closure(tree) = Reach(tree)` as a model obligation for non-sabotage writers;
-- inline closure-delta payloads with sorted/unique coverage and digest validation;
-- `RootEdgeIndex` separate from target in-degree;
-- per-root-shard `manifestToken`/`listedToken`/`lastFoldedToken`;
-- a `ListReturnsFreshToken` capability flag;
-- `InputSeal` with full root-shard coverage;
-- target reducers and per-target retired sets;
-- `AllRetiredDurable(round)` as the sole round-viewable condition;
-- lazy fence only if implemented.
-
-Do **not** add tree expansion markers, GC child-edge state, or cascade actions to the new model. Keep the old `SabotageCascadeRace` as regression evidence for why this design avoids that state class.
-
-Mandatory negative controls (each must produce the named counterexample):
-
-1. stale LIST token lets a changed manifest be skipped -> `INV_NO_DANGLE`;
-2. missing listed key treated as unchanged -> `INV_NO_DANGLE`;
-3. cursor/token advanced past incorporated closure state -> `SabotageCutOverclaim` shape;
-4. a reducer retires before all mapper inputs are sealed -> `INV_NO_DANGLE`;
-5. `gc/state.round` advanced after only one target shard's retire -> `ViewableRound`/publish-gate break;
-6. lazy fence skips a shard with a racing publish -> `INV_NO_DANGLE`;
-7. target-sharded root edges without `RootEdgeIndex` displacement -> leak/undercount;
-8. remove keyed only by `tree_hash`, not by `ref_epoch`, strips a later live content-identical tree -> `SabotageCascadeRace` shape without a cascade action;
-9. root pointer becomes visible before its closure transition is durable -> `INV_NO_LOSS`/`INV_NO_DANGLE`;
-10. closure underclaims reachability (missing child/blob) -> `INV_NO_LOSS`;
-11. remove computes old closure after the ref is no longer live and races a content-identical revival -> `INV_NO_LOSS`;
-12. malformed/over-limit closure-delta payload is treated as empty/partial instead of failing closed -> `INV_NO_LOSS`;
-13. non-exact delete / token reuse -> existing `SabotageUncondDelete`/`SabotageReusedTag` still fail.
-
-Rule: no performance optimization is "implemented" until the positive model passes and its paired sabotage still fails.
-
-## Phasing - each phase model-gated; no code before its model is green {#phasing}
-
-- **Phase 0 - model + streaming journal codec + backend probes.** No production behavior change. Extend/branch the `TLA+` model to root-closure transitions. Define the flat closure-delta codec (sorted unique `(kind, hash)` entries; compression; digest), the length-delimited streaming protobuf root-manifest/journal reader, and byte-based backpressure limits. Add backend capability probes for LIST token freshness (`list(k).token == head(k).token` after `put`/`casPut`/overwrite/delete) and an explicit `ListReturnsFreshToken` bit; absent means token-diff discovery falls back to per-shard reads.
-- **Phase 1 - root-closure journal authority, streaming generation, `gc_shards = 1`.** First behavior-changing phase. Populate table/root `Add`, `Remove`, and repoint transitions with inline exact closure deltas; `Remove`/`dropRef` expands the currently live tree before the CAS and retries on CAS loss. Introduce `RootEdgeIndex`, `TargetInDegreeShard`, `RootManifestTokenIndex`, and the coarse `gc/gen/<generation>/manifest` plus target-run layout. Enforce journal byte backpressure before accepting over-limit transitions. Remove resident `O(pool)` authority and all GC-side cascade state immediately. Keep the current all-shard root scan and all-shard fence for the first safe implementation.
-- **Phase 2 - root-manifest token-diff discovery.** Add `std::optional<Token> token` to `ListedKey`, populate it in `ObjectStorageBackend::list`/`InMemoryBackend::list`/local list paths, add a `GcRootDiscovery` helper returning `{ns, shard, key, listed_token, previous_token, action: Skip|Read|Mint, reason}`, persist `folded_manifest_token` beside `folded_cursor`, advance cursor+token in one generation commit, keep `assertSnapJournalCoherent` fail-closed.
-- **Phase 3 - lazy fence + lazy trim** (after `TLA+`). A shard may skip fence only when the model proves its previous fence position plus unchanged token closes both no-dangle horns; otherwise fence it. Practical rule: registry fence always first; new/ambiguous shards always fenced; changed-token shards fenced; skipped shards fenced only if persisted proof says the previous fence suffices. Lazy trim only below durable cursor coverage (`INV_JOURNAL_COVERAGE`).
-- **Phase 4 - target-shard reducers** (`gc_shards > 1`). Per-target-shard work leases; one coordinator; `AllRetiredDurable(round)` before the round advances; recheck/delete per target shard; two replicas own disjoint shards. `gc_shards = 1` remains the default.
-- **Phase 5 - retire-token optimization** (optional, separate, not coupled to sharding). To drop the per-candidate `HEAD`: store `last_observed_token`/`size` in `TargetInDegreeShard`; enumerate every legal token source (content `put`, resurrect, publish evidence, closure transition, explicit observe); prove a stale stored token yields only `TokenMismatch`/under-delete, never a fabricated delete-right, and never a token for an absent object; keep a `HEAD` fallback when the token is absent or the backend proof is incomplete.
-
-## Op-count & memory - by phase {#op-count-memory-by-phase}
-
-| Quantity | Today (baseline) | After Phase 1 | After Phase 2-3 | After Phase 4 |
-|---|---|---|---|---|
-| Root-manifest body reads/round | `O(S)` | `O(S)` but pass-fused | **`O(changed)`** + 1 LIST | `O(changed)` per mapper plan |
-| Fence writes/round | `O(S)` (all shards) | `O(S)` | **`O(shards needing fence proof)`** | same (global, serial) |
-| Snap memory (leader/owner) | `O(pool)` resident | **`O(stream buffers)`** | `O(stream buffers)` | `O(stream buffers)` per owner |
-| Snap I/O | 0 read / `O(pool)` write on change | **1 read + 1 write / touched target shard** | same, fewer touched shards | per owner |
-| GC-side expansion/cascade | resident `children_by_tree`, same-round cascade | **none** | none | none |
-| Per-candidate `HEAD` in retire | 1/candidate | 1/candidate | 1/candidate | 1/candidate (until Phase 5 removes it with proof) |
-| Deletes/round | `O(zeroed)` | `O(zeroed)` | `O(zeroed)` | `O(zeroed)` |
-| Publish/remove overhead | writes tree hash only | computes + writes inline root-ref closure delta; over-limit transitions throttle/fail closed | same | same |
-| Parallelism | single leader | single leader | single leader | **disjoint reducers across replicas** |
-
-The memory target lands at Phase 1. The "exactly one streaming read and one write" target for snap access also lands at Phase 1 for touched target shards because there is no cascade wave. Root-read/fence op-count targets land at Phase 2-3. R2 parallelism lands at Phase 4.
-
-The honest cost shift is the publish/remove path: each accepted root-ref transition must durably carry the closure it adds/removes. That is `O(changed ref closure)` on the write path, but it is one root-shard-local journal transition, not target-shard fanout and not GC S3 scratch. Byte backpressure bounds the operational lag; it is not a substitute for the `TLA+` safety proof.
-
-## Backend requirements {#backend-requirements}
-
-`ListedKey` gains `std::optional<Token> token`; backends populate it from list metadata (the `ObjectMetadata.etag` is already seen by `ObjectStorageBackend::list`, just dropped). Under-read safety requires the listed token to be fresh and strongly consistent, equal to the `head`/`casPut` token for the same object. S3 qualifies since 2020; RustFS and `LocalObjectStorage` must be verified by the Phase-0 probe and fall back to per-shard `HEAD` where `ListReturnsFreshToken` is false.
-
-## Debuggability & resume (R3) {#debuggability-resume}
-
-Every durable round artifact is self-describing: `round, fence_seq, parent_generation, new_generation, coordinator_id, phase, registry_version, root_shards_total/read/skipped/minted/ambiguous, target_shards_total/done, retired/deleted/spared/replaced/forgotten, closure_records_folded, closure_items_folded, closure_bytes_folded, journal_unfolded_bytes, largest_single_transition_bytes, backpressure_throttles, backpressure_rejections, list_token_skips, list_token_forced_reads, lazy_fence_skips, lazy_fence_forced`. Surface this through the existing `CasEvent`/`RoundReport` path and, where possible, a debug system table.
-
-An operator can answer at a glance: which round an artifact belongs to; which root shards were skipped and why; which root transition contributed a target delta; which reducer owns a candidate hash; whether a candidate is retired/fenced/spared/deleted; from which step it is safe to resume.
-
-Resume rules: all generation/segment objects are write-once; byte-identical existing objects are adopted; divergent ones are ignored via a higher generation/attempt path; content is removed only at the recheck exact-token delete; `round` is not advanced until all retired sets are durable; generation pointers and root cursors are not advanced until the fence-window closure deltas are incorporated.
-
-## Backlog reconciliation {#backlog-reconciliation}
-
-- **Subsumed/superseded:** B147 item-3 (shard the snap), B148b (snap-token-in-retire -> Phase 5 with proof), B168 P5/P6 (widen shards / dirty-only fence), B103 (lazy fence -> Phase 3), B178 (map-reduce adopted but made safe by sealed-generation commit protocol plus `RootEdgeIndex`), B201 (LIST+token-diff -> Phase 2), B176 (snap codec mooted by sorted-generation files).
-- **Replaced by root-closure deltas:** rev. 3's `TreeExpansionIndex`, expansion marker atomicity, same-round cascade wave, and cross-owner cascade barrier.
-- **Out of scope (not the GC round):** B195 (`CaContentWriteBuffer` allocation), B202 (inline-by-size), B204/B205/B206 (soak harness), B207 (`fsck` consistency race - a separate checker, tracked on its own).
-
-## Out of scope / non-goals {#out-of-scope-non-goals}
-
-- No on-disk compat work (CA is pre-release: zero persisted data, zero compat scaffolding).
-- No target-shard fanout from publish/remove; closure transitions stay root-shard-local.
-- No change to delete authority (round-keyed `retired`/outcome sets) or to the exact-token delete primitive.
-- No GC-side tree expansion, expansion markers, child-edge authority, or cascade.
-- No per-edge/per-candidate S3 object layout. Deltas are bundled into coarse run files; small protocol metadata is packed into generation manifests and round bundles.
-- No memoized closure object table in Phase 1. Inline streamed closure deltas plus byte backpressure are the base design; any external closure payload would be a separate storage optimization with its own lifecycle and proof.
-- A full LSM snap (multiple runs plus background compaction, `O(delta)` writes) is a possible later phase; the streaming single-run-per-shard generation is the chosen first form.
-
-## Resolved questions (from the cross-review) {#resolved-questions}
-
-- **Why keep the resident `O(pool)` snap?** We do not. The first behavior-changing phase moves authority to streaming generation files; resident structures are bounded caches only.
-- **How many small S3 objects does GC create?** Bounded and coarse only: one generation manifest, large target run files, and compact round bundles. No expansion/cascade files, no per-edge objects, no per-candidate objects.
-- **Do we need cascade?** No, not if root journal transitions carry full exact closures. Cascade was only needed because the snap represented tree-child edges. Root-closure in-degree makes the root ref the only source of reachability authority.
-- **What about content-addressed revival?** `ref_epoch` is part of the root-ref closure transition. A stale remove for epoch `E1` cannot decrement a later live epoch `E2`, even when both epochs use the same `tree_hash`.
-- **How does `dropRef` get the old closure?** It expands the currently live root ref before the CAS that removes it. If CAS loses, discard and retry. Do not store `O(live closure)` inside `refs`, and do not read a tree after its ref has been removed.
-- **How is journal growth controlled?** Byte-based backpressure (`journal_unfolded_bytes`, encoded manifest size, largest transition, closure entries per transition) throttles or fails closed before publishing more transitions. Safety does not rely on backpressure; it only keeps GC able to catch up.
-- **Should we memoize closures by tree hash?** Not in Phase 1. That would trade journal bytes for extra durable S3 lifecycle state. Keep the base protocol inline and streaming.
-- **Per-candidate `HEAD` in retire?** Kept through Phase 4; removed only in optional Phase 5 behind its own proof.
-
-## Open questions for planning {#open-questions}
-
-1. Exact root journal encoding: new replace-style `JournalRecord`, or paired `Remove`/`Add` records in one root-manifest CAS with one `root_version`.
-2. Flat closure-delta codec details: compression block size, hash delta coding, optional size fields, digest scope, and corruption behavior.
-3. Streaming protobuf migration details: record tags, length framing, footer checksums, whether `RefRecord` and `JournalRecord` live in one stream or separate sections, and how old whole-object protobuf tests migrate.
-4. Backpressure thresholds and user-visible behavior: throttle vs fail closed, per-pool/per-root-shard limits, and metrics.
-5. Recommended production `gc_shards` and whether it is a pool constant or reconfigurable.
-6. The Phase-0 backend LIST/ETag verification matrix (RustFS, `LocalObjectStorage`) and the precise `HEAD` fallback trigger.
+1. Exact debug fields in `FullTreeManifestProto` beyond the random 128-bit `tree_instance_id`.
+2. Whether `_subtrees/<writer_id>/<build_seq>/` should be under the root namespace root directly or
+   under a shard-specific subprefix tied to `root_shard`.
+3. Internal full-tree manifest indexing: block size, optional directory index, and path lookup layout.
+4. How much manifest streaming work is acceptable in `PromotePrecommit` revalidation and whether to
+   store a compact blob summary inside the same manifest object.
+5. Exact streaming protobuf framing shared by root manifests and full-tree manifest bodies.
+6. How `fsck` should distinguish owner-visible missing manifest bodies from reclaimable
+   pre-precommit manifest debris.
