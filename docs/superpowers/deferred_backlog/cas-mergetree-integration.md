@@ -496,3 +496,16 @@ Net: a server crash mid-soak cannot be diagnosed by a non-root unattended sessio
 file; (b) on FAILURE, do NOT auto `down -v` — leave the stack up (or gate teardown behind a SUCCESS
 check) so the live containers can be inspected; (c) make the bind-mounted CH logs world-readable
 (`chmod`/`umask` in the container) so the driver can read them. | Found night-2 soak attempt-2 | `utils/ca-soak/scripts/run_24h.sh` (trap), the compose log perms. |
+
+### B206 (SOAK-HARNESS gate tuning, 2026-06-26) — 180s persistent-dangling fsck gate too short at scale
+Attempt-4 (night-2 binary) tripped the harness hard gate at the gc_checkpoint stage: `dangling=243`
+didn't clear within the 180s fsck-settle window → `CHECKPOINT FAILURE (exit 36)`. Live inspection (stack
+left up by the no-teardown fix) confirmed it was a B185-class **transient**: live fsck `dangling=0
+unreachable=0`, `SELECT count()` = 1,251,067 identical on both replicas with no read error, soak's final
+`fsck_status=settled` — i.e. real durability is fine; rustfs-beta read-after-write lag just took >180s for
+243 keys under heavy churn. The harness gate is too aggressive for this pool-size/churn (B185 saw 94;
+here 243). FIX: either raise the settle window (scale with pool size), or — since `compare_aggregates` is
+the AUTHORITATIVE no-loss gate — downgrade `dangling>0-but-oracle-clean` to a WARN (the existing B185
+flapping-clean tolerance only fires if 0 is reached ONCE; here it never was within 180s). CA-side B185
+root cause (why rustfs returns transient-absent for reachable keys) remains open (rustfs RaW). Relates
+to [[B185]], [[B144]], [[B145]]. | Found attempt-4 soak | `utils/ca-soak/soak/run.py` (`wait_for_pool_consistent` timeout/gate). |
