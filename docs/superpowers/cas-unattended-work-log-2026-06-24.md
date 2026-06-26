@@ -338,3 +338,16 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   reclaims 100-190K objects at once → pool overshoots MAX_POOL_GB (hit 30G vs 20G budget at 06:15) because
   max insert-throttle can't pace fast enough between big reclaim rounds. Concrete evidence for the O(pool)
   fold/retire throughput bottleneck (B147 resident-snap / B148 op-count / B160 trim-lag / B201 LIST-discovery).
+
+## GC is O(delta) CONFIRMED + B148 per-candidate-HEAD pinpointed (attempt-4 ProfileEvents, 2026-06-26)
+- ProfileEvents of the long GC rounds (system.content_addressed_garbage_collection_log, live ch1):
+    snap_io (CasGcGet+CasGcPut) = 9 ops CONSTANT every round (any pool/delta size) → NO whole-pool snap
+    re-read. B147 (whole-pool snap reserialize) is NOT the bottleneck (binary+zstd resident snap is cheap).
+    heads ≈ deletes ≈ objects_deleted EXACTLY every round (r87 del50774 heads52389 del-ops50784;
+    r88 del130868 heads132469; r89 del192225 heads194233; r90 del67079 heads68683). gets flat ~1.5-1.8K.
+- VERDICT: GC IS O(delta) (objects deleted this round), NOT O(pool). The 476s rounds are long ONLY because
+  the delta was huge (50K-192K deleted in one burst) and rustfs serves ~200-400 ops/s. Duration ∝ delta,
+  AMPLIFIED 2x by a per-candidate HEAD.
+- ROOT (B148): Gc::retire HEADs EVERY zero-in-degree candidate to read its token before deleteExact, even
+  though the resident snap already knows the token. Dropping that HEAD (deleteExact from the snap's known
+  token) would HALVE S3 ops on big rounds (eliminate 50K-190K HEADs/round). Concrete B148 evidence.
