@@ -396,6 +396,25 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         return;
     }
 
+    const std::string status_path = export_path / "status";
+    Coordination::Stat status_stat;
+    std::string current_status;
+
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+    if (!zk->tryGet(status_path, current_status, &status_stat))
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: /status missing for {}, skipping failure bookkeeping", export_path.string());
+        return;
+    }
+
+    const auto status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(current_status);
+    if (!status || *status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: /status for {} is {} (not PENDING), skipping failure bookkeeping", export_path.string(), current_status);
+        return;
+    }
+
     Coordination::Requests ops;
 
     const auto processing_part_path = processing_parts_path / part_name;
@@ -426,7 +445,7 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         processing_part_entry.status = ExportReplicatedMergeTreePartitionProcessingPartEntry::Status::FAILED;
         processing_part_entry.finished_by = storage.replica_name;
 
-        ops.emplace_back(zkutil::makeSetRequest(export_path / "status", String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::FAILED)).data(), -1));
+        ops.emplace_back(zkutil::makeSetRequest(status_path, String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::FAILED)).data(), status_stat.version));
         LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit exceeded for part {}, will try to fail the entire task", part_name);
     }
     else
