@@ -11,9 +11,9 @@ doc_type: reference
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax — each step is one 2–5 min action; each task ends with a commit. Read `2026-06-26-cas-gc-redesign-overview.md` first, then this. **Gate:** Phase 0 must be GREEN (its `_RESULTS.md` ledger marks the R0 suite GREEN) before any code task here begins. **Depends on:** Phase 1a (consume its emitted types verbatim — see [Canonical Contract](#canonical-contract)).
 
-**Goal:** Convert the CA write path from the content-addressed-tree model to root-local single-owner part manifests. `Build::stageTree`→`Build::stageManifest` mints a `ManifestId` and stream-writes the body under `_manifests`; `precommitAdd` records a `PrecommitTransition` in the **target** root shard (no `_precommits` namespace); `promote` is one atomic single-shard CAS owner move with fail-closed revalidation; `republishRef` publishes a fresh destination `PartManifest` over the same blob hashes then drops the source; the writer best-effort cleans its own `_manifests` debris on `abandon`. The root journal carries compact `OwnerTransition`/`PrecommitTransition`/`PromotePrecommit` records — never transitive closures.
+**Goal:** Convert the CA write path from the content-addressed-tree model to root-local single-owner part manifests. `Build::stageTree`→`Build::stageManifest` mints a `ManifestId` and stream-writes the body under `_manifests`; `precommitAdd` appends a `RootOwnerEvent` (create precommit) to the **target** root shard's single ordered journal (no `_precommits` namespace); `promote` is one atomic single-shard CAS that appends a pure-owner-move `RootOwnerEvent` (precommit → committed, same `manifest_ref`) with fail-closed revalidation, never emitting blob deltas; `republishRef` publishes a fresh destination `PartManifest` over the same blob hashes then drops the source; the writer best-effort cleans its own `_manifests` debris on `abandon`. The root journal carries **one ordered `std::vector<RootOwnerEvent>` stream** of compact owner-change events — never transitive closures, never three separate record vectors.
 
-**Architecture:** Only **blobs** stay content-addressed. A part is one immutable, single-owner, namespace-qualified `ManifestId = (root_namespace_id, ManifestRef)` whose body lists every path, inline payload, and blob reference. The root journal carries owner transitions (old/new `ManifestRef`), not `ClosureNode` closures. Promotion is an owner move from `precommit(build_id)` to `ref(final_ref_name)` in one root-shard CAS. `JournalRecord`/`ClosureNode`/`buildStagedClosure` are removed; the separate `<server_hex>/_precommits` namespace disappears (the precommit lives in the target root shard).
+**Architecture:** Only **blobs** stay content-addressed. A part is one immutable, single-owner, namespace-qualified `ManifestId = (root_namespace_id, ManifestRef)` (the protocol identity; the TLA+ model abstracts it to `ManifestSafetyId = (root_namespace_id, manifest_instance_id)`, Phase 0). Its body lists every path, inline payload, and blob reference. The root journal carries **one ordered `RootOwnerEvent` stream** (each event pairs an `old_binding`?/`new_binding`?, an `OwnerKind` of `Committed` or `Precommit`), not `ClosureNode` closures. Promotion is a **pure owner move** from `precommit(build_id, final_ref_name)` to `committed(final_ref_name)` in one root-shard CAS over the **same** `manifest_ref` — it **never** emits blob deltas. `JournalRecord`/`ClosureNode`/`buildStagedClosure` are removed; the separate `<server_hex>/_precommits` namespace disappears (the precommit lives in the target root shard).
 
 **Tech Stack:** C++ (ClickHouse coding standards, Allman braces); Protobuf for the control-plane root journal (`RootShardManifest`, magic via `FormatId::Manifest`); gtest unit oracles against `InMemoryBackend`. No TLA+ in this phase (Phase 0 is the gate).
 
@@ -87,11 +87,13 @@ Phase 1b **EMITS** these (this plan creates them, in `CasRootShardCodec.h`/`.cpp
 
 ```cpp
 // CasRootShardCodec.h — replaces RefPayload; JournalRecord + ClosureNode are REMOVED.
+// The root journal is ONE ordered std::vector<RootOwnerEvent> (no transitions/precommits/promotions vectors).
+enum class OwnerKind : uint8_t { Committed = 1, Precommit = 2 };
+struct OwnerBinding { OwnerKind owner_kind; String ref_name; UInt128 build_id; ManifestRef manifest_ref; };
+    // Committed: ref_name set, build_id = 0.  Precommit: ref_name = final_ref_name, build_id set.
+struct RootOwnerEvent { uint64_t transition_version; std::optional<OwnerBinding> old_binding; std::optional<OwnerBinding> new_binding; };
 struct RootRef { String ref_name; ManifestRef manifest_ref; std::map<String,String> mutable_files; uint64_t published_at_ms; };
-struct OwnerTransition     { uint64_t transition_version; String ref_name; std::optional<ManifestRef> old_manifest; std::optional<ManifestRef> new_manifest; };
-struct PrecommitTransition { uint64_t transition_version; UInt128 build_id; String final_ref_name; std::optional<ManifestRef> old_manifest; std::optional<ManifestRef> new_manifest; };
-struct PromotePrecommit    { uint64_t transition_version; UInt128 build_id; String final_ref_name; ManifestRef manifest; };
-struct RootShard { uint64_t shard_version; uint64_t fence_round; std::map<String,RootRef> refs; std::vector<OwnerTransition> transitions; std::vector<PrecommitTransition> precommits; std::vector<PromotePrecommit> promotions; };
+struct RootShard { uint64_t shard_version; uint64_t fence_round; std::map<String,RootRef> refs; std::vector<RootOwnerEvent> journal; };  // ONE ordered stream, transition_version order
 ```
 
 ```cpp
@@ -101,29 +103,30 @@ void       precommitAdd(const RootNamespace & target_ns, const String & final_re
 void       promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id);
 ```
 
-Semantics required of the emitted types (spec §Root Journal Format / §Build And Precommit Protocol):
+Semantics required of the emitted types (spec §Root Journal Format / §Build And Precommit Protocol). Every owner change is **one** `RootOwnerEvent` that removes at most one `old_binding` and adds at most one `new_binding`, folded in `transition_version` order:
 - `RootRef` carries the committed `ManifestRef` plus mutable per-ref payload; `root_namespace_id` is **not** stored in the ref (it comes from the owning root context).
-- An `OwnerTransition`/`PrecommitTransition` with `old=none,new=T` is a create; `old=T,new=none` is a drop/abandon; `old=T_old,new=T_new` is a repoint.
-- `PromotePrecommit` carries the single manifest whose owner moves from `precommit(build_id)` to `ref(final_ref_name)` — no blob-edge change on the normal (already-activated) path.
+- create precommit: `old = none`, `new = {Precommit, final_ref_name, build_id, T}`; abandon/reclaim precommit: `old = {Precommit,…,T}`, `new = none`.
+- publish committed: `old = none`, `new = {Committed, ref_name, T}`; drop ref: `old = {Committed, ref_name, T}`, `new = none`; repoint ref: `old = {Committed, ref_name, T_old}`, `new = {Committed, ref_name, T_new}`.
+- **promote**: `old = {Precommit, final_ref_name, build_id, T}`, `new = {Committed, final_ref_name, T}` — **same** `manifest_ref` `T`, an owner move with blob Δ = 0 (it **never** emits blob deltas). A missing-body precommit is a non-activating intent that is **not promotable**.
 
 ## Spec invariants this phase upholds (task map) {#spec-invariants-this-phase-upholds-task-map}
 
 | Invariant (spec §Safety Invariants) | Upheld by task |
 |---|---|
-| `SingleManifestOwner` | T3 (`PrecommitTransition` in target shard), T5 (atomic single-shard `promote`), T6 (`republishRef` = fresh dst + src drop, no shared/moved manifest) |
+| `SingleManifestOwner` | T3 (create-precommit `RootOwnerEvent` in target shard), T5 (atomic single-shard `promote`), T6 (`republishRef` = fresh dst + src drop, no shared/moved manifest) |
 | `NoManifestIdReuse` | T2 (random `manifest_instance_id` per `stageManifest`) |
 | `CommittedManifestBodyRequired` / `NoCommittedDangle` | T5 (fail-closed revalidation: missing body/blob/condemned ⇒ `ABORTED`) |
 | `PrecommitMayReferenceMissingManifest` / `PrecommitMayReferenceMissingBlob` | T3 + T4 (precommit CAS needs no body `HEAD`; blobs upload *after* `precommitAdd`) |
 | `RefMatchesBody` / `ManifestNamespaceMatches` | T5 (revalidation streams + validates the body before the owner move) |
-| `MutablePayloadNotReachability` | T1 (a mutable-only update is a root-shard CAS changing `RootRef.mutable_files` only — no `OwnerTransition`, no blob delta, no `ManifestId` change) |
-| `ManifestActivationMatchesEdges` | T5 (missing-body activation ⇒ promotion emits committed `+` edges; already-activated ⇒ pure move) |
+| `MutablePayloadNotReachability` | T1 (a mutable-only update is a root-shard CAS changing `RootRef.mutable_files` only — no `RootOwnerEvent`, no blob delta, no `ManifestId` change) |
+| `PromoteIsPureOwnerMove` / `NonActivatedPrecommitNotPromotable` | T5 (promote appends a pure-move `RootOwnerEvent` over the same `manifest_ref`, never emitting blob deltas; a missing-body precommit is rejected fail-closed — the writer re-stages with a fresh `ManifestId`) |
 | `OrphanManifestDebrisDrains` (liveness) | T7 (writer best-effort `_manifests` debris cleanup on `abandon`) |
 | backpressure caps (OQ7) | T2 (fail-closed before the body write returns) |
 
 ## File Structure {#file-structure}
 
 - Modify: `CasRootShardCodec.h` / `CasRootShardCodec.cpp` — new types + protobuf codec; remove `JournalRecord`/`ClosureNode`. (T1)
-- Modify: `Proto/cas_format.proto` — `RootShardManifest` message: replace `RefPayload`/`JournalRecord`/`ClosureNode` fields with `RootRef`/`OwnerTransition`/`PrecommitTransition`/`PromotePrecommit`. (T1)
+- Modify: `Proto/cas_format.proto` — `RootShardManifest` message: replace `RefPayload`/`JournalRecord`/`ClosureNode` fields with `RootRef` and one ordered `repeated RootOwnerEvent journal` (carrying `OwnerBinding`/`OwnerKind`). (T1)
 - Modify: `CasBuild.h` / `CasBuild.cpp` — `stageManifest`, `precommitAdd`, `promote`; remove `stageTree`/`uploadStagedTree`/`putTree`/`precommit`/`publish`/`buildStagedClosure`/`precommitNs`/`buildRef`/`buildShard`; writer debris cleanup in `abandon`. (T2–T5, T7)
 - Modify: `ContentAddressedTransaction.cpp` — `republishRef` (`:134`) → fresh dst `PartManifest` + src drop; call sites `:871` (RENAME loop) and `:1025` (part-dir move). (T6)
 - Test: `src/Disks/tests/gtest_cas_build.cpp`, `gtest_cas_build_root_dangle.cpp`, `gtest_ca_transaction.cpp`, helpers `src/Disks/tests/cas_test_helpers.h` (extend `publishRaw`/add manifest-publish helper as needed). (all tasks)
@@ -150,11 +153,11 @@ Semantics required of the emitted types (spec §Root Journal Format / §Build An
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Proto/cas_format.proto`
 - Modify: `src/Disks/tests/gtest_cas_root_shard_codec.cpp` (or the codec round-trip gtest; create a `CasRootShardCodec` test group there)
 
-**Interfaces produced:** `RootRef`, `OwnerTransition`, `PrecommitTransition`, `PromotePrecommit`, `RootShard` (rewritten); `encodeRootShard`/`decodeRootShard` over the new shape; `JournalRecord`/`ClosureNode` removed.
+**Interfaces produced:** `OwnerKind`, `OwnerBinding`, `RootOwnerEvent`, `RootRef`, `RootShard` (rewritten to one ordered journal); `encodeRootShard`/`decodeRootShard` over the new shape; `JournalRecord`/`ClosureNode` removed.
 
-**Upholds:** `MutablePayloadNotReachability` (mutable payload is a `RootRef` field, separate from owner transitions); compact owner transitions (no transitive closure).
+**Upholds:** `MutablePayloadNotReachability` (mutable payload is a `RootRef` field, separate from owner events); a single ordered owner-event log (no transitive closure, no three separate record vectors).
 
-- [ ] **Step 1: Replace the header types.** In `CasRootShardCodec.h`, delete `struct ClosureNode`, `struct RefPayload`, and `struct JournalRecord`. Add (note `#include` for `CasManifestId.h` from Phase 1a; drop the `CasTreeCodec.h` include):
+- [ ] **Step 1: Replace the header types.** In `CasRootShardCodec.h`, delete `struct ClosureNode`, `struct RefPayload`, and `struct JournalRecord`. Add (note `#include` for `CasManifestId.h` from Phase 1a; drop the `CasTreeCodec.h` include). The root journal is **one ordered `std::vector<RootOwnerEvent>`** — there are no separate `transitions`/`precommits`/`promotions` vectors:
 
 ```cpp
 #pragma once
@@ -171,6 +174,39 @@ Semantics required of the emitted types (spec §Root Journal Format / §Build An
 namespace DB::Cas
 {
 
+/// Owner of a part manifest in the root journal: a committed ref or a precommit build intent.
+enum class OwnerKind : uint8_t
+{
+    Committed = 1,
+    Precommit = 2,
+};
+
+/// One owner binding: which kind of owner names which manifest. Committed: `ref_name` set,
+/// `build_id` = 0. Precommit: `ref_name` = the final committed ref name, `build_id` set. Carries the
+/// full `ManifestRef`, never a bare nonce.
+struct OwnerBinding
+{
+    OwnerKind owner_kind = OwnerKind::Committed;
+    String ref_name;                /// committed ref_name, or the precommit's final_ref_name
+    UInt128 build_id{};             /// 0 for Committed; the build id for Precommit
+    ManifestRef manifest_ref;
+    bool operator==(const OwnerBinding &) const = default;
+};
+
+/// One ordered owner-change event in the SINGLE root journal stream (spec §Root Journal Format).
+/// Removes at most one `old_binding` and adds at most one `new_binding`; folded in transition_version
+/// order. create precommit = old none / new {Precommit,…}; abandon = old {Precommit,…} / new none;
+/// publish committed = old none / new {Committed,…}; drop = old {Committed,…} / new none; repoint =
+/// old {Committed,ref,T_old} / new {Committed,ref,T_new}; promote = old {Precommit,final,build,T} /
+/// new {Committed,final,T} (SAME manifest_ref T ⇒ owner move, blob Δ = 0, no cleanup).
+struct RootOwnerEvent
+{
+    uint64_t transition_version = 0;
+    std::optional<OwnerBinding> old_binding;
+    std::optional<OwnerBinding> new_binding;
+    bool operator==(const RootOwnerEvent &) const = default;
+};
+
 /// The current committed ref payload in the root journal. Carries the committed `ManifestRef` plus the
 /// mutable per-ref files (txn_version.txt, metadata_version.txt, ...). `root_namespace_id` is NOT
 /// stored here — it comes from the owning root context (spec §Root Journal Format).
@@ -183,47 +219,12 @@ struct RootRef
     bool operator==(const RootRef &) const = default;
 };
 
-/// Atomic old/new committed-owner change in one root-journal decision. old=none,new=T: create;
-/// old=T,new=none: drop; old=T_old,new=T_new: repoint. Carries full `ManifestRef`s, never a bare nonce.
-struct OwnerTransition
-{
-    uint64_t transition_version = 0;
-    String ref_name;
-    std::optional<ManifestRef> old_manifest;
-    std::optional<ManifestRef> new_manifest;
-    bool operator==(const OwnerTransition &) const = default;
-};
-
-/// Build-intent owner change for a precommit, recorded in the TARGET root shard (no `_precommits`
-/// namespace). old=none,new=T: PrecommitAdd; old=T,new=none: abandon/reclaim.
-struct PrecommitTransition
-{
-    uint64_t transition_version = 0;
-    UInt128 build_id{};
-    String final_ref_name;
-    std::optional<ManifestRef> old_manifest;
-    std::optional<ManifestRef> new_manifest;
-    bool operator==(const PrecommitTransition &) const = default;
-};
-
-/// Atomic owner move from precommit(build_id) to ref(final_ref_name). Same manifest; owner only moves.
-struct PromotePrecommit
-{
-    uint64_t transition_version = 0;
-    UInt128 build_id{};
-    String final_ref_name;
-    ManifestRef manifest;
-    bool operator==(const PromotePrecommit &) const = default;
-};
-
 struct RootShard
 {
     uint64_t shard_version = 0;
     uint64_t fence_round = 0;
-    std::map<String, RootRef> refs;                  /// std::map keeps refs in canonical name order
-    std::vector<OwnerTransition> transitions;        /// committed owner transitions, insertion order
-    std::vector<PrecommitTransition> precommits;     /// precommit intents in this shard, insertion order
-    std::vector<PromotePrecommit> promotions;        /// promote-precommit owner moves, insertion order (GC-foldable)
+    std::map<String, RootRef> refs;            /// std::map keeps refs in canonical name order
+    std::vector<RootOwnerEvent> journal;       /// ONE ordered stream, folded in transition_version order
     bool operator==(const RootShard &) const = default;
 };
 
@@ -233,38 +234,69 @@ RootShard decodeRootShard(std::string_view data);
 }
 ```
 
-- [ ] **Step 2: Rewrite the protobuf message.** In `Proto/cas_format.proto`, in `message RootShardManifest`: replace the `RefPayload`/`JournalRecord`/`ClosureNode` sub-messages and fields with `RootRef`, `OwnerTransition`, `PrecommitTransition`, `PromotePrecommit`. Make every `ManifestRef` a nested message `{ string writer_instance_id = 1; uint64 build_sequence = 2; bytes manifest_instance_id = 3; }` (16-byte fixed for the `UInt128`); make `old_manifest`/`new_manifest` `optional ManifestRef` (proto3 explicit-presence) so absence is distinguishable from a zero ref. Keep the message name `RootShardManifest` and the magic via `FormatId::Manifest` (the redesign keeps the on-wire class id; only its fields change — CA is pre-release, so no compat path).
+- [ ] **Step 2: Rewrite the protobuf message.** In `Proto/cas_format.proto`, in `message RootShardManifest`: replace the `RefPayload`/`JournalRecord`/`ClosureNode` sub-messages and fields with `RootRef` and **one ordered** `repeated RootOwnerEvent journal`. Add nested messages: `OwnerBinding { OwnerKind owner_kind = 1; string ref_name = 2; bytes build_id = 3; ManifestRef manifest_ref = 4; }` (with `enum OwnerKind { OWNER_KIND_UNSPECIFIED = 0; COMMITTED = 1; PRECOMMIT = 2; }`) and `RootOwnerEvent { uint64 transition_version = 1; optional OwnerBinding old_binding = 2; optional OwnerBinding new_binding = 3; }`. Make every `ManifestRef` a nested message `{ string writer_instance_id = 1; uint64 build_sequence = 2; bytes manifest_instance_id = 3; }` (16-byte fixed for the `UInt128`); `old_binding`/`new_binding` are `optional` (proto3 explicit-presence) so absence is distinguishable. Keep the message name `RootShardManifest` and the magic via `FormatId::Manifest` (the redesign keeps the on-wire class id; only its fields change — CA is pre-release, so no compat path).
 
-- [ ] **Step 3: Rewrite the codec body.** In `CasRootShardCodec.cpp`, update `encodeRootShard`/`decodeRootShard` to map the new structs to/from the rewritten protobuf. Keep `set_magic(magicFor(FormatId::Manifest))` and `currentWriterVersion()` framing (`.cpp:105-106`). Encode `refs` in name-sorted order (`std::map` gives it), `transitions`/`precommits`/`promotions` in insertion order. Encode each `ManifestRef.manifest_instance_id` as exactly 16 bytes. Fail-closed decode: a `manifest_instance_id` whose length ≠ 16, a missing required field, a `transition` with neither `old_manifest` nor `new_manifest` set, or a bad envelope ⇒ `CORRUPTED_DATA`.
+- [ ] **Step 3: Rewrite the codec body.** In `CasRootShardCodec.cpp`, update `encodeRootShard`/`decodeRootShard` to map the new structs to/from the rewritten protobuf. Keep `set_magic(magicFor(FormatId::Manifest))` and `currentWriterVersion()` framing (`.cpp:105-106`). Encode `refs` in name-sorted order (`std::map` gives it) and `journal` in insertion order (the single ordered stream, `transition_version` order). Encode each `ManifestRef.manifest_instance_id` and each `OwnerBinding.build_id` as exactly 16 bytes. Fail-closed decode: a `manifest_instance_id` or `build_id` whose length ≠ 16, an unknown `OwnerKind`, a `RootOwnerEvent` with neither `old_binding` nor `new_binding` set, or a bad envelope ⇒ `CORRUPTED_DATA`.
 
 - [ ] **Step 4: Write the codec gtest.** In the codec gtest, add a `CasRootShardCodec` group:
 
 ```cpp
-TEST(CasRootShardCodec, RoundTripWithTransitionsAndPrecommits)
+namespace
+{
+    OwnerBinding committed(const String & ref, const ManifestRef & mr)
+    {
+        return OwnerBinding{OwnerKind::Committed, ref, UInt128(0), mr};
+    }
+    OwnerBinding precommit(const String & final_ref, UInt128 build_id, const ManifestRef & mr)
+    {
+        return OwnerBinding{OwnerKind::Precommit, final_ref, build_id, mr};
+    }
+}
+
+TEST(CasRootShardCodec, RoundTripInterleavedOwnerEvents)
 {
     RootShard r;
-    r.shard_version = 7;
+    r.shard_version = 12;
     r.fence_round = 3;
-    ManifestRef mr{"srv-a:42", 1042, UInt128(0xABCDEF)};
+    const ManifestRef mr{"srv-a:42", 1042, UInt128(0xABCDEF)};   /// the part this build owns
+    const ManifestRef mr_other{"srv-a:42", 1043, UInt128(0x112233)};
+    const UInt128 build_id(0x5678);
     r.refs["all_1_1_0"] = RootRef{"all_1_1_0", mr, {{"txn_version.txt", "5"}}, 1700000000000ULL};
-    r.transitions.push_back(OwnerTransition{8, "all_1_1_0", std::nullopt, mr});
-    r.precommits.push_back(PrecommitTransition{8, UInt128(0x5678), "all_1_1_0", std::nullopt, mr});
-    r.promotions.push_back(PromotePrecommit{9, UInt128(0x5678), "all_1_1_0", mr});
+
+    /// ONE ordered journal with INTERLEAVED kinds: create-precommit, publish-committed (a different
+    /// ref), promote (precommit→committed, SAME manifest_ref), then drop. transition_version increases.
+    r.journal.push_back(RootOwnerEvent{8, std::nullopt, precommit("all_1_1_0", build_id, mr)});
+    r.journal.push_back(RootOwnerEvent{9, std::nullopt, committed("other_2_2_0", mr_other)});
+    r.journal.push_back(RootOwnerEvent{10, precommit("all_1_1_0", build_id, mr), committed("all_1_1_0", mr)});
+    r.journal.push_back(RootOwnerEvent{11, committed("other_2_2_0", mr_other), std::nullopt});
 
     const String bytes = encodeRootShard(r);
     const RootShard back = decodeRootShard(bytes);
     EXPECT_EQ(back, r);
     /// Byte-equality: deterministic encoder ⇒ re-encode is byte-identical (resume/adoption).
     EXPECT_EQ(encodeRootShard(back), bytes);
+
+    /// transition_version order is preserved end-to-end (the single stream is folded in this order).
+    ASSERT_EQ(back.journal.size(), 4u);
+    for (size_t i = 1; i < back.journal.size(); ++i)
+        EXPECT_LT(back.journal[i - 1].transition_version, back.journal[i].transition_version);
+
+    /// The promote event is a pure owner move: SAME manifest_ref in old (Precommit) and new (Committed).
+    const RootOwnerEvent & promote = back.journal[2];
+    ASSERT_TRUE(promote.old_binding && promote.new_binding);
+    EXPECT_EQ(promote.old_binding->owner_kind, OwnerKind::Precommit);
+    EXPECT_EQ(promote.new_binding->owner_kind, OwnerKind::Committed);
+    EXPECT_EQ(promote.old_binding->manifest_ref, promote.new_binding->manifest_ref);
 }
 
-TEST(CasRootShardCodec, OptionalManifestAbsenceIsDistinguished)
+TEST(CasRootShardCodec, OptionalBindingAbsenceIsDistinguished)
 {
     RootShard r;
-    r.transitions.push_back(OwnerTransition{1, "p", ManifestRef{"w", 1, UInt128(9)}, std::nullopt});
+    /// A drop event: old committed binding present, new absent.
+    r.journal.push_back(RootOwnerEvent{1, committed("p", ManifestRef{"w", 1, UInt128(9)}), std::nullopt});
     const RootShard back = decodeRootShard(encodeRootShard(r));
-    EXPECT_FALSE(back.transitions.at(0).new_manifest.has_value());
-    EXPECT_TRUE(back.transitions.at(0).old_manifest.has_value());
+    EXPECT_TRUE(back.journal.at(0).old_binding.has_value());
+    EXPECT_FALSE(back.journal.at(0).new_binding.has_value());
 }
 ```
 
@@ -283,7 +315,7 @@ git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRo
         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.cpp \
         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Proto/cas_format.proto \
         src/Disks/tests/gtest_cas_root_shard_codec.cpp
-git commit -m "CA GC phase1b: root-journal owner-transition types + codec (remove JournalRecord/ClosureNode)"
+git commit -m "CA GC phase1b: single ordered RootOwnerEvent root journal + codec (remove JournalRecord/ClosureNode)"
 ```
 
 ---
@@ -469,16 +501,17 @@ git commit -m "CA GC phase1b: Build::stageManifest mints ManifestId + stream-wri
 
 **Interfaces produced:** `void Build::precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id)`. (`precommitNs`/`buildRef`/`buildShard` removed.)
 
-**Upholds:** `SingleManifestOwner` (the manifest's only owner is `precommit(build_id)` in the target shard); `PrecommitMayReferenceMissingManifest` (no body `HEAD` is a safety input — the CAS only writes the intent record).
+**Upholds:** `SingleManifestOwner` (the manifest's only owner is `precommit(build_id, final_ref_name)` in the target shard); `PrecommitMayReferenceMissingManifest` (no body `HEAD` is a safety input — the CAS only appends the intent event); a missing-body precommit is a non-activating intent that is **not promotable**.
 
 - [ ] **Step 1: Declare `precommitAdd`; remove the precommit-namespace helpers.** In `CasBuild.h`, replace the `precommit(const TreeId &)`, `precommitNs`, `buildRef`, `buildShard` declarations with:
 
 ```cpp
     /// Build-intent owner add, written to the SAME root shard as the future committed ref (spec §Precommit
-    /// Add) — there is no `_precommits` namespace. ONE root-shard CAS appending a PrecommitTransition
-    /// {old=none, new=id.ref}; shard = store->shardOf(final_ref_name), so PromotePrecommit later is an
-    /// atomic owner move in this same shard. Needs NO body-exists HEAD as a safety authority: GC and
-    /// promotion handle a missing precommit manifest body by failing closed.
+    /// Add) — there is no `_precommits` namespace. ONE root-shard CAS appending a RootOwnerEvent
+    /// {old=none, new={Precommit, final_ref_name, build_id, id.ref}} to the single ordered journal; shard =
+    /// store->shardOf(final_ref_name), so the later promote is an atomic owner move in this same shard.
+    /// Needs NO body-exists HEAD as a safety authority: GC and promotion handle a missing precommit
+    /// manifest body by failing closed (a missing-body precommit is a non-activating, non-promotable intent).
     void precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id);
 ```
 Also rename the `bool precommitted` member to track precommit-by-`(target_ns, final_ref_name, build_id)` so `promote` knows the shard to move in (store the `target_ns`/`final_ref_name`/`ManifestRef` on the `Build`).
@@ -499,16 +532,19 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
     /// W-REGISTER: the target namespace must be in `gc/registry` before its first transition exists.
     store->ensureRegistered(target_ns);
 
-    /// ONE CAS on the TARGET shard (shardOf(final_ref_name)): append PrecommitTransition{old=none,
-    /// new=id.ref}. No body HEAD — a missing body is a legal fail-closed intent (spec §Precommit Add).
+    /// ONE CAS on the TARGET shard (shardOf(final_ref_name)): append a create-precommit RootOwnerEvent
+    /// {old=none, new={Precommit, final_ref_name, build_id, id.ref}} to the single ordered journal. No body
+    /// HEAD — a missing body is a legal fail-closed, non-activating intent (spec §Precommit Add).
     store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
     {
-        root.precommits.push_back(PrecommitTransition{
+        root.journal.push_back(RootOwnerEvent{
             .transition_version = root.shard_version + 1,
-            .build_id = build_id,
-            .final_ref_name = final_ref_name,
-            .old_manifest = std::nullopt,
-            .new_manifest = id.ref});
+            .old_binding = std::nullopt,
+            .new_binding = OwnerBinding{
+                .owner_kind = OwnerKind::Precommit,
+                .ref_name = final_ref_name,
+                .build_id = build_id,
+                .manifest_ref = id.ref}});
     });
 
     precommit_target_ns = target_ns;
@@ -543,15 +579,19 @@ TEST(CasBuild, PrecommitAddWritesTransitionInTargetShard)
     const ManifestId id = build->stageManifest({ManifestEntry{"columns.txt", EntryPlacement::Inline, {}, 0, "x"}});
     build->precommitAdd(ns, "all_1_1_0", id);
 
-    /// The PrecommitTransition is in the TARGET shard (shardOf(final_ref_name)) — NOT a `_precommits` ns.
+    /// The create-precommit RootOwnerEvent is in the TARGET shard (shardOf(final_ref_name)) — NOT a
+    /// `_precommits` ns. old=none, new={Precommit, final_ref_name, build_id, manifest_ref}.
     const uint64_t shard = shardOfForTest("all_1_1_0", 4);
     const auto got = backend->get(store->layout().rootShardKey(ns, shard));
     ASSERT_TRUE(got.has_value());
     const RootShard root = decodeRootShard(got->bytes);
-    ASSERT_EQ(root.precommits.size(), 1u);
-    EXPECT_EQ(root.precommits.at(0).final_ref_name, "all_1_1_0");
-    ASSERT_TRUE(root.precommits.at(0).new_manifest.has_value());
-    EXPECT_EQ(root.precommits.at(0).new_manifest->manifest_instance_id, id.ref.manifest_instance_id);
+    ASSERT_EQ(root.journal.size(), 1u);
+    const RootOwnerEvent & ev = root.journal.at(0);
+    EXPECT_FALSE(ev.old_binding.has_value());
+    ASSERT_TRUE(ev.new_binding.has_value());
+    EXPECT_EQ(ev.new_binding->owner_kind, OwnerKind::Precommit);
+    EXPECT_EQ(ev.new_binding->ref_name, "all_1_1_0");
+    EXPECT_EQ(ev.new_binding->manifest_ref.manifest_instance_id, id.ref.manifest_instance_id);
     /// No `_precommits` segment anywhere in the pool.
     const auto page = backend->list(store->poolConfig().pool_prefix + "/roots/", "", 1000);
     for (const auto & k : page.keys)
@@ -628,7 +668,7 @@ git commit -m "CA GC phase1b: assert blob-under-precommit order (body->precommit
 
 **Interfaces produced:** `void Build::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id)`. Removes the now-dead `publish`/`checkAndResolveDeps`/`recreateTree`/`adoptTree`/`adoptFromTree`/`stageTree` machinery that the tree model required. (Keep `putBlob`/`uploadFromSource`/`observeAndAdmit`/the dep set — blob revalidation still uses them.)
 
-**Upholds:** `CommittedManifestBodyRequired` / `NoCommittedDangle` (revalidate body + every blob leaf before the owner move; missing body/blob/condemned ⇒ `ABORTED`); `SingleManifestOwner` (one CAS replaces `precommit(build_id)` with `ref(final_ref_name)` — never a window with neither owner); `ManifestActivationMatchesEdges` (missing-body activation ⇒ promotion is folded as a committed add — emit `+` edges; already-activated ⇒ pure move, no blob delta); `RefMatchesBody`/`ManifestNamespaceMatches`.
+**Upholds:** `CommittedManifestBodyRequired` / `NoCommittedDangle` (revalidate body + every blob leaf before the owner move; missing body/blob/condemned ⇒ `ABORTED`); `SingleManifestOwner` (one CAS replaces `precommit(build_id)` with `committed(final_ref_name)` — never a window with neither owner); `PromoteIsPureOwnerMove` (promotion appends one pure-move `RootOwnerEvent` over the **same** `manifest_ref` and **never** emits blob deltas — the activating `+` edges came from GC's barrier-activation of the create-precommit event, which the fold barrier guarantees is folded before any promote); `NonActivatedPrecommitNotPromotable` (a missing-body precommit is rejected fail-closed at step 4, and the writer re-stages with a fresh `ManifestId`); `RefMatchesBody`/`ManifestNamespaceMatches`.
 
 - [ ] **Step 1: Declare `promote`; delete the tree-model methods.** In `CasBuild.h`, add the `promote` declaration; delete the declarations for `publish`, `stageTree`, `uploadStagedTree`, `putTree`, `adoptTree`, `adoptFromTree`, `recreateTree`, `buildStagedClosure`, and `precommit`. Keep `putBlob`, `uploadFromSource`, `observeAndAdmit`, `recordPendingBlobDep`, `adoptEvidence`, `depIsTokened`, `hasDep`, `checkAndResolveDeps` (blob-only — the loop already keys deps by `(kind, hash)`; trees no longer appear).
 
@@ -638,10 +678,12 @@ git commit -m "CA GC phase1b: assert blob-under-precommit order (body->precommit
     ///  2. stream-read the precommit manifest body; validate RefMatchesBody / ManifestNamespaceMatches;
     ///  3. revalidate EVERY blob leaf listed in the manifest (fail-closed);
     ///  4. body absent | a blob absent | a blob condemned-and-not-recreatable ⇒ ABORTED;
-    ///  5. atomically replace precommit(build_id) owner with ref(final_ref_name) owner (erase the
-    ///     PrecommitTransition's live state, set refs[final_ref_name], append the journal records);
-    ///  6. append PromotePrecommit (already-activated ⇒ no blob delta) OR, if the precommit was
-    ///     missing-body, fold it as a committed add (OwnerTransition old=none,new=id.ref → emits + edges).
+    ///  5. atomically replace precommit(build_id) owner with committed(final_ref_name) owner by appending
+    ///     ONE pure-move RootOwnerEvent (old={Precommit,final_ref_name,build_id,T}, new={Committed,final_ref_name,T},
+    ///     same manifest_ref T) and setting refs[final_ref_name];
+    ///  6. promotion NEVER emits blob deltas (spec rev. 15 §Promote Precommit). The activating + edges came
+    ///     from GC's barrier-activation of the create-precommit event (the fold barrier guarantees it is
+    ///     folded before any promote); a missing-body precommit is non-activating and was rejected at step 4.
     void promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id);
 ```
 
@@ -696,21 +738,24 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
                     "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
         }
 
-        /// Was this precommit folded as missing-body (never contributed blob edges)? We cannot observe GC
-        /// fold state from the writer, so the SAFE choice is: the promotion record always names the
-        /// manifest; GC decides (spec §Fold Owner Transitions) whether to emit committed + edges (if the
-        /// precommit was missing-body / not-yet-active) or no delta (already active). We therefore append
-        /// BOTH the precommit close (old=ref,new=none) and the committed add (PromotePrecommit), atomically.
+        /// Promotion is a PURE OWNER MOVE (spec rev. 15 §Promote Precommit): append ONE RootOwnerEvent
+        /// whose old_binding and new_binding name the SAME manifest_ref T, moving ownership from
+        /// precommit(build_id) to committed(final_ref_name). It emits NO blob deltas. The activating +
+        /// edges came from GC's barrier-activation of the create-precommit event — the fold barrier
+        /// guarantees that event is folded (body present ⇒ activated) before this promote is folded, so
+        /// there is no "was it active when folded?" ambiguity and no committed-add path here.
         const uint64_t v = root.shard_version + 1;
-        root.precommits.push_back(PrecommitTransition{
-            .transition_version = v, .build_id = promote_build_id, .final_ref_name = final_ref_name,
-            .old_manifest = id.ref, .new_manifest = std::nullopt});
+        root.journal.push_back(RootOwnerEvent{
+            .transition_version = v,
+            .old_binding = OwnerBinding{
+                .owner_kind = OwnerKind::Precommit, .ref_name = final_ref_name,
+                .build_id = promote_build_id, .manifest_ref = id.ref},
+            .new_binding = OwnerBinding{
+                .owner_kind = OwnerKind::Committed, .ref_name = final_ref_name,
+                .build_id = UInt128(0), .manifest_ref = id.ref}});
         root.refs[final_ref_name] = RootRef{
             .ref_name = final_ref_name, .manifest_ref = id.ref,
             .mutable_files = pending_mutable_files, .published_at_ms = nowMs()};
-        root.promotions.push_back(PromotePrecommit{
-            .transition_version = v, .build_id = promote_build_id,
-            .final_ref_name = final_ref_name, .manifest = id.ref});
     });
 
     precommitted = false;
