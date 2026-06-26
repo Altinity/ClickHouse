@@ -301,7 +301,7 @@ TEST(CasProtocol, EvidenceHitCondemnedBlobAbortsRetryable)
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Token t0 = b->head(blob_key).token;
-    const TreeId source = writeTreeRaw(*b, s->layout(), {blobEntry("data.bin", "payload-X")}, s->poolMeta().pool_id);
+    const TreeId source = writeTreeRaw(*b, s->layout(), {blobEntry("data.bin", "payload-X")}, s->poolMeta().pool_id, s->poolMeta().blob_header_len);
 
     auto build = s->startBuild({});
     const TreeEntry adopted = build->adoptFromTree(source, "data.bin");   /// tokenless dep on X
@@ -592,7 +592,7 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     ASSERT_EQ(s->retireView().round(), 1u);
 
     const RootNamespace ns{"srv1/tbl"};
-    const TreeId source = writeTreeRaw(*b, s->layout(), {blobEntry("data.bin", "payload-fresh-ev")}, s->poolMeta().pool_id);
+    const TreeId source = writeTreeRaw(*b, s->layout(), {blobEntry("data.bin", "payload-fresh-ev")}, s->poolMeta().pool_id, s->poolMeta().blob_header_len);
 
     auto build = s->startBuild({});
     /// adoptFromTree records a TOKENLESS dep at observed_view_round = 1 (the current round) — FRESH.
@@ -655,4 +655,44 @@ TEST(CasProtocol, AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime)
 
     /// NOTHING may name the deleted tree.
     EXPECT_FALSE(s->resolveRef(RootNamespace{"srv1/tbl"}, "part_2").has_value());
+}
+
+TEST(CasProtocol, AdoptTreeRoundTripCarriesRealTreeSize)
+{
+    /// B92: adoptTree → publish must carry the real tree payload size, NOT 0.
+    ///
+    /// Root cause: observeAndAdmit hard-coded logical_size=0 for trees ("trees would need a decode").
+    /// Fix: compute logical_size = hr.size - blob_header_len (same as blobs) — no decode needed because
+    /// a tree object is laid out as [blob_header_len envelope][encodeTree payload].
+    ///
+    /// Round-trip invariant: a tree built + published as ref A, then adopted + republished as ref B,
+    /// must have the same tree_size in B as in A (and != 0 since the tree has real entries).
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// Build A: a blob + a tree with a real entry so the payload size T > 0.
+    auto build_a = s->startBuild({});
+    build_a->putBlob(idOf("payload-B92"), BlobSource::fromString("payload-B92"));
+    const TreeId tree = build_a->putTree({blobEntry("data.bin", "payload-B92")});
+    build_a->publish(ns, "ref_a", tree, RefPayload{});
+
+    /// Resolve ref A and capture its tree_size — the ground truth.
+    auto resolved_a = s->resolveRef(ns, "ref_a");
+    ASSERT_TRUE(resolved_a.has_value());
+    const uint64_t tree_size_a = resolved_a->tree_size;
+    EXPECT_NE(tree_size_a, 0u) << "ref A tree_size must be non-zero (tree has a real entry)";
+
+    /// Build B: fresh build, adopt the same tree, publish as ref_b (no re-upload).
+    auto build_b = s->startBuild({});
+    build_b->adoptTree(tree);
+    build_b->publish(ns, "ref_b", tree, RefPayload{});
+
+    /// Resolve ref B: tree_size must match ref A (round-trip invariant for B92).
+    auto resolved_b = s->resolveRef(ns, "ref_b");
+    ASSERT_TRUE(resolved_b.has_value());
+    EXPECT_NE(resolved_b->tree_size, 0u) << "adopted ref tree_size must not be 0 (B92)";
+    EXPECT_EQ(resolved_b->tree_size, tree_size_a)
+        << "adopted-ref tree_size " << resolved_b->tree_size
+        << " != original tree_size " << tree_size_a << " (B92 round-trip)";
 }

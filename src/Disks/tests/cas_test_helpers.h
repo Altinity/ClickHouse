@@ -116,11 +116,15 @@ inline DB::Cas::BlobId writeBlobRaw(
     return id;
 }
 
-/// Write a Tree object: a NATURAL-length (no pad) Tree envelope followed by the canonical tree payload,
-/// keyed by the tree id. Mirrors what Build::putTree will emit (Task 11).
+/// Write a Tree object: a fixed-length (pad_to_header_len = blob_header_len) envelope followed by the
+/// canonical tree payload, keyed by the tree id. Mirrors what Build::putTree emits (both blobs and
+/// trees pad to the pool's fixed header length, so every object's payload starts at a constant offset).
+/// Pass blob_header_len = 0 for a natural-length (unpadded) envelope (legacy / read-only test fixtures
+/// that never go through observeAndAdmit).
 inline DB::Cas::TreeId writeTreeRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
-    std::vector<DB::Cas::TreeEntry> entries, const DB::UInt128 & domain_id)
+    std::vector<DB::Cas::TreeEntry> entries, const DB::UInt128 & domain_id,
+    uint64_t blob_header_len = 0)
 {
     const DB::Cas::TreeId id = DB::Cas::merkleTreeId(entries);
     const String encoded = DB::Cas::encodeTree(std::move(entries));
@@ -133,6 +137,8 @@ inline DB::Cas::TreeId writeTreeRaw(
     header.domain_id = domain_id;
     header.incarnation_tag = DB::UInt128(0x1234);
     header.build_id = DB::UInt128(0x5678);
+    if (blob_header_len)
+        header.pad_to_header_len = static_cast<uint32_t>(blob_header_len);
 
     const String head = DB::Cas::encodeEnvelopeHeader(header);
     backend.putIfAbsent(layout.treeKey(id), head + encoded);

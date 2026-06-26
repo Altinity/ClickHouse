@@ -220,19 +220,17 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
 {
     /// `hr.exists` is guaranteed by the caller (the 3-arg wrapper checked it; the putBlob HEAD-first
     /// path only calls this on a present HEAD). Avoids a redundant second HEAD on the dedup-hit path.
-    /// Logical (payload) size = object size minus the pool's fixed blob header; trees would need a
-    /// decode, so report 0. GUARD against unsigned underflow: a truncated/corrupt blob whose object
-    /// size is below the header length must surface as CORRUPTED_DATA, never wrap to a huge value
-    /// (the result is the caller-visible BlobRef::size). Mirrors the GC path's `retiredLogicalSize`.
-    uint64_t logical_size = 0;
-    if (kind == ObjectKind::Blob)
-    {
-        const uint64_t header_len = store->poolMeta().blob_header_len;
-        if (hr.size < header_len)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "Build: blob {} object size {} is below the pool blob header length {}", key, hr.size, header_len);
-        logical_size = hr.size - header_len;
-    }
+    /// Logical (payload) size = object size minus the pool's fixed blob header. A tree object is laid
+    /// out as [blob_header_len envelope][encodeTree payload], so the same formula applies. GUARD against
+    /// unsigned underflow: a truncated/corrupt object whose size is below the header length must surface
+    /// as CORRUPTED_DATA, never wrap to a huge value. Mirrors the GC path's `retiredLogicalSize`.
+    /// B92: trees previously reported 0 ("would need a decode"); the layout makes that unnecessary.
+    const uint64_t header_len = store->poolMeta().blob_header_len;
+    if (hr.size < header_len)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "Build: {} object {} size {} is below the pool blob header length {}",
+            kind == ObjectKind::Blob ? "blob" : "tree", key, hr.size, header_len);
+    const uint64_t logical_size = hr.size - header_len;
 
     const CasEventObjectKind ev_kind = toEventKind(kind);
     if (store->retireView().isCondemnedToken(kind, hash, hr.token))
@@ -506,13 +504,11 @@ void Build::adoptTree(const TreeId & id)
     /// the root being adopted: a detached/frozen tree is exactly NOT pinned by anything. Absent
     /// => FILE_DOESNT_EXIST (fail closed; the caller re-creates from source or aborts the
     /// re-attach); condemned => ABORTED from observeAndAdmit (INV-1: no GET; caller retries).
-    /// FOLLOW-UP(M-W): size 0 here flows into `RefPayload.tree_size` at publish for adopt-published
-    /// parts (FREEZE / detached re-attach / replication relink). Harmless in M-C2 (no read path
-    /// consumes tree_size — `readTree` GETs the whole object, `locate` uses per-entry file_size), but
-    /// `Resolved.tree_size` is reader-facing precisely so the M-W wiring can build StoredObjects
-    /// without a HEAD (spec §6). Recover the real size on the adopt path before M-W relies on it
-    /// (the subtree case in `adoptFromTree` already carries entry.file_size); add a round-trip test
-    /// asserting tree_size survives adopt-republish.
+    /// B92 (RESOLVED): observeAndAdmit now computes logical_size = hr.size - blob_header_len for trees
+    /// (same formula as blobs; tree objects are [blob_header_len envelope][encodeTree payload]).
+    /// This flows into `RefPayload.tree_size` at publish, so adopt-published parts (FREEZE / detached
+    /// re-attach / replication relink) carry the correct payload size for `Resolved.tree_size`.
+    /// The subtree case in `adoptFromTree` already carries entry.file_size independently.
     const UInt128 hash = hexToU128(id.string());
     observeAndAdmit(ObjectKind::Tree, hash, keyFor(ObjectKind::Tree, hash));
 }
@@ -683,8 +679,8 @@ void Build::precommit(const TreeId & manifest)
     const RootNamespace ns = precommitNs();
     store->ensureRegistered(ns);
 
-    /// tree_size: for a tree we built we have the encoded payload size; for an adopted tree we may only
-    /// have 0 (the dep size) — acceptable GC bookkeeping in M-C2 (mirrors `publish`).
+    /// tree_size: for a built tree we have encoded.size(); for an adopted tree dep_it->second.size
+    /// carries the real payload size since B92 (observeAndAdmit = hr.size - blob_header_len).
     auto retained_it = retained_trees.find(manifest_hash);
     const uint64_t tree_size =
         retained_it != retained_trees.end() ? retained_it->second.size() : dep_it->second.size;
@@ -931,8 +927,8 @@ void Build::publish(const RootNamespace & ns, const String & ref_name, const Tre
     /// Fill the tree fields of the caller's payload (mutable_files is caller input, preserved).
     payload.tree_id = tree_hash;
     auto retained_it = retained_trees.find(tree_hash);
-    /// tree_size: for a tree we built we have the encoded payload size; for an adopted tree we may only
-    /// have 0 (the dep size) — acceptable GC bookkeeping in M-C2.
+    /// tree_size: for a built tree we have encoded.size(); for an adopted tree dep_it->second.size
+    /// carries the real payload size since B92 (observeAndAdmit = hr.size - blob_header_len).
     payload.tree_size = retained_it != retained_trees.end() ? retained_it->second.size() : dep_it->second.size;
 
     /// W-REGISTER (spec §5, decision 2026-06-12): a namespace must be in `gc/registry` BEFORE its

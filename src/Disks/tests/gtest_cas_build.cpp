@@ -511,7 +511,8 @@ TEST(CasBuild, PublishBodylessCondemnedDepThrowsAbortedRetryable)
     src_entry.placement = Placement::Blob;
     src_entry.file_hash = u128Of("payload-X");
     src_entry.file_size = 9;
-    const TreeId source = writeTreeRaw(*b, layout, {src_entry}, openStore(b)->poolMeta().pool_id);
+    const auto s_tmp = openStore(b);
+    const TreeId source = writeTreeRaw(*b, layout, {src_entry}, s_tmp->poolMeta().pool_id, s_tmp->poolMeta().blob_header_len);
 
     /// 3. Condemn (Blob, hash(X), t0) in the retire view, so the publish gate sees the evidence dep as a
     ///    condemned hit and must resolve it (observeAndAdmit -> HEAD-only, no GET).
@@ -575,7 +576,8 @@ TEST(CasBuild, GateBodylessAdoptFullyDeletedObjectThrowsAbortedNotFatal)
     src_entry.placement = Placement::Blob;
     src_entry.file_hash = u128Of("payload-B190");
     src_entry.file_size = 11;
-    const TreeId source = writeTreeRaw(*b, layout, {src_entry}, openStore(b)->poolMeta().pool_id);
+    const auto s_b190 = openStore(b);
+    const TreeId source = writeTreeRaw(*b, layout, {src_entry}, s_b190->poolMeta().pool_id, s_b190->poolMeta().blob_header_len);
 
     /// 3. Condemn (Blob, hash(B190), t0) in the retire view AND immediately GC-delete the object.
     ///    The retire entry stays present (GC has not yet confirmed the outcome and dropped it), so
@@ -662,7 +664,7 @@ TEST(CasBuild, AdoptFromTreeRecordsEvidence)
     src_entry.placement = Placement::Blob;
     src_entry.file_hash = u128Of("source-blob");
     src_entry.file_size = 11;
-    const TreeId source = writeTreeRaw(*b, layout, {src_entry}, s->poolMeta().pool_id);
+    const TreeId source = writeTreeRaw(*b, layout, {src_entry}, s->poolMeta().pool_id, s->poolMeta().blob_header_len);
 
     auto build = s->startBuild({});
 
