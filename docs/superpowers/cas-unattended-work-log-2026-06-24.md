@@ -226,3 +226,16 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
 - readTree now fail-closes if header.domain_id != pool_id (cross-pool contamination), right after the
   logical_hash identity check; emits a CorruptDecode event. Negative test CasStore.ReadTreeRejectsForeignDomainId.
   Sweep 363/1-baseline. Closes the one pre-freeze gap from the TLV review; envelope now freeze-ready.
+
+## Task 3 — proto rename — DONE + verified (commit c519a79f684)
+- cas_root_shard.proto→cas_format.proto, package DB.Cas.Proto→clickhouse.cas.format; per-file alias
+  namespace Proto = ::clickhouse::cas::format keeps call sites. grep gate empty; golden codec tests pass
+  (wire bytes unchanged); sweep 363/1-baseline. ALL 4 night-2 directive tasks DONE.
+
+## Grooming pass (2026-06-26 night-2) — DONE
+- Release-gate bullets updated: B92 DONE, envelope-TLV/domain_id DONE, proto rename DONE; B8 removed
+  (obsolete), B64 cross-refs cleaned, B1 trimmed. B92 row moved to archive.
+- Remaining open release-gate items: B164b (journal bound), B1 (Keeper manifest_hash umbrella), B176
+  (gc-snap protobuf, deferred), B186 (CaWiringOps.FreezeViaHardLinksIntoShadow shadow-listing — the 1
+  baseline-red gtest), B194 (GcSnap::stripTree O(NxM)), plus the larger cost/perf program (B147/B148/
+  B158/B168/B178/B201) and the soak-confirmation items (B185/B199).

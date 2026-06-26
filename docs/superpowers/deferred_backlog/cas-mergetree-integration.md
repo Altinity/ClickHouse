@@ -36,7 +36,12 @@ see `docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.md`
 - ✅ **Two-encodings / abandon-JSON DONE** — all 7 mutable JSON objects → protobuf; JSON codec family +
   monotone `checkVersion` + `CasEnumStrings.h` deleted.
 - ⏳ **B164b journal bound** [HARD] — REMAINING (two settings: `..._to_throw` hard + `..._to_delay` paced).
-- ⏳ **B92 adopt-path tree_size=0** [MED] — REMAINING (carry tree_size on the adopt/relink wire).
+- ✅ **B92 adopt-path tree_size** — DONE (2026-06-26, `b44db5dbaf7`): `observeAndAdmit` computes the tree
+  payload size (`hr.size - blob_header_len`) for adopt, so `RefPayload.tree_size` is correct on
+  FREEZE/relink; round-trip test. Row moved to archive.
+- ✅ **Envelope TLV freeze review** — DONE (2026-06-26): envelope is freeze-ready; the one gap (`domain_id`
+  written but unverified) closed by a fail-closed `readTree` check (cross-pool contamination). No dead
+  fields; nothing moves to S3 metadata.
 - ✅ **B64 projection attach** — DONE + archived (commit `d6f6b8345a0`, 2026-06-04; `03822` un-gated, oracle `05001`).
 - ✅ **B8 partition ops (REPLACE_RANGE/MOVE/DROP_PART covering race)** — OBSOLETE/DONE: implemented + tested +
   un-gated (Phase 3.2 `8fcea70ae3d`, B61(b) `6a0e506533c`; gate lifted in `StorageReplicatedMergeTree.cpp:~7421`).
@@ -45,8 +50,9 @@ see `docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.md`
   fetch-by-relink (`test_cas_replicated_relink` passes); TRUE remaining = the `manifest_hash` field on the
   per-replica Keeper `/parts` znode for cross-replica header-divergence detection (not yet in `commitPart`/
   `getCommitPartOps`).
-- ⏳ cosmetic: rename `cas_root_shard.proto`→`cas_format.proto`, package `DB.Cas.Proto`→
-  `clickhouse.cas.format` (broad sed; deferred from 3d). + the 3c-tail doc-comment nits (see work log).
+- ✅ cosmetic: renamed `cas_root_shard.proto`→`cas_format.proto`, package `DB.Cas.Proto`→
+  `clickhouse.cas.format` — DONE (2026-06-26, `c519a79f684`; grep gate clean, golden codec tests prove
+  the wire bytes are unchanged).
 
 **B. COST / bill control (S3 requests, storage, egress):**
 - B148 HEAD storm (resolveRef per warm hit + retire per candidate/round) — dominant request bill [HARD]
@@ -116,7 +122,6 @@ RustFS CI), **M-F** = full-GC walk / debris / packs / observability.
 | ID | Item | Why deferred | Where it plugs in (dead-end check) |
 |----|------|-------------|-------------------------------------|
 | B104 | **Verification residuals after the B91 refresh.** (a) `CaIncarnationProofCore.tla` (Apalache inductive-invariant rung) predates the registry/evidence amendments and `ViewableRound` — STALE; re-derive `IndInv` against the refreshed semantics or mark the §12 Apalache paragraph historical. (b) Registry × split-brain and registry × evidence combined TLC configs not run (state space); each amendment is checked against the full single-leader round only. (c) One model shard = one namespace; per-namespace `root_shards > 1` not modeled. (d) The model's hit checks read the live `retired` set — weaker than the implementation's frozen LIST snapshot (conservative direction, documented in the README). | Each is a bounded-verification scope cut, not a code gap | Cheapest first: re-run the Apalache recipe after porting the amendments into the proof core; combined configs may need ladder-style reduced bounds. |
-| B92 | **M-W: adopt-published `tree_size` = 0** (`CasBuild.cpp` `adoptTree`, FOLLOW-UP comment). FREEZE / detached-reattach / relink parts publish `RefPayload.tree_size = 0`. Harmless in-core (no read consumes it; `readTree` GETs whole, `locate` uses per-entry sizes) but `Resolved.tree_size` exists so the wiring can build `StoredObject`s without a HEAD (spec §6). | Needs nothing until the wiring consumes it | Recover the size on the adopt path (subtree entries already carry it; whole-tree adopt = one HEAD or caller-supplied) + an adopt-republish round-trip test. Pinned at the code site. |
 | B94 | **M-F: full-GC walk + debris reclaim + checkpoints.** LIST-driven authoritative walk (coherent cut vector), debris classification via build heartbeats (GC-observed staleness, no writer clocks), `gc/checkpoint/<n>` + `checkpoint_generation` (CAGS field reserved), outcome-log trimming after checkpoint inclusion (logs currently accumulate per round — small JSON objects, unbounded count). | Regular GC structurally cannot see debris/drift; spec §8 is designed, API slot reserved in `CasGc.h` | The retire→fence→recheck tail is SHARED (no second deletion path, spec §8); the walk feeds the same machinery. Also sweeps: orphaned snap generations (abandoned probe-upward partials), epoch-orphan retired sets (B95), registry entries of dropped namespaces (`dropNamespace` leaves registration; removal goes with final-manifest deletion). |
 | B95 | **M-F: epoch-orphan retired sets.** After a leadership steal (`fence_seq` bump), the old epoch's still-undropped retired sets are never probed by the new leader's resume — they linger, condemning their hashes (conservative: forces resurrect-on-reuse per publish, a cost/liveness leak, never a wrong delete). Documented at `Gc::tryResumeIncompleteRound`. | Cross-epoch cleanup needs the full-GC walk's authority (or a bounded epoch scan) — out of regular-round scope | Full GC lists `gc/retired/` wholesale and drops sets whose outcome logs exist (or re-runs their tail). The lingering direction is fail-safe meanwhile. |
 | B96 | **M-F: `snap_shards > 1` needs a displacement design.** Last-op-wins root-edge re-pointing is intra-shard; with the displaced and displacing trees in different snap shards a republish would leak the old edge forever. `Gc::fold` refuses `snap_shards != 1` (NOT_IMPLEMENTED, fail-closed). | Default 1 shard is correct-by-construction for M-C3 scale; cross-shard re-point needs per-ref displacement records or ref-identity-sharded root edges | The sharding axis (target-hash prefix) and all key shapes are already wired; only the fold's re-point logic generalizes. Spec §4 carries the constant. |
