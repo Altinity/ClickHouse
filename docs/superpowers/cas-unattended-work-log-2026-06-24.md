@@ -279,3 +279,19 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   raise memory headroom / lower workers / lower insert rate; if CA crash, bisect (note: NOT yet shown to
   be a night-2 regression — attempt-1 server logs were clean). Fix B205 first so the next run is
   diagnosable. Did NOT start a 3rd soak (context exhausted; needs the err.log + fresh analysis).
+
+## SOAK ATTEMPT 2 root-caused + ATTEMPT 3 launched (2026-06-26)
+- Attempt-2 root cause (via docker-read of syslog-owned ch logs): NO CRASH/OOM. Both ch1 AND ch2 got
+  'Received signal 15' (SIGTERM, graceful) at ~03:00:55-03:01:06; QUERY_WAS_CANCELLED = in-flight INSERTs
+  cancelled by shutdown. Watchdog did NOT trip (disk 484G >> 60G floor, no TRIPPED line). run.py failed
+  with TRANSPORT FAILURE (Connection refused x39 retries) AFTER the servers were stopped. => external
+  teardown (docker stop/down) ~5min in, almost certainly cross-run interference: attempt-1's run_24h.sh
+  (soak.run killed, but my pkill of the script exited 144=interrupted) ran its OLD trap 'down -v' on the
+  SHARED ca-soak project, killing attempt-2. The night-2 BINARY did NOT crash.
+- FIX (operator directive): run_24h.sh now tears down ONLY on happy PHASE3 OK (SOAK_OK=1); on ANY
+  failure it captures compose logs + docker-inspect (OOMKilled/ExitCode) and LEAVES the stack UP. Fixes
+  B205 + prevents cross-run teardown. Committed.
+- ATTEMPT 3: fixed script, MAX_POOL_GB=20 (observe the cap), du-breakdown resmon (scripts/soak_resmon.sh:
+  per-pool-dir du + df + docker system df every 5min → logs/soak_resmon_c.log), 12.5min heartbeat for
+  active health checks. Healthy at launch (pool_bytes probe working, containers up). Field verified clean
+  (no lingering procs). du-evidence will show WHERE disk goes (blobs/trees/roots/gc).
