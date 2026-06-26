@@ -74,6 +74,31 @@ vars == << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, 
 \* ---- helpers (filled across tasks) ----
 NoOp == UNCHANGED vars
 
+\* A blob token stops being current when displaced or deleted (INV_NO_RETURN oracle).
+CondemnedTok(b, t) == t \in deadTok[b]
+
+\* RefMatchesBody / ManifestNamespaceMatches: the body self-describes its ref + ns; a sabotage may
+\* publish a manifest whose body disagrees. A read/fold that accepts a mismatch is unsafe.
+BodyValid(m) == mRef[m] = m /\ mNs[m] = m[1]
+
+\* WStageManifest: write a part-manifest body BEFORE any owner transition (the pre-precommit object).
+\* everEdged tracks instance ids that have ever been bound to a body lineage; NoManifestIdReuse
+\* forbids re-binding a visible instance id to a new body. SabotageReuseManifestId drops the
+\* freshness guard (reuse a ManifestId for a byte-identical future manifest). SabotageAcceptRefMismatch
+\* / SabotageAcceptNamespaceMismatch write a body whose self-ref / self-ns disagree with the id.
+WStageManifest(m, f) ==
+    /\ owner[m] = None /\ ~mBody[m]
+    /\ (m[2] \notin everEdged \/ SabotageReuseManifestId)   \* fresh instance id (never-reused) unless sabotaged
+    /\ mBody' = [mBody EXCEPT ![m] = TRUE]
+    /\ mEntries' = [mEntries EXCEPT ![m] = f]
+    /\ mRef' = [mRef EXCEPT ![m] = IF SabotageAcceptRefMismatch THEN (CHOOSE x \in ManifestIds : x # m) ELSE m]
+    /\ mNs' = [mNs EXCEPT ![m] = IF SabotageAcceptNamespaceMismatch THEN (CHOOSE n \in Namespaces : n # m[1]) ELSE m[1]]
+    /\ everEdged' = everEdged \cup {m[2]}
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, owner, mActiveEdges, journal, blobIndeg,
+                    blobEdges, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
+                    cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
+                    mfDeleted, mPrefix, sweepEligible >>
+
 Init ==
     /\ present = [b \in Blobs |-> FALSE]
     /\ tokOf = [b \in Blobs |-> 0]
@@ -126,11 +151,19 @@ TypeOK ==
 
 INV_JOURNAL_COVERAGE == \A n \in Namespaces : trimBase[n] <= cursor[n]
 
+\* once a body is staged for an instance id, no DIFFERENT body lineage rebinds it (self-ref stays = id):
+NoManifestIdReuse ==
+    \A m \in ManifestIds : mBody[m] => (mRef[m] = m \/ SabotageAcceptRefMismatch)
+RefMatchesBody == \A m \in ManifestIds : (mBody[m] /\ owner[m] # None) => mRef[m] = m
+ManifestNamespaceMatches == \A m \in ManifestIds : (mBody[m] /\ owner[m] # None) => mNs[m] = m[1]
+INV_NO_RETURN == \A b \in Blobs : present[b] => tokOf[b] \notin deadTok[b]
+
 StateConstraint ==
     /\ \A n \in Namespaces : Len(journal[n]) <= MaxLog
     /\ Cardinality(inflight) <= 2
 
-Next == NoOp           \* replaced incrementally in Tasks 2-7
+Next ==
+    \/ \E m \in ManifestIds, f \in [Paths -> Blobs \cup {NoBlob}] : WStageManifest(m, f)
 
 Spec == Init /\ [][Next]_vars
 =============================================================================
