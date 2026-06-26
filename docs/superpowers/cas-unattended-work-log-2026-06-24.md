@@ -213,3 +213,16 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   passes); TRUE remaining = manifest_hash on the per-replica Keeper /parts znode (ReplicatedMergeTreeSink has
   no CA code). Verified: 0 manifest_hash/CA refs in the sink.
 - Independent verification done (archive row, test tags, gate-lift comment, sink grep) — research confirmed.
+
+## Task 1 — B92 carry tree_size on adopt — DONE + verified (commit b44db5dbaf7)
+- observeAndAdmit unified: logical_size = hr.size - blob_header_len for BOTH blobs and trees (tree obj =
+  [blob_header_len envelope][encodeTree payload]); flows to RefPayload.tree_size at publish/precommit.
+- Round-trip test CasProtocol.AdoptTreeRoundTripCarriesRealTreeSize (adopt-republished == freshly-built).
+- Side fix: writeTreeRaw test helper now pads to blob_header_len (was producing sub-header objects that
+  tripped the new guard). Sweep independently verified 362/1-baseline. Risk-check: only publish/precommit
+  consume tree dep.size (closure walk uses retained_trees).
+
+## Task 2 action — envelope domain_id read-check — DONE
+- readTree now fail-closes if header.domain_id != pool_id (cross-pool contamination), right after the
+  logical_hash identity check; emits a CorruptDecode event. Negative test CasStore.ReadTreeRejectsForeignDomainId.
+  Sweep 363/1-baseline. Closes the one pre-freeze gap from the TLV review; envelope now freeze-ready.

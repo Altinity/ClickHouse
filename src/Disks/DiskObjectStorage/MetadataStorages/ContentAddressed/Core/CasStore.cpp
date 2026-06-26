@@ -490,6 +490,29 @@ std::vector<TreeEntry> Store::readTree(const TreeId & id)
             id.string(), u128ToHex(header.logical_hash));
     }
 
+    /// Envelope freeze review (2026-06-26): the envelope `domain_id` is written = pool_id at upload
+    /// (`CasBuild`), so a tree carrying a FOREIGN domain_id at this pool's key is cross-pool
+    /// contamination — corruption. The field was decoded but never enforced; enforce it fail-closed
+    /// here (single pool per disk ⇒ every legitimate in-pool object matches).
+    if (header.domain_id != meta.pool_id)
+    {
+        if (hasEventSink())
+        {
+            CasEvent _ev3;
+            _ev3.type = CasEventType::CorruptDecode;
+            _ev3.object_kind = CasEventObjectKind::Tree;
+            _ev3.object_hash = id.string();
+            _ev3.outcome = "corrupt";
+            _ev3.reason = "tree domain_id mismatch: object belongs to a different pool (cross-pool contamination)";
+            _ev3.detail = {{"code", "CORRUPTED_DATA"}, {"site", "readTree"},
+                       {"carried_domain_id", u128ToHex(header.domain_id)}, {"pool_id", u128ToHex(meta.pool_id)}};
+            emitEvent(_ev3);
+        }
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS tree {} carries domain_id {} but this pool is {} — cross-pool contamination",
+            id.string(), u128ToHex(header.domain_id), u128ToHex(meta.pool_id));
+    }
+
     auto decoded = std::make_shared<const std::vector<TreeEntry>>(
         decodeTree(std::string_view(object->bytes).substr(payloadOffset(header))));
     {

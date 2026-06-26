@@ -359,6 +359,25 @@ TEST(CasStore, ResolveReadLocateRoundTrip)
     (void)blob;
 }
 
+/// Envelope freeze review (2026-06-26): readTree fail-closes on a tree whose envelope domain_id is not
+/// this pool's pool_id (cross-pool contamination). The object decodes cleanly (valid envelope + matching
+/// key/hash) but carries a foreign domain_id.
+TEST(CasStore, ReadTreeRejectsForeignDomainId)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    Layout layout("p");
+
+    const UInt128 foreign = s->poolMeta().pool_id ^ UInt128{1};   /// guaranteed != pool_id
+    std::vector<TreeEntry> entries;
+    entries.push_back(TreeEntry{
+        .name = "x.txt", .placement = Placement::Inline, .file_hash = {},
+        .file_size = 3, .inline_bytes = "abc"});
+    auto tree = writeTreeRaw(*b, layout, entries, foreign);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readTree(tree); });
+}
+
 TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
 {
     /// B113: resolveRef uses a token-validated shard-manifest decode cache. A write to the shard
