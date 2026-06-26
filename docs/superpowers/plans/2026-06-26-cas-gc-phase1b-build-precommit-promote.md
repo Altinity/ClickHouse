@@ -605,7 +605,7 @@ TEST(CasBuild, PrecommitAddWritesTransitionInTargetShard)
 git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h \
         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.cpp \
         src/Disks/tests/gtest_cas_build.cpp
-git commit -m "CA GC phase1b: Build::precommitAdd records PrecommitTransition in the target root shard"
+git commit -m "CA GC phase1b: Build::precommitAdd appends a create-precommit RootOwnerEvent in the target root shard"
 ```
 
 ---
@@ -773,7 +773,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
     });
 }
 ```
-(Where the journal carries `PromotePrecommit`: the canonical `RootShard` in [Canonical Contract](#canonical-contract) already carries `std::vector<PromotePrecommit> promotions` as a first-class third record vector — T1 defines, encodes, and round-trips it. Append the `PromotePrecommit` here into `root.promotions`; replace the `PromotePrecommitToTransition` placeholder with a direct `root.promotions.push_back(...)`. Confirm against the Phase 0 model's `WPromote` so the GC fold in Phase 1d reads exactly this record.)
+(The root journal is the single ordered `std::vector<RootOwnerEvent>` from [Canonical Contract](#canonical-contract): the promote appends exactly one pure-move `RootOwnerEvent` (above) whose `old_binding`/`new_binding` carry the **same** `manifest_ref` — there is no separate `promotions` vector. Confirm against the Phase 0 model's `WPromote` (a same-manifest owner move) so the GC fold in Phase 1d reads exactly this event.)
 
 - [ ] **Step 3: Write the happy-promote gtest.** In `gtest_cas_build.cpp`:
 
@@ -800,8 +800,14 @@ TEST(CasBuild, PromoteMovesOwnerAtomically)
     const RootShard root = decodeRootShard(got->bytes);
     ASSERT_TRUE(root.refs.contains("all_1_1_0"));
     EXPECT_EQ(root.refs.at("all_1_1_0").manifest_ref.manifest_instance_id, id.ref.manifest_instance_id);
-    ASSERT_EQ(root.promotions.size(), 1u);
-    EXPECT_EQ(root.promotions.at(0).final_ref_name, "all_1_1_0");
+    /// The promote is one pure-move RootOwnerEvent: old precommit(T) -> new committed(T), same manifest_ref.
+    const RootOwnerEvent & promote = root.journal.back();
+    ASSERT_TRUE(promote.old_binding.has_value() && promote.new_binding.has_value());
+    EXPECT_EQ(promote.old_binding->owner_kind, OwnerKind::Precommit);
+    EXPECT_EQ(promote.new_binding->owner_kind, OwnerKind::Committed);
+    EXPECT_EQ(promote.old_binding->manifest_ref.manifest_instance_id, id.ref.manifest_instance_id);
+    EXPECT_EQ(promote.new_binding->manifest_ref.manifest_instance_id, id.ref.manifest_instance_id);
+    EXPECT_EQ(promote.new_binding->ref_name, "all_1_1_0");
 }
 ```
 
@@ -1055,10 +1061,10 @@ git commit --allow-empty -m "CA GC phase1b: full Cas*/Ca* gtest sweep green — 
 ## Self-Review {#self-review}
 
 - **Spec coverage:** every sub-section of spec §Build And Precommit Protocol is a task — Stage Part Manifest (T2), Pre-Precommit Part-Manifest Debris / writer side (T7), Final Ref Name Requirement (T3, `final_ref_name` up front so the precommit shares `shardOf(final_ref_name)`), Precommit Add (T3), Blob Uploads Under Precommit (T4), Promote Precommit (T5), Write Path Budget (T5 honours one streaming manifest read + ≤U blob `HEAD`s + one `casPut`), Abandon Or Reclaim Precommit (T5 promote close + T7 abandon). §Root Journal Format → T1. §Part Manifest Ownership (no sharing/moving; `Atomic` rename no-op) → T6. ✓
-- **Canonical contract:** Phase 1a's `ManifestRef`/`ManifestId`/`ManifestEntry`/`PartManifest`/`encodePartManifest`/`decodePartManifest`/`refMatchesBody`/`manifestNamespaceMatches`/`CasLayout::manifestKey` are consumed, not redefined; Phase 1b emits exactly `RootRef`/`OwnerTransition`/`PrecommitTransition`/`PromotePrecommit`/`RootShard` (T1) and `stageManifest`/`precommitAdd`/`promote` (T2/T3/T5), with `buildStagedClosure`/`ClosureNode`/`JournalRecord`/`RefPayload` removed. ✓
-- **Contract is the single source of truth:** the canonical `RootShard` lists all three record vectors `{transitions, precommits, promotions}` up-front; `PromotePrecommit` is a first-class GC-foldable record (not an afterthought). T1 defines/encodes/round-trips it, T5 appends to `root.promotions`, and the promote impl confirms against the Phase 0 `WPromote` action. **Spec contract to honor in Phase 1d:** the fold reads `promotions` as committed-add-or-pure-move per `ManifestActivationMatchesEdges`. ✓
+- **Canonical contract:** Phase 1a's `ManifestRef`/`ManifestId`/`ManifestEntry`/`PartManifest`/`encodePartManifest`/`decodePartManifest`/`refMatchesBody`/`manifestNamespaceMatches`/`CasLayout::manifestKey` are consumed, not redefined; Phase 1b emits exactly `RootRef`/`OwnerKind`/`OwnerBinding`/`RootOwnerEvent`/`RootShard` (T1) and `stageManifest`/`precommitAdd`/`promote` (T2/T3/T5), with `buildStagedClosure`/`ClosureNode`/`JournalRecord`/`RefPayload` removed. ✓
+- **Contract is the single source of truth:** the canonical `RootShard` carries ONE ordered `std::vector<RootOwnerEvent> journal` (no separate transitions/precommits/promotions vectors). T1 defines/encodes/round-trips it (interleaved create-precommit/publish/promote/drop events, `transition_version` order preserved); T5's promote appends one pure-move event, and the impl confirms against the Phase 0 `WPromote` action. **Spec contract to honor in Phase 1d:** the fold reads the single ordered journal in `transition_version` order; a promote (equal `old`/`new` `manifest_ref`) is a pure owner move with blob Δ = 0. ✓
 - **Invariant map:** the [task map](#spec-invariants-this-phase-upholds-task-map) ties each task to `SingleManifestOwner`, `CommittedManifestBodyRequired`, `PrecommitMayReferenceMissingManifest`/`Blob`, `ManifestActivationMatchesEdges`, `MutablePayloadNotReachability` (a mutable-only update = a root-shard CAS changing `RootRef.mutable_files`, emitting no owner transition / no blob delta / no id change), `NoManifestIdReuse`, `OrphanManifestDebrisDrains`. ✓
 - **TDD + no placeholders:** every code step shows actual code; every run step shows the exact command + expected output; each task ends with a commit. Cross-phase surfaces are consumed verbatim, not reinvented: `stageManifest` sets `payload_digest` via Phase 1a's `computePayloadDigest`, and `republishRef` reads source entries via Phase 1c's `Store::readManifest(id).entries` (no bespoke `readManifestEntries` helper). ✓
 - **Style:** Allman braces throughout; only contract type names used; `f` not `f`-applied in prose; "exception" not "crash". ✓
 
-**Gate reminder:** this phase's code tasks presuppose Phase 0 GREEN and Phase 1a landed. Phase 1d (the GC fold + behavior switch) consumes the `RootShard.transitions`/`precommits`/`promotions` records this phase writes.
+**Gate reminder:** this phase's code tasks presuppose Phase 0 GREEN and Phase 1a landed. Phase 1d (the GC fold + behavior switch) consumes the `RootShard.journal` (the single ordered `RootOwnerEvent` stream) this phase writes.
