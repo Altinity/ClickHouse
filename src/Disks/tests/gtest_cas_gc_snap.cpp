@@ -454,3 +454,109 @@ TEST(CasGcSnap, BinaryEncodingIsCompact)
     auto d = decodeGcSnap(bytes);
     EXPECT_EQ(encodeGcSnap(d), bytes);
 }
+
+/// B194: GcSnap::stripTree reverse-index correctness + decode-rebuild proof.
+/// Builds a snap with root->treeA + many treeA->child edges + an unrelated treeB + root edges,
+/// then verifies: (a) stripTree(treeA) returns exactly the expected candidate set; (b) after the
+/// strip, edges contains only treeB edges + root edges; (c) indeg/known are consistent; (d) the
+/// reverse index loses treeA but retains treeB; (e) encode->decode round-trip then
+/// stripTree(treeB) still works (proves the index is rebuilt for free on decode).
+TEST(CasGcSnap, B194StripTreeReverseIndexCorrectnessAndDecodeRebuild)
+{
+    const UInt128 TA  = hexToU128("aa00000000000000000000000000000a");
+    const UInt128 TB  = hexToU128("bb00000000000000000000000000000b");
+    const UInt128 RA  = hexToU128("11000000000000000000000000000001");   /// root target
+    const UInt128 RB  = hexToU128("22000000000000000000000000000002");   /// root target (second)
+
+    /// Build a batch of treeA children (blobs + a subtree).
+    std::vector<UInt128> a_children;
+    for (uint64_t i = 0; i < 20; ++i)
+        a_children.push_back(static_cast<UInt128>(i + 1));               /// distinct hashes
+
+    const UInt128 A_SUB = hexToU128("a900000000000000000000000000000a"); /// tree-as-tree-child
+
+    GcSnap snap;
+
+    /// Two root edges pointing at RA and RB.
+    snap.addRootEdge("srv/tbl/0", "root_part_1", RA);
+    snap.addRootEdge("srv/tbl/0", "root_part_2", RB);
+
+    /// treeA with many blob children + one subtree child.
+    snap.markExpanded(TA);
+    for (const auto & h : a_children)
+        snap.addTreeEdge(TA, ObjectKind::Blob, h);
+    snap.addTreeEdge(TA, ObjectKind::Tree, A_SUB);
+
+    /// treeB with a few blob children.
+    const UInt128 B1 = hexToU128("b100000000000000000000000000000b");
+    const UInt128 B2 = hexToU128("b200000000000000000000000000000b");
+    snap.markExpanded(TB);
+    snap.addTreeEdge(TB, ObjectKind::Blob, B1);
+    snap.addTreeEdge(TB, ObjectKind::Blob, B2);
+
+    /// Build the expected candidate set for stripTree(treeA):
+    /// all a_children blobs + A_SUB tree (each has in-degree 1, so all become candidates).
+    using CandSet = std::set<std::pair<uint8_t, UInt128>>;
+    CandSet expected_a;
+    for (const auto & h : a_children)
+        expected_a.insert({static_cast<uint8_t>(ObjectKind::Blob), h});
+    expected_a.insert({static_cast<uint8_t>(ObjectKind::Tree), A_SUB});
+
+    /// (a) stripTree(treeA) returns the expected candidate set (order-insensitive).
+    auto freed = snap.stripTree(TA);
+    CandSet actual_a;
+    for (const auto & c : freed)
+        actual_a.insert({static_cast<uint8_t>(c.kind), c.hash});
+    EXPECT_EQ(actual_a, expected_a);
+
+    /// (b) After strip: treeA children are gone from edges; root edges and treeB edges remain.
+    ///     Verify by checking in-degrees.
+    for (const auto & h : a_children)
+        EXPECT_EQ(snap.inDegree(ObjectKind::Blob, h), 0u);
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, A_SUB), 0u);
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, RA), 1u);             /// root edge RA still alive
+    EXPECT_EQ(snap.inDegree(ObjectKind::Tree, RB), 1u);             /// root edge RB still alive
+    EXPECT_EQ(snap.inDegree(ObjectKind::Blob, B1), 1u);             /// treeB children intact
+    EXPECT_EQ(snap.inDegree(ObjectKind::Blob, B2), 1u);
+
+    /// (c) treeA expansion marker cleared; treeB still expanded.
+    EXPECT_FALSE(snap.isExpanded(TA));
+    EXPECT_TRUE(snap.isExpanded(TB));
+
+    /// (d) Reverse index consistency: treeA gone (stripTree consumed it), treeB still present
+    ///     — verified indirectly: a second stripTree(treeA) is a no-op (index was cleared) while
+    ///     treeB children are still tracked (stripTree(treeB) will yield them below).
+
+    /// Idempotent: second stripTree(treeA) is a no-op.
+    EXPECT_TRUE(snap.stripTree(TA).empty());
+
+    /// (e) Encode->decode round-trip then stripTree(treeB) works (proves index rebuilds on decode).
+    auto bytes = encodeGcSnap(snap);
+    auto d = decodeGcSnap(bytes);
+
+    /// Decoded snap has the same in-degrees for treeB children.
+    EXPECT_EQ(d.inDegree(ObjectKind::Blob, B1), 1u);
+    EXPECT_EQ(d.inDegree(ObjectKind::Blob, B2), 1u);
+
+    /// After decode, reverse index must be rebuilt: treeB entry must exist (proven by stripTree
+    /// below succeeding), and treeA entry is absent (proven by stripTree(treeA) returning empty —
+    /// the snap was encoded AFTER stripping treeA, so it carries no treeA edges).
+    EXPECT_TRUE(d.stripTree(TA).empty());
+
+    /// stripTree(treeB) on decoded snap yields {B1, B2} as candidates.
+    auto freed_b = d.stripTree(TB);
+    CandSet expected_b = {
+        {static_cast<uint8_t>(ObjectKind::Blob), B1},
+        {static_cast<uint8_t>(ObjectKind::Blob), B2},
+    };
+    CandSet actual_b;
+    for (const auto & c : freed_b)
+        actual_b.insert({static_cast<uint8_t>(c.kind), c.hash});
+    EXPECT_EQ(actual_b, expected_b);
+
+    /// After stripping treeB, a second call is a no-op (index entry was consumed).
+    EXPECT_TRUE(d.stripTree(TB).empty());
+
+    /// The wire format is byte-identical re-encode (no serialized children_by_tree).
+    EXPECT_EQ(encodeGcSnap(decodeGcSnap(bytes)), bytes);
+}

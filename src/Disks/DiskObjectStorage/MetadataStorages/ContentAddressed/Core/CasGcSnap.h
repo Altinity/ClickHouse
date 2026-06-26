@@ -112,6 +112,10 @@ private:
     /// Derived from edges, kept in sync. INVARIANT: indeg never stores a zero count — an entry is
     /// erased the moment it reaches 0, so zeroInDegreeKnown is "known minus indeg keys".
     std::map<NodeKey, uint64_t> indeg;
+    /// Reverse index: parent_tree -> tree-edge ids sourced from that tree. DERIVED; not serialized.
+    /// Rebuilt for free on decode because decodeSnapFields calls addEdge for every edge.
+    /// Turns stripTree from O(all-edges) to O(children-of-parent).
+    std::map<UInt128, std::vector<String>> children_by_tree;
 
     friend String encodeGcSnap(const GcSnap &);
     friend GcSnap decodeGcSnap(std::string_view);

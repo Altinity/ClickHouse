@@ -106,10 +106,19 @@ void GcSnap::addEdge(EdgeRec rec)
     /// have last-op-wins semantics per spec §7 and are handled in addRootEdge, not here.
     const String id = edgeIdFor(rec);
     const NodeKey target{static_cast<uint8_t>(rec.target_kind), rec.target_hash};
+    /// Capture before the move: is_tree and parent are needed to update the reverse index below.
+    const bool is_tree = rec.edge_kind != EdgeKind::Root;
+    const UInt128 parent = rec.parent_tree;
     const auto [it, inserted] = edges.try_emplace(id, std::move(rec));
     known.insert(target);                                        /// known even on duplicate add
     if (inserted)
+    {
         ++indeg[target];
+        /// Maintain the reverse index so stripTree can run in O(children) instead of O(all-edges).
+        /// Only on `inserted`: addEdge is set-semantics, so a duplicate add must NOT double-list.
+        if (is_tree)
+            children_by_tree[parent].push_back(id);
+    }
 }
 
 std::vector<Candidate> GcSnap::addRootEdge(const String & root_shard, const String & part_name, const UInt128 & tree)
@@ -190,16 +199,18 @@ std::vector<Candidate> GcSnap::removeRootEdge(const String & root_shard, const S
 std::vector<Candidate> GcSnap::stripTree(const UInt128 & parent_tree)
 {
     std::vector<Candidate> result;
-    for (auto it = edges.begin(); it != edges.end();)
+    if (auto cit = children_by_tree.find(parent_tree); cit != children_by_tree.end())
     {
-        if (it->second.edge_kind != EdgeKind::Root && it->second.parent_tree == parent_tree)
+        for (const String & id : cit->second)
         {
+            auto it = edges.find(id);
+            if (it == edges.end())
+                continue;                                        /// defensive: should not happen
             if (const auto candidate = dropEdgeTarget(it->second))
                 result.push_back(*candidate);
-            it = edges.erase(it);
+            edges.erase(it);
         }
-        else
-            ++it;
+        children_by_tree.erase(cit);
     }
     expanded.erase(parent_tree);
     return result;
