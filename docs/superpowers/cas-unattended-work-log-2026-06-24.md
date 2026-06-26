@@ -189,3 +189,17 @@ All findings→backlog; write this log; don't stop/don't ask; report in the morn
 Docker-safe: never touch the operator's `archeology` container; port 8123 may be occupied (soak gate).
 Carry-over: heartbeat-removal (Tasks 1-5) DONE + build/sweep-verified (1-baseline); formal combined
 review skipped (clean deletion, green) — superseded by this directive. Sweep binary fresh @ 01:59.
+
+## Task 2 — Envelope TLV / incarnation-zone freeze review (research-envelope-tlv) — DONE
+Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
+- Core (94-byte, hole-free) + TLV + incarnation zone all have documented, non-redundant purpose; NO
+  dead field (unlike the removed heartbeat). incarnation_tag is load-bearing at upload (INV-NO-RETURN);
+  build_id/provenance/intended_ref are intentional write-only forensics/diagnostics (correct to freeze).
+- S3-metadata placement correct: all fields in the envelope BODY (LocalObjectStorage drops S3 user-meta,
+  B167b) — nothing should move to S3 metadata.
+- **PRE-FREEZE ACTION (queued as a small code task):** `domain_id` (offset [38,54), = pool_id at write,
+  CasBuild.cpp:295) is decoded but NEVER verified on read → its stated cross-pool-contamination invariant
+  is unenforced. Add a fail-closed check in `CasStore::readTree` right after the `h.logical_hash != id`
+  check (~line 473): `if (h.domain_id != poolMeta().pool_id) throw CORRUPTED_DATA(...)`; mirror it in the
+  blob read path when that lands. Safe (every in-pool object was written with pool_id; single-pool-per-disk
+  → no legit cross-pool adoption), pre-release (no migration), fail-closed (correct direction).
