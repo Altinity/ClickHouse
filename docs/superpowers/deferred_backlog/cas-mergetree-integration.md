@@ -509,3 +509,23 @@ the AUTHORITATIVE no-loss gate — downgrade `dangling>0-but-oracle-clean` to a 
 flapping-clean tolerance only fires if 0 is reached ONCE; here it never was within 180s). CA-side B185
 root cause (why rustfs returns transient-absent for reachable keys) remains open (rustfs RaW). Relates
 to [[B185]], [[B144]], [[B145]]. | Found attempt-4 soak | `utils/ca-soak/soak/run.py` (`wait_for_pool_consistent` timeout/gate). |
+
+### B207 (fsck CONSISTENCY RACE — proven from code 2026-06-26; root cause of the "phantom dangling") 
+`runFsck` (`Core/CasFsck.cpp`) has NO point-in-time snapshot/fence and never re-validates the ref at
+HEAD-time, so under concurrent GC it manufactures phantom dangling. Three phases at three instants:
+(1) ref-walk lines 108-120 (live `listRefs`+`resolveRef`+`readTree`, ref-by-ref over MINUTES — soak saw
+1088 ref-pages) builds `reachable`; (2) LIST objects lines 123-125 builds `present` (later); (3) compare
++ HEAD-confirm lines 135-163 → `++dangling` if HEAD-absent. RACE: fsck records ref R → objX early; R is
+re-published to a new tree (merge/mutation drops the edge), GC LEGITIMATELY deletes objX (in-degree 0);
+fsck later HEADs objX → absent → reports DANGLING — but R no longer references objX. The HEAD-confirm
+(comment lines 141-146) only guards LIST-lag (present-but-unlisted), NOT stale-reachable
+(deleted-after-walk). **PROOF it's a race not loss:** attempt-4 dangling=243 peaked at gc_checkpoint (max
+re-point+delete churn), settled to 0 when GC quiesced; event log: 0/691,699 deletes used-after-delete (no
+GC over-delete) + 416 recheck-spared (heavy concurrent re-pointing); live data intact (1.25M rows both
+replicas). **This is the real root cause of the recurring soak "dangling" (supersedes the rustfs-RaW
+framing): B185 dangling=94, B206 gate trips, B144/B185 — all the same fsck race.** FIX: when a reachable
+key is HEAD-absent, RE-RESOLVE the ref(s) that referenced it (fsck already has `reachable_from` labels) —
+only TRULY dangling if a CURRENT ref still points at a HEAD-absent key; a superseded ref ⇒ stale-walk
+artifact, skip. (Or: pin a fence/generation and walk refs+objects consistently — harder online.) Relates
+to [[B185]], [[B206]], [[B144]]. | Proven from code + attempt-4 evidence | `Core/CasFsck.cpp` runFsck:
+add ref re-resolution at the HEAD-absent branch (line ~149). |
