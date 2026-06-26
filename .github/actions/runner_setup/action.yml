@@ -6,6 +6,12 @@ runs:
     - name: Setup zram
       shell: bash
       run: |
+          # Skip if zram swap is already active
+          if grep -q '/dev/zram0' /proc/swaps; then
+            echo "/dev/zram0 swap already configured, skipping zram setup."
+            exit 0
+          fi
+
           sudo modprobe zram
           MemTotal=$(grep -Po "(?<=MemTotal:)\s+\d+" /proc/meminfo) # KiB
           Percent=200
