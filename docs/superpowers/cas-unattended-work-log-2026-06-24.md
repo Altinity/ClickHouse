@@ -251,3 +251,10 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   91G mem (41G avail), 32 CPU. Waiter b1omvot2h fires on terminal marker (or 6.5h hang-guard).
 - On completion: record correctness (oracle) + resource curve; if GREEN, loop on next trivial backlog
   task; all findings → backlog.
+
+## SOAK ATTEMPT 1 (night-2) — FAILED at ~1.7h on a HARNESS bug (B204), disk recovered
+- pool_size() O(pool) mc-ls probe timed out as the pool grew → None → compute_throttle fails OPEN →
+  MAX_POOL_GB unenforced → / hit 100%. ch1 err.log 0 bytes, no CA errors → NOT a night-2 regression.
+  disk_watchdog.sh (B167g) exists but was NOT wired into run_24h.sh. Killed soak + scoped down -v →
+  disk reclaimed (431G free). Recorded as B204. NEXT: fix harness (du probe + fail-closed throttle +
+  wire watchdog) then re-run a bounded soak to actually validate the night-2 binary.

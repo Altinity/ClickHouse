@@ -423,3 +423,24 @@ per-kind thresholds become additional settings.
 `PoolConfig` / the disk config parse (the new setting). Keep an absolute hard upper bound so a huge file
 is never held inline regardless of the setting (memory safety). Watch tree-object size / `tree_cache`
 footprint growth in the soak.
+
+### B204 (SOAK-HARNESS bug, found 2026-06-26 night-2) — pool-size probe runaway fills the disk; watchdog unwired
+
+**NOT a CA-code bug.** The night-2 6h soak filled `/` to 100% at ~1.7h. ch1 `clickhouse-server.err.log`
+= 0 bytes, no CA errors anywhere → the server + the night-2 changes (B92, domain_id check, proto rename,
+heartbeat removal) ran clean. Pure soak-harness (`utils/ca-soak`) robustness gaps:
+1. **`soak/pool.py:pool_size()` is O(pool):** runs `mc ls` (HTTP LIST of EVERY object) with a 60s
+   timeout → returns `(None,None)` once the pool is large enough to exceed it (tick #1 had real values,
+   went None mid-run). Should use a cheap filesystem probe — `docker exec ca-soak-rustfs1-1 du -sb
+   /data/test/soak_pool` (the EXISTING `disk_watchdog.sh` already does `du -sm` on roots, proving it's
+   fast + scalable).
+2. **`soak/run.py:compute_throttle()` FAILS OPEN on a None probe** (`pool_bytes is None → return
+   current_sleep_s`, i.e. no throttle) → unbounded growth → `MAX_POOL_GB` never enforced → disk fill.
+   Should FAIL CLOSED (throttle hard when the pool is unmeasurable).
+3. **`disk_watchdog.sh` (B167g, the host-safety net that kills the soak + `down -v` at a 60GiB floor)
+   is NOT wired into `run_24h.sh`** — so nothing stopped the disk filling. Must be started alongside
+   every long soak.
+**Consequence:** the night-2 binary got only ~1.7h of (clean) soak coverage, not a full 6h. Disk was
+reclaimed via scoped `docker compose down -v` (rustfs anon volume). FIX: (1) du-based probe, (2)
+fail-closed throttle, (3) wire the watchdog — then re-run. | Found night-2 soak | `soak/pool.py`,
+`soak/run.py compute_throttle`, `scripts/run_24h.sh` (wire disk_watchdog.sh). |
