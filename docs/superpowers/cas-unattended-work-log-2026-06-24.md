@@ -326,3 +326,15 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   teardown, None-log-crash). ATTEMPT 4 launched (DURATION=6h MAX_POOL_GB=20, robust resmon gated on the
   log marker, 12.5min heartbeat). Disk evidence stands: live pool bounded (~6G); host disk dominated by
   147G docker images + 38.5G reclaimable dangling volumes (operator's prune call).
+
+## GC EVIDENCE from attempt-4 (system.content_addressed_garbage_collection_log, live, ~30min in)
+- ch1 = GC leader (148 Finish rounds); ch2 = NotALeader (1140 lease-checks) — single-leader confirmed.
+- Reclaim: 491,461 objects deleted + 425,537 children cascaded (~917K reclaimed) / 491,841 marked (99.9%).
+- Duration BIMODAL: avg 13.6s, max 476s (~8min). Distribution: <2s=58 rounds (2.7K del), 2-10s=89 (14K),
+  10-60s=3 (12.8K), >60s=6 rounds (463.8K del = 94% of all deletions). The 6 big rounds (rounds 85-91,
+  06:02-06:24) do the bulk: e.g. r88 470s del 130.9K+cascade 182.8K; r89 246s del 192.2K; r87 476s del
+  50.8K+cascade 102K.
+- INSIGHT: GC effective by count but BURSTY — pool grows during inserts, then a multi-minute round
+  reclaims 100-190K objects at once → pool overshoots MAX_POOL_GB (hit 30G vs 20G budget at 06:15) because
+  max insert-throttle can't pace fast enough between big reclaim rounds. Concrete evidence for the O(pool)
+  fold/retire throughput bottleneck (B147 resident-snap / B148 op-count / B160 trim-lag / B201 LIST-discovery).
