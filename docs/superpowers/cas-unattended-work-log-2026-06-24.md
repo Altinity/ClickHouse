@@ -314,3 +314,15 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
 - HARNESS NOTE: each soak run should 'docker compose down -v' on a HAPPY finish (now fixed) AND a
   periodic 'docker volume prune -f' of OWN dangling vols would prevent the 38GB leak — but left to the
   operator given shared-host docker-safety.
+
+## SOAK ATTEMPT 3 — failed ~17min on a HARNESS log-bug (NOT CA, stack preserved by the fix!) → ATTEMPT 4
+- The no-teardown-on-failure fix WORKED: attempt-3 failed but the stack was LEFT UP (containers healthy
+  28min, ch1/ch2 mem 2-2.75G/28G = NO OOM, cpu ~220%). Fully diagnosable for the first time.
+- Real cause: HARNESS bug. run.py:865 tick_once THROTTLE-change log divided pbytes/max_pool_bytes with
+  NO None-guard. The du probe returned None on a tick (best-effort, transient); the B204 fail-closed
+  throttle then made new!=old → the buggy log line ran with pbytes=None → TypeError → metrics thread
+  raise → PHASE3 FAILED. NOT a CA bug (servers healthy).
+- FIXED: None-guard the budget% (commit). 3 harness failure modes now fixed (B204 probe, cross-run
+  teardown, None-log-crash). ATTEMPT 4 launched (DURATION=6h MAX_POOL_GB=20, robust resmon gated on the
+  log marker, 12.5min heartbeat). Disk evidence stands: live pool bounded (~6G); host disk dominated by
+  147G docker images + 38.5G reclaimable dangling volumes (operator's prune call).
