@@ -365,3 +365,12 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
 - ACTIONABLE: B194 (stripTree O(N×M)→O(N)) cuts the CPU half; B148 (deleteExact from snap token, drop the
   per-candidate HEAD) cuts the I/O half. Soak is the before/after target. (trace_log needs
   allow_introspection_functions=1 to symbolize; GC bg-thread IS sampled in Real traces.)
+
+## B194 DONE + verified (commit b02a31f7e3b)
+- GcSnap::stripTree O(N×M)→O(children) via derived children_by_tree (parent_tree→[edge_id]); maintained at
+  the only 2 tree-edge touch points (addEdge insert-when-inserted / stripTree erase-all); rebuilt on decode
+  via addEdge → NOT serialized → no wire change (19/19 CasGcSnap golden/codec tests pass). Behavior-preserving
+  (equivalence + decode-rebuild test CasGcSnap.B194StripTreeReverseIndexCorrectnessAndDecodeRebuild).
+  Independent sweep 364/1-baseline. Built unit_tests_dbms only (soak's mounted binary untouched).
+- NEXT: stop before-baseline soak → ninja clickhouse → re-soak; expect stripTree to drop out of top GC
+  trace_log frames (before = attempt-4's 162-sample stripTree stack).
