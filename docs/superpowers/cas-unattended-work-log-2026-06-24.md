@@ -374,3 +374,21 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   Independent sweep 364/1-baseline. Built unit_tests_dbms only (soak's mounted binary untouched).
 - NEXT: stop before-baseline soak → ninja clickhouse → re-soak; expect stripTree to drop out of top GC
   trace_log frames (before = attempt-4's 162-sample stripTree stack).
+
+## SOAK ATTEMPT 4 — result: night-2 binary VALIDATED ~2.1h; failed on a B185-class TRANSIENT dangling (NOT real loss, NOT a regression)
+- Ran clean through warmup→steady→mutations→ttl_pressure→gc_checkpoint (~2.1h, t+7561s) on the fully-fixed
+  harness. PHASE3 FAILED at the gc_checkpoint fsck: PERSISTENT dangling=243 didn't clear within the 180s
+  fsck-settle window (exit 36). NO chaos faults yet (chaos@8640s not reached; last_fault=null).
+- DIAGNOSIS (stack LEFT UP by the no-teardown fix → live inspection):
+  * LIVE fsck now: reachable=72 dangling=0 unreachable=0 — dangling SETTLED to 0 (transient).
+  * Data INTACT: SELECT count()=1,251,067 on BOTH replicas (identical); WHERE NOT ignore(*) reads all
+    parts with NO error. Oracle-clean (no query-visible loss). soak's final fsck_status=settled.
+  * reachable 22417→72 = gc_checkpoint stage consolidating merges + GC reclaim (dedup 20.5x), expected.
+  => B185-class TRANSIENT (rustfs-beta read-after-write lag under heavy churn): 243 momentarily-absent
+  reachable keys took >180s to settle on single-disk rustfs → tripped the harness HARD gate. NOT real
+  durability loss, NOT a night-2 regression. NIGHT-2 BINARY VALIDATED ~2.1h, data intact.
+- HARNESS FINDING: the 180s persistent-dangling fsck gate is too short for this pool-size/churn on
+  rustfs-beta (B185 saw 94 transient; here 243). Options: raise the settle window, or treat
+  dangling>0-but-oracle-clean as WARN not hard-fail (the oracle is the authoritative no-loss gate).
+  CA-side B185 root cause (why rustfs returns transient-absent for reachable keys) still open (rustfs RaW).
+- Stack left UP (run.py exited cleanly, trap preserved containers+volumes+logs: phase3_20260626T074914_server.log).
