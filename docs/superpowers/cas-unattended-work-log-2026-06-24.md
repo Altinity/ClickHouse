@@ -258,3 +258,9 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   disk_watchdog.sh (B167g) exists but was NOT wired into run_24h.sh. Killed soak + scoped down -v →
   disk reclaimed (431G free). Recorded as B204. NEXT: fix harness (du probe + fail-closed throttle +
   wire watchdog) then re-run a bounded soak to actually validate the night-2 binary.
+
+## SOAK ATTEMPT 2 (night-2) — launched on fixed harness (B204 fix 10fcf585dd3)
+- du-based pool probe (cheap/scalable) + fail-closed throttle + disk_watchdog auto-wired (60G floor).
+  DURATION=6h MAX_POOL_GB=40 SEED=20260626. Logs: soak_night2b.log, resources_night2b.log,
+  disk_watchdog.log. Disk 403G free at launch; triple safety (du-pace / fail-closed / watchdog).
+  Waiter bg93rhr1j fires on terminal marker or ~6.7h guard. Validates the night-2 binary end-to-end.
