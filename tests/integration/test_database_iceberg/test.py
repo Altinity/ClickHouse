@@ -973,85 +973,12 @@ def test_invalid_auth_header_format(started_cluster):
             CREATE DATABASE {CATALOG_NAME}
             ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', 'dummy')
             SETTINGS
-<<<<<<< HEAD
                 catalog_type = 'rest',
                 warehouse = 'demo',
                 auth_header = 'wrong.header'
             """
         )
     assert "Invalid auth header format" in str(err.value)
-=======
-                object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
-        """
-    )
-
-    assert res == "Jack\tSparrow\nJohn\tDow\n"
-
-    res = node.query(
-        f"""
-            SELECT name
-            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
-            WHERE tag in (
-                SELECT id
-                FROM {CATALOG_NAME}.`{root_namespace}.{table_name_2}`
-            )
-            ORDER BY ALL
-            SETTINGS
-                object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
-        """
-    )
-
-    assert res == "Jack\nJohn\n"
-
-    res = node.query(
-        f"""
-            SELECT t1.name,t2.second_name
-            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}` AS t1
-                JOIN `{table_name_local}` AS t2
-                ON t1.tag=t2.id
-            WHERE t1.tag < 10 AND t2.id < 20
-            ORDER BY ALL
-            SETTINGS
-                object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
-        """
-    )
-
-    assert res == "Jack\tBlack\nJohn\tSilver\n"
-
-    res = node.query(
-        f"""
-            SELECT name
-            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
-            WHERE tag in (
-                SELECT id
-                FROM `{table_name_local}`
-            )
-            ORDER BY ALL
-            SETTINGS
-                object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
-        """
-    )
-
-    assert res == "Jack\nJohn\n"
-
-    res = node.query(
-        f"""
-            SELECT t1.name,t2.second_name
-            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}` AS t1
-                CROSS JOIN `{table_name_local}` AS t2
-            WHERE t1.tag < 10 AND t2.id < 20
-            ORDER BY ALL
-            SETTINGS
-                object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
-        """
-    )
-
-    assert res == "Jack\tBlack\nJack\tSilver\nJohn\tBlack\nJohn\tSilver\n"
 
 
 def test_partitioning_by_time(started_cluster):
@@ -1148,4 +1075,3 @@ def test_partitioning_by_string(started_cluster):
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
 
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "a:b,c[d=e/f%g?h\ttest\t12:00:00.000000\n"
->>>>>>> b51229ea981 (Merge pull request #1761 from Altinity/bugfix/antalya-26.3/1535_time_type_write_support)

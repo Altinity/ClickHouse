@@ -8,11 +8,8 @@
 #include <Core/Settings.h>
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypeArray.h>
-<<<<<<< HEAD
 #include <DataTypes/DataTypeCustom.h>
-=======
 #include <DataTypes/DataTypesDecimal.h>
->>>>>>> b51229ea981 (Merge pull request #1761 from Altinity/bugfix/antalya-26.3/1535_time_type_write_support)
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeTuple.h>
