@@ -135,6 +135,15 @@ namespace
 
         if (task_timed_out)
         {
+            /// Serialize against commit(): don't kill a task whose commit is in progress.
+            auto commit_lock = zkutil::EphemeralNodeHolder::tryCreate(
+                fs::path(entry_path) / "commit_lock", *zk, storage.getReplicaName());
+            if (!commit_lock)
+            {
+                LOG_INFO(log, "ExportPartition Manifest Updating Task: commit in progress for {}, skipping timeout kill", entry_path);
+                return;
+            }
+
             const std::string status_path = fs::path(entry_path) / "status";
 
             Coordination::Stat status_stat;
