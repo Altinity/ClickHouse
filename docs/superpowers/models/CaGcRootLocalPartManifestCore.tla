@@ -99,6 +99,135 @@ WStageManifest(m, f) ==
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
                     mfDeleted, mPrefix, sweepEligible >>
 
+\* ---- owner transitions (spec §Build And Precommit Protocol; §Fold Owner Transitions) ----
+PresentBlobs == { b \in Blobs : present[b] }
+\* A committed owner's fail-closed gate: body present+valid AND every named blob present (and not
+\* condemned). SabotageCommitSkipBlobReval drops the blob revalidation; SabotageMissingCommittedEmpty
+\* belongs to the FOLD path (a missing committed body treated as empty), not here.
+CommitGate(m) ==
+    \/ SabotageCommitSkipBlobReval
+    \/ ( mBody[m] /\ BodyValid(m)
+         /\ \A b \in BlobsOf(mEntries[m]) : present[b] /\ ~CondemnedTok(b, tokOf[b]) )
+\* Append one OwnerTransition [ver, ref, old, new] to journal[ns]; version = new length (monotone).
+AppendEvt(j, ns, rf, o, nw) ==
+    [j EXCEPT ![ns] = Append(@, [ver |-> Len(@) + 1, ref |-> rf, old |-> o, new |-> nw])]
+\* A committed ref names exactly one manifest (SingleManifestOwner): a ref may newly own m only when it
+\* owns nothing else, except under SabotageTwoOwners (the sharing hazard #2). A repoint moves a ref off
+\* its current manifest atomically, so the ref is considered free of everything other than mFrom.
+RefFreeFor(ref, mFrom) ==
+    SabotageTwoOwners \/ (\A x \in ManifestIds : owner[x] = ref => x = mFrom)
+
+\* A blob upload: mint a fresh token (never the condemned one unless SabotageReusedTag); present.
+WUploadBlob(b) ==
+    /\ nextTok[b] <= MaxToken
+    /\ LET newt == IF SabotageReusedTag /\ deadTok[b] # {} THEN (CHOOSE t \in deadTok[b] : TRUE) ELSE nextTok[b] IN
+       /\ present' = [present EXCEPT ![b] = TRUE]
+       /\ tokOf' = [tokOf EXCEPT ![b] = newt]
+       /\ nextTok' = [nextTok EXCEPT ![b] = IF SabotageReusedTag /\ deadTok[b] # {} THEN @ ELSE @ + 1]
+    /\ UNCHANGED << deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges, journal, blobIndeg,
+                    blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf,
+                    fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
+                    mfDeleted, mPrefix, sweepEligible >>
+
+\* PrecommitAdd: owner[m] := build bld. A precommit MAY have a missing body only when EnableMissingBody
+\* (the missing-body fail-closed intent). A precommit ACTIVATES (emits edges) iff its body is present
+\* and valid; SabotageMissingBodyActivated forces edges even with the body absent. The journal records
+\* an activation event old=None,new=m for ref=bld.
+WPrecommitAdd(m, bld) ==
+    /\ EnablePrecommit
+    /\ owner[m] = None
+    /\ (mBody[m] \/ EnableMissingBody)                  \* missing body only when allowed
+    /\ Len(journal[m[1]]) < MaxLog
+    /\ owner' = [owner EXCEPT ![m] = bld]
+    /\ mActiveEdges' = [mActiveEdges EXCEPT ![m] =
+            IF SabotageMissingBodyActivated \/ (mBody[m] /\ BodyValid(m))
+            THEN mEntries[m] ELSE [p \in Paths |-> NoBlob]]
+    /\ journal' = AppendEvt(journal, m[1], bld, None, m)
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, blobIndeg,
+                    blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf,
+                    fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
+                    mfDeleted, mPrefix, sweepEligible >>
+
+\* Promote precommit -> committed: the atomic PURE owner move. Same ManifestId, blob Δ=0, NO new
+\* edges (the activation +1 was emitted when the precommit's body arrived, or is still pending if the
+\* precommit is non-activated -- in which case promote must FAIL CLOSED). Single transition
+\* owner[m]: bld -> ref, journal old=m,new=m (a promotion event). Fail-closed gate ON ACTIVATION.
+\* SabotagePromoteAfterMissingBody emits +edges after a missing-body precommit (treats the move as an
+\* activation that adds reachability never folded). SabotageSplitPromote splits the move into
+\* remove-then-add with an interleaving gap (here: drops the owner first, leaving a window).
+\* Split-promote (#3): the move becomes two CAS with a gap and NO fail-closed retry on the add. The
+\* gap lets the precommit be reclaimed / a blob lapse; the non-fail-closed add then publishes a
+\* committed owner WITHOUT revalidating the blob bodies -> a committed ref over an absent blob.
+WPromote(m, bld, ref) ==
+    /\ EnablePrecommit
+    /\ owner[m] = bld
+    /\ RefFreeFor(ref, m)
+    \* split-promote and promote-after-missing-body both drop the atomic fail-closed activation gate:
+    /\ (SabotageSplitPromote \/ SabotagePromoteAfterMissingBody \/ CommitGate(m))
+    /\ Len(journal[m[1]]) < MaxLog
+    /\ owner' = [owner EXCEPT ![m] = ref]
+    /\ journal' = AppendEvt(journal, m[1], ref, m, m)
+    /\ mActiveEdges' = IF SabotagePromoteAfterMissingBody \/ SabotageSplitPromote
+                       THEN [mActiveEdges EXCEPT ![m] = mEntries[m]]  \* re-emit / publish edges unrevalidated
+                       ELSE mActiveEdges
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, blobIndeg,
+                    blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf,
+                    fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
+                    mfDeleted, mPrefix, sweepEligible >>
+
+\* Direct committed publish (no precommit). Same fail-closed body+blob gate as promote. Sets the
+\* committed owner and activates the edges (committed manifests are always activated).
+WPublishCommitted(m, ref) ==
+    /\ owner[m] = None
+    /\ RefFreeFor(ref, m)
+    /\ CommitGate(m)
+    /\ Len(journal[m[1]]) < MaxLog
+    /\ owner' = [owner EXCEPT ![m] = ref]
+    /\ mActiveEdges' = [mActiveEdges EXCEPT ![m] = mEntries[m]]   \* committed publishes the manifest's edges
+    /\ journal' = AppendEvt(journal, m[1], ref, None, m)
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, blobIndeg,
+                    blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf,
+                    fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
+                    mfDeleted, mPrefix, sweepEligible >>
+
+\* Drop a committed ref: owner[m]: ref -> None; a true removal (-1 + mfCleanup queued at fold).
+WDropRef(m) ==
+    /\ owner[m] \in Refs
+    /\ Len(journal[m[1]]) < MaxLog
+    /\ owner' = [owner EXCEPT ![m] = None]
+    /\ journal' = AppendEvt(journal, m[1], owner[m], m, None)
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
+                    blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
+                    roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+
+\* Abandon a precommit owner: owner[m]: bld -> None; a true removal.
+WAbandonPrecommit(m) ==
+    /\ owner[m] \in Builds
+    /\ Len(journal[m[1]]) < MaxLog
+    /\ owner' = [owner EXCEPT ![m] = None]
+    /\ journal' = AppendEvt(journal, m[1], owner[m], m, None)
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
+                    blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
+                    roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+
+\* Repoint a committed ref from mOld to mNew (last-op-wins at the root source): removes mOld and
+\* activates mNew under the SAME ref, in one event (old=mOld, new=mNew). Both must be in the same ns.
+WRepoint(mOld, mNew, ref) ==
+    /\ mOld # mNew /\ mOld[1] = mNew[1]
+    /\ owner[mOld] = ref /\ ref \in Refs /\ owner[mNew] = None
+    /\ RefFreeFor(ref, mOld)
+    /\ CommitGate(mNew)
+    /\ Len(journal[mOld[1]]) < MaxLog
+    /\ owner' = [owner EXCEPT ![mOld] = None, ![mNew] = ref]
+    /\ mActiveEdges' = [mActiveEdges EXCEPT ![mNew] = mEntries[mNew]]
+    /\ journal' = AppendEvt(journal, mOld[1], ref, mOld, mNew)
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, blobIndeg,
+                    blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf,
+                    fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
+                    mfDeleted, mPrefix, sweepEligible >>
+
 Init ==
     /\ present = [b \in Blobs |-> FALSE]
     /\ tokOf = [b \in Blobs |-> 0]
@@ -158,12 +287,35 @@ RefMatchesBody == \A m \in ManifestIds : (mBody[m] /\ owner[m] # None) => mRef[m
 ManifestNamespaceMatches == \A m \in ManifestIds : (mBody[m] /\ owner[m] # None) => mNs[m] = m[1]
 INV_NO_RETURN == \A b \in Blobs : present[b] => tokOf[b] \notin deadTok[b]
 
+\* ---- ownership / dangle invariants (spec §Safety Invariants) ----
+SingleManifestOwner ==
+    SabotageTwoOwners \/ (\A m1, m2 \in ManifestIds :
+        (owner[m1] # None /\ owner[m1] = owner[m2] /\ m1 # m2) => owner[m1] \in Builds)
+CommittedManifestBodyRequired ==
+    \A m \in ManifestIds : (owner[m] \in Refs) => (mBody[m] /\ BodyValid(m))
+PrecommitMayReferenceMissingManifest == TRUE   \* witnessed reachable, not an invariant to hold
+\* Every blob actually emitted as an active edge of a committed manifest is present and live.
+CommittedNoMissingBlob ==
+    \A m \in ManifestIds : (owner[m] \in Refs) =>
+        (\A b \in BlobsOf(mActiveEdges[m]) : present[b] /\ ~CondemnedTok(b, tokOf[b]))
+NoCommittedDangle ==
+    \A m \in ManifestIds : (owner[m] \in Refs) => (mBody[m] /\ \A b \in BlobsOf(mEntries[m]) : present[b])
+INV_NO_DANGLE == NoCommittedDangle
+ReachableBlobs == UNION { BlobsOf(mEntries[m]) : m \in {x \in ManifestIds : owner[x] \in Refs /\ mBody[x]} }
+INV_NO_LOSS == \A b \in ReachableBlobs : present[b]
+
 StateConstraint ==
     /\ \A n \in Namespaces : Len(journal[n]) <= MaxLog
     /\ Cardinality(inflight) <= 2
 
 Next ==
     \/ \E m \in ManifestIds, f \in [Paths -> Blobs \cup {NoBlob}] : WStageManifest(m, f)
+    \/ \E b \in Blobs : WUploadBlob(b)
+    \/ \E m \in ManifestIds, bld \in Builds : WPrecommitAdd(m, bld)
+    \/ \E m \in ManifestIds, bld \in Builds, ref \in Refs : WPromote(m, bld, ref)
+    \/ \E m \in ManifestIds, ref \in Refs : WPublishCommitted(m, ref)
+    \/ \E m \in ManifestIds : WDropRef(m) \/ WAbandonPrecommit(m)
+    \/ \E mOld, mNew \in ManifestIds, ref \in Refs : WRepoint(mOld, mNew, ref)
 
 Spec == Init /\ [][Next]_vars
 =============================================================================
