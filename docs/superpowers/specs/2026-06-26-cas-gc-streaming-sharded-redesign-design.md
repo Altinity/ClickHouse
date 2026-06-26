@@ -9,7 +9,7 @@ doc_type: reference
 
 # CA GC - root-local part manifest redesign - design {#ca-gc-root-local-part-manifest-redesign-design}
 
-**Status:** design (2026-06-26, rev. 14). Branch `codex-gc-proposal-2026-06-26`.
+**Status:** design (2026-06-26, rev. 15). Branch `codex-gc-proposal-2026-06-26`.
 **NOT behavior-preserving.** This is an architectural redesign of CA tree identity, build precommit,
 read-path tree resolution, and GC accounting. CA is pre-release, so no persisted-data compatibility
 path is required. Every behavior-changing phase is gated on a green `TLA+` model extension before code
@@ -21,6 +21,14 @@ intent; `GenerationSeal` is split into the write-once `FoldSeal` and `Completion
 is removed (only discovery and trim are lazy; the fence is always global); the recheck 404 policy is
 made context-specific (matching fold); and the build prefix is modeled explicitly while
 `(root_namespace_id, manifest_instance_id)` remains the unique safety identity.
+
+rev. 15 (review fixes on rev. 14): a missing-body precommit is a **fold barrier** (the durable cursor
+does not advance past it until it activates or is removed), so promotion is always of an activated
+manifest and stays Δ=0; an **owner move** (`old.manifest_ref == new.manifest_ref`) records no blob
+delta and no part-manifest cleanup; introduces `ManifestSafetyId` as the distinct TLA+ abstraction
+term while `ManifestId = (root_namespace_id, ManifestRef)` stays the protocol identity; reconciles
+`ViewableRound` (retired-token view after the retire barrier) with `FoldSeal`/`CompletionSeal`
+(internal products / adoption after completion); tightens the missing-body precommit invariant.
 
 The core change is now sharp: **only blobs remain content-addressed**. A root-local
 immutable tree object is not a folder node and does not point to child tree objects. It is a
@@ -291,6 +299,10 @@ The protocol identity used by GC is namespace-qualified:
 ```
 ManifestId = (root_namespace_id, ManifestRef)
 ```
+
+This `ManifestId` is the **protocol identity** used to locate/address objects and key source edges and
+cleanup work; it is distinct from the `ManifestSafetyId` the TLA+ model abstracts it to (see
+[Abstraction Boundary For The Model](#abstraction-boundary-for-the-model)).
 
 `CasLayout` builds the key as
 `<pool>/roots/<root_namespace>/_manifests/<writer_instance_id>/<build_sequence>/<aa>/<manifest_instance_id>.proto`, with
@@ -623,6 +635,11 @@ After `PrecommitAdd` is visible, the precommit is in exactly one of two states, 
 - **non-activated intent** — the manifest body is missing or invalid. It emits no blob edges, protects
   nothing, and is **not promotable**. It is a fail-closed intent, not corruption.
 
+On the happy path the body exists before `PrecommitAdd`. A missing body makes the precommit a
+non-activating **barrier**: the durable fold cursor is **not folded past it** (see
+[Fold Owner Transitions](#fold-owner-transitions)), so it is never recorded as a folded-past
+non-activated record that a later promotion could read as a pure owner move.
+
 A non-activated precommit cannot be promoted. The writer recovers by re-staging with the body present —
 that is, by creating a **fresh `ManifestId`** (which activates) — never by promoting the
 missing-body intent.
@@ -677,6 +694,12 @@ Commit promotion is a single root-shard CAS over an **already-activated** precom
 already-activated manifest, so blob Δ = 0. The dynamic owner changes; the static manifest and its blob
 edges do not. The single ordered journal guarantees the activating `PrecommitAdd` is folded before the
 promotion, so there is no "was this precommit active when folded earlier?" state on the promote path.
+
+The fold barrier makes this guarantee durable, not merely ordered: GC never advances the fold cursor
+past a missing-body precommit (see [Fold Owner Transitions](#fold-owner-transitions)), so a promotion —
+which requires the precommit binding still present — is **always of an activated manifest**. The `+1`
+source edges were therefore already emitted at activation, and re-emitting them at promote would
+double-count. Promotion correctly stays a pure Δ = 0 owner move and re-emits no edges.
 
 This is simpler than the current `Build::publish` plus best-effort precommit `Remove`: there is no
 leftover stale precommit edge after a successful commit, and no second namespace that GC must discover,
@@ -800,6 +823,27 @@ For every changed root shard, fold the **single ordered `RootOwnerEvent` stream*
 `new_binding`; the ordered fold guarantees an activating `PrecommitAdd` is seen before any promotion of
 it, so no per-event "was this precommit active earlier?" state is needed.
 
+`RootOwnerEvent` handling is defined up front by comparing `old_binding.manifest_ref` and
+`new_binding.manifest_ref`:
+
+- **both present and EQUAL ⇒ OWNER MOVE** (e.g. promote precommit→committed): **no blob delta, no
+  part-manifest cleanup** (the manifest stays owned; only the owner kind changes).
+- **old present, `manifest_ref` no longer owned after the event (true removal) ⇒** emit `−1` for its
+  source edges AND record part-manifest cleanup keyed by that `ManifestId` (single-owner, so a removed
+  binding with no equal new binding is a true removal).
+- **new present, no equal old (activation) ⇒** emit `+1` (subject to the FIX-1 body-present barrier
+  below).
+
+**Fold barrier (missing-body precommit).** GC fold does **NOT** advance the durable fold cursor past a
+`RootOwnerEvent` that leaves a live precommit binding whose manifest body is not yet present and valid.
+Each round re-reads that body; the cursor advances only once (i) the body is present+valid → the
+precommit **ACTIVATES** and emits its `+1` source-edge deltas, or (ii) the precommit binding is removed
+(abandon/reclaim → no edges). Therefore every precommit the fold has advanced past is either activated
+or gone. A promotion requires the precommit binding still present, so it is always of an activated
+manifest → it stays a pure Δ=0 owner move. **Liveness:** a stuck missing-body precommit is bounded by
+the watermark-based precommit reclaim, which removes it (a removal event) and unblocks the cursor; fold
+may collapse an add+remove of a never-activated precommit as a no-op.
+
 For `old_binding` (its `manifest_ref`, interpreted as `ManifestId` in the owning root namespace):
 
 - if the binding was a committed owner, or a precommit that was **activated** when folded, emit `-1`
@@ -809,7 +853,8 @@ For `old_binding` (its `manifest_ref`, interpreted as `ManifestId` in the owning
   deltas (it never contributed any);
 - for an edge-emitting removal, derive the key via `CasLayout`, verify `RefMatchesBody` and
   `ManifestNamespaceMatches` (else fail closed), and stream its entries once;
-- record the `ManifestId` as part-manifest cleanup work for this round/generation.
+- an old binding records `−1` decrements and part-manifest cleanup **ONLY** when it is a true removal
+  (`old.manifest_ref != new.manifest_ref`); an owner move (equal refs) records neither.
 
 For `new_binding` under a **committed** owner (its `manifest_ref`, interpreted as `ManifestId` in the
 owning root namespace):
@@ -912,6 +957,13 @@ by the normal owner-transition path.
 cleanup bundle for the round are durable. This preserves `ViewableRound`: a writer refreshing to round
 `R` sees the complete retired-token set, not a subset produced by faster reducers.
 
+Visibility splits in two. The **retired-token view must be writer-visible after this retire barrier**,
+because writers need it for their publish gate before the destructive-delete proof closes; that is the
+view `ViewableRound` governs. The GC's internal mapper/reducer **products** and the generation
+**adoption** stay internal until the `CompletionSeal` is written. So a round's retired-token view is
+published after the retire barrier, while products and adoption follow `FoldSeal`/`CompletionSeal` (see
+[Sharding Model](#sharding-model)).
+
 ### Global Fence {#global-fence}
 
 The fence is **always global** and coordinator-owned. There is no "lazy fence" and no model-proven
@@ -989,8 +1041,10 @@ durable `RootEdgeIndex` to solve displacement. The displacement decision is made
 shard, then the old/new manifest streams scatter blob deltas to target reducers.
 
 Two replicas may process different blob target shards and part-manifest cleanup ranges concurrently.
-No writer can observe mapper/reducer products until the generation's phase seals (`FoldSeal`, then
-`CompletionSeal`) are written.
+No writer observes the GC's internal mapper/reducer products, and no generation is adopted, until the
+`CompletionSeal` is written; the **retired-token view**, however, is published after the retire barrier
+per `ViewableRound` (when all retired sets and part-manifest cleanup bundles for the round are durable),
+which is exactly what writers consult for their publish gate.
 
 ## What Becomes Simpler {#what-becomes-simpler}
 
@@ -1039,7 +1093,8 @@ Mandatory invariants and liveness obligations:
 - `CommittedManifestBodyRequired`: a committed owner transition cannot become visible unless the named
   manifest body exists and validates.
 - `PrecommitMayReferenceMissingManifest`: a precommit owner may name a missing manifest body; such a
-  precommit emits no blob edges and cannot promote without revalidating a present manifest body.
+  precommit is a non-activating intent: it emits no blob edges and **cannot be promoted at all**; the
+  writer must re-stage with a fresh `ManifestId` once the body is present.
 - `RefMatchesBody`: the journal `ManifestRef` equals the `ref` inside the decoded manifest body; a
   read/fold against a mismatch fails closed.
 - `ManifestNamespaceMatches`: a manifest body's `root_namespace_id` equals the owning root namespace;
@@ -1068,17 +1123,24 @@ Mandatory invariants and liveness obligations:
 
 ### Abstraction Boundary For The Model {#abstraction-boundary-for-the-model}
 
-The model's safety identity is the unique `(root_namespace_id, manifest_instance_id)`, where
-`manifest_instance_id` is random and never reused once it becomes visible. `writer_instance_id` and
-`build_sequence` are **not** part of safety identity: they are a **locator plus sweep-eligibility
-grouping** — the build prefix `_manifests/<writer_instance_id>/<build_sequence>/`.
+The model's safety identity is a **distinct** term, `ManifestSafetyId = (root_namespace_id,
+manifest_instance_id)`, used **only** for the TLA+ abstraction (the `NoManifestIdReuse` /
+`SingleManifestOwner` safety argument), where `manifest_instance_id` is random and never reused once it
+becomes visible. The protocol identity, `ManifestId = (root_namespace_id, ManifestRef)`, is **not**
+renamed: the protocol uses the full `ManifestRef` (`writer_instance_id`, `build_sequence`,
+`manifest_instance_id`) to locate/address the object, while the safety argument rests on the unique
+`manifest_instance_id` alone. `writer_instance_id` and `build_sequence` are **not** part of safety
+identity: they are a **locator plus sweep-eligibility grouping** — the build prefix
+`_manifests/<writer_instance_id>/<build_sequence>/`. The model therefore abstracts `ManifestId` to
+`ManifestSafetyId`.
 
 Because the orphan-sweep and key-collision proofs reason about the real key space, the chosen position
 is to **model the build prefix explicitly**: the Phase-0 model represents a `BuildPrefixes` domain and a
 manifest → prefix mapping with per-prefix sweep-eligibility, so the sweep deletes by prefix and the
 collision proof covers the actual `_manifests/<writer_instance_id>/<build_sequence>/<aa>/<manifest_instance_id>`
-keys. The safety identity nonetheless remains `(root_namespace_id, manifest_instance_id)`: writer and
-build are locator-only and never decide reachability, ownership, or `NoManifestIdReuse`.
+keys. The safety identity nonetheless remains `ManifestSafetyId = (root_namespace_id,
+manifest_instance_id)`: writer and build are locator-only and never decide reachability, ownership, or
+`NoManifestIdReuse`.
 
 ## Negative Controls {#negative-controls}
 
@@ -1131,6 +1193,10 @@ Each negative control must produce the expected counterexample before the phase 
    eliminated by construction because the ordered journal activates before any promote and the
    committed-add-from-inactive-precommit branch no longer exists; the model must reject promotion of a
    non-activated precommit.
+23. Advance the fold cursor past a live missing-body precommit (fold it as non-activated and move on):
+   a later promotion emits Δ = 0 while no `+1` was ever emitted → the committed ref is under-protected
+   (`INV_NO_DANGLE`). The fold barrier (not advancing the cursor past a missing-body precommit) must
+   prevent this.
 
 ## Backpressure And Journal Encoding {#backpressure-and-journal-encoding}
 
