@@ -11,9 +11,9 @@ doc_type: reference
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax; each task is one 2–5 minute action and ends with a commit. Read `2026-06-26-cas-gc-redesign-overview.md` and the [Global Constraints](#global-constraints) below first. **Gate:** the Phase 4 model extension (Task 1) must be GREEN before any code task. **Depends on:** Phase 3 (lazy fence/trim) complete and its gtest sweep green.
 
-**Goal:** Enable `gc_shards > 1` so two replicas can fold and reduce **disjoint blob target shards** concurrently, while exactly one coordinator owns the registry fence, input seal, round visibility, global fence, and generation-pointer advance. The single-shard (`gc_shards = 1`) path must reproduce Phase 1d behavior byte-for-byte (same `GenerationSeal`). This removes the `snap_shards == 1` hard-pin in `Gc::fold` (`Core/CasGc.cpp:1641`), which was safe only because last-op-wins displacement was folded inside one resident snap; owner transitions now carry **both** old and new `ManifestRef`, so the displacement decision is made at the source root shard and reducers need no durable `RootEdgeIndex`.
+**Goal:** Enable `gc_shards > 1` so two replicas can fold and reduce **disjoint blob target shards** concurrently, while exactly one coordinator owns the registry fence, input seal, round visibility, global fence, and generation-pointer advance. The single-shard (`gc_shards = 1`) path must reproduce Phase 1d behavior byte-for-byte (same `CasFoldSeal`). This removes the `snap_shards == 1` hard-pin in `Gc::fold` (`Core/CasGc.cpp:1641`), which was safe only because last-op-wins displacement was folded inside one resident snap; owner transitions now carry **both** old and new `ManifestRef`, so the displacement decision is made at the source root shard and reducers need no durable `RootEdgeIndex`.
 
-**Architecture:** Root-shard mappers stream owner transitions and **scatter** blob deltas by `blobShard(blob_hash, gc_shards)` into per-shard delta runs. Blob target reducers own **disjoint blob-hash ranges** and merge their shard's delta runs (via `RunMerger`) into per-shard in-degree runs (`CasBlobInDegree`) stored in `RunFile`s under `blobTargetRunKey(gen, shard, seq)`. Part-manifest cleanup workers own disjoint `ManifestId` ranges/namespaces. One coordinator owns the global responsibilities; leases are work-dedup only. No writer observes any mapper/reducer product until the `GenerationSeal` is sealed atomically.
+**Architecture:** Root-shard mappers stream owner transitions and **scatter** blob deltas by `blobShard(blob_hash, gc_shards)` into per-shard delta runs. Blob target reducers own **disjoint blob-hash ranges** and merge their shard's delta runs (via `RunMerger`) into per-shard in-degree runs (`CasBlobInDegree`) stored in `RunFile`s under `blobTargetRunKey(gen, shard, seq)`; each reducer contributes its run refs into `CasFoldSeal.blob_target_runs`. Part-manifest cleanup workers own disjoint `ManifestId` ranges/namespaces and contribute their bundle refs into `CasFoldSeal.part_manifest_cleanup`. One coordinator owns the global responsibilities; leases are work-dedup only. The coordinator writes the single `CasCompletionSeal` (fence positions, delete outcomes, trim cursors, adoptable) — the round/adoption visibility point. The GC's internal reducer products and the generation adoption are gated on the `CasCompletionSeal`; the **retired-token view** is published independently, after the retire barrier (`ViewableRound`), not on the `CasCompletionSeal`.
 
 **Tech stack:** C++ (ClickHouse coding standards, Allman braces); Protobuf for the control plane; dense block-framed sorted binary runs (`RunFile`/`DataBlock`/`RunFooter`) for the hot data plane; TLA+ (TLC) for the safety gate; gtest for unit oracles; `ci.praktika` for integration and chaos-soak.
 
@@ -86,9 +86,11 @@ doc_type: reference
 
 These names are fixed by the redesign and are the **only** contract type names this plan uses (do not invent variants):
 
-- `GenerationSeal` — the only writer-visible product; sealed atomically (`Core/CasGenerationSeal.h`).
+- `CasFoldSeal` — the write-once fold seal (`gc/gen/<gen>/fold_seal`, `FormatId::FoldSeal` = "CAFS"); carries `per_ns_shard: map<String, ShardCoverage>`, `blob_target_runs: RunRef[]`, and `part_manifest_cleanup: RunRef[]` (`Core/CasFoldSeal.h`). Per-shard reducers contribute into `blob_target_runs`; cleanup workers into `part_manifest_cleanup`.
+- `CasCompletionSeal` — the write-once completion seal (`gc/gen/<gen>/completion_seal`, `FormatId::CompletionSeal` = "CACS"); carries `generation`, `fence_positions`, `delete_outcomes: RunRef[]`, `trim_cursors`, and `adoptable` (`Core/CasCompletionSeal.h`). The single coordinator writes it; internal reducer products + generation adoption are gated on it.
+- `RunRef` — a compact reference to a `RunFile` product, used in `CasFoldSeal.blob_target_runs` / `part_manifest_cleanup` and `CasCompletionSeal.delete_outcomes`.
 - `CasBlobInDegree` — per-shard reducer state held in `RunFile`s (`Core/CasBlobInDegree.h`).
-- `OwnerTransition` — carries **both** `old_manifest` and `new_manifest` (`ManifestRef`) (`Core/CasRootShardCodec`).
+- `RootOwnerEvent` — one ordered-journal event carrying `old_binding`?/`new_binding`? (each `{OwnerKind, ref_name, build_id, manifest_ref}`); a promote is an owner move with `old_binding.manifest_ref == new_binding.manifest_ref` (`Core/CasRootShardCodec`).
 - `RunFile` / `DataBlock` / `RunFooter` / `RunMerger` — dense sorted binary runs and their k-way merge (`Core/CasRunFile.h`).
 - `ManifestId` / `ManifestRef` — namespace-qualified manifest identity and its compact ref (`Core/CasManifestId.h`).
 - `CasLayout::blobTargetRunKey(gen, shard, seq)` — key for a blob-target run of one shard.
@@ -118,7 +120,7 @@ This phase adds to the Phase 0 `CaGcRootLocalPartManifestCore.tla` vocabulary:
 - CONSTANTS: `Shards` (the blob target shards, e.g. `{s1, s2}`), reuses `Leaders` (e.g. `{L1, L2}`), `EnableSharding`, `SabotageReducerOwnsFence`, `SabotageCrossShardDisplacement`.
 - A pure model function `BlobShard(b)` partitioning `Blobs` into `Shards` (the abstraction of `blobShard(blob_hash, gc_shards)`); reducers act only on their own `BlobShard(b)`.
 - VARIABLES: `shardIndeg` (`[Shards -> [Blobs -> Int]]` per-shard reducer in-degree, replacing the single `blobIndeg` when `EnableSharding`), `coordFence` (the single coordinator-owned fence position, replacing a per-shard fence), and `reducerOwner` (`[Shards -> Leaders]` disjoint-shard ownership).
-- Actions: `GScatterDelta(n, s)` (mapper scatters one owner-transition delta into shard `s`'s run), `GReduceShard(l, s)` (leader `l`, owning shard `s`, merges its delta runs into `shardIndeg[s]`), and a `GCoordSeal` that writes the single `GenerationSeal` only after every shard's reducer product and every cleanup bundle is durable.
+- Actions: `GScatterDelta(n, s)` (mapper scatters one owner-transition delta into shard `s`'s run), `GReduceShard(l, s)` (leader `l`, owning shard `s`, merges its delta runs into `shardIndeg[s]` and contributes into the `CasFoldSeal.blob_target_runs` abstraction), and a `GCoordSeal` that writes the single `CasCompletionSeal` (gating internal products + adoption) only after every shard's reducer product is in the `CasFoldSeal` and every cleanup bundle is durable. The retired-token view's visibility stays modeled by the existing `ViewableRound` / retire-barrier machinery, independent of the completion seal.
 
 ---
 
@@ -150,12 +152,12 @@ ReducerOwns(l, s) == reducerOwner[s] = l
 
 Initialize in `Init`: `shardIndeg = [s \in Shards |-> [b \in Blobs |-> 0]]`, `coordFence = 0`, `reducerOwner = [s \in Shards |-> CHOOSE l \in Leaders : TRUE]`.
 
-- [ ] **Step 2: Add the sharded fold actions.** Add `GScatterDelta`, `GReduceShard`, and the coordinator seal. The mapper scatters BOTH the `old_manifest` `-1` deltas and the `new_manifest` `+1` deltas of one `OwnerTransition` to the target shard of each blob (this is the contract: the displacement is solved at the source, so the reducer never infers the old target from the new ref alone):
+- [ ] **Step 2: Add the sharded fold actions.** Add `GScatterDelta`, `GReduceShard`, and the coordinator seal. The mapper scatters BOTH the `old_binding` `-1` deltas and the `new_binding` `+1` deltas of one `RootOwnerEvent` to the target shard of each blob (an owner move — equal old/new `manifest_ref` — contributes none). The displacement is solved at the source, so the reducer never infers the old target from the new ref alone:
 
 ```tla
-\* Mapper: scatter one owner transition's paired old/new blob deltas into per-shard delta runs,
+\* Mapper: scatter one RootOwnerEvent's paired old/new-binding blob deltas into per-shard delta runs,
 \* routing each blob b to BlobShard(b). SabotageCrossShardDisplacement makes the reducer infer the
-\* displaced old target from the NEW manifest ref alone (dropping the old_manifest's -1 deltas),
+\* displaced old target from the NEW manifest ref alone (dropping the old_binding's -1 deltas),
 \* which is exactly the cross-shard last-op-wins leak the old snap_shards == 1 pin guarded against.
 GScatterDelta(n, s) ==
     /\ EnableSharding
@@ -172,16 +174,17 @@ GReduceShard(l, s) ==
     /\ EnableSharding /\ ReducerOwns(l, s)
     /\ ...
 
-\* Coordinator: ONE leader owns the single global fence and the seal. SabotageReducerOwnsFence lets a
-\* target reducer write an independent per-shard fence instead, so a publish into a root shard that
+\* Coordinator: ONE leader owns the single global fence and the completion seal. SabotageReducerOwnsFence
+\* lets a target reducer write an independent per-shard fence instead, so a publish into a root shard that
 \* protects a blob in a DIFFERENT target shard races past the missing global fence -> INV_NO_DANGLE.
 GCoordFence(l) ==
     /\ ~SabotageReducerOwnsFence
     /\ coordFence' = ...        \* single global fence over the whole fence universe
 GCoordSeal(l) ==
-    /\ \A s \in Shards : ShardReducerDurable(s)   \* every shard's product durable before visibility
+    /\ \A s \in Shards : ShardReducerDurable(s)   \* every shard's product in the CasFoldSeal before adoption
     /\ \A m \in mfCleanupRound : CleanupBundleDurable(m)
-    /\ seal' = ...                                 \* the single GenerationSeal; ViewableRound preserved
+    /\ seal' = ...                                 \* the single CasCompletionSeal gates internal products + adoption;
+                                                   \* the retired-token view stays gated on ViewableRound (retire barrier), not on this seal
 ```
 
 Wire `EnableSharding => (GScatterDelta \/ GReduceShard \/ GCoordFence \/ GCoordSeal)` and `~EnableSharding => (the Phase 1d single-shard fold)` into `Next`, so a `gc_shards = 1` config exercises the original path unchanged.
@@ -374,18 +377,18 @@ inline uint64_t blobShard(const UInt128 & blob_hash, uint64_t gc_shards)
 }
 ```
 
-- [ ] **Step 2: Add the mapper scatter.** In `CasGcShardPlan.h`/`.cpp`, add a `ShardScatter` that takes one `OwnerTransition`'s paired old/new blob-edge lists and appends `+1`/`-1` blob deltas into the per-shard delta-run builders keyed by `blobShard(blob_hash, gc_shards)`. Both the old-manifest `-1` deltas and the new-manifest `+1` deltas are scattered here (the displacement is solved at the source — this is the `SabotageCrossShardDisplacement` defense from Task 1). Emit into `RunFile` delta runs (one per shard), not per-edge objects.
+- [ ] **Step 2: Add the mapper scatter.** In `CasGcShardPlan.h`/`.cpp`, add a `ShardScatter` that takes one `RootOwnerEvent`'s paired old/new-binding blob-edge lists and appends `+1`/`-1` blob deltas into the per-shard delta-run builders keyed by `blobShard(blob_hash, gc_shards)`. Both the old-binding `-1` deltas and the new-binding `+1` deltas are scattered here (an owner move with equal old/new `manifest_ref` contributes none; the displacement is solved at the source — this is the `SabotageCrossShardDisplacement` defense from Task 1). Emit into `RunFile` delta runs (one per shard), not per-edge objects.
 
 ```cpp
-/// Scatter the paired old/new blob deltas of one OwnerTransition into per-shard delta runs.
+/// Scatter the paired old/new-binding blob deltas of one RootOwnerEvent into per-shard delta runs.
 /// `gc_shards` shards, routing each blob by blobShard. Determinism + disjoint coverage are the
 /// contract proven by BlobShard in the model (Task 1) and the gtest below.
 class ShardScatter
 {
 public:
     explicit ShardScatter(uint64_t gc_shards_);
-    void scatterAdd(const UInt128 & blob_hash);     /// +1 (new_manifest edge)
-    void scatterRemove(const UInt128 & blob_hash);  /// -1 (old_manifest edge)
+    void scatterAdd(const UInt128 & blob_hash);     /// +1 (new_binding edge)
+    void scatterRemove(const UInt128 & blob_hash);  /// -1 (old_binding edge)
     /// ... finalize per-shard RunFile delta runs ...
 };
 ```
@@ -587,7 +590,7 @@ git commit -m "CA GC phase4: part-manifest cleanup workers own disjoint Manifest
 
 **Gate:** Task 1 GREEN.
 
-- [ ] **Step 1: Remove the `gc_shards != 1` fold pin** in `CA/Core/CasGc.cpp` (`Core/CasGc.cpp:1641`). Replace the `throw NOT_IMPLEMENTED` with the routed path: when `state.gc_shards > 1`, fold routes each `OwnerTransition`'s paired old/new deltas through `ShardScatter` (Task 3) and each owning leader's `ShardReducer` (Task 4); when `state.gc_shards == 1` it takes the single-shard path unchanged. Update the stale comment that claimed cross-shard displacement is undesigned — the owner transition's old/new pair now solves it at the source (cite the spec §Sharding Model).
+- [ ] **Step 1: Remove the `gc_shards != 1` fold pin** in `CA/Core/CasGc.cpp` (`Core/CasGc.cpp:1641`). Replace the `throw NOT_IMPLEMENTED` with the routed path: when `state.gc_shards > 1`, fold routes each `RootOwnerEvent`'s paired old/new-binding deltas through `ShardScatter` (Task 3) and each owning leader's `ShardReducer` (Task 4); when `state.gc_shards == 1` it takes the single-shard path unchanged. Update the stale comment that claimed cross-shard displacement is undesigned — the `RootOwnerEvent`'s old/new pair now solves it at the source (cite the spec §Sharding Model).
 
 - [ ] **Step 2: Encode the coordinator responsibilities.** Add a `CoordinatorPlan` to `CasGcShardPlan.h`/`.cpp` documenting and enforcing that exactly ONE coordinator owns: registry fence, input seal, round visibility (`ViewableRound`), the single global fence, and the generation-pointer advance. Reducers/cleanup workers own only their disjoint shard work. The global fence stays in `Gc::fence` (coordinator), NOT per reducer — a publish into one root shard can protect blobs in any target shard (spec §Global Fence; the Task 1 `SabotageReducerOwnsFence` control proves an independent reducer fence is unsafe).
 
@@ -642,7 +645,7 @@ git commit -m "CA GC phase4: remove gc_shards==1 fold pin; coordinator owns fenc
 
 **Gate:** Task 1 GREEN.
 
-- [ ] **Step 1: Write the equivalence gtest.** Drive one GC round through `CasInMemoryBackend` (the in-memory backend, `Core/CasInMemoryBackend.h`) twice over an identical scripted journal of owner transitions: once with `gc_shards = 1` via the single-shard path, once with the sharded code path forced to `gc_shards = 1`. Assert the produced `GenerationSeal` bytes are identical, and the resulting blob in-degrees match. This is the load-bearing equivalence: `gc_shards = 1` must produce the **same** `GenerationSeal` as Phase 1d.
+- [ ] **Step 1: Write the equivalence gtest.** Drive one GC round through `CasInMemoryBackend` (the in-memory backend, `Core/CasInMemoryBackend.h`) twice over an identical scripted journal of owner transitions: once with `gc_shards = 1` via the single-shard path, once with the sharded code path forced to `gc_shards = 1`. Assert the produced `CasFoldSeal` bytes are identical, and the resulting blob in-degrees match. This is the load-bearing equivalence: `gc_shards = 1` must produce the **same** `CasFoldSeal` as Phase 1d.
 
 ```cpp
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
@@ -651,7 +654,7 @@ git commit -m "CA GC phase4: remove gc_shards==1 fold pin; coordinator owns fenc
 TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dSeal)
 {
     /// Identical scripted journal; gc_shards=1. The sharded fold path (ShardScatter -> one ShardReducer
-    /// for shard 0) must seal byte-for-byte the same GenerationSeal as the Phase 1d single-shard fold.
+    /// for shard 0) must seal byte-for-byte the same CasFoldSeal as the Phase 1d single-shard fold.
     const String seal_phase1d = runRoundAndReadSeal(/* gc_shards = */ 1, /* force_sharded = */ false);
     const String seal_sharded = runRoundAndReadSeal(/* gc_shards = */ 1, /* force_sharded = */ true);
     EXPECT_EQ(seal_phase1d, seal_sharded);          /// byte-for-byte
@@ -667,7 +670,7 @@ Expected: the test passes (identical seal bytes). If the seals differ, the shard
 - [ ] **Step 3: Commit**
 ```bash
 git add src/Disks/tests/gtest_cas_gc_shard_plan.cpp
-git commit -m "CA GC phase4: gc_shards=1 reproduces Phase 1d GenerationSeal byte-for-byte (equivalence gtest)"
+git commit -m "CA GC phase4: gc_shards=1 reproduces Phase 1d CasFoldSeal byte-for-byte (equivalence gtest)"
 ```
 
 ---
@@ -679,7 +682,7 @@ git commit -m "CA GC phase4: gc_shards=1 reproduces Phase 1d GenerationSeal byte
 
 **Gate:** Task 1 GREEN.
 
-- [ ] **Step 1: Write the two-replica gtest.** Over a shared `CasInMemoryBackend`, run two `Gc` instances (two replicas) with `gc_shards = 2`, each reducing a different blob target shard concurrently (drive both deterministically with no sleeps — alternate their reduce steps from the test thread). Assert: (a) neither replica touches the other's shard's blobs; (b) **no writer observes any mapper/reducer product until the `GenerationSeal` is written** — i.e. before the coordinator seal, a reader querying the would-be in-degree sees only the prior sealed generation; (c) after the single coordinator seal, the merged in-degrees across both shards equal the active-manifest edge multiset.
+- [ ] **Step 1: Write the two-replica gtest.** Over a shared `CasInMemoryBackend`, run two `Gc` instances (two replicas) with `gc_shards = 2`, each reducing a different blob target shard concurrently (drive both deterministically with no sleeps — alternate their reduce steps from the test thread). Assert: (a) neither replica touches the other's shard's blobs; (b) **no writer observes any mapper/reducer product or adopts the generation until the `CasCompletionSeal` is written** — i.e. before the coordinator seal, a reader querying the would-be in-degree sees only the prior sealed generation (the retired-token view is published earlier, after the retire barrier per `ViewableRound`); (c) after the single coordinator seal, the merged in-degrees across both shards equal the active-manifest edge multiset.
 
 ```cpp
 TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
@@ -692,7 +695,7 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
     EXPECT_EQ(readerVisibleGeneration(backend), prior_generation);
     EXPECT_FALSE(generationSealExists(backend, new_generation));
 
-    coordinatorSeal(backend, new_generation);       /// single GenerationSeal, written once
+    coordinatorSeal(backend, new_generation);       /// single CasCompletionSeal, written once (adoption gate)
 
     /// Post-seal: merged in-degree across both shards == active-manifest edge multiset.
     EXPECT_EQ(mergedInDegree(backend, new_generation, b_in_shard0), expected0);
@@ -733,7 +736,7 @@ build/src/unit_tests_dbms --gtest_filter='Cas*:Ca*' > build/test_cas_sweep_phase
 ```bash
 python -m ci.praktika run "integration" --test test_cas_gc_sharded > build/test_cas_gc_sharded_soak.log 2>&1
 ```
-**Analyze the log with a subagent.** Watch for: no dangle/no-loss assertion fires; the regression-watch sees a single `GenerationSeal` per round (no partial-shard visibility); both replicas make reduce progress on disjoint shards. (This is the post-Phase-4 soak required by the overview §Phase exit.)
+**Analyze the log with a subagent.** Watch for: no dangle/no-loss assertion fires; the regression-watch sees a single `CasCompletionSeal` per round (no partial-shard visibility); both replicas make reduce progress on disjoint shards. (This is the post-Phase-4 soak required by the overview §Phase exit.)
 
 - [ ] **Step 4: Commit**
 ```bash
@@ -746,9 +749,9 @@ git commit -m "CA GC phase4: two-replica disjoint-shard integration soak; full C
 ## Self-Review {#self-review}
 
 - **Gate definition matches the overview:** Task 1 is the R0 model gate — `stage5` HOLDs (multi-shard `Shards={s1,s2}`, multi-leader `Leaders={L1,L2}`, `EnableSharding`, disjoint reducers, single coordinator fence) and the two negative controls VIOLATE: `SabotageReducerOwnsFence` ⇒ `INV_NO_DANGLE`, `SabotageCrossShardDisplacement` ⇒ `INV_NO_LOSS`. The whole prior suite is re-greened (Step 7). No code task starts before the gate is green. ✓
-- **Depends on Phase 3, gates Phase 5:** declared in the header; the plan consumes the Phase 1d/2/3 contract types (`GenerationSeal`, `CasBlobInDegree`, `OwnerTransition` old+new, `blobTargetRunKey`, `partManifestCleanupKey`) and emits `CasGcShardPlan` + the `gc_shards` config that Phase 5 builds on. ✓
+- **Depends on Phase 3, gates Phase 5:** declared in the header; the plan consumes the Phase 1d/2/3 contract types (`CasFoldSeal`/`CasCompletionSeal`, `CasBlobInDegree`, `RootOwnerEvent` old/new bindings, `blobTargetRunKey`, `partManifestCleanupKey`) and emits `CasGcShardPlan` + the `gc_shards` config that Phase 5 builds on. ✓
 - **Spec coverage (§Sharding Model / §Phase 4):** mappers scatter by `blobShard(blob_hash, gc_shards)` (Task 3); reducers own disjoint blob-hash ranges and merge via `RunMerger` into `CasBlobInDegree` runs (Task 4); part-manifest cleanup workers own disjoint `ManifestId` ranges/namespaces (Task 5); one coordinator owns registry fence / input seal / round visibility / global fence / generation-pointer advance, leases work-dedup only (Task 6); `gc_shards` default 1 (Task 2); two replicas process disjoint shards with no pre-seal visibility (Task 8); no `RootEdgeIndex` because owner transitions carry old+new refs (the `SabotageCrossShardDisplacement` defense). ✓
-- **Single-shard equivalence:** Task 7 proves `gc_shards = 1` reproduces the Phase 1d `GenerationSeal` byte-for-byte — the safety net for removing the `gc_shards != 1` fold pin (`Core/CasGc.cpp:1641`) in Task 6. ✓
+- **Single-shard equivalence:** Task 7 proves `gc_shards = 1` reproduces the Phase 1d `CasFoldSeal` byte-for-byte — the safety net for removing the `gc_shards != 1` fold pin (`Core/CasGc.cpp:1641`) in Task 6. ✓
 - **TDD + bite-sized + commits:** every task is one 2–5 minute action, ends with a commit, and each code task writes a failing-then-passing gtest before/with the implementation. No placeholders — exact paths, real cfg/code skeletons, runnable commands with expected output. ✓
 - **Constraints honored:** Allman braces in all C++ skeletons; only contract type names used; build/test logs redirected and subagent-analyzed; no `sleep` (Task 8 interleaves deterministically from the test thread); commits on `cas-gc-part-manifest-impl` with the two trailers; no compat shim for the `snap_shards`→`gc_shards` rename (unreleased format). ✓
 - **Two sharding axes kept distinct:** the `fence_version` root-shard axis is untouched; only the blob-target axis knob is renamed `snap_shards`→`gc_shards` (Task 2), matching `Core/CasGcFormats.h:33-37`. ✓
