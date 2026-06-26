@@ -239,3 +239,15 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   (gc-snap protobuf, deferred), B186 (CaWiringOps.FreezeViaHardLinksIntoShadow shadow-listing — the 1
   baseline-red gtest), B194 (GcSnap::stripTree O(NxM)), plus the larger cost/perf program (B147/B148/
   B158/B168/B178/B201) and the soak-confirmation items (B185/B199).
+
+## 6h SOAK launched (2026-06-26 ~02:5x) — night-2 binary
+- Field clear: no foreign containers, port 8123 free. Server rebuilt clean (ninja clickhouse exit 0,
+  binary 02:52) with ALL night-2 changes (B92, domain_id check, proto rename, heartbeat removal).
+- Command: cd utils/ca-soak; SEED=20260626 DURATION=6h WORKERS=6 METRICS=logs/soak_night2_metrics.db
+  MAX_POOL_GB=40 bash scripts/run_24h.sh (phase-3 time-driven chaos; compare_aggregates oracle + fsck at
+  checkpoints; exits non-zero on any failure). Scoped to compose project 'ca-soak'.
+- Logs: soak_night2.log (driver), resources_night2.log (CPU/mem/disk every 5min), phase3_*_server.log
+  (docker logs preserved at teardown), ch1/ch2 (per-node CH logs). Resources at start: 546G free disk,
+  91G mem (41G avail), 32 CPU. Waiter b1omvot2h fires on terminal marker (or 6.5h hang-guard).
+- On completion: record correctness (oracle) + resource curve; if GREEN, loop on next trivial backlog
+  task; all findings → backlog.
