@@ -32,12 +32,18 @@ mkdir -p "$LOGDIR/ch1" "$LOGDIR/ch2"
 chmod 777 "$LOGDIR/ch1" "$LOGDIR/ch2"
 
 docker compose down -v >/dev/null 2>&1; docker compose up -d
-trap 'docker compose logs --no-color > "$COMPOSE_LOG" 2>&1 || true; echo "preserved docker logs -> $COMPOSE_LOG"; docker compose down -v' EXIT
+WATCHDOG_PID=""
+trap 'docker compose logs --no-color > "$COMPOSE_LOG" 2>&1 || true; echo "preserved docker logs -> $COMPOSE_LOG"; kill $WATCHDOG_PID 2>/dev/null || true; docker compose down -v' EXIT
 
 # Wait for both replicas HTTP-healthy.
 for url in http://localhost:8123 http://localhost:8124; do
   for i in $(seq 1 90); do curl -sf "$url/ping" >/dev/null 2>&1 && break; sleep 1; done
 done
+
+# Start the host-disk safety watchdog (B167g/B204). It exits on its own when the driver finishes,
+# but the EXIT trap kills it explicitly so no stray process lingers after teardown.
+bash scripts/disk_watchdog.sh &
+WATCHDOG_PID=$!
 
 PYTHONPATH="$(pwd)" python3 -m soak.run \
   --seed "$SEED" --phase 3 --duration "$DURATION" --workers "$WORKERS" \

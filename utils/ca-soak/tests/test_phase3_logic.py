@@ -2,7 +2,7 @@ import pytest
 
 from soak.run import (
     parse_duration, metrics_interval_for, compute_throttle, _phase3_op_permitted,
-    phase3_chaos_schedule, demote_dense_mutations, GB, METRICS_INTERVAL_S,
+    phase3_chaos_schedule, demote_dense_mutations, GB, METRICS_INTERVAL_S, _THROTTLE_MAX,
 )
 from soak.schedule import stage_plan, StageKind
 from soak.ledger import Op, OpType, generate_ledger
@@ -40,9 +40,17 @@ def test_metrics_interval_scales_down_for_short_runs():
 
 
 # --- compute_throttle --------------------------------------------------------------------------
-def test_throttle_unknown_pool_keeps_current():
-    assert compute_throttle(None, 40 * GB, current_sleep_s=0.25) == 0.25
+def test_throttle_unknown_pool_fail_closed_when_budget_set():
+    # B204: unknown pool + budget set -> FAIL CLOSED (max throttle), not fail-open (keep current).
+    assert compute_throttle(None, 40 * GB, current_sleep_s=0.0) == _THROTTLE_MAX
+    assert compute_throttle(None, 40 * GB, current_sleep_s=0.25) == _THROTTLE_MAX
+
+
+def test_throttle_unknown_pool_passthrough_when_no_budget():
+    # No budget configured -> pool measurement is informational; keep the current throttle.
+    assert compute_throttle(None, None, current_sleep_s=0.25) == 0.25
     assert compute_throttle(10 * GB, None, current_sleep_s=0.1) == 0.1
+    assert compute_throttle(None, 0, current_sleep_s=0.3) == 0.3
 
 
 def test_throttle_bands():

@@ -760,20 +760,32 @@ class ChaosRunner(threading.Thread):
             log(f"CHAOS thread error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
+_THROTTLE_MAX = 1.0    # the heaviest pacing the over-budget branch applies
+
+
 def compute_throttle(pool_bytes, max_pool_bytes, *, current_sleep_s):
     """Resource-bounding policy (pure + unit-tested). Given the latest physical `pool_bytes` and the
     `max_pool_bytes` budget, decide the per-insert throttle sleep (seconds).
 
-    - pool unknown (None) -> keep the current throttle (don't react to a missing probe).
+    - pool unknown (None) AND no budget set -> keep the current throttle (no-op, pass-through).
+    - pool unknown (None) AND budget IS set -> FAIL CLOSED: return `_THROTTLE_MAX` so an
+      unmeasurable pool STOPS growth instead of running away. This is the B204 fix: the old
+      fail-open (keep current_sleep_s) let a timed-out probe keep the throttle at 0 while the pool
+      grew unchecked, filling the host disk to 100% in ~1.7h.
     - < 75% of budget   -> 0.0 (unthrottled; plenty of headroom).
     - 75%..90%          -> mild pacing (0.05s/insert).
     - 90%..100%         -> hard pacing (0.25s/insert).
-    - >= 100% of budget -> heavy pacing (1.0s/insert) — never DROP work, only slow it (the TTL
-      horizon is the real cap; throttling buys time for eviction + GC to reclaim).
+    - >= 100% of budget -> heavy pacing (`_THROTTLE_MAX` = 1.0s/insert) — never DROP work, only
+      slow it (the TTL horizon is the real cap; throttling buys time for eviction + GC to reclaim).
 
     Returns the new throttle sleep. The caller LOGS loudly on any change (never silently)."""
-    if pool_bytes is None or max_pool_bytes is None or max_pool_bytes <= 0:
+    if max_pool_bytes is None or max_pool_bytes <= 0:
+        # No budget configured: pool measurement is informational only; no throttle decision.
         return current_sleep_s
+    if pool_bytes is None:
+        # Budget is set but pool is unmeasurable — FAIL CLOSED to the maximum throttle so an
+        # unavailable probe cannot allow unchecked pool growth (B204).
+        return _THROTTLE_MAX
     frac = pool_bytes / max_pool_bytes
     if frac < 0.75:
         return 0.0
@@ -781,7 +793,7 @@ def compute_throttle(pool_bytes, max_pool_bytes, *, current_sleep_s):
         return 0.05
     if frac < 1.00:
         return 0.25
-    return 1.0
+    return _THROTTLE_MAX
 
 
 class MetricsTicker(threading.Thread):
