@@ -9,13 +9,13 @@ doc_type: reference
 
 # CA GC - root-local full-tree manifest redesign - design {#ca-gc-root-local-full-tree-manifest-redesign-design}
 
-**Status:** design (2026-06-26, rev. 9). Branch `codex-gc-proposal-2026-06-26`.
+**Status:** design (2026-06-26, rev. 10). Branch `codex-gc-proposal-2026-06-26`.
 **NOT behavior-preserving.** This is an architectural redesign of CA tree identity, build precommit,
 read-path tree resolution, and GC accounting. CA is pre-release, so no persisted-data compatibility
 path is required. Every behavior-changing phase is gated on a green `TLA+` model extension before code
 lands.
 
-The core change is now sharper than rev. 7: **only blobs remain content-addressed**. A root-local
+The core change is now sharp: **only blobs remain content-addressed**. A root-local
 immutable tree object is not a folder node and does not point to child tree objects. It is a
 **full-tree manifest**: one immutable object containing the complete logical subtree, including all
 file paths, inline payloads, and blob references. Directories inside it are path prefixes or an
@@ -28,11 +28,11 @@ that one manifest object as a stream and emits blob deltas. There are no nested 
 parent-child tree ownership, no tree expansion markers, no GC-side cascade state, and no full-closure
 root journal records.
 
-Rev. 9 closes the rev. 8 manifest-addressing gap: ref/owner/precommit records carry a `ManifestRef`
-(`manifest_nonce` + `writer_id` + `build_seq`); the S3 key is derived from it via `CasLayout`; the
-reserved segment is renamed `_subtrees` -> `_manifests`; and manifest-body identity checks
-(the body's `ManifestRef` and `root_namespace_id` must match the journal ref and owning namespace) become
-invariants.
+This design closes the remaining protocol gaps: the GC identity is namespace-qualified
+`ManifestId = (root_namespace_id, ManifestRef)`; manifests are never shared between refs or root
+namespaces; mutable per-ref payload stays in the root ref; orphan-manifest sweep is fenced by a
+durable build-death mark; `_manifests` is a reserved layout segment; and the operation cost is stated
+as `O(changed manifest entries)`, not as a tree diff.
 
 ## Goals {#goals}
 
@@ -41,9 +41,10 @@ The design must satisfy the original requirements:
 - **R0: safety is non-negotiable and `TLA+`-provable.** No delay, race, duplicate worker, interrupted
   attempt, stale view, or backend reorder may make the system less reliable. `INV_NO_DANGLE`,
   `INV_NO_LOSS`, and `INV_NO_RETURN` must be proved, not argued.
-- **R1: each GC round is optimal.** Work is proportional to changed root owner transitions,
-  deactivated full-tree manifests, and blobs whose in-degree changes. Memory is bounded by stream
-  buffers. GC state is stored as coarse write-once objects.
+- **R1: each GC round is bounded and streaming.** Work is proportional to changed root owner
+  transitions and the entries of the manifests those transitions name. Reducers cancel unchanged blob
+  edges after scatter. Memory is bounded by stream buffers. GC state is stored as coarse write-once
+  objects.
 - **R2: target-shardable GC.** Default `gc_shards = 1`, with the option for different replicas to own
   disjoint blob target shards.
 - **R3: simple, reliable, debuggable.** Durable state must explain what every round has folded,
@@ -64,18 +65,19 @@ This is not a local GC optimization. It changes the formal object model, the roo
 the read path, and the meaning of `fold`.
 
 The `TLA+` model must change because the current model treats trees as content hashes with `treeEdges`,
-`marker`, and a cascade action. Rev. 8 needs a new model branch with:
+`marker`, and a cascade action. This design needs a new model branch with:
 
 - random 128-bit `manifest_nonce` per full-tree manifest;
 - root-local immutable full-tree manifest bodies addressed by a structured `ManifestRef`
-  (`manifest_nonce` + `writer_id` + `build_seq`), with `RefMatchesBody` and
-  `ManifestNamespaceMatches` checks;
+  (`manifest_nonce` + `writer_id` + `build_seq`);
+- namespace-qualified `ManifestId = (root_namespace_id, ManifestRef)` as the only GC identity, with
+  `RefMatchesBody` and `ManifestNamespaceMatches` checks;
 - no nested tree objects and no child tree edges;
-- `SingleManifestOwner` and `NoManifestRefReuse`;
+- `SingleManifestOwner` and `NoManifestIdReuse`;
 - precommit owners, committed owners, and atomic `PromotePrecommit`;
 - precommit-visible missing blob leaves;
 - blob in-degree derived only from active full-tree manifests;
-- manifest-delete work keyed by `ManifestRef`;
+- manifest-delete work keyed by `ManifestId`;
 - namespace-scoped orphan manifest debris for objects written before `PrecommitAdd`;
 - the existing global registry/root fence and fold-through-fence recheck.
 
@@ -86,7 +88,7 @@ discover -> fold -> retire -> fence -> recheck -> exact-token delete -> trim
 ```
 
 What changes is `fold`. Today it folds root ref records into root edges, expands content-addressed
-trees, and later relies on cascade to remove child edges. Rev. 8 folds root owner transitions, reads a
+trees, and later relies on cascade to remove child edges. This design folds root owner transitions, reads a
 single root-local full-tree manifest object for each old/new owner, and emits blob deltas directly.
 There is no resident tree-child authority inside GC after the fold output is sealed.
 
@@ -117,17 +119,17 @@ The current implementation has four load-bearing properties that the new design 
   `JournalRecord.closure` with `ClosureNodeProto` records for staged trees. This was the B199-S2 fix:
   GC must not have to read a vanished staged tree to learn the precommit closure.
 
-The current code also shows where rev. 8 cuts complexity:
+The current code also shows where this design cuts complexity:
 
 - `Build::stageTree` mints `TreeId` from a Merkle/content hash and retains encoded tree payload for
-  re-upload. Rev. 8 changes `TreeId` to a root-local full-tree manifest id; the optional payload digest
+  re-upload. This design changes `TreeId` to a root-local full-tree `ManifestId`; the optional payload digest
   is only integrity/debug data.
 - `Store::readTree` assumes trees are global immutable content objects under `trees/<prefix>/<hash>`.
-  Rev. 8 reads full-tree manifests from the owning root prefix instead.
-- `RootShardManifest` is a whole-object protobuf with `refs` and repeated `JournalRecord`. Rev. 8
+- This design reads full-tree manifests from the owning root prefix instead.
+- `RootShardManifest` is a whole-object protobuf with `refs` and repeated `JournalRecord`. This design
   still wants the planned streaming protobuf migration, but the records are compact owner transitions,
   not full closures.
-- `CasLayout` has global `blobKey` and `treeKey`. Rev. 8 keeps `blobKey` and replaces CA `treeKey`
+- `CasLayout` has global `blobKey` and `treeKey`. This design keeps `blobKey` and replaces CA `treeKey`
   with root-local full-tree manifest keys.
 
 ## Formal Model Ground Truth {#formal-model-ground-truth}
@@ -149,13 +151,13 @@ The current code also shows where rev. 8 cuts complexity:
 - reclaiming a precommit of a still-live but judged-dead build is safe only because `Commit` rechecks
   all blob leaves before publishing.
 
-Rev. 8 keeps these proof obligations, but changes the tree model:
+This design keeps these proof obligations, but changes the tree model:
 
 - tree identities are no longer content hashes;
 - a full-tree manifest is a single-owner root-local object;
 - there is no tree-child protocol graph;
 - only blob objects are content-addressed, deduplicated, and shared across roots;
-- a full-tree manifest id is never reused after it becomes visible in any root journal.
+- a full-tree `ManifestId` is never reused after it becomes visible in any root journal.
 
 ## Core Principle {#core-principle}
 
@@ -178,10 +180,10 @@ prefixes. If lookup/list performance needs it, the same manifest object may incl
 directory index, but that index is still part of the single immutable manifest payload.
 
 Only blobs are content-addressed. Full-tree manifests are not deduplicated by payload. If two parts
-have byte-identical logical metadata, they still get different manifest ids. The payload may carry a
+have byte-identical logical metadata, they still get different `ManifestId`s. The payload may carry a
 digest for corruption detection, but that digest is not identity and is never used as a GC key.
 
-This is the key simplification: stale work is keyed by a unique full-tree manifest id, not by a content
+This is the key simplification: stale work is keyed by a unique full-tree `ManifestId`, not by a content
 hash that a future publish can revive.
 
 ## Object Identity And Ownership {#object-identity-and-ownership}
@@ -198,12 +200,11 @@ key       = <pool>/blobs/<first2>/<blob_hash>
 Blob payloads keep incarnation tokens. Exact-token delete remains the only destructive content delete
 authority. Blob dedup remains the main storage win.
 
-### Full-Tree Manifest Reference {#full-tree-manifest-reference}
+### Full-Tree Manifest Reference And Identity {#full-tree-manifest-reference-and-identity}
 
-A manifest is named by one self-contained `ManifestRef`. There is no separate id-plus-locator: the ref
-*is* the identity, and `CasLayout` derives the S3 key from it deterministically. Keeping the ref
-structured (not a string key) keeps journal authority free of path strings and lets the layout evolve
-in `CasLayout`:
+A root journal stores a compact `ManifestRef`. `CasLayout` derives the object key from that ref and the
+owning root namespace. Keeping the ref structured, not a string key, keeps journal authority free of
+path strings and lets the layout evolve in `CasLayout`:
 
 ```
 ManifestRef {
@@ -213,16 +214,26 @@ ManifestRef {
 }
 ```
 
+The protocol identity used by GC is namespace-qualified:
+
+```
+ManifestId = (root_namespace_id, ManifestRef)
+```
+
 `CasLayout` builds the key as
 `<pool>/roots/<root_namespace>/_manifests/<writer_id>/<build_seq>/<aa>/<manifest_nonce>.proto`, with
-`<aa>` derived from `manifest_nonce`. The whole `ManifestRef` is the GC identity — source edges,
-in-degree, manifest-delete work, and `NoManifestRefReuse` are all keyed by it. `root_namespace` is
-**not** stored in the ref; it comes from the owning root context.
+`<aa>` derived from `manifest_nonce`. Source edges, blob deltas, manifest-delete work, owner sets, and
+`NoManifestIdReuse` are all keyed by `ManifestId`, not by a bare `ManifestRef`. `root_namespace_id`
+is **not** stored in the ref carried by the root journal; it comes from the owning root context.
+
+This distinction is load-bearing. Two namespaces may legally have the same
+`(writer_id, build_seq, manifest_nonce)` tuple without addressing the same object key. A reducer that
+merged by `ManifestRef` alone could combine unrelated source edges or delete work across namespaces.
 
 Requirements:
 
 - `manifest_nonce` is random and never derived from payload;
-- no visible `ManifestRef` is ever reused;
+- no visible `ManifestId` is ever reused;
 - manifest objects are immutable write-once objects;
 - a nonce collision fails closed before any root journal transition becomes visible.
 
@@ -249,7 +260,7 @@ Entry {
 ```
 
 Entries are canonicalized by path. Duplicate paths are corruption. Duplicate blob hashes across
-different paths are allowed and are folded by deterministic source edge ids `(ManifestRef, path)`.
+different paths are allowed and are folded by deterministic source edge ids `(ManifestId, path)`.
 
 Two checks make a ref trustworthy, both modeled as invariants and fail-closed at read/fold time:
 
@@ -260,7 +271,7 @@ Two checks make a ref trustworthy, both modeled as invariants and fail-closed at
 
 ### Manifest Ownership {#manifest-ownership}
 
-A visible full-tree manifest has at most one structural owner:
+A visible full-tree manifest has at most one structural owner, identified by `ManifestId`:
 
 - a committed root ref;
 - a precommit ref.
@@ -273,6 +284,17 @@ invariant instead: a manifest owner is singular and explicit.
 
 An implementation may represent the move as `old_owner -> new_owner` inside one journal record. It
 must not expose a state where neither owner exists.
+
+Manifests are never shared across refs and never shared across root namespaces. If a part must appear
+in another table or root namespace, the destination publishes a new full-tree manifest with a fresh
+`ManifestId` over the same content-addressed blob hashes, then the source ref is dropped if the
+operation is a move. Blob dedup gives the storage win; manifest metadata is deliberately duplicated to
+keep ownership local and singular.
+
+`Atomic` database `RENAME TABLE` is namespace-stable for CA because the storage root is UUID-keyed. It
+does not move the CA folder, does not change `ManifestId`, and does not need a manifest operation.
+Legacy or cross-table republish paths are ordinary destination publishes plus source drops; there is
+no cross-namespace manifest move primitive.
 
 ## S3 Layout {#s3-layout}
 
@@ -291,12 +313,17 @@ Root-local full-tree manifests live under the owning root prefix:
   _manifests/<writer_id>/<build_seq>/<aa>/<manifest_nonce>.proto
 ```
 
-`_manifests` is a reserved segment, like `_files` (renamed from `_manifests` in rev. 9, since CA is
-pre-release and the object is one immutable full-tree manifest, not a nested subtree).
+`_manifests` is a reserved segment, like `_files` (renamed from the earlier `_subtrees` name because
+the object is one immutable full-tree manifest, not a nested subtree).
+
+`_manifests` must be rejected by `CasLayout::checkNamespace` as a namespace segment. Namespace/root
+listers must not expose it as a user namespace; registry-based namespace discovery already makes that
+the normal path, but raw LIST helpers must preserve the same rule.
 
 The `<writer_id>/<build_seq>` prefix doubles as build-scoped debris cleanup and diagnostics;
-`manifest_nonce` is the random 128-bit collision-safety field and the whole `ManifestRef` is the
-identity. The `<aa>` fanout is derived from `manifest_nonce`, not from the payload digest.
+`manifest_nonce` is the random 128-bit collision-safety field. The GC identity is `ManifestId`, while
+the root journal carries the compact `ManifestRef`. The `<aa>` fanout is derived from
+`manifest_nonce`, not from the payload digest.
 
 For the user's example namespace, the layout can be:
 
@@ -311,8 +338,8 @@ where `17` is a root shard manifest and `_manifests/srv-a/1042/7f/7f3a...c1.prot
 full-tree manifest staged by build sequence `1042`.
 
 Important: the build-scoped prefix is not a deletion authority. A manifest can remain live after the
-build sequence is below the watermark because promotion keeps the same manifest id and object. Cleanup
-must check liveness per manifest id against a sealed namespace owner view; it must never delete a whole
+build sequence is below the watermark because promotion keeps the same `ManifestId` and object. Cleanup
+must check liveness per `ManifestId` against a sealed namespace owner view; it must never delete a whole
 build prefix blindly.
 
 ## Root Journal Format {#root-journal-format}
@@ -320,11 +347,18 @@ build prefix blindly.
 The root journal no longer carries transitive closures. It carries compact owner transitions:
 
 ```
+RefRecord {
+    ref_name
+    manifest_ref       // ManifestRef, interpreted inside this root namespace
+    mutable_files      // e.g. txn_version.txt, metadata_version.txt, uuid.txt
+    published_at_ms
+}
+
 OwnerTransition {
     transition_version
     ref_name
-    old_manifest?   // ManifestRef, owner removed
-    new_manifest?   // ManifestRef, owner added
+    old_manifest?      // ManifestRef, owner removed
+    new_manifest?      // ManifestRef, owner added
 }
 
 PrecommitTransition {
@@ -339,7 +373,7 @@ PromotePrecommit {
     transition_version
     build_id
     final_ref_name
-    manifest         // ManifestRef; same manifest, owner only moves
+    manifest            // ManifestRef; same manifest, owner only moves
 }
 ```
 
@@ -354,8 +388,14 @@ Semantics:
   change.
 
 Every record that names a manifest — the committed `RefRecord` in the root manifest, `PrecommitRecord`,
-and every owner transition — carries a `ManifestRef`, never a bare id, so the reader and GC fold
-address the object directly via `CasLayout` without a LIST or body scan.
+and every owner transition — carries a `ManifestRef`, never a bare nonce. The reader and GC fold
+combine that ref with the owning root namespace to form `ManifestId` and address the object directly
+via `CasLayout` without a LIST or body scan.
+
+Mutable per-ref payload stays in `RefRecord`. `mutable_files`, `published_at_ms`, and similar
+non-reachability metadata are not part of `FullTreeManifestProto`. A mutable-only update is a
+root-shard CAS that changes `RefRecord` payload, emits no owner transition, emits no blob delta, and
+does not change `ManifestId`.
 
 The current `JournalRecord{Add, Remove}` shape is insufficient for target-sharded streaming because
 the target reducer cannot infer the displaced old tree. The new journal must encode replace/move
@@ -378,16 +418,16 @@ ManifestFooter
 
 This redesign changes the query-hot read path.
 
-`Store::resolveRef` resolves a ref to a root-local `ManifestRef` (`manifest_nonce` + `writer_id`
-+ `build_seq`) plus its owning root namespace. `Store::readTree` no longer reads `trees/<hash>`. It
-derives the key from the ref via `CasLayout`, reads the full-tree manifest, verifies
-`RefMatchesBody` and `ManifestNamespaceMatches`, then answers path lookup or directory listing from
-the manifest entries and optional directory index.
+`Store::resolveRef` resolves a ref to a root-local `ManifestRef` (`manifest_nonce`, `writer_id`, and
+`build_seq`), its owning root namespace, and the mutable per-ref payload. `Store::readTree` no
+longer reads `trees/<hash>`. It derives the key from `ManifestId` via `CasLayout`, reads the full-tree
+manifest, verifies `RefMatchesBody` and `ManifestNamespaceMatches`, then answers path lookup or
+directory listing from the manifest entries and optional directory index.
 
 The old per-process tree decode cache shared by content hash becomes less useful because each publish
-uses a unique manifest id. That is an intentional tradeoff. The data that matters for storage and
+uses a unique `ManifestId`. That is an intentional tradeoff. The data that matters for storage and
 large reads is still blob-deduplicated; tree metadata is small, immutable, and can be cached by
-`(ManifestRef, token)`.
+`(ManifestId, token)`.
 
 Planning must include:
 
@@ -403,13 +443,14 @@ The only semantic relaxation is: **precommit may reference missing blobs; commit
 
 ### Stage Full-Tree Manifest {#stage-full-tree-manifest}
 
-`Build::stageTree` changes from "compute Merkle `TreeId`" to "mint root-local full-tree manifest id".
+`Build::stageTree` changes from "compute Merkle `TreeId`" to "mint root-local full-tree `ManifestId`".
 
 The writer builds one full-tree manifest:
 
 1. Resolve the complete logical subtree into canonical entries: full path, placement, blob hash/size or
    inline bytes.
-2. Mint one random 128-bit `manifest_nonce` (with `writer_id`/`build_seq` it forms the `ManifestRef`).
+2. Mint one random 128-bit `manifest_nonce` (with `writer_id`/`build_seq` it forms the `ManifestRef`;
+   together with the root namespace it forms `ManifestId`).
 3. Write the manifest object under `_manifests/<writer_id>/<build_seq>/...`.
 4. Keep the encoded manifest payload in memory until the precommit root transition is durable.
 
@@ -423,33 +464,35 @@ recursive reads to reconstruct a staged precommit.
 ### Pre-Precommit Manifest Debris {#pre-precommit-manifest-debris}
 
 Manifest bodies are written before `PrecommitAdd`. If a build stops in that window, no owner
-transition names those manifest ids. Owner-driven GC would never read or delete them unless the
+transition names those `ManifestId`s. Owner-driven GC would never read or delete them unless the
 protocol adds an explicit debris path.
 
 This section defines the build-side contract. The round-level cleanup algorithm is specified in
 [Orphan Manifest-Debris Sweep](#orphan-manifest-debris-sweep).
 
-Rev. 8 makes this a first-class liveness obligation:
+This design makes this a first-class liveness obligation:
 
 - writer abort does best-effort deletion of its own `_manifests/<writer_id>/<build_seq>/` objects;
-- GC has a rare backstop sweep for build-scoped `_manifests` objects whose build is below the server
-  watermark floor, retired, or judged dead by the same rules used for precommit reclaim;
+- GC has a rare backstop sweep for build-scoped `_manifests` objects whose build has a durable
+  build-death mark;
+- the build-death mark is the same authority that `PrecommitAdd` CAS-checks before it can name any
+  manifest from `(writer_id, build_seq)`;
 - the sweep is scoped to one root namespace at a time;
-- the sweep builds the active manifest-id set from that namespace's sealed root/precommit owner view;
-- the sweep deletes only dead-build manifest objects whose ids are absent from that namespace active
-  set;
+- the sweep builds the active `ManifestId` set from that namespace's sealed root/precommit owner view;
+- the sweep deletes only build-death-marked manifest objects whose `ManifestId`s are absent from that
+  namespace active set;
 - every manifest delete is exact-token;
-- if the build was falsely judged dead and later tries to publish `PrecommitAdd`, it must first
-  re-check that the named manifest body still exists. A missing manifest makes `PrecommitAdd` fail
-  closed and the writer retries with a fresh manifest id.
+- if the build was falsely judged dead and later tries to publish `PrecommitAdd`, it fails the
+  build-liveness CAS before the manifest becomes visible; the writer retries with a fresh
+  `(writer_id, build_seq, manifest_nonce)`.
 
 This is a space-liveness mechanism, not reader-facing correctness. A pre-precommit manifest has no root
 owner, so readers cannot reach it. The important rule is that the debris sweep must never treat
-"dead build prefix" as enough to delete. It needs a sealed per-namespace owner view and a per-object
-liveness check.
+"dead build prefix" as enough to delete. It needs the durable build-death mark, a sealed
+per-namespace owner view, and a per-object liveness check.
 
 The common case should be writer cleanup. The GC backstop is for stopped writers and must be bounded:
-one namespace, one dead build prefix, and a limited number of exact-token deletes per round.
+one namespace, one build-death-marked prefix, and a limited number of exact-token deletes per round.
 
 ### Final Ref Name Requirement {#final-ref-name-requirement}
 
@@ -458,7 +501,7 @@ known before the build: insert assigns it and merge/mutation knows its target. T
 `PrecommitAdd` live in the same root shard as the final committed ref, so `PromotePrecommit` is one
 root-shard CAS owner move.
 
-Rev. 8 deliberately does not include a GC-visible scratch-root fallback. A caller that cannot know
+This design deliberately does not include a GC-visible scratch-root fallback. A caller that cannot know
 `final_ref_name` must delay `PrecommitAdd` until the final name is known or get a separate modeled
 design. A hidden scratch precommit would double-write manifests and add another debris location to
 prove.
@@ -469,11 +512,17 @@ The precommit CAS is written to the same root namespace as the future committed 
 publish, the precommit is placed in the same root shard as `final_ref_name`, so promotion can be atomic
 in one shard CAS.
 
+The CAS must check the durable build-liveness authority before it names the manifest. If
+`(writer_id, build_seq)` is already marked dead/retired, `PrecommitAdd` fails closed and the writer
+must mint a fresh build sequence and manifest ref. A body-exists `HEAD` before CAS is not a safety
+authority because the orphan sweep could delete the manifest between that check and the root-shard
+CAS.
+
 The precommit record:
 
 - names `build_id`;
 - names `final_ref_name`;
-- names the full-tree manifest id;
+- names the full-tree `ManifestRef`, interpreted as `ManifestId` inside the owning root namespace;
 - records enough build watermark identity to let GC reclaim abandoned precommits;
 - does not carry transitive closure.
 
@@ -539,12 +588,12 @@ An abandoned precommit owner is removed by GC or by writer cleanup:
 PrecommitRemove(build_id, manifest_ref)
 ```
 
-The manifest id is unique and never reused. Therefore removing this owner later is safe even if a
+The `ManifestId` is unique and never reused. Therefore removing this owner later is safe even if a
 different build later creates a byte-identical manifest under a different id.
 
 If GC falsely reclaims a still-live build's precommit, the later `PromotePrecommit` must fail closed
 because `precommit(build_id)` is no longer present. The writer retries by creating a fresh precommit
-with a fresh manifest id, then revalidates blobs again.
+with a fresh `ManifestId`, then revalidates blobs again.
 
 ## GC Authority Model {#gc-authority-model}
 
@@ -553,8 +602,8 @@ GC tracks blob reachability from active full-tree manifests:
 ```
 blob_indeg[b] =
     Cardinality({
-        source edge (manifest_ref, path)
-        : manifest_ref is active
+        source edge (ManifestId, path)
+        : ManifestId is active
           and its entry at path references blob b
     })
 ```
@@ -577,7 +626,7 @@ This deletes an entire class of GC state:
 - no content-hash tree revival race.
 
 GC still maintains a streaming blob in-degree generation. It may also maintain a coarse manifest-delete
-work bundle for manifest ids whose owner was removed. That bundle is keyed by manifest id and round,
+work bundle for `ManifestId`s whose owner was removed. That bundle is keyed by `ManifestId` and round,
 not by content hash, and is safe to replay.
 
 ## Round Protocol {#round-protocol}
@@ -594,7 +643,7 @@ There is no GC-side cascade step.
 removal. It does **not** mean the ordering obligation disappears. For an owner removal, GC must read
 the full-tree manifest while it is still available, seal the corresponding blob decrements into the
 generation, and only then allow exact-token deletion of the manifest body. The old cascade ordering
-becomes a simpler revival-proof ordering on unique manifest ids.
+becomes a simpler revival-proof ordering on unique `ManifestId`s.
 
 ### Discovery {#discovery}
 
@@ -612,15 +661,15 @@ contain compact owner transitions, not full closures.
 
 For every changed root shard, stream owner transitions in root-journal order.
 
-For `old_manifest` (a `ManifestRef`):
+For `old_manifest` (a `ManifestRef`, interpreted as `ManifestId` in the owning root namespace):
 
 - derive the key via `CasLayout` and read the one full-tree manifest object;
 - verify `RefMatchesBody` and `ManifestNamespaceMatches`, else fail closed;
 - stream its entries once;
 - emit `-1` blob-edge deltas for every blob entry;
-- record the manifest id as delete work for this round/generation.
+- record the `ManifestId` as delete work for this round/generation.
 
-For `new_manifest` (a `ManifestRef`):
+For `new_manifest` (a `ManifestRef`, interpreted as `ManifestId` in the owning root namespace):
 
 - derive the key via `CasLayout`, verify the manifest object exists, and check `RefMatchesBody`
   and `ManifestNamespaceMatches`;
@@ -634,7 +683,7 @@ For `PromotePrecommit`:
 
 The fold is streaming. It keeps only a manifest record buffer and target-sort/spill buffers. It does
 not build a resident closure set and does not recursively read any child manifests. Duplicate blob
-references are handled by deterministic source edge ids `(manifest_ref, path)`.
+references are handled by deterministic source edge ids `(ManifestId, path)`.
 
 A repoint/mutation over a large manifest emits `-old` and `+new` by reading both full manifests. Many
 unchanged blob refs may cancel in the target reducer. The design deliberately avoids a tree-diff
@@ -676,16 +725,19 @@ background sweep handles those objects. This is the GC-side backstop for
 
 The sweep is **per namespace**, not pool-wide:
 
-- choose one root namespace and one dead build prefix `_manifests/<writer_id>/<build_seq>/`;
-- build the active manifest-id set from that namespace's sealed committed-ref and live-precommit owner
+- choose one root namespace and one build prefix `_manifests/<writer_id>/<build_seq>/` whose durable
+  build-death mark is visible;
+- verify that `PrecommitAdd` for that `(writer_id, build_seq)` can no longer pass the same
+  build-liveness CAS;
+- build the active `ManifestId` set from that namespace's sealed committed-ref and live-precommit owner
   view;
 - enumerate that one build prefix;
 - delete only manifest objects whose ids are absent from the active set, using exact tokens;
 - record compact outcomes so the sweep can resume without depending on LIST stability.
 
 This sweep is not allowed to emit blob decrements, because a pre-precommit manifest never contributed
-blob increments. If a manifest id is found in the owner view, it leaves the sweep and is handled only by
-the normal owner-transition path.
+blob increments. If a `ManifestId` is found in the owner view, it leaves the sweep and is handled only
+by the normal owner-transition path.
 
 ### Retire Visibility Barrier {#retire-visibility-barrier}
 
@@ -711,7 +763,7 @@ Then:
 
 - a blob candidate is deleted only if its blob in-degree is still zero and the exact token still
   matches;
-- a manifest is deleted only if the manifest id still has no committed/precommit owner in the
+- a manifest is deleted only if the `ManifestId` still has no committed/precommit owner in the
   fold-through-fence view;
 - every delete is exact-token;
 - token mismatch is spared/replaced, not destructive;
@@ -742,7 +794,7 @@ For sharded mode:
 
 - root-shard mappers stream owner transitions and scatter blob deltas by blob hash;
 - blob target reducers own disjoint blob hash ranges;
-- manifest-delete workers own disjoint manifest id ranges or root namespaces;
+- manifest-delete workers own disjoint `ManifestId` ranges or root namespaces;
 - one coordinator owns registry fence, input seal, round visibility, global fence, and generation
   pointer advance;
 - leases are work-dedup only.
@@ -759,8 +811,8 @@ writer can observe mapper/reducer products until the generation manifest is seal
 This redesign removes or shrinks several previously hard pieces:
 
 - **No content-addressed tree revival race.** Byte-identical future manifests get different
-  `ManifestRef`s (a fresh `manifest_nonce`), so stale work for old manifest `T1` cannot delete `T2` or
-  apply `T1`'s blob decrements to `T2`.
+  `ManifestId`s (a fresh `manifest_nonce` in its root namespace), so stale work for old manifest `T1`
+  cannot delete `T2` or apply `T1`'s blob decrements to `T2`.
 - **No full-closure root journal.** Publish/drop records name old/new manifest refs only. The
   complete tree structure is stored once, in the full-tree manifest object.
 - **No recursive GC tree reads.** Fold reads one manifest object per old/new owner transition.
@@ -777,11 +829,10 @@ This redesign removes or shrinks several previously hard pieces:
 - **Precommit is not a second namespace protocol.** It lives in the target root prefix and promotes by
   owner move.
 - **Wide-table journal amplification disappears.** Rev. 5 wrote transitive closure into every owner
-  transition. Rev. 8 writes each full-tree manifest once and writes compact owner transitions
+  transition. This design writes each full-tree manifest once and writes compact owner transitions
   thereafter.
 - **Debugging is more physical.** A manifest key shows its root namespace and build prefix, and its
-  body explains every blob edge. A blob in-degree entry can point back to `(root_namespace,
-  manifest_ref, path)`.
+  body explains every blob edge. A blob in-degree entry can point back to `(ManifestId, path)`.
 
 The explicit tradeoff is also clear: tree dedup is gone. This is intentional. Tree objects are metadata
 relative to blobs, and the storage saved by deduplicating tree metadata was buying a disproportionate
@@ -794,16 +845,21 @@ The new `TLA+` model should be a branch of `CaIncarnationCore.tla` plus the usef
 
 Mandatory invariants and liveness obligations:
 
-- `NoManifestRefReuse`: once a manifest id appears in a visible root journal, no later action can bind that
-  id to a different payload or owner lineage.
-- `SingleManifestOwner`: each visible manifest has at most one structural owner. `PromotePrecommit` is
-  an atomic owner move.
+- `NoManifestIdReuse`: once a `ManifestId` appears in a visible root journal, no later action can bind
+  that id to a different payload or owner lineage.
+- `SingleManifestOwner`: each visible `ManifestId` has at most one structural owner.
+  `PromotePrecommit` is an atomic owner move. Cross-table operations publish a fresh destination
+  manifest; they do not share or move a manifest across namespaces.
 - `ManifestBodyBeforeVisible`: a root/precommit owner transition cannot become visible until the named
   manifest object exists.
 - `RefMatchesBody`: the journal `ManifestRef` equals the `ref` inside the decoded manifest body; a
   read/fold against a mismatch fails closed.
 - `ManifestNamespaceMatches`: a manifest body's `root_namespace_id` equals the owning root namespace;
   a mismatch fails closed (no cross-namespace ownership, no mis-scoped debris sweep).
+- `MutablePayloadNotReachability`: mutable per-ref payload changes do not change `ManifestId`, do not
+  emit owner transitions, and do not affect blob in-degree.
+- `BuildDeathFencesPrecommit`: orphan manifest sweep may delete build-scoped manifest objects only
+  after the durable build-death mark that makes future `PrecommitAdd` for that build fail closed.
 - `CommittedNoMissingBlob`: every blob reachable from a committed root ref is present and not condemned
   in the committing writer's view.
 - `PrecommitMayReferenceMissingBlob`: missing blob leaves under precommit are legal and not corruption.
@@ -818,16 +874,16 @@ Mandatory invariants and liveness obligations:
 - `JournalCoverage`: no root transition or manifest-delete work is trimmed before its effect is
   included in a sealed generation or carried forward.
 - `OrphanManifestDebrisDrains`: a manifest body staged before `PrecommitAdd` and never named by any
-  live owner is eventually deleted after its build is abandoned or judged dead.
+  live owner is eventually deleted after its build has a durable build-death mark.
 
 ## Negative Controls {#negative-controls}
 
 Each negative control must produce the expected counterexample before the phase is allowed to ship:
 
-1. Reuse a manifest id for a byte-identical future manifest: stale manifest-delete work deletes the new
+1. Reuse a `ManifestId` for a byte-identical future manifest: stale manifest-delete work deletes the new
    manifest or applies old blob decrements to the new owner.
-2. Allow two owners for one manifest id: deleting one owner removes blob edges still needed by the other
-   owner.
+2. Allow two owners for one `ManifestId`, including by sharing a manifest across refs/namespaces:
+   deleting one owner removes blob edges still needed by the other owner.
 3. Make `PromotePrecommit` two separate CAS operations with a gap and no fail-closed retry: a false
    precommit reclaim can create a committed dangle.
 4. Let precommit become visible before the manifest body is durable: GC cannot emit the required blob
@@ -837,25 +893,33 @@ Each negative control must produce the expected counterexample before the phase 
    before `PrecommitAdd`, so promotion must revalidate/reupload rather than assume protection.
 7. Omit the pre-precommit `_manifests` debris sweep: manifest bodies written before `PrecommitAdd` and
    then abandoned are never reachable from owner-transition fold and leak forever.
-8. Delete build-scoped `_manifests` debris using a partial owner view, or by wholesale deleting a dead
-   build prefix: a live precommit or committed ref can lose its manifest body and become dangling.
-9. Treat a missing manifest body under committed owner as an empty manifest: undercounts blob edges and
+8. Delete build-scoped `_manifests` debris using a partial owner view, without the durable build-death
+   mark, or by wholesale deleting a dead build prefix: a live precommit or committed ref can lose its
+   manifest body and become dangling.
+9. Let orphan sweep delete after a writer's pre-CAS body `HEAD` but before its `PrecommitAdd`: the root
+   can publish a visible precommit whose manifest body is gone.
+10. Treat a missing manifest body under committed owner as an empty manifest: undercounts blob edges and
    permits over-delete.
-10. Delete a manifest body before its owner-removal blob decrements are durable or carried forward:
+11. Delete a manifest body before its owner-removal blob decrements are durable or carried forward:
    child blob references leak because the body needed for subtraction is gone.
-11. Advance root cursor/token past unsealed owner-transition deltas: `SabotageCutOverclaim` shape.
-12. Advance `gc/state.round` after only one target shard's retired set is durable: `ViewableRound`
+12. Advance root cursor/token past unsealed owner-transition deltas: `SabotageCutOverclaim` shape.
+13. Advance `gc/state.round` after only one target shard's retired set is durable: `ViewableRound`
    break.
-13. Skip global fence for a racing publish: `INV_NO_DANGLE`.
-14. Trim root journal below an unincorporated owner transition: `INV_JOURNAL_COVERAGE`.
-15. Use non-exact delete or reuse blob tokens: existing `SabotageUncondDelete` and `SabotageReusedTag`
+14. Skip global fence for a racing publish: `INV_NO_DANGLE`.
+15. Trim root journal below an unincorporated owner transition: `INV_JOURNAL_COVERAGE`.
+16. Use non-exact delete or reuse blob tokens: existing `SabotageUncondDelete` and `SabotageReusedTag`
    shapes.
-16. Carry only a bare `manifest_nonce` (no `writer_id`/`build_seq`) instead of a full `ManifestRef`:
+17. Carry only a bare `manifest_nonce` (no `writer_id`/`build_seq`) instead of a full `ManifestRef`:
    the read path and GC fold cannot build the key, forcing an unsafe LIST/body scan.
-17. Decode a manifest whose body `root_namespace_id` differs from the owning namespace and accept it:
+18. Key source edges or delete work by `ManifestRef` alone instead of `ManifestId`: two root namespaces
+   with the same ref merge unrelated blob edges or manifest-delete work.
+19. Decode a manifest whose body `root_namespace_id` differs from the owning namespace and accept it:
    cross-namespace dangle and a mis-scoped debris sweep (`ManifestNamespaceMatches` must reject it).
-18. Follow a `ManifestRef` to an object whose body `ref` differs from it and accept it: the wrong
+20. Follow a `ManifestRef` to an object whose body `ref` differs from it and accept it: the wrong
    manifest is folded or deleted (`RefMatchesBody` must reject it).
+21. Put mutable per-ref payload into `FullTreeManifestProto` or mint a new `ManifestId` for a
+   mutable-only update: harmless metadata changes produce spurious blob deltas and can hide a real
+   reachability transition in unrelated noise.
 
 ## Backpressure And Journal Encoding {#backpressure-and-journal-encoding}
 
@@ -869,7 +933,7 @@ Backpressure remains necessary, but the pressure points are smaller:
 - `manifest_entries` (entry count per manifest);
 - `manifest_inline_bytes_total` and `largest_inline_entry_bytes` (inline payload is data, and the
   manifest is read on every part-open and every owner transition, so cap the total, not only per-file);
-- blob delta bytes per generation;
+- `blob_delta_bytes_per_generation`;
 - active precommit count and oldest precommit age.
 
 The streaming protobuf migration should proceed, but it no longer needs to carry huge closure blocks.
@@ -885,27 +949,33 @@ blob leaves did not pass revalidation.
 ### Phase 0 - Model And Format Skeleton {#phase-0-model-and-format-skeleton}
 
 - Create `CaGcRootLocalFullTreeCore.tla`.
-- Model unique manifest ids, structured manifest refs with `RefMatchesBody` /
-  `ManifestNamespaceMatches` checks, single ownership, precommit owner, committed owner, owner moves,
-  missing blobs under precommit, fail-closed promotion, blob target in-degree, global fence, recheck,
-  exact-token delete, manifest-delete work, and pre-precommit orphan manifest debris.
+- Model unique `ManifestId`s, structured manifest refs with `RefMatchesBody` /
+  `ManifestNamespaceMatches` checks, strict single ownership, no manifest sharing across refs or
+  namespaces, mutable ref payload as non-reachability state, precommit owner, committed owner, owner
+  moves, missing blobs under precommit, fail-closed promotion, blob target in-degree, global fence,
+  recheck, exact-token delete, manifest-delete work, build-death-fenced `PrecommitAdd`, and
+  pre-precommit orphan manifest debris.
 - Add negative controls listed above.
-- Define `ManifestRef`, `FullTreeManifestProto`, owner-transition records, and streaming root
+- Define `ManifestRef`, `ManifestId`, `FullTreeManifestProto`, owner-transition records, and streaming root
   manifest framing.
-- Define reserved `_manifests` layout and key validation.
+- Define reserved `_manifests` layout, `CasLayout::checkNamespace` rejection, and key validation.
 
 No production behavior changes in this phase.
 
 ### Phase 1 - Full-Tree Manifests, Single GC Shard {#phase-1-full-tree-manifests-single-gc-shard}
 
-- Change `Build::stageTree` to mint root-local full-tree manifest ids instead of Merkle `TreeId`
+- Change `Build::stageTree` to mint root-local full-tree `ManifestId`s instead of Merkle `TreeId`
   values.
 - Write full-tree manifest objects under `_manifests`.
-- Add writer best-effort cleanup and GC backstop sweep for pre-precommit `_manifests` debris.
+- Add writer best-effort cleanup and build-death-fenced GC backstop sweep for pre-precommit
+  `_manifests` debris.
 - Move precommit into the target root prefix.
 - Add atomic `PromotePrecommit`.
 - Replace `JournalRecord{Add, Remove}` reachability records with owner transitions carrying old/new
-  `ManifestRef`s (not bare ids); add `ManifestRef` to the committed `RefRecord`.
+  `ManifestRef`s (not bare ids); add `ManifestRef`, `mutable_files`, and `published_at_ms` to the
+  committed `RefRecord`.
+- Change cross-table `republishRef`-style paths to publish a fresh destination manifest over the same
+  blob hashes, then drop the source ref; `Atomic` database rename remains a CA no-op.
 - Build a streaming blob in-degree generation from owner-transition manifest streams.
 - Update `Store::resolveRef`, `Store::readTree`, and metadata read helpers to address root-local
   full-tree manifests via the ref + `CasLayout`, enforce `RefMatchesBody` /
@@ -937,7 +1007,7 @@ whole-pool `GcSnap` authority, expansion markers, nested tree objects, and casca
 - Enable `gc_shards > 1`.
 - Root mappers scatter blob deltas by blob hash.
 - Blob reducers merge disjoint target shards.
-- Manifest-delete workers process disjoint manifest id ranges or namespaces.
+- Manifest-delete workers process disjoint `ManifestId` ranges or namespaces.
 - The global coordinator keeps the registry/fence/round-visibility responsibilities.
 
 ### Phase 5 - Retire-Token Optimization {#phase-5-retire-token-optimization}
@@ -947,12 +1017,12 @@ complete and stale tokens can only cause under-delete, never over-delete.
 
 ## Operation Cost {#operation-cost}
 
-| Quantity | Current code | Rev. 5 root-closure | Rev. 8 full-tree manifests |
+| Quantity | Current code | Rev. 5 root-closure | Full-tree manifests |
 |---|---|---|---|
-| Tree identity | content hash | content hash + `ref_epoch` | unique root-local manifest id |
+| Tree identity | content hash | content hash + `ref_epoch` | unique root-local `ManifestId` |
 | Blob dedup | yes | yes | yes |
 | Tree dedup | yes | yes | no |
-| Publish journal size | tree hash | full transitive closure | old/new manifest ids |
+| Publish journal size | tree hash | full transitive closure | old/new `ManifestRef`s |
 | Tree structure storage | global `trees/` objects | global `trees/` object plus closure journal bytes | one root-local full-tree manifest |
 | Read-path tree cache sharing | content-hash sharing | content-hash sharing | per-instance cache; less sharing |
 | GC memory | resident `O(pool)` snap | stream buffers | stream buffers |
@@ -974,11 +1044,11 @@ Every durable generation must answer:
 
 - root shards read/skipped/minted and why;
 - owner transitions folded;
-- manifest ids activated/deactivated;
+- `ManifestId`s activated/deactivated;
 - manifest bytes and entry count;
 - blob deltas emitted per target shard;
 - retired blob candidates;
-- retired manifest ids;
+- retired `ManifestId`s;
 - orphan manifest sweep namespace/build prefix;
 - fence positions;
 - recheck results;
@@ -989,7 +1059,7 @@ A single blob delete should be explainable as:
 
 ```
 blob B
-  last source edge: root_namespace N, manifest_ref T, path P
+  last source edge: ManifestId(N, T), path P
   owner transition: ref R removed T at root version V
   folded in generation G
   retired in round Rn with token Tok
@@ -1003,7 +1073,7 @@ Resume rules:
 - root-local full-tree manifests are immutable; byte-identical existing writes may be adopted,
   divergent writes fail closed;
 - generation files are write-once;
-- manifest-delete work is keyed by `(round, generation, ManifestRef)` and can be replayed;
+- manifest-delete work is keyed by `(round, generation, ManifestId)` and can be replayed;
 - blob and manifest content deletes are exact-token and idempotent;
 - orphan manifest sweep outcomes are compact and replayable;
 - root cursors advance only with sealed blob-delta coverage;
@@ -1029,5 +1099,8 @@ Resume rules:
 4. How much manifest streaming work is acceptable in `PromotePrecommit` revalidation and whether to
    store a compact blob summary inside the same manifest object.
 5. Exact streaming protobuf framing shared by root manifests and full-tree manifest bodies.
-6. How `fsck` should distinguish owner-visible missing manifest bodies from reclaimable
+6. Exact durable build-liveness/build-death record layout shared by `PrecommitAdd` and orphan sweep.
+7. Exact backpressure thresholds for `manifest_entries`, `manifest_encoded_bytes`,
+   `manifest_inline_bytes_total`, and `blob_delta_bytes_per_generation`.
+8. How `fsck` should distinguish owner-visible missing manifest bodies from reclaimable
    pre-precommit manifest debris.
