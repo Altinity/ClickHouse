@@ -392,3 +392,16 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   dangling>0-but-oracle-clean as WARN not hard-fail (the oracle is the authoritative no-loss gate).
   CA-side B185 root cause (why rustfs returns transient-absent for reachable keys) still open (rustfs RaW).
 - Stack left UP (run.py exited cleanly, trap preserved containers+volumes+logs: phase3_20260626T074914_server.log).
+
+## Event-log proof on the attempt-4 dangling=243 (system.content_addressed_log)
+- Exact 243 dangling keys NOT individually traceable: the harness persisted a LATER settled fsck
+  (reachable=9406 dangling=0 unreachable=0), not the failing checkpoint's key list. That settled capture
+  itself confirms they cleared.
+- CLASS-level proof from the 16.3M-row event log:
+  * SMOKING GUN: used_after_final_delete = 0 of 691,699 deleted objects → GC NEVER deleted an object that
+    was later referenced. No over-delete.
+  * gc_recheck_verdict: deleted=819,690, SPARED=234, replaced=182 → 416 condemned candidates correctly
+    spared/re-pointed at recheck (re-referenced mid-round). Fold-through-fence no-dangle protection works.
+  => the 243 dangling were PRESENT+referenced, NOT GC-deleted; transiently HEAD-absent (rustfs RaW/
+    list-after-write lag under gc_checkpoint reclaim churn). Settled (dangling=0), data intact (1.25M rows
+    both replicas, no read error). CA GC logic SOUND; B185-class test-store lag, not loss, not a regression.
