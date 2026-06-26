@@ -17,7 +17,7 @@ doc_type: reference
 
 **Tech stack:** C++ (ClickHouse coding standards, Allman braces); gtest unit oracles against the `Cas::Backend` seam; `build/src/unit_tests_dbms` with `--gtest_filter='CasStore.*'` / `'CaWiring*'`.
 
-**Source spec:** `docs/superpowers/specs/2026-06-26-cas-gc-streaming-sharded-redesign-design.md` (rev. 13), sections §Read Path Scope, §Object Identity And Ownership (the `refMatchesBody` / `manifestNamespaceMatches` checks), §Core Principle.
+**Source spec:** `docs/superpowers/specs/2026-06-26-cas-gc-streaming-sharded-redesign-design.md` (rev. 15), sections §Read Path Scope, §Object Identity And Ownership (the `refMatchesBody` / `manifestNamespaceMatches` checks), §Core Principle.
 
 ## Global Constraints {#global-constraints}
 

@@ -17,7 +17,7 @@ doc_type: reference
 
 **Tech stack:** C++ (ClickHouse coding standards, Allman braces); Protobuf for the control plane; dense block-framed sorted binary runs (`RunFile`/`DataBlock`/`RunFooter`) for the hot data plane; TLA+ (TLC) for the safety gate; gtest for unit oracles; `ci.praktika` for integration and chaos-soak.
 
-**Source spec:** `docs/superpowers/specs/2026-06-26-cas-gc-streaming-sharded-redesign-design.md` (rev. 13), §Sharding Model and §Phase Plan / Phase 4.
+**Source spec:** `docs/superpowers/specs/2026-06-26-cas-gc-streaming-sharded-redesign-design.md` (rev. 15), §Sharding Model and §Phase Plan / Phase 4.
 
 ## Global Constraints {#global-constraints}
 
