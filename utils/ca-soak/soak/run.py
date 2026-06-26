@@ -861,8 +861,11 @@ class MetricsTicker(threading.Thread):
         if new != old:
             pool_gb = (pbytes / GB) if pbytes is not None else float("nan")
             budget_gb = self.max_pool_bytes / GB
+            # pbytes may be None (best-effort probe failed this tick) — the fail-closed throttle still
+            # changed, so this log line CAN run with pbytes=None; guard the percentage (B204 fallout).
+            pct = (pbytes / self.max_pool_bytes * 100) if pbytes is not None else float("nan")
             log(f"THROTTLE change {old}s -> {new}s/insert: pool={pool_gb:.2f}GB / "
-                f"budget={budget_gb:.2f}GB ({(pbytes / self.max_pool_bytes * 100):.0f}%) "
+                f"budget={budget_gb:.2f}GB ({pct:.0f}%) "
                 f"-- pacing inserts (work is slowed, NEVER dropped)")
             self.driver.throttle_sleep_s = new
         log(f"metrics tick #{self.ticks + 1}: ts={ts} pool_objects={objs} "
