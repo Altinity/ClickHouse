@@ -351,3 +351,17 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
 - ROOT (B148): Gc::retire HEADs EVERY zero-in-degree candidate to read its token before deleteExact, even
   though the resident snap already knows the token. Dropping that HEAD (deleteExact from the snap's known
   token) would HALVE S3 ops on big rounds (eliminate 50K-190K HEADs/round). Concrete B148 evidence.
+
+## trace_log GC evidence (attempt-4, allow_introspection_functions=1) — B194 + B148 pinpointed
+- GC interval = 2s (gc_interval_sec=2, grace 5s). Big delta = STARTUP catch-up (warmup fills pool, merges
+  mass-supersede → bulk unreference; GC drains backlog in a few huge batches). Steady-state (round ~588):
+  0-1460 deleted in 1-5s every 3-7s → pool plateaus ~36G.
+- system.trace_log top GC-controller stacks (Real): #1 = GcSnap::stripTree <- Gc::cascadeAndPersist (162
+  samples) — MORE than S3 I/O wait (poll/receiveBytes, 109). GC on-thread split: s3_io_wait 110 / stripTree
+  81 / other 77 / fold 9.
+- => Long rounds bottlenecked by TWO things: (1) B194 GcSnap::stripTree O(N×M) — the #1 on-CPU GC frame,
+  runs in cascadeAndPersist over the 101K-182K children cascaded in big rounds; (2) B148 per-candidate
+  HEAD + DELETE S3 ops (~2/object) at rustfs ~200-400 ops/s. snap_io stays constant (9) → NOT O(pool).
+- ACTIONABLE: B194 (stripTree O(N×M)→O(N)) cuts the CPU half; B148 (deleteExact from snap token, drop the
+  per-candidate HEAD) cuts the I/O half. Soak is the before/after target. (trace_log needs
+  allow_introspection_functions=1 to symbolize; GC bg-thread IS sampled in Real traces.)
