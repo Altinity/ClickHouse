@@ -203,3 +203,13 @@ Verdict: envelope is FREEZE-READY except ONE pre-freeze action.
   check (~line 473): `if (h.domain_id != poolMeta().pool_id) throw CORRUPTED_DATA(...)`; mirror it in the
   blob read path when that lands. Safe (every in-pool object was written with pool_id; single-pool-per-disk
   → no legit cross-pool adoption), pre-release (no migration), fail-closed (correct direction).
+
+## Task 4 — B8/B64/B1 recheck (research-b8-b64-b1) — DONE + applied (verified independently)
+- B64: DONE+archived (d6f6b8345a0); 03822 un-gated, oracle 05001. Stale cross-refs cleaned.
+- B8: OBSOLETE — REPLACE_RANGE/MOVE PARTITION/DROP_PART covering race all implemented+tested+un-gated
+  (Phase 3.2 8fcea70ae3d, B61(b) 6a0e506533c; gate lifted StorageReplicatedMergeTree.cpp:~7421). ROW REMOVED.
+  Multi-ref commit atomicity is the only residual, tracked separately as B122.
+- B1: KEPT open as umbrella; prose trimmed. Multi-replica works via fetch-by-relink (test_cas_replicated_relink
+  passes); TRUE remaining = manifest_hash on the per-replica Keeper /parts znode (ReplicatedMergeTreeSink has
+  no CA code). Verified: 0 manifest_hash/CA refs in the sink.
+- Independent verification done (archive row, test tags, gate-lift comment, sink grep) — research confirmed.
