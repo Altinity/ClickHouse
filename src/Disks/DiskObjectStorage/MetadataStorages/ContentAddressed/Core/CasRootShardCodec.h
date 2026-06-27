@@ -1,9 +1,10 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,71 +13,85 @@ namespace DB::Cas
 {
 
 /// Root-shard manifest codec — the only mutable object and the single commit point (protocol spec §3).
-/// One manifest names a set of refs → their tree, plus the per-ref mutable sidecar files and
-/// an embedded reachability journal.
+/// CA GC root-local part-manifest redesign (rev. 15): the root journal is ONE ordered stream of
+/// `RootOwnerEvent` in `transition_version` order. There are no separate transitions/precommits/
+/// promotions vectors, and there is no `ClosureNode`/`JournalRecord`/`RefPayload` — only blobs stay
+/// content-addressed; a part is a single-owner namespace-qualified `ManifestId`. The GC fold reads the
+/// single journal and dispatches each event by comparing `old_binding.manifest_ref` with
+/// `new_binding.manifest_ref`: equal ⇒ owner move (no blob delta, no cleanup); true removal ⇒ `-1` +
+/// cleanup; activation ⇒ `+1` (subject to the fold barrier).
 ///
-/// Non-hashed metadata object => binary protobuf (`Proto/cas_format.proto`, `RootShardManifest`,
-/// B164a; replaced the earlier strict-JSON encoding). The manifest is CAS-by-token, not
-/// content-addressed, so byte-determinism is not a correctness requirement; the encoder still
-/// serializes deterministically (name-sorted refs via std::map; journal in insertion order). `refs`
-/// maps ref name → its tree + per-ref mutable sidecar files; `journal` is the reachability-delta list
-/// (`op`: add | remove). Version and fail-closed gating live in the `CasFormat` framing header
-/// (`[magic CARS][writer:u16][min_reader:u16]`) prepended before the protobuf body; `decodeRootShard`
-/// reads and gates the header BEFORE parsing the protobuf body. Fail-closed decode (unknown/missing
-/// required field / wrong type / bad hash length / bad enum => CORRUPTED_DATA). Introspect a raw
-/// manifest offline with `protoc --decode clickhouse.cas.format.RootShardManifest cas_format.proto`.
+/// Non-hashed metadata object => binary protobuf (`Proto/cas_format.proto`, `RootShardManifest`).
+/// The manifest is CAS-by-token, not content-addressed; the encoder still serializes deterministically
+/// (name-sorted refs via std::map; journal in insertion order, which is transition_version order).
+/// Version + fail-closed gating live in the `CasHeader` field 1; `decodeRootShard` checks the magic and
+/// `compatibility_version` BEFORE reading any other field. Fail-closed decode (unknown OwnerKind, a
+/// `manifest_instance_id`/`build_id` whose length != 16, a `RootOwnerEvent` with neither binding set,
+/// or a bad envelope => CORRUPTED_DATA).
 
-/// One tree node of a precommit's inline closure: the node's tree hash and its staged entries.
-/// Rides the precommit-namespace journal `Add` record (B199-S2): it survives the commit/abandon
-/// `refs.erase` and is trimmed only after GC folds it.
-/// Only placement/file_hash/file_size are serialized (the closure only feeds the GC walk;
-/// name/inline_bytes are NOT needed and intentionally omitted — decode sets them to their defaults).
-struct ClosureNode
+/// Owner of a part manifest in the root journal: a committed ref or a precommit build intent.
+enum class OwnerKind : uint8_t
 {
-    UInt128 tree_hash{};
-    std::vector<TreeEntry> entries;
-    bool operator==(const ClosureNode &) const = default;
+    Committed = 1,
+    Precommit = 2,
 };
 
-/// The per-ref payload: the content tree plus the mutable per-ref files (txn_version.txt,
-/// metadata_version.txt, ...) that are excluded from the content hash and live here per-ref.
-struct RefPayload
+/// One owner binding: which kind of owner names which manifest. Committed: `ref_name` set,
+/// `build_id` = 0. Precommit: `ref_name` = the final committed ref name, `build_id` set. Carries the
+/// full `ManifestRef`, never a bare nonce.
+struct OwnerBinding
 {
-    UInt128 tree_id{};
-    uint64_t tree_size = 0;
+    OwnerKind owner_kind = OwnerKind::Committed;
+    String ref_name;                /// committed ref_name, or the precommit's final_ref_name
+    UInt128 build_id{};             /// 0 for Committed; the build id for Precommit
+    ManifestRef manifest_ref;
+    bool operator==(const OwnerBinding &) const = default;
+};
+
+/// One ordered owner-change event in the SINGLE root journal stream (spec §Root Journal Format).
+/// Removes at most one `old_binding` and adds at most one `new_binding`; folded in transition_version
+/// order. create precommit = old none / new {Precommit,…}; abandon = old {Precommit,…} / new none;
+/// publish committed = old none / new {Committed,…}; drop = old {Committed,…} / new none; repoint =
+/// old {Committed,ref,T_old} / new {Committed,ref,T_new}; promote = old {Precommit,final,build,T} /
+/// new {Committed,final,T} (SAME manifest_ref T ⇒ owner move, blob Δ = 0, no cleanup).
+struct RootOwnerEvent
+{
+    uint64_t transition_version = 0;
+    std::optional<OwnerBinding> old_binding;
+    std::optional<OwnerBinding> new_binding;
+    bool operator==(const RootOwnerEvent &) const = default;
+};
+
+/// The current committed ref payload in the root journal. Carries the committed `ManifestRef` plus the
+/// mutable per-ref files (txn_version.txt, metadata_version.txt, ...). `root_namespace_id` is NOT
+/// stored here — it comes from the owning root context (spec §Root Journal Format).
+struct RootRef
+{
+    String ref_name;
+    ManifestRef manifest_ref;
     std::map<String, String> mutable_files;
     uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
-    bool operator==(const RefPayload &) const = default;
-};
-
-/// One reachability-delta record appended on publish.
-struct JournalRecord
-{
-    enum class Op : uint8_t { Add = 1, Remove = 2 };
-    Op op = Op::Add;
-    String ref_name;
-    UInt128 tree_id{};
-    uint64_t at_version = 0;
-    std::vector<ClosureNode> closure;   /// populated only on precommit-ns Add records (B199-S2)
-    bool operator==(const JournalRecord &) const = default;
+    bool operator==(const RootRef &) const = default;
 };
 
 struct RootShard
 {
     uint64_t shard_version = 0;
     uint64_t fence_round = 0;
-    std::map<String, RefPayload> refs;    /// std::map keeps refs in canonical name order
-    std::vector<JournalRecord> journal;   /// preserved in insertion order
+    std::map<String, RootRef> refs;            /// std::map keeps refs in canonical name order
+    std::vector<RootOwnerEvent> journal;       /// ONE ordered stream, folded in transition_version order
+    bool operator==(const RootShard &) const = default;
 };
 
 /// Encodes the manifest. Refs are serialized in name-sorted order (std::map already gives it); the
-/// journal is preserved in insertion order; mutable files within a ref are name-sorted (std::map).
+/// journal is preserved in insertion order (== transition_version order). Each `manifest_instance_id`
+/// and each `build_id` is encoded as exactly 16 bytes.
 String encodeRootShard(const RootShard & root);
 
-/// Decodes a manifest. First reads and gates the `CasFormat` framing header (`[magic CARS][writer:u16]
-/// [min_reader:u16]`), then parses the protobuf body. Throws CORRUPTED_DATA on bad magic, malformed
-/// protobuf, a bad enum (`JournalOp` unspecified), a wrong-length hash, or any field-level
-/// inconsistency; UNKNOWN_FORMAT_VERSION when `min_reader` exceeds this build's `G_BUILD`.
+/// Decodes a manifest. Checks the `CasHeader` magic + compatibility_version before any other field,
+/// then maps the protobuf back. Throws CORRUPTED_DATA on bad magic, malformed protobuf, an unknown
+/// OwnerKind, a 16-byte field of the wrong length, or a RootOwnerEvent with neither binding set;
+/// UNKNOWN_FORMAT_VERSION when compatibility_version exceeds this build's G_BUILD.
 RootShard decodeRootShard(std::string_view data);
 
 }

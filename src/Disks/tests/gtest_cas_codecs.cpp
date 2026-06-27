@@ -348,50 +348,69 @@ TEST(CasTreeCodec, EmptyTreeRoundTrips)
 
 namespace Proto = ::clickhouse::cas::format;
 
-TEST(CasRootShardCodec, RoundTripRefsAndJournal)
+namespace
 {
-    RootShard rs;
-    rs.shard_version = 42;
-    rs.fence_round = 7;
+    OwnerBinding committedBinding(const String & ref, const ManifestRef & mr)
+    {
+        return OwnerBinding{OwnerKind::Committed, ref, UInt128(0), mr};
+    }
+    OwnerBinding precommitBinding(const String & final_ref, UInt128 build_id, const ManifestRef & mr)
+    {
+        return OwnerBinding{OwnerKind::Precommit, final_ref, build_id, mr};
+    }
+}
 
-    RefPayload all_1;
-    all_1.tree_id = (UInt128(0x11) << 64) | UInt128(0x22);
-    all_1.tree_size = 4096;
-    all_1.mutable_files["txn_version.txt"] = "100";
-    all_1.mutable_files["metadata_version.txt"] = "3";
-    rs.refs["all_1_1_0"] = all_1;
+TEST(CasRootShardCodec, RoundTripInterleavedOwnerEvents)
+{
+    RootShard r;
+    r.shard_version = 12;
+    r.fence_round = 3;
+    const ManifestRef mr{"srv-a:42", 1042, UInt128(0xABCDEF)};   /// the part this build owns
+    const ManifestRef mr_other{"srv-a:42", 1043, UInt128(0x112233)};
+    const UInt128 build_id(0x5678);
+    r.refs["all_1_1_0"] = RootRef{"all_1_1_0", mr, {{"txn_version.txt", "5"}}, 1700000000000ULL};
 
-    RefPayload all_2;
-    all_2.tree_id = (UInt128(0x33) << 64) | UInt128(0x44);
-    all_2.tree_size = 8192;
-    rs.refs["all_2_2_0"] = all_2;
+    /// ONE ordered journal with INTERLEAVED kinds: create-precommit, publish-committed (a different
+    /// ref), promote (precommit->committed, SAME manifest_ref), then drop. transition_version increases.
+    r.journal.push_back(RootOwnerEvent{8, std::nullopt, precommitBinding("all_1_1_0", build_id, mr)});
+    r.journal.push_back(RootOwnerEvent{9, std::nullopt, committedBinding("other_2_2_0", mr_other)});
+    r.journal.push_back(RootOwnerEvent{10, precommitBinding("all_1_1_0", build_id, mr), committedBinding("all_1_1_0", mr)});
+    r.journal.push_back(RootOwnerEvent{11, committedBinding("other_2_2_0", mr_other), std::nullopt});
 
-    rs.journal.push_back({JournalRecord::Op::Add, "all_1_1_0", all_1.tree_id, 40, {}});
-    rs.journal.push_back({JournalRecord::Op::Add, "all_2_2_0", all_2.tree_id, 41, {}});
-    rs.journal.push_back({JournalRecord::Op::Remove, "all_0_0_0", (UInt128(0x99) << 64), 42, {}});
+    const String bytes = encodeRootShard(r);
+    const RootShard back = decodeRootShard(bytes);
+    EXPECT_EQ(back, r);
+    /// Byte-equality: deterministic encoder => re-encode is byte-identical (resume/adoption).
+    EXPECT_EQ(encodeRootShard(back), bytes);
 
-    const String encoded = encodeRootShard(rs);
-    const RootShard d = decodeRootShard(encoded);
+    /// transition_version order is preserved end-to-end (the single stream is folded in this order).
+    ASSERT_EQ(back.journal.size(), 4u);
+    for (size_t i = 1; i < back.journal.size(); ++i)
+        EXPECT_LT(back.journal[i - 1].transition_version, back.journal[i].transition_version);
 
-    EXPECT_EQ(d.shard_version, 42u);
-    EXPECT_EQ(d.fence_round, 7u);
+    /// The promote event is a pure owner move: SAME manifest_ref in old (Precommit) and new (Committed).
+    const RootOwnerEvent & promote = back.journal[2];
+    ASSERT_TRUE(promote.old_binding && promote.new_binding);
+    EXPECT_EQ(promote.old_binding->owner_kind, OwnerKind::Precommit);
+    EXPECT_EQ(promote.new_binding->owner_kind, OwnerKind::Committed);
+    EXPECT_EQ(promote.old_binding->manifest_ref, promote.new_binding->manifest_ref);
 
-    ASSERT_EQ(d.refs.size(), 2u);
-    ASSERT_TRUE(d.refs.count("all_1_1_0"));
-    EXPECT_EQ(d.refs.at("all_1_1_0").tree_id, all_1.tree_id);
-    EXPECT_EQ(d.refs.at("all_1_1_0").tree_size, 4096u);
-    EXPECT_EQ(d.refs.at("all_1_1_0").mutable_files.size(), 2u);
-    EXPECT_EQ(d.refs.at("all_1_1_0").mutable_files.at("txn_version.txt"), "100");
-    EXPECT_EQ(d.refs.at("all_1_1_0").mutable_files.at("metadata_version.txt"), "3");
-    EXPECT_EQ(d.refs.at("all_2_2_0").mutable_files.size(), 0u);
+    /// RootRef payload round-trips.
+    ASSERT_TRUE(back.refs.contains("all_1_1_0"));
+    EXPECT_EQ(back.refs.at("all_1_1_0").manifest_ref, mr);
+    EXPECT_EQ(back.refs.at("all_1_1_0").mutable_files.at("txn_version.txt"), "5");
+    EXPECT_EQ(back.refs.at("all_1_1_0").published_at_ms, 1700000000000ULL);
+}
 
-    ASSERT_EQ(d.journal.size(), 3u);
-    EXPECT_EQ(d.journal[0].op, JournalRecord::Op::Add);
-    EXPECT_EQ(d.journal[0].ref_name, "all_1_1_0");
-    EXPECT_EQ(d.journal[0].at_version, 40u);
-    EXPECT_EQ(d.journal[2].op, JournalRecord::Op::Remove);
-    EXPECT_EQ(d.journal[2].ref_name, "all_0_0_0");
-    EXPECT_EQ(d.journal[2].at_version, 42u);
+TEST(CasRootShardCodec, OptionalBindingAbsenceIsDistinguished)
+{
+    RootShard r;
+    r.shard_version = 1;
+    /// A drop event: old committed binding present, new absent.
+    r.journal.push_back(RootOwnerEvent{1, committedBinding("p", ManifestRef{"w", 1, UInt128(9)}), std::nullopt});
+    const RootShard back = decodeRootShard(encodeRootShard(r));
+    EXPECT_TRUE(back.journal.at(0).old_binding.has_value());
+    EXPECT_FALSE(back.journal.at(0).new_binding.has_value());
 }
 
 TEST(CasRootShardCodec, EmptyManifestRoundTrips)
@@ -409,97 +428,73 @@ TEST(CasRootShardCodec, RefsCanonicalOrderRegardlessOfInsertion)
 {
     /// std::map already keeps refs name-sorted, but verify two manifests built in different insertion
     /// order encode byte-identically.
+    const ManifestRef m1{"w", 1, UInt128(0x1)};
+    const ManifestRef m2{"w", 2, UInt128(0x2)};
     RootShard a;
-    a.refs["zzz"] = RefPayload{.tree_id = UInt128(0x1), .tree_size = 1, .mutable_files = {}};
-    a.refs["aaa"] = RefPayload{.tree_id = UInt128(0x2), .tree_size = 2, .mutable_files = {}};
+    a.refs["zzz"] = RootRef{"zzz", m1, {}, 0};
+    a.refs["aaa"] = RootRef{"aaa", m2, {}, 0};
 
     RootShard b;
-    b.refs["aaa"] = RefPayload{.tree_id = UInt128(0x2), .tree_size = 2, .mutable_files = {}};
-    b.refs["zzz"] = RefPayload{.tree_id = UInt128(0x1), .tree_size = 1, .mutable_files = {}};
+    b.refs["aaa"] = RootRef{"aaa", m2, {}, 0};
+    b.refs["zzz"] = RootRef{"zzz", m1, {}, 0};
 
     EXPECT_EQ(encodeRootShard(a), encodeRootShard(b));
 }
 
-TEST(CasRootShardCodec, JournalAtVersionMonotonicityIsEnforced)
+TEST(CasRootShardCodec, JournalTransitionVersionMonotonicityIsEnforced)
 {
-    /// The GC fold replays the journal in order under a cursor bound; an out-of-order at_version
-    /// would fold silently in vector order (corruption-induced UNDER-count = a wrong delete later)
-    /// and a record claiming a version beyond shard_version would be silently skipped by the cursor
-    /// window. Both are corruption - fail closed at DECODE. The encoder does NOT validate, so we
-    /// encode a deliberately-bad manifest and confirm the decoder rejects it.
+    /// The GC fold replays the journal in transition_version order under a cursor bound; an out-of-order
+    /// transition_version would fold silently in vector order (a mis-count = a wrong delete later) and a
+    /// record claiming a version beyond shard_version would be silently skipped by the cursor window.
+    /// Both are corruption - fail closed at DECODE.
+    const ManifestRef mr{"w", 1, UInt128(1)};
 
-    /// Descending at_version.
+    /// Descending transition_version.
     {
         RootShard rs;
         rs.shard_version = 5;
-        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 3, {}});
-        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 2, {}});
+        rs.journal.push_back(RootOwnerEvent{3, std::nullopt, committedBinding("r", mr)});
+        rs.journal.push_back(RootOwnerEvent{2, std::nullopt, committedBinding("r", mr)});
         const String bytes = encodeRootShard(rs);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(bytes); });
     }
-    /// at_version beyond shard_version.
+    /// transition_version beyond shard_version.
     {
         RootShard rs;
         rs.shard_version = 1;
-        rs.journal.push_back({JournalRecord::Op::Add, "r", UInt128(1), 2, {}});
+        rs.journal.push_back(RootOwnerEvent{2, std::nullopt, committedBinding("r", mr)});
         const String bytes = encodeRootShard(rs);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(bytes); });
     }
-    /// EQUAL at_versions are legal (non-decreasing, not strict): dropNamespace appends N Removes at
-    /// the same committed version.
+    /// EQUAL transition_versions are legal (non-decreasing, not strict): dropNamespace appends N events
+    /// at the same committed version.
     {
         RootShard rs;
         rs.shard_version = 2;
-        rs.journal.push_back({JournalRecord::Op::Remove, "a", UInt128(1), 2, {}});
-        rs.journal.push_back({JournalRecord::Op::Remove, "b", UInt128(1), 2, {}});
+        rs.journal.push_back(RootOwnerEvent{2, committedBinding("a", mr), std::nullopt});
+        rs.journal.push_back(RootOwnerEvent{2, committedBinding("b", mr), std::nullopt});
         const RootShard d = decodeRootShard(encodeRootShard(rs));
         ASSERT_EQ(d.journal.size(), 2u);
-        EXPECT_EQ(d.journal[0].at_version, 2u);
-        EXPECT_EQ(d.journal[1].at_version, 2u);
+        EXPECT_EQ(d.journal[0].transition_version, 2u);
+        EXPECT_EQ(d.journal[1].transition_version, 2u);
     }
-}
-
-/// ---------- CasRootShardCodec protobuf encoding (B164a) ----------
-
-TEST(CasRootShardCodec, ProtobufEncodingIsBinaryAndRoundTrips)
-{
-    RootShard rs;
-    rs.shard_version = 9;
-    rs.fence_round = 3;
-    RefPayload p;
-    p.tree_id = (UInt128(0xab) << 64) | UInt128(0xcd);
-    p.tree_size = 1142;
-    p.published_at_ms = 1781588451000ULL;   /// epoch ms
-    rs.refs["part_a"] = p;
-    rs.journal.push_back({JournalRecord::Op::Add, "part_a", p.tree_id, 8, {}});
-    rs.journal.push_back({JournalRecord::Op::Remove, "part_a", p.tree_id, 9, {}});
-
-    const String encoded = encodeRootShard(rs);
-    ASSERT_FALSE(encoded.empty());
-    EXPECT_NE(encoded.front(), '{');   /// not JSON (pure protobuf)
-
-    const RootShard d = decodeRootShard(encoded);
-    EXPECT_EQ(d.shard_version, 9u);
-    EXPECT_EQ(d.fence_round, 3u);
-    ASSERT_EQ(d.refs.size(), 1u);
-    EXPECT_EQ(d.refs.at("part_a").tree_id, p.tree_id);
-    EXPECT_EQ(d.refs.at("part_a").tree_size, 1142u);
-    EXPECT_EQ(d.refs.at("part_a").published_at_ms, 1781588451000ULL);   /// round-trips epoch ms
-    ASSERT_EQ(d.journal.size(), 2u);
-    EXPECT_EQ(d.journal[0].op, JournalRecord::Op::Add);
-    EXPECT_EQ(d.journal[1].op, JournalRecord::Op::Remove);
-    EXPECT_EQ(d.journal[1].at_version, 9u);
+    /// An event with NEITHER binding is corruption (folds to a no-op).
+    {
+        RootShard rs;
+        rs.shard_version = 2;
+        rs.journal.push_back(RootOwnerEvent{1, std::nullopt, std::nullopt});
+        const String bytes = encodeRootShard(rs);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(bytes); });
+    }
 }
 
 TEST(CasRootShardCodec, ProtobufEncodingIsDeterministic)
 {
-    /// Deterministic serialization (sorted map<> entries) keeps the bytes stable across encodes -
-    /// golden-test friendly. Includes refs (a map) and a journal (repeated, insertion order).
     RootShard rs;
     rs.shard_version = 5;
-    rs.refs["zzz"] = RefPayload{.tree_id = UInt128(0x1), .tree_size = 1, .mutable_files = {{"b", "2"}, {"a", "1"}}};
-    rs.refs["aaa"] = RefPayload{.tree_id = UInt128(0x2), .tree_size = 2, .mutable_files = {}};
-    rs.journal.push_back({JournalRecord::Op::Add, "zzz", UInt128(0x1), 5, {}});
+    rs.refs["zzz"] = RootRef{"zzz", ManifestRef{"w", 1, UInt128(0x1)}, {{"b", "2"}, {"a", "1"}}, 0};
+    rs.refs["aaa"] = RootRef{"aaa", ManifestRef{"w", 2, UInt128(0x2)}, {}, 0};
+    rs.journal.push_back(RootOwnerEvent{5, std::nullopt, committedBinding("zzz", ManifestRef{"w", 1, UInt128(0x1)})});
     EXPECT_EQ(encodeRootShard(rs), encodeRootShard(rs));
 }
 
@@ -508,18 +503,18 @@ TEST(CasRootShardCodec, LargeJournalRoundTrips)
     RootShard rs;
     rs.shard_version = 5000;
     for (uint64_t v = 0; v < 2430; ++v)
-        rs.journal.push_back({JournalRecord::Op::Add, "p" + std::to_string(v % 38), UInt128(v), v, {}});
+        rs.journal.push_back(RootOwnerEvent{v, std::nullopt,
+            committedBinding("p" + std::to_string(v % 38), ManifestRef{"w", v, UInt128(v)})});
     const RootShard d = decodeRootShard(encodeRootShard(rs));
     ASSERT_EQ(d.journal.size(), 2430u);
-    EXPECT_EQ(d.journal[2429].at_version, 2429u);
-    EXPECT_EQ(d.journal[0].ref_name, "p0");
+    EXPECT_EQ(d.journal[2429].transition_version, 2429u);
+    EXPECT_EQ(d.journal[0].new_binding->ref_name, "p0");
 }
 
 TEST(CasRootShardCodec, FailClosedOnGarbageBytes)
 {
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootShard(String("")); });               /// empty
     /// A valid protobuf with a wrong magic in CasHeader.magic => CORRUPTED_DATA.
-    /// Build a RootShardManifest with the CAPM magic (wrong) in its header.
     {
         Proto::RootShardManifest msg;
         auto * hdr = msg.mutable_header();
@@ -535,8 +530,6 @@ TEST(CasRootShardCodec, FailClosedOnGarbageBytes)
 
 TEST(CasRootShardCodec, CasHeaderFutureCompatibilityVersionThrowsUnknownFormatVersion)
 {
-    /// A manifest with CasHeader.compatibility_version > G_BUILD from a newer writer must fail closed
-    /// (checkCompatibility) so an old build never mis-reads a future object.
     Proto::RootShardManifest msg;
     auto * hdr = msg.mutable_header();
     hdr->set_magic(magicFor(FormatId::Manifest));
@@ -550,64 +543,14 @@ TEST(CasRootShardCodec, CasHeaderFutureCompatibilityVersionThrowsUnknownFormatVe
 
 TEST(CasRootShardCodec, CasHeaderRoundTrips)
 {
-    /// The CasHeader (magic + writer_version + compatibility_version) must round-trip.
     RootShard rs;
     rs.shard_version = 3;
     const String encoded = encodeRootShard(rs);
-    /// Parse the raw protobuf to check the header fields directly.
     Proto::RootShardManifest msg;
     ASSERT_TRUE(msg.ParseFromString(encoded));
     EXPECT_EQ(msg.header().magic(), magicFor(FormatId::Manifest));
     EXPECT_EQ(msg.header().writer_version(), currentWriterVersion());
     EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
-}
-
-/// B199-S2: inline closure round-trip (nested staged entries) on the precommit `Add` journal record.
-TEST(CasRootShardCodec, JournalAddClosureRoundTrips)
-{
-    RootShard in;
-    in.shard_version = 7;
-
-    JournalRecord rec;
-    rec.op = JournalRecord::Op::Add;
-    rec.ref_name = "4815";
-    rec.tree_id = UInt128(0x54);   /// 'T'
-    rec.at_version = 1;
-
-    /// nested closure: tree T -> {Blob B1, Subtree S}; S -> {Blob B2}
-    ClosureNode nodeT;
-    nodeT.tree_hash = UInt128(0x54);   /// 'T'
-    {
-        TreeEntry e1;
-        e1.placement = Placement::Blob;
-        e1.file_hash = UInt128(0x4231);   /// 'B1'
-        e1.file_size = 52;
-        nodeT.entries.push_back(e1);
-
-        TreeEntry e2;
-        e2.placement = Placement::Subtree;
-        e2.file_hash = UInt128(0x53);     /// 'S'
-        e2.file_size = 10;
-        nodeT.entries.push_back(e2);
-    }
-    rec.closure.push_back(nodeT);
-
-    ClosureNode nodeS;
-    nodeS.tree_hash = UInt128(0x53);   /// 'S'
-    {
-        TreeEntry e;
-        e.placement = Placement::Blob;
-        e.file_hash = UInt128(0x4232);   /// 'B2'
-        e.file_size = 3;
-        nodeS.entries.push_back(e);
-    }
-    rec.closure.push_back(nodeS);
-
-    in.journal.push_back(rec);
-
-    const RootShard out = decodeRootShard(encodeRootShard(in));
-    ASSERT_EQ(out.journal.size(), 1u);
-    EXPECT_EQ(out.journal[0].closure, in.journal[0].closure);
 }
 
 /// ===================================================================================
@@ -723,12 +666,10 @@ TEST(CasByteOrderGolden, RootShardBigEndian)
     RootShard rs;
     rs.shard_version = 9;
     rs.fence_round = 3;
-    RefPayload p;
-    p.tree_id = (UInt128(0xab) << 64) | UInt128(0xcd);
-    p.tree_size = 1142;
-    p.published_at_ms = 1781588451000ULL;
-    rs.refs["part_a"] = p;
-    rs.journal.push_back({JournalRecord::Op::Add, "part_a", p.tree_id, 8, {}});
+    const ManifestRef mr{"w", 7, (UInt128(0xab) << 64) | UInt128(0xcd)};
+    rs.refs["part_a"] = RootRef{"part_a", mr, {}, 1781588451000ULL};
+    rs.journal.push_back(RootOwnerEvent{8, std::nullopt,
+        OwnerBinding{OwnerKind::Committed, "part_a", UInt128(0), mr}});
     const String encoded = encodeRootShard(rs);
     ASSERT_FALSE(encoded.empty());
     /// Pure protobuf: the first byte is a field tag, not the old ASCII magic.
@@ -736,11 +677,11 @@ TEST(CasByteOrderGolden, RootShardBigEndian)
     EXPECT_EQ(static_cast<uint8_t>(encoded[0]), 0x0Au);
     /// Decode round-trips the BE bytes correctly (the full round-trip is the functional pin).
     const RootShard d = decodeRootShard(encoded);
-    EXPECT_EQ(d.refs.at("part_a").tree_id, p.tree_id);
-    EXPECT_EQ(d.refs.at("part_a").published_at_ms, p.published_at_ms);
-    /// Verify the encoded bytes contain the tree_id in big-endian:
+    EXPECT_EQ(d.refs.at("part_a").manifest_ref, mr);
+    EXPECT_EQ(d.refs.at("part_a").published_at_ms, 1781588451000ULL);
+    /// Verify the encoded bytes contain manifest_instance_id in big-endian:
     /// (0xab<<64)|0xcd -> 16 bytes: 00000000000000ab 00000000000000cd.
     const String encoded_hex = toHexBytes(encoded);
     EXPECT_NE(encoded_hex.find("00000000000000ab00000000000000cd"), std::string::npos)
-        << "tree_id not found big-endian in protobuf encoding (hex): " << encoded_hex;
+        << "manifest_instance_id not found big-endian in protobuf encoding (hex): " << encoded_hex;
 }

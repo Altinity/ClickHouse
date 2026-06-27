@@ -42,54 +42,58 @@ message CasHeader {
   uint32  compatibility_version = 3; // functional: the floor targeted; reader dispatches + fail-closes
 }
 
-// Serialized form of a single DB.Cas.TreeEntry for closure storage.
-// Only the fields needed by the GC walk are serialized; name/inline_bytes are
-// intentionally omitted (decode leaves them at defaults).
-message TreeEntryProto {
-  uint32 placement = 1;   // DB.Cas.Placement enum value (Inline=1, Blob=2, Subtree=3)
-  bytes  file_hash = 2;   // raw 16 bytes (UInt128, big-endian); blob/subtree hash
-  uint64 file_size = 3;
+// CA GC root-local part-manifest redesign (rev. 15). The compact reference a root journal stores for a
+// part manifest. NOT a string key: CasLayout::manifestKey derives the object key from this ref plus the
+// owning root namespace. root_namespace_id is NOT a field here (it comes from the owning context).
+message ManifestRefProto {
+  string writer_instance_id    = 1;  // "<server_id_hex>:<process_epoch>"; used verbatim as a path segment
+  uint64 build_sequence        = 2;  // monotone build sequence inside one writer incarnation
+  bytes  manifest_instance_id  = 3;  // raw 16 bytes (UInt128, big-endian); random, never reused
 }
 
-// One tree node in a precommit's inline closure: the node's tree hash and its staged entries.
-// An ADDITIVE field (field 5 of JournalRecord); old readers skip it.
-message ClosureNodeProto {
-  bytes tree_hash = 1;                    // raw 16 bytes (UInt128, big-endian)
-  repeated TreeEntryProto entries = 2;
+enum OwnerKindProto {
+  OWNER_KIND_UNSPECIFIED = 0;        // decode fails closed on 0
+  OWNER_KIND_COMMITTED   = 1;
+  OWNER_KIND_PRECOMMIT   = 2;
 }
 
-message RefPayload {
-  bytes tree_id = 1;                      // raw 16 bytes (UInt128, big-endian)
-  uint64 tree_size = 2;
-  map<string, string> mutable_files = 3;
-  reserved 4;                             // was `closure` (B199-S2); moved to JournalRecord.closure
-  uint64 published_at_ms = 5;             // publish wall-clock (epoch ms) for getLastModified; replaces the .ca_mtime mutable_files key
+// One owner binding: which kind of owner names which manifest.
+// Committed: ref_name set, build_id = 0. Precommit: ref_name = final_ref_name, build_id set.
+message OwnerBindingProto {
+  OwnerKindProto   owner_kind  = 1;
+  string           ref_name    = 2;
+  bytes            build_id    = 3;  // raw 16 bytes (UInt128, big-endian); 0 for Committed
+  ManifestRefProto manifest_ref = 4;
 }
 
-enum JournalOp {
-  JOURNAL_OP_UNSPECIFIED = 0;         // decode fails closed on 0
-  JOURNAL_OP_ADD = 1;
-  JOURNAL_OP_REMOVE = 2;
+// One ordered owner-change event in the single root journal stream. old_binding/new_binding are
+// proto3 explicit-presence (optional) so absence is distinguishable from a zero binding.
+message RootOwnerEventProto {
+  uint64                     transition_version = 1;
+  optional OwnerBindingProto old_binding        = 2;
+  optional OwnerBindingProto new_binding        = 3;
 }
 
-message JournalRecord {
-  JournalOp op = 1;
-  string ref_name = 2;
-  bytes tree_id = 3;                  // raw 16 bytes
-  uint64 at_version = 4;
-  repeated ClosureNodeProto closure = 5;  // NEW (B199-S2); populated only on precommit-ns Add records
+// The current committed ref payload in the root journal: the committed ManifestRef plus the mutable
+// per-ref files. root_namespace_id is NOT stored here — it comes from the owning root context.
+message RootRefProto {
+  string              ref_name        = 1;
+  ManifestRefProto    manifest_ref    = 2;
+  map<string, string> mutable_files   = 3;
+  uint64              published_at_ms = 4;  // publish wall-clock (epoch ms); 0 = unset
 }
 
 // Root shard manifest (the per-namespace versioned ref store). Magic CARS, FormatId::Manifest.
-// CasHeader is field 1; existing fields renumbered from 2 to free field 1.
+// rev. 15: refs carry a ManifestRef; the journal is ONE ordered RootOwnerEvent stream
+// (transition_version order). The old RefPayload/JournalRecord/ClosureNode model is removed.
 // (Pre-release: field renumbering is safe — no on-disk data exists under the old numbering.)
 message RootShardManifest {
   CasHeader header      = 1;          // magic=CARS; set by encoder, checked by decoder
   reserved "codec_version";           // old name; reserved so it is never reused
   uint64 shard_version  = 2;
   uint64 fence_round    = 3;
-  map<string, RefPayload> refs = 4;
-  repeated JournalRecord journal = 5; // insertion order preserved
+  map<string, RootRefProto> refs = 4;
+  repeated RootOwnerEventProto journal = 5; // insertion order == transition_version order
 }
 
 // Pool-wide identity and constants (_pool_meta). Magic CAPM, FormatId::PoolMeta.
