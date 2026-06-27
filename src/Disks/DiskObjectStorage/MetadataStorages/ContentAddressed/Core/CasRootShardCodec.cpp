@@ -78,6 +78,17 @@ OwnerBinding decodeOwnerBinding(const Cas::Proto::OwnerBindingProto & p, std::st
     b.ref_name = p.ref_name();
     b.build_id = u128FromBytesBE(p.build_id(), what);
     b.manifest_ref = decodeManifestRef(p.manifest_ref(), what);
+
+    /// Fail-closed decode: enforce the owner_kind<->build_id invariant the proto only documents
+    /// (OwnerBindingProto: "Committed: build_id = 0. Precommit: build_id set."). A binding that violates
+    /// it is corruption — a Committed owner with a build_id, or a Precommit owner without one, would
+    /// mis-drive the fold's precommit-vs-committed dispatch (the barrier / reclaim decisions).
+    if (b.owner_kind == OwnerKind::Committed && b.build_id != UInt128(0))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS {}: committed owner binding carries a non-zero build_id (owner_kind<->build_id invariant)", what);
+    if (b.owner_kind == OwnerKind::Precommit && b.build_id == UInt128(0))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS {}: precommit owner binding has a zero build_id (owner_kind<->build_id invariant)", what);
     return b;
 }
 

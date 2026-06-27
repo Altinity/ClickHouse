@@ -308,6 +308,42 @@ TEST(CasRootShardCodec, JournalTransitionVersionMonotonicityIsEnforced)
     }
 }
 
+/// Fail-closed decode enforces the owner_kind<->build_id invariant the proto documents (Committed =>
+/// build_id 0; Precommit => build_id != 0). A violating binding would mis-drive the fold's precommit-vs-
+/// committed dispatch (the barrier / reclaim), so it is corruption — caught at DECODE.
+TEST(CasRootShardCodec, OwnerKindBuildIdInvariantIsEnforced)
+{
+    const ManifestRef mr{"w", 1, UInt128(1)};
+
+    /// A committed binding carrying a non-zero build_id is corruption.
+    {
+        RootShard rs;
+        rs.shard_version = 1;
+        rs.journal.push_back(RootOwnerEvent{1, std::nullopt,
+            OwnerBinding{OwnerKind::Committed, "r", UInt128(0x99), mr}});
+        const String bytes = encodeRootShard(rs);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(bytes); });
+    }
+    /// A precommit binding with a ZERO build_id is corruption.
+    {
+        RootShard rs;
+        rs.shard_version = 1;
+        rs.journal.push_back(RootOwnerEvent{1, std::nullopt,
+            OwnerBinding{OwnerKind::Precommit, "r", UInt128(0), mr}});
+        const String bytes = encodeRootShard(rs);
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootShard(bytes); });
+    }
+    /// The legal pairings decode fine.
+    {
+        RootShard rs;
+        rs.shard_version = 2;
+        rs.journal.push_back(RootOwnerEvent{1, std::nullopt, committedBinding("r", mr)});
+        rs.journal.push_back(RootOwnerEvent{2, std::nullopt,
+            OwnerBinding{OwnerKind::Precommit, "r", UInt128(0x7), mr}});
+        EXPECT_NO_THROW(decodeRootShard(encodeRootShard(rs)));
+    }
+}
+
 TEST(CasRootShardCodec, ProtobufEncodingIsDeterministic)
 {
     RootShard rs;
