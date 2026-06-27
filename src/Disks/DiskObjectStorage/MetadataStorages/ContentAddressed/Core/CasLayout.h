@@ -142,18 +142,30 @@ public:
         return prefix + "/gc/hb";
     }
 
-    /// In-degree snapshot object: <prefix>/gc/snap/<generation>/<snap_shard>.
-    /// Sharded by the TARGET content-hash prefix (spec §4, decision 2026-06-11): every edge
-    /// targeting a node lands in the node's own snap shard, so in-degree is intra-shard.
-    String gcSnapKey(uint64_t generation, uint64_t snap_shard) const
+    /// Per-generation FOLD seal (write-once): <prefix>/gc/gen/<generation>/fold_seal (rev. 15).
+    String foldSealKey(uint64_t generation) const
     {
-        return prefix + "/gc/snap/" + std::to_string(generation) + "/" + std::to_string(snap_shard);
+        return prefix + "/gc/gen/" + std::to_string(generation) + "/fold_seal";
     }
 
-    /// Prefix that covers all snap shards of one generation (for list).
-    String gcSnapShardPrefix(uint64_t generation) const
+    /// Per-generation COMPLETION seal (write-once): <prefix>/gc/gen/<generation>/completion_seal.
+    String completionSealKey(uint64_t generation) const
     {
-        return prefix + "/gc/snap/" + std::to_string(generation) + "/";
+        return prefix + "/gc/gen/" + std::to_string(generation) + "/completion_seal";
+    }
+
+    /// One blob-target in-degree/delta run segment: <prefix>/gc/gen/<generation>/blob_target/<shard>/<seq>
+    String blobTargetRunKey(uint64_t generation, uint64_t shard, uint64_t seq) const
+    {
+        return prefix + "/gc/gen/" + std::to_string(generation) + "/blob_target/"
+               + std::to_string(shard) + "/" + std::to_string(seq);
+    }
+
+    /// One part-manifest cleanup bundle: <prefix>/gc/gen/<generation>/part_manifest_cleanup/<owner_shard>/<seq>
+    String partManifestCleanupKey(uint64_t generation, uint64_t owner_shard, uint64_t seq) const
+    {
+        return prefix + "/gc/gen/" + std::to_string(generation) + "/part_manifest_cleanup/"
+               + std::to_string(owner_shard) + "/" + std::to_string(seq);
     }
 
     /// Prefix that covers every root-shard manifest and namespace file (GC round discovery).

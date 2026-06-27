@@ -187,6 +187,49 @@ message GcOutcomeLogProto {
   repeated GcOutcomeEntryProto entries     = 2;
 }
 
+// CA GC root-local part-manifest redesign (rev. 15) — two write-once generation seals.
+// A reference to one write-once run object plus its content checksum (RunFooter checksum).
+message RunRefProto {
+  string key         = 1;
+  uint64 checksum_hi = 2;  // high 64 bits of the UInt128 checksum
+  uint64 checksum_lo = 3;  // low 64 bits
+}
+
+// One (namespace, shard) coverage entry inside a FoldSealProto.
+message FoldShardCoverageProto {
+  string key                = 1;  // "ns/shard"
+  uint32 classification     = 2;  // 0=Absent 1=Unchanged 2=Folded 3=Minted
+  uint32 folded_token_type  = 3;  // TokenType enum
+  string folded_token_value = 4;
+  uint64 folded_cursor      = 5;
+}
+
+// FOLD seal (write-once gc/gen/<gen>/fold_seal). Magic CAFS, FormatId::FoldSeal.
+message FoldSealProto {
+  CasHeader header                            = 1;
+  uint64 generation                           = 2;
+  uint64 parent_generation                    = 3;
+  repeated FoldShardCoverageProto per_ns_shard = 4;  // sorted by key
+  repeated RunRefProto blob_target_runs       = 5;   // sorted by key
+  repeated RunRefProto part_manifest_cleanup  = 6;   // sorted by key
+}
+
+// One "ns/shard" (or "_registry") -> version entry inside a CompletionSealProto map.
+message SealVersionEntryProto {
+  string key     = 1;
+  uint64 version = 2;
+}
+
+// COMPLETION seal (write-once gc/gen/<gen>/completion_seal). Magic CACS, FormatId::CompletionSeal.
+message CompletionSealProto {
+  CasHeader header                          = 1;
+  uint64 generation                         = 2;
+  repeated SealVersionEntryProto fence_positions = 3;  // sorted by key
+  repeated RunRefProto delete_outcomes      = 4;       // sorted by key
+  repeated SealVersionEntryProto trim_cursors = 5;     // sorted by key
+  bool adoptable                            = 6;
+}
+
 // One condemned object inside a RetiredSetProto.
 // kind: 1=blob, 2=tree (mirrors ObjectKind enum).
 // token_type: 1=etag, 2=generation, 3=emulated (mirrors TokenType enum).
