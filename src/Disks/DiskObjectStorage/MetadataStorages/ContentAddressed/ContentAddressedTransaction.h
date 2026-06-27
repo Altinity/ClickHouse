@@ -90,7 +90,7 @@ private:
     struct PartStaging
     {
         Cas::BuildPtr build;                       /// nullptr until the first content upload
-        std::vector<Cas::TreeEntry> entries;       /// staged tree entries (uploads + adoptions)
+        std::vector<Cas::ManifestEntry> entries;   /// staged manifest entries (uploads + adoptions)
         std::map<std::string, std::string> mutable_files;
         std::set<std::string> mutable_removed;     /// staged deletions for a COMMITTED part's payload
         bool published = false;                    /// the ref is already durably published (at the
@@ -120,7 +120,7 @@ private:
 
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
     PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);
-    const Cas::TreeEntry * findStagedEntry(const ContentAddressedMetadataStorage::Route & r) const;
+    const Cas::ManifestEntry * findStagedEntry(const ContentAddressedMetadataStorage::Route & r) const;
     /// B188: return a pointer to the pending (staged-but-not-yet-uploaded) blob for `hash`, or nullptr
     /// if not pending (already uploaded or never staged).
     const PartStaging::PendingBlob * findPendingBlob(const PartStaging & st, const UInt128 & hash) const;
@@ -148,7 +148,7 @@ private:
     ///
     /// `pb == nullptr` (uploaded / committed): dst_build.adoptEvidence(entry) — tokenless W-EVIDENCE,
     /// no pool HEAD/GET before precommit.
-    void adoptStagedBlob(const PartStaging::PendingBlob * pb, const Cas::TreeEntry & entry,
+    void adoptStagedBlob(const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
                          PartStaging & dst_st, Cas::Build & dst_build, bool copy_pending);
 
     /// Publish one staged part durably (putTree + publish, or updateRefPayload for a mutable-only

@@ -135,31 +135,32 @@ bool ContentAddressedTransaction::republishRef(
     const Cas::RootNamespace & src_ns, const std::string & src_ref,
     const Cas::RootNamespace & dst_ns, const std::string & dst_ref)
 {
-    /// Move a COMMITTED ref: content addressing has no rename, so publish the SAME tree under the
-    /// destination and drop the source ref. Returns false (nothing written) when the source ref is absent.
+    /// Move a COMMITTED ref (rev. 15 §republish): content addressing has no rename. Read the SOURCE
+    /// manifest's entries, stage a FRESH dst part manifest over the SAME blob hashes (only blobs are
+    /// content-addressed; a part is a single-owner ManifestId, so dst gets its own id), precommitAdd +
+    /// promote it, then drop the source ref. Returns false (nothing written) when the source is absent.
     /// Force-fresh (Pillar B): RENAME/move source read — stale mutable_files must not carry to dst.
     auto resolved = metadata_storage.store()->resolveRef(src_ns, src_ref);
     if (!resolved)
         return false;
+    const Cas::PartManifest src_manifest = metadata_storage.store()->readManifest(resolved->manifest_id);
+
     auto build = metadata_storage.store()->startBuild(
         Cas::BuildInfo{.intended_ref = dst_ns.string() + "/" + dst_ref, .op = Cas::ProvenanceOp::Other});
-    /// B190 Task 4 (precommit-first): record a TOKENLESS tree-evidence dep WITHOUT HEADing the tree
-    /// object. A synthetic Subtree TreeEntry carries the (hash, size) from the resolved ref metadata —
-    /// no pool GET/HEAD needed. The merged publish gate (post-precommit) re-proves the dep at publish.
-    /// This eliminates the adoptTree → observeAndAdmit → HEAD that happened before precommit.
-    Cas::TreeEntry tree_evidence;
-    tree_evidence.placement = Cas::Placement::Subtree;
-    tree_evidence.file_hash = Cas::hexToU128(resolved->tree_id.string());
-    tree_evidence.file_size = resolved->tree_size;
-    build->adoptEvidence(tree_evidence);
-    Cas::RefPayload payload;
-    payload.tree_size = resolved->tree_size;
-    payload.mutable_files = resolved->mutable_files;
-    payload.published_at_ms = resolved->published_at_ms;   /// the publish stamp carries over (a rename is not a new part)
-    /// B190 precommit-first: protect the adopted closure via a build-root precommit BEFORE the
-    /// fail-closed publish. The publish gate (checkAndResolveDeps) re-proves the tree dep at publish time.
-    build->precommit(resolved->tree_id);
-    build->publish(dst_ns, dst_ref, resolved->tree_id, std::move(payload));
+
+    /// Record a TOKENLESS W-EVIDENCE dep for every blob the source manifest names — NO HEAD before
+    /// precommit. promote re-proves each dep fail-closed. Inline entries record nothing (adoptEvidence
+    /// skips them).
+    for (const auto & entry : src_manifest.entries)
+        build->adoptEvidence(entry);
+
+    /// Stage a fresh dst manifest over the SAME entries (same blob hashes), then move ownership in.
+    const Cas::ManifestId id = build->stageManifest(src_manifest.entries);
+    build->precommitAdd(dst_ns, dst_ref, id);
+    /// Mutable files carry over (a rename is not a new part). promote stamps the dst publish wall-clock.
+    build->setPendingMutableFiles(resolved->mutable_files);
+    build->promote(dst_ns, dst_ref, build->buildId(), id);
+
     metadata_storage.store()->dropRef(src_ns, src_ref);
     return true;
 }
@@ -215,7 +216,7 @@ ContentAddressedTransaction::findPendingBlob(const PartStaging & st, const UInt1
 }
 
 void ContentAddressedTransaction::adoptStagedBlob(
-    const PartStaging::PendingBlob * pb, const Cas::TreeEntry & entry,
+    const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
     PartStaging & dst_st, Cas::Build & dst_build, bool copy_pending)
 {
     if (pb)
@@ -226,7 +227,7 @@ void ContentAddressedTransaction::adoptStagedBlob(
         /// If !copy_pending, the record is already in dst_st (moved by caller) — skip the push.
         if (copy_pending)
             dst_st.pending_blobs.push_back(*pb);
-        dst_build.recordPendingBlobDep(entry.file_hash, entry.file_size);
+        dst_build.recordPendingBlobDep(entry.blob_hash, entry.blob_size);
     }
     else
     {
@@ -256,7 +257,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         /// fill-in/rewrite) and metadata_version bumps on a COMMITTED part.
         if (!st.mutable_files.empty() || !st.mutable_removed.empty())
         {
-            metadata_storage.store()->updateRefPayload(ns, ref, [&](Cas::RefPayload & payload)
+            metadata_storage.store()->updateRefPayload(ns, ref, [&](Cas::RootRef & payload)
             {
                 for (const auto & [name, bytes] : st.mutable_files)
                     payload.mutable_files[name] = bytes;
@@ -272,28 +273,22 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "ContentAddressedTransaction: staged entries for {}/{} without a Build", ns.string(), ref);
 
-    /// B188 precommit-first: stage the tree LOCALLY (no upload), precommit to protect the whole
-    /// closure by reachability, THEN do every pool write (tree object + pending blobs) and publish.
-    const Cas::TreeId tree = st.build->stageTree(st.entries);
+    /// Write path (rev. 15): stage the part manifest body (mints a ManifestId), precommitAdd a
+    /// build-intent owner (closure now protected by reachability), upload the pending blobs, then
+    /// promote — an atomic owner move that revalidates every blob fail-closed.
+    const Cas::ManifestId id = st.build->stageManifest(st.entries);
+    st.build->precommitAdd(ns, ref, id);
 
-    Cas::RefPayload payload;
-    payload.mutable_files = st.mutable_files;
-    payload.published_at_ms = static_cast<uint64_t>(::time(nullptr)) * 1000;
-
-    st.build->precommit(tree);                       /// closure now reachable from a durable build root
-
-    /// B189: build the set of blob hashes actually referenced by the staged tree. Only
-    /// Placement::Blob entries represent pending content uploads — Subtree/Inline are
-    /// not pending blobs. A pending_blob whose hash is NOT in this set had its tree entry removed
-    /// by unlinkFile/replaceFile and must not be uploaded (it is an orphan). Its temp file is
-    /// still cleaned by cleanupPendingTempFiles at commit end.
+    /// B189: build the set of blob hashes actually referenced by the staged manifest. Only Blob
+    /// entries represent pending content uploads — Inline are not pending blobs. A pending_blob whose
+    /// hash is NOT in this set had its entry removed by unlinkFile/replaceFile and must not be uploaded
+    /// (it is an orphan). Its temp file is still cleaned by cleanupPendingTempFiles at commit end.
     std::unordered_set<UInt128, UInt128Hash> referenced_hashes;
     for (const auto & entry : st.entries)
-        if (entry.placement == Cas::Placement::Blob)
-            referenced_hashes.insert(entry.file_hash);
+        if (entry.placement == Cas::EntryPlacement::Blob)
+            referenced_hashes.insert(entry.blob_hash);
 
-    st.build->uploadStagedTree(tree);                /// pool write #1 — under protection
-    for (const auto & pb : st.pending_blobs)         /// pool writes #2 — uploads + 412/HEAD/resurrect
+    for (const auto & pb : st.pending_blobs)         /// pool writes — uploads + 412/HEAD/resurrect
     {
         if (!referenced_hashes.count(pb.hash))
             continue;   /// B189: orphaned pending blob (entry removed by unlinkFile/replaceFile) — skip
@@ -309,7 +304,8 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     }
 
     const bool ref_existed = metadata_storage.store()->resolveRef(ns, ref).has_value();
-    st.build->publish(ns, ref, tree, std::move(payload));
+    st.build->setPendingMutableFiles(st.mutable_files);
+    st.build->promote(ns, ref, st.build->buildId(), id);
     st.published = true;
     return !ref_existed;
 }
@@ -382,14 +378,14 @@ StoredObjects ContentAddressedTransaction::getSubmittedForRemovalBlobs()
     return {};
 }
 
-const Cas::TreeEntry * ContentAddressedTransaction::findStagedEntry(
+const Cas::ManifestEntry * ContentAddressedTransaction::findStagedEntry(
     const ContentAddressedMetadataStorage::Route & r) const
 {
     auto it = parts.find({r.ns.string(), r.ref});
     if (it == parts.end())
         return nullptr;
     auto eit = std::find_if(it->second.entries.begin(), it->second.entries.end(),
-        [&](const Cas::TreeEntry & e) { return e.name == r.file; });
+        [&](const Cas::ManifestEntry & e) { return e.path == r.file; });
     return eit == it->second.entries.end() ? nullptr : &*eit;
 }
 
@@ -405,16 +401,16 @@ std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageO
         return {};
     if (const auto * entry = findStagedEntry(*r))
     {
-        if (entry->placement == Cas::Placement::Blob)
+        if (entry->placement == Cas::EntryPlacement::Blob)
         {
             /// B188: a pending blob has not been uploaded yet — its storage object does not exist in
             /// the pool. Return empty so the caller falls back to tryReadFileInFlight (local temp read).
-            if (findPendingBlob(it->second, entry->file_hash))
+            if (findPendingBlob(it->second, entry->blob_hash))
                 return {};
             const auto location = metadata_storage.store()->locate(*entry);
             return StoredObjects{StoredObject(location.key, path, location.length)};
         }
-        return StoredObjects{StoredObject("", path, entry->file_size)};
+        return StoredObjects{StoredObject("", path, entry->blob_size)};
     }
     return {};
 }
@@ -433,13 +429,13 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFile
         return std::make_unique<ReadBufferFromOwnMemoryFile>(path, mit->second);
     if (const auto * entry = findStagedEntry(*r))
     {
-        if (entry->placement == Cas::Placement::Inline)
+        if (entry->placement == Cas::EntryPlacement::Inline)
             return std::make_unique<ReadBufferFromOwnMemoryFile>(path, entry->inline_bytes);
-        if (entry->placement == Cas::Placement::Blob)
+        if (entry->placement == Cas::EntryPlacement::Blob)
         {
             /// B188: a pending blob has not been uploaded yet — serve reads from the local temp file
             /// (the same file that will be streamed to the pool in publishStaging post-precommit).
-            if (const auto * pb = findPendingBlob(it->second, entry->file_hash))
+            if (const auto * pb = findPendingBlob(it->second, entry->blob_hash))
                 return std::make_unique<ReadBufferFromFile>(pb->temp_path);
             return metadata_storage.readBlobPayload(metadata_storage.store()->locate(*entry), path, settings);
         }
@@ -458,7 +454,7 @@ std::optional<uint64_t> ContentAddressedTransaction::tryGetInFlightFileSize(cons
     if (auto mit = it->second.mutable_files.find(r->file); mit != it->second.mutable_files.end())
         return mit->second.size();
     if (const auto * entry = findStagedEntry(*r))
-        return entry->file_size;
+        return entry->blob_size;
     return {};
 }
 
@@ -479,7 +475,7 @@ bool ContentAddressedTransaction::hasInFlightDirectory(const std::string & path)
         return false;
     const std::string prefix = r->file + "/";
     for (const auto & entry : it->second.entries)
-        if (entry.name.starts_with(prefix))
+        if (entry.path.starts_with(prefix))
             return true;
     for (const auto & [name, _] : it->second.mutable_files)
         if (name.starts_with(prefix))
@@ -509,7 +505,7 @@ std::vector<std::string> ContentAddressedTransaction::listInFlightDirectory(cons
         names.insert(slash == std::string::npos ? rest : rest.substr(0, slash));
     };
     for (const auto & entry : it->second.entries)
-        add(entry.name);
+        add(entry.path);
     for (const auto & [name, _] : it->second.mutable_files)
         add(name);
     return {names.begin(), names.end()};
@@ -531,12 +527,12 @@ void ContentAddressedTransaction::stageBlobPartFile(
     st.pending_blobs.push_back({hash, temp_path, size});
     buildFor(route, st).recordPendingBlobDep(hash, size);
 
-    Cas::TreeEntry entry;
-    entry.name = route.file;
-    entry.placement = Cas::Placement::Blob;
-    entry.file_hash = hash;
-    entry.file_size = size;
-    std::erase_if(st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+    Cas::ManifestEntry entry;
+    entry.path = route.file;
+    entry.placement = Cas::EntryPlacement::Blob;
+    entry.blob_hash = hash;
+    entry.blob_size = size;
+    std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
     st.entries.push_back(std::move(entry));
 }
 
@@ -625,13 +621,13 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             if (bytes.size() <= INLINE_CAP)
             {
                 auto & st = stagingFor(route);
-                Cas::TreeEntry entry;
-                entry.name = route.file;
-                entry.placement = Cas::Placement::Inline;
-                entry.file_hash = hash;            /// content hash — inline == blob for the Merkle id
-                entry.file_size = bytes.size();
+                Cas::ManifestEntry entry;
+                entry.path = route.file;
+                entry.placement = Cas::EntryPlacement::Inline;
+                entry.blob_hash = hash;            /// content hash — inline == blob for the Merkle id
+                entry.blob_size = bytes.size();
                 entry.inline_bytes = std::move(bytes);
-                std::erase_if(st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+                std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
                 st.entries.push_back(std::move(entry));
             }
             else
@@ -786,40 +782,47 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
     /// re-observes the blob via cold reuse — its own dependency); else carry forward from the
     /// COMMITTED source part (adoptFromTree: tokenless evidence pinned by the witnessed live
     /// source tree, W-EVIDENCE).
-    Cas::TreeEntry entry;
+    Cas::ManifestEntry entry;
     if (auto * src_st = findStaging(*src))
     {
         auto it = std::find_if(src_st->entries.begin(), src_st->entries.end(),
-            [&](const Cas::TreeEntry & e) { return e.name == src->file; });
+            [&](const Cas::ManifestEntry & e) { return e.path == src->file; });
         if (it != src_st->entries.end())
         {
             entry = *it;
-            if (entry.placement == Cas::Placement::Blob)
+            if (entry.placement == Cas::EntryPlacement::Blob)
             {
                 /// B190 Task 4: unified adopt dispatch. copy_pending=(&dst_st != src_st) so the pending
                 /// blob record is copied into dst_st only when the destination is a different part
                 /// (hardlink = copy semantics; same-part is a self-ref that shouldn't duplicate the record).
-                const auto * pb = findPendingBlob(*src_st, entry.file_hash);
+                const auto * pb = findPendingBlob(*src_st, entry.blob_hash);
                 adoptStagedBlob(pb, entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/(&dst_st != src_st));
             }
-            else if (entry.placement != Cas::Placement::Inline)
+            else if (entry.placement != Cas::EntryPlacement::Inline)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "ContentAddressed: staged hardlink of unsupported placement for {}", path_from);
-            entry.name = dst->file;
-            std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+            entry.path = dst->file;
+            std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
             dst_st.entries.push_back(std::move(entry));
             return;
         }
     }
 
-    /// Force-fresh (Pillar B): projection hardlink source — carry the current payload/tree_id.
+    /// Carry forward from the COMMITTED source part: read the source manifest, find the named entry,
+    /// record a TOKENLESS W-EVIDENCE dep for its blob (no HEAD before precommit; promote re-proves it).
     auto resolved = metadata_storage.store()->resolveRef(src->ns, src->ref);
     if (!resolved)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: createHardLink source part missing: {}", path_from);
-    entry = buildFor(*dst, dst_st).adoptFromTree(resolved->tree_id, src->file);
-    entry.name = dst->file;
-    std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+    const Cas::PartManifest src_manifest = metadata_storage.store()->readManifest(resolved->manifest_id);
+    auto src_entry = metadata_storage.store()->lookupPath(src_manifest, src->file);
+    if (!src_entry)
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+            "ContentAddressed: createHardLink source file missing in manifest: {}", path_from);
+    buildFor(*dst, dst_st).adoptEvidence(*src_entry);
+    entry = *src_entry;
+    entry.path = dst->file;
+    std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
     dst_st.entries.push_back(std::move(entry));
 }
 
@@ -903,8 +906,8 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             const std::string old_prefix = src->file + "/";
             const std::string new_prefix = dst->file + "/";
             for (auto & entry : st->entries)
-                if (entry.name.starts_with(old_prefix))
-                    entry.name = new_prefix + entry.name.substr(old_prefix.size());
+                if (entry.path.starts_with(old_prefix))
+                    entry.path = new_prefix + entry.path.substr(old_prefix.size());
             for (auto it = st->mutable_files.begin(); it != st->mutable_files.end();)
             {
                 if (it->first.starts_with(old_prefix))
@@ -944,7 +947,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             PartStaging & src_st = src_it->second;
             for (auto & entry : src_st.entries)
             {
-                std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+                std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
                 dst_st.entries.push_back(std::move(entry));
             }
             for (auto & [file, bytes] : src_st.mutable_files)
@@ -981,11 +984,11 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 /// time is unnecessary - entries staged via putBlob/adopt carry deps in the SOURCE
                 /// build... merge conservatively by abandoning nothing and re-observing):
                 for (const auto & entry : dst_st.entries)
-                    if (entry.placement == Cas::Placement::Blob)
+                    if (entry.placement == Cas::EntryPlacement::Blob)
                     {
                         /// B190 Task 4: unified adopt dispatch. Pending blob records were already moved
                         /// to dst_st.pending_blobs above (MOVE semantics), so copy_pending=false.
-                        adoptStagedBlob(findPendingBlob(dst_st, entry.file_hash), entry, dst_st, *dst_st.build, /*copy_pending=*/false);
+                        adoptStagedBlob(findPendingBlob(dst_st, entry.blob_hash), entry, dst_st, *dst_st.build, /*copy_pending=*/false);
                     }
                 src_st.build->abandon();
             }
@@ -1114,27 +1117,27 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
     }
     /// Staged content entry re-keys in place (cross-part included; deps follow the entries).
     auto it = std::find_if(src_st.entries.begin(), src_st.entries.end(),
-        [&](const Cas::TreeEntry & e) { return e.name == src->file; });
+        [&](const Cas::ManifestEntry & e) { return e.path == src->file; });
     if (it != src_st.entries.end())
     {
         auto entry = std::move(*it);
         src_st.entries.erase(it);
-        entry.name = dst->file;
-        if (&src_st != &dst_st && entry.placement == Cas::Placement::Blob)
+        entry.path = dst->file;
+        if (&src_st != &dst_st && entry.placement == Cas::EntryPlacement::Blob)
         {
             /// B190 Task 4: unified adopt dispatch. MOVE semantics — physically move the pending blob
             /// record from src_st to dst_st FIRST (so dst_st owns the upload), then call adoptStagedBlob
             /// with copy_pending=false (the record is already in dst_st; no additional copy needed).
             auto pb_it = std::find_if(src_st.pending_blobs.begin(), src_st.pending_blobs.end(),
-                [&](const PartStaging::PendingBlob & pb) { return pb.hash == entry.file_hash; });
+                [&](const PartStaging::PendingBlob & pb) { return pb.hash == entry.blob_hash; });
             if (pb_it != src_st.pending_blobs.end())
             {
                 dst_st.pending_blobs.push_back(std::move(*pb_it));
                 src_st.pending_blobs.erase(pb_it);
             }
-            adoptStagedBlob(findPendingBlob(dst_st, entry.file_hash), entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/false);
+            adoptStagedBlob(findPendingBlob(dst_st, entry.blob_hash), entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/false);
         }
-        std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == entry.name; });
+        std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
         dst_st.entries.push_back(std::move(entry));
         return;
     }
@@ -1166,7 +1169,7 @@ void ContentAddressedTransaction::replaceFile(const std::string & path_from, con
         /// cleanupPendingTempFiles at commit end, and the orphaned record is filtered out of the
         /// publish upload by the staged-tree-hash check in publishStaging (B189). We do NOT purge it
         /// eagerly because the same hash may still be referenced by another staged entry.
-        std::erase_if(dst_st.entries, [&](const Cas::TreeEntry & e) { return e.name == dst->file; });
+        std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == dst->file; });
         dst_st.mutable_files.erase(dst->file);
         dst_st.mutable_removed.erase(dst->file);
     }
@@ -1204,12 +1207,12 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
         auto & st = stagingFor(*r);
         const bool staged_here = st.mutable_files.contains(r->file)
             || std::any_of(st.entries.begin(), st.entries.end(),
-                           [&](const Cas::TreeEntry & e) { return e.name == r->file; });
+                           [&](const Cas::ManifestEntry & e) { return e.path == r->file; });
         /// A matching pending_blobs record (if any) is left in place — its temp file is cleaned by
         /// cleanupPendingTempFiles at commit end, and the orphaned record is filtered out of the
         /// publish upload by the staged-tree-hash check in publishStaging (B189). We do NOT purge it
         /// eagerly because the same hash may still be referenced by another staged entry.
-        std::erase_if(st.entries, [&](const Cas::TreeEntry & e) { return e.name == r->file; });
+        std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == r->file; });
         st.mutable_files.erase(r->file);
         if (!staged_here && ContentAddressed::isMutablePerPartFile(r->file))
             st.mutable_removed.insert(r->file);

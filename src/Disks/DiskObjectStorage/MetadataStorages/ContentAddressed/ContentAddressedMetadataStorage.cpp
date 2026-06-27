@@ -33,6 +33,7 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int READONLY;
     extern const int BAD_ARGUMENTS;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace
@@ -966,60 +967,31 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedMetadataStorage::readBlo
 
 /// ==== IContentAddressedExchange (M-W T11; D-W4) ====
 
-std::optional<String> ContentAddressedMetadataStorage::getPartTreeId(const String & part_path) const
+std::optional<String> ContentAddressedMetadataStorage::getPartTreeId(const String & /*part_path*/) const
 {
-    /// Sender side: the tree id THIS server's ref names for the part - the relink offer. No ref
-    /// (or an unroutable path) means no offer; the sender streams bytes.
-    if (!cas_store)
-        return std::nullopt;
-    auto p = ContentAddressed::parsePartFilePath(part_path);
-    if (!p)
-        return std::nullopt;
-    auto r = route(*p);
-    if (!r || r->ref.empty() || !r->file.empty())
-        return std::nullopt;
-    auto resolved = store()->resolveRef(r->ns, r->ref, /*allow_stale=*/true);
-    if (!resolved)
-        return std::nullopt;
-    return resolved->tree_id.string();
+    /// Cross-server relink offer (rev. 15): the old optimization transmitted a CONTENT-ADDRESSED tree
+    /// id that the receiver could adopt, because trees were shared by content hash across servers. In
+    /// the part-manifest redesign a part is a per-instance single-owner ManifestId — there is no shared
+    /// content-addressed id to offer. A manifest-era relink (transmit the manifest's blob hashes; the
+    /// receiver stages its OWN manifest over them) is a separate interface rework (backlog B7). Until
+    /// then this offers nothing, so the sender streams bytes — the documented, correct fallback path.
+    return std::nullopt;
 }
 
 bool ContentAddressedMetadataStorage::adoptPart(
-    const String & table_uuid, const String & part_name,
-    const String & tree_id_hex, const std::map<String, String> & mutable_files)
+    const String & /*table_uuid*/, const String & /*part_name*/,
+    const String & /*tree_id_hex*/, const std::map<String, String> & /*mutable_files*/)
 {
     if (read_only)
         throw Exception(ErrorCodes::READONLY, "Content-addressed disk is opened read-only: adoptPart is rejected");
 
-    /// Receiver side: adopt-by-tree-id + publish this server's own ref. adoptTree OBSERVES the
-    /// tree (cold reuse, 2026-06-12) - a tree reclaimed since the sender's offer surfaces as
-    /// FILE_DOESNT_EXIST and the caller falls back to the byte fetch, exactly where the old
-    /// 4-step pin protocol fell back. Publish-gate ABORTED propagates (a retryable fetch error).
-    const Cas::TreeId tree{tree_id_hex};
-    const auto ns = liveNamespace(table_uuid);
-    auto build = store()->startBuild(
-        Cas::BuildInfo{.intended_ref = ns.string() + "/" + part_name, .op = Cas::ProvenanceOp::Other});
-    try
-    {
-        build->adoptTree(tree);
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
-            throw;
-        build->abandon();
-        return false;
-    }
-    Cas::RefPayload payload;
-    payload.mutable_files = mutable_files;
-    payload.published_at_ms = static_cast<uint64_t>(::time(nullptr)) * 1000;
-    /// tree_size is not carried on the wire (B92: the adopt path publishes 0 until the size is
-    /// recovered; no read path consumes it yet).
-    /// B171: protect the adopted closure via a build-root precommit before the fail-closed publish,
-    /// so GC cannot reclaim a tree/blob between this server's adopt and its own commit.
-    build->precommit(tree);
-    build->publish(ns, part_name, tree, std::move(payload));
-    return true;
+    /// Unreachable while getPartTreeId offers nothing (the sender always streams bytes). Fail closed if
+    /// a caller ever reaches it — a manifest-era relink is backlog B7, not a silent no-op. (Fail-close:
+    /// publishing NOTHING is the safe outcome; returning false here would route the caller to a byte
+    /// fetch, but the offer was never made, so reaching this is a logic error.)
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "ContentAddressed: adoptPart is not supported in the part-manifest model (cross-server relink "
+        "reworked to manifest blob-hash transfer — backlog B7); the sender streams bytes");
 }
 
 }
