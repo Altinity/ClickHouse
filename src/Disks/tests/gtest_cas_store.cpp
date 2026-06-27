@@ -91,9 +91,11 @@ ManifestRef manifestRefFor(const String & tag)
         .manifest_instance_id = DB::Cas::tests::u128Of(tag)};
 }
 
-/// Publish a part holding the given manifest entries verbatim (no blob upload) through the real Build.
-/// Used by read-path lookup/list tests that want a precise multi-entry manifest (the entries' blobs do
-/// not need bodies for resolve/readManifest/lookup — only `locate`+ranged read would). Returns the id.
+/// Publish a part holding the given manifest entries verbatim through the real Build. Used by read-path
+/// lookup/list tests that want a precise multi-entry manifest. Each Blob entry's body MUST be present at
+/// promote: the promote gate revalidates EVERY blob leaf with a HEAD and fails closed on an absent body.
+/// So write a blob body for each Blob entry (addressed by its hash) and record it as W-EVIDENCE before
+/// staging. Inline entries need no body. Returns the published ManifestId.
 ManifestId publishPartWithEntries(
     const StorePtr & s, const String & ns, const String & ref, std::vector<ManifestEntry> entries)
 {
@@ -101,9 +103,14 @@ ManifestId publishPartWithEntries(
     BuildInfo info;
     info.intended_ref = ns + "/" + ref;
     auto build = s->startBuild(info);
-    /// Inline entries need no body; Blob entries are recorded as W-EVIDENCE so promote can revalidate.
     for (const auto & e : entries)
-        build->adoptEvidence(e);
+        if (e.placement == EntryPlacement::Blob)
+        {
+            /// Materialize the blob body so the promote-time HEAD revalidation succeeds, then record the
+            /// tokenless W-EVIDENCE dep (the gate re-observes the current token at promote).
+            DB::Cas::tests::writeBlobBody(s->backend(), s->layout(), e.blob_hash);
+            build->adoptEvidence(e);
+        }
     const ManifestId id = build->stageManifest(std::move(entries));
     build->precommitAdd(nsr, ref, id);
     build->promote(nsr, ref, build->buildId(), id);

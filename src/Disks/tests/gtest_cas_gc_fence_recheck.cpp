@@ -69,8 +69,10 @@ TEST(CasGcRecheck, PublishRacingFenceSparesBlob)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
     Gc gc(store, kGc);
     gc.runRegularRound();
-    // Drop r1 AND re-publish blob 1 under r2 in the same window before the next round folds.
-    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+    // Repoint the ref from r1 to r2 (both reference blob 1) in the same window before the next round
+    // folds. ONE repoint event {old=committed(r1), new=committed(r2)} — the -1 (r1's body) and +1
+    // (r2's body) net to in-degree 1, so blob 1 is re-pinned and must be SPARED. (Not a separate drop
+    // THEN repoint — that would double-count the -1 on r1's body and over-delete.)
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);
     gc.runRegularRound();   // net in-degree 1 => spared

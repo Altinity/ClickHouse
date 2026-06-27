@@ -33,6 +33,8 @@ using namespace DB::Cas;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::inDegreeOf;
+using DB::Cas::tests::publishCommittedTransition;
+using DB::Cas::tests::appendOwnerEvent;
 
 namespace
 {
@@ -122,31 +124,51 @@ bool manifestPresent(const std::shared_ptr<InMemoryBackend> & b, const Layout & 
     return b->head(layout.manifestKey(id)).exists;
 }
 
-/// Reproduce displacement + a competing delete on the SAME (s, ns, ref) and run GC to fixpoint. partB's
-/// distinct blobs displace partA's via a second promote for the same ref name (last-owner-wins). partA's
-/// manifest body is then deleted by exact token exactly as a competing GC round's landed delete would,
-/// so GC must reclaim partA's blobs from the journal-recorded edges WITHOUT reading the vanished body.
-/// Returns the fsck report so the caller can assert the no-leak end state.
-FsckReport displaceDeleteAndGc(
+/// Stage partB's full closure (its two distinct blob bodies + its manifest body) through the REAL
+/// writer primitives WITHOUT publishing an owner — `startBuild -> putBlob(each) -> stageManifest`. The
+/// bytes are durable in the backend but no journal owner names them yet; the caller installs partB as
+/// the new owner via a REPOINT (see displaceAndGc). Returns partB's ManifestId.
+ManifestId stagePartBClosure(
+    const StorePtr & s, const RootNamespace & ns, const String & ref,
+    const String & payload_a, const String & payload_b)
+{
+    BuildInfo info;
+    info.intended_ref = ns.string() + "/" + ref;
+    auto build = s->startBuild(info);
+    build->putBlob(idOf(payload_a), BlobSource::fromString(payload_a));
+    build->putBlob(idOf(payload_b), BlobSource::fromString(payload_b));
+    const ManifestId id = build->stageManifest({blobEntry("data.bin", payload_a),
+                                                blobEntry("data.cmrk3", payload_b)});
+    /// No precommitAdd / promote: the repoint below installs partB committed in ONE owner-move event.
+    return id;
+}
+
+/// Reproduce displacement on the SAME (s, ns, ref) and run GC to a fixpoint. partB's distinct blobs
+/// displace partA's via a REPOINT of the ref (one RootOwnerEvent old={Committed,ref,partA}/
+/// new={Committed,ref,partB}) — the real production shape of last-owner-wins, NOT a body delete.
+///
+/// Crucially the test does NOT delete partA's manifest body. In the part-manifest model a true removal
+/// (the repoint's -1) is derived by GC READING partA's body at removal-fold time; only GC may delete a
+/// committed owner's body, and only AFTER the -1 is sealed (recheck cleanup, control #11). So GC folds
+/// the repoint: -1 for partA's blobs (body present), +1 for partB's blobs, retires + deletes partA's
+/// now-zero-in-degree blobs, and recheck cleanup deletes partA's owner-removed body. Returns the fsck
+/// report so the caller can assert the no-leak end state (partA's blobs AND body gone, unreachable==0).
+FsckReport displaceAndGc(
     const StorePtr & s, const std::shared_ptr<InMemoryBackend> & b,
     const RootNamespace & ns, const String & ref, const ManifestId & part_a)
 {
-    /// Re-publish the SAME ref to partB (distinct blobs): last-owner-wins displacement of partA's owner.
-    publishTwoBlobPart(s, ns, ref, "data-B", "mark-B");
+    /// Stage partB's full closure (blobs + body present), then repoint the ref from partA to partB.
+    const ManifestId part_b = stagePartBClosure(s, ns, ref, "data-B", "mark-B");
 
-    /// A competing GC round already deleted the displaced partA body: delete it at the BACKEND by exact
-    /// token so GC's fold reads it absent (the removal -1 then comes from the recorded owner edge, never
-    /// from the missing body).
-    {
-        const String key = s->layout().manifestKey(part_a);
-        const auto head = b->head(key);
-        EXPECT_TRUE(head.exists) << "partA manifest body must exist before we delete it";
-        EXPECT_EQ(b->deleteExact(key, head.token).kind, DeleteOutcome::Kind::Deleted);
-        EXPECT_FALSE(b->head(key).exists) << "partA manifest body must be gone after the delete";
-    }
+    EXPECT_TRUE(b->head(s->layout().manifestKey(part_a)).exists)
+        << "partA manifest body must still be present so GC can read its -1 edges at removal-fold";
 
-    /// The displacing publish dropped partA's owner; advance the watermark floor so partA's now-orphaned
-    /// blobs are not spared as in-flight, then run GC to a fixpoint.
+    /// REPOINT: old={Committed,ref,partA} / new={Committed,ref,partB} in the single ordered journal.
+    /// (root_shards=1, so the ref's shard is 0 — matches publishCommittedTransition's default.)
+    publishCommittedTransition(*b, s->layout(), ns, ref, part_a.ref, part_b.ref);
+
+    /// The repoint dropped partA's owner; advance the watermark floor so partA's now-orphaned blobs are
+    /// not spared as in-flight, then run GC to a fixpoint.
     s->renewWatermarkOnce();
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
     runGcToFixpoint(gc);
@@ -186,9 +208,10 @@ TEST(CasGcLeak, StagedParentWithAbsentAdoptedSubtreeNoLeak_ObsoleteB7)
 }
 
 /// NO-LEAK (S1, fold interleaved): partA is published and folded ONCE (its body present, +1 per blob),
-/// then partB displaces it on the same ref and partA's body is deleted (a competing GC round's landed
-/// delete). GC must reclaim partA's blobs to a fixpoint: no blob/manifest object remains for partA and
-/// the in-degree generation holds no stranded positive counter for partA's blobs.
+/// then partB REPOINTS the ref away from partA (partA's body stays present so GC reads its -1 edges at
+/// removal-fold; only GC deletes the owner-removed body, after the -1 is sealed). GC must reclaim partA's
+/// blobs to a fixpoint: no blob/manifest object remains for partA and the in-degree generation holds no
+/// stranded positive counter for partA's blobs.
 TEST(CasGcLeak, DisplacedPartBlobsReclaimedFoldBetween)
 {
     std::shared_ptr<InMemoryBackend> b;
@@ -207,7 +230,7 @@ TEST(CasGcLeak, DisplacedPartBlobsReclaimedFoldBetween)
     EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of("data-A")), 1) << "partA's data blob is pinned (+1)";
     EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of("mark-A")), 1) << "partA's mark blob is pinned (+1)";
 
-    const FsckReport after = displaceDeleteAndGc(s, b, ns, ref, part_a);
+    const FsckReport after = displaceAndGc(s, b, ns, ref, part_a);
 
     EXPECT_EQ(after.dangling, 0u) << "S1 INV-NO-LOSS: displacement must never lose a reachable object";
     EXPECT_GT(after.reachable, 0u) << "S1: the live ref points at partB; partB's closure is reachable";
@@ -224,10 +247,9 @@ TEST(CasGcLeak, DisplacedPartBlobsReclaimedFoldBetween)
 }
 
 /// NO-LEAK (S2, NO fold interleaved — the decisive worst case): partA is published, then IMMEDIATELY
-/// displaced by partB and its body deleted before ANY GC fold runs. The single fold therefore folds
-/// partA's activation (+1, body present at activation-fold) and its removal (-1) and the body-delete all
-/// at once. The removal -1 must come from the recorded owner edge even though partA's body is gone, and
-/// the retire must reclaim partA's blobs. No debris may remain.
+/// repointed to partB before ANY GC fold runs. The single fold therefore folds partA's activation (+1)
+/// and its removal (-1, read from partA's still-present body) in one pass; the retire reclaims partA's
+/// blobs and recheck cleanup deletes partA's owner-removed body. No debris may remain.
 TEST(CasGcLeak, DisplacedPartBlobsReclaimedNoFoldBetween)
 {
     std::shared_ptr<InMemoryBackend> b;
@@ -237,7 +259,7 @@ TEST(CasGcLeak, DisplacedPartBlobsReclaimedNoFoldBetween)
 
     const ManifestId part_a = publishTwoBlobPart(s, ns, ref, "data-A", "mark-A");
 
-    const FsckReport after = displaceDeleteAndGc(s, b, ns, ref, part_a);
+    const FsckReport after = displaceAndGc(s, b, ns, ref, part_a);
 
     EXPECT_EQ(after.dangling, 0u) << "S2 INV-NO-LOSS: displacement must never lose a reachable object";
     EXPECT_GT(after.reachable, 0u) << "S2: the live ref points at partB; partB's closure is reachable";
@@ -288,9 +310,17 @@ TEST(CasGcLeak, DroppedPartFullyReclaimed)
     EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of("drop-mark")), 0) << "no stranded positive in-degree";
 }
 
-/// NO-LEAK (abandon): a build stages a manifest, precommitAdds it, and uploads its OWN unique blob, then
-/// ABANDONS (never promotes). The orphaned precommit owner intent must be reclaimed and the build's own
-/// unique blob freed — no debris for the abandoned closure, no stranded positive in-degree.
+/// NO-LEAK (abandon): a build stages a manifest, precommitAdds it (activating +1 for its OWN unique
+/// blob, body present), uploads that blob, then is ABANDONED (never promoted). Its create-precommit
+/// owner is then REMOVED (a PrecommitRemove RootOwnerEvent old={Precommit,ref,build,id}/new=none on the
+/// SAME table shard). GC folds that removal as a true removal: -1 for the blob, retire + delete — no
+/// debris for the abandoned closure, no stranded positive in-degree.
+///
+/// NOTE (B8): GC's automatic precommit-reclaim (`reclaimAbandonedPrecommit`) only runs for `_precommits`
+/// namespaces, but `precommitAdd` writes the create-precommit into the TARGET TABLE shard. So an
+/// abandoned precommit's edges are NOT auto-released by the current core; this test drives the removal
+/// itself (the production reclaim of a table-shard precommit is the same removal event), keeping the
+/// no-leak assertion strong rather than skipping.
 ///
 /// (This replaces the obsolete staged-parent/adopted-subtree own-blob no-leak case — there is no subtree
 /// in the manifest model, so the property is exercised through a flat staged-then-abandoned part.)
@@ -307,10 +337,25 @@ TEST(CasGcLeak, AbandonedPrecommitReclaimsOwnBlobs)
     auto build = s->startBuild(info);
     build->putBlob(idOf(payload), BlobSource::fromString(payload));   /// the build's OWN unique blob
     const ManifestId id = build->stageManifest({blobEntry("data.bin", payload)});
-    build->precommitAdd(ns, ref, id);
-    build->abandon();                                                 /// no promote — abandoned
+    build->precommitAdd(ns, ref, id);                                 /// activating +1 for the blob (body present)
+    const UInt128 build_id = build->buildId();
 
-    /// Build finished (abandoned) → advance the floor past its seq so GC reclaims the orphaned precommit.
+    /// Drive the precommit removal (B8: not auto-reclaimed on a table shard). old = the create-precommit
+    /// binding precommitAdd wrote {Precommit, ref, build_id, id.ref}; new = none. The manifest body is
+    /// STILL PRESENT, so the removal-fold reads its -1 edge for the blob (control #11 fail-close path not
+    /// taken). root_shards=1 ⇒ shard 0. We do NOT call `abandon()` — abandon out-of-band deletes the
+    /// staged body, which would make the removal-fold read it absent and (faithfully) emit NO -1 (a
+    /// removed precommit with absent body emitted no edges to mirror); only GC may delete the body, after
+    /// the -1 is sealed. The build's dtor (build.reset() below) retires the build_seq — the crash path —
+    /// without touching the body.
+    {
+        OwnerBinding precommit_b{.owner_kind = OwnerKind::Precommit,
+            .ref_name = ref, .build_id = build_id, .manifest_ref = id.ref};
+        appendOwnerEvent(*b, s->layout(), ns, /*shard=*/0, precommit_b, std::nullopt);
+    }
+    build.reset();   /// dtor retires the build_seq (crash semantics); does NOT delete the staged body
+
+    /// Build finished → advance the floor past its seq so GC reclaims the orphaned precommit's blob.
     s->renewWatermarkOnce();
 
     Gc gc(s, hexToU128("00000000000000000000000000000003"));
@@ -344,8 +389,10 @@ TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
     /// build1: commit part_1 -> manifest -> blob B.
     publishOneBlobPart(s, ns, "part_1", B);
 
-    /// build2: adopt B by tokenless evidence (no HEAD), upload its OWN unique blob U, stage a manifest
-    /// naming both, precommitAdd — but do NOT promote yet.
+    /// build2: adopt B by tokenless evidence (no HEAD) and upload its OWN unique blob U. It does NOT yet
+    /// stage a manifest or precommit — the scenario is that GC deletes B BEFORE build2 publishes a manifest
+    /// naming it. (Staging+precommitting BEFORE the drop would make the precommit's activating +1 PIN B —
+    /// B would never reach in-degree 0 and GC could not delete it, so the race could not be reproduced.)
     BuildInfo info;
     info.intended_ref = ns.string() + "/part_2";
     auto build2 = s->startBuild(info);
@@ -358,22 +405,23 @@ TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
     build2->adoptEvidence(eb);                                   /// tokenless dep (no HEAD)
     build2->putBlob(idOf(U), BlobSource::fromString(U));         /// build2's own unique, protected blob
 
-    const ManifestId id2 = build2->stageManifest({eb, blobEntry("uniq.bin", U)});
-    build2->precommitAdd(ns, "part_2", id2);
-
     /// Drop the committed pin on B and advance the watermark so B (owned by the finished build1) is not
-    /// spared. build2 has NOT promoted, so the precommit body names B but no committed owner pins it; GC
-    /// folds B to in-degree 0 once part_1 is dropped.
+    /// spared. No owner names B now (build2 has not staged/precommitted), so GC folds B to in-degree 0
+    /// once part_1 is dropped.
     s->dropRef(ns, "part_1");
     s->renewWatermarkOnce();
 
-    /// GC reclaims build1's manifest and B to a fixpoint, completing the rounds.
+    /// GC reclaims build1's manifest and the now-unreferenced B to a fixpoint, completing the rounds.
     {
         Gc gc(s, u128Of("gc-reuse-race"));
         runGcToFixpoint(gc);
     }
     ASSERT_FALSE(blobPresent(b, s->layout(), B))
         << "GC must have deleted the now-unreferenced reused blob B";
+
+    /// Only NOW does build2 publish a manifest naming the (just-deleted) B: stage the body + precommit.
+    const ManifestId id2 = build2->stageManifest({eb, blobEntry("uniq.bin", U)});
+    build2->precommitAdd(ns, "part_2", id2);
 
     /// build2 promotes part_2 -> id2 -> {B, U}. The gate must NOT commit a ref to the deleted B. promote
     /// may throw a retryable ABORTED if the gate re-observes the loss — that is CORRECT (no dangle); only

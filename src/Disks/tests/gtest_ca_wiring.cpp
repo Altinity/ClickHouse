@@ -196,10 +196,13 @@ void publishWiredPart(
     DB::ContentAddressedMetadataStorage & storage, const DB::Cas::RootNamespace & ns, const String & ref)
 {
     /// Port off the removed Build::putTree/publish API onto the part-manifest write flow
-    /// (startBuild → stageManifest → precommitAdd → putBlob → promote). The promote derives the
-    /// manifest namespace from BuildInfo::intended_ref ("ns/ref" split on the LAST '/'), so set it.
+    /// (startBuild → stageManifest → precommitAdd → putBlob → promote). The wiring sets the owning
+    /// namespace EXPLICITLY (intended_namespace) — faithful to ContentAddressedTransaction — so a
+    /// `detached/<part>` ref (which itself contains '/') is staged in the TABLE namespace, not in a
+    /// spurious `<ns>/detached` namespace. intended_ref stays as "ns/ref" diagnostic forensics.
     DB::Cas::BuildInfo info;
     info.intended_ref = ns.string() + "/" + ref;
+    info.intended_namespace = ns;
     auto build = storage.store()->startBuild(info);
 
     const auto id = build->stageManifest(
@@ -970,6 +973,16 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
 /// edges and the fold reads the ONE removal-target body to release them (a missing removal body clamps
 /// + records an anomaly, never guesses). So this port drives the genuine manifest displacement WITHOUT
 /// the out-of-band pre-delete twist — the reclamation contract (no leak / no loss) is what survives.
+///
+/// PORT (rev. 15 displacement shape): a part is a single-owner ManifestId and `promote` is a PURE OWNER
+/// MOVE (precommit→committed). Re-publishing over a LIVE committed ref does NOT emit a removal of the
+/// displaced owner (the displaced manifest is not named in any event), so its blobs would never get a
+/// -1 — there is no in-place "republish-over-committed". The genuine displacement that DOES journal a
+/// true-removal is the real MergeTree pattern: DROP the old part (dropRef appends old→none, leaving the
+/// old body present for the fold to read the -1 edges), THEN publish the new part. GC folds manifestA's
+/// removal, retires its now-zero-in-degree blobs, and the recheck cleanup deletes the owner-removed
+/// body. We do NOT pre-delete manifestA's body — only GC deletes an owner-removed body, after sealing
+/// its decrements.
 TEST(CaWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
 {
     auto storage = openWiringStorage();
@@ -985,9 +998,16 @@ TEST(CaWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
     ASSERT_TRUE(resolved_a.has_value());
     const DB::Cas::ManifestId manifest_a = resolved_a->manifest_id;
 
-    /// DISPLACE: re-write the SAME part path with DISTINCT content (data-B / mark-B) in a fresh
-    /// transaction. The ref `all_0_0_0` is republished to a NEW part ManifestId (last-op-wins). Confirm
-    /// the displacement is real: the ref now resolves to a DIFFERENT manifest.
+    /// DISPLACE (true-removal repoint): drop the old part so dropRef journals manifestA's removal
+    /// (old=committed(manifestA)→new=none) — this leaves manifestA's body PRESENT for the fold to read
+    /// its -1 edges. Then re-write the SAME part path with DISTINCT content (data-B / mark-B), which
+    /// publishes a NEW part ManifestId over the (now free) ref. Confirm the displacement is real: the
+    /// ref resolves to a DIFFERENT manifest.
+    {
+        auto tx = storage->createTransaction();
+        tx->removeDirectory("uui/uuid-1/all_0_0_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
     {
         auto tx = storage->createTransaction();
         writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "data-B");
@@ -1249,15 +1269,17 @@ TEST(CaWiring, RootShardsConfigurable)
 /// uses on the commit path — writeObject (PUT), exists + getObjectMetadata (the HEAD), and readObject
 /// (the GET) — as (op_name, logical_key). "Logical" means the bare pool key (without the emu_root
 /// prefix) — the same string the Layout functions produce, so the `/blobs/`, `/trees/`, and
-/// `/_precommits/` substring tests are unambiguous.
+/// root-shard (`/roots/<ns>/<shard_number>`) substring tests are unambiguous.
 ///
-/// After commit the test asserts: the FIRST write to a key containing "/_precommits/" happened before
-/// ALL ops (read OR write) on keys containing "/blobs/" or "/trees/". The precommit ref is what pins
-/// the in-flight build-root closure so GC cannot reclaim the not-yet-uploaded content objects;
-/// therefore every pool op touching a content blob or the manifest tree must be AFTER the precommit
-/// ref is durably written. The READ gating is the heart of the B188 fix: the original bug was an
-/// EAGER HEAD on a content blob during staging, before any precommit protection existed — a
-/// write-only assertion would not catch its reintroduction.
+/// After commit the test asserts: the FIRST write that appends the create-precommit owner event (the
+/// first durable CAS to the target ROOT SHARD's key — owner_kind == Precommit; the converged rev. 15
+/// model has NO `_precommits` namespace, the precommit binding lives in the target shard's journal)
+/// happened before ALL ops (read OR write) on keys containing "/blobs/" or "/trees/". The precommit
+/// owner record is what pins the in-flight build-root closure so GC cannot reclaim the not-yet-uploaded
+/// content objects; therefore every pool op touching a content blob or the manifest tree must be AFTER
+/// the precommit owner record is durably written. The READ gating is the heart of the B188 fix: the
+/// original bug was an EAGER HEAD on a content blob during staging, before any precommit protection
+/// existed — a write-only assertion would not catch its reintroduction.
 
 namespace
 {
@@ -1346,21 +1368,43 @@ std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const s
         DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
 }
 
-/// Index of the first writeObject to a /_precommits/ key (the durable precommit), or -1. Anchors on
-/// the WRITE, not on any op: mutateShard(precommitNs) reads the precommit-shard key (exists/readObject)
-/// before its casPut, so an any-op scan would anchor on that READ rather than the durable write.
+/// True for a root-shard manifest key (`<...>/roots/<namespace...>/<shard_number>`) — the object a
+/// precommit (and later a promote) CASes. The converged model (rev. 15) appends the create-precommit
+/// RootOwnerEvent into the TARGET TABLE SHARD's journal (owner_kind == Precommit) keyed by the final
+/// ref name — there is NO `_precommits` namespace on the precommit path. The namespace itself contains
+/// '/', so the discriminator is "under /roots/ AND the last path segment is all digits", which excludes
+/// blobs (`/blobs/`), staged manifests (`/_manifests/...`), the registry (`/gc/registry`), the
+/// watermark (`/_watermark`), and verbatim files (`/_files/...`).
+bool isRootShardKey(const std::string & key)
+{
+    if (key.find("/roots/") == std::string::npos)
+        return false;
+    const auto slash = key.rfind('/');
+    if (slash == std::string::npos || slash + 1 >= key.size())
+        return false;
+    const std::string last = key.substr(slash + 1);
+    return std::all_of(last.begin(), last.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+}
+
+/// Index of the first writeObject that appends the create-precommit owner event — i.e. the first
+/// durable CAS (casPut → writeObject) to the TARGET shard's root-shard key. In the happy path the
+/// precommit write strictly precedes the promote write (the second write to the SAME shard key), so
+/// the FIRST root-shard write IS the precommit. Anchors on the WRITE, not on any op: mutateShard
+/// READS the shard key (exists/readObject) before its casPut, so an any-op scan would anchor on that
+/// READ rather than the durable write. Returns -1 if no root-shard write was recorded.
 int firstPrecommitWriteIdx(const std::vector<RecordingLocalObjectStorage::Record> & log)
 {
     for (int i = 0; i < static_cast<int>(log.size()); ++i)
-        if (log[i].op == "writeObject" && log[i].key.find("/_precommits/") != std::string::npos)
+        if (log[i].op == "writeObject" && isRootShardKey(log[i].key))
             return i;
     return -1;
 }
 
 }
 
-/// B188: every pool op (read OR write) on /blobs/ or /trees/ must come AFTER the first write to a
-/// /_precommits/ key — including HEAD (exists/getObjectMetadata) and GET (readObject), since the
+/// B188: every pool op (read OR write) on /blobs/ or /trees/ must come AFTER the first write that
+/// appends the create-precommit owner event (the first root-shard CAS) — including HEAD
+/// (exists/getObjectMetadata) and GET (readObject), since the
 /// exact bug was an eager HEAD on a content blob during staging. The transaction writes a fresh
 /// content file (pending blob) AND adopts an existing committed blob via hardlink — both paths must
 /// satisfy the invariant.
@@ -1401,26 +1445,28 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
 
     const auto & log = recording->ops;
 
-    /// The content objects THIS transaction publishes are exactly the keys it WRITES under /blobs/
-    /// or /trees/ (the staged tree + the fresh/pending blobs). The B188 invariant is that the build
-    /// must not touch ITS OWN staged content before precommit. Reads of foreign committed objects
-    /// (another part's tree) are legitimate and must not be gated — so we restrict the gate to the
-    /// set of content keys this transaction itself wrote.
+    /// The content objects THIS transaction publishes are exactly the BLOB keys it WRITES under
+    /// /blobs/ (the fresh/pending content blobs). The B188 invariant is that the build must not touch
+    /// ITS OWN not-yet-protected content before precommit. NOTE (rev. 15 manifest model): the staged
+    /// part-manifest body (`/_manifests/...`) is the precommit's EVIDENCE and is therefore written
+    /// BEFORE precommitAdd by design (stageManifest → precommitAdd → putBlob → promote) — it is NOT a
+    /// gated content object. Only the content BLOBS must wait for the precommit. Reads of foreign
+    /// committed objects (another part's blob) are legitimate and must not be gated — so we restrict
+    /// the gate to the set of /blobs/ keys this transaction itself wrote.
     std::set<std::string> own_content_keys;
     for (const auto & r : log)
-        if (r.op == "writeObject"
-            && (r.key.find("/blobs/") != std::string::npos || r.key.find("/trees/") != std::string::npos))
+        if (r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos)
             own_content_keys.insert(r.key);
 
     /// Anchor on the first precommit WRITE (the durable casPut), not on any precommit-key op.
     const int first_precommit_idx = firstPrecommitWriteIdx(log);
     ASSERT_GE(first_precommit_idx, 0)
-        << "No write to a /_precommits/ key was recorded — precommit step did not fire";
+        << "No create-precommit owner write (root-shard CAS) was recorded — precommit step did not fire";
 
-    /// Every op (read OR write) on one of THIS build's own content keys must have an index AFTER
+    /// Every op (read OR write) on one of THIS build's own content blobs must have an index AFTER
     /// first_precommit_idx. This gates HEAD (exists/getObjectMetadata) and GET (readObject), not just
-    /// PUT (writeObject) — an eager HEAD/GET on the build's own pending blob or staged tree before
-    /// precommit is the exact B188 regression this guards against.
+    /// PUT (writeObject) — an eager HEAD/GET on the build's own pending blob before precommit is the
+    /// exact B188 regression this guards against.
     for (int i = 0; i < static_cast<int>(log.size()); ++i)
     {
         if (!own_content_keys.contains(log[i].key))
@@ -1438,16 +1484,17 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
     EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path,
               storage->getStorageObjects("uui/uuid-1/all_2_2_0/extra.bin")[0].remote_path);
 
-    /// Confirm at least one blob and one tree WRITE was recorded (both upload paths were exercised),
-    /// so the gate above actually had content keys to check.
+    /// Confirm at least one blob WRITE and one staged-manifest WRITE were recorded (both the upload
+    /// path and the manifest-evidence path were exercised), so the gate above actually had content
+    /// keys to check and the precommit anchored on a real build.
     const bool has_blob_write = std::any_of(log.begin(), log.end(),
         [](const RecordingLocalObjectStorage::Record & r)
         { return r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos; });
     const bool has_tree_write = std::any_of(log.begin(), log.end(),
         [](const RecordingLocalObjectStorage::Record & r)
-        { return r.op == "writeObject" && r.key.find("/trees/") != std::string::npos; });
+        { return r.op == "writeObject" && r.key.find("/_manifests/") != std::string::npos; });
     EXPECT_TRUE(has_blob_write) << "No /blobs/ write recorded — fresh blob path not exercised";
-    EXPECT_TRUE(has_tree_write) << "No /trees/ write recorded — tree upload path not exercised";
+    EXPECT_TRUE(has_tree_write) << "No /_manifests/ write recorded — manifest staging path not exercised";
     EXPECT_FALSE(own_content_keys.empty()) << "No own content keys collected — gate would be vacuous";
 }
 
@@ -1507,7 +1554,7 @@ TEST(CaWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
     /// Anchor on the first precommit WRITE (the durable casPut), not on any precommit-key op.
     const int first_precommit_idx = firstPrecommitWriteIdx(log);
     ASSERT_GE(first_precommit_idx, 0)
-        << "No write to a /_precommits/ key was recorded — precommit step did not fire";
+        << "No create-precommit owner write (root-shard CAS) was recorded — precommit step did not fire";
 
     /// TARGETED assertion: the adopted (foreign, committed) blob key must NOT be touched by ANY op
     /// (HEAD via exists/getObjectMetadata, GET via readObject, or PUT via writeObject) before the
@@ -1587,9 +1634,12 @@ TEST(CaWiringPending, HardlinkOfPendingBlobCommitsAndReadsBack)
 /// ==== B190 Task 4: precommit-first for republishRef and committed-source createHardLink ====
 ///
 /// B190-A: republishRef (called by moveDirectory for a COMMITTED part rename — RENAME TABLE, DETACH,
-/// ATTACH, delete_tmp_ rename) must NOT call adoptTree (which HEADs the source tree) before precommit.
-/// It should record a TOKENLESS tree-evidence dep and precommit FIRST. The source part's tree key
-/// must not be accessed (exists / getObjectMetadata / readObject) before the first precommit write.
+/// ATTACH, delete_tmp_ rename) must carry the source part's BLOBS forward by TOKENLESS W-EVIDENCE
+/// (adoptEvidence), NOT by HEAD/GET/PUT on the source blob before precommit. In the rev. 15 manifest
+/// model republishRef legitimately READS the FOREIGN source MANIFEST body (to copy its entries into a
+/// fresh dst manifest) during staging — that is the manifest-era analog of the old adoptFromTree
+/// source-tree read and is NOT a violation (see CommittedSourceAdoptNoHeadBeforePrecommit). The
+/// invariant that survives: the source BLOB key must not be touched before the first precommit write.
 TEST(CaWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("republish");
@@ -1598,24 +1648,25 @@ TEST(CaWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
         std::filesystem::temp_directory_path() / "ca_b190_republish_scratch", nullptr);
     storage->startup();
 
-    /// Phase 1: commit a source part. Capture its tree key from the /trees/ write.
+    /// Phase 1: commit a source part. Capture its BLOB key from the /blobs/ write (republishRef must
+    /// carry this blob by reference, never touching it before precommit).
     recording->ops.clear();
     {
         auto tx = storage->createTransaction();
         writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "republish-source");
         tx->commit(DB::NoCommitOptions{});
     }
-    std::string source_tree_key;
+    std::string source_blob_key;
     for (const auto & r : recording->ops)
     {
-        if (r.op == "writeObject" && r.key.find("/trees/") != std::string::npos)
+        if (r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos)
         {
-            source_tree_key = r.key;
+            source_blob_key = r.key;
             break;
         }
     }
-    ASSERT_FALSE(source_tree_key.empty())
-        << "Phase 1 recorded no /trees/ write — could not capture the source tree key";
+    ASSERT_FALSE(source_blob_key.empty())
+        << "Phase 1 recorded no /blobs/ write — could not capture the source blob key";
 
     /// Phase 2: a COMMITTED rename (delete_tmp_ pattern) that triggers republishRef. Clear the log
     /// so only Phase 2's ops are analysed.
@@ -1630,25 +1681,26 @@ TEST(CaWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
 
     const int first_precommit_idx = firstPrecommitWriteIdx(log);
     ASSERT_GE(first_precommit_idx, 0)
-        << "No write to a /_precommits/ key was recorded — precommit step did not fire";
+        << "No create-precommit owner write (root-shard CAS) was recorded — precommit step did not fire";
 
-    /// The source tree key must NOT be accessed (HEAD via exists/getObjectMetadata, GET via readObject,
-    /// or PUT via writeObject) before the precommit write. With adoptTree before precommit (the old
-    /// code), observeAndAdmit HEADs the tree key at an index < first_precommit_idx, failing here.
-    bool tree_touched_before_precommit = false;
+    /// The source BLOB key must NOT be accessed (HEAD via exists/getObjectMetadata, GET via readObject,
+    /// or PUT via writeObject) before the precommit write. With an eager adopt-by-HEAD on the source
+    /// blob (the regression), observeAndAdmit HEADs the blob key at an index < first_precommit_idx,
+    /// failing here. A tokenless adoptEvidence dep touches nothing.
+    bool blob_touched_before_precommit = false;
     for (int i = 0; i < first_precommit_idx; ++i)
     {
-        if (log[i].key == source_tree_key)
+        if (log[i].key == source_blob_key)
         {
-            tree_touched_before_precommit = true;
+            blob_touched_before_precommit = true;
             ADD_FAILURE()
-                << "republishRef tree op '" << log[i].op << "' on '" << log[i].key
+                << "republishRef blob op '" << log[i].op << "' on '" << log[i].key
                 << "' at index " << i << " came BEFORE the first precommit write at index "
                 << first_precommit_idx << " — violates B190 precommit-first: republishRef must not "
-                << "HEAD/GET/PUT the source tree before precommit (use tokenless adoptEvidence)";
+                << "HEAD/GET/PUT the source blob before precommit (use tokenless adoptEvidence)";
         }
     }
-    EXPECT_FALSE(tree_touched_before_precommit);
+    EXPECT_FALSE(blob_touched_before_precommit);
 
     /// Sanity: the renamed part is visible under the new name and NOT under the old name.
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
@@ -1693,13 +1745,14 @@ TEST(CaWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
     const auto & log = recording->ops;
     const int first_precommit_idx = firstPrecommitWriteIdx(log);
     ASSERT_GE(first_precommit_idx, 0)
-        << "No precommit write recorded";
+        << "No create-precommit owner write (root-shard CAS) was recorded — precommit step did not fire";
 
-    /// Collect own content keys (blobs/trees this transaction wrote).
+    /// Collect own content keys (the content BLOBS this transaction wrote). The staged part-manifest
+    /// body (`/_manifests/...`) is the precommit's evidence and is written before precommit by design,
+    /// so it is NOT gated content — only /blobs/ are.
     std::set<std::string> own_content_keys;
     for (const auto & r : log)
-        if (r.op == "writeObject"
-            && (r.key.find("/blobs/") != std::string::npos || r.key.find("/trees/") != std::string::npos))
+        if (r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos)
             own_content_keys.insert(r.key);
 
     /// No own-content pool op before precommit (B188 invariant extends to all adopt sites).

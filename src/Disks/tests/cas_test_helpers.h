@@ -441,17 +441,25 @@ inline String cursorKeyForTest(const DB::Cas::RootNamespace & ns, uint64_t shard
     return ns.string() + "/" + std::to_string(shard);
 }
 
-/// The folded cursor sealed for (ns, shard) by the latest fold seal, or 0 when absent.
+/// The folded cursor sealed for (ns, shard) by the latest fold seal, or 0 when absent. After a COMPLETE
+/// round the gc/state generation pointer is the recheck's COMPLETION generation (G+2 for a round started
+/// at G), but the fold seal is written at the FOLD generation (G+1) — recheck writes a completion seal,
+/// not a fold seal. So scan downward from the current generation for the most recent existing fold seal.
 inline uint64_t foldCursorOf(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns, uint64_t shard)
 {
     const uint64_t gen = currentGenerationOf(backend, layout);
-    const auto got = backend.get(layout.foldSealKey(gen));
-    if (!got)
-        return 0;
-    const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
-    const auto it = seal.per_ns_shard.find(cursorKeyForTest(ns, shard));
-    return it != seal.per_ns_shard.end() ? it->second.folded_cursor : 0;
+    for (uint64_t g = gen; ; --g)
+    {
+        if (const auto got = backend.get(layout.foldSealKey(g)))
+        {
+            const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
+            const auto it = seal.per_ns_shard.find(cursorKeyForTest(ns, shard));
+            return it != seal.per_ns_shard.end() ? it->second.folded_cursor : 0;
+        }
+        if (g == 0)
+            return 0;
+    }
 }
 
 /// Set a server's durable watermark min_active (so orphan-sweep eligibility can be driven). The server
