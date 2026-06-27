@@ -19,7 +19,11 @@ CONSTANTS
     SabotageUncondDelete, SabotageReusedTag, SabotageBareNonce, SabotageKeyByRefNotId,
     SabotageAcceptNamespaceMismatch, SabotageAcceptRefMismatch,
     SabotageMutableAsReachability, SabotagePromoteAfterMissingBody,
-    SabotageAdvancePastMissingBodyPrecommit
+    SabotageAdvancePastMissingBodyPrecommit,
+    \* ---- Phase 2: token-diff discovery (rev.15 token split) ----
+    EnableTokenDiff,            \* TRUE -> discover MAY skip an unchanged shard's body read
+    TokenObservable,            \* TRUE -> LIST surfaces a per-shard token (supportsListTokens); FALSE -> always read
+    SabotageSkipChangedShard    \* skip a shard whose listed root token actually advanced past the folded token (must dangle)
 
 \* A ManifestId is (namespace, manifest_instance_id). manifest_instance_id is drawn from
 \* ManifestInstances and is NEVER reused once visible (NoManifestIdReuse). Two namespaces may
@@ -54,7 +58,10 @@ VARIABLES
     gcRound, gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion,
     retired, inflight, wView,                  \* GC pipeline (carried from core)
     mfCleanup, mfDeleted, mPrefix, sweepEligible,  \* part-manifest cleanup work; deleted-bodies set; per-manifest build-prefix; per-prefix orphan-sweep eligibility
-    extraShared                                    \* #2: ManifestIds carrying a SECOND shared committed owner (SabotageTwoOwners only)
+    extraShared,                                   \* #2: ManifestIds carrying a SECOND shared committed owner (SabotageTwoOwners only)
+    \* ---- Phase 2: token-diff discovery (rev.15 token split) ----
+    listedTok,   \* [Namespaces -> 0..MaxToken] live root-shard token discovery observes from LIST; any owner transition advances it (discovery MAY set it)
+    foldedTok    \* [Namespaces -> 0..MaxToken] persisted ShardCoverage.folded_token; advanced ONLY by the fold-seal write, NEVER by discovery
 
 \* SrcEdges(m): the active source edges currently emitted by m's activation map. Derived operator,
 \* NOT a constant, so it follows mActiveEdges as the fold mutates it.
@@ -75,10 +82,18 @@ IsActivation(e)          == e.new # {} /\ e.old # e.new
 vars == << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
            journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
            roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-           mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+           mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* ---- helpers (filled across tasks) ----
 NoOp == UNCHANGED vars
+
+\* Phase 2 (rev.15 token split): an owner transition in namespace n advances the LIST-observable live
+\* root-shard token (capped at MaxToken so TypeOK holds). Only the fold-seal write (GDiscoverRead) ever
+\* advances foldedTok. When EnableTokenDiff is FALSE the token machinery is inert (listedTok stays at its
+\* zero init), so every pre-Phase-2 stage is unaffected and its state space is unchanged.
+BumpListed(n) == listedTok' = IF EnableTokenDiff
+                              THEN [listedTok EXCEPT ![n] = IF listedTok[n] < MaxToken THEN listedTok[n] + 1 ELSE listedTok[n]]
+                              ELSE listedTok
 
 \* A blob token stops being current when displaced or deleted (INV_NO_RETURN oracle).
 CondemnedTok(b, t) == t \in deadTok[b]
@@ -111,7 +126,7 @@ WStageManifest(m, f) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, owner, mActiveEdges, journal, blobIndeg,
                     blobEdges, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
-                    mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* ---- owner transitions (spec §Build And Precommit Protocol; §Fold Owner Transitions) ----
 PresentBlobs == { b \in Blobs : present[b] }
@@ -162,7 +177,7 @@ WUploadBlob(b) ==
     /\ UNCHANGED << deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges, journal, blobIndeg,
                     blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf,
                     fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
-                    mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* The round a retire-view refresh may CLAIM COVERAGE of. The retired-token view is writer-visible only
 \* AFTER the round's retire barrier (all retired sets durable). While a leader is still RETIRING at the
@@ -178,7 +193,7 @@ WRefreshView(w) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* PrecommitAdd: owner[m] := build bld. A precommit MAY have a missing body only when EnableMissingBody
 \* (the missing-body fail-closed intent). A precommit ACTIVATES (emits edges) iff its body is present
@@ -195,10 +210,11 @@ WPrecommitAdd(m, bld, f) ==
     /\ owner' = [owner EXCEPT ![m] = bld]
     /\ mEntries' = IF mBody[m] THEN mEntries ELSE [mEntries EXCEPT ![m] = f]  \* record intended entries when no body yet
     /\ journal' = AppendEvt(journal, m[1], bld, NoBind, Bind(m))
+    /\ BumpListed(m[1])
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok >>
 
 \* Promote precommit -> committed: the atomic PURE owner move. Same ManifestId, blob Δ=0, NO new
 \* edges (the activation +1 was emitted when the precommit's body arrived, or is still pending if the
@@ -219,10 +235,11 @@ WPromote(m, bld, ref, w) ==
     /\ Len(journal[m[1]]) < MaxLog
     /\ owner' = [owner EXCEPT ![m] = ref]
     /\ journal' = AppendEvt(journal, m[1], ref, Bind(m), Bind(m))
+    /\ BumpListed(m[1])
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok >>
 
 \* #2 (SabotageTwoOwners): a SECOND committed owner is attached to an already-committed ManifestId
 \* (sharing a manifest across refs/namespaces). The single-owner rule (RefFreeFor / owner being a
@@ -238,7 +255,7 @@ WShareOwner(m) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
-                    wView, mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    wView, mfCleanup, mfDeleted, mPrefix, sweepEligible, listedTok, foldedTok >>
 
 \* Direct committed publish (no precommit). Same fail-closed body+blob gate as promote. Sets the
 \* committed owner and activates the edges (committed manifests are always activated).
@@ -250,10 +267,11 @@ WPublishCommitted(m, ref, w) ==
     /\ Len(journal[m[1]]) < MaxLog
     /\ owner' = [owner EXCEPT ![m] = ref]
     /\ journal' = AppendEvt(journal, m[1], ref, NoBind, Bind(m))
+    /\ BumpListed(m[1])
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok >>
 
 \* Drop a committed ref: owner[m]: ref -> None; a true removal (-1 + mfCleanup queued at fold).
 WDropRef(m) ==
@@ -261,10 +279,11 @@ WDropRef(m) ==
     /\ Len(journal[m[1]]) < MaxLog
     /\ owner' = [owner EXCEPT ![m] = None]
     /\ journal' = AppendEvt(journal, m[1], owner[m], Bind(m), NoBind)
+    /\ BumpListed(m[1])
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok >>
 
 \* Abandon a precommit owner: owner[m]: bld -> None; a true removal.
 WAbandonPrecommit(m) ==
@@ -272,10 +291,11 @@ WAbandonPrecommit(m) ==
     /\ Len(journal[m[1]]) < MaxLog
     /\ owner' = [owner EXCEPT ![m] = None]
     /\ journal' = AppendEvt(journal, m[1], owner[m], Bind(m), NoBind)
+    /\ BumpListed(m[1])
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok >>
 
 \* A missing-body precommit's manifest body ARRIVES asynchronously (the upload completes after
 \* PrecommitAdd). Only meaningful under EnableMissingBody. Sets the body + entries; if the precommit is
@@ -291,7 +311,7 @@ WManifestBodyArrives(m, f) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, owner, mActiveEdges, journal, blobIndeg,
                     blobEdges, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
-                    mPrefix, sweepEligible, extraShared >>
+                    mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* Repoint a committed ref from mOld to mNew (last-op-wins at the root source): removes mOld and
 \* activates mNew under the SAME ref, in one event (old=mOld, new=mNew). Both must be in the same ns.
@@ -304,10 +324,11 @@ WRepoint(mOld, mNew, ref, w) ==
     /\ Len(journal[mOld[1]]) < MaxLog
     /\ owner' = [owner EXCEPT ![mOld] = None, ![mNew] = ref]
     /\ journal' = AppendEvt(journal, mOld[1], ref, Bind(mOld), Bind(mNew))
+    /\ BumpListed(mOld[1])
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok >>
 
 \* ============================ GC pipeline (spec §Round Protocol) ============================
 \* blobIndeg is ALWAYS the exact count of folded source edges by referenced blob (the
@@ -348,7 +369,7 @@ GStartRound(l) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
-                    mPrefix, sweepEligible, extraShared >>
+                    mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* Fold one RootOwnerEvent at cursor[n], dispatching by old-vs-new manifest comparison (rev.15).
 GFoldTransition(n) ==
@@ -420,7 +441,7 @@ GFoldTransition(n) ==
     /\ foldSeal' = [foldSeal EXCEPT ![gcRound].foldedCursor[n] = cursor'[n]]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, journal,
                     completionSeal, gcRound, gcPhase, roundOf, fencePos, trimBase, fenceVersion,
-                    retired, inflight, wView, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    retired, inflight, wView, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* Retire a folded, present, in-degree-0 blob candidate at its CURRENT token (the HEAD). The fold must
 \* be CAUGHT UP first (cursor at journal end for every ns): otherwise a pending unfolded activation
@@ -437,7 +458,7 @@ GRetireBlob(l, b) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* Global fence: fence every namespace this round. SabotageNoFence skips the fence write (a racing
 \* publish is never blocked). SabotageRoundVisibilityEarly marks the round adoptable before the fence.
@@ -458,7 +479,7 @@ GFenceRegistry(l) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, gcRound, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
-                    mPrefix, sweepEligible, extraShared >>
+                    mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 GFenceShard(l, n) ==
     /\ gcPhase[l] \in {"fencing"}
@@ -473,7 +494,7 @@ GFenceShard(l, n) ==
                                          THEN "fenced" ELSE "fencing"]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, gcRound, roundOf, cursor,
-                    trimBase, retired, inflight, wView, mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    trimBase, retired, inflight, wView, mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* Recheck + issue exact-token delete. Requires the fold to have provably reached every fence
 \* position (SabotageNoRecheckFold-equivalent: SabotageRoundVisibilityEarly opens an early-visibility
@@ -498,7 +519,7 @@ GRecheckDelete(l, e) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, gcRound, gcPhase, roundOf,
                     fencePos, cursor, trimBase, fenceVersion, wView, mfCleanup, mfDeleted, mPrefix,
-                    sweepEligible, extraShared >>
+                    sweepEligible, extraShared, listedTok, foldedTok >>
 
 GEndRound(l) ==
     /\ gcPhase[l] = "fenced"
@@ -507,7 +528,7 @@ GEndRound(l) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* A delete message lands: exact-token (412 = no-op). SabotageUncondDelete ignores the token match.
 \* The landing is the confirmed outcome: the matching retired entry drops HERE. Any token stopping
@@ -523,7 +544,7 @@ Land(d) ==
     /\ UNCHANGED << tokOf, nextTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges, journal,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, wView, mfCleanup, mfDeleted,
-                    mPrefix, sweepEligible, extraShared >>
+                    mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* Journal trim: INV_JOURNAL_COVERAGE — only below the durable folded cursor. SabotageTrimUnincorporated
 \* trims below an unfolded transition (cursor).
@@ -533,7 +554,7 @@ Trim(n) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* ---- part-manifest cleanup ordering + orphan sweep + mutable update (Task 5) ----
 \* Delete an unowned manifest body (exact-token abstracted). NORMAL: only after its owner-removal
@@ -551,7 +572,7 @@ GDeleteManifest(m) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
-                    wView, mPrefix, sweepEligible, extraShared >>
+                    wView, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* Stale part-manifest cleanup replay (control #1). When a ManifestId is REUSED (SabotageReuseManifestId),
 \* a cleanup bundle queued for the OLD incarnation (m \in mfCleanup) cannot tell the id was rebound to a
@@ -569,7 +590,7 @@ GStaleReuseCleanup(m) ==
     /\ mfCleanup' = mfCleanup \ {m}
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, journal,
                     everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos, cursor,
-                    trimBase, fenceVersion, retired, inflight, wView, mfDeleted, mPrefix, sweepEligible, extraShared >>
+                    trimBase, fenceVersion, retired, inflight, wView, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* A durable watermark fact makes a build prefix conservatively sweep-eligible (the writer incarnation
 \* can no longer publish from it). SabotageFrozenSeqAuthority sets it from a frozen-seq heuristic
@@ -583,7 +604,7 @@ GMarkSweepEligible(p) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
-                    wView, mfCleanup, mfDeleted, mPrefix, extraShared >>
+                    wView, mfCleanup, mfDeleted, mPrefix, extraShared, listedTok, foldedTok >>
 
 \* Orphan pre-precommit sweep: deletes a staged-but-unowned manifest body whose build prefix is
 \* sweep-eligible AND whose id is absent from the sealed owner view (owner = None). Emits NO blob
@@ -610,7 +631,7 @@ GOrphanSweep(n) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
-                    wView, mfCleanup, mPrefix, sweepEligible, extraShared >>
+                    wView, mfCleanup, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
 
 \* Mutable per-ref payload update: changes only mutable payload — NO owner transition, NO blob delta,
 \* NO id change (MutablePayloadNotReachability). Modeled as a no-op stutter on every reachability var,
@@ -630,7 +651,58 @@ WMutableUpdate(m) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, journal,
                     everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
-                    mPrefix, sweepEligible, extraShared >>
+                    mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
+
+\* ---- Phase 2: token-diff discovery (spec §Discovery; the rev.15 token split) ----
+\* The token-diff skip CLAIMS a shard's fold coverage WITHOUT reading its body: it advances the durable
+\* fold cursor to the journal end (the shard is declared "covered this round") while emitting NO source
+\* edges and NOT re-sealing foldedTok. This is exactly the "elide the body read / re-fold" of §Discovery.
+\* A shard is skippable iff LIST surfaces a token (TokenObservable) AND the observed listed token equals
+\* the persisted folded token (listedTok[n] = foldedTok[n]). When that guard holds the shard is UNCHANGED
+\* since the last fold (no owner transition advanced listedTok, so the journal did not grow), hence the
+\* cursor is already at the journal end and the skip is a true no-op — it folds nothing because there is
+\* nothing left to fold. The cursor jump only ever has teeth on a CHANGED shard, which the equality guard
+\* forbids on the honest path.
+\*
+\* The negative control SabotageSkipChangedShard DROPS the equality guard, so the skip may fire on a shard
+\* whose listed token advanced past the folded token (listedTok[n] # foldedTok[n]) — i.e. with unfolded
+\* owner transitions still in the journal. Claiming coverage then jumps the cursor PAST those unfolded
+\* activations without ever emitting their +1 source edges (the SabotageCutOverclaim failure mode reached
+\* through token-diff): the newly-committed manifest's blobs look in-degree 0 and GC over-deletes them ->
+\* INV_NO_DANGLE. This is what proves the skip rule unsafe unless gated by listedTok = foldedTok.
+\*
+\* The skip governs ONLY the body read / re-fold cursor; it does NOT touch the fence (the all-shard fence
+\* is orthogonal and still fences every shard every round, GFenceShard).
+GDiscoverSkip(n) ==
+    /\ EnableTokenDiff
+    /\ TokenObservable
+    /\ (listedTok[n] = foldedTok[n] \/ SabotageSkipChangedShard)
+    \* Claim coverage to the journal end WITHOUT folding the body. On the honest path (listedTok =
+    \* foldedTok) the shard is unchanged since the last fold, so cursor is already at Len(journal) and
+    \* this is a harmless no-op (the skip elides only the I/O of re-reading already-folded bytes). Under
+    \* SabotageSkipChangedShard it may jump the cursor PAST unfolded activations (cut-overclaim) -> dangle.
+    /\ cursor' = [cursor EXCEPT ![n] = Len(journal[n])]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
+                    journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
+                    roundOf, fencePos, trimBase, fenceVersion, retired, inflight, wView,
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok >>
+
+\* The body read + fold-seal write. Always legal (fail-closed to a read). The FOLD-SEAL WRITE is the
+\* ONLY thing that advances the persisted folded token, bringing foldedTok[n] up to the listed token
+\* observed at fold time so a later round may skip. Discovery itself never advances foldedTok — only
+\* this seal write does. The fold of the journal records it covers is the existing GFoldTransition; this
+\* action models ONLY the fold-seal folded-token write that follows a caught-up read, leaving the edge
+\* fold (cursor/edges/blobIndeg) to GFoldTransition. Sealing only when the fold has actually caught up
+\* (cursor at the journal end) keeps foldedTok an HONEST record of what was folded — never a claim that
+\* outruns the deltas, which is what the skip guard then relies on.
+GDiscoverRead(n) ==
+    /\ EnableTokenDiff
+    /\ cursor[n] = Len(journal[n])                       \* the body read folded through the journal end (GFoldTransition caught up)
+    /\ foldedTok' = [foldedTok EXCEPT ![n] = listedTok[n]]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
+                    journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
+                    roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok >>
 
 Init ==
     /\ present = [b \in Blobs |-> FALSE]
@@ -667,6 +739,9 @@ Init ==
     /\ mPrefix = [m \in ManifestIds |-> CHOOSE p \in BuildPrefixes : TRUE]   \* each manifest belongs to one build-prefix
     /\ sweepEligible = [p \in BuildPrefixes |-> FALSE]   \* per-prefix eligibility from a durable watermark fact
     /\ extraShared = {}
+    \* Phase 2: a fresh pool has a zero live listed token and no folded token (the rev.15 token split):
+    /\ listedTok = [n \in Namespaces |-> 0]
+    /\ foldedTok = [n \in Namespaces |-> 0]
 
 TypeOK ==
     /\ extraShared \in SUBSET ManifestIds
@@ -683,6 +758,8 @@ TypeOK ==
     /\ completionSeal \in [0..MaxRound -> [fenced : SUBSET Namespaces, rechecked : SUBSET Blobs, deleted : SUBSET Blobs, adoptable : BOOLEAN]]
     /\ mPrefix \in [ManifestIds -> BuildPrefixes]
     /\ sweepEligible \in [BuildPrefixes -> BOOLEAN]
+    /\ listedTok \in [Namespaces -> 0..MaxToken]
+    /\ foldedTok \in [Namespaces -> 0..MaxToken]
 
 INV_JOURNAL_COVERAGE == \A n \in Namespaces : trimBase[n] <= cursor[n]
 
@@ -792,6 +869,9 @@ Next ==
     \/ \E p \in BuildPrefixes : GMarkSweepEligible(p)
     \/ \E n \in Namespaces : GOrphanSweep(n)
     \/ \E m \in ManifestIds : WMutableUpdate(m)
+    \* Phase 2: token-diff discovery (the rev.15 token split):
+    \/ \E n \in Namespaces : GDiscoverSkip(n)
+    \/ \E n \in Namespaces : GDiscoverRead(n)
 
 Spec == Init /\ [][Next]_vars
 
