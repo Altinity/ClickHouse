@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcSnap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
@@ -370,39 +369,6 @@ TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
         std::string dup_bytes; msg.SerializeToString(&dup_bytes);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(dup_bytes); });
     }
-}
-
-/// Verify that `encodeGcSnap` produces zstd-compressed output (version 3, codec byte 1) and that
-/// the round-trip is byte-stable.  The snap is populated with 2000 repetitive root edges so that
-/// the compressor has obvious redundancy to exploit — the encoded blob must be materially smaller
-/// than the uncompressed field footprint, proving compression engaged.
-TEST(CasGcSnapCodec, ZstdRoundTripAndShrinks)
-{
-    GcSnap snap;
-    snap.snap_shard = 0;
-    snap.generation = 7;
-    /// 2000 root edges, each pointing to a distinct tree hash derived from i.
-    /// Root edges: (root_shard="srv1/tbl/0", part_name="part_<i>") -> tree_i.
-    /// part_name shares the same long prefix — lots of repetition for the compressor.
-    for (uint64_t i = 0; i < 2000; ++i)
-    {
-        const UInt128 tree = (static_cast<UInt128>(i + 1) << 64) | (i + 7);
-        snap.addRootEdge("srv1/tbl/0", "part_" + std::to_string(i), tree);
-    }
-
-    const String encoded = encodeGcSnap(snap);
-    const GcSnap decoded = decodeGcSnap(encoded);
-
-    /// Canonical, byte-stable re-encode: decodeGcSnap(encodeGcSnap(snap)) re-encodes identically.
-    EXPECT_EQ(encodeGcSnap(decoded), encoded);
-
-    /// Each root edge raw (uncompressed) costs ~40 bytes (1 kind byte + 2 len shorts + shard string
-    /// "srv1/tbl/0" ~10 bytes + part string ~12 bytes avg + 1 target-kind + 16 hash bytes).
-    /// 2000 edges * 40 bytes = ~80 KiB uncompressed field footprint; zstd on repetitive data
-    /// collapses this to a few KiB.
-    GTEST_LOG_(INFO) << "gc/snap zstd-encoded size for 2000 root edges: " << encoded.size() << " bytes"
-                     << " (uncompressed footprint estimate: " << 2000u * 40u << " bytes)";
-    EXPECT_LT(encoded.size(), 2000u * 40u);
 }
 
 /// ===================================================================================

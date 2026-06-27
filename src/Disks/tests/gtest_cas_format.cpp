@@ -13,7 +13,7 @@ using namespace DB::Cas;
 TEST(CasFormat, ChangePointsExistForEveryClass)
 {
     /// Every registered class has a non-empty, gen-1 baseline.
-    for (auto id : {FormatId::Blob, FormatId::Tree, FormatId::Manifest, FormatId::GcSnap,
+    for (auto id : {FormatId::Blob, FormatId::Manifest,
                     FormatId::GcState, FormatId::RetiredSet, FormatId::Watermark,
                     FormatId::PoolMeta, FormatId::Roster,
                     FormatId::RootsRegistry, FormatId::GcOutcomes,
@@ -67,7 +67,6 @@ TEST(CasFormat, MagicForEachMutableObjectClass)
     };
 
     EXPECT_EQ(le32toStr(magicFor(FormatId::Blob)),          "CABL");
-    EXPECT_EQ(le32toStr(magicFor(FormatId::Tree)),          "CATR");
     EXPECT_EQ(le32toStr(magicFor(FormatId::Manifest)),      "CARS");
     EXPECT_EQ(le32toStr(magicFor(FormatId::PoolMeta)),      "CAPM");
     EXPECT_EQ(le32toStr(magicFor(FormatId::Watermark)),     "CAWM");
@@ -85,16 +84,8 @@ TEST(CasFormat, MagicForEachMutableObjectClass)
 
 TEST(CasFormat, MagicForUndefinedClassThrowsLogicalError)
 {
-    /// GcSnap and Roster have no mutable protobuf magic defined — they must throw LOGICAL_ERROR.
-    try
-    {
-        magicFor(FormatId::GcSnap);
-        FAIL() << "expected LOGICAL_ERROR";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
-    }
+    /// Roster has no mutable protobuf magic defined — it must throw LOGICAL_ERROR. (Tree and GcSnap
+    /// were removed from the enum entirely in the rev. 15 part-manifest redesign.)
     try
     {
         magicFor(FormatId::Roster);
@@ -111,7 +102,6 @@ TEST(CasFormat, MagicsAreDistinct)
     /// All per-type magics must be unique — a collision would make bad-magic detection useless.
     const uint32_t magics[] = {
         magicFor(FormatId::Blob),
-        magicFor(FormatId::Tree),
         magicFor(FormatId::Manifest),
         magicFor(FormatId::PoolMeta),
         magicFor(FormatId::Watermark),

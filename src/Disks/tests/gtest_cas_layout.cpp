@@ -52,11 +52,14 @@ TEST(CasLayout, RootNamespaceValidation)
     EXPECT_NO_THROW(l.rootShardKey(RootNamespace{"my_files/tbl"}, 0));
 }
 
-TEST(CasLayout, GcSnapAndRootsKeys)
+TEST(CasLayout, GenerationAndRootsKeys)
 {
     Layout l("p");
-    EXPECT_EQ(l.gcSnapKey(/*generation*/ 12, /*snap_shard*/ 3), "p/gc/snap/12/3");
-    EXPECT_EQ(l.gcSnapShardPrefix(12), "p/gc/snap/12/");
+    /// rev. 15: gc/snap is gone; generations carry write-once seals + blob-target / cleanup runs.
+    EXPECT_EQ(l.foldSealKey(12), "p/gc/gen/12/fold_seal");
+    EXPECT_EQ(l.completionSealKey(12), "p/gc/gen/12/completion_seal");
+    EXPECT_EQ(l.blobTargetRunKey(12, 0, 0), "p/gc/gen/12/blob_target/0/0");
+    EXPECT_EQ(l.partManifestCleanupKey(12, 0, 0), "p/gc/gen/12/part_manifest_cleanup/0/0");
     EXPECT_EQ(l.rootsPrefix(), "p/roots/");
 }
 
