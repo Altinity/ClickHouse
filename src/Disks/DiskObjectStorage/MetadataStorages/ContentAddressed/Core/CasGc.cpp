@@ -13,6 +13,7 @@
 #include <base/defines.h>
 #include <city.h>
 #include <algorithm>
+#include <limits>
 #include <set>
 
 namespace DB
@@ -277,6 +278,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
             }
         }
 
+        /// B8: reclaim ABANDONED precommits BEFORE reading the shard for the fold, so the reclaim's
+        /// PrecommitRemove event is folded IN THIS SAME ROUND — its `-1` lands in this round's deltas, the
+        /// fold cursor advances to cover it, and the fence_version stays consistent with the fold cursor.
+        /// (Appending it AFTER sealing the cursor would leave an event below the fence but above the sealed
+        /// cursor, which the round's recheck fold-through-fence AND the next round's fold would both apply
+        /// — a double-counted `-1`.) The reclaim PIGGYBACKS on this per-shard visit: it reads the shard
+        /// already being visited, no extra LIST / no separate enumeration stage. It judges build-death from
+        /// each live `OwnerKind::Precommit` binding's `manifest_ref` (server + build_seq) via the watermark.
+        reclaimAbandonedPrecommit(ns, root_shard, state.round + 1);
+
         const auto [root, manifest_token] = store->readShard(ns, root_shard);
         const auto cursor_it = parent_cursors.find(cursor_key);
         const uint64_t cursor = cursor_it != parent_cursors.end() ? cursor_it->second.folded_cursor : 0;
@@ -368,9 +379,6 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
         result.fold_seal.per_ns_shard[cursor_key] = cov;
         if (shard_changed)
             folded_any = true;
-
-        if (Layout::isPrecommitNamespace(ns))
-            reclaimAbandonedPrecommit(ns, root_shard, root, state.round + 1);
     }
 
     if (state.gc_shards == 1)
@@ -1444,99 +1452,126 @@ const ServerWatermark * Gc::watermarkOf(UInt128 server_id)
     return &it->second;
 }
 
-void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, const RootShard & root,
-                                   uint64_t /*round*/)
+namespace
 {
-    /// B171 §C.3: reclaim ABANDONED precommits — those whose owning build is no longer live. The
-    /// precommit namespace is sharded like any namespace (ref name == build_seq, shard == shardOf), so
-    /// one shard holds many precommit refs. We derive the server from `<server_hex>/_precommits` and the
-    /// build_seq from each REF NAME, reading the shard already in hand (the fold's `root`).
-    if (root.refs.empty())
-        return;
 
-    const String & ns_str = ns.string();
-    static constexpr std::string_view kPrecommitsSuffix = "/_precommits";
-    chassert(ns_str.ends_with(kPrecommitsSuffix));
-    const String server_hex = ns_str.substr(0, ns_str.size() - kPrecommitsSuffix.size());
-    if (server_hex.size() != 32)
-        return;
-    UInt128 server;
-    try
+/// The server hex of a `writer_instance_id` "<server_hex>:<process_epoch>" (the watermark slot key). An
+/// id without a ':' has no derivable server (returns empty). Mirrors `serverHexOf` in the orphan sweep.
+String serverHexOfWriter(const String & writer_instance_id)
+{
+    const size_t colon = writer_instance_id.find(':');
+    if (colon == String::npos)
+        return {};
+    return writer_instance_id.substr(0, colon);
+}
+
+}
+
+void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uint64_t /*round*/)
+{
+    /// B8: reclaim ABANDONED precommits in the CONVERGED-SHARD model. `precommitAdd` writes a precommit
+    /// owner binding into the FUTURE COMMITTED REF's OWN table shard (keyed by `final_ref_name`, kind
+    /// `OwnerKind::Precommit`) — there is no `_precommits` namespace. So while the fold visits a shard, this
+    /// enumerates the LIVE precommit bindings from the journal owner-state replay (the same
+    /// accumulate-adds/subtract-removals the fold and `Build::promote` do), then for each derives
+    /// `(server, build_seq)` from the binding's `manifest_ref` and judges build-death via the per-server
+    /// watermark (identical to the orphan sweep). It runs BEFORE the fold reads this shard so its
+    /// PrecommitRemove is folded in the SAME round (no double-counted `-1`).
+
+    /// Read the shard being visited (the fold re-reads it right after, picking up any removal we append).
+    const RootShard root = store->readShard(ns, shard).first;
+
+    /// Owner-state replay: a precommit `new_binding` not later removed (or moved off its manifest_ref) is
+    /// LIVE. Keep the FULL binding so the removal event names EXACTLY it (the encoding `Build::promote`
+    /// re-proves against; a partial binding would not match and the fold/promote guards would mis-judge).
+    std::vector<OwnerBinding> live;
+    for (const RootOwnerEvent & e : root.journal)
     {
-        server = hexToU128(server_hex);
+        if (e.old_binding)
+            std::erase(live, *e.old_binding);
+        if (e.new_binding)
+            live.push_back(*e.new_binding);
     }
-    catch (...)
-    {
-        return;
-    }
 
-    const ServerWatermark * w = watermarkOf(server);
-    const bool server_live = server_live_this_round[server];
-
-    struct DeadRef { String name; uint64_t build_seq; };
-    std::vector<DeadRef> dead_refs;
-    for (const auto & [name, payload] : root.refs)
+    struct DeadPrecommit { OwnerBinding binding; bool retired_sentinel; };
+    std::vector<DeadPrecommit> dead;
+    for (const OwnerBinding & binding : live)
     {
-        uint64_t build_seq = 0;
+        if (binding.owner_kind != OwnerKind::Precommit)
+            continue;
+
+        /// Derive (server, build_seq) from the binding's ManifestRef. A `writer_instance_id` without a
+        /// derivable 32-hex server has no watermark slot — judge CONSERVATIVELY (not dead): a precommit we
+        /// cannot attribute to a server must never be reclaimed (a live build must not be aborted).
+        const String server_hex = serverHexOfWriter(binding.manifest_ref.writer_instance_id);
+        if (server_hex.size() != 32)
+            continue;
+        UInt128 server;
         try
         {
-            size_t consumed = 0;
-            build_seq = std::stoull(name, &consumed);
-            if (consumed != name.size())
-                continue;
+            server = hexToU128(server_hex);
         }
         catch (...)
         {
             continue;
         }
 
-        const bool dead = (w == nullptr) || !server_live || build_seq < w->min_active;
-        if (dead)
-            dead_refs.push_back(DeadRef{name, build_seq});
+        /// CONSERVATIVE death judgment, identical to the orphan sweep's `prefixEligible` — a DURABLE
+        /// watermark FACT only, never a frozen-seq / judged-dead guess (control #9). A build is provably
+        /// DEAD iff the server has a watermark AND either the farewell/retired sentinel
+        /// (`min_active == UINT64_MAX`, every seq retired) or its `build_sequence` is below the live floor
+        /// (`min_active > build_sequence`). A missing watermark, or a build at/above the floor, is NOT dead
+        /// — the precommit is spared. The K=2 frozen-seq crash detector is deliberately NOT consulted here:
+        /// it is a liveness heuristic, unsafe as a reclaim trigger (a live but slow-renewing build must
+        /// never have its in-flight precommit reclaimed). A wrongful reclaim would still be caught by the
+        /// promote guard (fail closed), but conservatism keeps live builds from being needlessly aborted.
+        const ServerWatermark * w = watermarkOf(server);
+        if (w == nullptr)
+            continue;   /// no durable fact => not dead (conservative)
+        const bool retired_sentinel = w->min_active == std::numeric_limits<uint64_t>::max();
+        const bool is_dead = retired_sentinel || w->min_active > binding.manifest_ref.build_sequence;
+        if (is_dead)
+            dead.push_back(DeadPrecommit{binding, retired_sentinel});
     }
 
-    if (dead_refs.empty())
+    if (dead.empty())
         return;
 
-    /// Reclaim: drop each dead precommit ref + append a removal RootOwnerEvent on the SAME shard (the
-    /// next fold reads the removal and releases the edges, so the closure's blobs become normal
-    /// zero-in-degree candidates). ONE mutateShard CAS removes all dead refs at once.
+    /// Reclaim: append a removal RootOwnerEvent per dead precommit on the SAME shard (old = the precommit
+    /// binding, new = none — the encoding shared by `Build::abandon` / `Store::dropRef`). The fold (which
+    /// re-reads this shard immediately after) then folds the removal IN THIS ROUND, releasing the edges so
+    /// the closure's blobs become zero-in-degree candidates. ONE mutateShard CAS removes all dead bindings;
+    /// each gets a distinct, contiguous transition_version above the shard's current version (mutateShard
+    /// bumps shard_version by one, so the LAST appended event aligns with the committed shard_version).
+    /// `mutateShard` does a single `++shard_version` AFTER this callback, so the LAST event we append must
+    /// carry `shard_version + dead.size()` and we pre-advance shard_version to one below that; the trailing
+    /// `++` lands it exactly on the last event's transition_version (no gap, contiguous versions).
     store->mutateShard(ns, shard, [&](RootShard & fresh)
     {
-        for (const DeadRef & dr : dead_refs)
-        {
-            auto it = fresh.refs.find(dr.name);
-            if (it == fresh.refs.end())
-                continue;
-            OwnerBinding old_binding;
-            old_binding.owner_kind = OwnerKind::Precommit;
-            old_binding.ref_name = it->second.ref_name;
-            old_binding.manifest_ref = it->second.manifest_ref;
-            fresh.refs.erase(it);
+        const uint64_t base = fresh.shard_version;
+        for (size_t i = 0; i < dead.size(); ++i)
             fresh.journal.push_back(RootOwnerEvent{
-                .transition_version = fresh.shard_version + 1,
-                .old_binding = std::move(old_binding),
+                .transition_version = base + i + 1,
+                .old_binding = dead[i].binding,
                 .new_binding = std::nullopt});
-        }
+        fresh.shard_version = base + dead.size() - 1;
     });
 
-    /// B170: each abandoned precommit reclaimed (its owner edge removed; the next fold releases its
-    /// blob edges). Records WHY the build was judged dead — the soak's leak/dangle attribution.
-    for (const DeadRef & dr : dead_refs)
+    /// B170: each abandoned precommit reclaimed (its owner edge removed; the next fold releases its blob
+    /// edges). Records WHY the build was judged dead — the soak's leak/dangle attribution.
+    for (const DeadPrecommit & dp : dead)
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::PrecommitReclaim;
-            e.namespace_ = ns_str;
-            e.ref_name = dr.name;
+            e.namespace_ = ns.string();
+            e.ref_name = dp.binding.ref_name;
             e.object_kind = CasEventObjectKind::Root;
             e.outcome = "reclaimed";
-            e.reason = w == nullptr
-                ? "precommit reclaim: owning server has no watermark (abandoned/vanished build)"
-                : (!server_live
-                    ? "precommit reclaim: owning server frozen K=2 rounds (crashed build)"
-                    : "precommit reclaim: build_seq below the server's min_active floor (retired build)");
-            e.detail = {{"build_seq", std::to_string(dr.build_seq)},
-                        {"min_active", w ? std::to_string(w->min_active) : "absent"}};
+            e.reason = dp.retired_sentinel
+                ? "precommit reclaim: owning server posted the farewell/retired sentinel (build gone)"
+                : "precommit reclaim: build_seq below the server's min_active floor (retired build)";
+            e.detail = {{"build_seq", std::to_string(dp.binding.manifest_ref.build_sequence)},
+                        {"writer_instance_id", dp.binding.manifest_ref.writer_instance_id}};
         });
 }
 

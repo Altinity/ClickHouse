@@ -311,16 +311,17 @@ TEST(CasGcLeak, DroppedPartFullyReclaimed)
 }
 
 /// NO-LEAK (abandon): a build stages a manifest, precommitAdds it (activating +1 for its OWN unique
-/// blob, body present), uploads that blob, then is ABANDONED (never promoted). Its create-precommit
-/// owner is then REMOVED (a PrecommitRemove RootOwnerEvent old={Precommit,ref,build,id}/new=none on the
-/// SAME table shard). GC folds that removal as a true removal: -1 for the blob, retire + delete — no
-/// debris for the abandoned closure, no stranded positive in-degree.
+/// blob, body present), uploads that blob, then VANISHES (crash: never promoted, never abandoned). GC's
+/// automatic precommit-reclaim (B8) judges the build dead via the watermark and appends a PrecommitRemove
+/// RootOwnerEvent old={Precommit,ref,build,id}/new=none on the table shard. GC then folds that removal as
+/// a true removal: -1 for the blob, retire + delete — no debris for the abandoned closure, no stranded
+/// positive in-degree.
 ///
-/// NOTE (B8): GC's automatic precommit-reclaim (`reclaimAbandonedPrecommit`) only runs for `_precommits`
-/// namespaces, but `precommitAdd` writes the create-precommit into the TARGET TABLE shard. So an
-/// abandoned precommit's edges are NOT auto-released by the current core; this test drives the removal
-/// itself (the production reclaim of a table-shard precommit is the same removal event), keeping the
-/// no-leak assertion strong rather than skipping.
+/// B8: the reclaim now runs for EVERY table shard the fold visits (not just legacy `_precommits`
+/// namespaces). `precommitAdd` writes the create-precommit into the TARGET TABLE shard, and the reclaim
+/// derives `(server, build_seq)` from the precommit binding's `manifest_ref` and judges death by the
+/// per-server watermark — so an abandoned table-shard precommit IS auto-released by the core. This test no
+/// longer drives the removal itself; it asserts the automatic reclaim.
 ///
 /// (This replaces the obsolete staged-parent/adopted-subtree own-blob no-leak case — there is no subtree
 /// in the manifest model, so the property is exercised through a flat staged-then-abandoned part.)
@@ -338,28 +339,25 @@ TEST(CasGcLeak, AbandonedPrecommitReclaimsOwnBlobs)
     build->putBlob(idOf(payload), BlobSource::fromString(payload));   /// the build's OWN unique blob
     const ManifestId id = build->stageManifest({blobEntry("data.bin", payload)});
     build->precommitAdd(ns, ref, id);                                 /// activating +1 for the blob (body present)
-    const UInt128 build_id = build->buildId();
 
-    /// Drive the precommit removal (B8: not auto-reclaimed on a table shard). old = the create-precommit
-    /// binding precommitAdd wrote {Precommit, ref, build_id, id.ref}; new = none. The manifest body is
-    /// STILL PRESENT, so the removal-fold reads its -1 edge for the blob (control #11 fail-close path not
-    /// taken). root_shards=1 ⇒ shard 0. We do NOT call `abandon()` — abandon out-of-band deletes the
-    /// staged body, which would make the removal-fold read it absent and (faithfully) emit NO -1 (a
-    /// removed precommit with absent body emitted no edges to mirror); only GC may delete the body, after
-    /// the -1 is sealed. The build's dtor (build.reset() below) retires the build_seq — the crash path —
-    /// without touching the body.
-    {
-        OwnerBinding precommit_b{.owner_kind = OwnerKind::Precommit,
-            .ref_name = ref, .build_id = build_id, .manifest_ref = id.ref};
-        appendOwnerEvent(*b, s->layout(), ns, /*shard=*/0, precommit_b, std::nullopt);
-    }
+    /// CRASH: the build vanishes without abandon (which would remove the binding) or promote. The dtor's
+    /// idempotent retireBuildSeq is the only effect — the precommit binding and its body survive. GC's
+    /// automatic reclaim (B8) must judge the build dead and append the PrecommitRemove itself.
     build.reset();   /// dtor retires the build_seq (crash semantics); does NOT delete the staged body
 
     /// Build finished → advance the floor past its seq so GC reclaims the orphaned precommit's blob.
     s->renewWatermarkOnce();
 
+    /// The automatic reclaim (B8) appends the PrecommitRemove DURING the first round's fold, but that round
+    /// still sees the precommit's +1 pinning the blob (the removal is folded only in the NEXT round), so it
+    /// reports no candidates — `runGcToFixpoint` would stop on that first empty round before the cascade.
+    /// Drive a fixed, generous number of rounds so the -1 folds and the blob is condemned and deleted.
     Gc gc(s, hexToU128("00000000000000000000000000000003"));
-    EXPECT_NO_THROW(runGcToFixpoint(gc));
+    for (int round = 0; round < 32; ++round)
+    {
+        try { gc.runRegularRound(); }
+        catch (const DB::Exception &) { break; }
+    }
 
     const FsckReport after = runFsck(*s, /*detail=*/false);
     EXPECT_EQ(after.dangling, 0u) << "abandon INV-NO-LOSS: nothing reachable was lost";

@@ -126,14 +126,19 @@ public:
     /// blob in-degree). Production never calls this; trim is always enabled.
     void setTrimEnabledForTest(bool enabled) { trim_enabled = enabled; }
 
-    /// B171 precommit reclaim: while folding a precommit shard, drop the precommits of ABANDONED builds
-    /// (the owning build is no longer live). The precommit namespace is sharded like any namespace, so
-    /// one shard holds MANY precommit refs each named `std::to_string(build_seq)`. A build is DEAD iff
-    /// the server has no watermark, is judged not-live this round (K=2 frozen-seq crash detector), or
-    /// `build_seq < min_active`. Each dead ref is dropped + a removal RootOwnerEvent appended in ONE CAS
-    /// on the shard already in hand.
-    void reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, const RootShard & root,
-                                   uint64_t round);
+    /// B8 precommit reclaim (converged-shard model): while folding ANY table shard, drop the precommit
+    /// bindings of ABANDONED builds (the owning build is no longer live). `precommitAdd` writes a precommit
+    /// owner binding into the FUTURE COMMITTED REF's OWN table shard (keyed by `final_ref_name`, kind
+    /// `OwnerKind::Precommit`) — there is no `_precommits` namespace. The reclaim therefore enumerates the
+    /// LIVE precommit bindings from the shard's folded owner state (the journal owner-state replay), and for
+    /// each derives `(server, build_seq)` from the binding's `manifest_ref`
+    /// (`writer_instance_id = "<server_hex>:<epoch>"`, `build_sequence`). A build is DEAD iff the server has
+    /// no watermark, is judged not-live this round (K=2 frozen-seq crash detector), or
+    /// `build_sequence < min_active`. Each dead binding is removed by appending a `PrecommitRemove`
+    /// RootOwnerEvent (old = the precommit binding, new = none — the SAME encoding `Build::abandon` /
+    /// `Store::dropRef` / the legacy reclaim use) in ONE CAS on the shard already in hand. CONSERVATIVE: a
+    /// live build is never reclaimed; a wrongful reclaim is caught by the promote guard (fail closed).
+    void reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uint64_t round);
 
     /// DELETE-SITE AUDIT (closeout invariant; grep `deleteExact` under Core/): the recheck holds the
     /// ONLY content (blob reachability) delete in the whole core, behind the four INV-NO-LOSS gates.

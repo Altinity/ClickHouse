@@ -2,6 +2,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Common/Exception.h>
 #include <set>
 #include <limits>
@@ -22,9 +25,36 @@ String serverHexOf(const String & writer_instance_id)
     return writer_instance_id.substr(0, colon);
 }
 
+/// The shard's sealed fold cursor (the latest CasFoldSeal's `folded_cursor` for ns/shard), or 0 when no
+/// seal covers it yet. A precommit-removal event AT OR ABOVE this cursor has NOT had its `-1` blob
+/// decrement folded+sealed, so the precommit's manifest body is still load-bearing (delete-after-
+/// sealed-decrements). The seal is written at the FOLD generation (G+1) while gc/state points at the
+/// COMPLETION generation (G+2), so scan downward from the current generation for the most recent seal.
+uint64_t sealedFoldCursor(Store & store, const RootNamespace & ns, uint64_t shard)
+{
+    const Layout & layout = store.layout();
+    const auto state_got = store.backend().get(layout.gcStateKey());
+    if (!state_got)
+        return 0;
+    const uint64_t gen = decodeGcState(state_got->bytes).snap_generation;
+    const String key = cursorKey(ns, shard);
+    for (uint64_t g = gen; ; --g)
+    {
+        if (const auto got = store.backend().get(layout.foldSealKey(g)))
+        {
+            const CasFoldSeal seal = decodeFoldSeal(got->bytes);
+            const auto it = seal.per_ns_shard.find(key);
+            return it != seal.per_ns_shard.end() ? it->second.folded_cursor : 0;
+        }
+        if (g == 0)
+            return 0;
+    }
+}
+
 /// The active manifest-object-KEY set for one namespace: every committed RootRef's manifest_ref plus
-/// every live precommit binding (a precommit new_binding not later removed). Keys (not ManifestIds) so a
-/// listed object key can be tested directly without parsing the key back into a ManifestId.
+/// every live precommit binding (a precommit new_binding not later removed) AND every precommit body
+/// whose REMOVAL is still PENDING (above the sealed fold cursor — its `-1` not yet sealed). Keys (not
+/// ManifestIds) so a listed object key can be tested directly without parsing the key back.
 std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
 {
     std::set<String> active;
@@ -46,15 +76,27 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
 
         /// Live precommit owners: a precommit new_binding whose manifest_ref is not later removed. The
         /// journal is append-only (trimmed below the GC fold cursor only after sealing), so accumulate
-        /// adds and subtract removals by manifest_ref.
+        /// adds and subtract removals by manifest_ref. A removal whose `-1` is NOT YET SEALED (its
+        /// transition_version is above the sealed fold cursor) is treated as STILL ACTIVE: the GC fold
+        /// must read the body to emit that `-1` next round (delete-after-sealed-decrements), so the sweep
+        /// must NOT delete it. This closes the B8 race where GC's own precommit reclaim appends a removal
+        /// in a round whose end-of-round sweep would otherwise delete the body before the `-1` folds.
+        const uint64_t cursor = sealedFoldCursor(store, ns, shard);
         std::set<ManifestRef> precommit_live;
         for (const RootOwnerEvent & e : root.journal)
         {
-            if (e.old_binding && (!e.new_binding
-                || e.old_binding->manifest_ref != e.new_binding->manifest_ref))
+            const bool is_removal = e.old_binding
+                && (!e.new_binding || e.old_binding->manifest_ref != e.new_binding->manifest_ref);
+            if (is_removal && e.transition_version <= cursor)
                 precommit_live.erase(e.old_binding->manifest_ref);
             if (e.new_binding && e.new_binding->owner_kind == OwnerKind::Precommit)
                 precommit_live.insert(e.new_binding->manifest_ref);
+            /// A PENDING precommit removal (its `-1` not yet sealed) keeps the body load-bearing even when
+            /// the matching create-precommit was already folded and TRIMMED away — protect the body named
+            /// by the removal's old_binding directly so the GC fold can still read it to emit the `-1`.
+            if (is_removal && e.transition_version > cursor
+                && e.old_binding->owner_kind == OwnerKind::Precommit)
+                precommit_live.insert(e.old_binding->manifest_ref);
         }
         for (const ManifestRef & ref : precommit_live)
             active.insert(layout.manifestKey(ManifestId{ns, ref}));
