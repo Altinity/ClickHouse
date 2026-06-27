@@ -147,3 +147,23 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   `CasFsck` audit, rewrite the GC/tree gtests, then link + green `Cas*`/`Ca*` (modulo B3). This is the
   R0 invariants in C++ → thorough code-review of the GC core after it goes green, before the post-1d
   soak + Phase 2.
+
+### 2026-06-27 — Behavior switch: run 3 done (1d GC core); run 4 = test ports + B170 events → green gate
+- Run 3 completed the **1d GC core** (T3-T7,T6,T9 + removals). `CasGc.{h,cpp}` fully rewritten over the
+  `RootOwnerEvent` journal: owner-move (no delta/cleanup), true-removal (−1+deferred cleanup),
+  activation (+1) + **fold barrier #23** (live missing-body precommit clamps the cursor); 404 realized
+  exactly (present-but-invalid ⇒ CORRUPTED_DATA; missing committed/removal ⇒ clamp+recordAnomaly; missing
+  precommit ⇒ barrier); wires `CasBlobInDegree` + `CasFoldSeal`/`CasCompletionSeal` (resume by which seal
+  exists); proved tail preserved (exact-token-only delete, registry-then-all-shard fence, fold-through-
+  fence recheck, body-delete-after-decrements-sealed, ViewableRound, never-GET-condemned, never-wedge-404).
+  New `CasOrphanManifestSweep` (watermark-eligible, no blob deltas); `CasFsck` manifest audit; **deleted**
+  `CasGcSnap`/`CasTreeCodec`/`CasClosureWalk` + pruned `FormatId::Tree`/`GcSnap`. **All 29 product objects
+  compile; the whole non-test source LINKS.** 4 commits (`3526407`,`889a591`,`a2bf373`,`0f13d7d`).
+- **Remaining (B6):** 12 stale write-path/wiring gtests still use the removed tree API
+  (`event_log`/`gc_log`/`ca_transaction`/`truncate_reclaim`/`ca_wiring`/`b140_dangle`/`build`/
+  `build_root_dangle`/`store`/`protocol_scenarios`/`gc_round`/`gc_leak`); the link gate needs every
+  globbed `gtest_*.cpp` to compile. Sub-gap (B8): the new core dropped **B170 GC event emission** that
+  `event_log`/`gc_log` + the soak rely on — re-add `emitEvent` at the GC decision points (manifest
+  model).
+- **Action:** dispatched run 4 = re-add B170 GC events to the new core + port the 12 gtests → link +
+  green `Cas*`/`Ca*` (modulo B3). Then: code-review the whole switch, post-1d soak, Phase 2.
