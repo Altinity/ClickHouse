@@ -103,46 +103,84 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
     streams bytes — the documented fallback). Manifest-era relink = new backlog **B7**.
     Commit: "CA GC phase1b T6 + write-path wiring: transaction over part manifests".
 
-  REMAINING (resume in order) — this is the 1d CORE, NOT yet started; build still RED:
-  1. **1d T3-T8 — `CasGc.{h,cpp}` (the big one, ~2113 lines).** Still entirely on the snap/closure model:
-     every method takes `std::map<uint64_t, GcSnap>&` (`fold`, `foldShardRecords`, `recheck`, `trim`,
-     `cascadeAndPersist`, `assertSnapJournalCoherent`, `persistGenerationProbingUpward`, `loadSnap`).
-     Rewrite `fold` over the single ordered `RootOwnerEvent` journal (owner-move ⇒ no delta/no cleanup;
-     true removal ⇒ −1 + cleanup; activation ⇒ +1 subject to fold barrier #23 — don't advance the cursor
-     past a live missing-body precommit; context-specific 404 = clamp+record, never wedge); add
-     `foldManifestEdges`; wire `CasBlobInDegree` (EXISTS, 1d T2) + `CasGenerationSeal` (EXISTS, 1d T1:
-     `CasFoldSeal` at fold / `CasCompletionSeal` at completion, resume keys off which seal exists); create
-     `CasOrphanManifestSweep.{h,cpp}` (per-namespace, sealed owner view, `sweepEligible` from a durable
-     watermark fact per OQ6, exact-token, no blob deltas); `CasGcFormats` `snap_*`→generation pointer;
-     DELETE `CasGcSnap.*` (479), `CasTreeCodec.*` (170), `CasClosureWalk.*` (43) + their machinery
-     (cascade, `children_by_tree`, expansion markers, resident snap); prune `FormatId::Tree`/`GcSnap` +
-     magics in `CasFormat.{h,cpp}` (1d T1 left this enum prune pending). PRESERVE rev.15 invariants:
-     exact-token delete only, global-then-shard fence, fold-through-fence recheck, `ViewableRound`,
-     `deadTok`/no-return, never-GET-a-condemned-blob, GC never throws on a 404 during fold/sweep.
-  2. **1d T9** `CasFsck` read-only manifest audit (OQ8: owner-visible missing body ⇒ error; reclaimable
-     pre-precommit body ⇒ info; same sealed-owner-view + eligibility as the sweep). `CasFsck.cpp` (194)
-     still tree-based.
-  3. **1d T8 (tests)** rewrite/delete obsolete gtests (`gtest_cas_gc_snap.cpp`, `gtest_cas_tree_id.cpp`,
-     `gtest_cas_closure_walk.cpp`, old `gtest_cas_build*.cpp`, `gtest_cas_gc_*`, `gtest_cas_store.cpp`,
-     `gtest_cas_codecs.cpp` tree blocks, `gtest_cas_protocol_scenarios.cpp` tree_size cases,
-     `gtest_cas_gc_leak.cpp` adopt-by-tree) + adapt `cas_test_helpers.h` (`publishRaw`→`RootRef`/
-     `RootOwnerEvent`; add `writeManifestRaw`). Write the new TDD gtests the plans specify
-     (`CasGcFold`, `CasOrphanManifestSweep`, `CasStore` readManifest, `CasBuild` promote fail-closed). NOTE
-     the isolated 1b/1d gtests written in run 1 are still UNRUN (link blocked) and the read-path 1c gtests
-     in the 1c plan (`CasStore.ResolveReturnsManifestId`, `.ReadManifestValidatesBodyAndFailsClosed`,
-     `.LookupAndListOverManifestEntries`, `.ManifestCacheIsKeyedByIdAndToken`) are NOT yet written —
-     `cas_test_helpers.h` lacks the `RootRef` `publishRaw` overload + `writeManifestRaw`.
-  4. **Gate** — `unit_tests_dbms` links; `--gtest_filter='Cas*:Ca*'` green except known B3.
+  RUN 3 (2026-06-27) — the 1d GC CORE is DONE; ALL PRODUCT (non-test) SOURCE COMPILES. Build still RED
+  ONLY because 12 stale write-path gtests have not yet been ported off the old `Build::putTree`/`publish`
+  API (the link gate needs every globbed `gtest_*.cpp` to compile). Commits this run:
+  `3526407f1b1` (GC core), `889a591645d` (codec/format/fsck/layout test ports).
 
-  WHY STOPPED HERE: 1c + 1b T6 + write-path are clean committed boundaries (each migrated file has zero
-  non-comment references to the removed types — verified by grep). The 1d CasGc rewrite is a large,
-  safety-critical, TLA+-grounded rewrite of ~2100 lines that must preserve INV_NO_DANGLE/NO_LOSS/NO_RETURN
-  and the fold-barrier #23 semantics; it deserves its own focused run rather than a rushed pass. Files
-  touching removed types now (verified by non-comment grep): only `Core/CasGc.{h,cpp}`,
-  `Core/CasFsck.cpp`, `Core/CasGcSnap.*`, `Core/CasClosureWalk.*`, `Core/CasTreeCodec.*`, and the gtests.
-  (`Core/CasBuild.cpp`, `PartPathParser.h`, `ContentAddressedWriteBuffers.h`,
-  `ContentAddressedMetadataStorage.h` are CLEAN. `Core/CasPlacement.h` — the dead tree-era `visitPlacement`
-  helper — was DELETED this run and its only include, in `CasBuild.cpp`, removed.)
+  DONE (committed, run 3):
+  - **1d T3-T7 — `CasGc.{h,cpp}` fully rewritten** over the single ordered `RootOwnerEvent` journal.
+    `fold` dispatches owner-move (equal old/new `manifest_ref` ⇒ no delta/no cleanup) / true-removal
+    (−1 + deferred body cleanup) / activation (+1) with the **fold barrier (control #23)**: a live
+    missing-body precommit is non-activating and CLAMPS the shard cursor (re-read each round, advances on
+    activation/removal). 404 rule realized: present-but-invalid body ⇒ `CORRUPTED_DATA`; missing
+    committed/removal body ⇒ clamp + `RoundReport::recordAnomaly` (never guess, never wedge); missing
+    precommit body ⇒ barrier. `foldManifestEdges` reads ONE `PartManifest`, validates `refMatchesBody`/
+    `manifestNamespaceMatches`, emits ±1/blob. Wires `CasBlobInDegree` + `CasFoldSeal` (at fold) /
+    `CasCompletionSeal` (at recheck); resume keys off WHICH seal exists. `retire` (zero-in-degree blobs,
+    per-candidate HEAD, write-once sets), `fence` (registry-then-all-shard, positions into the completion
+    seal), `recheck` (fold-through-fence completion gen, the single exact-token content-delete site,
+    manifest-body deletes only after decrements sealed), `trim` (below sealed cursor), seal-driven
+    `tryResumeIncompleteRound`. Lease/watermark/heartbeat kept verbatim; `reclaimAbandonedPrecommit`
+    adapted to append removal `RootOwnerEvent`s. Added `inDegreeInGeneration` to `CasBlobInDegree`.
+  - **1d T6 — `CasOrphanManifestSweep.{h,cpp}` (new)** — `sweepNamespace`/`prefixEligible` (OQ6 durable
+    watermark fact only, never frozen-seq)/`pickOneSweepTarget`; active owner-key set from committed refs
+    + live precommit bindings; exact-token deletes; no blob deltas; wired one bounded step per round.
+  - **1d T9 — `CasFsck.cpp` rewritten** to the manifest audit (owner-visible missing body/blob ⇒ error;
+    pre-precommit body ⇒ info via `prefixEligible`).
+  - **Removals** — `FormatId::Tree`/`GcSnap` + magics pruned (`CasFormat.{h,cpp}`); `CasGcSnap.*`,
+    `CasTreeCodec.*`, `CasClosureWalk.*` DELETED. `CasGcScheduler.cpp` dropped the removed
+    cascade/forget `RoundReport` columns (the only product-code casualty — now fixed; everything else
+    was test-only). `GcState` field names (`snap_generation`/`snap_shards`/`snap_pruned_through`) KEPT
+    as-is (they now mean the generation pointer; renaming is cosmetic and would churn the JSON codec +
+    every gc-state test — deferred, functionally correct).
+  - **Tests** — deleted `gtest_cas_gc_snap.cpp`/`gtest_cas_tree_id.cpp`/`gtest_cas_closure_walk.cpp`/
+    `gtest_cas_tree_layout.cpp`; wrote NEW TDD gtests `gtest_cas_gc_fold.cpp` (committed/precommit/
+    promote/barrier/404/ref-mismatch/removal-missing-body), `gtest_cas_gc_fence_recheck.cpp`,
+    `gtest_cas_orphan_manifest_sweep.cpp`, `gtest_cas_gc_resume.cpp` — ALL COMPILE. `cas_test_helpers.h`
+    gained `writeManifestRaw`/`blobEntryFor`/owner-transition fixtures (`appendOwnerEvent`,
+    `publishCommittedTransition`, `dropRefTransition`, `addPrecommitTransition`, `promoteTransition`,
+    `deleteManifestBody`) + GC-core helpers (`openStoreForTest`, `writeBlobBody`, `inDegreeOf`,
+    `foldCursorOf`, `currentGenerationOf`, `setWatermarkMinActive`). Ported `gtest_cas_format.cpp`,
+    `gtest_cas_codecs.cpp` (dropped Tree block), `gtest_cas_gc_formats.cpp` (dropped GcSnap block),
+    `gtest_cas_layout.cpp` (generation keys), `gtest_cas_fsck.cpp` (manifest audit) — ALL COMPILE.
+
+  REMAINING (resume in order) — the ONLY thing between here and the GREEN gate:
+  1. **Port 12 stale write-path/wiring gtests** off the old `Build::putTree`/`publish`/`adoptFromTree`/
+     `TreeEntry`/`Placement`/`Resolved::tree_id`/`Store::readTree` API to the new Build flow
+     (`startBuild → stageManifest(entries) → precommitAdd → putBlob → promote`; entries are
+     `ManifestEntry{path, EntryPlacement::Blob|Inline, blob_hash, blob_size, inline_bytes}`). Each must
+     COMPILE (link gate). Broken-file inventory (error counts at run-3 end), smallest first:
+       - `gtest_cas_event_log.cpp` (4) and `gtest_cas_gc_log.cpp` (4): replace `publishOneBlobPart` tree
+         flow with the manifest flow. **CAVEAT: both assert B170 GC event types** (`BlobPut`/`BlobRetire`/
+         `BlobDelete`/`GcFold*`/`GcFence`/etc.). The run-3 `CasGc` rewrite DROPPED all B170 event
+         emission to bound scope. To make these pass, **re-add B170 `emitEvent` calls to the new core**
+         (fold begin/end, retire-observe, fence, the single blob-delete site, precommit-reclaim) using
+         the existing `CasEvent`/`EventEmitter` types (still present, Tree/Snap enum values kept) — a
+         worthwhile addition for soak attribution. If only compilation (not the assertions) is needed
+         first, port the publish flow and let the event assertions fail, then re-add events.
+       - `gtest_ca_transaction.cpp` (6), `gtest_cas_truncate_reclaim.cpp` (6), `gtest_ca_wiring.cpp` (8),
+         `gtest_cas_b140_dangle.cpp` (11): wiring/transaction over `TreeEntry`/`Placement`/`readTree`/
+         `gcSnapKey`/`GcSnap` — port to manifests; b140 was a snap-cursor-coherence test (the new model's
+         analog is the fold barrier — rewrite or delete as no-successor).
+       - `gtest_cas_build.cpp` (20), `gtest_cas_build_root_dangle.cpp` (19), `gtest_cas_store.cpp` (20),
+         `gtest_cas_protocol_scenarios.cpp` (20), `gtest_cas_gc_round.cpp` (20), `gtest_cas_gc_leak.cpp`
+         (20): the deep write-path/round/leak suites — the largest port. `gtest_cas_gc_round.cpp` (2234
+         lines) is entirely snap/cascade-based; most cases have manifest-model analogs already covered by
+         the new `gtest_cas_gc_*` suites, so prefer DELETE-and-replace over line-by-line port for the
+         snap-specific cases. `gtest_cas_store.cpp` needs the 1c read-path tests
+         (`CasStore.ResolveReturnsManifestId`/`.ReadManifestValidatesBodyAndFailsClosed`/
+         `.LookupAndListOverManifestEntries`/`.ManifestCacheIsKeyedByIdAndToken`) — still unwritten.
+         `gtest_cas_build.cpp` needs `CasBuild` promote fail-closed cases.
+  2. **GATE** — `ninja -C build unit_tests_dbms` LINKS; `build/src/unit_tests_dbms
+     --gtest_filter='Cas*:Ca*'` GREEN except the known B3 (`CaWiringOps.FreezeViaHardLinksIntoShadow`).
+     The new GC-core suites (`CasGcFold`/`CasGcFence`/`CasGcRecheck`/`CasOrphanManifestSweep`/`CasGcResume`/
+     `CasFsck`) compile but are UNRUN (binary not linked) — run + verify them once the link gate passes.
+
+  WHY STOPPED HERE (run 3): the safety-critical GC core (the TLA+-grounded heart) is COMPLETE, COMPILES
+  into the product, and is committed; the remaining work is mechanical test porting against a now-stable
+  API plus an optional B170 event re-add. A clean resumable boundary per the run brief. No product code
+  references any removed type (verified: only the 12 listed gtests do).
 
 - **B7 — cross-server part relink in the part-manifest model (feature regression to restore).**
   Severity: medium (a fetch-path optimization, not a correctness issue — the byte-fetch fallback is
