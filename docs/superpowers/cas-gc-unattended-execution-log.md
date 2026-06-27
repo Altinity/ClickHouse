@@ -206,3 +206,21 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   no-double-count test; M2 encode/decode; M3 paginate; decodeOwnerBinding; **B9 generation prune** +
   un-skip the 2 retention tests) → rebuild + green `Cas*`/`Ca*` (modulo B3). MINORS deferred to **B10**.
   Then: verify → post-1d chaos soak → Phase 2.
+
+### 2026-06-27 — GC durability fixes verified; BEHAVIOR SWITCH fully closed; soak + Phase-2 model in parallel
+- Fix pass FIXED+GREEN, **independently verified**: 350 ran, **343 passed, 6 skipped, 1 failed (B3
+  only)**, 0 aborts; the 8 key fix tests (M1 `FoldCursorSurvives`, B9 retention ×2, M2, M3,
+  `decodeOwnerBinding`) all PASS. M1: cursor survives via `completion_seal.folded_cursors` +
+  `readSealedCursors` (no trim dependence; double-count test fails-before/passes-after). M2: completion-
+  seal runs encoded. M3: sweep paginates. `decodeOwnerBinding` invariant enforced. **B9** generation
+  prune live (retention tests un-skipped + passing). `activeManifestKeys` verified safe (atomic promote
+  CAS). 5 commits. B9→Resolved; **B10** added (7 deferred minors). **Behavior switch (1b+1c+1d) fully
+  closed — T18 done.** The R0 invariants are realized in C++ and exercised by 343 green gtests; only the
+  pre-existing unrelated B3 is red.
+- **Parallel dispatch** (mutually independent): (a) post-1d **chaos soak** — feasibility-gated (docker +
+  ca-soak harness + incremental server build cost); if feasible, scoped soak asserting no dangle/loss/
+  leak + bounded `gc/gen/` growth (B9 prune) + B170 events; else reports infeasible → I backlog (B11) +
+  proceed. (b) **Phase 2 R0 model gate** — token-diff `listedTok`/`foldedTok` split + `SabotageSkipChangedShard`,
+  re-green the whole suite (model file only; independent of the soak).
+- Next: soak result (clean / infeasible→B11) + Phase-2-model GREEN → Phase 2 code (discovery skip) →
+  Phase 3 → 4 (+soak) → 5, each gated on its TLA+ extension + reviewed.
