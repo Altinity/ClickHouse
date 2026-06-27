@@ -117,3 +117,17 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   code-review the whole switch — the honest review point since intermediate states don't compile.
 - **Action:** dispatched the behavior-switch implementer (1b+1c+1d). Gate after 1d: clean build +
   `Cas*`/`Ca*` sweep with no new failures beyond B3, then the post-1d chaos soak.
+
+### 2026-06-27 — Behavior switch: run 1 PARTIAL (clean boundary), continuing
+- Run-1 implementer completed the isolated/foundational pieces + write path, stopped at a clean,
+  documented boundary (5 commits `a8576aaa12a`…`5ffcaa6714b`). DONE: **1b T1** (`RootOwnerEvent`
+  journal + proto, removed `JournalRecord`/`ClosureNode`/`RefPayload`), **1b T2-T7** (`CasBuild`
+  write path: `stageManifest`/`precommitAdd`/pure-move `promote`/`abandon`), **1d T1**
+  (`CasFoldSeal`+`CasCompletionSeal`), **1d T2** (`CasBlobInDegree`). Each compiles as an isolated TU;
+  full build RED by design (CasBuild blocked on CasStore until 1c). Resume marker durable in backlog **B6**.
+- Useful header-truth adaptations recorded: landed `CasRunFile` API is `RunFileWriter`/`RunFileReader`/
+  `RunMerger`; `PartManifest.root_namespace_id` is `RootNamespace`; journal stays `FormatId::Manifest`
+  ("CARS"); `FormatId::Tree`/`GcSnap` enum prune deferred to 1d core.
+- **Action:** dispatched continuation (run 2), resuming at **1c T1** per B6 → 1c → 1b T6 → 1d T3-T10 →
+  link + green `Cas*`/`Ca*` gate (modulo B3). Continuation updates B6 + reports its resume point if it
+  also stops short (the switch may take several runs).
