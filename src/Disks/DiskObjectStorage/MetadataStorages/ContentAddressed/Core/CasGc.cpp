@@ -959,6 +959,13 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
 
 void Gc::trim(FoldResult & folded, uint64_t /*round*/)
 {
+    const uint64_t trim_min_events = store->poolConfig().gc_trim_min_events;
+    const uint64_t trim_body_soft_limit = store->poolConfig().gc_trim_body_soft_limit;
+
+    /// B12: consume (and reset) the maintenance-trim flag exactly once per round.
+    const bool is_maintenance = maintenance_trim;
+    maintenance_trim = false;
+
     for (const auto & [ns, shard] : folded.root_shards)
     {
         const String cursor_key = cursorKey(ns, shard);
@@ -972,12 +979,34 @@ void Gc::trim(FoldResult & folded, uint64_t /*round*/)
         if (cursor == 0)
             continue;
 
-        /// Peek: only touch the shard when there is something to trim (no pointless version bumps).
+        /// Peek: read the shard once to inspect the journal and encoded body size.
         const auto [peek, tok] = store->readShard(ns, shard);
-        const bool has_trimmable = std::any_of(peek.journal.begin(), peek.journal.end(),
-            [&](const RootOwnerEvent & e) { return e.transition_version <= cursor; });
-        if (!has_trimmable)
-            continue;
+
+        /// Count events at/below the sealed cursor (these are the trimmable ones).
+        uint64_t trimmable_count = 0;
+        for (const RootOwnerEvent & e : peek.journal)
+            if (e.transition_version <= cursor)
+                ++trimmable_count;
+
+        if (trimmable_count == 0)
+            continue;   /// nothing to trim — no pointless version bump (same as before)
+
+        /// B12 lazy-trim gate: compact only when a threshold is met.
+        ///   (a) event-count batch gate: trimmable_count >= gc_trim_min_events (0 = eager, always compact).
+        ///   (b) body soft-limit gate: the encoded shard body is at/above gc_trim_body_soft_limit.
+        ///   (c) maintenance mode: explicit one-round full-compaction bypass.
+        /// Gate (b) guarantees bounded journal growth even when (a) never fires (unbounded build-up
+        /// is impossible once the encoded body exceeds the soft limit — a hard cap on inert events).
+        const bool count_gate = (trim_min_events == 0) || (trimmable_count >= trim_min_events);
+        const String encoded_peek = encodeRootShard(peek);
+        const bool size_gate = (trim_body_soft_limit > 0) && (encoded_peek.size() >= trim_body_soft_limit);
+        if (!count_gate && !size_gate && !is_maintenance)
+            continue;   /// B12: skip this shard — inert events; token stays stable for the next discover Skip
+
+        /// Determine the trigger reason for the B170 audit log.
+        const char * trim_reason = is_maintenance ? "maintenance"
+                                 : size_gate       ? "soft-limit"
+                                                   : "threshold";
 
         store->mutateShard(ns, shard, [&](RootShard & fresh)
         {
@@ -997,7 +1026,9 @@ void Gc::trim(FoldResult & folded, uint64_t /*round*/)
             e.outcome = "trimmed";
             e.reason = "INV-JOURNAL-COVERAGE: trimmed owner events at or below the sealed fold cursor";
             e.detail = {{"shard", std::to_string(shard)},
-                        {"sealed_fold_cursor", std::to_string(cursor)}};
+                        {"sealed_fold_cursor", std::to_string(cursor)},
+                        {"trimmed_count", std::to_string(trimmable_count)},
+                        {"trim_trigger", trim_reason}};
         });
     }
 }

@@ -770,6 +770,232 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
     EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
 }
 
+/// ---- B12 lazy/batched trim tests ----
+
+/// B12: a shard with FEW (< gc_trim_min_events) trimmable events at/below the sealed fold cursor must
+/// NOT be compacted by a regular round. Its journal retains those events after the round (they are
+/// inert — at/below the sealed cursor; the next fold skips them via the per-shard cursor carried in the
+/// completion seal). As a consequence the shard's root-shard token is UNCHANGED after the round (no
+/// mutateShard bumped it). The next round therefore SKIPs the shard in the discover phase (the listed
+/// token equals the sealed post-fence token from the prior round = no settling re-read is needed).
+///
+/// Setup: gc_trim_min_events=4 (the batch threshold); publish exactly 3 events, all below the sealed
+/// fold cursor after the first round. Assert: (a) the 3 events survive the round in the journal,
+/// (b) the shard token is NOT bumped by trim (the token after the round == the post-fence token stored
+/// in the completion seal), and (c) discoverDecisionsForTest() returns Skip for the shard.
+TEST(CasGcRound, LazyTrimSkipsSmallJournalAndKeepsTokenStable)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// gc_trim_min_events=4 and maintenance disabled; 3 events must not trigger trim.
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1,
+                                                 .gc_trim_min_events = 4});
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// Publish 3 distinct committed events so the journal has exactly 3 entries.
+    /// All 3 have bodies so the fold advances the cursor past all of them (no barrier).
+    const ManifestRef r1 = ref(1, 0xA1);
+    const ManifestRef r2 = ref(2, 0xA2);
+    const ManifestRef r3 = ref(3, 0xA3);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeBlobBody(*backend, store->layout(), DB::UInt128(2));
+    writeBlobBody(*backend, store->layout(), DB::UInt128(3));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    writeManifestRaw(*backend, store->layout(), ns, r3, {blobEntryFor("c", DB::UInt128(3))});
+    /// v1: publish ref1; v2: move ref1->ref2 (drop ref1, add ref2); v3: move ref2->ref3.
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", r2, r3);
+
+    Gc gc(store, kGc);
+    /// One round: folds all 3 events (cursor = v3), then trim sees 3 trimmable events < 4 => SKIP.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    /// (a) All 3 events must remain in the journal (lazy trim did NOT compact them).
+    const auto shard_bytes = backend->get(store->layout().rootShardKey(ns, 0));
+    ASSERT_TRUE(shard_bytes.has_value()) << "root shard must exist after the round";
+    const RootShard root_after = decodeRootShard(shard_bytes->bytes);
+    EXPECT_EQ(root_after.journal.size(), 3u)
+        << "lazy trim must NOT compact a journal with fewer than gc_trim_min_events trimmable events";
+
+    /// (b) The shard token recorded in the completion seal (post-fence) equals the CURRENT token
+    /// of the shard object — i.e., trim did NOT mutate the shard and bump its token.
+    /// Read the completion seal's per-shard folded_token for the shard.
+    const GcState st = readState(*backend, *store);
+    const auto completion = backend->get(store->layout().completionSealKey(st.snap_generation));
+    ASSERT_TRUE(completion.has_value()) << "completion seal must exist after a successful round";
+    const CasCompletionSeal seal = decodeCompletionSeal(completion->bytes);
+    const String ck = cursorKeyForTest(ns, 0);
+    const auto cov_it = seal.folded_cursors.find(ck);
+    ASSERT_NE(cov_it, seal.folded_cursors.end()) << "completion seal must carry coverage for ns/0";
+    /// The stored post-fence token must equal the current shard token (no trim mutation).
+    const auto current_head = backend->head(store->layout().rootShardKey(ns, 0));
+    ASSERT_TRUE(current_head.exists);
+    EXPECT_EQ(cov_it->second.folded_token, current_head.token)
+        << "lazy trim must not bump the shard token; the completion-seal post-fence token "
+           "must equal the live shard token (no settling re-read needed next round)";
+
+    /// (c) The next round's discover step must Skip the shard (no settling re-read): the listed token
+    /// equals the sealed post-fence token because trim did NOT mutate it.
+    const auto decisions = gc.discoverDecisionsForTest();
+    const auto dec_it = decisions.find(ck);
+    ASSERT_NE(dec_it, decisions.end()) << "discover must produce a decision for ns/0";
+    EXPECT_EQ(dec_it->second, Gc::DiscoverDecision::Skip)
+        << "B12: lazy trim avoids bumping the shard token, so the next round's discover "
+           "must Skip the shard (no settling re-read)";
+}
+
+/// B12: a shard with ENOUGH (>= gc_trim_min_events) trimmable events IS compacted by a regular round.
+/// Also verifies the body-size soft-limit path: a shard whose encoded body is >= gc_trim_body_soft_limit
+/// is always compacted even if it has fewer than gc_trim_min_events events.
+/// The safety invariant (INV-JOURNAL-COVERAGE) is unchanged: trim only removes events AT OR BELOW
+/// the sealed cursor — events above it survive (same guarantee as the pre-B12 eager trim).
+TEST(CasGcRound, LazyTrimCompactsAtThresholdOrSoftLimit)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// Use gc_trim_min_events=3 and a tiny body-size soft limit (1 byte) to test both gates separately.
+    /// For the event-count gate: publish 3 events so the count exactly meets the threshold.
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1,
+                                                 .gc_trim_min_events = 3,
+                                                 .gc_trim_body_soft_limit = 1024ULL * 1024 * 1024}); /// 1 GiB: only event-count fires
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// Publish 3 committed events — exactly at the threshold.
+    const ManifestRef r1 = ref(1, 0xC1);
+    const ManifestRef r2 = ref(2, 0xC2);
+    const ManifestRef r3 = ref(3, 0xC3);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(0x11));
+    writeBlobBody(*backend, store->layout(), DB::UInt128(0x22));
+    writeBlobBody(*backend, store->layout(), DB::UInt128(0x33));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(0x11))});
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(0x22))});
+    writeManifestRaw(*backend, store->layout(), ns, r3, {blobEntryFor("c", DB::UInt128(0x33))});
+    [[maybe_unused]] const uint64_t v1 = publishCommittedTransition(*backend, store->layout(), ns, "t1", std::nullopt, r1);
+    [[maybe_unused]] const uint64_t v2 = publishCommittedTransition(*backend, store->layout(), ns, "t2", std::nullopt, r2);
+    const uint64_t v3 = publishCommittedTransition(*backend, store->layout(), ns, "t3", std::nullopt, r3);
+
+    Gc gc(store, kGc);
+    /// One round: folds all 3 events (cursor = v3), then trim sees 3 trimmable events >= 3 => COMPACT.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    /// The fold cursor must cover all 3 events (no barrier).
+    const uint64_t cursor = foldCursorOf(*backend, store->layout(), ns, 0);
+    EXPECT_EQ(cursor, v3) << "cursor must be sealed at v3 (all 3 events cleanly folded)";
+
+    /// After the round, the journal must be EMPTY (all 3 events <= cursor were trimmed).
+    const auto shard_bytes = backend->get(store->layout().rootShardKey(ns, 0));
+    ASSERT_TRUE(shard_bytes.has_value());
+    const RootShard root_after = decodeRootShard(shard_bytes->bytes);
+    EXPECT_TRUE(root_after.journal.empty())
+        << "B12: at threshold (>= gc_trim_min_events) the journal must be compacted";
+
+    /// INV-JOURNAL-COVERAGE unchanged: now add a pre-cursor event above the cursor and verify a
+    /// second round does NOT trim it. Publish a 4th event at v4 (above v3 = cursor after first round).
+    const ManifestRef r4 = ref(4, 0xD4);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(0x44));
+    writeManifestRaw(*backend, store->layout(), ns, r4, {blobEntryFor("d", DB::UInt128(0x44))});
+    const uint64_t v4 = publishCommittedTransition(*backend, store->layout(), ns, "t4", std::nullopt, r4);
+    ASSERT_GT(v4, v3);
+
+    /// Second round: folds the new event (v4); trim now has 1 trimmable event (< 3) => SKIP per lazy rule.
+    /// The v4 event (above the sealed cursor from round 1) must survive after round 2.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const uint64_t cursor2 = foldCursorOf(*backend, store->layout(), ns, 0);
+    EXPECT_EQ(cursor2, v4) << "cursor must advance to v4 after the second round";
+
+    /// The journal must still contain the v4 event (now below cursor2, but count = 1 < threshold).
+    const auto shard2 = backend->get(store->layout().rootShardKey(ns, 0));
+    ASSERT_TRUE(shard2.has_value());
+    const RootShard root2 = decodeRootShard(shard2->bytes);
+    EXPECT_EQ(root2.journal.size(), 1u)
+        << "B12: 1 trimmable event < gc_trim_min_events=3 must not be compacted (lazy skip)";
+
+    /// INV-JOURNAL-COVERAGE: that surviving event must be AT OR BELOW the current cursor (it was just
+    /// folded, so cursor2 = v4; the event at v4 is <= cursor2). No event above cursor2 exists.
+    for (const RootOwnerEvent & e : root2.journal)
+        EXPECT_LE(e.transition_version, cursor2)
+            << "lazy trim: surviving event at v" << e.transition_version
+            << " must be <= cursor2=" << cursor2 << " (below the sealed cursor — safe to leave)";
+
+    /// Now test the body-size soft-limit gate: open a second store with a tiny soft-limit (1 byte)
+    /// so the body size always triggers trim regardless of event count.
+    auto backend2 = std::make_shared<InMemoryBackend>();
+    auto store2 = Store::open(backend2, PoolConfig{.pool_prefix = "p", .root_shards = 1,
+                                                    .gc_trim_min_events = 256,     /// large batch threshold — event count won't fire
+                                                    .gc_trim_body_soft_limit = 1}); /// 1 byte: always over limit
+    const RootNamespace ns2{"00/bb@cas@"};
+    const ManifestRef s1 = ref(10, 0xE1);
+    writeBlobBody(*backend2, store2->layout(), DB::UInt128(0x55));
+    writeManifestRaw(*backend2, store2->layout(), ns2, s1, {blobEntryFor("e", DB::UInt128(0x55))});
+    const uint64_t u1 = publishCommittedTransition(*backend2, store2->layout(), ns2, "tE", std::nullopt, s1);
+
+    Gc gc2(store2, kGc);
+    /// One round: 1 trimmable event < 256 (batch gate skips), but body >= 1 byte (soft-limit fires).
+    ASSERT_TRUE(gc2.runRegularRound().acquired_lease);
+
+    const auto shard3 = backend2->get(store2->layout().rootShardKey(ns2, 0));
+    ASSERT_TRUE(shard3.has_value());
+    const RootShard root3 = decodeRootShard(shard3->bytes);
+    EXPECT_TRUE(root3.journal.empty())
+        << "B12 soft-limit gate: body >= gc_trim_body_soft_limit must force compaction "
+           "even when event count < gc_trim_min_events";
+    (void)u1;
+}
+
+/// B12 maintenance mode: setMaintenanceTrimForTest(true) arms full compaction for one round,
+/// bypassing both the event-count and soft-limit thresholds. After the round the flag resets to false
+/// so subsequent rounds are lazy again.
+TEST(CasGcRound, MaintenanceTrimCompactsEverythingOnce)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// Large thresholds so lazy trim never fires on its own.
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1,
+                                                 .gc_trim_min_events = 256,
+                                                 .gc_trim_body_soft_limit = 1024ULL * 1024 * 1024});
+    const RootNamespace ns{"00/cc@cas@"};
+    const ManifestRef r1 = ref(1, 0xF1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(0xAA));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("f", DB::UInt128(0xAA))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tF", std::nullopt, r1);
+
+    Gc gc(store, kGc);
+    /// Normal round: 1 event < 256 (lazy skip). Journal stays intact.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    {
+        const auto shard = backend->get(store->layout().rootShardKey(ns, 0));
+        ASSERT_TRUE(shard.has_value());
+        EXPECT_EQ(decodeRootShard(shard->bytes).journal.size(), 1u)
+            << "before maintenance: lazy skip leaves 1 trimmable event";
+    }
+
+    /// Arm maintenance mode and run one more round. Journal must be fully compacted.
+    gc.setMaintenanceTrimForTest(true);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    {
+        const auto shard = backend->get(store->layout().rootShardKey(ns, 0));
+        ASSERT_TRUE(shard.has_value());
+        EXPECT_TRUE(decodeRootShard(shard->bytes).journal.empty())
+            << "maintenance round must fully compact the journal (bypass all lazy-trim thresholds)";
+    }
+
+    /// After the maintenance round the flag resets automatically: another round is lazy again.
+    const ManifestRef r2 = ref(2, 0xF2);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(0xBB));
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("g", DB::UInt128(0xBB))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tF", r1, r2);
+
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    {
+        const auto shard = backend->get(store->layout().rootShardKey(ns, 0));
+        ASSERT_TRUE(shard.has_value());
+        EXPECT_EQ(decodeRootShard(shard->bytes).journal.size(), 1u)
+            << "after maintenance round flag auto-reset: next round is lazy (1 event < 256 => skip)";
+    }
+}
+
 /// keep == 0 is the forensics "keep ALL" mode: NO generation is pruned, snap_pruned_through stays 0.
 TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
 {

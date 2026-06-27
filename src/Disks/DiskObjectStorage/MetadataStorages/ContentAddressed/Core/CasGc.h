@@ -127,6 +127,13 @@ public:
     /// blob in-degree). Production never calls this; trim is always enabled.
     void setTrimEnabledForTest(bool enabled) { trim_enabled = enabled; }
 
+    /// B12 lazy-trim TEST SEAM: enable maintenance (full-compaction) mode for the next round.
+    /// When true, trim ignores the event-count and body-size thresholds and compacts every shard that
+    /// has any trimmable events (the pre-B12 eager behaviour). Cleared to false after each round so
+    /// each test call arms exactly one round. Production never calls this; maintenance mode is driven
+    /// externally (e.g. by a scheduled maintenance task, not yet wired).
+    void setMaintenanceTrimForTest(bool enabled) { maintenance_trim = enabled; }
+
     /// B8 precommit reclaim (converged-shard model): while folding ANY table shard, drop the precommit
     /// bindings of ABANDONED builds (the owning build is no longer live). `precommitAdd` writes a precommit
     /// owner binding into the FUTURE COMMITTED REF's OWN table shard (keyed by `final_ref_name`, kind
@@ -313,6 +320,7 @@ private:
     StorePtr store;
     UInt128 gc_id{};              /// this leader's identity (random u128, never 0)
     bool trim_enabled = true;     /// TEST SEAM ONLY (M1): production always trims; see setTrimEnabledForTest
+    bool maintenance_trim = false; /// B12 TEST SEAM: bypass lazy-trim thresholds for one round (full compaction); see setMaintenanceTrimForTest
 
     /// the contender's observation window (steal protocol)
     bool has_observation = false;

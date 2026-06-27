@@ -48,6 +48,17 @@ struct PoolConfig
     /// Phase 1d). Creation-time only; the pool is authoritative on reopen, like `root_shards`. This
     /// is the BLOB-HASH-prefix reducer axis, distinct from the root-shard fence axis.
     uint64_t gc_shards = 1;
+    /// B12 lazy-trim: compact a root shard's journal ONLY when at least this many events lie at/below
+    /// the sealed fold cursor (batch gate), OR the encoded shard body is at/above
+    /// `gc_trim_body_soft_limit` (soft-cap gate), OR `Gc::setMaintenanceTrimForTest(true)` is set.
+    /// The two hard gates guarantee bounded journal growth: a shard that accumulates enough events or
+    /// grows large enough is ALWAYS compacted regardless of batch size. 0 disables the batch gate
+    /// (compact on >= 1 event — the previous eager behaviour, useful for tests).
+    uint64_t gc_trim_min_events = 256;
+    /// B12: encoded root-shard body size at/above which trim is forced regardless of event count. This
+    /// prevents unbounded journal growth when event rate is high. Defaults to half the manifest soft
+    /// cap so a shard trimmed at or near the soft limit never hits the hard limit before the next round.
+    uint64_t gc_trim_body_soft_limit = 8ULL << 20;   /// 8 MiB
     uint64_t manifest_soft_limit = 16ULL << 20;
     uint64_t manifest_hard_limit = 64ULL << 20;
     std::chrono::milliseconds watermark_renew_period{5000};

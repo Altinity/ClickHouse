@@ -396,9 +396,13 @@ inline uint64_t shardOfForTest(const String & ref_name, uint64_t root_shards)
 /// ---- GC-core (Phase 1d) test helpers over the part-manifest model ----
 
 /// Open a Store over `backend` with a single root shard (so cursor keys are "ns/0").
+/// gc_trim_min_events=0 (eager, pre-B12 behaviour) is the test default so existing tests that
+/// assert "the event was trimmed after one round" do not need to be updated.
+/// New tests that want to exercise the lazy-trim threshold pass their own PoolConfig to Store::open.
 inline DB::Cas::StorePtr openStoreForTest(std::shared_ptr<DB::Cas::InMemoryBackend> backend)
 {
-    return DB::Cas::Store::open(std::move(backend), DB::Cas::PoolConfig{.pool_prefix = "p", .root_shards = 1});
+    return DB::Cas::Store::open(std::move(backend),
+        DB::Cas::PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_trim_min_events = 0});
 }
 
 /// Write a blob object (envelope + payload) addressed by `hash`, so a HEAD returns a token. The bytes
