@@ -259,6 +259,25 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   `report.deleted` (and rename it to reflect "objects" = blobs + manifests). Low priority — operators with
   the event log can already reconstruct the true count; this only de-confuses the at-a-glance summary.
 
+- **B12 — optimal one-round token-diff skip (current Phase-2 impl is conservative).** The Phase-2
+  token-diff skip compares the root-shard object's backend token surfaced via `Backend::list`
+  (`ListedKey.token`). That token is bumped by GC's OWN per-round writes: `fence` calls `mutateShard`
+  on every shard every round, and `trim` calls `mutateShard` when a shard has trimmable events. The
+  TLA+ model's `listedTok` advances only on writer owner-transitions, so to stay provably safe WITHOUT a
+  model change the impl records `folded_token` from the POST-FENCE token `recheck` reads (canonical round
+  order, no reorder) and skips only when nothing wrote the shard since — a strict SUBSET of the
+  model-proven-safe skips. Cost: a shard `trim` mutated in round R is re-read in R+1; only once a shard is
+  quiescent (a round with nothing to trim ⇒ recheck token == final token) does it skip from the next round
+  on. Steady-state quiescent shards (the common case) skip every round, so R1's win is preserved; the loss
+  is one extra read per shard per activity burst. The OPTIMAL one-round skip would capture the post-trim
+  (post-all-GC-writes) token. That requires either sealing the completion generation after `trim` or a
+  dedicated post-round token snapshot, AND a TLA+ model extension proving the discovery token may advance
+  on GC's own per-round writes with `foldedTok` = post-round token (plus a sabotage for capturing a
+  pre-GC-write/stale token). A first attempt did this via an UNSAFE trim-before-recheck pipeline reorder
+  (reverted at `7ae46d27701`, originally `43cd5eef11e`) — the reorder touches the `sab_trimunincorporated`
+  /`INV_JOURNAL_COVERAGE` concern and was unproven. Deferred: model-extend + reseal/snapshot, then lift to
+  one-round skip. Medium priority (perf only; correctness already holds conservatively).
+
 ## Resolved
 
 - **B9 — GC generation pruning: DONE.** `Gc::pruneSupersededGenerations` (called in the recheck round tail

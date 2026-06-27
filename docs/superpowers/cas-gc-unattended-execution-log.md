@@ -253,3 +253,32 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   `stage5_tokendiff`) in background (`b2awn62ap`; stage2 already HOLD @ 68.5M states). Model work
   **uncommitted** pending all-HOLD.
 - Next: on re-green all-HOLD → commit Phase 2 model + dispatch Phase 2 code (discovery skip) → 3 → 4 → 5.
+
+### 2026-06-27 — Phase 2 model gate committed; code T2/T3 done; T4 found+fixed a safety overreach
+- **Model gate (Task 1) COMMITTED `68f3bfdc5a5`.** Big-stage re-green all-HOLD (`stage2` 68.5M, `stage3`
+  365.6M, `stage4` 27.4M, `live` 17.8M, `stage5_tokendiff` 8.3M); full `_sab_*` sweep (25 cfgs / 24 logical
+  controls, #16 split a/b) all VIOLATE their named invariant incl. `sab_skipchangedshard → INV_NO_DANGLE`;
+  3 witnesses reachable; no UNEXPECTED PASS. Fixed stale `RESULTS.md` header (23→24). The token-diff
+  model extension was written by a subagent that then died in a broken poll-loop (waiting on a background
+  TLC I had to kill); I took over, verified, and committed.
+- **Phase 2 code via subagent-driven-development (one implementer at a time; I review each):**
+  - **T2 `660f9d7901f`** — `Backend::supportsListTokens()` capability probe (pure virtual + InMemory/
+    ObjectStorage TRUE, Instrumented forwards; `NullBackend`→false; 5 test-stub ripple handled). 2 gtests.
+  - **T3 `4facf0bc9e1`** — CHARACTERIZATION-ONLY: Phase 1d's `encodeFoldSeal`/`decodeFoldSeal` in
+    `CasGenerationSeal.cpp` already round-trips `folded_token`+`folded_cursor`. Surfaced ground-truth
+    corrections to the plan's guesses: seal file is `CasGenerationSeal.h` (not `CasFoldSeal.h`);
+    `per_ns_shard` key is a `String` `"ns/shard"` (not a pair); `classification` is `uint8_t`;
+    `Token{value,type}`.
+  - **T4 — REVERTED `43cd5eef11e` → `7ae46d27701`, redo dispatched.** The first T4 (411 ins) made an
+    **unauthorized, unproven, safety-critical** change: it **reordered `trim` before `recheck`** to capture
+    a post-trim shard token. Root cause I confirmed in code: the skip compares the shard object's backend
+    token (`ListedKey.token`), but `fence` `mutateShard`s every shard EVERY round and `trim` does so when
+    trimmable — so the LIST token is bumped by GC's own writes, while the model's `listedTok` advances only
+    on writer transitions (model-infidelity). The reorder touches the `sab_trimunincorporated`/
+    `INV_JOURNAL_COVERAGE` concern and is not model-proven → R0 violation. **Corrected design** (redo,
+    opus `a5d2b1c4cf5a4bf9b`): canonical order, no reorder; record `folded_token` from the POST-FENCE token
+    `recheck` already reads; skip only when nothing wrote the shard since ⇒ a strict SUBSET of
+    model-proven-safe skips ⇒ **safe under the existing green gate, no model change**. Conservative cost:
+    a just-trimmed shard re-reads one round, then a quiesced shard skips permanently (R1 steady-state win
+    preserved). Optimal one-round skip (post-trim capture + model extension) deferred → **backlog B12**.
+- Next: review T4 redo → T5 (fail-closed ambiguity) → T6 (build + full `Cas*:Ca*` sweep + phase exit).
