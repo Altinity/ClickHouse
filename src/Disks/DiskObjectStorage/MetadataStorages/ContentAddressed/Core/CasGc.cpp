@@ -1231,7 +1231,7 @@ bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundRep
     /// durable incompleteness signal. The fold for this round already committed (retire's CAS advanced
     /// .round AFTER the fold's CAS), so a fold_seal exists for the current generation.
     RetireResult retired;
-    for (uint64_t shard = 0; shard < state.snap_shards; ++shard)
+    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
         if (const auto got = backend.get(layout.retiredKey(round, state.fence_seq, shard)))
             retired.blobs.emplace(shard, decodeRetiredSet(got->bytes));
     if (retired.blobs.empty())

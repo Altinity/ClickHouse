@@ -28,7 +28,7 @@ namespace DB::Cas
 
 /// gc/state ("cas_gc_state" v3):
 ///   {"format":"cas_gc_state","version":3,
-///    "round":7,"fence_seq":3,"snap_shards":1,"snap_generation":12,
+///    "round":7,"fence_seq":3,"gc_shards":1,"snap_generation":12,
 ///    "lease":{"owner":"<32hex>","seq":5},
 ///    "fence_version":{"<round>":{"<ns>/<root_shard>":4}}}
 /// fence_version is indexed by ROOT shard ("ns/shard" strings — the journal sources); the snap /
@@ -46,7 +46,7 @@ struct GcState
 {
     uint64_t round = 0;            /// the highest GC round whose retire sets are durable
     uint64_t fence_seq = 0;        /// leadership-epoch component of retired/outcome paths (spec §4)
-    uint64_t snap_shards = 1;      /// GC constant (target-hash-prefix sharding); set once, immutable
+    uint64_t gc_shards = 1;        /// GC blob-target-shard count (blob-hash-prefix sharding); set once, immutable
     uint64_t snap_generation = 0;  /// monotone; the authoritative snap objects' generation
     uint64_t snap_pruned_through = 0;   /// B174: highest snap generation fully pruned (retention cursor)
     GcLease lease;

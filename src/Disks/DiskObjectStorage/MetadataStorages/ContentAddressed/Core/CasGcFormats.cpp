@@ -65,7 +65,7 @@ TokenType tokenTypeFromProto(uint32_t v, std::string_view what)
 
 String encodeGcState(const GcState & state)
 {
-    chassert(state.snap_shards >= 1);   /// catch a zeroed GC constant at the write site
+    chassert(state.gc_shards >= 1);   /// catch a zeroed GC constant at the write site
 
     Cas::Proto::GcStateProto msg;
 
@@ -77,7 +77,7 @@ String encodeGcState(const GcState & state)
 
     msg.set_round(state.round);
     msg.set_fence_seq(state.fence_seq);
-    msg.set_snap_shards(state.snap_shards);
+    msg.set_snap_shards(state.gc_shards);
     msg.set_snap_generation(state.snap_generation);
     msg.set_snap_pruned_through(state.snap_pruned_through);
 
@@ -128,9 +128,9 @@ GcState decodeGcState(std::string_view data)
     GcState state;
     state.round = msg.round();
     state.fence_seq = msg.fence_seq();
-    state.snap_shards = msg.snap_shards();
-    if (state.snap_shards == 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: snap_shards must be >= 1");
+    state.gc_shards = msg.snap_shards();
+    if (state.gc_shards == 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: gc_shards must be >= 1");
     state.snap_generation = msg.snap_generation();
     state.snap_pruned_through = msg.snap_pruned_through();
 

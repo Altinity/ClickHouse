@@ -44,6 +44,10 @@ struct PoolConfig
     /// margin covering any in-flight/resuming leader (a leader more than `keep` generations behind
     /// has lost its lease; its round-commit CAS fails).
     uint64_t gc_snap_generations_to_keep = 3;
+    /// Blob target shards for GC (spec §Sharding Model). Default 1 (single-shard equivalence to
+    /// Phase 1d). Creation-time only; the pool is authoritative on reopen, like `root_shards`. This
+    /// is the BLOB-HASH-prefix reducer axis, distinct from the root-shard fence axis.
+    uint64_t gc_shards = 1;
     uint64_t manifest_soft_limit = 16ULL << 20;
     uint64_t manifest_hard_limit = 64ULL << 20;
     std::chrono::milliseconds watermark_renew_period{5000};

@@ -28,7 +28,7 @@ TEST(CasGcFormats, GcStateV3RoundTrip)
     GcState s;
     s.round = 7;
     s.fence_seq = 3;
-    s.snap_shards = 1;
+    s.gc_shards = 1;
     s.snap_generation = 12;
     s.lease.owner = hexToU128("00000000000000000000000000000005");
     s.lease.seq = 5;
@@ -37,7 +37,7 @@ TEST(CasGcFormats, GcStateV3RoundTrip)
     auto d = decodeGcState(encodeGcState(s));
     EXPECT_EQ(d.round, 7u);
     EXPECT_EQ(d.fence_seq, 3u);
-    EXPECT_EQ(d.snap_shards, 1u);
+    EXPECT_EQ(d.gc_shards, 1u);
     EXPECT_EQ(d.snap_generation, 12u);
     EXPECT_EQ(d.lease.owner, hexToU128("00000000000000000000000000000005"));
     EXPECT_EQ(d.lease.seq, 5u);
@@ -47,7 +47,7 @@ TEST(CasGcFormats, GcStateV3RoundTrip)
 TEST(CasGcFormats, GcStateSnapPrunedThroughRoundTrip)
 {
     GcState s;
-    s.snap_shards = 2;
+    s.gc_shards = 2;
     s.snap_generation = 42;
     s.snap_pruned_through = 38;
     auto d = decodeGcState(encodeGcState(s));
@@ -58,7 +58,7 @@ TEST(CasGcFormats, GcStateSnapPrunedThroughDefaultsZero)
 {
     /// snap_pruned_through defaults to 0 when omitted (proto3 zero-value default).
     GcState s;
-    s.snap_shards = 1;
+    s.gc_shards = 1;
     s.snap_generation = 5;
     s.round = 1;
     s.snap_pruned_through = 0;
@@ -86,7 +86,7 @@ TEST(CasGcFormats, GcHeartbeatRoundTrip)
 TEST(CasGcFormats, GcStateV3DefaultsAndEncodingIsBinary)
 {
     GcState s;
-    EXPECT_EQ(s.snap_shards, 1u);                /// default 1 (the GC constant)
+    EXPECT_EQ(s.gc_shards, 1u);                  /// default 1 (the GC constant)
     auto bytes = encodeGcState(s);
     ASSERT_FALSE(bytes.empty());
     EXPECT_NE(bytes.front(), '{');               /// not JSON (pure protobuf with CasHeader)
@@ -121,14 +121,14 @@ TEST(CasGcFormats, GcStateV3Validation)
         std::string bytes; msg.SerializeToString(&bytes);
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeGcState(bytes); });
     }
-    /// snap_shards == 0 is an invariant violation => CORRUPTED_DATA (post-parse check).
+    /// gc_shards == 0 is an invariant violation => CORRUPTED_DATA (post-parse check).
     /// A GcStateProto with valid CasHeader but snap_shards=0 (proto3 default / explicitly zero).
     {
         Proto::GcStateProto msg;
         auto * hdr = msg.mutable_header();
         hdr->set_magic(magicFor(FormatId::GcState));
         hdr->set_compatibility_version(currentCompatibilityVersion());
-        /// snap_shards defaults to 0 in proto3 — don't set it.
+        /// gc_shards (proto field snap_shards) defaults to 0 in proto3 — don't set it.
         std::string bytes; msg.SerializeToString(&bytes);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
     }
@@ -483,7 +483,7 @@ TEST(CasHeaderGolden, GcStateCasHeaderRoundTrips)
     GcState s;
     s.round = 7;
     s.fence_seq = 3;
-    s.snap_shards = 2;
+    s.gc_shards = 2;
     s.snap_generation = 12;
     const String bytes = encodeGcState(s);
     ASSERT_FALSE(bytes.empty());
@@ -494,7 +494,7 @@ TEST(CasHeaderGolden, GcStateCasHeaderRoundTrips)
     EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
     const GcState d = decodeGcState(bytes);
     EXPECT_EQ(d.round, 7u);
-    EXPECT_EQ(d.snap_shards, 2u);
+    EXPECT_EQ(d.gc_shards, 2u);
 }
 
 TEST(CasHeaderGolden, RetiredSetCasHeaderRoundTrips)
