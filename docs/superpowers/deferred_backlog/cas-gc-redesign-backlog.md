@@ -16,6 +16,15 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   not a semantic gap. Deferred: renaming would cascade into the phase2 model reference; defer to a
   terminology-only pass once the model is green, to avoid churn during the R0 gate.
 
+- **B2 — make the model-proven load-bearing orderings explicit in phase1b/1d (enhancement).**
+  Severity: low. The Phase-0 model proved 5 ordering rules necessary (publish/promote gate
+  retire-view-relative + fence-floored; round order fold→retire→fence; recheck keeps a retired entry
+  until its delete lands; `NoManifestIdReuse` by full `ManifestId`; fold-barrier reclaim liveness).
+  All are already implemented by the plans, but they are not all called out as "load-bearing, proven
+  necessary by Phase-0 control #N." Adding short callouts in phase1b's promote gate and phase1d's
+  round/recheck steps would reduce the risk of a future optimization silently removing one. Deferred:
+  not required for correctness (the behavior is in the plans); a documentation-only polish.
+
 ## Resolved
 
 (none yet)

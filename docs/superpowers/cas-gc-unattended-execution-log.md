@@ -43,3 +43,25 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
 ### 2026-06-27 — run start
 - Stood up this execution log + the backlog file.
 - Phase 0 implementer subagent running; awaiting its result to verify the R0 gate.
+
+### 2026-06-27 — Phase 0 GREEN, verified; findings analyzed (no spec change needed)
+- **Phase 0 complete + GREEN.** `CaGcRootLocalPartManifestCore.tla` (813 lines) + 5 stages + live +
+  24 `_sab_*` (23 controls, #16 a/b) + 3 witnesses + wrapper + RESULTS ledger. 10 commits on
+  `cas-gc-part-manifest-impl`. stage3 holds over 365.6M distinct states (27m45s); stage2 68.5M; live
+  17.8M under FairSpec.
+- **Independent verification (did NOT just trust the summary):** read the RESULTS ledger; re-ran
+  `stage0` (HOLD, exit 0), `sab_nofence`→`INV_NO_DANGLE`, `sab_advancepastmissingbody` (#23)→
+  `INV_NO_DANGLE`, `sab_promoteaftermissingbody`→`INV_NO_LOSS` (all VIOLATE, exit 12); read the
+  invariant block (lines 688–745) — invariants are substantive (NoCommittedDangle; INV_NO_LOSS with
+  the `extraShared` sharing-control term; BlobInDegreeMatchesActiveManifests precise edge multiset;
+  FoldedEdgesAreActive with the pending-removal disjunct for the drop-then-fold window). Verdict:
+  **R0 gate satisfied.**
+- **5 R0 findings the gate surfaced (model fixed them) — analyzed for spec/plan impact:** all are
+  already captured: (1) retire-view-relative + fence-floored publish/promote gate → spec §Promote
+  step 1 + phase1b refresh-then-revalidate; (2) round order fold→retire→fence → §Round Protocol +
+  phase1d sequential round; (3) recheck keeps retired-until-delete-lands → §Trim drop-on-confirmed-
+  outcome + phase1d sealCompletionAndAdvance; (4) NoManifestIdReuse keys by full ManifestId →
+  §Object Identity + control #18; (5) fold-barrier reclaim fairness → model-internal liveness
+  fairness (protocol statement already in spec/plan). **Decision: no rev.16, no plan edits required —
+  the findings validate the design.** Optional "make these orderings explicit in phase1b/1d" → backlog B2.
+- **Next:** Phase 1a (identity/codecs) via subagent-driven-development + TDD.
