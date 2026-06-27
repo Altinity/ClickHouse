@@ -8,9 +8,15 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 
 #include <Common/Exception.h>
 
@@ -116,33 +122,146 @@ inline DB::Cas::BlobId writeBlobRaw(
     return id;
 }
 
-/// Write a Tree object: a fixed-length (pad_to_header_len = blob_header_len) envelope followed by the
-/// canonical tree payload, keyed by the tree id. Mirrors what Build::putTree emits (both blobs and
-/// trees pad to the pool's fixed header length, so every object's payload starts at a constant offset).
-/// Pass blob_header_len = 0 for a natural-length (unpadded) envelope (legacy / read-only test fixtures
-/// that never go through observeAndAdmit).
-inline DB::Cas::TreeId writeTreeRaw(
+/// Forward declaration: the manifest/transition helpers below call registerNamespaceRaw, which is
+/// defined further down (alongside publishRaw).
+inline void registerNamespaceRaw(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns);
+
+/// Write a part-manifest body object directly via the manifest codec, exactly as Build::stageManifest
+/// emits it. Returns the ManifestId. Used by GC fold/retire/fsck tests to stage owner targets.
+inline DB::Cas::ManifestId writeManifestRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
-    std::vector<DB::Cas::TreeEntry> entries, const DB::UInt128 & domain_id,
-    uint64_t blob_header_len = 0)
+    const DB::Cas::RootNamespace & ns, const DB::Cas::ManifestRef & ref,
+    const std::vector<DB::Cas::ManifestEntry> & entries)
 {
-    const DB::Cas::TreeId id = DB::Cas::merkleTreeId(entries);
-    const String encoded = DB::Cas::encodeTree(std::move(entries));
-
-    DB::Cas::EnvelopeHeader header;
-    header.kind = DB::Cas::ObjectKind::Tree;
-    header.hash_algo = 1;
-    header.logical_size = encoded.size();
-    header.logical_hash = DB::Cas::hexToU128(id.string());
-    header.domain_id = domain_id;
-    header.incarnation_tag = DB::UInt128(0x1234);
-    header.build_id = DB::UInt128(0x5678);
-    if (blob_header_len)
-        header.pad_to_header_len = static_cast<uint32_t>(blob_header_len);
-
-    const String head = DB::Cas::encodeEnvelopeHeader(header);
-    backend.putIfAbsent(layout.treeKey(id), head + encoded);
+    const DB::Cas::ManifestId id{ns, ref};
+    DB::Cas::PartManifest body;
+    body.ref = ref;
+    body.root_namespace_id = ns;
+    body.entries = entries;
+    body.payload_digest = DB::Cas::computePayloadDigest(body);
+    backend.putIfAbsent(layout.manifestKey(id), DB::Cas::encodePartManifest(body));
     return id;
+}
+
+/// A blob ManifestEntry referencing `hash` at `path` (size 1, the GC fold counts edges, not bytes).
+inline DB::Cas::ManifestEntry blobEntryFor(const String & path, const DB::UInt128 & hash, uint64_t size = 1)
+{
+    DB::Cas::ManifestEntry e;
+    e.path = path;
+    e.placement = DB::Cas::EntryPlacement::Blob;
+    e.blob_hash = hash;
+    e.blob_size = size;
+    return e;
+}
+
+/// Append ONE RootOwnerEvent to a shard's journal via read-modify-CAS (mirroring the production Build
+/// path): bump shard_version, append the event at the new version, maintain `refs` for committed
+/// bindings, and CAS. Returns the event's transition_version. Registers the namespace first.
+inline uint64_t appendOwnerEvent(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+    const DB::Cas::RootNamespace & ns, uint64_t shard,
+    std::optional<DB::Cas::OwnerBinding> old_binding,
+    std::optional<DB::Cas::OwnerBinding> new_binding,
+    const String & committed_ref_name = {})
+{
+    registerNamespaceRaw(backend, layout, ns);
+    const String key = layout.rootShardKey(ns, shard);
+    while (true)
+    {
+        const auto got = backend.get(key);
+        DB::Cas::RootShard root;
+        std::optional<DB::Cas::Token> expected;
+        if (got)
+        {
+            root = DB::Cas::decodeRootShard(got->bytes);
+            expected = got->token;
+        }
+        const uint64_t version = root.shard_version + 1;
+        root.shard_version = version;
+        root.journal.push_back(DB::Cas::RootOwnerEvent{
+            .transition_version = version, .old_binding = old_binding, .new_binding = new_binding});
+
+        /// Maintain committed refs so the read path + fsck see the current owner.
+        if (new_binding && new_binding->owner_kind == DB::Cas::OwnerKind::Committed && !committed_ref_name.empty())
+        {
+            DB::Cas::RootRef r;
+            r.ref_name = committed_ref_name;
+            r.manifest_ref = new_binding->manifest_ref;
+            root.refs[committed_ref_name] = r;
+        }
+        if ((!new_binding || new_binding->owner_kind != DB::Cas::OwnerKind::Committed)
+            && old_binding && old_binding->owner_kind == DB::Cas::OwnerKind::Committed && !committed_ref_name.empty())
+            root.refs.erase(committed_ref_name);
+
+        const auto outcome = backend.casPut(key, DB::Cas::encodeRootShard(root), expected).outcome;
+        if (outcome == DB::Cas::CasOutcome::Committed)
+            return version;
+    }
+}
+
+/// Publish a committed ref over `ref` (old none unless `old_ref` set). Returns the event version.
+inline uint64_t publishCommittedTransition(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const String & ref_name, std::optional<DB::Cas::ManifestRef> old_ref, const DB::Cas::ManifestRef & new_ref,
+    uint64_t shard = 0)
+{
+    std::optional<DB::Cas::OwnerBinding> old_b;
+    if (old_ref)
+        old_b = DB::Cas::OwnerBinding{.owner_kind = DB::Cas::OwnerKind::Committed,
+            .ref_name = ref_name, .build_id = {}, .manifest_ref = *old_ref};
+    DB::Cas::OwnerBinding new_b{.owner_kind = DB::Cas::OwnerKind::Committed,
+        .ref_name = ref_name, .build_id = {}, .manifest_ref = new_ref};
+    return appendOwnerEvent(backend, layout, ns, shard, old_b, new_b, ref_name);
+}
+
+/// Drop a committed ref (old committed / new none). Returns the event version.
+inline uint64_t dropRefTransition(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const String & ref_name, const DB::Cas::ManifestRef & old_ref, uint64_t shard = 0)
+{
+    DB::Cas::OwnerBinding old_b{.owner_kind = DB::Cas::OwnerKind::Committed,
+        .ref_name = ref_name, .build_id = {}, .manifest_ref = old_ref};
+    return appendOwnerEvent(backend, layout, ns, shard, old_b, std::nullopt, ref_name);
+}
+
+/// Add a precommit binding (old none / new precommit). Returns the event version.
+inline uint64_t addPrecommitTransition(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const DB::UInt128 & build_id, const String & final_ref_name, std::optional<DB::Cas::ManifestRef> old_ref,
+    const DB::Cas::ManifestRef & new_ref, uint64_t shard = 0)
+{
+    std::optional<DB::Cas::OwnerBinding> old_b;
+    if (old_ref)
+        old_b = DB::Cas::OwnerBinding{.owner_kind = DB::Cas::OwnerKind::Committed,
+            .ref_name = final_ref_name, .build_id = {}, .manifest_ref = *old_ref};
+    DB::Cas::OwnerBinding new_b{.owner_kind = DB::Cas::OwnerKind::Precommit,
+        .ref_name = final_ref_name, .build_id = build_id, .manifest_ref = new_ref};
+    return appendOwnerEvent(backend, layout, ns, shard, old_b, new_b);
+}
+
+/// Promote a precommit to committed at the SAME manifest_ref (an owner move: equal old/new). Returns
+/// the event version.
+inline uint64_t promoteTransition(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const DB::UInt128 & build_id, const String & final_ref_name, const DB::Cas::ManifestRef & ref,
+    uint64_t shard = 0)
+{
+    DB::Cas::OwnerBinding old_b{.owner_kind = DB::Cas::OwnerKind::Precommit,
+        .ref_name = final_ref_name, .build_id = build_id, .manifest_ref = ref};
+    DB::Cas::OwnerBinding new_b{.owner_kind = DB::Cas::OwnerKind::Committed,
+        .ref_name = final_ref_name, .build_id = {}, .manifest_ref = ref};
+    return appendOwnerEvent(backend, layout, ns, shard, old_b, new_b, final_ref_name);
+}
+
+/// Exact-token delete of a manifest body (HEAD then deleteExact). No-op when absent.
+inline void deleteManifestBody(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::ManifestId & id)
+{
+    const String key = layout.manifestKey(id);
+    const DB::Cas::HeadResult h = backend.head(key);
+    if (h.exists)
+        backend.deleteExact(key, h.token);
 }
 
 /// Register a namespace in `gc/registry` exactly as a writer's W-REGISTER does (read-modify-CAS
@@ -272,6 +391,88 @@ inline DB::Cas::Token displaceBlobToken(
 inline uint64_t shardOfForTest(const String & ref_name, uint64_t root_shards)
 {
     return CityHash_v1_0_2::CityHash64(ref_name.data(), ref_name.size()) % root_shards;
+}
+
+/// ---- GC-core (Phase 1d) test helpers over the part-manifest model ----
+
+/// Open a Store over `backend` with a single root shard (so cursor keys are "ns/0").
+inline DB::Cas::StorePtr openStoreForTest(std::shared_ptr<DB::Cas::InMemoryBackend> backend)
+{
+    return DB::Cas::Store::open(std::move(backend), DB::Cas::PoolConfig{.pool_prefix = "p", .root_shards = 1});
+}
+
+/// Write a blob object (envelope + payload) addressed by `hash`, so a HEAD returns a token. The bytes
+/// are arbitrary (GC never reads them); the hash is what the manifest entry references.
+inline void writeBlobBody(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash,
+    uint64_t blob_header_len = 256)
+{
+    DB::Cas::EnvelopeHeader header;
+    header.kind = DB::Cas::ObjectKind::Blob;
+    header.hash_algo = 1;
+    header.logical_size = 1;
+    header.logical_hash = hash;
+    header.domain_id = DB::UInt128(0x42);
+    header.incarnation_tag = DB::UInt128(0x1234);
+    header.build_id = DB::UInt128(0x5678);
+    header.pad_to_header_len = static_cast<uint32_t>(blob_header_len);
+    const String head = DB::Cas::encodeEnvelopeHeader(header);
+    backend.putIfAbsent(layout.blobKey(DB::Cas::BlobId(DB::Cas::u128ToHex(hash))), head + String("x"));
+}
+
+/// The latest GC generation (snap_generation pointer in gc/state), or 0 when absent.
+inline uint64_t currentGenerationOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout)
+{
+    const auto got = backend.get(layout.gcStateKey());
+    if (!got)
+        return 0;
+    return DB::Cas::decodeGcState(got->bytes).snap_generation;
+}
+
+/// The in-degree of a blob in the current GC generation's sealed run (0 when absent/zeroed).
+inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
+{
+    return DB::Cas::inDegreeInGeneration(backend, layout, currentGenerationOf(backend, layout), /*shard*/0, hash);
+}
+
+/// The cursor key "ns/shard" — matches CasGcCursorKey::cursorKey.
+inline String cursorKeyForTest(const DB::Cas::RootNamespace & ns, uint64_t shard)
+{
+    return ns.string() + "/" + std::to_string(shard);
+}
+
+/// The folded cursor sealed for (ns, shard) by the latest fold seal, or 0 when absent.
+inline uint64_t foldCursorOf(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns, uint64_t shard)
+{
+    const uint64_t gen = currentGenerationOf(backend, layout);
+    const auto got = backend.get(layout.foldSealKey(gen));
+    if (!got)
+        return 0;
+    const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
+    const auto it = seal.per_ns_shard.find(cursorKeyForTest(ns, shard));
+    return it != seal.per_ns_shard.end() ? it->second.folded_cursor : 0;
+}
+
+/// Set a server's durable watermark min_active (so orphan-sweep eligibility can be driven). The server
+/// hex is the segment before ':' in the writer_instance_id.
+inline void setWatermarkMinActive(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & writer_instance_id,
+    uint64_t min_active)
+{
+    const size_t colon = writer_instance_id.find(':');
+    const String server_hex = colon == String::npos ? writer_instance_id : writer_instance_id.substr(0, colon);
+    DB::Cas::ServerWatermark w;
+    w.server_id = DB::Cas::hexToU128(server_hex);
+    w.epoch = 1;
+    w.min_active = min_active;
+    w.seq = 1;
+    const String key = layout.serverWatermarkKey(server_hex);
+    const DB::Cas::HeadResult h = backend.head(key);
+    if (h.exists)
+        backend.putOverwrite(key, DB::Cas::encodeServerWatermark(w), h.token);
+    else
+        backend.putIfAbsent(key, DB::Cas::encodeServerWatermark(w));
 }
 
 /// Counts head/get/putIfAbsent per key for op-count assertions (Pillar B / A1 tests).
