@@ -869,6 +869,9 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
                         /// fence-window removal's own decrements aren't sealed into this fold generation,
                         /// so a later round folds them and deletes the body then — control #11 ordering)
         const DeleteOutcome mdel = backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
+        /// B11: count manifest-body deletes separately from blob deletes in the round summary.
+        if (mdel.kind == DeleteOutcome::Kind::Deleted)
+            ++report.manifests_deleted;
         /// B170: the owner-removed manifest body delete (the tree-delete analog in the manifest model) —
         /// deleted ONLY after its blob decrements were sealed into the fold generation (control #11).
         EventEmitter{*store}.emit([&](CasEvent & e)

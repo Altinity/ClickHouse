@@ -358,6 +358,50 @@ TEST(CasGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }
 
+/// B11: the round summary must count manifest-body (tree) deletes separately from blob deletes. A drop
+/// that reclaims one manifest body must report manifests_deleted >= 1 in the RoundReport of the
+/// reclaiming round, while blobs and manifests remain separately countable.
+TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xCC);
+    const ManifestId id{ns, r};
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(3));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(3))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    driveToFixpoint(gc);   /// fold the publish; no delete yet
+
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+
+    /// Drive rounds until at least one manifest-body delete happens. Capture the FIRST report
+    /// that deletes anything (the reclaiming round).
+    RoundReport reclaim_report;
+    for (size_t i = 0; i < 64; ++i)
+    {
+        reclaim_report = gc.runRegularRound();
+        if (reclaim_report.acquired_lease
+            && (reclaim_report.deleted > 0 || reclaim_report.absent > 0
+                || reclaim_report.manifests_deleted > 0))
+            break;
+    }
+
+    ASSERT_TRUE(reclaim_report.acquired_lease);
+    /// B11: the manifest-body delete must be counted separately from the blob delete.
+    EXPECT_GE(reclaim_report.manifests_deleted, 1u)
+        << "round summary must count the owner-removed manifest body delete (B11 — manifests_deleted)";
+    /// Blobs and manifests are separately countable: the blob delete (deleted >= 1) is independent.
+    EXPECT_GE(reclaim_report.deleted, 1u)
+        << "the blob exact-token delete must still be counted in deleted";
+    /// The manifest body is gone and the blob is gone — no-leak / no-dangle.
+    EXPECT_FALSE(manifestExists(*backend, store->layout(), id));
+    EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(3)));
+}
+
 /// M1 REGRESSION (cross-round fold cursor must survive independent of trim): a folded-but-untrimmed owner
 /// event must NOT be re-folded by the next round. With eager trim the folded event is removed so the bug
 /// (sealedCursorOf resetting to 0 after a completed round, because snap_generation points at the COMPLETION

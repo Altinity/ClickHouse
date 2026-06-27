@@ -41,6 +41,7 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"objects_absent", std::make_shared<DataTypeUInt64>(), "Retire candidates found already absent."},
         {"objects_replaced", std::make_shared<DataTypeUInt64>(), "412-saves (a resurrection won the race)."},
         {"objects_spared", std::make_shared<DataTypeUInt64>(), "Candidates spared (in-degree > 0 at recheck)."},
+        {"manifests_deleted", std::make_shared<DataTypeUInt64>(), "Owner-removed manifest bodies physically deleted this round (counted separately from blob deletes, B11)."},
         {"children_cascaded", std::make_shared<DataTypeUInt64>(), "Child edges freed by the cascade."},
         {"forgotten_on_delete", std::make_shared<DataTypeUInt64>(), "Nodes pruned from the GC snapshot because GC deleted them this round (P9)."},
         {"forgotten_absent", std::make_shared<DataTypeUInt64>(), "Nodes pruned because a retire HEAD found them already gone (404); >0 in steady state signals split-brain or out-of-band deletes (P9)."},
@@ -69,6 +70,7 @@ void ContentAddressedGarbageCollectionLogElement::appendToBlock(MutableColumns &
     columns[i++]->insert(objects_absent);
     columns[i++]->insert(objects_replaced);
     columns[i++]->insert(objects_spared);
+    columns[i++]->insert(manifests_deleted);
     columns[i++]->insert(children_cascaded);
     columns[i++]->insert(forgotten_on_delete);
     columns[i++]->insert(forgotten_absent);

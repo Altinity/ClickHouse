@@ -132,6 +132,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::
         fin.objects_absent = rep.absent;
         fin.objects_replaced = rep.replaced;
         fin.objects_spared = rep.spared;
+        fin.manifests_deleted = rep.manifests_deleted;
         /// rev. 15 part-manifest model has no GC-side cascade / forget (no trees): these log columns
         /// are retained for schema stability but are always 0 now.
         fin.children_cascaded = 0;
@@ -184,9 +185,9 @@ void CasGcScheduler::loop()
             if (report.acquired_lease)
             {
                 consecutive_backoffs = 0;
-                LOG_DEBUG(log, "CA GC round {}: candidates={} deleted={} absent={} replaced={} spared={}",
+                LOG_DEBUG(log, "CA GC round {}: candidates={} deleted={} absent={} replaced={} spared={} manifests_deleted={}",
                     report.round, report.candidates, report.deleted, report.absent,
-                    report.replaced, report.spared);
+                    report.replaced, report.spared, report.manifests_deleted);
             }
             else
             {

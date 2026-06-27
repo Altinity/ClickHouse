@@ -42,6 +42,7 @@ struct RoundReport
     uint64_t absent = 0;
     uint64_t replaced = 0;        /// 412-saves — a health metric
     uint64_t spared = 0;
+    uint64_t manifests_deleted = 0;  /// owner-removed manifest bodies deleted (B11 — distinct from blob deletes)
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
 
     /// Record a fold/recheck anomaly (a clamped cursor). Surfacing, never throwing.

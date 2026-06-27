@@ -27,6 +27,7 @@ struct GcRoundLogRecord
     UInt64 objects_absent = 0;
     UInt64 objects_replaced = 0;
     UInt64 objects_spared = 0;
+    UInt64 manifests_deleted = 0;   /// owner-removed manifest bodies deleted (B11 — distinct from blob deletes)
     UInt64 children_cascaded = 0;
     UInt64 forgotten_on_delete = 0;
     UInt64 forgotten_absent = 0;
