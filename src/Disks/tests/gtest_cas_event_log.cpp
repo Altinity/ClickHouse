@@ -51,19 +51,23 @@ TEST(CasEvent, StoreEmitsToSink)
 namespace
 {
 
-/// A single-blob part: upload one blob, build a one-entry tree naming it, publish the ref. Returns
-/// the blob's object_hash (lowercase hex) so the test can filter the captured rows by it.
+/// A single-blob part: upload one blob, stage a one-entry manifest naming it, precommit + promote the
+/// ref. Returns the blob's object_hash (lowercase hex) so the test can filter the captured rows by it.
 String publishOneBlobPart(const StorePtr & s, const String & ns, const String & ref, const String & payload)
 {
-    auto build = s->startBuild({});
+    const RootNamespace nsr{ns};
+    BuildInfo info;
+    info.intended_ref = ns + "/" + ref;
+    auto build = s->startBuild(info);
     build->putBlob(idOf(payload), BlobSource::fromString(payload));
-    TreeEntry e;
-    e.name = "data.bin";
-    e.placement = Placement::Blob;
-    e.file_hash = u128Of(payload);
-    e.file_size = payload.size();
-    const TreeId tree = build->putTree({e});
-    build->publish(RootNamespace{ns}, ref, tree, {});
+    ManifestEntry e;
+    e.path = "data.bin";
+    e.placement = EntryPlacement::Blob;
+    e.blob_hash = u128Of(payload);
+    e.blob_size = payload.size();
+    const ManifestId id = build->stageManifest({e});
+    build->precommitAdd(nsr, ref, id);
+    build->promote(nsr, ref, build->buildId(), id);
     return u128ToHex(u128Of(payload));
 }
 
@@ -125,12 +129,10 @@ TEST(CasEvent, LifecycleReconstructionFromRows)
     ASSERT_FALSE(b->head(s->layout().blobKey(BlobId{blob_hash})).exists)
         << "GC must have deleted the now-unreferenced blob";
 
-    /// (a) the expected taxonomy was emitted across the lifecycle.
+    /// (a) the expected taxonomy was emitted across the lifecycle (manifest model: no trees).
     EXPECT_TRUE(hasType(events, CasEventType::BlobPut));
-    EXPECT_TRUE(hasType(events, CasEventType::TreePut));
-    EXPECT_TRUE(hasType(events, CasEventType::RefPublish));
-    EXPECT_TRUE(hasType(events, CasEventType::RootAdd) || hasType(events, CasEventType::TreeExpand))
-        << "a fold must have recorded the root edge / expanded the tree";
+    EXPECT_TRUE(hasType(events, CasEventType::RootAdd))
+        << "a fold must have recorded the manifest owner's blob edge (+1)";
     EXPECT_TRUE(hasType(events, CasEventType::RefDrop));
     EXPECT_TRUE(hasType(events, CasEventType::IndegZero));
     EXPECT_TRUE(hasType(events, CasEventType::GcRetireObserve)

@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
@@ -79,9 +80,33 @@ RoundReport Gc::runRegularRound()
     if (tryResumeIncompleteRound(state, state_token, report))
         return report;
 
+    /// B170: fold begins — the round's R1. round here is state.round (pre-retire); generation is the
+    /// authoritative one being folded.
+    EventEmitter{*store}.emit([&](CasEvent & e)
+    {
+        e.type = CasEventType::GcFoldBegin;
+        e.object_kind = CasEventObjectKind::Snap;
+        e.round = state.round;
+        e.gen = state.snap_generation;
+        e.reason = "R1: fold the RootOwnerEvent journals into a new durable blob in-degree generation";
+    });
+
     /// R1: fold the ONE ordered RootOwnerEvent journal into blob deltas, seal them into a write-once
     /// blob in-degree generation (the fold cursor advances only on activation/removal — the barrier).
     FoldResult folded = fold(state, state_token, report);
+
+    /// B170: fold ended — the new sealed generation (advanced past every clamp-free shard).
+    EventEmitter{*store}.emit([&](CasEvent & e)
+    {
+        e.type = CasEventType::GcFoldEnd;
+        e.object_kind = CasEventObjectKind::Snap;
+        e.round = state.round;
+        e.gen = state.snap_generation;
+        e.outcome = "ok";
+        e.reason = "R1 complete";
+        e.detail = {{"shards", std::to_string(folded.root_shards.size())},
+                    {"anomalies", std::to_string(report.anomalies.size())}};
+    });
 
     /// R2: HEAD-observe each zero-in-degree blob's current token, write the round's retire sets, advance
     /// .round. Threaded (state, token) — never re-read (zombie-steal protection).
@@ -140,7 +165,25 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
 
     for (const ManifestEntry & entry : body.entries)
         if (entry.placement == EntryPlacement::Blob)
+        {
             deltas.push_back(BlobDelta{.blob_hash = entry.blob_hash, .delta = sign});
+            /// B170: a folded owner edge over this blob (the manifest-model analog of the old tree
+            /// RootAdd/TreeExpand). +1 = the manifest's owner activated this blob's reference; -1 =
+            /// the owner was removed, dropping the reference. Reconstructs WHY a blob's in-degree moved.
+            EventEmitter{*store}.emit([&](CasEvent & ev)
+            {
+                ev.type = sign > 0 ? CasEventType::RootAdd : CasEventType::RootRemove;
+                ev.namespace_ = id.root_namespace.string();
+                ev.object_kind = CasEventObjectKind::Blob;
+                ev.object_hash = u128ToHex(entry.blob_hash);
+                ev.outcome = sign > 0 ? "edge_added" : "edge_removed";
+                ev.reason = sign > 0
+                    ? "fold: manifest owner activated; +1 blob edge"
+                    : "fold: manifest owner removed; -1 blob edge";
+                ev.detail = {{"manifest_ref_instance", u128ToHex(id.ref.manifest_instance_id)},
+                             {"path", entry.path}};
+            });
+        }
 
     if (sign < 0)
         mf_cleanup.emplace(id, got->token);   /// owner removed: defer exact-token body delete to recheck
@@ -323,7 +366,33 @@ Gc::RetireResult Gc::retire(GcState & state, Token & state_token, const FoldResu
     /// fabricate a token, never GET a condemned body).
     for (const BlobCandidate & cand : zeroInDegree(backend, layout, folded.fold_seal.generation, /*shard*/0))
     {
+        /// B170: the blob's in-degree transitioned to 0 in this generation — the moment it became a
+        /// retire candidate. The cause is the fold's last -1 edge (its RootRemove row above for the same
+        /// object_hash), so a blob's "why did it become collectable" is a row-level join.
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::IndegZero;
+            e.object_kind = CasEventObjectKind::Blob;
+            e.object_hash = u128ToHex(cand.hash);
+            e.round = round;
+            e.gen = folded.fold_seal.generation;
+            e.reason = "last folded owner edge dropped; in-degree reached 0";
+        });
+
         const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
+        /// B170: HEAD-observe — the current incarnation token, the only token the eventual exact-token
+        /// delete may carry (absent => skipped: a prior round's landed delete).
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::GcRetireObserve;
+            e.object_kind = CasEventObjectKind::Blob;
+            e.object_hash = u128ToHex(cand.hash);
+            e.token = observed.exists ? observed.token.value : "";
+            e.round = round;
+            e.gen = folded.fold_seal.generation;
+            e.outcome = observed.exists ? "present" : "absent";
+            e.reason = "zero-in-degree candidate; HEAD-observe the current token";
+        });
         if (!observed.exists)
             continue;
         RetiredEntry entry;
@@ -331,6 +400,19 @@ Gc::RetireResult Gc::retire(GcState & state, Token & state_token, const FoldResu
         entry.hash = cand.hash;
         entry.token = observed.token;
         entry.size = retiredLogicalSize(ObjectKind::Blob, observed.size, store->poolMeta().blob_header_len);
+        /// B170: the retire entry written for this incarnation (per RetiredEntry).
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::BlobRetire;
+            e.object_kind = CasEventObjectKind::Blob;
+            e.object_hash = u128ToHex(cand.hash);
+            e.token = observed.token.value;
+            e.round = round;
+            e.gen = folded.fold_seal.generation;
+            e.outcome = "retired";
+            e.reason = "condemned zero-in-degree candidate written to the round's retired set";
+            e.detail = {{"size", std::to_string(entry.size)}};
+        });
         result.blobs[/*single shard*/0].entries.push_back(std::move(entry));
     }
 
@@ -430,6 +512,18 @@ void Gc::fence(GcState & state, Token & state_token, FoldResult & folded)
     if (fence_res.outcome == CasOutcome::Committed)
     {
         state_token = fence_res.token;
+        /// B170: the monotone fence committed — the durable point the recheck folds through.
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::GcFence;
+            e.object_kind = CasEventObjectKind::Snap;
+            e.round = round;
+            e.gen = state.snap_generation;
+            e.outcome = "fenced";
+            e.reason = "R3: fenced the registry + every root shard of every registered namespace";
+            e.detail = {{"fence_seq", std::to_string(state.fence_seq)},
+                        {"namespaces", std::to_string(fence_universe.namespaces.size())}};
+        });
         return;
     }
 
@@ -500,7 +594,27 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
         {
             OutcomeEntry outcome{.kind = entry.kind, .hash = entry.hash, .token = entry.token,
                                  .outcome = OutcomeKind::Spared};
-            if (inDegreeInGeneration(backend, layout, completion_generation, /*shard*/0, entry.hash) == 0)
+            const int64_t indeg_at_recheck =
+                inDegreeInGeneration(backend, layout, completion_generation, /*shard*/0, entry.hash);
+            if (indeg_at_recheck > 0)
+            {
+                /// B170: a fold-through-fence publish re-pinned this candidate — record the verdict +
+                /// the in-degree it found, so "why wasn't it deleted" is answerable from the rows.
+                EventEmitter{*store}.emit([&](CasEvent & e)
+                {
+                    e.type = CasEventType::GcRecheckVerdict;
+                    e.object_kind = CasEventObjectKind::Blob;
+                    e.object_hash = u128ToHex(entry.hash);
+                    e.token = entry.token.value;
+                    e.round = round;
+                    e.gen = completion_generation;
+                    e.outcome = "spared";
+                    e.reason = "in-degree > 0 after fold-through-fence; a publish re-pinned it";
+                    e.detail = {{"indeg_at_recheck", std::to_string(indeg_at_recheck)},
+                                {"fence_seq", std::to_string(state.fence_seq)}};
+                });
+            }
+            else
             {
                 /// ==================== THE SINGLE CONTENT-DELETE SITE (blob) ====================
                 const DeleteOutcome del = backend.deleteExact(blobKeyOf(layout, entry.hash), entry.token);
@@ -511,6 +625,39 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
                 outcome.outcome = del.kind == DeleteOutcome::Kind::Deleted ? OutcomeKind::Deleted
                                 : del.kind == DeleteOutcome::Kind::NotFound ? OutcomeKind::Absent
                                 : OutcomeKind::Replaced;
+                const String del_outcome = outcome.outcome == OutcomeKind::Deleted ? "deleted"
+                                         : outcome.outcome == OutcomeKind::Absent ? "absent" : "replaced";
+                /// B170: the single content-delete site. This is the ONLY place Gc deletes a content
+                /// object, so a `blob_delete` row makes any "reachable object MISSING" finding
+                /// attributable. Carries the full decision context + the exact-token verdict.
+                EventEmitter{*store}.emit([&](CasEvent & e)
+                {
+                    e.type = CasEventType::BlobDelete;
+                    e.object_kind = CasEventObjectKind::Blob;
+                    e.object_hash = u128ToHex(entry.hash);
+                    e.token = entry.token.value;
+                    e.round = round;
+                    e.gen = completion_generation;
+                    e.outcome = del_outcome;
+                    e.reason = "in-degree 0 through the fence; recheck confirmed 0; exact-token delete";
+                    e.detail = {{"fence_seq", std::to_string(state.fence_seq)},
+                                {"indeg_at_recheck", "0"},
+                                {"token_outcome", del_outcome},
+                                {"key", blobKeyOf(layout, entry.hash)}};
+                });
+                /// B170: the recheck verdict for the delete arm; pairs with the blob_delete above so a
+                /// verdict exists for every candidate.
+                EventEmitter{*store}.emit([&](CasEvent & e)
+                {
+                    e.type = CasEventType::GcRecheckVerdict;
+                    e.object_kind = CasEventObjectKind::Blob;
+                    e.object_hash = u128ToHex(entry.hash);
+                    e.token = entry.token.value;
+                    e.round = round;
+                    e.gen = completion_generation;
+                    e.outcome = del_outcome;
+                    e.reason = "in-degree 0 through fold-through-fence; exact-token delete issued";
+                });
             }
             computed[shard].entries.push_back(std::move(outcome));
         }
@@ -559,7 +706,22 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     {
         if (recheck_cleanup.count(id))
             continue;   /// re-removed in the fence window too; still deleting once is fine
-        backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
+        const DeleteOutcome mdel = backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
+        /// B170: the owner-removed manifest body delete (the tree-delete analog in the manifest model) —
+        /// deleted ONLY after its blob decrements were sealed into the fold generation (control #11).
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::TreeDelete;
+            e.namespace_ = id.root_namespace.string();
+            e.object_kind = CasEventObjectKind::Tree;
+            e.object_hash = u128ToHex(id.ref.manifest_instance_id);
+            e.token = token.value;
+            e.round = round;
+            e.gen = completion_generation;
+            e.outcome = mdel.kind == DeleteOutcome::Kind::Deleted ? "deleted"
+                      : mdel.kind == DeleteOutcome::Kind::NotFound ? "absent" : "replaced";
+            e.reason = "recheck: owner-removed manifest body; exact-token delete after decrements sealed";
+        });
     }
 
     /// 4. Seal the completion generation (write-once) + advance the pointer + drop the round's retired
@@ -625,6 +787,17 @@ void Gc::trim(const FoldResult & folded, uint64_t /*round*/)
         {
             std::erase_if(fresh.journal,
                 [&](const RootOwnerEvent & e) { return e.transition_version <= cursor; });
+        });
+        /// B170: the journal trim for this shard (events provably folded into the durable generation).
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::GcTrim;
+            e.namespace_ = ns.string();
+            e.object_kind = CasEventObjectKind::Root;
+            e.outcome = "trimmed";
+            e.reason = "INV-JOURNAL-COVERAGE: trimmed owner events at or below the durable fold cursor";
+            e.detail = {{"shard", std::to_string(shard)},
+                        {"trimmed_up_to_cursor", std::to_string(cursor)}};
         });
     }
 }
@@ -946,6 +1119,25 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, con
                 .new_binding = std::nullopt});
         }
     });
+
+    /// B170: each abandoned precommit reclaimed (its owner edge removed; the next fold releases its
+    /// blob edges). Records WHY the build was judged dead — the soak's leak/dangle attribution.
+    for (const DeadRef & dr : dead_refs)
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::PrecommitReclaim;
+            e.namespace_ = ns_str;
+            e.ref_name = dr.name;
+            e.object_kind = CasEventObjectKind::Root;
+            e.outcome = "reclaimed";
+            e.reason = w == nullptr
+                ? "precommit reclaim: owning server has no watermark (abandoned/vanished build)"
+                : (!server_live
+                    ? "precommit reclaim: owning server frozen K=2 rounds (crashed build)"
+                    : "precommit reclaim: build_seq below the server's min_active floor (retired build)");
+            e.detail = {{"build_seq", std::to_string(dr.build_seq)},
+                        {"min_active", w ? std::to_string(w->min_active) : "absent"}};
+        });
 }
 
 bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)

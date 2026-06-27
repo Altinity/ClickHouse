@@ -36,21 +36,25 @@ using Rec = DB::ContentAddressed::GcRoundLogRecord;
 namespace
 {
 
-/// Publish one part `ref` with a single content blob whose payload is `payload`. Returns the tree id.
-TreeId publishPart(const StorePtr & s, const String & ns, const String & ref, const String & payload)
+/// Publish one part `ref` with a single content blob whose payload is `payload`. Returns the manifest id.
+ManifestId publishPart(const StorePtr & s, const String & ns, const String & ref, const String & payload)
 {
-    auto build = s->startBuild({});
+    const RootNamespace nsr{ns};
+    BuildInfo info;
+    info.intended_ref = ns + "/" + ref;
+    auto build = s->startBuild(info);
     build->putBlob(idOf(payload), BlobSource::fromString(payload));
 
-    TreeEntry e;
-    e.name = "data.bin";
-    e.placement = Placement::Blob;
-    e.file_hash = u128Of(payload);
-    e.file_size = payload.size();
+    ManifestEntry e;
+    e.path = "data.bin";
+    e.placement = EntryPlacement::Blob;
+    e.blob_hash = u128Of(payload);
+    e.blob_size = payload.size();
 
-    const TreeId tree = build->putTree({e});
-    build->publish(RootNamespace{ns}, ref, tree, {});
-    return tree;
+    const ManifestId id = build->stageManifest({e});
+    build->precommitAdd(nsr, ref, id);
+    build->promote(nsr, ref, build->buildId(), id);
+    return id;
 }
 
 }
@@ -115,8 +119,7 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
 
     EXPECT_GT(rows[marking_finish_idx].candidates_marked, 0u);
     EXPECT_GT(rows[deleting_finish_idx].objects_deleted, 0u);
-    /// P9: the deletion round forgot the deleted node(s) in the same round; the record surfaces it.
-    EXPECT_GT(rows[deleting_finish_idx].forgotten_on_delete, 0u);
+    /// (the manifest model has no P9 `forgotten_on_delete` cursor prune — that column is now always 0.)
 
     /// Identity + timing fields are set on every record.
     for (const Rec & r : rows)
