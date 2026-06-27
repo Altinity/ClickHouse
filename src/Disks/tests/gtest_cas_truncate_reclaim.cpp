@@ -38,30 +38,34 @@ StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 
 /// Publish one part `ref` with TWO content files whose payloads are passed in. Identical payloads
 /// across parts dedup to the SAME blob object (the soak's dedup_ratio ~3.8 comes from exactly this
-/// sharing). Returns the tree id.
-TreeId publishPart2(
+/// sharing). Returns the manifest id.
+ManifestId publishPart2(
     const StorePtr & s, const String & ns, const String & ref,
     const String & payload_a, const String & payload_b)
 {
-    auto build = s->startBuild({});
+    const RootNamespace nsr{ns};
+    BuildInfo info;
+    info.intended_ref = ns + "/" + ref;
+    auto build = s->startBuild(info);
     build->putBlob(idOf(payload_a), BlobSource::fromString(payload_a));
     build->putBlob(idOf(payload_b), BlobSource::fromString(payload_b));
 
-    TreeEntry ea;
-    ea.name = "data.bin";
-    ea.placement = Placement::Blob;
-    ea.file_hash = u128Of(payload_a);
-    ea.file_size = payload_a.size();
+    ManifestEntry ea;
+    ea.path = "data.bin";
+    ea.placement = EntryPlacement::Blob;
+    ea.blob_hash = u128Of(payload_a);
+    ea.blob_size = payload_a.size();
 
-    TreeEntry eb;
-    eb.name = "data.cmrk3";
-    eb.placement = Placement::Blob;
-    eb.file_hash = u128Of(payload_b);
-    eb.file_size = payload_b.size();
+    ManifestEntry eb;
+    eb.path = "data.cmrk3";
+    eb.placement = EntryPlacement::Blob;
+    eb.blob_hash = u128Of(payload_b);
+    eb.blob_size = payload_b.size();
 
-    const TreeId tree = build->putTree({ea, eb});
-    build->publish(RootNamespace{ns}, ref, tree, {});
-    return tree;
+    const ManifestId id = build->stageManifest({ea, eb});
+    build->precommitAdd(nsr, ref, id);
+    build->promote(nsr, ref, build->buildId(), id);
+    return id;
 }
 
 /// Run regular GC rounds until the round does no further reclamation work (a fixpoint). The soak's
