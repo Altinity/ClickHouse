@@ -1,5 +1,7 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <base/types.h>
@@ -79,6 +81,56 @@ public:
 private:
     uint64_t gc_shards;
     std::vector<std::vector<BlobDelta>> buckets;   /// buckets[shard] accumulates BlobDelta items
+};
+
+/// Per-shard in-degree reducer for phase 4 of the sharded GC fold (spec §Phase4).
+///
+/// `ShardReducer` owns exactly ONE target shard (`shard` in [0, `gc_shards`)). It accepts the
+/// shard's slice of blob deltas (from `ShardScatter::take()[shard]`) and merges them into a
+/// per-shard `CasBlobInDegree` generation run via `foldDeltasIntoGeneration`.
+///
+/// Ownership invariant: a reducer touches ONLY blobs it owns — i.e. `blobShard(h, gc_shards) == shard`.
+/// Two reducers for DIFFERENT shards may run concurrently; their key namespaces are disjoint
+/// (`blobTargetRunKey(gen, shard0, seq)` vs `blobTargetRunKey(gen, shard1, seq)`).
+///
+/// The `reduce` method delegates to `foldDeltasIntoGeneration` (the same path the non-sharded fold
+/// uses with `shard == 0`), so `gc_shards == 1` with `shard == 0` reproduces the non-sharded fold
+/// byte-for-byte (Task 7 compatibility requirement).
+///
+/// NOTE on durable writes: `reduce` writes the per-shard in-degree run directly via `backend`
+/// (under `blobTargetRunKey(new_generation, shard, 0)`), exactly as `foldDeltasIntoGeneration`
+/// does. Returning the durable write here (rather than an in-memory map) keeps the round driver
+/// stateless: it simply constructs a `ShardReducer` per shard, calls `reduce`, and the sealed
+/// run is already present for `zeroInDegree` / `inDegreeInGeneration` consumers. An in-memory
+/// return value is unnecessary because the backend is directly queryable; tests use
+/// `inDegreeInGeneration` over an `InMemoryBackend`.
+class ShardReducer
+{
+public:
+    /// Construct a reducer that owns `shard` (in [0, `gc_shards`)).
+    ShardReducer(uint64_t shard_, uint64_t gc_shards_);
+
+    /// True iff this reducer owns `blob_hash` — i.e. `blobShard(blob_hash, gc_shards) == shard`.
+    bool owns(const UInt128 & blob_hash) const;
+
+    /// Merge `shard_deltas` (the `ShardScatter::take()[shard]` slice for this shard) into a
+    /// new in-degree generation for this shard. Writes the sealed run under
+    /// `blobTargetRunKey(new_generation, shard, 0)` via `backend`, appends its `RunRef` to
+    /// `out_runs`, and returns the `RunRef`. The call is idempotent (write-once via `putIfAbsent`).
+    ///
+    /// `prior_generation` is the generation whose per-shard run forms the baseline (0 = fresh pool).
+    /// `new_generation` must be > `prior_generation`.
+    ///
+    /// PRECONDITION: every `BlobDelta` in `shard_deltas` must be owned by this reducer
+    /// (`blobShard(d.blob_hash, gc_shards) == shard`).  Violations are caught at the
+    /// `foldDeltasIntoGeneration` layer (an undercount would be CORRUPTED_DATA).
+    std::vector<RunRef> reduce(Backend & backend, const Layout & layout,
+                               uint64_t prior_generation, uint64_t new_generation,
+                               std::vector<BlobDelta> shard_deltas);
+
+private:
+    uint64_t shard;
+    uint64_t gc_shards;
 };
 
 }

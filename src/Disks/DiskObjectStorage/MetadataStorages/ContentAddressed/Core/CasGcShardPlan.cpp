@@ -1,5 +1,15 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcShardPlan.h>
+#include <Common/Exception.h>
+#include <base/defines.h>
 #include <algorithm>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int BAD_ARGUMENTS;
+}
+}
 
 namespace DB::Cas
 {
@@ -52,6 +62,31 @@ std::vector<std::vector<BlobDelta>> ShardScatter::take()
     std::vector<std::vector<BlobDelta>> result = std::move(buckets);
     buckets.assign(gc_shards, {});   /// leave in a defined (empty) state; caller must not reuse
     return result;
+}
+
+ShardReducer::ShardReducer(uint64_t shard_, uint64_t gc_shards_)
+    : shard(shard_), gc_shards(gc_shards_)
+{
+    if (gc_shards_ == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "ShardReducer: gc_shards must be >= 1");
+    if (shard_ >= gc_shards_)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "ShardReducer: shard {} is out of range [0, {})", shard_, gc_shards_);
+}
+
+bool ShardReducer::owns(const UInt128 & blob_hash) const
+{
+    return blobShard(blob_hash, gc_shards) == shard;
+}
+
+std::vector<RunRef> ShardReducer::reduce(Backend & backend, const Layout & layout,
+                                         uint64_t prior_generation, uint64_t new_generation,
+                                         std::vector<BlobDelta> shard_deltas)
+{
+    std::vector<RunRef> out_runs;
+    foldDeltasIntoGeneration(backend, layout, prior_generation, new_generation, shard,
+                             std::move(shard_deltas), out_runs);
+    return out_runs;
 }
 
 }

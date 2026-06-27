@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 
 using namespace DB::Cas;
@@ -153,4 +154,128 @@ TEST(CasGcShardScatter, InlineEntriesAreIgnored)
 
     for (uint64_t s = 0; s < 4; ++s)
         EXPECT_TRUE(buckets[s].empty()) << "inline entries must not produce any delta on shard " << s;
+}
+
+/// ---- ShardReducer tests (Phase 4, Task 4) ----
+
+/// Build two blob hashes that route to DIFFERENT shards under gc_shards=2.
+/// Returns {hash_for_shard0, hash_for_shard1}.
+static std::pair<UInt128, UInt128> makeTwoShardHashes()
+{
+    /// Scan pairs (i, j): find hash_a -> shard 0, hash_b -> shard 1 under gc_shards=2.
+    /// We construct candidates by setting the high 64 bits and leaving the low 64 bits zero
+    /// so blobShard = high64 % 2.  i=0 => shard 0, i=1 => shard 1.
+    const UInt128 h0 = static_cast<UInt128>(0ULL) << 64;   /// high64=0 => shard 0
+    const UInt128 h1 = static_cast<UInt128>(1ULL) << 64;   /// high64=1 => shard 1
+    return {h0, h1};
+}
+
+/// `ShardReducer::reduce` merges deltas into the correct per-shard in-degree run.
+///
+/// Scenario: scatter (+1 b1, +1 b1, -1 b1, +1 b2) across two shards.
+///   - b1 routes to shard 0; net = +2 - 1 = 1; in-degree after reduce = 1.
+///   - b2 routes to shard 1; net = +1; in-degree after reduce = 1.
+///   - Each reducer touches ONLY its own shard's key space.
+TEST(CasGcShardReducer, MergesDeltasToInDegree)
+{
+    const auto [b1, b2] = makeTwoShardHashes();
+    ASSERT_EQ(blobShard(b1, 2), 0u) << "b1 must route to shard 0";
+    ASSERT_EQ(blobShard(b2, 2), 1u) << "b2 must route to shard 1";
+
+    /// Scatter: b1 twice +1 and once -1 (net +1) into shard-0 bucket;
+    ///          b2 once +1 (net +1) into shard-1 bucket.
+    ShardScatter scatter(2);
+    {
+        ManifestEntry e1;
+        e1.placement = EntryPlacement::Blob;
+        e1.blob_hash = b1;
+
+        ManifestEntry e2;
+        e2.placement = EntryPlacement::Blob;
+        e2.blob_hash = b2;
+
+        /// Publish b1 once (+1 for b1), then b2 once (+1 for b2): simulate two add events.
+        scatter.scatter({}, {e1});   /// add b1: shard-0 gets +1
+        scatter.scatter({}, {e2});   /// add b2: shard-1 gets +1
+        scatter.scatter({}, {e1});   /// add b1 again: shard-0 gets +1
+        scatter.scatter({e1}, {});   /// remove b1: shard-0 gets -1
+    }
+    auto buckets = scatter.take();
+
+    /// Verify bucket contents before reducing.
+    ASSERT_EQ(buckets.size(), 2u);
+    {
+        int64_t net_b1 = 0;
+        for (const auto & d : buckets[0])
+            if (d.blob_hash == b1)
+                net_b1 += d.delta;
+        EXPECT_EQ(net_b1, 1) << "shard-0 bucket net delta for b1 must be +1";
+    }
+    {
+        int64_t net_b2 = 0;
+        for (const auto & d : buckets[1])
+            if (d.blob_hash == b2)
+                net_b2 += d.delta;
+        EXPECT_EQ(net_b2, 1) << "shard-1 bucket net delta for b2 must be +1";
+    }
+
+    /// Reduce: each reducer merges its shard's deltas into generation 1 (prior = 0 = fresh).
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+
+    ShardReducer r0(0, 2);
+    ShardReducer r1(1, 2);
+
+    EXPECT_TRUE(r0.owns(b1)) << "r0 must own b1";
+    EXPECT_FALSE(r0.owns(b2)) << "r0 must not own b2";
+    EXPECT_TRUE(r1.owns(b2)) << "r1 must own b2";
+    EXPECT_FALSE(r1.owns(b1)) << "r1 must not own b1";
+
+    const auto runs0 = r0.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1,
+                                 std::move(buckets[0]));
+    const auto runs1 = r1.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1,
+                                 std::move(buckets[1]));
+
+    ASSERT_EQ(runs0.size(), 1u) << "shard-0 reduce must produce exactly one RunRef";
+    ASSERT_EQ(runs1.size(), 1u) << "shard-1 reduce must produce exactly one RunRef";
+
+    /// The keys must be distinct (disjoint shard namespaces).
+    EXPECT_NE(runs0[0].key, runs1[0].key) << "shard-0 and shard-1 run keys must be distinct";
+
+    /// Read back in-degree from the sealed runs.
+    const int64_t indeg_b1 = inDegreeInGeneration(*backend, layout, 1, /*shard=*/0, b1);
+    const int64_t indeg_b2 = inDegreeInGeneration(*backend, layout, 1, /*shard=*/1, b2);
+    EXPECT_EQ(indeg_b1, 1) << "b1 in-degree after reduce must be 1";
+    EXPECT_EQ(indeg_b2, 1) << "b2 in-degree after reduce must be 1";
+
+    /// Cross-shard reads: shard-0's run must not contain b2; shard-1's run must not contain b1.
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/0, b2), 0)
+        << "shard-0 run must not mention b2";
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/1, b1), 0)
+        << "shard-1 run must not mention b1";
+}
+
+/// `ShardReducer::owns` partitions the blob hash space: for any hash, exactly ONE reducer among
+/// {r0, r1} owns it (union == all, intersection == empty).
+TEST(CasGcShardReducer, TwoReducersCoverDisjointShards)
+{
+    constexpr uint64_t kNumHashes = 4096;
+    constexpr uint64_t kGcShards = 2;
+
+    ShardReducer r0(0, kGcShards);
+    ShardReducer r1(1, kGcShards);
+
+    for (uint64_t i = 0; i < kNumHashes; ++i)
+    {
+        const UInt128 h = (static_cast<UInt128>(i * 0x9e3779b97f4a7c15ULL) << 64)
+                        | static_cast<UInt128>(i * 0x6c62272e07bb0142ULL);
+        const bool o0 = r0.owns(h);
+        const bool o1 = r1.owns(h);
+
+        /// Exactly one of the two reducers must own every hash.
+        ASSERT_TRUE(o0 || o1)
+            << "hash " << i << " is owned by neither shard (gap in coverage)";
+        ASSERT_FALSE(o0 && o1)
+            << "hash " << i << " is owned by BOTH shards (overlap in coverage)";
+    }
 }
