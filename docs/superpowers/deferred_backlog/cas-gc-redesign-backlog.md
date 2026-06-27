@@ -336,7 +336,12 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   the existing HEAD. Lowest-stakes phase (R1 perf only). Phase 5 Task 2/3 code NOT written (the field would
   be an unpopulated no-op without the provenance); no dead code committed.
 
-- **B15 — plan bodies retain stale rejected-protocol snippets (documentation hygiene).** The execution
+- **B15 — ADDRESSED 2026-06-27 (proportionate fix).** Rather than a risky snippet-by-snippet rewrite of
+  executed-and-superseded plans, added a prominent SOURCE-OF-TRUTH disclaimer at the top of the overview
+  plan pointing to the committed code / RESULTS ledger / execution log as authoritative, and naming the
+  phase-1b Task 5 example. Full rewrite intentionally NOT done (regression risk, low value for done plans).
+  Original finding below.
+- **B15 (original) — plan bodies retain stale rejected-protocol snippets (documentation hygiene).** The execution
   log's earlier "all plans re-synced clean to rev.15" claim is OVERSTATED: some plan bodies still contain
   pre-rev.15 snippets the design rejected. Example: `…-phase1b-build-precommit-promote.md` Task 5 still
   describes missing-body promotion folding as committed and appending the old `PrecommitTransition`/

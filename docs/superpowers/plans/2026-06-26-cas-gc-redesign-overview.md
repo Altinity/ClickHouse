@@ -9,6 +9,19 @@ doc_type: reference
 
 # CAS GC Root-Local Part Manifest Redesign — Master Plan & Index {#cas-gc-root-local-part-manifest-redesign-master-plan-index}
 
+> **⚠️ IMPLEMENTATION STATUS / SOURCE OF TRUTH (2026-06-27, B15).** These plans were **executed** on
+> branch `cas-gc-part-manifest-impl` (phases 0–4 code complete; phase-5 model gate done, its retire-token
+> code intentionally not implemented — see B14). During implementation the design converged and some
+> **task bodies below still contain pre-rev.15 protocol snippets that were superseded** (e.g. phase-1b
+> Task 5 describes missing-body promotion folding "as committed" and appending old
+> `PrecommitTransition`/`PromotePrecommit` vectors — the shipped protocol uses a **single ordered
+> `RootOwnerEvent` journal** + a **pure owner-move promote** + the **missing-body fold barrier**, and
+> `promote`/`abandon` were hardened post-review to match the model). **The authoritative record of what was
+> actually built is the committed code, the TLA+ ledger `…/models/CaGcRootLocalPartManifestCore_RESULTS.md`,
+> the execution log `…/cas-gc-unattended-execution-log.md`, and the backlog.** Read these plan bodies as the
+> original intent, not as a description of the final code. (A full snippet-by-snippet rewrite was judged
+> not worth the regression risk for executed-and-superseded plans.)
+
 > **For agentic workers:** This is the **index and shared-constraints anchor** for a multi-plan redesign. The bite-sized, checkbox (`- [ ]`) tasks live in the **per-phase plan files** listed under [Phase Index](#phase-index). REQUIRED SUB-SKILL: use superpowers:subagent-driven-development to execute each phase plan task-by-task. Read this overview first; every phase plan repeats the [Global Constraints](#global-constraints) so an implementer who only sees one task still has them.
 
 **Goal:** Replace CA's content-addressed *tree* model and resident-snapshot GC with **root-local immutable part manifests** plus a **streaming, target-shardable blob-in-degree GC**, with each behavior-changing phase gated on a green TLA+ model extension.
