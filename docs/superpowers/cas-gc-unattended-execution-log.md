@@ -301,3 +301,28 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   T2 lazy trim only below sealed-generation coverage (`INV_JOURNAL_COVERAGE`); T3 sweep + exit. Lazy FENCE
   stays dropped. Model-writer subagent dispatched (writes + fast-sanity only — no background TLC after the
   Phase-2 poll-loop lesson); I run the heavy re-green + commit.
+
+### 2026-06-27 — PHASE 3 COMPLETE (lazy trim); Phase 4 (sharded reducers) started
+- **T1 model gate `adc8dc92015`.** Model writer added `EnableLazyTrim` + permanent `SabotageLazyFenceUnsafe`
+  control (reuse a stale fence for a shard published-into between discovery and recheck → `INV_NO_DANGLE`)
+  + `foldTok`/`prevFencePos` witnesses. **Review caught the new vars doubled every stage's state space
+  (stage2 68M→131M); I gated both writes behind `SabotageLazyFenceUnsafe`** (their only consumer) → inert
+  in non-sabotage stages. Inertness PROVEN: `stage0`/`stage1`/`stage2` reproduce EXACT Phase-2 distinct
+  counts (19,846 / 402,034 / 68,550,326) → `stage3`/`stage4`/`live` + all 24 prior controls carried
+  forward (no re-run). `sab_lazyfenceunsafe` VIOLATES (24.5M). `stage5_lazytrim`: the full `{n1,n2}`
+  cross-product exploded multi-billion (killed); right-sized to a BOUNDED `{n1,n2}` (1 shared blob,
+  precommit off) for feasible cross-namespace shared-blob coverage → HOLD 338.8M. Full control+witness
+  sweep all VIOLATE, no UNEXPECTED PASS. `RESULTS.md` finalized.
+- **T2 lazy-trim code `ad278c9f903`.** `trim` ALREADY sourced the sealed `CasFoldSeal` coverage cursor (the
+  M1 durability fix did that); locked by `CasGcRound.TrimOnlyBelowSealedCoverage` (fold-barrier scenario:
+  committed v1 trimmed, barrier precommit v2 retained) + `trim_cursors` audit recorded. `fence`/`recheck`/
+  round-order untouched (verified). **T3 exit `8989c70bfb2`**: full `Cas*:Ca*` 360 ran / 353 passed / 1 =
+  baseline B3. **Phase 3 DONE.**
+- **Infra lessons:** long `run_in_background` bash is REAPED (~minutes); use `setsid`-detached for long
+  TLC (survives, poll via ScheduleWakeup) and Agent subagents for code (survive + notify). The Bash tool
+  itself caps foreground at 120s.
+- **Phase 4 (sharded reducers, R2) started.** 9 tasks: T1 model ext (multi-shard/multi-leader stage +
+  sab_reducerownsfence + sab_crosssharddisplacement) = gate; T2 gc_shards config; T3 shard-plan mapper;
+  T4 reducers via RunMerger; T5 cleanup workers; T6 coordinator/leases; T7 gc_shards=1 byte-equivalence;
+  T8 two-replica concurrency; T9 sweep + two-replica chaos soak. Applying the Phase-3 lesson: new vars
+  gated behind EnableSharding for inertness from the start.
