@@ -247,7 +247,7 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
                 {
                     LOG_DEBUG(log, "Sending part {} by relink (content-addressed, shared pool {}), manifest payload {} bytes",
                         part_name, receiver_pool_uuid, manifest_bytes->size());
-                    response.addCookie({CA_RELINK_COOKIE, "1"});
+                    response.addCookie({CA_RELINK_COOKIE, "part_manifest_v1"});
                     /// The relink payload (B7 part_manifest_v1): the opaque encoded PartManifest body
                     /// (the receiver decodes it, ignores the sender identity, and stages its OWN local
                     /// manifest over the shared-pool blobs; the legacy part_id wire field carries it) +
