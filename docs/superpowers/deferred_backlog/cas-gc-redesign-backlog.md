@@ -278,6 +278,22 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   /`INV_JOURNAL_COVERAGE` concern and was unproven. Deferred: model-extend + reseal/snapshot, then lift to
   one-round skip. Medium priority (perf only; correctness already holds conservatively).
 
+- **B13 — two-replica sharded GC integration soak blocked by the test MinIO image (environmental).** The
+  Phase-4 `tests/integration/test_cas_gc_sharded/` module (gc_shards=2, two replicas, disjoint shards) is
+  committed but `pytest.mark.skip`-ped: the integration Docker MinIO (`RELEASE.2024-09-13`) predates S3
+  `DeleteObject If-Match` (conditional delete), which `CasProbe::runCapabilityProbe` step 6 hard-requires
+  (fail-closed) — so the server refuses to start. This blocks ALL CA S3 integration tests in the repo
+  (`test_content_addressed_gc_s3`, `test_content_addressed_shared_pool` show the identical
+  `CasProbe: deleteExact with a wrong token was not TokenMismatch` failure in cached runs), not just the
+  sharded soak. Remove the skip + run the soak once the integration MinIO image is bumped to
+  ≥ `RELEASE.2025-09` (or a conditional-delete-capable backend is wired for CA S3 integration tests).
+  Phase 4's safety is covered meanwhile by the unit gate (376 `Cas*:Ca*` gtests green) + the TLA+
+  `stage5_sharding` HOLD + the two new sharding controls. Medium priority (validation gap, not a code bug).
+  Note: the soak prep CAUGHT+FIXED a real latent bug en route — `gc_shards` in `PoolConfig` was never
+  written to the initial `GcState` (XML config was a no-op; all pools silently ran gc_shards=1), fixed in
+  `209d4ff1462` by threading `<gc_shards>` through `MetadataStorageFactory`/`ContentAddressedMetadataStorage`
+  and setting it on first lease acquire.
+
 ## Resolved
 
 - **B9 — GC generation pruning: DONE.** `Gc::pruneSupersededGenerations` (called in the recheck round tail

@@ -326,3 +326,28 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   T4 reducers via RunMerger; T5 cleanup workers; T6 coordinator/leases; T7 gc_shards=1 byte-equivalence;
   T8 two-replica concurrency; T9 sweep + two-replica chaos soak. Applying the Phase-3 lesson: new vars
   gated behind EnableSharding for inertness from the start.
+
+### 2026-06-27 — PHASE 4 COMPLETE (sharded reducers, R2)
+- **T1 model gate `925f907bd70`.** Sharded fold actions (GScatterDelta mapper / GReduceShard / GCoordFence
+  / GCoordSeal coordinator) + shardIndeg/coordFence/reducerOwner vars. Writer made coordFence per-namespace
+  (scalar was self-healing — sound). New vars GATED behind EnableSharding → inertness proven (stage0/1/2
+  EXACT pre-Phase-4 counts) → stage3/4/live + 25 prior controls carried. `stage5_sharding` (bounded
+  `{s1,s2}×{L1,L2}×{b1,b2}`, heavy features off — full cross-product won't converge) HOLD 983.9M. Two new
+  controls: sab_reducerownsfence→INV_NO_DANGLE, sab_crosssharddisplacement→INV_NO_LOSS. 27 controls VIOLATE,
+  3 witnesses, no UNEXPECTED PASS.
+- **Code T2-T8 (subagent-driven, all reviews clean):** T2 `bb7a07a5b4f` gc_shards knob (snap_shards→gc_shards);
+  T3 `6c9140211b7` `blobShard`=(hash>>64)%gc_shards + ShardScatter (CasGcSnap deleted → new rule); T4
+  `0a3c1c62227` ShardReducer delegates to existing `foldDeltasIntoGeneration` (no divergent path); T5
+  `57cccef654c` manifestCleanupShard = std::hash<ManifestId>%gc_shards (qualified, not ref-only); T6
+  `d21a8a89ef5` removed the implicit shard-0 pin → gated routing (gc_shards==1 untouched; >1 partitions by
+  blobShard), CoordinatorPlan policy, scheduler unchanged (work-dedup lease + disjoint key namespaces); T7
+  `25eeeccc45a` gc_shards=1 in-degree equivalence; T8 `62c20f3339d` two-replica disjoint + pre-seal
+  invisibility + post-seal merge. Full `Cas*:Ca*` 376 ran / 369 passed / 1 = baseline B3.
+- **T9 soak INFEASIBLE → B13.** docker+harness+server-rebuild OK, but the integration MinIO image predates
+  S3 `If-Match` conditional delete that `CasProbe` step-6 hard-requires → server won't start (blocks ALL CA
+  S3 integration tests, pre-existing). Test module `tests/integration/test_cas_gc_sharded/` committed
+  `pytest.mark.skip` with reason. **Soak prep CAUGHT+FIXED a latent bug** `209d4ff1462`: `gc_shards` in
+  PoolConfig was never written to the initial GcState (XML config a no-op; all pools silently gc_shards=1) —
+  threaded `<gc_shards>` through MetadataStorageFactory/ContentAddressedMetadataStorage + set on first lease
+  acquire. Re-verified: rebuild + `Cas*:Ca*` 369 passed / 1=B3 (no regression). Phase 4 DONE.
+- Next: **Phase 5** (retire-token optimization — the final phase).
