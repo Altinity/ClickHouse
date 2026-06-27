@@ -242,6 +242,23 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
     `gtest_cas_gc_round.cpp::SharedBlobSparedUntilBothRefsDrop`. Either cross-reference it from the b140
     file or drop `gtest_cas_b140_dangle.cpp` as redundant.
 
+- **B11 — round-summary `objects_deleted` undercounts: it omits manifest-body (tree) deletes (soak finding,
+  introspection only).** Severity: low (the `system.content_addressed_log` per-event audit is correct and
+  complete; only the aggregated round-summary counter is misleading). Found in the post-switch scoped chaos
+  soak (2026-06-27, branch `cas-gc-part-manifest-impl`, seed 20260627, 45m timeline, GREEN/`PHASE3 OK`,
+  `dangling=0` at all 4 checkpoints). Where: `Core/CasGc.cpp` — `report.deleted` (which feeds the
+  `content_addressed_garbage_collection_log.objects_deleted` round-summary column) is incremented ONLY in
+  the per-blob outcome loop (`OutcomeKind::Deleted`, ~line 699). The separate manifest-body delete site at
+  the recheck tail (`deleteExact(layout.manifestKey(id), token)`, ~line 717, which emits a `TreeDelete`
+  event) does NOT increment `report.deleted`. Observed live: the round summary showed `objects_deleted=0`
+  for all rounds while `system.content_addressed_log` recorded `tree_delete=13078` — i.e. GC was performing
+  substantial real reclaim, but the round-summary counter read zero. (`blob_delete=0` was separately
+  CORRECT behavior here: content dedup kept every blob's in-degree > 0, so the fold-through-fence recheck
+  correctly spared all 939 retired blob candidates — R0 no-loss exercised, not a GC stall.) Fix: either add
+  a `manifests_deleted`/`tree_deleted` column to the round summary, or fold the manifest deletes into
+  `report.deleted` (and rename it to reflect "objects" = blobs + manifests). Low priority — operators with
+  the event log can already reconstruct the true count; this only de-confuses the at-a-glance summary.
+
 ## Resolved
 
 - **B9 — GC generation pruning: DONE.** `Gc::pruneSupersededGenerations` (called in the recheck round tail
