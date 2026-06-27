@@ -195,12 +195,22 @@ RunFileReader::RunFileReader(ReadBuffer & in_) : in(in_)
 
 void RunFileReader::loadFooter()
 {
-    /// Locate the footer via the trailing footer_len u32; `full` already holds the whole run.
-    if (full.size() < 4)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: truncated");
+    /// SECURITY: every length/offset read here comes from UNTRUSTED bytes. We must bound-check the
+    /// trailer and verify the footer CRC BEFORE trusting any in-footer length, then still bound-check
+    /// every offset against the footer body while parsing (defense in depth). Under libc++ release
+    /// hardening `operator[]` is not bounds-checked (heap over-read = UB) and `substr(pos, n)` with
+    /// `pos > size()` throws std::out_of_range — which decodeGuarded does NOT catch. So: no unchecked
+    /// `operator[]`/`substr` on untrusted offsets; everything maps to CORRUPTED_DATA (a DB::Exception).
 
+    /// `requireBytes(pos, n)`: assert that [pos, pos+n) lies fully inside `full`, fail-closed otherwise.
+    auto requireBytes = [&](size_t pos, size_t n)
+    {
+        if (pos > full.size() || n > full.size() - pos)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: footer field out of bounds");
+    };
     auto le32at = [&](size_t off) -> uint32_t
     {
+        requireBytes(off, 4);
         uint32_t v = 0;
         for (int i = 0; i < 4; ++i)
             v |= static_cast<uint32_t>(static_cast<uint8_t>(full[off + i])) << (8 * i);
@@ -208,36 +218,65 @@ void RunFileReader::loadFooter()
     };
     auto le64at = [&](size_t off) -> uint64_t
     {
+        requireBytes(off, 8);
         uint64_t v = 0;
         for (int i = 0; i < 8; ++i)
             v |= static_cast<uint64_t>(static_cast<uint8_t>(full[off + i])) << (8 * i);
         return v;
     };
 
+    /// 1. Bound-check the trailer and locate the footer body. The smallest possible footer body is
+    /// block_count(u32) + total_count(u64) + footer_crc(u32) = 16 bytes; footer_len counts the body
+    /// plus its own trailing u32, so footer_len >= 16 + 4 = 20. The footer must also start at or after
+    /// the 13-byte header.
+    constexpr size_t kHeaderLen = 13;
+    constexpr size_t kMinFooterBody = 4 + 8 + 4;            /// block_count + total_count + footer_crc
+    constexpr size_t kMinFooterLen = kMinFooterBody + 4;    /// + the trailing footer_len u32 itself
+    if (full.size() < 4)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: truncated");
     const uint32_t footer_len = le32at(full.size() - 4);
-    if (footer_len < 4 || footer_len > full.size())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: bad footer_len");
+    if (footer_len < kMinFooterLen || footer_len > full.size())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: bad footer_len {}", footer_len);
     const size_t footer_start = full.size() - footer_len;   /// start of footer body
-    size_t pos = footer_start;
+    if (footer_start < kHeaderLen)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: footer overlaps header");
     const size_t footer_body_end = full.size() - 4;         /// excludes the trailer u32
+    const size_t crc_pos = footer_body_end - 4;             /// the stored footer crc u32
 
+    /// 2. Verify the footer CRC FIRST, over the now-known, fully-present byte range
+    /// [footer_start, crc_pos). Only after this passes do we trust the in-footer length fields.
+    const uint32_t want_crc = le32at(crc_pos);
+    const std::string_view footer_body(full.data() + footer_start, crc_pos - footer_start);
+    if (crc32cOf(footer_body) != want_crc)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: footer crc mismatch");
+
+    /// 3. Parse the CRC-validated footer region. Still bound-check every offset/length against the
+    /// footer body (defense in depth): a CRC-valid-but-self-inconsistent footer must fail closed, not
+    /// over-read. Reads must stay within [footer_start, crc_pos).
+    auto requireInFooterBody = [&](size_t pos, size_t n)
+    {
+        if (pos > crc_pos || n > crc_pos - pos)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: footer entry out of bounds");
+    };
+
+    size_t pos = footer_start;
     const uint32_t block_count = le32at(pos); pos += 4;
     index.clear();
-    index.reserve(block_count);
+    index.reserve(std::min<size_t>(block_count, 64));       /// cap reservation on untrusted count
     for (uint32_t b = 0; b < block_count; ++b)
     {
         BlockIndexEntry e;
-        e.block_offset = le64at(pos); pos += 8;
-        uint32_t mn = le32at(pos); pos += 4; e.min_key = full.substr(pos, mn); pos += mn;
-        uint32_t mx = le32at(pos); pos += 4; e.max_key = full.substr(pos, mx); pos += mx;
+        requireInFooterBody(pos, 8); e.block_offset = le64at(pos); pos += 8;
+        requireInFooterBody(pos, 4); uint32_t mn = le32at(pos); pos += 4;
+        requireInFooterBody(pos, mn); e.min_key.assign(full.data() + pos, mn); pos += mn;
+        requireInFooterBody(pos, 4); uint32_t mx = le32at(pos); pos += 4;
+        requireInFooterBody(pos, mx); e.max_key.assign(full.data() + pos, mx); pos += mx;
         index.push_back(std::move(e));
     }
-    total_count = le64at(pos); pos += 8;
-    /// crc check over the footer body (everything before the trailing crc + footer_len).
-    const uint32_t want_crc = le32at(pos);
-    const std::string_view footer_body(full.data() + footer_start, (footer_body_end - 4) - footer_start);
-    if (crc32cOf(footer_body) != want_crc)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: footer crc mismatch");
+    requireInFooterBody(pos, 8); total_count = le64at(pos); pos += 8;
+    /// The block index must consume exactly the footer body up to the stored crc (no trailing slack).
+    if (pos != crc_pos)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: footer length inconsistent");
 }
 
 bool RunFileReader::loadBlock(size_t block_no)
@@ -247,8 +286,16 @@ bool RunFileReader::loadBlock(size_t block_no)
         exhausted = true;
         return false;
     }
+    /// Block offsets came from the CRC-validated footer, but harden anyway (N4): every read is
+    /// bound-checked against `full`, so a self-inconsistent block fails closed, never over-reads.
+    auto requireBytes = [&](size_t pos, size_t n)
+    {
+        if (pos > full.size() || n > full.size() - pos)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: block field out of bounds");
+    };
     auto le32at = [&](size_t off) -> uint32_t
     {
+        requireBytes(off, 4);
         uint32_t v = 0;
         for (int i = 0; i < 4; ++i)
             v |= static_cast<uint32_t>(static_cast<uint8_t>(full[off + i])) << (8 * i);
@@ -257,11 +304,14 @@ bool RunFileReader::loadBlock(size_t block_no)
 
     size_t off = index[block_no].block_offset;
     const uint32_t block_len = le32at(off); off += 4;
+    requireBytes(off, block_len);                          /// the whole block body must be present
     const size_t block_end = off + block_len;
     const uint32_t rec_count = le32at(off); off += 4;
-    uint32_t mn = le32at(off); off += 4; off += mn;        /// skip min_key
-    uint32_t mx = le32at(off); off += 4; off += mx;        /// skip max_key
+    uint32_t mn = le32at(off); off += 4; requireBytes(off, mn); off += mn;   /// skip min_key
+    uint32_t mx = le32at(off); off += 4; requireBytes(off, mx); off += mx;   /// skip max_key
     const uint32_t stored_crc = le32at(off); off += 4;
+    if (off > block_end)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: block header exceeds block");
     const std::string_view payload(full.data() + off, block_end - off);
     if (crc32cOf(payload) != stored_crc)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: block crc mismatch");

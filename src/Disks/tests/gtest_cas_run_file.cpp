@@ -130,6 +130,135 @@ TEST(CasRunFile, CorruptedPayloadFailsClosed)
     }
 }
 
+namespace
+{
+
+/// Run `body`, assert it throws a DB::Exception with code CORRUPTED_DATA. No std::out_of_range /
+/// std::length_error / UB may escape: any non-DB::Exception is an explicit test failure.
+template <typename F>
+void expectCorruptedData(const char * what, F && body)
+{
+    try
+    {
+        body();
+        FAIL() << "expected CORRUPTED_DATA for " << what;
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << what << ": " << e.message();
+    }
+    catch (const std::exception & e)
+    {
+        FAIL() << what << ": escaping std::exception (not fail-closed): " << e.what();
+    }
+}
+
+/// Construct a reader over `bytes` and drain it fully (forces footer + every block to be parsed).
+void constructAndDrain(const String & bytes)
+{
+    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
+    RunFileReader r(in);
+    String k, p;
+    while (r.next(k, p)) {}
+}
+
+}
+
+TEST(CasRunFile, EmptyBufferFailsClosed)
+{
+    expectCorruptedData("empty buffer", [] { constructAndDrain(String{}); });
+}
+
+TEST(CasRunFile, GarbageBytesFailClosed)
+{
+    /// Random-ish bytes with no valid "CARN" magic.
+    String garbage;
+    for (int i = 0; i < 257; ++i)
+        garbage.push_back(static_cast<char>((i * 37 + 11) & 0xFF));
+    expectCorruptedData("garbage bytes", [&] { constructAndDrain(garbage); });
+}
+
+TEST(CasRunFile, CorruptedFooterLenTrailerFailsClosed)
+{
+    const String valid = writeRun({{"aa", "1"}, {"bb", "22"}, {"cc", "333"}});
+
+    /// footer_len trailer is the last 4 bytes (LE u32). Set it huge.
+    {
+        String b = valid;
+        const size_t off = b.size() - 4;
+        b[off + 0] = static_cast<char>(0xFF);
+        b[off + 1] = static_cast<char>(0xFF);
+        b[off + 2] = static_cast<char>(0xFF);
+        b[off + 3] = static_cast<char>(0xFF);
+        expectCorruptedData("huge footer_len", [&] { constructAndDrain(b); });
+    }
+    /// Set it tiny (smaller than the minimum footer body).
+    {
+        String b = valid;
+        const size_t off = b.size() - 4;
+        b[off + 0] = static_cast<char>(0x01);
+        b[off + 1] = 0;
+        b[off + 2] = 0;
+        b[off + 3] = 0;
+        expectCorruptedData("tiny footer_len", [&] { constructAndDrain(b); });
+    }
+    /// Set it to zero.
+    {
+        String b = valid;
+        const size_t off = b.size() - 4;
+        b[off + 0] = 0;
+        b[off + 1] = 0;
+        b[off + 2] = 0;
+        b[off + 3] = 0;
+        expectCorruptedData("zero footer_len", [&] { constructAndDrain(b); });
+    }
+}
+
+TEST(CasRunFile, CorruptedBlockCountInFooterFailsClosed)
+{
+    /// Force several small blocks so the footer index is non-trivial.
+    std::vector<std::pair<String, String>> recs;
+    for (int i = 0; i < 40; ++i)
+    {
+        char k[8];
+        std::snprintf(k, sizeof(k), "k%05d", i);
+        recs.emplace_back(String(k), String("v") + std::to_string(i));
+    }
+    const String valid = writeRun(recs, /*block_size*/ 32);
+
+    /// footer_len is the trailing u32; footer body starts at size()-footer_len. block_count is the
+    /// first u32 of the footer body. Set it absurdly large -> would over-read parsing per-block
+    /// entries, must fail closed (and the footer CRC must catch the mutation regardless).
+    String b = valid;
+    const size_t footer_len = static_cast<uint8_t>(b[b.size() - 4])
+        | (static_cast<uint32_t>(static_cast<uint8_t>(b[b.size() - 3])) << 8)
+        | (static_cast<uint32_t>(static_cast<uint8_t>(b[b.size() - 2])) << 16)
+        | (static_cast<uint32_t>(static_cast<uint8_t>(b[b.size() - 1])) << 24);
+    const size_t footer_start = b.size() - footer_len;
+    b[footer_start + 0] = static_cast<char>(0xFF);
+    b[footer_start + 1] = static_cast<char>(0xFF);
+    b[footer_start + 2] = static_cast<char>(0xFF);
+    b[footer_start + 3] = static_cast<char>(0x7F);
+    expectCorruptedData("huge block_count", [&] { constructAndDrain(b); });
+}
+
+TEST(CasRunFile, TruncationSweepFailsClosed)
+{
+    /// A multi-block run; truncate at many lengths past the header and require every prefix to
+    /// fail closed (never crash, never throw std::out_of_range).
+    std::vector<std::pair<String, String>> recs;
+    for (int i = 0; i < 60; ++i)
+    {
+        char k[8];
+        std::snprintf(k, sizeof(k), "k%05d", i);
+        recs.emplace_back(String(k), String("payload-") + std::to_string(i));
+    }
+    const String valid = writeRun(recs, /*block_size*/ 32);
+    constexpr size_t header_len = 13;
+    for (size_t k = header_len + 1; k < valid.size(); ++k)
+        expectCorruptedData("truncated prefix", [&] { constructAndDrain(valid.substr(0, k)); });
+}
+
 TEST(CasRunFile, MergeTwoDisjointRuns)
 {
     const String a = writeRun({{"a", "1"}, {"c", "3"}, {"e", "5"}});

@@ -111,6 +111,31 @@ TEST(CasManifestCodec, TruncatedFailsClosed)
     }
 }
 
+TEST(CasManifestCodec, TruncationSweepFailsClosed)
+{
+    /// Sweep many truncation lengths over a valid encoded PartManifest. Every prefix must fail
+    /// closed with CORRUPTED_DATA — never crash, never let a std::out_of_range escape (the embedded
+    /// RunFile footer parse must be hardened against truncated/corrupt length fields).
+    const String bytes = encodePartManifest(sample());
+    for (size_t k = 1; k < bytes.size(); ++k)
+    {
+        const String truncated = bytes.substr(0, k);
+        try
+        {
+            decodePartManifest(truncated);
+            FAIL() << "expected CORRUPTED_DATA for truncation length " << k;
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << "length " << k << ": " << e.message();
+        }
+        catch (const std::exception & e)
+        {
+            FAIL() << "length " << k << ": escaping std::exception (not fail-closed): " << e.what();
+        }
+    }
+}
+
 TEST(CasManifestCodec, EmptyEntriesRoundTrips)
 {
     PartManifest m = sample();

@@ -119,9 +119,12 @@ private:
 
 /// K-way merge over several sorted `RunFileReader`s. `next` advances all readers positioned at the
 /// smallest key and returns that key together with EVERY payload stored for it (across all inputs and
-/// across duplicate-key records within one input). Memory is O(inputs * block_size): only the current
-/// front record of each reader plus one loaded block per reader is resident. Inputs must share a key
-/// ordering (they do: keys are byte-compared).
+/// across duplicate-key records within one input). Inputs must share a key ordering (they do: keys are
+/// byte-compared).
+///
+/// Memory: the O(inputs * block_size) bound applies once block-ranged reads replace the Phase-1a
+/// whole-run `full` materialization. TODAY each `RunFileReader` materializes its entire run into
+/// `full`, so resident memory is O(sum of run sizes); the merge front itself is O(inputs * block_size).
 class RunMerger
 {
 public:
