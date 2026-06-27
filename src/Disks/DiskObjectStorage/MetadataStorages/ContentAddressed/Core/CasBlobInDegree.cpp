@@ -185,4 +185,15 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout
     return result;
 }
 
+int64_t inDegreeInGeneration(Backend & backend, const Layout & layout,
+                             uint64_t generation, uint64_t shard, const UInt128 & blob_hash)
+{
+    /// The run is sorted by hash and carries at most one row per key; absent => 0 (never pinned, or a
+    /// prior-gen zero that was dropped). An explicit 0-row (transitioned this gen) also reads as 0.
+    for (const auto & [hash, count] : readGenerationRows(backend, layout, generation, shard))
+        if (hash == blob_hash)
+            return count;
+    return 0;
+}
+
 }

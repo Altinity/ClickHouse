@@ -1,11 +1,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasClosureWalk.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 
 #include <Common/Exception.h>
 
-#include <functional>
 #include <set>
 #include <unordered_map>
 
@@ -19,20 +20,15 @@ namespace DB::Cas
 
 namespace
 {
-/// Report progress every PROGRESS_PAGES list pages so a long/slow scan is visibly working (#5).
 constexpr uint64_t PROGRESS_PAGES = 16;
 
 using Deadline = std::optional<std::chrono::steady_clock::time_point>;
 
-/// Bound the WHOLE scan (checked between pages/refs): a slow-but-progressing scan surfaces a clear
-/// error instead of an opaque hang. (A single page stuck in S3-client retries is bounded by the
-/// disk's S3 retry/timeout settings, not here.)
 void checkDeadline(const Deadline & deadline, std::string_view phase)
 {
     if (deadline && std::chrono::steady_clock::now() > *deadline)
         throw Exception(ErrorCodes::TIMEOUT_EXCEEDED,
-            "fsck: exceeded the deadline during '{}' — likely a RustFS LIST stall under load. "
-            "Run against a QUIESCED pool, raise --timeout, or lower the disk's S3 retry budget (see B158).", phase);
+            "fsck: exceeded the deadline during '{}' — run against a QUIESCED pool or raise --timeout.", phase);
 }
 
 void listAll(Backend & backend, const String & prefix, std::unordered_map<String, uint64_t> & out,
@@ -56,6 +52,33 @@ void listAll(Backend & backend, const String & prefix, std::unordered_map<String
     if (on_progress)
         on_progress(phase, out.size(), pages);
 }
+
+/// Parse (writer_instance_id, build_sequence) from a manifest object key of the shape
+/// `<ns-prefix>_manifests/<writer>/<build_seq>/<aa>/<inst>.proto`. Returns false on a malformed key.
+bool parseBuildPrefix(const String & key, const String & manifests_prefix, BuildPrefix & out)
+{
+    if (!key.starts_with(manifests_prefix))
+        return false;
+    const String rest = key.substr(manifests_prefix.size());
+    const size_t s1 = rest.find('/');
+    if (s1 == String::npos)
+        return false;
+    const size_t s2 = rest.find('/', s1 + 1);
+    if (s2 == String::npos)
+        return false;
+    out.writer_instance_id = rest.substr(0, s1);
+    const String seq_str = rest.substr(s1 + 1, s2 - s1 - 1);
+    try
+    {
+        size_t consumed = 0;
+        out.build_sequence = std::stoull(seq_str, &consumed);
+        return consumed == seq_str.size();
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
 }
 
 FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
@@ -66,44 +89,12 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
 
     FsckReport report;
 
-    std::unordered_map<String, std::vector<String>> reachable;
-    std::set<String> reachable_blobs;
-
-    /// One closure traversal (CasClosureWalk) drives the fsck reachability accounting. The seen-set
-    /// dedup, the Subtree recursion, and the Inline skip all live inside `closureWalk`; here we only
-    /// record what each tree/edge makes reachable, keyed by the ref `label`.
-    auto walk = [&](const TreeId & root, const String & label)
-    {
-        auto backendSource = [&](const UInt128 & node) -> std::vector<TreeEntry>
-        {
-            return store.readTree(TreeId(u128ToHex(node)));
-        };
-        auto on_tree = [&](const UInt128 & tree)
-        {
-            const String tkey = layout.treeKey(TreeId(u128ToHex(tree)));
-            if (detail)
-                reachable[tkey].push_back(label);
-            else
-                reachable.try_emplace(tkey);
-        };
-        auto on_edge = [&](const UInt128 & /*parent_tree*/, const TreeEntry & e)
-        {
-            if (e.placement == Placement::Blob)
-            {
-                const String bkey = layout.blobKey(BlobId(u128ToHex(e.file_hash)));
-                if (detail)
-                    reachable[bkey].push_back(label);
-                else
-                    reachable.try_emplace(bkey);
-                reachable_blobs.insert(bkey);
-                ++report.total_blob_refs;
-                report.referenced_logical_bytes += e.file_size;
-            }
-            /// Placement::Subtree yields an edge here too, but the child tree itself is recorded by
-            /// `on_tree` when `closureWalk` recurses into it — nothing to account for the edge.
-        };
-        closureWalk(hexToU128(root.string()), backendSource, on_tree, on_edge);
-    };
+    /// OQ8 manifest audit. Reachability is recomputed from the AUTHORITATIVE refs (never from gc state):
+    /// for each namespace, each committed ref resolves to a ManifestId; read its body; a committed ref
+    /// naming a MISSING body is an ERROR (Dangling); a present body whose blobs are missing is an ERROR.
+    std::set<String> reachable_blobs;        /// blob object keys named by a live owner
+    std::set<String> owned_manifest_keys;    /// manifest object keys named by a committed owner
+    std::unordered_map<String, std::vector<String>> blob_labels;   /// blob key -> "ns/ref" (detail)
 
     uint64_t refs_walked = 0;
     for (const String & ns_str : store.listNamespaces(""))
@@ -111,52 +102,87 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
         const RootNamespace ns{ns_str};
         for (const auto & [ref_name, resolved] : store.listRefs(ns))
         {
-            walk(resolved.tree_id, ns_str + "/" + ref_name);
+            const ManifestId id = resolved.manifest_id;
+            const String mkey = layout.manifestKey(id);
+            owned_manifest_keys.insert(mkey);
+            const String label = ns_str + "/" + ref_name;
+
+            const auto got = backend.get(mkey);
+            if (!got)
+            {
+                /// A committed ref naming a missing manifest body — INV-NO-DANGLE surfaced (error).
+                ++report.dangling;
+                if (detail || true)
+                {
+                    FsckObject o;
+                    o.key = mkey;
+                    o.kind = ObjectKind::Blob;   /// manifests have no ObjectKind; reuse Blob as the generic kind
+                    o.size = 0;
+                    o.cls = FsckClass::Dangling;
+                    o.reachable_from = {label};
+                    report.objects.push_back(std::move(o));
+                }
+                ++refs_walked;
+                continue;
+            }
+
+            PartManifest body = decodePartManifest(got->bytes);
+            if (!refMatchesBody(id.ref, body) || !manifestNamespaceMatches(id.root_namespace, body))
+            {
+                ++report.dangling;
+                FsckObject o;
+                o.key = mkey;
+                o.kind = ObjectKind::Blob;
+                o.size = got->bytes.size();
+                o.cls = FsckClass::Dangling;
+                o.reachable_from = {label};
+                report.objects.push_back(std::move(o));
+                ++refs_walked;
+                continue;
+            }
+
+            for (const ManifestEntry & e : body.entries)
+            {
+                if (e.placement != EntryPlacement::Blob)
+                    continue;
+                const String bkey = layout.blobKey(BlobId(u128ToHex(e.blob_hash)));
+                reachable_blobs.insert(bkey);
+                ++report.total_blob_refs;
+                report.referenced_logical_bytes += e.blob_size;
+                if (detail)
+                    blob_labels[bkey].push_back(label);
+            }
+
             ++refs_walked;
-            checkDeadline(deadline, "walking refs");   /// every ref (cheap) — fires even for pools < 64 refs
+            checkDeadline(deadline, "walking refs");
             if (on_progress && refs_walked % 64 == 0)
-                on_progress("walking refs", reachable.size(), refs_walked);
+                on_progress("walking refs", reachable_blobs.size(), refs_walked);
         }
     }
     report.distinct_blobs = reachable_blobs.size();
 
-    std::unordered_map<String, uint64_t> present;
-    listAll(backend, layout.blobsPrefix(), present, on_progress, deadline, "listing blobs");
-    listAll(backend, layout.treesPrefix(), present, on_progress, deadline, "listing trees");
-    for (const auto & [_, sz] : present)
+    /// Physical listing: blobs + manifest bodies.
+    std::unordered_map<String, uint64_t> present_blobs;
+    listAll(backend, layout.blobsPrefix(), present_blobs, on_progress, deadline, "listing blobs");
+    for (const auto & [_, sz] : present_blobs)
         report.physical_bytes += sz;
 
-    auto kindOf = [&](const String & key)
+    /// Reachable blobs must be present (HEAD-confirm against LIST lag before declaring loss).
+    for (const String & bkey : reachable_blobs)
     {
-        if (key.starts_with(layout.blobsPrefix())) return ObjectKind::Blob;
-        return ObjectKind::Tree;
-    };
-
-    for (const auto & [key, labels] : reachable)
-    {
-        auto it = present.find(key);
-        bool exists = it != present.end();
+        auto it = present_blobs.find(bkey);
+        bool exists = it != present_blobs.end();
         uint64_t size = exists ? it->second : 0;
-
-        /// INV-NO-LOSS is SAFETY-critical, so it must be authoritative against LIST lag. A LIST can lag
-        /// for recently-written objects (eventual consistency / mid-churn), so a reachable object that is
-        /// actually PRESENT may be absent from a lagging LIST. Before declaring loss, HEAD-confirm the
-        /// suspected-dangling key — `head` is authoritative for presence, LIST is merely advisory. Only a
-        /// reachable object that HEAD ALSO cannot find is truly dangling. We HEAD only the reachable∖LIST
-        /// set (~0 in the healthy case), so this stays cheap.
         if (!exists)
         {
-            const HeadResult h = backend.head(key);
+            const HeadResult h = backend.head(bkey);
             if (h.exists)
             {
                 exists = true;
                 size = h.size;
-                /// LIST lagged behind a present object — count its bytes in physical accounting too,
-                /// since the LIST-based scan above missed it.
                 report.physical_bytes += h.size;
             }
         }
-
         if (exists)
             ++report.reachable;
         else
@@ -164,27 +190,63 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
         if (detail || !exists)
         {
             FsckObject o;
-            o.key = key;
-            o.kind = kindOf(key);
+            o.key = bkey;
+            o.kind = ObjectKind::Blob;
             o.size = size;
             o.cls = exists ? FsckClass::Reachable : FsckClass::Dangling;
-            o.reachable_from = labels;
+            if (detail)
+                if (const auto lit = blob_labels.find(bkey); lit != blob_labels.end())
+                    o.reachable_from = lit->second;
             report.objects.push_back(std::move(o));
         }
     }
-    for (const auto & [key, sz] : present)
+
+    /// Unreachable present blobs (in-grace debris or a leak) — info, never an error.
+    for (const auto & [bkey, sz] : present_blobs)
     {
-        if (reachable.contains(key))
+        if (reachable_blobs.count(bkey))
             continue;
         ++report.unreachable;
         if (detail)
         {
             FsckObject o;
-            o.key = key;
-            o.kind = kindOf(key);
+            o.key = bkey;
+            o.kind = ObjectKind::Blob;
             o.size = sz;
             o.cls = FsckClass::Unreachable;
             report.objects.push_back(std::move(o));
+        }
+    }
+
+    /// Pre-precommit manifest debris: a `_manifests/` body with no committed owner. An ELIGIBLE prefix's
+    /// orphan is reclaimable debris => INFO (Unreachable); a non-eligible (in-flight) one is also info,
+    /// never an error. The owner-visible missing-body case is the error above.
+    for (const String & ns_str : store.listNamespaces(""))
+    {
+        const RootNamespace ns{ns_str};
+        const String manifests_prefix = layout.rootNamespacePrefix(ns) + "_manifests/";
+        std::unordered_map<String, uint64_t> manifest_bodies;
+        listAll(backend, manifests_prefix, manifest_bodies, on_progress, deadline, "listing manifests");
+        for (const auto & [mkey, sz] : manifest_bodies)
+        {
+            if (owned_manifest_keys.count(mkey))
+                continue;   /// owned by a committed ref — accounted above
+            ++report.unreachable;
+            if (detail)
+            {
+                BuildPrefix prefix;
+                const bool parsed = parseBuildPrefix(mkey, manifests_prefix, prefix);
+                FsckObject o;
+                o.key = mkey;
+                o.kind = ObjectKind::Blob;
+                o.size = sz;
+                o.cls = FsckClass::Unreachable;
+                if (parsed && prefixEligible(store, prefix))
+                    o.reachable_from = {"reclaimable-pre-precommit"};
+                else
+                    o.reachable_from = {"in-flight-pre-precommit"};
+                report.objects.push_back(std::move(o));
+            }
         }
     }
 

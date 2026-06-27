@@ -18,9 +18,9 @@ constexpr uint32_t G_BUILD = 1;
 enum class FormatId : uint16_t
 {
     Blob = 1,
-    Tree = 2,
+    /// 2 (Tree) and 4 (GcSnap) retired in the rev. 15 root-local part-manifest redesign — no on-disk
+    /// compat to honor (CA pre-release). The survivors keep their numeric values; no two share a value.
     Manifest = 3,
-    GcSnap = 4,
     GcState = 5,
     RetiredSet = 6,
     Watermark = 7,

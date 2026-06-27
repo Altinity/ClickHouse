@@ -29,9 +29,7 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
     switch (id)
     {
         case FormatId::Blob:
-        case FormatId::Tree:
         case FormatId::Manifest:
-        case FormatId::GcSnap:
         case FormatId::GcState:
         case FormatId::RetiredSet:
         case FormatId::Watermark:
@@ -55,7 +53,6 @@ uint32_t magicFor(FormatId id)
     switch (id)
     {
         case FormatId::Blob:          return 0x4C424143u; /// "CABL"
-        case FormatId::Tree:          return 0x52544143u; /// "CATR"
         case FormatId::Manifest:      return 0x53524143u; /// "CARS"
         case FormatId::PoolMeta:      return 0x4D504143u; /// "CAPM"
         case FormatId::Watermark:     return 0x4D574143u; /// "CAWM"
@@ -67,7 +64,6 @@ uint32_t magicFor(FormatId id)
         case FormatId::RunFile:        return 0x4E524143u; /// "CARN"
         case FormatId::FoldSeal:       return 0x53464143u; /// "CAFS"
         case FormatId::CompletionSeal: return 0x53434143u; /// "CACS"
-        case FormatId::GcSnap:
         case FormatId::Roster:
             break;
     }

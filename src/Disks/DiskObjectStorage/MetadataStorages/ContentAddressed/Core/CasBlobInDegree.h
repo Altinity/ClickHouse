@@ -40,4 +40,10 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
 std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout,
                                         uint64_t generation, uint64_t shard);
 
+/// The in-degree of one blob in the sealed (generation, shard) run: 0 when the blob is absent from the
+/// run (or written as an explicit transitioned-to-0 row), else its count. Used by the recheck's
+/// per-candidate spare/delete decision and by tests.
+int64_t inDegreeInGeneration(Backend & backend, const Layout & layout,
+                             uint64_t generation, uint64_t shard, const UInt128 & blob_hash);
+
 }
