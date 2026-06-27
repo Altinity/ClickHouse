@@ -282,3 +282,22 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
     a just-trimmed shard re-reads one round, then a quiesced shard skips permanently (R1 steady-state win
     preserved). Optimal one-round skip (post-trim capture + model extension) deferred → **backlog B12**.
 - Next: review T4 redo → T5 (fail-closed ambiguity) → T6 (build + full `Cas*:Ca*` sweep + phase exit).
+
+### 2026-06-27 — PHASE 2 COMPLETE; Phase 3 (lazy trim) started
+- **T4 redo `559b8bd15ce`** — verified clean: `runRegularRound` byte-identical (no reorder), `fence`/`trim`
+  untouched; records the post-fence token `recheck` already reads; `SkipsQuiescedShard` confirms the
+  predicted 1-round settle (round 1 folds+trims → token moves → Read; round 2 nothing to trim → stable →
+  round 3 Skip). Also fixed a latent capability lie (`ObjectStorageBackend::list` advertised
+  `supportsListTokens()` but didn't surface a token — now populated from the ETag). `CasGc*` 59/0.
+- **T5 `cf95be90a6e`** — fail-closed hardening: `listRootShardTokens` reports ambiguous keys (a shard key
+  seen >1× in the LIST sweep) via out-param; `computeDiscoverDecisions` forces Read for ambiguous keys.
+  `DuplicateListBackend` test proves the guard overrides a would-be Skip (settled state, token would match).
+  Unobservable + no-prior-coverage cases pass pre-change (characterization locks).
+- **T6 phase exit `dfb963993fd`** — TLA+ gate re-confirmed (`stage5_tokendiff` HOLD; `sab_skipchangedshard`
+  → `INV_NO_DANGLE`); full `Cas*:Ca*` sweep **359 ran / 352 passed / 1 failed = `CaWiringOps.
+  FreezeViaHardLinksIntoShadow`** (pre-existing baseline-red B3 only). **Phase 2 token-diff discovery DONE.**
+- **Phase 3 (lazy trim) started.** Plan `…-phase3-lazy-fence-trim.md`: T1 model ext (EnableLazyTrim
+  positive stage + permanent `SabotageLazyFenceUnsafe` control proving why lazy fence is unsafe) = R0 gate;
+  T2 lazy trim only below sealed-generation coverage (`INV_JOURNAL_COVERAGE`); T3 sweep + exit. Lazy FENCE
+  stays dropped. Model-writer subagent dispatched (writes + fast-sanity only — no background TLC after the
+  Phase-2 poll-loop lesson); I run the heavy re-green + commit.
