@@ -351,3 +351,36 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   threaded `<gc_shards>` through MetadataStorageFactory/ContentAddressedMetadataStorage + set on first lease
   acquire. Re-verified: rebuild + `Cas*:Ca*` 369 passed / 1=B3 (no regression). Phase 4 DONE.
 - Next: **Phase 5** (retire-token optimization — the final phase).
+
+### 2026-06-27 — PHASE 5 model gate DONE; code DEFERRED (B14, design decision); REDESIGN COMPLETE through Phase 4
+- **T1 model gate `d56f4e84a4d`.** `EnableRetireTokenSource` + `SabotageStaleTokenOverDelete` + `storedTok`
+  (seal-time token). storedTok write GATED behind the flag → inertness (stage0/1/2 EXACT) → stage3/4/live +
+  27 controls carried. `stage5_retiretoken` (bounded) HOLD 3.5M on INV_NO_DANGLE/LOSS/RETURN +
+  `RetireTokenSourceComplete` (tightened to monotone `e.t ≤ tokOf[e.b]` — sound; plan's form wrongly failed
+  a never-edged present blob). `sab_staletokenoverdelete` VIOLATES **INV_NO_LOSS** (not INV_NO_RETURN: monotone
+  tokens preclude a dead token returning live; the over-delete is a LOSS of re-incarnated referenced bytes —
+  matches the plan's prose). 28 controls VIOLATE, 3 witnesses, no UNEXPECTED PASS.
+- **T2/T3 code DEFERRED → B14.** Investigation found the optimization is NOT realizable as planned: the
+  blob's incarnation token (ETag) is **not available at fold time without a HEAD** — `ManifestEntry` records
+  only `blob_hash`, not the storage token. Eliminating the per-candidate `retire` HEAD requires recording
+  the blob's committed ETag in the manifest payload (a core write-path / on-disk schema change coupling the
+  content-plane manifest to storage incarnations) — a design decision for the maintainer, NOT an autonomous
+  overnight core-schema change. The model gate stands as the safety proof; the current per-candidate-HEAD
+  `retire` is correct and shipped. No dead code committed. Lowest-stakes phase (R1 perf only).
+
+### 2026-06-27 — UNATTENDED RUN SUMMARY (Phases 0–5)
+- **Phase 0** R0 TLA+ gate; **Phase 1a** identity/codecs; **behavior switch (1b+1c+1d)** content-addressed-tree
+  → root-local part-manifest model, hardened (durability M1/M2/M3 + B9) + reviewed; **post-1d chaos soak CLEAN**
+  (caught the binary predated the switch, rebuilt, re-ran). **Phase 2** token-diff discovery (caught+reverted
+  an unsafe trim-before-recheck reorder → conservative skip ⊆ model-proven-safe, no model change). **Phase 3**
+  lazy trim. **Phase 4** target-sharded reducers R2 (caught+fixed the gc_shards XML no-op bug; soak infeasible
+  =B13 MinIO). **Phase 5** model-proven, code deferred =B14.
+- Method that held up: every TLA+ extension GATES new vars behind its flag → inertness proven (stage0/1/2 exact
+  counts) → existing stages carried, cheap re-greens. Big positive stages bounded when the full cross-product
+  won't converge. subagent-driven-development + per-task review caught two real safety issues (the trim reorder,
+  the gc_shards no-op) and one design blocker (B14). Infra: setsid-detached for long TLC + ScheduleWakeup poll;
+  Agent subagents for code (background bash is reaped).
+- **State:** all phase model gates GREEN + committed; Phases 0–4 code DONE + committed; full `Cas*:Ca*` 369
+  pass / 1 = pre-existing baseline-red B3. Open decisions: **B14** (Phase 5 manifest-token provenance) for the
+  maintainer; B13 (sharded soak needs newer MinIO); B3 (pre-existing freeze test). Branch
+  `cas-gc-part-manifest-impl` — NOT yet PR'd (a multi-phase branch; opening a PR is the maintainer's call).

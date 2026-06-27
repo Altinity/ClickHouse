@@ -294,6 +294,29 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   `209d4ff1462` by threading `<gc_shards>` through `MetadataStorageFactory`/`ContentAddressedMetadataStorage`
   and setting it on first lease acquire.
 
+- **B14 — Phase 5 retire-token optimization: CODE deferred — blocked on blob-token provenance (design
+  decision).** The Phase-5 model gate is committed GREEN (`d56f4e84a4d`): it PROVES that `retire` can
+  source `RetiredEntry.token` from a token captured into sealed generation state at fold time (`storedTok`)
+  instead of a per-candidate `backend.head`, with the delete staying exact (a stale stored token only
+  fails the match → under-delete/spared, never over-delete; `sab_staletokenoverdelete` → `INV_NO_LOSS`).
+  BUT the optimization is NOT realizable in code as planned: **the blob's incarnation token (ETag) is not
+  available at fold time without a HEAD.** `ManifestEntry` (`CasManifestCodec.h`) records only
+  `blob_hash`/`blob_size`/`placement` — NOT the blob's storage token; `BlobDelta` carries only hash+sign;
+  the in-degree run (`blobTargetRunKey`) stores only hash+count. The token is first obtained in `retire`
+  via `backend.head(blobKeyOf(...))` — exactly the HEAD Phase 5 wants to eliminate. To have the token in
+  sealed state without a HEAD, the writer would have to record the blob's committed ETag into the
+  `ManifestEntry` payload at commit time (`CasBuild`/`CasStore` already hold it from the `put` `PutResult`)
+  and plumb it manifest → `BlobDelta` → fold → in-degree run. That is a **manifest on-disk schema change**
+  that couples the content-plane manifest to storage incarnations — a design decision with real trade-offs
+  (manifest size grows by a token per entry; content/storage-separation), worth review, NOT an autonomous
+  overnight core-schema change. Alternatives: (a) manifest carries `blob_token` (cleanest realization,
+  enables HEAD-free fold-time capture; the recommended path if the size/coupling cost is acceptable);
+  (b) a batched fold-time HEAD into a token side-table (relocates rather than eliminates the HEAD — little
+  win); (c) leave it — the current per-candidate-HEAD `retire` is CORRECT and already shipped. Decision for
+  the maintainer. Until then the model gate stands as the safety proof and the GC behaves correctly with
+  the existing HEAD. Lowest-stakes phase (R1 perf only). Phase 5 Task 2/3 code NOT written (the field would
+  be an unpopulated no-op without the provenance); no dead code committed.
+
 ## Resolved
 
 - **B9 — GC generation pruning: DONE.** `Gc::pruneSupersededGenerations` (called in the recheck round tail
