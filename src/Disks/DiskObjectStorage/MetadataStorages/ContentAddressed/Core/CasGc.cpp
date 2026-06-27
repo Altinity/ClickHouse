@@ -863,11 +863,14 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     }
 }
 
-void Gc::trim(const FoldResult & folded, uint64_t /*round*/)
+void Gc::trim(FoldResult & folded, uint64_t /*round*/)
 {
     for (const auto & [ns, shard] : folded.root_shards)
     {
         const String cursor_key = cursorKey(ns, shard);
+        /// INV-JOURNAL-COVERAGE: source the trim cursor exclusively from the sealed CasFoldSeal
+        /// per-shard coverage. A shard absent from the sealed coverage has no provably-folded
+        /// records yet — trim nothing for it (no fallback to a looser cursor, per the invariant).
         const auto cov_it = folded.fold_seal.per_ns_shard.find(cursor_key);
         if (cov_it == folded.fold_seal.per_ns_shard.end())
             continue;
@@ -887,6 +890,10 @@ void Gc::trim(const FoldResult & folded, uint64_t /*round*/)
             std::erase_if(fresh.journal,
                 [&](const RootOwnerEvent & e) { return e.transition_version <= cursor; });
         });
+        /// Record the sealed cursor used for this shard's trim into the in-round completion seal
+        /// audit log. The completion seal is already written write-once before trim runs, so this
+        /// populates the in-memory context only — it is an audit annotation, not a decision input.
+        folded.completion_seal.trim_cursors[cursor_key] = cursor;
         /// B170: the journal trim for this shard (events provably folded into the durable generation).
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
@@ -894,9 +901,9 @@ void Gc::trim(const FoldResult & folded, uint64_t /*round*/)
             e.namespace_ = ns.string();
             e.object_kind = CasEventObjectKind::Root;
             e.outcome = "trimmed";
-            e.reason = "INV-JOURNAL-COVERAGE: trimmed owner events at or below the durable fold cursor";
+            e.reason = "INV-JOURNAL-COVERAGE: trimmed owner events at or below the sealed fold cursor";
             e.detail = {{"shard", std::to_string(shard)},
-                        {"trimmed_up_to_cursor", std::to_string(cursor)}};
+                        {"sealed_fold_cursor", std::to_string(cursor)}};
         });
     }
 }

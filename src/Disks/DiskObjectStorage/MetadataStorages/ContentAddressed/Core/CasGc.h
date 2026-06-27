@@ -223,10 +223,12 @@ private:
     void recheck(GcState & state, Token & state_token, FoldResult & folded, const RetireResult & retired,
                  RoundReport & report);
 
-    /// Trim (INV-JOURNAL-COVERAGE): drop owner events with transition_version <= the sealed folded_cursor
-    /// (the generation carrying those deltas is durable: fold/recheck sealed it before trim runs). Shards
-    /// with nothing to trim are not touched. The trim's own CAS bumps shard_version with no event.
-    void trim(const FoldResult & folded, uint64_t round);
+    /// Trim (INV-JOURNAL-COVERAGE): drop owner events with transition_version <= the sealed fold cursor,
+    /// sourced from `CasFoldSeal::per_ns_shard[cursorKey].folded_cursor` (the generation carrying those
+    /// deltas is durable: fold/recheck sealed it before trim runs). A shard absent from the sealed
+    /// coverage is not trimmed (no fallback to a looser cursor). The cursor used per shard is recorded
+    /// into `folded.completion_seal.trim_cursors` for the in-round audit log.
+    void trim(FoldResult & folded, uint64_t round);
 
     /// Discover the namespace universe from the registry (namespaces x ALL root_shards shards); shared by
     /// the fold and the resume re-fence. Absent registry => empty (fresh pool).

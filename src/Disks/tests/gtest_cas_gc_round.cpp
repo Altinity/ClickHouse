@@ -555,6 +555,89 @@ TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
 }
 
+/// INV-JOURNAL-COVERAGE: trim only removes journal records at or below the SEALED fold cursor
+/// (CasFoldSeal::per_ns_shard[ck].folded_cursor). Records with transition_version strictly above
+/// the sealed cursor survive trim, even when the journal still holds them. This test uses a
+/// fold-barrier scenario (a live precommit with no body) to produce a clamped cursor < shard_version,
+/// so the journal has both trimmed events (<= cursor) and retained events (> cursor) after one round.
+///
+/// A second assertion confirms that a shard whose coverage cursor is carried forward across rounds
+/// trims correctly on the second round — trim only removes records at or below the carried cursor.
+TEST(CasGcRound, TrimOnlyBelowSealedCoverage)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// Publish a committed ref at version 1: has a body, folds cleanly.
+    const ManifestRef r_committed = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r_committed, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t v1 = publishCommittedTransition(*backend, store->layout(), ns, "tbl1", std::nullopt, r_committed);
+
+    /// Add a live precommit with NO body at version 2: this triggers the fold barrier, clamping the
+    /// fold cursor at v1 (= v2 - 1). The fold seals cursor = v1; trim must remove the event at v1
+    /// but RETAIN the precommit event at v2 (above the sealed cursor).
+    const ManifestRef r_precommit = ref(2, 0xB2);
+    /// No writeManifestRaw for r_precommit: body is intentionally absent (fold barrier).
+    const uint64_t v2 = addPrecommitTransition(*backend, store->layout(), ns, DB::UInt128(9), "tbl2",
+                                               std::nullopt, r_precommit);
+    ASSERT_EQ(v2, v1 + 1);   /// ensure v2 = v1+1 so the cursor split is clear
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+
+    /// The fold cursor must be v1 (barrier halted at v2; resolved_through = v2-1 = v1).
+    const uint64_t cursor = foldCursorOf(*backend, store->layout(), ns, 0);
+    EXPECT_EQ(cursor, v1)
+        << "sealed fold cursor must equal the last clean-folded version (v1); barrier halted at v2";
+
+    /// Read the live shard journal and check the invariant:
+    ///   - event at v1 (transition_version <= cursor): removed by trim
+    ///   - event at v2 (transition_version > cursor): retained by trim
+    const auto shard_bytes = backend->get(store->layout().rootShardKey(ns, 0));
+    ASSERT_TRUE(shard_bytes.has_value()) << "root shard must exist after the round";
+    const RootShard root = decodeRootShard(shard_bytes->bytes);
+    for (const RootOwnerEvent & e : root.journal)
+    {
+        EXPECT_GT(e.transition_version, cursor)
+            << "INV-JOURNAL-COVERAGE: event at version " << e.transition_version
+            << " must be ABOVE the sealed cursor " << cursor << " (trim must not remove it)";
+    }
+    /// The precommit event (v2 > cursor) must survive trim.
+    const bool precommit_retained = std::any_of(root.journal.begin(), root.journal.end(),
+        [v2](const RootOwnerEvent & e) { return e.transition_version == v2; });
+    EXPECT_TRUE(precommit_retained)
+        << "the fold-barrier precommit event (v2=" << v2 << ") must be retained above the sealed cursor";
+    /// The committed event (v1 <= cursor) must be removed by trim.
+    const bool committed_removed = std::none_of(root.journal.begin(), root.journal.end(),
+        [v1](const RootOwnerEvent & e) { return e.transition_version == v1; });
+    EXPECT_TRUE(committed_removed)
+        << "the committed publish event (v1=" << v1 << " <= cursor=" << cursor << ") must be trimmed";
+
+    /// Second assertion: the cursor at v1 is carried forward into the next round. Run a second round
+    /// (the barrier is still present — the precommit body is still absent). The new fold cursor is
+    /// again v1 (barrier re-fires at v2, resolved_through = v1 again). Trim again removes events
+    /// <= v1 (none remain) and retains v2. The journal must still contain exactly the precommit event.
+    gc.runRegularRound();
+    const uint64_t cursor2 = foldCursorOf(*backend, store->layout(), ns, 0);
+    EXPECT_EQ(cursor2, v1)
+        << "carried-forward cursor must remain at v1 while the barrier is unresolved";
+    const auto shard2 = backend->get(store->layout().rootShardKey(ns, 0));
+    ASSERT_TRUE(shard2.has_value());
+    const RootShard root2 = decodeRootShard(shard2->bytes);
+    for (const RootOwnerEvent & e : root2.journal)
+    {
+        EXPECT_GT(e.transition_version, cursor2)
+            << "second round: event at version " << e.transition_version
+            << " must be ABOVE the carried-forward cursor " << cursor2;
+    }
+    const bool precommit_still_retained = std::any_of(root2.journal.begin(), root2.journal.end(),
+        [v2](const RootOwnerEvent & e) { return e.transition_version == v2; });
+    EXPECT_TRUE(precommit_still_retained)
+        << "second round: the precommit event (v2=" << v2 << ") must still be retained above the cursor";
+}
+
 /// ---- INTENTIONALLY NOT PORTED (covered elsewhere or obsolete in the manifest model) ----
 ///
 /// The removed snap/cascade/tree cases and where their behaviour now lives:
