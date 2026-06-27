@@ -475,3 +475,16 @@ didn't drive):
   (Phase 4 now has real integration validation under chaos).
 - Unit-verify of all 3 fixes together (recheck + promote + abandon) at HEAD: rebuild + `Cas*:Ca*` sweep
   in progress.
+
+### 2026-06-27 — all 3 HIGH fixes verified together GREEN; effort at a validated rest point
+- Rebuilt `unit_tests_dbms` at HEAD (recheck-shard `08e7dcf8f00` + promote `c93c1149694` + abandon
+  `77ad8b460e4`) → full `Cas*:Ca*` **380 ran / 373 passed / 6 skipped / 1 failed = baseline B3 only** (none
+  beyond baseline). All three review-found HIGH bugs fixed with no regression; the gc_shards==1 path stays
+  byte-identical (all unit tests use it).
+- **Validated rest point.** All five phases' TLA+ gates GREEN+committed; Phases 0–4 code done; Phase 4
+  sharded GC validated under chaos on RustFS (gc_shards=2); 3 HIGH protocol bugs from two review passes
+  fixed to match the proven model. Remaining items are maintainer decisions / deferred, NOT autonomous
+  work: **B14** (Phase-5 retire-token: manifest must carry blob_token — a content/storage-plane design
+  decision), **B8** (crashed-build precommit reclaim wiring for the converged model), **B7** (cross-server
+  relink), **B11/B12/B15** (counter / one-round-skip / plan-doc staleness), **B3** (pre-existing freeze test).
+  Branch `cas-gc-part-manifest-impl` NOT PR'd — the maintainer's call.

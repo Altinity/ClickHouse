@@ -278,7 +278,14 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   /`INV_JOURNAL_COVERAGE` concern and was unproven. Deferred: model-extend + reseal/snapshot, then lift to
   one-round skip. Medium priority (perf only; correctness already holds conservatively).
 
-- **B13 — two-replica sharded GC integration soak blocked by the test MinIO image (environmental).** The
+- **B13 — RESOLVED 2026-06-27.** Misdiagnosis: the ca-soak harness runs **RustFS** (`rustfs:1.0.0-beta.8`,
+  supports `If-Match` conditional delete), not MinIO; the MinIO blocker only applied to the praktika path.
+  The `gc_shards=2` two-replica chaos soak ran on RustFS (infra `6f9407fa4cd`) and is CLEAN on the fixed
+  binary (PHASE3 OK, pool stable, dangling=0, both `blob_target/{0,1}` populated). It also CAUGHT a 3rd HIGH
+  bug — `Gc::recheck()` hardcoded `/*shard*/0` (Task 6 sharded `fold` but not `recheck`) → GC wedged at
+  `gc_shards>1` → fixed `08e7dcf8f00`. Phase 4 now has real integration validation under chaos. (Original
+  finding preserved below for context.)
+- **B13 (original) — two-replica sharded GC integration soak blocked by the test MinIO image (environmental).** The
   Phase-4 `tests/integration/test_cas_gc_sharded/` module (gc_shards=2, two replicas, disjoint shards) is
   committed but `pytest.mark.skip`-ped: the integration Docker MinIO (`RELEASE.2024-09-13`) predates S3
   `DeleteObject If-Match` (conditional delete), which `CasProbe::runCapabilityProbe` step 6 hard-requires
