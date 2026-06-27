@@ -21,6 +21,7 @@ not vacuous).
 | `stage3` (GC pipeline: fold/retire/fence/recheck/delete/trim) | HOLD | 1,926,070,427 | 365,609,430 | 27m45s |
 | `stage4` (manifest cleanup + orphan sweep + mutable) | HOLD | 134,769,744 | 27,396,110 | 3m29s |
 | `stage5_tokendiff` (token-diff discovery: `GDiscoverSkip`/`GDiscoverRead`, `EnableTokenDiff`+`TokenObservable`) | HOLD | 48,552,772 | 8,327,064 | 28s |
+| `stage5_lazytrim` (Phase 3 lazy trim: `EnableLazyTrim`, all-shard fresh fence stays the only behavior; bounded `{n1,n2}`, 1 shared blob, precommit/missing-body off — feasible cross-namespace shared-blob in-degree coverage) | HOLD | 2,046,375,017 | 338,817,903 | ~21m |
 | `live` (`FairSpec`: `OrphanManifestDebrisDrains` + `NoLeakForever`) | HOLD | 74,147,107 | 17,845,340 | 30m10s |
 
 Invariants proven across stage3/stage4: `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN`,
@@ -29,7 +30,7 @@ Invariants proven across stage3/stage4: `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_
 `NoCommittedDangle`, `BlobInDegreeMatchesActiveManifests`, `FoldedEdgesAreActive`,
 `ManifestActivationMatchesEdges`; property `MonotoneGC`.
 
-## Negative controls (all 24; must VIOLATE the named invariant)
+## Negative controls (all 25; must VIOLATE the named invariant)
 
 | # | Config (`_sab_*`) | Spec control | Result (violated) | Distinct states |
 |---|---|---|---|---|
@@ -58,8 +59,9 @@ Invariants proven across stage3/stage4: `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_
 | 22 | `promoteaftermissingbody` | promote-as-move after missing-body | `INV_NO_LOSS` | 425 |
 | 23 | `advancepastmissingbody` | fold advances past live missing-body precommit | `INV_NO_DANGLE` | 570,004 |
 | 24 | `skipchangedshard` | token-diff skip of a CHANGED root shard (`listedTok # foldedTok`) — cut-overclaims the fold cursor past unfolded activations | `INV_NO_DANGLE` | 160,227 |
+| 25 | `lazyfenceunsafe` | reuse a STALE parent fence position for a shard that got a publish between discovery and recheck (no all-shard fresh fence) — permanent control: why a lazy fence is deliberately not implemented | `INV_NO_DANGLE` | 24,540,205 |
 
-No `UNEXPECTED PASS`. All 24 controls (25 cfgs, #16 split a/b) reproduce their named counterexample.
+No `UNEXPECTED PASS`. All 25 controls (26 cfgs, #16 split a/b) reproduce their named counterexample.
 
 ## Non-vacuity witnesses (must be REACHABLE ⇒ the negated `W_*` is reported violated)
 
@@ -72,7 +74,7 @@ No `UNEXPECTED PASS`. All 24 controls (25 cfgs, #16 split a/b) reproduce their n
 ## Verdict
 
 **SUITE GREEN.** Every positive stage (including Phase 2 `stage5_tokendiff`), the liveness config, and
-all three witnesses behave as required, and all 24 negative controls produce their named counterexample
+all three witnesses behave as required, and all 25 negative controls produce their named counterexample
 with no `UNEXPECTED PASS`. The R0 safety gate is satisfied: `INV_NO_DANGLE`, `INV_NO_LOSS`, and
 `INV_NO_RETURN` are proved by the model (stage3/stage4/stage5_tokendiff), liveness holds under
 `FairSpec`, and the protocol's load-bearing rules are each shown necessary by their sabotage
@@ -100,3 +102,34 @@ manifest's blob looks in-degree 0, GC over-deletes it, and `INV_NO_DANGLE` is vi
 use a small scope (`MaxToken = MaxLog = 2`) chosen so `listedTok` saturates exactly when the journal is
 full — required for soundness, since a saturated `listedTok` that still equalled a stale `foldedTok` while
 unfolded records remained would mint a spurious skip.
+
+### Phase 3 — lazy trim (all-shard fresh fence stays load-bearing) {#phase-3-lazy-trim}
+
+Phase 3 adds two per-namespace variables: `foldTok` (the abstract persisted folded token a fence was
+recorded against) and `prevFencePos` (the parent generation's fence position a sabotaged reuse copies).
+Both writes are **GATED behind `SabotageLazyFenceUnsafe`** — they are the ONLY consumer (`shardUnchanged`
+and the stale-reuse branch live exclusively in that sabotage arm), so in every non-sabotage stage both
+vars stay constant 0 and add NO state. This keeps the pre-Phase-3 suite byte-for-byte identical:
+`stage0`/`stage1`/`stage2` reproduce their EXACT Phase-2 distinct counts (19,846 / 402,034 / 68,550,326),
+proving the new vars are inert — so `stage3`/`stage4`/`live` and every pre-existing control are unchanged
+and carried forward without re-running. `EnableLazyTrim` does NOT introduce a positive lazy-fence arm: the
+all-shard FRESH fence (`GFenceShard` advancing `fencePos[n] := Len(journal[n])`) stays the ONLY
+non-sabotage behavior. Lazy trim may let trim work lag, but the fence is fenced afresh on every shard every
+round — there is deliberately no honest "reuse the parent fence" path.
+
+`stage5_lazytrim` (positive, `EnableLazyTrim = TRUE`, all `Sabotage* = FALSE`) HOLDs `INV_NO_DANGLE`/
+`INV_NO_LOSS`/`INV_NO_RETURN`/`INV_JOURNAL_COVERAGE`/`BlobInDegreeMatchesActiveManifests`/`TypeOK`. It is
+scoped `Namespaces = {n1, n2}` with a single shared blob (`Blobs = {b1}`) and precommit/missing-body off —
+a deliberately BOUNDED config (the full-feature `{n1,n2}` cross-product is multi-billion states and does
+not converge), chosen to add genuine **cross-namespace shared-blob in-degree** coverage (a blob referenced
+from manifests in two namespaces must stay alive while either references it) on top of the single-namespace
+pipeline proof carried from `stage3`. 338,817,903 distinct states, ~21m.
+
+`sab_lazyfenceunsafe` (`SabotageLazyFenceUnsafe = TRUE`) is a PERMANENT negative control documenting WHY a
+lazy fence is dropped. Its `GFenceShard` branch fires for a shard that got a publish between fence discovery
+and recheck (`~shardUnchanged(n)`, modeling a concurrent publish that bumps `foldTok`) and REUSES the stale
+parent fence position `prevFencePos[n]` instead of advancing — so the racing activation is left below the
+fence. `GRecheckDelete`'s `FoldedThroughFence` gate (`cursor[n] >= fencePos[n]`) then passes against the
+stale low fence before the fold has consumed the racing publish, the freshly-committed manifest's blob looks
+in-degree 0, GC over-deletes it, and `INV_NO_DANGLE` is violated (24,540,205 distinct states, ~1m). This
+is exactly why the all-shard fresh fence is load-bearing and a reused (lazy) fence is not implemented.
