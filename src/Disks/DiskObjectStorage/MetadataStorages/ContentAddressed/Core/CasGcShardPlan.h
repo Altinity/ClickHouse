@@ -3,10 +3,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace DB::Cas
@@ -36,6 +38,20 @@ inline uint64_t blobShard(const UInt128 & blob_hash, uint64_t gc_shards)
     const uint64_t high64 = static_cast<uint64_t>(blob_hash >> 64);
     return high64 % gc_shards;
 }
+
+/// Route a part-manifest cleanup bundle to a worker by its namespace-qualified `ManifestId`. Workers
+/// own disjoint ranges; routing by `ManifestRef` alone would merge two namespaces' cleanup work
+/// (Phase 0 `SabotageKeyByRefNotId`). `gc_shards == 1` routes every `ManifestId` to owner shard 0.
+///
+/// The hash mixes both the `root_namespace` string and the three `ManifestRef` components — the
+/// same mixing used by `std::hash<ManifestId>`. Two `ManifestId`s that share the same `ManifestRef`
+/// but carry different namespaces produce independent hash values and may route to different shards.
+///
+/// Properties:
+///   - Deterministic/stable: same inputs always yield the same shard.
+///   - Total: result is in [0, gc_shards).
+///   - Single-shard equivalence: gc_shards == 1 always returns 0.
+uint64_t manifestCleanupShard(const ManifestId & id, uint64_t gc_shards);
 
 /// Accumulates per-shard `BlobDelta` lists from a stream of `RootOwnerEvent` blob-edge dispatches.
 ///

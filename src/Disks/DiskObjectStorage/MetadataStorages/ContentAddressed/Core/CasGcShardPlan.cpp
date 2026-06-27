@@ -2,6 +2,7 @@
 #include <Common/Exception.h>
 #include <base/defines.h>
 #include <algorithm>
+#include <functional>
 
 namespace DB
 {
@@ -13,6 +14,17 @@ namespace ErrorCodes
 
 namespace DB::Cas
 {
+
+uint64_t manifestCleanupShard(const ManifestId & id, uint64_t gc_shards)
+{
+    /// gc_shards >= 1 is enforced by GcState decode (CORRUPTED_DATA on 0).
+    /// Hash the QUALIFIED id (namespace + all three ManifestRef components) using the same mixing
+    /// as `std::hash<ManifestId>`. Routing by `ManifestRef` alone would be the modeled
+    /// `SabotageKeyByRefNotId` hazard: two namespaces can legally carry the same `ManifestRef`
+    /// without addressing the same object, so their cleanup work must never be merged.
+    const size_t h = std::hash<ManifestId>{}(id);
+    return static_cast<uint64_t>(h) % gc_shards;
+}
 
 ShardScatter::ShardScatter(uint64_t gc_shards_)
     : gc_shards(gc_shards_), buckets(gc_shards_)

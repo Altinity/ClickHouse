@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 
 using namespace DB::Cas;
 
@@ -278,4 +279,91 @@ TEST(CasGcShardReducer, TwoReducersCoverDisjointShards)
         ASSERT_FALSE(o0 && o1)
             << "hash " << i << " is owned by BOTH shards (overlap in coverage)";
     }
+}
+
+/// ---- manifestCleanupShard tests (Phase 4, Task 5) ----
+
+/// Two `ManifestId`s with the SAME `ManifestRef` but DIFFERENT namespaces must be unequal (proving
+/// qualified identity), and `manifestCleanupShard` must depend on the namespace — not just the ref.
+///
+/// Phase 0 `SabotageKeyByRefNotId`: if routing used only the `ManifestRef`, two namespaces sharing
+/// the same ref would land on the same worker, merging cleanup work that belongs to distinct objects.
+TEST(CasGcShardCleanup, RoutesByQualifiedManifestIdNotRef)
+{
+    /// Shared ManifestRef: identical across both ManifestIds.
+    const ManifestRef shared_ref{
+        .writer_instance_id = "deadbeef:42",
+        .build_sequence = 7,
+        .manifest_instance_id = hexToU128("0102030405060708090a0b0c0d0e0f10"),
+    };
+
+    const ManifestId id_a{RootNamespace("ns_alpha"), shared_ref};
+    const ManifestId id_b{RootNamespace("ns_beta"), shared_ref};
+
+    /// The two ids are unequal (different namespace => different qualified identity).
+    EXPECT_NE(id_a, id_b) << "ManifestIds with different namespaces must be unequal";
+
+    /// Both results must be in range.
+    constexpr uint64_t kShards = 4;
+    const uint64_t shard_a = manifestCleanupShard(id_a, kShards);
+    const uint64_t shard_b = manifestCleanupShard(id_b, kShards);
+    EXPECT_LT(shard_a, kShards) << "shard for id_a must be < gc_shards";
+    EXPECT_LT(shard_b, kShards) << "shard for id_b must be < gc_shards";
+
+    /// Deterministic: same id always routes to the same shard.
+    EXPECT_EQ(manifestCleanupShard(id_a, kShards), shard_a) << "manifestCleanupShard must be deterministic";
+    EXPECT_EQ(manifestCleanupShard(id_b, kShards), shard_b) << "manifestCleanupShard must be deterministic";
+
+    /// Single-shard equivalence: gc_shards==1 routes everything to shard 0.
+    EXPECT_EQ(manifestCleanupShard(id_a, 1), 0u) << "gc_shards==1 must route to shard 0";
+    EXPECT_EQ(manifestCleanupShard(id_b, 1), 0u) << "gc_shards==1 must route to shard 0";
+
+    /// KEY ASSERTION: routing depends on the namespace, not the ref alone.
+    /// Scan namespace-pair candidates (varying only the namespace string) until we find two that
+    /// route to different shards under gc_shards=8. This directly demonstrates that
+    /// `manifestCleanupShard` is NOT a function of `ManifestRef` alone.
+    bool found_namespace_split = false;
+    for (uint64_t i = 0; i < 256 && !found_namespace_split; ++i)
+    {
+        const ManifestId probe_a{RootNamespace("namespace_probe_" + std::to_string(i)), shared_ref};
+        for (uint64_t j = i + 1; j < 256 && !found_namespace_split; ++j)
+        {
+            const ManifestId probe_b{RootNamespace("namespace_probe_" + std::to_string(j)), shared_ref};
+            if (manifestCleanupShard(probe_a, 8) != manifestCleanupShard(probe_b, 8))
+                found_namespace_split = true;
+        }
+    }
+    EXPECT_TRUE(found_namespace_split)
+        << "could not find two namespace variants of the same ManifestRef that route to different "
+           "shards — routing is not namespace-sensitive (SabotageKeyByRefNotId hazard)";
+}
+
+/// Over many `ManifestId`s with `gc_shards=4`: every owner shard is covered, and each id lands in
+/// exactly one shard (total, disjoint coverage).
+TEST(CasGcShardCleanup, DisjointWorkerCoverage)
+{
+    constexpr uint64_t kNumIds = 4096;
+    constexpr uint64_t kShards = 4;
+
+    std::vector<bool> seen(kShards, false);
+    for (uint64_t i = 0; i < kNumIds; ++i)
+    {
+        /// Vary both namespace and ManifestRef fields to spread the distribution.
+        const ManifestId id{
+            RootNamespace("ns_" + std::to_string(i % 16)),
+            ManifestRef{
+                .writer_instance_id = "writer:" + std::to_string(i / 16),
+                .build_sequence = i,
+                .manifest_instance_id = (static_cast<UInt128>(i * 0x9e3779b97f4a7c15ULL) << 64)
+                                      | static_cast<UInt128>(i * 0x6c62272e07bb0142ULL),
+            },
+        };
+
+        const uint64_t s = manifestCleanupShard(id, kShards);
+        ASSERT_LT(s, kShards) << "manifestCleanupShard out of range at i=" << i;
+        seen[s] = true;
+    }
+
+    for (uint64_t s = 0; s < kShards; ++s)
+        EXPECT_TRUE(seen[s]) << "owner shard " << s << " received no ManifestIds (dead shard)";
 }
