@@ -427,3 +427,25 @@ didn't drive):
   target-shard model) remains deferred — it covers the CRASHED-build case (no abandon called); HIGH #2 fixes
   the explicit-abandon path. **B11** (manifest-delete counter undercount) deferred as before.
 - Also re-attempting the Phase-4 sharded soak on the ca-soak/RustFS harness (B13 misdiagnosis).
+
+### 2026-06-27 — 2 HIGH precommit bugs FIXED + verified (code now matches the proven model)
+- **BUG 1 `c93c1149694`** — `promote` fails closed unless the precommit is the live owner (WPromote
+  `owner[m]=bld`). Guard: inside the shard CAS, replay `root.journal` exactly as the fold dispatches it
+  (old_binding removes, new_binding installs) and ABORT iff a REMOVAL of EXACTLY this precommit binding
+  (`old={Precommit,ref,build_id,manifest_ref}`, `new=none`) is recorded and not re-added (`present_in_live`).
+  Subtlety the implementer caught (a naive "present in live set" check broke
+  `SharedBlobSurvivesSourceDropDuringBuild`): the create-precommit add can be legitimately TRIMMED below the
+  sealed fold cursor once GC activates it, so a trimmed-but-live precommit (no removal) is correctly ALLOWED.
+  **Completeness of the visible-removal check** (a removal could itself be trimmed) rests on the build-seq
+  WATERMARK: an in-flight build doesn't `retireBuildSeq` until promote/abandon, so GC cannot reclaim its
+  precommit while it's promoting → no trimmed removal for a live build; abandon is the same build (wouldn't
+  promote); + the existing blob revalidation is a third fail-closed layer. Faithful to WPromote.
+- **BUG 2 `77ad8b460e4`** — `abandon` appends a precommit-REMOVAL `RootOwnerEvent` (old=Precommit,
+  new=none) in the target shard (mirroring `Store::dropRef`/`Gc::reclaimAbandonedPrecommit`), reliably,
+  and SKIPS the precommit body in the best-effort `staged_manifests` delete loop (never writer-delete a
+  live precommit body — WAbandonPrecommit; delete-after-sealed-decrements). Never-precommitted staged
+  debris is still best-effort deleted.
+- 4 new RED-first tests pass; regression `CasBuild*:CasGc*:Ca*` 373 passed / 6 skipped (unchanged; B8 NOT
+  un-skipped) / 1 = baseline B3. No model change (code now matches the already-proven protocol).
+- NOTE: a final full `Cas*:Ca*` build+sweep including these fixes is pending (the running RustFS soak uses
+  a pre-fix binary; will rebuild+sweep after it returns).
