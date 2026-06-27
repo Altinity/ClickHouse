@@ -944,14 +944,9 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
     storage->runOneGcRoundForTest();
 
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    /// The relink offer (B7): in the part-manifest model there is no shared content-addressed tree id
-    /// to transmit, so getPartTreeId offers NOTHING and the sender always streams bytes. adoptPart is
-    /// consequently unreachable and fails closed (NOT_IMPLEMENTED) if a caller ever reaches it. Asserts
-    /// the documented post-redesign contract instead of the old adopt-by-tree-id deletion witness.
-    EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_1_1_0").has_value());
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
-        [&] { exchange->adoptPart("uuid-1", "tmp-fetch_back", std::string(32, '0'), {}); });
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp-fetch_back"));
+    /// The relink offer (B7 part_manifest_v1): a reclaimed part is no longer a committed CA part here,
+    /// so getPartManifestBytes offers NOTHING and the sender streams bytes — the documented fallback.
+    EXPECT_FALSE(exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0").has_value());
 
     /// A fresh identical write re-CREATES the content at the same key and reads back fine.
     auto tx3 = storage->createTransaction();
@@ -1034,63 +1029,126 @@ TEST(CaWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
         << "retired+deleted next round); unreachable=" << after.unreachable;
 }
 
-/// ==== M-W Task 11: the DataPartsExchange facade (relink) ====
+/// ==== M-W Task 11 / B7: the DataPartsExchange facade (manifest relink, part_manifest_v1) ====
 
-/// B7 (cross-server relink reworked for the part-manifest model): the old optimization transmitted a
-/// CONTENT-ADDRESSED tree id the receiver could adopt-by-id, because trees were shared by content hash
-/// across servers. A part is now a per-instance single-owner ManifestId — there is no shared id to
-/// offer — so getPartTreeId offers NOTHING (the sender always streams bytes, the documented fallback)
-/// and adoptPart is unreachable, failing closed with NOT_IMPLEMENTED. A manifest-era relink (transmit
-/// the manifest's blob hashes; the receiver stages its OWN manifest over them) is the deferred rework.
-/// This asserts the documented no-offer / fail-closed contract for a COMMITTED part.
-TEST(CaWiringExchange, RelinkOffersNothingAndAdoptFailsClosed)
+/// B7 sender side: getPartManifestBytes returns the COMMITTED part's encoded PartManifest body — the
+/// opaque payload the receiver decodes. The bytes must decode to the same entries the part was
+/// published with; an absent part offers nothing (the sender streams bytes — the documented fallback).
+TEST(CaWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
 {
     auto storage = openWiringStorage();
-    auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "replicate-me");
-    tx->commit(DB::NoCommitOptions{});
+    /// Publish a real committed part (data.bin + a projection blob + mutable per-part files).
+    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
 
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
-    /// The pool identity is still offered (two replicas relink iff equal); only the tree-id offer is gone.
     EXPECT_FALSE(exchange->getPoolUUID().empty());
 
-    /// No relink offer for a committed part, nor for an absent one.
-    EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_1_1_0").has_value());
-    EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_9_9_9").has_value());
+    auto bytes = exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0");
+    ASSERT_TRUE(bytes.has_value());
+    EXPECT_FALSE(bytes->empty());
 
-    /// adoptPart is unreachable (no offer is ever made) and fails closed if reached. It publishes
-    /// NOTHING; the caller falls back to the byte fetch.
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
-        [&] { exchange->adoptPart("uuid-1", "tmp-fetch_all_1_1_0", std::string(32, '0'), {{"metadata_version.txt", "4"}}); });
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp-fetch_all_1_1_0"));
+    /// The transferred body decodes to the SAME blob entries the part names (the receiver uses ONLY
+    /// these). The sender's ManifestRef/namespace/digest are present but non-authoritative downstream.
+    const DB::Cas::PartManifest decoded = DB::Cas::decodePartManifest(*bytes);
+    ASSERT_EQ(decoded.entries.size(), 2u);
+    EXPECT_EQ(decoded.entries[0].path, "data.bin");
+    EXPECT_EQ(decoded.entries[0].blob_hash, u128Of("payload-A"));
+    EXPECT_EQ(decoded.entries[1].path, "p.proj/data.bin");
+    EXPECT_EQ(decoded.entries[1].blob_hash, u128Of("payload-B"));
+
+    /// An absent part is not a committed CA part here -> no offer.
+    EXPECT_FALSE(exchange->getPartManifestBytes("uui/uuid-1/all_9_9_9").has_value());
 }
 
-/// B7: even after a part is dropped and reclaimed there is still no relink offer (the no-offer contract
-/// is independent of reclamation — the sender always streams bytes). Ported off the old reclaimed-tree
-/// adopt-fallback race, which the no-offer contract subsumes.
-TEST(CaWiringExchange, AdoptOfReclaimedTreeFallsBack)
+/// B7 receiver side (the core): take a COMMITTED part's transferred manifest bytes and adopt them into
+/// a DIFFERENT table namespace WITHOUT moving any blob body (blobs are shared by hash in the pool).
+/// The receiver stages its OWN fresh local manifest, precommitAdd + promote it, and reports success.
+/// Asserts: success; the adopted ref is live + loadable; the receiver's ManifestId differs from the
+/// sender's (no shared identity); the ref lives in the RECEIVER namespace (no cross-namespace adoption);
+/// and NO blob body was uploaded by the receiver (the put-counter stays flat across adopt).
+TEST(CaWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
 {
     auto storage = openWiringStorage();
-    auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "soon-gone");
-    tx->commit(DB::NoCommitOptions{});
+    const auto sender_ns = storage->liveNamespace("uuid-1");
+    publishWiredPart(*storage, sender_ns, "all_1_1_0");
+
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
-    /// No offer for the live committed part (the part-manifest model never offers a relink id).
-    EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_1_1_0").has_value());
 
-    /// The part is dropped and reclaimed (the former relink race window).
-    auto tx2 = storage->createTransaction();
-    tx2->removeDirectory("uui/uuid-1/all_1_1_0");
-    storage->runOneGcRoundForTest();
-    storage->runOneGcRoundForTest();
+    auto bytes = exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0");
+    ASSERT_TRUE(bytes.has_value());
+    const DB::Cas::ManifestId sender_id =
+        storage->store()->resolveRef(sender_ns, "all_1_1_0")->manifest_id;
 
-    /// Still no offer; adoptPart publishes NOTHING (fail-closed) — the caller byte-fetches.
-    EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_1_1_0").has_value());
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
-        [&] { exchange->adoptPart("uuid-1", "tmp-fetch_all_1_1_0", std::string(32, '0'), {}); });
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp-fetch_all_1_1_0"));
+    /// Count blob PUTs over the adopt: a manifest relink must NOT upload any blob body (the blobs are
+    /// already in the shared pool, adopted by hash). We assert via the blob keys' presence/incarnation:
+    /// the receiver never overwrites or re-creates the blobs — their head tokens are unchanged.
+    const auto data_key = storage->store()->layout().blobKey(idOf("payload-A"));
+    const auto proj_key = storage->store()->layout().blobKey(idOf("payload-B"));
+    const auto data_tok_before = storage->store()->backend().head(data_key).token;
+    const auto proj_tok_before = storage->store()->backend().head(proj_key).token;
+
+    /// Adopt into a DIFFERENT table (uuid-2). The transferred body's root_namespace_id is the sender's
+    /// (uuid-1) — the receiver must IGNORE it and use uuid-2.
+    const bool ok = exchange->adoptPartFromManifest(
+        "uuid-2", "tmp-fetch_all_1_1_0", *bytes, {{"metadata_version.txt", "1"}});
+    EXPECT_TRUE(ok);
+
+    /// The adopted ref is live in the RECEIVER namespace and loadable.
+    const auto receiver_ns = storage->liveNamespace("uuid-2");
+    auto receiver_resolved = storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0");
+    ASSERT_TRUE(receiver_resolved.has_value());
+    const DB::Cas::PartManifest receiver_manifest =
+        storage->store()->readManifest(receiver_resolved->manifest_id);
+    ASSERT_EQ(receiver_manifest.entries.size(), 2u);
+    EXPECT_EQ(receiver_manifest.entries[0].blob_hash, u128Of("payload-A"));
+
+    /// FRESH receiver-local identity: a DIFFERENT ManifestId from the sender's, in the RECEIVER namespace.
+    EXPECT_FALSE(sender_id == receiver_resolved->manifest_id)
+        << "the receiver must mint its OWN manifest id, not share the sender's";
+    EXPECT_EQ(receiver_resolved->manifest_id.root_namespace.string(), receiver_ns.string())
+        << "the adopted manifest must live in the receiver namespace (derived from table_uuid), not the sender's";
+    EXPECT_FALSE(receiver_ns.string() == sender_ns.string());
+
+    /// The transferred mutable per-part file rode in via promote.
+    EXPECT_EQ(receiver_resolved->mutable_files.at("metadata_version.txt"), "1");
+
+    /// NO blob body was uploaded: the shared blobs' incarnations are untouched by the adopt.
+    EXPECT_EQ(storage->store()->backend().head(data_key).token, data_tok_before)
+        << "adopt-from-manifest must not re-upload a blob already in the shared pool";
+    EXPECT_EQ(storage->store()->backend().head(proj_key).token, proj_tok_before);
+}
+
+/// B7 fail-closed: if a referenced blob is absent/condemned in the pool, adoptPartFromManifest must
+/// promote-abort and return FALSE (NOT throw) so the caller byte-fetches — exactly where the old pin
+/// protocol fell back. Nothing is published (no dangling ref).
+TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
+{
+    auto storage = openWiringStorage();
+    const auto sender_ns = storage->liveNamespace("uuid-1");
+    publishWiredPart(*storage, sender_ns, "all_1_1_0");
+
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    ASSERT_NE(exchange, nullptr);
+    auto bytes = exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0");
+    ASSERT_TRUE(bytes.has_value());
+
+    /// Make a referenced blob ABSENT in the shared pool (the genuine missing-blob / different-pool case).
+    const auto data_key = storage->store()->layout().blobKey(idOf("payload-A"));
+    const auto h = storage->store()->backend().head(data_key);
+    ASSERT_TRUE(h.exists);
+    ASSERT_EQ(storage->store()->backend().deleteExact(data_key, h.token).kind,
+              DB::Cas::DeleteOutcome::Kind::Deleted);
+
+    /// promote re-proves every blob leaf fail-closed; an absent leaf is ABORTED -> the impl returns
+    /// FALSE (retryable, caller byte-fetches), it does NOT throw and publishes NOTHING.
+    const bool ok = exchange->adoptPartFromManifest(
+        "uuid-2", "tmp-fetch_all_1_1_0", *bytes, {{"metadata_version.txt", "1"}});
+    EXPECT_FALSE(ok);
+
+    /// No dangling ref was published in the receiver namespace.
+    EXPECT_FALSE(storage->store()->resolveRef(storage->liveNamespace("uuid-2"), "tmp-fetch_all_1_1_0").has_value());
 }
 
 /// ==== Commit atomicity (B122): a publish failing mid-loop must not leave a PARTIAL commit ====
@@ -1225,7 +1283,7 @@ TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::READONLY,
         [&] { ro->createTransaction(); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::READONLY,
-        [&] { ro->adoptPart("uuid-1", "tmp-fetch", std::string(32, '0'), {}); });
+        [&] { ro->adoptPartFromManifest("uuid-1", "tmp-fetch", std::string{}, {}); });
 }
 
 TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)

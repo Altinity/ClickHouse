@@ -33,7 +33,7 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int READONLY;
     extern const int BAD_ARGUMENTS;
-    extern const int NOT_IMPLEMENTED;
+    extern const int ABORTED;
 }
 
 namespace
@@ -969,33 +969,97 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedMetadataStorage::readBlo
         std::move(impl), path, location.offset, location.offset + location.length);
 }
 
-/// ==== IContentAddressedExchange (M-W T11; D-W4) ====
+/// ==== IContentAddressedExchange (M-W T11; B7 part_manifest_v1) ====
 
-std::optional<String> ContentAddressedMetadataStorage::getPartTreeId(const String & /*part_path*/) const
+std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(const String & part_path) const
 {
-    /// Cross-server relink offer (rev. 15): the old optimization transmitted a CONTENT-ADDRESSED tree
-    /// id that the receiver could adopt, because trees were shared by content hash across servers. In
-    /// the part-manifest redesign a part is a per-instance single-owner ManifestId — there is no shared
-    /// content-addressed id to offer. A manifest-era relink (transmit the manifest's blob hashes; the
-    /// receiver stages its OWN manifest over them) is a separate interface rework (backlog B7). Until
-    /// then this offers nothing, so the sender streams bytes — the documented, correct fallback path.
-    return std::nullopt;
+    /// Sender side (B7): the committed part's encoded `PartManifest` body — the opaque payload the
+    /// receiver decodes. Resolve the part path to its (ns, ref) exactly as the read surface does
+    /// (route), resolve the committed ref to its ManifestId, read the immutable manifest, and re-encode
+    /// it canonically. nullopt when the path is not a committed content-addressed part here (no ref =>
+    /// no relink offer; the sender streams bytes). A live ref to a missing/corrupt manifest throws
+    /// (INV-NO-DANGLE surfaced, never substituted) — the same fail-loud contract as resolveRouted.
+    auto p = ContentAddressed::parsePartFilePath(part_path);
+    if (!p)
+        return std::nullopt;
+    auto r = route(*p);
+    if (!r || r->ref.empty())
+        return std::nullopt;
+
+    auto resolved = store()->resolveRef(r->ns, r->ref);
+    if (!resolved)
+        return std::nullopt;
+
+    const Cas::PartManifest manifest = store()->readManifest(resolved->manifest_id);
+    return Cas::encodePartManifest(manifest);
 }
 
-bool ContentAddressedMetadataStorage::adoptPart(
-    const String & /*table_uuid*/, const String & /*part_name*/,
-    const String & /*tree_id_hex*/, const std::map<String, String> & /*mutable_files*/)
+bool ContentAddressedMetadataStorage::adoptPartFromManifest(
+    const String & table_uuid, const String & part_name,
+    const String & manifest_bytes, const std::map<String, String> & mutable_files)
 {
     if (read_only)
-        throw Exception(ErrorCodes::READONLY, "Content-addressed disk is opened read-only: adoptPart is rejected");
+        throw Exception(ErrorCodes::READONLY, "Content-addressed disk is opened read-only: adoptPartFromManifest is rejected");
 
-    /// Unreachable while getPartTreeId offers nothing (the sender always streams bytes). Fail closed if
-    /// a caller ever reaches it — a manifest-era relink is backlog B7, not a silent no-op. (Fail-close:
-    /// publishing NOTHING is the safe outcome; returning false here would route the caller to a byte
-    /// fetch, but the offer was never made, so reaching this is a logic error.)
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-        "ContentAddressed: adoptPart is not supported in the part-manifest model (cross-server relink "
-        "reworked to manifest blob-hash transfer — backlog B7); the sender streams bytes");
+    /// Receiver side (B7 part_manifest_v1). Sender identity is NON-AUTHORITATIVE: we ignore the decoded
+    /// ManifestRef, root_namespace_id and payload_digest, and use ONLY the entries. We run a normal
+    /// LOCAL build (the proven republishRef sequence) over the SHARED-pool blobs — adopted by hash via
+    /// adoptEvidence, NO blob body transferred — then stage a FRESH receiver-local ManifestId in the
+    /// RECEIVER namespace, precommitAdd, and promote (fail-closed blob revalidation). Any retryable
+    /// failure (decode/build/stage/precommit/promote, incl. a condemned/absent blob => ABORTED) returns
+    /// false, publishing NOTHING, so the caller falls back to the byte fetch.
+
+    Cas::PartManifest decoded;
+    try
+    {
+        decoded = Cas::decodePartManifest(manifest_bytes);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::CORRUPTED_DATA)
+            throw;
+        LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} not possible: transferred manifest failed to decode ({}); "
+            "caller falls back to a byte fetch", part_name, e.message());
+        return false;
+    }
+
+    /// The RECEIVER namespace, derived from THIS server's table_uuid — never the sender's
+    /// root_namespace_id (which is foreign to this server's path-mirroring identity).
+    const Cas::RootNamespace receiver_ns = liveNamespace(table_uuid);
+
+    try
+    {
+        auto build = store()->startBuild(
+            Cas::BuildInfo{.intended_ref = receiver_ns.string() + "/" + part_name,
+                           .intended_namespace = receiver_ns, .op = Cas::ProvenanceOp::Attach});
+
+        /// Tokenless W-EVIDENCE dep per entry — NO pool HEAD/GET before precommit; promote re-proves
+        /// each fail-closed. Inline entries record nothing (adoptEvidence skips them). The blobs are
+        /// already in the shared pool (referenced by hash), so we never putBlob here.
+        for (const auto & entry : decoded.entries)
+            build->adoptEvidence(entry);
+
+        /// Stage a FRESH receiver-local manifest over the SAME entries (its ManifestRef is RANDOM under
+        /// receiver_ns — NOT the sender's identity), then move ownership in.
+        const Cas::ManifestId id = build->stageManifest(decoded.entries);
+        build->precommitAdd(receiver_ns, part_name, id);
+        build->setPendingMutableFiles(mutable_files);
+        build->promote(receiver_ns, part_name, build->buildId(), id);
+        return true;
+    }
+    catch (const Exception & e)
+    {
+        /// ABORTED = a referenced blob is absent/condemned, or the precommit binding is not the live
+        /// owner: retryable, the caller byte-fetches. Any other exception: fail SAFE to a byte fetch
+        /// too (publish nothing), but log it as it is not the expected retryable path.
+        if (e.code() == ErrorCodes::ABORTED)
+            LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} aborted (a referenced blob is absent/condemned in the shared "
+                "pool, or the precommit is not live): {}; caller falls back to a byte fetch", part_name, e.message());
+        else
+            LOG_WARNING(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} failed with an unexpected error: {}; caller falls back to a "
+                "byte fetch", part_name, e.message());
+        return false;
+    }
 }
 
 }

@@ -12,11 +12,14 @@ namespace DB
 /// concrete class (the design's "small purpose-built facade instead of dynamic_cast into the
 /// concrete class").
 ///
-/// Relink wire contract (D-W4): the sender transmits {pool_uuid, tree_id}; the legacy `part_id`
-/// cookie field carries the tree id hex (replica-internal wire on this branch — no protocol field
-/// changes). The receiver adopts by tree id and publishes its own ref; a tree no longer adoptable
-/// (reclaimed) makes adoptPart return false and the caller falls back to the byte fetch — exactly
-/// where the old 4-step pin protocol fell back.
+/// Relink wire contract (B7 part-manifest model, maintainer-approved part_manifest_v1): the sender
+/// transmits {pool_uuid, encoded PartManifest body}; the legacy `part_id` cookie field carries the
+/// opaque manifest bytes (replica-internal wire on this branch — no protocol field changes). Sender
+/// identity in the body (ManifestRef, root_namespace_id, payload_digest) is NON-AUTHORITATIVE — the
+/// receiver uses ONLY the entries, runs a normal LOCAL build over the SHARED-pool blobs (adopted by
+/// hash; no blob body is transferred), and publishes its OWN fresh receiver-local ManifestId. A blob
+/// no longer present/condemned makes adoptPartFromManifest return false and the caller falls back to
+/// the byte fetch — exactly where the old 4-step pin protocol fell back.
 class IContentAddressedExchange
 {
 public:
@@ -27,18 +30,23 @@ public:
     /// the storage started up.
     virtual const String & getPoolUUID() const = 0;
 
-    /// Sender side: the tree id THIS server's ref names for the given disk-relative part path
-    /// (nullopt = no committed ref => no relink offer; the sender streams bytes).
-    virtual std::optional<String> getPartTreeId(const String & part_path) const = 0;
+    /// Sender side: THIS server's committed part's encoded `PartManifest` body (the opaque payload
+    /// the receiver decodes) for the given disk-relative part path. nullopt = the part is not a
+    /// committed content-addressed part here => no relink offer; the sender streams bytes.
+    virtual std::optional<String> getPartManifestBytes(const String & part_path) const = 0;
 
-    /// Receiver side: adopt-by-id + publish a ref under (table_uuid, part_name) carrying the
-    /// transferred mutable per-part files. Returns false — publishing NOTHING — when the tree is
-    /// not adoptable (reclaimed meanwhile); the caller falls back to a byte fetch. Retryable
-    /// publish failures (ABORTED) propagate: the fetch retries like any retryable fetch error.
-    virtual bool adoptPart(
+    /// Receiver side: decode the transferred manifest body, run a normal LOCAL build over the
+    /// shared-pool blobs (adopt-by-hash; NO blob body read from the sender), stage a FRESH
+    /// receiver-local manifest in the RECEIVER namespace (derived from table_uuid; the sender's
+    /// root_namespace_id is ignored), precommitAdd + promote it (fail-closed blob revalidation),
+    /// carrying the transferred mutable per-part files. Returns true iff a local manifest was
+    /// committed and the ref is live. Returns false — publishing NOTHING — on ANY retryable failure
+    /// (decode/validation/stage/precommit/promote, including a condemned/absent blob: ABORTED); the
+    /// caller falls back to a byte fetch.
+    virtual bool adoptPartFromManifest(
         const String & table_uuid,
         const String & part_name,
-        const String & tree_id_hex,
+        const String & manifest_bytes,
         const std::map<String, String> & mutable_files) = 0;
 };
 

@@ -90,10 +90,10 @@ public:
 
     /// ==== IContentAddressedExchange (DataPartsExchange facade; relink lands in M-W T11) ====
     const String & getPoolUUID() const override { return pool_uuid; }
-    std::optional<String> getPartTreeId(const String & part_path) const override;
-    bool adoptPart(
+    std::optional<String> getPartManifestBytes(const String & part_path) const override;
+    bool adoptPartFromManifest(
         const String & table_uuid, const String & part_name,
-        const String & tree_id_hex, const std::map<String, String> & mutable_files) override;
+        const String & manifest_bytes, const std::map<String, String> & mutable_files) override;
 
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====
 

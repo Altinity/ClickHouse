@@ -242,17 +242,18 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
             auto * ca_meta = tryGetContentAddressedExchange(part_disk);
             if (ca_meta && !receiver_pool_uuid.empty() && receiver_pool_uuid == ca_meta->getPoolUUID())
             {
-                auto tree_id = ca_meta->getPartTreeId(part->getDataPartStorage().getRelativePath());
-                if (tree_id)
+                auto manifest_bytes = ca_meta->getPartManifestBytes(part->getDataPartStorage().getRelativePath());
+                if (manifest_bytes)
                 {
-                    LOG_DEBUG(log, "Sending part {} by relink (content-addressed, shared pool {}), tree id {}",
-                        part_name, receiver_pool_uuid, *tree_id);
+                    LOG_DEBUG(log, "Sending part {} by relink (content-addressed, shared pool {}), manifest payload {} bytes",
+                        part_name, receiver_pool_uuid, manifest_bytes->size());
                     response.addCookie({CA_RELINK_COOKIE, "1"});
-                    /// The relink payload (D-W4): the authoritative tree id (the receiver adopts the
-                    /// tree from the shared pool itself; the legacy part_id wire field carries it) +
-                    /// the mutable per-part header the tree does not carry (metadata_version; the
+                    /// The relink payload (B7 part_manifest_v1): the opaque encoded PartManifest body
+                    /// (the receiver decodes it, ignores the sender identity, and stages its OWN local
+                    /// manifest over the shared-pool blobs; the legacy part_id wire field carries it) +
+                    /// the mutable per-part header the manifest does not carry (metadata_version; the
                     /// UUID is already in the protocol >= 5 header field).
-                    writeStringBinary(*tree_id, out);
+                    writeStringBinary(*manifest_bytes, out);
                     writeBinary(static_cast<Int32>(part->getMetadataVersion()), out);
                     data.addLastSentPart(part->info);
                     return;
@@ -696,17 +697,17 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     if (server_protocol_version >= REPLICATION_PROTOCOL_VERSION_WITH_PARTS_PROJECTION)
         readBinary(projections, *in);
 
-    /// CAS replication 2b — fetch-by-relink (spec §4). The sender chose to relink: it sent only the
-    /// part's content id + metadata_version, no file bytes. Build the part by publishing this server's
-    /// own ref to the blobs already in the shared pool (pin -> revalidate -> publish -> release inside
-    /// adoptPart). If the relink is not possible (manifest/blob missing — a transient or a
-    /// genuinely-different pool the cheap pre-filter let through), fall back to a normal byte fetch by
-    /// re-requesting WITHOUT the relink capability.
+    /// CAS replication 2b — fetch-by-relink (spec §4; B7 part_manifest_v1). The sender chose to relink:
+    /// it sent only the part's encoded PartManifest body + metadata_version, no file bytes. Build the
+    /// part by staging this server's OWN local manifest over the blobs already in the shared pool
+    /// (adopt-by-hash -> revalidate -> promote inside adoptPartFromManifest). If the relink is not
+    /// possible (blob missing/condemned — a transient or a genuinely-different pool the cheap
+    /// pre-filter let through), fall back to a normal byte fetch by re-requesting WITHOUT relink.
     String ca_relink = parse<String>(in->getResponseCookie(CA_RELINK_COOKIE, ""));
     if (!ca_relink.empty())
     {
-        String sender_part_id;
-        readStringBinary(sender_part_id, *in);
+        String sender_manifest_bytes;
+        readStringBinary(sender_manifest_bytes, *in);
         Int32 metadata_version = 0;
         readBinary(metadata_version, *in);
         assertEOF(*in);
@@ -717,12 +718,12 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
                 "Got '{}' cookie but the target disk {} is not content-addressed", CA_RELINK_COOKIE, disk->getName());
 
         auto relinked = relinkPartToDisk(
-            part_name, tmp_prefix, disk, sender_part_id, part_uuid, metadata_version);
+            part_name, tmp_prefix, disk, sender_manifest_bytes, part_uuid, metadata_version);
         if (relinked)
             return std::make_pair(std::move(relinked), std::move(temporary_directory_lock));
 
-        LOG_INFO(log, "Relink of part {} not possible (content id {} not resolvable in the shared pool); "
-            "falling back to a byte fetch", part_name, sender_part_id);
+        LOG_INFO(log, "Relink of part {} not possible (manifest's blobs not resolvable in the shared pool); "
+            "falling back to a byte fetch", part_name);
         temporary_directory_lock = {};
         /// Re-request without the relink capability: pass the SAME (CA) disk but disable zero-copy/relink
         /// so the sender streams bytes; on CA the downloaded files content-address and dedup.
@@ -1059,7 +1060,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     const String & part_name,
     const String & tmp_prefix,
     DiskPtr disk,
-    const String & sender_part_id,
+    const String & sender_manifest_bytes,
     UUID part_uuid,
     Int32 metadata_version)
 {
@@ -1094,14 +1095,15 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     if (part_uuid != UUIDHelpers::Nil)
         sidecar_values[IMergeTreeDataPart::UUID_FILE_NAME] = toString(part_uuid);
 
-    LOG_DEBUG(log, "Relinking part {} (staged as {}) onto content-addressed disk {} from shared part_id {}.",
-        part_name, part_dir, disk->getName(), sender_part_id);
+    LOG_DEBUG(log, "Relinking part {} (staged as {}) onto content-addressed disk {} from a {}-byte transferred manifest.",
+        part_name, part_dir, disk->getName(), sender_manifest_bytes.size());
 
-    /// Adopt-by-tree-id + publish (M-W D-W4): Build::adoptTree OBSERVES the tree (cold reuse) and
-    /// the publish gate provides the GC-race safety the old 4-step pin protocol carried. Returns
-    /// false if the tree is not adoptable in this pool (reclaimed) — relink not possible, the
-    /// caller falls back to a byte fetch; nothing was published (no dangling ref).
-    const bool published = ca_meta->adoptPart(*table_uuid, part_dir, sender_part_id, sidecar_values);
+    /// Adopt-from-manifest + publish (B7 part_manifest_v1): the receiver decodes the transferred body,
+    /// stages its OWN local manifest over the shared-pool blobs (adopt-by-hash), and promotes it with
+    /// fail-closed blob revalidation (the GC-race safety the old 4-step pin protocol carried). Returns
+    /// false if a referenced blob is missing/condemned in this pool — relink not possible, the caller
+    /// falls back to a byte fetch; nothing was published (no dangling ref).
+    const bool published = ca_meta->adoptPartFromManifest(*table_uuid, part_dir, sender_manifest_bytes, sidecar_values);
     if (!published)
         return nullptr;
 
