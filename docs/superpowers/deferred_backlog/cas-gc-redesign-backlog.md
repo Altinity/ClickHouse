@@ -25,6 +25,18 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   round/recheck steps would reduce the risk of a future optimization silently removing one. Deferred:
   not required for correctness (the behavior is in the plans); a documentation-only polish.
 
+- **B3 — pre-existing `CaWiringOps.FreezeViaHardLinksIntoShadow` gtest failure (unrelated to Phase 1a).**
+  Severity: medium. Where: `src/Disks/tests/gtest_ca_wiring.cpp:852`. Symptom: after
+  `removeRecursive("shadow/bk1")` + commit (the UNFREEZE step), `existsDirectory("shadow/bk1")` still
+  returns `true` (expected `false`). Reproduces in isolation and with a clean
+  `$TMPDIR/ca_wiring_scratch`, so it is a real `removeRecursive`/shadow-namespace-drop bug in
+  `ContentAddressedMetadataStorage`, not stale on-disk state. Confirmed NOT caused by Phase 1a: Phase 1a
+  is purely additive (new `Cas{ManifestId,ManifestCodec,RunFile}` files + additive `FormatId` enum
+  values + additive `CasLayout::manifestKey` + a `_manifests` namespace-segment rejection); the freeze
+  test uses the `shadow/bk1/...` namespace which contains no `_manifests` segment, so the one behavioral
+  change to existing code cannot affect it. Deferred: out of scope for Phase 1a (identity/codecs/layout);
+  belongs to the wiring/freeze layer. The other 392 `Cas*`/`Ca*` tests pass.
+
 ## Resolved
 
 (none yet)
