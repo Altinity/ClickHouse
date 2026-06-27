@@ -14,8 +14,8 @@ CasFoldSeal sampleFoldSeal()
     seal.parent_generation = 6;
     seal.per_ns_shard["ns1/0"] = ShardCoverage{.classification = 2, .folded_token = Token{"tok-a"}, .folded_cursor = 42};
     seal.per_ns_shard["ns1/1"] = ShardCoverage{.classification = 1, .folded_token = Token{}, .folded_cursor = 0};
-    seal.blob_target_runs.push_back(RunRef{.key = "gc/gen/7/blob_target/0/0", .checksum = DB::UInt128(0xABCDEF)});
-    seal.part_manifest_cleanup.push_back(RunRef{.key = "gc/gen/7/part_manifest_cleanup/0/0", .checksum = DB::UInt128(0x1234)});
+    seal.blob_target_runs.push_back(RunRef{.key = "gc/gen/7/blob_target/0/0", .checksum = UInt128(0xABCDEF)});
+    seal.part_manifest_cleanup.push_back(RunRef{.key = "gc/gen/7/part_manifest_cleanup/0/0", .checksum = UInt128(0x1234)});
     return seal;
 }
 
@@ -25,7 +25,7 @@ CasCompletionSeal sampleCompletionSeal()
     seal.generation = 7;
     seal.fence_positions["ns1/0"] = 99;
     seal.fence_positions["_registry"] = 100;
-    seal.delete_outcomes.push_back(RunRef{.key = "gc/outcomes/2.0/0", .checksum = DB::UInt128(0x55)});
+    seal.delete_outcomes.push_back(RunRef{.key = "gc/outcomes/2.0/0", .checksum = UInt128(0x55)});
     seal.trim_cursors["ns1/0"] = 42;
     seal.adoptable = true;
     return seal;
@@ -45,7 +45,7 @@ TEST(CasFoldSeal, RoundTripsAllFields)
     EXPECT_EQ(out.per_ns_shard.at("ns1/0").folded_cursor, 42u);
     ASSERT_EQ(out.blob_target_runs.size(), 1u);
     EXPECT_EQ(out.blob_target_runs[0].key, "gc/gen/7/blob_target/0/0");
-    EXPECT_EQ(out.blob_target_runs[0].checksum, DB::UInt128(0xABCDEF));
+    EXPECT_EQ(out.blob_target_runs[0].checksum, UInt128(0xABCDEF));
     ASSERT_EQ(out.part_manifest_cleanup.size(), 1u);
 }
 
