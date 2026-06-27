@@ -84,3 +84,20 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   no `_manifests` segment, so it cannot be caused here. Backlogged B3 (medium). **Sweep-gate working
   definition for the rest of the run: GREEN = no NEW failures beyond B3** (392/393 with B3 the only red).
 - **Next:** code-review the Phase 1a diff, then Phase 1b.
+
+### 2026-06-27 — Phase 1a code-review: CHANGES-NEEDED (one real blocker), fixing before 1b
+- Code-review of the Phase 1a diff found ONE real **blocker (B1/B2)**: `RunFileReader::loadFooter`
+  parses untrusted footer length fields (`block_count`, key lengths) with unchecked accessors BEFORE
+  verifying the footer CRC → heap over-read/UB under libc++ FAST hardening on corrupt input, and
+  `substr(pos>size)` throws `std::out_of_range` which `decodeGuarded` doesn't catch → decode NOT
+  reliably fail-closed (a rev.15 safety property 1b/1c/1d rely on, since they read runs from object
+  storage). **M1:** the absence of corrupt-footer/truncation/empty-buffer tests hid it.
+- Everything else verified correct by the reviewer: identity types, magics (CAPT≠CAPM), `manifestKey`/
+  `_manifests` rejection, manifest codec semantics, writer/seek/merge logic, determinism, CMake/crc32c.
+- **Action:** dispatched fixer `abb6873296baecbb1` for B1/B2 (verify footer CRC first; bounds-check
+  every read → `CORRUPTED_DATA`; no escaping `std::exception`) + M1 (corrupt-footer/truncation-sweep/
+  empty-buffer negative tests) + N4 (loadBlock defensive bounds) + N2 (RunMerger doc). Rebuild+test+commit.
+- **N1 (doc) fixed by me:** the plan/overview contract said `payload_digest` = BLAKE3; the code/decision
+  is `CityHash128` (CAS has no BLAKE3; digest is integrity-only). Corrected 5 spots in overview +
+  phase1a so 1b reads an accurate contract. **N3→backlog B4** (operator< cosmetic). N5 (CMake) verified fine.
+- **Verdict:** proceed to 1b only after the fixer lands GREEN (re-verify the negative tests myself).

@@ -37,6 +37,11 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   change to existing code cannot affect it. Deferred: out of scope for Phase 1a (identity/codecs/layout);
   belongs to the wiring/freeze layer. The other 392 `Cas*`/`Ca*` tests pass.
 
+- **B4 — `ManifestId::operator<` cosmetic (code-review N3).** Severity: trivial. Where:
+  `Core/CasManifestId.h`. Hand-compares `root_namespace.string()` though `RootNamespace` has a
+  defaulted `operator<=>`; could be `std::tie(root_namespace, ref) < std::tie(...)`. Equivalent and
+  correct; cosmetic. Deferred.
+
 ## Resolved
 
 (none yet)

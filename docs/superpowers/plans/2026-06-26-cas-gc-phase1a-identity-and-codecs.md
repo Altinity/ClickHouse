@@ -91,7 +91,7 @@ All under `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/` 
   struct PartManifest { ManifestRef ref; RootNamespace root_namespace_id; UInt128 payload_digest; std::vector<ManifestEntry> entries; };
   String encodePartManifest(const PartManifest &);   // deterministic, streaming-capable, entries in canonical path order, duplicate-path => throw CORRUPTED_DATA
   PartManifest decodePartManifest(std::string_view);
-  UInt128 computePayloadDigest(const PartManifest &);  // BLAKE3 of the canonical encoded body; callers set PartManifest.payload_digest from it
+  UInt128 computePayloadDigest(const PartManifest &);  // CityHash128 of the canonical encoded body; callers set PartManifest.payload_digest from it
   bool refMatchesBody(const ManifestRef & journal_ref, const PartManifest & body);
   bool manifestNamespaceMatches(const RootNamespace & owning, const PartManifest & body);
   ```
@@ -1366,7 +1366,7 @@ String encodePartManifest(const PartManifest & m);
 /// truncated buffer.
 PartManifest decodePartManifest(std::string_view data);
 
-/// BLAKE3 digest of the canonical encoded body. Callers (Phase 1b `stageManifest`) set
+/// CityHash128 digest of the canonical encoded body. Callers (Phase 1b `stageManifest`) set
 /// `PartManifest.payload_digest` from this. It is integrity/debug ONLY - never a key, never dedup,
 /// never in-degree. Stable for identical bodies; changes when any byte of the canonical encoding does.
 UInt128 computePayloadDigest(const PartManifest & m);
@@ -1542,11 +1542,11 @@ UInt128 computePayloadDigest(const PartManifest & m)
 {
     /// Digest the canonical encoding with payload_digest zeroed, so the digest does not depend on
     /// itself (it would be circular otherwise) and is stable for identical bodies, changing whenever
-    /// ref / namespace / entries change. BLAKE3 over the deterministic encodePartManifest bytes.
+    /// ref / namespace / entries change. CityHash128 over the deterministic encodePartManifest bytes.
     PartManifest probe = m;
     probe.payload_digest = UInt128{};
     const String bytes = encodePartManifest(probe);
-    return blake3OfBytes(bytes);   /// CasIds.h BLAKE3 helper (the one blobKey hashing already uses)
+    return cityHash128OfBytes(bytes);   /// CityHash_v1_0_2::CityHash128 — the CAS content-hash primitive (same as blob/tree hashing)
 }
 
 bool refMatchesBody(const ManifestRef & journal_ref, const PartManifest & body)
@@ -1561,7 +1561,7 @@ bool manifestNamespaceMatches(const RootNamespace & owning, const PartManifest &
 
 }
 ```
-(Use the project's existing BLAKE3-of-bytes helper - the same one blob content hashing uses; if it is spelled differently in `CasIds.h`/`CasCodecUtil.h`, call that name. Do NOT introduce a second hash primitive.)
+(Use the project's existing `CityHash128`-of-bytes primitive — `CityHash_v1_0_2::CityHash128`, the same one blob content hashing uses. Do NOT introduce a second hash primitive — there is no BLAKE3 in CAS core.)
 
 - [ ] **Step 3: Write `gtest_cas_manifest_codec.cpp`** - round-trip, byte-determinism, canonical path order, duplicate-path rejection, inline-vs-blob entries.
 
