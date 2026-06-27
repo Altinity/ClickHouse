@@ -358,6 +358,45 @@ TEST(CasGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }
 
+/// M1 REGRESSION (cross-round fold cursor must survive independent of trim): a folded-but-untrimmed owner
+/// event must NOT be re-folded by the next round. With eager trim the folded event is removed so the bug
+/// (sealedCursorOf resetting to 0 after a completed round, because snap_generation points at the COMPLETION
+/// generation whose fold_seal lives at the parent) is MASKED. Disable trim to expose it: the publish event
+/// stays in the journal, so a round that re-folds from 0 emits a SECOND +1 and drives the blob's in-degree
+/// to 2 (a silent over-pin => leak). The fix carries the per-shard fold cursor into the completion seal so
+/// the next round recovers the exact cursor. Asserts in-degree stays EXACTLY 1 across >= 2 re-folds.
+TEST(CasGcRound, FoldCursorSurvivesAcrossRoundsWithoutTrim)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.setTrimEnabledForTest(false);   /// keep the folded publish event in the journal across rounds
+
+    /// Round 1 folds the +1 edge: in-degree 1, blob pinned.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
+
+    /// Several more rounds. The publish event is STILL in the journal (trim off). Each round must
+    /// recover the exact sealed cursor and re-fold NOTHING for this shard — in-degree stays exactly 1.
+    for (int round = 0; round < 3; ++round)
+    {
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+        EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1)
+            << "round " << round << ": a folded-but-untrimmed event was re-folded => blob in-degree double-counted";
+    }
+
+    /// No-loss throughout: the live blob and its owner body are intact.
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+    EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
+}
+
 /// Multi-ref sharing (INV-NO-LOSS): one blob referenced by TWO committed refs is spared until BOTH
 /// drop. Dropping the first ref must NOT collect the blob (the second ref still pins it); only after the
 /// second ref drops does the round collect it.
@@ -551,15 +590,81 @@ TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
 ///     CasGcRetire.ReclaimsAbandonedPrecommitWhenFloorPasses — precommit reclaim is exercised by the
 ///     orphan-manifest-sweep / build-root suites against the new reclaimAbandonedPrecommit path.
 
-/// snap-generation retention (B174) is a snap-model feature that has NO implementation in the new
-/// run/generation model yet (CasGc.cpp does not prune generations; gc/state.snap_pruned_through is a
-/// dormant format field). Skipped until retention is reimplemented over blobTargetRun/foldSeal keys.
+/// B9 snap-generation retention, reimplemented over the run/generation model: after a generation is
+/// adopted the GC prunes the per-generation seal/run/cleanup objects of generations at or below the
+/// retention floor (snap_generation - gc_snap_generations_to_keep), advancing snap_pruned_through. This
+/// test drives enough rounds to accumulate several generations, then asserts that everything at or below
+/// the floor is GONE while the last `keep` generations (and the live current one) remain.
 TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 {
-    GTEST_SKIP() << "snap-generation retention not yet reimplemented for the run/generation model";
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// keep the default 3 generations; one root shard so cursor keys are "ns/0".
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_snap_generations_to_keep = 3});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    /// Several quiescent rounds, each advancing the generation pointer (fold + completion). Enough to
+    /// push generations below the floor.
+    for (int i = 0; i < 8; ++i)
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const GcState st = readState(*backend, *store);
+    const uint64_t keep = 3;
+    ASSERT_GT(st.snap_generation, keep);
+    const uint64_t floor = st.snap_generation - keep;
+
+    /// snap_pruned_through reached the floor (bounded burst is large enough for this generation count).
+    EXPECT_EQ(st.snap_pruned_through, floor)
+        << "retention cursor must reach the floor (snap_generation - keep)";
+
+    /// Every generation at or below the floor is fully gone (fold seal + completion seal absent).
+    for (uint64_t g = 1; g <= floor; ++g)
+    {
+        EXPECT_FALSE(backend->head(store->layout().foldSealKey(g)).exists)
+            << "fold seal of pruned generation " << g << " must be gone";
+        EXPECT_FALSE(backend->head(store->layout().completionSealKey(g)).exists)
+            << "completion seal of pruned generation " << g << " must be gone";
+        EXPECT_FALSE(backend->head(store->layout().blobTargetRunKey(g, /*shard*/0, /*seq*/0)).exists)
+            << "blob-target run of pruned generation " << g << " must be gone";
+    }
+
+    /// The latest seal at the current generation survives (the live in-degree view).
+    EXPECT_TRUE(backend->head(store->layout().completionSealKey(st.snap_generation)).exists
+                || backend->head(store->layout().foldSealKey(st.snap_generation)).exists)
+        << "the current generation's seal must NOT be pruned";
+
+    /// No-loss: the live blob and owner body are intact throughout retention pruning.
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+    EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
 }
 
+/// keep == 0 is the forensics "keep ALL" mode: NO generation is pruned, snap_pruned_through stays 0.
 TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
 {
-    GTEST_SKIP() << "snap-generation retention not yet reimplemented for the run/generation model";
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_snap_generations_to_keep = 0});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    for (int i = 0; i < 6; ++i)
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const GcState st = readState(*backend, *store);
+    EXPECT_EQ(st.snap_pruned_through, 0u) << "keep==0 must prune nothing";
+
+    /// Every fold seal from generation 1 up to the current one remains.
+    for (uint64_t g = 1; g <= st.snap_generation; ++g)
+        EXPECT_TRUE(backend->head(store->layout().foldSealKey(g)).exists
+                    || backend->head(store->layout().completionSealKey(g)).exists)
+            << "keep==0: seal of generation " << g << " must remain";
 }

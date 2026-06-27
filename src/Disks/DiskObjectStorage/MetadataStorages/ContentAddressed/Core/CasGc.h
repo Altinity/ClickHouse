@@ -103,6 +103,12 @@ public:
     /// PER-ROUND caches; the ACROSS-ROUND maps persist (the K=2 frozen-seq crash detector's memory).
     void beginWatermarkRound();
 
+    /// TEST SEAM (M1 regression): disable the round's journal trim so a folded event stays in the journal
+    /// across rounds — exactly the Phase-3 lazy-trim / partial-trim-after-crash condition under which the
+    /// next round's fold MUST recover the exact sealed cursor (else it re-folds the event and double-counts
+    /// blob in-degree). Production never calls this; trim is always enabled.
+    void setTrimEnabledForTest(bool enabled) { trim_enabled = enabled; }
+
     /// B171 precommit reclaim: while folding a precommit shard, drop the precommits of ABANDONED builds
     /// (the owning build is no longer live). The precommit namespace is sharded like any namespace, so
     /// one shard holds MANY precommit refs each named `std::to_string(build_seq)`. A build is DEAD iff
@@ -227,12 +233,24 @@ private:
     void writePartManifestCleanupBundle(uint64_t generation, uint64_t owner_shard,
                                         const std::map<ManifestId, Token> & cleanup, std::vector<RunRef> & out);
 
+    /// B9 retention: prune the per-generation GC objects (fold seal, completion seal, blob-target runs,
+    /// part-manifest-cleanup bundles) of generations at or below the retention floor
+    /// (`adopted_generation - gc_snap_generations_to_keep`), walking forward from `next.snap_pruned_through`
+    /// (bounded per round) and folding the advanced cursor into `next` (persisted by the round-commit CAS).
+    /// keep==0 prunes nothing (keep-all forensics mode). Never throws on a 404 (record-and-continue).
+    void pruneSupersededGenerations(uint64_t adopted_generation, GcState & next);
+
     /// Read the fold seal for `generation` (nullopt when absent). Used by resume + parent-cursor reads.
     std::optional<CasFoldSeal> readFoldSeal(uint64_t generation);
 
-    /// The cursor a prior fold sealed for (ns, shard): the parent generation's fold seal's coverage, or
-    /// 0 when absent (fresh pool / first fold).
-    uint64_t sealedCursorOf(const CasFoldSeal & parent, const String & cursor_key);
+    /// Read the completion seal for `generation` (nullopt when absent).
+    std::optional<CasCompletionSeal> readCompletionSeal(uint64_t generation);
+
+    /// M1: the per-(ns,shard) fold cursor coverage as of `generation`, read from the LATEST seal there
+    /// (completion seal's folded_cursors if the round finished, else the fold seal's per_ns_shard, else
+    /// empty). This is what the next fold keys its parent cursor off — recovered with NO dependence on
+    /// trim having run, so a folded-but-untrimmed event is never re-folded from 0 (no in-degree double-count).
+    std::map<String, ShardCoverage> readSealedCursors(uint64_t generation);
 
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
@@ -244,6 +262,7 @@ private:
 
     StorePtr store;
     UInt128 gc_id{};              /// this leader's identity (random u128, never 0)
+    bool trim_enabled = true;     /// TEST SEAM ONLY (M1): production always trims; see setTrimEnabledForTest
 
     /// the contender's observation window (steal protocol)
     bool has_observation = false;
