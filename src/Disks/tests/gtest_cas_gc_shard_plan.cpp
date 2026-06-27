@@ -1,13 +1,17 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcShardPlan.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include "cas_test_helpers.h"
 
 using namespace DB::Cas;
+using namespace DB::Cas::tests;
 
 TEST(CasGcShardConfig, DefaultIsSingleShard)
 {
@@ -431,4 +435,112 @@ TEST(CasGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
         << "b0 must NOT appear in shard-1's run";
     EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/0, b1), 0)
         << "b1 must NOT appear in shard-0's run";
+}
+
+/// ---- Phase 4, Task 7: single-shard equivalence ----
+///
+/// Prove that the sharded partition+reduce path (gc_shards=2, all blobs routing to shard 0) produces
+/// the SAME per-blob in-degrees as the single-shard (gc_shards=1, Phase 1d) fold over an IDENTICAL
+/// journal. This is approach (a) from the spec: choose blob hashes whose high64 % 2 == 0 so shard 1's
+/// bucket is always empty; the sharded path's shard-0 reducer and the single-shard path both call
+/// `foldDeltasIntoGeneration` with the same delta stream (one routing into shard 0 of 2, the other
+/// into shard 0 of 1).
+///
+/// NOTE ON SEAL-BYTE EQUALITY: byte-for-byte equality of the `CasFoldSeal` is NOT asserted here. The
+/// fold seal records the `blobTargetRunKey(gen, shard, seq)` path, which embeds the shard number. The
+/// single-shard path writes `blobTargetRunKey(g, 0, 0)` for gc_shards=1, while the sharded path writes
+/// `blobTargetRunKey(g, 0, 0)` for the shard-0 run AND `blobTargetRunKey(g, 1, 0)` for the (empty)
+/// shard-1 run. The per-blob in-degree (the load-bearing property — it drives the spare/delete
+/// decision) is identical; the seal's key-set legitimately differs by shard count.
+TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
+{
+    /// Build three blob hashes that ALL route to shard 0 under gc_shards=2 (high64 % 2 == 0).
+    /// high64=0 => shard 0, high64=2 => shard 0, high64=4 => shard 0.
+    const UInt128 hA = static_cast<UInt128>(0ULL) << 64;   /// high64=0, routes to shard 0
+    const UInt128 hB = static_cast<UInt128>(2ULL) << 64;   /// high64=2, routes to shard 0
+    const UInt128 hC = static_cast<UInt128>(4ULL) << 64;   /// high64=4, routes to shard 0
+
+    ASSERT_EQ(blobShard(hA, 2), 0u) << "hA must route to shard 0 under gc_shards=2";
+    ASSERT_EQ(blobShard(hB, 2), 0u) << "hB must route to shard 0 under gc_shards=2";
+    ASSERT_EQ(blobShard(hC, 2), 0u) << "hC must route to shard 0 under gc_shards=2";
+    ASSERT_EQ(blobShard(hA, 1), 0u) << "hA must route to shard 0 under gc_shards=1";
+    ASSERT_EQ(blobShard(hB, 1), 0u) << "hB must route to shard 0 under gc_shards=1";
+    ASSERT_EQ(blobShard(hC, 1), 0u) << "hC must route to shard 0 under gc_shards=1";
+
+    /// Construct the journal: hA gets net +2 (published twice), hB gets net +1, hC gets net 0 (publish
+    /// then drop => transitions to zero). This exercises all three outcomes (>1, =1, =0) for the
+    /// equivalence proof.
+    ///
+    /// Note: net +2 is unrealistic for production (two DISTINCT manifests can share a blob, each
+    /// contributing +1 independently) but is valid for the fold math test. It directly verifies that
+    /// accumulators sum correctly under both paths.
+    const RootNamespace ns{"ns-equiv"};
+    const ManifestRef rA1{.writer_instance_id = "srv:1", .build_sequence = 1, .manifest_instance_id = UInt128(0x1)};
+    const ManifestRef rA2{.writer_instance_id = "srv:1", .build_sequence = 2, .manifest_instance_id = UInt128(0x2)};
+    const ManifestRef rB{.writer_instance_id = "srv:1", .build_sequence = 3, .manifest_instance_id = UInt128(0x3)};
+    const ManifestRef rC{.writer_instance_id = "srv:1", .build_sequence = 4, .manifest_instance_id = UInt128(0x4)};
+
+    /// Helper lambda that sets up a fresh backend + store with the shared scripted journal, runs one GC
+    /// round with the given gc_shards, and returns the per-blob in-degrees in the sealed generation.
+    /// Returns {indeg_A, indeg_B, indeg_C}.
+    auto runJournalAndGetInDegrees = [&](uint64_t gc_shards) -> std::tuple<int64_t, int64_t, int64_t>
+    {
+        auto backend = std::make_shared<InMemoryBackend>();
+        const Layout layout("p");
+
+        /// Write blob bodies so HEAD returns a token (GC retires zero-in-degree blobs only if present).
+        writeBlobBody(*backend, layout, hA);
+        writeBlobBody(*backend, layout, hB);
+        writeBlobBody(*backend, layout, hC);
+
+        /// Write manifests: rA1 references hA once; rA2 also references hA once; rB references hB;
+        /// rC references hC. Each publication contributes +1 per referenced blob.
+        writeManifestRaw(*backend, layout, ns, rA1, {blobEntryFor("a", hA)});
+        writeManifestRaw(*backend, layout, ns, rA2, {blobEntryFor("a", hA)});
+        writeManifestRaw(*backend, layout, ns, rB,  {blobEntryFor("b", hB)});
+        writeManifestRaw(*backend, layout, ns, rC,  {blobEntryFor("c", hC)});
+
+        /// Publish all four refs (tbl1=rA1, tbl2=rA2, tbl3=rB, tbl4=rC).
+        publishCommittedTransition(*backend, layout, ns, "tbl1", std::nullopt, rA1);
+        publishCommittedTransition(*backend, layout, ns, "tbl2", std::nullopt, rA2);
+        publishCommittedTransition(*backend, layout, ns, "tbl3", std::nullopt, rB);
+        publishCommittedTransition(*backend, layout, ns, "tbl4", std::nullopt, rC);
+        /// Drop tbl4 (hC net = 0): rC removed from the live set.
+        dropRefTransition(*backend, layout, ns, "tbl4", rC);
+
+        /// Open a store with the given gc_shards (root_shards=1 keeps cursor keys as "ns/0").
+        auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_shards = gc_shards});
+        const UInt128 gc_id = UInt128(0xDEADBEEF42ULL);
+        Gc gc(store, gc_id);
+        EXPECT_TRUE(gc.runRegularRound().acquired_lease);
+
+        /// The fold seal for new_generation (== snap_generation after fold) holds the in-degree runs.
+        /// After runRegularRound the snap_generation points at the COMPLETION generation; the fold
+        /// generation is snap_generation - 1 for the first full round. Use inDegreeOf (which reads
+        /// currentGenerationOf = completion generation) for the final in-degrees.
+        const uint64_t gen = currentGenerationOf(*backend, layout);
+        const int64_t iA = inDegreeInGeneration(*backend, layout, gen, /*shard=*/0, hA);
+        const int64_t iB = inDegreeInGeneration(*backend, layout, gen, /*shard=*/0, hB);
+        const int64_t iC = inDegreeInGeneration(*backend, layout, gen, /*shard=*/0, hC);
+        return {iA, iB, iC};
+    };
+
+    const auto [a1, b1_indeg, c1] = runJournalAndGetInDegrees(/*gc_shards=*/1);
+    const auto [a2, b2_indeg, c2] = runJournalAndGetInDegrees(/*gc_shards=*/2);
+
+    /// The in-degree values must match exactly between the two runs.
+    EXPECT_EQ(a1, a2)
+        << "hA in-degree must match: gc_shards=1 gives " << a1 << ", gc_shards=2 gives " << a2;
+    EXPECT_EQ(b1_indeg, b2_indeg)
+        << "hB in-degree must match: gc_shards=1 gives " << b1_indeg << ", gc_shards=2 gives " << b2_indeg;
+    EXPECT_EQ(c1, c2)
+        << "hC in-degree must match: gc_shards=1 gives " << c1 << ", gc_shards=2 gives " << c2;
+
+    /// Cross-check the known correct values (derivable from the scripted journal).
+    /// hA: +1 (tbl1/rA1) + 1 (tbl2/rA2) = 2.
+    EXPECT_EQ(a1, 2) << "hA in-degree must be 2 (two distinct live refs both citing hA)";
+    /// hB: +1 (tbl3/rB) = 1.
+    EXPECT_EQ(b1_indeg, 1) << "hB in-degree must be 1";
+    /// hC: +1 (tbl4/rC publish) - 1 (tbl4 drop) = 0.
+    EXPECT_EQ(c1, 0) << "hC in-degree must be 0 (publish then drop; net zero)";
 }
