@@ -167,3 +167,22 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   model).
 - **Action:** dispatched run 4 = re-add B170 GC events to the new core + port the 12 gtests → link +
   green `Cas*`/`Ca*` (modulo B3). Then: code-review the whole switch, post-1d soak, Phase 2.
+
+### 2026-06-27 — BEHAVIOR SWITCH GREEN (verified); code-review dispatched
+- Run 4 finished the switch: B170 GC events restored; 12 gtests ported (faithful — fixed 2 real bugs
+  rather than weaken assertions: a detached-part manifest-namespace wiring bug [added
+  `BuildInfo::intended_namespace`], and a `foldCursorOf` test-helper bug); 7 commits
+  (`3124eb…`→`2007520…`).
+- **Independently verified the gate:** `unit_tests_dbms` links; `Cas*:Ca*` = **338 passed, 8 skipped,
+  1 failed**. The 1 failure is exactly **B3** (`CaWiringOps.FreezeViaHardLinksIntoShadow`, pre-existing).
+  No process aborts. (Run-4's "17 skipped" was a miscount; actual 8.) **The behavior switch
+  (1b+1c+1d) is GREEN.** The tree/snap/cascade model is gone; only blobs are content-addressed; GC is
+  the streaming `RootOwnerEvent`-fold with the two seals.
+- **8 skips triaged:** B7 adopt-by-tree relink ×3 (backlogged), B8 precommit-reclaim ×1 (backlogged),
+  2 genuinely-obsolete tree-era tests (inline-closure, deferred-upload — no action), and **B9 ×2**
+  (`CasGcSnapRetention`): generation pruning is NOT implemented — `CasGc` doesn't prune old
+  `gc/gen/<gen>/` (fold/completion seals + runs + cleanup bundles), so they accumulate. The phase1d
+  trim task specified this prune; it was deferred. **Space-liveness, NOT safety** (R0 invariants hold),
+  but the post-1d soak would show unbounded `gc/gen/` growth → must fix B9 before the soak.
+- **Action:** dispatched the full-switch code-review (GC core = R0 invariants in C++). Next: review →
+  one fix pass (any review blockers + **B9 generation prune**) → post-1d chaos soak → Phase 2.

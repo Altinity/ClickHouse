@@ -219,6 +219,18 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   spec's INV-COMMIT-FAILCLOSED still holds (a falsely-reclaimed live build's `promote` fails closed), so
   this is a space leak of abandoned-precommit closures, not data loss.
 
+- **B9 — GC generation pruning not implemented (space leak; pre-soak must-fix).** Severity: medium
+  (space-liveness, NOT safety). Where: `Core/CasGc.cpp` round/trim. The new GC writes a `CasFoldSeal` +
+  `CasCompletionSeal` + blob-target runs + part-manifest-cleanup bundles per generation under
+  `gc/gen/<gen>/`, but never prunes superseded generations (the old core kept
+  `gc_snap_generations_to_keep`=3 GcSnap generations). So `gc/gen/` grows unboundedly. The phase1d trim
+  task specified the prune (prune `foldSealKey`/`completionSealKey`/`blobTargetRunKey`/
+  `partManifestCleanupKey` of generations below the retention floor instead of `gcSnapKey`); deferred
+  during the switch. Skipped tests `CasGcSnapRetention.{KeepZeroPrunesNothing,
+  PrunesOldGenerationsKeepingLastThree}` wait on it. **Fix before the post-1d soak** (else the soak shows
+  ever-growing `gc/gen/` metadata) — implement the retention prune + un-skip the 2 tests. R0 invariants
+  hold regardless.
+
 ## Resolved
 
 - **B6 — behavior switch (1b+1c+1d) DONE; SWITCH GREEN.** The link gate passes (`unit_tests_dbms` links)
