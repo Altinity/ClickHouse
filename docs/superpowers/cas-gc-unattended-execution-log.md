@@ -224,3 +224,32 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   re-green the whole suite (model file only; independent of the soak).
 - Next: soak result (clean / infeasible→B11) + Phase-2-model GREEN → Phase 2 code (discovery skip) →
   Phase 3 → 4 (+soak) → 5, each gated on its TLA+ extension + reviewed.
+
+### 2026-06-27 — POST-1d CHAOS SOAK CLEAN: behavior switch validated under chaos (T19 done)
+- Feasibility gate **PASSED**. Agent caught a sharp trap: the on-disk server binary (2026-06-26
+  02:52) **predated the entire switch** (1a–1d landed 2026-06-27 03:00+) → the running 22h soak was
+  testing the OLD GC. Rebuilt (incremental ccache-warm link, minutes) + ran a **fresh clean-data 45m
+  chaos soak** on the new binary. The integration oracle now confirms the R0 invariants live:
+  - **No loss / no dangle** — all 4 quiesced checkpoints `dangling=0` incl. post node-kill+restart;
+    1.2M rows, both replicas agree; `PHASE3 OK (exit 0)`.
+  - **No exception/logical-error storm** — zero CA-layer/logical/fatal lines in either server log.
+  - **`gc/gen/` bounded** — oscillated 3↔5↔3↔4, ended at 3 (= `gc_snap_generations_to_keep`) →
+    **B9 prune actively reclaims** superseded generations, does not climb per round.
+  - **B170 populated** with the new core's events (`gc_fold_begin/end`, `gc_fence`,
+    `gc_retire_observe`, `indeg_zero`, `blob_retire`, `gc_recheck_verdict`, `gc_trim`).
+  - **Real progress + correct sparing** — 32+ Success rounds, `tree_delete=13078` manifest objects
+    reclaimed; all 939 retired-blob candidates correctly **spared** (in-degree>0 via dedup) through
+    fold-through-fence recheck — R0 no-loss exercised, not a stall. Pool plateaued ~20.9 GB < 30 GB.
+  - **One low finding (introspection only)** → **B11**, committed `6ee6385dac4`: round-summary
+    `objects_deleted` reads 0 while events show `tree_delete=13078` (`report.deleted` in `CasGc.cpp`
+    ~717 counts only blob deletes, not the manifest-body delete site). Per-event audit correct; only
+    the aggregate undercounts. Not a correctness bug. Stack auto-torn-down; artifacts archived under
+    `utils/ca-soak/soak/archive/`. (~65m wall vs 45m nominal — pre-existing B146/B154 fsck-under-load
+    180s timeout degrades gracefully; not a switch issue.)
+- **Phase 2 model gate (parallel)**: subagent wrote the token-diff extension (`listedTok`/`foldedTok`,
+  `SabotageSkipChangedShard`) but died in a broken poll-loop (waiting on a background TLC) — I took
+  over, killed orphaned TLC, fast-verified (stage0/1 HOLD; sab_skipchangedshard + sab_nofence VIOLATE
+  `INV_NO_DANGLE`), and launched the big-stage re-green (`stage2/3/4/live` + full-feature
+  `stage5_tokendiff`) in background (`b2awn62ap`; stage2 already HOLD @ 68.5M states). Model work
+  **uncommitted** pending all-HOLD.
+- Next: on re-green all-HOLD → commit Phase 2 model + dispatch Phase 2 code (discovery skip) → 3 → 4 → 5.
