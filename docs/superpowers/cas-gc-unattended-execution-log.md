@@ -541,3 +541,19 @@ didn't drive):
   disclaimer). REMAINING: **B7** (cross-server relink — a replication-path FEATURE rework, held for the
   maintainer's explicit go-ahead; byte-streaming fallback is correct meanwhile) and **B3** (pre-existing,
   unrelated freeze test). PR: not opened (maintainer's call). Branch `cas-gc-part-manifest-impl`.
+
+### 2026-06-27 — B7 RESOLVED + VALIDATED (cross-server relink, part_manifest_v1); BACKLOG FULLY CLEARED
+- Maintainer approved the `part_manifest_v1` protocol (receiver-driven, no shared tree id). Implemented in
+  2 parts: Task A `784c698bb40` (CA-exchange core: `getPartManifestBytes` sender + `adoptPartFromManifest`
+  receiver local-build, fail-closed→fallback; unit-tested) + finisher `743c432f98e`/`25f0cc9b912` (server
+  wire compile-verified, cookie `part_manifest_v1`, two-replica ca-soak/RustFS validation). EVIDENCE:
+  relink path taken (1611-byte manifest transfer, ch1+ch2 logs), `CasBlobPut=0` on receiver (manifest
+  transferred, blobs NOT re-uploaded — shared by hash), ch1 ManifestId `cf1fa3a8…` ≠ ch2 `38cee8b7…` over
+  the SAME shared blob (no shared identity), byte-stream fallback intact, data consistent (3 rows). No
+  model change (reuses proven stageManifest/precommit/promote). No wire bugs.
+- **BACKLOG FULLY CLEARED.** Resolved this session: 3 HIGH review bugs (promote/abandon/recheck-shard),
+  B7 (relink), B8 (reclaim), B11 (counter), B12 (lazy trim), B13 (RustFS soak), B14 (decided=keep HEAD),
+  B15 (plan disclaimer). REMAINING: only **B3** (pre-existing, unrelated freeze test — not part of this
+  work) and the **PR** (maintainer's call, not opened). Branch `cas-gc-part-manifest-impl`: all 5 phase
+  model gates green, Phases 0-4 code complete, Phase 5 model-proven (retire-token code = keep-HEAD/c),
+  every backlog item resolved or decided, sharded GC + relink validated under chaos on RustFS.

@@ -182,7 +182,18 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   API plus an optional B170 event re-add. A clean resumable boundary per the run brief. No product code
   references any removed type (verified: only the 12 listed gtests do).
 
-- **B7 — ASSESSED 2026-06-27: recommend DELIBERATE handling, not an autonomous overnight rework.** This is
+- **B7 — RESOLVED 2026-06-27 (maintainer-approved `part_manifest_v1` protocol).** CA cross-server relink
+  restored WITHOUT shared tree identity: sender ships the opaque encoded `PartManifest` body
+  (`getPartManifestBytes`, `784c698bb40`); receiver decodes it, ignores sender identity, runs a NORMAL local
+  build (`adoptEvidence` per blob → `stageManifest` FRESH local ManifestId in the receiver namespace →
+  `precommitAdd` → `setPendingMutableFiles` → fail-closed `promote`), `ABORTED`→false→byte-stream fallback
+  (`adoptPartFromManifest`). Wire: `DataPartsExchange` carries the manifest bytes in the existing payload
+  slot, cookie `part_manifest_v1` (`743c432f98e`). VALIDATED two-replica on ca-soak/RustFS (`25f0cc9b912`):
+  relink path taken (1611-byte manifest transfer), **`CasBlobPut=0` on the receiver** (blobs shared by hash,
+  not re-uploaded), distinct per-replica ManifestId over the same shared blob, fallback intact, data
+  consistent. No model change (reuses the proven stageManifest/precommit/promote path). Unit `Cas*:Ca*`
+  380 pass / 5 skip / 1=B3; server compiles clean. Original assessment below.
+- **B7 (assessment) — recommend DELIBERATE handling, not an autonomous overnight rework.** This is
   not a bugfix — it is a multi-subsystem FEATURE rework on the critical replication path
   (`IContentAddressedExchange` + impl + `DataPartsExchange`): the old relink shipped a shared
   content-addressed TREE id that does not exist in the per-instance `ManifestId` model, so the wire format
