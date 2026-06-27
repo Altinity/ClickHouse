@@ -384,3 +384,25 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   pass / 1 = pre-existing baseline-red B3. Open decisions: **B14** (Phase 5 manifest-token provenance) for the
   maintainer; B13 (sharded soak needs newer MinIO); B3 (pre-existing freeze test). Branch
   `cas-gc-part-manifest-impl` — NOT yet PR'd (a multi-phase branch; opening a PR is the maintainer's call).
+
+### 2026-06-27 — REPORTING CORRECTION (review caught an under-reported final state)
+The "unattended run summary" above under-reported open items and over-claimed two things. Honest state:
+- **Full open-issue list** (the summary wrongly listed only B14/B13/B3): **B3** pre-existing baseline-red
+  freeze test; **B7** cross-server part relink — feature regression to restore (3 `_ObsoleteB7` GC-leak
+  skips); **B8** GC precommit-reclaim NOT wired for the converged-shard model — a **real core
+  space-liveness gap** (not R0 data-loss, but space can leak; 1 skip `CasBuildRoot.AbandonedPrecommitReclaimed`);
+  **B12** optimal one-round token-diff skip; **B13** sharded integration soak (was deferred on MinIO — see
+  below); **B14** Phase-5 retire-token code (blob-token provenance decision); **B15** plan bodies retain
+  stale rejected-protocol snippets (doc hygiene). The 6 `Cas*:Ca*` skips = B7(3) + B8(1) + 2 genuinely
+  obsolete (deferred-tree-upload, inline-closure JournalRecord — the tree model was removed). So the unit
+  state is **376 ran / 369 passed / 6 skipped / 1 failed (B3)** — the 6 skips are NOT all benign: B7+B8 are
+  real deferred gaps, B8 especially.
+- **Phase 4 wording corrected:** it is **model + unit green; the integration soak was DEFERRED** (B13), NOT
+  full integration validation.
+- **B13 was MISDIAGNOSED as a hard blocker.** The MinIO-If-Match limitation only affects the *praktika*
+  integration path (`test_cas_gc_sharded/`). The canonical **`ca-soak` harness already runs RustFS**
+  (`rustfs/rustfs:1.0.0-beta.8`), which supports the conditional delete — so the two-replica sharded soak
+  IS feasible there. Re-attempting it now via ca-soak/RustFS at `gc_shards=2` (subagent dispatched). If it
+  passes, B13 closes properly (integration validation, not just unit+model).
+- **"All plans re-synced clean" was overstated** → B15 (plan bodies still carry pre-rev.15 rejected
+  snippets; the CODE is correct, the plans are stale docs).

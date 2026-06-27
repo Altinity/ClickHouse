@@ -317,6 +317,17 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   the existing HEAD. Lowest-stakes phase (R1 perf only). Phase 5 Task 2/3 code NOT written (the field would
   be an unpopulated no-op without the provenance); no dead code committed.
 
+- **B15 — plan bodies retain stale rejected-protocol snippets (documentation hygiene).** The execution
+  log's earlier "all plans re-synced clean to rev.15" claim is OVERSTATED: some plan bodies still contain
+  pre-rev.15 snippets the design rejected. Example: `…-phase1b-build-precommit-promote.md` Task 5 still
+  describes missing-body promotion folding as committed and appending the old `PrecommitTransition`/
+  `PromotePrecommit` vectors (rev.15 uses a single ordered `RootOwnerEvent` journal + pure owner-move
+  promote; the IMPLEMENTATION did the right thing — `Build::promote` appends one pure-owner-move
+  `RootOwnerEvent`, `CasGc::fold` has owner-move no-delta/no-cleanup + the missing-body fold barrier). Code
+  correct; PLANS stale as documentation. Do a doc pass over `docs/superpowers/plans/2026-06-26-cas-gc-*` to
+  replace rejected snippets to match committed code + rev.15. Low priority (doc-only), but do it before the
+  plans are used as reference.
+
 ## Resolved
 
 - **B9 — GC generation pruning: DONE.** `Gc::pruneSupersededGenerations` (called in the recheck round tail
