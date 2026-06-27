@@ -50,9 +50,9 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   1b/1c "build+sweep" steps to "compiles as part of the 1b+1c+1d switch; green sweep gated after 1d."
   Deferred: execution already accounts for it; documentation-only.
 
-- **B6 — behavior switch (1b+1c+1d) IN PROGRESS; resume state.** Severity: n/a (worklog/resume marker).
-  Branch `cas-gc-part-manifest-impl`. The build does NOT link yet — expected mid-switch red (gate = green
-  `Cas*:Ca*` sweep after 1d).
+- **B6 — behavior switch (1b+1c+1d): DONE (SWITCH GREEN). See the Resolved section below.** The detailed
+  per-run worklog that used to live here is preserved in git history (commits up to the run-4 test ports).
+  Branch `cas-gc-part-manifest-impl`.
 
   DONE (committed; each compiles as an isolated TU):
   - **1b T1** — `CasRootShardCodec` rewritten to the single ordered `RootOwnerEvent` journal
@@ -200,6 +200,36 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   `gtest_cas_gc_leak.cpp`'s adopt-by-tree must be rewritten or removed for B7 (and meanwhile they fail to
   compile against the new exchange impl — they are part of the 1d T8 gtest rewrite).
 
+- **B8 — GC precommit-reclaim is not wired for the converged-shard precommit model (real core gap).**
+  Severity: medium (space-liveness, not a safety/no-loss issue — fail-closed holds). Where:
+  `Core/CasGc.cpp` `Gc::fold` (the `if (Layout::isPrecommitNamespace(ns)) reclaimAbandonedPrecommit(...)`
+  gate) and `Gc::reclaimAbandonedPrecommit` (which parses a `<server_hex>/_precommits` suffix). What: per
+  spec rev. 15 / the run-2 `Build::precommitAdd`, a precommit owner binding now lives in the FUTURE
+  COMMITTED REF's OWN table-namespace shard (keyed by `final_ref_name`); there is no `_precommits`
+  namespace. But `reclaimAbandonedPrecommit` still runs ONLY on `_precommits`-suffixed namespaces and
+  derives the server from that suffix, so under the converged write path it NEVER fires: an abandoned
+  precommit of a judged-dead build is never released by GC (only by the writer's best-effort `abandon` or
+  the orphan-manifest sweep for the body). The watermark/K=2 frozen-seq reclaim machinery is effectively
+  dead code. Surfaced by porting `gtest_cas_build_root_dangle.cpp::CasBuildRoot.AbandonedPrecommitReclaimed`
+  (now `GTEST_SKIP`-ped citing B8) and `gtest_cas_gc_leak.cpp::AbandonedPrecommitReclaimsOwnBlobs`.
+  Why-deferred: fixing it is a non-trivial core change — the fold must, for EVERY table shard (not just
+  `_precommits`), scan precommit-kind owner bindings, derive `(server, build_seq)` from the binding's
+  `build_id` / ref, judge liveness via the watermark, and append a `PrecommitRemove` `RootOwnerEvent`
+  for dead ones — plus the corresponding TLA+/model update. Out of scope for the test-port run. NOTE: the
+  spec's INV-COMMIT-FAILCLOSED still holds (a falsely-reclaimed live build's `promote` fails closed), so
+  this is a space leak of abandoned-precommit closures, not data loss.
+
 ## Resolved
 
-(none yet)
+- **B6 — behavior switch (1b+1c+1d) DONE; SWITCH GREEN.** The link gate passes (`unit_tests_dbms` links)
+  and the `Cas*:Ca*` sweep is green except the known B3 (`CaWiringOps.FreezeViaHardLinksIntoShadow`).
+  Task A: B170 GC event emission restored in the new `CasGc` core (fold begin/end, per-blob fold edges
+  RootAdd/RootRemove, IndegZero/GcRetireObserve/BlobRetire at retire, GcFence, GcRecheckVerdict/BlobDelete
+  at the single content-delete site, TreeDelete for manifest cleanup, GcTrim, PrecommitReclaim). Task B:
+  all 12 stale gtests ported to the manifest model (`event_log`/`gc_log`/`ca_transaction`/
+  `truncate_reclaim`/`b140_dangle`/`build`/`build_root_dangle`/`store`/`protocol_scenarios`/`gc_round`/
+  `gc_leak`/`ca_wiring`). Faithful ports — no-dangle/no-loss/no-leak assertions kept strong. Genuinely-
+  obsolete tree/snap-only scenarios `GTEST_SKIP`-ped with reasons (deferred-tree-upload, inline-closure
+  JournalRecord, snap-retention B174, adopt-by-tree relink B7, abandoned-precommit-reclaim B8). The
+  `b140_dangle` white-box snap-cursor injection was rewritten as a black-box no-loss oracle (the failure
+  mode is structurally impossible in the manifest model). Found+flagged B8 (precommit-reclaim wiring gap).
