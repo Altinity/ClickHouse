@@ -265,7 +265,6 @@ ListPage InMemoryBackend::list(const String & prefix, const String & cursor, siz
         ListedKey lk;
         lk.key = it->first;
         lk.size = static_cast<uint64_t>(it->second.bytes.size());
-        lk.token = it->second.token;   /// in-memory backend always surfaces the token (supportsListTokens == true)
         page.keys.push_back(std::move(lk));
         ++count;
         ++it;
