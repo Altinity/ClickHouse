@@ -118,13 +118,17 @@ RoundReport Gc::runRegularRound()
     /// R3: global registry + all-shard fence; record fence positions into the completion seal.
     fence(state, state_token, folded);
 
+    /// Trim journals below the sealed fold cursor. Running trim BEFORE recheck is safe (trim removes
+    /// events at or below the folded_cursor; recheck reads events strictly ABOVE the folded_cursor in
+    /// the fence window — the ranges are disjoint). Running trim first allows recheck to record the
+    /// post-trim shard token in the completion seal's folded_cursors, so the next round's discover step
+    /// can compare listed tokens against the post-round token and correctly skip unchanged shards.
+    if (trim_enabled)
+        trim(folded, state.round);
+
     /// R4: fold-through-fence recheck + the single content-delete site + exact-token manifest deletes;
     /// seal the completion generation; drop the round's retired sets.
     recheck(state, state_token, folded, retired, report);
-
-    /// Trim journals below the sealed fold cursor.
-    if (trim_enabled)
-        trim(folded, state.round);
 
     /// Bounded orphan-manifest backstop (spec §Orphan sweep): at most one namespace + one eligible
     /// prefix per round. Records-and-continues on a 404; never throws (feedback_ca_gc_never_throw_on_404).
@@ -219,10 +223,65 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     std::vector<BlobDelta> deltas;
     bool folded_any = false;
 
+    /// Phase-2 token-diff: compute per-shard discover decisions ONCE before the shard loop. A Skip
+    /// means the listed token equals the sealed `folded_token`, so the shard body is unchanged and
+    /// the durable state already covers it — we carry the parent coverage forward unchanged, emitting
+    /// no new deltas and avoiding the `readShard` body GET. A Read uses the existing path unchanged.
+    /// The decisions are derived from the COMPLETION SEAL's `folded_cursors` (post-trim tokens) and
+    /// `fence_positions` (to detect clamped cursors with unfolded events). Falling back to the fold
+    /// seal when no completion exists (fresh pool, mid-round crash, or pruned generation).
+    CasFoldSeal parent_seal;
+    std::map<String, uint64_t> discover_fence_positions;
+    {
+        if (const auto completion = readCompletionSeal(state.snap_generation))
+        {
+            /// Completion seal's folded_cursors carry the post-trim tokens — use them.
+            parent_seal.generation = state.snap_generation;
+            parent_seal.per_ns_shard = completion->folded_cursors;
+            discover_fence_positions = completion->fence_positions;
+        }
+        else
+        {
+            for (uint64_t g = state.snap_generation; g > 0; --g)
+            {
+                if (const auto opt = readFoldSeal(g))
+                {
+                    parent_seal = *opt;
+                    break;
+                }
+            }
+        }
+    }
+    const std::map<String, DiscoverDecision> discover_decisions = computeDiscoverDecisions(
+        parent_seal, discover_fence_positions);
+
     for (const auto & [ns, root_shard] : result.root_shards)
     {
-        const auto [root, manifest_token] = store->readShard(ns, root_shard);
         const String cursor_key = cursorKey(ns, root_shard);
+
+        /// Phase-2 token-diff skip: when the listed root token equals the sealed folded_token,
+        /// the shard body is unchanged. Carry the parent coverage forward (same token, same cursor),
+        /// emit no deltas, and skip the body GET. The fence runs globally regardless — this skip
+        /// only elides the body read and re-fold, never the fence or recheck.
+        {
+            const auto dec_it = discover_decisions.find(cursor_key);
+            if (dec_it != discover_decisions.end() && dec_it->second == DiscoverDecision::Skip)
+            {
+                /// Copy coverage from parent: classification=1 (Unchanged), same folded_token and
+                /// folded_cursor. The seal carries it forward so future rounds key off the same cursor.
+                const auto parent_it = parent_cursors.find(cursor_key);
+                if (parent_it != parent_cursors.end())
+                {
+                    result.fold_seal.per_ns_shard[cursor_key] = parent_it->second;
+                    continue;
+                }
+                /// If parent coverage is missing despite a Skip decision, fall through to Read.
+                /// This should not happen (computeDiscoverDecisions requires prior coverage for Skip),
+                /// but fail closed: a missing parent cursor => Read is the safe default.
+            }
+        }
+
+        const auto [root, manifest_token] = store->readShard(ns, root_shard);
         const auto cursor_it = parent_cursors.find(cursor_key);
         const uint64_t cursor = cursor_it != parent_cursors.end() ? cursor_it->second.folded_cursor : 0;
 
@@ -743,6 +802,19 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     /// exact per-(ns,shard) folded_cursor from the latest seal at snap_generation, with NO dependence on
     /// trim having run (a folded-but-untrimmed event must not be re-folded => no blob in-degree double-count).
     folded.completion_seal.folded_cursors = folded.fold_seal.per_ns_shard;
+    /// Phase-2 token-diff: update `folded_token` in the completion seal's `folded_cursors` to the
+    /// POST-TRIM token of each shard. Trim (which bumps the shard's backend token via `mutateShard`)
+    /// runs BEFORE recheck (trim-before-recheck order is safe: trim touches events at or below the
+    /// folded_cursor, recheck only reads events above it). Updating the token HERE — after trim has
+    /// run — means the next round's discover step sees the correct post-round token in the completion
+    /// seal and can correctly skip unchanged shards (listed token == post-round token → Skip).
+    for (auto & [ck, cov] : folded.completion_seal.folded_cursors)
+    {
+        const auto [ns, shard] = parseCursorKey(ck);
+        const auto current_token = store->readShard(ns, shard).second;
+        if (current_token.has_value())
+            cov.folded_token = *current_token;
+    }
     {
         const String body = encodeCompletionSeal(folded.completion_seal);
         const String key = layout.completionSealKey(completion_generation);
@@ -958,6 +1030,169 @@ std::vector<uint64_t> Gc::shardsToVisit(const RootNamespace &)
     return shards;
 }
 
+std::map<String, Token> Gc::listRootShardTokens()
+{
+    std::map<String, Token> result;
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+
+    const String prefix = layout.rootsPrefix();
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
+        for (const ListedKey & lk : page.keys)
+        {
+            if (lk.token.has_value())
+                result[lk.key] = *lk.token;
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    return result;
+}
+
+std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
+    const CasFoldSeal & sealed,
+    const std::map<String, uint64_t> & fence_positions)
+{
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+
+    std::map<String, DiscoverDecision> decisions;
+    const std::vector<std::pair<RootNamespace, uint64_t>> universe = discoverUniverse();
+
+    if (!backend.supportsListTokens())
+    {
+        /// Fail closed: no token information available from LIST; every shard must be read.
+        for (const auto & [ns, shard] : universe)
+            decisions[cursorKey(ns, shard)] = DiscoverDecision::Read;
+        return decisions;
+    }
+
+    /// ONE LIST sweep — the accelerator. The result is keyed by full backend key; we need to map
+    /// it to cursor keys ("ns/shard") for lookup against `per_ns_shard`.
+    const std::map<String, Token> listed = listRootShardTokens();
+
+    const String roots_prefix = layout.rootsPrefix();   /// e.g. "p/roots/"
+
+    /// Build a cursor-key → listed token map for fast lookup.
+    std::map<String, Token> listed_by_cursor_key;
+    for (const auto & [full_key, token] : listed)
+    {
+        /// Full key: "<pool_prefix>/roots/<ns>/<shard>" — strip the roots prefix to get "<ns>/<shard>".
+        /// That is exactly the cursor-key format used in `per_ns_shard`.
+        if (full_key.starts_with(roots_prefix))
+        {
+            const String cursor_key_part = full_key.substr(roots_prefix.size());
+            /// Skip non-shard keys: verbatim files live under "_files/", pool meta under "_pool_meta",
+            /// etc. Shard keys end in "/<decimal>" — we rely on the registry universe being the
+            /// authority and only use the listed token as an accelerator.
+            listed_by_cursor_key[cursor_key_part] = token;
+        }
+    }
+
+    for (const auto & [ns, shard] : universe)
+    {
+        const String ck = cursorKey(ns, shard);
+
+        const auto sealed_it = sealed.per_ns_shard.find(ck);
+        if (sealed_it == sealed.per_ns_shard.end())
+        {
+            /// No prior coverage in the seal (new shard since last round). Must Read.
+            decisions[ck] = DiscoverDecision::Read;
+            continue;
+        }
+
+        /// CLAMP CHECK: if the previous fold was clamped (fold barrier or anomaly), the cursor
+        /// sits below the fence-time shard_version. Events above the cursor exist (or existed at
+        /// fence time) and may become foldable (barrier cleared, body appeared). Must Read.
+        /// fence_position is the shard_version AFTER fence (+1 relative to fold time), so
+        /// fully-folded: cursor == fence_position - 1. Clamped: cursor < fence_position - 1.
+        {
+            const auto fence_it = fence_positions.find(ck);
+            if (fence_it != fence_positions.end() && fence_it->second > 0)
+            {
+                const uint64_t fence_pos = fence_it->second;
+                const uint64_t folded_cursor = sealed_it->second.folded_cursor;
+                if (folded_cursor + 1 < fence_pos)
+                {
+                    /// Clamped: cursor is behind the fence position by more than 1 (the fence's own +1).
+                    decisions[ck] = DiscoverDecision::Read;
+                    continue;
+                }
+            }
+        }
+
+        const auto listed_it = listed_by_cursor_key.find(ck);
+        if (listed_it == listed_by_cursor_key.end())
+        {
+            /// Shard not visible in LIST (absent in storage, or key format differs). Must Read.
+            decisions[ck] = DiscoverDecision::Read;
+            continue;
+        }
+
+        /// Skip IFF the listed token matches the sealed post-trim folded token exactly.
+        if (listed_it->second == sealed_it->second.folded_token)
+            decisions[ck] = DiscoverDecision::Skip;
+        else
+            decisions[ck] = DiscoverDecision::Read;
+    }
+
+    return decisions;
+}
+
+std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
+{
+    /// Read the latest durable state to find the reference for token comparison.
+    const auto state_bytes = store->backend().get(store->layout().gcStateKey());
+    if (!state_bytes)
+    {
+        /// Fresh pool: no sealed state; all shards are Read.
+        std::map<String, DiscoverDecision> decisions;
+        for (const auto & [ns, shard] : discoverUniverse())
+            decisions[cursorKey(ns, shard)] = DiscoverDecision::Read;
+        return decisions;
+    }
+    const GcState state = decodeGcState(state_bytes->bytes);
+
+    /// Phase-2 token-diff: prefer the COMPLETION SEAL's `folded_cursors` for the reference tokens.
+    /// The completion seal is written AFTER trim (trim-before-recheck order), so its `folded_cursors`
+    /// carry the post-trim token — the exact token the next round's LIST will see for an unchanged
+    /// shard. Also use `fence_positions` from the completion seal to detect clamped shards (a clamped
+    /// cursor sits below fence_position - 1, signalling unfolded events that must be re-read).
+    CasFoldSeal fake_seal;
+    std::map<String, uint64_t> fence_positions;
+    bool found_completion = false;
+    if (const auto completion = readCompletionSeal(state.snap_generation))
+    {
+        /// Construct a fake CasFoldSeal that carries the post-trim tokens from the completion seal,
+        /// so that `computeDiscoverDecisions` can compare against them uniformly.
+        fake_seal.generation = state.snap_generation;
+        fake_seal.per_ns_shard = completion->folded_cursors;
+        fence_positions = completion->fence_positions;
+        found_completion = true;
+    }
+
+    if (!found_completion)
+    {
+        /// No completion seal: walk backward for the latest fold seal. This covers a mid-round state
+        /// (fold complete, recheck not yet). A Skip cannot fire here (post-trim tokens not recorded),
+        /// so all shards default to Read via the empty fence_positions (no fence info => no Skip).
+        for (uint64_t g = state.snap_generation; g > 0; --g)
+        {
+            if (const auto opt = readFoldSeal(g))
+            {
+                fake_seal = *opt;
+                break;
+            }
+        }
+    }
+
+    return computeDiscoverDecisions(fake_seal, fence_positions);
+}
+
 std::vector<Gc::PreviewEntry> Gc::previewDeletes()
 {
     std::vector<PreviewEntry> out;
@@ -1049,11 +1284,12 @@ bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundRep
     if (!state.fence_version.contains(round))
         fence(state, state_token, folded);
 
-    /// Re-run recheck (deletes are exact-token idempotent) and trim. recheck folds the fence window into
-    /// a completion generation, deletes/spares the durable retired blobs, seals completion, drops the sets.
-    recheck(state, state_token, folded, retired, report);
+    /// Re-run trim then recheck (same order as the normal round: trim before recheck so the completion
+    /// seal records the post-trim shard token). Both are idempotent: trim removing already-absent events
+    /// is a no-op; recheck deletes are exact-token so NotFound/TokenMismatch are tolerated.
     if (trim_enabled)
         trim(folded, state.round);
+    recheck(state, state_token, folded, retired, report);
     return true;
 }
 

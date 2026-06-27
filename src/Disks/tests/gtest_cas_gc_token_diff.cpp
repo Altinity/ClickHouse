@@ -3,10 +3,15 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include "cas_test_helpers.h"
 
 using namespace DB::Cas;
+using namespace DB::Cas::tests;
 
 /// Phase 2 token-diff discovery: `supportsListTokens` capability probe.
 ///
@@ -113,4 +118,115 @@ TEST(CasShardCoverageRoundTrip, FoldedTokenAndCursorSurviveEncodeDecode)
     EXPECT_EQ(decoded.folded_cursor, cov.folded_cursor);
     /// The full struct equality confirms no other field was corrupted.
     EXPECT_EQ(out, in);
+}
+
+/// ---- Phase 2 Task 4: discover skips a root shard iff listed token == persisted folded token ----
+
+namespace
+{
+
+const UInt128 kGcD = hexToU128("0000000000000000000000000000000d");
+
+/// Construct a single-shard Store over an in-memory backend and return both.
+std::pair<StorePtr, std::shared_ptr<InMemoryBackend>> openDiscoveryStore()
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    return {store, backend};
+}
+
+ManifestRef discRef(uint64_t seq, uint64_t inst)
+{
+    return ManifestRef{.writer_instance_id = "srv-d:1", .build_sequence = seq, .manifest_instance_id = DB::UInt128(inst)};
+}
+
+} // anonymous namespace
+
+/// After ONE full round with a committed publish, the fold seal carries a non-empty `folded_token`
+/// for the shard. With no new publish the shard's root token has not advanced, so
+/// `discoverDecisionsForTest()` must return Skip for that shard.
+TEST(CasGcDiscovery, SkipsUnchangedShardWhenListedTokenEqualsFoldedToken)
+{
+    auto [store, backend] = openDiscoveryStore();
+    const RootNamespace ns{"00/aa@disc@"};
+    const ManifestRef r = discRef(1, 0xD1);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGcD);
+    /// Run ONE full round so the fold seal is written with the shard's `folded_token`.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    /// No new publish: the shard's root manifest token has not changed since the seal.
+    /// The seam must decide Skip for the shard.
+    const std::map<String, Gc::DiscoverDecision> decisions = gc.discoverDecisionsForTest();
+
+    const String shard_key = cursorKey(ns, 0);
+    ASSERT_GT(decisions.count(shard_key), 0u) << "shard must appear in decisions";
+    EXPECT_EQ(decisions.at(shard_key), Gc::DiscoverDecision::Skip)
+        << "shard token unchanged since last fold seal => Skip";
+}
+
+/// After round 1 seals the `folded_token`, a NEW publish into the same shard advances the root
+/// manifest's token past what was sealed. The seam must decide Read for that shard.
+TEST(CasGcDiscovery, ReadsShardWhenTokenAdvancedOrMissing)
+{
+    auto [store, backend] = openDiscoveryStore();
+    const RootNamespace ns{"00/aa@disc@"};
+    const ManifestRef r1 = discRef(1, 0xD1);
+    const ManifestRef r2 = discRef(2, 0xD2);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+
+    Gc gc(store, kGcD);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    /// New publish: advances the shard's root manifest token beyond the sealed `folded_token`.
+    writeBlobBody(*backend, store->layout(), DB::UInt128(2));
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", DB::UInt128(2))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);
+
+    const std::map<String, Gc::DiscoverDecision> decisions = gc.discoverDecisionsForTest();
+
+    /// At least one shard in the namespace must have a Read decision (the one that was published to).
+    bool any_read = false;
+    for (const auto & [key, decision] : decisions)
+        if (decision == Gc::DiscoverDecision::Read)
+            any_read = true;
+
+    EXPECT_TRUE(any_read) << "a publish advanced the shard token past the fold seal => at least one Read";
+}
+
+/// Registry authority: two namespaces registered, publish into only one. Both namespaces must
+/// appear in the decisions map — the registry universe is never shrunk by LIST.
+TEST(CasGcDiscovery, RegistryUniverseNeverShrunkByList)
+{
+    auto [store, backend] = openDiscoveryStore();
+    const RootNamespace ns1{"00/aa@disc@"};
+    const RootNamespace ns2{"00/bb@disc@"};
+    const ManifestRef r = discRef(1, 0xD1);
+
+    /// Register ns2 into the registry WITHOUT publishing any shard manifest — so its shard is absent
+    /// in storage (list won't see it), but the registry lists it.
+    registerNamespaceRaw(*backend, store->layout(), ns2);
+
+    /// Publish into ns1 so it has a real shard.
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns1, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns1, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGcD);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const std::map<String, Gc::DiscoverDecision> decisions = gc.discoverDecisionsForTest();
+
+    /// Both namespaces must appear (registry universe, not list).
+    const String key1 = cursorKey(ns1, 0);
+    const String key2 = cursorKey(ns2, 0);
+    EXPECT_GT(decisions.count(key1), 0u) << "ns1 (published) must appear in decisions";
+    EXPECT_GT(decisions.count(key2), 0u) << "ns2 (registry-only, no shard body) must appear in decisions";
 }

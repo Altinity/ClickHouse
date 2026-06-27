@@ -71,7 +71,17 @@ struct DeleteOutcome
     bool created_delete_marker = false;
 };
 
-struct ListedKey { String key; uint64_t size = 0; };
+/// A key returned by `Backend::list`. The `token` field is populated ONLY when the backend
+/// returns TRUE from `supportsListTokens` — it identifies the key's current incarnation, matching
+/// what `head` would return for the same key at that instant. Callers that do not need the token
+/// (e.g. GC fence sweep, orphan sweep) ignore the field; GC discover uses it to skip unchanged
+/// root shards.
+struct ListedKey
+{
+    String key;
+    uint64_t size = 0;
+    std::optional<Token> token;   /// present iff supportsListTokens() == true
+};
 struct ListPage
 {
     std::vector<ListedKey> keys;
