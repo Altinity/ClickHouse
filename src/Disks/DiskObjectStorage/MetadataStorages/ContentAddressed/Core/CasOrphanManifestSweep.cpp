@@ -37,7 +37,10 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
             continue;
         const RootShard root = decodeRootShard(got->bytes);
 
-        /// Committed owners: the current ref payloads.
+        /// Committed owners: the current ref payloads. `root.refs` IS the sealed committed view — a
+        /// promote/publish sets refs[final_ref_name] AND appends the committed RootOwnerEvent in ONE
+        /// mutateShard CAS (Build::promote / publishCommitted), so a committed manifest is ALWAYS in
+        /// root.refs the instant it exists; there is no committed-in-journal-only window to miss.
         for (const auto & [name, ref] : root.refs)
             active.insert(layout.manifestKey(ManifestId{ns, ref.manifest_ref}));
 
@@ -131,42 +134,50 @@ std::optional<SweepTarget> pickOneSweepTarget(Store & store)
         const RootNamespace ns{ns_name};
         const String manifests_prefix = layout.rootNamespacePrefix(ns) + "_manifests/";
 
-        /// LIST one page of distinct writer/build prefixes. Keys are
-        /// `<manifests_prefix><writer_instance_id>/<build_sequence>/<aa>/<inst>.proto`; parse the first
-        /// two path segments after the prefix to recover (writer_instance_id, build_sequence).
-        String cursor;
-        const ListPage page = store.backend().list(manifests_prefix, cursor, /*limit*/1000);
+        /// LIST distinct writer/build prefixes, FOLLOWING next_cursor across ALL pages (mirroring
+        /// sweepNamespace). Keys are `<manifests_prefix><writer_instance_id>/<build_sequence>/<aa>/<inst>.proto`;
+        /// parse the first two path segments after the prefix to recover (writer_instance_id, build_sequence).
+        /// A single page that is all live/ineligible prefixes must NOT hide an eligible older build prefix on
+        /// a later page (else pre-precommit debris leaks forever — violates OrphanManifestDebrisDrains).
         std::set<std::pair<String, uint64_t>> seen;
-        for (const ListedKey & listed : page.keys)
+        String cursor;
+        while (true)
         {
-            if (!listed.key.starts_with(manifests_prefix))
-                continue;
-            const String rest = listed.key.substr(manifests_prefix.size());
-            const size_t s1 = rest.find('/');
-            if (s1 == String::npos)
-                continue;
-            const String writer = rest.substr(0, s1);
-            const size_t s2 = rest.find('/', s1 + 1);
-            if (s2 == String::npos)
-                continue;
-            const String seq_str = rest.substr(s1 + 1, s2 - s1 - 1);
-            uint64_t build_seq = 0;
-            try
+            const ListPage page = store.backend().list(manifests_prefix, cursor, /*limit*/1000);
+            for (const ListedKey & listed : page.keys)
             {
-                size_t consumed = 0;
-                build_seq = std::stoull(seq_str, &consumed);
-                if (consumed != seq_str.size())
+                if (!listed.key.starts_with(manifests_prefix))
                     continue;
+                const String rest = listed.key.substr(manifests_prefix.size());
+                const size_t s1 = rest.find('/');
+                if (s1 == String::npos)
+                    continue;
+                const String writer = rest.substr(0, s1);
+                const size_t s2 = rest.find('/', s1 + 1);
+                if (s2 == String::npos)
+                    continue;
+                const String seq_str = rest.substr(s1 + 1, s2 - s1 - 1);
+                uint64_t build_seq = 0;
+                try
+                {
+                    size_t consumed = 0;
+                    build_seq = std::stoull(seq_str, &consumed);
+                    if (consumed != seq_str.size())
+                        continue;
+                }
+                catch (...)
+                {
+                    continue;
+                }
+                if (!seen.emplace(writer, build_seq).second)
+                    continue;
+                const BuildPrefix prefix{.writer_instance_id = writer, .build_sequence = build_seq};
+                if (prefixEligible(store, prefix))
+                    return SweepTarget{.ns = ns, .prefix = prefix};
             }
-            catch (...)
-            {
-                continue;
-            }
-            if (!seen.emplace(writer, build_seq).second)
-                continue;
-            const BuildPrefix prefix{.writer_instance_id = writer, .build_sequence = build_seq};
-            if (prefixEligible(store, prefix))
-                return SweepTarget{.ns = ns, .prefix = prefix};
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
         }
     }
     return std::nullopt;

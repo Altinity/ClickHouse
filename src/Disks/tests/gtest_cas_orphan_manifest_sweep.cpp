@@ -64,6 +64,59 @@ TEST(CasOrphanManifestSweep, EmitsNoBlobDeltas)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
 }
 
+/// M3 REGRESSION (pickOneSweepTarget must paginate): the eligible build prefix sorts AFTER several
+/// ineligible ones, and the backend's list page size is clamped so the eligible prefix lands on a LATER
+/// page. Before the fix pickOneSweepTarget listed ONE page and never followed next_cursor, so an eligible
+/// older prefix beyond the first page was never found => pre-precommit debris leaks forever (violates
+/// OrphanManifestDebrisDrains). The fix follows next_cursor across all pages.
+TEST(CasOrphanManifestSweep, PickOneSweepTargetPaginatesToLaterPage)
+{
+    /// Clamp the page size to 1 so a single page can never contain all the prefixes — the cursor loop
+    /// MUST run to reach the eligible prefix on a later page. The clamp is enabled only AFTER the store
+    /// is opened, so the capability probe's list-after-write (which writes several keys) is unaffected.
+    class TinyPageBackend : public InMemoryBackend
+    {
+    public:
+        bool clamp = false;
+        ListPage list(const String & prefix, const String & cursor, size_t limit) override
+        {
+            return InMemoryBackend::list(prefix, cursor, clamp ? std::min<size_t>(limit, 1) : limit);
+        }
+    };
+
+    auto backend = std::make_shared<TinyPageBackend>();
+    auto store = openStoreForTest(backend);
+    backend->clamp = true;   /// from here on, force multi-page listing
+    const RootNamespace ns{"00/aa@cas@"};
+    registerNamespaceRaw(*backend, store->layout(), ns);
+
+    /// Several INELIGIBLE build prefixes (writers with NO watermark fact => not eligible), with keys that
+    /// sort BEFORE the eligible one. Each is a staged-but-unowned body.
+    const String ineligible_writer = "00000000000000000000000000000aaa:1";
+    for (uint64_t seq = 1; seq <= 3; ++seq)
+        writeManifestRaw(*backend, store->layout(), ns,
+            ManifestRef{.writer_instance_id = ineligible_writer, .build_sequence = seq,
+                        .manifest_instance_id = DB::UInt128(seq)},
+            {blobEntryFor("a", DB::UInt128(seq))});
+
+    /// The ELIGIBLE prefix: a writer with a watermark whose min_active retires its build_sequence. Its
+    /// writer hex sorts AFTER the ineligible writer's, so it appears only on a later list page.
+    const String eligible_writer = "00000000000000000000000000000fff:1";
+    const ManifestRef eligible_ref{.writer_instance_id = eligible_writer, .build_sequence = 5,
+                                   .manifest_instance_id = DB::UInt128(0xEE)};
+    writeManifestRaw(*backend, store->layout(), ns, eligible_ref, {blobEntryFor("a", DB::UInt128(0xEE))});
+    setWatermarkMinActive(*backend, store->layout(), eligible_writer, /*min_active*/6);   // 6 > 5 => eligible
+
+    const std::optional<SweepTarget> target = pickOneSweepTarget(*store);
+    ASSERT_TRUE(target.has_value()) << "pickOneSweepTarget failed to follow next_cursor to the later page";
+    EXPECT_EQ(target->prefix.writer_instance_id, eligible_writer);
+    EXPECT_EQ(target->prefix.build_sequence, 5u);
+
+    /// End-to-end: sweeping the found target deletes the eligible unowned body.
+    sweepNamespace(*store, target->ns, target->prefix);
+    EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, eligible_ref})).exists);
+}
+
 /// A NON-eligible prefix (no watermark fact) deletes NOTHING (#9: frozen-seq is not authority).
 TEST(CasOrphanManifestSweep, NoWatermarkIsNotAuthority)
 {
