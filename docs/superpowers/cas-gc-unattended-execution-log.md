@@ -498,3 +498,13 @@ didn't drive):
   content↔storage coupling) for only a partial win (staler token → more spared+retried deletes). Added a
   design-rationale comment (pros/cons) at the HEAD call (`1e123418f4b`). Phase-5 model gate remains the
   future proof. B14 → DECIDED/closed (reopen only on profiling). No code behavior change.
+
+### 2026-06-27 — B8 RESOLVED (precommit-reclaim wired into the fold pass)
+- `b43001fa42d`: per maintainer constraint, reclaim rides the EXISTING per-shard fold pass (no dedicated
+  scan), runs before the shard's fold read so the `PrecommitRemove` folds in-round (appending after the
+  sealed cursor double-counted the -1 → underflow; caught+fixed). `(server,build_seq)` from the binding's
+  `manifest_ref.writer_instance_id`+`build_sequence`. Death = DURABLE watermark fact only (NOT K=2 frozen-seq
+  — that wrongly reclaimed a live build + is the model's `sab_frozenseqauthority` hazard); wrongful reclaim
+  still caught by promote-fail-closed. Orphan sweep made cursor-aware (delete-after-sealed-decrements).
+  Un-skipped the B8 test + added a conservatism test. Full `Cas*:Ca*` 381 ran / 375 pass / 5 skip (was 6) /
+  1=B3. Code-only (model's WAbandonPrecommit already covers it). Remaining backlog: B7, B11, B12, B3.

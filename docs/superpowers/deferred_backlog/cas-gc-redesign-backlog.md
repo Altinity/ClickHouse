@@ -200,7 +200,21 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   `gtest_cas_gc_leak.cpp`'s adopt-by-tree must be rewritten or removed for B7 (and meanwhile they fail to
   compile against the new exchange impl — they are part of the 1d T8 gtest rewrite).
 
-- **B8 — GC precommit-reclaim is not wired for the converged-shard precommit model (real core gap).**
+- **B8 — RESOLVED 2026-06-27 `b43001fa42d`.** Re-wired: `reclaimAbandonedPrecommit` now runs per table
+  shard WITHIN the existing fold pass (the `isPrecommitNamespace` gate is gone), BEFORE the shard's fold
+  read so the `PrecommitRemove` folds in the SAME round (appending it after the sealed cursor double-counted
+  the -1 → in-degree underflow; caught+fixed). `(server,build_seq)` recovered from the binding's
+  `manifest_ref.writer_instance_id` (`<server_hex>:<epoch>`) + `build_sequence` (no precommitAdd change).
+  Death judged CONSERVATIVELY by the DURABLE watermark fact only (retired sentinel / min_active>seq) — NOT
+  the K=2 frozen-seq heuristic (that wrongly reclaimed a live build, and per the model `sab_frozenseqauthority`
+  frozen-seq-as-sole-authority is unsafe). A wrongful reclaim is still caught by promote-fail-closed
+  (WPromote owner==bld). Also made the orphan sweep cursor-aware so a pending (unsealed) precommit-removal
+  body is protected until the -1 seals (delete-after-sealed-decrements). Un-skipped
+  `CasBuildRoot.AbandonedPrecommitReclaimed` + added `LivePrecommitNotReclaimed` (conservatism). Code-only,
+  no model change (WAbandonPrecommit already covers it). Full `Cas*:Ca*` 375 pass / 5 skip / 1=B3.
+  (NOTE: the dead `_precommits` reserved-segment validator in `CasLayout.h` has no producer left — removable
+  dead code, left in scope-avoidance; minor follow-up.) Original finding below.
+- **B8 (original) — GC precommit-reclaim is not wired for the converged-shard precommit model (real core gap).**
   Severity: medium (space-liveness, not a safety/no-loss issue — fail-closed holds). Where:
   `Core/CasGc.cpp` `Gc::fold` (the `if (Layout::isPrecommitNamespace(ns)) reclaimAbandonedPrecommit(...)`
   gate) and `Gc::reclaimAbandonedPrecommit` (which parses a `<server_hex>/_precommits` suffix). What: per
