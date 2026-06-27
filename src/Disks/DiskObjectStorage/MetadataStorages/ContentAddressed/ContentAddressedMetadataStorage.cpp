@@ -485,14 +485,14 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
     return r;
 }
 
-std::optional<std::pair<Cas::Resolved, std::vector<Cas::TreeEntry>>>
+std::optional<std::pair<Cas::Resolved, Cas::PartManifest>>
 ContentAddressedMetadataStorage::resolveRouted(const Route & r) const
 {
     auto resolved = store()->resolveRef(r.ns, r.ref, /*allow_stale=*/true);
     if (!resolved)
         return std::nullopt;
-    /// A live ref to a missing/corrupt tree throws (INV-NO-DANGLE surfaced, never substituted).
-    return std::make_pair(*resolved, store()->readTree(resolved->tree_id));
+    /// A live ref to a missing/corrupt manifest throws (INV-NO-DANGLE surfaced, never substituted).
+    return std::make_pair(*resolved, store()->readManifest(resolved->manifest_id));
 }
 
 std::vector<std::string> ContentAddressedMetadataStorage::detachedRefNames(const Cas::RootNamespace & ns) const
@@ -533,10 +533,7 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     auto rt = resolveRouted(*r);
     if (!rt)
         return false;
-    for (const auto & entry : rt->second)
-        if (entry.name == r->file)
-            return true;
-    return false;
+    return store()->lookupPath(rt->second, r->file).has_value();
 }
 
 bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
@@ -585,8 +582,8 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
                 auto rt = resolveRouted(*r);
                 if (!rt)
                     return false;
-                for (const auto & entry : rt->second)
-                    if (entry.name.starts_with(*prefix))
+                for (const auto & entry : rt->second.entries)
+                    if (entry.path.starts_with(*prefix))
                         return true;
                 for (const auto & [file, _] : rt->first.mutable_files)
                     if (file.starts_with(*prefix))
@@ -640,10 +637,9 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     auto rt = resolveRouted(*r);
     if (!rt)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-    for (const auto & entry : rt->second)
-        if (entry.name == r->file)
-            return entry.file_size;
-    throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in tree of {}", r->file, path);
+    if (auto entry = store()->lookupPath(rt->second, r->file))
+        return entry->placement == Cas::EntryPlacement::Inline ? entry->inline_bytes.size() : entry->blob_size;
+    throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in manifest of {}", r->file, path);
 }
 
 Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::string & path) const
@@ -687,8 +683,8 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             if (!rt)
                 return {};
             std::unordered_set<std::string> result;
-            for (const auto & entry : rt->second)
-                addFirstComponent(result, entry.name);
+            for (const auto & entry : rt->second.entries)
+                addFirstComponent(result, entry.path);
             for (const auto & [file, _] : rt->first.mutable_files)
                 if (!isReservedMutableName(file))
                     addFirstComponent(result, file);
@@ -754,8 +750,8 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             if (!rt)
                 return {};
             std::unordered_set<std::string> result;
-            for (const auto & entry : rt->second)
-                addFirstComponent(result, entry.name);
+            for (const auto & entry : rt->second.entries)
+                addFirstComponent(result, entry.path);
             for (const auto & [file, _] : rt->first.mutable_files)
                 if (!isReservedMutableName(file))
                     addFirstComponent(result, file);
@@ -770,9 +766,9 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
                 if (!rt)
                     return {};
                 std::unordered_set<std::string> result;
-                for (const auto & entry : rt->second)
-                    if (entry.name.starts_with(*prefix))
-                        result.emplace(entry.name.substr(prefix->size()));
+                for (const auto & entry : rt->second.entries)
+                    if (entry.path.starts_with(*prefix))
+                        result.emplace(entry.path.substr(prefix->size()));
                 for (const auto & [file, _] : rt->first.mutable_files)
                     if (!isReservedMutableName(file) && file.starts_with(*prefix))
                         result.emplace(file.substr(prefix->size()));
@@ -859,17 +855,15 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     auto rt = resolveRouted(*r);
     if (!rt)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-    for (const auto & entry : rt->second)
+    if (auto entry = store()->lookupPath(rt->second, r->file))
     {
-        if (entry.name != r->file)
-            continue;
-        const auto location = store()->locate(entry);
+        const auto location = store()->locate(*entry);
         /// StoredObject carries no range (the recorded upstream delta) — the PAYLOAD length is the
         /// size (what every size consumer wants); the header offset is applied by
         /// getBlobViewPlan's view window, the only byte-reading path.
         return {StoredObject(location.key, path, location.length)};
     }
-    throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in tree of {}", r->file, path);
+    throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in manifest of {}", r->file, path);
 }
 
 std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(const std::string & path) const
@@ -906,9 +900,9 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     auto rt = resolveRouted(*r);
     if (!rt)
         return std::nullopt;
-    for (const auto & entry : rt->second)
-        if (entry.name == r->file && entry.placement == Cas::Placement::Inline)
-            return entry.inline_bytes;
+    if (auto entry = store()->lookupPath(rt->second, r->file);
+        entry && entry->placement == Cas::EntryPlacement::Inline)
+        return entry->inline_bytes;
     return std::nullopt;
 }
 
@@ -945,11 +939,9 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
     auto rt = resolveRouted(*r);
     if (!rt)
         return std::nullopt;
-    for (const auto & entry : rt->second)
+    if (auto entry = store()->lookupPath(rt->second, r->file))
     {
-        if (entry.name != r->file)
-            continue;
-        const auto location = store()->locate(entry);
+        const auto location = store()->locate(*entry);
         BlobViewPlan plan;
         /// bytes_size is the readable extent of THIS file's window, NOT the whole blob: a
         /// right-bounded read stops at payload_end, and a shared blob's bytes beyond it belong

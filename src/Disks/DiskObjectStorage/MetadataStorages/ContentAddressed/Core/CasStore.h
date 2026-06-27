@@ -5,8 +5,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRetireView.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTreeCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Common/CacheBase.h>
 #include <Common/CurrentMetrics.h>
@@ -57,8 +58,11 @@ struct PoolConfig
 
 struct Resolved
 {
-    TreeId tree_id;
-    uint64_t tree_size = 0;
+    /// The namespace-qualified identity of the part manifest this ref names. The owning RootNamespace
+    /// + the RootRef.manifest_ref form the ManifestId (the ref carries no namespace itself — that comes
+    /// from the owning root context, spec §Object Identity And Ownership).
+    ManifestId manifest_id;
+    uint64_t manifest_size = 0;
     std::map<String, String> mutable_files;
     uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
 };
@@ -116,8 +120,20 @@ public:
 
     /// ---- read side (spec §6) ----
     std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false);
-    std::vector<TreeEntry> readTree(const TreeId & id);           /// validates envelope, kind, key↔hash
-    BlobLocation locate(const TreeEntry & entry) const;           /// Blob placement only
+    /// Read the single immutable part manifest named by `id`. Derives the key via CasLayout::manifestKey,
+    /// decodes the body, and fails CLOSED: a committed ref naming a missing body throws FILE_DOESNT_EXIST
+    /// (INV-NO-DANGLE surfaced on the read path); a body whose `ref` ≠ id.ref (refMatchesBody) or whose
+    /// `root_namespace_id` ≠ id.root_namespace (manifestNamespaceMatches) throws CORRUPTED_DATA — the
+    /// ref is addressing the wrong object, or a cross-namespace dangle. Token-gated decode cache below.
+    PartManifest readManifest(const ManifestId & id);
+    /// Path lookup over a decoded part manifest's canonical-path-ordered entries (Resolved OQ3: no
+    /// DirectoryIndex yet). Returns the entry whose `path` equals `path`, or nullopt.
+    std::optional<ManifestEntry> lookupPath(const PartManifest & manifest, const String & path) const;
+    /// Directory listing: every entry whose `path` lies under `dir_prefix`, in canonical path order.
+    /// `dir_prefix` is matched as a path prefix; the caller collapses to first path segments (the
+    /// wiring's listDirectory does the segment collapse, as it did for tree entries).
+    std::vector<ManifestEntry> listDirectory(const PartManifest & manifest, const String & dir_prefix) const;
+    BlobLocation locate(const ManifestEntry & entry) const;       /// Blob placement only
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
     /// Registered namespaces with the given prefix (one registry GET; opaque strings, sorted).
     /// Dropped namespaces linger registered until full GC (M-F) — visible-but-empty, never wrong.
@@ -132,7 +148,7 @@ public:
     /// ---- ref lifecycle (CAS loops on the owning shard) ----
     void dropRef(const RootNamespace & ns, const String & ref_name);            /// refs−− + '-' journal, atomic
     void updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                          std::function<void(RefPayload &)> mutator);           /// mutable fields only; NO journal
+                          std::function<void(RootRef &)> mutator);              /// mutable fields only; NO journal
     void dropNamespace(const RootNamespace & ns);                 /// tombstone every shard + delete verbatim files
 
     /// ---- verbatim namespace files (format_version.txt, ...) — plain keys, never content-addressed ----
@@ -309,14 +325,26 @@ private:
     std::mutex shard_inflight_mutex;
     std::unordered_map<String, std::shared_future<std::shared_ptr<const RootShard>>> shard_inflight;
 
-    /// B113 (part 2) tree decode cache: tree_id_hex -> decoded immutable tree. Trees are
-    /// content-addressed (the key IS the content hash), so entries never go stale — no invalidation.
-    /// `route` resolves per FILE op, so the same part's tree was decoded O(files) times per read;
-    /// caching makes it O(1). Bounded (cleared wholesale on overflow) to cap memory on a server that
-    /// reads very many distinct parts.
-    static constexpr size_t TREE_CACHE_MAX_ENTRIES = 16384;
-    std::mutex tree_cache_mutex;
-    std::unordered_map<String, std::shared_ptr<const std::vector<TreeEntry>>> tree_cache;
+    /// Phase 1c manifest decode cache: (ManifestId, Token) -> decoded immutable PartManifest. Part
+    /// manifests are immutable single-owner objects, so a token match guarantees identical bytes; the
+    /// Token component lets the cache fail closed if the backend object is re-incarnated under the same
+    /// id. Unlike the old content-hash tree cache there is NO cross-id sharing — each publish has a
+    /// unique ManifestId (spec §Read Path Scope: per-instance cache, less sharing, intentional). The
+    /// read path resolves `route` per file, so caching makes a repeated same-part read O(1) decodes.
+    /// Bounded (wholesale clear on overflow) to cap memory on a server that reads very many parts.
+    struct ManifestCacheKey
+    {
+        ManifestId manifest_id;
+        Token token;
+        bool operator==(const ManifestCacheKey &) const = default;
+    };
+    struct ManifestCacheKeyHash
+    {
+        size_t operator()(const ManifestCacheKey & k) const;
+    };
+    static constexpr size_t MANIFEST_CACHE_MAX_ENTRIES = 16384;
+    std::mutex manifest_cache_mutex;
+    std::unordered_map<ManifestCacheKey, std::shared_ptr<const PartManifest>, ManifestCacheKeyHash> manifest_cache;
 
     /// NOTE (M-C2): the manifest journal is never trimmed here — trimming needs folded_cursor
     /// (INV-JOURNAL-COVERAGE), which is GC state landing in M-C3; the manifest size guard

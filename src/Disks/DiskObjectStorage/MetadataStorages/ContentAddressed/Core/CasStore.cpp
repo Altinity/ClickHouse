@@ -404,15 +404,15 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
 {
     /// Read side (spec §6): no GC awareness, no tokens. The ref is pure manifest state — resolving it
     /// only reads the owning shard manifest; whether the named tree object is still present is checked
-    /// later by readTree (INV-NO-DANGLE surfaces there).
+    /// later by readManifest (INV-NO-DANGLE surfaces there).
     const auto root = readShardDecoded(ns, shardOf(ref_name), allow_stale);
     auto it = root->refs.find(ref_name);
     if (it == root->refs.end())
         return std::nullopt;
 
-    const RefPayload & payload = it->second;
-    /// B170: a ref resolved to its tree (the read-path entry point). object_hash is the tree the
-    /// ref names; pairs with a later readTree ReadMissing/DanglingAccess if that tree is gone.
+    const RootRef & payload = it->second;
+    /// B170: a ref resolved to its manifest (the read-path entry point). object_hash is the manifest
+    /// instance id the ref names; pairs with a later readManifest ReadMissing if that body is gone.
     if (hasEventSink())
     {
         CasEvent _ev0;
@@ -420,127 +420,157 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
         _ev0.namespace_ = ns.string();
         _ev0.ref_name = ref_name;
         _ev0.object_kind = CasEventObjectKind::Tree;
-        _ev0.object_hash = u128ToHex(payload.tree_id);
+        _ev0.object_hash = u128ToHex(payload.manifest_ref.manifest_instance_id);
         _ev0.outcome = "resolved";
-        _ev0.reason = "read-side resolve of a ref to its tree";
+        _ev0.reason = "read-side resolve of a ref to its part manifest";
         emitEvent(_ev0);
     }
     return Resolved{
-        .tree_id = TreeId(u128ToHex(payload.tree_id)),
-        .tree_size = payload.tree_size,
+        .manifest_id = ManifestId{.root_namespace = ns, .ref = payload.manifest_ref},
+        .manifest_size = 0,
         .mutable_files = payload.mutable_files,
         .published_at_ms = payload.published_at_ms,
     };
 }
 
-std::vector<TreeEntry> Store::readTree(const TreeId & id)
+size_t Store::ManifestCacheKeyHash::operator()(const ManifestCacheKey & k) const
 {
-    /// B113: trees are content-addressed (immutable), so a cached decode is always valid — no token,
-    /// no invalidation. The read path resolves `route` per file, hitting the same tree repeatedly.
-    {
-        std::lock_guard lock(tree_cache_mutex);
-        auto it = tree_cache.find(id.string());
-        if (it != tree_cache.end())
-            return *it->second;
-    }
+    /// Combine the manifest-id hash with the token's bytes + type. The token is part of the key so a
+    /// re-incarnation under the same id misses (the immutable bytes changed identity).
+    const size_t h1 = std::hash<ManifestId>{}(k.manifest_id);
+    const size_t h2 = std::hash<String>{}(k.token.value);
+    const size_t h3 = std::hash<uint8_t>{}(static_cast<uint8_t>(k.token.type));
+    size_t h = h1;
+    h ^= h2 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    h ^= h3 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+}
 
-    /// A live ref naming a missing tree object is a storage invariant violation (INV-NO-DANGLE): surface
-    /// it, never substitute an empty tree or any default. Readers have no condemnation awareness — a
-    /// present-but-condemned object reads fine here.
-    std::optional<GetResult> object = pool_backend->get(pool_layout.treeKey(id));
-    if (!object)
+PartManifest Store::readManifest(const ManifestId & id)
+{
+    /// A live ref naming a missing manifest body is INV-NO-DANGLE (spec §Read Path Scope: "fail-closed
+    /// behavior when a committed ref names a missing manifest"). Never substitute an empty manifest.
+    const String key = pool_layout.manifestKey(id);
+
+    /// HEAD first for the current token: on a (id, token) cache hit, the immutable decode is reused
+    /// with no get and no re-decode. A missing object surfaces INV-NO-DANGLE.
+    const HeadResult head = pool_backend->head(key);
+    if (!head.exists)
     {
-        /// B170: a live ref named a tree whose object is gone — INV-NO-DANGLE surfaced on the read
-        /// path (the dangling-access anomaly). Record before failing closed.
         if (hasEventSink())
         {
             CasEvent _ev1;
             _ev1.type = CasEventType::ReadMissing;
             _ev1.object_kind = CasEventObjectKind::Tree;
-            _ev1.object_hash = id.string();
+            _ev1.object_hash = u128ToHex(id.ref.manifest_instance_id);
             _ev1.outcome = "missing";
-            _ev1.reason = "live ref names tree but its object is missing (INV-NO-DANGLE)";
-            _ev1.detail = {{"code", "FILE_DOESNT_EXIST"}, {"site", "readTree"}};
+            _ev1.reason = "live ref names manifest but its object is missing (INV-NO-DANGLE)";
+            _ev1.detail = {{"code", "FILE_DOESNT_EXIST"}, {"site", "readManifest"}};
             emitEvent(_ev1);
         }
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-            "live ref names tree {} but its object is missing — INV-NO-DANGLE", id.string());
+            "live ref names manifest at {} but its object is missing — INV-NO-DANGLE", key);
     }
 
-    /// Validate the envelope (magic / kind=Tree / header_hash / size arithmetic), then the key↔hash
-    /// binding: a tree stored at a key other than hex(logical_hash) is corruption.
-    const EnvelopeHeader header = decodeEnvelopeHeader(object->bytes, object->bytes.size(), ObjectKind::Tree);
-    if (u128ToHex(header.logical_hash) != id.string())
     {
-        /// B170: the tree object decoded but its content hash does not match its key — corruption.
+        std::lock_guard lock(manifest_cache_mutex);
+        auto it = manifest_cache.find(ManifestCacheKey{.manifest_id = id, .token = head.token});
+        if (it != manifest_cache.end())
+            return *it->second;
+    }
+
+    std::optional<GetResult> object = pool_backend->get(key);
+    if (!object)
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+            "manifest at {} vanished between head and get — INV-NO-DANGLE", key);
+
+    PartManifest body = decodePartManifest(object->bytes);
+
+    /// refMatchesBody: the journal ManifestRef must equal the body's self-described `ref`. A mismatch
+    /// means the ref addresses the WRONG object (spec §Object Identity And Ownership).
+    if (!refMatchesBody(id.ref, body))
+    {
         if (hasEventSink())
         {
             CasEvent _ev2;
             _ev2.type = CasEventType::CorruptDecode;
             _ev2.object_kind = CasEventObjectKind::Tree;
-            _ev2.object_hash = id.string();
+            _ev2.object_hash = u128ToHex(id.ref.manifest_instance_id);
             _ev2.outcome = "corrupt";
-            _ev2.reason = "tree key/hash mismatch: object carries a different logical_hash";
-            _ev2.detail = {{"code", "CORRUPTED_DATA"}, {"site", "readTree"},
-                       {"carried_hash", u128ToHex(header.logical_hash)}};
+            _ev2.reason = "manifest body `ref` does not match the journal ManifestRef (refMatchesBody)";
+            _ev2.detail = {{"code", "CORRUPTED_DATA"}, {"site", "readManifest"}};
             emitEvent(_ev2);
         }
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS tree key/hash mismatch: object at tree key {} carries logical_hash {}",
-            id.string(), u128ToHex(header.logical_hash));
+            "CAS manifest at {} body ref does not match the journal ManifestRef — refMatchesBody", key);
     }
 
-    /// Envelope freeze review (2026-06-26): the envelope `domain_id` is written = pool_id at upload
-    /// (`CasBuild`), so a tree carrying a FOREIGN domain_id at this pool's key is cross-pool
-    /// contamination — corruption. The field was decoded but never enforced; enforce it fail-closed
-    /// here (single pool per disk ⇒ every legitimate in-pool object matches).
-    if (header.domain_id != meta.pool_id)
+    /// manifestNamespaceMatches: the body's root_namespace_id must equal the owning root namespace. A
+    /// mismatch is a cross-namespace dangle and would hand the debris sweep the wrong authority.
+    if (!manifestNamespaceMatches(id.root_namespace, body))
     {
         if (hasEventSink())
         {
             CasEvent _ev3;
             _ev3.type = CasEventType::CorruptDecode;
             _ev3.object_kind = CasEventObjectKind::Tree;
-            _ev3.object_hash = id.string();
+            _ev3.object_hash = u128ToHex(id.ref.manifest_instance_id);
             _ev3.outcome = "corrupt";
-            _ev3.reason = "tree domain_id mismatch: object belongs to a different pool (cross-pool contamination)";
-            _ev3.detail = {{"code", "CORRUPTED_DATA"}, {"site", "readTree"},
-                       {"carried_domain_id", u128ToHex(header.domain_id)}, {"pool_id", u128ToHex(meta.pool_id)}};
+            _ev3.reason = "manifest body root_namespace_id does not match the owning namespace (manifestNamespaceMatches)";
+            _ev3.detail = {{"code", "CORRUPTED_DATA"}, {"site", "readManifest"}};
             emitEvent(_ev3);
         }
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS tree {} carries domain_id {} but this pool is {} — cross-pool contamination",
-            id.string(), u128ToHex(header.domain_id), u128ToHex(meta.pool_id));
+            "CAS manifest at {} body root_namespace_id does not match the owning namespace — manifestNamespaceMatches", key);
     }
 
-    auto decoded = std::make_shared<const std::vector<TreeEntry>>(
-        decodeTree(std::string_view(object->bytes).substr(payloadOffset(header))));
+    auto decoded = std::make_shared<const PartManifest>(std::move(body));
     {
-        std::lock_guard lock(tree_cache_mutex);
-        /// Bound memory: a wholesale clear on overflow is fine — the entries are pure decode caches
-        /// that re-populate on demand (immutable content, no correctness dependence on residency).
-        if (tree_cache.size() >= TREE_CACHE_MAX_ENTRIES)
-            tree_cache.clear();
-        tree_cache[id.string()] = decoded;
+        std::lock_guard lock(manifest_cache_mutex);
+        /// Bound memory: a wholesale clear on overflow is fine — entries are pure immutable decode
+        /// caches that re-populate on demand.
+        if (manifest_cache.size() >= MANIFEST_CACHE_MAX_ENTRIES)
+            manifest_cache.clear();
+        manifest_cache[ManifestCacheKey{.manifest_id = id, .token = head.token}] = decoded;
     }
     return *decoded;
 }
 
-BlobLocation Store::locate(const TreeEntry & entry) const
+std::optional<ManifestEntry> Store::lookupPath(const PartManifest & manifest, const String & path) const
+{
+    for (const auto & entry : manifest.entries)
+    {
+        if (entry.path == path)
+            return entry;
+    }
+    return std::nullopt;
+}
+
+std::vector<ManifestEntry> Store::listDirectory(const PartManifest & manifest, const String & dir_prefix) const
+{
+    std::vector<ManifestEntry> result;
+    for (const auto & entry : manifest.entries)
+    {
+        if (dir_prefix.empty() || entry.path.starts_with(dir_prefix))
+            result.push_back(entry);
+    }
+    return result;
+}
+
+BlobLocation Store::locate(const ManifestEntry & entry) const
 {
     /// A ranged read into the content object: the payload starts at a constant offset for blobs
-    /// (the pool's fixed blob_header_len — no per-object header read). Inline/Subtree carry no
-    /// standalone object location.
+    /// (the pool's fixed blob_header_len — no per-object header read). Inline carries no standalone
+    /// object location (there is no Subtree placement on a part manifest).
     switch (entry.placement)
     {
-        case Placement::Blob:
+        case EntryPlacement::Blob:
             return BlobLocation{
-                .key = pool_layout.blobKey(BlobId(u128ToHex(entry.file_hash))),
+                .key = pool_layout.blobKey(BlobId(u128ToHex(entry.blob_hash))),
                 .offset = meta.blob_header_len,
-                .length = entry.file_size,
+                .length = entry.blob_size,
             };
-        case Placement::Inline:
-        case Placement::Subtree:
+        case EntryPlacement::Inline:
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "entry placement {} has no blob location", static_cast<int>(entry.placement));
     }
@@ -560,8 +590,8 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
         for (const auto & [ref_name, payload] : root->refs)
         {
             result.emplace(ref_name, Resolved{
-                .tree_id = TreeId(u128ToHex(payload.tree_id)),
-                .tree_size = payload.tree_size,
+                .manifest_id = ManifestId{.root_namespace = ns, .ref = payload.manifest_ref},
+                .manifest_size = 0,
                 .mutable_files = payload.mutable_files,
                 .published_at_ms = payload.published_at_ms,
             });
@@ -616,8 +646,10 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
 
 void Store::dropRef(const RootNamespace & ns, const String & ref_name)
 {
-    /// Drop = the same CAS shape as publish (spec §5 step 6): remove refs[name], append {-, name, T}.
-    UInt128 dropped_tree{};
+    /// Drop = the same CAS shape as publish (spec rev. 15 §Root Journal Format): remove refs[name],
+    /// append a RootOwnerEvent whose old_binding is the committed binding being removed and whose
+    /// new_binding is none (true removal ⇒ GC folds -1 + cleanup of the named manifest).
+    ManifestRef dropped_ref;
     uint64_t at_version = 0;
     mutateShard(ns, shardOf(ref_name), [&](RootShard & root)
     {
@@ -627,18 +659,20 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                 "dropRef: no such ref {} in namespace {}", ref_name, ns.string());
 
-        const UInt128 tree_id = it->second.tree_id;
-        dropped_tree = tree_id;
+        dropped_ref = it->second.manifest_ref;
         at_version = root.shard_version + 1;
         root.refs.erase(it);
-        /// The at_version is the NEW shard_version this attempt commits — the helper bumps AFTER mutate,
-        /// so here the post-commit version is root.shard_version + 1.
-        root.journal.push_back(JournalRecord{
-            .op = JournalRecord::Op::Remove, .ref_name = ref_name, .tree_id = tree_id,
-            .at_version = root.shard_version + 1, .closure = {}});
+        /// transition_version is the NEW shard_version this attempt commits — the helper bumps AFTER
+        /// mutate, so here the post-commit version is root.shard_version + 1.
+        root.journal.push_back(RootOwnerEvent{
+            .transition_version = root.shard_version + 1,
+            .old_binding = OwnerBinding{
+                .owner_kind = OwnerKind::Committed, .ref_name = ref_name,
+                .build_id = UInt128(0), .manifest_ref = dropped_ref},
+            .new_binding = std::nullopt});
     });
-    /// B170: the ref was dropped (a '-' journal record GC will fold as a root Remove). object_hash is
-    /// the tree the ref named, so a part's "publish -> drop" life is reconstructable from the rows.
+    /// B170: the ref was dropped (a removal RootOwnerEvent GC folds as a true removal). object_hash is
+    /// the manifest the ref named, so a part's "publish -> drop" life is reconstructable from the rows.
     if (hasEventSink())
     {
         CasEvent _ev3;
@@ -646,18 +680,18 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
         _ev3.namespace_ = ns.string();
         _ev3.ref_name = ref_name;
         _ev3.object_kind = CasEventObjectKind::Tree;
-        _ev3.object_hash = u128ToHex(dropped_tree);
+        _ev3.object_hash = u128ToHex(dropped_ref.manifest_instance_id);
         _ev3.at_version = at_version;
         _ev3.outcome = "ok";
-        _ev3.reason = "dropRef: removed the ref and appended a Remove record";
+        _ev3.reason = "dropRef: removed the ref and appended a removal RootOwnerEvent";
         emitEvent(_ev3);
     }
 }
 
 void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                             std::function<void(RefPayload &)> mutator)
+                             std::function<void(RootRef &)> mutator)
 {
-    /// Mutable-fields-only update (design §3): no reachability change ⇒ NO journal record.
+    /// Mutable-fields-only update (design §3): no reachability change ⇒ NO journal event.
     mutateShard(ns, shardOf(ref_name), [&](RootShard & root)
     {
         auto it = root.refs.find(ref_name);
@@ -665,17 +699,16 @@ void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                 "updateRefPayload: no such ref {} in namespace {}", ref_name, ns.string());
 
-        const UInt128 old_tree_id = it->second.tree_id;
-        const uint64_t old_tree_size = it->second.tree_size;
+        const ManifestRef old_manifest_ref = it->second.manifest_ref;
 
-        RefPayload payload = it->second;
+        RootRef payload = it->second;
         mutator(payload);
 
-        /// A reachability change is not allowed on this path: it would need a journal record (use
+        /// A reachability change is not allowed on this path: it would need a journal event (use
         /// publish/drop instead). Throwing here aborts before casPut — the manifest stays untouched.
-        if (payload.tree_id != old_tree_id || payload.tree_size != old_tree_size)
+        if (!(payload.manifest_ref == old_manifest_ref))
             throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "updateRefPayload must not change tree_id/tree_size; use publish/drop");
+                "updateRefPayload must not change manifest_ref; use publish/drop");
 
         it->second = std::move(payload);
     });
@@ -719,11 +752,15 @@ void Store::dropNamespace(const RootNamespace & ns)
 
         mutateShard(ns, shard, [](RootShard & shard_root)
         {
-            /// Append one Remove per former ref (iterate before clearing), then clear all refs.
+            /// Append one removal RootOwnerEvent per former ref (iterate before clearing), then clear
+            /// all refs. Each event: old_binding = the committed binding being removed / new_binding none.
             for (const auto & [ref_name, payload] : shard_root.refs)
-                shard_root.journal.push_back(JournalRecord{
-                    .op = JournalRecord::Op::Remove, .ref_name = ref_name, .tree_id = payload.tree_id,
-                    .at_version = shard_root.shard_version + 1, .closure = {}});
+                shard_root.journal.push_back(RootOwnerEvent{
+                    .transition_version = shard_root.shard_version + 1,
+                    .old_binding = OwnerBinding{
+                        .owner_kind = OwnerKind::Committed, .ref_name = ref_name,
+                        .build_id = UInt128(0), .manifest_ref = payload.manifest_ref},
+                    .new_binding = std::nullopt});
             shard_root.refs.clear();
         });
     }

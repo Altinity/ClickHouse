@@ -208,9 +208,9 @@ private:
         return physical_key_prefix + "/" + key;
     }
 
-    /// resolveRef + readTree for a routed path; nullopt when the ref is absent. Throws on a
-    /// present-but-corrupt tree (fail closed, INV-NO-DANGLE surfaced).
-    std::optional<std::pair<Cas::Resolved, std::vector<Cas::TreeEntry>>>
+    /// resolveRef + readManifest for a routed path; nullopt when the ref is absent. Throws on a
+    /// present-but-corrupt manifest (fail closed, INV-NO-DANGLE surfaced).
+    std::optional<std::pair<Cas::Resolved, Cas::PartManifest>>
     resolveRouted(const Route & r) const;
 
     /// Build the GC round sink: the std::function the scheduler calls per Start/Finish. Captures the
