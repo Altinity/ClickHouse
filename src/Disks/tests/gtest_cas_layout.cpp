@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
 
 using namespace DB::Cas;
@@ -92,4 +93,32 @@ TEST(CasVfsPaths, MirroredArchiveNamespace)
     /// Non-Atomic: a full data/db/tbl path is used verbatim, @cas@ appended to the last segment.
     EXPECT_EQ(mirroredArchiveNamespace("data/mydb/events"),
               "data/mydb/events@cas@");
+}
+
+TEST(CasLayout, ManifestKeyShape)
+{
+    Layout l("p");
+    ManifestId id;
+    id.root_namespace = RootNamespace("srv-a/3f2e-uuid@cas@");
+    id.ref.writer_instance_id = "ab:7";                    /// String token, used verbatim
+    id.ref.build_sequence = 1042;
+    id.ref.manifest_instance_id = (UInt128(0x7f3aULL) << 112);   /// top bytes 7f 3a -> aa = "7f"
+    const String key = l.manifestKey(id);
+    /// <prefix>/roots/<ns>/_manifests/<writer_instance_id>/<build_seq>/<aa>/<inst_hex>.proto
+    EXPECT_EQ(key,
+        "p/roots/srv-a/3f2e-uuid@cas@/_manifests/"
+        "ab:7/1042/7f/"
+        "7f3a0000000000000000000000000000.proto");
+}
+
+TEST(CasLayout, ManifestsSegmentReserved)
+{
+    Layout l("p");
+    ManifestId bad;
+    bad.root_namespace = RootNamespace("srv-a/_manifests/x");
+    EXPECT_THROW(l.manifestKey(bad), DB::Exception);
+    /// Also rejected as a generic namespace segment via rootShardKey.
+    EXPECT_THROW(l.rootShardKey(RootNamespace{"srv-a/_manifests/tbl"}, 0), DB::Exception);
+    /// A segment that merely CONTAINS "_manifests" as a substring is still legal (no false positive).
+    EXPECT_NO_THROW(l.rootShardKey(RootNamespace{"my_manifests/tbl"}, 0));
 }

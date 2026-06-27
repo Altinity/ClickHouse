@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Common/Exception.h>
 #include <base/types.h>
 #include <optional>
@@ -98,6 +99,21 @@ public:
     {
         checkNamespace(ns);
         return prefix + "/roots/" + ns.string() + "/_files/";
+    }
+
+    /// Root-local part manifest body key (spec §S3 Layout):
+    ///   <prefix>/roots/<ns>/_manifests/<writer_instance_id>/<build_sequence>/<aa>/<manifest_instance_id>.proto
+    /// `<writer_instance_id>` is the ManifestRef's String token ("<server_id_hex>:<process_epoch>"),
+    /// used verbatim - NOT hex-rendered. `<manifest_instance_id>` is 32-char lowercase hex of the
+    /// 128-bit field; `<aa>` = first 2 hex chars of `manifest_instance_id`. `root_namespace_id` comes
+    /// from the owning context (the `ManifestId`), never from the journal ref.
+    String manifestKey(const ManifestId & id) const
+    {
+        checkNamespace(id.root_namespace);
+        const String inst_hex = u128ToHex(id.ref.manifest_instance_id);
+        return prefix + "/roots/" + id.root_namespace.string() + "/_manifests/"
+             + id.ref.writer_instance_id + "/" + std::to_string(id.ref.build_sequence) + "/"
+             + manifestAa(id.ref) + "/" + inst_hex + ".proto";
     }
 
     /// A PLAIN mountpoint object (design §5.2): a loose, non-content-addressed file mirrored at its
@@ -223,6 +239,9 @@ private:
             if (segment == "_files")
                 throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
                     "CasLayout: namespace '{}' uses the reserved segment '_files'", s);
+            if (segment == "_manifests")
+                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                    "CasLayout: namespace '{}' uses the reserved segment '_manifests'", s);
             /// Reserved for the precommit namespace (B171: `<server-hex>/_precommits`). A user namespace
             /// must not use the `_precommits` segment, but the precommit namespace itself is legal — it is
             /// exactly `<server-hex>/_precommits`, recognized by `isPrecommitNamespace`.
