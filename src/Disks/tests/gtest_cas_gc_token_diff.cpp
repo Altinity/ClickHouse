@@ -4,6 +4,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 
 using namespace DB::Cas;
 
@@ -81,4 +82,35 @@ TEST(CasBackendListTokens, OverridableToFalse)
 {
     NoListTokenBackend backend;
     EXPECT_FALSE(backend.supportsListTokens());
+}
+
+/// Characterization test: `CasFoldSeal::per_ns_shard` entries carry `folded_token` and
+/// `folded_cursor` through the `encodeFoldSeal`/`decodeFoldSeal` codec byte-stably.
+///
+/// A later `discover` reads `ShardCoverage.folded_token`/`folded_cursor` back out of the
+/// persisted `CasFoldSeal` to decide whether to skip a shard's body read. This test confirms
+/// the round-trip was already correct in Phase 1d — no codec change was required.
+TEST(CasShardCoverageRoundTrip, FoldedTokenAndCursorSurviveEncodeDecode)
+{
+    CasFoldSeal in;
+    in.generation = 5;
+    in.parent_generation = 4;
+
+    /// One shard with a non-zero `folded_token`, non-zero `folded_cursor`, and a concrete
+    /// `classification` value (2 = Folded per the spec enum).
+    ShardCoverage cov;
+    cov.classification = 2;
+    cov.folded_token = Token{"etag-abc123", TokenType::ETag};
+    cov.folded_cursor = 99;
+    in.per_ns_shard["myns/7"] = cov;
+
+    const CasFoldSeal out = decodeFoldSeal(encodeFoldSeal(in));
+
+    ASSERT_EQ(out.per_ns_shard.size(), 1u);
+    const ShardCoverage & decoded = out.per_ns_shard.at("myns/7");
+    EXPECT_EQ(decoded.classification, cov.classification);
+    EXPECT_EQ(decoded.folded_token, cov.folded_token);
+    EXPECT_EQ(decoded.folded_cursor, cov.folded_cursor);
+    /// The full struct equality confirms no other field was corrupted.
+    EXPECT_EQ(out, in);
 }
