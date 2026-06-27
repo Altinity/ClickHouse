@@ -28,6 +28,12 @@ enum class FormatId : uint16_t
     Roster = 9,
     RootsRegistry = 10,
     GcOutcomes = 11,
+    /// Phase 1a (CA GC root-local part-manifest redesign):
+    PartManifest = 12,    /// immutable root-local part manifest body; magic "CAPT" (see plan note: "CAPM" is taken by PoolMeta)
+    RunFile = 13,         /// dense block-framed sorted binary data-plane run; magic "CARN"
+    /// rev. 15 splits the old single generation seal into two write-once phase seals:
+    FoldSeal = 14,        /// write-once gc/gen/<gen>/fold_seal (coverage + blob_target/cleanup runs); magic "CAFS"
+    CompletionSeal = 15,  /// write-once gc/gen/<gen>/completion_seal (fence/recheck/delete/trim + adoptable); magic "CACS"
 };
 
 /// Per-type magic: the 4 ASCII bytes of each object class encoded as a little-endian uint32. Used in

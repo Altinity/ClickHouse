@@ -39,6 +39,10 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
         case FormatId::Roster:
         case FormatId::RootsRegistry:
         case FormatId::GcOutcomes:
+        case FormatId::PartManifest:
+        case FormatId::RunFile:
+        case FormatId::FoldSeal:
+        case FormatId::CompletionSeal:
             return BASELINE;
     }
     throw Exception(ErrorCodes::LOGICAL_ERROR, "CasFormat: unknown FormatId {}", static_cast<int>(id));
@@ -59,6 +63,10 @@ uint32_t magicFor(FormatId id)
         case FormatId::RetiredSet:    return 0x54524143u; /// "CART"
         case FormatId::RootsRegistry: return 0x52524143u; /// "CARR"
         case FormatId::GcOutcomes:    return 0x4F474143u; /// "CAGO"
+        case FormatId::PartManifest:   return 0x54504143u; /// "CAPT" (NOT "CAPM"; that is PoolMeta)
+        case FormatId::RunFile:        return 0x4E524143u; /// "CARN"
+        case FormatId::FoldSeal:       return 0x53464143u; /// "CAFS"
+        case FormatId::CompletionSeal: return 0x53434143u; /// "CACS"
         case FormatId::GcSnap:
         case FormatId::Roster:
             break;

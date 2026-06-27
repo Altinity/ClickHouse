@@ -16,7 +16,9 @@ TEST(CasFormat, ChangePointsExistForEveryClass)
     for (auto id : {FormatId::Blob, FormatId::Tree, FormatId::Manifest, FormatId::GcSnap,
                     FormatId::GcState, FormatId::RetiredSet, FormatId::Watermark,
                     FormatId::PoolMeta, FormatId::Roster,
-                    FormatId::RootsRegistry, FormatId::GcOutcomes})
+                    FormatId::RootsRegistry, FormatId::GcOutcomes,
+                    FormatId::PartManifest, FormatId::RunFile,
+                    FormatId::FoldSeal, FormatId::CompletionSeal})
     {
         auto cps = changePoints(id);
         ASSERT_FALSE(cps.empty());
@@ -73,6 +75,12 @@ TEST(CasFormat, MagicForEachMutableObjectClass)
     EXPECT_EQ(le32toStr(magicFor(FormatId::RetiredSet)),    "CART");
     EXPECT_EQ(le32toStr(magicFor(FormatId::RootsRegistry)), "CARR");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcOutcomes)),    "CAGO");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::PartManifest)),    "CAPT");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::RunFile)),         "CARN");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::FoldSeal)),        "CAFS");
+    EXPECT_EQ(le32toStr(magicFor(FormatId::CompletionSeal)),  "CACS");
+    /// Guard the documented collision: PartManifest must NOT reuse PoolMeta's "CAPM".
+    EXPECT_NE(magicFor(FormatId::PartManifest), magicFor(FormatId::PoolMeta));
 }
 
 TEST(CasFormat, MagicForUndefinedClassThrowsLogicalError)
@@ -111,6 +119,10 @@ TEST(CasFormat, MagicsAreDistinct)
         magicFor(FormatId::RetiredSet),
         magicFor(FormatId::RootsRegistry),
         magicFor(FormatId::GcOutcomes),
+        magicFor(FormatId::PartManifest),
+        magicFor(FormatId::RunFile),
+        magicFor(FormatId::FoldSeal),
+        magicFor(FormatId::CompletionSeal),
     };
     for (size_t i = 0; i < std::size(magics); ++i)
         for (size_t j = i + 1; j < std::size(magics); ++j)
