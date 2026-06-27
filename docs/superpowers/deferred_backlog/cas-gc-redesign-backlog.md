@@ -219,19 +219,39 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   spec's INV-COMMIT-FAILCLOSED still holds (a falsely-reclaimed live build's `promote` fails closed), so
   this is a space leak of abandoned-precommit closures, not data loss.
 
-- **B9 — GC generation pruning not implemented (space leak; pre-soak must-fix).** Severity: medium
-  (space-liveness, NOT safety). Where: `Core/CasGc.cpp` round/trim. The new GC writes a `CasFoldSeal` +
-  `CasCompletionSeal` + blob-target runs + part-manifest-cleanup bundles per generation under
-  `gc/gen/<gen>/`, but never prunes superseded generations (the old core kept
-  `gc_snap_generations_to_keep`=3 GcSnap generations). So `gc/gen/` grows unboundedly. The phase1d trim
-  task specified the prune (prune `foldSealKey`/`completionSealKey`/`blobTargetRunKey`/
-  `partManifestCleanupKey` of generations below the retention floor instead of `gcSnapKey`); deferred
-  during the switch. Skipped tests `CasGcSnapRetention.{KeepZeroPrunesNothing,
-  PrunesOldGenerationsKeepingLastThree}` wait on it. **Fix before the post-1d soak** (else the soak shows
-  ever-growing `gc/gen/` metadata) — implement the retention prune + un-skip the 2 tests. R0 invariants
-  hold regardless.
+- **B10 — deferred MINORS from the GC-core durability code review (do NOT fix in the must-fix pass).**
+  Severity: low (none are safety/correctness blockers). Collected while fixing M1/M2/M3/decodeOwnerBinding/
+  B9 so they are not lost:
+  - **`inDegreeInGeneration` is O(candidates x runsize).** Where: `Core/CasBlobInDegree.cpp` (called per
+    retired blob in `recheck`). Each lookup re-streams the generation's run instead of building a map once
+    per round. Fine at current scale; revisit if a round's candidate set grows large.
+  - **Unguarded `int64_t` in-degree accumulation before the `merged<0` guard.** Where: the fold/merge in
+    `Core/CasBlobInDegree.cpp`. A corrupt run could overflow before the under-count guard fires; the guard
+    catches the negative result but not an intermediate wrap. Add a saturating/overflow check.
+  - **`gtest_cas_gc_resume.cpp::ResumeFromDurableFoldSealCompletesRound` doesn't simulate a real mid-round
+    crash** — it reconstructs the resume inputs by hand rather than crashing a partially-run round and
+    re-entering `runRegularRound`. A more faithful crash-injection test would exercise
+    `tryResumeIncompleteRound` end-to-end.
+  - **`~Build` calls `retireBuildSeq` without confirming it is `noexcept`.** Where: `Core/CasBuild.cpp`
+    destructor. If `retireBuildSeq` can throw, a destructor throw is UB. Audit + mark `noexcept` or guard.
+  - **`CasStore Resolved.manifest_size` is always 0.** Where: `Core/CasStore.cpp` resolve path. The field
+    is populated nowhere; either wire it up or drop it from `Resolved`.
+  - **Redundant 2nd watermark GET in `sweepNamespace`.** Where: `Core/CasOrphanManifestSweep.cpp` —
+    `prefixEligible` GETs the watermark, and the sweep path may GET it again. Cache/thread it through.
+  - **`gtest_cas_b140_dangle` is a shallow oracle.** The real shared-blob no-dangle oracle now lives at
+    `gtest_cas_gc_round.cpp::SharedBlobSparedUntilBothRefsDrop`. Either cross-reference it from the b140
+    file or drop `gtest_cas_b140_dangle.cpp` as redundant.
 
 ## Resolved
+
+- **B9 — GC generation pruning: DONE.** `Gc::pruneSupersededGenerations` (called in the recheck round tail
+  before the round-commit `gc/state` CAS) deletes the `foldSealKey`/`completionSealKey`/`blobTargetRunKey`/
+  `partManifestCleanupKey` objects of generations at or below the retention floor
+  (`snap_generation - gc_snap_generations_to_keep`), walking forward from `snap_pruned_through` (bounded
+  64/round) and folding the advanced cursor into the same CAS. `keep == 0` prunes nothing (forensics
+  keep-all). Never throws on a 404 (record-and-continue). The 2 skipped tests
+  `CasGcSnapRetention.{PrunesOldGenerationsKeepingLastThree,KeepZeroPrunesNothing}` are un-skipped and now
+  assert generations below the floor are gone (and the last N + live generation remain). R0 invariants hold.
 
 - **B6 — behavior switch (1b+1c+1d) DONE; SWITCH GREEN.** The link gate passes (`unit_tests_dbms` links)
   and the `Cas*:Ca*` sweep is green except the known B3 (`CaWiringOps.FreezeViaHardLinksIntoShadow`).
