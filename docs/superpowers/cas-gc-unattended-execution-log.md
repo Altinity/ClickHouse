@@ -186,3 +186,23 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   but the post-1d soak would show unbounded `gc/gen/` growth → must fix B9 before the soak.
 - **Action:** dispatched the full-switch code-review (GC core = R0 invariants in C++). Next: review →
   one fix pass (any review blockers + **B9 generation prune**) → post-1d chaos soak → Phase 2.
+
+### 2026-06-27 — Switch code-review: CHANGES-NEEDED (no blockers, 3 durability MAJORs); fix pass dispatched
+- **Review verdict: CHANGES-NEEDED, NO blockers.** The GC core faithfully realizes the rev.15 model —
+  fold dispatch, the #23 fold barrier, context-404, exact-token delete, global fence, fold-through-fence
+  recheck, decrement-before-body-delete ordering, two-seal resume all verified correct; **no ported test
+  weakened a no-dangle/no-loss/no-leak assertion**; B170 emission complete. Skip inventory is 10 (not 8):
+  6 known (B7×3/B8×1/B9×2) + 4 genuinely-obsolete tree-era skips, all with coverage pointers — none hide
+  a gap. The `b140_dangle` rewrite is a shallow oracle but the real shared-blob spare-vs-collect oracle
+  was relocated to `gtest_cas_gc_round.cpp::SharedBlobSparedUntilBothRefsDrop` (→ B10 cross-ref nit).
+- **3 durability MAJORs (pre-soak):** **M1** the cross-round per-shard fold cursor resets to 0
+  (`fold` reads `readFoldSeal(snap_generation)` but `snap_generation` is the completion gen) → masked by
+  eager trim today, becomes an **active in-degree double-count / over-pin leak under Phase-3 lazy trim**
+  or partial-trim-after-crash; **M2** `CasCompletionSeal.blob_target_runs` populated but never
+  encoded/decoded (silent coverage loss); **M3** `pickOneSweepTarget` lists only the first 1000-key page
+  → eligible older debris never drains (violates `OrphanManifestDebrisDrains`). Plus a `decodeOwnerBinding`
+  fail-closed hardening + verify the orphan-sweep active-set vs the atomic promote write order.
+- **Action:** dispatched a consolidated fix pass (M1 with the reviewer's multi-round/trim-disabled
+  no-double-count test; M2 encode/decode; M3 paginate; decodeOwnerBinding; **B9 generation prune** +
+  un-skip the 2 retention tests) → rebuild + green `Cas*`/`Ca*` (modulo B3). MINORS deferred to **B10**.
+  Then: verify → post-1d chaos soak → Phase 2.
