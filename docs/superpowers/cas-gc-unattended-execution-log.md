@@ -529,3 +529,15 @@ didn't drive):
 - Net: every CONTAINED, clear-win, correctness-or-cheap item is done + verified. The two remaining are
   optimizations whose realization cost/risk argues for a maintainer decision, consistent with B14. Also
   open: B3 (pre-existing, unrelated freeze test). PR: not opened (maintainer's call).
+
+### 2026-06-27 — B12 RESOLVED as lazy/batched trim; backlog sweep complete (only B7 + B3 remain)
+- `01495419be7`: `Gc::trim` threshold-gated (count>=256 OR body>=8MiB OR maintenance; else skip) → the
+  Phase-2 conservative skip's settling re-read is eliminated for sub-threshold shards AND the trim write is
+  saved; journal bounded by the cap. `TrimOnlyBelowSealedCoverage` unchanged; NO model change (model `Trim`
+  already optional). Test confirms a sub-threshold shard Skips next round. Full `Cas*:Ca*` 385 ran / 379 pass
+  / 5 skip / 1=B3.
+- **BACKLOG SWEEP COMPLETE.** Resolved this session: 3 HIGH review bugs (promote/abandon/recheck-shard),
+  B8 (reclaim), B11 (counter), B12 (lazy trim), B13 (RustFS soak), B14 (decided=keep HEAD), B15 (plan
+  disclaimer). REMAINING: **B7** (cross-server relink — a replication-path FEATURE rework, held for the
+  maintainer's explicit go-ahead; byte-streaming fallback is correct meanwhile) and **B3** (pre-existing,
+  unrelated freeze test). PR: not opened (maintainer's call). Branch `cas-gc-part-manifest-impl`.

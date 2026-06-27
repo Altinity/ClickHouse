@@ -288,8 +288,16 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   `report.deleted` (and rename it to reflect "objects" = blobs + manifests). Low priority — operators with
   the event log can already reconstruct the true count; this only de-confuses the at-a-glance summary.
 
-- **B12 — REFRAMED 2026-06-27 (maintainer): do LAZY/BATCHED journal trim; durable optimal-skip stays
-  CLOSED.** Root cause of the settling re-read is purely `trim` mutating the root-shard object every time it
+- **B12 — RESOLVED 2026-06-27 `01495419be7` (lazy/batched trim).** `Gc::trim` now compacts a shard only
+  when `trimmable_count >= gc_trim_min_events` (default 256; 0 = eager) OR encoded body `>= gc_trim_body_soft_limit`
+  (default 8 MiB) OR a one-shot maintenance mode — else it skips the compaction, so the root-shard token stays
+  stable and the shard SKIPs next round (the per-round settling re-read is gone, and the trim write is saved).
+  (a)+(b) cap journal growth (backpressure). `TrimOnlyBelowSealedCoverage` unchanged (lazy trim trims a strict
+  subset `<= sealed cursor`). NO model change (verified). Knobs in `PoolConfig`. Test
+  `LazyTrimSkipsSmallJournalAndKeepsTokenStable` confirms the sub-threshold shard then Skips. Full `Cas*:Ca*`
+  379 pass / 5 skip / 1=B3. The durable post-trim-snapshot variant stays CLOSED; the process-local token-hint
+  is a noted future option if even-tighter skipping is ever wanted. Original/reframe notes below.
+- **B12 (reframe note) — do LAZY/BATCHED journal trim; durable optimal-skip stays CLOSED.** Root cause of the settling re-read is purely `trim` mutating the root-shard object every time it
   has >=1 folded event (bumping the token recheck recorded). Fix the cause, not the symptom: make `trim`
   lazy — only compact a shard's journal when `trimmable_events >= N` (e.g. 256), OR the encoded body nears a
   soft size limit, OR an explicit maintenance/full-GC mode. Below threshold, skip trim → the shard's token
