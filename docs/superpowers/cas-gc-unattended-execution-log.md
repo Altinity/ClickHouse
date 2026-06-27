@@ -131,3 +131,19 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
 - **Action:** dispatched continuation (run 2), resuming at **1c T1** per B6 → 1c → 1b T6 → 1d T3-T10 →
   link + green `Cas*`/`Ca*` gate (modulo B3). Continuation updates B6 + reports its resume point if it
   also stops short (the switch may take several runs).
+
+### 2026-06-27 — Behavior switch: run 2 done (1c + 1b T6 + wiring); run 3 = 1d core
+- Run 2 completed **1c (read path)** — `CasStore` `Resolved.manifest_id`/`readManifest`/`lookupPath`/
+  `listDirectory`/`(ManifestId,Token)` cache; `ContentAddressedMetadataStorage` rewired — and **1b T6**
+  (`republishRef` + `ContentAddressedTransaction` over part manifests), plus 1d prep (deleted dead
+  `CasPlacement.h`). 3 commits (`7a640e5ac69`, `2be338197d2`, `02ce8b412bd`). Grep-verified: the ONLY
+  files still referencing removed tree types are the 1d-core files (`CasGc.{h,cpp}`, `CasFsck.cpp`,
+  `CasGcSnap.cpp`, `CasClosureWalk.*`, `CasTreeCodec.*`). B6 rewritten to the new resume point; **B7**
+  added (cross-server part relink fail-closed under per-instance manifests; byte-fetch fallback correct).
+- **Action:** dispatched run 3 = the **1d GC core**: `CasGc.{h,cpp}` fold over the `RootOwnerEvent`
+  journal (owner-move / removal / activation + fold barrier #23 + context-404 clamp), wire
+  `CasBlobInDegree` + `CasFoldSeal`/`CasCompletionSeal`, `CasOrphanManifestSweep`, `CasGcFormats`
+  snap→generation, DELETE `CasGcSnap`/`CasTreeCodec`/`CasClosureWalk` + prune `FormatId::Tree`/`GcSnap`,
+  `CasFsck` audit, rewrite the GC/tree gtests, then link + green `Cas*`/`Ca*` (modulo B3). This is the
+  R0 invariants in C++ → thorough code-review of the GC core after it goes green, before the post-1d
+  soak + Phase 2.
