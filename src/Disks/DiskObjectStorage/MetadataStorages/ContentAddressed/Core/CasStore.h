@@ -77,6 +77,12 @@ struct BlobLocation
 struct BuildInfo
 {
     std::optional<String> intended_ref;       /// "ns/ref" forensics for the envelope (diagnostic)
+    /// The owning root namespace, set EXPLICITLY by the wiring. When present it is authoritative for
+    /// the manifest's owning namespace (Build::manifestNamespace), so a ref that itself contains '/'
+    /// (the `detached/<part>` fold, B181) is staged in the TABLE namespace — NOT in a spurious
+    /// `<ns>/detached` namespace produced by splitting intended_ref on the last '/'. Absent ⇒ fall
+    /// back to splitting intended_ref on the last '/' (the diagnostic-only path used by Core tests).
+    std::optional<RootNamespace> intended_namespace;
     ProvenanceOp op = ProvenanceOp::Other;
 };
 

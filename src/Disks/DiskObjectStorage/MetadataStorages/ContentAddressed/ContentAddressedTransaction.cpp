@@ -127,7 +127,8 @@ Cas::Build & ContentAddressedTransaction::buildFor(
 {
     if (!st.build)
         st.build = metadata_storage.store()->startBuild(
-            Cas::BuildInfo{.intended_ref = r.ns.string() + "/" + r.ref, .op = Cas::ProvenanceOp::Insert});
+            Cas::BuildInfo{.intended_ref = r.ns.string() + "/" + r.ref,
+                           .intended_namespace = r.ns, .op = Cas::ProvenanceOp::Insert});
     return *st.build;
 }
 
@@ -146,7 +147,8 @@ bool ContentAddressedTransaction::republishRef(
     const Cas::PartManifest src_manifest = metadata_storage.store()->readManifest(resolved->manifest_id);
 
     auto build = metadata_storage.store()->startBuild(
-        Cas::BuildInfo{.intended_ref = dst_ns.string() + "/" + dst_ref, .op = Cas::ProvenanceOp::Other});
+        Cas::BuildInfo{.intended_ref = dst_ns.string() + "/" + dst_ref,
+                       .intended_namespace = dst_ns, .op = Cas::ProvenanceOp::Other});
 
     /// Record a TOKENLESS W-EVIDENCE dep for every blob the source manifest names — NO HEAD before
     /// precommit. promote re-proves each dep fail-closed. Inline entries record nothing (adoptEvidence

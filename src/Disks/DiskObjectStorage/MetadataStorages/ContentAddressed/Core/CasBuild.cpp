@@ -477,8 +477,16 @@ String Build::writerInstanceId() const
 
 RootNamespace Build::manifestNamespace() const
 {
-    /// The owning namespace is BuildInfo::intended_ref minus its last `/`-segment (the ref name). A CA
-    /// namespace itself contains `/` (e.g. "srv1/<uuid>@cas@"), so split on the LAST slash only.
+    /// The wiring sets the owning namespace EXPLICITLY (BuildInfo::intended_namespace). This is the
+    /// authoritative source: a ref can itself contain `/` (the `detached/<part>` fold, B181), so we
+    /// must NOT recover the namespace by splitting intended_ref on the last `/` — that would yield a
+    /// spurious `<ns>/detached` namespace and the precommit namespace-match check would throw.
+    if (info.intended_namespace)
+        return *info.intended_namespace;
+
+    /// Fallback (Core tests that set only the diagnostic intended_ref, where the ref has no `/`): the
+    /// owning namespace is intended_ref minus its last `/`-segment (the ref name). A CA namespace itself
+    /// contains `/` (e.g. "srv1/<uuid>@cas@"), so split on the LAST slash only.
     const String intended = info.intended_ref.value_or("");
     const size_t slash = intended.find_last_of('/');
     if (slash == String::npos || slash == 0)
