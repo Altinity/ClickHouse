@@ -1275,3 +1275,72 @@ TEST(CasBuild, PromoteSucceedsWhenPrecommitIsLiveOwner)
     ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
     EXPECT_EQ(s->resolveRef(ns, "part_1")->manifest_id, id);
 }
+
+/// BUG 2 (WAbandonPrecommit; delete-after-sealed-decrements): once `precommitAdd` has made a manifest a
+/// LIVE precommit owner input, `abandon` must NOT writer-delete its body. The TLA+ `WAbandonPrecommit`
+/// appends a REMOVAL event (`old = precommit(build_id, final_ref, T)`, `new = none`) and NEVER deletes
+/// the body — GC decrements the precommit's blob edges and deletes the body only after the decrement is
+/// sealed. Writer-deleting a live precommit body strands GC's fold barrier (live precommit, missing body
+/// → clamp forever) or loses the activating +1.
+TEST(CasBuild, AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
+    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "kept")});
+    const String manifest_key = s->layout().manifestKey(mid);
+    const UInt128 abandoned_build_id = build->buildId();
+    build->precommitAdd(ns, "part_1", mid);
+
+    /// The precommit manifest body is present before abandon.
+    ASSERT_TRUE(b->head(manifest_key).exists);
+
+    build->abandon();
+
+    /// (a) the LIVE precommit body must SURVIVE abandon (left for GC after the sealed decrement).
+    EXPECT_TRUE(b->head(manifest_key).exists)
+        << "abandon must NOT writer-delete a live precommit body (delete-after-sealed-decrements)";
+
+    /// (b) a precommit-REMOVAL RootOwnerEvent (old = Precommit binding, new = none) is in the target shard.
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+    const auto shard_raw = b->get(s->layout().rootShardKey(ns, shard));
+    ASSERT_TRUE(shard_raw.has_value());
+    const RootShard root = decodeRootShard(shard_raw->bytes);
+    const OwnerBinding expected{
+        .owner_kind = OwnerKind::Precommit, .ref_name = "part_1",
+        .build_id = abandoned_build_id, .manifest_ref = mid.ref};
+    bool found_removal = false;
+    for (const RootOwnerEvent & e : root.journal)
+        if (!e.new_binding && e.old_binding && *e.old_binding == expected)
+            found_removal = true;
+    EXPECT_TRUE(found_removal)
+        << "abandon must append a precommit-removal RootOwnerEvent (old=Precommit, new=none)";
+}
+
+/// BUG 2 regression for the never-precommitted path: a manifest that was STAGED but never precommitted is
+/// still best-effort writer-deleted by abandon (pre-precommit debris) — only a LIVE precommit body is
+/// spared. Confirms the fix narrows the skip to the precommitted manifest exactly.
+TEST(CasBuild, AbandonStillDeletesNeverPrecommittedStagedDebris)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
+    /// Two staged manifests: one becomes the precommit, the other is pure pre-precommit debris.
+    const ManifestId debris = build->stageManifest({blobManifestEntry("debris.bin", "kept")});
+    const ManifestId precommitted = build->stageManifest({blobManifestEntry("data.bin", "kept")});
+    build->precommitAdd(ns, "part_1", precommitted);
+
+    build->abandon();
+
+    /// The never-precommitted debris is best-effort deleted; the live precommit body survives.
+    EXPECT_FALSE(b->head(s->layout().manifestKey(debris)).exists)
+        << "never-precommitted staged debris must still be best-effort deleted by abandon";
+    EXPECT_TRUE(b->head(s->layout().manifestKey(precommitted)).exists)
+        << "the live precommit body must be spared";
+}

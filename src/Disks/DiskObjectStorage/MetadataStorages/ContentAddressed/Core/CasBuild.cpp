@@ -746,12 +746,41 @@ void Build::abandon()
     store->retireBuildSeq(build_seq);
     alive = false;
 
+    /// BUG 2 / TLA+ `WAbandonPrecommit`: if this build made a manifest a LIVE precommit owner input
+    /// (`precommitAdd` ran), abandoning it must NOT writer-delete that body. Instead append a precommit
+    /// REMOVAL event into the target shard, mirroring EXACTLY the removal encoding used by `Store::dropRef`
+    /// and `Gc::reclaimAbandonedPrecommit` (old = the precommit binding, new = none). GC then folds the
+    /// `-1` blob decrements and deletes the body only after they are sealed
+    /// (delete-after-sealed-decrements). Deleting a live precommit body here would strand GC's fold
+    /// barrier (live precommit, missing body → clamp forever) or lose the activating `+1`. This is the
+    /// correctness-bearing step of abandon, so it runs through `mutateShard` (reliable CAS), not
+    /// best-effort. It precedes the best-effort debris deletion below so a partial cleanup can never
+    /// leave the precommit binding live without its body's GC release queued.
+    if (precommitted)
+    {
+        store->mutateShard(precommit_target_ns, store->shardOf(precommit_final_ref), [&](RootShard & root)
+        {
+            root.journal.push_back(RootOwnerEvent{
+                .transition_version = root.shard_version + 1,
+                .old_binding = OwnerBinding{
+                    .owner_kind = OwnerKind::Precommit,
+                    .ref_name = precommit_final_ref,
+                    .build_id = build_id,
+                    .manifest_ref = precommit_manifest},
+                .new_binding = std::nullopt});
+        });
+        precommitted = false;
+    }
+
     /// Best-effort writer cleanup of THIS build's pre-precommit/staged `_manifests` debris (spec
     /// §Pre-Precommit Part-Manifest Debris). The common case is writer cleanup; a missed object is
     /// benign — the Phase-1d namespace-scoped orphan sweep reclaims it. Exact-token delete only; never
-    /// throw from abandon.
+    /// throw from abandon. SKIP the manifest that became a live precommit owner above: its body is a live
+    /// precommit input whose deletion is GC's job after the sealed decrement (never writer-delete it).
     for (const ManifestId & id : staged_manifests)
     {
+        if (id.ref == precommit_manifest && id.root_namespace == precommit_target_ns)
+            continue;   /// the live precommit body — left for GC (delete-after-sealed-decrements)
         try
         {
             const String key = store->layout().manifestKey(id);
@@ -768,7 +797,8 @@ void Build::abandon()
         e.type = CasEventType::BuildAbort;
         e.token = u128ToHex(build_id);
         e.outcome = "abandoned";
-        e.reason = "abandon: best-effort _manifests debris cleanup; remainder reaped by the orphan sweep";
+        e.reason = "abandon: appended a precommit-removal event for the live precommit (body left for GC); "
+                   "best-effort deleted the never-precommitted _manifests debris; remainder reaped by the orphan sweep";
         e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
     });
 }
