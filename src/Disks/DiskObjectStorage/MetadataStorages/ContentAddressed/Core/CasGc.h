@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <map>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -236,7 +237,11 @@ private:
     /// `supportsListTokens()` is TRUE; the result is an accelerator — a missing key here means Read
     /// (fail closed). Key format: the full backend key (e.g. `p/roots/ns/0`); callers strip the roots
     /// prefix to get the "ns/shard" cursor-key form when looking up in `per_ns_shard`.
-    std::map<String, Token> listRootShardTokens();
+    ///
+    /// AMBIGUITY DETECTION: a key seen more than once across all pages is ambiguous (a backend anomaly
+    /// or a racing write that landed between two pages). Ambiguous keys are reported into
+    /// `ambiguous_keys` so that `computeDiscoverDecisions` can force those shards to Read (fail closed).
+    std::map<String, Token> listRootShardTokens(std::set<String> & ambiguous_keys);
 
     /// Phase-2 token-diff: compute the per-shard `DiscoverDecision` for the upcoming round. The universe
     /// is ALWAYS the REGISTRY universe (LIST is only an accelerator and can never remove a shard). The

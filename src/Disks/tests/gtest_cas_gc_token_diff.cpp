@@ -235,3 +235,216 @@ TEST(CasGcDiscovery, RegistryUniverseNeverShrunkByList)
     EXPECT_TRUE(decisions.contains(cursorKey(ns_b, 0)))
         << "a registered-but-empty namespace must remain in the universe (registry authority, not LIST)";
 }
+
+/// ---- Task 5: fail-closed fallback to body reads on any ambiguity ----
+
+/// Characterization / lock test: when the backend's `supportsListTokens` returns FALSE, EVERY shard
+/// decision must be Read (fail closed) regardless of sealed state. This locks the `supportsListTokens`
+/// guard that was introduced in Task 4 and must never regress.
+TEST(CasGcDiscovery, FailsClosedToReadWhenTokensUnobservable)
+{
+    /// Build a store over an `InMemoryBackend` (which supports list tokens) to run a real settling round,
+    /// then verify: if we were using a backend that does NOT support list tokens, every shard would be Read.
+    ///
+    /// We can test this directly by using `NoListTokenBackend` for a store whose GC has gone through
+    /// a round. However `NoListTokenBackend` is a no-op stub — it cannot run a real round. Instead we
+    /// exercise the guard path: open a real store, run two settling rounds so a shard becomes Skip-eligible,
+    /// confirm it IS Skip on the real backend, then open a SECOND store over a `NoListTokenBackend`-derived
+    /// store that delegates all ops to the same in-memory storage but returns `supportsListTokens` = false.
+    /// The second store's `discoverDecisionsForTest` must report all Read.
+    auto real_backend = std::make_shared<InMemoryBackend>();
+    auto real_store = openStoreForTest(real_backend);
+    const RootNamespace ns{"srv1/no_list_tokens"};
+    const ManifestRef r = discoveryRef(1, 0xCC);
+
+    writeBlobBody(*real_backend, real_store->layout(), DB::UInt128(1));
+    writeManifestRaw(*real_backend, real_store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*real_backend, real_store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc_real(real_store, kGcDiscovery);
+    ASSERT_TRUE(gc_real.runRegularRound().acquired_lease);   /// round 1: fold + trim
+    ASSERT_TRUE(gc_real.runRegularRound().acquired_lease);   /// round 2: settle
+
+    /// Confirm the shard is Skip-eligible on the real (supportsListTokens=true) backend.
+    const String ck = cursorKey(ns, 0);
+    ASSERT_EQ(gc_real.discoverDecisionsForTest().at(ck), Gc::DiscoverDecision::Skip)
+        << "precondition: shard settled and is skippable on a list-tokens-capable backend";
+
+    /// Now build a no-list-tokens wrapper that delegates storage to the same in-memory backend but
+    /// returns FALSE from `supportsListTokens`. Open a separate Store + Gc over it.
+    class NoListWrapper final : public InMemoryBackend
+    {
+    public:
+        explicit NoListWrapper(InMemoryBackend & base_) : base(base_) {}
+        bool supportsListTokens() const override { return false; }
+
+        std::optional<GetResult> get(const String & key, Range range = {}) override { return base.get(key, range); }
+        HeadResult head(const String & key) override { return base.head(key); }
+        PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+        {
+            return base.putIfAbsent(key, bytes, meta);
+        }
+        WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override
+        {
+            return base.putIfAbsentStream(key, meta);
+        }
+        PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
+                               const ObjectMeta & meta = {}) override
+        {
+            return base.putOverwrite(key, bytes, expected, meta);
+        }
+        CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                         const ObjectMeta & meta = {}) override
+        {
+            return base.casPut(key, bytes, expected, meta);
+        }
+        DeleteOutcome deleteExact(const String & key, const Token & token) override
+        {
+            return base.deleteExact(key, token);
+        }
+        ListPage list(const String & prefix, const String & cursor, size_t limit) override
+        {
+            return base.list(prefix, cursor, limit);
+        }
+
+    private:
+        InMemoryBackend & base;
+    };
+
+    auto no_list_backend = std::make_shared<NoListWrapper>(*real_backend);
+    auto no_list_store = Store::open(
+        no_list_backend, PoolConfig{.pool_prefix = "p", .root_shards = 1});
+    Gc gc_no_list(no_list_store, kGcDiscovery);
+
+    const auto decisions = gc_no_list.discoverDecisionsForTest();
+    ASSERT_TRUE(decisions.contains(ck));
+    EXPECT_EQ(decisions.at(ck), Gc::DiscoverDecision::Read)
+        << "supportsListTokens=false must force every shard to Read (fail closed; the spec)";
+}
+
+/// Characterization / lock test: a shard registered but never covered by a prior completed round must
+/// be Read. No `runRegularRound` is called here — there is no sealed folded_token — so the prior-coverage
+/// guard must fire and keep the decision as Read.
+TEST(CasGcDiscovery, FailsClosedToReadWhenNoPriorCoverage)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"srv1/no_coverage"};
+    const ManifestRef r = discoveryRef(1, 0xDD);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(3));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(3))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    /// Deliberately do NOT run any GC round — there is no sealed coverage for this shard.
+    Gc gc(store, kGcDiscovery);
+
+    const auto decisions = gc.discoverDecisionsForTest();
+    const String ck = cursorKey(ns, 0);
+    ASSERT_TRUE(decisions.contains(ck));
+    EXPECT_EQ(decisions.at(ck), Gc::DiscoverDecision::Read)
+        << "a shard with no prior sealed coverage must be Read (fail closed; the spec)";
+}
+
+/// New guard test: a shard whose key appears MORE THAN ONCE in the LIST sweep (ambiguous) must be
+/// Read, even when the token would otherwise match the sealed folded_token. This is tested via a
+/// focused unit on a duplicate-key-yielding backend: the backend's `list` returns the same shard key
+/// twice in the same page; `listRootShardTokens` must mark that key as ambiguous, and
+/// `computeDiscoverDecisions` must return Read for it.
+TEST(CasGcDiscovery, FailsClosedToReadWhenListKeyAmbiguous)
+{
+    /// First run a real settling round to get a valid sealed completion seal with a folded_token.
+    auto real_backend = std::make_shared<InMemoryBackend>();
+    auto real_store = openStoreForTest(real_backend);
+    const RootNamespace ns{"srv1/ambiguous"};
+    const ManifestRef r = discoveryRef(1, 0xEE);
+
+    writeBlobBody(*real_backend, real_store->layout(), DB::UInt128(4));
+    writeManifestRaw(*real_backend, real_store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(4))});
+    publishCommittedTransition(*real_backend, real_store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc_real(real_store, kGcDiscovery);
+    ASSERT_TRUE(gc_real.runRegularRound().acquired_lease);   /// round 1: fold + trim
+    ASSERT_TRUE(gc_real.runRegularRound().acquired_lease);   /// round 2: settle
+
+    /// Confirm the shard is Skip-eligible on the real backend (precondition for the ambiguity test:
+    /// the token-match path would normally yield Skip, which we need to override with Read).
+    const String ck = cursorKey(ns, 0);
+    ASSERT_EQ(gc_real.discoverDecisionsForTest().at(ck), Gc::DiscoverDecision::Skip)
+        << "precondition: shard settled and is skippable";
+
+    /// Build a backend that injects a duplicate `ListedKey` for the shard's full key on every `list`
+    /// call, while delegating all other ops to the real backend. This simulates an ambiguous LIST
+    /// sweep (the same key returned twice in one page or across pages).
+    const String roots_prefix = real_store->layout().rootsPrefix();
+    const String shard_full_key = roots_prefix + ck;   /// e.g. "p/roots/srv1/ambiguous/0"
+
+    class DuplicateListBackend final : public InMemoryBackend
+    {
+    public:
+        DuplicateListBackend(InMemoryBackend & base_, String dup_key_)
+            : base(base_), dup_key(std::move(dup_key_))
+        {}
+
+        bool supportsListTokens() const override { return true; }
+
+        std::optional<GetResult> get(const String & key, Range range = {}) override { return base.get(key, range); }
+        HeadResult head(const String & key) override { return base.head(key); }
+        PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+        {
+            return base.putIfAbsent(key, bytes, meta);
+        }
+        WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override
+        {
+            return base.putIfAbsentStream(key, meta);
+        }
+        PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
+                               const ObjectMeta & meta = {}) override
+        {
+            return base.putOverwrite(key, bytes, expected, meta);
+        }
+        CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                         const ObjectMeta & meta = {}) override
+        {
+            return base.casPut(key, bytes, expected, meta);
+        }
+        DeleteOutcome deleteExact(const String & key, const Token & token) override
+        {
+            return base.deleteExact(key, token);
+        }
+
+        /// Inject the duplicate: for any page that would contain `dup_key`, also add a second entry
+        /// for that key with the same token (so the token-match would succeed if ambiguity were not detected).
+        ListPage list(const String & prefix, const String & cursor, size_t limit) override
+        {
+            ListPage page = base.list(prefix, cursor, limit);
+            /// Find whether dup_key appears in this page and, if so, append a duplicate entry.
+            for (size_t i = 0; i < page.keys.size(); ++i)
+            {
+                if (page.keys[i].key == dup_key)
+                {
+                    /// Inject a second occurrence of the same key with the same token.
+                    page.keys.push_back(page.keys[i]);
+                    break;
+                }
+            }
+            return page;
+        }
+
+    private:
+        InMemoryBackend & base;
+        String dup_key;
+    };
+
+    auto dup_backend = std::make_shared<DuplicateListBackend>(*real_backend, shard_full_key);
+    auto dup_store = Store::open(
+        dup_backend, PoolConfig{.pool_prefix = "p", .root_shards = 1});
+    Gc gc_dup(dup_store, kGcDiscovery);
+
+    /// The GC on the duplicate-yielding backend should see the shard key as ambiguous and fall back
+    /// to Read (even though the token value would otherwise match the sealed folded_token).
+    const auto decisions = gc_dup.discoverDecisionsForTest();
+    ASSERT_TRUE(decisions.contains(ck));
+    EXPECT_EQ(decisions.at(ck), Gc::DiscoverDecision::Read)
+        << "an ambiguous (duplicate) listed key must be Read (fail closed; never Skip on ambiguity)";
+}

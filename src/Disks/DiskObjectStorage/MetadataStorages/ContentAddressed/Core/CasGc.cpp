@@ -1033,7 +1033,7 @@ std::vector<uint64_t> Gc::shardsToVisit(const RootNamespace &)
     return shards;
 }
 
-std::map<String, Token> Gc::listRootShardTokens()
+std::map<String, Token> Gc::listRootShardTokens(std::set<String> & ambiguous_keys)
 {
     std::map<String, Token> result;
     Backend & backend = store->backend();
@@ -1046,7 +1046,15 @@ std::map<String, Token> Gc::listRootShardTokens()
         const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
         for (const ListedKey & lk : page.keys)
         {
-            if (lk.token.has_value())
+            if (!lk.token.has_value())
+                continue;
+            /// AMBIGUITY DETECTION: a key observed more than once across pages is ambiguous (a backend
+            /// anomaly or a racing write that landed between pages). Ambiguous keys are forced Read in
+            /// `computeDiscoverDecisions` — a shard we cannot unambiguously identify must never be
+            /// skipped (fail closed; the spec, not a hidden fallback).
+            if (result.contains(lk.key))
+                ambiguous_keys.insert(lk.key);
+            else
                 result[lk.key] = *lk.token;
         }
         if (page.next_cursor.empty())
@@ -1078,13 +1086,25 @@ std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
     /// stripping the roots prefix (`rootShardKey` == rootsPrefix() + "ns/shard"), so they line up with
     /// `per_ns_shard`. Non-shard keys under `roots/` (e.g. `_files/`, `_manifests/`) cannot match a
     /// registry-universe cursor key, so they are harmless.
-    const std::map<String, Token> listed = listRootShardTokens();
+    ///
+    /// AMBIGUITY: `listRootShardTokens` also reports keys it observed MORE THAN ONCE across all pages.
+    /// An ambiguous full key is mapped to cursor-key form and added to `ambiguous_cursor_keys` so the
+    /// Skip guard below can force those shards to Read (fail closed; an unambiguous listed token is
+    /// required for Skip — the spec, not a hidden fallback).
+    std::set<String> ambiguous_full_keys;
+    const std::map<String, Token> listed = listRootShardTokens(ambiguous_full_keys);
     const String roots_prefix = layout.rootsPrefix();
     std::map<String, Token> listed_by_cursor_key;
+    std::set<String> ambiguous_cursor_keys;
     for (const auto & [full_key, token] : listed)
     {
         if (full_key.starts_with(roots_prefix))
             listed_by_cursor_key[full_key.substr(roots_prefix.size())] = token;
+    }
+    for (const auto & full_key : ambiguous_full_keys)
+    {
+        if (full_key.starts_with(roots_prefix))
+            ambiguous_cursor_keys.insert(full_key.substr(roots_prefix.size()));
     }
 
     for (const auto & [ns, shard] : universe)
@@ -1110,6 +1130,11 @@ std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
         const auto listed_it = listed_by_cursor_key.find(ck);
         if (listed_it == listed_by_cursor_key.end())
             continue;   /// shard not visible in LIST (absent / key format differs) => Read (defaulted)
+
+        /// AMBIGUITY guard: a shard key seen more than once in the LIST sweep is ambiguous — we cannot
+        /// unambiguously identify its current token. Forced Read (fail closed; the spec, not a fallback).
+        if (ambiguous_cursor_keys.contains(ck))
+            continue;   /// ambiguous listed key => Read (already defaulted)
 
         /// Skip IFF the listed token equals the sealed post-fence `folded_token` exactly.
         if (listed_it->second == sealed_it->second.folded_token)
