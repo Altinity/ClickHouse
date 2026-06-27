@@ -1,0 +1,71 @@
+#pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <base/types.h>
+#include <base/extended_types.h>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace DB::Cas
+{
+
+/// Where a manifest entry's file bytes live (spec §Object Identity And Ownership). No `Subtree`:
+/// there are no nested tree objects in this design; a directory is a path prefix, not a placement.
+enum class EntryPlacement : uint8_t
+{
+    Inline = 1,   /// bytes embedded in `inline_bytes`
+    Blob = 2,     /// bytes stored as a content-addressed blob at blobKey(blob_hash)
+};
+
+/// One file entry inside a part manifest. `blob_hash`/`blob_size` are meaningful only for `Blob`;
+/// `inline_bytes` only for `Inline`.
+struct ManifestEntry
+{
+    String path;
+    EntryPlacement placement = EntryPlacement::Inline;
+    UInt128 blob_hash{};
+    uint64_t blob_size = 0;
+    String inline_bytes;
+    bool operator==(const ManifestEntry &) const = default;
+};
+
+/// The immutable body of a single root-local part manifest (spec §Part Manifest Reference And
+/// Identity, OQ1). It repeats its own `ref` and `root_namespace_id` for fail-closed validation only -
+/// never as a second identity. `payload_digest` is integrity/debug only: NEVER a key, NEVER dedup,
+/// NEVER in-degree. No mutable per-ref payload here (that stays in the root RefRecord). No directory
+/// index in Phase 1a (OQ3-deferred).
+struct PartManifest
+{
+    ManifestRef ref;
+    RootNamespace root_namespace_id;
+    UInt128 payload_digest{};
+    std::vector<ManifestEntry> entries;
+    bool operator==(const PartManifest &) const = default;
+};
+
+/// Deterministic, streaming-capable encode. Entries are written in canonical path order (the encoder
+/// sorts them); a duplicate path throws CORRUPTED_DATA. Byte output is reproducible for identical
+/// input (no timestamps, no nondeterministic compression).
+String encodePartManifest(const PartManifest & m);
+
+/// Decode. Throws CORRUPTED_DATA on bad magic, future format, unknown placement, duplicate path, or a
+/// truncated buffer.
+PartManifest decodePartManifest(std::string_view data);
+
+/// Content digest of the canonical encoded body, using the CAS content-hash primitive
+/// (`CityHash_v1_0_2::CityHash128`, the same one blob/tree hashing uses - NOT a second hash
+/// primitive). Callers (Phase 1b `stageManifest`) set `PartManifest.payload_digest` from this. It is
+/// integrity/debug ONLY - never a key, never dedup, never in-degree. Stable for identical bodies;
+/// changes when any byte of the canonical encoding does, and is independent of the `payload_digest`
+/// field itself (computed with it zeroed).
+UInt128 computePayloadDigest(const PartManifest & m);
+
+/// Fail-closed read/fold checks (spec §Object Identity And Ownership). Tested in Task 6.
+/// The journal `ManifestRef` must equal the `ref` inside the decoded body.
+bool refMatchesBody(const ManifestRef & journal_ref, const PartManifest & body);
+/// The body `root_namespace_id` must equal the owning root namespace.
+bool manifestNamespaceMatches(const RootNamespace & owning, const PartManifest & body);
+
+}
