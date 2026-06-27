@@ -36,6 +36,7 @@ public:
     PutResult putOverwrite(const String & k, const String & b, const Token & e, const ObjectMeta & m = {}) override { return inner->putOverwrite(k, b, e, m); }
     CasResult casPut(const String & k, const String & b, const std::optional<Token> & e, const ObjectMeta & m = {}) override { return inner->casPut(k, b, e, m); }
     DeleteOutcome deleteExact(const String & k, const Token & t) override { return inner->deleteExact(k, t); }
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
 private:
     BackendPtr inner;

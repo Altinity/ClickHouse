@@ -65,6 +65,8 @@ struct NullBackend final : Backend
     {
         return ListPage{};
     }
+
+    bool supportsListTokens() const override { return false; }
 };
 
 TEST(CasBackend, NullBackendShapeAndDefaults)

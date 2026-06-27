@@ -121,6 +121,8 @@ public:
         return page;
     }
 
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
 private:
     BackendPtr inner;
 };

@@ -140,6 +140,19 @@ public:
                              const ObjectMeta & meta = {}) = 0;
     virtual DeleteOutcome deleteExact(const String & key, const Token & token) = 0;
     virtual ListPage list(const String & prefix, const String & cursor, size_t limit) = 0;
+
+    /// Capability fact about the LIST seam: TRUE iff this backend can surface a per-key incarnation
+    /// token through `list` (i.e. each `ListedKey` carries a token that uniquely identifies the
+    /// current incarnation of that key, matching what `head` would return).
+    ///
+    /// Why this matters: S3 ETags are content-derived and are returned in list responses; the
+    /// in-memory backend mints a monotonic token it can also surface through `list`. A backend that
+    /// cannot surface per-key tokens through `list` MUST return FALSE.
+    ///
+    /// FALSE ⇒ GC `discover` must read every root-shard body to learn the current token (fail closed).
+    /// TRUE  ⇒ `discover` may skip an unchanged root-shard body read when the listed token equals
+    ///          the persisted folded token, saving a GET per unchanged shard.
+    virtual bool supportsListTokens() const = 0;
 };
 
 using BackendPtr = std::shared_ptr<Backend>;
