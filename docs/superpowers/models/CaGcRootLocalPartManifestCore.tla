@@ -53,7 +53,8 @@ VARIABLES
     completionSeal,                            \* per-round COMPLETION fence: fence positions, recheck, delete outcomes, trim, adoptable
     gcRound, gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion,
     retired, inflight, wView,                  \* GC pipeline (carried from core)
-    mfCleanup, mfDeleted, mPrefix, sweepEligible   \* part-manifest cleanup work; deleted-bodies set; per-manifest build-prefix; per-prefix orphan-sweep eligibility
+    mfCleanup, mfDeleted, mPrefix, sweepEligible,  \* part-manifest cleanup work; deleted-bodies set; per-manifest build-prefix; per-prefix orphan-sweep eligibility
+    extraShared                                    \* #2: ManifestIds carrying a SECOND shared committed owner (SabotageTwoOwners only)
 
 \* SrcEdges(m): the active source edges currently emitted by m's activation map. Derived operator,
 \* NOT a constant, so it follows mActiveEdges as the fold mutates it.
@@ -74,7 +75,7 @@ IsActivation(e)          == e.new # {} /\ e.old # e.new
 vars == << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
            journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
            roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-           mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+           mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* ---- helpers (filled across tasks) ----
 NoOp == UNCHANGED vars
@@ -83,44 +84,65 @@ NoOp == UNCHANGED vars
 CondemnedTok(b, t) == t \in deadTok[b]
 
 \* RefMatchesBody / ManifestNamespaceMatches: the body self-describes its ref + ns; a sabotage may
-\* publish a manifest whose body disagrees. A read/fold that accepts a mismatch is unsafe.
-BodyValid(m) == mRef[m] = m /\ mNs[m] = m[1]
+\* publish a manifest whose body disagrees. BodyValid is the TRUE predicate (the structural invariants
+\* use it). BodyAccepted is what the gate/fold USE to decide acceptance: the honest path equals
+\* BodyValid, but SabotageAcceptRefMismatch / SabotageAcceptNamespaceMismatch make the gate ACCEPT a
+\* mismatched body (the unsafe "accept it" of controls #19/#20), so a committed binding becomes visible
+\* over a body that names the wrong ref/ns.
+BodyValid(m)    == mRef[m] = m /\ mNs[m] = m[1]
+BodyAccepted(m) == \/ BodyValid(m)
+                   \/ (SabotageAcceptRefMismatch /\ mNs[m] = m[1])        \* accept ref mismatch (ns still ok)
+                   \/ (SabotageAcceptNamespaceMismatch /\ mRef[m] = m)    \* accept ns mismatch (ref still ok)
 
 \* WStageManifest: write a part-manifest body BEFORE any owner transition (the pre-precommit object).
-\* everEdged tracks instance ids that have ever been bound to a body lineage; NoManifestIdReuse
-\* forbids re-binding a visible instance id to a new body. SabotageReuseManifestId drops the
-\* freshness guard (reuse a ManifestId for a byte-identical future manifest). SabotageAcceptRefMismatch
-\* / SabotageAcceptNamespaceMismatch write a body whose self-ref / self-ns disagree with the id.
+\* everEdged tracks ManifestIds (ns, instance) that have ever been bound to a body lineage;
+\* NoManifestIdReuse forbids re-binding a visible ManifestId to a new body. Note it keys by the FULL
+\* ManifestId, NOT the bare instance id: two namespaces may legitimately hold the same instance id as
+\* DIFFERENT ManifestIds (the #18 KeyByRefNotId hazard). SabotageReuseManifestId drops the freshness
+\* guard. SabotageAcceptRefMismatch / SabotageAcceptNamespaceMismatch write a mismatched body.
 WStageManifest(m, f) ==
     /\ owner[m] = None /\ ~mBody[m]
-    /\ (m[2] \notin everEdged \/ SabotageReuseManifestId)   \* fresh instance id (never-reused) unless sabotaged
+    /\ (m \notin everEdged \/ SabotageReuseManifestId)   \* fresh ManifestId (never-reused) unless sabotaged
     /\ mBody' = [mBody EXCEPT ![m] = TRUE]
     /\ mEntries' = [mEntries EXCEPT ![m] = f]
     /\ mRef' = [mRef EXCEPT ![m] = IF SabotageAcceptRefMismatch THEN (CHOOSE x \in ManifestIds : x # m) ELSE m]
     /\ mNs' = [mNs EXCEPT ![m] = IF SabotageAcceptNamespaceMismatch THEN (CHOOSE n \in Namespaces : n # m[1]) ELSE m[1]]
-    /\ everEdged' = everEdged \cup {m[2]}
+    /\ everEdged' = everEdged \cup {m}
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, owner, mActiveEdges, journal, blobIndeg,
                     blobEdges, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
-                    mfDeleted, mPrefix, sweepEligible >>
+                    mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* ---- owner transitions (spec §Build And Precommit Protocol; §Fold Owner Transitions) ----
 PresentBlobs == { b \in Blobs : present[b] }
-\* A blob's CURRENT token is condemned in the writer's publish view if GC has retired it or has a
-\* delete in flight for that exact token (the W-PUBLISH-GATE / retire-view: the global fence guarantees
-\* the writer sees the round's retired set before publishing). Committing over such a blob would race a
-\* GC delete and dangle, so the fail-closed gate must reject it (the writer must re-upload from source).
-BlobCondemnedInView(b) ==
+\* The publish-gate FLOOR for namespace n: the highest round at which n was globally fenced. A writer
+\* must have refreshed its retire-view to at least this round before it may publish into n (so it sees
+\* the round's retired set). Derived from fenceVersion (the per-round fence record); 0 if never fenced.
+PubFloor(n) == IF \E r \in 0..MaxRound : fenceVersion[r][n] > 0
+               THEN CHOOSE r \in 0..MaxRound : fenceVersion[r][n] > 0 /\ \A r2 \in 0..MaxRound : fenceVersion[r2][n] > 0 => r2 <= r
+               ELSE 0
+\* A blob's CURRENT token is condemned in the WRITER'S retire-view: GC has a retired entry for that
+\* exact token at a round the writer has refreshed to (e.r <= wView[w]), or the token is already
+\* physically dead. This is the W-PUBLISH-GATE retire-view. The GLOBAL FENCE is load-bearing: a publish
+\* requires wView[w] >= PubFloor(n), so a writer cannot publish without first observing the fence-round's
+\* retired set — that is exactly what SabotageNoFence removes (PubFloor stays 0, the racing publish slips
+\* through over a blob GC is about to delete). Inflight is GC-internal and NOT writer-visible here.
+BlobCondemnedInView(b, w) ==
     \/ CondemnedTok(b, tokOf[b])
-    \/ \E e \in retired  : e.b = b /\ e.t = tokOf[b]
-    \/ \E d \in inflight : d.b = b /\ d.t = tokOf[b]
+    \/ \E e \in retired : e.b = b /\ e.t = tokOf[b] /\ e.r <= wView[w]
 \* A committed owner's fail-closed gate: body present+valid AND every named blob present and not
 \* condemned-in-view. SabotageCommitSkipBlobReval drops the blob revalidation; SabotageMissingCommittedEmpty
 \* belongs to the FOLD path (a missing committed body treated as empty), not here.
-CommitGate(m) ==
+\* SabotagePrecommitlessProtect (#6): the writer assumes a speculatively-uploaded blob is protected by
+\* the future build and skips revalidating that it is still live (present + not condemned). GC may have
+\* deleted it before PrecommitAdd, so the committed publish dangles. (Distinct from #5: #5 skips body+blob
+\* entirely; #6 keeps the present check but drops the condemned/retired-view recheck, modeling the
+\* "assume protection" error.)
+CommitGate(m, w) ==
     \/ SabotageCommitSkipBlobReval
-    \/ ( mBody[m] /\ BodyValid(m)
-         /\ \A b \in BlobsOf(mEntries[m]) : present[b] /\ ~BlobCondemnedInView(b) )
+    \/ ( mBody[m] /\ BodyAccepted(m)
+         /\ wView[w] >= PubFloor(m[1])            \* must have observed the namespace's fence round
+         /\ \A b \in BlobsOf(mEntries[m]) : present[b] /\ (SabotagePrecommitlessProtect \/ ~BlobCondemnedInView(b, w)) )
 \* Append one OwnerTransition [ver, ref, old, new] to journal[ns]; version = new length (monotone).
 AppendEvt(j, ns, rf, o, nw) ==
     [j EXCEPT ![ns] = Append(@, [ver |-> Len(@) + 1, ref |-> rf, old |-> o, new |-> nw])]
@@ -140,24 +162,43 @@ WUploadBlob(b) ==
     /\ UNCHANGED << deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges, journal, blobIndeg,
                     blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf,
                     fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
-                    mfDeleted, mPrefix, sweepEligible >>
+                    mfDeleted, mPrefix, sweepEligible, extraShared >>
+
+\* The round a retire-view refresh may CLAIM COVERAGE of. The retired-token view is writer-visible only
+\* AFTER the round's retire barrier (all retired sets durable). While a leader is still RETIRING at the
+\* current round, a refresh can claim only gcRound-1 (the previous round's complete view). This is the
+\* ViewableRound / retire-visibility-barrier (spec §Retire Visibility Barrier). SabotageRoundVisibilityEarly
+\* (#13) makes the round visible after only partial retire work, so a refresh claims gcRound too early
+\* and a later same-round retire+delete slips past the writer's gate -> a committed dangle.
+ViewableRound == IF SabotageRoundVisibilityEarly THEN gcRound
+                 ELSE IF \E l \in Leaders : gcPhase[l] = "retiring" /\ roundOf[l] = gcRound
+                      THEN gcRound - 1 ELSE gcRound
+WRefreshView(w) ==
+    /\ wView' = [wView EXCEPT ![w] = ViewableRound]
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
+                    journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
+                    gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* PrecommitAdd: owner[m] := build bld. A precommit MAY have a missing body only when EnableMissingBody
 \* (the missing-body fail-closed intent). A precommit ACTIVATES (emits edges) iff its body is present
-\* and valid; SabotageMissingBodyActivated forces edges even with the body absent. The journal records
-\* an activation event old=None,new=m for ref=bld.
-WPrecommitAdd(m, bld) ==
+\* and valid; SabotageMissingBodyActivated forces edges even with the body absent. The intent record
+\* (final_ref_name, manifest_ref, INTENDED entries) is known at PrecommitAdd even before the body is
+\* uploaded, so a missing-body precommit may name intended blob entries f while mBody stays FALSE; GC
+\* must NOT emit those as edges (non-activating intent) until the body is present.
+WPrecommitAdd(m, bld, f) ==
     /\ EnablePrecommit
     /\ owner[m] = None
     /\ (m \notin mfDeleted \/ SabotageReuseManifestId)   \* a swept/deleted id is retired forever
     /\ (mBody[m] \/ EnableMissingBody)                  \* missing body only when allowed
     /\ Len(journal[m[1]]) < MaxLog
     /\ owner' = [owner EXCEPT ![m] = bld]
+    /\ mEntries' = IF mBody[m] THEN mEntries ELSE [mEntries EXCEPT ![m] = f]  \* record intended entries when no body yet
     /\ journal' = AppendEvt(journal, m[1], bld, NoBind, Bind(m))
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* Promote precommit -> committed: the atomic PURE owner move. Same ManifestId, blob Δ=0, NO new
 \* edges (the activation +1 was emitted when the precommit's body arrived, or is still pending if the
@@ -169,34 +210,50 @@ WPrecommitAdd(m, bld) ==
 \* Split-promote (#3): the move becomes two CAS with a gap and NO fail-closed retry on the add. The
 \* gap lets the precommit be reclaimed / a blob lapse; the non-fail-closed add then publishes a
 \* committed owner WITHOUT revalidating the blob bodies -> a committed ref over an absent blob.
-WPromote(m, bld, ref) ==
+WPromote(m, bld, ref, w) ==
     /\ EnablePrecommit
     /\ owner[m] = bld
     /\ RefFreeFor(ref, m)
     \* split-promote and promote-after-missing-body both drop the atomic fail-closed activation gate:
-    /\ (SabotageSplitPromote \/ SabotagePromoteAfterMissingBody \/ CommitGate(m))
+    /\ (SabotageSplitPromote \/ SabotagePromoteAfterMissingBody \/ CommitGate(m, w))
     /\ Len(journal[m[1]]) < MaxLog
     /\ owner' = [owner EXCEPT ![m] = ref]
     /\ journal' = AppendEvt(journal, m[1], ref, Bind(m), Bind(m))
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
+
+\* #2 (SabotageTwoOwners): a SECOND committed owner is attached to an already-committed ManifestId
+\* (sharing a manifest across refs/namespaces). The single-owner rule (RefFreeFor / owner being a
+\* function) forbids this on the honest path; the sabotage records the shared second owner in
+\* extraShared. The manifest's blobs are now reachable from TWO owners, but GC tracks only one — so
+\* dropping the tracked owner removes the manifest's blob edges still needed by the shared owner, and
+\* the blob is over-deleted (INV_NO_LOSS). SingleManifestOwner also flags the shared state directly.
+WShareOwner(m) ==
+    /\ SabotageTwoOwners
+    /\ owner[m] \in Refs /\ mBody[m]
+    /\ m \notin extraShared
+    /\ extraShared' = extraShared \cup {m}
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
+                    journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
+                    gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
+                    wView, mfCleanup, mfDeleted, mPrefix, sweepEligible >>
 
 \* Direct committed publish (no precommit). Same fail-closed body+blob gate as promote. Sets the
 \* committed owner and activates the edges (committed manifests are always activated).
-WPublishCommitted(m, ref) ==
+WPublishCommitted(m, ref, w) ==
     /\ owner[m] = None
     /\ (m \notin mfDeleted \/ SabotageReuseManifestId)
     /\ RefFreeFor(ref, m)
-    /\ CommitGate(m)
+    /\ CommitGate(m, w)
     /\ Len(journal[m[1]]) < MaxLog
     /\ owner' = [owner EXCEPT ![m] = ref]
     /\ journal' = AppendEvt(journal, m[1], ref, NoBind, Bind(m))
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* Drop a committed ref: owner[m]: ref -> None; a true removal (-1 + mfCleanup queued at fold).
 WDropRef(m) ==
@@ -207,7 +264,7 @@ WDropRef(m) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* Abandon a precommit owner: owner[m]: bld -> None; a true removal.
 WAbandonPrecommit(m) ==
@@ -218,7 +275,7 @@ WAbandonPrecommit(m) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* A missing-body precommit's manifest body ARRIVES asynchronously (the upload completes after
 \* PrecommitAdd). Only meaningful under EnableMissingBody. Sets the body + entries; if the precommit is
@@ -230,33 +287,39 @@ WManifestBodyArrives(m, f) ==
     /\ mEntries' = [mEntries EXCEPT ![m] = f]
     /\ mRef' = [mRef EXCEPT ![m] = m]
     /\ mNs' = [mNs EXCEPT ![m] = m[1]]
-    /\ everEdged' = everEdged \cup {m[2]}
+    /\ everEdged' = everEdged \cup {m}
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, owner, mActiveEdges, journal, blobIndeg,
                     blobEdges, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
-                    mPrefix, sweepEligible >>
+                    mPrefix, sweepEligible, extraShared >>
 
 \* Repoint a committed ref from mOld to mNew (last-op-wins at the root source): removes mOld and
 \* activates mNew under the SAME ref, in one event (old=mOld, new=mNew). Both must be in the same ns.
-WRepoint(mOld, mNew, ref) ==
+WRepoint(mOld, mNew, ref, w) ==
     /\ mOld # mNew /\ mOld[1] = mNew[1]
     /\ owner[mOld] = ref /\ ref \in Refs /\ owner[mNew] = None
     /\ (mNew \notin mfDeleted \/ SabotageReuseManifestId)
     /\ RefFreeFor(ref, mOld)
-    /\ CommitGate(mNew)
+    /\ CommitGate(mNew, w)
     /\ Len(journal[mOld[1]]) < MaxLog
     /\ owner' = [owner EXCEPT ![mOld] = None, ![mNew] = ref]
     /\ journal' = AppendEvt(journal, mOld[1], ref, Bind(mOld), Bind(mNew))
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, mActiveEdges,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* ============================ GC pipeline (spec §Round Protocol) ============================
 \* blobIndeg is ALWAYS the exact count of folded source edges by referenced blob (the
 \* BlobInDegreeMatchesActiveManifests accounting). Recompute it from any (edges, activeMap) pair.
 IndegFrom(edges, ae) == [b \in Blobs |-> Cardinality({ ed \in edges : ae[ed[1]][ed[2]] = b })]
-EdgesFor(m) == { ed \in blobEdges : ed[1] = m }
+\* The folded source edges of m. Control #18 (SabotageKeyByRefNotId) keys edges/cleanup by the bare
+\* manifest_instance_id (the ManifestRef-without-namespace) instead of the full ManifestId, so a removal
+\* in one namespace also strips an edge of a DIFFERENT namespace's manifest sharing the instance id —
+\* merging unrelated blob edges and under-counting in-degree.
+EdgesFor(m) == IF SabotageKeyByRefNotId
+               THEN { ed \in blobEdges : ed[1][2] = m[2] }   \* match by instance id only (drops namespace)
+               ELSE { ed \in blobEdges : ed[1] = m }
 \* m has an owner-removal recorded in the journal but not yet folded (the fold lags the owner change).
 HasUnfoldedRemoval(m) ==
     \E i \in (cursor[m[1]] + 1)..Len(journal[m[1]]) :
@@ -285,21 +348,32 @@ GStartRound(l) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
-                    mPrefix, sweepEligible >>
+                    mPrefix, sweepEligible, extraShared >>
 
 \* Fold one RootOwnerEvent at cursor[n], dispatching by old-vs-new manifest comparison (rev.15).
 GFoldTransition(n) ==
     /\ cursor[n] < Len(journal[n])
     /\ LET e == journal[n][cursor[n] + 1] IN
-       \* FOLD BARRIER (control #23): do NOT advance past a live missing-body precommit, unless sabotaged.
-       /\ (~LiveMissingBodyPrecommit(e) \/ SabotageAdvancePastMissingBodyPrecommit)
+       \* FOLD BARRIER (control #23): do NOT advance past a live missing-body precommit. Bypassed by
+       \* SabotageAdvancePastMissingBodyPrecommit (#23, fold-it-as-non-activated) and by
+       \* SabotageMissingBodyActivated (#4, fold-it-AS-activated, emitting its intended edges).
+       /\ (~LiveMissingBodyPrecommit(e) \/ SabotageAdvancePastMissingBodyPrecommit \/ SabotageMissingBodyActivated)
        /\ LET
             mo == IF e.old # {} THEN TheM(e.old) ELSE TheM(e.new)   \* old manifest (guarded by IsRemoval)
             mn == IF e.new # {} THEN TheM(e.new) ELSE TheM(e.old)   \* new manifest (guarded by IsActivation)
             \* The activation edge map of e.new, decided by body validity (committed fail-closed; a
             \* missing committed body fails closed unless SabotageMissingCommittedEmpty treats it empty;
-            \* SabotageMissingBodyActivated forces edges for an absent precommit body).
-            actMap == IF SabotageMissingBodyActivated THEN mEntries[mn]
+            \* SabotageMissingBodyActivated forces edges for an absent precommit body). SabotageBareNonce
+            \* (#17): the journal carried only a bare manifest_instance_id (no writer/build locator), so GC
+            \* fold cannot build the manifest key — it emits NO edges for the committed activation, leaving
+            \* the committed ref's blobs unprotected (over-delete -> INV_NO_LOSS).
+            \* SabotageMissingCommittedEmpty (#10): a committed new-binding whose body the fold cannot
+            \* read is treated as an EMPTY manifest (no edges) instead of failing closed — undercounts the
+            \* committed ref's blob edges and permits over-delete (INV_NO_LOSS). Modeled by emitting empty
+            \* edges for a committed activation.
+            committedActivation == IsActivation(e) /\ owner[mn] \in Refs
+            actMap == IF SabotageBareNonce THEN [p \in Paths |-> NoBlob]
+                      ELSE IF SabotageMissingCommittedEmpty /\ committedActivation THEN [p \in Paths |-> NoBlob]
                       ELSE IF mBody[mn] /\ BodyValid(mn) THEN mEntries[mn]
                       ELSE [p \in Paths |-> NoBlob]
             \* promote-of-never-activated: this owner-move event re-emits edges (the #22 fold hazard).
@@ -322,32 +396,48 @@ GFoldTransition(n) ==
             be1 == IF IsActivation(e)    THEN beRem \cup { <<mn, p>> : p \in {q \in Paths : actMap[q] \in Blobs} }
                    ELSE IF promoteReEmit THEN beRem \cup { <<mn, p>> : p \in {q \in Paths : mEntries[mn][q] \in Blobs} }
                    ELSE beRem
+            \* #4 (SabotageMissingBodyActivated): a missing-body precommit was treated as ACTIVATED (folded
+            \* past the barrier) but emitted NO edge (body absent, nothing to read). Its REMOVAL nonetheless
+            \* emits -1 deltas from the intended entries — edges that were NEVER added — so a SHARED blob's
+            \* in-degree is pushed below its true committed count and the blob is over-deleted (INV_NO_LOSS).
+            sabUndercount == SabotageMissingBodyActivated /\ IsRemoval(e) /\ ~mBody[mo]
+            ix0 == IndegFrom(be1, ae1)
+            ix1 == IF sabUndercount
+                   THEN [b \in Blobs |-> IF b \in BlobsOf(mEntries[mo]) /\ ix0[b] > 0 THEN ix0[b] - 1 ELSE ix0[b]]
+                   ELSE ix0
           IN
             /\ mActiveEdges' = ae1
             /\ blobEdges' = be1
-            /\ blobIndeg' = IndegFrom(be1, ae1)
+            /\ blobIndeg' = ix1
             \* a true removal queues part-manifest cleanup keyed by ManifestId; an owner move does not.
             /\ mfCleanup' = IF IsRemoval(e) THEN mfCleanup \cup {mo} ELSE mfCleanup
-            /\ everEdged' = IF IsActivation(e) THEN everEdged \cup {mn[2]} ELSE everEdged
-    /\ cursor' = [cursor EXCEPT ![n] = @ + 1]
-    \* SabotageCutOverclaim jumps the sealed folded cursor to the journal end (the cut outruns the
-    \* deltas it claims to cover) — recorded into the foldSeal coverage field.
-    /\ foldSeal' = [foldSeal EXCEPT ![gcRound].foldedCursor[n] =
-                       IF SabotageCutOverclaim THEN Len(journal[n]) ELSE cursor[n] + 1]
+            /\ everEdged' = IF IsActivation(e) THEN everEdged \cup {mn} ELSE everEdged
+    \* SabotageCutOverclaim (#12) advances the durable cursor PAST the unfolded suffix (to the journal
+    \* end) while emitting deltas for only THIS one event — the cut outruns the deltas it claims to
+    \* cover. The skipped activations' +1 source edges are never emitted, so their committed/precommit
+    \* blobs look in-degree 0 and get over-deleted (a committed dangle). The honest cursor advances by 1.
+    /\ cursor' = [cursor EXCEPT ![n] = IF SabotageCutOverclaim THEN Len(journal[n]) ELSE @ + 1]
+    /\ foldSeal' = [foldSeal EXCEPT ![gcRound].foldedCursor[n] = cursor'[n]]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, journal,
                     completionSeal, gcRound, gcPhase, roundOf, fencePos, trimBase, fenceVersion,
-                    retired, inflight, wView, mfDeleted, mPrefix, sweepEligible >>
+                    retired, inflight, wView, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
-\* Retire a folded, present, in-degree-0 blob candidate at its CURRENT token (the HEAD).
+\* Retire a folded, present, in-degree-0 blob candidate at its CURRENT token (the HEAD). The fold must
+\* be CAUGHT UP first (cursor at journal end for every ns): otherwise a pending unfolded activation
+\* (+1) referencing the blob has not been counted, and retiring it would race that activation — the
+\* protocol order is discover -> fold -> retire. (Found by TLC: retiring an in-degree-0 blob whose
+\* precommit/committed activation was still unfolded let a later promote keep a committed ref over a
+\* blob GC then deleted -> CommittedNoMissingBlob.)
 GRetireBlob(l, b) ==
     /\ gcPhase[l] = "retiring"
+    /\ \A n \in Namespaces : cursor[n] = Len(journal[n])
     /\ present[b] /\ blobIndeg[b] = 0
     /\ ~\E r \in retired : r.b = b /\ r.t = tokOf[b]
     /\ retired' = retired \cup { [b |-> b, t |-> tokOf[b], r |-> roundOf[l]] }
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* Global fence: fence every namespace this round. SabotageNoFence skips the fence write (a racing
 \* publish is never blocked). SabotageRoundVisibilityEarly marks the round adoptable before the fence.
@@ -368,7 +458,7 @@ GFenceRegistry(l) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, gcRound, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
-                    mPrefix, sweepEligible >>
+                    mPrefix, sweepEligible, extraShared >>
 
 GFenceShard(l, n) ==
     /\ gcPhase[l] \in {"fencing"}
@@ -383,7 +473,7 @@ GFenceShard(l, n) ==
                                          THEN "fenced" ELSE "fencing"]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, gcRound, roundOf, cursor,
-                    trimBase, retired, inflight, wView, mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    trimBase, retired, inflight, wView, mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* Recheck + issue exact-token delete. Requires the fold to have provably reached every fence
 \* position (SabotageNoRecheckFold-equivalent: SabotageRoundVisibilityEarly opens an early-visibility
@@ -392,18 +482,23 @@ FoldedThroughFence == \A n \in Namespaces : cursor[n] >= fencePos[n]
 GRecheckDelete(l, e) ==
     /\ gcPhase[l] = "fenced" /\ e \in retired /\ e.r = roundOf[l]
     /\ (SabotageRoundVisibilityEarly \/ FoldedThroughFence)
-    /\ IF blobIndeg[e.b] > 0
+    \* Spare only if the in-degree recovered AND no delete is already in flight for this exact token.
+    \* Once a delete is inflight, the entry is KEPT until the landing confirms the outcome (drop-on-
+    \* confirmed-outcome): a spare that dropped an entry with a pending delete would make a writer stop
+    \* seeing the blob as condemned while GC still deletes it — a committed dangle.
+    /\ IF blobIndeg[e.b] > 0 /\ [b |-> e.b, t |-> e.t] \notin inflight
        THEN /\ retired' = retired \ {e}                       \* spared
             /\ inflight' = inflight
             /\ completionSeal' = completionSeal
        ELSE /\ [b |-> e.b, t |-> e.t] \notin inflight
+            /\ blobIndeg[e.b] = 0                             \* only send a delete when still unreferenced
             /\ retired' = retired                             \* kept until the landing confirms
             /\ inflight' = inflight \cup { [b |-> e.b, t |-> e.t] }
             /\ completionSeal' = [completionSeal EXCEPT ![roundOf[l]].deleted = @ \cup {e.b}]
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, gcRound, gcPhase, roundOf,
                     fencePos, cursor, trimBase, fenceVersion, wView, mfCleanup, mfDeleted, mPrefix,
-                    sweepEligible >>
+                    sweepEligible, extraShared >>
 
 GEndRound(l) ==
     /\ gcPhase[l] = "fenced"
@@ -412,7 +507,7 @@ GEndRound(l) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* A delete message lands: exact-token (412 = no-op). SabotageUncondDelete ignores the token match.
 \* The landing is the confirmed outcome: the matching retired entry drops HERE. Any token stopping
@@ -428,7 +523,7 @@ Land(d) ==
     /\ UNCHANGED << tokOf, nextTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges, journal,
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, wView, mfCleanup, mfDeleted,
-                    mPrefix, sweepEligible >>
+                    mPrefix, sweepEligible, extraShared >>
 
 \* Journal trim: INV_JOURNAL_COVERAGE — only below the durable folded cursor. SabotageTrimUnincorporated
 \* trims below an unfolded transition (cursor).
@@ -438,7 +533,7 @@ Trim(n) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, fenceVersion, retired, inflight, wView,
-                    mfCleanup, mfDeleted, mPrefix, sweepEligible >>
+                    mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* ---- part-manifest cleanup ordering + orphan sweep + mutable update (Task 5) ----
 \* Delete an unowned manifest body (exact-token abstracted). NORMAL: only after its owner-removal
@@ -456,7 +551,25 @@ GDeleteManifest(m) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
-                    wView, mPrefix, sweepEligible >>
+                    wView, mPrefix, sweepEligible, extraShared >>
+
+\* Stale part-manifest cleanup replay (control #1). When a ManifestId is REUSED (SabotageReuseManifestId),
+\* a cleanup bundle queued for the OLD incarnation (m \in mfCleanup) cannot tell the id was rebound to a
+\* NEW live owner. Replaying it strips the NEW incarnation's folded source edges — applying old blob
+\* decrements to the new owner — so the still-referenced blob falls to in-degree 0 and is over-deleted
+\* (INV_NO_LOSS). The unique-never-reused-id rule (NoManifestIdReuse) is exactly what forbids this.
+GStaleReuseCleanup(m) ==
+    /\ SabotageReuseManifestId
+    /\ m \in mfCleanup /\ owner[m] # None /\ EdgesFor(m) # {}   \* reused: queued for cleanup yet live again
+    /\ LET be1 == blobEdges \ EdgesFor(m)
+           ae1 == [mActiveEdges EXCEPT ![m] = [p \in Paths |-> NoBlob]] IN
+       /\ blobEdges' = be1
+       /\ mActiveEdges' = ae1
+       /\ blobIndeg' = IndegFrom(be1, ae1)
+    /\ mfCleanup' = mfCleanup \ {m}
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, journal,
+                    everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos, cursor,
+                    trimBase, fenceVersion, retired, inflight, wView, mfDeleted, mPrefix, sweepEligible, extraShared >>
 
 \* A durable watermark fact makes a build prefix conservatively sweep-eligible (the writer incarnation
 \* can no longer publish from it). SabotageFrozenSeqAuthority sets it from a frozen-seq heuristic
@@ -470,7 +583,7 @@ GMarkSweepEligible(p) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
-                    wView, mfCleanup, mfDeleted, mPrefix >>
+                    wView, mfCleanup, mfDeleted, mPrefix, extraShared >>
 
 \* Orphan pre-precommit sweep: deletes a staged-but-unowned manifest body whose build prefix is
 \* sweep-eligible AND whose id is absent from the sealed owner view (owner = None). Emits NO blob
@@ -487,13 +600,17 @@ GOrphanSweep(n) ==
                  /\ mBody' = [x \in ManifestIds |-> IF x \in grp THEN FALSE ELSE mBody[x]]
                  /\ mfDeleted' = mfDeleted \cup grp
        ELSE \E m \in ManifestIds :
-              /\ m[1] = n /\ mBody[m] /\ owner[m] = None /\ sweepEligible[mPrefix[m]]
+              \* Honest sweep: per-object owner-view check (owner = None). SabotageFrozenSeqAuthority uses
+              \* the frozen-seq prefix eligibility as the SOLE deletion authority, dropping the per-object
+              \* owner check — so it deletes a still-live (committed) manifest body -> committed dangle.
+              /\ m[1] = n /\ mBody[m] /\ sweepEligible[mPrefix[m]]
+              /\ (SabotageFrozenSeqAuthority \/ owner[m] = None)
               /\ mBody' = [mBody EXCEPT ![m] = FALSE]
               /\ mfDeleted' = mfDeleted \cup {m}
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mEntries, mRef, mNs, owner, mActiveEdges,
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
-                    wView, mfCleanup, mPrefix, sweepEligible >>
+                    wView, mfCleanup, mPrefix, sweepEligible, extraShared >>
 
 \* Mutable per-ref payload update: changes only mutable payload — NO owner transition, NO blob delta,
 \* NO id change (MutablePayloadNotReachability). Modeled as a no-op stutter on every reachability var,
@@ -513,7 +630,7 @@ WMutableUpdate(m) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, journal,
                     everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
-                    mPrefix, sweepEligible >>
+                    mPrefix, sweepEligible, extraShared >>
 
 Init ==
     /\ present = [b \in Blobs |-> FALSE]
@@ -549,8 +666,10 @@ Init ==
     /\ mfDeleted = {}
     /\ mPrefix = [m \in ManifestIds |-> CHOOSE p \in BuildPrefixes : TRUE]   \* each manifest belongs to one build-prefix
     /\ sweepEligible = [p \in BuildPrefixes |-> FALSE]   \* per-prefix eligibility from a durable watermark fact
+    /\ extraShared = {}
 
 TypeOK ==
+    /\ extraShared \in SUBSET ManifestIds
     /\ present \in [Blobs -> BOOLEAN]
     /\ tokOf \in [Blobs -> 0..MaxToken]
     /\ owner \in [ManifestIds -> Refs \cup Builds \cup {None}]
@@ -575,9 +694,13 @@ ManifestNamespaceMatches == \A m \in ManifestIds : (mBody[m] /\ owner[m] # None)
 INV_NO_RETURN == \A b \in Blobs : present[b] => tokOf[b] \notin deadTok[b]
 
 \* ---- ownership / dangle invariants (spec §Safety Invariants) ----
+\* Each visible ManifestId has at most one structural committed owner: no two committed refs share a
+\* manifest (extraShared empty), and no ref names two manifests. (Builds may legitimately appear on
+\* multiple precommits.) SabotageTwoOwners populates extraShared and is flagged directly.
 SingleManifestOwner ==
-    SabotageTwoOwners \/ (\A m1, m2 \in ManifestIds :
-        (owner[m1] # None /\ owner[m1] = owner[m2] /\ m1 # m2) => owner[m1] \in Builds)
+    /\ extraShared = {}
+    /\ \A m1, m2 \in ManifestIds :
+        (owner[m1] # None /\ owner[m1] = owner[m2] /\ m1 # m2) => owner[m1] \in Builds
 CommittedManifestBodyRequired ==
     \A m \in ManifestIds : (owner[m] \in Refs) => (mBody[m] /\ BodyValid(m))
 PrecommitMayReferenceMissingManifest == TRUE   \* witnessed reachable, not an invariant to hold
@@ -588,7 +711,11 @@ CommittedNoMissingBlob ==
 NoCommittedDangle ==
     \A m \in ManifestIds : (owner[m] \in Refs) => (mBody[m] /\ \A b \in BlobsOf(mEntries[m]) : present[b])
 INV_NO_DANGLE == NoCommittedDangle
-ReachableBlobs == UNION { BlobsOf(mEntries[m]) : m \in {x \in ManifestIds : owner[x] \in Refs /\ mBody[x]} }
+\* Blobs reachable from a committed ref OR from a SHARED second owner (#2 extraShared) — both must
+\* keep their blobs present; a manifest shared across owners but tracked by only one loses blobs when
+\* the tracked owner is dropped.
+ReachableBlobs == UNION { BlobsOf(mEntries[m]) :
+                           m \in {x \in ManifestIds : (owner[x] \in Refs \/ x \in extraShared) /\ mBody[x]} }
 INV_NO_LOSS == \A b \in ReachableBlobs : present[b]
 
 \* ---- GC accounting (spec §GC Authority Model) ----
@@ -612,6 +739,14 @@ MutablePayloadNotReachability == TRUE   \* enforced by WMutableUpdate touching n
 \* A manifest's emitted active edges are a sub-map of its body entries (or its body is gone/missing).
 ManifestActivationMatchesEdges ==
     \A m \in ManifestIds : (\A p \in Paths : mActiveEdges[m][p] \in Blobs => mActiveEdges[m][p] = mEntries[m][p]) \/ ~mBody[m]
+
+\* ---- non-vacuity witnesses (Task 9). Each W_x == ~(interesting reachable state); TLC must report it
+\* VIOLATED, proving the dangerous-but-safe interleaving is actually reached (the positive stages are
+\* not vacuously true). An UNEXPECTED PASS means the state is unreachable — a modeling bug.
+W_PrecommitMissingBodyReached == ~(\E m \in ManifestIds : owner[m] \in Builds /\ ~mBody[m])
+W_CommittedOverFoldedBlob == ~(\E m \in ManifestIds : owner[m] \in Refs /\ mBody[m]
+                                  /\ \E p \in Paths : mActiveEdges[m][p] \in Blobs)
+W_OrphanDeleted == ~(\E m \in ManifestIds : ~mBody[m] /\ owner[m] = None /\ m \in everEdged /\ m \in mfDeleted)
 
 \* ---- liveness (under FairSpec) ----
 \* A staged-unowned body in a sweep-eligible prefix eventually either DRAINS (deleted) or is ADOPTED
@@ -638,12 +773,14 @@ StateConstraint ==
 Next ==
     \/ \E m \in ManifestIds, f \in [Paths -> Blobs \cup {NoBlob}] : WStageManifest(m, f)
     \/ \E b \in Blobs : WUploadBlob(b)
-    \/ \E m \in ManifestIds, bld \in Builds : WPrecommitAdd(m, bld)
-    \/ \E m \in ManifestIds, bld \in Builds, ref \in Refs : WPromote(m, bld, ref)
-    \/ \E m \in ManifestIds, ref \in Refs : WPublishCommitted(m, ref)
+    \/ \E w \in Writers : WRefreshView(w)
+    \/ \E m \in ManifestIds, bld \in Builds, f \in [Paths -> Blobs \cup {NoBlob}] : WPrecommitAdd(m, bld, f)
+    \/ \E m \in ManifestIds, bld \in Builds, ref \in Refs, w \in Writers : WPromote(m, bld, ref, w)
+    \/ \E m \in ManifestIds, ref \in Refs, w \in Writers : WPublishCommitted(m, ref, w)
+    \/ \E m \in ManifestIds : WShareOwner(m)
     \/ \E m \in ManifestIds : WDropRef(m) \/ WAbandonPrecommit(m)
     \/ \E m \in ManifestIds, f \in [Paths -> Blobs \cup {NoBlob}] : WManifestBodyArrives(m, f)
-    \/ \E mOld, mNew \in ManifestIds, ref \in Refs : WRepoint(mOld, mNew, ref)
+    \/ \E mOld, mNew \in ManifestIds, ref \in Refs, w \in Writers : WRepoint(mOld, mNew, ref, w)
     \/ \E l \in Leaders : GStartRound(l) \/ GFenceRegistry(l) \/ GEndRound(l)
     \/ \E n \in Namespaces : GFoldTransition(n) \/ Trim(n)
     \/ \E l \in Leaders, b \in Blobs : GRetireBlob(l, b)
@@ -651,6 +788,7 @@ Next ==
     \/ \E l \in Leaders, e \in retired : GRecheckDelete(l, e)
     \/ \E d \in inflight : Land(d)
     \/ \E m \in ManifestIds : GDeleteManifest(m)
+    \/ \E m \in ManifestIds : GStaleReuseCleanup(m)
     \/ \E p \in BuildPrefixes : GMarkSweepEligible(p)
     \/ \E n \in Namespaces : GOrphanSweep(n)
     \/ \E m \in ManifestIds : WMutableUpdate(m)
