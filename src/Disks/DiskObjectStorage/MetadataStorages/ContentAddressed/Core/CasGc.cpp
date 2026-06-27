@@ -689,8 +689,31 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
         }
     }
     const uint64_t completion_generation = state.snap_generation + 1;
-    foldDeltasIntoGeneration(backend, layout, state.snap_generation, completion_generation, /*shard*/0,
-                             std::move(window), folded.completion_seal.blob_target_runs);
+    if (state.gc_shards == 1)
+    {
+        /// SINGLE-SHARD PATH: all deltas fold into shard 0 of the completion generation.
+        foldDeltasIntoGeneration(backend, layout, state.snap_generation, completion_generation, /*shard*/0,
+                                 std::move(window), folded.completion_seal.blob_target_runs);
+    }
+    else
+    {
+        /// SHARDED PATH (gc_shards > 1): scatter window deltas by blob hash, then fold each shard
+        /// into its own target run (blobTargetRunKey(completion_generation, shard, 0)).
+        /// Mirrors the sharded path in fold() — each shard's run is independent and keyed by shard
+        /// number, so two replicas reducing disjoint shards never collide.
+        std::vector<std::vector<BlobDelta>> buckets(state.gc_shards);
+        for (BlobDelta & d : window)
+            buckets[blobShard(d.blob_hash, state.gc_shards)].push_back(std::move(d));
+        for (uint64_t sh = 0; sh < state.gc_shards; ++sh)
+        {
+            ShardReducer reducer{sh, state.gc_shards};
+            std::vector<RunRef> shard_runs =
+                reducer.reduce(backend, layout, state.snap_generation, completion_generation,
+                               std::move(buckets[sh]));
+            for (RunRef & r : shard_runs)
+                folded.completion_seal.blob_target_runs.push_back(std::move(r));
+        }
+    }
 
     /// 2. Per retired blob: spare if in-degree > 0 in the completion generation, else exact-token delete.
     std::map<uint64_t, OutcomeLog> computed;
@@ -700,8 +723,11 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
         {
             OutcomeEntry outcome{.kind = entry.kind, .hash = entry.hash, .token = entry.token,
                                  .outcome = OutcomeKind::Spared};
+            /// Route to the correct target shard — mirrors blobShard routing in fold() and the
+            /// sharded path above. For gc_shards==1 this always produces 0 (identity).
+            const uint64_t entry_shard = blobShard(entry.hash, state.gc_shards);
             const int64_t indeg_at_recheck =
-                inDegreeInGeneration(backend, layout, completion_generation, /*shard*/0, entry.hash);
+                inDegreeInGeneration(backend, layout, completion_generation, entry_shard, entry.hash);
             if (indeg_at_recheck > 0)
             {
                 /// B170: a fold-through-fence publish re-pinned this candidate — record the verdict +
