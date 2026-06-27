@@ -508,3 +508,8 @@ didn't drive):
   still caught by promote-fail-closed. Orphan sweep made cursor-aware (delete-after-sealed-decrements).
   Un-skipped the B8 test + added a conservatism test. Full `Cas*:Ca*` 381 ran / 375 pass / 5 skip (was 6) /
   1=B3. Code-only (model's WAbandonPrecommit already covers it). Remaining backlog: B7, B11, B12, B3.
+
+### 2026-06-27 — B11 RESOLVED (manifest-delete counter)
+- `0c3fc15d3da`: `RoundReport.manifests_deleted` → `system.content_addressed_garbage_collection_log` column
+  + round-summary log line. Blob vs manifest deletes counted separately. Known minor gap: crash-resume path
+  doesn't increment it (rare). `CasGc*` 80 pass / 3 skip / 0 fail. Remaining backlog: B7 (assess), B12, B3.

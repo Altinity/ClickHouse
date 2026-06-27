@@ -256,7 +256,13 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
     `gtest_cas_gc_round.cpp::SharedBlobSparedUntilBothRefsDrop`. Either cross-reference it from the b140
     file or drop `gtest_cas_b140_dangle.cpp` as redundant.
 
-- **B11 — round-summary `objects_deleted` undercounts: it omits manifest-body (tree) deletes (soak finding,
+- **B11 — RESOLVED 2026-06-27 `0c3fc15d3da`.** Added `RoundReport.manifests_deleted`, incremented on a
+  `DeleteOutcome::Kind::Deleted` in the `mf_cleanup` loop, surfaced as a new
+  `system.content_addressed_garbage_collection_log.manifests_deleted` column + the round-summary LOG_DEBUG
+  line. Blob and manifest deletes now counted separately. Minor known gap: the crash-resume path
+  (`tryResumeIncompleteRound`) deletes manifest bodies directly and does not increment the counter
+  (rare path; tiny follow-up). Original finding below.
+- **B11 (original) — round-summary `objects_deleted` undercounts: it omits manifest-body (tree) deletes (soak finding,
   introspection only).** Severity: low (the `system.content_addressed_log` per-event audit is correct and
   complete; only the aggregated round-summary counter is misleading). Found in the post-switch scoped chaos
   soak (2026-06-27, branch `cas-gc-part-manifest-impl`, seed 20260627, 45m timeline, GREEN/`PHASE3 OK`,
