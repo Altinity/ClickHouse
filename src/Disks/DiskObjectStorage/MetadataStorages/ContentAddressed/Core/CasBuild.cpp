@@ -28,6 +28,7 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int ABORTED;
     extern const int CORRUPTED_DATA;
+    extern const int LIMIT_EXCEEDED;
 }
 }
 
@@ -36,6 +37,12 @@ namespace DB::Cas
 
 namespace
 {
+
+/// OQ7 backpressure caps, enforced fail-closed in stageManifest BEFORE the body write returns.
+constexpr uint64_t kMaxManifestEntries = 1048576;
+constexpr uint64_t kMaxManifestEncodedBytes = 256ULL << 20;        /// 256 MiB
+constexpr uint64_t kMaxManifestInlineBytesTotal = 16ULL << 20;     /// 16 MiB
+constexpr uint64_t kMaxLargestInlineEntryBytes = 1ULL << 20;       /// 1 MiB
 
 /// Two thread_local_rng draws composed into a UInt128. Used both to mint build ids and to mint, on
 /// every upload/re-upload, a FRESH incarnation_tag (W-FRESH-TAG).
@@ -440,25 +447,19 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     }
 }
 
-void Build::adoptEvidence(const TreeEntry & entry)
+void Build::adoptEvidence(const ManifestEntry & entry)
 {
     requireAlive();
 
-    /// W-EVIDENCE: record a TOKENLESS dependency — liveness evidence is the live source root, not a
-    /// token. Inline entries reference no standalone object, so they record nothing.
-    /// NO backend call (no HEAD, no GET, no PUT) — the caller already holds the resolved entry.
-    const uint64_t view_round = store->retireView().round();
-    visitPlacement(entry.placement,
-        [&] {},   /// Inline: no standalone object — nothing to depend on
-        [&] {   /// Blob: tokenless dep keyed by file_hash
-            deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}] =
-                DepEntry{ObjectKind::Blob, std::nullopt, view_round, entry.file_size};
-        },
-        [&] {   /// Subtree: tokenless dep keyed by file_hash (child tree id)
-            deps[{static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}] =
-                DepEntry{ObjectKind::Tree, std::nullopt, view_round, entry.file_size};
-        }
-    );
+    /// W-EVIDENCE: record a TOKENLESS dependency — liveness evidence is the live source manifest, not a
+    /// token. Inline entries reference no standalone object, so they record nothing. NO backend call
+    /// (no HEAD, no GET, no PUT) — the caller already holds the resolved entry. Part manifests have only
+    /// Inline / Blob placements (no Subtree): only blobs are content-addressed.
+    if (entry.placement == EntryPlacement::Blob)
+    {
+        deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.blob_hash}] =
+            DepEntry{ObjectKind::Blob, std::nullopt, store->retireView().round(), entry.blob_size};
+    }
 }
 
 void Build::recordPendingBlobDep(const UInt128 & hash, uint64_t size)
@@ -468,115 +469,83 @@ void Build::recordPendingBlobDep(const UInt128 & hash, uint64_t size)
         DepEntry{ObjectKind::Blob, std::nullopt, store->retireView().round(), size};
 }
 
-TreeEntry Build::adoptFromTree(const TreeId & source, const String & name)
+String Build::writerInstanceId() const
 {
-    requireAlive();
-
-    auto it = source_tree_cache.find(source);
-    if (it == source_tree_cache.end())
-        it = source_tree_cache.emplace(source, store->readTree(source)).first;
-
-    for (const TreeEntry & entry : it->second)
-    {
-        if (entry.name != name)
-            continue;
-
-        adoptEvidence(entry);
-        return entry;
-    }
-
-    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-        "adoptFromTree: no entry named '{}' in source tree {}", name, source.string());
+    /// OQ6: stable server id + durable process epoch. A new process incarnation gets a new epoch, so it
+    /// cannot reuse a prior incarnation's `_manifests/<writer_instance_id>/...` build prefix.
+    return u128ToHex(store->poolConfig().server_id) + ":" + std::to_string(epoch);
 }
 
-void Build::adoptTree(const TreeId & id)
+RootNamespace Build::manifestNamespace() const
 {
-    requireAlive();
-    /// Whole-tree adoption is a COLD REUSE, not blind evidence (amended 2026-06-12, found
-    /// refreshing the TLA+ model): the object is OBSERVED at adopt time (one HEAD inside
-    /// observeAndAdmit) and the dependency recorded TOKEN-BEARING, so the full W-REVALIDATE
-    /// machinery covers it. A blind tokenless dep here was a dangle: a detached tree already
-    /// reclaimed by a COMPLETED round has no view hit (entries drop on confirmed outcomes), and a
-    /// view already refreshed AT the current round skips both the publish-time re-observation
-    /// (the observed_view_round >= round keep branch) and the fence-advanced refresh (view round
-    /// == fence round) - the publish would land a manifest naming a deleted tree. The live-source
-    /// argument that justifies tokenless evidence for adoptFromTree CHILDREN does not apply to
-    /// the root being adopted: a detached/frozen tree is exactly NOT pinned by anything. Absent
-    /// => FILE_DOESNT_EXIST (fail closed; the caller re-creates from source or aborts the
-    /// re-attach); condemned => ABORTED from observeAndAdmit (INV-1: no GET; caller retries).
-    /// B92 (RESOLVED): observeAndAdmit now computes logical_size = hr.size - blob_header_len for trees
-    /// (same formula as blobs; tree objects are [blob_header_len envelope][encodeTree payload]).
-    /// This flows into `RefPayload.tree_size` at publish, so adopt-published parts (FREEZE / detached
-    /// re-attach / replication relink) carry the correct payload size for `Resolved.tree_size`.
-    /// The subtree case in `adoptFromTree` already carries entry.file_size independently.
-    const UInt128 hash = hexToU128(id.string());
-    observeAndAdmit(ObjectKind::Tree, hash, keyFor(ObjectKind::Tree, hash));
-}
-
-TreeId Build::stageTree(std::vector<TreeEntry> entries)
-{
-    requireAlive();
-
-    /// W-TREE-BUILD: bottom-up discipline — every referenced child must already be a dependency.
-    for (const TreeEntry & entry : entries)
-    {
-        visitPlacement(entry.placement,
-            [&] {},   /// Inline: inline bytes need no dependency
-            [&] {   /// Blob: must already be in the dep set
-                if (!deps.contains({static_cast<uint8_t>(ObjectKind::Blob), entry.file_hash}))
-                    throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "stageTree: child blob {} not in dependency set (W-TREE-BUILD)",
-                        u128ToHex(entry.file_hash));
-            },
-            [&] {   /// Subtree: child tree must already be in the dep set
-                if (!deps.contains({static_cast<uint8_t>(ObjectKind::Tree), entry.file_hash}))
-                    throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "stageTree: child tree {} not in dependency set (W-TREE-BUILD)",
-                        u128ToHex(entry.file_hash));
-            }
-        );
-    }
-
-    /// Identity is the Merkle id over the logical children (independent of serialization/placement);
-    /// the encoded payload below is just the on-disk representation, retained for re-upload.
-    const TreeId id = merkleTreeId(entries);
-    const String encoded = encodeTree(std::move(entries));   /// canonical sort + duplicate-name check
-    const UInt128 logical_hash = hexToU128(id.string());
-
-    /// RETAIN the encoded payload: trees are always re-creatable during the gate's W-REVALIDATE
-    /// (Task 13), unlike blob payloads which are not retained.
-    retained_trees[logical_hash] = encoded;
-
-    /// Record a TOKENLESS Tree dep — LOCAL ONLY, no upload. precommit tolerates an absent tree
-    /// object (it just needs the dep in the set); uploadStagedTree uploads the object post-precommit.
-    deps[{static_cast<uint8_t>(ObjectKind::Tree), logical_hash}] =
-        DepEntry{ObjectKind::Tree, std::nullopt, store->retireView().round(), encoded.size()};
-
-    return id;
-}
-
-void Build::uploadStagedTree(const TreeId & id)
-{
-    requireAlive();
-
-    const UInt128 logical_hash = hexToU128(id.string());
-
-    /// Recover the retained payload — must have been staged first.
-    auto it = retained_trees.find(logical_hash);
-    if (it == retained_trees.end())
+    /// The owning namespace is BuildInfo::intended_ref minus its last `/`-segment (the ref name). A CA
+    /// namespace itself contains `/` (e.g. "srv1/<uuid>@cas@"), so split on the LAST slash only.
+    const String intended = info.intended_ref.value_or("");
+    const size_t slash = intended.find_last_of('/');
+    if (slash == String::npos || slash == 0)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "uploadStagedTree: tree {} was not staged", id.string());
-
-    const String key = store->layout().treeKey(id);
-    /// Thin caller of uploadFromSource — INV-1: never reads the dying object even if the tree
-    /// is condemned (uploadFromSource uses the retained payload, not a GET).
-    uploadFromSource(ObjectKind::Tree, logical_hash, key, it->second);
+            "stageManifest: intended_ref '{}' has no namespace/ref split", intended);
+    return RootNamespace{intended.substr(0, slash)};
 }
 
-TreeId Build::putTree(std::vector<TreeEntry> entries)
+ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
 {
-    auto id = stageTree(std::move(entries));
-    uploadStagedTree(id);
+    requireAlive();
+
+    /// Fail-closed caps (OQ7) — checked BEFORE the body write so no owner transition can ever name a
+    /// manifest that breaches a cap. Inline payload is read on every part-open and every owner
+    /// transition, so cap the total, not only per-entry.
+    if (entries.size() > kMaxManifestEntries)
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+            "stageManifest: {} entries exceeds cap {}", entries.size(), kMaxManifestEntries);
+    uint64_t inline_total = 0;
+    for (const ManifestEntry & e : entries)
+    {
+        if (e.placement == EntryPlacement::Inline)
+        {
+            if (e.inline_bytes.size() > kMaxLargestInlineEntryBytes)
+                throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                    "stageManifest: inline entry '{}' of {} bytes exceeds cap {}",
+                    e.path, e.inline_bytes.size(), kMaxLargestInlineEntryBytes);
+            inline_total += e.inline_bytes.size();
+        }
+    }
+    if (inline_total > kMaxManifestInlineBytesTotal)
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+            "stageManifest: total inline {} bytes exceeds cap {}", inline_total, kMaxManifestInlineBytesTotal);
+
+    /// Mint the identity. manifest_instance_id is random (NoManifestIdReuse) and never derived from
+    /// payload. With writer_instance_id + build_seq it forms the ManifestRef; with the owning namespace
+    /// it forms the ManifestId.
+    const ManifestRef ref{writerInstanceId(), build_seq, mintU128()};
+
+    /// Build the body. payload_digest is integrity/debug only — never a key, never dedup, never
+    /// in-degree. The body repeats its own ref + namespace for fail-closed RefMatchesBody /
+    /// ManifestNamespaceMatches at read/fold/promote time.
+    const RootNamespace owning_ns = manifestNamespace();
+    PartManifest body;
+    body.ref = ref;
+    body.root_namespace_id = owning_ns;
+    body.entries = std::move(entries);
+    body.payload_digest = computePayloadDigest(body);
+    const String encoded = encodePartManifest(body);
+    if (encoded.size() > kMaxManifestEncodedBytes)
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+            "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded.size(), kMaxManifestEncodedBytes);
+
+    const ManifestId id{owning_ns, ref};
+    const String key = store->layout().manifestKey(id);
+
+    /// Stream-write the body — NO preliminary HEAD (the instance id is random). A PreconditionFailed
+    /// would mean a 128-bit collision: fail closed before any root transition becomes visible.
+    WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
+    writeString(encoded, sink->buffer());
+    const PutResult res = sink->finalize();
+    if (res.outcome != PutOutcome::Done)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "stageManifest: manifest_instance_id collision at {} (PreconditionFailed) — failing closed", key);
+
+    staged_manifests.push_back(id);
     return id;
 }
 
@@ -585,495 +554,131 @@ String Build::keyFor(ObjectKind kind, const UInt128 & hash) const
     return objectKey(store->layout(), kind, hash);
 }
 
-RootNamespace Build::precommitNs() const
-{
-    /// `<server_hex>/_precommits` — the precommit namespace for this server (B171, spec §A; relocated
-    /// under the server's own subtree in Phase 6).
-    return RootNamespace{u128ToHex(store->poolConfig().server_id) + "/_precommits"};
-}
-
-String Build::buildRef() const
-{
-    /// The precommit ref name IS the per-process monotone build_seq (B171 fix). Many builds share a
-    /// precommit shard, each keyed by its own ref name, exactly like a table namespace's refs.
-    return std::to_string(build_seq);
-}
-
-uint64_t Build::buildShard() const
-{
-    /// B171 fix: shard the precommit namespace EXACTLY like every other namespace — hash the ref name. The
-    /// precommit namespace then has at most root_shards shards (bounded), each holding many builds'
-    /// precommit refs keyed by build_seq, folded via the normal [0, root_shards) enumeration. Was
-    /// `build_seq` (per-process unique), which created an unbounded shard per build and wedged GC fold.
-    return store->shardOf(buildRef());
-}
-
-std::vector<ClosureNode> Build::buildStagedClosure(UInt128 root_hash) const
-{
-    /// B199-S2 Task 4: traverse the in-memory staged trees (retained_trees) depth-first from root_hash.
-    /// Produces one ClosureNode per BUILT tree (those in retained_trees); adopted subtrees (Subtree entries
-    /// whose hash is NOT in retained_trees) stop recursion — they appear in their parent's entries only.
-    /// Never reads from the pool/backend: all data comes from retained_trees (in-memory encoded payloads).
-    std::vector<ClosureNode> result;
-    std::set<UInt128> visited;
-
-    /// Iterative DFS using a stack of tree hashes to process.
-    std::vector<UInt128> stack;
-    stack.push_back(root_hash);
-
-    while (!stack.empty())
-    {
-        const UInt128 hash = stack.back();
-        stack.pop_back();
-
-        /// Dedup: skip trees we have already emitted a ClosureNode for.
-        if (!visited.insert(hash).second)
-            continue;
-
-        /// Only emit a ClosureNode for trees THIS build staged (retained_trees).
-        /// Adopted subtrees (hash NOT in retained_trees) are leaves — recursion stops here.
-        auto it = retained_trees.find(hash);
-        if (it == retained_trees.end())
-            continue;
-
-        /// Decode the in-memory encoded tree payload — no backend/pool call.
-        const std::vector<TreeEntry> entries = decodeTree(it->second);
-
-        /// Emit this node (tree hash + its entries).
-        ClosureNode node;
-        node.tree_hash = hash;
-        node.entries = entries;
-        result.push_back(std::move(node));
-
-        /// For each Subtree entry whose hash is ALSO in retained_trees, recurse (push onto stack).
-        /// Adopted subtrees (not in retained_trees) are intentionally not pushed — they are leaves.
-        for (const TreeEntry & entry : entries)
-        {
-            if (entry.placement == Placement::Subtree && retained_trees.contains(entry.file_hash))
-                stack.push_back(entry.file_hash);
-        }
-    }
-
-    return result;
-}
-
-void Build::precommit(const TreeId & manifest)
+void Build::precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id)
 {
     requireAlive();
 
-    /// B171 two-phase commit, phase 1. Publish the build's manifest tree as a ref (named build_seq) under
-    /// the precommit namespace `<server_hex>/_precommits`, shard = shardOf(build_seq). GC discovers it via the registry
-    /// (ensureRegistered) and folds it like any namespace → root edge → tree_expand → child in-degree ≥ 1,
-    /// so every object reachable from the precommit is protected by REACHABILITY (replacing the revocable
-    /// `cas_owner` hint). The manifest must be in this build's W-DEP-SET — it was built/adopted by this
-    /// Build (the caller putTree'd / adoptTree'd it), mirroring `publish`'s precondition.
-    const UInt128 manifest_hash = hexToU128(manifest.string());
-    auto dep_it = deps.find({static_cast<uint8_t>(ObjectKind::Tree), manifest_hash});
-    if (dep_it == deps.end())
+    /// ManifestNamespaceMatches at the source: the precommit's manifest must belong to the target
+    /// namespace (its key is built from id.root_namespace). A cross-namespace precommit is a bug.
+    if (id.root_namespace != target_ns)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "precommit: tree {} was not built/adopted by this Build", manifest.string());
+            "precommitAdd: manifest namespace '{}' != target namespace '{}'",
+            id.root_namespace.string(), target_ns.string());
 
-    /// W-REGISTER: the precommit namespace must be in `gc/registry` before its first manifest exists,
-    /// so GC discovers it (it is an ordinary namespace key-wise; only behavioral branches key off
-    /// `isPrecommitNamespace`). Monotone — a cache hit short-circuits without I/O.
-    const RootNamespace ns = precommitNs();
-    store->ensureRegistered(ns);
+    /// W-REGISTER: the target namespace must be in `gc/registry` before its first transition exists.
+    store->ensureRegistered(target_ns);
 
-    /// tree_size: for a built tree we have encoded.size(); for an adopted tree dep_it->second.size
-    /// carries the real payload size since B92 (observeAndAdmit = hr.size - blob_header_len).
-    auto retained_it = retained_trees.find(manifest_hash);
-    const uint64_t tree_size =
-        retained_it != retained_trees.end() ? retained_it->second.size() : dep_it->second.size;
-
-    /// ONE CAS on the precommit shard: set refs[build_seq] = manifest, append {+, build_seq, manifest},
-    /// shard_version++. The SAME RootShard machinery as `publish` — the precommit edge is an ordinary
-    /// root ref the GC fold will expand. The ref name is the build_seq and the shard is shardOf(ref), so
-    /// many builds co-locate in the same bounded shard (B171 fix).
-    const String ref = buildRef();
-    store->mutateShard(ns, buildShard(), [&](RootShard & root)
+    /// ONE CAS on the TARGET shard (shardOf(final_ref_name)): append a create-precommit RootOwnerEvent
+    /// {old=none, new={Precommit, final_ref_name, build_id, id.ref}} to the single ordered journal. No body
+    /// HEAD — a missing body is a legal fail-closed, non-activating intent (spec §Precommit Add).
+    store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
     {
-        RefPayload payload;
-        payload.tree_id = manifest_hash;
-        payload.tree_size = tree_size;
-        root.refs[ref] = payload;
-        /// B199-S2: the closure rides the Add journal record (it survives the commit/abandon refs.erase
-        /// and is trimmed only after GC folds it), so GC can protect/reclaim the build's closure WITHOUT
-        /// reading any tree object. Built in-memory from the staged structure — no pool read.
-        root.journal.push_back(JournalRecord{
-            .op = JournalRecord::Op::Add, .ref_name = ref, .tree_id = manifest_hash,
-            .at_version = root.shard_version + 1, .closure = buildStagedClosure(manifest_hash)});
+        root.journal.push_back(RootOwnerEvent{
+            .transition_version = root.shard_version + 1,
+            .old_binding = std::nullopt,
+            .new_binding = OwnerBinding{
+                .owner_kind = OwnerKind::Precommit,
+                .ref_name = final_ref_name,
+                .build_id = build_id,
+                .manifest_ref = id.ref}});
     });
 
-    /// B171: the precommit was published — the precommit edge now protects the manifest's closure.
-    /// Record that fact so the successful-commit path (and only it) removes the edge.
+    precommit_target_ns = target_ns;
+    precommit_final_ref = final_ref_name;
+    precommit_manifest = id.ref;
     precommitted = true;
+
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::Precommit;
-        e.namespace_ = ns.string();
-        e.ref_name = ref;
-        e.object_kind = CasEventObjectKind::Tree;
-        e.object_hash = manifest.string();
+        e.namespace_ = target_ns.string();
+        e.ref_name = final_ref_name;
         e.token = u128ToHex(build_id);
-        e.round = store->retireView().round();
         e.outcome = "ok";
-        e.reason = "precommit: published precommit manifest edge to protect the closure during the build";
+        e.reason = "precommitAdd: build-intent owner add in the target shard (owner = precommit(build_id))";
         e.detail = {{"build_seq", std::to_string(build_seq)}};
     });
 }
 
-void Build::recreateTree(const UInt128 & hash)
+void Build::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & id)
 {
-    /// W-REVALIDATE re-create branch. The encoded payload was RETAINED at stageTree, so a tree is
-    /// always re-creatable. Thin caller of uploadFromSource — INV-1: never reads the dying object.
-    const auto retained_it = retained_trees.find(hash);
-    if (retained_it == retained_trees.end())
+    requireAlive();
+
+    if (id.root_namespace != target_ns)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Build::recreateTree: no retained payload for tree {} (only built trees are re-creatable)",
-            u128ToHex(hash));
+            "promote: manifest namespace '{}' != target namespace '{}'",
+            id.root_namespace.string(), target_ns.string());
 
-    const TreeId id{u128ToHex(hash)};
-    const String key = store->layout().treeKey(id);
-    uploadFromSource(ObjectKind::Tree, hash, key, retained_it->second);
-}
+    const uint64_t registry_fence = store->ensureRegistered(target_ns);
 
-void Build::checkAndResolveDeps()
-{
-    /// B190 Task 3 merged gate pass: W-REVALIDATE (the model's `WPublishReval`) + W-EVIDENCE /
-    /// condemned-token scan in a SINGLE loop over `deps`. Replaces the former separate
-    /// `revalidateDeps` + `gateCheckDeps` calls. Runs INSIDE the publish mutateShard lambda —
-    /// re-runs on every CAS retry (idempotent: re-observe is safe).
-    ///
-    /// Iterating `deps` while uploadFromSource/observeAndAdmit/recreateTree mutate deps is safe:
-    /// all three overwrite the SAME (kind, hash) entry (deps[thatkey].token / observed_view_round),
-    /// never insert a new key — so the map structure and the current iterator stay valid.
-    EventEmitter{*store}.emit([&](CasEvent & e)
+    /// Read + validate the manifest body ONCE (O(manifest entries), one streaming read). Absent or
+    /// invalid ⇒ fail closed: a committed ref must never name a missing/mismatched manifest.
+    const String manifest_key = store->layout().manifestKey(id);
+    const auto body_got = store->backend().get(manifest_key);
+    if (!body_got)
+        throw Exception(ErrorCodes::ABORTED,
+            "promote: manifest body absent at {} — failing closed (retry with a fresh ManifestId)", manifest_key);
+    const PartManifest body = decodePartManifest(body_got->bytes);
+    if (!refMatchesBody(id.ref, body))
+        throw Exception(ErrorCodes::ABORTED, "promote: RefMatchesBody failed for {}", manifest_key);
+    if (!manifestNamespaceMatches(target_ns, body))
+        throw Exception(ErrorCodes::ABORTED, "promote: ManifestNamespaceMatches failed for {}", manifest_key);
+
+    store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
     {
-        e.type = CasEventType::GateRevalidate;
-        e.token = u128ToHex(build_id);
-        e.round = store->retireView().round();
-        e.outcome = "revalidating";
-        e.reason = "fail-closed commit: re-prove the dependency closure is present before writing the ref";
-        e.detail = {{"deps", std::to_string(deps.size())}};
-    });
-
-    /// Gate-local wrapper: calls the 3-arg observeAndAdmit and converts FILE_DOESNT_EXIST (object absent
-    /// at observe time) to ABORTED. At the publish gate, an object that is fully GC-deleted before our
-    /// HEAD is a transient race under INV-3 — the caller retries the operation and re-materializes from
-    /// source. Every other absent/condemned outcome in the gate already throws ABORTED; this wrapper
-    /// makes the absent-at-HEAD path consistent. Note: adoptTree also calls the 3-arg overload and
-    /// intentionally keeps FILE_DOESNT_EXIST (fail-closed semantics for detached-tree re-attach) — it
-    /// does NOT use this wrapper.
-    auto gateObserveAndAdmit = [&](ObjectKind k_, const UInt128 & h_, const String & kstr_)
-    {
-        try
-        {
-            observeAndAdmit(k_, h_, kstr_);
-        }
-        catch (const Exception & e_)
-        {
-            if (e_.code() != ErrorCodes::FILE_DOESNT_EXIST)
-                throw;
-            /// B190 residual (INV-3): object vanished (GC-deleted) between the retire-view hit and our
-            /// HEAD. The dep is lost with no source bytes at the gate → retryable ABORTED, matching all
-            /// other absent/condemned gate branches. The soak saw: "WORKLOAD FAILURE: Code 107 ... blobs/
-            /// 0b/0b343... absent — cannot reuse" — exactly this path for a bodyless adopt dep.
-            throw Exception(ErrorCodes::ABORTED,
-                "checkAndResolveDeps: object {} vanished (GC-deleted) before gate observe; "
-                "retry the operation — re-upload/re-materialize from source (INV-3)", kstr_);
-        }
-    };
-
-    for (auto & [key, dep] : deps)
-    {
-        /// Iteration-safety invariant: DepKey's kind byte (key.first) == dep.kind, so any mutation
-        /// inside uploadFromSource/observeAndAdmit/recreateTree overwrites THIS entry, never a new key.
-        chassert(static_cast<uint8_t>(dep.kind) == key.first);
-
-        const ObjectKind kind = dep.kind;
-        const UInt128 & hash = key.second;
-        const String k = keyFor(kind, hash);
-
-        const std::optional<std::vector<Token>> hits = store->retireView().findCondemned(kind, hash);
-
-        if (!dep.token.has_value())
-        {
-            /// ── TOKENLESS (W-EVIDENCE) dep ──────────────────────────────────────────────────────
-            ///
-            /// Priority 1: any view hit by hash — act regardless of staleness.
-            /// Retire entries drop on confirmed outcomes (F1), so "no hit" can mean "condemned, deleted,
-            /// entry dropped". When the entry IS still there (hit), it identifies a condemned token for
-            /// this hash. observeAndAdmit HEADs the object; if the current token is condemned it throws
-            /// ABORTED (INV-1: no GET of the dying object). This covers both fresh and stale evidence
-            /// deps — the old two-pass did this in gateCheckDeps after revalidateDeps' `continue`.
-            if (hits.has_value())
-            {
-                gateObserveAndAdmit(kind, hash, k);
-                continue;
-            }
-
-            /// Priority 2: no hit + stale (the view round advanced past the evidence's recording round).
-            /// The live-source-root argument covers only the SAME round window; a full boundary in between
-            /// invalidates it (the source may have been dropped and the object reclaimed). Re-observe.
-            if (dep.observed_view_round < store->retireView().round())
-            {
-                const HeadResult hr = store->backend().head(k);
-                if (!hr.exists)
-                {
-                    if (kind == ObjectKind::Tree && retained_trees.contains(hash))
-                        recreateTree(hash);
-                    else
-                        throw Exception(ErrorCodes::ABORTED,
-                            "publish evidence dependency {} lost and not re-creatable; retry the operation",
-                            u128ToHex(hash));
-                }
-                else
-                {
-                    /// Present: adopt the current token via the 4-arg overload to avoid a redundant second
-                    /// HEAD (we already hold `hr`). Condemned → ABORTED from observeAndAdmit (INV-1).
-                    observeAndAdmit(kind, hash, k, hr);
-                }
-            }
-            /// Priority 3: no hit + fresh → keep (evidence as fresh as the view; the handshake covers it).
-        }
-        else
-        {
-            /// ── TOKEN-BEARING dep ───────────────────────────────────────────────────────────────
-            ///
-            /// Priority 1: any view hit by hash — act regardless of staleness.
-            /// A hit is by HASH: the current incarnation may have been displaced to a different token t'
-            /// that GC then condemned; our dep.token may be stale and not capture t'. We act on any hit.
-            if (hits.has_value())
-            {
-                EventEmitter{*store}.emit([&](CasEvent & e)
-                {
-                    e.type = CasEventType::GateResurrect;
-                    e.object_kind = toEventKind(kind);
-                    e.object_hash = u128ToHex(hash);
-                    e.token = u128ToHex(build_id);
-                    e.round = store->retireView().round();
-                    e.outcome = "recreate-or-reobserve";
-                    e.reason = "gate: dep has a view hit by hash (INV-1: no GET)";
-                });
-
-                if (store->retireView().isCondemnedToken(kind, hash, *dep.token))
-                {
-                    /// Case (a): dep's own token is condemned.
-                    if (kind == ObjectKind::Tree && retained_trees.contains(hash))
-                        recreateTree(hash);
-                    else
-                        /// No source bytes at the gate (blob with condemned own token) →
-                        /// retryable ABORTED. The outer INSERT retry re-uploads from source. (INV-1)
-                        throw Exception(ErrorCodes::ABORTED,
-                            "checkAndResolveDeps: condemned dep {} has no retained payload; retry the operation (INV-1)",
-                            u128ToHex(hash));
-                }
-                else
-                {
-                    /// Case (b): dep's own token is live, but a displaced incarnation's token was
-                    /// condemned. Re-observe to adopt the current token (HEAD-only, no GET). observeAndAdmit
-                    /// throws ABORTED if the current incarnation is itself condemned (bounded by caller).
-                    /// gateObserveAndAdmit converts FILE_DOESNT_EXIST (object absent — GC-deleted in the
-                    /// window between the view hit and our HEAD) to ABORTED (INV-3 retryable).
-                    gateObserveAndAdmit(kind, hash, k);
-                }
-                continue;
-            }
-
-            /// Priority 2: no hit + stale — W-REVALIDATE single re-observation (one HEAD).
-            if (dep.observed_view_round < store->retireView().round())
-            {
-                const HeadResult hr = store->backend().head(k);
-                if (!hr.exists)
-                {
-                    /// Deleted / absent in the refreshed reality.
-                    if (kind == ObjectKind::Tree && retained_trees.contains(hash))
-                        recreateTree(hash);   /// spec §7 step 4: deleted/absent ⇒ re-create
-                    else
-                        throw Exception(ErrorCodes::ABORTED,
-                            "publish dependency {} lost and not re-creatable; retry the operation",
-                            u128ToHex(hash));
-                }
-                else if (hr.token == *dep.token)
-                {
-                    /// current == observed ⇒ KEEP — safe by the IN-FLIGHT DISJUNCTION (model-checked): a
-                    /// delete in flight for (hash, t) implies its retire entry is still HELD (a VIEW HIT),
-                    /// and we are in the no-hit branch. Re-stamp so a later same-publish recheck is fresh.
-                    dep.observed_view_round = store->retireView().round();
-                }
-                else
-                {
-                    /// current token differs ⇒ adopt the newer token via the 4-arg overload (pass the
-                    /// already-fetched hr — avoids a redundant second HEAD). condemned → ABORTED (INV-1).
-                    observeAndAdmit(kind, hash, k, hr);
-                }
-            }
-            /// Priority 3: no hit + fresh → keep (already valid at this view round).
-        }
-    }
-}
-
-void Build::publish(const RootNamespace & ns, const String & ref_name, const TreeId & tree, RefPayload payload)
-{
-    requireAlive();   /// abandon disables publish too (the test asserts LOGICAL_ERROR after abandon)
-
-    /// The published root MUST be in the W-DEP-SET — built or adopted by this Build (spec §5).
-    const UInt128 tree_hash = hexToU128(tree.string());
-    auto dep_it = deps.find({static_cast<uint8_t>(ObjectKind::Tree), tree_hash});
-    if (dep_it == deps.end())
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "publish: tree {} was not built/adopted by this Build", tree.string());
-
-    /// Fill the tree fields of the caller's payload (mutable_files is caller input, preserved).
-    payload.tree_id = tree_hash;
-    auto retained_it = retained_trees.find(tree_hash);
-    /// tree_size: for a built tree we have encoded.size(); for an adopted tree dep_it->second.size
-    /// carries the real payload size since B92 (observeAndAdmit = hr.size - blob_header_len).
-    payload.tree_size = retained_it != retained_trees.end() ? retained_it->second.size() : dep_it->second.size;
-
-    /// W-REGISTER (spec §5, decision 2026-06-12): a namespace must be in `gc/registry` BEFORE its
-    /// first manifest exists — that is what orders namespace CREATION against the GC fence. The
-    /// returned registry fence_round is the GATE FLOOR for this publish: a brand-new namespace's
-    /// shard manifest carries fence_round 0 and could never trigger the refresh below on its own,
-    /// so a stale-view writer would slip a condemned hash past the recheck (the absent-shard
-    /// ordering hole). Already-registered namespaces return floor 0 (cache hit) — R3 fences all
-    /// their shards each round, so the per-shard fence carries the ordering.
-    const uint64_t registry_fence = store->ensureRegistered(ns);
-
-    /// Publish = ONE CAS (spec §5 step 4): set refs[name], append {+, name, T}, shard_version++.
-    /// We REUSE Store::mutateShard (the verified Task-10 loop: re-read-inside-loop, size-guard,
-    /// casPut, bounded retry). The gate-aware mutate lambda owns the gate; because mutateShard
-    /// re-reads + re-invokes the lambda each attempt, a fence-advanced conflict naturally re-runs the
-    /// gate on the fresh fence_round (spec §5 step 5).
-    /// B170: captured inside the CAS lambda (which mutateShard re-runs per attempt — they reflect the
-    /// COMMITTED attempt) to classify the publish event as RefPublish vs RefRepoint.
-    bool repointed_over = false;
-    uint64_t committed_at_version = 0;
-    store->mutateShard(ns, store->shardOf(ref_name), [&](RootShard & root)
-    {
-        /// Fence vs view: if the manifest's fence_round (floored by the registry fence at
-        /// registration, W-REGISTER) is ahead of our view, GC advanced — refresh BEFORE revalidating
-        /// so the dependency set is checked against the freshest reality. This ordering (refresh, then
-        /// revalidate) is load-bearing for W-REGISTER (the registry fence is the gate floor); keep it.
+        /// Refresh-then-revalidate (W-REGISTER ordering, load-bearing): if the shard's fence_round
+        /// (floored by the registry fence) is ahead of our view, GC advanced — refresh first.
         if (store->retireView().round() < std::max(root.fence_round, registry_fence))
             store->retireView().refresh();
 
-        /// B171 INV-COMMIT-FAILCLOSED (fail-closed commit): revalidate UNCONDITIONALLY — every commit
-        /// re-proves the full closure is present (re-pin via recreate / observeAndAdmit; a missing
-        /// non-recreatable blob → ABORTED, caller retries). This used to run only when the fence advanced
-        /// past our view, which left a window: a precommit prematurely reclaimed could let the shared blob
-        /// be collected, yet a stale-but-not-fence-advanced view would skip the presence check and commit a
-        /// dangle. Running checkAndResolveDeps every time closes that window — a publish can NEVER commit a
-        /// table ref over a missing dependency. checkAndResolveDeps is idempotent and re-runs naturally on
-        /// each mutateShard CAS retry (spec §4.4, §4.6). It merges the former revalidateDeps +
-        /// gateCheckDeps into a single pass (B190 Task 3).
-        checkAndResolveDeps();
+        /// Fail-closed blob revalidation of EVERY blob leaf (spec §Promote Precommit step 3). A condemned
+        /// blob is recreatable only from this build's own source (INV-1); a missing or condemned blob ⇒
+        /// ABORTED.
+        for (const ManifestEntry & e : body.entries)
+        {
+            if (e.placement != EntryPlacement::Blob)
+                continue;
+            const BlobId blob_id{u128ToHex(e.blob_hash)};
+            const String blob_key = store->layout().blobKey(blob_id);
+            const HeadResult hr = store->backend().head(blob_key);
+            if (!hr.exists)
+                throw Exception(ErrorCodes::ABORTED,
+                    "promote: blob {} absent at commit revalidation — failing closed", blob_key);
+            if (store->retireView().isCondemnedToken(ObjectKind::Blob, e.blob_hash, hr.token))
+                throw Exception(ErrorCodes::ABORTED,
+                    "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
+        }
 
-        repointed_over = root.refs.contains(ref_name);
-        committed_at_version = root.shard_version + 1;
-        root.refs[ref_name] = payload;
-        /// at_version == the committed shard_version: mutateShard bumps AFTER the lambda, so inside it
-        /// the post-commit version is root.shard_version + 1 (matches dropRef).
-        root.journal.push_back(JournalRecord{
-            .op = JournalRecord::Op::Add, .ref_name = ref_name, .tree_id = payload.tree_id,
-            .at_version = root.shard_version + 1, .closure = {}});
+        /// Promotion is a PURE OWNER MOVE (spec rev. 15 §Promote Precommit): append ONE RootOwnerEvent
+        /// whose old_binding and new_binding name the SAME manifest_ref T, moving ownership from
+        /// precommit(build_id) to committed(final_ref_name). It emits NO blob deltas. The activating +
+        /// edges came from GC's barrier-activation of the create-precommit event (the fold barrier
+        /// guarantees that event is folded — body present ⇒ activated — before this promote is folded).
+        const uint64_t v = root.shard_version + 1;
+        root.journal.push_back(RootOwnerEvent{
+            .transition_version = v,
+            .old_binding = OwnerBinding{
+                .owner_kind = OwnerKind::Precommit, .ref_name = final_ref_name,
+                .build_id = promote_build_id, .manifest_ref = id.ref},
+            .new_binding = OwnerBinding{
+                .owner_kind = OwnerKind::Committed, .ref_name = final_ref_name,
+                .build_id = UInt128(0), .manifest_ref = id.ref}});
+        root.refs[final_ref_name] = RootRef{
+            .ref_name = final_ref_name, .manifest_ref = id.ref,
+            .mutable_files = pending_mutable_files, .published_at_ms = nowMs()};
     });
 
-    /// B170: the ref was published (RefRepoint when it already named a tree, else RefPublish). The
-    /// at_version is the committed shard_version — the journal record GC will fold as a root Add.
-    EventEmitter{*store}.emit([&](CasEvent & e)
-    {
-        e.type = repointed_over ? CasEventType::RefRepoint : CasEventType::RefPublish;
-        e.namespace_ = ns.string();
-        e.ref_name = ref_name;
-        e.object_kind = CasEventObjectKind::Tree;
-        e.object_hash = tree.string();
-        e.token = u128ToHex(build_id);
-        e.at_version = committed_at_version;
-        e.outcome = "ok";
-        e.reason = repointed_over ? "published over an existing ref (repoint)" : "published a new ref";
-    });
-
-    /// B171: the table ref is now durably committed — the manifest's closure is table-pinned. Remove
-    /// the precommit edge so GC's fold releases it. ORDER: the table ref Add committed FIRST
-    /// (above), THEN the precommit is removed — never the reverse, which would leave a window with
-    /// neither edge protecting the closure. A transient failure is SAFE to ignore: the commit already
-    /// succeeded, so the closure is protected by the table ref; the leftover precommit is a stale
-    /// precommit edge GC reclaims later (Task 4). We therefore catch/log/emit and continue — failing
-    /// the publish here would be wrong (the part IS committed). Only attempt removal if this build
-    /// actually precommitted (spec §B.2, design §4.4).
-    ///
-    /// NB: we drop via mutateShard on the precommit shard, mirroring how `precommit` wrote it (ref name
-    /// = build_seq, shard = shardOf(ref)) — NOT via Store::dropRef, which routes by shardOf(ref_name) of
-    /// the TABLE ref. The shard happens to be shardOf(build_seq) too, so this is the same routing, but we
-    /// keep it explicit. Same CAS shape as dropRef: erase refs[build_seq] + append a Remove journal record
-    /// (the journal Remove is what GC's fold reads to release edges).
-    if (precommitted)
-    {
-        const String ref = buildRef();
-        try
-        {
-            store->mutateShard(precommitNs(), buildShard(), [&](RootShard & root)
-            {
-                auto it = root.refs.find(ref);
-                if (it == root.refs.end())
-                    throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-                        "remove precommit: no ref {} in precommit shard {}", ref, buildShard());
-                const UInt128 part_tree = it->second.tree_id;
-                root.refs.erase(it);
-                root.journal.push_back(JournalRecord{
-                    .op = JournalRecord::Op::Remove, .ref_name = ref, .tree_id = part_tree,
-                    .at_version = root.shard_version + 1, .closure = {}});
-            });
-            precommitted = false;
-            EventEmitter{*store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::PrecommitRemoved;
-                e.namespace_ = precommitNs().string();
-                e.ref_name = ref;
-                e.object_kind = CasEventObjectKind::Tree;
-                e.object_hash = tree.string();
-                e.token = u128ToHex(build_id);
-                e.outcome = "removed";
-                e.reason = "fail-closed commit succeeded; closure now table-pinned, releasing the precommit edge";
-                e.detail = {{"build_seq", std::to_string(build_seq)}};
-            });
-        }
-        catch (const Exception & e)
-        {
-            /// Best-effort: the commit already succeeded, so leaving a stale precommit is benign (GC
-            /// reclaims it). Do NOT propagate — that would fail an already-committed publish.
-            EventEmitter{*store}.emit([&](CasEvent & ev)
-            {
-                ev.type = CasEventType::PrecommitRemoved;
-                ev.namespace_ = precommitNs().string();
-                ev.ref_name = ref;
-                ev.object_kind = CasEventObjectKind::Tree;
-                ev.object_hash = tree.string();
-                ev.token = u128ToHex(build_id);
-                ev.outcome = "deferred";
-                ev.reason = "precommit removal failed transiently after a successful commit; left for GC reclaim: "
-                    + e.message();
-                ev.detail = {{"build_seq", std::to_string(build_seq)}};
-            });
-        }
-    }
-
-    /// Published: this build is no longer in-flight. Retire its seq so the GC watermark floor
-    /// (minActive) can advance past it (idempotent — the dtor also retires).
+    precommitted = false;
     store->retireBuildSeq(build_seq);
-    /// B170: the build's terminal success — the part is committed.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::BuildPublish;
-        e.namespace_ = ns.string();
-        e.ref_name = ref_name;
-        e.object_kind = CasEventObjectKind::Tree;
-        e.object_hash = tree.string();
-        e.token = u128ToHex(build_id);
-        e.at_version = committed_at_version;
-        e.outcome = "published";
-        e.reason = "build committed its root manifest; no longer in-flight";
+        e.namespace_ = target_ns.string();
+        e.ref_name = final_ref_name;
+        e.object_hash = u128ToHex(id.ref.manifest_instance_id);
+        e.token = u128ToHex(promote_build_id);
+        e.outcome = "promoted";
+        e.reason = "promote: atomic owner move precommit(build_id) -> ref(final_ref_name) after fail-closed reval";
         e.detail = {{"build_seq", std::to_string(build_seq)}};
     });
 }
@@ -1084,14 +689,31 @@ void Build::abandon()
     /// No longer in-flight: retire the seq so the GC watermark floor can advance (idempotent).
     store->retireBuildSeq(build_seq);
     alive = false;
+
+    /// Best-effort writer cleanup of THIS build's pre-precommit/staged `_manifests` debris (spec
+    /// §Pre-Precommit Part-Manifest Debris). The common case is writer cleanup; a missed object is
+    /// benign — the Phase-1d namespace-scoped orphan sweep reclaims it. Exact-token delete only; never
+    /// throw from abandon.
+    for (const ManifestId & id : staged_manifests)
+    {
+        try
+        {
+            const String key = store->layout().manifestKey(id);
+            const HeadResult hr = store->backend().head(key);
+            if (hr.exists)
+                store->backend().deleteExact(key, hr.token);
+        }
+        catch (...) {}   /// best-effort: GC backstop sweep is the durable guarantee
+    }
+
     /// B170: the build was abandoned; its uploads become GC-reclaimable debris.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::BuildAbort;
         e.token = u128ToHex(build_id);
         e.outcome = "abandoned";
-        e.reason = "abandon: build abandoned; uploads become reclaimable debris (reaped by full GC via min_active)";
-        e.detail = {{"build_seq", std::to_string(build_seq)}};
+        e.reason = "abandon: best-effort _manifests debris cleanup; remainder reaped by the orphan sweep";
+        e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
     });
 }
 
