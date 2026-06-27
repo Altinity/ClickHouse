@@ -406,3 +406,24 @@ The "unattended run summary" above under-reported open items and over-claimed tw
   passes, B13 closes properly (integration validation, not just unit+model).
 - **"All plans re-synced clean" was overstated** → B15 (plan bodies still carry pre-rev.15 rejected
   snippets; the CODE is correct, the plans are stale docs).
+### 2026-06-27 — REVIEW FOUND 2 HIGH PROTOCOL BUGS (precommit lifecycle) — fixing
+A second review pass (Codex) caught two HIGH protocol-level bugs where the C++ build path violates the
+preconditions the TLA+ model proves safe (NOT caught by my per-task reviews — they were in Phase 1b code
+predating this session, exercised only by specific precommit-removal/abandon sequences the unit tests
+didn't drive):
+- **HIGH #1 — promote doesn't verify the precommit is the live owner.** `Build::promote` (CasBuild.cpp
+  ~:634) appends the pure owner-move (Δ=0, no blob delta — fold treats equal old/new manifest_ref as
+  no-delta) WITHOUT checking the precommit is still the current owner. Model `WPromote` has `owner[m]=bld`.
+  If the precommit was removed/reclaimed, the Δ=0 move restores no in-degree → committed manifest with
+  in-degree-0 blobs → GC deletes → **DANGLE**. Fix: require the exact live precommit binding before the
+  move, else ABORTED.
+- **HIGH #2 — abandon deletes a live precommit body.** `Build::abandon` (CasBuild.cpp ~:704, called from
+  `ContentAddressedTransaction`'s destructor on a failed txn) deletes every staged manifest body, incl. one
+  `precommitAdd` made a live owner input. Model `WAbandonPrecommit` appends a REMOVAL event and never
+  deletes the body (delete-after-sealed-decrements; `sab_deletebodybeforedecrements`). Fix: append a
+  precommit-removal RootOwnerEvent in the target shard + never writer-delete a precommitted body.
+- Both fixes = make code match the already-proven model (no model change). Dispatched (opus, TDD, 2 commits).
+- Related: **B8** (abandoned-precommit RECLAIM still wired to the old `_precommits` namespace, not the new
+  target-shard model) remains deferred — it covers the CRASHED-build case (no abandon called); HIGH #2 fixes
+  the explicit-abandon path. **B11** (manifest-delete counter undercount) deferred as before.
+- Also re-attempting the Phase-4 sharded soak on the ca-soak/RustFS harness (B13 misdiagnosis).
