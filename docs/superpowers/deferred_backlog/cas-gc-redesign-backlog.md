@@ -288,7 +288,23 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   `report.deleted` (and rename it to reflect "objects" = blobs + manifests). Low priority — operators with
   the event log can already reconstruct the true count; this only de-confuses the at-a-glance summary.
 
-- **B12 — ASSESSED 2026-06-27: recommend DEFER (same call as B14).** Marginal perf win (saves one shard
+- **B12 — REFRAMED 2026-06-27 (maintainer): do LAZY/BATCHED journal trim; durable optimal-skip stays
+  CLOSED.** Root cause of the settling re-read is purely `trim` mutating the root-shard object every time it
+  has >=1 folded event (bumping the token recheck recorded). Fix the cause, not the symptom: make `trim`
+  lazy — only compact a shard's journal when `trimmable_events >= N` (e.g. 256), OR the encoded body nears a
+  soft size limit, OR an explicit maintenance/full-GC mode. Below threshold, skip trim → the shard's token
+  stays stable → the existing conservative skip fires next round (no settling read), AND we save the trim
+  write itself. Safety is trivial: trim is OPTIONAL and only ever removes events `<= sealed fold cursor`
+  (old events are never re-folded); NOT trimming is strictly safer. **No model change** (verified: model
+  `Trim` is an optional `Next` disjunct with no fairness forcing it; lazy trim trims a subset within the
+  proven `INV_JOURNAL_COVERAGE` envelope). Cost: journals live a bit longer, bounded by the soft size limit
+  / hard cap (backpressure); a big burst still pays ONE settling read after a compaction — an honest
+  compaction cost, not a per-round tax. Semantics clarified: journal compaction = batching/maintenance, not
+  a safety authority. SECONDARY (NOT now): a process-local post-trim token hint (`mutateShard` returns the
+  casPut token → in-mem `post_trim_token_hint` → skip if LIST==hint; zero S3 state, fail-closed) — start
+  with lazy trim. The DURABLE post-trim snapshot / seal-after-trim variant is CLOSED (too much protocol for
+  one read). Original analysis below.
+- **B12 (original/deferred-durable) — optimal one-round token-diff skip via durable post-trim state.** Marginal perf win (saves one shard
   read only during the brief post-activity SETTLING; steady-state quiescent shards already skip every round
   under the conservative impl) at the cost of a TLA+ model EXTENSION (prove the discovery token may advance
   on GC's own per-round writes + a new sabotage + a full ~1-2h suite re-green) AND a delicate round-structure
