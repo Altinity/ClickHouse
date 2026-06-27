@@ -1511,6 +1511,10 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
 
             GcState fresh;
             fresh.lease = GcLease{gc_id, 1};
+            /// Creation-time only: gc_shards is set ONCE on first-ever acquire; subsequent rounds read
+            /// the authoritative value from the persisted GcState (pool is authoritative on reopen,
+            /// like root_shards). PoolConfig carries the configured value from the disk XML.
+            fresh.gc_shards = store->poolConfig().gc_shards;
             const CasResult acquire_res = store->backend().casPut(key, encodeGcState(fresh), std::nullopt);
             if (acquire_res.outcome == CasOutcome::Committed)
             {

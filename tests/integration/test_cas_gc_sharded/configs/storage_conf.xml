@@ -1,0 +1,42 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <disk_cas_gc_sharded>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>content_addressed</metadata_type>
+                <!-- A single shared bucket path; BOTH replicas mount the SAME content-addressed pool
+                     (one source of truth — shared-pool mode, spec §6). This is what makes a two-replica
+                     disjoint-shard GC scenario possible: both nodes see the same gc/state key and
+                     compete for the coordinator lease. -->
+                <endpoint>http://minio1:9001/root/cas_gc_sharded/</endpoint>
+                <access_key_id>minio</access_key_id>
+                <secret_access_key>ClickHouse_Minio_P@ssw0rd</secret_access_key>
+                <!-- Phase 4: two blob-hash-prefix GC shards (gc_shards=2). Creation-time only; the
+                     pool is authoritative on reopen. With gc_shards=2 the coordinator splits the
+                     BlobDelta stream into two disjoint buckets (even/odd high-64 hash mod 2) and
+                     writes two blob_target shard keys per generation.
+                     NOTE: the CA capability probe requires an S3 backend that enforces
+                     DeleteObject If-Match (conditional delete, GA in S3/MinIO 2025-09+). The
+                     integration-test MinIO image (RELEASE.2024-09-13T20-26-02Z) does NOT support
+                     this; the test fixture detects the probe failure and skips the soak. -->
+                <gc_shards>2</gc_shards>
+                <!-- Fast GC for the integration soak: grace 3s, interval 1s. -->
+                <gc_enabled>1</gc_enabled>
+                <content_addressed_gc_grace_sec>3</content_addressed_gc_grace_sec>
+                <gc_interval_sec>1</gc_interval_sec>
+                <!-- root_shards=4 is sufficient and non-default (tests the value passes through). -->
+                <root_shards>4</root_shards>
+            </disk_cas_gc_sharded>
+        </disks>
+        <policies>
+            <cas_gc_sharded>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_gc_sharded</disk>
+                    </main>
+                </volumes>
+            </cas_gc_sharded>
+        </policies>
+    </storage_configuration>
+</clickhouse>

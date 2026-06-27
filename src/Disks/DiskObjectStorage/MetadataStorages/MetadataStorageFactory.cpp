@@ -247,10 +247,13 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         const uint64_t dedup_cache_bytes = config.getUInt64(config_prefix + ".dedup_cache_bytes", 64ULL << 20);
         const uint64_t dedup_head_first_min_bytes = config.getUInt64(config_prefix + ".dedup_head_first_min_bytes", 1ULL << 20);
         const uint64_t gc_snap_generations_to_keep = config.getUInt64(config_prefix + ".gc_snap_generations_to_keep", 3);
+        /// Phase 4: blob-hash-prefix reducer sharding. Default 1 (single-shard, identical to Phase 1d).
+        /// Creation-time only: the pool's persisted GcState is authoritative on reopen.
+        const uint64_t gc_shards = config.getUInt64(config_prefix + ".gc_shards", 1);
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path,
             global_context, gc_enabled, gc_interval, root_shards, name, dedup_cache_bytes, dedup_head_first_min_bytes,
-            gc_snap_generations_to_keep);
+            gc_snap_generations_to_keep, gc_shards);
 
         return metadata_storage;
     });
