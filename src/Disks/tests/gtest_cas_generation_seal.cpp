@@ -28,6 +28,11 @@ CasCompletionSeal sampleCompletionSeal()
     seal.delete_outcomes.push_back(RunRef{.key = "gc/outcomes/2.0/0", .checksum = UInt128(0x55)});
     seal.trim_cursors["ns1/0"] = 42;
     seal.adoptable = true;
+    /// M2: the completion gen's in-degree runs (recheck fills these; must survive the round trip).
+    seal.blob_target_runs.push_back(RunRef{.key = "gc/gen/7/blob_target/0/0", .checksum = UInt128(0xBEEF)});
+    /// M1: the fold-cursor coverage carried forward so the next round recovers the exact cursor.
+    seal.folded_cursors["ns1/0"] = ShardCoverage{.classification = 2, .folded_token = Token{"tok-c"}, .folded_cursor = 77};
+    seal.folded_cursors["ns1/1"] = ShardCoverage{.classification = 1, .folded_token = Token{}, .folded_cursor = 0};
     return seal;
 }
 }
@@ -84,6 +89,21 @@ TEST(CasCompletionSeal, RoundTripsAllFields)
     EXPECT_EQ(out.delete_outcomes[0].key, "gc/outcomes/2.0/0");
     EXPECT_EQ(out.trim_cursors.at("ns1/0"), 42u);
     EXPECT_TRUE(out.adoptable);
+
+    /// M2: blob_target_runs survive (previously dropped silently).
+    ASSERT_EQ(out.blob_target_runs.size(), 1u);
+    EXPECT_EQ(out.blob_target_runs[0].key, "gc/gen/7/blob_target/0/0");
+    EXPECT_EQ(out.blob_target_runs[0].checksum, UInt128(0xBEEF));
+
+    /// M1: folded_cursors survive so the next round recovers the exact per-shard cursor.
+    ASSERT_EQ(out.folded_cursors.size(), 2u);
+    EXPECT_EQ(out.folded_cursors.at("ns1/0").classification, 2);
+    EXPECT_EQ(out.folded_cursors.at("ns1/0").folded_token.value, "tok-c");
+    EXPECT_EQ(out.folded_cursors.at("ns1/0").folded_cursor, 77u);
+    EXPECT_EQ(out.folded_cursors.at("ns1/1").folded_cursor, 0u);
+
+    /// The whole struct must round-trip exactly (operator== covers every field).
+    EXPECT_EQ(out, in);
 }
 
 TEST(CasCompletionSeal, EncodingIsByteDeterministic)

@@ -61,6 +61,11 @@ struct CasCompletionSeal
     std::vector<RunRef> delete_outcomes;            /// the outcome-log segments this gen wrote
     std::map<String, uint64_t> trim_cursors;        /// "ns/shard" -> the cursor trim ran to
     bool adoptable = false;                         /// gen adoption gated on this (see §Visibility-Split)
+    /// M1: per-(ns,shard) fold cursor coverage carried forward from the round's fold seal at recheck. The
+    /// next round's fold reads its parent cursor from the LATEST seal at snap_generation; after a completed
+    /// round that is THIS completion seal (its fold_seal lives at the parent generation), so the cursor must
+    /// be recoverable here with NO dependence on trim having run (else re-fold from 0 => blob double-count).
+    std::map<String, ShardCoverage> folded_cursors; /// "ns/shard" -> coverage (mirrors CasFoldSeal::per_ns_shard)
     bool operator==(const CasCompletionSeal &) const = default;
 };
 

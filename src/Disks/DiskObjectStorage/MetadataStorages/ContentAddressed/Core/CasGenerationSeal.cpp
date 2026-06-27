@@ -45,6 +45,30 @@ void readRuns(const google::protobuf::RepeatedPtrField<Proto::RunRefProto> & fie
             .checksum = (UInt128(e.checksum_hi()) << 64) | UInt128(e.checksum_lo())});
 }
 
+void addCoverage(google::protobuf::RepeatedPtrField<Proto::FoldShardCoverageProto> * field,
+                 const std::map<String, ShardCoverage> & cov)
+{
+    for (const auto & [key, c] : cov)   /// std::map => sorted => deterministic
+    {
+        auto * e = field->Add();
+        e->set_key(key);
+        e->set_classification(c.classification);
+        e->set_folded_token_type(static_cast<uint32_t>(c.folded_token.type));
+        e->set_folded_token_value(c.folded_token.value);
+        e->set_folded_cursor(c.folded_cursor);
+    }
+}
+
+void readCoverage(const google::protobuf::RepeatedPtrField<Proto::FoldShardCoverageProto> & field,
+                  std::map<String, ShardCoverage> & cov)
+{
+    for (const auto & e : field)
+        cov[e.key()] = ShardCoverage{
+            .classification = static_cast<uint8_t>(e.classification()),
+            .folded_token = Token{e.folded_token_value(), static_cast<TokenType>(e.folded_token_type())},
+            .folded_cursor = e.folded_cursor()};
+}
+
 }
 
 String encodeFoldSeal(const CasFoldSeal & seal)
@@ -123,6 +147,8 @@ String encodeCompletionSeal(const CasCompletionSeal & seal)
         e->set_version(version);
     }
     msg.set_adoptable(seal.adoptable);
+    addRuns(msg.mutable_blob_target_runs(), seal.blob_target_runs);   /// M2
+    addCoverage(msg.mutable_folded_cursors(), seal.folded_cursors);   /// M1
 
     return msg.SerializeAsString();
 }
@@ -149,6 +175,8 @@ CasCompletionSeal decodeCompletionSeal(std::string_view data)
     for (const auto & e : msg.trim_cursors())
         seal.trim_cursors[e.key()] = e.version();
     seal.adoptable = msg.adoptable();
+    readRuns(msg.blob_target_runs(), seal.blob_target_runs);   /// M2
+    readCoverage(msg.folded_cursors(), seal.folded_cursors);   /// M1
     return seal;
 }
 

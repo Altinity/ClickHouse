@@ -228,6 +228,15 @@ message CompletionSealProto {
   repeated RunRefProto delete_outcomes      = 4;       // sorted by key
   repeated SealVersionEntryProto trim_cursors = 5;     // sorted by key
   bool adoptable                            = 6;
+  // M2: the completion (fold-through-fence) generation's in-degree run segments. CasCompletionSeal
+  // declared this field and recheck fills it, but it was never (de)serialized => silent coverage loss.
+  repeated RunRefProto blob_target_runs     = 7;  // sorted by key
+  // M1: the completion gen overwrites the snap_generation pointer with the completion generation, whose
+  // fold_seal lives at the PARENT (fold) generation, not here. Carry the per-(ns,shard) fold cursor
+  // coverage forward so the NEXT round's fold recovers the exact sealed cursor from the LATEST seal at
+  // snap_generation (completion seal => these folded_cursors), independent of whether trim ran. Without
+  // this, sealedCursorOf falls back to 0 and a folded-but-untrimmed event is re-folded => double-count.
+  repeated FoldShardCoverageProto folded_cursors = 8;  // sorted by key
 }
 
 // One condemned object inside a RetiredSetProto.
