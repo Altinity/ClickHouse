@@ -65,3 +65,22 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   fairness (protocol statement already in spec/plan). **Decision: no rev.16, no plan edits required —
   the findings validate the design.** Optional "make these orderings explicit in phase1b/1d" → backlog B2.
 - **Next:** Phase 1a (identity/codecs) via subagent-driven-development + TDD.
+
+### 2026-06-27 — Phase 1a GREEN (verified); B3 baseline established
+- **Phase 1a complete + GREEN.** 8 tasks, 7 commits (`5f1272cc8a7`…`c3a8ce4dfa6`) on
+  `cas-gc-part-manifest-impl`. New: `CasManifestId.h`, `CasFormat.{h,cpp}` (FormatId 12-15 =
+  CAPT/CARN/CAFS/CACS), `CasRunFile.{h,cpp}` + `RunMerger`, `CasManifestCodec.{h,cpp}`
+  (`computePayloadDigest`, `refMatchesBody`/`manifestNamespaceMatches`), `CasLayout.h` `manifestKey` +
+  `_manifests` rejection; 43 new gtests. Build links clean (incremental in `build/`).
+- **Independent verification:** ran the 5 Phase-1a suites myself → 43/43 PASS; ran
+  `CaWiringOps.FreezeViaHardLinksIntoShadow` in isolation → FAILS (confirms it's a real isolated bug,
+  not a test-ordering artifact).
+- **Deviations (sound, contract intact):** `computePayloadDigest` uses `CityHash128` (CAS core has no
+  BLAKE3; the digest is integrity/debug only, never identity — fine); `::String`/`::UInt128` global
+  qualifiers; `RunFileReader` materializes the run incl. header (absolute footer offsets); crc32c
+  linked unconditionally for `CasRunFile.cpp`.
+- **B3 (pre-existing, unrelated):** `CaWiringOps.FreezeViaHardLinksIntoShadow` fails — a freeze/shadow
+  `removeRecursive` bug in the wiring layer; Phase 1a is purely additive and the test's namespace has
+  no `_manifests` segment, so it cannot be caused here. Backlogged B3 (medium). **Sweep-gate working
+  definition for the rest of the run: GREEN = no NEW failures beyond B3** (392/393 with B3 the only red).
+- **Next:** code-review the Phase 1a diff, then Phase 1b.
