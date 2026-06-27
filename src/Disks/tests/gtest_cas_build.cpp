@@ -1213,3 +1213,65 @@ TEST(CasBuild, PrecommitAddRecordCarriesInlineClosure)
 {
     GTEST_SKIP() << "obsolete: closure/JournalRecord/ClosureNode removed; in-degree is folded per-blob from the journal";
 }
+
+/// BUG 1 (WPromote owner==bld): promote is a PURE owner MOVE (Δ=0 — it restores no blob in-degree). The
+/// TLA+ `WPromote` requires the precommit to STILL be the live owner of the ref before the move (`owner[m]
+/// = bld`). If the precommit was removed/reclaimed (an abandon or GC reclaim appended a removal event), a
+/// Δ=0 move would re-publish a committed ref over blobs whose in-degree was already decremented to 0 — GC
+/// then deletes them ⇒ a reachable committed manifest with dangling blobs (INV_NO_DANGLE violation).
+/// promote MUST fail closed (ABORTED) unless the precommit is the current live owner binding of the ref.
+TEST(CasBuild, PromoteFailsClosedWhenPrecommitNoLongerLiveOwner)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
+    const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
+    build->precommitAdd(ns, "part_1", id);
+
+    /// Make the precommit NO LONGER the live owner: append a precommit-REMOVAL RootOwnerEvent on the
+    /// target shard exactly as an abandon / GC reclaim would (old = the precommit binding, new = none).
+    /// We drive the shard manifest CAS directly through the backend codec (the converged model keeps the
+    /// precommit binding in the future committed ref's own shard, keyed by final_ref_name).
+    {
+        const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
+        const String key = s->layout().rootShardKey(ns, shard);
+        const auto got = b->get(key);
+        ASSERT_TRUE(got.has_value());
+        RootShard root = decodeRootShard(got->bytes);
+        ++root.shard_version;
+        root.journal.push_back(RootOwnerEvent{
+            .transition_version = root.shard_version,
+            .old_binding = OwnerBinding{
+                .owner_kind = OwnerKind::Precommit, .ref_name = "part_1",
+                .build_id = build->buildId(), .manifest_ref = id.ref},
+            .new_binding = std::nullopt});
+        ASSERT_EQ(b->casPut(key, encodeRootShard(root), got->token).outcome, CasOutcome::Committed);
+    }
+
+    /// promote must fail closed: the precommit is no longer the live owner, so a Δ=0 move would dangle.
+    expectThrowsCode(DB::ErrorCodes::ABORTED,
+        [&] { build->promote(ns, "part_1", build->buildId(), id); });
+    /// No ref committed.
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+}
+
+/// BUG 1 happy path: a promote whose precommit is STILL the live owner succeeds (the guard must not
+/// reject the normal commit). Distinct from PublishHappyPathRoundTrip in that it pins the WPromote guard.
+TEST(CasBuild, PromoteSucceedsWhenPrecommitIsLiveOwner)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
+    const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
+    build->precommitAdd(ns, "part_1", id);
+
+    EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
+    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
+    EXPECT_EQ(s->resolveRef(ns, "part_1")->manifest_id, id);
+}

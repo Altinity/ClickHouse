@@ -631,12 +631,61 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
     if (!manifestNamespaceMatches(target_ns, body))
         throw Exception(ErrorCodes::ABORTED, "promote: ManifestNamespaceMatches failed for {}", manifest_key);
 
+    /// The OwnerBinding that the create-precommit event installed (precommitAdd). The promote is a pure
+    /// owner MOVE off EXACTLY this binding (spec §Promote Precommit step 5; TLA+ `WPromote` old-binding).
+    const OwnerBinding expected_precommit{
+        .owner_kind = OwnerKind::Precommit, .ref_name = final_ref_name,
+        .build_id = promote_build_id, .manifest_ref = id.ref};
+
     store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
     {
         /// Refresh-then-revalidate (W-REGISTER ordering, load-bearing): if the shard's fence_round
         /// (floored by the registry fence) is ahead of our view, GC advanced — refresh first.
         if (store->retireView().round() < std::max(root.fence_round, registry_fence))
             store->retireView().refresh();
+
+        /// BUG 1 / TLA+ `WPromote` guard (`owner[m] = bld`): a promote is a PURE owner MOVE that emits NO
+        /// blob delta (Δ=0) — it restores no blob in-degree. It is therefore only sound when the precommit
+        /// is STILL the live owner of the ref: if an abandon or GC reclaim already appended a REMOVAL of
+        /// the precommit binding, the blobs' in-degree was already decremented and a Δ=0 move would
+        /// re-publish a committed ref over to-be-deleted blobs ⇒ a dangling committed manifest
+        /// (INV_NO_DANGLE).
+        ///
+        /// The ref's owner state is the model's `owner[m]`; the converged model keeps a precommit owner
+        /// ONLY in the root journal (precommitAdd appends the create-precommit event; it never touches
+        /// `root.refs`). A removal of a precommit is a `new_binding = none` event whose `old_binding`
+        /// names EXACTLY that precommit binding (the encoding shared by `Build::abandon`,
+        /// `Store::dropRef`, and `Gc::reclaimAbandonedPrecommit`). We replay the shard journal exactly as
+        /// the GC fold dispatches it — `old_binding` removes a live binding, `new_binding` installs one —
+        /// to see whether the precommit binding is removed. The create-precommit `new_binding` may already
+        /// be TRIMMED below the sealed fold cursor once GC has activated it (a trimmed-but-still-live
+        /// precommit); a removal event, by contrast, is what makes the precommit no longer the owner. So
+        /// the precommit is the live owner iff replaying the journal does NOT leave the binding removed:
+        /// either it is present in the (untrimmed) live set, or it was trimmed away and no later removal
+        /// for it appears. Any removal of EXACTLY this precommit binding ⇒ fail closed (ABORTED): the
+        /// build must restart.
+        std::vector<OwnerBinding> live;
+        for (const RootOwnerEvent & e : root.journal)
+        {
+            if (e.old_binding)
+                std::erase(live, *e.old_binding);
+            if (e.new_binding)
+                live.push_back(*e.new_binding);
+        }
+        const bool present_in_live = std::find(live.begin(), live.end(), expected_precommit) != live.end();
+        /// A removal of EXACTLY this precommit binding (old = precommit, new = none) anywhere in the
+        /// (untrimmed) journal means it stopped being the owner; only a later re-add (present_in_live)
+        /// restores it.
+        bool seen_removal = false;
+        for (const RootOwnerEvent & e : root.journal)
+            if (!e.new_binding && e.old_binding && *e.old_binding == expected_precommit)
+                seen_removal = true;
+        if (seen_removal && !present_in_live)
+            throw Exception(ErrorCodes::ABORTED,
+                "promote: precommit owner binding for ref '{}' (build {}) was removed (abandon or GC "
+                "reclaim) and is no longer the live owner — failing closed; the build must restart "
+                "(WPromote owner==bld)",
+                final_ref_name, u128ToHex(promote_build_id));
 
         /// Fail-closed blob revalidation of EVERY blob leaf (spec §Promote Precommit step 3). A condemned
         /// blob is recreatable only from this build's own source (INV-1); a missing or condemned blob ⇒
