@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
@@ -372,18 +373,54 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
             reclaimAbandonedPrecommit(ns, root_shard, root, state.round + 1);
     }
 
-    if (!folded_any)
+    if (state.gc_shards == 1)
     {
-        /// Nothing new this round; still seal the (empty-delta) generation so the cursor coverage is
-        /// durable and the resume rule has a fold_seal to key off. Reuse the prior generation's blob run
-        /// (no delta) by sealing a fresh generation whose in-degree equals the parent.
-        foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, /*shard*/0,
-                                 {}, result.fold_seal.blob_target_runs);
+        /// SINGLE-SHARD PATH (gc_shards == 1) — UNCHANGED from Phase 1d. Every blob routes to shard 0,
+        /// so the entire delta stream folds into one `blobTargetRunKey(new_generation, 0, 0)` run. Task 7
+        /// asserts this path reproduces Phase 1d byte-for-byte; keep it isolated and untouched.
+        if (!folded_any)
+        {
+            /// Nothing new this round; still seal the (empty-delta) generation so the cursor coverage is
+            /// durable and the resume rule has a fold_seal to key off. Reuse the prior generation's blob run
+            /// (no delta) by sealing a fresh generation whose in-degree equals the parent.
+            foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, /*shard*/0,
+                                     {}, result.fold_seal.blob_target_runs);
+        }
+        else
+        {
+            foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, /*shard*/0,
+                                     std::move(deltas), result.fold_seal.blob_target_runs);
+        }
     }
     else
     {
-        foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, /*shard*/0,
-                                 std::move(deltas), result.fold_seal.blob_target_runs);
+        /// SHARDED PATH (gc_shards > 1) — target-sharded reducers (spec §Sharding Model). Each blob's
+        /// `BlobDelta` carries its full signed edge stream; `blobShard(blob_hash, gc_shards)` partitions
+        /// the stream into `gc_shards` disjoint buckets. Each bucket folds via its own `ShardReducer`
+        /// into `blobTargetRunKey(new_generation, shard, 0)`. The `RootOwnerEvent`'s paired old/new
+        /// bindings produced the `-1`/`+1` deltas above, so a promote that displaces a blob's owner
+        /// emits BOTH the `-1` (old binding) and the `+1` (new binding) at the SAME source event. This
+        /// is why cross-shard displacement needs no special handling: each delta routes independently and
+        /// deterministically to whichever target shard owns its blob; the old/new pair is solved at the
+        /// source, not by a cross-shard fixup.
+        ///
+        /// Every shard is sealed (even with an empty bucket) so the generation has a complete per-shard
+        /// run set for `zeroInDegree`/`retire` consumers; an empty bucket reuses the parent in-degree.
+        std::vector<std::vector<BlobDelta>> buckets(state.gc_shards);
+        for (BlobDelta & d : deltas)
+            buckets[blobShard(d.blob_hash, state.gc_shards)].push_back(std::move(d));
+
+        for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
+        {
+            /// A reducer owns exactly one disjoint shard. Two replicas may run reducers for DIFFERENT
+            /// shards concurrently (CasGcScheduler ownership); their run-key namespaces never collide.
+            ShardReducer reducer{shard, state.gc_shards};
+            std::vector<RunRef> shard_runs =
+                reducer.reduce(backend, layout, state.snap_generation, new_generation,
+                               std::move(buckets[shard]));
+            for (RunRef & r : shard_runs)
+                result.fold_seal.blob_target_runs.push_back(std::move(r));
+        }
     }
     writePartManifestCleanupBundle(new_generation, /*owner_shard*/0, result.mf_cleanup,
                                    result.fold_seal.part_manifest_cleanup);

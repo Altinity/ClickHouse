@@ -367,3 +367,68 @@ TEST(CasGcShardCleanup, DisjointWorkerCoverage)
     for (uint64_t s = 0; s < kShards; ++s)
         EXPECT_TRUE(seen[s]) << "owner shard " << s << " received no ManifestIds (dead shard)";
 }
+
+/// ---- CoordinatorPlan tests (Phase 4, Task 6) ----
+
+/// The coordinator owns the SINGLE global fence over the whole fence universe; a per-shard fence is
+/// unsafe because a publish into one root shard can protect blobs in any target shard
+/// (Task 1 `SabotageReducerOwnsFence`).
+TEST(CasGcShardCoordinator, SingleGlobalFenceNotPerShard)
+{
+    CoordinatorPlan plan{4};
+    EXPECT_TRUE(plan.hasSingleGlobalFence());
+    EXPECT_FALSE(plan.allowsPerShardFence());
+}
+
+/// Reducer work is lease-free (the lease is work-dedup only); seal and fence are coordinator-only.
+TEST(CasGcShardCoordinator, ReducerWorkIsLeaseFree)
+{
+    CoordinatorPlan plan{4};
+    EXPECT_FALSE(plan.requiresLeaseForReduce());
+    EXPECT_TRUE(plan.requiresCoordinatorForSeal());
+    EXPECT_TRUE(plan.requiresCoordinatorForFence());
+}
+
+/// The sharded fold (gc_shards > 1) partitions a flat `BlobDelta` stream by `blobShard` and folds
+/// each bucket via its own `ShardReducer`, exactly as `Gc::fold` does. This test replicates that
+/// partition-and-reduce step over `gc_shards = 2` and asserts each blob's in-degree lands in its
+/// owning shard's run and nowhere else. (The full two-replica round is covered by Task 8.)
+TEST(CasGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
+{
+    constexpr uint64_t kGcShards = 2;
+    const auto [b0, b1] = makeTwoShardHashes();
+    ASSERT_EQ(blobShard(b0, kGcShards), 0u);
+    ASSERT_EQ(blobShard(b1, kGcShards), 1u);
+
+    /// A flat delta stream as produced by `foldManifestEdges`: b0 net +1 (two +1, one -1), b1 net +1.
+    std::vector<BlobDelta> deltas{
+        BlobDelta{.blob_hash = b0, .delta = +1},
+        BlobDelta{.blob_hash = b1, .delta = +1},
+        BlobDelta{.blob_hash = b0, .delta = +1},
+        BlobDelta{.blob_hash = b0, .delta = -1},
+    };
+
+    /// Partition by blobShard — the exact step the sharded fold runs before reducing.
+    std::vector<std::vector<BlobDelta>> buckets(kGcShards);
+    for (BlobDelta & d : deltas)
+        buckets[blobShard(d.blob_hash, kGcShards)].push_back(d);
+
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+
+    for (uint64_t shard = 0; shard < kGcShards; ++shard)
+    {
+        ShardReducer reducer{shard, kGcShards};
+        reducer.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1,
+                       std::move(buckets[shard]));
+    }
+
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/0, b0), 1)
+        << "b0 must fold into shard-0 with in-degree 1";
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/1, b1), 1)
+        << "b1 must fold into shard-1 with in-degree 1";
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/1, b0), 0)
+        << "b0 must NOT appear in shard-1's run";
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/0, b1), 0)
+        << "b1 must NOT appear in shard-0's run";
+}

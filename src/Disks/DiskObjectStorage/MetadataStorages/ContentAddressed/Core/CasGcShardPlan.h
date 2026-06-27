@@ -149,4 +149,47 @@ private:
     uint64_t gc_shards;
 };
 
+/// Coordinator policy for the sharded GC round (spec §Phase4, §Sharding Model).
+///
+/// In a sharded round (`gc_shards > 1`) the work splits into two roles:
+///
+///   - COORDINATOR (exactly one per round — the lease holder): owns registry-fence, input-seal,
+///     round-visibility, the single GLOBAL fence, and generation-advance. These steps span the whole
+///     fence universe and must NOT be sharded: a publish into one root shard can protect blobs in ANY
+///     target shard, so an independent per-reducer fence is unsafe (Task 1 `SabotageReducerOwnsFence`).
+///     `Gc::fence` therefore stays the single coordinator fence over the entire universe.
+///
+///   - REDUCERS / CLEANUP WORKERS (one per disjoint shard): own ONLY their shard's blob-target reduce
+///     (`ShardReducer`) or part-manifest cleanup (`manifestCleanupShard`). Their key namespaces are
+///     disjoint, so two replicas may reduce DIFFERENT shards concurrently. Reducer work needs NO lease:
+///     the lease is work-dedup only (see `CasGcScheduler`), not a coordination primitive.
+///
+/// `CoordinatorPlan` is a tiny policy object that encodes these invariants for callers and tests; it
+/// holds no durable state and performs no I/O. The booleans are constant for any `gc_shards >= 1`.
+class CoordinatorPlan
+{
+public:
+    explicit CoordinatorPlan(uint64_t gc_shards_) : gc_shards(gc_shards_) {}
+
+    /// One global fence covers the whole fence universe — never one fence per shard.
+    bool hasSingleGlobalFence() const { return true; }
+
+    /// A per-reducer fence is unsafe (cross-shard protection); reducers never fence on their own.
+    bool allowsPerShardFence() const { return false; }
+
+    /// Reducer work is lease-free: the lease is work-dedup only, not a reduce gate.
+    bool requiresLeaseForReduce() const { return false; }
+
+    /// Input-seal (round visibility) is a coordinator-only step.
+    bool requiresCoordinatorForSeal() const { return true; }
+
+    /// The global fence is a coordinator-only step.
+    bool requiresCoordinatorForFence() const { return true; }
+
+    uint64_t shardCount() const { return gc_shards; }
+
+private:
+    uint64_t gc_shards;
+};
+
 }
