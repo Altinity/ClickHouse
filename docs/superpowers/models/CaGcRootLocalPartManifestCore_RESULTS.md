@@ -23,6 +23,7 @@ not vacuous).
 | `stage5_tokendiff` (token-diff discovery: `GDiscoverSkip`/`GDiscoverRead`, `EnableTokenDiff`+`TokenObservable`) | HOLD | 48,552,772 | 8,327,064 | 28s |
 | `stage5_lazytrim` (Phase 3 lazy trim: `EnableLazyTrim`, all-shard fresh fence stays the only behavior; bounded `{n1,n2}`, 1 shared blob, precommit/missing-body off — feasible cross-namespace shared-blob in-degree coverage) | HOLD | 2,046,375,017 | 338,817,903 | ~21m |
 | `stage5_sharding` (Phase 4 target-sharded reducers: `EnableSharding`, `Shards = {s1, s2}`, `Leaders = {L1, L2}`, `Blobs = {b1, b2}` — disjoint-shard concurrent reduce + single-coordinator fence/seal; bounded scope: precommit/missing-body/orphan-sweep/mutable off, `MaxLog = 2`, since the full-feature cross-product does not converge) | HOLD | 8,982,051,323 | 983,917,208 | ~65m |
+| `stage5_retiretoken` (Phase 5 retire-token optimization: `EnableRetireTokenSource`, retire sources `RetiredEntry.token` from the seal-time `storedTok` instead of a per-candidate `backend.head` read; `MaxToken = 3`, `Blobs = {b1, b2}` — re-incarnation room; bounded: precommit/missing-body/orphan-sweep/mutable off, `MaxLog = 2`, since the full-feature copy does not converge) | HOLD | 17,565,591 | 3,529,248 | <1m |
 | `live` (`FairSpec`: `OrphanManifestDebrisDrains` + `NoLeakForever`) | HOLD | 74,147,107 | 17,845,340 | 30m10s |
 
 Invariants proven across stage3/stage4: `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN`,
@@ -31,7 +32,7 @@ Invariants proven across stage3/stage4: `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_
 `NoCommittedDangle`, `BlobInDegreeMatchesActiveManifests`, `FoldedEdgesAreActive`,
 `ManifestActivationMatchesEdges`; property `MonotoneGC`.
 
-## Negative controls (all 27; must VIOLATE the named invariant)
+## Negative controls (all 28; must VIOLATE the named invariant)
 
 | # | Config (`_sab_*`) | Spec control | Result (violated) | Distinct states |
 |---|---|---|---|---|
@@ -63,8 +64,9 @@ Invariants proven across stage3/stage4: `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_
 | 25 | `lazyfenceunsafe` | reuse a STALE parent fence position for a shard that got a publish between discovery and recheck (no all-shard fresh fence) — permanent control: why a lazy fence is deliberately not implemented | `INV_NO_DANGLE` | 24,540,205 |
 | 26 | `reducerownsfence` | a target reducer seals/fences from its OWN shard alone (independent per-shard fence) instead of the single coordinator's global fence — a cross-shard publish races past the stale-low `coordFence` | `INV_NO_DANGLE` | 536,944 |
 | 27 | `crosssharddisplacement` | the scatter drops the displaced old-binding `-1` deltas (infers the old target from the new ref alone) — cross-shard last-op-wins under-counts a blob a surviving cross-shard ref still references | `INV_NO_LOSS` | 762,911 |
+| 28 | `staletokenoverdelete` | the destructive `Land` guard ALSO fires on a stale stored token (`d.t = storedTok[d.b]`) — over-deletes a RE-INCARNATED object's live referenced bytes (Phase 5 retire-token source) | `INV_NO_LOSS` | 20,497 |
 
-No `UNEXPECTED PASS`. All 27 controls (28 cfgs, #16 split a/b) reproduce their named counterexample.
+No `UNEXPECTED PASS`. All 28 controls (29 cfgs, #16 split a/b) reproduce their named counterexample.
 The two Phase-4 controls were run at a reduced scope for a fast counterexample (`reducerownsfence`:
 `Namespaces = {n1, n2}`, `Leaders = {L1}`, `Blobs = {b1}`, `Shards = {s1, s2}`, precommit/missing-body/
 orphan-sweep/mutable off, `MaxLog = 2` — 2 namespaces are REQUIRED so the per-shard-vs-global fence race
@@ -83,7 +85,7 @@ same displaced blob across shards).
 ## Verdict
 
 **SUITE GREEN.** Every positive stage (including Phase 2 `stage5_tokendiff`), the liveness config, and
-all three witnesses behave as required, and all 27 negative controls produce their named counterexample
+all three witnesses behave as required, and all 28 negative controls produce their named counterexample
 with no `UNEXPECTED PASS`. The R0 safety gate is satisfied: `INV_NO_DANGLE`, `INV_NO_LOSS`, and
 `INV_NO_RETURN` are proved by the model (stage3/stage4/stage5_tokendiff), liveness holds under
 `FairSpec`, and the protocol's load-bearing rules are each shown necessary by their sabotage
@@ -184,3 +186,50 @@ cross-shard ref still references. `sab_crosssharddisplacement` (`SabotageCrossSh
 `INV_NO_LOSS`: the dropped old-binding `-1` under-counts a blob still referenced by a surviving cross-shard
 committed ref, and GC over-deletes it. Both produce their counterexample in seconds at the reduced scope noted
 in the negative-controls table.
+
+### Phase 5 — retire-token optimization (source the retired token from the seal, not `backend.head`) {#phase-5-retire-token-optimization}
+
+Phase 5 drops `retire`'s per-candidate `backend.head` read: instead of reading the live head token of every
+in-degree-0 candidate, retire sources the `RetiredEntry.token` from the token OBSERVED and SEALED into the
+generation at fold time. The model adds one variable, `storedTok` (`[Blobs -> 0..MaxToken]`), written ONLY in
+the `GFoldTransition` activation branch (the action that emits the `+1` blob-edge delta into the sealed
+generation): for each newly-edged PRESENT blob it records the current `tokOf[b]`. The write is **GATED on
+`EnableRetireTokenSource`** — when `FALSE` the seal is `storedTok' = storedTok` and the var stays constant 0,
+so every pre-Phase-5 stage keeps its EXACT state space. `RetireTokOf(b) == IF EnableRetireTokenSource THEN
+storedTok[b] ELSE tokOf[b]` is the only place the source changes; `GRetireBlob` keeps the zero-in-degree +
+present guard and the exact-token retired entry. The single destructive site (`Land`) keeps an EXACT token
+match — only its SOURCE moved.
+
+Inertness is proven: with `EnableRetireTokenSource = FALSE`, `stage0` reproduces its EXACT 71,184 / 19,846
+baseline and `stage1` its EXACT 1,659,466 / 402,034 baseline, so the new var is inert and `stage2`/`stage3`/
+`stage4`/`stage5_*`/`live` and every pre-existing control are carried forward unchanged.
+
+`stage5_retiretoken` (positive, `EnableRetireTokenSource = TRUE`, all `Sabotage* = FALSE`, `MaxToken = 3`,
+`Blobs = {b1, b2}` for re-incarnation room) is expected to HOLD `TypeOK` + `INV_NO_DANGLE`/`INV_NO_LOSS`/
+`INV_NO_RETURN` + `RetireTokenSourceComplete`. `RetireTokenSourceComplete` is the monotonicity safety
+statement `e.t <= tokOf[e.b]` for every retired entry: `storedTok[b]` is sealed FROM `tokOf[b]` at fold time
+and `tokOf[b]` is strictly monotone (`WUploadBlob` only mints higher tokens, never wraps), so a retired
+entry's stored-sourced token never exceeds the current head. This is EXACTLY the optimization's safety thesis
+— a stale stored token stays strictly below a re-incarnated (higher) head, so it can only UNDER-match the
+exact-token delete in `Land` (sparing the live bytes — safe) and can NEVER match a re-incarnated object's
+head. (An earlier "current-head OR dead OR inert-zero" form of the invariant was too strict: a present
+in-degree-0 blob that was uploaded but never edged into the generation has `storedTok = 0` and is legitimately
+retired at token 0 — the safe never-match case — which that form rejected; the monotonicity form admits it.)
+
+`sab_staletokenoverdelete` (`SabotageStaleTokenOverDelete = TRUE`) adds the UNSAFE disjunct
+`d.t = storedTok[d.b]` to the `Land` destructive guard, so a stale stored token DOES match a re-incarnated
+object. The reached counterexample: b1 is retired at stored token 1; b1 is re-incarnated to token 2 and a new
+committed ref publishes over it; the stale inflight delete `{b1, t=1}` then lands — `tokOf = 2 ≠ 1`, but
+`d.t = 1 = storedTok[b1]` fires the sabotage disjunct — and GC deletes the still-referenced live b1.
+
+**Deviation from the task brief (oracle invariant).** The brief specified this control should violate
+`INV_NO_RETURN`. With the model's standard exact-token delete semantics it does NOT: the over-delete sets
+`present[b] = FALSE` and condemns the live token, so no PRESENT blob is ever left carrying a dead token (the
+`INV_NO_RETURN` shape `present[b] => tokOf[b] \notin deadTok[b]`). Tokens are strictly monotone per blob
+(`WUploadBlob` requires `nextTok[b] <= MaxToken` and never wraps), so a condemned token can never reappear on
+a present blob without `SabotageReusedTag`. The over-delete instead destroys the live bytes of a blob a
+surviving committed ref still references, which is exactly `INV_NO_LOSS` (and `INV_NO_DANGLE`) — the
+"loses bytes — unsafe" outcome the brief describes in prose. The control is therefore oracled on `INV_NO_LOSS`
+(verified VIOLATED at the minimal scope `Blobs = {b1}`, precommit/missing-body/orphan-sweep/mutable off,
+`MaxToken = 3` — 20,497 distinct states). `RetireTokenSourceComplete` is retained on `stage5_retiretoken` as
+the positive token-accounting invariant for the honest source.
