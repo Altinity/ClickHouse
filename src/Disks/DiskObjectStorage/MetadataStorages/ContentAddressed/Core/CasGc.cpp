@@ -219,10 +219,64 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     std::vector<BlobDelta> deltas;
     bool folded_any = false;
 
+    /// Phase-2 token-diff: compute the per-shard discover decisions ONCE before the shard loop. A Skip
+    /// means the LIST-observed shard token equals the sealed post-fence `folded_token`, so the shard body
+    /// is unchanged since the prior fold and the durable state already covers it — we carry the parent
+    /// coverage forward unchanged and elide the `readShard` body GET. A Read uses the existing fold path
+    /// unchanged. The fence still runs globally on EVERY shard regardless — this skip elides ONLY the body
+    /// read / re-fold, never the fence.
+    ///
+    /// The reference (post-fence tokens + fence positions) comes from the PARENT generation's completion
+    /// seal (recorded by `recheck`). If no completion seal exists (fresh pool, mid-round crash, or pruned
+    /// generation) we walk back for the latest fold seal; if neither exists the empty seal yields all Read.
+    CasFoldSeal discover_ref_seal;
+    std::map<String, uint64_t> discover_fence_positions;
+    if (const auto completion = readCompletionSeal(state.snap_generation))
+    {
+        discover_ref_seal.generation = state.snap_generation;
+        discover_ref_seal.per_ns_shard = completion->folded_cursors;
+        discover_fence_positions = completion->fence_positions;
+    }
+    else
+    {
+        for (uint64_t g = state.snap_generation; g > 0; --g)
+        {
+            if (const auto opt = readFoldSeal(g))
+            {
+                discover_ref_seal = *opt;
+                break;
+            }
+        }
+    }
+    const std::map<String, DiscoverDecision> discover_decisions =
+        computeDiscoverDecisions(discover_ref_seal, discover_fence_positions);
+
     for (const auto & [ns, root_shard] : result.root_shards)
     {
-        const auto [root, manifest_token] = store->readShard(ns, root_shard);
         const String cursor_key = cursorKey(ns, root_shard);
+
+        /// Phase-2 token-diff skip: carry the parent coverage forward (classification 1 = Unchanged,
+        /// same folded_token + folded_cursor) and skip the body GET. The default below is Read, so a
+        /// missing decision or missing parent coverage falls through to the existing read path (fail
+        /// closed — the spec, not a hidden fallback).
+        {
+            const auto dec_it = discover_decisions.find(cursor_key);
+            if (dec_it != discover_decisions.end() && dec_it->second == DiscoverDecision::Skip)
+            {
+                const auto parent_it = parent_cursors.find(cursor_key);
+                if (parent_it != parent_cursors.end())
+                {
+                    ShardCoverage carried = parent_it->second;
+                    carried.classification = 1;   /// Unchanged: token matched persisted; body read skipped
+                    result.fold_seal.per_ns_shard[cursor_key] = carried;
+                    continue;
+                }
+                /// Skip decided but parent coverage absent (should not happen — `computeDiscoverDecisions`
+                /// requires prior coverage for Skip). Fail closed: fall through to the Read path below.
+            }
+        }
+
+        const auto [root, manifest_token] = store->readShard(ns, root_shard);
         const auto cursor_it = parent_cursors.find(cursor_key);
         const uint64_t cursor = cursor_it != parent_cursors.end() ? cursor_it->second.folded_cursor : 0;
 
@@ -566,12 +620,21 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     /// throw on a 404 (record-and-continue). mf_cleanup additions here are spare-side only.
     std::vector<BlobDelta> window;
     std::map<ManifestId, Token> recheck_cleanup;
+    /// Phase-2 token-diff: capture each shard's POST-FENCE token (recheck runs AFTER fence in the
+    /// canonical round order, so `readShard` below observes the token the fence's per-shard `mutateShard`
+    /// produced). This is recorded into the completion seal's `folded_cursors[ck].folded_token` so the
+    /// NEXT round's discover can compare a listed token against it and skip an unchanged shard. It is the
+    /// post-fence (NOT post-trim) token by design: trim runs after recheck, so a shard trim mutates this
+    /// round is conservatively Read next round (a 1-round settle); see `computeDiscoverDecisions`.
+    std::map<String, Token> post_fence_tokens;
     for (const auto & [cursor_key, fence_version] : fence_it->second)
     {
         if (cursor_key == "_registry")
             continue;
         const auto [ns, shard] = parseCursorKey(cursor_key);
         const auto [root, tok] = store->readShard(ns, shard);
+        if (tok.has_value())
+            post_fence_tokens[cursor_key] = *tok;
         const auto cov_it = folded.fold_seal.per_ns_shard.find(cursor_key);
         const uint64_t lo = cov_it != folded.fold_seal.per_ns_shard.end() ? cov_it->second.folded_cursor : 0;
         for (const RootOwnerEvent & e : root.journal)
@@ -743,6 +806,18 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     /// exact per-(ns,shard) folded_cursor from the latest seal at snap_generation, with NO dependence on
     /// trim having run (a folded-but-untrimmed event must not be re-folded => no blob in-degree double-count).
     folded.completion_seal.folded_cursors = folded.fold_seal.per_ns_shard;
+    /// Phase-2 token-diff: overwrite each shard's `folded_token` with the POST-FENCE token observed at
+    /// recheck time (captured above). The fold-seal token is the FOLD-time token; the fence (which runs
+    /// between fold and recheck) bumped it via `mutateShard`. Recording the post-fence token here is the
+    /// reference the next round's `discoverDecisionsForTest`/`computeDiscoverDecisions` compares the
+    /// listed token against. A shard whose token did not change since this point (no writer publish and
+    /// no trim mutation) is safely skippable next round.
+    for (auto & [ck, cov] : folded.completion_seal.folded_cursors)
+    {
+        const auto tok_it = post_fence_tokens.find(ck);
+        if (tok_it != post_fence_tokens.end())
+            cov.folded_token = tok_it->second;
+    }
     {
         const String body = encodeCompletionSeal(folded.completion_seal);
         const String key = layout.completionSealKey(completion_generation);
@@ -956,6 +1031,130 @@ std::vector<uint64_t> Gc::shardsToVisit(const RootNamespace &)
     for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
         shards.push_back(shard);
     return shards;
+}
+
+std::map<String, Token> Gc::listRootShardTokens()
+{
+    std::map<String, Token> result;
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+
+    const String prefix = layout.rootsPrefix();
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
+        for (const ListedKey & lk : page.keys)
+        {
+            if (lk.token.has_value())
+                result[lk.key] = *lk.token;
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    return result;
+}
+
+std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
+    const CasFoldSeal & sealed,
+    const std::map<String, uint64_t> & fence_positions)
+{
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+
+    /// Universe is ALWAYS the REGISTRY universe (registry authority) — LIST is only an accelerator and can
+    /// never remove a shard from the set. Default decision is Read (fail closed; the spec, not a fallback).
+    std::map<String, DiscoverDecision> decisions;
+    const std::vector<std::pair<RootNamespace, uint64_t>> universe = discoverUniverse();
+    for (const auto & [ns, shard] : universe)
+        decisions[cursorKey(ns, shard)] = DiscoverDecision::Read;
+
+    if (!backend.supportsListTokens())
+        /// No token information available from LIST — every shard must be read (already defaulted to Read).
+        return decisions;
+
+    /// ONE LIST sweep — the accelerator. Map the full backend keys to cursor-key form ("ns/shard") by
+    /// stripping the roots prefix (`rootShardKey` == rootsPrefix() + "ns/shard"), so they line up with
+    /// `per_ns_shard`. Non-shard keys under `roots/` (e.g. `_files/`, `_manifests/`) cannot match a
+    /// registry-universe cursor key, so they are harmless.
+    const std::map<String, Token> listed = listRootShardTokens();
+    const String roots_prefix = layout.rootsPrefix();
+    std::map<String, Token> listed_by_cursor_key;
+    for (const auto & [full_key, token] : listed)
+    {
+        if (full_key.starts_with(roots_prefix))
+            listed_by_cursor_key[full_key.substr(roots_prefix.size())] = token;
+    }
+
+    for (const auto & [ns, shard] : universe)
+    {
+        const String ck = cursorKey(ns, shard);
+
+        const auto sealed_it = sealed.per_ns_shard.find(ck);
+        if (sealed_it == sealed.per_ns_shard.end())
+            continue;   /// no prior coverage (new shard since last round) => Read (already defaulted)
+
+        /// CLAMP guard: if the previous fold was barrier-clamped, the cursor sits below the fence-time
+        /// shard_version and unfolded events may exist (or may become foldable). `fence_position` is the
+        /// shard_version AFTER fence (+1 over the fold position), so fully-folded => cursor == fence_pos - 1
+        /// and clamped => cursor + 1 < fence_pos. A clamped shard is forced Read.
+        const auto fence_it = fence_positions.find(ck);
+        if (fence_it != fence_positions.end() && fence_it->second > 0)
+        {
+            const uint64_t fence_pos = fence_it->second;
+            if (sealed_it->second.folded_cursor + 1 < fence_pos)
+                continue;   /// clamped => Read (already defaulted)
+        }
+
+        const auto listed_it = listed_by_cursor_key.find(ck);
+        if (listed_it == listed_by_cursor_key.end())
+            continue;   /// shard not visible in LIST (absent / key format differs) => Read (defaulted)
+
+        /// Skip IFF the listed token equals the sealed post-fence `folded_token` exactly.
+        if (listed_it->second == sealed_it->second.folded_token)
+            decisions[ck] = DiscoverDecision::Skip;
+    }
+
+    return decisions;
+}
+
+std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
+{
+    /// WRITE-FREE: load the reference tokens from durable state and return the decisions the next round's
+    /// discover would make. No CAS, no delete, no fold.
+    const auto state_bytes = store->backend().get(store->layout().gcStateKey());
+    if (!state_bytes)
+        /// Fresh pool: no sealed state. `computeDiscoverDecisions` over an empty seal yields all Read.
+        return computeDiscoverDecisions(CasFoldSeal{}, {});
+
+    const GcState state = decodeGcState(state_bytes->bytes);
+
+    /// Prefer the parent generation's completion seal — its `folded_cursors` carry the post-fence tokens
+    /// (recorded by `recheck`) that the next round's LIST compares against, plus `fence_positions` for the
+    /// clamp guard. Fall back to the latest fold seal for a mid-round state (a Skip cannot fire there:
+    /// the fold seal carries fold-time tokens and no fence positions, so the token comparison fails Read).
+    CasFoldSeal ref_seal;
+    std::map<String, uint64_t> fence_positions;
+    if (const auto completion = readCompletionSeal(state.snap_generation))
+    {
+        ref_seal.generation = state.snap_generation;
+        ref_seal.per_ns_shard = completion->folded_cursors;
+        fence_positions = completion->fence_positions;
+    }
+    else
+    {
+        for (uint64_t g = state.snap_generation; g > 0; --g)
+        {
+            if (const auto opt = readFoldSeal(g))
+            {
+                ref_seal = *opt;
+                break;
+            }
+        }
+    }
+
+    return computeDiscoverDecisions(ref_seal, fence_positions);
 }
 
 std::vector<Gc::PreviewEntry> Gc::previewDeletes()

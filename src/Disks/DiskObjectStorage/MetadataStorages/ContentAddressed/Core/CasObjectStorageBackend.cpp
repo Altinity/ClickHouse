@@ -582,6 +582,11 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
         ListedKey lk;
         lk.key = child->relative_path.substr(strip.size());
         lk.size = child->metadata ? child->metadata->size_bytes : 0;
+        /// Surface the per-key incarnation token (matching what `head` would return, see above) so the
+        /// `supportsListTokens() == true` capability is honest. A listing without an etag leaves the
+        /// token unset, which GC discover treats as Read (fail closed).
+        if (child->metadata && !child->metadata->etag.empty())
+            lk.token = Token{child->metadata->etag, TokenType::ETag};
         all.push_back(std::move(lk));
     }
     std::sort(all.begin(), all.end(), [](const ListedKey & a, const ListedKey & b) { return a.key < b.key; });

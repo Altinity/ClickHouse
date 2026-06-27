@@ -82,6 +82,22 @@ public:
     /// harmless — the next pulse retries). Touches NO Gc instance state. Static by design.
     static void pulseHeartbeat(Store & store, UInt128 gc_id);
 
+    /// Phase-2 token-diff: whether the next round's discover step should skip the body read for a
+    /// root shard (the listed token equals the persisted folded token, so durable state covers it)
+    /// or must read and re-fold the body (token advanced, missing, or no prior coverage).
+    enum class DiscoverDecision : uint8_t
+    {
+        Skip = 0,   /// listed token == sealed folded_token => body already covered; skip the GET
+        Read = 1,   /// token advanced / missing / no prior coverage / !supportsListTokens => must read
+    };
+
+    /// WRITE-FREE TEST SEAM: the per-shard discover decisions the NEXT round would make, derived from
+    /// the durable sealed `folded_token` (recorded by `recheck` from the POST-FENCE shard token) plus a
+    /// single LIST sweep over the roots prefix. Returns a map keyed by "ns/shard" (the same format as
+    /// `CasFoldSeal::per_ns_shard`). The universe is always the REGISTRY universe — LIST cannot shrink it
+    /// (registry authority). No CAS, no delete, no fold. Mirrors the write-free contract of `previewDeletes`.
+    std::map<String, DiscoverDecision> discoverDecisionsForTest();
+
     /// One previewed deletion the next regular round would make, with the reason it is eligible.
     struct PreviewEntry
     {
@@ -214,6 +230,27 @@ private:
     /// Discover the namespace universe from the registry (namespaces x ALL root_shards shards); shared by
     /// the fold and the resume re-fence. Absent registry => empty (fresh pool).
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverse();
+
+    /// Phase-2 token-diff: do ONE LIST sweep over `<prefix>/roots/` and return, for each listed key
+    /// whose backend surfaced an incarnation token, that token. Only meaningful when
+    /// `supportsListTokens()` is TRUE; the result is an accelerator — a missing key here means Read
+    /// (fail closed). Key format: the full backend key (e.g. `p/roots/ns/0`); callers strip the roots
+    /// prefix to get the "ns/shard" cursor-key form when looking up in `per_ns_shard`.
+    std::map<String, Token> listRootShardTokens();
+
+    /// Phase-2 token-diff: compute the per-shard `DiscoverDecision` for the upcoming round. The universe
+    /// is ALWAYS the REGISTRY universe (LIST is only an accelerator and can never remove a shard). The
+    /// default decision is Read (fail closed; the spec, not a hidden fallback). A shard is Skip IFF:
+    ///   `supportsListTokens()` is TRUE, AND
+    ///   `sealed.per_ns_shard` has prior coverage for the key, AND
+    ///   the LIST sweep surfaced a token for the key, AND
+    ///   that listed token == the sealed `folded_token` (the post-fence token recheck recorded), AND
+    ///   the shard is NOT clamped: if `fence_positions` has the key with `fence_pos > 0` and
+    ///   `folded_cursor + 1 < fence_pos`, the previous fold was barrier-clamped (unfolded events may
+    ///   exist) => forced Read.
+    std::map<String, DiscoverDecision> computeDiscoverDecisions(
+        const CasFoldSeal & sealed,
+        const std::map<String, uint64_t> & fence_positions);
 
     /// The shard numbers GC must visit for a namespace: the static fan-out [0, root_shards) (every
     /// namespace — table AND precommit — uses it). The fence mints fence-only manifests for absent ones.
