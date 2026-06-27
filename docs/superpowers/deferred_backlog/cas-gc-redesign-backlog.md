@@ -77,25 +77,90 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
     balanced; only stale doc-comment mentions of removed methods remain. Does NOT compile yet — blocked on
     `CasStore.h` still carrying `RefPayload`/`TreeId tree_id`/`readTree` (1c).
 
-  REMAINING (resume in order):
-  1. **1c T1-T5** — `CasStore.{h,cpp}`: `Resolved.manifest_id` (drop tree fields → `manifest_size`);
-     `resolveRef`→`ManifestId{ns, RootRef.manifest_ref}`; `readManifest` replaces `readTree`
-     (manifestKey→get→decode→`refMatchesBody`/`manifestNamespaceMatches`, fail-closed); `lookupPath`/
-     `listDirectory`; `(ManifestId,Token)` cache replaces tree_cache; `locate(ManifestEntry)`; swap
-     `CasTreeCodec.h` include; `updateRefPayload` mutates a `RootRef`; convert `dropRef`/`dropNamespace`/
-     publish-side `mutateShard` callers in `CasStore.cpp` from `JournalRecord` to `RootOwnerEvent` (drop =
-     old committed binding / new none). Then wire `ContentAddressedMetadataStorage.{h,cpp}`.
-  2. **1b T6** — `ContentAddressedTransaction::republishRef` → fresh dst manifest over shared blobs.
-  3. **1d T3-T8** — `CasGc.{h,cpp}` fold over the `RootOwnerEvent` journal (owner-move/removal/activation
-     + fold barrier #23), `foldManifestEdges`, wire `CasBlobInDegree`+`CasGenerationSeal` (FoldSeal/
-     CompletionSeal resume rule), `CasOrphanManifestSweep.{h,cpp}`, `CasGcFormats` snap_*→generation
-     pointer; DELETE `CasGcSnap.*`/`CasTreeCodec.*`/`CasClosureWalk.*`, prune `FormatId::Tree`/`GcSnap`.
-  4. **1d T9** `CasFsck` audit; **1d T8** rewrite/delete obsolete gtests + `cas_test_helpers.h`
-     (`publishRaw`→RootRef, add `writeManifestRaw`); write the new TDD gtests from the plans.
-  5. **Gate** — `unit_tests_dbms` links; `--gtest_filter='Cas*:Ca*'` green except known B3.
+  NOW ALSO DONE (committed run 2, 2026-06-27):
+  - **1c (all) — DONE.** `CasStore.{h,cpp}`: `Resolved.manifest_id` (+ `manifest_size`, set 0 — `RootRef`
+    carries no size; the wiring derives per-file sizes from `ManifestEntry.blob_size`/`inline_bytes`);
+    `resolveRef`/`listRefs` build `ManifestId{ns, RootRef.manifest_ref}`; `readManifest` replaces
+    `readTree` (HEAD→`(ManifestId,Token)` cache→get→`decodePartManifest`→`refMatchesBody`/
+    `manifestNamespaceMatches`, fail-closed missing/mismatch); `lookupPath`/`listDirectory` over
+    canonical-path entries; `locate(const ManifestEntry&)` (Blob only; no Subtree); `manifest_cache`
+    (`ManifestCacheKey{ManifestId,Token}` + a `ManifestCacheKeyHash` hashing the token's value+type, since
+    there is no `std::hash<Token>`); `CasTreeCodec.h` include swapped for `CasManifestCodec.h`/
+    `CasManifestId.h`; `updateRefPayload` mutator takes `RootRef`; `dropRef`/`dropNamespace` append removal
+    `RootOwnerEvent`s (old committed binding / new none). NOTE: `EntryPlacement` (not `Placement`) is the
+    1a enum name; `RootRef` has `published_at_ms` but NO `manifest_size`. `ContentAddressedMetadataStorage`
+    read helpers rewired to `resolveRouted -> (Resolved, PartManifest)` + `lookupPath`/`listDirectory`.
+    Commit: "CA GC phase1c: read path over root-local part manifests".
+  - **1b T6 + write-path wiring — DONE.** `ContentAddressedTransaction.{h,cpp}`: `PartStaging.entries` is
+    `ManifestEntry`; ALL entry-field accesses migrated (`name`→`path`, `file_hash`→`blob_hash`,
+    `file_size`→`blob_size`, `Placement`→`EntryPlacement`, Subtree dropped). `publishStaging` uses the new
+    write path `stageManifest → precommitAdd → putBlob → promote` (was stageTree/precommit/
+    uploadStagedTree/publish); `updateRefPayload` mutator → `RootRef`. `republishRef` (T6) reads src
+    manifest entries, `stageManifest` a fresh dst over the SAME blob hashes, `precommitAdd`+`promote`,
+    `dropRef` src. `createHardLink` carry-forward reads the src manifest + `adoptEvidence` (was
+    `adoptFromTree`). Exchange `getPartTreeId`/`adoptPart` (`ContentAddressedMetadataStorage.cpp`) made
+    fail-closed/no-offer (manifests are per-instance ⇒ no shared content-addressed id to transmit; sender
+    streams bytes — the documented fallback). Manifest-era relink = new backlog **B7**.
+    Commit: "CA GC phase1b T6 + write-path wiring: transaction over part manifests".
 
-  Isolated TDD gtests for the committed 1b/1d pieces are WRITTEN but NOT YET RUN (link blocked); the old
-  `gtest_cas_build*.cpp` still use the pre-switch API and must be rewritten in step 4.
+  REMAINING (resume in order) — this is the 1d CORE, NOT yet started; build still RED:
+  1. **1d T3-T8 — `CasGc.{h,cpp}` (the big one, ~2113 lines).** Still entirely on the snap/closure model:
+     every method takes `std::map<uint64_t, GcSnap>&` (`fold`, `foldShardRecords`, `recheck`, `trim`,
+     `cascadeAndPersist`, `assertSnapJournalCoherent`, `persistGenerationProbingUpward`, `loadSnap`).
+     Rewrite `fold` over the single ordered `RootOwnerEvent` journal (owner-move ⇒ no delta/no cleanup;
+     true removal ⇒ −1 + cleanup; activation ⇒ +1 subject to fold barrier #23 — don't advance the cursor
+     past a live missing-body precommit; context-specific 404 = clamp+record, never wedge); add
+     `foldManifestEdges`; wire `CasBlobInDegree` (EXISTS, 1d T2) + `CasGenerationSeal` (EXISTS, 1d T1:
+     `CasFoldSeal` at fold / `CasCompletionSeal` at completion, resume keys off which seal exists); create
+     `CasOrphanManifestSweep.{h,cpp}` (per-namespace, sealed owner view, `sweepEligible` from a durable
+     watermark fact per OQ6, exact-token, no blob deltas); `CasGcFormats` `snap_*`→generation pointer;
+     DELETE `CasGcSnap.*` (479), `CasTreeCodec.*` (170), `CasClosureWalk.*` (43) + their machinery
+     (cascade, `children_by_tree`, expansion markers, resident snap); prune `FormatId::Tree`/`GcSnap` +
+     magics in `CasFormat.{h,cpp}` (1d T1 left this enum prune pending). PRESERVE rev.15 invariants:
+     exact-token delete only, global-then-shard fence, fold-through-fence recheck, `ViewableRound`,
+     `deadTok`/no-return, never-GET-a-condemned-blob, GC never throws on a 404 during fold/sweep.
+  2. **1d T9** `CasFsck` read-only manifest audit (OQ8: owner-visible missing body ⇒ error; reclaimable
+     pre-precommit body ⇒ info; same sealed-owner-view + eligibility as the sweep). `CasFsck.cpp` (194)
+     still tree-based.
+  3. **1d T8 (tests)** rewrite/delete obsolete gtests (`gtest_cas_gc_snap.cpp`, `gtest_cas_tree_id.cpp`,
+     `gtest_cas_closure_walk.cpp`, old `gtest_cas_build*.cpp`, `gtest_cas_gc_*`, `gtest_cas_store.cpp`,
+     `gtest_cas_codecs.cpp` tree blocks, `gtest_cas_protocol_scenarios.cpp` tree_size cases,
+     `gtest_cas_gc_leak.cpp` adopt-by-tree) + adapt `cas_test_helpers.h` (`publishRaw`→`RootRef`/
+     `RootOwnerEvent`; add `writeManifestRaw`). Write the new TDD gtests the plans specify
+     (`CasGcFold`, `CasOrphanManifestSweep`, `CasStore` readManifest, `CasBuild` promote fail-closed). NOTE
+     the isolated 1b/1d gtests written in run 1 are still UNRUN (link blocked) and the read-path 1c gtests
+     in the 1c plan (`CasStore.ResolveReturnsManifestId`, `.ReadManifestValidatesBodyAndFailsClosed`,
+     `.LookupAndListOverManifestEntries`, `.ManifestCacheIsKeyedByIdAndToken`) are NOT yet written —
+     `cas_test_helpers.h` lacks the `RootRef` `publishRaw` overload + `writeManifestRaw`.
+  4. **Gate** — `unit_tests_dbms` links; `--gtest_filter='Cas*:Ca*'` green except known B3.
+
+  WHY STOPPED HERE: 1c + 1b T6 + write-path are clean committed boundaries (each migrated file has zero
+  non-comment references to the removed types — verified by grep). The 1d CasGc rewrite is a large,
+  safety-critical, TLA+-grounded rewrite of ~2100 lines that must preserve INV_NO_DANGLE/NO_LOSS/NO_RETURN
+  and the fold-barrier #23 semantics; it deserves its own focused run rather than a rushed pass. Files
+  touching removed types now (verified by non-comment grep): only `Core/CasGc.{h,cpp}`,
+  `Core/CasFsck.cpp`, `Core/CasGcSnap.*`, `Core/CasClosureWalk.*`, `Core/CasTreeCodec.*`, and the gtests.
+  (`Core/CasBuild.cpp`, `PartPathParser.h`, `ContentAddressedWriteBuffers.h`,
+  `ContentAddressedMetadataStorage.h` are CLEAN. `Core/CasPlacement.h` — the dead tree-era `visitPlacement`
+  helper — was DELETED this run and its only include, in `CasBuild.cpp`, removed.)
+
+- **B7 — cross-server part relink in the part-manifest model (feature regression to restore).**
+  Severity: medium (a fetch-path optimization, not a correctness issue — the byte-fetch fallback is
+  always correct). Where: `IContentAddressedExchange` (`ContentAddressedExchange.h`), its impl in
+  `ContentAddressedMetadataStorage.cpp` (`getPartTreeId`/`adoptPart`), and the caller
+  `src/Storages/MergeTree/DataPartsExchange.cpp` (~`:245`, `:1104`). What: the old relink transmitted a
+  CONTENT-ADDRESSED tree id the receiver could `adoptTree`-then-`publish`, because trees were shared by
+  content hash across servers. In the rev. 15 redesign a part is a PER-INSTANCE single-owner `ManifestId`
+  — there is no shared content-addressed id to transmit. During the behavior switch (run 2) `getPartTreeId`
+  was made to return `nullopt` (no offer ⇒ sender streams bytes, the documented fallback) and `adoptPart`
+  to throw `NOT_IMPLEMENTED` (unreachable while no offer is made). Why-deferred: a correct manifest-era
+  relink is an INTERFACE rework (the wire must carry the manifest's blob hashes/sizes, not one id; the
+  receiver `stageManifest`s its OWN manifest over the transferred blob hashes, `adoptEvidence` each, then
+  `precommitAdd`+`promote`), spanning `IContentAddressedExchange`, the impl, and `DataPartsExchange` — out
+  of scope for the GC switch plans. Until then replication of CA parts falls back to byte streaming (slower
+  but correct). The `gtest_ca_wiring.cpp` relink tests (`getPartTreeId`/`adoptPart`, ~`:912`–`:1033`) and
+  `gtest_cas_gc_leak.cpp`'s adopt-by-tree must be rewritten or removed for B7 (and meanwhile they fail to
+  compile against the new exchange impl — they are part of the 1d T8 gtest rewrite).
 
 ## Resolved
 
