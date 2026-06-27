@@ -513,3 +513,19 @@ didn't drive):
 - `0c3fc15d3da`: `RoundReport.manifests_deleted` → `system.content_addressed_garbage_collection_log` column
   + round-summary log line. Blob vs manifest deletes counted separately. Known minor gap: crash-resume path
   doesn't increment it (rare). `CasGc*` 80 pass / 3 skip / 0 fail. Remaining backlog: B7 (assess), B12, B3.
+
+### 2026-06-27 — Backlog sweep outcome; B7 + B12 assessed as optimization-decisions
+- Contained backlog work DONE: B8 (reclaim, `b43001fa42d`), B11 (manifests_deleted, `0c3fc15d3da`),
+  B14 (decided=keep HEAD), B15 (overview disclaimer), B13 (resolved via RustFS soak). Plus the 3 HIGH
+  protocol bugs (promote/abandon/recheck-shard) from the review passes. Full `Cas*:Ca*` 375 pass / 5 skip /
+  1=B3.
+- **B7 (cross-server relink) — recommend DELIBERATE handling, NOT autonomous overnight.** It is a
+  multi-subsystem FEATURE rework on the critical replication path (`DataPartsExchange` + exchange iface),
+  an OPTIMIZATION (byte-streaming fallback is correct), needs two-server integration validation, and has a
+  wire-format design dimension. Blast radius + no correctness pressure ⇒ wants the maintainer's go-ahead.
+- **B12 (one-round token-diff skip) — recommend DEFER (same call as B14).** Marginal win (extra reads only
+  during post-activity settling; steady state already optimal) vs a model extension + ~1-2h re-green + a
+  delicate round-structure change (a prior reorder attempt was unsafe/reverted). Correctness already holds.
+- Net: every CONTAINED, clear-win, correctness-or-cheap item is done + verified. The two remaining are
+  optimizations whose realization cost/risk argues for a maintainer decision, consistent with B14. Also
+  open: B3 (pre-existing, unrelated freeze test). PR: not opened (maintainer's call).

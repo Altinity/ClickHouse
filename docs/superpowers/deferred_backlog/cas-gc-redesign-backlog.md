@@ -182,7 +182,16 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   API plus an optional B170 event re-add. A clean resumable boundary per the run brief. No product code
   references any removed type (verified: only the 12 listed gtests do).
 
-- **B7 — cross-server part relink in the part-manifest model (feature regression to restore).**
+- **B7 — ASSESSED 2026-06-27: recommend DELIBERATE handling, not an autonomous overnight rework.** This is
+  not a bugfix — it is a multi-subsystem FEATURE rework on the critical replication path
+  (`IContentAddressedExchange` + impl + `DataPartsExchange`): the old relink shipped a shared
+  content-addressed TREE id that does not exist in the per-instance `ManifestId` model, so the wire format
+  AND receiver flow must be redesigned (receiver `stageManifest`s its own manifest over transferred blob
+  hashes → `adoptEvidence` → `precommitAdd`+`promote`). It is an OPTIMIZATION — byte-streaming fallback is
+  always correct — and needs two-server INTEGRATION validation (the ca-soak/RustFS harness can do it). Given
+  the blast radius (replication) + design dimension + no correctness pressure, this warrants the maintainer's
+  explicit go-ahead on approach/timing rather than a backlog-sweep implementation. Original finding below.
+- **B7 (original) — cross-server part relink in the part-manifest model (feature regression to restore).**
   Severity: medium (a fetch-path optimization, not a correctness issue — the byte-fetch fallback is
   always correct). Where: `IContentAddressedExchange` (`ContentAddressedExchange.h`), its impl in
   `ContentAddressedMetadataStorage.cpp` (`getPartTreeId`/`adoptPart`), and the caller
@@ -279,7 +288,15 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   `report.deleted` (and rename it to reflect "objects" = blobs + manifests). Low priority — operators with
   the event log can already reconstruct the true count; this only de-confuses the at-a-glance summary.
 
-- **B12 — optimal one-round token-diff skip (current Phase-2 impl is conservative).** The Phase-2
+- **B12 — ASSESSED 2026-06-27: recommend DEFER (same call as B14).** Marginal perf win (saves one shard
+  read only during the brief post-activity SETTLING; steady-state quiescent shards already skip every round
+  under the conservative impl) at the cost of a TLA+ model EXTENSION (prove the discovery token may advance
+  on GC's own per-round writes + a new sabotage + a full ~1-2h suite re-green) AND a delicate round-structure
+  change (post-round token snapshot or seal-after-trim — a prior reorder attempt was UNSAFE and reverted).
+  Correctness already holds (conservative skip ⊆ model-proven-safe). Cost/benefit mirrors B14 (deferred):
+  not worth the realization cost unless profiling shows the settling-burst extra reads matter. Original
+  finding below.
+- **B12 (original) — optimal one-round token-diff skip (current Phase-2 impl is conservative).** The Phase-2
   token-diff skip compares the root-shard object's backend token surfaced via `Backend::list`
   (`ListedKey.token`). That token is bumped by GC's OWN per-round writes: `fence` calls `mutateShard`
   on every shard every round, and `trim` calls `mutateShard` when a shard has trimmable events. The
