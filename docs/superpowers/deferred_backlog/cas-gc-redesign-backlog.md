@@ -42,6 +42,14 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   defaulted `operator<=>`; could be `std::tie(root_namespace, ref) < std::tie(...)`. Equivalent and
   correct; cosmetic. Deferred.
 
+- **B5 — phase1b/1c plans' standalone "build + sweep green" steps are unachievable (cross-cutting build).**
+  Severity: low (doc/process). The behavior switch 1b+1c+1d is atomic on the build: removing
+  `JournalRecord`/`ClosureNode` in 1b breaks `CasStore`/`CasGc` until 1c/1d rewrite them. The 1b and 1c
+  plans each end with a "build + full Cas*:Ca* sweep" step that cannot pass in isolation. Handled in
+  execution by running 1b+1c+1d as one unit with the green gate after 1d. Plan-doc polish: reword the
+  1b/1c "build+sweep" steps to "compiles as part of the 1b+1c+1d switch; green sweep gated after 1d."
+  Deferred: execution already accounts for it; documentation-only.
+
 ## Resolved
 
 (none yet)

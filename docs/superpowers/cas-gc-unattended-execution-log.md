@@ -101,3 +101,19 @@ Each behavior-changing phase exits on a green `Cas*`/`Ca*` gtest sweep; soak aft
   is `CityHash128` (CAS has no BLAKE3; digest is integrity-only). Corrected 5 spots in overview +
   phase1a so 1b reads an accurate contract. **N3→backlog B4** (operator< cosmetic). N5 (CMake) verified fine.
 - **Verdict:** proceed to 1b only after the fixer lands GREEN (re-verify the negative tests myself).
+
+### 2026-06-27 — RunFile blocker FIXED+verified; Phase 1a CLOSED; behavior switch dispatched
+- Fixer `ceb77aa56bc`: `loadFooter` now verifies the footer CRC first + bounds-checks every read →
+  `CORRUPTED_DATA` (no UB, no escaping `std::exception`); `loadBlock` hardened; 6 negative tests added
+  (empty/garbage/corrupt-footer_len/corrupt-block_count/truncation-sweep + manifest truncation sweep).
+- **Independently verified:** `CasRunFile.*:CasManifestCodec.*` → 27/27 PASSED, exit 0, **0 aborts**,
+  9 fail-closed/truncation tests OK. **Phase 1a fully GREEN + closed.**
+- **Coordination finding (B5):** the behavior switch **1b+1c+1d is cross-cutting on the build** —
+  phase1b removes `JournalRecord`/`ClosureNode` and rewrites `RootShard`, which breaks `CasStore`
+  (read) and `CasGc` (GC) compilation until 1c and 1d land. So the standalone "build+sweep green"
+  step at the end of the 1b and 1c plans is NOT achievable alone; the green `Cas*`/`Ca*` sweep is the
+  gate **after 1d**, and the gtest sweep is the switch's integration oracle. **Decision:** execute
+  1b+1c+1d as ONE atomic unit (commit per task; build may be red mid-switch; green at the end), then
+  code-review the whole switch — the honest review point since intermediate states don't compile.
+- **Action:** dispatched the behavior-switch implementer (1b+1c+1d). Gate after 1d: clean build +
+  `Cas*`/`Ca*` sweep with no new failures beyond B3, then the post-1d chaos soak.
