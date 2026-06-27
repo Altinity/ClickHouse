@@ -3,6 +3,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
@@ -22,13 +25,12 @@ extern const int LOGICAL_ERROR;
 }
 
 using namespace DB::Cas;
+using DB::Cas::tests::blobEntryFor;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::publishRaw;
 using DB::Cas::tests::shardOfForTest;
 using DB::Cas::tests::u128Of;
-using DB::Cas::tests::writeBlobRaw;
-using DB::Cas::tests::writeTreeRaw;
 
 namespace
 {
@@ -50,6 +52,63 @@ public:
 private:
     std::shared_ptr<DB::Cas::Backend> inner;
 };
+
+/// Publish one part `ref` through the REAL Build write path: stage a manifest holding a single content
+/// blob whose payload is `payload`, precommit-add into the owning shard, then promote precommit ->
+/// committed. Returns the published ManifestId. This is the canonical write-side fixture for the
+/// read-path tests (the same shape as `publishPart` in gtest_cas_gc_log.cpp). The manifest entry path
+/// is `data.bin` unless `entry_path` overrides it.
+ManifestId publishPart(
+    const StorePtr & s, const String & ns, const String & ref, const String & payload,
+    const String & entry_path = "data.bin")
+{
+    const RootNamespace nsr{ns};
+    BuildInfo info;
+    info.intended_ref = ns + "/" + ref;
+    auto build = s->startBuild(info);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
+
+    ManifestEntry e;
+    e.path = entry_path;
+    e.placement = EntryPlacement::Blob;
+    e.blob_hash = u128Of(payload);
+    e.blob_size = payload.size();
+
+    const ManifestId id = build->stageManifest({e});
+    build->precommitAdd(nsr, ref, id);
+    build->promote(nsr, ref, build->buildId(), id);
+    return id;
+}
+
+/// A ManifestRef carrying a unique instance id derived from `tag` (all fields explicit so the
+/// missing-designated-field-initializer warning never fires). The writer/build fields are stable test
+/// constants — the read path keys identity by the full ref, so any consistent choice works here.
+ManifestRef manifestRefFor(const String & tag)
+{
+    return ManifestRef{
+        .writer_instance_id = "srv-test:1",
+        .build_sequence = 1,
+        .manifest_instance_id = DB::Cas::tests::u128Of(tag)};
+}
+
+/// Publish a part holding the given manifest entries verbatim (no blob upload) through the real Build.
+/// Used by read-path lookup/list tests that want a precise multi-entry manifest (the entries' blobs do
+/// not need bodies for resolve/readManifest/lookup — only `locate`+ranged read would). Returns the id.
+ManifestId publishPartWithEntries(
+    const StorePtr & s, const String & ns, const String & ref, std::vector<ManifestEntry> entries)
+{
+    const RootNamespace nsr{ns};
+    BuildInfo info;
+    info.intended_ref = ns + "/" + ref;
+    auto build = s->startBuild(info);
+    /// Inline entries need no body; Blob entries are recorded as W-EVIDENCE so promote can revalidate.
+    for (const auto & e : entries)
+        build->adoptEvidence(e);
+    const ManifestId id = build->stageManifest(std::move(entries));
+    build->precommitAdd(nsr, ref, id);
+    build->promote(nsr, ref, build->buildId(), id);
+    return id;
+}
 }
 
 TEST(CasStore, ReadOnlyOpenSkipsProbe)
@@ -309,73 +368,213 @@ TEST(CasStore, ListNamespaceFilesEmpty)
     EXPECT_TRUE(s->listNamespaceFiles(ns).empty());
 }
 
-/// ---------- read side (spec §6): resolveRef / readTree / locate / listRefs ----------
+/// ---------- read side (spec §6): resolveRef / readManifest / lookupPath / listDirectory / listRefs ----------
 
-TEST(CasStore, ResolveReadLocateRoundTrip)
+/// Phase 1c read path: a published ref resolves to a ManifestId; readManifest returns the immutable
+/// body; locate yields a ranged blob read; an Inline entry has no location. Replaces the old
+/// resolveRef().tree_id / readTree round trip (the tree model is gone — a part is a single ManifestId).
+TEST(CasStore, ResolveReturnsManifestId)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
-    const UInt128 dom = s->poolMeta().pool_id;
-    Layout layout("p");
+    const RootNamespace ns{"srv1/tbl"};
 
-    /// blob "hello world" written with the pool's fixed header length.
-    auto blob = writeBlobRaw(*b, layout, "hello world", s->poolMeta().blob_header_len, dom);
+    /// blob "hello world" + an inline file, published through the real Build write path.
+    const String payload = "hello world";
+    BuildInfo info;
+    info.intended_ref = ns.string() + "/part_1";
+    auto build = s->startBuild(info);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
 
-    /// tree: {"data.bin" → Blob hash("hello world"), 11} and {"small.txt" → Inline "tiny\n", 5}.
-    std::vector<TreeEntry> entries;
-    entries.push_back(TreeEntry{
-        .name = "data.bin", .placement = Placement::Blob, .file_hash = u128Of("hello world"),
-        .file_size = 11, .inline_bytes = ""});
-    entries.push_back(TreeEntry{
-        .name = "small.txt", .placement = Placement::Inline, .file_hash = {},
-        .file_size = 5, .inline_bytes = "tiny\n"});
-    auto tree = writeTreeRaw(*b, layout, entries, dom);
+    ManifestEntry blob_entry;
+    blob_entry.path = "data.bin";
+    blob_entry.placement = EntryPlacement::Blob;
+    blob_entry.blob_hash = u128Of(payload);
+    blob_entry.blob_size = payload.size();
+    ManifestEntry inline_entry;
+    inline_entry.path = "small.txt";
+    inline_entry.placement = EntryPlacement::Inline;
+    inline_entry.inline_bytes = "tiny\n";
 
-    RootShard root;
-    root.shard_version = 1;
-    root.refs["part_1"] = RefPayload{
-        .tree_id = hexToU128(tree.string()), .tree_size = 0, .mutable_files = {{"txn_version.txt", "42"}}};
-    /// Place the manifest in the shard the Store will look in for "part_1".
-    publishRaw(*b, layout, RootNamespace{"srv1/tbl"},
-        shardOfForTest("part_1", s->poolMeta().root_shards), root);
+    const ManifestId id = build->stageManifest({blob_entry, inline_entry});
+    build->precommitAdd(ns, "part_1", id);
+    build->promote(ns, "part_1", build->buildId(), id);
 
-    auto r = s->resolveRef(RootNamespace{"srv1/tbl"}, "part_1");
+    auto r = s->resolveRef(ns, "part_1");
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->tree_id, tree);
-    EXPECT_EQ(r->mutable_files.at("txn_version.txt"), "42");
+    EXPECT_EQ(r->manifest_id, id);                  /// resolve yields the published ManifestId
 
-    auto read = s->readTree(r->tree_id);
-    ASSERT_EQ(read.size(), 2u);
+    auto manifest = s->readManifest(r->manifest_id);
+    ASSERT_EQ(manifest.entries.size(), 2u);
 
-    auto loc = s->locate(read[0]);                  /// "data.bin" sorts before "small.txt"
+    /// "data.bin" sorts before "small.txt" (canonical path order).
+    auto data = s->lookupPath(manifest, "data.bin");
+    ASSERT_TRUE(data.has_value());
+    auto loc = s->locate(*data);
     EXPECT_EQ(loc.offset, s->poolMeta().blob_header_len);
-    EXPECT_EQ(loc.length, 11u);
+    EXPECT_EQ(loc.length, payload.size());
 
     auto bytes = b->get(loc.key, Range{loc.offset, loc.length});
     ASSERT_TRUE(bytes.has_value());
-    EXPECT_EQ(bytes->bytes, "hello world");         /// ranged read, no header touch
+    EXPECT_EQ(bytes->bytes, payload);               /// ranged read, no header touch
 
-    EXPECT_THROW(s->locate(read[1]), DB::Exception); /// Inline has no location
-    (void)blob;
+    auto small = s->lookupPath(manifest, "small.txt");
+    ASSERT_TRUE(small.has_value());
+    EXPECT_THROW(s->locate(*small), DB::Exception);  /// Inline has no location
 }
 
-/// Envelope freeze review (2026-06-26): readTree fail-closes on a tree whose envelope domain_id is not
-/// this pool's pool_id (cross-pool contamination). The object decodes cleanly (valid envelope + matching
-/// key/hash) but carries a foreign domain_id.
-TEST(CasStore, ReadTreeRejectsForeignDomainId)
+/// readManifest fail-closes on a body whose self-described `ref`/`root_namespace_id` does NOT match the
+/// resolved ManifestId — the ref is addressing the wrong object / a cross-namespace dangle. We stage a
+/// body raw (writeManifestRaw, the on-storage write fixture) at a ManifestId, then resolve through a
+/// committed binding that names a DIFFERENT ManifestRef pointing at the SAME object key — so the head
+/// succeeds, the body decodes, but refMatchesBody fails => CORRUPTED_DATA.
+TEST(CasStore, ReadManifestValidatesBodyAndFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const RootNamespace ns{"srv1/tbl"};
     Layout layout("p");
 
-    const UInt128 foreign = s->poolMeta().pool_id ^ UInt128{1};   /// guaranteed != pool_id
-    std::vector<TreeEntry> entries;
-    entries.push_back(TreeEntry{
-        .name = "x.txt", .placement = Placement::Inline, .file_hash = {},
-        .file_size = 3, .inline_bytes = "abc"});
-    auto tree = writeTreeRaw(*b, layout, entries, foreign);
+    /// (1) ref/namespace mismatch: the BODY self-describes namespace `srv1/other`, but it is addressed
+    /// as a manifest of `srv1/tbl` => manifestNamespaceMatches fails => CORRUPTED_DATA. We craft an id
+    /// whose key lives under `srv1/tbl` but whose body carries the foreign namespace.
+    {
+        const ManifestRef ref = manifestRefFor("mismatch-ns");
+        const ManifestId addressed{.root_namespace = ns, .ref = ref};
+        /// Encode a body that claims a DIFFERENT namespace than `addressed.root_namespace`.
+        PartManifest body;
+        body.ref = ref;                                     /// ref matches
+        body.root_namespace_id = RootNamespace{"srv1/other"};  /// namespace does NOT
+        body.entries = {blobEntryFor("f", u128Of("x"), 1)};
+        body.payload_digest = computePayloadDigest(body);
+        b->putIfAbsent(layout.manifestKey(addressed), encodePartManifest(body));
 
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readTree(tree); });
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readManifest(addressed); });
+    }
+
+    /// (2) ref mismatch: the body self-describes a DIFFERENT ManifestRef than the id addressing it =>
+    /// refMatchesBody fails => CORRUPTED_DATA.
+    {
+        const ManifestRef addressed_ref = manifestRefFor("addressed-ref");
+        const ManifestRef body_ref = manifestRefFor("body-ref-other");
+        const ManifestId addressed{.root_namespace = ns, .ref = addressed_ref};
+        PartManifest body;
+        body.ref = body_ref;                                /// ref does NOT match `addressed`
+        body.root_namespace_id = ns;                        /// namespace matches
+        body.entries = {blobEntryFor("f", u128Of("y"), 1)};
+        body.payload_digest = computePayloadDigest(body);
+        b->putIfAbsent(layout.manifestKey(addressed), encodePartManifest(body));
+
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readManifest(addressed); });
+    }
+
+    /// (3) a committed ref naming a manifest with NO body present => readManifest throws
+    /// FILE_DOESNT_EXIST (INV-NO-DANGLE surfaced on the read path). resolveRef itself SUCCEEDS — refs
+    /// are pure manifest state.
+    {
+        const ManifestRef missing_ref = manifestRefFor("never-staged");
+        const uint64_t shard = shardOfForTest("part_dangle", s->poolMeta().root_shards);
+        RootShard root;
+        root.shard_version = 1;
+        RootRef rr;
+        rr.ref_name = "part_dangle";
+        rr.manifest_ref = missing_ref;
+        root.refs["part_dangle"] = rr;
+        publishRaw(*b, layout, ns, shard, root);
+
+        auto r = s->resolveRef(ns, "part_dangle");
+        ASSERT_TRUE(r.has_value());
+        expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->readManifest(r->manifest_id); });
+    }
+}
+
+/// lookupPath and listDirectory over a decoded part manifest's canonical-path-ordered entries.
+TEST(CasStore, LookupAndListOverManifestEntries)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// A multi-file/multi-directory part: top-level + a projection subdir.
+    std::vector<ManifestEntry> entries;
+    entries.push_back(blobEntryFor("columns.txt", u128Of("cols"), 4));
+    entries.push_back(blobEntryFor("data.bin", u128Of("data"), 8));
+    entries.push_back(blobEntryFor("p.proj/data.bin", u128Of("proj-data"), 6));
+    entries.push_back(blobEntryFor("p.proj/columns.txt", u128Of("proj-cols"), 5));
+    const ManifestId id = publishPartWithEntries(s, ns.string(), "all_1_1_0", entries);
+
+    auto r = s->resolveRef(ns, "all_1_1_0");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->manifest_id, id);
+    auto manifest = s->readManifest(r->manifest_id);
+    ASSERT_EQ(manifest.entries.size(), 4u);
+
+    /// lookupPath: exact-path hit + miss.
+    auto hit = s->lookupPath(manifest, "data.bin");
+    ASSERT_TRUE(hit.has_value());
+    EXPECT_EQ(hit->blob_hash, u128Of("data"));
+    EXPECT_FALSE(s->lookupPath(manifest, "no_such_file").has_value());
+
+    /// listDirectory under "p.proj/" yields exactly the two projection files, in canonical order.
+    auto proj = s->listDirectory(manifest, "p.proj/");
+    ASSERT_EQ(proj.size(), 2u);
+    EXPECT_EQ(proj[0].path, "p.proj/columns.txt");
+    EXPECT_EQ(proj[1].path, "p.proj/data.bin");
+
+    /// The empty prefix lists everything (all four), still in canonical order.
+    auto all = s->listDirectory(manifest, "");
+    ASSERT_EQ(all.size(), 4u);
+    EXPECT_EQ(all[0].path, "columns.txt");
+    EXPECT_EQ(all[3].path, "p.proj/data.bin");
+}
+
+/// The Phase 1c manifest decode cache is keyed by (ManifestId, Token). Resolve+read the same ref twice:
+/// the second readManifest must be served from the cache (no second GET of the body). A fresh publish
+/// of the SAME ref name mints a NEW ManifestId (and a new shard token), so the cache misses and the
+/// body is fetched again. A CountingBackend asserts the body GET count.
+TEST(CasStore, ManifestCacheIsKeyedByIdAndToken)
+{
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    const RootNamespace ns{"srv1/tbl"};
+    Layout layout("p");
+
+    const ManifestId id1 = publishPart(s, ns.string(), "part_1", "payload-1");
+    const String key1 = layout.manifestKey(id1);
+
+    /// First read: a body GET populates the (id1, token) cache entry.
+    {
+        auto r = s->resolveRef(ns, "part_1");
+        ASSERT_TRUE(r.has_value());
+        auto m = s->readManifest(r->manifest_id);
+        ASSERT_EQ(m.entries.size(), 1u);
+    }
+    const uint64_t gets_after_first = b->getCount(key1);
+    ASSERT_GE(gets_after_first, 1u);               /// the first read DID fetch the body
+
+    /// Second read of the SAME id: the (id, token) cache must serve it — NO additional body GET.
+    {
+        auto r = s->resolveRef(ns, "part_1");
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->manifest_id, id1);
+        auto m = s->readManifest(r->manifest_id);
+        ASSERT_EQ(m.entries.size(), 1u);
+    }
+    EXPECT_EQ(b->getCount(key1), gets_after_first)
+        << "second readManifest re-GET the body for the same (ManifestId, Token) — cache miss";
+
+    /// A fresh publish over the SAME ref name mints a NEW ManifestId: the cache (keyed by id) misses.
+    const ManifestId id2 = publishPart(s, ns.string(), "part_1", "payload-2");
+    EXPECT_FALSE(id2 == id1);                       /// a new publish never reuses a ManifestId
+    const String key2 = layout.manifestKey(id2);
+
+    auto r2 = s->resolveRef(ns, "part_1");
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2->manifest_id, id2);               /// resolve now sees the new manifest
+    auto m2 = s->readManifest(r2->manifest_id);
+    ASSERT_EQ(m2.entries.size(), 1u);
+    EXPECT_GE(b->getCount(key2), 1u)               /// the new id's body WAS fetched (cache miss)
+        << "fresh publish (new ManifestId) should miss the id-keyed manifest cache";
 }
 
 TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
@@ -385,14 +584,9 @@ TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
     /// stale decoded manifest). Without token invalidation this would still see the dropped ref.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
-    Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
-    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
 
-    RootShard root;
-    root.shard_version = 1;
-    root.refs["part_1"] = RefPayload{.tree_id = u128Of("tree-part_1"), .tree_size = 7, .mutable_files = {}};
-    publishRaw(*b, layout, ns, shard, root);
+    publishPart(s, ns.string(), "part_1", "payload-1");
 
     /// First resolve decodes + caches; second is a cache hit — both must see part_1.
     ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
@@ -422,19 +616,22 @@ TEST(CasStore, ListRefsMergesAllShards)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
-    const UInt128 dom = s->poolMeta().pool_id;
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
     const uint64_t shards = s->poolMeta().root_shards;
 
-    /// Publish refs "a".."h", each in its own shard's manifest; refs colliding into one shard share it.
+    /// Publish refs "a".."h", each routed to its shard's manifest; refs colliding into one shard share
+    /// it. A raw RootShard with a committed RootRef per ref (manifest bodies need not exist — listRefs
+    /// reads only shard manifest state, like resolveRef).
     std::map<uint64_t, RootShard> by_shard;
     for (char c = 'a'; c <= 'h'; ++c)
     {
         const String ref(1, c);
-        const UInt128 tree_id = u128Of("tree-" + ref);
-        by_shard[shardOfForTest(ref, shards)].refs[ref] =
-            RefPayload{.tree_id = tree_id, .tree_size = 0, .mutable_files = {}};
+        const ManifestRef mref = manifestRefFor("manifest-" + ref);
+        RootRef rr;
+        rr.ref_name = ref;
+        rr.manifest_ref = mref;
+        by_shard[shardOfForTest(ref, shards)].refs[ref] = rr;
     }
     for (auto & [shard, root] : by_shard)
     {
@@ -448,77 +645,33 @@ TEST(CasStore, ListRefsMergesAllShards)
     {
         const String ref(1, c);
         ASSERT_TRUE(refs.count(ref));
-        EXPECT_EQ(refs.at(ref).tree_id, TreeId(u128ToHex(u128Of("tree-" + ref))));
+        EXPECT_EQ(refs.at(ref).manifest_id.ref.manifest_instance_id, u128Of("manifest-" + ref));
+        EXPECT_EQ(refs.at(ref).manifest_id.root_namespace.string(), ns.string());
     }
-    (void)dom;
 }
 
-TEST(CasStore, ReadTreeFailsClosed)
+/// readManifest fails CLOSED on a corrupt or kind-mismatched manifest body addressed by a live id.
+TEST(CasStore, ReadManifestFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
-    const UInt128 dom = s->poolMeta().pool_id;
     Layout layout("p");
+    const RootNamespace ns{"srv1/tbl"};
 
-    /// (1) A tree object stored at the WRONG key (key != hex(logical_hash)) ⇒ CORRUPTED_DATA.
+    /// (1) Garbage bytes at the manifest key => decodePartManifest throws CORRUPTED_DATA.
     {
-        std::vector<TreeEntry> entries;
-        entries.push_back(TreeEntry{
-            .name = "f", .placement = Placement::Inline, .file_hash = {},
-            .file_size = 3, .inline_bytes = "abc"});
-        const TreeId real_id = merkleTreeId(entries);
-        const String encoded = encodeTree(entries);
-
-        EnvelopeHeader header;
-        header.kind = ObjectKind::Tree;
-        header.hash_algo = 1;
-        header.logical_size = encoded.size();
-        header.logical_hash = hexToU128(real_id.string());   /// honest hash of THIS tree
-        header.domain_id = dom;
-        header.incarnation_tag = UInt128(0x1);
-        header.build_id = UInt128(0x1);
-        const String head = encodeEnvelopeHeader(header);
-
-        /// ... but stored under a DIFFERENT id's key.
-        const TreeId wrong_id{"00000000000000000000000000000001"};
-        b->putIfAbsent(layout.treeKey(wrong_id), head + encoded);
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readTree(wrong_id); });
+        const ManifestRef ref = manifestRefFor("garbage-body");
+        const ManifestId id{.root_namespace = ns, .ref = ref};
+        b->putIfAbsent(layout.manifestKey(id), "not a valid manifest body");
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readManifest(id); });
     }
 
-    /// (2) A ref naming a tree id with NO object present ⇒ resolveRef SUCCEEDS (refs are manifest
-    /// state) but readTree throws FILE_DOESNT_EXIST carrying the tree id (INV-NO-DANGLE surfaced).
+    /// (2) A ref naming a manifest id with NO object present => readManifest throws FILE_DOESNT_EXIST
+    /// (INV-NO-DANGLE), carrying the manifest key.
     {
-        RootNamespace ns{"srv1/dangle"};
-        const UInt128 missing_tree = u128Of("missing");
-        RootShard root;
-        root.shard_version = 1;
-        root.refs["part_x"] = RefPayload{.tree_id = missing_tree, .tree_size = 0, .mutable_files = {}};
-        publishRaw(*b, layout, ns, shardOfForTest("part_x", s->poolMeta().root_shards), root);
-
-        auto r = s->resolveRef(ns, "part_x");
-        ASSERT_TRUE(r.has_value());
-        expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->readTree(r->tree_id); });
-    }
-
-    /// (3) A Blob-kind envelope stored at a tree key ⇒ CORRUPTED_DATA (expected_kind=Tree mismatch).
-    {
-        /// Build a blob whose content id we then (ab)use as a tree key.
-        const String payload = "not a tree";
-        const BlobId blob_id = idOf(payload);
-        const TreeId tree_key{blob_id.string()};   /// reuse the hex as a tree id
-
-        EnvelopeHeader header;
-        header.kind = ObjectKind::Blob;            /// WRONG kind for a tree key
-        header.hash_algo = 1;
-        header.logical_size = payload.size();
-        header.logical_hash = u128Of(payload);
-        header.domain_id = dom;
-        header.incarnation_tag = UInt128(0x1);
-        header.build_id = UInt128(0x1);
-        const String head = encodeEnvelopeHeader(header);
-
-        b->putIfAbsent(layout.treeKey(tree_key), head + payload);
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readTree(tree_key); });
+        const ManifestRef ref = manifestRefFor("absent-body");
+        const ManifestId id{.root_namespace = ns, .ref = ref};
+        expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->readManifest(id); });
     }
 }
 
@@ -530,26 +683,29 @@ TEST(CasStore, DropRefAppendsJournalAtomically)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
-    const uint64_t shards = s->poolMeta().root_shards;
-    const uint64_t shard = shardOfForTest("part_1", shards);
-    const UInt128 tree_id = u128Of("tree-part_1");
+    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
 
-    RootShard root;
-    root.shard_version = 1;
-    root.refs["part_1"] = RefPayload{.tree_id = tree_id, .tree_size = 7, .mutable_files = {}};
-    publishRaw(*b, layout, ns, shard, root);
+    const ManifestId id = publishPart(s, ns.string(), "part_1", "payload-1");
+    const ManifestRef manifest_ref = id.ref;
+
+    const auto before = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
 
     s->dropRef(ns, "part_1");
 
     auto after = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
     EXPECT_TRUE(after.refs.empty());
-    EXPECT_EQ(after.shard_version, 2u);                 /// +1 from the published value
+    EXPECT_GT(after.shard_version, before.shard_version);   /// advanced past the published value
     ASSERT_FALSE(after.journal.empty());
-    const JournalRecord & last = after.journal.back();
-    EXPECT_EQ(last.op, JournalRecord::Op::Remove);
-    EXPECT_EQ(last.ref_name, "part_1");
-    EXPECT_EQ(last.tree_id, tree_id);
-    EXPECT_EQ(last.at_version, after.shard_version);    /// at_version == the committed shard_version
+
+    /// The drop appends a removal RootOwnerEvent: old_binding = the committed binding being removed,
+    /// new_binding = none (true removal ⇒ GC folds -1 + cleanup of the named manifest).
+    const RootOwnerEvent & last = after.journal.back();
+    ASSERT_TRUE(last.old_binding.has_value());
+    EXPECT_FALSE(last.new_binding.has_value());
+    EXPECT_EQ(last.old_binding->owner_kind, OwnerKind::Committed);
+    EXPECT_EQ(last.old_binding->ref_name, "part_1");
+    EXPECT_EQ(last.old_binding->manifest_ref, manifest_ref);
+    EXPECT_EQ(last.transition_version, after.shard_version);   /// transition_version == committed shard_version
 
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 
@@ -564,40 +720,35 @@ TEST(CasStore, UpdateRefPayloadMutatesWithoutJournal)
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
     const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
-    const UInt128 tree_id = u128Of("tree-part_1");
 
-    RootShard root;
-    root.shard_version = 3;
-    root.refs["part_1"] = RefPayload{
-        .tree_id = tree_id, .tree_size = 11, .mutable_files = {{"txn_version.txt", "1"}}};
-    publishRaw(*b, layout, ns, shard, root);
+    const ManifestId id = publishPart(s, ns.string(), "part_1", "payload-1");
+    const ManifestRef manifest_ref = id.ref;
 
-    const size_t journal_before = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes).journal.size();
+    /// Seed a mutable file first (publish leaves mutable_files empty).
+    s->updateRefPayload(ns, "part_1", [](RootRef & r) { r.mutable_files["txn_version.txt"] = "1"; });
 
-    s->updateRefPayload(ns, "part_1", [](RefPayload & p) { p.mutable_files["txn_version.txt"] = "7"; });
+    const auto seeded = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
+    const size_t journal_before = seeded.journal.size();
+    const uint64_t version_before = seeded.shard_version;
+
+    s->updateRefPayload(ns, "part_1", [](RootRef & r) { r.mutable_files["txn_version.txt"] = "7"; });
 
     auto after = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
     EXPECT_EQ(after.refs.at("part_1").mutable_files.at("txn_version.txt"), "7");
-    EXPECT_EQ(after.refs.at("part_1").tree_id, tree_id);
-    EXPECT_EQ(after.refs.at("part_1").tree_size, 11u);
-    EXPECT_EQ(after.shard_version, 4u);                 /// +1 from the published value
-    EXPECT_EQ(after.journal.size(), journal_before);    /// no reachability change ⇒ no journal record
+    EXPECT_EQ(after.refs.at("part_1").manifest_ref, manifest_ref);
+    EXPECT_EQ(after.shard_version, version_before + 1);   /// +1 from the mutate CAS
+    EXPECT_EQ(after.journal.size(), journal_before);      /// no reachability change ⇒ no journal record
 
-    /// A mutator that changes tree_id is rejected, and the manifest is left UNTOUCHED.
+    /// A mutator that changes manifest_ref is rejected, and the manifest is left UNTOUCHED.
     expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
     {
-        s->updateRefPayload(ns, "part_1", [](RefPayload & p) { p.tree_id = u128Of("other"); });
+        s->updateRefPayload(ns, "part_1", [](RootRef & r)
+            { r.manifest_ref = manifestRefFor("other"); });
     });
     auto unchanged = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
-    EXPECT_EQ(unchanged.shard_version, 4u);             /// throw aborted before casPut
-    EXPECT_EQ(unchanged.refs.at("part_1").tree_id, tree_id);
+    EXPECT_EQ(unchanged.shard_version, version_before + 1);   /// throw aborted before casPut
+    EXPECT_EQ(unchanged.refs.at("part_1").manifest_ref, manifest_ref);
     EXPECT_EQ(unchanged.refs.at("part_1").mutable_files.at("txn_version.txt"), "7");
-
-    /// Likewise, a mutator that changes tree_size is rejected.
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
-    {
-        s->updateRefPayload(ns, "part_1", [](RefPayload & p) { p.tree_size = 99; });
-    });
 }
 
 TEST(CasStore, DropRefSurvivesCasConflict)
@@ -607,12 +758,9 @@ TEST(CasStore, DropRefSurvivesCasConflict)
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
     const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
-    const UInt128 tree_id = u128Of("tree-part_1");
 
-    RootShard root;
-    root.shard_version = 1;
-    root.refs["part_1"] = RefPayload{.tree_id = tree_id, .tree_size = 7, .mutable_files = {}};
-    publishRaw(*b, layout, ns, shard, root);
+    publishPart(s, ns.string(), "part_1", "payload-1");
+    const auto before = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
 
     /// Inject one artificial Conflict: the loop must re-read the (unchanged) manifest and re-apply.
     b->failNextCasPut(layout.rootShardKey(ns, shard));
@@ -620,12 +768,13 @@ TEST(CasStore, DropRefSurvivesCasConflict)
 
     auto after = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
     EXPECT_TRUE(after.refs.empty());
-    EXPECT_GT(after.shard_version, 1u);                 /// advanced (exact delta depends on the fake)
+    EXPECT_GT(after.shard_version, before.shard_version);   /// advanced (exact delta depends on the fake)
     ASSERT_FALSE(after.journal.empty());
-    /// Exactly one Remove for part_1 — the mutate must not double-append across the retry.
+    /// Exactly one removal event for part_1 — the mutate must not double-append across the retry.
     size_t removes = 0;
-    for (const JournalRecord & rec : after.journal)
-        if (rec.op == JournalRecord::Op::Remove && rec.ref_name == "part_1")
+    for (const RootOwnerEvent & rec : after.journal)
+        if (rec.old_binding && !rec.new_binding
+            && rec.old_binding->owner_kind == OwnerKind::Committed && rec.old_binding->ref_name == "part_1")
             ++removes;
     EXPECT_EQ(removes, 1u);
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
@@ -639,18 +788,15 @@ TEST(CasStore, DropNamespaceTombstonesAndRemovesFiles)
     RootNamespace ns{"srv1/tbl"};
     const uint64_t shards = s->poolMeta().root_shards;
 
-    /// Three refs, one per manifest (their shards may collide; each touched shard holds its refs).
+    /// Three refs, published through the real Build (each routed to its shard; shards may collide).
     const std::vector<String> ref_names{"alpha", "bravo", "charlie"};
-    std::map<uint64_t, RootShard> by_shard;
     for (const String & name : ref_names)
-    {
-        const uint64_t shard = shardOfForTest(name, shards);
-        by_shard[shard].shard_version = 1;
-        by_shard[shard].refs[name] = RefPayload{
-            .tree_id = u128Of("tree-" + name), .tree_size = 3, .mutable_files = {}};
-    }
-    for (const auto & [shard, root] : by_shard)
-        publishRaw(*b, layout, ns, shard, root);
+        publishPart(s, ns.string(), name, "payload-" + name);
+
+    /// Record which shards actually hold a manifest after the publishes.
+    std::set<uint64_t> touched_shards;
+    for (const String & name : ref_names)
+        touched_shards.insert(shardOfForTest(name, shards));
 
     /// Two verbatim files.
     s->putNamespaceFile(ns, "format_version.txt", "1\n");
@@ -658,23 +804,23 @@ TEST(CasStore, DropNamespaceTombstonesAndRemovesFiles)
 
     s->dropNamespace(ns);
 
-    /// Every TOUCHED shard manifest still EXISTS, with empty refs and a Remove journal record.
-    for (const auto & [shard, root] : by_shard)
+    /// Every TOUCHED shard manifest still EXISTS, with empty refs and a removal journal record.
+    for (uint64_t shard : touched_shards)
     {
         auto obj = b->get(layout.rootShardKey(ns, shard));
         ASSERT_TRUE(obj.has_value());
         auto after = decodeRootShard(obj->bytes);
         EXPECT_TRUE(after.refs.empty());
         bool has_remove = false;
-        for (const JournalRecord & rec : after.journal)
-            if (rec.op == JournalRecord::Op::Remove)
+        for (const RootOwnerEvent & rec : after.journal)
+            if (rec.old_binding && !rec.new_binding && rec.old_binding->owner_kind == OwnerKind::Committed)
                 has_remove = true;
         EXPECT_TRUE(has_remove);
     }
 
     /// UNTOUCHED shards (no manifest) remain absent — no tombstone manifest minted.
     for (uint64_t shard = 0; shard < shards; ++shard)
-        if (!by_shard.count(shard))
+        if (!touched_shards.count(shard))
             EXPECT_FALSE(b->get(layout.rootShardKey(ns, shard)).has_value());
 
     /// Verbatim files gone; listRefs empty.
@@ -707,21 +853,6 @@ TEST(CasStore, ListNamespacesFromRegistry)
 
 namespace
 {
-/// Publish one ref through the real Build: tree {"f" -> blob of `payload`}.
-/// Mirrors the `publishPart` helper in gtest_cas_gc_round.cpp (local copy to avoid cross-TU linkage).
-void publishPart(const StorePtr & s, const String & ns, const String & ref, const String & payload)
-{
-    auto build = s->startBuild({});
-    build->putBlob(DB::Cas::tests::idOf(payload), BlobSource::fromString(payload));
-    TreeEntry entry;
-    entry.name = "f";
-    entry.placement = Placement::Blob;
-    entry.file_hash = DB::Cas::tests::u128Of(payload);
-    entry.file_size = payload.size();
-    const TreeId tree = build->putTree({entry});
-    build->publish(RootNamespace{ns}, ref, tree, {});
-}
-
 /// Blocks the FIRST head() call made after `arm()` on a latch so followers attach to the
 /// single-flight entry while the leader is still in-flight. Deterministic: no sleeps.
 /// Calls before `arm()` pass through immediately.
@@ -876,7 +1007,7 @@ TEST(CasStoreSingleFlight, ConcurrentResolvesCoalesceToOneHead)
     for (const auto & r : results)
     {
         ASSERT_TRUE(r.has_value());
-        EXPECT_EQ(r->tree_size, results[0]->tree_size);
+        EXPECT_EQ(r->manifest_id, results[0]->manifest_id);
     }
 }
 
@@ -920,11 +1051,6 @@ TEST(CasStoreDecodeTtl, ForceFreshAlwaysHeads)
     EXPECT_EQ(b->headTotal(), 1u);   /// exactly one HEAD
 }
 
-/// Read-your-writes coherence (B157): an in-flight reader whose GET snapshots a shard manifest that
-/// PREDATES a concurrent publish must NOT poison the TTL decode cache with that stale decode after
-/// the publish's invalidation erase has already run — otherwise a later allow_stale read serves the
-/// stale decode within the TTL window and the just-published ref looks absent (→ "no ref" → the
-/// adopted part is wrongly marked broken in the real server).
 TEST(CasStore, MountpointObjectRoundTrip)
 {
     auto b = std::make_shared<DB::Cas::InMemoryBackend>();
@@ -939,6 +1065,11 @@ TEST(CasStore, MountpointObjectRoundTrip)
     EXPECT_FALSE(store->getMountpointObject(key).has_value());
 }
 
+/// Read-your-writes coherence (B157): an in-flight reader whose GET snapshots a shard manifest that
+/// PREDATES a concurrent publish must NOT poison the TTL decode cache with that stale decode after
+/// the publish's invalidation erase has already run — otherwise a later allow_stale read serves the
+/// stale decode within the TTL window and the just-published ref looks absent (→ "no ref" → the
+/// adopted part is wrongly marked broken in the real server).
 TEST(CasStoreDecodeTtl, ConcurrentWriteDuringGetDoesNotPoisonStaleEntry)
 {
     using namespace DB::Cas;

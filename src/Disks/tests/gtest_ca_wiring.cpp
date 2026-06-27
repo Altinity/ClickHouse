@@ -171,13 +171,13 @@ using DB::Cas::tests::u128Of;
 namespace
 {
 
-DB::Cas::TreeEntry wiringBlobEntry(const String & name, const String & payload)
+DB::Cas::ManifestEntry wiringBlobEntry(const String & path, const String & payload)
 {
-    DB::Cas::TreeEntry e;
-    e.name = name;
-    e.placement = DB::Cas::Placement::Blob;
-    e.file_hash = u128Of(payload);
-    e.file_size = payload.size();
+    DB::Cas::ManifestEntry e;
+    e.path = path;
+    e.placement = DB::Cas::EntryPlacement::Blob;
+    e.blob_hash = u128Of(payload);
+    e.blob_size = payload.size();
     return e;
 }
 
@@ -195,14 +195,26 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openWiringStorage()
 void publishWiredPart(
     DB::ContentAddressedMetadataStorage & storage, const DB::Cas::RootNamespace & ns, const String & ref)
 {
-    auto build = storage.store()->startBuild({});
+    /// Port off the removed Build::putTree/publish API onto the part-manifest write flow
+    /// (startBuild → stageManifest → precommitAdd → putBlob → promote). The promote derives the
+    /// manifest namespace from BuildInfo::intended_ref ("ns/ref" split on the LAST '/'), so set it.
+    DB::Cas::BuildInfo info;
+    info.intended_ref = ns.string() + "/" + ref;
+    auto build = storage.store()->startBuild(info);
+
+    const auto id = build->stageManifest(
+        {wiringBlobEntry("data.bin", "payload-A"), wiringBlobEntry("p.proj/data.bin", "payload-B")});
+    build->precommitAdd(ns, ref, id);
     build->putBlob(idOf("payload-A"), DB::Cas::BlobSource::fromString("payload-A"));
     build->putBlob(idOf("payload-B"), DB::Cas::BlobSource::fromString("payload-B"));
-    auto tree = build->putTree({wiringBlobEntry("data.bin", "payload-A"), wiringBlobEntry("p.proj/data.bin", "payload-B")});
-    DB::Cas::RefPayload payload;
-    payload.mutable_files = {{"uuid.txt", "u-123"}, {"metadata_version.txt", "5"}};
-    payload.published_at_ms = 1700000000ULL * 1000;   /// epoch ms; getLastModified divides by 1000
-    build->publish(ns, ref, tree, std::move(payload));
+    /// The mutable per-part files ride into RootRef.mutable_files via promote (was RefPayload).
+    build->setPendingMutableFiles({{"uuid.txt", "u-123"}, {"metadata_version.txt", "5"}});
+    build->promote(ns, ref, build->buildId(), id);
+
+    /// promote stamps published_at_ms with nowMs(); the read assertions want a FIXED stamp, so pin it
+    /// through the mutable-only updateRefPayload path (no journal record — same as a payload-only edit).
+    storage.store()->updateRefPayload(ns, ref,
+        [](DB::Cas::RootRef & r) { r.published_at_ms = 1700000000ULL * 1000; });   /// epoch ms; getLastModified /1000
 }
 
 }
@@ -899,6 +911,11 @@ TEST(CaWiringInFlight, StagedFilesVisibleBeforeCommit)
               (std::vector<std::string>{"data.bin"}));
 }
 
+namespace DB::ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
+}
+
 /// ==== M-W Task 10: the GC scheduler end-to-end through the wiring ====
 
 TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
@@ -909,26 +926,28 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
     tx->commit(DB::NoCommitOptions{});
 
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
-    const auto tree_id = exchange->getPartTreeId("uui/uuid-1/all_1_1_0");
-    ASSERT_TRUE(tree_id.has_value());
+    ASSERT_NE(exchange, nullptr);
     const auto blob_key = storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path;
 
     auto tx2 = storage->createTransaction();
     tx2->removeDirectory("uui/uuid-1/all_1_1_0");   /// dropRef - the part is unreachable now
 
-    /// Round 1 folds the drop and retires+deletes the TREE; the cascade frees the blob, which a
-    /// FOLLOWING round retires+deletes (next-round reclamation, M-C3). The steal needs one extra
-    /// observation window between rounds (the pacing scheduler is stable across these calls -
-    /// each call after the first re-acquires via renewal).
+    /// Round 1 folds the drop and retires+deletes the part MANIFEST; the freed blob is retired+deleted
+    /// by a FOLLOWING round (next-round reclamation, M-C3). The steal needs one extra observation
+    /// window between rounds (the pacing scheduler is stable across these calls - each call after the
+    /// first re-acquires via renewal).
     storage->runOneGcRoundForTest();
     storage->runOneGcRoundForTest();
     storage->runOneGcRoundForTest();
 
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    /// The DELETION WITNESS: adopting the old tree id must fail (the tree object is GONE) - the
-    /// same probe the relink race uses. (Key equality of a re-written identical part would be
-    /// vacuous: content addressing reproduces the key whether or not the old object survived.)
-    EXPECT_FALSE(exchange->adoptPart("uuid-1", "tmp-fetch_back", *tree_id, {}));
+    /// The relink offer (B7): in the part-manifest model there is no shared content-addressed tree id
+    /// to transmit, so getPartTreeId offers NOTHING and the sender always streams bytes. adoptPart is
+    /// consequently unreachable and fails closed (NOT_IMPLEMENTED) if a caller ever reaches it. Asserts
+    /// the documented post-redesign contract instead of the old adopt-by-tree-id deletion witness.
+    EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_1_1_0").has_value());
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
+        [&] { exchange->adoptPart("uuid-1", "tmp-fetch_back", std::string(32, '0'), {}); });
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp-fetch_back"));
 
     /// A fresh identical write re-CREATES the content at the same key and reads back fine.
@@ -939,86 +958,73 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_9_9_0/data.bin"));
 }
 
-/// B199 (real-path leak repro, replaces the former Build-level `CasGcLeak.DisplacedUnexpandedTreeBlobsLeak`):
-/// the original repro drove `build->publish(...)` DIRECTLY with NO precommit — a path production NEVER
-/// takes (`ContentAddressedTransaction` always goes precommit-first). This test reproduces the SAME
-/// scenario through the GENUINE transaction/wiring entry point and asserts it is reclaimed:
-///   - commit a part to treeA (unique content),
-///   - DISPLACE the part's ref to treeB (distinct content) by RE-WRITING the same part path in a fresh
-///     transaction: `publishStaging` republishes the existing ref via `build->publish` — a second `Add`
-///     for the same ref name with NO Remove between (last-op-wins displacement),
-///   - delete treeA's TREE OBJECT at the backend BEFORE any GC fold (a competing GC's landed delete,
-///     `deleteExact`-by-token — the same primitive GC uses),
-///   - run GC to a fixpoint.
-/// GREEN because the real path is precommit-first: treeA was born under its own unique precommit ref
-/// whose `Add` carries treeA's closure INLINE on the journal record (B199-S2), so the fold records
-/// treeA→{its blobs} from the recorded closure WITHOUT reading the vanished tree object, and the
-/// B199-S1 retire absent-tree strip then releases those edges. treeA's unique blobs are reclaimed
-/// (`unreachable==0`); `dangling==0` throughout (treeB and its closure are never at risk — no data loss).
+/// B199 (real-path displacement reclamation, ported off the tree model to part manifests): re-writing
+/// the SAME part path with DISTINCT content publishes a NEW part ManifestId over the ref (a true-removal
+/// of the old owner manifest + an activation of the new one in the single ordered journal — no shared
+/// content-addressed identity between the two parts). GC must reclaim the displaced (manifestA) unique
+/// blobs while never losing the live (manifestB) closure.
+///
+/// NOTE (port): the original repro pre-deleted treeA's TREE OBJECT before the fold to exercise the
+/// tree-era inline-closure 404 path (the precommit `Add` carried treeA's closure INLINE so the fold
+/// recorded edges without a `readTree`). That mechanism is gone: a part manifest carries its OWN blob
+/// edges and the fold reads the ONE removal-target body to release them (a missing removal body clamps
+/// + records an anomaly, never guesses). So this port drives the genuine manifest displacement WITHOUT
+/// the out-of-band pre-delete twist — the reclamation contract (no leak / no loss) is what survives.
 TEST(CaWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
 {
     auto storage = openWiringStorage();
-    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
-    ASSERT_NE(exchange, nullptr);
 
-    /// Commit treeA with unique content (data-A / mark-A), through the real precommit-first transaction.
+    /// Commit manifestA with unique content (data-A / mark-A), through the real precommit-first transaction.
     {
         auto tx = storage->createTransaction();
         writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "data-A");
         writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.cmrk3", "mark-A");
         tx->commit(DB::NoCommitOptions{});
     }
-    const auto tree_a_hex = exchange->getPartTreeId("uui/uuid-1/all_0_0_0");
-    ASSERT_TRUE(tree_a_hex.has_value());
+    const auto resolved_a = storage->store()->resolveRef(storage->liveNamespace("uuid-1"), "all_0_0_0");
+    ASSERT_TRUE(resolved_a.has_value());
+    const DB::Cas::ManifestId manifest_a = resolved_a->manifest_id;
 
     /// DISPLACE: re-write the SAME part path with DISTINCT content (data-B / mark-B) in a fresh
-    /// transaction. publishStaging republishes ref `all_0_0_0` → treeB via build->publish, appending a
-    /// second Add for the ref with no intervening Remove (last-op-wins). Confirm the displacement is real:
-    /// the ref now resolves to a DIFFERENT tree.
+    /// transaction. The ref `all_0_0_0` is republished to a NEW part ManifestId (last-op-wins). Confirm
+    /// the displacement is real: the ref now resolves to a DIFFERENT manifest.
     {
         auto tx = storage->createTransaction();
         writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "data-B");
         writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.cmrk3", "mark-B");
         tx->commit(DB::NoCommitOptions{});
     }
-    const auto tree_b_hex = exchange->getPartTreeId("uui/uuid-1/all_0_0_0");
-    ASSERT_TRUE(tree_b_hex.has_value());
-    ASSERT_NE(*tree_a_hex, *tree_b_hex)
-        << "the second write must displace the ref to a distinct tree (last-op-wins Add, no Remove)";
+    const auto resolved_b = storage->store()->resolveRef(storage->liveNamespace("uuid-1"), "all_0_0_0");
+    ASSERT_TRUE(resolved_b.has_value());
+    ASSERT_FALSE(manifest_a == resolved_b->manifest_id)
+        << "the second write must displace the ref to a distinct part manifest (last-op-wins)";
 
-    /// A competing GC round already deleted the displaced treeA OBJECT: remove it at the backend by
-    /// token, BEFORE any fold here, so the fold would 404 a readTree of treeA.
-    {
-        auto & backend = storage->store()->backend();
-        const String tree_a_key = storage->store()->layout().treeKey(DB::Cas::TreeId(*tree_a_hex));
-        const auto head = backend.head(tree_a_key);
-        ASSERT_TRUE(head.exists) << "treeA object must exist before we delete it";
-        ASSERT_EQ(backend.deleteExact(tree_a_key, head.token).kind, DB::Cas::DeleteOutcome::Kind::Deleted);
-        ASSERT_FALSE(backend.head(tree_a_key).exists) << "treeA backend object must be gone after the delete";
-    }
-
-    /// Drive GC to a fixpoint. The dropped-part test needs ~3 rounds (next-round cascade reclamation);
-    /// give a generous bound so the displaced-tree closure fully drains.
+    /// Drive GC to a fixpoint. Displacement reclamation needs the next-round cascade (manifestA's
+    /// removal folds, its blobs hit zero in-degree, a following round retires+deletes them); give a
+    /// generous bound so the displaced closure fully drains.
     for (int i = 0; i < 8; ++i)
         storage->runOneGcRoundForTest();
 
     const DB::Cas::FsckReport after = DB::Cas::runFsck(*storage->store(), /*detail=*/false);
-    EXPECT_EQ(after.dangling, 0u) << "displacement must never lose a reachable object (treeB stays live)";
-    EXPECT_GT(after.reachable, 0u) << "the live ref points at treeB; treeB's closure is reachable";
+    EXPECT_EQ(after.dangling, 0u) << "displacement must never lose a reachable object (manifestB stays live)";
+    EXPECT_GT(after.reachable, 0u) << "the live ref points at manifestB; manifestB's closure is reachable";
     EXPECT_EQ(after.unreachable, 0u)
-        << "B199 real-path: treeA's unique blobs (data-A / mark-A) must be reclaimed even though treeA's "
-        << "object vanished before the fold — the precommit Add's INLINE closure records treeA's edges "
-        << "without a readTree (B199-S2) and the retire absent-tree strip releases them (B199-S1); "
-        << "unreachable=" << after.unreachable;
+        << "B199 real-path: manifestA's unique blobs (data-A / mark-A) must be reclaimed after the "
+        << "displacement (the removal of manifestA releases its blob edges; zero-in-degree blobs are "
+        << "retired+deleted next round); unreachable=" << after.unreachable;
 }
 
 /// ==== M-W Task 11: the DataPartsExchange facade (relink) ====
 
-TEST(CaWiringExchange, AdoptPartPublishesOwnRef)
+/// B7 (cross-server relink reworked for the part-manifest model): the old optimization transmitted a
+/// CONTENT-ADDRESSED tree id the receiver could adopt-by-id, because trees were shared by content hash
+/// across servers. A part is now a per-instance single-owner ManifestId — there is no shared id to
+/// offer — so getPartTreeId offers NOTHING (the sender always streams bytes, the documented fallback)
+/// and adoptPart is unreachable, failing closed with NOT_IMPLEMENTED. A manifest-era relink (transmit
+/// the manifest's blob hashes; the receiver stages its OWN manifest over them) is the deferred rework.
+/// This asserts the documented no-offer / fail-closed contract for a COMMITTED part.
+TEST(CaWiringExchange, RelinkOffersNothingAndAdoptFailsClosed)
 {
-    /// Sender and receiver share one pool: model both as two metadata storages over the SAME
-    /// backend is not constructible here (Local storages differ), so use one storage as both ends
-    /// - the facade only touches pool state.
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
     writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "replicate-me");
@@ -1026,22 +1032,23 @@ TEST(CaWiringExchange, AdoptPartPublishesOwnRef)
 
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
+    /// The pool identity is still offered (two replicas relink iff equal); only the tree-id offer is gone.
     EXPECT_FALSE(exchange->getPoolUUID().empty());
 
-    auto tree_id = exchange->getPartTreeId("uui/uuid-1/all_1_1_0");
-    ASSERT_TRUE(tree_id.has_value());
+    /// No relink offer for a committed part, nor for an absent one.
+    EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_1_1_0").has_value());
     EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_9_9_9").has_value());
 
-    /// The receiver's adoption: a new ref to the SAME tree under the fetched part name, carrying
-    /// the transferred mutable header.
-    ASSERT_TRUE(exchange->adoptPart("uuid-1", "tmp-fetch_all_1_1_0", *tree_id, {{"metadata_version.txt", "4"}}));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/tmp-fetch_all_1_1_0/data.bin"));
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/tmp-fetch_all_1_1_0/metadata_version.txt"),
-              std::optional<String>("4"));
-    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path,
-              storage->getStorageObjects("uui/uuid-1/tmp-fetch_all_1_1_0/data.bin")[0].remote_path);
+    /// adoptPart is unreachable (no offer is ever made) and fails closed if reached. It publishes
+    /// NOTHING; the caller falls back to the byte fetch.
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
+        [&] { exchange->adoptPart("uuid-1", "tmp-fetch_all_1_1_0", std::string(32, '0'), {{"metadata_version.txt", "4"}}); });
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp-fetch_all_1_1_0"));
 }
 
+/// B7: even after a part is dropped and reclaimed there is still no relink offer (the no-offer contract
+/// is independent of reclamation — the sender always streams bytes). Ported off the old reclaimed-tree
+/// adopt-fallback race, which the no-offer contract subsumes.
 TEST(CaWiringExchange, AdoptOfReclaimedTreeFallsBack)
 {
     auto storage = openWiringStorage();
@@ -1049,17 +1056,20 @@ TEST(CaWiringExchange, AdoptOfReclaimedTreeFallsBack)
     writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "soon-gone");
     tx->commit(DB::NoCommitOptions{});
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
-    auto tree_id = exchange->getPartTreeId("uui/uuid-1/all_1_1_0");
-    ASSERT_TRUE(tree_id.has_value());
+    ASSERT_NE(exchange, nullptr);
+    /// No offer for the live committed part (the part-manifest model never offers a relink id).
+    EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_1_1_0").has_value());
 
-    /// The part is dropped and reclaimed before the receiver adopts (the relink race).
+    /// The part is dropped and reclaimed (the former relink race window).
     auto tx2 = storage->createTransaction();
     tx2->removeDirectory("uui/uuid-1/all_1_1_0");
     storage->runOneGcRoundForTest();
     storage->runOneGcRoundForTest();
 
-    /// adoptPart returns false (byte-fetch fallback) and publishes NOTHING.
-    EXPECT_FALSE(exchange->adoptPart("uuid-1", "tmp-fetch_all_1_1_0", *tree_id, {}));
+    /// Still no offer; adoptPart publishes NOTHING (fail-closed) — the caller byte-fetches.
+    EXPECT_FALSE(exchange->getPartTreeId("uui/uuid-1/all_1_1_0").has_value());
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
+        [&] { exchange->adoptPart("uuid-1", "tmp-fetch_all_1_1_0", std::string(32, '0'), {}); });
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp-fetch_all_1_1_0"));
 }
 
@@ -1210,7 +1220,7 @@ TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)
 
     /// Ensure published_at_ms is unset (the default is 0).
     storage->store()->updateRefPayload(storage->liveNamespace("uuid-1"), "all_1_1_0",
-        [](DB::Cas::RefPayload & payload) { payload.published_at_ms = 0; });
+        [](DB::Cas::RootRef & r) { r.published_at_ms = 0; });
 
     EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 0);
 }

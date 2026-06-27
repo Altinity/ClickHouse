@@ -8,16 +8,18 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
-/// Task 13 — the adversarial publish gate (the protocol climax of M-C2). Every scenario injects GC
-/// state through the on-storage GC surface ONLY (injectRetire writes gc/state + a retired set;
-/// fenceNamespace raises fence_round — exactly the writes a GC leader performs), then publishes. The
-/// Store refreshes its retire view at open; Build::publish refreshes again on a fence-advanced conflict
-/// and then runs `checkAndResolveDeps` — the merged W-REVALIDATE + W-EVIDENCE + condemned-token pass
-/// (B190 Task 3; replaces the former separate `revalidateDeps` + `gateCheckDeps` calls).
-///
-/// The standard pattern: build + upload (records tokens at view round 0), THEN inject retire + fence,
-/// THEN publish. The first CAS attempt reads the fenced manifest, sees view.round() < fence_round,
-/// refreshes, and runs `checkAndResolveDeps`.
+/// Multi-actor protocol scenarios for the root-local part-manifest model (CA GC redesign rev. 15).
+/// Ported from the removed tree/closure model. The single-call `publish(ns, ref, tree, RefPayload{})`
+/// gate is gone; a write is now the four-step flow:
+///   stageManifest(entries) -> precommitAdd(ns, ref, id) -> putBlob(...) -> promote(ns, ref, build_id, id)
+/// The fail-closed publish gate that those scenarios exercise now lives in TWO places:
+///   • putBlob: INV-1 condemned-dedup re-upload from the writer's OWN source bytes (never GETs the
+///     dying object);
+///   • promote: a fail-closed HEAD over EVERY blob leaf of the staged manifest body — a blob that is
+///     ABSENT or condemned-at-its-CURRENT-token ⇒ ABORTED (the committed ref never names a missing or
+///     dying blob). promote refreshes the retire view when the shard/registry fence is ahead of it.
+/// These scenarios assert the no-dangle / no-loss / fail-closed protocol properties faithfully on that
+/// flow. The strong safety assertions are preserved.
 
 namespace DB::ErrorCodes
 {
@@ -27,6 +29,7 @@ extern const int LOGICAL_ERROR;
 }
 
 using namespace DB::Cas;
+using DB::Cas::tests::blobEntryFor;
 using DB::Cas::tests::displaceBlobToken;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::fenceNamespace;
@@ -34,7 +37,6 @@ using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::writeBlobRaw;
-using DB::Cas::tests::writeTreeRaw;
 
 namespace
 {
@@ -44,30 +46,49 @@ StorePtr openStore(const std::shared_ptr<InMemoryBackend> & b)
     return Store::open(b, PoolConfig{.pool_prefix = "p"});
 }
 
-/// A single-blob tree entry naming `payload` at `name` (the entry the part's tree carries).
-TreeEntry blobEntry(const String & name, const String & payload)
+/// A single-blob manifest entry naming `payload` at `path` (the entry the part's manifest carries).
+ManifestEntry blobEntry(const String & path, const String & payload)
 {
-    TreeEntry e;
-    e.name = name;
-    e.placement = Placement::Blob;
-    e.file_hash = u128Of(payload);
-    e.file_size = payload.size();
-    return e;
+    return blobEntryFor(path, u128Of(payload), payload.size());
 }
 
-/// Read the part's blob back through the full read stack (resolve → readTree → locate → ranged GET)
-/// and assert it returns `payload`. This is the INV-NO-DANGLE check: every named object resolves.
+/// Start a build whose `intended_ref` is "ns/ref" — REQUIRED: stageManifest derives the manifest's
+/// owning namespace by splitting intended_ref on the LAST '/'. (See Build::manifestNamespace.)
+BuildPtr startBuildFor(const StorePtr & s, const RootNamespace & ns, const String & ref)
+{
+    BuildInfo info;
+    info.intended_ref = ns.string() + "/" + ref;
+    return s->startBuild(info);
+}
+
+/// The full write flow for a part whose only file is `payload` at `path` (blob placement). Uploads the
+/// blob via putBlob, stages the manifest, precommits, then promotes. Returns the committed ManifestId.
+/// Mirrors what the old single-call `publish` did on the tree model.
+ManifestId publishBlobPart(
+    const StorePtr & s, const RootNamespace & ns, const String & ref, const String & path, const String & payload)
+{
+    auto build = startBuildFor(s, ns, ref);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
+    const ManifestId id = build->stageManifest({blobEntry(path, payload)});
+    build->precommitAdd(ns, ref, id);
+    build->promote(ns, ref, build->buildId(), id);
+    return id;
+}
+
+/// Read the part's blob back through the full read stack (resolveRef → readManifest → lookupPath →
+/// locate → ranged GET) and assert it returns `payload`. This is the INV-NO-DANGLE check: every named
+/// object resolves and reads.
 void assertPartReads(
     const std::shared_ptr<InMemoryBackend> & b, const StorePtr & s,
-    const RootNamespace & ns, const String & ref, const TreeId & tree, const String & payload)
+    const RootNamespace & ns, const String & ref, const String & path, const String & payload)
 {
     auto r = s->resolveRef(ns, ref);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->tree_id, tree);
 
-    auto entries = s->readTree(tree);
-    ASSERT_EQ(entries.size(), 1u);
-    auto loc = s->locate(entries[0]);
+    const PartManifest manifest = s->readManifest(r->manifest_id);
+    auto entry = s->lookupPath(manifest, path);
+    ASSERT_TRUE(entry.has_value());
+    auto loc = s->locate(*entry);
     auto got = b->get(loc.key, Range{loc.offset, loc.length});
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->bytes, payload);
@@ -77,20 +98,18 @@ void assertPartReads(
 
 TEST(CasProtocol, FenceConflictCondemnedBlobDepAbortsRetryable)
 {
-    /// B190 INV-1: a blob dep whose OWN token is condemned at the gate has no source bytes available
-    /// (they were not retained after putBlob returned). The gate MUST throw ABORTED (retryable), never
-    /// GET the dying object. Resurrection-by-GET was the old behavior; INV-1 forbids it.
-    ///
-    /// Spec §5: "blob or adopted-tree with no source → retryable ABORTED". The caller retries the full
-    /// build from scratch (re-putBlob from its own source bytes).
+    /// INV-1: a blob leaf whose CURRENT token is condemned at the promote gate has no source bytes
+    /// available (a precommitted build's promote holds no BlobSource). The gate MUST throw ABORTED
+    /// (retryable), never GET the dying object. The caller retries the whole build from scratch.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    /// Build: own upload of X (records token t0 at view round 0), then tree T.
-    auto build = s->startBuild({});
+    /// Build: upload X (records token t0 at view round 0), stage the manifest, precommit.
+    auto build = startBuildFor(s, ns, "part_1");
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
-    const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
+    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
+    build->precommitAdd(ns, "part_1", id);
 
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Token t0 = b->head(blob_key).token;
@@ -100,9 +119,9 @@ TEST(CasProtocol, FenceConflictCondemnedBlobDepAbortsRetryable)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// First CAS reads fence_round=1 > view round 0 ⇒ refresh ⇒ `checkAndResolveDeps`: X condemned at t0
-    /// ⇒ Case(a): dep's own token condemned, no retained payload ⇒ ABORTED (INV-1; caller must retry).
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
+    /// promote: mutateShard refreshes the view (fence_round 1 > view round 0), then revalidates X:
+    /// HEAD t0 is condemned ⇒ ABORTED (INV-1; caller must retry from scratch).
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
 
     /// The condemned object is still at t0 — nothing was written.
     EXPECT_EQ(b->head(blob_key).token, t0);
@@ -112,7 +131,9 @@ TEST(CasProtocol, FenceConflictCondemnedBlobDepAbortsRetryable)
 
 TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
 {
-    /// The F1 IN-FLIGHT DISJUNCTION keep-branch.
+    /// The keep-branch: a blob dedup-adopted at round 0, an EMPTY retire set at round 1, the blob's
+    /// token unchanged. promote re-HEADs at the gate, finds t0 live (not condemned) ⇒ commits in place,
+    /// no rewrite.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -122,25 +143,28 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Token t0 = b->head(blob_key).token;
 
-    auto build = s->startBuild({});
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0 (TOKENED dep)
-    const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
+    auto build = startBuildFor(s, ns, "part_1");
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
+    build->precommitAdd(ns, "part_1", id);
 
-    /// GC advanced the round to 1 but dropped all entries on outcomes ⇒ EMPTY retired set; fence to 1.
-    /// X is NOT condemned in the refreshed view and its token is unchanged.
+    /// GC advanced the round to 1 with an EMPTY retired set; fence to 1. X is NOT condemned and its
+    /// token is unchanged.
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0, {});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// refresh ⇒ X stale (observed round 0 < 1), no hit ⇒ re-observe ⇒ current == t0 ⇒ KEEP.
-    build->publish(ns, "part_1", tree, RefPayload{});
+    /// promote refreshes ⇒ revalidate X ⇒ HEAD t0 not condemned ⇒ commit (KEEP).
+    build->promote(ns, "part_1", build->buildId(), id);
 
-    assertPartReads(b, s, ns, "part_1", tree, "payload-X");
+    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
     /// No rewrite happened — the keep-branch left the object's token at t0.
     EXPECT_EQ(b->head(blob_key).token, t0);
 }
 
 TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
 {
+    /// A blob displaced out-of-band to a fresh live token t1 before the gate. promote re-HEADs the
+    /// CURRENT token (t1), finds it live ⇒ commits; the part rides t1.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -149,9 +173,10 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Token t0 = b->head(blob_key).token;
 
-    auto build = s->startBuild({});
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0 at round 0
-    const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
+    auto build = startBuildFor(s, ns, "part_1");
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
+    build->precommitAdd(ns, "part_1", id);
 
     /// Another writer displaces X out-of-band ⇒ a new current token t1 (same payload, fresh tag).
     const Token t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
@@ -161,42 +186,30 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0, {});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// refresh ⇒ X stale, no hit ⇒ re-observe ⇒ current t1 != observed t0 ⇒ observeAndAdmit ⇒ adopt t1.
-    build->publish(ns, "part_1", tree, RefPayload{});
-    assertPartReads(b, s, ns, "part_1", tree, "payload-X");
+    /// promote refreshes ⇒ revalidate X ⇒ HEAD current t1 not condemned ⇒ commit. The dep rides t1.
+    build->promote(ns, "part_1", build->buildId(), id);
+    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
     EXPECT_EQ(b->head(blob_key).token, t1);
 
-    /// Black-box proof the dep now rides t1 (not the stale t0): re-publish the same tree into a SECOND
-    /// namespace with NO new GC injection — no fence advance, so no refresh and no gate displacement.
-    /// The dep is already token-bearing at t1; nothing is re-uploaded and the object stays at t1.
-    /// (Condemning hashX at ANY token now forces a resurrect on a fence-advanced publish — view hits
-    /// are by HASH, not by our exact token — so the dep's token cannot be probed via a hash-condemn.)
-    build->publish(RootNamespace{"srv1/tbl/copy"}, "part_2", tree, RefPayload{});
+    /// Black-box proof the part reads the t1 incarnation: re-publish the same blob into a SECOND
+    /// namespace with NO new GC injection. The blob is already present at t1; nothing is re-uploaded.
+    publishBlobPart(s, RootNamespace{"srv1/tbl/copy"}, "part_2", "data.bin", "payload-X");
     EXPECT_EQ(b->head(blob_key).token, t1);
-    assertPartReads(b, s, RootNamespace{"srv1/tbl/copy"}, "part_2", tree, "payload-X");
+    assertPartReads(b, s, RootNamespace{"srv1/tbl/copy"}, "part_2", "data.bin", "payload-X");
 
-    /// Independent discriminator that the dep rides t1, not the stale t0: t0 is DEAD. A deleteExact
-    /// against t0 must TokenMismatch (INV-NO-RETURN — t0 was displaced and can never be current
-    /// again), proving the adoption was to t1 and did not silently retain t0.
+    /// Independent discriminator that the blob rides t1, not the stale t0: t0 is DEAD. A deleteExact
+    /// against t0 must TokenMismatch (INV-NO-RETURN — t0 was displaced and can never be current again).
     EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
 }
 
 TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentToken)
 {
-    /// B190 INV-1 Case(b): a token-bearing dep whose OWN token t0 is LIVE (not condemned), but a
-    /// DIFFERENT phantom token t_other for the same hash IS condemned. `checkAndResolveDeps`: hash hit,
-    /// but isCondemnedToken(t0)=false ⇒ Case(b): dep's own token is live ⇒ re-observe (observeAndAdmit,
-    /// HEAD-only, no GET) ⇒ current still t0 ⇒ adopt t0 (keep in place, no upload). The old resurrect
-    /// path would have re-uploaded from GET(condemned_object), which is forbidden by INV-1.
-    ///
-    /// Discriminating contract: publish SUCCEEDS and the object STAYS at t0 (no displacement).
-    /// The old test expected EXPECT_NE(t_after, t0) because the old resurrect replaced the object;
-    /// the B190 Case(b) path does NOT re-upload — it merely re-adopts the still-live t0.
+    /// A blob whose OWN current token t0 is LIVE, but a DIFFERENT phantom token t_other for the same
+    /// hash IS condemned. promote HEADs t0; isCondemnedToken(t0)=false ⇒ commit in place (no upload,
+    /// no displacement). The condemnation is for a different incarnation and does not touch t0.
     auto b = std::make_shared<InMemoryBackend>();
     const RootNamespace ns{"srv1/tbl"};
 
-    /// X pre-exists at its current token t0; another incarnation token t_other is condemned by hash at
-    /// round 1 (a different incarnation's entry — the GC surface only needs the (hash, token) pair).
     DB::Cas::Layout layout("p");
     {
         auto s0 = Store::open(b, PoolConfig{.pool_prefix = "p"});
@@ -210,32 +223,27 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t_other, .size = 9}});
     /// Fence to round 1 BEFORE opening the store, so the store's open-time refresh lands the view at
-    /// round 1 already populated — and the build's dep is then recorded at round 1 (non-stale).
+    /// round 1 already populated.
     fenceNamespace(*b, layout, ns, /*n_shards*/ 8, /*round*/ 1);
 
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});   /// open-time refresh ⇒ view round 1
-    auto build = s->startBuild({});
-    /// putBlob dedup-adopts t0: current t0 is NOT in the condemned set {t_other} ⇒ ADOPT t0, dep
-    /// recorded at observed_view_round = 1 (the current view round) ⇒ NON-STALE at publish time.
+    auto build = startBuildFor(s, ns, "part_1");
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
-    const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
+    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
+    build->precommitAdd(ns, "part_1", id);
 
-    /// publish: view round 1 == fence_round 1 ⇒ NO fence advance ⇒ no refresh before the gate.
-    /// `checkAndResolveDeps`: hash hit (t_other condemned) but dep's own t0 is NOT condemned ⇒ Case(b):
-    /// observeAndAdmit (HEAD-only) ⇒ current t0 is live ⇒ re-adopt t0. Publish lands.
-    build->publish(ns, "part_1", tree, RefPayload{});
+    /// promote: revalidate X ⇒ HEAD t0; t0 is NOT in the condemned set {t_other} ⇒ commit. Lands.
+    build->promote(ns, "part_1", build->buildId(), id);
 
-    assertPartReads(b, s, ns, "part_1", tree, "payload-X");
+    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
 
-    /// B190 Case(b): the object was NOT displaced — it STAYS at t0 (no re-upload, just re-adopted).
-    /// This is the discriminator vs the old resurrect: the old code replaced the object with a fresh
-    /// incarnation (EXPECT_NE); the new path merely re-adopts the live t0 (EXPECT_EQ).
-    const Token t_after = b->head(blob_key).token;
-    EXPECT_EQ(t_after, t0);
+    /// The object was NOT displaced — it STAYS at t0 (no re-upload, only re-validated).
+    EXPECT_EQ(b->head(blob_key).token, t0);
 }
 
 TEST(CasProtocol, RevalidateAbsentBlobDepAbortsRetryable)
 {
+    /// A blob deleted (a landed GC delete) before the gate. promote HEADs it ⇒ absent ⇒ ABORTED.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -243,104 +251,68 @@ TEST(CasProtocol, RevalidateAbsentBlobDepAbortsRetryable)
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
 
-    auto build = s->startBuild({});
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts token at round 0
-    const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
+    auto build = startBuildFor(s, ns, "part_1");
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts current token
+    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
+    build->precommitAdd(ns, "part_1", id);
 
-    /// A landed GC delete whose retire entry already dropped: delete X raw by its current token.
+    /// A landed GC delete: delete X raw by its current token.
     const Token cur = b->head(blob_key).token;
     ASSERT_EQ(b->deleteExact(blob_key, cur).kind, DeleteOutcome::Kind::Deleted);
 
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0, {});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// refresh ⇒ X stale, no hit ⇒ re-observe ⇒ absent ⇒ blob payload not retained ⇒ ABORTED (retryable).
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
-}
-
-TEST(CasProtocol, RevalidateAbsentTreeDepRecreates)
-{
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    const RootNamespace ns{"srv1/tbl"};
-
-    auto build = s->startBuild({});
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
-    const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});   /// retained payload
-
-    /// Delete the tree object raw (its retire entry already dropped). The blob X is untouched.
-    const String tree_key = s->layout().treeKey(tree);
-    const Token tree_tok = b->head(tree_key).token;
-    ASSERT_EQ(b->deleteExact(tree_key, tree_tok).kind, DeleteOutcome::Kind::Deleted);
-
-    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0, {});
-    fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
-
-    /// refresh ⇒ T stale, no hit ⇒ re-observe ⇒ absent ⇒ re-create from the retained payload ⇒ lands.
-    build->publish(ns, "part_1", tree, RefPayload{});
-
-    /// The tree object is back (fresh incarnation) and the part reads.
-    EXPECT_TRUE(b->head(tree_key).exists);
-    EXPECT_NE(b->head(tree_key).token, tree_tok);
-    assertPartReads(b, s, ns, "part_1", tree, "payload-X");
+    /// promote: revalidate X ⇒ HEAD absent ⇒ ABORTED (retryable). No ref published.
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 }
 
 TEST(CasProtocol, EvidenceHitCondemnedBlobAbortsRetryable)
 {
-    /// B190 INV-1: W-EVIDENCE (tokenless dep) on blob X — `checkAndResolveDeps`: view hit by hash ⇒
-    /// observeAndAdmit ⇒ HEAD ⇒ current t0 condemned ⇒ ABORTED (blob has no retained source bytes;
-    /// INV-1 forbids GET). The old behavior was resurrect-by-GET, which is now forbidden.
-    ///
-    /// Spec §5: "blob or adopted-tree with no source → retryable ABORTED". The caller retries the full
-    /// build from scratch (re-uploads from its own source).
+    /// W-EVIDENCE (tokenless adopted dep) on a blob X that is condemned at the gate. promote does not
+    /// consult the dep set — it HEADs every blob leaf of the manifest body directly. X condemned at its
+    /// current token t0 ⇒ ABORTED (no source bytes to re-upload; INV-1 forbids GET).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    /// Source tree S names blob X; X pre-exists with token t0.
+    /// X pre-exists with token t0; the manifest names it (a tokenless adopted leaf).
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Token t0 = b->head(blob_key).token;
-    const TreeId source = writeTreeRaw(*b, s->layout(), {blobEntry("data.bin", "payload-X")}, s->poolMeta().pool_id, s->poolMeta().blob_header_len);
 
-    auto build = s->startBuild({});
-    const TreeEntry adopted = build->adoptFromTree(source, "data.bin");   /// tokenless dep on X
-    const TreeId tree = build->putTree({adopted});
+    auto build = startBuildFor(s, ns, "part_1");
+    const ManifestEntry entry = blobEntry("data.bin", "payload-X");
+    build->adoptEvidence(entry);   /// tokenless W-EVIDENCE dep on X (no HEAD, no upload)
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(ns, "part_1", id);
 
     /// GC condemns X at t0 in round 1 + fence.
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// refresh ⇒ `checkAndResolveDeps`: tokenless X has a view hit (condemned at t0) ⇒
-    /// observeAndAdmit ⇒ HEAD ⇒ current t0 condemned ⇒ ABORTED (INV-1; no source bytes to re-upload).
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
+    /// promote: revalidate X ⇒ HEAD t0 condemned ⇒ ABORTED (INV-1; no source bytes).
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
 
-    /// The condemned object stays at t0 — nothing was written.
     EXPECT_EQ(b->head(blob_key).token, t0);
-    /// No ref was published.
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 }
 
 TEST(CasProtocol, WedgedHeartbeatCondemnedBlobDepAbortsRetryable)
 {
-    /// B190 INV-1: a build whose heartbeat never renews finds its OWN uploads condemned by full GC;
-    /// its publish refreshes, sees them condemned, but has NO retained source bytes for the blob ⇒
-    /// ABORTED (INV-1 forbids GET on the condemned object). The caller must retry from scratch,
-    /// re-uploading from its own source bytes. The old "self-heal resurrect" path used GET, which
-    /// is now forbidden.
-    ///
-    /// Spec §5: "blob or adopted-tree with no source → retryable ABORTED". The precommit/two-phase
-    /// commit redesign (B171+) removes this window for normal builds: the precommit fence ensures GC
-    /// cannot condemn the build's uploads while the build is in-flight. This test validates the
-    /// correct ABORTED behavior for the degenerate case where a build skips precommit.
+    /// A build whose watermark never renews finds its OWN upload condemned by full GC; its promote
+    /// revalidates, sees the blob condemned, and has no retained source bytes at promote time ⇒ ABORTED.
+    /// The precommit fence normally removes this window; this validates the degenerate case.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    auto build = s->startBuild({});   /// background_watermark=false by config; never renewed
+    auto build = startBuildFor(s, ns, "part_1");
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
-    const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
+    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
+    build->precommitAdd(ns, "part_1", id);
 
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Token t0 = b->head(blob_key).token;
@@ -350,83 +322,73 @@ TEST(CasProtocol, WedgedHeartbeatCondemnedBlobDepAbortsRetryable)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// refresh ⇒ `checkAndResolveDeps`: X condemned at dep's own t0 ⇒ Case(a): no retained payload ⇒ ABORTED.
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
+    /// promote: revalidate X ⇒ HEAD t0 condemned ⇒ ABORTED.
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
 
-    /// The condemned object stays at t0 — nothing was written.
     EXPECT_EQ(b->head(blob_key).token, t0);
-    /// No ref was published.
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 }
 
 TEST(CasProtocol, AbandonLeavesDebrisAndDisables)
 {
+    /// abandon leaves the uploaded blob + staged manifest body as debris (reaped by the orphan sweep);
+    /// no owner transition is touched, and further build ops fail LOGICAL_ERROR (requireAlive).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    auto build = s->startBuild({});
+    auto build = startBuildFor(s, ns, "part_1");
     auto blob = build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
-    const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
+    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
 
     build->abandon();
 
-    /// Uploaded objects remain as debris (reaped by full GC via min_active); no manifest was touched.
+    /// The uploaded blob remains as debris; the staged manifest body is best-effort deleted by abandon.
     EXPECT_TRUE(b->head(s->layout().blobKey(blob.id)).exists);
-    EXPECT_TRUE(b->head(s->layout().treeKey(tree)).exists);
+    EXPECT_FALSE(b->head(s->layout().manifestKey(id)).exists);   /// best-effort cleanup ran
     EXPECT_TRUE(s->listRefs(ns).empty());
 
     /// Further build ops ⇒ LOGICAL_ERROR (requireAlive).
     expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
+        [&] { build->stageManifest({blobEntry("data.bin", "payload-X")}); });
 }
 
 TEST(CasProtocol, DropReattachThroughDetachedNamespace)
 {
-    /// ATTACH choreography (design §4): publish part_1 in ns; adopt the tree and publish into
-    /// ns/detached + drop part_1 from ns; then adopt + re-publish part_1 back in ns + drop from detached.
-    /// The tree id never changes and the objects are never re-uploaded.
+    /// ATTACH choreography (design §4): publish part_1 in ns; re-publish into ns/detached + drop part_1
+    /// from ns; then re-publish part_1 back in ns + drop from detached. The BLOB is never re-uploaded
+    /// (its token is stable throughout); each namespace gets its own single-owner manifest.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
     const RootNamespace detached{"srv1/tbl/detached"};
 
-    auto build1 = s->startBuild({});
-    auto blob = build1->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
-    const TreeId tree = build1->putTree({blobEntry("data.bin", "payload-X")});
-    build1->publish(ns, "part_1", tree, RefPayload{});
+    publishBlobPart(s, ns, "part_1", "data.bin", "payload-X");
 
-    const String blob_key = s->layout().blobKey(blob.id);
-    const String tree_key = s->layout().treeKey(tree);
+    const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Token blob_tok = b->head(blob_key).token;
-    const Token tree_tok = b->head(tree_key).token;
 
     EXPECT_TRUE(s->listRefs(ns).contains("part_1"));
     EXPECT_TRUE(s->listRefs(detached).empty());
 
-    /// Move to detached: adopt the live tree, publish into detached, drop from ns.
-    auto build2 = s->startBuild({});
-    build2->adoptTree(tree);
-    build2->publish(detached, "part_1", tree, RefPayload{});
+    /// Move to detached: re-publish into detached (adopting the live blob), drop from ns.
+    publishBlobPart(s, detached, "part_1", "data.bin", "payload-X");
     s->dropRef(ns, "part_1");
 
     EXPECT_TRUE(s->listRefs(ns).empty());
     ASSERT_TRUE(s->listRefs(detached).contains("part_1"));
-    EXPECT_EQ(s->listRefs(detached).at("part_1").tree_id, tree);
+    assertPartReads(b, s, detached, "part_1", "data.bin", "payload-X");
 
-    /// Re-attach: adopt the tree, re-publish part_1 back in ns, drop from detached.
-    auto build3 = s->startBuild({});
-    build3->adoptTree(tree);
-    build3->publish(ns, "part_1", tree, RefPayload{});
+    /// Re-attach: re-publish part_1 back in ns, drop from detached.
+    publishBlobPart(s, ns, "part_1", "data.bin", "payload-X");
     s->dropRef(detached, "part_1");
 
     ASSERT_TRUE(s->listRefs(ns).contains("part_1"));
-    EXPECT_EQ(s->listRefs(ns).at("part_1").tree_id, tree);
+    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
     EXPECT_TRUE(s->listRefs(detached).empty());
 
-    /// The tree id never changed and neither object was ever re-uploaded (tokens stable throughout).
+    /// The blob was never re-uploaded (token stable throughout — every publish dedup-adopted it).
     EXPECT_EQ(b->head(blob_key).token, blob_tok);
-    EXPECT_EQ(b->head(tree_key).token, tree_tok);
 }
 
 TEST(CasProtocol, FreezeIntoShadowNamespace)
@@ -438,35 +400,26 @@ TEST(CasProtocol, FreezeIntoShadowNamespace)
     const RootNamespace ns{"srv1/tbl"};
     const RootNamespace shadow{"shadow/backup1/tbl"};
 
-    auto build1 = s->startBuild({});
-    build1->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
-    const TreeId tree = build1->putTree({blobEntry("data.bin", "payload-X")});
-    build1->publish(ns, "part_1", tree, RefPayload{});
+    publishBlobPart(s, ns, "part_1", "data.bin", "payload-X");
 
-    /// Freeze into the shadow namespace, then drop the live ref.
-    auto build2 = s->startBuild({});
-    build2->adoptTree(tree);
-    build2->publish(shadow, "part_1", tree, RefPayload{});
+    /// Freeze into the shadow namespace (adopting the live blob), then drop the live ref.
+    publishBlobPart(s, shadow, "part_1", "data.bin", "payload-X");
     s->dropRef(ns, "part_1");
 
     EXPECT_TRUE(s->listRefs(ns).empty());
     /// The shadow ref still resolves and reads after the live ref is gone.
-    assertPartReads(b, s, shadow, "part_1", tree, "payload-X");
+    assertPartReads(b, s, shadow, "part_1", "data.bin", "payload-X");
 }
 
-TEST(CasProtocol, ResurrectLosesRaceCondemnedDepAbortsRetryable)
+TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
 {
-    /// B190 INV-1: a tokened dep whose OWN token t0 is condemned. Even if the object was
-    /// concurrently displaced to t1 (live), the dep's own token t0 is still condemned in the view ⇒
-    /// `checkAndResolveDeps` Case(a): dep's own token condemned, blob has no retained source bytes ⇒ ABORTED.
-    ///
-    /// The old resurrect path would have GET'd the current incarnation (t1, uncondemned) and
-    /// rewritten it with putOverwrite. INV-1 forbids GET on any dying object and forbids GET
-    /// even on a live object when the dep's own token is condemned. ABORTED is the correct outcome.
-    ///
-    /// The model's `W_Resurrect` racing `W_Publish` interleaving (displacement between GET and
-    /// putOverwrite) was the old test's focus. Under B190 the entire resurrect-by-GET path is
-    /// removed; the caller retries from scratch with their own source bytes.
+    /// (Ported from the former ResurrectLosesRace scenario.) The old tree-model gate condemned the dep's
+    /// OWN recorded token and ABORTED even when the object had been displaced to a live t1. The new model
+    /// re-HEADs at promote and checks the CURRENT token: a blob displaced to a LIVE t1 (while its old t0
+    /// is condemned for a now-defunct incarnation) is SAFE to commit — the committed manifest names a
+    /// blob HASH, the live t1 incarnation backs it, and GC's exact-token delete of t0 only TokenMismatches.
+    /// So promote COMMITS. This is the correct no-loss / no-dangle outcome under the re-HEAD gate; the
+    /// old conservative ABORTED has no manifest-model analog.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -475,9 +428,10 @@ TEST(CasProtocol, ResurrectLosesRaceCondemnedDepAbortsRetryable)
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Token t0 = b->head(blob_key).token;
 
-    auto build = s->startBuild({});
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0 at round 0
-    const TreeId tree = build->putTree({blobEntry("data.bin", "payload-X")});
+    auto build = startBuildFor(s, ns, "part_1");
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
+    build->precommitAdd(ns, "part_1", id);
 
     /// Another writer displaces X to t1 (uncondemned) before our gate runs.
     const Token t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
@@ -488,98 +442,84 @@ TEST(CasProtocol, ResurrectLosesRaceCondemnedDepAbortsRetryable)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// refresh ⇒ `checkAndResolveDeps`: hash hit (t0), dep's own t0 IS condemned ⇒ Case(a): no retained
-    /// source bytes ⇒ ABORTED (INV-1; caller must retry from scratch with its own source bytes).
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
+    /// promote: revalidate X ⇒ HEAD current t1 (NOT condemned; only the defunct t0 is) ⇒ commit.
+    build->promote(ns, "part_1", build->buildId(), id);
 
-    /// The object is at t1 (the displacing writer's incarnation, live and untouched by us).
+    /// The blob lives at t1 (the displacing writer's incarnation) and the part reads.
     EXPECT_EQ(b->head(blob_key).token, t1);
-    /// No ref was published.
-    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
+
+    /// NO-LOSS / NO-RETURN: t0 is dead — a deleteExact against it TokenMismatches (the GC delete of the
+    /// condemned t0 spares the live t1).
+    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
 }
 
 TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
 {
-    /// THE ABSENT-SHARD ORDERING HOLE's regression test (spec section 5 W-REGISTER, decision
-    /// 2026-06-12). A publish into a BRAND-NEW namespace creates its manifest with fence_round 0,
-    /// so the manifest alone can never trigger the gate's fence-advanced refresh - without the
-    /// registry fence floor a stale-view writer would republish a condemned hash invisibly to the
-    /// recheck, and the exact-token delete would then dangle a live ref. With W-REGISTER, the
-    /// registration observes the registry's fence_round (raised by the GC round) and the gate
-    /// refreshes + revalidates BEFORE the first publish commits.
-    ///
-    /// Discriminating asserts: WITHOUT the floor (max(root.fence_round /*0*/, 0)) the stale view
-    /// has no entry for T, no resurrect happens, and deleteExact(T, t0) would return Deleted -
-    /// the dangle made concrete. With the floor it returns TokenMismatch.
+    /// THE ABSENT-SHARD ORDERING HOLE's regression test (spec §5 W-REGISTER). A publish into a BRAND-NEW
+    /// namespace creates its shard with fence_round 0, so the shard alone can never trigger the gate's
+    /// fence-advanced refresh. W-REGISTER makes promote's ensureRegistered observe the REGISTRY's
+    /// fence_round (raised by the GC round) and refresh the view BEFORE revalidating. Re-expressed on the
+    /// manifest model with a blob leaf (the tree object is gone): build B adopts a blob, a GC round
+    /// retires + deletes it, then B publishes into a fresh namespace — promote refreshes (registry floor)
+    /// and revalidates the now-ABSENT blob ⇒ ABORTED. It must NEVER land a manifest naming a deleted blob.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
 
-    /// 1. part_1 -> tree T in namespace A, through the real Build (registers A).
-    auto build_a = s->startBuild({});
+    /// 1. part_1 → a blob in namespace A, through the real Build (registers A).
+    const RootNamespace ns_a{"srv1/tbl"};
+    auto build_a = startBuildFor(s, ns_a, "part_1");
     build_a->putBlob(idOf("floor-payload"), BlobSource::fromString("floor-payload"));
-    auto tree = build_a->putTree({blobEntry("data.bin", "floor-payload")});
-    build_a->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{});
-    const String tree_key = s->layout().treeKey(tree);
-    const Token t0 = b->head(tree_key).token;
+    const ManifestId id_a = build_a->stageManifest({blobEntry("data.bin", "floor-payload")});
+    build_a->precommitAdd(ns_a, "part_1", id_a);
+    build_a->promote(ns_a, "part_1", build_a->buildId(), id_a);
+    const String blob_key = s->layout().blobKey(idOf("floor-payload"));
+    const Token t0 = b->head(blob_key).token;
 
-    /// 2. build B adopts T while the view is still at round 0 (a token-bearing cold-reuse dep
-    /// since 2026-06-12 - observed at adopt time, stamped with view round 0).
-    auto build_b = s->startBuild({});
-    build_b->adoptTree(tree);
+    /// 2. build B adopts the blob (tokenless W-EVIDENCE) while the view is still at round 0.
+    auto build_b = startBuildFor(s, RootNamespace{"srv2/new"}, "part_x");
+    build_b->adoptEvidence(blobEntry("data.bin", "floor-payload"));
 
-    /// 3. the last ref to T drops; a REAL GC round retires T at t0 and fences the registry
-    /// (fence_round 1). No delete exists yet in this milestone - the retire set is the barrier.
-    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
-    /// build_a (T's owner) finished; advance the durable watermark floor past its seq so the Task 10
-    /// build-watermark guard condemns T. build_b is still in-flight, but it does NOT own T (T was
-    /// written by build_a), so its still-active seq does not protect T.
+    /// 3. drop part_1 from A; a REAL GC round retires the blob at t0, deletes it, and fences the
+    /// registry (fence_round 1). build_a finished, so advancing the watermark floor condemns the blob.
+    s->dropRef(ns_a, "part_1");
     build_a.reset();
     s->renewWatermarkOnce();
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
-    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    for (size_t r = 0; r < 8; ++r)
+    {
+        const RoundReport rep = gc.runRegularRound();
+        if (rep.acquired_lease && rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
+            && rep.replaced == 0 && rep.spared == 0)
+            break;
+    }
+    /// The blob (unreachable) was deleted at t0.
+    EXPECT_FALSE(b->head(blob_key).exists);
 
-    /// The full round COMPLETED: T (unreachable) was deleted at t0 and its retired entry dropped
-    /// on the confirmed outcome - the view alone can no longer condemn it.
-    EXPECT_FALSE(b->head(tree_key).exists);
-
-    /// 4. build B publishes T into a BRAND-NEW namespace: ensureRegistered returns the registry's
-    /// fence_round (1) > view round (0) => the gate refreshes => B's STALE dep on T (observed at
-    /// view round 0 < 1, no view hit - the entry dropped) is RE-OBSERVED (one HEAD,
-    /// W-REVALIDATE): T is ABSENT and adoptTree retains no payload => the publish ABORTS
-    /// retryably. It must NEVER land - landing would write a manifest naming a deleted tree (the
-    /// dangle this whole ordering machinery exists to prevent).
+    /// 4. build B publishes into a BRAND-NEW namespace: ensureRegistered returns the registry's
+    /// fence_round (1) > view round (0) ⇒ promote refreshes ⇒ revalidate the blob ⇒ ABSENT ⇒ ABORTED.
+    /// It must NEVER land — landing would write a manifest naming a deleted blob (the dangle).
+    const ManifestId id_b = build_b->stageManifest({blobEntry("data.bin", "floor-payload")});
+    build_b->precommitAdd(RootNamespace{"srv2/new"}, "part_x", id_b);
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
     {
-        build_b->publish(RootNamespace{"srv2/new"}, "part_x", tree, RefPayload{});
+        build_b->promote(RootNamespace{"srv2/new"}, "part_x", build_b->buildId(), id_b);
     });
 
-    /// NO DANGLE: nothing in the new namespace names the deleted tree.
+    /// NO DANGLE: nothing in the new namespace names the deleted blob.
     EXPECT_FALSE(s->resolveRef(RootNamespace{"srv2/new"}, "part_x").has_value());
-    EXPECT_EQ(b->deleteExact(tree_key, t0).kind, DeleteOutcome::Kind::NotFound);   /// long gone
-
-    /// WITHOUT the registry gate floor the publish LANDS on the stale round-0 view (no refresh, no
-    /// re-observation) and resolveRef would return a ref whose readTree throws - the dangle made
-    /// concrete. (Verified red with the floor disabled.)
+    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::NotFound);   /// long gone
 }
 
 TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
 {
-    /// B190 Task-3 coverage: a TOKENLESS (W-EVIDENCE) dep recorded at the CURRENT view round (fresh —
-    /// observed_view_round == current round, so the stale branch does NOT fire) that has a
-    /// view hit by hash MUST still be resolved by `checkAndResolveDeps` (observeAndAdmit → ABORTED
-    /// when condemned).
-    ///
-    /// In the merged `checkAndResolveDeps` pass: a fresh tokenless dep with a view hit goes
-    /// directly to observeAndAdmit (the stale-refresh branch is skipped because
-    /// observed_view_round == current round). This test verifies that path is preserved:
-    /// "fresh tokenless + hit → observeAndAdmit."
-    ///
-    /// Discriminating assertion: publish throws ABORTED (condemned blob, no source bytes) — NOT
-    /// FILE_DOESNT_EXIST and NOT success (which would publish a dangle).
+    /// A TOKENLESS (W-EVIDENCE) leaf recorded at the CURRENT view round (fresh — no stale-refresh) whose
+    /// blob is condemned by hash MUST still be caught by promote's unconditional blob revalidation.
+    /// Discriminating assertion: promote throws ABORTED (condemned blob, no source) — NOT a dangle.
     auto b = std::make_shared<InMemoryBackend>();
 
-    /// Pre-inject retire state at round=1 BEFORE opening the store — the store's open-time refresh
-    /// lands at round=1, so any dep recorded thereafter is non-stale (observed_view_round == 1).
+    /// Pre-inject retire state at round=1 BEFORE opening the store — the store's open-time refresh lands
+    /// at round=1, so any dep recorded thereafter is non-stale (observed_view_round == 1).
     DB::Cas::Layout layout("p");
     writeBlobRaw(*b, layout, "payload-fresh-ev", 256 /*blob_header_len*/, UInt128{} /*pool_id*/);
     const String blob_key = layout.blobKey(idOf("payload-fresh-ev"));
@@ -587,112 +527,78 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-fresh-ev"), .token = t0, .size = 16}});
 
-    /// Open the store AFTER injecting round=1 — retire view refreshes at round=1.
     auto s = openStore(b);
     ASSERT_EQ(s->retireView().round(), 1u);
 
     const RootNamespace ns{"srv1/tbl"};
-    const TreeId source = writeTreeRaw(*b, s->layout(), {blobEntry("data.bin", "payload-fresh-ev")}, s->poolMeta().pool_id, s->poolMeta().blob_header_len);
+    auto build = startBuildFor(s, ns, "part_1");
+    /// adoptEvidence records a TOKENLESS dep at observed_view_round = 1 (the current round) — FRESH.
+    const ManifestEntry entry = blobEntry("data.bin", "payload-fresh-ev");
+    build->adoptEvidence(entry);
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(ns, "part_1", id);
 
-    auto build = s->startBuild({});
-    /// adoptFromTree records a TOKENLESS dep at observed_view_round = 1 (the current round) — FRESH.
-    const TreeEntry adopted = build->adoptFromTree(source, "data.bin");
-    const TreeId tree = build->putTree({adopted});
-
-    /// No fence advance (round stays 1): `checkAndResolveDeps` will see observed_view_round=1 >= round=1
-    /// (fresh) — skips the stale-refresh branch. The hash hit still triggers observeAndAdmit.
-    ///
-    /// Publish: no fence advance ⇒ no refresh ⇒ `checkAndResolveDeps`: dep is fresh (skips stale
-    /// branch); hits.has_value() → tokenless + hit ⇒ observeAndAdmit ⇒ HEAD ⇒ current t0 condemned
-    /// ⇒ ABORTED (INV-1; blob has no retained source bytes).
+    /// No fence advance (round stays 1): promote does NOT refresh, but its blob revalidation is
+    /// unconditional — HEAD t0 condemned ⇒ ABORTED.
     expectThrowsCode(DB::ErrorCodes::ABORTED,
-        [&] { build->publish(ns, "part_1", tree, RefPayload{}); });
+        [&] { build->promote(ns, "part_1", build->buildId(), id); });
 
-    /// The condemned blob stays at t0 — nothing was written by the gate.
     EXPECT_EQ(b->head(blob_key).token, t0);
-    /// No ref was published.
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 }
 
-TEST(CasProtocol, AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime)
+TEST(CasProtocol, AdoptedLeafCarriesRealBlobSize)
 {
-    /// The SAME-ROUND companion of the scenario above (found refreshing the TLA+ model, B91,
-    /// 2026-06-12): adoptTree must OBSERVE the object (cold-reuse semantics, one HEAD), never
-    /// record blind tokenless evidence. A detached tree reclaimed by a COMPLETED round has no
-    /// view hit (entries drop on confirmed outcomes), and a view already refreshed AT the current
-    /// round skips both the publish-time re-observation (the observed_view_round >= round keep
-    /// branch) AND the fence-advanced refresh (view round == fence round). With a blind adopt
-    /// nothing is left to catch it and the publish lands a manifest naming a deleted tree - the
-    /// dangle. The live-source argument that justifies tokenless evidence for adoptFromTree
-    /// children does not apply here: a detached tree is exactly NOT pinned by anything.
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-
-    auto build_a = s->startBuild({});
-    build_a->putBlob(idOf("wr-payload"), BlobSource::fromString("wr-payload"));
-    auto tree = build_a->putTree({blobEntry("data.bin", "wr-payload")});
-    build_a->publish(RootNamespace{"srv1/tbl"}, "part_1", tree, RefPayload{});
-
-    /// Detach, then a FULL GC round: T deleted at its observed token, entry dropped on the
-    /// confirmed outcome, namespace fenced at round 1.
-    s->dropRef(RootNamespace{"srv1/tbl"}, "part_1");
-    /// build_a (T's owner) finished; advance the durable watermark floor past its seq so the Task 10
-    /// build-watermark guard condemns T (the background renewer is off in this test).
-    build_a.reset();
-    s->renewWatermarkOnce();
-    Gc gc(s, hexToU128("00000000000000000000000000000001"));
-    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
-    ASSERT_FALSE(b->head(s->layout().treeKey(tree)).exists);
-
-    /// The process view refreshes AFTER the round completed (any unrelated publish does this in
-    /// production): round 1, NO entry for T - the view alone can never condemn it again.
-    s->retireView().refresh();
-
-    /// Re-attach attempt: the adopt itself must fail closed at observation time - by the time of
-    /// the publish gate there is nothing left to catch it (no hit, fresh round, no refresh).
-    auto build_b = s->startBuild({});
-    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { build_b->adoptTree(tree); });
-
-    /// NOTHING may name the deleted tree.
-    EXPECT_FALSE(s->resolveRef(RootNamespace{"srv1/tbl"}, "part_2").has_value());
-}
-
-TEST(CasProtocol, AdoptTreeRoundTripCarriesRealTreeSize)
-{
-    /// B92: adoptTree → publish must carry the real tree payload size, NOT 0.
-    ///
-    /// Root cause: observeAndAdmit hard-coded logical_size=0 for trees ("trees would need a decode").
-    /// Fix: compute logical_size = hr.size - blob_header_len (same as blobs) — no decode needed because
-    /// a tree object is laid out as [blob_header_len envelope][encodeTree payload].
-    ///
-    /// Round-trip invariant: a tree built + published as ref A, then adopted + republished as ref B,
-    /// must have the same tree_size in B as in A (and != 0 since the tree has real entries).
+    /// B92 round-trip (re-expressed on the manifest model): an adopted leaf must carry its real
+    /// blob_size, NOT 0. Build A publishes a blob; build B adopts that leaf into a second ref. The
+    /// adopted manifest's entry must report the same non-zero blob_size as the original.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    /// Build A: a blob + a tree with a real entry so the payload size T > 0.
-    auto build_a = s->startBuild({});
-    build_a->putBlob(idOf("payload-B92"), BlobSource::fromString("payload-B92"));
-    const TreeId tree = build_a->putTree({blobEntry("data.bin", "payload-B92")});
-    build_a->publish(ns, "ref_a", tree, RefPayload{});
+    /// Build A: a blob with a real payload so blob_size > 0.
+    const ManifestId id_a = publishBlobPart(s, ns, "ref_a", "data.bin", "payload-B92");
 
-    /// Resolve ref A and capture its tree_size — the ground truth.
-    auto resolved_a = s->resolveRef(ns, "ref_a");
-    ASSERT_TRUE(resolved_a.has_value());
-    const uint64_t tree_size_a = resolved_a->tree_size;
-    EXPECT_NE(tree_size_a, 0u) << "ref A tree_size must be non-zero (tree has a real entry)";
+    const PartManifest manifest_a = s->readManifest(id_a);
+    auto entry_a = s->lookupPath(manifest_a, "data.bin");
+    ASSERT_TRUE(entry_a.has_value());
+    const uint64_t size_a = entry_a->blob_size;
+    EXPECT_NE(size_a, 0u) << "ref A blob_size must be non-zero";
+    EXPECT_EQ(size_a, String("payload-B92").size());
 
-    /// Build B: fresh build, adopt the same tree, publish as ref_b (no re-upload).
-    auto build_b = s->startBuild({});
-    build_b->adoptTree(tree);
-    build_b->publish(ns, "ref_b", tree, RefPayload{});
+    /// Build B: adopt the same leaf, publish as ref_b (no re-upload).
+    auto build_b = startBuildFor(s, ns, "ref_b");
+    ASSERT_TRUE(entry_a.has_value());
+    build_b->adoptEvidence(*entry_a);
+    const ManifestId id_b = build_b->stageManifest({*entry_a});
+    build_b->precommitAdd(ns, "ref_b", id_b);
+    build_b->promote(ns, "ref_b", build_b->buildId(), id_b);
 
-    /// Resolve ref B: tree_size must match ref A (round-trip invariant for B92).
-    auto resolved_b = s->resolveRef(ns, "ref_b");
-    ASSERT_TRUE(resolved_b.has_value());
-    EXPECT_NE(resolved_b->tree_size, 0u) << "adopted ref tree_size must not be 0 (B92)";
-    EXPECT_EQ(resolved_b->tree_size, tree_size_a)
-        << "adopted-ref tree_size " << resolved_b->tree_size
-        << " != original tree_size " << tree_size_a << " (B92 round-trip)";
+    /// Resolve ref B: the adopted leaf's blob_size must match ref A (round-trip invariant for B92).
+    const PartManifest manifest_b = s->readManifest(s->resolveRef(ns, "ref_b")->manifest_id);
+    auto entry_b = s->lookupPath(manifest_b, "data.bin");
+    ASSERT_TRUE(entry_b.has_value());
+    EXPECT_NE(entry_b->blob_size, 0u) << "adopted leaf blob_size must not be 0 (B92)";
+    EXPECT_EQ(entry_b->blob_size, size_a) << "adopted-leaf blob_size mismatch (B92 round-trip)";
+}
+
+/// ---- Genuinely-obsolete pure-tree-model scenarios (no manifest analog) ----
+
+TEST(CasProtocol, DISABLED_RevalidateAbsentTreeDepRecreates)
+{
+    GTEST_SKIP() << "Obsolete (tree model). The gate's 'absent tree dep recreated from retained "
+                    "payload' behavior has no manifest analog: a part manifest body is staged ONCE by "
+                    "stageManifest and promote never re-creates it — an absent/invalid body at promote "
+                    "fails closed (ABORTED). The blob-leaf absent-recreate case is covered by putBlob's "
+                    "INV-1 re-upload-from-source path, not by the publish gate.";
+}
+
+TEST(CasProtocol, DISABLED_AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime)
+{
+    GTEST_SKIP() << "Obsolete (tree model). adoptTree's fail-closed observe-at-adopt-time (one HEAD, "
+                    "FILE_DOESNT_EXIST on an absent detached tree) has no manifest analog: the manifest "
+                    "model's adoptEvidence is deliberately TOKENLESS and performs NO backend call — the "
+                    "no-dangle guarantee for an adopted-but-reclaimed leaf is enforced at the promote "
+                    "gate (unconditional blob revalidation ⇒ ABORTED), covered by "
+                    "NewNamespacePublishSeesRegistryFenceFloor and FreshEvidenceDepWithViewHitIsResolvedByGate.";
 }
