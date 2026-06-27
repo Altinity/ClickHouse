@@ -488,3 +488,13 @@ didn't drive):
   decision), **B8** (crashed-build precommit reclaim wiring for the converged model), **B7** (cross-server
   relink), **B11/B12/B15** (counter / one-round-skip / plan-doc staleness), **B3** (pre-existing freeze test).
   Branch `cas-gc-part-manifest-impl` NOT PR'd — the maintainer's call.
+
+### 2026-06-27 — B14 DECIDED (maintainer): keep the retire HEAD (variant c)
+- Maintainer confirmed variant (c): keep the per-candidate `HEAD` in `retire`. Verified-against-model
+  rationale: it's the `EnableRetireTokenSource=FALSE` baseline (proven), safety is from `deleteExact` not
+  the token source (a stale token → spared, never over-deletes; the model advances tokens freely via
+  `WUploadBlob` with no in-degree guard and stays green → concurrent writers / re-incarnations never
+  threaten safety). The stored-token alt would need the manifest to carry the ETag (schema change,
+  content↔storage coupling) for only a partial win (staler token → more spared+retried deletes). Added a
+  design-rationale comment (pros/cons) at the HEAD call (`1e123418f4b`). Phase-5 model gate remains the
+  future proof. B14 → DECIDED/closed (reopen only on profiling). No code behavior change.

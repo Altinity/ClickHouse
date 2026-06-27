@@ -301,7 +301,19 @@ not block the current phase. Each item: ID, severity, where, what, why-deferred.
   `209d4ff1462` by threading `<gc_shards>` through `MetadataStorageFactory`/`ContentAddressedMetadataStorage`
   and setting it on first lease acquire.
 
-- **B14 — Phase 5 retire-token optimization: CODE deferred — blocked on blob-token provenance (design
+- **B14 — DECIDED 2026-06-27: keep the per-candidate HEAD (variant c); stored-token optimization deferred
+  to profiling.** Rationale (verified against the model): the per-candidate `HEAD` in `retire` is the
+  model's `EnableRetireTokenSource = FALSE` baseline — correct and proven, zero schema change. Safety does
+  NOT depend on the token source: `deleteExact` is the guarantee (a stale/foreign token fails the exact
+  match → spared, never over-deletes; `WUploadBlob` advances a blob's token freely in the model with the
+  whole suite green, so concurrent writers / repeated re-incarnations never threaten safety). The
+  stored-token alternative (a) would require the manifest body to carry the blob ETag (on-disk schema
+  change coupling content↔storage planes; bigger manifests) and only yields a PARTIAL win (a fold-time
+  token is staler → more spared+retried deletes). Decision documented in `CasGc.cpp` at the HEAD call
+  (commit `1e123418f4b`). The Phase-5 model gate (`d56f4e84a4d`) stands as the future safety proof if the
+  optimization is ever pursued. Reopen only if profiling shows these HEADs are a hot-path cost. Original
+  analysis below.
+- **B14 (original) — Phase 5 retire-token optimization: CODE deferred — blocked on blob-token provenance (design
   decision).** The Phase-5 model gate is committed GREEN (`d56f4e84a4d`): it PROVES that `retire` can
   source `RetiredEntry.token` from a token captured into sealed generation state at fold time (`storedTok`)
   instead of a per-candidate `backend.head`, with the delete staying exact (a stale stored token only
