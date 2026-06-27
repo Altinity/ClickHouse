@@ -557,3 +557,11 @@ didn't drive):
   work) and the **PR** (maintainer's call, not opened). Branch `cas-gc-part-manifest-impl`: all 5 phase
   model gates green, Phases 0-4 code complete, Phase 5 model-proven (retire-token code = keep-HEAD/c),
   every backlog item resolved or decided, sharded GC + relink validated under chaos on RustFS.
+
+### 2026-06-27 — Test-suite cleanup: removed 5 obsolete skipped tests (now 0 skip)
+- `082dec65399`: removed the 5 GTEST_SKIP-ped tests for redesign-removed mechanisms (deferred tree-object
+  upload, inline-closure JournalRecords, and the OLD adopt-by-tree relink trio `_ObsoleteB7`) + trimmed the
+  stale comments. No coverage lost (the code they tested no longer exists; the new `part_manifest_v1` relink
+  is tested by `CaWiringExchange.*` + the ca-soak two-replica validation). Full `Cas*:Ca*` now **380 passed /
+  0 skipped / 1 failed = CaWiringOps.FreezeViaHardLinksIntoShadow (pre-existing baseline-red B3 only)**. The
+  CA GC suite is clean — every test green except the one unrelated pre-existing freeze failure.
