@@ -449,3 +449,29 @@ didn't drive):
   un-skipped) / 1 = baseline B3. No model change (code now matches the already-proven protocol).
 - NOTE: a final full `Cas*:Ca*` build+sweep including these fixes is pending (the running RustFS soak uses
   a pre-fix binary; will rebuild+sweep after it returns).
+
+### 2026-06-27 — RustFS sharded soak CLEAN (on fixed binary); B13 RESOLVED; found+fixed a 3rd HIGH bug (recheck shard routing)
+- **B13 was a misdiagnosis** (RustFS, not MinIO): the ca-soak harness runs `rustfs/rustfs:1.0.0-beta.8`,
+  which DOES support `DeleteObject If-Match` — the conditional delete `CasProbe` requires. The MinIO blocker
+  only applied to the praktika integration path. Sharded `gc_shards=2` two-replica chaos soak is feasible
+  and now run. Infra committed `6f9407fa4cd` (gc_shards=2 compose + config + runner).
+- **3rd HIGH bug, found by the soak (not by unit tests): `Gc::recheck()` hardcoded `/*shard*/0`.** Phase-4
+  Task 6 sharded `fold()` but MISSED `recheck()`: both `foldDeltasIntoGeneration(...,/*shard*/0,...)` (the
+  fold-through-fence window) and `inDegreeInGeneration(...,/*shard*/0,...)` (per-blob lookup) used shard 0.
+  With `gc_shards=2`, shard-1 removal edges folded into shard 0 with no matching +1 → merged in-degree
+  `-1 < 0` → `CORRUPTED_DATA` → **GC permanently wedged** (fails closed: `dangling=0`, but the pool grows
+  unboundedly — a liveness/space failure, not data loss). Unit tests missed it (they exercised mapper/
+  reducer/fold in isolation, never a full `gc_shards>1` round through recheck). **Fixed `08e7dcf8f00`**:
+  scatter the recheck window by `blobShard` into per-shard buckets + `foldDeltasIntoGeneration` per shard +
+  `entry_shard = blobShard(entry.hash, gc_shards)` routing; `gc_shards==1` kept byte-for-byte.
+- **Soak evidence:** Run 1 (buggy, gc_shards=2) GC stuck at round 44, gen 87 had BOTH `blob_target/0/0`
+  (17KiB) + `blob_target/1/0` (16KiB) (fold sharding worked), recheck wedged, pool → 108GB, dangling=0
+  throughout. Run 2 (fixed, gc_shards=2, 15min) **PHASE3 OK**: rounds 9-15 clean recheck (255
+  `gc_recheck_verdict` events, all `spared` w/ positive in-degree), pool stable ~2.8GB, dangling=0,
+  count=671547 consistent, chaos handled (1 fault, 66 transport retries), both `blob_target/{0,1}` populated.
+- **Lesson:** sharding correctness needs a FULL `gc_shards>1` round end-to-end (fold→retire→fence→recheck→
+  delete→trim), not just per-step unit tests — recheck/delete/trim shard-routing must each be verified. The
+  soak is the only thing that exercised the whole sharded round; it's what caught this. B13 → RESOLVED
+  (Phase 4 now has real integration validation under chaos).
+- Unit-verify of all 3 fixes together (recheck + promote + abandon) at HEAD: rebuild + `Cas*:Ca*` sweep
+  in progress.
