@@ -476,6 +476,26 @@ Gc::RetireResult Gc::retire(GcState & state, Token & state_token, const FoldResu
             e.reason = "last folded owner edge dropped; in-degree reached 0";
         });
 
+        /// DESIGN NOTE (B14 / Phase-5 retire-token; decided 2026-06-27 = keep the HEAD, "variant c").
+        /// One `HEAD` per zero-in-degree candidate, here, fetches the CURRENT incarnation token that the
+        /// eventual exact-token `deleteExact` will carry. This HEAD CAN be eliminated by instead sourcing
+        /// the token from sealed generation state captured at fold time (the `EnableRetireTokenSource`
+        /// stage of `CaGcRootLocalPartManifestCore` proves that variant safe). We deliberately keep the
+        /// HEAD because:
+        ///   + (this path) zero schema change; the token is always fresh, so few wasted delete attempts.
+        ///   - (the alternative) the fold only sees a blob's CONTENT hash, not its storage token, so the
+        ///     writer would have to record the ETag into the manifest body (`ManifestEntry`) — an on-disk
+        ///     schema change that couples the content plane to storage incarnations and grows manifests;
+        ///   - a fold-time token is staler than this HEAD: a re-incarnation between fold and delete makes
+        ///     it stale, the exact-token delete then misses (`TokenMismatch`) and the blob is SPARED and
+        ///     retried next round — safe, but it delays reclamation. So the win is only partial.
+        /// SAFETY is independent of the token SOURCE: `deleteExact` is the guarantee — a stale/foreign
+        /// token fails the exact match and the blob is spared, NEVER over-deleted (proved by the Phase-5
+        /// model: `stage5_retiretoken` HOLDs `INV_NO_RETURN`/`INV_NO_LOSS` + `RetireTokenSourceComplete`,
+        /// while `sab_staletokenoverdelete` shows that bypassing exactness violates `INV_NO_LOSS`). Concurrent
+        /// writers / repeated re-incarnations never threaten safety — the model advances a blob's token
+        /// freely (`WUploadBlob`, no in-degree guard) and the whole suite stays green. Revisit the
+        /// stored-token variant only if profiling shows these per-candidate HEADs are a hot-path cost.
         const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
         /// B170: HEAD-observe — the current incarnation token, the only token the eventual exact-token
         /// delete may carry (absent => skipped: a prior round's landed delete).
