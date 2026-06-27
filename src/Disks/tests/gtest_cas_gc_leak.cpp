@@ -25,9 +25,9 @@ extern const int ABORTED;
 /// (only blobs stay content-addressed; manifests are NEVER shared across instances — backlog item B7).
 /// The leak scenarios below therefore drive the REAL write flow (`stageManifest -> precommitAdd ->
 /// putBlob -> promote`) and the real drop/abandon paths, then assert the reclaimed closure leaves no
-/// debris. The old "adopt-by-tree relink" leak cases are OBSOLETE under B7 (no shared content id, no
-/// subtree placement, `getPartTreeId` returns nullopt and `adoptPart` throws `NOT_IMPLEMENTED`); they
-/// are `GTEST_SKIP`ped with a one-line reason rather than weakened.
+/// debris. The old "adopt-by-tree relink" leak cases (B7) are REMOVED: there is no shared content id,
+/// no subtree placement, `getPartTreeId` returns nullopt and `adoptPart` throws `NOT_IMPLEMENTED`; the
+/// byte-stream-fallback relink is an ordinary publish covered by the no-leak displacement repros below.
 
 using namespace DB::Cas;
 using DB::Cas::tests::idOf;
@@ -175,36 +175,6 @@ FsckReport displaceAndGc(
     return runFsck(*s, /*detail=*/false);
 }
 
-}
-
-/// ---- OBSOLETE under B7: adopt-by-tree relink leak cases (no shared content id, no subtree) ----
-///
-/// The relink/republish/staged-subtree leak cases targeted the removed "adopt a tree by its shared
-/// content id" path. In the part-manifest model every part is a per-instance `ManifestId` (manifests are
-/// NEVER shared), there is no `Placement::Subtree`, and the cross-server relink is gone: `getPartTreeId`
-/// returns nullopt and `adoptPart` throws `NOT_IMPLEMENTED` (backlog item B7 — the sender always streams
-/// bytes; a relink would be a byte-stream-fallback publish, which is just an ordinary `publishTwoBlobPart`
-/// already covered by the no-leak repros below). These have no manifest analog, so they are skipped, not
-/// weakened.
-
-TEST(CasGcLeak, RelinkAdoptedRootFoldNoLeak_ObsoleteB7)
-{
-    GTEST_SKIP() << "B7: adopt-by-tree relink removed (per-instance manifests, no shared content id; "
-                    "getPartTreeId=nullopt, adoptPart throws NOT_IMPLEMENTED). The byte-stream-fallback "
-                    "relink is an ordinary publish — covered by the no-leak displacement repros.";
-}
-
-TEST(CasGcLeak, RepublishAdoptedRootFoldNoLeak_ObsoleteB7)
-{
-    GTEST_SKIP() << "B7: rename/move via adopt-by-subtree-evidence removed (no Placement::Subtree in the "
-                    "manifest model). Rename is an ordinary republish — covered by the no-leak repros.";
-}
-
-TEST(CasGcLeak, StagedParentWithAbsentAdoptedSubtreeNoLeak_ObsoleteB7)
-{
-    GTEST_SKIP() << "B7: nested staged-parent + adopted-subtree closures removed (manifests are flat, "
-                    "single-owner, no subtree placement). The own-blob no-leak property it asserted is "
-                    "covered by the abandon repro AbandonedPrecommitReclaimsOwnBlobs below.";
 }
 
 /// NO-LEAK (S1, fold interleaved): partA is published and folded ONCE (its body present, +1 per blob),

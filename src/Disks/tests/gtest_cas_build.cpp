@@ -987,16 +987,6 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     EXPECT_FALSE(build->hasDep(u128Of("xy")));
 }
 
-/// PORTED-OUT (no manifest analog): StageTreeRetainsAndDefersUpload tested the OLD deferred tree-object
-/// upload (stageTree retains payload, precommit accepts an unuploaded tree object, uploadStagedTree later
-/// writes it). The part-manifest stageManifest writes the manifest body IMMEDIATELY (no separate
-/// tree-object upload, no deferral), so there is nothing to defer. Covered instead by stageManifest's own
-/// immediate-write contract (PublishHappyPathRoundTrip reads the body back).
-TEST(CasBuild, StageTreeRetainsAndDefersUpload)
-{
-    GTEST_SKIP() << "obsolete: deferred tree-object upload is gone; stageManifest writes the body immediately";
-}
-
 TEST(CasBuild, ConvergesUnderProductiveGc)
 {
     /// B167/B171 LIVENESS — the re-upload/condemn livelock, now closed by the build-root precommit edge.
@@ -1202,16 +1192,6 @@ TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
         expectThrowsCode(DB::ErrorCodes::ABORTED,
             [&] { build->promote(ns, "part_3", build->buildId(), mid); });
     }
-}
-
-/// PORTED-OUT (no manifest analog): PrecommitAddRecordCarriesInlineClosure asserted the precommit `Add`
-/// JournalRecord carried an inline `ClosureNode` for the staged tree. The closure/JournalRecord/ClosureNode
-/// model is REMOVED entirely (CasRootShardCodec.h: the journal is one ordered RootOwnerEvent stream; there
-/// is no ClosureNode/JournalRecord). GC reachability is now per-blob in-degree folded from the single
-/// journal, not an inline closure carried on a precommit record — there is nothing analogous to assert.
-TEST(CasBuild, PrecommitAddRecordCarriesInlineClosure)
-{
-    GTEST_SKIP() << "obsolete: closure/JournalRecord/ClosureNode removed; in-degree is folded per-blob from the journal";
 }
 
 /// BUG 1 (WPromote owner==bld): promote is a PURE owner MOVE (Δ=0 — it restores no blob in-degree). The
