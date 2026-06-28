@@ -67,6 +67,24 @@ TEST(CasGcFormats, GcStateSnapPrunedThroughDefaultsZero)
     EXPECT_EQ(d.snap_generation, 5u);
 }
 
+TEST(CasGcFormats, SnapAttemptRoundTrips)
+{
+    DB::Cas::GcState s;
+    s.round = 7;
+    s.snap_generation = 4;
+    s.snap_attempt = 42;
+    const String bytes = DB::Cas::encodeGcState(s);
+    const DB::Cas::GcState back = DB::Cas::decodeGcState(bytes);
+    EXPECT_EQ(back.snap_attempt, 42u);
+    EXPECT_EQ(back.snap_generation, 4u);
+}
+
+TEST(CasGcFormats, SnapAttemptDefaultsZero)
+{
+    DB::Cas::GcState s;
+    EXPECT_EQ(DB::Cas::decodeGcState(DB::Cas::encodeGcState(s)).snap_attempt, 0u);
+}
+
 TEST(CasGcFormats, GcHeartbeatRoundTrip)
 {
     GcHeartbeat hb;
