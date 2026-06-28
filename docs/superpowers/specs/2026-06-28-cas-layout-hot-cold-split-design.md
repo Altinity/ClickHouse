@@ -121,9 +121,26 @@ old server still alive. Failover to a different physical server is an **operator
 Background renewer (a periodic scheduled task — no `sleep`-loop): CAS-overwrite the same object every
 `mount_renew_period`, advancing `seq` and `expires_at_ms = now + ttl`. **Renew-failure policy:**
 
-- token mismatch but body still ours → bounded retry;
-- body **foreign** → treat the disk as **lost**: stop accepting writes / fail closed;
+- token mismatch but body is **still ours — same `server_uuid` AND same `writer_epoch`** → bounded retry
+  (a transient CAS race with our own renew);
+- body has **our `server_uuid` but a different `writer_epoch`** → we have been **superseded** by a newer
+  incarnation of this same server (it reclaimed an expired lease) → treat the disk as **lost**: stop accepting
+  writes / fail closed. **This is not a retry.**
+- body **foreign `server_uuid`** → disk **lost**: stop accepting writes / fail closed;
 - backend error → fail closed for writes until recovered, per the existing disk-failure policy.
+
+### Write-path lease fence (paused-process safety) {#write-fence}
+
+An expired-lease reclaim by a new process does **not**, by itself, stop the *old* process from writing — the
+old process could resume after a long pause (VM pause, long GC, swap) believing it still holds the mount. To
+prevent a superseded writer from corrupting the live one's ref shards / owner log, **every mutable CAS/PUT is
+fenced on the local lease**: a write proceeds only while this process's `(server_uuid, writer_epoch)` is the
+one currently in the `mount` body **and** the local lease is unexpired. `writer_epoch` is the **fencing
+token**: the moment the renewer observes the mount carrying a different `writer_epoch` (or foreign uuid, or an
+expired lease it cannot renew), the disk trips to **lost / read-only-fail-closed** and all mutable ops fail —
+the superseded process never races the live one. (Manifest *bodies* are already epoch-pathed, so a stray
+write lands under the dead epoch's prefix and is swept; the fence additionally protects the shared mutable ref
+shards.)
 
 **Startup error text** (actionable):
 
@@ -141,13 +158,26 @@ This prevents two ClickHouse servers from writing the same CAS namespace.
 (`gc/server-roots/<server_root_id>/watermark`, body `server_root_id, server_uuid, writer_epoch, min_active,
 seq`) answers "which builds are active for GC?". Different cadence/semantics → separate colocated objects.
 
-### `writer_epoch` allocation (durable monotone) {#writer-epoch-alloc}
+### `writer_epoch` allocation (durable monotone, in a separate sticky object) {#writer-epoch-alloc}
 
-`writer_epoch` is allocated as a **durable, strictly-monotone counter per `server_root_id`**, bumped via CAS
-when a server claims/reclaims the mount on writable open, persisted in the mount/server-root object, **never
-reused**. Each writable `Store::open` thus gets a unique, ordered `writer_epoch`. This is what makes the
-Phase-3 identity invariant provable by construction (not by random-collision improbability); it also gives GC
-a real ordering for "superseding/dead incarnation" instead of an equality-only random token.
+`writer_epoch` is a **durable, strictly-monotone counter per `server_root_id`**, **never reused**. It lives in
+its **own sticky object** `gc/server-roots/<server_root_id>/epoch`, **never auto-deleted** — deliberately
+**not** in the recreatable `mount` lease, so it cannot reset when the lease expires or is cleared. A writable
+`Store::open` allocates its epoch by CAS-bumping that counter; each open gets a unique, ordered value.
+
+**Missing/corrupt-object rules (close the epoch-reset hazard):**
+
+- A **missing or corrupt `epoch` (or `owner`) object while the root is non-empty is `CORRUPTED_DATA`** — never
+  silently recreate it. Recreating a deleted `epoch` would reset the counter and reissue a `writer_epoch`,
+  violating `NoManifestIdReuse` against the still-present old-epoch manifests. Recreate the counter **only** if
+  the root is provably empty (no `cas/refs/<id>/…` and no `cas/manifests/<id>/…`).
+- A missing `mount` object is **benign** — it is a lease, not the allocator; recreate it by reclaim.
+
+So three objects with three different lifetimes: `owner` (immutable identity, `putIfAbsent` once, never
+rewritten), `epoch` (monotone counter, CAS-bumped per writable open, never deleted), `mount` (lease,
+expirable/recreatable). This makes the Phase-3 identity invariant provable by construction (not by
+random-collision improbability) and gives GC a real ordering for "superseding/dead incarnation."
+`WriterEpochMonotoneUnique` is a **mandatory** TLA+ invariant ([below](#tla)).
 
 ## Target layout {#target-layout}
 
@@ -172,9 +202,10 @@ a real ordering for "superseding/dead incarnation" instead of an equality-only r
   gc/
     server-roots/
       <server_root_id>/
-        owner                      # single sticky owner object (identity)
-        mount                      # active heartbeat lease (liveness) + durable writer_epoch counter
-        watermark                  # active-build floor for the manifest sweep
+        owner                      # sticky: immutable identity (server_uuid), putIfAbsent once
+        epoch                      # sticky: durable monotone writer_epoch counter, never deleted
+        mount                      # lease: active heartbeat (liveness), expirable/recreatable
+        watermark                  # active-build floor (writer_epoch + min_active) for the manifest sweep
     registry                       # namespace universe + registry fence (UNCHANGED authority)
     state                          # GcState (+ best-effort manifest_sweep_cursor)
     gen/<generation>/attempt/<attempt>/…
@@ -226,12 +257,17 @@ foundation first, the load-bearing manifest-identity reshape last.
 
 - Add the required, validated, immutable `content_addressed.server_root_id` config; demote `ServerUUID` to
   owner-token-only.
-- Create `gc/server-roots/<server_root_id>/{owner, mount, watermark}`; relocate the per-server watermark there
-  from `roots/<server-hex>/_watermark`.
+- Create `gc/server-roots/<server_root_id>/{owner, epoch, mount, watermark}`; relocate the per-server
+  watermark there from `roots/<server-hex>/_watermark` (watermark body carries `writer_epoch` + `min_active`).
 - Implement the [single-owner gate](#owner-marker) + the [mount lease](#mount-lease) with the exact rules
-  above (same-UUID reclaim only after expiry; foreign UUID fails closed regardless of expiry), the background
-  renewer, the renew-failure policy, and the actionable error text.
-- Allocate `writer_epoch` as the [durable monotone counter](#writer-epoch-alloc) at mount claim.
+  above (same-UUID reclaim only after expiry; same-UUID *live* lease fails closed; foreign UUID fails closed
+  regardless of expiry), the background renewer, the [renew-failure policy](#mount-lease), and the actionable
+  error text.
+- Allocate `writer_epoch` from the [sticky `epoch` counter](#writer-epoch-alloc) (NOT the lease); enforce the
+  missing/corrupt-object rules (missing `owner`/`epoch` over a non-empty root ⇒ `CORRUPTED_DATA`).
+- Implement the [write-path lease fence](#write-fence): mutable CAS/PUT proceed only while this process's
+  `(server_uuid, writer_epoch)` is the live mount and the local lease is unexpired; on supersession the disk
+  trips to lost/fail-closed.
 - **Build-death lookup is by `root_namespace → server_root_id → gc/server-roots/<server_root_id>/watermark`**,
   NOT by parsing a writer id out of a manifest key (the sweep code must resolve the watermark from the
   namespace's `server_root_id`, since `writer_epoch` no longer carries `server_hex`).
@@ -317,9 +353,18 @@ A PartManifest body's liveness is **owner-state + build-death + delete-after-sea
 sweep uses the same protect test as today (`CasOrphanManifestSweep`), with the watermark resolved via the
 namespace's `server_root_id` (Phase 0):
 
-- **Build-death (eligibility):** the build's `(writer_epoch, build_sequence)` is below the live floor in
-  `gc/server-roots/<server_root_id>/watermark` (`min_active > build_sequence`, or the farewell/retired
-  sentinel). Missing watermark ⇒ **not** eligible (never a frozen-seq guess).
+- **Build-death (eligibility) — compare `writer_epoch` FIRST, then `build_sequence`.** With durable ordered
+  epochs the test is two-level against `gc/server-roots/<server_root_id>/watermark` (which carries the
+  current `writer_epoch` + `min_active`):
+  - `manifest.writer_epoch < watermark.writer_epoch` → an **older, superseded epoch** → **dead/eligible**
+    regardless of `min_active` (this is what reclaims orphan manifests left by a crashed prior process —
+    without the epoch compare, an old-epoch build whose `build_sequence ≥` the current `min_active` would
+    **leak forever**);
+  - `manifest.writer_epoch == watermark.writer_epoch` → current epoch → eligible **iff**
+    `min_active > manifest.build_sequence`;
+  - `manifest.writer_epoch > watermark.writer_epoch` → a **future** epoch the watermark has not yet caught up
+    to → **not eligible** (skip; treat as anomalous/`CORRUPTED_DATA`-adjacent, never delete).
+  Missing watermark ⇒ **not** eligible (never a frozen-seq guess).
 - **Owner-state protection (never sweep):** every committed ref's `manifest_ref` in `RootShard.refs`; every
   live precommit binding (a precommit `new_binding` not later removed below the sealed fold cursor); and every
   **pending** precommit removal whose `-1` is **not yet sealed/folded** (`transition_version >` sealed cursor)
@@ -337,9 +382,14 @@ Phase 2 changes only the cadence/pacing of this test, not the test itself.
 - **No two live servers write the same `server_root_id`.** Same-UUID reclaim requires an **expired** lease, so
   a live double-start fails closed until expiry; a foreign UUID fails closed always; renew-failure on a foreign
   body stops writes (disk-lost).
-- **Identity uniqueness is by construction, not by chance.** `writer_epoch` is a durable monotone allocator,
-  so `(root_namespace, writer_epoch, build_sequence, manifest_ordinal)` is unique without relying on random
-  epoch non-collision.
+- **A superseded/paused writer cannot mutate** — the [write-path fence](#write-fence) gates every mutable op on
+  this process's `(server_uuid, writer_epoch)` being the live mount; a same-UUID renew that finds a different
+  `writer_epoch` trips the disk to lost (not a retry), so an old process resuming after a long pause cannot
+  race the reclaimer on the shared ref shards.
+- **Identity uniqueness is by construction, not by chance.** `writer_epoch` is a durable monotone allocator in
+  a **sticky `epoch` object that is never deleted** (a missing `epoch`/`owner` over a non-empty root is
+  `CORRUPTED_DATA`, never a reset), so `(root_namespace, writer_epoch, build_sequence, manifest_ordinal)` is
+  unique without relying on random epoch non-collision and cannot be reset by clearing the lease.
 - **Registry remains authority.** `LIST cas/refs/` is only a token accelerator and **never shrinks the
   universe**; missing/ambiguous listed ref shard → Read (fail-closed), unchanged.
 - **PartManifestId stays namespace-qualified** (`server_root_id`-rooted); no cross-namespace sharing.
@@ -356,8 +406,15 @@ Phase 2 changes only the cadence/pacing of this test, not the test itself.
     including expired (no wall-clock path to an identity switch);
   - `SameUuidRestartCanReclaimExpiredMount` (liveness witness) — the same `ServerUUID` reclaims its own mount
     **only after expiry**, and a same-UUID *live* lease blocks a second claimant (the double-start guard);
-  - (optional) `WriterEpochMonotoneUnique` — the mount-claim allocator never reissues a `writer_epoch` for a
-    `server_root_id`. Safety must not depend on the clock (only the same-UUID reclaim uses expiry).
+  - **`WriterEpochMonotoneUnique` (mandatory)** — the `epoch`-object allocator never reissues a `writer_epoch`
+    for a `server_root_id`, across crash/restart and across `mount` deletion (the counter is in the sticky
+    `epoch` object, not the lease); a deleted `epoch` over a non-empty root is modeled as `CORRUPTED_DATA`,
+    not a reset;
+  - **`SupersededWriterMakesNoMutation` (mandatory, the write fence)** — once a `writer_epoch` is no longer the
+    one in `mount` (a newer same-UUID incarnation reclaimed, or the lease lapsed), the superseded writer
+    issues **no** mutable CAS/PUT. Model an old paused writer resuming concurrently with the reclaimer and show
+    it cannot mutate a ref shard.
+  Safety must not depend on the clock (only the same-UUID reclaim uses expiry).
 - **Phases 1 & 2:** identity-preserving + cursor-non-load-bearing ⇒ **no manifest-identity TLA+ change**; the
   existing `CaGcRootLocalPartManifestCore` model treats ref/manifest objects as opaque ids and the universe as
   registry-authoritative, and never modeled the physical LIST prefix. A note records the discovery-LIST source
@@ -371,9 +428,13 @@ Phase 2 changes only the cadence/pacing of this test, not the test itself.
 
 - **Phase 0:** gtest — single-owner gate (absent→claim; ours→ok via GET; foreign→fail; sticky across
   restart); mount lease (absent→claim; **same-uuid expired→reclaim; same-uuid live→fail-until-expiry**;
-  foreign→fail regardless of expiry); renew-failure (foreign body → writes stop); `writer_epoch` strictly
-  increases across reclaims and is never reissued; `server_root_id` validation rejects bad paths; error text
-  contains the remediation. TLA+ gate green.
+  foreign→fail regardless of expiry); **renew mismatch with same-uuid-but-different-`writer_epoch` → disk lost
+  (writes stop), NOT retry**; **write fence — a superseded writer (its `writer_epoch` no longer in `mount`)
+  issues no mutable op** (simulate a paused old process resuming after a reclaim, assert its ref-shard CAS is
+  refused); `writer_epoch` strictly increases across reclaims and is **never reissued even after the `mount`
+  object is deleted** (and a deleted `epoch`/`owner` over a non-empty root → `CORRUPTED_DATA`);
+  `server_root_id` validation rejects bad paths; error text contains the remediation. TLA+ gate green
+  (incl. `WriterEpochMonotoneUnique` + `SupersededWriterMakesNoMutation`).
 - **Phase 1:** gtest — discovery LISTs `cas/refs/` and ignores `cas/manifests/` + `roots/` noise; a planted
   manifest backlog does not appear in discovery; fsck over the split classifies correctly; the sweep resolves
   the watermark via `server_root_id`; publish→fold→retire→reclaim still drains under `server_root_id`-rooted
@@ -387,8 +448,9 @@ Phase 2 changes only the cadence/pacing of this test, not the test itself.
 ## Scope and non-goals {#scope}
 
 - **In scope:** required+validated `server_root_id` identity + `ServerUUID` demotion; single-owner + heartbeat
-  mount protocol with durable-monotone `writer_epoch` (Phase 0); re-rooted relocation A (Phase 1); cursor sweep
-  C (Phase 2); `manifest_ordinal`/`writer_epoch` reshape B (Phase 3). Recommended companion: the `max_keys`
+  mount protocol with the durable-monotone `writer_epoch` in a sticky `epoch` object + the write-path lease
+  fence (Phase 0); re-rooted relocation A (Phase 1); cursor sweep C with epoch-then-sequence build-death
+  (Phase 2); `manifest_ordinal`/`writer_epoch` reshape B (Phase 3). Recommended companion: the `max_keys`
   pagination fix.
 - **`trees/` is legacy/dead** (replaced by single-owner ManifestIds; no live writer/reader; `ObjectKind::Tree`
   is a vestigial switch arm). This design neither uses nor extends it; removing it is a separate cleanup, not
