@@ -478,7 +478,12 @@ Gc::RetireResult Gc::retire(GcState & state, Token & state_token, const FoldResu
     /// Blob candidates: zero-in-degree in the sealed fold generation (blob-only). ONE HEAD per candidate
     /// observes the current token; an absent object is SKIPPED (a prior round's landed delete — never
     /// fabricate a token, never GET a condemned body).
-    for (const BlobCandidate & cand : zeroInDegree(backend, layout, folded.fold_seal.generation, state.snap_attempt, /*shard*/0))
+    /// Scan EVERY blob-target shard's sealed run, not just shard 0: `fold`/`ShardReducer` write one run
+    /// per `state.gc_shards`, so a zero-in-degree blob owned by shard 1..N would never be retired if we
+    /// only scanned shard 0 (it would leak forever under `gc_shards > 1`). Each candidate is owned by the
+    /// shard whose run it came from, so it goes into that shard's retired set.
+    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
+    for (const BlobCandidate & cand : zeroInDegree(backend, layout, folded.fold_seal.generation, state.snap_attempt, shard))
     {
         /// B170: the blob's in-degree transitioned to 0 in this generation — the moment it became a
         /// retire candidate. The cause is the fold's last -1 edge (its RootRemove row above for the same
@@ -547,7 +552,7 @@ Gc::RetireResult Gc::retire(GcState & state, Token & state_token, const FoldResu
             e.reason = "condemned zero-in-degree candidate written to the round's retired set";
             e.detail = {{"size", std::to_string(entry.size)}};
         });
-        result.blobs[/*single shard*/0].entries.push_back(std::move(entry));
+        result.blobs[shard].entries.push_back(std::move(entry));
     }
 
     /// Write each shard's retired set write-once (adopt a byte-equal occupant as our crash-replay).
@@ -872,18 +877,19 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
         }
     }
 
-    /// OUTCOME-COVERAGE GATE (CAS #2 precondition): the completion-advance below must not commit until
-    /// EVERY retired entry of this round has a recorded outcome in the FINAL (post-adopt) outcome logs
-    /// keyed under the accepted `(completion_generation, attempt)`. By construction `computed` collects one
-    /// outcome per retired entry (the per-entry loops above push exactly one, unconditionally), so coverage
-    /// holds by construction in the steady state. The outcome log is OBSERVATION-BEARING (first-durable-
-    /// write-wins): the adopt path may have REPLACED a shard's `log` with another observer's durable log.
-    /// That winner observed the SAME accepted retired set under the SAME adopted attempt, so it must cover
-    /// the same entries — but we guard it rather than assume it. For any retired entry whose
-    /// `(kind, hash, token)` is missing from the adopted logs, recompute its outcome from the accepted
-    /// retired set via the exact-token delete (Absent/Replaced/Deleted) so the physical delete is not
-    /// skipped, tally it, and proceed. We do NOT re-persist the durable outcome log — it is first-durable-
-    /// write-wins and the seal's `delete_outcomes` RunRef already points at the winner's durable bytes.
+    /// OUTCOME-COVERAGE GATE (CAS #2 precondition): the completion-advance below MUST NOT commit unless
+    /// EVERY retired entry of this round has a recorded outcome in the FINAL (post-adopt) durable outcome
+    /// logs keyed under the accepted `(completion_generation, attempt)`. By construction `computed` collects
+    /// one outcome per retired entry (the per-entry loops above push exactly one, unconditionally), so
+    /// coverage holds by construction in the steady state. The outcome log is OBSERVATION-BEARING (first-
+    /// durable-write-wins): the adopt path may have REPLACED a shard's `log` with another observer's durable
+    /// log. That winner observed the SAME accepted retired set under the SAME adopted attempt, so it MUST
+    /// cover the same entries. If it does not, the durable record is incomplete and sealing the completion
+    /// generation here would persist a "rechecked + done" marker over an outcome log that does not account
+    /// for every retired blob — an integrity violation. FAIL-CLOSE with `CORRUPTED_DATA` BEFORE the
+    /// completion seal / CAS #2 rather than completing the round on a partial durable log (a deposed-leader
+    /// divergent occupant or a genuine corruption); the round retries. `chassert` is a no-op in release, so
+    /// the gate is enforced by this throw, not by the assertion.
     for (const auto & [shard, set] : retired.blobs)
     {
         const OutcomeLog & log = computed[shard];
@@ -892,25 +898,12 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
             const bool covered = std::any_of(log.entries.begin(), log.entries.end(),
                 [&](const OutcomeEntry & o)
                 { return o.kind == entry.kind && o.hash == entry.hash && o.token == entry.token; });
-            /// Steady state: the per-entry loops above already covered this entry. The gap branch is
-            /// purely defensive against a divergent adopted occupant; never the normal path.
-            chassert(covered && "outcome-coverage gap: a retired entry has no recorded outcome before CAS #2");
-            if (covered)
-                continue;
-
-            const DeleteOutcome del = backend.deleteExact(blobKeyOf(layout, entry.hash), entry.token);
-            if (del.created_delete_marker)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "CAS gc recheck: coverage-gap delete of blob {} created a delete marker — versioning "
-                    "is enabled on the pool (mis-provisioned)", u128ToHex(entry.hash));
-            switch (del.kind == DeleteOutcome::Kind::Deleted ? OutcomeKind::Deleted
-                  : del.kind == DeleteOutcome::Kind::NotFound ? OutcomeKind::Absent : OutcomeKind::Replaced)
-            {
-                case OutcomeKind::Deleted: ++report.deleted; break;
-                case OutcomeKind::Absent: ++report.absent; break;
-                case OutcomeKind::Replaced: ++report.replaced; break;
-                case OutcomeKind::Spared: ++report.spared; break;
-            }
+            if (!covered)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS gc recheck: durable outcome log for shard {} under (gen {}, attempt {}) does not "
+                    "cover retired blob {} (token {}) — refusing to seal the completion generation over an "
+                    "incomplete outcome log; the round will retry", shard, completion_generation, attempt,
+                    u128ToHex(entry.hash), entry.token.value);
         }
     }
 
@@ -1484,7 +1477,10 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
 
-    for (const BlobCandidate & cand : zeroInDegree(backend, layout, state.snap_generation, state.snap_attempt, /*shard*/0))
+    /// Scan every blob-target shard (see `retire`): a preview that only looked at shard 0 would miss the
+    /// zero-in-degree candidates owned by shards 1..N under `gc_shards > 1`.
+    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
+    for (const BlobCandidate & cand : zeroInDegree(backend, layout, state.snap_generation, state.snap_attempt, shard))
     {
         const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
         if (!observed.exists)

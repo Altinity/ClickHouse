@@ -45,7 +45,9 @@ struct GcLease
 struct GcState
 {
     uint64_t round = 0;            /// the highest GC round whose retire sets are durable
-    uint64_t fence_seq = 0;        /// leadership-epoch component of retired/outcome paths (spec §4)
+    uint64_t fence_seq = 0;        /// leadership-epoch counter, bumped on every lease steal (recorded in GC
+                                   /// events). NOT a key component anymore: retired/outcome objects are now
+                                   /// keyed under the adopted (snap_generation, snap_attempt), not fence_seq.
     uint64_t gc_shards = 1;        /// GC blob-target-shard count (blob-hash-prefix sharding); set once, immutable
     uint64_t snap_generation = 0;  /// monotone; the authoritative snap objects' generation
     uint64_t snap_pruned_through = 0;   /// B174: highest snap generation fully pruned (retention cursor)
