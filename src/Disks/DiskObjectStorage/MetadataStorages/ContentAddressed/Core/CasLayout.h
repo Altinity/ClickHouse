@@ -227,6 +227,38 @@ public:
         return prefix + "/roots/" + server_id_hex + "/_watermark";
     }
 
+    /// Phase 0 (mount safety): per-server-root control subtree, keyed by the configured `server_root_id`
+    /// (validated by `DB::Cas::validateServerRootId`). All four control objects live together under
+    /// `<prefix>/gc/server-roots/<server_root_id>/` so a server's mount-safety state is one subtree.
+    String serverRootPrefix(const String & server_root_id) const
+    {
+        return prefix + "/gc/server-roots/" + server_root_id + "/";
+    }
+
+    /// Owner anchor: `<prefix>/gc/server-roots/<srid>/owner`.
+    String ownerKey(const String & server_root_id) const
+    {
+        return serverRootPrefix(server_root_id) + "owner";
+    }
+
+    /// Writer-epoch fence: `<prefix>/gc/server-roots/<srid>/epoch`.
+    String epochKey(const String & server_root_id) const
+    {
+        return serverRootPrefix(server_root_id) + "epoch";
+    }
+
+    /// Mount lease: `<prefix>/gc/server-roots/<srid>/mount`.
+    String mountKey(const String & server_root_id) const
+    {
+        return serverRootPrefix(server_root_id) + "mount";
+    }
+
+    /// Per-server-root build watermark: `<prefix>/gc/server-roots/<srid>/watermark`.
+    String serverRootWatermarkKey(const String & server_root_id) const
+    {
+        return serverRootPrefix(server_root_id) + "watermark";
+    }
+
     /// Pool-level metadata object.
     String poolMetaKey() const
     {

@@ -117,6 +117,36 @@ message WatermarkProto {
   uint64 seq        = 5;
 }
 
+// CA Phase 0 (mount safety): per-server-root control objects under gc/server-roots/<server_root_id>/.
+// Each is a pure-protobuf mutable object carrying a CasHeader as field 1.
+
+// Owner anchor (gc/server-roots/<srid>/owner). Magic CAOW, FormatId::Owner. Binds a configured
+// server_root_id to the server UUID that owns the subtree; write-once, never reused.
+message OwnerProto {
+  CasHeader header     = 1;  // magic=CAOW; set by encoder, checked by decoder
+  bytes     server_uuid = 2; // raw 16 bytes (UInt128, big-endian)
+}
+
+// Writer-epoch fence (gc/server-roots/<srid>/epoch). Magic CAEP, FormatId::ServerEpoch. The monotone
+// next writer epoch to hand out; CAS-advanced on each mount.
+message ServerEpochProto {
+  CasHeader header           = 1;  // magic=CAEP; set by encoder, checked by decoder
+  uint64    next_writer_epoch = 2;
+}
+
+// Mount lease (gc/server-roots/<srid>/mount). Magic CAML, FormatId::MountLease. The current live mount
+// holder of the subtree: who, at which writer epoch, and until when.
+message MountLeaseProto {
+  CasHeader header        = 1;  // magic=CAML; set by encoder, checked by decoder
+  bytes     server_uuid   = 2;  // raw 16 bytes (UInt128, big-endian)
+  uint64    writer_epoch  = 3;
+  string    hostname      = 4;
+  uint64    pid           = 5;
+  uint64    started_at_ms = 6;
+  uint64    seq           = 7;
+  uint64    expires_at_ms = 8;
+}
+
 // GC lease embedded inside GcStateProto.
 message GcLeaseProto {
   bytes  owner = 1;  // raw 16 bytes (UInt128, big-endian); 0 = never held

@@ -34,6 +34,10 @@ enum class FormatId : uint16_t
     /// rev. 15 splits the old single generation seal into two write-once phase seals:
     FoldSeal = 14,        /// write-once gc/gen/<gen>/fold_seal (coverage + blob_target/cleanup runs); magic "CAFS"
     CompletionSeal = 15,  /// write-once gc/gen/<gen>/completion_seal (fence/recheck/delete/trim + adoptable); magic "CACS"
+    /// Phase 0 (mount safety): per-server-root control objects under gc/server-roots/<server_root_id>/.
+    Owner = 16,           /// owner anchor (server_root_id -> server UUID); magic "CAOW"
+    ServerEpoch = 17,     /// writer-epoch fence (next_writer_epoch); magic "CAEP"
+    MountLease = 18,      /// live mount lease; magic "CAML"
 };
 
 /// Per-type magic: the 4 ASCII bytes of each object class encoded as a little-endian uint32. Used in

@@ -41,6 +41,9 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
         case FormatId::RunFile:
         case FormatId::FoldSeal:
         case FormatId::CompletionSeal:
+        case FormatId::Owner:
+        case FormatId::ServerEpoch:
+        case FormatId::MountLease:
             return BASELINE;
     }
     throw Exception(ErrorCodes::LOGICAL_ERROR, "CasFormat: unknown FormatId {}", static_cast<int>(id));
@@ -64,6 +67,9 @@ uint32_t magicFor(FormatId id)
         case FormatId::RunFile:        return 0x4E524143u; /// "CARN"
         case FormatId::FoldSeal:       return 0x53464143u; /// "CAFS"
         case FormatId::CompletionSeal: return 0x53434143u; /// "CACS"
+        case FormatId::Owner:          return 0x574F4143u; /// "CAOW"
+        case FormatId::ServerEpoch:    return 0x50454143u; /// "CAEP"
+        case FormatId::MountLease:     return 0x4C4D4143u; /// "CAML"
         case FormatId::Roster:
             break;
     }
