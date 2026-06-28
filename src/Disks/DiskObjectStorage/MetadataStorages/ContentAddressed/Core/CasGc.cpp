@@ -1195,77 +1195,21 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
         next.snap_pruned_through = g - 1;   /// highest generation fully processed this round
     }
 
-    /// (2) CURRENT-GENERATION attempt orphan sweep (opportunistic, bounded, fail-open best-effort). The
-    /// wholesale retention prune above is the real reclaimer; this sweep only mops up the debris a deposed
-    /// leader of the JUST-COMPLETED round left at the FOLD generation, which retention will not reach for
-    /// `keep` more rounds.
+    /// (2) NO per-round current-generation attempt-sweep (KISS). A previous revision LISTed the FOLD
+    /// generation's `gc/gen/<G_f>/` prefix EVERY completed round to delete non-adopted attempts with
+    /// `a < snap_attempt` — debris a deposed leader of the just-completed round left under its own
+    /// (unadopted) `lease.seq`. That per-round LIST was steady-state S3 budget spent for the RARE case
+    /// of a concurrent-leader collision (the GC-DISCOVERY-LIST-QUADRATIC concern), so it is removed.
     ///
-    /// WHICH generation: a deposed competitor of the round that just committed folded into the FOLD
-    /// generation `G_f` under its own (unadopted) attempt before its CAS failed. The completion-advance
-    /// has already set `next.snap_generation = G_c = G_f + 1`, so `G_f = next.snap_generation - 1`. The
-    /// new completion generation `G_c` holds only the winner's artifacts (no deposed write yet), so the
-    /// fold generation is the one with non-adopted debris. We never touch `G_c` or any generation
-    /// `> snap_generation`.
-    ///
-    /// WATERMARK — deliberately CONSERVATIVE: sweep ONLY attempts `a < snap_attempt` of `G_f`. Reasoning:
-    ///   - `a == snap_attempt` is the ADOPTED attempt (still within retention) — never touch it.
-    ///   - `a > snap_attempt`: a LATER stealer mints a HIGHER `lease.seq`; such an attempt could still be
-    ///     the next adopter (its CAS has not been observed to fail) or still be mid-write. Sweeping it
-    ///     would race a live writer. NEVER sweep `a > snap_attempt`.
-    ///   - `a < snap_attempt`: strictly below the adopted `lease.seq`. Since `snap_attempt` is already
-    ///     recorded in gc/state, any leader holding a lower seq has already lost the lease (its
-    ///     lease-guarded CAS fails against the higher seq), so its fold-generation artifacts are dead
-    ///     debris — safe to reclaim.
-    const uint64_t adopted_attempt = attempt;   /// == next.snap_attempt (the adopted attempt)
-    if (adopted_attempt > 0 && next.snap_generation > 0)
-    {
-        const uint64_t cur_generation = next.snap_generation - 1;   /// the fold generation G_f
-        uint64_t swept = 0;
-        String cursor;
-        const String gen_prefix = layout.gcGenPrefix(cur_generation);
-        const String attempt_marker = "attempt/";
-        std::set<uint64_t> sweep_attempts;
-        /// Discover candidate attempts by LISTing the current generation prefix and parsing the
-        /// `attempt/<a>/` path segment. Bounded by kMaxPrunePerRound distinct attempts.
-        while (sweep_attempts.size() < kMaxPrunePerRound)
-        {
-            ListPage page = backend.list(gen_prefix, cursor, 1000);
-            for (const auto & listed : page.keys)
-            {
-                /// Key shape: <gen_prefix>attempt/<a>/...  Extract <a>.
-                if (listed.key.size() <= gen_prefix.size())
-                    continue;
-                const String tail = listed.key.substr(gen_prefix.size());
-                if (tail.compare(0, attempt_marker.size(), attempt_marker) != 0)
-                    continue;
-                const size_t a_begin = attempt_marker.size();
-                const size_t a_end = tail.find('/', a_begin);
-                if (a_end == String::npos)
-                    continue;
-                uint64_t a = 0;
-                try
-                {
-                    a = std::stoull(tail.substr(a_begin, a_end - a_begin));
-                }
-                catch (...)
-                {
-                    continue;   /// unparseable attempt segment — skip (never throw during a prune sweep)
-                }
-                if (a < adopted_attempt)   /// strictly older than the adopted attempt => dead debris
-                    sweep_attempts.insert(a);
-            }
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
-        }
-        for (const uint64_t a : sweep_attempts)
-        {
-            if (swept >= kMaxPrunePerRound)
-                break;
-            swept += deletePrefixWholesale(backend, layout.gcGenAttemptPrefix(cur_generation, a),
-                                           kMaxPrunePerRound - swept);
-        }
-    }
+    /// The wholesale generation-retention prune in (1) is now the SOLE reclaimer of ALL attempt debris,
+    /// including a deposed leader's: every artifact of generation `g` — across every attempt — lives
+    /// under `gc/gen/<g>/`, and the prefix-delete in (1) reclaims the whole subtree once `g` ages past
+    /// `keep`. Deposed-leader current-generation debris is therefore BOUNDED space (one collision leaves
+    /// at most a handful of small objects per generation) that waits at most `keep` completion-advances
+    /// to be reclaimed. This trades ~`keep` rounds of reclaim latency on (rare) concurrent-leader
+    /// collisions for eliminating a per-round LIST on the common (single-leader) path. When `keep == 0`
+    /// (keep-all / forensics mode) nothing is reclaimed by design — same as before.
+    (void)attempt;
 }
 
 std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attempt)

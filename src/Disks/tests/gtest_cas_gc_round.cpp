@@ -872,15 +872,19 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
 }
 
-/// Task 9 (current-generation attempt orphan sweep): a deposed leader can write its fold seal under an
-/// attempt that lost CAS #1 to a higher-seq adopter. Such an attempt at the CURRENT generation, with
-/// `a < snap_attempt` (strictly older than the adopted attempt — it already lost the lease), is dead
-/// debris and is swept opportunistically (bounded, fail-open) while the adopted attempt survives. An
-/// attempt `a > snap_attempt` (a later stealer that could still adopt) is NEVER swept.
-TEST(CasGcSnapRetention, SweepsNonAdoptedCurrentGenAttempt)
+/// Reclaim-VIA-RETENTION of a non-adopted current-generation attempt orphan (KISS prune model). A
+/// deposed leader can write its fold seal under an attempt that lost CAS #1 to a higher-seq adopter —
+/// debris at the FOLD generation under a NON-adopted attempt. There is NO per-round current-generation
+/// attempt-sweep anymore (it cost a per-round LIST for a rare collision); the wholesale
+/// generation-retention prune is the SOLE reclaimer. So such an orphan is NOT reclaimed within one
+/// round; instead it waits until its generation ages past `keep` and the wholesale prefix-delete
+/// reclaims the whole `gc/gen/<g>/` subtree — every attempt at once, including this orphan. This test
+/// plants the orphan at a fold generation, ages that generation out, and asserts retention reclaims it.
+TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    /// keep=3 retention floor (matches WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes).
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_snap_generations_to_keep = 3});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -894,36 +898,38 @@ TEST(CasGcSnapRetention, SweepsNonAdoptedCurrentGenAttempt)
     const GcState st = readState(*backend, *store);
     ASSERT_GT(st.snap_attempt, 0u) << "need snap_attempt > 0 so a strictly-older orphan attempt exists";
 
-    /// The next round folds `snap_generation -> snap_generation+1` and completes to `snap_generation+2`,
-    /// then its prune sweeps the FOLD generation `G_f = (snap_generation+2) - 1 = snap_generation + 1`.
-    /// Plant a deposed competitor's debris at exactly that fold generation, under an attempt strictly
-    /// older than the round's adopted attempt (snap_attempt only grows, so `st.snap_attempt - 1` is below
-    /// the next round's adopted attempt). The sweep must reclaim it.
-    const uint64_t swept_gen = st.snap_generation + 1;
+    /// Plant a deposed competitor's debris at the next round's FOLD generation under an attempt strictly
+    /// older than that round's adopted attempt — exactly the orphan the old per-round sweep targeted.
+    const uint64_t orphan_gen = st.snap_generation + 1;
     const uint64_t orphan_attempt = st.snap_attempt - 1;
-    const String orphan_seal = store->layout().foldSealKey(swept_gen, orphan_attempt);
-    const String orphan_run = store->layout().blobTargetRunKey(swept_gen, orphan_attempt, 0, 0);
+    const String orphan_seal = store->layout().foldSealKey(orphan_gen, orphan_attempt);
+    const String orphan_run = store->layout().blobTargetRunKey(orphan_gen, orphan_attempt, 0, 0);
     backend->putIfAbsent(orphan_seal, "orphan-seal");
     backend->putIfAbsent(orphan_run, "orphan-run");
 
-    /// A LATER attempt at the same fold generation (could still be the next adopter / still being
-    /// written) must be SPARED — it is >= the round's adopted attempt.
-    const uint64_t future_attempt = st.snap_attempt + 50;
-    const String future_seal = store->layout().foldSealKey(swept_gen, future_attempt);
-    backend->putIfAbsent(future_seal, "future-seal");
-
-    /// One more round runs the sweep over fold generation `swept_gen`.
+    /// One more round folds into `orphan_gen` and completes. The orphan must SURVIVE this round — there
+    /// is no current-generation sweep; retention has not yet reached `orphan_gen`.
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_TRUE(backend->head(orphan_seal).exists)
+        << "orphan must survive its own round — there is no per-round current-gen sweep";
+
+    /// Age `orphan_gen` well past the retention floor (keep=3): several more quiescent rounds. The
+    /// wholesale generation-retention prune then reclaims the WHOLE `gc/gen/<orphan_gen>/` subtree,
+    /// including this non-adopted attempt's debris.
+    for (int i = 0; i < 8; ++i)
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
     const GcState st_after = readState(*backend, *store);
-    ASSERT_EQ(st_after.snap_generation - 1, swept_gen) << "the round's fold generation must be swept_gen";
-    ASSERT_GT(st_after.snap_attempt, orphan_attempt) << "orphan must be strictly below the adopted attempt";
+    ASSERT_GT(st_after.snap_generation, orphan_gen + 3) << "orphan_gen must be below the retention floor";
 
-    EXPECT_FALSE(backend->head(orphan_seal).exists) << "orphan attempt (a < snap_attempt) must be swept";
-    EXPECT_FALSE(backend->head(orphan_run).exists) << "orphan attempt subtree must be swept wholesale";
+    EXPECT_FALSE(backend->head(orphan_seal).exists)
+        << "non-adopted attempt orphan must be reclaimed by wholesale retention once its generation ages out";
+    EXPECT_FALSE(backend->head(orphan_run).exists)
+        << "the whole orphan subtree must be reclaimed by wholesale retention";
 
-    /// A later attempt (a > snap_attempt) is conservatively spared.
-    EXPECT_TRUE(backend->head(future_seal).exists)
-        << "an attempt > snap_attempt could still adopt and must NOT be swept";
+    /// No-loss: the live data is intact throughout.
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+    EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
 }
 
 /// ---- B12 lazy/batched trim tests ----
