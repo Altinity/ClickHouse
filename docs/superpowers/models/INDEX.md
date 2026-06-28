@@ -13,6 +13,7 @@ shipped code on branch `cas-vfs-path-mapping`; "HISTORICAL/SUPERSEDED" = kept as
 | `Apalache.tla` | Apalache stdlib shim for the proof core | — |
 | `CaBuildRootPrecommit.tla` | **The current B140/B171 fix model**: precommit-first + build-root reachability + fail-closed commit + `reclaimAbandonedPrecommit` | `CaBuildRootPrecommit_RESULTS.md` |
 | `CaGcLeaseCore.tla` | B160 GC leader-lease / heartbeat steal (renew/steal/fence) | `CaGcLeaseCore_RESULTS.md` |
+| `CaCasMountCore.tla` | Mount ownership + server-root identity safety gate: sticky owner, foreign-uuid fail-closed, durable monotone epoch (own object), one-atomic-CAS mount claim/adopt/reclaim, superseded-writer fence; 3 sabotage controls + reclaim liveness witness | `CaCasMountCore_RESULTS.md` |
 | `CaB140DangleMerge.tla` | Faithful B140 reproduction + fix proof (trim-before-durable gap across lease handoff) | `CaB140DangleMerge_RESULTS.md` |
 | `CaB140DangleFaithful.tla` | Faithful refutation of the Phase-1 mechanism (clean 9.1M states) | (recorded inside `CaB140DangleMerge_RESULTS.md`) |
 
