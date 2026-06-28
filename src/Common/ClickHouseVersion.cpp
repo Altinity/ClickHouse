@@ -4,7 +4,6 @@
 #include <IO/ReadHelpers.h>
 
 #include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/join.hpp>
 
 #include <fmt/ranges.h>
 
@@ -30,12 +29,13 @@ ClickHouseVersion::ClickHouseVersion(std::string_view version)
         ReadBufferFromString buf(split[i]);
         if (!tryReadIntText(component, buf) || !buf.eof())
         {
-            /// Non-numeric component (e.g. "altinityantalya"): treat this and remaining parts as suffix.
-            /// Valid version must have at least one numeric component (e.g. "26.1.3.20001.altinityantalya").
-            if (components.empty())
+            /// The first non-numeric token is treated as a build suffix (e.g. "altinityantalya"
+            /// in "26.1.3.20001.altinityantalya"). To prevent silently accepting malformed versions
+            /// like "26..1", "26.1." or "26.x.1", the suffix must be a single, non-empty, trailing
+            /// token, preceded by at least one numeric component.
+            if (components.empty() || i + 1 != split.size() || split[i].empty())
                 throw Exception{ErrorCodes::BAD_ARGUMENTS, "Cannot parse ClickHouse version here: {}", version};
-            Strings suffix_parts(split.begin() + i, split.end());
-            suffix = boost::algorithm::join(suffix_parts, ".");
+            suffix = split[i];
             break;
         }
         components.push_back(component);
