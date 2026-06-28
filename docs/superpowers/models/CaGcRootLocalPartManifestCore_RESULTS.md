@@ -233,3 +233,32 @@ surviving committed ref still references, which is exactly `INV_NO_LOSS` (and `I
 (verified VIOLATED at the minimal scope `Blobs = {b1}`, precommit/missing-body/orphan-sweep/mutable off,
 `MaxToken = 3` — 20,497 distinct states). `RetireTokenSourceComplete` is retained on `stage5_retiretoken` as
 the positive token-accounting invariant for the honest source.
+
+---
+
+## Phase 6 — attempt-scoped generation visibility (concurrent-leader-leak fix, 2026-06-28)
+
+Spec: `docs/superpowers/specs/2026-06-28-cas-gc-attempt-scoped-generation-design.md`.
+New constants `EnableAttemptScoping`, `SabotageDeposedLeaderWritesFinalGen`, `MaxAttempt` (bound 2),
+all bound FALSE/2 in every pre-existing cfg. A self-contained attempt-bookkeeping layer (vars
+`attemptSeq`/`adopted`/`sealAt`/`retiredAt`/`attViewable`; actions `GMintAttempt`/`GAdopt`/
+`GDeposedFinalWrite`) fully decoupled from existing vars (`vars == origVars \o attemptVars`).
+
+| Config | Verdict | Distinct states |
+|---|---|---|
+| `stage6_attemptscoping` (EnableAttemptScoping=TRUE) | **GREEN** — INV_ONLY_ADOPTED_VIEWABLE + INV_NO_LOSS/NO_DANGLE/NO_RETURN/JOURNAL_COVERAGE hold | 11,658,986 |
+| `sab_deposedleaderwritesfinalgen` (Sabotage…=TRUE) | **VIOLATED `INV_ONLY_ADOPTED_VIEWABLE`** (negative control) | 1,631 to ce |
+| `witness_twoleadersoneadopt` | **VIOLATED `W_TwoLeadersOneAdopt`** (reachable: two attempts one round, one adopted) | 787 to witness |
+
+**Inertness (new vars inert when both flags FALSE) — exact baseline reproduction:**
+`stage0` = 19,846; `stage1` = 402,034; **`stage3` = 365,609,430** (1,926,070,427 generated, 24min46s) — identical
+to the pre-Phase-6 baseline. Confirms the attempt layer adds zero states to every existing stage.
+No `UNEXPECTED PASS`: `sab_twoowners` still VIOLATED `INV_NO_LOSS`.
+
+`INV_ONLY_ADOPTED_VIEWABLE == \A r : \A a \in attViewable[r] : (adopted[r] # 0) => a = adopted[r]`.
+**Abstraction boundary:** `attViewable` models "attempts a decision path may consult"; the proof shows the
+visibility discipline is internally consistent and the deposed-final-write breaks it (the spec's accepted
+counterexample form). It does not wire `attViewable` into the model's delete decisions (would need
+attempt-keyed in-degree runs) — the concrete no-wedge/no-leak safety check is the implementation-level gtest.
+Because the layer is decoupled, R0 is identical flag-on/off, so full-scope R0 is covered by `stage3`;
+`stage6` scope (Blobs={b1}, MaxRound=1) suffices for the attempt invariant.

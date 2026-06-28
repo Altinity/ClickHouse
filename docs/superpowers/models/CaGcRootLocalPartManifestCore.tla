@@ -34,7 +34,11 @@ CONSTANTS
     SabotageCrossShardDisplacement,  \* the scatter drops the displaced old-binding -1 deltas (infers the old target from the new ref alone) -> cross-shard last-op-wins leak (INV_NO_LOSS)
     \* ---- Phase 5: retire-token optimization ----
     EnableRetireTokenSource,         \* TRUE -> retire sources the RetiredEntry.token from the token observed+sealed at fold time (storedTok), dropping the per-candidate backend.head read; FALSE -> the existing tokOf[b] head read (storedTok stays inert)
-    SabotageStaleTokenOverDelete     \* the destructive Land guard ALSO fires when d.t = storedTok[d.h] (a stale stored token), modeling an over-delete that matches a RE-INCARNATED object -> INV_NO_RETURN
+    SabotageStaleTokenOverDelete,    \* the destructive Land guard ALSO fires when d.t = storedTok[d.h] (a stale stored token), modeling an over-delete that matches a RE-INCARNATED object -> INV_NO_RETURN
+    \* ---- attempt-scoping (a non-adopted GC attempt's artifact is never reader-visible) ----
+    EnableAttemptScoping,                 \* TRUE = the fix: only the adopted attempt is reader-visible
+    SabotageDeposedLeaderWritesFinalGen,  \* TRUE = a deposed leader makes a non-adopted attempt viewable (the bug)
+    MaxAttempt                            \* bound on the attempt counter (TLC finiteness)
 
 \* A ManifestId is (namespace, manifest_instance_id). manifest_instance_id is drawn from
 \* ManifestInstances and is NEVER reused once visible (NoManifestIdReuse). Two namespaces may
@@ -81,7 +85,13 @@ VARIABLES
     coordFence,  \* 0..MaxLog the SINGLE global fence position the ONE coordinator advances over the whole fence universe; a per-shard reducer NEVER writes it (SabotageReducerOwnsFence breaks that)
     reducerOwner,\* [Shards -> Leaders] which leader owns (folds/reduces) each target shard; DisjointShardOwnership; lets two leaders reduce DISJOINT shards concurrently while ONE coordinator owns the fence/seal
     \* ---- Phase 5: retire-token optimization ----
-    storedTok    \* [Blobs -> 0..MaxToken] the token OBSERVED at fold time when a +1 blob-edge was sealed into the generation; retire sources RetiredEntry.token from HERE instead of a per-candidate backend.head read. Written ONLY by the EnableRetireTokenSource-gated seal branch; inert (all 0) when EnableRetireTokenSource=FALSE
+    storedTok,   \* [Blobs -> 0..MaxToken] the token OBSERVED at fold time when a +1 blob-edge was sealed into the generation; retire sources RetiredEntry.token from HERE instead of a per-candidate backend.head read. Written ONLY by the EnableRetireTokenSource-gated seal branch; inert (all 0) when EnableRetireTokenSource=FALSE
+    \* ---- attempt-scoping: self-contained bookkeeping; touches none of the existing vars (provably inert when off) ----
+    attemptSeq,    \* global monotone attempt counter; each minted attempt id is attemptSeq'
+    adopted,       \* [0..MaxRound -> 0..MaxAttempt] the adopted attempt id per round (0 = none)
+    sealAt,        \* [0..MaxRound -> SUBSET (1..MaxAttempt)] minted attempts that wrote artifacts for the round
+    retiredAt,     \* [0..MaxRound -> SUBSET (1..MaxAttempt)] minted attempts that wrote a retired set
+    attViewable    \* [0..MaxRound -> SUBSET (1..MaxAttempt)] attempts a decision path may consult
 
 \* SrcEdges(m): the active source edges currently emitted by m's activation map. Derived operator,
 \* NOT a constant, so it follows mActiveEdges as the fold mutates it.
@@ -99,14 +109,19 @@ OwnerMoveSameManifest(e) == e.old # {} /\ e.old = e.new
 IsRemoval(e)             == e.old # {} /\ e.old # e.new
 IsActivation(e)          == e.new # {} /\ e.old # e.new
 
-vars == << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
+origVars == << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, mActiveEdges,
            journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
            roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
            mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok,
            foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+attemptVars == << attemptSeq, adopted, sealAt, retiredAt, attViewable >>
+vars == origVars \o attemptVars
 
 \* ---- helpers (filled across tasks) ----
 NoOp == UNCHANGED vars
+
+\* The attempt-scoping layer is live iff either of its two flags is set; otherwise it is provably inert.
+AttemptActive == EnableAttemptScoping \/ SabotageDeposedLeaderWritesFinalGen
 
 \* Phase 3 (lazy trim): a shard is UNCHANGED since the fence's recorded folded token iff its abstract
 \* persisted folded token has not moved. A writer publish bumps foldTok[n], so a publish between fence
@@ -161,6 +176,7 @@ WStageManifest(m, f) ==
                     blobEdges, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
                     mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* ---- owner transitions (spec §Build And Precommit Protocol; §Fold Owner Transitions) ----
 PresentBlobs == { b \in Blobs : present[b] }
@@ -212,6 +228,7 @@ WUploadBlob(b) ==
                     blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf,
                     fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup,
                     mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* The round a retire-view refresh may CLAIM COVERAGE of. The retired-token view is writer-visible only
 \* AFTER the round's retire barrier (all retired sets durable). While a leader is still RETIRING at the
@@ -228,6 +245,7 @@ WRefreshView(w) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* PrecommitAdd: owner[m] := build bld. A precommit MAY have a missing body only when EnableMissingBody
 \* (the missing-body fail-closed intent). A precommit ACTIVATES (emits edges) iff its body is present
@@ -249,6 +267,7 @@ WPrecommitAdd(m, bld, f) ==
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Promote precommit -> committed: the atomic PURE owner move. Same ManifestId, blob Δ=0, NO new
 \* edges (the activation +1 was emitted when the precommit's body arrived, or is still pending if the
@@ -274,6 +293,7 @@ WPromote(m, bld, ref, w) ==
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* #2 (SabotageTwoOwners): a SECOND committed owner is attached to an already-committed ManifestId
 \* (sharing a manifest across refs/namespaces). The single-owner rule (RefFreeFor / owner being a
@@ -290,6 +310,7 @@ WShareOwner(m) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
                     wView, mfCleanup, mfDeleted, mPrefix, sweepEligible, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Direct committed publish (no precommit). Same fail-closed body+blob gate as promote. Sets the
 \* committed owner and activates the edges (committed manifests are always activated).
@@ -307,6 +328,7 @@ WPublishCommitted(m, ref, w) ==
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Drop a committed ref: owner[m]: ref -> None; a true removal (-1 + mfCleanup queued at fold).
 WDropRef(m) ==
@@ -319,6 +341,7 @@ WDropRef(m) ==
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Abandon a precommit owner: owner[m]: bld -> None; a true removal.
 WAbandonPrecommit(m) ==
@@ -331,6 +354,7 @@ WAbandonPrecommit(m) ==
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* A missing-body precommit's manifest body ARRIVES asynchronously (the upload completes after
 \* PrecommitAdd). Only meaningful under EnableMissingBody. Sets the body + entries; if the precommit is
@@ -347,6 +371,7 @@ WManifestBodyArrives(m, f) ==
                     blobEdges, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
                     mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Repoint a committed ref from mOld to mNew (last-op-wins at the root source): removes mOld and
 \* activates mNew under the SAME ref, in one event (old=mOld, new=mNew). Both must be in the same ns.
@@ -365,6 +390,7 @@ WRepoint(mOld, mNew, ref, w) ==
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, foldedTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* ============================ GC pipeline (spec §Round Protocol) ============================
 \* blobIndeg is ALWAYS the exact count of folded source edges by referenced blob (the
@@ -406,6 +432,7 @@ GStartRound(l) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
                     mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Fold one RootOwnerEvent at cursor[n], dispatching by old-vs-new manifest comparison (rev.15).
 GFoldTransition(n) ==
@@ -487,6 +514,7 @@ GFoldTransition(n) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, journal,
                     completionSeal, gcRound, gcPhase, roundOf, fencePos, trimBase, fenceVersion,
                     retired, inflight, wView, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner >>
+    /\ UNCHANGED attemptVars
 
 \* ============================ Phase 4: target-sharded reducers (R2) ============================
 \* gc_shards > 1 lets two replicas fold/reduce DISJOINT blob target shards concurrently, while exactly
@@ -578,6 +606,7 @@ GRetireBlob(l, b) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Global fence: fence every namespace this round. SabotageNoFence skips the fence write (a racing
 \* publish is never blocked). SabotageRoundVisibilityEarly marks the round adoptable before the fence.
@@ -599,6 +628,7 @@ GFenceRegistry(l) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, gcRound, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
                     mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Phase 3 (lazy trim): the per-shard fence. The ONLY non-sabotage behavior is the FRESH all-shard
 \* fence — advance fencePos[n] to the current journal end (capturing every publish), capping the
@@ -644,6 +674,7 @@ GFenceShard(l, n) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, gcRound, roundOf, cursor,
                     trimBase, retired, inflight, wView, mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok,
                     shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Recheck + issue exact-token delete. Requires the fold to have provably reached every fence
 \* position (SabotageNoRecheckFold-equivalent: SabotageRoundVisibilityEarly opens an early-visibility
@@ -679,6 +710,7 @@ GRecheckDelete(l, e) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, gcRound, gcPhase, roundOf,
                     fencePos, cursor, trimBase, fenceVersion, wView, mfCleanup, mfDeleted, mPrefix,
                     sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 GEndRound(l) ==
     /\ gcPhase[l] = "fenced"
@@ -688,6 +720,7 @@ GEndRound(l) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* A delete message lands: exact-token (412 = no-op). SabotageUncondDelete ignores the token match.
 \* The landing is the confirmed outcome: the matching retired entry drops HERE. Any token stopping
@@ -710,6 +743,7 @@ Land(d) ==
                     blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, wView, mfCleanup, mfDeleted,
                     mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Journal trim: INV_JOURNAL_COVERAGE — only below the durable folded cursor. SabotageTrimUnincorporated
 \* trims below an unfolded transition (cursor).
@@ -720,6 +754,7 @@ Trim(n) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* ---- part-manifest cleanup ordering + orphan sweep + mutable update (Task 5) ----
 \* Delete an unowned manifest body (exact-token abstracted). NORMAL: only after its owner-removal
@@ -738,6 +773,7 @@ GDeleteManifest(m) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
                     wView, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Stale part-manifest cleanup replay (control #1). When a ManifestId is REUSED (SabotageReuseManifestId),
 \* a cleanup bundle queued for the OLD incarnation (m \in mfCleanup) cannot tell the id was rebound to a
@@ -756,6 +792,7 @@ GStaleReuseCleanup(m) ==
     /\ UNCHANGED << present, tokOf, nextTok, deadTok, mBody, mEntries, mRef, mNs, owner, journal,
                     everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos, cursor,
                     trimBase, fenceVersion, retired, inflight, wView, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* A durable watermark fact makes a build prefix conservatively sweep-eligible (the writer incarnation
 \* can no longer publish from it). SabotageFrozenSeqAuthority sets it from a frozen-seq heuristic
@@ -770,6 +807,7 @@ GMarkSweepEligible(p) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
                     wView, mfCleanup, mfDeleted, mPrefix, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Orphan pre-precommit sweep: deletes a staged-but-unowned manifest body whose build prefix is
 \* sweep-eligible AND whose id is absent from the sealed owner view (owner = None). Emits NO blob
@@ -797,6 +835,7 @@ GOrphanSweep(n) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound,
                     gcPhase, roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight,
                     wView, mfCleanup, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* Mutable per-ref payload update: changes only mutable payload — NO owner transition, NO blob delta,
 \* NO id change (MutablePayloadNotReachability). Modeled as a no-op stutter on every reachability var,
@@ -817,6 +856,7 @@ WMutableUpdate(m) ==
                     everEdged, foldSeal, completionSeal, gcRound, gcPhase, roundOf, fencePos,
                     cursor, trimBase, fenceVersion, retired, inflight, wView, mfCleanup, mfDeleted,
                     mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* ---- Phase 2: token-diff discovery (spec §Discovery; the rev.15 token split) ----
 \* The token-diff skip CLAIMS a shard's fold coverage WITHOUT reading its body: it advances the durable
@@ -851,6 +891,7 @@ GDiscoverSkip(n) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* The body read + fold-seal write. Always legal (fail-closed to a read). The FOLD-SEAL WRITE is the
 \* ONLY thing that advances the persisted folded token, bringing foldedTok[n] up to the listed token
@@ -868,6 +909,7 @@ GDiscoverRead(n) ==
                     journal, blobIndeg, blobEdges, everEdged, foldSeal, completionSeal, gcRound, gcPhase,
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* GScatterDelta(n, s): the MAPPER. Consume the next unfolded journal[n] record at cursor[n] and apply
 \* the paired old/new-binding deltas. It performs the SAME journal fold as GFoldTransition (edges,
@@ -906,6 +948,7 @@ GScatterDelta(n, s) ==
                     completionSeal, gcRound, gcPhase, roundOf, fencePos, trimBase, fenceVersion,
                     retired, inflight, wView, mfDeleted, mPrefix, sweepEligible, extraShared,
                     listedTok, foldedTok, foldTok, prevFencePos, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* GReduceShard(l, s): the REDUCER. Leader l owning shard s (ReducerOwns) folds its shard's deltas —
 \* a work-dedup no-op on shardIndeg (the deltas were already scattered); its only job is to assert that
@@ -940,6 +983,7 @@ GCoordFence(l) ==
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok,
                     foldTok, prevFencePos, shardIndeg, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
 
 \* GCoordSeal(l): the SINGLE input seal gates internal products + adoption — every shard's product
 \* durable + cleanup bundles durable BEFORE adoption. The retired-token view stays gated on
@@ -960,6 +1004,52 @@ GCoordSeal(l) ==
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldedTok,
                     foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
+    /\ UNCHANGED attemptVars
+
+\* ============================ attempt-scoping (self-contained) ============================
+\* A SELF-CONTAINED attempt-bookkeeping layer. Every action below holds origVars UNCHANGED, so it
+\* perturbs none of the existing safety machinery; it is gated on AttemptActive, so when both flags
+\* are FALSE these actions never fire and the new vars stay at their zero init (provably inert).
+
+\* Mint a fresh attempt id for round r and record its artifacts (a candidate fold by some leader).
+\* Multiple leaders may mint candidates for the same round. Gated on AttemptActive; inert otherwise.
+GMintAttempt(r) ==
+    /\ AttemptActive
+    /\ attemptSeq < MaxAttempt
+    /\ attemptSeq' = attemptSeq + 1
+    /\ sealAt'    = [sealAt    EXCEPT ![r] = @ \cup {attemptSeq'}]
+    /\ retiredAt' = [retiredAt EXCEPT ![r] = @ \cup {attemptSeq'}]
+    /\ UNCHANGED << adopted, attViewable >>
+    /\ UNCHANGED origVars
+
+\* Adopt a minted candidate a for round r (the lease-guarded CAS #1). Exactly one attempt is adopted per
+\* round; ONLY the adopted attempt becomes viewable. Fires in BOTH the fix and the sabotage worlds.
+GAdopt(r, a) ==
+    /\ AttemptActive
+    /\ adopted[r] = 0
+    /\ a \in sealAt[r]
+    /\ adopted'     = [adopted     EXCEPT ![r] = a]
+    /\ attViewable' = [attViewable EXCEPT ![r] = {a}]
+    /\ UNCHANGED << attemptSeq, sealAt, retiredAt >>
+    /\ UNCHANGED origVars
+
+\* A deposed leader holding a STALE (non-adopted) minted attempt a writes its artifacts for round r.
+\* FIX (EnableAttemptScoping): it stays attempt-scoped — NEVER added to attViewable (invisible).
+\* SABOTAGE (SabotageDeposedLeaderWritesFinalGen): it writes the shared/final slot -> a NON-ADOPTED
+\* attempt becomes viewable (the wedge/divergence bug).
+GDeposedFinalWrite(r, a) ==
+    /\ AttemptActive
+    /\ adopted[r] # 0
+    /\ a \in 1..MaxAttempt
+    /\ a # adopted[r]
+    /\ a <= attemptSeq            \* a was actually minted (a real prior candidate)
+    /\ sealAt'    = [sealAt    EXCEPT ![r] = @ \cup {a}]
+    /\ retiredAt' = [retiredAt EXCEPT ![r] = @ \cup {a}]
+    /\ attViewable' = IF SabotageDeposedLeaderWritesFinalGen
+                      THEN [attViewable EXCEPT ![r] = @ \cup {a}]
+                      ELSE attViewable
+    /\ UNCHANGED << attemptSeq, adopted >>
+    /\ UNCHANGED origVars
 
 Init ==
     /\ present = [b \in Blobs |-> FALSE]
@@ -1009,6 +1099,12 @@ Init ==
     /\ reducerOwner = [s \in Shards |-> FixedShardOwner(s)]
     \* Phase 5: no token has been observed/sealed yet; inert (all 0) unless EnableRetireTokenSource:
     /\ storedTok = [b \in Blobs |-> 0]
+    \* attempt-scoping: no attempts minted/adopted yet; inert (empty) unless AttemptActive:
+    /\ attemptSeq = 0
+    /\ adopted = [r \in 0..MaxRound |-> 0]
+    /\ sealAt = [r \in 0..MaxRound |-> {}]
+    /\ retiredAt = [r \in 0..MaxRound |-> {}]
+    /\ attViewable = [r \in 0..MaxRound |-> {}]
 
 TypeOK ==
     /\ extraShared \in SUBSET ManifestIds
@@ -1033,6 +1129,11 @@ TypeOK ==
     /\ coordFence \in [Namespaces -> 0..MaxLog]
     /\ reducerOwner \in [Shards -> Leaders]
     /\ storedTok \in [Blobs -> 0..MaxToken]
+    /\ attemptSeq \in 0..MaxAttempt
+    /\ adopted \in [0..MaxRound -> 0..MaxAttempt]
+    /\ sealAt \in [0..MaxRound -> SUBSET (1..MaxAttempt)]
+    /\ retiredAt \in [0..MaxRound -> SUBSET (1..MaxAttempt)]
+    /\ attViewable \in [0..MaxRound -> SUBSET (1..MaxAttempt)]
 
 INV_JOURNAL_COVERAGE == \A n \in Namespaces : trimBase[n] <= cursor[n]
 
@@ -1129,6 +1230,19 @@ W_CommittedOverFoldedBlob == ~(\E m \in ManifestIds : owner[m] \in Refs /\ mBody
                                   /\ \E p \in Paths : mActiveEdges[m][p] \in Blobs)
 W_OrphanDeleted == ~(\E m \in ManifestIds : ~mBody[m] /\ owner[m] = None /\ m \in everEdged /\ m \in mfDeleted)
 
+\* ---- attempt-scoping safety + witness ----
+\* The governing property: a non-adopted attempt's artifact is NEVER reader-visible. Unguarded so the
+\* sabotage (scoping OFF) violates it; harmlessly vacuous in every existing cfg (attViewable stays empty
+\* when both flags are FALSE). attViewable is only ever populated with adopted[r] under the fix.
+INV_ONLY_ADOPTED_VIEWABLE ==
+    \A r \in 0..MaxRound : \A a \in attViewable[r] : (adopted[r] # 0) => (a = adopted[r])
+
+\* Non-vacuity witness (TLC must report VIOLATED = the state is reachable): two attempts wrote a seal for
+\* the same round and exactly one is adopted.
+W_TwoLeadersOneAdopt ==
+    ~(\E r \in 0..MaxRound : \E a1, a2 \in 1..MaxAttempt :
+        a1 # a2 /\ a1 \in sealAt[r] /\ a2 \in sealAt[r] /\ adopted[r] \in {a1, a2})
+
 \* ---- liveness (under FairSpec) ----
 \* A staged-unowned body in a sweep-eligible prefix eventually either DRAINS (deleted) or is ADOPTED
 \* (gets an owner). The adoption disjunct is essential: a staged body a writer later promotes to a
@@ -1181,6 +1295,9 @@ Next ==
     \* Phase 2: token-diff discovery (the rev.15 token split):
     \/ \E n \in Namespaces : GDiscoverSkip(n)
     \/ \E n \in Namespaces : GDiscoverRead(n)
+    \* attempt-scoping (self-contained; inert unless AttemptActive):
+    \/ \E r \in 0..MaxRound : GMintAttempt(r)
+    \/ \E r \in 0..MaxRound, a \in 1..MaxAttempt : GAdopt(r, a) \/ GDeposedFinalWrite(r, a)
 
 Spec == Init /\ [][Next]_vars
 
