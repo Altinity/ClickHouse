@@ -677,3 +677,117 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
     EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/1, b0), 0)
         << "post-seal: b0 must remain absent from shard-1 post-seal";
 }
+
+/// ---- Phase 4 regression: gc_shards>1 retire-drain (High #1) ----
+///
+/// A FULL round-protocol regression that drives publish -> drop -> reclaim end-to-end under
+/// `gc_shards = 2` with a droppable blob owned by a NON-zero shard. The fold/`ShardReducer` write one
+/// in-degree run PER shard, so a zero-in-degree blob owned by shard 1..N is only ever retired (and
+/// then exact-token deleted) if `retire`/`previewDeletes` scan EVERY blob-target shard. Before
+/// `5f5fa5f7906` both hardcoded shard 0: a shard-1 candidate was never scanned, never retired, and
+/// leaked forever. After the fix both shards are drained.
+///
+/// The test plants TWO droppable blobs in the SAME round — one owned by shard 0, one owned by shard 1
+/// (verified via `blobShard(hash, 2)`) — and asserts BOTH are reclaimed. The shard-0 blob proves the
+/// round works at all; the shard-1 blob is the regression's teeth (it would leak pre-fix while shard-0
+/// still drained, so a single-blob test could pass even with the bug).
+///
+/// HOW IT WOULD LEAK PRE-FIX: under the old shard-0-only `retire`, the round folds the drop (shard-1
+/// blob's in-degree -> 0 in shard 1's run) but `retire` only reads shard 0's in-degree run and only
+/// writes shard 0's retired set, so the shard-1 zero-in-degree blob is never proposed for retirement.
+/// `previewDeletes` (also shard-0-only pre-fix) never lists it, the recheck never spares-or-deletes it,
+/// and `blobExists(b1)` stays true at fixpoint. The shard-0 blob would still be reclaimed — which is
+/// exactly why the existing in-degree-equivalence tests (all blobs route to shard 0) did not catch it.
+TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
+{
+    constexpr uint64_t kGcShards = 2;
+
+    /// Two blob hashes routing to DIFFERENT shards under gc_shards=2. blobShard = high64 % 2.
+    /// high64=0 => shard 0; high64=1 => shard 1.
+    const UInt128 blob_shard0 = (static_cast<UInt128>(0ULL) << 64) | static_cast<UInt128>(7ULL); /// high64=0 => shard 0
+    const UInt128 blob_shard1 = (static_cast<UInt128>(1ULL) << 64) | static_cast<UInt128>(7ULL); /// high64=1 => shard 1
+    ASSERT_EQ(blobShard(blob_shard0, kGcShards), 0u) << "blob_shard0 must route to shard 0";
+    ASSERT_EQ(blobShard(blob_shard1, kGcShards), 1u) << "blob_shard1 must route to shard 1 (regression teeth)";
+
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1,
+                                                 .gc_shards = kGcShards, .gc_trim_min_events = 0});
+    const Layout & layout = store->layout();
+
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r0{.writer_instance_id = "srv-a:1", .build_sequence = 1, .manifest_instance_id = UInt128(0xA0)};
+    const ManifestRef r1{.writer_instance_id = "srv-a:1", .build_sequence = 2, .manifest_instance_id = UInt128(0xA1)};
+    const ManifestId id0{ns, r0};
+    const ManifestId id1{ns, r1};
+
+    /// Local blobExists (the round-level helper is file-local to gtest_cas_gc_round.cpp).
+    auto blobExists = [&](const UInt128 & hash)
+    {
+        return backend->head(layout.blobKey(BlobId(u128ToHex(hash)))).exists;
+    };
+    auto manifestExists = [&](const ManifestId & id)
+    {
+        return backend->head(layout.manifestKey(id)).exists;
+    };
+    auto driveToFixpoint = [&](Gc & gc)
+    {
+        for (size_t r = 0; r < 64; ++r)
+        {
+            const RoundReport rep = gc.runRegularRound();
+            if (!rep.acquired_lease)
+                continue;
+            if (rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
+                && rep.replaced == 0 && rep.spared == 0)
+                break;
+        }
+    };
+
+    /// Publish: ref r0 names the shard-0 blob, ref r1 names the shard-1 blob (distinct refs => distinct
+    /// edges, each contributing +1 to its blob's in-degree in its OWNING shard's run).
+    writeBlobBody(*backend, layout, blob_shard0);
+    writeBlobBody(*backend, layout, blob_shard1);
+    writeManifestRaw(*backend, layout, ns, r0, {blobEntryFor("a", blob_shard0)});
+    writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("b", blob_shard1)});
+    publishCommittedTransition(*backend, layout, ns, "tbl0", std::nullopt, r0);
+    publishCommittedTransition(*backend, layout, ns, "tbl1", std::nullopt, r1);
+
+    const UInt128 gc_id = UInt128(0xDEADBEEF42ULL);
+    Gc gc(store, gc_id);
+    driveToFixpoint(gc);
+
+    /// While both refs are live: each blob's in-degree is 1 in its OWNING shard's run, and nothing is
+    /// collected (no-loss). Derive generation/attempt from gc/state — never hardcode.
+    const GcState live = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    ASSERT_GT(live.snap_generation, 0u);
+    ASSERT_EQ(live.gc_shards, kGcShards) << "the pool must be running with gc_shards=2";
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, live.snap_generation, live.snap_attempt, /*shard=*/0, blob_shard0), 1)
+        << "shard-0 blob in-degree must be 1 while live";
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, live.snap_generation, live.snap_attempt, /*shard=*/1, blob_shard1), 1)
+        << "shard-1 blob in-degree must be 1 while live";
+    EXPECT_TRUE(blobExists(blob_shard0));
+    EXPECT_TRUE(blobExists(blob_shard1));
+
+    /// Drop BOTH refs: each blob's only edge goes away (in-degree -> 0 in its owning shard's run).
+    dropRefTransition(*backend, layout, ns, "tbl0", r0);
+    dropRefTransition(*backend, layout, ns, "tbl1", r1);
+    driveToFixpoint(gc);
+
+    /// After drop + fixpoint: BOTH blobs are retired and exact-token deleted, and BOTH owner-removed
+    /// manifest bodies are collected. The shard-1 blob is the regression's teeth — pre-`5f5fa5f` it
+    /// would still exist here because retire/previewDeletes never scanned shard 1.
+    const GcState dead = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, dead.snap_generation, dead.snap_attempt, /*shard=*/0, blob_shard0), 0)
+        << "shard-0 blob in-degree must be 0 after drop";
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, dead.snap_generation, dead.snap_attempt, /*shard=*/1, blob_shard1), 0)
+        << "shard-1 blob in-degree must be 0 after drop";
+    EXPECT_FALSE(blobExists(blob_shard0)) << "shard-0 droppable blob must be reclaimed";
+    EXPECT_FALSE(blobExists(blob_shard1))
+        << "shard-1 droppable blob must be reclaimed (High #1: retire must scan ALL shards, not just shard 0)";
+    EXPECT_FALSE(manifestExists(id0)) << "shard-0 owner-removed manifest body must be reclaimed";
+    EXPECT_FALSE(manifestExists(id1)) << "shard-1 owner-removed manifest body must be reclaimed";
+
+    /// Idempotent: another fixpoint changes nothing and never throws.
+    EXPECT_NO_THROW(driveToFixpoint(gc));
+    EXPECT_FALSE(blobExists(blob_shard0));
+    EXPECT_FALSE(blobExists(blob_shard1));
+}
