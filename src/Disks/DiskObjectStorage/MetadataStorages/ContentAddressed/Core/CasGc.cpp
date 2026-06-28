@@ -235,8 +235,17 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     /// read / re-fold, never the fence.
     ///
     /// The reference (post-fence tokens + fence positions) comes from the PARENT generation's completion
-    /// seal (recorded by `recheck`). If no completion seal exists (fresh pool, mid-round crash, or pruned
-    /// generation) we walk back for the latest fold seal; if neither exists the empty seal yields all Read.
+    /// seal (recorded by `recheck`). If no completion seal exists (mid-round: fold sealed, completion not
+    /// yet advanced) we read the fold seal at the SAME adopted pair; if neither exists (fresh pool) the
+    /// empty seal yields all Read.
+    ///
+    /// VERIFIED-SAFE (B2): the reference seal always resolves at the ADOPTED `(snap_generation,
+    /// snap_attempt)` — a completed round leaves the completion seal there; a mid-round state has
+    /// `snap_generation == G_f` with its fold seal under `snap_attempt`; a fresh pool has neither. The old
+    /// `for g = snap_generation downto 1` back-scan was UNSOUND with a single stored `snap_attempt`: for
+    /// `g < snap_generation` the adopted attempt was a DIFFERENT `lease.seq`, recorded nowhere, so
+    /// `readFoldSeal(g, snap_attempt)` is the wrong key (nullopt only by accident). A direct read at the
+    /// adopted pair (else empty) is conservative — fail-closed to all-Read, never an older generation.
     CasFoldSeal discover_ref_seal;
     std::map<String, uint64_t> discover_fence_positions;
     if (const auto completion = readCompletionSeal(state.snap_generation, state.snap_attempt))
@@ -245,17 +254,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
         discover_ref_seal.per_ns_shard = completion->folded_cursors;
         discover_fence_positions = completion->fence_positions;
     }
-    else
-    {
-        for (uint64_t g = state.snap_generation; g > 0; --g)
-        {
-            if (const auto opt = readFoldSeal(g, state.snap_attempt))
-            {
-                discover_ref_seal = *opt;
-                break;
-            }
-        }
-    }
+    else if (const auto fold = readFoldSeal(state.snap_generation, state.snap_attempt))
+        discover_ref_seal = *fold;
+    /// else: leave discover_ref_seal empty (fresh pool / no adopted seal) => all Read.
     const std::map<String, DiscoverDecision> discover_decisions =
         computeDiscoverDecisions(discover_ref_seal, discover_fence_positions);
 
@@ -1345,6 +1346,9 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
     /// (recorded by `recheck`) that the next round's LIST compares against, plus `fence_positions` for the
     /// clamp guard. Fall back to the latest fold seal for a mid-round state (a Skip cannot fire there:
     /// the fold seal carries fold-time tokens and no fence positions, so the token comparison fails Read).
+    /// Mirror `fold`'s reference-seal resolution (B2): read directly at the adopted `(snap_generation,
+    /// snap_attempt)` — completion seal else fold seal else empty. No back-scan: a prior generation's
+    /// adopted attempt was a different `lease.seq`, unreachable via the single stored `snap_attempt`.
     CasFoldSeal ref_seal;
     std::map<String, uint64_t> fence_positions;
     if (const auto completion = readCompletionSeal(state.snap_generation, state.snap_attempt))
@@ -1353,17 +1357,9 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
         ref_seal.per_ns_shard = completion->folded_cursors;
         fence_positions = completion->fence_positions;
     }
-    else
-    {
-        for (uint64_t g = state.snap_generation; g > 0; --g)
-        {
-            if (const auto opt = readFoldSeal(g, state.snap_attempt))
-            {
-                ref_seal = *opt;
-                break;
-            }
-        }
-    }
+    else if (const auto fold = readFoldSeal(state.snap_generation, state.snap_attempt))
+        ref_seal = *fold;
+    /// else: empty ref_seal (fresh pool / no adopted seal) => all Read.
 
     return computeDiscoverDecisions(ref_seal, fence_positions);
 }

@@ -160,6 +160,53 @@ TEST(CasRetireView, PaginationCoversManyObjects)
     }
 }
 
+/// Attempt-scoping (writer-facing leak): a retired set planted under a NON-adopted attempt must be
+/// INVISIBLE to RetireView (the writer publish gate). A deposed GC leader writes its retired set under
+/// its own (unadopted) attempt; RetireView resolves only the adopted `(snap_generation, snap_attempt)`
+/// recorded in gc/state, so that decoy set must never condemn a live writer token. Planting the SAME
+/// token under the ADOPTED attempt then makes it condemned (positive control), proving the test is real.
+TEST(CasRetireView, NonAdoptedAttemptRetiredSetInvisible)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout layout("p");
+
+    /// gc/state adopts (snap_generation=4, snap_attempt=42); round 2.
+    GcState state;
+    state.round = 2;
+    state.snap_generation = 4;
+    state.snap_attempt = 42;
+    b->putIfAbsent(layout.gcStateKey(), encodeGcState(state));
+
+    const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
+    const Token tok{"3", TokenType::Emulated};
+
+    /// Decoy: a retired set under a NON-adopted attempt (snap_attempt + 999).
+    {
+        RetiredSet rs;
+        rs.entries.push_back({ObjectKind::Blob, h, tok, 10});
+        b->putIfAbsent(layout.retiredKey(state.snap_generation, state.snap_attempt + 999, 2, 0),
+                       encodeRetiredSet(rs));
+    }
+
+    RetireView v(b, layout);
+    v.refresh();
+    EXPECT_EQ(v.round(), 2u);
+    /// The token lives ONLY in the decoy under a non-adopted attempt => NOT condemned.
+    EXPECT_FALSE(v.isCondemnedToken(ObjectKind::Blob, h, tok))
+        << "a retired set under a non-adopted attempt must be invisible to the writer publish gate";
+
+    /// Positive control: plant the SAME token under the ADOPTED attempt; after refresh it IS condemned.
+    {
+        RetiredSet rs;
+        rs.entries.push_back({ObjectKind::Blob, h, tok, 10});
+        b->putIfAbsent(layout.retiredKey(state.snap_generation, state.snap_attempt, 2, 0),
+                       encodeRetiredSet(rs));
+    }
+    v.refresh();
+    EXPECT_TRUE(v.isCondemnedToken(ObjectKind::Blob, h, tok))
+        << "a retired set under the adopted attempt must be visible to the writer publish gate";
+}
+
 TEST(CasRetireView, IsCondemnedTokenIdentity)
 {
     auto b = std::make_shared<InMemoryBackend>();

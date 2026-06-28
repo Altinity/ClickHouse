@@ -25,11 +25,17 @@ String serverHexOf(const String & writer_instance_id)
     return writer_instance_id.substr(0, colon);
 }
 
-/// The shard's sealed fold cursor (the latest CasFoldSeal's `folded_cursor` for ns/shard), or 0 when no
-/// seal covers it yet. A precommit-removal event AT OR ABOVE this cursor has NOT had its `-1` blob
-/// decrement folded+sealed, so the precommit's manifest body is still load-bearing (delete-after-
-/// sealed-decrements). The seal is written at the FOLD generation (G+1) while gc/state points at the
-/// COMPLETION generation (G+2), so scan downward from the current generation for the most recent seal.
+/// The shard's sealed fold cursor (the latest seal's `folded_cursor` for ns/shard), or 0 when no seal
+/// covers it yet. A precommit-removal event AT OR ABOVE this cursor has NOT had its `-1` blob decrement
+/// folded+sealed, so the precommit's manifest body is still load-bearing (delete-after-sealed-decrements).
+///
+/// B2 — resolve the seal DIRECTLY at the adopted `(snap_generation, snap_attempt)` (mirrors
+/// `Gc::readSealedCursors`): the completion seal if the adopted round finished (it carries the cursors
+/// forward into `folded_cursors`), else the fold seal at the same pair (mid-round: fold sealed, completion
+/// not yet advanced, so `snap_generation == G_f`), else cursor 0 (fresh pool). The old `for g downto 1`
+/// back-scan was UNSOUND with a single stored `snap_attempt`: a prior generation's adopted attempt was a
+/// different `lease.seq`, recorded nowhere, so its key is unreachable here — the scan never legitimately
+/// reached a prior round.
 uint64_t sealedFoldCursor(Store & store, const RootNamespace & ns, uint64_t shard)
 {
     const Layout & layout = store.layout();
@@ -38,20 +44,22 @@ uint64_t sealedFoldCursor(Store & store, const RootNamespace & ns, uint64_t shar
         return 0;
     const GcState state = decodeGcState(state_got->bytes);
     const uint64_t gen = state.snap_generation;
-    /// Task 3 placeholder: resolve the seal under the adopted attempt (Task 7 refines the back-scan).
     const uint64_t attempt = state.snap_attempt;
     const String key = cursorKey(ns, shard);
-    for (uint64_t g = gen; ; --g)
+
+    if (const auto got = store.backend().get(layout.completionSealKey(gen, attempt)))
     {
-        if (const auto got = store.backend().get(layout.foldSealKey(g, attempt)))
-        {
-            const CasFoldSeal seal = decodeFoldSeal(got->bytes);
-            const auto it = seal.per_ns_shard.find(key);
-            return it != seal.per_ns_shard.end() ? it->second.folded_cursor : 0;
-        }
-        if (g == 0)
-            return 0;
+        const CasCompletionSeal seal = decodeCompletionSeal(got->bytes);
+        const auto it = seal.folded_cursors.find(key);
+        return it != seal.folded_cursors.end() ? it->second.folded_cursor : 0;
     }
+    if (const auto got = store.backend().get(layout.foldSealKey(gen, attempt)))
+    {
+        const CasFoldSeal seal = decodeFoldSeal(got->bytes);
+        const auto it = seal.per_ns_shard.find(key);
+        return it != seal.per_ns_shard.end() ? it->second.folded_cursor : 0;
+    }
+    return 0;
 }
 
 /// The active manifest-object-KEY set for one namespace: every committed RootRef's manifest_ref plus

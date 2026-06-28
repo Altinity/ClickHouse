@@ -358,6 +358,45 @@ TEST(CasGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }
 
+/// Attempt-scoping (B2): a fold seal planted under a NON-adopted attempt at the adopted generation
+/// must be INVISIBLE to every reader. A deposed leader writes its fold seal under its own (unadopted)
+/// `lease.seq`; that artifact lives at `foldSealKey(snap_generation, snap_attempt + k)` and no decision
+/// path may resolve it. `previewDeletes` reads the in-degree generation strictly at the adopted
+/// `(snap_generation, snap_attempt)`, so the decoy must not change its output and must not throw. This
+/// is the implementation-level complement to the TLA+ `INV_ONLY_ADOPTED_VIEWABLE` gate.
+TEST(CasGcRound, NonAdoptedAttemptSealIgnored)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    const GcState st = readState(*backend, *store);
+    ASSERT_GT(st.snap_generation, 0u);
+
+    /// Control preview BEFORE the decoy (previewDeletes is write-free, so the result is deterministic).
+    const auto control = gc.previewDeletes();
+
+    /// Plant a decoy fold seal under a DIFFERENT attempt at the SAME generation (a deposed leader's
+    /// unadopted artifact). It must be invisible to the adopted-attempt readers.
+    backend->putIfAbsent(store->layout().foldSealKey(st.snap_generation, st.snap_attempt + 999),
+                         "decoy-seal-bytes");
+
+    /// No reader resolves the non-adopted attempt: no throw, and the preview is unchanged by the decoy.
+    std::vector<Gc::PreviewEntry> after;
+    EXPECT_NO_THROW(after = gc.previewDeletes());
+    EXPECT_EQ(after.size(), control.size())
+        << "a non-adopted attempt's fold seal must not influence previewDeletes";
+
+    /// A further full round must still proceed without throwing and without the decoy wedging it.
+    EXPECT_NO_THROW(gc.runRegularRound());
+}
+
 /// B11: the round summary must count manifest-body (tree) deletes separately from blob deletes. A drop
 /// that reclaims one manifest body must report manifests_deleted >= 1 in the RoundReport of the
 /// reclaiming round, while blobs and manifests remain separately countable.
