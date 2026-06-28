@@ -1111,7 +1111,11 @@ void Gc::writePartManifestCleanupBundle(uint64_t generation, uint64_t attempt, u
     const String run_bytes = buf.str();
 
     const String run_key = layout.partManifestCleanupKey(generation, attempt, owner_shard, 0);
-    backend.putIfAbsent(run_key, run_bytes);
+    /// The cleanup bundle is a DETERMINISTIC artifact (same cleanup map => byte-reproducible run, OQ5), in
+    /// the same artifact class as the in-degree runs and the fold/completion seals: a byte-equal occupant
+    /// is our own deterministic replay (adopt, no-op) and divergent bytes fail closed with CORRUPTED_DATA
+    /// rather than letting a divergent bundle disagree with the adopted snapshot.
+    putDeterministicArtifact(backend, run_key, run_bytes);
     out.push_back(RunRef{.key = run_key, .checksum = cityHash128(run_bytes)});
 }
 
