@@ -10,6 +10,16 @@
 namespace DB::Cas
 {
 
+/// Write-once for a DETERMINISTIC artifact (same inputs => byte-identical bytes): the blob in-degree
+/// runs AND the fold/completion seals. `putIfAbsent`; on a `PreconditionFailed` the key is already
+/// occupied — `get` it and compare bytes: byte-equal means our own deterministic replay (adopt, no-op),
+/// divergent bytes are impossible under correct operation and we fail closed with `CORRUPTED_DATA`
+/// rather than let a divergent artifact disagree with the adopted snapshot. This is the spec's
+/// "deterministic artifacts: byte-equal-or-CORRUPTED_DATA" rule (spec §strict-put-if-absent). It is
+/// NOT for the observation-bearing artifacts (retired set, outcome log) — those carry HEAD-observed
+/// tokens that two observers may legitimately differ on and keep first-durable-write-wins semantics.
+void putDeterministicArtifact(Backend & backend, const String & key, const String & bytes);
+
 /// A single +1/-1 source-edge update to a blob's in-degree, pre-merge. `delta` is always +1 or -1.
 struct BlobDelta
 {

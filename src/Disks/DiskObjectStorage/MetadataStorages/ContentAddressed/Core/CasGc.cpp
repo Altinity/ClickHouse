@@ -442,19 +442,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     writePartManifestCleanupBundle(new_generation, attempt, /*owner_shard*/0, result.mf_cleanup,
                                    result.fold_seal.part_manifest_cleanup);
 
-    /// Write-once CasFoldSeal: its existence marks fold complete. On PreconditionFailed adopt a
-    /// byte-equal occupant as our own crash-replay, else ABORTED.
-    {
-        const String body = encodeFoldSeal(result.fold_seal);
-        const String key = layout.foldSealKey(new_generation, attempt);
-        if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
-        {
-            const auto existing = backend.get(key);
-            if (!existing || existing->bytes != body)
-                throw Exception(ErrorCodes::ABORTED,
-                    "CAS gc fold: fold seal at {} occupied by divergent bytes (concurrent leader); retry", key);
-        }
-    }
+    /// Write-once CasFoldSeal: its existence marks fold complete. The fold seal is DETERMINISTIC (same
+    /// fold inputs => byte-identical seal), so it goes through `putDeterministicArtifact`: a byte-equal
+    /// occupant is our own crash/deterministic replay (adopt, no-op); divergent bytes are impossible
+    /// under correct operation and fail closed with `CORRUPTED_DATA`. A deposed leader writes under its
+    /// own unadopted attempt so it never collides with the adopted seal — the occupant here is only ever
+    /// our own prior attempt-scoped write.
+    putDeterministicArtifact(backend, layout.foldSealKey(new_generation, attempt),
+                             encodeFoldSeal(result.fold_seal));
 
     /// Fold-adopt CAS #1: commit (snap_generation, snap_attempt) together under the lease token. After
     /// this, the whole round operates at `attempt` (== this leader's lease.seq); in-round readers
@@ -876,6 +871,48 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
         }
     }
 
+    /// OUTCOME-COVERAGE GATE (CAS #2 precondition): the completion-advance below must not commit until
+    /// EVERY retired entry of this round has a recorded outcome in the FINAL (post-adopt) outcome logs
+    /// keyed under the accepted `(completion_generation, attempt)`. By construction `computed` collects one
+    /// outcome per retired entry (the per-entry loops above push exactly one, unconditionally), so coverage
+    /// holds by construction in the steady state. The outcome log is OBSERVATION-BEARING (first-durable-
+    /// write-wins): the adopt path may have REPLACED a shard's `log` with another observer's durable log.
+    /// That winner observed the SAME accepted retired set under the SAME adopted attempt, so it must cover
+    /// the same entries — but we guard it rather than assume it. For any retired entry whose
+    /// `(kind, hash, token)` is missing from the adopted logs, recompute its outcome from the accepted
+    /// retired set via the exact-token delete (Absent/Replaced/Deleted) so the physical delete is not
+    /// skipped, tally it, and proceed. We do NOT re-persist the durable outcome log — it is first-durable-
+    /// write-wins and the seal's `delete_outcomes` RunRef already points at the winner's durable bytes.
+    for (const auto & [shard, set] : retired.blobs)
+    {
+        const OutcomeLog & log = computed[shard];
+        for (const RetiredEntry & entry : set.entries)
+        {
+            const bool covered = std::any_of(log.entries.begin(), log.entries.end(),
+                [&](const OutcomeEntry & o)
+                { return o.kind == entry.kind && o.hash == entry.hash && o.token == entry.token; });
+            /// Steady state: the per-entry loops above already covered this entry. The gap branch is
+            /// purely defensive against a divergent adopted occupant; never the normal path.
+            chassert(covered && "outcome-coverage gap: a retired entry has no recorded outcome before CAS #2");
+            if (covered)
+                continue;
+
+            const DeleteOutcome del = backend.deleteExact(blobKeyOf(layout, entry.hash), entry.token);
+            if (del.created_delete_marker)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "CAS gc recheck: coverage-gap delete of blob {} created a delete marker — versioning "
+                    "is enabled on the pool (mis-provisioned)", u128ToHex(entry.hash));
+            switch (del.kind == DeleteOutcome::Kind::Deleted ? OutcomeKind::Deleted
+                  : del.kind == DeleteOutcome::Kind::NotFound ? OutcomeKind::Absent : OutcomeKind::Replaced)
+            {
+                case OutcomeKind::Deleted: ++report.deleted; break;
+                case OutcomeKind::Absent: ++report.absent; break;
+                case OutcomeKind::Replaced: ++report.replaced; break;
+                case OutcomeKind::Spared: ++report.spared; break;
+            }
+        }
+    }
+
     /// 3. Manifest exact-token deletes — ONLY now, after the owner-removal decrements are sealed into the
     /// fold generation (control #11). recheck never READS the body to recompute decrements (they were
     /// produced at fold from the present body); it deletes by the token captured at fold. A manifest the
@@ -930,17 +967,12 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
         if (tok_it != post_fence_tokens.end())
             cov.folded_token = tok_it->second;
     }
-    {
-        const String body = encodeCompletionSeal(folded.completion_seal);
-        const String key = layout.completionSealKey(completion_generation, attempt);
-        if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
-        {
-            const auto existing = backend.get(key);
-            if (!existing || existing->bytes != body)
-                throw Exception(ErrorCodes::ABORTED,
-                    "CAS gc recheck: completion seal at {} occupied by divergent bytes; retry", key);
-        }
-    }
+    /// The completion seal is DETERMINISTIC (same recheck inputs => byte-identical seal); route it through
+    /// `putDeterministicArtifact` (byte-equal replay adopts, divergent bytes => `CORRUPTED_DATA`). The
+    /// retired set and outcome log above stay observation-bearing (first-durable-write-wins) — they carry
+    /// HEAD-observed tokens two observers may legitimately differ on, so they must NOT go through here.
+    putDeterministicArtifact(backend, layout.completionSealKey(completion_generation, attempt),
+                             encodeCompletionSeal(folded.completion_seal));
 
     GcState next = state;
     next.snap_generation = completion_generation;
