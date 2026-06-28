@@ -41,6 +41,7 @@ DISK_DEF="disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04290',
     name = '04290_content_addressed',
     path = '${POOL_DIR}/',
     gc_enabled = 1,

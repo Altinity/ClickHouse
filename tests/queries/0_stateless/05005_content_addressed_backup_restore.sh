@@ -25,6 +25,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '05005',
     name = '05005_content_addressed_backup_restore',
     path = '05005_content_addressed_backup_restore_pool/');"
 

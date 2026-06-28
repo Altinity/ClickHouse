@@ -14,6 +14,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04287',
     name = '04287_content_addressed_detach',
     path = '04287_content_addressed_detach_pool/');
 

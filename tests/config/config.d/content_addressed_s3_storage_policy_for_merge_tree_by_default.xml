@@ -5,6 +5,9 @@
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
                 <metadata_type>content_addressed</metadata_type>
+                <!-- Phase 0 (mount safety): required, validated identity of the layout subtree this
+                     server owns. Single-server stateless lane → a stable literal id. -->
+                <server_root_id>stateless-ca-s3</server_root_id>
                 <!-- RustFS (M-W D-W8): the CA pool needs ENFORCED conditional ops (exact-token
                      DELETE must 412 on mismatch) - MinIO OSS silently ignores If-Match on DELETE
                      and the fail-closed capability probe rejects it. RustFS runs on a dedicated

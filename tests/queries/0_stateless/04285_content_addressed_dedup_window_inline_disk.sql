@@ -15,6 +15,7 @@ SETTINGS non_replicated_deduplication_window = 100, disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04285',
     name = '04285_content_addressed_dedup',
     path = '04285_content_addressed_dedup_pool/');
 

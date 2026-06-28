@@ -19,6 +19,7 @@ SETTINGS assign_part_uuids = 1, disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04282',
     name = '04282_content_addressed',
     path = '04282_content_addressed_pool/');
 

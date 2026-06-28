@@ -19,6 +19,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04279',
     name = '04279_content_addressed_gc',
     path = '04279_content_addressed_gc_pool/',
     gc_enabled = 1,

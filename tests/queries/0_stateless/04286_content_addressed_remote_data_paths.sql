@@ -15,6 +15,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04286',
     name = '04286_content_addressed_rdp',
     path = '04286_content_addressed_rdp_pool/');
 

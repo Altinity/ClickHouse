@@ -22,6 +22,7 @@ DISK_CA="disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04293',
     name = '04293_content_addressed_lwd',
     path = '04293_content_addressed_lwd_pool/')"
 

@@ -90,7 +90,7 @@ CA_FATAL_LOG_KEYWORDS = [
 def start_cluster():
     cluster.add_instance(
         "node1",
-        main_configs=["configs/storage_conf.xml"],
+        main_configs=["configs/storage_conf.xml", "configs/server_root_id_node1.xml"],
         macros={"replica": "node1"},
         with_minio=True,
         with_zookeeper=True,
@@ -98,7 +98,7 @@ def start_cluster():
     )
     cluster.add_instance(
         "node2",
-        main_configs=["configs/storage_conf.xml"],
+        main_configs=["configs/storage_conf.xml", "configs/server_root_id_node2.xml"],
         macros={"replica": "node2"},
         with_minio=True,
         with_zookeeper=True,

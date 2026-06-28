@@ -13,6 +13,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04299',
     name = '04299_content_addressed_projection',
     path = '04299_content_addressed_projection_pool/');
 

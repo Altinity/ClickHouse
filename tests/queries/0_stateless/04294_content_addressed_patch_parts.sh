@@ -22,6 +22,7 @@ DISK_CA="disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04294',
     name = '04294_content_addressed_patch',
     path = '04294_content_addressed_patch_pool/')"
 

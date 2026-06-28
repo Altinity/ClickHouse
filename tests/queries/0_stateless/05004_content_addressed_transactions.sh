@@ -28,6 +28,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '05004',
     name = '05004_content_addressed_transactions',
     path = '05004_content_addressed_transactions_pool/');"
 

@@ -14,7 +14,7 @@ DROP TABLE IF EXISTS t_pmb;
 CREATE TABLE t_pmb (a UInt64, b UInt64, PROJECTION p_by_b (SELECT b, sum(a) GROUP BY b))
 ENGINE = MergeTree ORDER BY a
 SETTINGS disk = disk(type = object_storage, object_storage_type = local, metadata_type = content_addressed,
-    name = '04300_pmb', path = '04300_pmb_pool/');
+    name = '04300_pmb', server_root_id = '04300', path = '04300_pmb_pool/');
 
 -- 1.3M distinct b values, each appearing twice: a = number and a = number + 1300000, so for group b the
 -- two rows are b and b + 1300000 -> sum(a) = 2*b + 1300000. The projection emits 1.3M rows > 1048449 ->

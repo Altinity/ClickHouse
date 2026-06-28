@@ -23,6 +23,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '05003',
     name = '05003_content_addressed_freeze',
     path = '05003_content_addressed_freeze_pool/');"
 

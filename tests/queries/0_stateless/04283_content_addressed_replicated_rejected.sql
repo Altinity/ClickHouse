@@ -19,6 +19,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04283',
     name = '04283_content_addressed_repl',
     path = '04283_content_addressed_repl_pool/');
 
@@ -34,6 +35,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
+    server_root_id = '04283',
     name = '04283_content_addressed_plain',
     path = '04283_content_addressed_plain_pool/');
 

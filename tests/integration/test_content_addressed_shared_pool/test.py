@@ -32,13 +32,13 @@ def start_cluster():
     # identical storage_conf.xml, so both mount the SAME shared pool.
     cluster.add_instance(
         "node1",
-        main_configs=["configs/storage_conf.xml"],
+        main_configs=["configs/storage_conf.xml", "configs/server_root_id_node1.xml"],
         with_minio=True,
         stay_alive=True,
     )
     cluster.add_instance(
         "node2",
-        main_configs=["configs/storage_conf.xml"],
+        main_configs=["configs/storage_conf.xml", "configs/server_root_id_node2.xml"],
         with_minio=True,
         stay_alive=True,
     )
