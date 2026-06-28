@@ -104,7 +104,8 @@ std::vector<std::pair<UInt128, int64_t>> readGenerationRows(
 }
 
 void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
-                              uint64_t prior_generation, uint64_t new_generation, uint64_t attempt,
+                              uint64_t prior_generation, uint64_t prior_attempt,
+                              uint64_t new_generation, uint64_t attempt,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs)
 {
@@ -115,7 +116,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     /// The prior generation's per-blob counts (one row per key, in key order). A key with count==0 in
     /// the prior gen is a transitioned-to-0 marker we must NOT carry forward as a fresh candidate.
     const std::vector<std::pair<UInt128, int64_t>> prior_rows =
-        readGenerationRows(backend, layout, prior_generation, attempt, shard);
+        readGenerationRows(backend, layout, prior_generation, prior_attempt, shard);
 
     /// Merge prior counts with scattered deltas, both already in key order. For each key sum
     /// prior_count + Σ deltas. A merged count < 0 is an undercount (would over-delete) — fail closed.

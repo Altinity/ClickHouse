@@ -236,9 +236,9 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
     EXPECT_TRUE(r1.owns(b2)) << "r1 must own b2";
     EXPECT_FALSE(r1.owns(b1)) << "r1 must not own b1";
 
-    const auto runs0 = r0.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1, /*attempt=*/0,
+    const auto runs0 = r0.reduce(*backend, layout, /*prior_generation=*/0, /*prior_attempt=*/0, /*new_generation=*/1, /*attempt=*/0,
                                  std::move(buckets[0]));
-    const auto runs1 = r1.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1, /*attempt=*/0,
+    const auto runs1 = r1.reduce(*backend, layout, /*prior_generation=*/0, /*prior_attempt=*/0, /*new_generation=*/1, /*attempt=*/0,
                                  std::move(buckets[1]));
 
     ASSERT_EQ(runs0.size(), 1u) << "shard-0 reduce must produce exactly one RunRef";
@@ -423,7 +423,7 @@ TEST(CasGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
     for (uint64_t shard = 0; shard < kGcShards; ++shard)
     {
         ShardReducer reducer{shard, kGcShards};
-        reducer.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1, /*attempt=*/0,
+        reducer.reduce(*backend, layout, /*prior_generation=*/0, /*prior_attempt=*/0, /*new_generation=*/1, /*attempt=*/0,
                        std::move(buckets[shard]));
     }
 
@@ -602,7 +602,7 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
     /// (b) PRE-SEAL INVISIBILITY — drive both reducers before any coordinator action.
     ///
     /// Run shard-0 reducer (simulates the shard-0 replica's work).
-    const auto runs0 = r0.reduce(*backend, layout, kPriorGen, kNewGen, kAttempt, std::move(bucket0));
+    const auto runs0 = r0.reduce(*backend, layout, kPriorGen, kAttempt, kNewGen, kAttempt, std::move(bucket0));
     ASSERT_FALSE(runs0.empty()) << "shard-0 reducer must produce at least one RunRef";
 
     /// After shard-0 reduce, the completion seal must NOT exist.
@@ -610,7 +610,7 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
         << "CasCompletionSeal must be absent after shard-0 reduce (pre-seal state)";
 
     /// Run shard-1 reducer (simulates the shard-1 replica's work, interleaved from the test thread).
-    const auto runs1 = r1.reduce(*backend, layout, kPriorGen, kNewGen, kAttempt, std::move(bucket1));
+    const auto runs1 = r1.reduce(*backend, layout, kPriorGen, kAttempt, kNewGen, kAttempt, std::move(bucket1));
     ASSERT_FALSE(runs1.empty()) << "shard-1 reducer must produce at least one RunRef";
 
     /// After BOTH reducers have finished, the completion seal still must NOT exist.

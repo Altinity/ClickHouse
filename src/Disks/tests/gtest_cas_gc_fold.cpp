@@ -23,6 +23,35 @@ ManifestRef ref(const String & writer, uint64_t seq, uint64_t inst)
 }
 
 /// Committed new_manifest => +1 per blob entry (BlobInDegreeMatchesActiveManifests).
+/// After a fold, gc/state records snap_attempt == the folding leader's lease.seq, and the fold seal
+/// lives under (snap_generation, snap_attempt).
+TEST(CasGcFold, FoldAdoptsAttemptEqualsLeaseSeq)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+
+    const auto st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    EXPECT_EQ(st.snap_attempt, st.lease.seq);
+    EXPECT_GT(st.snap_generation, 0u);
+    /// The round's seal is durable under (snap_generation, snap_attempt) — a completed round leaves the
+    /// completion seal at snap_generation; a fold-only round leaves the fold seal there. Either way the
+    /// adopted attempt locates it (a seal under any other attempt would be unadopted debris).
+    EXPECT_TRUE(backend->head(store->layout().completionSealKey(st.snap_generation, st.snap_attempt)).exists
+                || backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists);
+    /// The fold seal specifically lives under the adopted attempt at the fold generation (G_f = G_c - 1
+    /// after completion; = snap_generation for a fold-only round).
+    const uint64_t fold_gen = backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists
+        ? st.snap_generation : st.snap_generation - 1;
+    EXPECT_TRUE(backend->head(store->layout().foldSealKey(fold_gen, st.snap_attempt)).exists);
+}
+
 TEST(CasGcFold, CommittedAddEmitsPlusOnePerBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();

@@ -141,7 +141,8 @@ public:
     /// (`blobShard(d.blob_hash, gc_shards) == shard`).  Violations are caught at the
     /// `foldDeltasIntoGeneration` layer (an undercount would be CORRUPTED_DATA).
     std::vector<RunRef> reduce(Backend & backend, const Layout & layout,
-                               uint64_t prior_generation, uint64_t new_generation, uint64_t attempt,
+                               uint64_t prior_generation, uint64_t prior_attempt,
+                               uint64_t new_generation, uint64_t attempt,
                                std::vector<BlobDelta> shard_deltas);
 
 private:

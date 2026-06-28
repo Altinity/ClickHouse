@@ -215,10 +215,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     const std::map<String, ShardCoverage> parent_cursors = readSealedCursors(state.snap_generation, state.snap_attempt);
 
     const uint64_t new_generation = state.snap_generation + 1;
-    /// Task 3 placeholder: thread the CURRENTLY-adopted attempt at every fold write and read (Task 5
-    /// replaces this with `state.lease.seq` + the fold-adopt CAS). `snap_attempt` is 0 pre-Task-5, so
-    /// the prior-gen reads and the new-gen writes use the same attempt — no behavior change.
-    const uint64_t attempt = state.snap_attempt;
+    /// The fold mints THIS round's attempt id from `lease.seq` (the renew/steal paths bump it every
+    /// round, so it is a fresh monotonic per-round id). EVERY fold-artifact WRITE below lands under this
+    /// attempt; the PARENT-generation READS keep using `state.snap_attempt` (the attempt the prior round
+    /// adopted). The fold-adopt CAS #1 then commits `(new_generation, attempt)` together — a deposed
+    /// leader's fold lands under its own unadopted attempt and is invisible to every reader.
+    const uint64_t attempt = state.lease.seq;
     result.fold_seal.generation = new_generation;
     result.fold_seal.parent_generation = state.snap_generation;
 
@@ -395,12 +397,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
             /// Nothing new this round; still seal the (empty-delta) generation so the cursor coverage is
             /// durable and the resume rule has a fold_seal to key off. Reuse the prior generation's blob run
             /// (no delta) by sealing a fresh generation whose in-degree equals the parent.
-            foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, attempt, /*shard*/0,
+            foldDeltasIntoGeneration(backend, layout, state.snap_generation, state.snap_attempt,
+                                     new_generation, attempt, /*shard*/0,
                                      {}, result.fold_seal.blob_target_runs);
         }
         else
         {
-            foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, attempt, /*shard*/0,
+            foldDeltasIntoGeneration(backend, layout, state.snap_generation, state.snap_attempt,
+                                     new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs);
         }
     }
@@ -428,7 +432,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
             /// shards concurrently (CasGcScheduler ownership); their run-key namespaces never collide.
             ShardReducer reducer{shard, state.gc_shards};
             std::vector<RunRef> shard_runs =
-                reducer.reduce(backend, layout, state.snap_generation, new_generation, attempt,
+                reducer.reduce(backend, layout, state.snap_generation, state.snap_attempt,
+                               new_generation, attempt,
                                std::move(buckets[shard]));
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
@@ -451,11 +456,15 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
         }
     }
 
+    /// Fold-adopt CAS #1: commit (snap_generation, snap_attempt) together under the lease token. After
+    /// this, the whole round operates at `attempt` (== this leader's lease.seq); in-round readers
+    /// (retire/recheck) and the next round's parent-generation reads resolve through `state.snap_attempt`.
     state.snap_generation = new_generation;
+    state.snap_attempt = attempt;
     const CasResult fold_res = backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token);
     if (fold_res.outcome != CasOutcome::Committed)
         throw Exception(ErrorCodes::ABORTED,
-            "CAS gc fold: gc/state moved during the fold (another leader advanced it); retry next round");
+            "CAS gc fold: gc/state moved during the fold (lease lost / another leader advanced); retry next round");
     state_token = fold_res.token;
     return result;
 }
@@ -727,7 +736,8 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     if (state.gc_shards == 1)
     {
         /// SINGLE-SHARD PATH: all deltas fold into shard 0 of the completion generation.
-        foldDeltasIntoGeneration(backend, layout, state.snap_generation, completion_generation, attempt, /*shard*/0,
+        foldDeltasIntoGeneration(backend, layout, state.snap_generation, attempt,
+                                 completion_generation, attempt, /*shard*/0,
                                  std::move(window), folded.completion_seal.blob_target_runs);
     }
     else
@@ -743,7 +753,8 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
         {
             ShardReducer reducer{sh, state.gc_shards};
             std::vector<RunRef> shard_runs =
-                reducer.reduce(backend, layout, state.snap_generation, completion_generation, attempt,
+                reducer.reduce(backend, layout, state.snap_generation, attempt,
+                               completion_generation, attempt,
                                std::move(buckets[sh]));
             for (RunRef & r : shard_runs)
                 folded.completion_seal.blob_target_runs.push_back(std::move(r));

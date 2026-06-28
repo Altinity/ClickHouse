@@ -20,7 +20,7 @@ TEST(CasBlobInDegree, FoldStartsFromEmptyPriorGeneration)
     /// Generation 1 from empty prior: +1 b1, +1 b1, +1 b2 => indeg(b1)=2, indeg(b2)=1.
     std::vector<BlobDelta> deltas{{b(1), +1}, {b(1), +1}, {b(2), +1}};
     std::vector<RunRef> runs;
-    foldDeltasIntoGeneration(backend, layout, /*prior*/0, /*new*/1, /*attempt*/0, /*shard*/0, deltas, runs);
+    foldDeltasIntoGeneration(backend, layout, /*prior*/0, /*prior_attempt*/0, /*new*/1, /*attempt*/0, /*shard*/0, deltas, runs);
     ASSERT_FALSE(runs.empty());
 
     const auto zero = zeroInDegree(backend, layout, /*gen*/1, /*attempt*/0, /*shard*/0);
@@ -33,11 +33,11 @@ TEST(CasBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)
     Layout layout{"pool"};
 
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, 0, 1, /*attempt*/0, 0, {{b(1), +1}, {b(2), +1}}, runs1);
+    foldDeltasIntoGeneration(backend, layout, 0, /*prior_attempt*/0, 1, /*attempt*/0, 0, {{b(1), +1}, {b(2), +1}}, runs1);
 
     /// Generation 2 merges prior gen-1 run with a -1 on b1: indeg(b1)=0, indeg(b2)=1.
     std::vector<RunRef> runs2;
-    foldDeltasIntoGeneration(backend, layout, /*prior*/1, /*new*/2, /*attempt*/0, 0, {{b(1), -1}}, runs2);
+    foldDeltasIntoGeneration(backend, layout, /*prior*/1, /*prior_attempt*/0, /*new*/2, /*attempt*/0, 0, {{b(1), -1}}, runs2);
 
     const auto zero = zeroInDegree(backend, layout, 2, /*attempt*/0, 0);
     ASSERT_EQ(zero.size(), 1u);
@@ -52,8 +52,8 @@ TEST(CasBlobInDegree, RunsAreByteDeterministic)
     std::vector<RunRef> ra;
     std::vector<RunRef> rb;
     /// Same deltas in a DIFFERENT input order must produce the same sealed run bytes (sorted by key).
-    foldDeltasIntoGeneration(a,  layout, 0, 1, /*attempt*/0, 0, {{b(3), +1}, {b(1), +1}, {b(2), +1}}, ra);
-    foldDeltasIntoGeneration(b2, layout, 0, 1, /*attempt*/0, 0, {{b(1), +1}, {b(2), +1}, {b(3), +1}}, rb);
+    foldDeltasIntoGeneration(a,  layout, 0, /*prior_attempt*/0, 1, /*attempt*/0, 0, {{b(3), +1}, {b(1), +1}, {b(2), +1}}, ra);
+    foldDeltasIntoGeneration(b2, layout, 0, /*prior_attempt*/0, 1, /*attempt*/0, 0, {{b(1), +1}, {b(2), +1}, {b(3), +1}}, rb);
     const auto ga = a.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
     const auto gb = b2.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
     ASSERT_TRUE(ga.has_value());
@@ -70,7 +70,7 @@ TEST(CasBlobInDegree, NegativeInDegreeIsCorruption)
     Layout layout{"pool"};
     std::vector<RunRef> runs;
     /// A -1 with no prior +1 would drive in-degree below zero — an undercount bug; fold must fail closed.
-    EXPECT_ANY_THROW(foldDeltasIntoGeneration(backend, layout, 0, 1, /*attempt*/0, 0, {{b(9), -1}}, runs));
+    EXPECT_ANY_THROW(foldDeltasIntoGeneration(backend, layout, 0, /*prior_attempt*/0, 1, /*attempt*/0, 0, {{b(9), -1}}, runs));
 }
 
 TEST(CasBlobInDegree, FoldDeltaByteEqualReplayAdopts)
@@ -80,9 +80,9 @@ TEST(CasBlobInDegree, FoldDeltaByteEqualReplayAdopts)
     std::vector<BlobDelta> deltas{{b(1), +1}};
     std::vector<RunRef> runs1;
     std::vector<RunRef> runs2;
-    foldDeltasIntoGeneration(backend, layout, 0, 1, /*attempt*/7, /*shard*/0, deltas, runs1);
+    foldDeltasIntoGeneration(backend, layout, 0, /*prior_attempt*/7, 1, /*attempt*/7, /*shard*/0, deltas, runs1);
     /// Same inputs, same attempt => byte-identical run already present => adopt, no throw.
-    EXPECT_NO_THROW(foldDeltasIntoGeneration(backend, layout, 0, 1, /*attempt*/7, /*shard*/0, deltas, runs2));
+    EXPECT_NO_THROW(foldDeltasIntoGeneration(backend, layout, 0, /*prior_attempt*/7, 1, /*attempt*/7, /*shard*/0, deltas, runs2));
     EXPECT_EQ(runs1, runs2);
 }
 
@@ -94,6 +94,6 @@ TEST(CasBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
     backend.putIfAbsent(layout.blobTargetRunKey(1, /*attempt*/7, /*shard*/0, /*seq*/0), "not-a-valid-run");
     std::vector<BlobDelta> deltas{{b(1), +1}};
     std::vector<RunRef> runs;
-    EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, 0, 1, /*attempt*/7, /*shard*/0, deltas, runs),
+    EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, 0, /*prior_attempt*/7, 1, /*attempt*/7, /*shard*/0, deltas, runs),
                  DB::Exception);
 }

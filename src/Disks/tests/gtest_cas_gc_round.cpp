@@ -1015,9 +1015,16 @@ TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
     const GcState st = readState(*backend, *store);
     EXPECT_EQ(st.snap_pruned_through, 0u) << "keep==0 must prune nothing";
 
-    /// Every fold seal from generation 1 up to the current one remains.
+    /// Every seal from generation 1 up to the current one remains. Each generation was sealed under the
+    /// attempt of the round that produced it (attempt == that round's lease.seq, which bumps every round),
+    /// so a historical generation's seal lives under an earlier attempt than the final snap_attempt — scan
+    /// all attempts up to snap_attempt and require the seal to survive under one of them.
     for (uint64_t g = 1; g <= st.snap_generation; ++g)
-        EXPECT_TRUE(backend->head(store->layout().foldSealKey(g, st.snap_attempt)).exists
-                    || backend->head(store->layout().completionSealKey(g, st.snap_attempt)).exists)
-            << "keep==0: seal of generation " << g << " must remain";
+    {
+        bool seal_present = false;
+        for (uint64_t a = 0; a <= st.snap_attempt && !seal_present; ++a)
+            seal_present = backend->head(store->layout().foldSealKey(g, a)).exists
+                        || backend->head(store->layout().completionSealKey(g, a)).exists;
+        EXPECT_TRUE(seal_present) << "keep==0: seal of generation " << g << " must remain";
+    }
 }

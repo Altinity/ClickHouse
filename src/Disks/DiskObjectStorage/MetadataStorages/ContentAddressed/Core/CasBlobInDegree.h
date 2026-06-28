@@ -31,8 +31,14 @@ struct BlobCandidate
 /// whose count transitions to exactly 0 this generation is written as an explicit 0-row so
 /// `zeroInDegree` can stream it; rows that are still 0 from a prior generation are dropped. Appends the
 /// produced run's `RunRef` (key + footer checksum) to `out_runs` for the fold seal.
+/// `prior_attempt` is the attempt under which the PARENT generation's run was sealed (the prior round's
+/// adopted `snap_attempt`); `attempt` is the attempt under which THIS generation's run is written (the
+/// folding leader's `lease.seq`). They differ whenever the round that produced `prior_generation` adopted
+/// a different attempt than the current fold mints — keeping them distinct lets the fold read the correct
+/// parent baseline while writing under its own attempt.
 void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
-                              uint64_t prior_generation, uint64_t new_generation, uint64_t attempt,
+                              uint64_t prior_generation, uint64_t prior_attempt,
+                              uint64_t new_generation, uint64_t attempt,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs);
 
