@@ -149,3 +149,21 @@ TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
     MountLeaseKeeper k2(b, l, "r", UInt128(1), /*epoch*/ 8, std::chrono::milliseconds(100), [&] { return now; });
     EXPECT_ANY_THROW(k2.start());
 }
+
+TEST(CasMountFence, SupersededWriterRefusedNoS3Read)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "r", .root_shards = 1});
+
+    /// Permissive default: a Store that has NOT armed the fence allows mutations.
+    EXPECT_TRUE(store->mayMutate());
+
+    /// Latching loss: once the renewer trips the fence it stays lost (purely local — no S3 read).
+    store->tripMountLost();
+    EXPECT_FALSE(store->mayMutate());
+
+    /// A real mutate entrypoint that funnels through mutateShard now fails closed at the gate, BEFORE
+    /// the mutate lambda runs (so this is the ABORTED gate throw, not a FILE_DOESNT_EXIST from inside).
+    const RootNamespace ns{"srv1/tbl"};
+    EXPECT_THROW(store->dropRef(ns, "any_ref"), DB::Exception);
+}

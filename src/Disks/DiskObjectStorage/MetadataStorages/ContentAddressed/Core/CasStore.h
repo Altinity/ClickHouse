@@ -111,6 +111,22 @@ class Gc;
 class Store;
 using StorePtr = std::shared_ptr<Store>;
 
+/// Local write fence (spec §write-fence, Phase 0 Task 6). A PURELY LOCAL, in-memory check — never a
+/// per-write S3 read. The renewer (the MountLeaseKeeper, Task 7) is the only thing that touches S3 for
+/// the lease; on each successful renew it refreshes `deadline` (an S3 `expires_at_ms` translated to a
+/// monotonic steady-clock instant, so a wall-clock change cannot extend it), and on any supersession
+/// (a foreign uuid / a newer writer_epoch / an unrenewable expired lease) it latches `lost`. A mutable
+/// op proceeds only while `!lost` AND the deadline has not passed. `writer_epoch` is the fencing token.
+struct MountFence
+{
+    UInt128 server_uuid{};
+    uint64_t writer_epoch = 0;
+    /// Permissive default (set in the Store ctor): until something arms a real lease deadline, the
+    /// fence allows mutations — so existing tests and pre-Task-7 behavior are unchanged.
+    std::atomic<std::chrono::steady_clock::time_point> deadline{std::chrono::steady_clock::time_point::max()};
+    std::atomic<bool> lost{false};
+};
+
 /// One content-addressed pool. open is FAIL-CLOSED: capability probe + pool-format check; any
 /// failure refuses the pool (design §6). The read side has no GC awareness and no tokens (spec §6).
 class Store : public std::enable_shared_from_this<Store>
@@ -139,6 +155,19 @@ public:
     /// In production this is driven by the background renewer (background_watermark); tests with the
     /// renewer disabled drive it explicitly to make a finished build's floor advance durable.
     void renewWatermarkOnce();
+
+    /// ---- local write fence (spec §write-fence, Phase 0 Task 6) ----
+    /// A purely local, in-memory check — NEVER a per-write S3 read. True iff the fence has not latched
+    /// `lost` and the monotonic deadline has not passed. Permissive until armed: a Store that has not
+    /// armed the fence (the default deadline is steady_clock::time_point::max()) always allows mutations.
+    bool mayMutate() const;
+    /// Latch the fence to lost (once lost, stays lost). Called by the renewer (Task 7) on a superseded
+    /// or foreign observation; the gated mutate chokepoints then fail closed.
+    void tripMountLost();
+    /// Refresh the monotonic lease deadline (release). Task 7's keeper renew calls this on success.
+    void setMountDeadline(std::chrono::steady_clock::time_point d);
+    /// Arm the fence at startup (Task 7): set (uuid, epoch, deadline), clear `lost`.
+    void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, std::chrono::steady_clock::time_point deadline);
 
     /// ---- write side ----
     BuildPtr startBuild(BuildInfo info);                          /// W-HEARTBEAT durable before return
@@ -313,6 +342,11 @@ private:
     uint64_t next_build_seq = 1;
     std::set<uint64_t> active_build_seqs;
     std::unique_ptr<WatermarkKeeper> watermark;
+
+    /// Local write fence (spec §write-fence). Permissive by default (deadline = time_point::max,
+    /// lost = false), so mayMutate() is true until Task 7 arms it with a real lease deadline and the
+    /// renewer trips it. Gates the mutate chokepoint (mutateShard).
+    MountFence mount_fence;
 
     /// B113 read-path decode cache: rootShardKey -> ShardDecodeCacheEntry. Guarded by its own mutex.
     /// A token mismatch (any write to the shard) forces a fresh get + decode; cache entries are

@@ -57,6 +57,30 @@ void Store::dedupCacheAdd(const UInt128 & blob_hash)
         dedup_cache->set(blob_hash, std::make_shared<DedupPresent>());
 }
 
+bool Store::mayMutate() const
+{
+    return !mount_fence.lost.load(std::memory_order_acquire)
+        && std::chrono::steady_clock::now() < mount_fence.deadline.load(std::memory_order_acquire);
+}
+
+void Store::tripMountLost()
+{
+    mount_fence.lost.store(true, std::memory_order_release);
+}
+
+void Store::setMountDeadline(std::chrono::steady_clock::time_point d)
+{
+    mount_fence.deadline.store(d, std::memory_order_release);
+}
+
+void Store::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, std::chrono::steady_clock::time_point deadline)
+{
+    mount_fence.server_uuid = server_uuid;
+    mount_fence.writer_epoch = writer_epoch;
+    mount_fence.deadline.store(deadline, std::memory_order_release);
+    mount_fence.lost.store(false, std::memory_order_release);
+}
+
 StorePtr Store::open(BackendPtr backend, PoolConfig config)
 {
     /// B168 P0: wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,
@@ -603,6 +627,15 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
 void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
                         uint64_t * out_committed_version)
 {
+    /// Local write fence (spec §write-fence, Phase 0 Task 6): the shared mutable ref shards are the
+    /// state the fence most protects. A superseded/paused writer (lease lost or local deadline passed)
+    /// must not race the live one. Purely local — no S3 read. Permissive until Task 7 arms it, so
+    /// existing flows (GC/build/bootstrap writes) are unaffected.
+    if (!mayMutate())
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS mount lost / lease expired — refusing to mutate ref shard for server_root '{}'",
+            config.server_root_id);
+
     const String key = pool_layout.rootShardKey(ns, shard);
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
     {
