@@ -123,7 +123,14 @@ Model + 3 new cfgs created; all 45 cfgs bind the 3 new constants. Verified verdi
   - `s28_s33_corner.py` S33: flipped the LIVENESS framing (docstring + verdict message + note_anomaly) from "EXPECTED TO FAIL / intended signal" to "must drain; a nonzero residual is a real regression of the attempt-scoped fix." The assertion was already `residual == 0` (passes on drain); only the framing changed.
   - `BACKLOG.md`: added a **RESOLVED 2026-06-28** block to `GC-CONCURRENT-LEADER-LEAK` (root cause + attempt-scoped fix + commit refs).
   - **S33 end-to-end run DEFERRED to a soak host** (needs docker RustFS + 2-node cluster; not available in the unattended dev env). Recorded, not faked. The unit-level equivalent `CasGcAttempt.DeposedFoldAttemptDoesNotWedge` IS green here.
-- Awaiting the holistic review; will address any findings, then finalize.
+- **Holistic final review — CLEAN.** No Blocker/Major/Minor correctness issues; all 9 focus areas confirmed (governing invariant end-to-end; attempt consistency incl. prior_attempt split; artifact-class rule for all six families; CAS #1/#2; resume incl. the fence_positions determinism fix; two-tier prune incl. fail-open 404; exception safety; RetireView writer-facing; no stale flat-key callers / no `.has_value()` misuse / no hardcoded gen). Cross-task integration sound (G_f retired / G_c outcomes, both reclaimed wholesale). Two Nits only.
+  - Nit 1 (stale comment `CasGc.cpp:1512` "(round, fence_seq)") — FIXED, comment-only, commit `8dcf8f7`.
+  - Nit 2 (test `gtest_cas_gc_attempt.cpp` assumes renew bumps lease.seq by exactly 1) — left as-is; it fails loudly (no false pass), reviewer marked optional.
+
+## DONE — implementation complete
+**12 commits on `cas-gc-part-manifest-impl`:** `cd27ac6` (TLA+ Gate A) · `e9d898d` (snap_attempt) · `c779b93` (key scoping) · `9ed646a` (strict runs) · `e55c962` (fold CAS #1) · `696cc252` (recheck/CAS #2/seals) · `692fe0ca` (cleanup-bundle strict) · `65ce6f47` (readers/back-scan/decoys) · `ef1ed86` (resume + fence_positions fix) · `e9d435c` (prune) · `b4dde7e` (regression test) · `8dcf8f7` (comment nit). Plus worklog `6c2511a`/this.
+Final unit gate: 394/395 (1 pre-existing unrelated `CaWiringOps` failure). TLA+ Gate A green + sabotage counterexamples + inertness exact. S33 flipped + BACKLOG RESOLVED (working tree, user's untracked suite). S33 end-to-end run deferred to a soak host.
+**Next step (user's call, NOT done unattended — outward-facing):** open a PR / merge (`finishing-a-development-branch`); run S33 on a soak host. The branch also still carries the user's unrelated uncommitted `CasBuild` putBlob work (untouched).
 
 **Modeling design (committed approach):** 5 inert vars (`attemptSeq` counter, `adopted`/`sealAt`/`retiredAt`/`attViewable` per-round maps); 3 gated actions (`GMintAttempt`/`GAdopt`/`GDeposedFinalWrite`) forming a **self-contained attempt-bookkeeping layer fully decoupled from existing vars** (new actions hold `origVars` UNCHANGED; existing hold `attemptVars` UNCHANGED). `vars == origVars \o attemptVars`. Gating `AttemptActive == EnableAttemptScoping \/ SabotageDeposedLeaderWritesFinalGen`.
 
