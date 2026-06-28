@@ -264,6 +264,12 @@ TEST(CasServerRootClaim, MissingOwnerOverNonEmptyRootIsCorrupted)
 
 **Note:** `claim`/`renew` go through `SingleWriterSlot`, whose `renewOnce` already **fails closed (throws `LOGICAL_ERROR`) on any foreign touch** — reuse that for the foreign/superseded renew case. The renew body must carry our `writer_epoch`; the keeper detects supersession by comparing the observed mount's `writer_epoch` to ours (Task 6 wires the `lost` flag).
 
+**Adopt rule (critical — the normal flow is `claimMount(...)` writes the mount, THEN `keeper.start()`):** the keeper's `claim` hook must **ADOPT a live mount that is already ours** instead of seeing it as a double-start. The discriminator is `(server_uuid, writer_epoch)`:
+- **same `server_uuid` + same `writer_epoch`** → it is *our own* just-written claim (or a replay) → **adopt**: use the observed token and `putOverwrite` to refresh `seq`/`expires_at_ms` (no fail);
+- **same `server_uuid` + a *different* live `writer_epoch`** → a newer incarnation superseded us (or a concurrent double-start) → **fail closed**;
+- **foreign `server_uuid`** → **fail closed**.
+So `claimMount` (the startup decision) returning `Claimed` after writing the mount, followed by `keeper.start()`, is the steady path and must not self-trip the live-double-start guard. (The same-uuid+same-epoch adopt is exactly why `claimMount` and the keeper share the `(uuid, epoch)` identity rather than only checking `uuid`.)
+
 - [ ] **Step 1: Failing tests** (template from `gtest_cas_heartbeat.cpp:17-35`; drive the clock via `now_ms_fn`):
 
 ```cpp
@@ -290,6 +296,21 @@ TEST(CasMountLease, SameUuidLiveFailsForeignFailsExpiredReclaims)
     EXPECT_EQ(claimMount(*b, l, "r", UInt128(2), 1, 1200, 100).kind, MountClaimResult::ForeignOwner);
     // same uuid after expiry → reclaim:
     EXPECT_EQ(claimMount(*b, l, "r", UInt128(1), 9, 1200, 100).kind, MountClaimResult::Claimed);
+}
+
+TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
+{
+    auto b = std::make_shared<InMemoryBackend>(); Layout l("p");
+    uint64_t now = 1000;
+    // The normal flow: claimMount writes the live mount under (uuid=1, epoch=7), THEN keeper.start().
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch*/7, now, /*ttl*/100).kind, MountClaimResult::Claimed);
+    MountLeaseKeeper k(b, l, "r", UInt128(1), /*epoch*/7, std::chrono::milliseconds(100), [&]{ return now; });
+    EXPECT_NO_THROW(k.start());     // adopts our own live (uuid=1,epoch=7) mount — NOT a double-start
+    EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 7u);
+
+    // A keeper for the SAME uuid but a DIFFERENT live epoch must fail closed (superseded/double-start):
+    MountLeaseKeeper k2(b, l, "r", UInt128(1), /*epoch*/8, std::chrono::milliseconds(100), [&]{ return now; });
+    EXPECT_ANY_THROW(k2.start());
 }
 ```
 
@@ -341,14 +362,15 @@ TEST(CasMountFence, SupersededWriterRefusedNoS3Read)
 - Test: `src/Disks/tests/gtest_cas_mount.cpp`
 
 **Interfaces:**
-- Consumes: Tasks 2–6. Order, in the `if (!config.read_only)` block, after `PoolMeta::createOrValidate` and after the watermark anchor:
+- Consumes: Tasks 2–6. **Strict order, in the `if (!config.read_only)` block, after `PoolMeta::createOrValidate`.** The existing `WatermarkKeeper` construction (currently `CasStore.cpp:106-115`, fed the random `process_epoch`) **MOVES to after epoch allocation** — it now consumes the durable `writer_epoch`, so it cannot anchor first. **owner / epoch / mount / watermark are bootstrap-control writes**: they run here during open, *before* the write fence is armed and *before* any ordinary data/ref/manifest write; the [write fence](#task-6) gates only **ordinary mutations**, never these bootstrap writes (which establish the very right to write). Order:
   1. `validateServerRootId(config.server_root_id)`;
-  2. `claimOwnerOrThrow(backend, layout, config.server_root_id, config.server_id)`;
-  3. `uint64_t writer_epoch = allocateWriterEpoch(...)`; store it (this phase: feed it as the watermark/`writer_instance_id` epoch — the [bridge](#bridge); replace the random `process_epoch` for the WatermarkKeeper's epoch arg);
-  4. `auto claim = claimMount(...)`; if `LiveDoubleStart`/`ForeignOwner` → throw `ErrorCodes::ABORTED` with the actionable error text (spec §mount-safety);
-  5. construct + `start()` the `MountLeaseKeeper`; initialize `MountFence{server_uuid, writer_epoch, deadline, lost=false}`.
-  - Read-only open: do NONE of the mutating steps; may `get(ownerKey)` to validate if present, never `putIfAbsent`.
-- Produces: a `Store` whose `writer_epoch` (durable monotone) is the value carried in the watermark + the manifest `writer_instance_id` field this phase; `mayMutate()` reflects the live mount.
+  2. `claimOwnerOrThrow(backend, layout, config.server_root_id, config.server_id)` — **identity**;
+  3. `uint64_t writer_epoch = allocateWriterEpoch(backend, layout, config.server_root_id)` — **durable monotone epoch** (replaces the random `process_epoch` for identity; the [bridge](#bridge));
+  4. `auto claim = claimMount(backend, layout, srid, config.server_id, writer_epoch, now_ms, ttl_ms)`; if `LiveDoubleStart` / `ForeignOwner` → throw `ErrorCodes::ABORTED` with the actionable error text (spec §mount-safety); else construct + `start()` the `MountLeaseKeeper` (which **adopts** the just-written same-`(uuid,epoch)` mount — Task 5) and arm `MountFence{server_uuid = config.server_id, writer_epoch, deadline, lost = false}`;
+  5. construct + `start()` the `WatermarkKeeper` with the durable **`writer_epoch`** (NOT the random `process_epoch`) — the watermark must be durable *before* ordinary writes;
+  6. only now are ordinary data/ref/manifest mutable writes allowed (each gated by `mayMutate()`).
+  - Read-only open: do NONE of steps 2–5 (no mutation); may `get(ownerKey)` to validate if present, never `putIfAbsent`.
+- Produces: a `Store` whose `writer_epoch` (durable monotone) is the value carried in the watermark + the manifest `writer_instance_id` field this phase; `mayMutate()` reflects the live mount; `Store::writerEpoch()` accessor.
 
 > **Bridge note {#bridge}:** Phase 0 makes the watermark + the `writer_instance_id`-field epoch the **durable monotone** `writer_epoch` (dropping the random `process_epoch` for identity). Phase 2's epoch-aware sweep reads this value; Phase 3 only renames the field + adds `manifest_ordinal`.
 
