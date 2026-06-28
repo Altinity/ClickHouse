@@ -83,8 +83,12 @@ gc/server-roots/<server_root_id>/owner        # ONE object; putIfAbsent; holds o
 On writable startup, a single `putIfAbsent` of our `server_uuid_hex` — **no owner set, no LIST** (safety must
 not depend on a complete listing):
 
-- **absent** → our `putIfAbsent` wins → we are the owner → continue;
-- **present, equals ours** (a `GET` after a lost `putIfAbsent`) → continue;
+- **absent** → allowed **only if the whole `server_root_id` subtree is provably empty** — no keys under
+  `cas/refs/<id>/`, `cas/manifests/<id>/`, **or** `roots/<id>/`. Then `putIfAbsent` our `server_uuid_hex` and
+  continue (a genuinely fresh root). If the owner is absent but the subtree is **non-empty**, the identity
+  object was lost while its data still exists → **`CORRUPTED_DATA`, fail closed** — never silently re-claim
+  (that would adopt another server's tree and reset the [epoch](#writer-epoch-alloc));
+- **present, equals ours** (a `GET` after a lost `putIfAbsent` race) → continue;
 - **present, differs** (or malformed) → **fail closed**.
 
 The object is **sticky**: never auto-deleted on shutdown. If `ServerUUID` is regenerated (uuid file lost),
@@ -134,13 +138,16 @@ Background renewer (a periodic scheduled task — no `sleep`-loop): CAS-overwrit
 An expired-lease reclaim by a new process does **not**, by itself, stop the *old* process from writing — the
 old process could resume after a long pause (VM pause, long GC, swap) believing it still holds the mount. To
 prevent a superseded writer from corrupting the live one's ref shards / owner log, **every mutable CAS/PUT is
-fenced on the local lease**: a write proceeds only while this process's `(server_uuid, writer_epoch)` is the
-one currently in the `mount` body **and** the local lease is unexpired. `writer_epoch` is the **fencing
-token**: the moment the renewer observes the mount carrying a different `writer_epoch` (or foreign uuid, or an
-expired lease it cannot renew), the disk trips to **lost / read-only-fail-closed** and all mutable ops fail —
-the superseded process never races the live one. (Manifest *bodies* are already epoch-pathed, so a stray
-write lands under the dead epoch's prefix and is swept; the fence additionally protects the shared mutable ref
-shards.)
+fenced on the local lease**. The fence is a **purely local, in-memory check — never a per-write S3 read**:
+each process caches its own `(server_uuid, writer_epoch)`, a **monotonic local deadline** (the lease's
+`expires_at_ms` translated to a local steady-clock instant at renew time, so wall-clock changes can't extend
+it), and a **`lost` flag**. A mutable op proceeds only if `lost` is false **and** the local deadline has not
+passed. The **renewer** is the only thing that touches S3 for the lease: on each `mount_renew_period` it CASes
+the mount and, on any supersession (mount now carries a different `writer_epoch`, a foreign uuid, or an
+unrenewable expired lease), sets `lost = true` (latching) and trips the disk to **lost /
+read-only-fail-closed**. `writer_epoch` is the **fencing token**; the superseded process never races the live
+one, at zero per-write S3 cost. (Manifest *bodies* are already epoch-pathed, so a stray write would land under
+the dead epoch's prefix and be swept; the fence additionally protects the shared mutable ref shards.)
 
 **Startup error text** (actionable):
 
@@ -265,6 +272,13 @@ foundation first, the load-bearing manifest-identity reshape last.
   error text.
 - Allocate `writer_epoch` from the [sticky `epoch` counter](#writer-epoch-alloc) (NOT the lease); enforce the
   missing/corrupt-object rules (missing `owner`/`epoch` over a non-empty root ⇒ `CORRUPTED_DATA`).
+- **Epoch bridge (so Phase 2 can be epoch-aware before the Phase-3 rename):** Phase 0 changes the writer-epoch
+  *semantics* now — the value carried in the existing `writer_instance_id` field (and in the watermark body)
+  becomes the **durable monotone epoch** from the `epoch` object (dropping the old `<server_hex>:<random>`
+  form; the sweep already resolves the watermark by `server_root_id`, so no `server_hex` parsing remains).
+  The epoch-aware sweep (Phase 2) reads this durable value out of that field regardless of its name. **Phase 3
+  is then a pure rename (`writer_instance_id` → `writer_epoch`) + the `manifest_ordinal` reshape — no further
+  epoch-semantics change.**
 - Implement the [write-path lease fence](#write-fence): mutable CAS/PUT proceed only while this process's
   `(server_uuid, writer_epoch)` is the live mount and the local lease is unexpired; on supersession the disk
   trips to lost/fail-closed.
@@ -343,8 +357,10 @@ leaders race → only the accepted `gc/state` cursor wins (fine); any uncertaint
 - **Hot discovery, after:** `GET gc/registry` + `LIST cas/refs/` (≈ `namespaces × root_shards` keys only),
   independent of backlog size; with the `max_keys` fix, ~one page-RPC per ~1000 shards.
 - **Cold sweep:** bounded `LIST cas/manifests/` after the cursor, ≤ N keys + ≤ M deletes per round.
-- **Startup:** `putIfAbsent`/`GET owner` (one tiny object) + `GET`/CAS `mount`; renewer = one CAS per
-  `mount_renew_period`.
+- **Startup:** `putIfAbsent`/`GET owner` + `GET`/CAS `epoch` (allocate `writer_epoch`) + `GET`/CAS `mount`
+  (all tiny single objects); the owner-absent path adds a bounded **empty-check** (one LIST-with-limit-1 over
+  each of `cas/refs/<id>/`, `cas/manifests/<id>/`, `roots/<id>/` — only on a fresh/empty root). Renewer = one
+  CAS per `mount_renew_period`. The [write fence](#write-fence) adds **zero** per-write S3 reads (local state).
 
 ## Sweep liveness (manifest-body protection) {#sweep-liveness}
 
