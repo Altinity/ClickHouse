@@ -809,6 +809,123 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
     EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
 }
 
+/// Task 9 (wholesale generation-retention): a generation may hold artifacts under MULTIPLE attempts
+/// (each round mints a fresh `lease.seq`, and a deposed leader may have written debris under its own
+/// unadopted attempt). When a generation ages past the retention floor it must be reclaimed WHOLESALE
+/// — every attempt's artifacts (incl. the attempt-scoped `retired/` and `outcomes/` sets that now live
+/// under `gc/gen/<g>/attempt/<a>/`), not just the final adopted attempt's. This test plants a retired
+/// set AND a decoy fold seal under a NON-adopted attempt at an old generation, ages that generation out,
+/// and asserts the whole `gc/gen/<g>/` subtree is gone (the per-key single-attempt prune leaked it).
+TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_snap_generations_to_keep = 3});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    /// One round to establish the first completed generation and learn its adopted attempt (derive both
+    /// from gc/state — never hardcode a generation; the round folds and completes, so it is > 1).
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const GcState st1 = readState(*backend, *store);
+    ASSERT_GT(st1.snap_generation, 0u);
+    const uint64_t old_gen = st1.snap_generation;
+    const uint64_t adopted_attempt_g1 = st1.snap_attempt;
+
+    /// Plant debris under a NON-adopted attempt of generation 1: a retired set, an outcomes log, a fold
+    /// seal, and a blob-target run — exactly the families a deposed leader would have written before its
+    /// CAS failed. The per-key single-attempt prune (keyed on the FINAL snap_attempt) never touches them.
+    const uint64_t decoy_attempt = adopted_attempt_g1 + 777;
+    const String decoy_retired = store->layout().retiredKey(old_gen, decoy_attempt, /*round*/0, /*shard*/0);
+    const String decoy_outcomes = store->layout().outcomesKey(old_gen, decoy_attempt, /*round*/0, /*shard*/0);
+    const String decoy_seal = store->layout().foldSealKey(old_gen, decoy_attempt);
+    const String decoy_run = store->layout().blobTargetRunKey(old_gen, decoy_attempt, /*shard*/0, /*seq*/0);
+    backend->putIfAbsent(decoy_retired, "decoy-retired");
+    backend->putIfAbsent(decoy_outcomes, "decoy-outcomes");
+    backend->putIfAbsent(decoy_seal, "decoy-seal");
+    backend->putIfAbsent(decoy_run, "decoy-run");
+
+    /// Age generation 1 well past the retention floor (keep=3): several more quiescent rounds.
+    for (int i = 0; i < 8; ++i)
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const GcState st = readState(*backend, *store);
+    ASSERT_GT(st.snap_generation, old_gen + 3) << "generation 1 must be below the retention floor";
+
+    /// The ENTIRE gc/gen/<old_gen>/ subtree — across ALL attempts — must be reclaimed.
+    EXPECT_FALSE(backend->head(decoy_retired).exists) << "non-adopted retired set leaked past retention";
+    EXPECT_FALSE(backend->head(decoy_outcomes).exists) << "non-adopted outcomes log leaked past retention";
+    EXPECT_FALSE(backend->head(decoy_seal).exists) << "non-adopted fold seal leaked past retention";
+    EXPECT_FALSE(backend->head(decoy_run).exists) << "non-adopted blob-target run leaked past retention";
+
+    /// Nothing remains under the old generation prefix at all.
+    const ListPage residue = backend->list(store->layout().gcGenPrefix(old_gen), "", 1000);
+    EXPECT_TRUE(residue.keys.empty()) << "old generation prefix must be fully reclaimed; left "
+                                      << residue.keys.size() << " objects";
+
+    /// No-loss: the live data is intact.
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+    EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
+}
+
+/// Task 9 (current-generation attempt orphan sweep): a deposed leader can write its fold seal under an
+/// attempt that lost CAS #1 to a higher-seq adopter. Such an attempt at the CURRENT generation, with
+/// `a < snap_attempt` (strictly older than the adopted attempt — it already lost the lease), is dead
+/// debris and is swept opportunistically (bounded, fail-open) while the adopted attempt survives. An
+/// attempt `a > snap_attempt` (a later stealer that could still adopt) is NEVER swept.
+TEST(CasGcSnapRetention, SweepsNonAdoptedCurrentGenAttempt)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    /// Drive a couple of rounds so snap_attempt is comfortably above 0 (a low orphan seq exists below it).
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const GcState st = readState(*backend, *store);
+    ASSERT_GT(st.snap_attempt, 0u) << "need snap_attempt > 0 so a strictly-older orphan attempt exists";
+
+    /// The next round folds `snap_generation -> snap_generation+1` and completes to `snap_generation+2`,
+    /// then its prune sweeps the FOLD generation `G_f = (snap_generation+2) - 1 = snap_generation + 1`.
+    /// Plant a deposed competitor's debris at exactly that fold generation, under an attempt strictly
+    /// older than the round's adopted attempt (snap_attempt only grows, so `st.snap_attempt - 1` is below
+    /// the next round's adopted attempt). The sweep must reclaim it.
+    const uint64_t swept_gen = st.snap_generation + 1;
+    const uint64_t orphan_attempt = st.snap_attempt - 1;
+    const String orphan_seal = store->layout().foldSealKey(swept_gen, orphan_attempt);
+    const String orphan_run = store->layout().blobTargetRunKey(swept_gen, orphan_attempt, 0, 0);
+    backend->putIfAbsent(orphan_seal, "orphan-seal");
+    backend->putIfAbsent(orphan_run, "orphan-run");
+
+    /// A LATER attempt at the same fold generation (could still be the next adopter / still being
+    /// written) must be SPARED — it is >= the round's adopted attempt.
+    const uint64_t future_attempt = st.snap_attempt + 50;
+    const String future_seal = store->layout().foldSealKey(swept_gen, future_attempt);
+    backend->putIfAbsent(future_seal, "future-seal");
+
+    /// One more round runs the sweep over fold generation `swept_gen`.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const GcState st_after = readState(*backend, *store);
+    ASSERT_EQ(st_after.snap_generation - 1, swept_gen) << "the round's fold generation must be swept_gen";
+    ASSERT_GT(st_after.snap_attempt, orphan_attempt) << "orphan must be strictly below the adopted attempt";
+
+    EXPECT_FALSE(backend->head(orphan_seal).exists) << "orphan attempt (a < snap_attempt) must be swept";
+    EXPECT_FALSE(backend->head(orphan_run).exists) << "orphan attempt subtree must be swept wholesale";
+
+    /// A later attempt (a > snap_attempt) is conservatively spared.
+    EXPECT_TRUE(backend->head(future_seal).exists)
+        << "an attempt > snap_attempt could still adopt and must NOT be swept";
+}
+
 /// ---- B12 lazy/batched trim tests ----
 
 /// B12: a shard with FEW (< gc_trim_min_events) trimmable events at/below the sealed fold cursor must

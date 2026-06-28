@@ -1128,51 +1128,151 @@ void Gc::writePartManifestCleanupBundle(uint64_t generation, uint64_t attempt, u
     out.push_back(RunRef{.key = run_key, .checksum = cityHash128(run_bytes)});
 }
 
+namespace
+{
+/// GC-metadata wholesale delete of every object under `prefix`. Returns the number of objects deleted.
+/// `bounded_remaining` caps how many objects this call may delete (0 => stop immediately, deleting none).
+///
+/// Token source: the in-memory and S3 backends surface a per-key token through `list`
+/// (`supportsListTokens()`), so `deleteExact` straight from the listed token; otherwise HEAD first.
+///
+/// 404 / NotFound is FAIL-OPEN: an object that vanished between LIST and delete (a concurrent crashed
+/// attempt, or a racing prune) is already reclaimed — never throw on a benign missing GC-internal object
+/// during a prune (it would only wedge GC; feedback_ca_gc_never_throw_on_404). A genuine TokenMismatch is
+/// likewise tolerated here: the object was rewritten under us (another attempt is live at this key) — the
+/// safe direction during a best-effort prune is to leave it for a later round, never to force-delete.
+uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_t bounded_remaining)
+{
+    static constexpr size_t kListPageLimit = 1000;
+    uint64_t deleted = 0;
+    String cursor;
+    while (deleted < bounded_remaining)
+    {
+        ListPage page = backend.list(prefix, cursor, kListPageLimit);
+        for (const auto & listed : page.keys)
+        {
+            if (deleted >= bounded_remaining)
+                return deleted;
+            if (listed.token.has_value())
+            {
+                /// deleteExact tolerates NotFound (returns Kind::NotFound) and TokenMismatch — both are
+                /// benign here (already gone / rewritten by a live attempt); do not throw.
+                backend.deleteExact(listed.key, *listed.token);
+            }
+            else if (const auto head = backend.head(listed.key); head.exists)
+            {
+                backend.deleteExact(listed.key, head.token);
+            }
+            ++deleted;
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    return deleted;
+}
+}
+
 void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next)
 {
     const uint64_t keep = store->poolConfig().gc_snap_generations_to_keep;
     if (keep == 0)
         return;   /// keep ALL (debug/forensics — replay GC's in-degree view as-of a past round)
-    if (adopted_generation <= keep)
-        return;   /// nothing below the floor yet
 
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
-    const uint64_t prune_floor = adopted_generation - keep;   /// prune generations <= prune_floor
 
     static constexpr uint64_t kMaxPrunePerRound = 64;   /// bound the per-round prune burst
-    uint64_t g = next.snap_pruned_through + 1;
-    uint64_t pruned = 0;
-    auto dropExact = [&](const String & key)
+
+    /// (1) WHOLESALE generation-retention (correctness). A single generation may hold artifacts under
+    /// MULTIPLE attempts: every round mints a fresh `lease.seq` (= attempt), and a deposed leader writes
+    /// its fold_seal/runs/cleanup AND its attempt-scoped retired/outcomes sets under its OWN unadopted
+    /// attempt before its CAS fails. The old per-key single-attempt prune (keyed on the final
+    /// snap_attempt) therefore leaked every non-adopted attempt's debris. Instead, LIST the whole
+    /// `gc/gen/<g>/` prefix and delete every listed object — reclaiming ALL attempts of `g`, including
+    /// the retired/ and outcomes/ sets that now live under `gc/gen/<g>/attempt/<a>/`. Bounded per round;
+    /// fail-open on 404. snap_pruned_through only advances over generations fully reclaimed this round.
+    if (adopted_generation > keep)
     {
-        /// GC-metadata delete: HEAD for the token, exact-token delete. A 404 (already gone — a prior
-        /// crashed attempt) is tolerated; never throw on a missing GC-internal object (it would only
-        /// wedge the round; feedback_ca_gc_never_throw_on_404).
-        if (const auto head = backend.head(key); head.exists)
-            backend.deleteExact(key, head.token);
-    };
-    for (; g <= prune_floor && pruned < kMaxPrunePerRound; ++g, ++pruned)
+        const uint64_t prune_floor = adopted_generation - keep;   /// prune generations <= prune_floor
+        uint64_t g = next.snap_pruned_through + 1;
+        uint64_t pruned = 0;
+        for (; g <= prune_floor && pruned < kMaxPrunePerRound; ++g, ++pruned)
+            deletePrefixWholesale(backend, layout.gcGenPrefix(g), std::numeric_limits<uint64_t>::max());
+        next.snap_pruned_through = g - 1;   /// highest generation fully processed this round
+    }
+
+    /// (2) CURRENT-GENERATION attempt orphan sweep (opportunistic, bounded, fail-open best-effort). The
+    /// wholesale retention prune above is the real reclaimer; this sweep only mops up the debris a deposed
+    /// leader of the JUST-COMPLETED round left at the FOLD generation, which retention will not reach for
+    /// `keep` more rounds.
+    ///
+    /// WHICH generation: a deposed competitor of the round that just committed folded into the FOLD
+    /// generation `G_f` under its own (unadopted) attempt before its CAS failed. The completion-advance
+    /// has already set `next.snap_generation = G_c = G_f + 1`, so `G_f = next.snap_generation - 1`. The
+    /// new completion generation `G_c` holds only the winner's artifacts (no deposed write yet), so the
+    /// fold generation is the one with non-adopted debris. We never touch `G_c` or any generation
+    /// `> snap_generation`.
+    ///
+    /// WATERMARK — deliberately CONSERVATIVE: sweep ONLY attempts `a < snap_attempt` of `G_f`. Reasoning:
+    ///   - `a == snap_attempt` is the ADOPTED attempt (still within retention) — never touch it.
+    ///   - `a > snap_attempt`: a LATER stealer mints a HIGHER `lease.seq`; such an attempt could still be
+    ///     the next adopter (its CAS has not been observed to fail) or still be mid-write. Sweeping it
+    ///     would race a live writer. NEVER sweep `a > snap_attempt`.
+    ///   - `a < snap_attempt`: strictly below the adopted `lease.seq`. Since `snap_attempt` is already
+    ///     recorded in gc/state, any leader holding a lower seq has already lost the lease (its
+    ///     lease-guarded CAS fails against the higher seq), so its fold-generation artifacts are dead
+    ///     debris — safe to reclaim.
+    const uint64_t adopted_attempt = attempt;   /// == next.snap_attempt (the adopted attempt)
+    if (adopted_attempt > 0 && next.snap_generation > 0)
     {
-        dropExact(layout.foldSealKey(g, attempt));
-        dropExact(layout.completionSealKey(g, attempt));
-        /// blob-target runs and part-manifest-cleanup bundles are seq-indexed (shard 0 for gc_shards==1);
-        /// delete from seq 0 until the first absent seq.
-        for (uint64_t seq = 0; ; ++seq)
+        const uint64_t cur_generation = next.snap_generation - 1;   /// the fold generation G_f
+        uint64_t swept = 0;
+        String cursor;
+        const String gen_prefix = layout.gcGenPrefix(cur_generation);
+        const String attempt_marker = "attempt/";
+        std::set<uint64_t> sweep_attempts;
+        /// Discover candidate attempts by LISTing the current generation prefix and parsing the
+        /// `attempt/<a>/` path segment. Bounded by kMaxPrunePerRound distinct attempts.
+        while (sweep_attempts.size() < kMaxPrunePerRound)
         {
-            const String key = layout.blobTargetRunKey(g, attempt, /*shard*/0, seq);
-            if (!backend.head(key).exists)
+            ListPage page = backend.list(gen_prefix, cursor, 1000);
+            for (const auto & listed : page.keys)
+            {
+                /// Key shape: <gen_prefix>attempt/<a>/...  Extract <a>.
+                if (listed.key.size() <= gen_prefix.size())
+                    continue;
+                const String tail = listed.key.substr(gen_prefix.size());
+                if (tail.compare(0, attempt_marker.size(), attempt_marker) != 0)
+                    continue;
+                const size_t a_begin = attempt_marker.size();
+                const size_t a_end = tail.find('/', a_begin);
+                if (a_end == String::npos)
+                    continue;
+                uint64_t a = 0;
+                try
+                {
+                    a = std::stoull(tail.substr(a_begin, a_end - a_begin));
+                }
+                catch (...)
+                {
+                    continue;   /// unparseable attempt segment — skip (never throw during a prune sweep)
+                }
+                if (a < adopted_attempt)   /// strictly older than the adopted attempt => dead debris
+                    sweep_attempts.insert(a);
+            }
+            if (page.next_cursor.empty())
                 break;
-            dropExact(key);
+            cursor = page.next_cursor;
         }
-        for (uint64_t seq = 0; ; ++seq)
+        for (const uint64_t a : sweep_attempts)
         {
-            const String key = layout.partManifestCleanupKey(g, attempt, /*owner_shard*/0, seq);
-            if (!backend.head(key).exists)
+            if (swept >= kMaxPrunePerRound)
                 break;
-            dropExact(key);
+            swept += deletePrefixWholesale(backend, layout.gcGenAttemptPrefix(cur_generation, a),
+                                           kMaxPrunePerRound - swept);
         }
     }
-    next.snap_pruned_through = g - 1;   /// highest generation fully processed this round
 }
 
 std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attempt)

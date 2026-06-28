@@ -290,11 +290,17 @@ private:
     void writePartManifestCleanupBundle(uint64_t generation, uint64_t attempt, uint64_t owner_shard,
                                         const std::map<ManifestId, Token> & cleanup, std::vector<RunRef> & out);
 
-    /// B9 retention: prune the per-generation GC objects (fold seal, completion seal, blob-target runs,
-    /// part-manifest-cleanup bundles) of generations at or below the retention floor
-    /// (`adopted_generation - gc_snap_generations_to_keep`), walking forward from `next.snap_pruned_through`
-    /// (bounded per round) and folding the advanced cursor into `next` (persisted by the round-commit CAS).
-    /// keep==0 prunes nothing (keep-all forensics mode). Never throws on a 404 (record-and-continue).
+    /// B9 retention + Task 9 (attempt-scoped). Two reclaimers, both bounded per round and FAIL-OPEN on a
+    /// benign 404 (never throw during a prune — it would only wedge GC):
+    ///   (1) WHOLESALE generation-retention (correctness): every generation at or below the retention
+    ///       floor (`adopted_generation - gc_snap_generations_to_keep`) is reclaimed by LISTing its whole
+    ///       `gc/gen/<g>/` prefix and deleting every object — ALL attempts, including the attempt-scoped
+    ///       retired/ and outcomes/ sets. Walks forward from `next.snap_pruned_through`, advancing it over
+    ///       generations fully reclaimed (persisted by the round-commit CAS).
+    ///   (2) CURRENT-GENERATION attempt orphan sweep (opportunistic): deletes the subtree of any attempt
+    ///       `a < next.snap_attempt` at `next.snap_generation` (deposed-leader debris). Never sweeps the
+    ///       adopted attempt, an attempt `> snap_attempt`, or any generation `> snap_generation`.
+    /// keep==0 prunes nothing (keep-all forensics mode). `attempt` == `next.snap_attempt` (the adopted).
     void pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next);
 
     /// Read the fold seal for (generation, attempt) (nullopt when absent). Used by resume + parent-cursor reads.
