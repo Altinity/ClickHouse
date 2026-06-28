@@ -196,7 +196,13 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// here ordinary mutations (mutateShard) are fence-gated via mayMutate().
         store->armMountFence(our_uuid, writer_epoch,
             std::chrono::steady_clock::now() + store->config.mount_lease_ttl_ms);
-        store->mount_keeper->startBackground(store->config.mount_renew_period);
+        /// Gate the background renewer exactly like the watermark below: it runs only in production
+        /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
+        /// drive renewOnce explicitly and rely on the armed sub-TTL deadline, never on the loop. The
+        /// keeper itself is still started above (it must claim/adopt the mount + arm the fence on every
+        /// writable open); only the renewal thread is conditional.
+        if (store->config.background_watermark)
+            store->mount_keeper->startBackground(store->config.mount_renew_period);
 
         /// 5. Per-server watermark — anchored AFTER epoch allocation so it carries the DURABLE
         ///    writer_epoch (now in `process_epoch`), not the random mint. Must be durable before any
