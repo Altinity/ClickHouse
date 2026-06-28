@@ -61,6 +61,23 @@ UInt128 cityHash128(const String & bytes)
     return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
 }
 
+/// Write-once for a DETERMINISTIC artifact (same inputs => byte-identical bytes). `putIfAbsent`; on a
+/// `PreconditionFailed` the key is already occupied — `get` it and compare: byte-equal means our own
+/// deterministic replay (adopt, no-op), divergent bytes are impossible under correct operation and we
+/// fail closed with `CORRUPTED_DATA` rather than let a divergent run disagree with the fold seal.
+void putDeterministicArtifact(Backend & backend, const String & key, const String & bytes)
+{
+    if (backend.putIfAbsent(key, bytes).outcome == PutOutcome::PreconditionFailed)
+    {
+        const auto existing = backend.get(key);
+        if (!existing || existing->bytes != bytes)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS gc: deterministic artifact at {} occupied by divergent bytes (impossible under "
+                "correct operation; refusing to proceed)", key);
+        /// byte-equal => our own deterministic replay; adopt (no-op).
+    }
+}
+
 /// Read every blob in-degree run segment of (generation, shard) into a flat sorted list of
 /// (hash, count). The segments are written one per generation (seq 0); enumerating seq>0 future-proofs
 /// the multi-segment layout. Returns rows in key order.
@@ -170,7 +187,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     const String run_bytes = out.str();
 
     const String run_key = layout.blobTargetRunKey(new_generation, attempt, shard, 0);
-    backend.putIfAbsent(run_key, run_bytes);
+    putDeterministicArtifact(backend, run_key, run_bytes);
     out_runs.push_back(RunRef{.key = run_key, .checksum = cityHash128(run_bytes)});
 }
 

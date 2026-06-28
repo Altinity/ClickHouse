@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Common/Exception.h>
 
 using namespace DB::Cas;
 
@@ -70,4 +71,29 @@ TEST(CasBlobInDegree, NegativeInDegreeIsCorruption)
     std::vector<RunRef> runs;
     /// A -1 with no prior +1 would drive in-degree below zero — an undercount bug; fold must fail closed.
     EXPECT_ANY_THROW(foldDeltasIntoGeneration(backend, layout, 0, 1, /*attempt*/0, 0, {{b(9), -1}}, runs));
+}
+
+TEST(CasBlobInDegree, FoldDeltaByteEqualReplayAdopts)
+{
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+    std::vector<BlobDelta> deltas{{b(1), +1}};
+    std::vector<RunRef> runs1;
+    std::vector<RunRef> runs2;
+    foldDeltasIntoGeneration(backend, layout, 0, 1, /*attempt*/7, /*shard*/0, deltas, runs1);
+    /// Same inputs, same attempt => byte-identical run already present => adopt, no throw.
+    EXPECT_NO_THROW(foldDeltasIntoGeneration(backend, layout, 0, 1, /*attempt*/7, /*shard*/0, deltas, runs2));
+    EXPECT_EQ(runs1, runs2);
+}
+
+TEST(CasBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
+{
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+    /// Pre-occupy the run key (attempt 7) with junk, then fold => divergent => CORRUPTED_DATA.
+    backend.putIfAbsent(layout.blobTargetRunKey(1, /*attempt*/7, /*shard*/0, /*seq*/0), "not-a-valid-run");
+    std::vector<BlobDelta> deltas{{b(1), +1}};
+    std::vector<RunRef> runs;
+    EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, 0, 1, /*attempt*/7, /*shard*/0, deltas, runs),
+                 DB::Exception);
 }
