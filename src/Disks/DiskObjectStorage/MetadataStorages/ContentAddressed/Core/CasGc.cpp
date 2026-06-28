@@ -483,76 +483,78 @@ Gc::RetireResult Gc::retire(GcState & state, Token & state_token, const FoldResu
     /// only scanned shard 0 (it would leak forever under `gc_shards > 1`). Each candidate is owned by the
     /// shard whose run it came from, so it goes into that shard's retired set.
     for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
-    for (const BlobCandidate & cand : zeroInDegree(backend, layout, folded.fold_seal.generation, state.snap_attempt, shard))
     {
-        /// B170: the blob's in-degree transitioned to 0 in this generation — the moment it became a
-        /// retire candidate. The cause is the fold's last -1 edge (its RootRemove row above for the same
-        /// object_hash), so a blob's "why did it become collectable" is a row-level join.
-        EventEmitter{*store}.emit([&](CasEvent & e)
+        for (const BlobCandidate & cand : zeroInDegree(backend, layout, folded.fold_seal.generation, state.snap_attempt, shard))
         {
-            e.type = CasEventType::IndegZero;
-            e.object_kind = CasEventObjectKind::Blob;
-            e.object_hash = u128ToHex(cand.hash);
-            e.round = round;
-            e.gen = folded.fold_seal.generation;
-            e.reason = "last folded owner edge dropped; in-degree reached 0";
-        });
+            /// B170: the blob's in-degree transitioned to 0 in this generation — the moment it became a
+            /// retire candidate. The cause is the fold's last -1 edge (its RootRemove row above for the same
+            /// object_hash), so a blob's "why did it become collectable" is a row-level join.
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::IndegZero;
+                e.object_kind = CasEventObjectKind::Blob;
+                e.object_hash = u128ToHex(cand.hash);
+                e.round = round;
+                e.gen = folded.fold_seal.generation;
+                e.reason = "last folded owner edge dropped; in-degree reached 0";
+            });
 
-        /// DESIGN NOTE (B14 / Phase-5 retire-token; decided 2026-06-27 = keep the HEAD, "variant c").
-        /// One `HEAD` per zero-in-degree candidate, here, fetches the CURRENT incarnation token that the
-        /// eventual exact-token `deleteExact` will carry. This HEAD CAN be eliminated by instead sourcing
-        /// the token from sealed generation state captured at fold time (the `EnableRetireTokenSource`
-        /// stage of `CaGcRootLocalPartManifestCore` proves that variant safe). We deliberately keep the
-        /// HEAD because:
-        ///   + (this path) zero schema change; the token is always fresh, so few wasted delete attempts.
-        ///   - (the alternative) the fold only sees a blob's CONTENT hash, not its storage token, so the
-        ///     writer would have to record the ETag into the manifest body (`ManifestEntry`) — an on-disk
-        ///     schema change that couples the content plane to storage incarnations and grows manifests;
-        ///   - a fold-time token is staler than this HEAD: a re-incarnation between fold and delete makes
-        ///     it stale, the exact-token delete then misses (`TokenMismatch`) and the blob is SPARED and
-        ///     retried next round — safe, but it delays reclamation. So the win is only partial.
-        /// SAFETY is independent of the token SOURCE: `deleteExact` is the guarantee — a stale/foreign
-        /// token fails the exact match and the blob is spared, NEVER over-deleted (proved by the Phase-5
-        /// model: `stage5_retiretoken` HOLDs `INV_NO_RETURN`/`INV_NO_LOSS` + `RetireTokenSourceComplete`,
-        /// while `sab_staletokenoverdelete` shows that bypassing exactness violates `INV_NO_LOSS`). Concurrent
-        /// writers / repeated re-incarnations never threaten safety — the model advances a blob's token
-        /// freely (`WUploadBlob`, no in-degree guard) and the whole suite stays green. Revisit the
-        /// stored-token variant only if profiling shows these per-candidate HEADs are a hot-path cost.
-        const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
-        /// B170: HEAD-observe — the current incarnation token, the only token the eventual exact-token
-        /// delete may carry (absent => skipped: a prior round's landed delete).
-        EventEmitter{*store}.emit([&](CasEvent & e)
-        {
-            e.type = CasEventType::GcRetireObserve;
-            e.object_kind = CasEventObjectKind::Blob;
-            e.object_hash = u128ToHex(cand.hash);
-            e.token = observed.exists ? observed.token.value : "";
-            e.round = round;
-            e.gen = folded.fold_seal.generation;
-            e.outcome = observed.exists ? "present" : "absent";
-            e.reason = "zero-in-degree candidate; HEAD-observe the current token";
-        });
-        if (!observed.exists)
-            continue;
-        RetiredEntry entry;
-        entry.kind = ObjectKind::Blob;
-        entry.hash = cand.hash;
-        entry.token = observed.token;
-        entry.size = retiredLogicalSize(ObjectKind::Blob, observed.size, store->poolMeta().blob_header_len);
-        /// B170: the retire entry written for this incarnation (per RetiredEntry).
-        EventEmitter{*store}.emit([&](CasEvent & e)
-        {
-            e.type = CasEventType::BlobRetire;
-            e.object_kind = CasEventObjectKind::Blob;
-            e.object_hash = u128ToHex(cand.hash);
-            e.token = observed.token.value;
-            e.round = round;
-            e.gen = folded.fold_seal.generation;
-            e.outcome = "retired";
-            e.reason = "condemned zero-in-degree candidate written to the round's retired set";
-            e.detail = {{"size", std::to_string(entry.size)}};
-        });
-        result.blobs[shard].entries.push_back(std::move(entry));
+            /// DESIGN NOTE (B14 / Phase-5 retire-token; decided 2026-06-27 = keep the HEAD, "variant c").
+            /// One `HEAD` per zero-in-degree candidate, here, fetches the CURRENT incarnation token that the
+            /// eventual exact-token `deleteExact` will carry. This HEAD CAN be eliminated by instead sourcing
+            /// the token from sealed generation state captured at fold time (the `EnableRetireTokenSource`
+            /// stage of `CaGcRootLocalPartManifestCore` proves that variant safe). We deliberately keep the
+            /// HEAD because:
+            ///   + (this path) zero schema change; the token is always fresh, so few wasted delete attempts.
+            ///   - (the alternative) the fold only sees a blob's CONTENT hash, not its storage token, so the
+            ///     writer would have to record the ETag into the manifest body (`ManifestEntry`) — an on-disk
+            ///     schema change that couples the content plane to storage incarnations and grows manifests;
+            ///   - a fold-time token is staler than this HEAD: a re-incarnation between fold and delete makes
+            ///     it stale, the exact-token delete then misses (`TokenMismatch`) and the blob is SPARED and
+            ///     retried next round — safe, but it delays reclamation. So the win is only partial.
+            /// SAFETY is independent of the token SOURCE: `deleteExact` is the guarantee — a stale/foreign
+            /// token fails the exact match and the blob is spared, NEVER over-deleted (proved by the Phase-5
+            /// model: `stage5_retiretoken` HOLDs `INV_NO_RETURN`/`INV_NO_LOSS` + `RetireTokenSourceComplete`,
+            /// while `sab_staletokenoverdelete` shows that bypassing exactness violates `INV_NO_LOSS`). Concurrent
+            /// writers / repeated re-incarnations never threaten safety — the model advances a blob's token
+            /// freely (`WUploadBlob`, no in-degree guard) and the whole suite stays green. Revisit the
+            /// stored-token variant only if profiling shows these per-candidate HEADs are a hot-path cost.
+            const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
+            /// B170: HEAD-observe — the current incarnation token, the only token the eventual exact-token
+            /// delete may carry (absent => skipped: a prior round's landed delete).
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::GcRetireObserve;
+                e.object_kind = CasEventObjectKind::Blob;
+                e.object_hash = u128ToHex(cand.hash);
+                e.token = observed.exists ? observed.token.value : "";
+                e.round = round;
+                e.gen = folded.fold_seal.generation;
+                e.outcome = observed.exists ? "present" : "absent";
+                e.reason = "zero-in-degree candidate; HEAD-observe the current token";
+            });
+            if (!observed.exists)
+                continue;
+            RetiredEntry entry;
+            entry.kind = ObjectKind::Blob;
+            entry.hash = cand.hash;
+            entry.token = observed.token;
+            entry.size = retiredLogicalSize(ObjectKind::Blob, observed.size, store->poolMeta().blob_header_len);
+            /// B170: the retire entry written for this incarnation (per RetiredEntry).
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::BlobRetire;
+                e.object_kind = CasEventObjectKind::Blob;
+                e.object_hash = u128ToHex(cand.hash);
+                e.token = observed.token.value;
+                e.round = round;
+                e.gen = folded.fold_seal.generation;
+                e.outcome = "retired";
+                e.reason = "condemned zero-in-degree candidate written to the round's retired set";
+                e.detail = {{"size", std::to_string(entry.size)}};
+            });
+            result.blobs[shard].entries.push_back(std::move(entry));
+        }
     }
 
     /// Write each shard's retired set write-once (adopt a byte-equal occupant as our crash-replay).
@@ -847,6 +849,11 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     {
         const String key = layout.outcomesKey(completion_generation, attempt, round, shard);
         const String body = encodeOutcomeLog(log);
+        /// The DURABLE bytes that actually live at `key`: our own `body` on a clean win, or the adopted
+        /// occupant's bytes on PreconditionFailed. The completion seal's `delete_outcomes` RunRef must
+        /// checksum THESE bytes (not a fresh re-encode of `log`), so the seal references exactly what is
+        /// durable — a re-encode could differ from a byte-divergent-but-decodable adopted occupant.
+        String sealed_body = body;
         if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
         {
             const auto existing = backend.get(key);
@@ -862,9 +869,10 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
                         "CAS gc recheck: undecodable outcome log at {} cannot be adopted: {}", key, e.message());
                 }
             }
+            sealed_body = existing->bytes;
         }
         folded.completion_seal.delete_outcomes.push_back(
-            RunRef{.key = key, .checksum = cityHash128(encodeOutcomeLog(log))});
+            RunRef{.key = key, .checksum = cityHash128(sealed_body)});
         for (const OutcomeEntry & o : log.entries)
         {
             switch (o.outcome)
@@ -1424,18 +1432,20 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
     /// Scan every blob-target shard (see `retire`): a preview that only looked at shard 0 would miss the
     /// zero-in-degree candidates owned by shards 1..N under `gc_shards > 1`.
     for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
-    for (const BlobCandidate & cand : zeroInDegree(backend, layout, state.snap_generation, state.snap_attempt, shard))
     {
-        const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
-        if (!observed.exists)
-            continue;
-        PreviewEntry e;
-        e.kind = ObjectKind::Blob;
-        e.hash = cand.hash;
-        e.key = blobKeyOf(layout, cand.hash);
-        e.size = observed.size;
-        e.reason = "unreachable";
-        out.push_back(std::move(e));
+        for (const BlobCandidate & cand : zeroInDegree(backend, layout, state.snap_generation, state.snap_attempt, shard))
+        {
+            const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
+            if (!observed.exists)
+                continue;
+            PreviewEntry e;
+            e.kind = ObjectKind::Blob;
+            e.hash = cand.hash;
+            e.key = blobKeyOf(layout, cand.hash);
+            e.size = observed.size;
+            e.reason = "unreachable";
+            out.push_back(std::move(e));
+        }
     }
     return out;
 }
