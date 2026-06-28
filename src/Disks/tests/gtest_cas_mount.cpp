@@ -3,6 +3,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 
+#include <chrono>
+
 using namespace DB::Cas;
 
 TEST(CasServerRootId, ValidationAcceptsCleanPathsRejectsBad)
@@ -103,4 +105,47 @@ TEST(CasServerRootClaim, MissingOwnerOverNonEmptyRootIsCorrupted)
     /// Simulate existing data without an owner (identity lost): plant a key under roots/<srid>/.
     b->putIfAbsent(l.serverRootDataPrefix("r") + "some-data", "x");
     EXPECT_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1)), DB::Exception);
+}
+
+TEST(CasMountLease, AbsentClaimThenRenewBumpsSeq)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    auto r = claimMount(*b, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100);
+    EXPECT_EQ(r.kind, MountClaimResult::Claimed);
+    MountLeaseKeeper k(b, l, "r", UInt128(1), 7, std::chrono::milliseconds(100), [&] { return now; });
+    k.start();
+    EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).seq, 1u);
+    k.renewOnce();
+    EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).seq, 2u);
+}
+
+TEST(CasMountLease, SameUuidLiveFailsForeignFailsExpiredReclaims)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    claimMount(*b, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100);    // A live until 1100
+    // same uuid, lease still live → double-start guard:
+    EXPECT_EQ(claimMount(*b, l, "r", UInt128(1), 8, 1050, 100).kind, MountClaimResult::LiveDoubleStart);
+    // foreign uuid, even after expiry → fail closed:
+    EXPECT_EQ(claimMount(*b, l, "r", UInt128(2), 1, 1200, 100).kind, MountClaimResult::ForeignOwner);
+    // same uuid after expiry → reclaim:
+    EXPECT_EQ(claimMount(*b, l, "r", UInt128(1), 9, 1200, 100).kind, MountClaimResult::Claimed);
+}
+
+TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    // The normal flow: claimMount writes the live mount under (uuid=1, epoch=7), THEN keeper.start().
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    MountLeaseKeeper k(b, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100), [&] { return now; });
+    EXPECT_NO_THROW(k.start());     // adopts our own live (uuid=1,epoch=7) mount — NOT a double-start
+    EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 7u);
+
+    // A keeper for the SAME uuid but a DIFFERENT live epoch must fail closed (superseded/double-start):
+    MountLeaseKeeper k2(b, l, "r", UInt128(1), /*epoch*/ 8, std::chrono::milliseconds(100), [&] { return now; });
+    EXPECT_ANY_THROW(k2.start());
 }

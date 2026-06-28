@@ -1,8 +1,11 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasSingleWriterSlot.h>
 #include <Common/Exception.h>
 #include <base/types.h>
 #include <base/extended_types.h>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string_view>
 
 namespace DB
@@ -127,5 +130,77 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
 ///   - otherwise read `next = current.next_writer_epoch`, `casPut` `{next + 1}` against the
 ///     observed token, retry on `Conflict` (bounded), and return `next`.
 uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid);
+
+/// Startup decision for the mount lease (`gc/server-roots/<srid>/mount`), run AFTER the owner gate
+/// (so `our_uuid` is the established owner). The lease is LIVENESS, not identity — the owner object
+/// already settled who may write; the lease settles whether a live incarnation currently holds the
+/// slot. Decision over `get(mountKey)`:
+///   - absent → write our body via `putIfAbsent` → `Claimed`;
+///   - same `server_uuid` AND same `writer_epoch` as (our_uuid, our_epoch) → it is OUR OWN claim
+///     (a replay / the keeper adopting it) → refresh (`putOverwrite` to bump seq + fresh
+///     `expires_at_ms`) → `Claimed`;
+///   - same `server_uuid`, DIFFERENT `writer_epoch`, lease EXPIRED (`expires_at_ms <= now_ms`) →
+///     reclaim (overwrite with our body, seq = prev + 1) → `Claimed`;
+///   - same `server_uuid`, DIFFERENT `writer_epoch`, lease LIVE (`expires_at_ms > now_ms`) →
+///     `LiveDoubleStart` (do NOT write — a second incarnation of the same server is already up);
+///   - different `server_uuid` → `ForeignOwner` (do NOT write, regardless of expiry).
+struct MountClaimResult
+{
+    /// Plain (unscoped) enum: callers compare with `MountClaimResult::Claimed` directly.
+    enum Kind
+    {
+        Claimed,
+        LiveDoubleStart,
+        ForeignOwner,
+    };
+    Kind kind = ForeignOwner;
+    MountLease body;
+};
+
+MountClaimResult claimMount(
+    Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
+    uint64_t now_ms, uint64_t ttl_ms);
+
+/// Mount-lease heartbeat (liveness), the sibling of `WatermarkKeeper` over the per-server-root mount
+/// object. Reuses `SingleWriterSlot`: anchors the slot synchronously on `start`, renews it async off
+/// the write path, and fails closed on any foreign touch (`renewOnce` throws on a precondition miss).
+///
+/// ADOPT RULE (critical): the steady-state flow is `claimMount(...)` writes the live mount under
+/// (our_uuid, our_epoch), THEN `keeper.start()`. So `start`'s `claim` hook must ADOPT a live mount
+/// that is ALREADY ours — same `server_uuid` AND same `writer_epoch` — instead of self-tripping the
+/// live-double-start guard. The discriminator is the (uuid, epoch) pair:
+///   - same uuid + same epoch  → our own just-written claim (or a replay) → adopt: `putOverwrite`
+///     against the observed token to refresh seq/expiry (no fail);
+///   - same uuid + DIFFERENT live epoch → a newer incarnation superseded us → fail closed;
+///   - foreign uuid → fail closed;
+///   - absent → `putIfAbsent`; expired-our-uuid (any epoch) → `putOverwrite` reclaim.
+/// After `start`, `renewOnce` (base) keeps the slot alive and already fails closed on a foreign touch.
+class MountLeaseKeeper final : public SingleWriterSlot
+{
+public:
+    MountLeaseKeeper(
+        BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
+        uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_);
+
+    /// Claims (adopts) the mount slot for (server_uuid, writer_epoch) with seq following the observed
+    /// one — durable when `start` returns.
+    void start() { doStart(); }
+
+    /// Releases the mount: the terminal op. Stops the background thread first.
+    void stop() { doTerminate(); }
+
+protected:
+    RenewPayload prepareRenew() const override;
+    String encodeBody(uint64_t seq_, const RenewPayload & payload) const override;
+    Token claim(const String & body) override;
+    void terminate() override;
+
+private:
+    String srid;
+    UInt128 server_uuid;
+    uint64_t writer_epoch;
+    std::chrono::milliseconds ttl;
+    std::function<uint64_t()> now_ms_fn;
+};
 
 }
