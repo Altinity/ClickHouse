@@ -1509,8 +1509,9 @@ bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundRep
     if (round == 0)
         return false;
 
-    /// Detect an incomplete round from durable state: retired sets still present at (round, fence_seq).
-    /// They drop only at the very end of a completed round (recheck step 4), so their presence is the
+    /// Detect an incomplete round from durable state: retired sets still present at
+    /// (snap_generation, snap_attempt, round). They drop only at the very end of a completed round
+    /// (recheck step 4), so their presence is the
     /// durable incompleteness signal. The fold for this round already committed (retire's CAS advanced
     /// .round AFTER the fold's CAS), so a fold_seal exists for the current generation.
     RetireResult retired;
