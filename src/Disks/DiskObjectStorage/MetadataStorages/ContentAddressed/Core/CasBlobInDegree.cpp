@@ -65,12 +65,12 @@ UInt128 cityHash128(const String & bytes)
 /// (hash, count). The segments are written one per generation (seq 0); enumerating seq>0 future-proofs
 /// the multi-segment layout. Returns rows in key order.
 std::vector<std::pair<UInt128, int64_t>> readGenerationRows(
-    Backend & backend, const Layout & layout, uint64_t generation, uint64_t shard)
+    Backend & backend, const Layout & layout, uint64_t generation, uint64_t attempt, uint64_t shard)
 {
     std::vector<std::pair<UInt128, int64_t>> rows;
     for (uint64_t seq = 0; ; ++seq)
     {
-        const String key = layout.blobTargetRunKey(generation, shard, seq);
+        const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
         std::optional<GetResult> got = backend.get(key);
         if (!got)
             break;
@@ -87,7 +87,8 @@ std::vector<std::pair<UInt128, int64_t>> readGenerationRows(
 }
 
 void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
-                              uint64_t prior_generation, uint64_t new_generation, uint64_t shard,
+                              uint64_t prior_generation, uint64_t new_generation, uint64_t attempt,
+                              uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs)
 {
     /// Deterministic input ordering => byte-reproducible output run (OQ5 resume/adoption).
@@ -97,7 +98,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     /// The prior generation's per-blob counts (one row per key, in key order). A key with count==0 in
     /// the prior gen is a transitioned-to-0 marker we must NOT carry forward as a fresh candidate.
     const std::vector<std::pair<UInt128, int64_t>> prior_rows =
-        readGenerationRows(backend, layout, prior_generation, shard);
+        readGenerationRows(backend, layout, prior_generation, attempt, shard);
 
     /// Merge prior counts with scattered deltas, both already in key order. For each key sum
     /// prior_count + Σ deltas. A merged count < 0 is an undercount (would over-delete) — fail closed.
@@ -168,16 +169,16 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     writer.finish();
     const String run_bytes = out.str();
 
-    const String run_key = layout.blobTargetRunKey(new_generation, shard, 0);
+    const String run_key = layout.blobTargetRunKey(new_generation, attempt, shard, 0);
     backend.putIfAbsent(run_key, run_bytes);
     out_runs.push_back(RunRef{.key = run_key, .checksum = cityHash128(run_bytes)});
 }
 
 std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout,
-                                        uint64_t generation, uint64_t shard)
+                                        uint64_t generation, uint64_t attempt, uint64_t shard)
 {
     std::vector<BlobCandidate> result;
-    for (const auto & [hash, count] : readGenerationRows(backend, layout, generation, shard))
+    for (const auto & [hash, count] : readGenerationRows(backend, layout, generation, attempt, shard))
     {
         if (count == 0)
             result.push_back(BlobCandidate{.hash = hash});
@@ -186,11 +187,11 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout
 }
 
 int64_t inDegreeInGeneration(Backend & backend, const Layout & layout,
-                             uint64_t generation, uint64_t shard, const UInt128 & blob_hash)
+                             uint64_t generation, uint64_t attempt, uint64_t shard, const UInt128 & blob_hash)
 {
     /// The run is sorted by hash and carries at most one row per key; absent => 0 (never pinned, or a
     /// prior-gen zero that was dropped). An explicit 0-row (transitioned this gen) also reads as 0.
-    for (const auto & [hash, count] : readGenerationRows(backend, layout, generation, shard))
+    for (const auto & [hash, count] : readGenerationRows(backend, layout, generation, attempt, shard))
         if (hash == blob_hash)
             return count;
     return 0;

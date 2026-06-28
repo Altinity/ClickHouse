@@ -310,9 +310,18 @@ inline String encodeMinimalGcState(uint64_t round, uint64_t fence_seq)
 }
 
 /// Inject GC state so a fresh `Store::open` over the same backend sees the given incarnations as
-/// condemned. Writes `gc/state` ({round, fence_seq}) and one retired-set object at
-/// `retiredKey(round, fence_seq, shard)`. The Store refreshes its `retireView` only at open, so the
-/// caller injects BEFORE opening the Store whose Build will consult the view.
+/// condemned. Writes `gc/state` ({round, fence_seq}) and one retired-set object under the adopted
+/// `(snap_generation, snap_attempt)` — both 0 in the minimal injected state — that `RetireView::refresh`
+/// LISTs (it lists the whole `gcGenAttemptRetiredPrefix(snap_generation, snap_attempt)` subtree, so the
+/// retired set's round/shard components are irrelevant to RetireView visibility). The Store refreshes its
+/// `retireView` only at open, so the caller injects BEFORE opening the Store whose Build consults the view.
+///
+/// The retired set is written under the reserved round component 0. Real GC rounds start at round 1 and
+/// key their retired sets at `retiredKey(fold_generation, snap_attempt, round>=1, shard)`, so a set under
+/// round 0 is NEVER mistaken for a resumable incomplete round by `Gc::tryResumeIncompleteRound` (which
+/// reads `retiredKey(snap_generation, snap_attempt, state.round, shard)` with `state.round == round >= 1`).
+/// This reproduces the pre-attempt-scoping behavior, where the lease steal's `fence_seq` bump shielded the
+/// injected set from resume while RetireView's flat LIST still saw it.
 inline void injectRetire(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     uint64_t round, uint64_t fence_seq, uint64_t shard, std::vector<DB::Cas::RetiredEntry> entries)
@@ -324,7 +333,9 @@ inline void injectRetire(
     else
         backend.putOverwrite(layout.gcStateKey(), state, head.token);
 
-    backend.putIfAbsent(layout.retiredKey(round, fence_seq, shard),
+    /// The minimal injected gc/state has snap_generation == snap_attempt == 0; round component 0 (a
+    /// no-real-round sentinel) keeps the set RetireView-visible but invisible to resume detection.
+    backend.putIfAbsent(layout.retiredKey(/*generation*/0, /*attempt*/0, /*round*/0, shard),
         DB::Cas::encodeRetiredSet(DB::Cas::RetiredSet{.entries = std::move(entries)}));
 }
 
@@ -433,10 +444,20 @@ inline uint64_t currentGenerationOf(DB::Cas::Backend & backend, const DB::Cas::L
     return DB::Cas::decodeGcState(got->bytes).snap_generation;
 }
 
+/// The adopted attempt (snap_attempt pointer in gc/state), or 0 when absent.
+inline uint64_t currentAttemptOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout)
+{
+    const auto got = backend.get(layout.gcStateKey());
+    if (!got)
+        return 0;
+    return DB::Cas::decodeGcState(got->bytes).snap_attempt;
+}
+
 /// The in-degree of a blob in the current GC generation's sealed run (0 when absent/zeroed).
 inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
-    return DB::Cas::inDegreeInGeneration(backend, layout, currentGenerationOf(backend, layout), /*shard*/0, hash);
+    return DB::Cas::inDegreeInGeneration(backend, layout, currentGenerationOf(backend, layout),
+                                         currentAttemptOf(backend, layout), /*shard*/0, hash);
 }
 
 /// The cursor key "ns/shard" — matches CasGcCursorKey::cursorKey.
@@ -453,9 +474,10 @@ inline uint64_t foldCursorOf(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns, uint64_t shard)
 {
     const uint64_t gen = currentGenerationOf(backend, layout);
+    const uint64_t attempt = currentAttemptOf(backend, layout);
     for (uint64_t g = gen; ; --g)
     {
-        if (const auto got = backend.get(layout.foldSealKey(g)))
+        if (const auto got = backend.get(layout.foldSealKey(g, attempt)))
         {
             const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
             const auto it = seal.per_ns_shard.find(cursorKeyForTest(ns, shard));

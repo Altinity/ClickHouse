@@ -212,9 +212,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     /// (fold sealed, completion not yet) the fold seal at snap_generation carries them. Absent both =>
     /// fresh pool (cursor 0). This is independent of trim — a folded-but-untrimmed event must never be
     /// re-folded from 0 (that double-counts blob in-degree => silent over-pin/leak).
-    const std::map<String, ShardCoverage> parent_cursors = readSealedCursors(state.snap_generation);
+    const std::map<String, ShardCoverage> parent_cursors = readSealedCursors(state.snap_generation, state.snap_attempt);
 
     const uint64_t new_generation = state.snap_generation + 1;
+    /// Task 3 placeholder: thread the CURRENTLY-adopted attempt at every fold write and read (Task 5
+    /// replaces this with `state.lease.seq` + the fold-adopt CAS). `snap_attempt` is 0 pre-Task-5, so
+    /// the prior-gen reads and the new-gen writes use the same attempt — no behavior change.
+    const uint64_t attempt = state.snap_attempt;
     result.fold_seal.generation = new_generation;
     result.fold_seal.parent_generation = state.snap_generation;
 
@@ -233,7 +237,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     /// generation) we walk back for the latest fold seal; if neither exists the empty seal yields all Read.
     CasFoldSeal discover_ref_seal;
     std::map<String, uint64_t> discover_fence_positions;
-    if (const auto completion = readCompletionSeal(state.snap_generation))
+    if (const auto completion = readCompletionSeal(state.snap_generation, state.snap_attempt))
     {
         discover_ref_seal.generation = state.snap_generation;
         discover_ref_seal.per_ns_shard = completion->folded_cursors;
@@ -243,7 +247,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     {
         for (uint64_t g = state.snap_generation; g > 0; --g)
         {
-            if (const auto opt = readFoldSeal(g))
+            if (const auto opt = readFoldSeal(g, state.snap_attempt))
             {
                 discover_ref_seal = *opt;
                 break;
@@ -391,12 +395,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
             /// Nothing new this round; still seal the (empty-delta) generation so the cursor coverage is
             /// durable and the resume rule has a fold_seal to key off. Reuse the prior generation's blob run
             /// (no delta) by sealing a fresh generation whose in-degree equals the parent.
-            foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, /*shard*/0,
+            foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, attempt, /*shard*/0,
                                      {}, result.fold_seal.blob_target_runs);
         }
         else
         {
-            foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, /*shard*/0,
+            foldDeltasIntoGeneration(backend, layout, state.snap_generation, new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs);
         }
     }
@@ -424,20 +428,20 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
             /// shards concurrently (CasGcScheduler ownership); their run-key namespaces never collide.
             ShardReducer reducer{shard, state.gc_shards};
             std::vector<RunRef> shard_runs =
-                reducer.reduce(backend, layout, state.snap_generation, new_generation,
+                reducer.reduce(backend, layout, state.snap_generation, new_generation, attempt,
                                std::move(buckets[shard]));
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
         }
     }
-    writePartManifestCleanupBundle(new_generation, /*owner_shard*/0, result.mf_cleanup,
+    writePartManifestCleanupBundle(new_generation, attempt, /*owner_shard*/0, result.mf_cleanup,
                                    result.fold_seal.part_manifest_cleanup);
 
     /// Write-once CasFoldSeal: its existence marks fold complete. On PreconditionFailed adopt a
     /// byte-equal occupant as our own crash-replay, else ABORTED.
     {
         const String body = encodeFoldSeal(result.fold_seal);
-        const String key = layout.foldSealKey(new_generation);
+        const String key = layout.foldSealKey(new_generation, attempt);
         if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
         {
             const auto existing = backend.get(key);
@@ -469,7 +473,7 @@ Gc::RetireResult Gc::retire(GcState & state, Token & state_token, const FoldResu
     /// Blob candidates: zero-in-degree in the sealed fold generation (blob-only). ONE HEAD per candidate
     /// observes the current token; an absent object is SKIPPED (a prior round's landed delete — never
     /// fabricate a token, never GET a condemned body).
-    for (const BlobCandidate & cand : zeroInDegree(backend, layout, folded.fold_seal.generation, /*shard*/0))
+    for (const BlobCandidate & cand : zeroInDegree(backend, layout, folded.fold_seal.generation, state.snap_attempt, /*shard*/0))
     {
         /// B170: the blob's in-degree transitioned to 0 in this generation — the moment it became a
         /// retire candidate. The cause is the fold's last -1 edge (its RootRemove row above for the same
@@ -544,7 +548,7 @@ Gc::RetireResult Gc::retire(GcState & state, Token & state_token, const FoldResu
     /// Write each shard's retired set write-once (adopt a byte-equal occupant as our crash-replay).
     for (auto & [shard, set] : result.blobs)
     {
-        const String key = layout.retiredKey(round, state.fence_seq, shard);
+        const String key = layout.retiredKey(folded.fold_seal.generation, state.snap_attempt, round, shard);
         const String body = encodeRetiredSet(set);
         if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
         {
@@ -717,10 +721,13 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
         }
     }
     const uint64_t completion_generation = state.snap_generation + 1;
+    /// Task 3 placeholder: recheck INHERITS the adopted attempt (never mints a new one). `snap_attempt`
+    /// is 0 pre-Task-5, so reads/writes here use the same attempt as the fold/retire — no behavior change.
+    const uint64_t attempt = state.snap_attempt;
     if (state.gc_shards == 1)
     {
         /// SINGLE-SHARD PATH: all deltas fold into shard 0 of the completion generation.
-        foldDeltasIntoGeneration(backend, layout, state.snap_generation, completion_generation, /*shard*/0,
+        foldDeltasIntoGeneration(backend, layout, state.snap_generation, completion_generation, attempt, /*shard*/0,
                                  std::move(window), folded.completion_seal.blob_target_runs);
     }
     else
@@ -736,7 +743,7 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
         {
             ShardReducer reducer{sh, state.gc_shards};
             std::vector<RunRef> shard_runs =
-                reducer.reduce(backend, layout, state.snap_generation, completion_generation,
+                reducer.reduce(backend, layout, state.snap_generation, completion_generation, attempt,
                                std::move(buckets[sh]));
             for (RunRef & r : shard_runs)
                 folded.completion_seal.blob_target_runs.push_back(std::move(r));
@@ -755,7 +762,7 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
             /// sharded path above. For gc_shards==1 this always produces 0 (identity).
             const uint64_t entry_shard = blobShard(entry.hash, state.gc_shards);
             const int64_t indeg_at_recheck =
-                inDegreeInGeneration(backend, layout, completion_generation, entry_shard, entry.hash);
+                inDegreeInGeneration(backend, layout, completion_generation, attempt, entry_shard, entry.hash);
             if (indeg_at_recheck > 0)
             {
                 /// B170: a fold-through-fence publish re-pinned this candidate — record the verdict +
@@ -826,7 +833,7 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     /// Write outcome logs write-once (adopt a byte-equal occupant), then tally from the FINAL logs.
     for (auto & [shard, log] : computed)
     {
-        const String key = layout.outcomesKey(round, state.fence_seq, shard);
+        const String key = layout.outcomesKey(completion_generation, attempt, round, shard);
         const String body = encodeOutcomeLog(log);
         if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
         {
@@ -914,7 +921,7 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     }
     {
         const String body = encodeCompletionSeal(folded.completion_seal);
-        const String key = layout.completionSealKey(completion_generation);
+        const String key = layout.completionSealKey(completion_generation, attempt);
         if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
         {
             const auto existing = backend.get(key);
@@ -934,7 +941,7 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     /// keeping `keep` generations covers any in-flight/resuming leader. Walk forward from the durable
     /// cursor, bounded per round; fold snap_pruned_through into the SAME gc/state CAS below. If a stale
     /// leader pruned and then loses the CAS, the deletes were still below the winner's even-higher floor.
-    pruneSupersededGenerations(completion_generation, next);
+    pruneSupersededGenerations(completion_generation, attempt, next);
 
     const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
     if (res.outcome != CasOutcome::Committed)
@@ -946,7 +953,7 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     /// Drop the round's retired-set objects on their confirmed outcomes (a GC-metadata delete).
     for (const auto & [shard, set] : retired.blobs)
     {
-        const String key = layout.retiredKey(round, state.fence_seq, shard);
+        const String key = layout.retiredKey(folded.fold_seal.generation, attempt, round, shard);
         if (const auto got = backend.get(key))
         {
             const DeleteOutcome dropped = backend.deleteExact(key, got->token);
@@ -1033,7 +1040,7 @@ void Gc::trim(FoldResult & folded, uint64_t /*round*/)
     }
 }
 
-void Gc::writePartManifestCleanupBundle(uint64_t generation, uint64_t owner_shard,
+void Gc::writePartManifestCleanupBundle(uint64_t generation, uint64_t attempt, uint64_t owner_shard,
                                         const std::map<ManifestId, Token> & cleanup, std::vector<RunRef> & out)
 {
     if (cleanup.empty())
@@ -1060,12 +1067,12 @@ void Gc::writePartManifestCleanupBundle(uint64_t generation, uint64_t owner_shar
     writer.finish();
     const String run_bytes = buf.str();
 
-    const String run_key = layout.partManifestCleanupKey(generation, owner_shard, 0);
+    const String run_key = layout.partManifestCleanupKey(generation, attempt, owner_shard, 0);
     backend.putIfAbsent(run_key, run_bytes);
     out.push_back(RunRef{.key = run_key, .checksum = cityHash128(run_bytes)});
 }
 
-void Gc::pruneSupersededGenerations(uint64_t adopted_generation, GcState & next)
+void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next)
 {
     const uint64_t keep = store->poolConfig().gc_snap_generations_to_keep;
     if (keep == 0)
@@ -1090,20 +1097,20 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, GcState & next)
     };
     for (; g <= prune_floor && pruned < kMaxPrunePerRound; ++g, ++pruned)
     {
-        dropExact(layout.foldSealKey(g));
-        dropExact(layout.completionSealKey(g));
+        dropExact(layout.foldSealKey(g, attempt));
+        dropExact(layout.completionSealKey(g, attempt));
         /// blob-target runs and part-manifest-cleanup bundles are seq-indexed (shard 0 for gc_shards==1);
         /// delete from seq 0 until the first absent seq.
         for (uint64_t seq = 0; ; ++seq)
         {
-            const String key = layout.blobTargetRunKey(g, /*shard*/0, seq);
+            const String key = layout.blobTargetRunKey(g, attempt, /*shard*/0, seq);
             if (!backend.head(key).exists)
                 break;
             dropExact(key);
         }
         for (uint64_t seq = 0; ; ++seq)
         {
-            const String key = layout.partManifestCleanupKey(g, /*owner_shard*/0, seq);
+            const String key = layout.partManifestCleanupKey(g, attempt, /*owner_shard*/0, seq);
             if (!backend.head(key).exists)
                 break;
             dropExact(key);
@@ -1112,29 +1119,29 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, GcState & next)
     next.snap_pruned_through = g - 1;   /// highest generation fully processed this round
 }
 
-std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation)
+std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attempt)
 {
-    if (const auto got = store->backend().get(store->layout().foldSealKey(generation)))
+    if (const auto got = store->backend().get(store->layout().foldSealKey(generation, attempt)))
         return decodeFoldSeal(got->bytes);
     return std::nullopt;
 }
 
-std::optional<CasCompletionSeal> Gc::readCompletionSeal(uint64_t generation)
+std::optional<CasCompletionSeal> Gc::readCompletionSeal(uint64_t generation, uint64_t attempt)
 {
-    if (const auto got = store->backend().get(store->layout().completionSealKey(generation)))
+    if (const auto got = store->backend().get(store->layout().completionSealKey(generation, attempt)))
         return decodeCompletionSeal(got->bytes);
     return std::nullopt;
 }
 
-std::map<String, ShardCoverage> Gc::readSealedCursors(uint64_t generation)
+std::map<String, ShardCoverage> Gc::readSealedCursors(uint64_t generation, uint64_t attempt)
 {
     /// M1: the per-(ns,shard) fold cursor coverage as of `generation`, from the LATEST seal there: the
     /// completion seal if the round that produced this generation finished (it overwrote snap_generation
     /// with its completion generation and carried the cursors into folded_cursors), else the fold seal
     /// (a mid-round fold sealed but not yet completed). Absent both => empty (fresh pool, cursor 0).
-    if (const auto completion = readCompletionSeal(generation))
+    if (const auto completion = readCompletionSeal(generation, attempt))
         return completion->folded_cursors;
-    if (const auto fold = readFoldSeal(generation))
+    if (const auto fold = readFoldSeal(generation, attempt))
         return fold->per_ns_shard;
     return {};
 }
@@ -1293,7 +1300,7 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
     /// the fold seal carries fold-time tokens and no fence positions, so the token comparison fails Read).
     CasFoldSeal ref_seal;
     std::map<String, uint64_t> fence_positions;
-    if (const auto completion = readCompletionSeal(state.snap_generation))
+    if (const auto completion = readCompletionSeal(state.snap_generation, state.snap_attempt))
     {
         ref_seal.generation = state.snap_generation;
         ref_seal.per_ns_shard = completion->folded_cursors;
@@ -1303,7 +1310,7 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
     {
         for (uint64_t g = state.snap_generation; g > 0; --g)
         {
-            if (const auto opt = readFoldSeal(g))
+            if (const auto opt = readFoldSeal(g, state.snap_attempt))
             {
                 ref_seal = *opt;
                 break;
@@ -1326,7 +1333,7 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
 
-    for (const BlobCandidate & cand : zeroInDegree(backend, layout, state.snap_generation, /*shard*/0))
+    for (const BlobCandidate & cand : zeroInDegree(backend, layout, state.snap_generation, state.snap_attempt, /*shard*/0))
     {
         const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
         if (!observed.exists)
@@ -1357,7 +1364,7 @@ bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundRep
     /// .round AFTER the fold's CAS), so a fold_seal exists for the current generation.
     RetireResult retired;
     for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
-        if (const auto got = backend.get(layout.retiredKey(round, state.fence_seq, shard)))
+        if (const auto got = backend.get(layout.retiredKey(state.snap_generation, state.snap_attempt, round, shard)))
             retired.blobs.emplace(shard, decodeRetiredSet(got->bytes));
     if (retired.blobs.empty())
         return false;
@@ -1371,7 +1378,7 @@ bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundRep
     /// part-manifest cleanup is re-read from the durable bundle so the manifest deletes re-issue (recheck
     /// deletes by the bundle's token, never the deleted body).
     FoldResult folded;
-    if (const auto seal = readFoldSeal(state.snap_generation))
+    if (const auto seal = readFoldSeal(state.snap_generation, state.snap_attempt))
         folded.fold_seal = *seal;
     else
         /// No fold seal but retired sets present is out-of-model; fail closed rather than guess.
@@ -1383,7 +1390,7 @@ bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundRep
     /// Re-read the cleanup bundle (manifestKey -> token) so recheck re-issues the deferred deletes.
     for (uint64_t seq = 0; ; ++seq)
     {
-        const auto got = backend.get(layout.partManifestCleanupKey(state.snap_generation, /*owner_shard*/0, seq));
+        const auto got = backend.get(layout.partManifestCleanupKey(state.snap_generation, state.snap_attempt, /*owner_shard*/0, seq));
         if (!got)
             break;
         DB::ReadBufferFromMemory in(got->bytes.data(), got->bytes.size());

@@ -36,11 +36,14 @@ uint64_t sealedFoldCursor(Store & store, const RootNamespace & ns, uint64_t shar
     const auto state_got = store.backend().get(layout.gcStateKey());
     if (!state_got)
         return 0;
-    const uint64_t gen = decodeGcState(state_got->bytes).snap_generation;
+    const GcState state = decodeGcState(state_got->bytes);
+    const uint64_t gen = state.snap_generation;
+    /// Task 3 placeholder: resolve the seal under the adopted attempt (Task 7 refines the back-scan).
+    const uint64_t attempt = state.snap_attempt;
     const String key = cursorKey(ns, shard);
     for (uint64_t g = gen; ; --g)
     {
-        if (const auto got = store.backend().get(layout.foldSealKey(g)))
+        if (const auto got = store.backend().get(layout.foldSealKey(g, attempt)))
         {
             const CasFoldSeal seal = decodeFoldSeal(got->bytes);
             const auto it = seal.per_ns_shard.find(key);

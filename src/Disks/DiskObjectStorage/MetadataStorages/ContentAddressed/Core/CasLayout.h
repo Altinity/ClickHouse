@@ -142,30 +142,65 @@ public:
         return prefix + "/gc/hb";
     }
 
-    /// Per-generation FOLD seal (write-once): <prefix>/gc/gen/<generation>/fold_seal (rev. 15).
-    String foldSealKey(uint64_t generation) const
+    /// Prefix that covers EVERY per-round artifact of one generation (all attempts): <prefix>/gc/gen/<generation>/
+    /// The wholesale retention prune reclaims a whole generation (every attempt's debris) by this prefix.
+    String gcGenPrefix(uint64_t generation) const
     {
-        return prefix + "/gc/gen/" + std::to_string(generation) + "/fold_seal";
+        return prefix + "/gc/gen/" + std::to_string(generation) + "/";
     }
 
-    /// Per-generation COMPLETION seal (write-once): <prefix>/gc/gen/<generation>/completion_seal.
-    String completionSealKey(uint64_t generation) const
+    /// Prefix that covers one (generation, attempt)'s artifacts: <prefix>/gc/gen/<generation>/attempt/<attempt>/
+    /// `attempt` is the folding leader's monotonic per-round id; only the adopted attempt is reader-visible.
+    String gcGenAttemptPrefix(uint64_t generation, uint64_t attempt) const
     {
-        return prefix + "/gc/gen/" + std::to_string(generation) + "/completion_seal";
+        return gcGenPrefix(generation) + "attempt/" + std::to_string(attempt) + "/";
     }
 
-    /// One blob-target in-degree/delta run segment: <prefix>/gc/gen/<generation>/blob_target/<shard>/<seq>
-    String blobTargetRunKey(uint64_t generation, uint64_t shard, uint64_t seq) const
+    /// Per-(generation, attempt) FOLD seal (write-once): <prefix>/gc/gen/<generation>/attempt/<attempt>/fold_seal.
+    String foldSealKey(uint64_t generation, uint64_t attempt) const
     {
-        return prefix + "/gc/gen/" + std::to_string(generation) + "/blob_target/"
+        return gcGenAttemptPrefix(generation, attempt) + "fold_seal";
+    }
+
+    /// Per-(generation, attempt) COMPLETION seal (write-once): <prefix>/gc/gen/<generation>/attempt/<attempt>/completion_seal.
+    String completionSealKey(uint64_t generation, uint64_t attempt) const
+    {
+        return gcGenAttemptPrefix(generation, attempt) + "completion_seal";
+    }
+
+    /// One blob-target in-degree/delta run segment:
+    ///   <prefix>/gc/gen/<generation>/attempt/<attempt>/blob_target/<shard>/<seq>
+    String blobTargetRunKey(uint64_t generation, uint64_t attempt, uint64_t shard, uint64_t seq) const
+    {
+        return gcGenAttemptPrefix(generation, attempt) + "blob_target/"
                + std::to_string(shard) + "/" + std::to_string(seq);
     }
 
-    /// One part-manifest cleanup bundle: <prefix>/gc/gen/<generation>/part_manifest_cleanup/<owner_shard>/<seq>
-    String partManifestCleanupKey(uint64_t generation, uint64_t owner_shard, uint64_t seq) const
+    /// One part-manifest cleanup bundle:
+    ///   <prefix>/gc/gen/<generation>/attempt/<attempt>/part_manifest_cleanup/<owner_shard>/<seq>
+    String partManifestCleanupKey(uint64_t generation, uint64_t attempt, uint64_t owner_shard, uint64_t seq) const
     {
-        return prefix + "/gc/gen/" + std::to_string(generation) + "/part_manifest_cleanup/"
+        return gcGenAttemptPrefix(generation, attempt) + "part_manifest_cleanup/"
                + std::to_string(owner_shard) + "/" + std::to_string(seq);
+    }
+
+    /// Prefix that covers all retired-set objects of one (generation, attempt) (for list):
+    ///   <prefix>/gc/gen/<generation>/attempt/<attempt>/retired/
+    String gcGenAttemptRetiredPrefix(uint64_t generation, uint64_t attempt) const
+    {
+        return gcGenAttemptPrefix(generation, attempt) + "retired/";
+    }
+
+    /// Retired-set key: <prefix>/gc/gen/<generation>/attempt/<attempt>/retired/<round>/<shard>
+    String retiredKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const
+    {
+        return gcGenAttemptRetiredPrefix(generation, attempt) + std::to_string(round) + "/" + std::to_string(shard);
+    }
+
+    /// Outcomes key: <prefix>/gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>
+    String outcomesKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const
+    {
+        return gcGenAttemptPrefix(generation, attempt) + "outcomes/" + std::to_string(round) + "/" + std::to_string(shard);
     }
 
     /// Prefix that covers every root-shard manifest and namespace file (GC round discovery).
@@ -177,26 +212,6 @@ public:
     /// Prefixes that cover every content object of one kind (raw object listing for fsck).
     String blobsPrefix() const { return prefix + "/blobs/"; }
     String treesPrefix() const { return prefix + "/trees/"; }
-
-    /// Retired-set key: <prefix>/gc/retired/<round>.<fence_seq>/<shard>
-    String retiredKey(uint64_t round, uint64_t fence_seq, uint64_t shard) const
-    {
-        return prefix + "/gc/retired/" + std::to_string(round) + "." + std::to_string(fence_seq)
-               + "/" + std::to_string(shard);
-    }
-
-    /// Prefix that covers all retired-set objects (for list).
-    String gcRetiredPrefix() const
-    {
-        return prefix + "/gc/retired/";
-    }
-
-    /// Outcomes key: <prefix>/gc/outcomes/<round>.<fence_seq>/<shard>
-    String outcomesKey(uint64_t round, uint64_t fence_seq, uint64_t shard) const
-    {
-        return prefix + "/gc/outcomes/" + std::to_string(round) + "." + std::to_string(fence_seq)
-               + "/" + std::to_string(shard);
-    }
 
     /// Checkpoint key: <prefix>/gc/checkpoint/<version>
     String checkpointKey(uint64_t version) const

@@ -37,13 +37,23 @@ void RetireView::refresh()
     /// internally coherent and honestly labeled with the round it observed, and a gate needing a
     /// newer round simply refreshes again; there is deliberately no monotonicity guard.
     uint64_t new_round = 0;
+    uint64_t snap_generation = 0;
+    uint64_t snap_attempt = 0;
     if (auto state_object = backend->get(layout.gcStateKey()))
-        new_round = decodeGcState(state_object->bytes).round;
+    {
+        const GcState state = decodeGcState(state_object->bytes);
+        new_round = state.round;
+        snap_generation = state.snap_generation;
+        snap_attempt = state.snap_attempt;
+    }
     /// ABSENT gc/state => round 0: a pool GC never touched.
 
     std::map<std::pair<uint8_t, UInt128>, std::vector<Token>> new_condemned;
 
-    const String prefix = layout.gcRetiredPrefix();
+    /// Task 3: retired sets are attempt-scoped under the adopted (snap_generation, snap_attempt). LIST
+    /// only that attempt's retired namespace so an unadopted (deposed-leader) retired set is invisible to
+    /// the writer publish gate. (Task 7 refines round/generation coherence; minimal compile-correct here.)
+    const String prefix = layout.gcGenAttemptRetiredPrefix(snap_generation, snap_attempt);
     String cursor;
     while (true)
     {

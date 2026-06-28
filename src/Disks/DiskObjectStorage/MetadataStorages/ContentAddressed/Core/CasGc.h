@@ -287,7 +287,7 @@ private:
     /// Write the part-manifest cleanup bundle(s) for one fold generation: a write-once record listing
     /// every owner-removed (ManifestId, token) whose body delete is deferred to recheck. Keyed by
     /// owner_shard (one bundle for gc_shards==1). Appends the produced RunRefs to `out`.
-    void writePartManifestCleanupBundle(uint64_t generation, uint64_t owner_shard,
+    void writePartManifestCleanupBundle(uint64_t generation, uint64_t attempt, uint64_t owner_shard,
                                         const std::map<ManifestId, Token> & cleanup, std::vector<RunRef> & out);
 
     /// B9 retention: prune the per-generation GC objects (fold seal, completion seal, blob-target runs,
@@ -295,19 +295,19 @@ private:
     /// (`adopted_generation - gc_snap_generations_to_keep`), walking forward from `next.snap_pruned_through`
     /// (bounded per round) and folding the advanced cursor into `next` (persisted by the round-commit CAS).
     /// keep==0 prunes nothing (keep-all forensics mode). Never throws on a 404 (record-and-continue).
-    void pruneSupersededGenerations(uint64_t adopted_generation, GcState & next);
+    void pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next);
 
-    /// Read the fold seal for `generation` (nullopt when absent). Used by resume + parent-cursor reads.
-    std::optional<CasFoldSeal> readFoldSeal(uint64_t generation);
+    /// Read the fold seal for (generation, attempt) (nullopt when absent). Used by resume + parent-cursor reads.
+    std::optional<CasFoldSeal> readFoldSeal(uint64_t generation, uint64_t attempt);
 
-    /// Read the completion seal for `generation` (nullopt when absent).
-    std::optional<CasCompletionSeal> readCompletionSeal(uint64_t generation);
+    /// Read the completion seal for (generation, attempt) (nullopt when absent).
+    std::optional<CasCompletionSeal> readCompletionSeal(uint64_t generation, uint64_t attempt);
 
     /// M1: the per-(ns,shard) fold cursor coverage as of `generation`, read from the LATEST seal there
     /// (completion seal's folded_cursors if the round finished, else the fold seal's per_ns_shard, else
     /// empty). This is what the next fold keys its parent cursor off — recovered with NO dependence on
     /// trim having run, so a folded-but-untrimmed event is never re-folded from 0 (no in-degree double-count).
-    std::map<String, ShardCoverage> readSealedCursors(uint64_t generation);
+    std::map<String, ShardCoverage> readSealedCursors(uint64_t generation, uint64_t attempt);
 
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);

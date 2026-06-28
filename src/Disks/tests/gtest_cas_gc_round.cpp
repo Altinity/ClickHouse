@@ -752,17 +752,17 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
     /// Every generation at or below the floor is fully gone (fold seal + completion seal absent).
     for (uint64_t g = 1; g <= floor; ++g)
     {
-        EXPECT_FALSE(backend->head(store->layout().foldSealKey(g)).exists)
+        EXPECT_FALSE(backend->head(store->layout().foldSealKey(g, st.snap_attempt)).exists)
             << "fold seal of pruned generation " << g << " must be gone";
-        EXPECT_FALSE(backend->head(store->layout().completionSealKey(g)).exists)
+        EXPECT_FALSE(backend->head(store->layout().completionSealKey(g, st.snap_attempt)).exists)
             << "completion seal of pruned generation " << g << " must be gone";
-        EXPECT_FALSE(backend->head(store->layout().blobTargetRunKey(g, /*shard*/0, /*seq*/0)).exists)
+        EXPECT_FALSE(backend->head(store->layout().blobTargetRunKey(g, st.snap_attempt, /*shard*/0, /*seq*/0)).exists)
             << "blob-target run of pruned generation " << g << " must be gone";
     }
 
     /// The latest seal at the current generation survives (the live in-degree view).
-    EXPECT_TRUE(backend->head(store->layout().completionSealKey(st.snap_generation)).exists
-                || backend->head(store->layout().foldSealKey(st.snap_generation)).exists)
+    EXPECT_TRUE(backend->head(store->layout().completionSealKey(st.snap_generation, st.snap_attempt)).exists
+                || backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists)
         << "the current generation's seal must NOT be pruned";
 
     /// No-loss: the live blob and owner body are intact throughout retention pruning.
@@ -822,7 +822,7 @@ TEST(CasGcRound, LazyTrimSkipsSmallJournalAndKeepsTokenStable)
     /// of the shard object — i.e., trim did NOT mutate the shard and bump its token.
     /// Read the completion seal's per-shard folded_token for the shard.
     const GcState st = readState(*backend, *store);
-    const auto completion = backend->get(store->layout().completionSealKey(st.snap_generation));
+    const auto completion = backend->get(store->layout().completionSealKey(st.snap_generation, st.snap_attempt));
     ASSERT_TRUE(completion.has_value()) << "completion seal must exist after a successful round";
     const CasCompletionSeal seal = decodeCompletionSeal(completion->bytes);
     const String ck = cursorKeyForTest(ns, 0);
@@ -1017,7 +1017,7 @@ TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
 
     /// Every fold seal from generation 1 up to the current one remains.
     for (uint64_t g = 1; g <= st.snap_generation; ++g)
-        EXPECT_TRUE(backend->head(store->layout().foldSealKey(g)).exists
-                    || backend->head(store->layout().completionSealKey(g)).exists)
+        EXPECT_TRUE(backend->head(store->layout().foldSealKey(g, st.snap_attempt)).exists
+                    || backend->head(store->layout().completionSealKey(g, st.snap_attempt)).exists)
             << "keep==0: seal of generation " << g << " must remain";
 }

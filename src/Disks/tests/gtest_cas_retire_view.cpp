@@ -11,9 +11,10 @@
 
 using namespace DB::Cas;
 
-/// RetireView tests inject GC state by writing the gc/state and gc/retired/ objects directly:
-/// that is the documented on-storage interface between GC and the writer (spec §5), not a
-/// white-box shortcut.
+/// RetireView tests inject GC state by writing gc/state and the attempt-scoped retired objects
+/// directly: that is the documented on-storage interface between GC and the writer (spec §5), not a
+/// white-box shortcut. The minimal injected gc/state has snap_generation == snap_attempt == 0, so the
+/// retired sets are written under retiredKey(0, 0, round, shard) — exactly the prefix RetireView LISTs.
 
 TEST(CasRetireView, EmptyPoolIsRoundZero)
 {
@@ -33,7 +34,7 @@ TEST(CasRetireView, SeesInjectedRetirements)
     RetiredSet rs;
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
     rs.entries.push_back({ObjectKind::Blob, h, Token{"3", TokenType::Emulated}, 10});
-    b->putIfAbsent(layout.retiredKey(2, 1, 0), encodeRetiredSet(rs));
+    b->putIfAbsent(layout.retiredKey(0, 0, 2, 0), encodeRetiredSet(rs));
     RetireView v(b, layout);
     v.refresh();
     EXPECT_EQ(v.round(), 2u);
@@ -52,7 +53,7 @@ TEST(CasRetireView, RefreshDropsRewrittenEntries)
     RetiredSet rs;
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
     rs.entries.push_back({ObjectKind::Blob, h, Token{"3", TokenType::Emulated}, 10});
-    b->putIfAbsent(layout.retiredKey(2, 1, 0), encodeRetiredSet(rs));
+    b->putIfAbsent(layout.retiredKey(0, 0, 2, 0), encodeRetiredSet(rs));
 
     RetireView v(b, layout);
     v.refresh();
@@ -62,9 +63,9 @@ TEST(CasRetireView, RefreshDropsRewrittenEntries)
     /// GC "drops" the entry by rewriting the retired object WITHOUT it, and bumps gc/state.
     /// Reading current storage state IS the protocol's view.
     {
-        auto head = b->head(layout.retiredKey(2, 1, 0));
+        auto head = b->head(layout.retiredKey(0, 0, 2, 0));
         ASSERT_TRUE(head.exists);
-        ASSERT_EQ(b->putOverwrite(layout.retiredKey(2, 1, 0), encodeRetiredSet(RetiredSet{}), head.token).outcome,
+        ASSERT_EQ(b->putOverwrite(layout.retiredKey(0, 0, 2, 0), encodeRetiredSet(RetiredSet{}), head.token).outcome,
                   PutOutcome::Done);
     }
     {
@@ -91,12 +92,12 @@ TEST(CasRetireView, MultipleRoundsUnion)
     {
         RetiredSet rs;
         rs.entries.push_back({ObjectKind::Blob, h, Token{"7", TokenType::Emulated}, 10});
-        b->putIfAbsent(layout.retiredKey(1, 1, 0), encodeRetiredSet(rs));
+        b->putIfAbsent(layout.retiredKey(0, 0, 1, 0), encodeRetiredSet(rs));
     }
     {
         RetiredSet rs;
         rs.entries.push_back({ObjectKind::Blob, h, Token{"9", TokenType::Emulated}, 10});
-        b->putIfAbsent(layout.retiredKey(2, 1, 3), encodeRetiredSet(rs));
+        b->putIfAbsent(layout.retiredKey(0, 0, 2, 3), encodeRetiredSet(rs));
     }
 
     RetireView v(b, layout);
@@ -134,9 +135,9 @@ TEST(CasRetireView, PaginationCoversManyObjects)
     Layout layout("p");
     b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(5, 1));
 
-    /// Five retired objects under gc/retired/, each condemning a distinct hash. The view must
-    /// union ALL of them; with the clamped page size the union completes only if the cursor loop
-    /// is correct.
+    /// Five retired objects under the adopted attempt's retired prefix, each condemning a distinct
+    /// hash. The view must union ALL of them; with the clamped page size the union completes only if
+    /// the cursor loop is correct.
     std::vector<UInt128> hashes;
     for (uint64_t i = 0; i < 5; ++i)
     {
@@ -144,7 +145,7 @@ TEST(CasRetireView, PaginationCoversManyObjects)
         hashes.push_back(h);
         RetiredSet rs;
         rs.entries.push_back({ObjectKind::Tree, h, Token{std::to_string(100 + i), TokenType::Emulated}, i});
-        b->putIfAbsent(layout.retiredKey(i + 1, 1, i), encodeRetiredSet(rs));
+        b->putIfAbsent(layout.retiredKey(0, 0, i + 1, i), encodeRetiredSet(rs));
     }
 
     RetireView v(b, layout);
@@ -167,7 +168,7 @@ TEST(CasRetireView, IsCondemnedTokenIdentity)
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
     RetiredSet rs;
     rs.entries.push_back({ObjectKind::Blob, h, Token{"3", TokenType::Emulated}, 10});
-    b->putIfAbsent(layout.retiredKey(1, 1, 0), encodeRetiredSet(rs));
+    b->putIfAbsent(layout.retiredKey(0, 0, 1, 0), encodeRetiredSet(rs));
 
     RetireView v(b, layout);
     v.refresh();

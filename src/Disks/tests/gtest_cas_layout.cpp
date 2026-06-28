@@ -11,8 +11,8 @@ TEST(CasLayout, KeyShapes)
     EXPECT_EQ(l.blobKey(BlobId{"00aabb"}), "p/blobs/00/00aabb");
     EXPECT_EQ(l.treeKey(TreeId{"ffee01"}), "p/trees/ff/ffee01");
     EXPECT_EQ(l.gcStateKey(), "p/gc/state");
-    EXPECT_EQ(l.retiredKey(4, 9, 1), "p/gc/retired/4.9/1");
-    EXPECT_EQ(l.outcomesKey(4, 9, 1), "p/gc/outcomes/4.9/1");
+    EXPECT_EQ(l.retiredKey(4, 42, 7, 1), "p/gc/gen/4/attempt/42/retired/7/1");
+    EXPECT_EQ(l.outcomesKey(4, 42, 7, 1), "p/gc/gen/4/attempt/42/outcomes/7/1");
     EXPECT_EQ(l.checkpointKey(12), "p/gc/checkpoint/12");
     EXPECT_EQ(l.poolMetaKey(), "p/_pool_meta");
 }
@@ -25,7 +25,6 @@ TEST(CasLayout, RootNamespaceKeys)
     EXPECT_EQ(l.rootNamespacePrefix(ns), "p/roots/srv1/3f2e-uuid/");
     EXPECT_EQ(l.namespaceFileKey(ns, "format_version.txt"), "p/roots/srv1/3f2e-uuid/_files/format_version.txt");
     EXPECT_EQ(l.namespaceFilesPrefix(ns), "p/roots/srv1/3f2e-uuid/_files/");
-    EXPECT_EQ(l.gcRetiredPrefix(), "p/gc/retired/");
 }
 
 TEST(CasLayout, RootNamespaceValidation)
@@ -56,11 +55,26 @@ TEST(CasLayout, GenerationAndRootsKeys)
 {
     Layout l("p");
     /// rev. 15: gc/snap is gone; generations carry write-once seals + blob-target / cleanup runs.
-    EXPECT_EQ(l.foldSealKey(12), "p/gc/gen/12/fold_seal");
-    EXPECT_EQ(l.completionSealKey(12), "p/gc/gen/12/completion_seal");
-    EXPECT_EQ(l.blobTargetRunKey(12, 0, 0), "p/gc/gen/12/blob_target/0/0");
-    EXPECT_EQ(l.partManifestCleanupKey(12, 0, 0), "p/gc/gen/12/part_manifest_cleanup/0/0");
+    /// rev. 16: every per-round artifact is attempt-scoped under gc/gen/<gen>/attempt/<attempt>/.
+    EXPECT_EQ(l.foldSealKey(12, 0), "p/gc/gen/12/attempt/0/fold_seal");
+    EXPECT_EQ(l.completionSealKey(12, 0), "p/gc/gen/12/attempt/0/completion_seal");
+    EXPECT_EQ(l.blobTargetRunKey(12, 0, 0, 0), "p/gc/gen/12/attempt/0/blob_target/0/0");
+    EXPECT_EQ(l.partManifestCleanupKey(12, 0, 0, 0), "p/gc/gen/12/attempt/0/part_manifest_cleanup/0/0");
     EXPECT_EQ(l.rootsPrefix(), "p/roots/");
+}
+
+TEST(CasLayout, AttemptScopedGenKeys)
+{
+    DB::Cas::Layout layout("p");
+    EXPECT_EQ(layout.foldSealKey(4, 42), "p/gc/gen/4/attempt/42/fold_seal");
+    EXPECT_EQ(layout.completionSealKey(5, 42), "p/gc/gen/5/attempt/42/completion_seal");
+    EXPECT_EQ(layout.blobTargetRunKey(4, 42, 3, 0), "p/gc/gen/4/attempt/42/blob_target/3/0");
+    EXPECT_EQ(layout.partManifestCleanupKey(4, 42, 0, 1), "p/gc/gen/4/attempt/42/part_manifest_cleanup/0/1");
+    EXPECT_EQ(layout.retiredKey(4, 42, 7, 3), "p/gc/gen/4/attempt/42/retired/7/3");
+    EXPECT_EQ(layout.outcomesKey(5, 42, 7, 3), "p/gc/gen/5/attempt/42/outcomes/7/3");
+    EXPECT_EQ(layout.gcGenPrefix(4), "p/gc/gen/4/");
+    EXPECT_EQ(layout.gcGenAttemptPrefix(4, 42), "p/gc/gen/4/attempt/42/");
+    EXPECT_EQ(layout.gcGenAttemptRetiredPrefix(4, 42), "p/gc/gen/4/attempt/42/retired/");
 }
 
 TEST(CasLayout, ShortIdThrows)

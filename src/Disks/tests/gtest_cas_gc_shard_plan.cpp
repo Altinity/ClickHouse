@@ -236,9 +236,9 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
     EXPECT_TRUE(r1.owns(b2)) << "r1 must own b2";
     EXPECT_FALSE(r1.owns(b1)) << "r1 must not own b1";
 
-    const auto runs0 = r0.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1,
+    const auto runs0 = r0.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1, /*attempt=*/0,
                                  std::move(buckets[0]));
-    const auto runs1 = r1.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1,
+    const auto runs1 = r1.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1, /*attempt=*/0,
                                  std::move(buckets[1]));
 
     ASSERT_EQ(runs0.size(), 1u) << "shard-0 reduce must produce exactly one RunRef";
@@ -248,15 +248,15 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
     EXPECT_NE(runs0[0].key, runs1[0].key) << "shard-0 and shard-1 run keys must be distinct";
 
     /// Read back in-degree from the sealed runs.
-    const int64_t indeg_b1 = inDegreeInGeneration(*backend, layout, 1, /*shard=*/0, b1);
-    const int64_t indeg_b2 = inDegreeInGeneration(*backend, layout, 1, /*shard=*/1, b2);
+    const int64_t indeg_b1 = inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/0, b1);
+    const int64_t indeg_b2 = inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/1, b2);
     EXPECT_EQ(indeg_b1, 1) << "b1 in-degree after reduce must be 1";
     EXPECT_EQ(indeg_b2, 1) << "b2 in-degree after reduce must be 1";
 
     /// Cross-shard reads: shard-0's run must not contain b2; shard-1's run must not contain b1.
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/0, b2), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/0, b2), 0)
         << "shard-0 run must not mention b2";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/1, b1), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/1, b1), 0)
         << "shard-1 run must not mention b1";
 }
 
@@ -423,17 +423,17 @@ TEST(CasGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
     for (uint64_t shard = 0; shard < kGcShards; ++shard)
     {
         ShardReducer reducer{shard, kGcShards};
-        reducer.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1,
+        reducer.reduce(*backend, layout, /*prior_generation=*/0, /*new_generation=*/1, /*attempt=*/0,
                        std::move(buckets[shard]));
     }
 
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/0, b0), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/0, b0), 1)
         << "b0 must fold into shard-0 with in-degree 1";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/1, b1), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/1, b1), 1)
         << "b1 must fold into shard-1 with in-degree 1";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/1, b0), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/1, b0), 0)
         << "b0 must NOT appear in shard-1's run";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*shard=*/0, b1), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/0, b1), 0)
         << "b1 must NOT appear in shard-0's run";
 }
 
@@ -519,9 +519,10 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
         /// generation is snap_generation - 1 for the first full round. Use inDegreeOf (which reads
         /// currentGenerationOf = completion generation) for the final in-degrees.
         const uint64_t gen = currentGenerationOf(*backend, layout);
-        const int64_t iA = inDegreeInGeneration(*backend, layout, gen, /*shard=*/0, hA);
-        const int64_t iB = inDegreeInGeneration(*backend, layout, gen, /*shard=*/0, hB);
-        const int64_t iC = inDegreeInGeneration(*backend, layout, gen, /*shard=*/0, hC);
+        const uint64_t att = currentAttemptOf(*backend, layout);
+        const int64_t iA = inDegreeInGeneration(*backend, layout, gen, att, /*shard=*/0, hA);
+        const int64_t iB = inDegreeInGeneration(*backend, layout, gen, att, /*shard=*/0, hB);
+        const int64_t iC = inDegreeInGeneration(*backend, layout, gen, att, /*shard=*/0, hC);
         return {iA, iB, iC};
     };
 
@@ -568,6 +569,7 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
     constexpr uint64_t kGcShards = 2;
     constexpr uint64_t kPriorGen = 0;
     constexpr uint64_t kNewGen = 1;
+    constexpr uint64_t kAttempt = 0;
 
     /// b0 routes to shard 0, b1 routes to shard 1 (from makeTwoShardHashes).
     const auto [b0, b1] = makeTwoShardHashes();
@@ -600,41 +602,41 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
     /// (b) PRE-SEAL INVISIBILITY — drive both reducers before any coordinator action.
     ///
     /// Run shard-0 reducer (simulates the shard-0 replica's work).
-    const auto runs0 = r0.reduce(*backend, layout, kPriorGen, kNewGen, std::move(bucket0));
+    const auto runs0 = r0.reduce(*backend, layout, kPriorGen, kNewGen, kAttempt, std::move(bucket0));
     ASSERT_FALSE(runs0.empty()) << "shard-0 reducer must produce at least one RunRef";
 
     /// After shard-0 reduce, the completion seal must NOT exist.
-    EXPECT_FALSE(backend->head(layout.completionSealKey(kNewGen)).exists)
+    EXPECT_FALSE(backend->head(layout.completionSealKey(kNewGen, kAttempt)).exists)
         << "CasCompletionSeal must be absent after shard-0 reduce (pre-seal state)";
 
     /// Run shard-1 reducer (simulates the shard-1 replica's work, interleaved from the test thread).
-    const auto runs1 = r1.reduce(*backend, layout, kPriorGen, kNewGen, std::move(bucket1));
+    const auto runs1 = r1.reduce(*backend, layout, kPriorGen, kNewGen, kAttempt, std::move(bucket1));
     ASSERT_FALSE(runs1.empty()) << "shard-1 reducer must produce at least one RunRef";
 
     /// After BOTH reducers have finished, the completion seal still must NOT exist.
     /// This is the pre-seal invariant: products are present on the backend but not yet adoptable.
-    EXPECT_FALSE(backend->head(layout.completionSealKey(kNewGen)).exists)
+    EXPECT_FALSE(backend->head(layout.completionSealKey(kNewGen, kAttempt)).exists)
         << "CasCompletionSeal must be absent after BOTH reducers finish (pre-seal: no coordinator seal yet)";
 
     /// The blob-target runs for both shards are durably present (the reducer's write-once
     /// `putIfAbsent`). The runs are readable but NOT yet covered by an adoptable completion seal.
-    EXPECT_TRUE(backend->head(layout.blobTargetRunKey(kNewGen, /*shard=*/0, /*seq=*/0)).exists)
+    EXPECT_TRUE(backend->head(layout.blobTargetRunKey(kNewGen, kAttempt, /*shard=*/0, /*seq=*/0)).exists)
         << "shard-0 blob-target run must be durably written by r0.reduce";
-    EXPECT_TRUE(backend->head(layout.blobTargetRunKey(kNewGen, /*shard=*/1, /*seq=*/0)).exists)
+    EXPECT_TRUE(backend->head(layout.blobTargetRunKey(kNewGen, kAttempt, /*shard=*/1, /*seq=*/0)).exists)
         << "shard-1 blob-target run must be durably written by r1.reduce";
 
     /// In-degrees are already correct in the per-shard runs — the completion seal is the
     /// generation-ADOPTION gate for higher-level consumers, not the validity gate for raw
     /// `inDegreeInGeneration` reads. Verify the raw values are present and correct pre-seal
     /// (they must remain unchanged post-seal).
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, /*shard=*/0, b0), 2)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/0, b0), 2)
         << "b0 in-degree must be 2 in shard-0 run even before completion seal";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, /*shard=*/1, b1), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/1, b1), 1)
         << "b1 in-degree must be 1 in shard-1 run even before completion seal";
     /// Cross-shard: each blob must be absent from the other shard's run.
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, /*shard=*/0, b1), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/0, b1), 0)
         << "b1 must NOT appear in shard-0's run (cross-shard disjointness)";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, /*shard=*/1, b0), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/1, b0), 0)
         << "b0 must NOT appear in shard-1's run (cross-shard disjointness)";
 
     /// (c) POST-SEAL MERGE — the coordinator writes a single `CasCompletionSeal` (adoptable=true).
@@ -650,7 +652,7 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
     for (const RunRef & r : runs1)
         completion.blob_target_runs.push_back(r);
 
-    const String completion_key = layout.completionSealKey(kNewGen);
+    const String completion_key = layout.completionSealKey(kNewGen, kAttempt);
     backend->putIfAbsent(completion_key, encodeCompletionSeal(completion));
 
     /// Post-seal: the completion seal now exists and is adoptable.
@@ -666,12 +668,12 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
     EXPECT_EQ(decoded.generation, kNewGen);
 
     /// Post-seal: merged in-degrees across both shards equal the expected edge multiset.
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, /*shard=*/0, b0), 2)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/0, b0), 2)
         << "post-seal: b0 in-degree must be 2 (shard 0)";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, /*shard=*/1, b1), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/1, b1), 1)
         << "post-seal: b1 in-degree must be 1 (shard 1)";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, /*shard=*/0, b1), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/0, b1), 0)
         << "post-seal: b1 must remain absent from shard-0 post-seal";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, /*shard=*/1, b0), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/1, b0), 0)
         << "post-seal: b0 must remain absent from shard-1 post-seal";
 }
