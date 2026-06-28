@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 
 #include <chrono>
+#include <string>
 
 using namespace DB::Cas;
 
@@ -198,4 +199,87 @@ TEST(CasMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
     const uint64_t e2 = s2->writerEpoch();
     EXPECT_GT(e2, e1);
+}
+
+TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+
+    /// Server A claims the pool (writable): owner = uuid(1), a durable epoch + a live mount lease.
+    auto a = Store::open(b, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+
+    /// Capture the control objects BEFORE the read-only open so we can prove it mutated nothing.
+    const auto owner_before = b->get(l.ownerKey("r"));
+    const auto mount_before = b->get(l.mountKey("r"));
+    const auto epoch_before = b->get(l.epochKey("r"));
+    ASSERT_TRUE(owner_before.has_value());
+    ASSERT_TRUE(mount_before.has_value());
+    ASSERT_TRUE(epoch_before.has_value());
+
+    /// A READ-ONLY observer with a DIFFERENT server_id on the SAME backend/server_root_id must NOT
+    /// throw — a read-only mount never participates in the owner/epoch/mount protocol, so a pool
+    /// owned by another server_uuid is freely observable.
+    StorePtr ro;
+    EXPECT_NO_THROW(
+        ro = Store::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(2), .server_root_id = "r",
+            .root_shards = 1, .read_only = true}));
+    EXPECT_NE(ro, nullptr);
+
+    /// And it mutated nothing: owner still decodes to A's uuid, the mount body is still A's, and the
+    /// raw bytes of owner/epoch/mount are byte-for-byte unchanged (no second owner, no re-claim).
+    const auto owner_after = b->get(l.ownerKey("r"));
+    const auto mount_after = b->get(l.mountKey("r"));
+    const auto epoch_after = b->get(l.epochKey("r"));
+    ASSERT_TRUE(owner_after.has_value());
+    ASSERT_TRUE(mount_after.has_value());
+    ASSERT_TRUE(epoch_after.has_value());
+
+    EXPECT_EQ(decodeOwner(owner_after->bytes).server_uuid, UInt128(1));
+    EXPECT_EQ(decodeMountLease(mount_after->bytes).server_uuid, UInt128(1));
+
+    EXPECT_EQ(owner_after->bytes, owner_before->bytes);
+    EXPECT_EQ(mount_after->bytes, mount_before->bytes);
+    EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
+}
+
+TEST(CasMountStartup, LiveDoubleStartErrorTextHasRemediation)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// Server A opens writable and KEEPS its Store alive so its mount lease stays LIVE (the default
+    /// TTL is 30s; the background renewer is off but the claimed mount's expires_at_ms is now+TTL).
+    auto a = Store::open(b, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+    ASSERT_NE(a, nullptr);
+
+    /// A SECOND writable open with the SAME (server_id, server_root_id): the owner gate passes (same
+    /// uuid), allocateWriterEpoch hands out a NEW epoch e2 != e1, so claimMount observes a same-uuid /
+    /// different-epoch / LIVE mount → LiveDoubleStart → throws ABORTED with the actionable text.
+    bool threw = false;
+    try
+    {
+        auto a2 = Store::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+        FAIL() << "second live open of the same (uuid, server_root_id) must throw";
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        const std::string msg = e.message();
+        /// Identity / existing-holder fields.
+        EXPECT_NE(msg.find("server_root_id"), std::string::npos);
+        EXPECT_NE(msg.find("'r'"), std::string::npos);
+        EXPECT_NE(msg.find("hostname="), std::string::npos);
+        EXPECT_NE(msg.find("pid="), std::string::npos);
+        EXPECT_NE(msg.find("last_seq="), std::string::npos);
+        EXPECT_NE(msg.find("expires_at_ms="), std::string::npos);
+        /// The three remediation lines (spec §mount-safety).
+        EXPECT_NE(msg.find("configure a unique"), std::string::npos);
+        EXPECT_NE(msg.find("mount lease expires"), std::string::npos);
+        EXPECT_NE(msg.find("stale"), std::string::npos);
+    }
+    EXPECT_TRUE(threw);
 }
