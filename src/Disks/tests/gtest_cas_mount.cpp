@@ -86,6 +86,7 @@ TEST(CasServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
     claimOwnerOrThrow(*b, l, "r", UInt128(1));
     const uint64_t e1 = allocateWriterEpoch(*b, l, "r");
     const uint64_t e2 = allocateWriterEpoch(*b, l, "r");
+    EXPECT_GE(e1, 1u);                                             // 0 is a reserved sentinel
     EXPECT_GT(e2, e1);                                             // strictly increasing
 
     /// Deleting the (separate) mount object must NOT reset the epoch. No mount has been written in

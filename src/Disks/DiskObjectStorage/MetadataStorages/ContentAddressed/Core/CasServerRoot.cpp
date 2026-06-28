@@ -235,7 +235,11 @@ uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid)
                     "CAS server-root '{}' has no durable epoch object but its data subtree is "
                     "non-empty (writer_epoch reset hazard) — refusing to proceed",
                     srid);
-            /// Fresh empty root: the first epoch handed out is 0.
+            /// Fresh empty root: reserve 0 as a sentinel (0 means "no epoch", UINT64_MAX is the
+            /// retired sentinel), so the first epoch handed out is 1 — matching the random
+            /// `process_epoch` draw (CasStore.cpp re-draws on 0) and the TLA+ model (first
+            /// AllocEpoch makes epoch=1).
+            current.next_writer_epoch = 1;
         }
 
         const uint64_t next = current.next_writer_epoch;
