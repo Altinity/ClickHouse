@@ -313,7 +313,7 @@ TEST(CasGcDiscovery, FailsClosedToReadWhenTokensUnobservable)
 
     auto no_list_backend = std::make_shared<NoListWrapper>(*real_backend);
     auto no_list_store = Store::open(
-        no_list_backend, PoolConfig{.pool_prefix = "p", .root_shards = 1});
+        no_list_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
     Gc gc_no_list(no_list_store, kGcDiscovery);
 
     const auto decisions = gc_no_list.discoverDecisionsForTest();
@@ -438,7 +438,7 @@ TEST(CasGcDiscovery, FailsClosedToReadWhenListKeyAmbiguous)
 
     auto dup_backend = std::make_shared<DuplicateListBackend>(*real_backend, shard_full_key);
     auto dup_store = Store::open(
-        dup_backend, PoolConfig{.pool_prefix = "p", .root_shards = 1});
+        dup_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
     Gc gc_dup(dup_store, kGcDiscovery);
 
     /// The GC on the duplicate-yielding backend should see the shard key as ambiguous and fall back

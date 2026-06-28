@@ -65,7 +65,7 @@ ManifestId publishPart(const StorePtr & s, const String & ns, const String & ref
 TEST(CasGcLog, EmitsStartFinishWithCounts)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p"});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
 
     /// Publish a part, then drop it so its blob/tree become collectable.
@@ -175,7 +175,7 @@ public:
 TEST(CasGcLog, AbortedFinishOnThrowingRound)
 {
     auto backend = std::make_shared<ThrowingBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p"});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     std::vector<Rec> rows;
     DB::ContentAddressed::CasGcScheduler sched(

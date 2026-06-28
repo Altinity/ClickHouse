@@ -51,10 +51,10 @@ TEST(CasProbe, ConcurrentMountsDoNotCollide)
 
     /// A real (second) mount over the same shared pool must still succeed — its probe runs under a
     /// fresh per-mount-unique prefix and never touches the seeded fixed key.
-    EXPECT_NO_THROW(Store::open(b, PoolConfig{.pool_prefix = "p"}));
+    EXPECT_NO_THROW(Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
 
     /// And two genuinely-concurrent mounts (distinct unique prefixes) both succeed over one backend.
-    EXPECT_NO_THROW(Store::open(b, PoolConfig{.pool_prefix = "p"}));
+    EXPECT_NO_THROW(Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
 
     /// The seeded fixed-key artifact is untouched (the probe never collided with it).
     EXPECT_TRUE(b->get("p/_probe/token").has_value());

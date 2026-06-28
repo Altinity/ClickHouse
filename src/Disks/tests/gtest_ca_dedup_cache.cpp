@@ -44,7 +44,7 @@ private:
 
 PoolConfig cfg(uint64_t cache_bytes, uint64_t head_first_min_bytes)
 {
-    PoolConfig c{.pool_prefix = "p"};
+    PoolConfig c{.pool_prefix = "p", .server_root_id = "test"};
     c.dedup_cache_bytes = cache_bytes;
     c.dedup_head_first_min_bytes = head_first_min_bytes;
     return c;

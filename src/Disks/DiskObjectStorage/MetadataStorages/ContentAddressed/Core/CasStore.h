@@ -28,7 +28,11 @@ namespace DB::Cas
 struct PoolConfig
 {
     String pool_prefix;
-    UInt128 server_id{};                      /// provenance + watermark
+    UInt128 server_id{};                      /// owner token (ServerUUID) — provenance + watermark
+    /// Explicit, configured identity of the layout subtree this server owns (spec §mount-safety,
+    /// Phase 0). Required + validated (clean relative path); `ServerUUID`/`server_id` is demoted to an
+    /// owner token. Validated via `Cas::validateServerRootId`.
+    String server_root_id;
     uint64_t root_shards = 8;                 /// creation-time only; pool is authoritative on reopen
     uint64_t blob_header_len = 256;           /// creation-time only; ditto
     /// P1 (dedup cache): byte ceiling for the per-disk known-present blob-hash LRU set. 0 disables the

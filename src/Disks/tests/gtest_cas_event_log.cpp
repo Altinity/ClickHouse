@@ -33,7 +33,7 @@ TEST(CasEvent, ConstructAndCopyAndName)
 TEST(CasEvent, StoreEmitsToSink)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     std::vector<CasEvent> seen;
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
     CasEvent e;
@@ -100,7 +100,7 @@ bool hasType(const std::vector<CasEvent> & events, CasEventType t)
 TEST(CasEvent, LifecycleReconstructionFromRows)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     std::vector<CasEvent> events;
     std::mutex events_mutex;

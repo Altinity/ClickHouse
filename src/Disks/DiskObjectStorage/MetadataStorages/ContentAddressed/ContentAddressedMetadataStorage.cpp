@@ -141,6 +141,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     ObjectStoragePtr object_storage_,
     String storage_path_prefix_,
     String server_id_,
+    String server_root_id_,
     String local_scratch_path_,
     ContextPtr context_,
     bool gc_enabled_,
@@ -155,6 +156,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
     , server_id(std::move(server_id_))
+    , server_root_id(std::move(server_root_id_))
     , disk_name(!disk_name_.empty() ? disk_name_ : storage_path_prefix)
     , local_scratch_path(std::move(local_scratch_path_))
     , context(context_)
@@ -356,6 +358,7 @@ void ContentAddressedMetadataStorage::startup()
     Cas::PoolConfig pool_config;
     pool_config.pool_prefix = pool_prefix;
     pool_config.server_id = serverIdToU128(server_id);
+    pool_config.server_root_id = server_root_id;
     pool_config.background_watermark = (context != nullptr) && !read_only;
     pool_config.read_only = read_only;
     /// Creation-time only (the pool is authoritative on reopen): widening the shard fanout spreads

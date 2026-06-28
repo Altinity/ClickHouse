@@ -333,14 +333,14 @@ TEST(CasStore, OpenFailsClosedOnNonEnforcingBackend)
     auto b = std::make_shared<InMemoryBackend>();
     b->setEnforceTokens(false);
     expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
-        [&] { Store::open(b, PoolConfig{.pool_prefix = "p"}); });   /// the probe error contract
+        [&] { Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });   /// the probe error contract
 }
 
 TEST(CasStore, OpenCreatesPoolMetaAndReopens)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s1 = Store::open(b, PoolConfig{.pool_prefix = "p"});
-    auto s2 = Store::open(b, PoolConfig{.pool_prefix = "p", .root_shards = 4});
+    auto s1 = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s2 = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 4});
     EXPECT_EQ(s2->poolMeta().root_shards, 8u);                      /// pool authoritative
     EXPECT_EQ(s1->poolMeta().pool_id, s2->poolMeta().pool_id);
 }
@@ -348,7 +348,7 @@ TEST(CasStore, OpenCreatesPoolMetaAndReopens)
 TEST(CasStore, OpenWithExplicitConstantsCreatesThem)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .root_shards = 4, .blob_header_len = 512});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 4, .blob_header_len = 512});
     EXPECT_EQ(s->poolMeta().root_shards, 4u);                       /// config applies at creation
     EXPECT_EQ(s->poolMeta().blob_header_len, 512u);
 }
@@ -356,7 +356,7 @@ TEST(CasStore, OpenWithExplicitConstantsCreatesThem)
 TEST(CasStore, VerbatimFilesLifecycle)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
     s->putNamespaceFile(ns, "format_version.txt", "1\n");
     s->putNamespaceFile(ns, "uuid.txt", "abc");
@@ -371,7 +371,7 @@ TEST(CasStore, VerbatimFilesLifecycle)
 TEST(CasStore, ListNamespaceFilesEmpty)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
     EXPECT_TRUE(s->listNamespaceFiles(ns).empty());
 }
@@ -384,7 +384,7 @@ TEST(CasStore, ListNamespaceFilesEmpty)
 TEST(CasStore, ResolveReturnsManifestId)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
 
     /// blob "hello world" + an inline file, published through the real Build write path.
@@ -439,7 +439,7 @@ TEST(CasStore, ResolveReturnsManifestId)
 TEST(CasStore, ReadManifestValidatesBodyAndFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
     Layout layout("p");
 
@@ -500,7 +500,7 @@ TEST(CasStore, ReadManifestValidatesBodyAndFailsClosed)
 TEST(CasStore, LookupAndListOverManifestEntries)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
 
     /// A multi-file/multi-directory part: top-level + a projection subdir.
@@ -543,7 +543,7 @@ TEST(CasStore, LookupAndListOverManifestEntries)
 TEST(CasStore, ManifestCacheIsKeyedByIdAndToken)
 {
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
     Layout layout("p");
 
@@ -591,7 +591,7 @@ TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
     /// mints a new token, so a subsequent resolve must observe the change (cache must NOT serve a
     /// stale decoded manifest). Without token invalidation this would still see the dropped ref.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
 
     publishPart(s, ns.string(), "part_1", "payload-1");
@@ -611,7 +611,7 @@ TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
 TEST(CasStore, ResolveAbsentRefAndAbsentNamespace)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
 
     /// A freshly-opened pool has no shard manifests: an absent shard is an empty manifest, so resolve
@@ -623,7 +623,7 @@ TEST(CasStore, ResolveAbsentRefAndAbsentNamespace)
 TEST(CasStore, ListRefsMergesAllShards)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
     const uint64_t shards = s->poolMeta().root_shards;
@@ -662,7 +662,7 @@ TEST(CasStore, ListRefsMergesAllShards)
 TEST(CasStore, ReadManifestFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     const RootNamespace ns{"srv1/tbl"};
 
@@ -688,7 +688,7 @@ TEST(CasStore, ReadManifestFailsClosed)
 TEST(CasStore, DropRefAppendsJournalAtomically)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
     const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
@@ -724,7 +724,7 @@ TEST(CasStore, DropRefAppendsJournalAtomically)
 TEST(CasStore, UpdateRefPayloadMutatesWithoutJournal)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
     const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
@@ -762,7 +762,7 @@ TEST(CasStore, UpdateRefPayloadMutatesWithoutJournal)
 TEST(CasStore, DropRefSurvivesCasConflict)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
     const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
@@ -791,7 +791,7 @@ TEST(CasStore, DropRefSurvivesCasConflict)
 TEST(CasStore, DropNamespaceTombstonesAndRemovesFiles)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
     const uint64_t shards = s->poolMeta().root_shards;
@@ -842,7 +842,7 @@ TEST(CasStore, ListNamespacesFromRegistry)
     /// listNamespaces = one registry GET filtered by prefix (the W-REGISTER universe, never LIST).
     /// The wiring uses it for directory-style enumeration of opaque namespace strings (M-W).
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     EXPECT_TRUE(s->listNamespaces("").empty());   /// fresh pool: no registry yet
 
@@ -989,7 +989,7 @@ TEST(CasStoreSingleFlight, ConcurrentResolvesCoalesceToOneHead)
     /// snapshot the counter afterwards and assert that exactly ONE more head() happens during
     /// the concurrent burst (the single-flight leader's shard HEAD).
     auto b = std::make_shared<GatedHeadBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     publishPart(s, "srv1/tbl", "part_1", "payload-1");
 
     /// Arm the gate: the NEXT head() call (the leader's shard HEAD) will block until release().
@@ -1026,7 +1026,7 @@ TEST(CasStoreDecodeTtl, WarmHitWithinTtlSkipsHead)
     using namespace DB::Cas;
     /// TTL of 60 s — easily satisfied in any test run.
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .shard_decode_cache_ttl_ms = std::chrono::milliseconds{60000}});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .shard_decode_cache_ttl_ms = std::chrono::milliseconds{60000}});
     publishPart(s, "srv1/tbl", "part_1", "payload-1");
 
     const RootNamespace ns{"srv1/tbl"};
@@ -1045,7 +1045,7 @@ TEST(CasStoreDecodeTtl, ForceFreshAlwaysHeads)
 {
     using namespace DB::Cas;
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .shard_decode_cache_ttl_ms = std::chrono::milliseconds{60000}});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .shard_decode_cache_ttl_ms = std::chrono::milliseconds{60000}});
     publishPart(s, "srv1/tbl", "part_1", "payload-1");
 
     const RootNamespace ns{"srv1/tbl"};
@@ -1062,7 +1062,7 @@ TEST(CasStoreDecodeTtl, ForceFreshAlwaysHeads)
 TEST(CasStore, MountpointObjectRoundTrip)
 {
     auto b = std::make_shared<DB::Cas::InMemoryBackend>();
-    auto store = DB::Cas::Store::open(b, DB::Cas::PoolConfig{.pool_prefix = "p"});
+    auto store = DB::Cas::Store::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const String key = "srv1/clickhouse_access_check_abc";
     EXPECT_FALSE(store->getMountpointObject(key).has_value());
     store->putMountpointObject(key, "probe-bytes");
@@ -1085,7 +1085,7 @@ TEST(CasStoreDecodeTtl, ConcurrentWriteDuringGetDoesNotPoisonStaleEntry)
     /// root_shards = 1: every ref maps to shard 0, so publishing part_2 invalidates the SAME shard
     /// the gated reader is decoding for part_1. TTL of 60 s — comfortably covers the test.
     auto s = Store::open(b, PoolConfig{
-        .pool_prefix = "p", .root_shards = 1, .shard_decode_cache_ttl_ms = std::chrono::milliseconds{60000}});
+        .pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .shard_decode_cache_ttl_ms = std::chrono::milliseconds{60000}});
 
     const std::string ns_str = "srv1/tbl";
     const RootNamespace ns{ns_str};
@@ -1119,7 +1119,7 @@ TEST(CasStore, ListMirroredChildren)
 {
     using namespace DB::Cas;
     auto b = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto store = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     /// Seed two shadow archives by writing a verbatim file into each (creates the prefix in S3).
     store->putNamespaceFile(RootNamespace{"shadow/bk1/store/3f2/3f2a-uuid@cas@"}, "x", "1");
     store->putNamespaceFile(RootNamespace{"shadow/bk2/store/3f2/3f2a-uuid@cas@"}, "x", "1");

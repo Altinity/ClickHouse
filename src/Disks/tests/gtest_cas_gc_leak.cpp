@@ -43,7 +43,7 @@ StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
     /// One root shard so the journal of a ref lives in a single, predictable shard (cursor keys "ns/0").
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .root_shards = 1});
+    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
 }
 
 /// Drive regular GC to a fixpoint. A round that only retired/fenced without deleting has not reached a

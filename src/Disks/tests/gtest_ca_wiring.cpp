@@ -184,7 +184,7 @@ DB::Cas::ManifestEntry wiringBlobEntry(const String & path, const String & paylo
 std::shared_ptr<DB::ContentAddressedMetadataStorage> openWiringStorage()
 {
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1",
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_wiring_scratch", nullptr);
     storage->startup();
     return storage;
@@ -278,7 +278,7 @@ TEST(CaWiringRead, BlobViewPlanRidesTheStandardPipeline)
     /// composes it.
     auto object_storage = DB::Cas::tests::makeLocalObjectStorageForTest();
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        object_storage, "pool", "srv1",
+        object_storage, "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_wiring_scratch", nullptr);
     storage->startup();
     publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
@@ -1222,7 +1222,7 @@ TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
 {
     auto faulty = makeFaultyStorageForTest();
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        faulty, "pool", "srv1", std::filesystem::temp_directory_path() / "ca_b122_scratch", nullptr);
+        faulty, "pool", "srv1", "test", std::filesystem::temp_directory_path() / "ca_b122_scratch", nullptr);
     storage->startup();
 
     /// Two parts in ONE transaction. The staging map is keyed by (ns, ref), so all_1_1_0 publishes
@@ -1259,7 +1259,7 @@ TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
         DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
     {
         auto w = std::make_shared<DB::ContentAddressedMetadataStorage>(
-            writable_os, "pool", "srv1", std::filesystem::temp_directory_path() / "ca_ro_scratch", nullptr);
+            writable_os, "pool", "srv1", "test", std::filesystem::temp_directory_path() / "ca_ro_scratch", nullptr);
         w->startup();
         auto tx = w->createTransaction();
         writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "ro-bytes");
@@ -1272,7 +1272,7 @@ TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
     /// Same server_id as the writer: live namespaces are server-scoped (liveNamespace prepends
     /// server_id), so an observe-only mount reads the same server's data — the WORM scenario.
     auto ro = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        ro_os, "pool", "srv1", std::filesystem::temp_directory_path() / "ca_ro_scratch2", nullptr);
+        ro_os, "pool", "srv1", "test", std::filesystem::temp_directory_path() / "ca_ro_scratch2", nullptr);
     ro->startup();   /// must NOT throw (probe skipped — a probe write would fail on a read-only os)
 
     EXPECT_TRUE(ro->isReadOnly());
@@ -1308,14 +1308,14 @@ TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)
 TEST(CaWiring, RootShardsConfigurable)
 {
     auto widened = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1",
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_wiring_rootshards", nullptr,
         /*gc_enabled=*/false, std::chrono::seconds(60), /*root_shards=*/4);
     widened->startup();
     EXPECT_EQ(widened->store()->poolMeta().root_shards, 4u);
 
     auto defaulted = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1",
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_wiring_rootshards_def", nullptr);
     defaulted->startup();
     EXPECT_EQ(defaulted->store()->poolMeta().root_shards, 8u);
@@ -1470,7 +1470,7 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("order");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1",
+        recording, "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_b188_order_scratch", nullptr);
     storage->startup();
 
@@ -1572,7 +1572,7 @@ TEST(CaWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("committed_adopt");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1",
+        recording, "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_b188_committed_adopt_scratch", nullptr);
     storage->startup();
 
@@ -1702,7 +1702,7 @@ TEST(CaWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("republish");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1",
+        recording, "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_b190_republish_scratch", nullptr);
     storage->startup();
 
@@ -1777,7 +1777,7 @@ TEST(CaWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
     /// Use a recording storage so we can verify no pre-precommit pool ops on own content.
     auto recording = makeRecordingStorageForTest("adopt_helper");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1",
+        recording, "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_b190_adopt_scratch", nullptr);
     storage->startup();
 
@@ -1853,7 +1853,7 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterUnlink)
 {
     auto recording = makeRecordingStorageForTest("b189_unlink");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1",
+        recording, "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_b189_unlink_scratch", nullptr);
     storage->startup();
 
@@ -1903,7 +1903,7 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
 {
     auto recording = makeRecordingStorageForTest("b189_replace");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1",
+        recording, "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_b189_replace_scratch", nullptr);
     storage->startup();
 

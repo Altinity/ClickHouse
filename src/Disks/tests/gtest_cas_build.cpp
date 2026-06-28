@@ -36,7 +36,7 @@ namespace
 
 StorePtr openStore(const std::shared_ptr<InMemoryBackend> & b)
 {
-    return Store::open(b, PoolConfig{.pool_prefix = "p"});
+    return Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// Start a build whose owning manifest namespace + final ref name are `ns`/`ref` (promote/stageManifest
@@ -171,6 +171,39 @@ TEST(CasBuild, PutBlobWrongSizeFailsClosed)
     EXPECT_FALSE(b->head(s->layout().blobKey(id)).exists);
 }
 
+/// The happy-path upload STREAMS the source directly into the put sink — it does NOT pre-materialize the
+/// whole blob into an in-memory String before the I/O. We assert this by counting `write_payload`
+/// invocations: a single fresh upload must invoke it EXACTLY ONCE (streamed straight into the sink). The
+/// previous implementation buffered the whole blob into a `String source_bytes` first (a full in-memory
+/// copy whose peak grew ~linearly with the blob size — the OOM); that pass would invoke `write_payload`
+/// before the sink write. One invocation here is the streaming-not-materializing guarantee.
+TEST(CasBuild, PutBlobStreamsSourceOnceNoFullMaterialization)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    auto build = s->startBuild({});
+
+    const String payload = "streamed-not-materialized";
+    int invocations = 0;
+    BlobSource source;
+    source.size = payload.size();
+    source.write_payload = [&invocations, &payload](DB::WriteBuffer & out)
+    {
+        ++invocations;
+        DB::writeString(payload, out);
+    };
+
+    auto ref = build->putBlob(idOf(payload), std::move(source));
+    EXPECT_EQ(ref.size, payload.size());
+    EXPECT_EQ(invocations, 1) << "happy-path upload must stream the source exactly once (no pre-materialization pass)";
+
+    /// And the object really landed with the streamed payload.
+    auto raw = b->get(s->layout().blobKey(ref.id));
+    ASSERT_TRUE(raw.has_value());
+    auto h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
+    EXPECT_EQ(h.logical_size, payload.size());
+}
+
 /// B190: reuseBlob is removed (it had no production callers post-B188). Its behaviors are now covered by:
 ///   - absent blob / absent-at-gate: RevalidateAbsentBlobDepAbortsRetryable (CasProtocol).
 ///   - condemned dep at gate:        PromoteBodylessCondemnedDepThrowsAbortedRetryable (CasBuild).
@@ -231,7 +264,7 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
     ///    deleteExact(blob_key, t0) exactly once — GC's delete in the HEAD->GET window. Open a FRESH
     ///    Store over the hook so its retire view (refreshed at open) sees the condemnation.
     auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
-    auto s = Store::open(hook, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = s->startBuild({});
 
     /// 4. putBlob with a re-invokable body.
@@ -311,7 +344,7 @@ TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
 
     /// 3. Open a fresh Store over a GET-counting wrapper; the retire view sees the condemnation at open.
     auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
-    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = s->startBuild({});
 
     /// 4. putBlob Y — the object is absent (was deleted). The dedup-hit (PreconditionFailed) path
@@ -381,7 +414,7 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
 
     /// 3. Open a fresh Store over a GET-counting wrapper.
     auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
-    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = s->startBuild({});
 
     /// 4. putBlob Z: putIfAbsentStream → PreconditionFailed (object present) → observeAndAdmit →
@@ -472,7 +505,7 @@ TEST(CasBuild, PutBlobVanishDuringRevivalReUploadsNotFatal)
     /// The blob does NOT need to pre-exist: the scripted backend models the conditional-PUT 412
     /// (object present at PUT time) independently of the inner store, then reports absent on HEAD.
     auto scripted = std::make_shared<ScriptedVanishBackend>(raw, blob_key);
-    auto s = Store::open(scripted, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(scripted, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = s->startBuild({});
 
     /// putBlob holds "payload-V" as source bytes. The vanish-during-revival must NOT be fatal:
@@ -524,7 +557,7 @@ TEST(CasBuild, PromoteBodylessCondemnedDepThrowsAbortedRetryable)
     ///    deleteExact(blob_key, t0) exactly once — GC's exact-token delete racing the gate's HEAD.
     ///    Open a FRESH Store over the hook so its retire view (refreshed at open) sees the condemnation.
     auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
-    auto s = Store::open(hook, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = startBuildFor(s, ns, "part_1");
 
     /// 4. Adopt the blob as a tokenless evidence dep (no body in hand), then stage a manifest naming it
@@ -579,7 +612,7 @@ TEST(CasBuild, GateBodylessAdoptFullyDeletedObjectThrowsAbortedNotFatal)
     ASSERT_FALSE(b->head(blob_key).exists) << "object must be absent before the gate HEAD";
 
     /// 3. Open a fresh Store over the raw backend — retire view (refreshed at open) sees the condemnation.
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = startBuildFor(s, ns, "part_1");
 
     /// 4. Adopt the blob as a tokenless evidence dep; stage a manifest naming it; precommit. No body in hand.
@@ -899,7 +932,7 @@ TEST(CasBuild, FirstPublishRegistersNamespace)
     /// CAS-appends it to `gc/registry`; later publishes into the same namespace hit the Store's monotone
     /// cache and leave the registry untouched. precommitAdd/promote both call ensureRegistered.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv9/fresh"};
 
     EXPECT_FALSE(b->get(s->layout().rootsRegistryKey()).has_value());
@@ -954,7 +987,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
 
     auto raw = std::make_shared<InMemoryBackend>();
     auto counting = std::make_shared<LocalCountingBackend>(raw);
-    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p"});
+    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = s->startBuild({});
 
     /// A Blob ManifestEntry. adoptEvidence is called on a hand-crafted entry — that IS the B188 interface.
@@ -1010,6 +1043,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     /// root_shards=1 keeps the build-root precommit and the table ref in one shard (single-shard fold).
     PoolConfig cfg;
     cfg.pool_prefix = "p";
+    cfg.server_root_id = "test";
     cfg.server_id = UInt128(0xAB);
     cfg.background_watermark = false;
     cfg.root_shards = 1;

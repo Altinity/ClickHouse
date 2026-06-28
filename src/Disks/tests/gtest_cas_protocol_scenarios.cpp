@@ -43,7 +43,7 @@ namespace
 
 StorePtr openStore(const std::shared_ptr<InMemoryBackend> & b)
 {
-    return Store::open(b, PoolConfig{.pool_prefix = "p"});
+    return Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// A single-blob manifest entry naming `payload` at `path` (the entry the part's manifest carries).
@@ -212,7 +212,7 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
 
     DB::Cas::Layout layout("p");
     {
-        auto s0 = Store::open(b, PoolConfig{.pool_prefix = "p"});
+        auto s0 = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
         writeBlobRaw(*b, s0->layout(), "payload-X", s0->poolMeta().blob_header_len, s0->poolMeta().pool_id);
     }
     const String blob_key = layout.blobKey(idOf("payload-X"));
@@ -226,7 +226,7 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     /// round 1 already populated.
     fenceNamespace(*b, layout, ns, /*n_shards*/ 8, /*round*/ 1);
 
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p"});   /// open-time refresh ⇒ view round 1
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});   /// open-time refresh ⇒ view round 1
     auto build = startBuildFor(s, ns, "part_1");
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});

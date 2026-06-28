@@ -33,7 +33,7 @@ namespace
 StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p"});
+    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// Publish one part `ref` with TWO content files whose payloads are passed in. Identical payloads

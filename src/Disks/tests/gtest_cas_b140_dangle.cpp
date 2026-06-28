@@ -20,7 +20,7 @@ namespace
 StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .root_shards = 1});
+    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
 }
 
 size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)

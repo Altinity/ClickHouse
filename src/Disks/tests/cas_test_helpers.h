@@ -413,7 +413,7 @@ inline uint64_t shardOfForTest(const String & ref_name, uint64_t root_shards)
 inline DB::Cas::StorePtr openStoreForTest(std::shared_ptr<DB::Cas::InMemoryBackend> backend)
 {
     return DB::Cas::Store::open(std::move(backend),
-        DB::Cas::PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_trim_min_events = 0});
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_trim_min_events = 0});
 }
 
 /// Write a blob object (envelope + payload) addressed by `hash`, so a HEAD returns a token. The bytes

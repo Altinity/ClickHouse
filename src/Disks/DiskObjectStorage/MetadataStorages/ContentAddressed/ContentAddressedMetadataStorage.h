@@ -42,6 +42,7 @@ public:
         ObjectStoragePtr object_storage_,
         String storage_path_prefix_,
         String server_id_,
+        String server_root_id_,
         String local_scratch_path_,
         ContextPtr context_ = nullptr,
         bool gc_enabled_ = true,
@@ -177,6 +178,7 @@ private:
     const std::string storage_path_prefix;
     const std::string storage_path_full;
     const std::string server_id;
+    const std::string server_root_id;
     const std::string disk_name;
     const std::string local_scratch_path;
     const ContextPtr context;

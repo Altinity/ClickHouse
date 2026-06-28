@@ -58,7 +58,7 @@ bool manifestExists(InMemoryBackend & b, const Layout & layout, const ManifestId
 StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p"});
+    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 GcState readState(InMemoryBackend & b, const Store & s)
@@ -765,7 +765,7 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep the default 3 generations; one root shard so cursor keys are "ns/0".
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_snap_generations_to_keep = 3});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -819,7 +819,7 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_snap_generations_to_keep = 3});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -884,7 +884,7 @@ TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=3 retention floor (matches WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes).
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_snap_generations_to_keep = 3});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -949,7 +949,7 @@ TEST(CasGcRound, LazyTrimSkipsSmallJournalAndKeepsTokenStable)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// gc_trim_min_events=4 and maintenance disabled; 3 events must not trigger trim.
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1,
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
                                                  .gc_trim_min_events = 4});
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -1017,7 +1017,7 @@ TEST(CasGcRound, LazyTrimCompactsAtThresholdOrSoftLimit)
     auto backend = std::make_shared<InMemoryBackend>();
     /// Use gc_trim_min_events=3 and a tiny body-size soft limit (1 byte) to test both gates separately.
     /// For the event-count gate: publish 3 events so the count exactly meets the threshold.
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1,
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
                                                  .gc_trim_min_events = 3,
                                                  .gc_trim_body_soft_limit = 1024ULL * 1024 * 1024}); /// 1 GiB: only event-count fires
     const RootNamespace ns{"00/aa@cas@"};
@@ -1083,7 +1083,7 @@ TEST(CasGcRound, LazyTrimCompactsAtThresholdOrSoftLimit)
     /// Now test the body-size soft-limit gate: open a second store with a tiny soft-limit (1 byte)
     /// so the body size always triggers trim regardless of event count.
     auto backend2 = std::make_shared<InMemoryBackend>();
-    auto store2 = Store::open(backend2, PoolConfig{.pool_prefix = "p", .root_shards = 1,
+    auto store2 = Store::open(backend2, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
                                                     .gc_trim_min_events = 256,     /// large batch threshold — event count won't fire
                                                     .gc_trim_body_soft_limit = 1}); /// 1 byte: always over limit
     const RootNamespace ns2{"00/bb@cas@"};
@@ -1112,7 +1112,7 @@ TEST(CasGcRound, MaintenanceTrimCompactsEverythingOnce)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// Large thresholds so lazy trim never fires on its own.
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1,
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
                                                  .gc_trim_min_events = 256,
                                                  .gc_trim_body_soft_limit = 1024ULL * 1024 * 1024});
     const RootNamespace ns{"00/cc@cas@"};
@@ -1162,7 +1162,7 @@ TEST(CasGcRound, MaintenanceTrimCompactsEverythingOnce)
 TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_snap_generations_to_keep = 0});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 

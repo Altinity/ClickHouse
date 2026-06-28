@@ -509,7 +509,7 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
         dropRefTransition(*backend, layout, ns, "tbl4", rC);
 
         /// Open a store with the given gc_shards (root_shards=1 keeps cursor keys as "ns/0").
-        auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1, .gc_shards = gc_shards});
+        auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_shards = gc_shards});
         const UInt128 gc_id = UInt128(0xDEADBEEF42ULL);
         Gc gc(store, gc_id);
         EXPECT_TRUE(gc.runRegularRound().acquired_lease);
@@ -710,7 +710,7 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     ASSERT_EQ(blobShard(blob_shard1, kGcShards), 1u) << "blob_shard1 must route to shard 1 (regression teeth)";
 
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .root_shards = 1,
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
                                                  .gc_shards = kGcShards, .gc_trim_min_events = 0});
     const Layout & layout = store->layout();
 

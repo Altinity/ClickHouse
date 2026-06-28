@@ -15,7 +15,7 @@ namespace
 std::shared_ptr<DB::ContentAddressedMetadataStorage> openTxStorage()
 {
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1",
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_tx_lockscope_scratch", nullptr);
     storage->startup();
     return storage;
