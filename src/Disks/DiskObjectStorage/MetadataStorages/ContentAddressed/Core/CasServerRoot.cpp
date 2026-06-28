@@ -407,6 +407,22 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
     return res.token;
 }
 
+void MountLeaseKeeper::onRenewSucceeded()
+{
+    /// A successful background renew extended the durable lease. Refresh the local write-fence
+    /// deadline (the Store translates this to `steady_clock::now() + ttl`, monotonic). No S3 read.
+    if (on_renew_ok)
+        on_renew_ok();
+}
+
+void MountLeaseKeeper::onRenewFailed()
+{
+    /// Background renewal failed: `renewOnce` threw on a foreign/superseded touch and the loop is
+    /// stopping. Latch the local write fence to lost so no further mutation proceeds — fail closed.
+    if (on_lost)
+        on_lost();
+}
+
 void MountLeaseKeeper::terminate()
 {
     /// Terminal op: retire the lease by stamping it already-expired (expires_at_ms = started_at_ms),

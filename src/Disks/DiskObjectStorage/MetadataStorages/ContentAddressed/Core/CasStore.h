@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Common/CacheBase.h>
 #include <Common/CurrentMetrics.h>
@@ -67,6 +68,13 @@ struct PoolConfig
     uint64_t manifest_hard_limit = 64ULL << 20;
     std::chrono::milliseconds watermark_renew_period{5000};
     bool background_watermark = false;       /// tests drive renewOnce explicitly
+
+    /// Mount-lease TTL (spec §mount-safety): how long a freshly-renewed mount lease is valid. The local
+    /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
+    /// once `this` elapses with no successful renew. The background renewer runs every
+    /// `mount_renew_period` (default ttl/3) so a healthy mount renews well before expiry.
+    std::chrono::milliseconds mount_lease_ttl_ms{30000};
+    std::chrono::milliseconds mount_renew_period{10000};   /// = ttl/3 by default
     bool read_only = false;                   /// observe-only open: skip the mutating capability probe; reads only
 
     /// Pillar B bounded-TTL decode cache: a staleness-tolerant caller (allow_stale=true) may reuse a
@@ -146,6 +154,11 @@ public:
     /// ---- per-server watermark surface (spec 2026-06-16-ca-build-watermark) ----
     /// process_epoch: random nonzero per Store (process). GC checks epoch EQUALITY, never ordering.
     uint64_t epoch() const { return process_epoch; }
+    /// The durable-monotone writer_epoch allocated at writable open (spec §writer-epoch-alloc). On a
+    /// writable Store this is the value bridged into `process_epoch` (so the watermark + the manifest
+    /// `writer_instance_id` carry it); on a read-only open the random `process_epoch` is unchanged and
+    /// no durable epoch is allocated. Phase 2's epoch-aware sweep reads this value.
+    uint64_t writerEpoch() const { return process_epoch; }
     /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
     /// quiescent server's watermark floor advances to the next-to-be-allocated seq). Locks builds_mutex.
     uint64_t minActive();
@@ -342,6 +355,13 @@ private:
     uint64_t next_build_seq = 1;
     std::set<uint64_t> active_build_seqs;
     std::unique_ptr<WatermarkKeeper> watermark;
+
+    /// Mount-lease heartbeat (spec §mount-safety, Phase 0 Task 7). Constructed + started on a writable
+    /// open AFTER the owner/epoch/mount startup protocol; renews the mount lease async off the write
+    /// path and drives the local write fence (deadline on each successful renew, `tripMountLost` on a
+    /// superseded/foreign touch). The dtor stops it, whose terminate() retires the lease (so a
+    /// same-server reopen can immediately reclaim). Null on a read-only open.
+    std::unique_ptr<MountLeaseKeeper> mount_keeper;
 
     /// Local write fence (spec §write-fence). Permissive by default (deadline = time_point::max,
     /// lost = false), so mayMutate() is true until Task 7 arms it with a real lease deadline and the

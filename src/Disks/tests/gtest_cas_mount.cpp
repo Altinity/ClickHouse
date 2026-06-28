@@ -167,3 +167,35 @@ TEST(CasMountFence, SupersededWriterRefusedNoS3Read)
     const RootNamespace ns{"srv1/tbl"};
     EXPECT_THROW(store->dropRef(ns, "any_ref"), DB::Exception);
 }
+
+TEST(CasMountStartup, SecondServerSameRootFailsClosed)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s1 = Store::open(b, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+    /// A second server (different uuid) on the SAME server_root_id + same backend → fail closed
+    /// (the owner gate rejects the foreign uuid before any mount/epoch mutation).
+    EXPECT_THROW(
+        Store::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(2), .server_root_id = "r", .root_shards = 1}),
+        DB::Exception);
+}
+
+TEST(CasMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s1 = Store::open(b, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+    const uint64_t e1 = s1->writerEpoch();
+
+    /// Simulate shutdown: the Store dtor stops the keeper, whose terminate() retires the lease
+    /// (stamps it already-expired). The owner + the durable epoch object stay sticky.
+    s1.reset();
+
+    /// Same server reopen → reclaims the (now-expired, different-epoch) mount and allocates a strictly
+    /// higher durable writer_epoch.
+    auto s2 = Store::open(b, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+    const uint64_t e2 = s2->writerEpoch();
+    EXPECT_GT(e2, e1);
+}

@@ -312,8 +312,11 @@ TEST(CasGcDiscovery, FailsClosedToReadWhenTokensUnobservable)
     };
 
     auto no_list_backend = std::make_shared<NoListWrapper>(*real_backend);
+    /// A SECOND live Store over the same storage: it shares the pool (and thus the pool-global GC
+    /// registry/roots the discovery reads) but must mount a DISTINCT server_root_id — co-mounting the
+    /// same root while `real_store` is still live is correctly fail-closed by the mount protocol.
     auto no_list_store = Store::open(
-        no_list_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
+        no_list_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test-nolist", .root_shards = 1});
     Gc gc_no_list(no_list_store, kGcDiscovery);
 
     const auto decisions = gc_no_list.discoverDecisionsForTest();
@@ -437,8 +440,11 @@ TEST(CasGcDiscovery, FailsClosedToReadWhenListKeyAmbiguous)
     };
 
     auto dup_backend = std::make_shared<DuplicateListBackend>(*real_backend, shard_full_key);
+    /// Distinct server_root_id: a second live Store over the same shared storage must not co-mount the
+    /// same root while `real_store` is alive (correctly fail-closed). It still shares the pool-global GC
+    /// state the discovery reads.
     auto dup_store = Store::open(
-        dup_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
+        dup_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test-dup", .root_shards = 1});
     Gc gc_dup(dup_store, kGcDiscovery);
 
     /// The GC on the duplicate-yielding backend should see the shard key as ambiguous and fall back

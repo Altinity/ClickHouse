@@ -75,6 +75,15 @@ protected:
     virtual String encodeBody(uint64_t seq, const RenewPayload & payload) const = 0;
     virtual Token claim(const String & body) = 0;
 
+    /// === optional background-renewal observation hooks (default no-op) ===
+    /// Called from the background loop after a SUCCESSFUL `renewOnce` (off `state_mutex`); the
+    /// mount-lease keeper refreshes the local write-fence deadline here. The watermark keeper does not
+    /// override it (no-op), so its behavior is unchanged.
+    virtual void onRenewSucceeded() {}
+    /// Called from the background loop when `renewOnce` THREW (the loop is about to stop, off
+    /// `state_mutex`); the mount-lease keeper latches the write fence to lost here. Default no-op.
+    virtual void onRenewFailed() {}
+
     /// Runs the slot's terminal op against the held `last_token`. Called under `state_mutex` with
     /// `dead` already set (so renewal can never race it). Owns its own fail-closed throws and final
     /// bookkeeping (the watermark bumps seq/last_token/last_renew_time on its retiring putOverwrite).

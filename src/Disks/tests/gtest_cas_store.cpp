@@ -126,6 +126,7 @@ TEST(CasStore, ReadOnlyOpenSkipsProbe)
     DB::Cas::PoolConfig cfg;
     cfg.pool_prefix = "pool";
     cfg.server_id = DB::UInt128(1);
+    cfg.server_root_id = "test";
     /// Writable open: creates _pool_meta and runs the probe (which writes+cleans up).
     DB::Cas::Store::open(std::make_shared<WriteCountingBackend>(shared), cfg);
 
@@ -144,6 +145,7 @@ TEST(CasStore, MinActiveTracksInFlightBuilds)
     DB::Cas::PoolConfig cfg;
     cfg.pool_prefix = "pool";
     cfg.server_id = DB::UInt128(1);
+    cfg.server_root_id = "test";
     cfg.background_watermark = false;
     auto store = DB::Cas::Store::open(backend, cfg);
 
@@ -163,6 +165,7 @@ TEST(CasStore, BuildSeqIsStrictlyMonotone)
     DB::Cas::PoolConfig cfg;
     cfg.pool_prefix = "pool";
     cfg.server_id = DB::UInt128(1);
+    cfg.server_root_id = "test";
     cfg.background_watermark = false;
     auto store = DB::Cas::Store::open(backend, cfg);
     auto a = store->startBuild({});
@@ -339,8 +342,14 @@ TEST(CasStore, OpenFailsClosedOnNonEnforcingBackend)
 TEST(CasStore, OpenCreatesPoolMetaAndReopens)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s1 = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto s2 = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 4});
+    /// Two CONCURRENT opens over the same POOL: a shared pool is the multi-server model, so each
+    /// mounts a DISTINCT server_root_id (and a distinct server_id) — same-root same-uuid co-mounting
+    /// is correctly fail-closed by the mount-safety protocol. This test only asserts that pool-meta is
+    /// pool-authoritative and shared across opens.
+    auto s1 = Store::open(b, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "srv-1"});
+    auto s2 = Store::open(b, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(2), .server_root_id = "srv-2", .root_shards = 4});
     EXPECT_EQ(s2->poolMeta().root_shards, 8u);                      /// pool authoritative
     EXPECT_EQ(s1->poolMeta().pool_id, s2->poolMeta().pool_id);
 }

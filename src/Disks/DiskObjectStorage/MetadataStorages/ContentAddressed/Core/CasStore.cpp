@@ -129,7 +129,78 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
     /// — which writes the roots/<server-hex>/_watermark slot — is only constructed and anchored on a writable open.
     if (!store->config.read_only)
     {
+        /// === Mount-safety startup protocol (spec §mount-safety; Phase 0 Task 7) ===
+        /// STRICT ORDER: validate id → claim owner (identity) → allocate durable writer_epoch → claim
+        /// the mount lease (liveness) + arm the local write fence → anchor the watermark. owner / epoch
+        /// / mount / watermark are BOOTSTRAP-CONTROL writes: they establish the very right to write and
+        /// run BEFORE the write fence gates ordinary data/ref/manifest mutations. Fail closed throughout.
+        const String & srid = store->config.server_root_id;
+        const UInt128 our_uuid = store->config.server_id;
+
+        /// 1. The server_root_id is a clean relative path (mirrors the config-read validation; cheap to
+        ///    re-check here so a Store opened directly in tests is held to the same contract).
+        validateServerRootId(srid);
+
+        /// 2. Owner anchor — IDENTITY (clock-free). A foreign uuid fails closed; an absent owner over a
+        ///    non-empty subtree is CORRUPTED_DATA; a fresh empty root is claimed.
+        claimOwnerOrThrow(*store->pool_backend, store->pool_layout, srid, our_uuid);
+
+        /// 3. Durable-monotone writer_epoch — CAS-bump the sticky `epoch` object. THE BRIDGE: this
+        ///    durable value REPLACES the random `process_epoch` for identity, so the watermark + every
+        ///    manifest's `writer_instance_id` carry it (the random mint above stays for the read-only
+        ///    path, which never reaches here). Phase 2's epoch-aware sweep reads this value.
+        const uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
+        store->process_epoch = writer_epoch;
+
+        /// 4. Mount lease — LIVENESS. Decide over the current mount object using a wall-clock `now_ms`.
+        const auto now_ms = []() -> uint64_t
+        {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        };
+        const uint64_t ttl_ms = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
+        const MountClaimResult claim = claimMount(
+            *store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch, now_ms(), ttl_ms);
+        if (claim.kind != MountClaimResult::Claimed)
+        {
+            /// Actionable, multi-line startup error (spec §mount-safety). It names the existing mount's
+            /// holder so an operator can decide between "configure a unique server_root_id", "wait for
+            /// the lease to lapse", or "restore the uuid file / remove the stale owner".
+            throw Exception(ErrorCodes::ABORTED,
+                "Content-addressed disk cannot start: server_root_id '{}' is actively mounted by another server.\n"
+                "  Existing mount: server_uuid={} hostname={} pid={} last_seq={} expires_at_ms={}\n"
+                "This prevents two ClickHouse servers from writing the same CAS namespace.\n"
+                " - If the other server is still running, configure a unique <server_root_id> for this disk.\n"
+                " - If it is dead, wait until the mount lease expires and retry (same server only).\n"
+                " - If the local ClickHouse uuid file was regenerated, restore the old uuid file, or remove the stale\n"
+                "   owner object gc/server-roots/{}/owner only after verifying no server uses this root.",
+                srid, u128ToHex(claim.body.server_uuid), claim.body.hostname, claim.body.pid,
+                claim.body.seq, claim.body.expires_at_ms, srid);
+        }
+
+        /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which
+        /// ADOPTS that very (uuid, epoch) slot (Task 5) rather than self-tripping the double-start guard.
         Store * raw = store.get();
+        store->mount_keeper = std::make_unique<MountLeaseKeeper>(
+            store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
+            store->config.mount_lease_ttl_ms, now_ms);
+        /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh the
+        /// monotonic deadline; on a superseded/foreign renew failure latch the fence to lost. Set BEFORE
+        /// startBackground so no renewal can fire before the callbacks are in place.
+        store->mount_keeper->setFenceCallbacks(
+            [raw, ttl_ms] { raw->setMountDeadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms)); },
+            [raw] { raw->tripMountLost(); });
+        store->mount_keeper->start();
+
+        /// Arm the local write fence: cache (uuid, epoch) and set the monotonic deadline now + ttl. From
+        /// here ordinary mutations (mutateShard) are fence-gated via mayMutate().
+        store->armMountFence(our_uuid, writer_epoch,
+            std::chrono::steady_clock::now() + store->config.mount_lease_ttl_ms);
+        store->mount_keeper->startBackground(store->config.mount_renew_period);
+
+        /// 5. Per-server watermark — anchored AFTER epoch allocation so it carries the DURABLE
+        ///    writer_epoch (now in `process_epoch`), not the random mint. Must be durable before any
+        ///    ordinary data write.
         store->watermark = std::make_unique<WatermarkKeeper>(
             store->pool_backend, store->pool_layout, store->config.server_id, store->process_epoch,
             [raw] { return raw->minActive(); });
@@ -149,6 +220,24 @@ Store::~Store()
     /// liveness detection (spec 2026-06-16-ca-build-watermark), so stopBackground alone is correct.
     if (watermark)
         watermark->stopBackground();
+
+    /// Retire the mount lease on a clean Store teardown: stop() runs the keeper's terminal op, which
+    /// stamps the lease already-expired (expires_at_ms = now). Unlike the watermark (whose farewell is
+    /// deliberately skipped — a transient drop must not retire its epoch), retiring the mount is
+    /// correct: it is a recreatable lease, and stamping it expired lets a SAME-server reopen reclaim
+    /// immediately (the durable epoch + owner stay sticky). A throw here (e.g. a foreign incarnation
+    /// touched the slot) must not escape the dtor — log and continue tearing down.
+    if (mount_keeper)
+    {
+        try
+        {
+            mount_keeper->stop();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("CasStore"), "CAS mount-lease: release during Store teardown failed");
+        }
+    }
 }
 
 uint64_t Store::shardOf(const String & ref_name) const

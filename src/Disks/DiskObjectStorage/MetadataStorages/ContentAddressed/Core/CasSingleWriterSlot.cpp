@@ -146,8 +146,15 @@ void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
         {
             tryLogCurrentException(
                 log, fmt::format("CAS {}: background renewal failed, the {} stops advancing", slot_name, slot_name));
+            /// Notify the subclass that renewal failed and the loop is stopping (off `state_mutex`).
+            /// The mount-lease keeper latches its local write fence to lost here. Never let the hook's
+            /// own throw escape the loop — we are already stopping.
+            try { onRenewFailed(); } catch (...) {}
             return;
         }
+        /// Successful renewal: notify the subclass (off `state_mutex`) before sleeping again. The
+        /// mount-lease keeper refreshes the write-fence deadline here.
+        try { onRenewSucceeded(); } catch (...) {}
         lock.lock();
     }
 }

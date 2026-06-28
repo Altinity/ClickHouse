@@ -189,11 +189,25 @@ public:
     /// Releases the mount: the terminal op. Stops the background thread first.
     void stop() { doTerminate(); }
 
+    /// Local write-fence coupling (set once by `Store::open` before `startBackground`): the keeper is
+    /// the ONLY thing that touches S3 for the lease, so the fence must reflect the live lease without a
+    /// per-write S3 read. On each SUCCESSFUL background renew the keeper calls `on_renew_ok` (the Store
+    /// refreshes its monotonic fence deadline); when background renewal FAILS (a foreign/superseded
+    /// touch makes `renewOnce` throw and the loop stop) the keeper calls `on_lost` (the Store latches
+    /// its fence to lost). Both default to no-op so a keeper used without a Store is inert.
+    void setFenceCallbacks(std::function<void()> on_renew_ok_, std::function<void()> on_lost_)
+    {
+        on_renew_ok = std::move(on_renew_ok_);
+        on_lost = std::move(on_lost_);
+    }
+
 protected:
     RenewPayload prepareRenew() const override;
     String encodeBody(uint64_t seq_, const RenewPayload & payload) const override;
     Token claim(const String & body) override;
     void terminate() override;
+    void onRenewSucceeded() override;
+    void onRenewFailed() override;
 
 private:
     String srid;
@@ -201,6 +215,8 @@ private:
     uint64_t writer_epoch;
     std::chrono::milliseconds ttl;
     std::function<uint64_t()> now_ms_fn;
+    std::function<void()> on_renew_ok;
+    std::function<void()> on_lost;
 };
 
 }
