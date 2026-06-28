@@ -4,7 +4,7 @@
 
 **Goal:** Close the GC concurrent-leader reclaim leak and divergent-run corruption by making every per-round `gc/gen/<gen>/…` write-once artifact **attempt-scoped** (keyed by the folding leader's `lease.seq`) and reader-visible only through the single `(snap_generation, snap_attempt)` pair adopted by a lease-guarded `gc/state` CAS.
 
-**Architecture:** A deposed GC leader currently writes a `fold_seal`/`completion_seal`/in-degree-run/cleanup-bundle to a **final** `gc/gen/<gen>/…` key *before* its lease-guarded `gc/state` CAS fails, leaving an orphaned write-once artifact that wedges every future round (and a checksum-divergent run that can corrupt in-degree). The fix moves those four artifacts under `gc/gen/<gen>/attempt/<a>/…` (`a = lease.seq`), adds a `snap_attempt` field to `GcState`, makes the fold/completion `gc/state` CASes *select* (CAS #1) then *inherit* (CAS #2) that attempt, and resolves every reader through the adopted `(snap_generation, snap_attempt)`. A deposed leader's writes land under its own unadopted attempt — pure space debris, invisible to every decision path. The `retired`/`outcomes` keys already carry `(round, fence_seq)` epoch separation and need no change. TLA+ proves adopted-only visibility under a second concurrent leader before any code lands.
+**Architecture:** A deposed GC leader currently writes a `fold_seal`/`completion_seal`/in-degree-run/cleanup-bundle to a **final** `gc/gen/<gen>/…` key *before* its lease-guarded `gc/state` CAS fails, leaving an orphaned write-once artifact that wedges every future round (and a checksum-divergent run that can corrupt in-degree). The fix moves **every per-round decision-bearing artifact** — the four `gc/gen` artifacts **plus the `retired` sets and `outcomes` logs** — under `gc/gen/<gen>/attempt/<a>/…` (`a = lease.seq`, which the renew/steal paths bump every round, so it is a fresh monotonic per-round attempt id), adds a `snap_attempt` field to `GcState`, makes the fold/completion `gc/state` CASes *select* (CAS #1) then *inherit* (CAS #2) that attempt, and resolves every reader — **including `RetireView`, which writers consult on the publish gate** — through the adopted `(snap_generation, snap_attempt)`. A deposed leader's writes land under its own unadopted attempt — pure space debris reclaimed wholesale by the `gc/gen/<g>/` retention prune, invisible to every decision path (GC *and* writer). TLA+ proves adopted-only visibility (seal **and** retired set) under a second concurrent leader minting a fresh attempt id, before any code lands.
 
 **Tech Stack:** C++ (ClickHouse `DB::Cas` namespace), Protocol Buffers (`cas_format.proto`), GoogleTest (`unit_tests_dbms`), TLA+/TLC (`tla2tools.jar`), Python (ca-soak scenario suite).
 
@@ -27,6 +27,16 @@
 
 Spec: `docs/superpowers/specs/2026-06-28-cas-gc-attempt-scoped-generation-design.md`.
 
+## Post-review corrections (apply in EVERY task — verified against code)
+
+These were caught in user + adversarial plan review; they bind every task below:
+
+1. **`Backend::head(key)` returns `HeadResult` with a `.exists` bool, NOT `std::optional`.** Every test in this plan that writes `backend->head(...).has_value()` must use `backend->head(...).exists` (see existing tests, e.g. `gtest_cas_gc_round.cpp:755`). `backend->get(...)` *does* return `std::optional` — `.has_value()` is correct there.
+2. **gtest per-file helpers are NOT shared.** `ref`, `kGc`/`kGcA`, `blobExists`, `runGcToFixpoint`, `runFsck` are anonymous-namespace helpers redefined per file (and `ref` has two different signatures across files). A new test file (Task 10) must **copy in** the helpers it needs; only these come from the shared header/core: `hexToU128`, `decodeGcState`, `writeBlobBody`, `writeManifestRaw`, `publishCommittedTransition`, `dropRefTransition`, `openStoreForTest`, `blobEntryFor`, `inDegreeOf`, `RootNamespace`, `ManifestRef`. (`runGcToFixpoint`/`runFsck` live only in `gtest_cas_gc_leak.cpp`; `blobExists` in `gtest_cas_gc_round.cpp`/`gtest_cas_gc_resume.cpp`.)
+3. **Never hardcode a generation number in an assertion** — derive it from `decodeGcState(...)` state (the first round's `G_f` happens to be 1, but later rounds differ). Read `snap_generation`/`snap_attempt` from `gc/state` and assert against those.
+4. **The seals' divergent throws today are `ErrorCodes::ABORTED` "concurrent leader"** (`CasGc.cpp:445` fold seal, `:922` completion seal), not `CORRUPTED_DATA`. Tasks 4-6 *replace* them with `putDeterministicArtifact` (which throws `CORRUPTED_DATA` on genuine byte divergence). Do not expect to find `CORRUPTED_DATA` there pre-change.
+5. **There are 42 `CaGcRootLocalPartManifestCore_*.cfg` files** (not "~38"). "Bind the new constants in every cfg" means all 42.
+
 ## File Structure
 
 **TLA+ (Task 1):**
@@ -39,10 +49,11 @@ Spec: `docs/superpowers/specs/2026-06-28-cas-gc-attempt-scoped-generation-design
 **C++ (Tasks 2–10)** — all under `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/`:
 - `CasGcFormats.h` / `CasGcFormats.cpp` — `GcState::snap_attempt`.
 - `Proto/cas_format.proto` — `GcStateProto.snap_attempt = 9`.
-- `CasLayout.h` — attempt-scoped key derivation for the four `gc/gen` keys.
+- `CasLayout.h` — attempt-scoped key derivation for **all six** `gc/gen` key families (fold_seal, completion_seal, blob_target run, part_manifest_cleanup, **retired**, **outcomes**).
 - `CasBlobInDegree.cpp` / `CasBlobInDegree.h` — attempt-threaded `foldDeltasIntoGeneration` + strict `putIfAbsent`.
 - `CasGcShardPlan.cpp` / `CasGcShardPlan.h` — `ShardReducer::reduce` attempt-threading.
-- `CasGc.cpp` / `CasGc.h` — `fold` (CAS #1), `recheck` (CAS #2), readers, resume, pruning.
+- `CasGc.cpp` / `CasGc.h` — `fold` (CAS #1), `retire` (retired set under attempt), `recheck` (CAS #2, outcomes/retired-drop under attempt), readers, resume, pruning.
+- `CasRetireView.cpp` / `CasRetireView.h` — `refresh()` resolves retired sets under the accepted `(snap_generation, snap_attempt)` instead of LISTing `gc/retired/` (writer-facing publish gate).
 - A shared strict-putIfAbsent helper (added to `CasGc.cpp` anonymous namespace, or `CasCodecUtil.h` if reused by BlobInDegree).
 
 **Tests (Tasks 2–11):** `src/Disks/tests/gtest_cas_gc_formats.cpp`, `gtest_cas_layout.cpp`, `gtest_cas_blob_indegree.cpp`, `gtest_cas_gc_fold.cpp`, `gtest_cas_gc_resume.cpp`, new `gtest_cas_gc_attempt.cpp`; `utils/ca-soak/scenarios/cards/s28_s33_corner.py` (S33).
@@ -69,11 +80,14 @@ Spec: `docs/superpowers/specs/2026-06-28-cas-gc-attempt-scoped-generation-design
 - Inertness targets: `stage0` = 71,184 generated / **19,846 distinct**; `stage1` = 1,659,466 / **402,034 distinct** (`CaGcRootLocalPartManifestCore_RESULTS.md`).
 
 **Modeling approach (what "attempt-scoping" means in this model):**
-- Add CONSTANT `EnableAttemptScoping` (the fix) and CONSTANT `SabotageDeposedLeaderWritesFinalGen` (negative control).
-- Add a generation/attempt **adopt pointer** variable `adopted` — a per-round record of the *one* leader whose seal is viewable, e.g. `adopted = [r \in 0..MaxRound |-> None]` (None until adopted; set to the adopting leader's identity by the existing seal/`adoptable` step under a token-style guard).
-- Add attempt-keyed seal slots: a variable `sealAttempt = [r \in 0..MaxRound |-> [a \in Actors \cup {None} |-> <seal-written?>]]` recording which leaders wrote a seal for round `r`. (Model "the artifact under attempt `a`".) When `EnableAttemptScoping = TRUE`, a leader writes its seal under its own attempt slot and a reader consults only `adopted[r]`'s slot; when `FALSE` (baseline), there is a single shared slot (today's behavior) and a deposed write overwrites/occupies it.
-- Add action `GDeposedWriteSeal(l, r)`: a leader `l` that does **not** own round `r` writes a seal artifact for it (models the deposed leader finishing its fold). Guard with `EnableAttemptScoping` routing: scoped ⟹ writes only `sealAttempt[r][l]` (invisible unless `adopted[r] = l`); under `SabotageDeposedLeaderWritesFinalGen` ⟹ writes the shared/final slot and flips a reader-visible bit even though `adopted[r] # l`.
-- All new variables MUST be inert when `EnableAttemptScoping = FALSE` (stay at `Init`), added to the `VARIABLES` block, `vars` tuple (line 102), `Init`, `TypeOK`, and every action's `UNCHANGED` list, with writes gated behind the flag — exactly like `coordFence`/`storedTok`.
+- Add CONSTANT `EnableAttemptScoping` (the fix) and CONSTANT `SabotageDeposedLeaderWritesFinalGen` (negative control). Add CONSTANT `MaxAttempt` (bound on the attempt counter for TLC finiteness).
+- **`attempt` is a FRESH MONOTONIC id, not a leader identity** (user-review correction; matches `attempt = lease.seq`, which bumps every round). Add variable `attemptSeq \in 0..MaxAttempt` (a global monotone counter, like `gcRound`); each fold mints `attemptSeq' = attemptSeq + 1` and uses that value as its attempt id. Modeling the attempt as the leader id would be unsound: the same leader gets a *different* attempt across rounds/steals, so leader-id scoping would mask collision/resume/pruning bugs.
+- Add a generation/attempt **adopt pointer** variable `adopted = [r \in 0..MaxRound |-> 0]` (`0` = none; set to the *minted attempt id* by the fold-adopt step under a guard ensuring exactly one attempt is adopted per round).
+- Add attempt-keyed artifact slots covering **both** the seal **and the retired set** (the retired set is writer-visible via the RetireView LIST, so it must be in the invariant): e.g. `sealAt = [r \in 0..MaxRound |-> SUBSET (0..MaxAttempt)]` (which attempt ids wrote a seal for round `r`) and `retiredAt = [r \in 0..MaxRound |-> SUBSET (0..MaxAttempt)]` (which attempt ids wrote a retired set). When `EnableAttemptScoping = TRUE`, a leader writes under its own minted attempt id and readers (GC decisions **and** the modeled writer publish gate) consult only `adopted[r]`'s slot; when `FALSE` (baseline), there is a single shared slot and a deposed write occupies it.
+- Add action `GDeposedWriteSeal(l, r, a)`: a leader `l` holding a *stale* minted attempt `a` (`a # adopted[r]`) writes a seal AND a retired set for round `r` (models the deposed leader finishing its fold + retire before its CAS fails). Scoped ⟹ writes only `sealAt[r] \cup {a}` / `retiredAt[r] \cup {a}` (invisible unless `adopted[r] = a`); under `SabotageDeposedLeaderWritesFinalGen` ⟹ writes the shared/final slot and makes `a` reader-visible even though `adopted[r] # a`.
+- Model a **writer publish-gate read** of the retired set (the RetireView consumer) as part of `SealViewable`/a `RetiredViewable(r, a)` operator, so the invariant catches a stale retired set influencing a writer — not only a stale seal influencing GC.
+- All new variables (`attemptSeq`, `adopted`, `sealAt`, `retiredAt`) MUST be inert when `EnableAttemptScoping = FALSE` (stay at `Init`), added to the `VARIABLES` block, `vars` tuple (line 102), `Init`, `TypeOK`, and every action's `UNCHANGED` list, with writes gated behind the flag — exactly like `coordFence`/`storedTok`.
+- **M4 soundness guard (avoid a false Gate-A failure):** do NOT admit a full second-leader pipeline over the shared globals (`gcRound`/`cursor`/`blobIndeg`/`fencePos`) — this model has no lease to serialize two leaders, so a free L2 could break an R0 invariant for reasons unrelated to the fix. Instead keep the existing single-driver pipeline for the *adopted* path and model the deposed leader as the **single extra action `GDeposedWriteSeal`** that only writes the new attempt-scoped slots (`sealAt`/`retiredAt`) for a stale attempt — it touches no shared global. The two-leader concurrency that matters (one folds+adopts, a deposed one writes its own attempt) is captured by `attemptSeq` minting + this one action, without unserialized global mutation. Stage6 may keep `Leaders={L1}` if `GDeposedWriteSeal` alone produces the deposed write; only widen to `{L1,L2}` if a second *minting* leader is needed and confirm no spurious R0 violation results.
 
 - [ ] **Step 1: Add the two CONSTANTS to the model**
 
@@ -86,11 +100,12 @@ In `CaGcRootLocalPartManifestCore.tla` `CONSTANTS` block (lines 8–37), add nea
 
 - [ ] **Step 2: Bind both constants `FALSE` in every existing cfg, run stage0+stage1, confirm inertness BEFORE adding any new variable/action**
 
-Add these two lines to **every** `CaGcRootLocalPartManifestCore_*.cfg` (all ~38) in the `CONSTANTS` section:
+Add these three lines to **every** `CaGcRootLocalPartManifestCore_*.cfg` (all 42) in the `CONSTANTS` section:
 
 ```
 EnableAttemptScoping = FALSE
 SabotageDeposedLeaderWritesFinalGen = FALSE
+MaxAttempt = 2
 ```
 
 Run: `cd docs/superpowers/models && ./run_gc_partmanifest.sh CaGcRootLocalPartManifestCore_stage1`
@@ -121,7 +136,7 @@ INV_ONLY_ADOPTED_VIEWABLE ==
 
 - [ ] **Step 5: Create the positive stage cfg and prove Gate A green**
 
-Create `CaGcRootLocalPartManifestCore_stage6_attemptscoping.cfg` modeled on `_stage3.cfg`, with: `EnableAttemptScoping = TRUE`, `SabotageDeposedLeaderWritesFinalGen = FALSE`, `Leaders = {L1, L2}` (admit two leaders), all other `Enable*`/`Sabotage* = FALSE`, `CHECK_DEADLOCK FALSE`, `CONSTRAINT StateConstraint`, and:
+Create `CaGcRootLocalPartManifestCore_stage6_attemptscoping.cfg` modeled on `_stage3.cfg`, with: `EnableAttemptScoping = TRUE`, `SabotageDeposedLeaderWritesFinalGen = FALSE`, `MaxAttempt = 2`, `Leaders = {L1}` (the deposed write is the `GDeposedWriteSeal` action; widen to `{L1,L2}` only if a second minting leader is needed and it does not spuriously violate R0 — see the M4 guard), all other `Enable*`/`Sabotage* = FALSE`, `CHECK_DEADLOCK FALSE`, `CONSTRAINT StateConstraint`, and:
 
 ```
 INVARIANT TypeOK
@@ -278,18 +293,29 @@ Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces (changed signatures — update ALL callers in later tasks):
+- Produces (changed signatures — Task 3 lands a compile-clean tree by updating EVERY caller listed below):
   - `String foldSealKey(uint64_t generation, uint64_t attempt) const` → `<p>/gc/gen/<generation>/attempt/<attempt>/fold_seal`
   - `String completionSealKey(uint64_t generation, uint64_t attempt) const` → `…/attempt/<attempt>/completion_seal`
   - `String blobTargetRunKey(uint64_t generation, uint64_t attempt, uint64_t shard, uint64_t seq) const` → `…/attempt/<attempt>/blob_target/<shard>/<seq>`
   - `String partManifestCleanupKey(uint64_t generation, uint64_t attempt, uint64_t owner_shard, uint64_t seq) const` → `…/attempt/<attempt>/part_manifest_cleanup/<owner_shard>/<seq>`
-  - `String gcGenPrefix(uint64_t generation) const` → `<p>/gc/gen/<generation>/` (NEW — used by wholesale generation-retention prune in Task 9)
-  - `String gcGenAttemptPrefix(uint64_t generation, uint64_t attempt) const` → `<p>/gc/gen/<generation>/attempt/<attempt>/` (NEW — used by the attempt orphan sweep in Task 9)
-- `retiredKey`/`outcomesKey` are UNCHANGED (already `(round, fence_seq)`-keyed).
+  - `String retiredKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const` → `…/attempt/<attempt>/retired/<round>/<shard>` (was `gc/retired/<round>.<fence_seq>/<shard>`)
+  - `String outcomesKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const` → `…/attempt/<attempt>/outcomes/<round>/<shard>` (was `gc/outcomes/<round>.<fence_seq>/<shard>`)
+  - `String gcGenPrefix(uint64_t generation) const` → `<p>/gc/gen/<generation>/` (NEW — wholesale retention prune, Task 9; also the prefix `RetireView` LISTs)
+  - `String gcGenAttemptPrefix(uint64_t generation, uint64_t attempt) const` → `<p>/gc/gen/<generation>/attempt/<attempt>/` (NEW — attempt sweep + RetireView resolution)
+  - `String gcGenAttemptRetiredPrefix(uint64_t generation, uint64_t attempt) const` → `…/attempt/<attempt>/retired/` (NEW — `RetireView` LISTs this under the accepted attempt instead of the old `gcRetiredPrefix()`)
+  - **REMOVE** `gcRetiredPrefix()` (was `<p>/gc/retired/`) — no reader LISTs the flat namespace anymore.
+
+> **Why retired/outcomes move too (user review):** `retired` is writer-facing — `RetireView::refresh()` LISTs the retired namespace and writers consult `store->retireView().isCondemnedToken(...)` on the publish gate (`CasBuild.cpp:235,414,666,725`). A deposed leader's stale retired set under its own epoch would survive a flat LIST and influence live writers — violating "no unadopted artifact may influence a decision." Scoping them under the adopted attempt closes that and lets the wholesale `gc/gen/<g>/` retention prune reclaim them (no separate sweep).
+
+**Complete caller set Task 3 must update to keep `unit_tests_dbms` compiling (M1/B1):**
+- Production: `CasGc.cpp` (`foldSealKey`/`completionSealKey`/`blobTargetRunKey`/`partManifestCleanupKey`/`retiredKey`/`outcomesKey` at 440, 547, 829, 917, 949, 1093-1106, 1360, 1374, 1386 + `readFoldSeal`/`readCompletionSeal`/`readSealedCursors` 1115-1140), `CasBlobInDegree.cpp` (71-73, 171; `foldDeltasIntoGeneration`/`zeroInDegree`/`inDegreeInGeneration` signatures), `CasGcShardPlan.cpp` (`ShardReducer::reduce` 94-102), **`CasOrphanManifestSweep.cpp:43`** (`sealedFoldCursor` calls `foldSealKey(g)` — production consumer, see Task 7 for the back-scan fix), `CasRetireView.cpp:46` (replaces `gcRetiredPrefix()` LIST — see Task 7).
+- Tests: `gtest_cas_layout.cpp:59-62`, `gtest_cas_blob_indegree.cpp:22,25,35,39,41,54-57,72`, `gtest_cas_gc_round.cpp:755,757,759,764,765,825,1020,1021`, `gtest_cas_gc_shard_plan.cpp:251-259,430-436,522-524,607,616,621,623,630-675`, `cas_test_helpers.h:439,458` (`inDegreeInGeneration`, `foldSealKey`, `foldCursorOf` helper).
+
+For Task 3, give every caller a *mechanical* placeholder attempt argument so the tree compiles: pass `state.snap_attempt` at GC readers, the fold leader's `state.lease.seq` at the fold/retire writers, and a literal in tests (the existing tests assert generation-N behavior with a single implicit attempt — pass `0` or the test's chosen attempt and update the expected key strings). The *semantics* (CAS #1/#2, strict putIfAbsent, RetireView resolution, resume, pruning) are refined by Tasks 4-9, each with its own failing-test-first cycle.
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `src/Disks/tests/gtest_cas_layout.cpp`:
+Add to `src/Disks/tests/gtest_cas_layout.cpp` (match the `Layout` ctor form the file already uses):
 
 ```cpp
 TEST(CasLayout, AttemptScopedGenKeys)
@@ -299,20 +325,21 @@ TEST(CasLayout, AttemptScopedGenKeys)
     EXPECT_EQ(layout.completionSealKey(5, 42), "p/gc/gen/5/attempt/42/completion_seal");
     EXPECT_EQ(layout.blobTargetRunKey(4, 42, 3, 0), "p/gc/gen/4/attempt/42/blob_target/3/0");
     EXPECT_EQ(layout.partManifestCleanupKey(4, 42, 0, 1), "p/gc/gen/4/attempt/42/part_manifest_cleanup/0/1");
+    EXPECT_EQ(layout.retiredKey(4, 42, 7, 3), "p/gc/gen/4/attempt/42/retired/7/3");
+    EXPECT_EQ(layout.outcomesKey(5, 42, 7, 3), "p/gc/gen/5/attempt/42/outcomes/7/3");
     EXPECT_EQ(layout.gcGenPrefix(4), "p/gc/gen/4/");
     EXPECT_EQ(layout.gcGenAttemptPrefix(4, 42), "p/gc/gen/4/attempt/42/");
+    EXPECT_EQ(layout.gcGenAttemptRetiredPrefix(4, 42), "p/gc/gen/4/attempt/42/retired/");
 }
 ```
 
-(Confirm the `Layout` ctor form used by existing `gtest_cas_layout.cpp` — match it; if the ctor takes a `PoolConfig`/prefix differently, mirror the existing tests in that file.)
-
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `ninja unit_tests_dbms > build_t3.log 2>&1` — Expected: compile FAIL (`foldSealKey` arity mismatch / `gcGenPrefix` not declared).
+Run: `ninja unit_tests_dbms > build_t3.log 2>&1` — Expected: compile FAIL (arity mismatches across the caller set above — fix them all in Step 3).
 
-- [ ] **Step 3: Implement the key changes**
+- [ ] **Step 3: Implement the key changes + update every caller**
 
-Replace `CasLayout.h:146-169` (`foldSealKey`, `completionSealKey`, `blobTargetRunKey`, `partManifestCleanupKey`) with the attempt-scoped forms and add the two prefix helpers:
+Replace the four `gc/gen` helpers and `retiredKey`/`outcomesKey` in `CasLayout.h` with the attempt-scoped forms below, add the three prefix helpers, and remove `gcRetiredPrefix()`:
 
 ```cpp
     String gcGenPrefix(uint64_t generation) const
@@ -346,30 +373,40 @@ Replace `CasLayout.h:146-169` (`foldSealKey`, `completionSealKey`, `blobTargetRu
         return gcGenAttemptPrefix(generation, attempt) + "part_manifest_cleanup/"
                + std::to_string(owner_shard) + "/" + std::to_string(seq);
     }
+
+    String gcGenAttemptRetiredPrefix(uint64_t generation, uint64_t attempt) const
+    {
+        return gcGenAttemptPrefix(generation, attempt) + "retired/";
+    }
+
+    String retiredKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const
+    {
+        return gcGenAttemptRetiredPrefix(generation, attempt) + std::to_string(round) + "/" + std::to_string(shard);
+    }
+
+    String outcomesKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const
+    {
+        return gcGenAttemptPrefix(generation, attempt) + "outcomes/" + std::to_string(round) + "/" + std::to_string(shard);
+    }
 ```
 
-(This task only changes the header. Callers in `CasGc.cpp`/`CasBlobInDegree.cpp`/`CasGcShardPlan.cpp` are updated in Tasks 4–9 — the tree will not compile fully until those land, so build only `gtest_cas_layout` semantics here by accepting the known break in dependent TUs. If a clean per-task build is required, fold Tasks 3–9's caller edits together; see note below.)
+Then mechanically thread the `attempt` argument through **every caller in the "Complete caller set" list above** (production with `state.snap_attempt`/`state.lease.seq` as noted; tests with the literal attempt + updated expected strings). The tree MUST compile at the end of this task.
 
-> **Build-ordering note for the executor:** changing these signatures breaks all callers at once. To keep each task independently building, the implementer of Task 3 should also apply the mechanical caller-site updates in `CasGc.cpp`/`CasBlobInDegree.cpp`/`CasGcShardPlan.cpp` to pass an `attempt` argument, using `state.snap_attempt` (readers) or the fold leader's `lease.seq` (fold writes) as specified in Tasks 4–9 — i.e. Task 3 lands the compile-clean skeleton, and Tasks 4–9 refine the *semantics* (CAS #1/#2, strict putIfAbsent, resume, pruning) with their own tests. Each later task still has its own failing-test-first cycle for the behavior it owns.
-
-- [ ] **Step 4: Run the layout test**
+- [ ] **Step 4: Run the layout test + full suite compiles**
 
 Run: `ninja unit_tests_dbms > build_t3b.log 2>&1` then `./src/unit_tests_dbms --gtest_filter='CasLayout.*' > test_t3.log 2>&1`
-Expected: PASS. Analyze via subagent.
+Expected: build succeeds (all callers threaded), `CasLayout.*` PASS. Analyze via subagent.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h \
-        src/Disks/tests/gtest_cas_layout.cpp \
-        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp \
-        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.cpp \
-        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcShardPlan.cpp
-git commit -m "CA GC: attempt-scope the four gc/gen/<gen> key derivations
+git add -A
+git commit -m "CA GC: attempt-scope all six gc/gen key families + thread callers
 
-fold_seal, completion_seal, blob_target run, part_manifest_cleanup now live
-under gc/gen/<gen>/attempt/<a>/. Add gcGenPrefix/gcGenAttemptPrefix. Callers
-threaded with the attempt arg (semantics refined in following commits).
+fold_seal/completion_seal/blob_target/part_manifest_cleanup AND retired/outcomes
+now live under gc/gen/<gen>/attempt/<a>/. Add gcGenPrefix/gcGenAttemptPrefix/
+gcGenAttemptRetiredPrefix; remove the flat gcRetiredPrefix. All production +
+test callers threaded with the attempt arg (semantics refined next commits).
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
@@ -513,8 +550,8 @@ TEST(CasGcFold, FoldAdoptsAttemptEqualsLeaseSeq)
     const auto st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
     EXPECT_EQ(st.snap_attempt, st.lease.seq);
     EXPECT_GT(st.snap_generation, 0u);
-    // The fold seal is durable under (snap_generation_at_fold, snap_attempt).
-    EXPECT_TRUE(backend->head(store->layout().foldSealKey(/*G_f*/ 1, st.snap_attempt)).has_value());
+    // The fold seal is durable under (snap_generation, snap_attempt) — derive the generation from state.
+    EXPECT_TRUE(backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists);
 }
 ```
 
@@ -558,15 +595,19 @@ Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
 
 ---
 
-### Task 6: `Gc::recheck` — completion artifacts under the adopted attempt + completion-advance CAS #2
+### Task 6: `Gc::retire` + `Gc::recheck` — tail artifacts (retired set, outcomes, completion seal/runs) under the adopted attempt + completion-advance CAS #2
 
 **Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp:667-958` (`recheck`)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp` — `retire:459-577` (retired-set write at 547), `recheck:667-958` (outcomes at 829, completion seal at 915-925, retired-drop at 949, CAS #2 at 927-944)
 - Test: `src/Disks/tests/gtest_cas_gc_fence_recheck.cpp`
 
 **Interfaces:**
-- Consumes: `state.snap_attempt` (the attempt adopted by CAS #1 — recheck does NOT mint a new one); `Layout::completionSealKey(gen, attempt)`, `blobTargetRunKey(gen, attempt, …)`; `putDeterministicArtifact`.
-- Produces: completion in-degree runs + completion_seal written under `(completion_generation, state.snap_attempt)`; CAS #2 advances `next.snap_generation = completion_generation` while keeping `next.snap_attempt = state.snap_attempt`; CAS #2 is gated on a complete outcome log (every retired entry of the round has a recorded outcome).
+- Consumes: `state.snap_attempt` (the attempt adopted by CAS #1 — neither retire nor recheck mints a new one); `Layout::completionSealKey(gen, attempt)`, `blobTargetRunKey(gen, attempt, …)`, `retiredKey(gen, attempt, round, shard)`, `outcomesKey(gen, attempt, round, shard)`; `putDeterministicArtifact` for the **deterministic** artifacts (runs, seals); **adopt-on-present** (read-if-present, never recompute-and-compare) for the **observation-bearing** artifacts (retired set, outcome log — these carry HEAD-observed tokens that two observers may legitimately differ on, so they keep their existing `putIfAbsent`→decode-existing path, NOT the strict byte-equal guard).
+- Produces:
+  - `retire` writes the retired set under `retiredKey(folded.fold_seal.generation /*G_f*/, state.snap_attempt, round, shard)` (the fold generation `G_f` + the adopted attempt).
+  - `recheck` writes outcomes under `outcomesKey(completion_generation /*G_c*/, state.snap_attempt, round, shard)`, completion in-degree runs + completion_seal under `(completion_generation, state.snap_attempt)`, and drops the retired set at the same `retiredKey(G_f, snap_attempt, round, shard)`.
+  - CAS #2 advances `next.snap_generation = completion_generation` while keeping `next.snap_attempt = state.snap_attempt`; gated on a complete outcome log (every retired entry of the round has a recorded outcome).
+- **Artifact-class rule (spec §strict-put-if-absent):** runs/seals (deterministic) → `putDeterministicArtifact` (byte-equal-or-`CORRUPTED_DATA`); retired set + outcome log (observation-bearing) → first-durable-write-wins / read-if-present. Do NOT route retired/outcomes through `putDeterministicArtifact`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -591,9 +632,11 @@ TEST(CasGcRecheck, CompletionInheritsFoldAttempt)
     EXPECT_EQ(after_complete.snap_attempt, after_fold.snap_attempt);     // inherited, not re-minted
     EXPECT_GT(after_complete.snap_generation, after_fold.snap_generation);
     EXPECT_TRUE(backend->head(store->layout()
-        .completionSealKey(after_complete.snap_generation, after_complete.snap_attempt)).has_value());
+        .completionSealKey(after_complete.snap_generation, after_complete.snap_attempt)).exists);
 }
 ```
+
+Also add a test asserting the retired set is written under the fold generation + adopted attempt during the second round's retire (read it from `gc/state` after the drop-ref round but before completion, or assert it is consumed/dropped under the accepted attempt — match the file's existing fence/recheck driving pattern).
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -602,7 +645,9 @@ Expected: FAIL (completion seal not under the inherited attempt / signature mism
 
 - [ ] **Step 3: Implement**
 
-In `recheck` (CasGc.cpp:667-958): use `const uint64_t attempt = state.snap_attempt;` for all completion-generation artifact keys. Thread `attempt` into the completion `foldDeltasIntoGeneration`/`ShardReducer::reduce` calls (723, 735-743). Replace the completion_seal block (915-925) to write `completionSealKey(completion_generation, attempt)` via `putDeterministicArtifact`. In the CAS #2 block (927-944), keep `next.snap_attempt = state.snap_attempt` (it is copied by `GcState next = state;`, so just do NOT change it). Confirm the outcome-coverage gate: the completion-advance must occur only after every retired entry has a recorded outcome — the existing outcome-log writes (826-848) already key `outcomesKey(round, fence_seq, shard)` (unchanged); add an assertion/guard that the computed outcome set covers the retired set before the CAS (if a gap, recompute the missing outcome from the accepted retired set via the exact-token delete, then proceed). Keep `pruneSupersededGenerations` (Task 9 adjusts it).
+**retire (CasGc.cpp:459-577):** the retired-set write at line 547 changes from `retiredKey(round, state.fence_seq, shard)` to `retiredKey(folded.fold_seal.generation, state.snap_attempt, round, shard)` (fold generation `G_f` + adopted attempt). Keep its existing observation-bearing path (`putIfAbsent`→on `PreconditionFailed` decode the existing set), NOT `putDeterministicArtifact`.
+
+**recheck (CasGc.cpp:667-958):** use `const uint64_t attempt = state.snap_attempt;` for all completion-generation artifact keys. Thread `attempt` into the completion `foldDeltasIntoGeneration`/`ShardReducer::reduce` calls (723, 735-743). The outcome-log writes (826-848) change to `outcomesKey(completion_generation, attempt, round, shard)` (observation-bearing — keep the existing decode-existing path). Replace the completion_seal block (915-925) to write `completionSealKey(completion_generation, attempt)` via `putDeterministicArtifact`. The retired-set drop at line 949 changes to `retiredKey(folded.fold_seal.generation, attempt, round, shard)` (must match retire's write key). In the CAS #2 block (927-944), keep `next.snap_attempt = state.snap_attempt` (copied by `GcState next = state;` — do NOT change it). Outcome-coverage gate: the completion-advance must occur only after every retired entry has a recorded outcome (the existing logic computes `computed` per shard; assert/guard it covers the retired set before the CAS — if a gap, recompute the missing outcome from the accepted retired set via the exact-token delete, then proceed). Keep `pruneSupersededGenerations` (Task 9 adjusts it).
 
 - [ ] **Step 4: Run the test (+ fence/recheck + resume suites)**
 
@@ -624,16 +669,20 @@ Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
 
 ---
 
-### Task 7: Readers resolve via `(snap_generation, snap_attempt)`
+### Task 7: Readers resolve via `(snap_generation, snap_attempt)` — incl. the back-scan elimination (B2) + `RetireView`
 
 **Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp` — `readSealedCursors` (1129-1140), `readFoldSeal` (~1117), `readCompletionSeal` (~1124), `previewDeletes` (1317-1343), `trim` (960-1034), and the `zeroInDegree`/`inDegreeInGeneration` call sites in `retire`/`recheck`.
-- Modify: `CasBlobInDegree.h`/`.cpp` — `zeroInDegree`/`inDegreeInGeneration` already took `attempt` from Task 4; ensure all call sites pass `state.snap_attempt` (or the just-adopted attempt).
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp` — `readSealedCursors` (1129-1140), `readFoldSeal` (~1117), `readCompletionSeal` (~1124), the **`fold` discover-ref-seal back-scan (244-251)**, `previewDeletes` (1317-1343), `trim` (960-1034), the `zeroInDegree`/`inDegreeInGeneration` call sites in `retire`/`recheck`.
+- Modify: `src/Disks/.../Core/CasRetireView.cpp:46` — `refresh()` resolves retired sets under the accepted attempt (writer-facing publish gate).
+- Modify: `src/Disks/.../Core/CasOrphanManifestSweep.cpp:43` — `sealedFoldCursor` reads the seal at the adopted `(snap_generation, snap_attempt)` instead of a blind back-scan (B1).
+- Modify: `CasBlobInDegree.h`/`.cpp` — `zeroInDegree`/`inDegreeInGeneration` already took `attempt` from Task 4; ensure all call sites pass `state.snap_attempt`.
 - Test: `src/Disks/tests/gtest_cas_gc_round.cpp`
 
 **Interfaces:**
-- Consumes: `GcState::snap_attempt`.
-- Produces: every read of a `gc/gen` artifact resolves `(snap_generation, snap_attempt)`. `readFoldSeal`/`readCompletionSeal` gain an `attempt` parameter; `readSealedCursors(generation, attempt)`; `previewDeletes` reads `zeroInDegree(backend, layout, state.snap_generation, state.snap_attempt, 0)`.
+- Consumes: `GcState::snap_attempt`, `snap_generation`; `Layout::gcGenAttemptRetiredPrefix`.
+- Produces: every read of a `gc/gen` artifact resolves `(snap_generation, snap_attempt)`. `readFoldSeal`/`readCompletionSeal` gain an `attempt` parameter; `readSealedCursors(generation, attempt)`; `previewDeletes` reads `zeroInDegree(backend, layout, state.snap_generation, state.snap_attempt, 0)`; `RetireView::refresh()` reads `gc/state` then resolves retired sets under `gcGenAttemptRetiredPrefix(snap_generation, snap_attempt)` (replacing the flat `gcRetiredPrefix()` LIST).
+
+> **B2 — eliminate the blind multi-generation back-scan (design-gap fix, verified safe).** Today `fold` (242-251) and `CasOrphanManifestSweep::sealedFoldCursor` (33-52) walk generations `g = snap_generation downto 1` looking for the latest seal. With one stored `snap_attempt` that is unsound for `g ≤ snap_generation-2` (a *prior* round's adopted attempt is a different `lease.seq`, recorded nowhere). **Verified:** in all reachable states the seal resolves at `snap_generation` (normal completed round → `readCompletionSeal(snap_generation)`, attempt `snap_attempt`) or, mid-round, at `snap_generation = G_f` (its fold seal, same `snap_attempt`); the loop never legitimately reaches a prior round. **Fix:** read the seal **directly at the adopted `(snap_generation, snap_attempt)`** — `readCompletionSeal(snap_generation, snap_attempt)` else `readFoldSeal(snap_generation, snap_attempt)` — and on absence **fail-closed to the empty seal** (all-Read / conservative, never an older generation). This removes the unsound scan and keeps the spec's single-`snap_attempt` schema. Apply the same direct-read to `sealedFoldCursor`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -668,7 +717,13 @@ Expected: compile FAIL until `readSealedCursors`/`previewDeletes` take the attem
 
 - [ ] **Step 3: Implement**
 
-Thread `state.snap_attempt` into every reader. `readSealedCursors(generation, attempt)`, `readFoldSeal(generation, attempt)`, `readCompletionSeal(generation, attempt)`; in `fold` the `readSealedCursors(state.snap_generation, state.snap_attempt)` call (line 215); in `previewDeletes` the `zeroInDegree(backend, layout, state.snap_generation, state.snap_attempt, 0)` (line 1329); in `trim`, source from the sealed fold coverage of the adopted attempt; in `retire` `zeroInDegree(backend, layout, folded.fold_seal.generation, attempt_just_adopted, 0)`; in `recheck` `inDegreeInGeneration(backend, layout, completion_generation, state.snap_attempt, entry_shard, entry.hash)`.
+Thread `state.snap_attempt` into every reader. `readSealedCursors(generation, attempt)`, `readFoldSeal(generation, attempt)`, `readCompletionSeal(generation, attempt)`; in `fold` the `readSealedCursors(state.snap_generation, state.snap_attempt)` call (line 215) AND replace the back-scan (242-251) with the direct adopted-attempt read + fail-closed-empty per the B2 note above; in `previewDeletes` the `zeroInDegree(backend, layout, state.snap_generation, state.snap_attempt, 0)` (line 1329); in `trim`, source from the sealed fold coverage of the adopted attempt; in `retire` `zeroInDegree(backend, layout, folded.fold_seal.generation, state.snap_attempt, 0)`; in `recheck` `inDegreeInGeneration(backend, layout, completion_generation, state.snap_attempt, entry_shard, entry.hash)`.
+
+**`RetireView::refresh()` (`CasRetireView.cpp:46`):** replace the flat `layout.gcRetiredPrefix()` LIST with: read `gc/state`, decode `(snap_generation, snap_attempt)`, then LIST `layout.gcGenAttemptRetiredPrefix(snap_generation, snap_attempt)` and GET each retired set there. A retired set under any *other* attempt is invisible to writers — closing the writer-facing leak. (`RetireView` already GETs `gc/state`; reuse that read for the pair.)
+
+**`CasOrphanManifestSweep::sealedFoldCursor` (`CasOrphanManifestSweep.cpp:43`):** read `gc/state` for `(snap_generation, snap_attempt)` and read `foldSealKey(snap_generation, snap_attempt)` (else completion seal at the same pair) directly; drop the `for g downto 1` scan.
+
+Add a second test asserting a **decoy retired set** planted under a non-adopted attempt does NOT condemn a live writer token through `RetireView` (construct a fresh `RetireView`, `refresh()`, and assert `isCondemnedToken(...)` is false for a token only present in the decoy set).
 
 - [ ] **Step 4: Run the test (+ full CasGc suite)**
 
@@ -697,8 +752,8 @@ Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
 - Test: `src/Disks/tests/gtest_cas_gc_resume.cpp`
 
 **Interfaces:**
-- Consumes: `state.snap_attempt`, `state.snap_generation`; `readFoldSeal(snap_generation, snap_attempt)`, `partManifestCleanupKey(snap_generation, snap_attempt, …)`.
-- Produces: resume reads the tail of the accepted attempt — `readFoldSeal(state.snap_generation, state.snap_attempt)`; the cleanup-bundle walk uses `partManifestCleanupKey(state.snap_generation, state.snap_attempt, 0, seq)`; re-fence + re-recheck run under the accepted attempt. No new leader's `lease.seq` is used for the tail (the tail belongs to the adopted attempt).
+- Consumes: `state.snap_attempt`, `state.snap_generation`; `readFoldSeal(snap_generation, snap_attempt)`, `partManifestCleanupKey(snap_generation, snap_attempt, …)`, `retiredKey(snap_generation /*G_f*/, snap_attempt, round, shard)`.
+- Produces: resume reads the tail of the accepted attempt — the incompleteness signal (retired sets present) is read at `retiredKey(state.snap_generation, state.snap_attempt, round, shard)`; `readFoldSeal(state.snap_generation, state.snap_attempt)`; the cleanup-bundle walk uses `partManifestCleanupKey(state.snap_generation, state.snap_attempt, 0, seq)`; re-fence + re-recheck run under the accepted attempt. No new leader's `lease.seq` is used for the tail (the tail belongs to the adopted attempt). **Note:** mid-round, `snap_generation = G_f` (fold-adopted, completion not yet advanced), so the retired set written by `retire` under `(G_f, snap_attempt)` is found at exactly this generation+attempt.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -734,7 +789,7 @@ Expected: FAIL (resume reads fold seal at the wrong key — old single-slot sign
 
 - [ ] **Step 3: Implement**
 
-In `tryResumeIncompleteRound` (1345-1414): replace `readFoldSeal(state.snap_generation)` (1374) with `readFoldSeal(state.snap_generation, state.snap_attempt)`; replace the cleanup-bundle walk (1384-1400) to use `partManifestCleanupKey(state.snap_generation, state.snap_attempt, 0, seq)`. The re-`recheck` call already uses `state` (which carries `snap_attempt`), so it inherits correctly once Task 6 lands.
+In `tryResumeIncompleteRound` (1345-1414): replace the retired-set probe at line 1360 (`backend.get(layout.retiredKey(round, state.fence_seq, shard))`) with `layout.retiredKey(state.snap_generation, state.snap_attempt, round, shard)`; replace `readFoldSeal(state.snap_generation)` (1374) with `readFoldSeal(state.snap_generation, state.snap_attempt)`; replace the cleanup-bundle walk (1384-1400) to use `partManifestCleanupKey(state.snap_generation, state.snap_attempt, 0, seq)`. The re-`recheck` call already uses `state` (which carries `snap_attempt`), so it inherits correctly once Task 6 lands.
 
 - [ ] **Step 4: Run the test**
 
@@ -781,9 +836,9 @@ TEST(CasGcPrune, SweepsNonAdoptedCurrentGenAttempt)
     backend->putIfAbsent(orphan, "orphan");
     Gc gc(store, kGc);
     gc.runRegularRound();   // a round should sweep the orphan (seq < min_live_lease_seq)
-    EXPECT_FALSE(backend->head(orphan).has_value());
+    EXPECT_FALSE(backend->head(orphan).exists);
     // The adopted attempt's artifact survives.
-    EXPECT_TRUE(backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).has_value());
+    EXPECT_TRUE(backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists);
 }
 ```
 
@@ -796,7 +851,7 @@ Expected: FAIL (orphan attempt survives — prune only handled attempt-0 final k
 
 - [ ] **Step 3: Implement**
 
-In `pruneSupersededGenerations` (1068-1113): (a) for `g <= prune_floor`, replace the per-key `dropExact` of `foldSealKey(g)/completionSealKey(g)/blobTargetRunKey(g,0,seq)/partManifestCleanupKey(g,0,seq)` with a wholesale LIST over `gcGenPrefix(g)` and `deleteExact` each listed key (tolerate 404 — fail-open, never throw on a benign 404 during prune, per the GC-never-throw-on-404 rule); (b) add a bounded current-generation attempt sweep: LIST `gcGenPrefix(snap_generation)`, parse the `attempt/<a>/` segment, and for each `a != snap_attempt` with `a < min_live_lease_seq` (a low-watermark below which no in-flight leader could still be writing — derive conservatively, e.g. from the current `lease.seq` minus an in-flight margin, documented inline), delete the attempt subtree via `gcGenAttemptPrefix(snap_generation, a)`. Never prune generations `> snap_generation`. Keep `kMaxPrunePerRound` bounding.
+In `pruneSupersededGenerations` (1068-1113): (a) for `g <= prune_floor`, replace the per-key `dropExact` of `foldSealKey(g)/completionSealKey(g)/blobTargetRunKey(g,0,seq)/partManifestCleanupKey(g,0,seq)` with a wholesale LIST over `gcGenPrefix(g)` and `deleteExact` each listed key (tolerate 404 — fail-open, never throw on a benign 404 during prune, per the GC-never-throw-on-404 rule). **This wholesale `gcGenPrefix(g)` delete now also reclaims the `retired/` and `outcomes/` artifacts** (they live under `gc/gen/<g>/attempt/<a>/` after Task 3) — so there is NO separate `gc/retired/`+`gc/outcomes/` sweep, and no orphaned writer-visible retired debris (the user-review concern). (b) add a bounded current-generation attempt sweep: LIST `gcGenPrefix(snap_generation)`, parse the `attempt/<a>/` segment, and for each `a != snap_attempt` with `a < min_live_lease_seq` (a low-watermark below which no in-flight leader could still be writing — derive conservatively, e.g. from the current `lease.seq` minus an in-flight margin, documented inline), delete the attempt subtree via `gcGenAttemptPrefix(snap_generation, a)`. Never prune generations `> snap_generation`. Keep `kMaxPrunePerRound` bounding.
 
 - [ ] **Step 4: Run the test (+ full CasGc suite)**
 
@@ -929,22 +984,22 @@ Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
 - Problem (orphaned-seal wedge + divergent run) → Tasks 4 (strict putIfAbsent), 5 (attempt-prefix fold + CAS #1). ✓
 - Governing invariant (only `(snap_generation, snap_attempt)` viewable) → Task 1 (`INV_ONLY_ADOPTED_VIEWABLE`), Task 7 (readers). ✓
 - `GcState.snap_attempt`, no phase field → Task 2. ✓
-- Attempt namespace for the four gc/gen keys → Task 3. ✓
+- Attempt namespace for **all six** gc/gen key families (incl. retired/outcomes per spec lines 102-106) → Task 3. ✓
 - Round lifecycle: one attempt, CAS #1 selects / CAS #2 inherits → Tasks 5, 6. ✓
-- Strict putIfAbsent by artifact class: deterministic → byte-equal-or-CORRUPTED; observation-bearing (retired/outcomes) → write-once/adopt-on-present → Task 4 (deterministic helper); retired/outcomes already adopt-on-present (`retire` 545-565, `recheck` 826-848) and are fence_seq-keyed (documented, no change needed). ✓
-- Readers → Task 7. Content deletes (exact-token, idempotent, unchanged) → untouched (documented). ✓
+- Strict putIfAbsent by artifact class: deterministic (runs/seals) → byte-equal-or-CORRUPTED via `putDeterministicArtifact` (Task 4); observation-bearing (retired set/outcome log) → write-once/adopt-on-present, kept on their decode-existing path, NOT the strict guard (Task 6, explicit). ✓
+- Readers → Task 7 (incl. the B2 back-scan elimination, `RetireView` writer-facing resolution, `CasOrphanManifestSweep`). Content deletes (exact-token, idempotent, unchanged) → untouched (documented). ✓
 - Recheck ordering & outcome coverage → Task 6 (CAS #2 gated on outcome coverage). ✓
-- Resume derives from durable artifacts → Task 8. ✓
-- Pruning (generation-retention wholesale + current-gen attempt sweep, seq<min_live_lease_seq, never `>snap_generation`) → Task 9. ✓
+- Resume derives from durable artifacts (incl. the attempt-scoped retired-set probe) → Task 8. ✓
+- Pruning (generation-retention wholesale — now also reclaims retired/outcomes — + current-gen attempt sweep, seq<min_live_lease_seq, never `>snap_generation`) → Task 9. ✓
 - Distributed sharded reducer boundary → covered by the artifact-class rule (Task 4 deterministic + retired/outcomes adopt-on-present) which holds for any producer; no scheduler built (out of scope per spec). ✓
-- TLA+ Gate A (`INV_ONLY_ADOPTED_VIEWABLE` + R0 + `SabotageDeposedLeaderWritesFinalGen` + bounded-B witnesses + inertness) → Task 1. ✓
-- Testing (TLA+ gate, gtest attempt-scoped fold→adopt→resume + strict putIfAbsent + deposed invisible, S33 drains) → Tasks 1, 4, 5, 6, 8, 10, 11. ✓
+- TLA+ Gate A (`INV_ONLY_ADOPTED_VIEWABLE` over seal **and** retired-set visibility + R0 + `SabotageDeposedLeaderWritesFinalGen` + bounded-B witnesses + inertness; fresh monotonic attempt id) → Task 1. ✓
+- Testing (TLA+ gate, gtest attempt-scoped fold→adopt→resume + strict putIfAbsent + deposed invisible + RetireView ignores non-adopted retired set, S33 drains) → Tasks 1, 4, 5, 6, 7, 8, 10, 11. ✓
 
 **2. Placeholder scan:** Every code step shows real code; every TLA+ step gives concrete invariant text + run command + expected verdict + the inertness numbers (19,846 / 402,034). The one irreducible TLA+ discretion (`SealViewable`/`GDeposedWriteSeal` shape) is bounded by an objective acceptance test (Step 6 must produce a counterexample; Step 5 must be green) — not a "TODO".
 
 **3. Type/name consistency:** `snap_attempt` (`uint64_t`) consistent Tasks 2–9. `foldSealKey(gen, attempt)`, `completionSealKey(gen, attempt)`, `blobTargetRunKey(gen, attempt, shard, seq)`, `partManifestCleanupKey(gen, attempt, owner_shard, seq)`, `gcGenPrefix(gen)`, `gcGenAttemptPrefix(gen, attempt)` consistent Tasks 3–9. `putDeterministicArtifact(backend, key, bytes)` consistent Tasks 4–6. `attempt = state.lease.seq` at fold; `attempt = state.snap_attempt` at recheck/resume/readers — consistent.
 
-**Known deviation from spec wording (documented):** the spec illustrates `retired` under `gc/gen/<G_f>/attempt/<a>/retired/…` and outcomes under `gc/gen/<G_c>/attempt/<a>/…`. Code reality: `retiredKey`/`outcomesKey` already live under `gc/retired/<round>.<fence_seq>/…` and `gc/outcomes/<round>.<fence_seq>/…`, already epoch-separated by `fence_seq` (bumped only on lease steal) and written in the lease-guarded tail. The governing invariant (no unadopted artifact influences a decision) is satisfied for them without a new attempt segment; only the four `gc/gen/<gen>/…` write-once keys (which key on generation alone) are the wedge/divergence surface and get attempt-scoped. This realizes the spec's *intent* with the minimal correct change and is recorded in the worklog.
+**Alignment with spec (no deviations):** an earlier draft attempt-scoped only the four `gc/gen` keys and left `retired`/`outcomes` flat. User review rejected that as unsafe — `retired` is **writer-facing** (`RetireView::refresh()` LISTs the retired namespace; writers consult `isCondemnedToken` on the publish gate, `CasBuild.cpp:235,414,666,725`), so a deposed leader's stale retired set under its own epoch would influence live writers. The plan now scopes **all six** artifact families under the adopted attempt (spec lines 102-106), `RetireView` resolves via the accepted `(snap_generation, snap_attempt)`, and the wholesale `gc/gen/<g>/` prune reclaims them (no separate sweep). **Design-gap fix (B2):** a single `snap_attempt` is unsound for blind multi-generation back-scans; verified the back-scans only ever resolve at `snap_generation` (or `G_f` mid-round, same attempt) in reachable states, so Task 7 replaces the blind scan with a direct adopted-attempt read + fail-closed-empty — keeping the spec's single-`snap_attempt` schema, no map. **TLA+ correction:** attempt modeled as a fresh monotonic id (not leader identity), and the proof covers retired-set visibility (the RetireView consumer), not only the GC-internal seal.
 
 ## Execution Handoff
 
