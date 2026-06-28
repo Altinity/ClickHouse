@@ -259,6 +259,30 @@ public:
         return serverRootPrefix(server_root_id) + "watermark";
     }
 
+    /// The data subtree owned by a server root: `<prefix>/roots/<srid>/`. The mount-safety
+    /// empty-root precondition (Phase 0) lists this prefix; data/ref/manifest writes (Phase 1)
+    /// will relocate under it.
+    String serverRootDataPrefix(const String & server_root_id) const
+    {
+        return prefix + "/roots/" + server_root_id + "/";
+    }
+
+    /// Per-server-root content-addressed ref subtree (Phase 1 relocation target):
+    /// `<prefix>/cas/refs/<srid>/`. Constructed now so the empty-root precondition (Phase 0)
+    /// stays correct once Phase 1 populates it.
+    String casRefsServerPrefix(const String & server_root_id) const
+    {
+        return prefix + "/cas/refs/" + server_root_id + "/";
+    }
+
+    /// Per-server-root content-addressed manifest subtree (Phase 1 relocation target):
+    /// `<prefix>/cas/manifests/<srid>/`. Constructed now so the empty-root precondition (Phase 0)
+    /// stays correct once Phase 1 populates it.
+    String casManifestsServerPrefix(const String & server_root_id) const
+    {
+        return prefix + "/cas/manifests/" + server_root_id + "/";
+    }
+
     /// Pool-level metadata object.
     String poolMetaKey() const
     {

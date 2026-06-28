@@ -96,4 +96,36 @@ ServerEpoch decodeServerEpoch(std::string_view data);
 String encodeMountLease(const MountLease & m);
 MountLease decodeMountLease(std::string_view data);
 
+class Backend;
+class Layout;
+
+/// Mount-safety claim logic (Phase 0). These are the identity + epoch-allocation steps a server
+/// runs at startup over its `server_root_id` subtree, BEFORE any ordinary data write. They fail
+/// closed (`ErrorCodes::CORRUPTED_DATA`); there is no re-mint or silent-recreate fallback.
+
+/// TRUE iff the whole `server_root_id` subtree is provably empty — `list(prefix, "", 1)` (limit 1)
+/// over EACH of the three subtrees that can hold this server root's data
+/// (`cas/refs/<srid>/`, `cas/manifests/<srid>/`, `roots/<srid>/`) returns no keys. The `cas/refs`
+/// and `cas/manifests` prefixes carry no data until Phase 1 relocates into them, but all three are
+/// listed so the precondition stays correct once Phase 1 lands.
+bool serverRootSubtreeEmpty(Backend & b, const Layout & l, const String & srid);
+
+/// Claim (or validate) the sticky owner anchor that binds `srid` to a server UUID (identity).
+///   - owner present, equal `our_uuid` → ok (return);
+///   - owner present, different → throw `CORRUPTED_DATA` (foreign owner — fail closed);
+///   - owner absent AND the subtree is provably empty → `putIfAbsent` the owner (claim);
+///   - owner absent BUT the subtree is non-empty → throw `CORRUPTED_DATA` (identity lost over
+///     existing data — never silently re-claim).
+/// The owner object is never deleted and never reassigned to a different UUID.
+void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt128 our_uuid);
+
+/// Allocate the next durable-monotone `writer_epoch` by CAS-bumping the sticky `epoch` object
+/// (`ServerEpoch{next_writer_epoch}`), returning the value the caller adopts as its writer_epoch.
+///   - `epoch` absent AND the subtree is non-empty → throw `CORRUPTED_DATA` (missing epoch over
+///     data is a reset hazard);
+///   - `epoch` absent AND the subtree is empty → start at 0;
+///   - otherwise read `next = current.next_writer_epoch`, `casPut` `{next + 1}` against the
+///     observed token, retry on `Conflict` (bounded), and return `next`.
+uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid);
+
 }

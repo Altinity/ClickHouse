@@ -69,3 +69,37 @@ TEST(CasServerRoot, KeysAndCodecsRoundTrip)
     EXPECT_THROW(decodeServerEpoch(""), DB::Exception);
     EXPECT_THROW(decodeMountLease(""), DB::Exception);
 }
+
+TEST(CasServerRootClaim, OwnerStickyAndForeignFailsClosed)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    EXPECT_NO_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1)));     // fresh empty root → claim
+    EXPECT_NO_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1)));     // same uuid → ok
+    EXPECT_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(2)), DB::Exception);  // foreign → fail closed
+}
+
+TEST(CasServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("r");
+    claimOwnerOrThrow(*b, l, "r", UInt128(1));
+    const uint64_t e1 = allocateWriterEpoch(*b, l, "r");
+    const uint64_t e2 = allocateWriterEpoch(*b, l, "r");
+    EXPECT_GT(e2, e1);                                             // strictly increasing
+
+    /// Deleting the (separate) mount object must NOT reset the epoch. No mount has been written in
+    /// Task 4, so deleteExact of a non-existent mount is a NotFound no-op that touches nothing.
+    const auto del = b->deleteExact(l.mountKey("r"), b->head(l.mountKey("r")).token);
+    EXPECT_EQ(del.kind, DeleteOutcome::Kind::NotFound);
+    EXPECT_GT(allocateWriterEpoch(*b, l, "r"), e2);
+}
+
+TEST(CasServerRootClaim, MissingOwnerOverNonEmptyRootIsCorrupted)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    /// Simulate existing data without an owner (identity lost): plant a key under roots/<srid>/.
+    b->putIfAbsent(l.serverRootDataPrefix("r") + "some-data", "x");
+    EXPECT_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1)), DB::Exception);
+}
