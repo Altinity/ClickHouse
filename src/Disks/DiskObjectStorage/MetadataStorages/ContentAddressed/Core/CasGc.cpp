@@ -949,6 +949,14 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     /// sets. WHICH seal exists IS the durable "rechecked + deleted + done" marker (the resume rule).
     folded.completion_seal.generation = completion_generation;
     folded.completion_seal.adoptable = true;
+    /// Fence positions are taken from the DURABLE `state.fence_version[round]` (the authoritative copy
+    /// persisted by `fence`'s gc/state CAS), NOT from whatever `fence` happened to populate into the
+    /// in-memory `folded.completion_seal` this process. On the RESUME path `fence` is skipped (the round
+    /// already fenced), so the in-memory seal's `fence_positions` would be empty — making the recomputed
+    /// completion seal diverge from the original leader's and trip `putDeterministicArtifact`'s
+    /// byte-equal guard. Sourcing them here from durable state makes the seal byte-identical whether
+    /// recheck is reached fresh or via resume (the determinism the strict put depends on).
+    folded.completion_seal.fence_positions = fence_it->second;
     /// M1: carry the round's fold cursor coverage forward into the completion seal. After this round the
     /// snap_generation pointer is the COMPLETION generation, whose fold_seal lives at the parent (fold)
     /// generation — so readFoldSeal(snap_generation) is nullopt and the next fold's sealedCursorOf would
