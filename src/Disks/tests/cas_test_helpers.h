@@ -488,20 +488,19 @@ inline uint64_t foldCursorOf(
     }
 }
 
-/// Set a server's durable watermark min_active (so orphan-sweep eligibility can be driven). The server
-/// hex is the segment before ':' in the writer_instance_id.
+/// Set a server root's durable watermark min_active (so orphan-sweep eligibility can be driven).
 inline void setWatermarkMinActive(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & writer_instance_id,
-    uint64_t min_active)
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & server_root_id,
+    const String & writer_instance_id, uint64_t min_active)
 {
     const size_t colon = writer_instance_id.find(':');
-    const String server_hex = colon == String::npos ? writer_instance_id : writer_instance_id.substr(0, colon);
+    const String epoch_str = colon == String::npos ? "0" : writer_instance_id.substr(colon + 1);
     DB::Cas::ServerWatermark w;
-    w.server_id = DB::Cas::hexToU128(server_hex);
-    w.epoch = 1;
+    w.server_id = DB::UInt128(0);
+    w.epoch = std::stoull(epoch_str);
     w.min_active = min_active;
     w.seq = 1;
-    const String key = layout.serverWatermarkKey(server_hex);
+    const String key = layout.serverRootWatermarkKey(server_root_id);
     const DB::Cas::HeadResult h = backend.head(key);
     if (h.exists)
         backend.putOverwrite(key, DB::Cas::encodeServerWatermark(w), h.token);

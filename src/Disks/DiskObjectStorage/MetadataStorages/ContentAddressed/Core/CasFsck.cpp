@@ -54,7 +54,7 @@ void listAll(Backend & backend, const String & prefix, std::unordered_map<String
 }
 
 /// Parse (writer_instance_id, build_sequence) from a manifest object key of the shape
-/// `<ns-prefix>_manifests/<writer>/<build_seq>/<aa>/<inst>.proto`. Returns false on a malformed key.
+/// `<manifest-prefix><writer>/<build_seq>/<aa>/<inst>.proto`. Returns false on a malformed key.
 bool parseBuildPrefix(const String & key, const String & manifests_prefix, BuildPrefix & out)
 {
     if (!key.starts_with(manifests_prefix))
@@ -218,7 +218,7 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
         }
     }
 
-    /// Pre-precommit manifest debris: a `_manifests/` body with no committed owner. An ELIGIBLE prefix's
+    /// Pre-precommit manifest debris: a `cas/manifests/` body with no committed owner. An ELIGIBLE prefix's
     /// orphan is reclaimable debris => INFO (Unreachable); a non-eligible (in-flight) one is also info,
     /// never an error. The owner-visible missing-body case is the error above.
     for (const String & ns_str : store.listNamespaces(""))
@@ -241,7 +241,7 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
                 o.kind = ObjectKind::Blob;
                 o.size = sz;
                 o.cls = FsckClass::Unreachable;
-                if (parsed && prefixEligible(store, prefix))
+                if (parsed && prefixEligible(store, ns, prefix))
                     o.reachable_from = {"reclaimable-pre-precommit"};
                 else
                     o.reachable_from = {"in-flight-pre-precommit"};

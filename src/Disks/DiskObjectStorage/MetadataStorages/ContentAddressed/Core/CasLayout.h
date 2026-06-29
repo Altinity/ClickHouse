@@ -88,6 +88,12 @@ public:
         return prefix + "/cas/manifests/" + ns.string() + "/";
     }
 
+    /// Pool-wide part-manifest prefix (Phase 1): `<prefix>/cas/manifests/`.
+    String casManifestsPrefix() const
+    {
+        return prefix + "/cas/manifests/";
+    }
+
     /// Prefix that covers all root manifest shards of a namespace (for list).
     /// Note: also covers the "_files/" sub-prefix; listers must skip it.
     String rootNamespacePrefix(const RootNamespace & ns) const

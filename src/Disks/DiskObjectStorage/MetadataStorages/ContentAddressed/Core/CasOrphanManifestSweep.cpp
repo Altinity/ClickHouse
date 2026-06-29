@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Common/Exception.h>
+#include <map>
 #include <set>
 #include <limits>
 
@@ -15,14 +16,100 @@ namespace DB::Cas
 namespace
 {
 
-/// The server hex of a writer_instance_id "<server_hex>:<process_epoch>" (the watermark slot key). An
-/// id without a ':' has no derivable server => no eligibility (returns empty).
-String serverHexOf(const String & writer_instance_id)
+std::optional<uint64_t> writerEpochOf(const String & writer_instance_id)
 {
     const size_t colon = writer_instance_id.find(':');
     if (colon == String::npos)
-        return {};
-    return writer_instance_id.substr(0, colon);
+        return std::nullopt;
+    try
+    {
+        size_t consumed = 0;
+        const uint64_t epoch = std::stoull(writer_instance_id.substr(colon + 1), &consumed);
+        if (consumed != writer_instance_id.size() - colon - 1)
+            return std::nullopt;
+        return epoch;
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
+std::optional<ServerWatermark> watermarkForNamespace(Store & store, const RootNamespace & ns)
+{
+    /// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
+    /// slashes. Try namespace prefixes from longest to shortest and accept the first durable watermark.
+    /// No watermark => no authority => fail open / not eligible.
+    const String & value = ns.string();
+    size_t pos = value.size();
+    while (true)
+    {
+        pos = value.rfind('/', pos == 0 ? 0 : pos - 1);
+        if (pos == String::npos)
+            break;
+
+        const String server_root_id = value.substr(0, pos);
+        if (!server_root_id.empty())
+        {
+            if (const auto got = store.backend().get(store.layout().serverRootWatermarkKey(server_root_id)))
+                return decodeServerWatermark(got->bytes);
+        }
+        if (pos == 0)
+            break;
+    }
+    return std::nullopt;
+}
+
+struct ListedManifestObject
+{
+    RootNamespace ns;
+    BuildPrefix prefix;
+    String key;
+};
+
+std::optional<ListedManifestObject> parseListedManifestObject(const Layout & layout, const String & key)
+{
+    const String base = layout.casManifestsPrefix();
+    if (!key.starts_with(base))
+        return std::nullopt;
+
+    const String rest = key.substr(base.size());
+    const size_t file_sep = rest.rfind('/');
+    if (file_sep == String::npos)
+        return std::nullopt;
+    const size_t aa_sep = rest.rfind('/', file_sep == 0 ? 0 : file_sep - 1);
+    if (aa_sep == String::npos)
+        return std::nullopt;
+    const size_t build_sep = rest.rfind('/', aa_sep == 0 ? 0 : aa_sep - 1);
+    if (build_sep == String::npos)
+        return std::nullopt;
+    const size_t writer_sep = rest.rfind('/', build_sep == 0 ? 0 : build_sep - 1);
+    if (writer_sep == String::npos)
+        return std::nullopt;
+
+    const String ns_str = rest.substr(0, writer_sep);
+    const String writer = rest.substr(writer_sep + 1, build_sep - writer_sep - 1);
+    const String seq_str = rest.substr(build_sep + 1, aa_sep - build_sep - 1);
+    if (ns_str.empty() || writer.empty() || seq_str.empty())
+        return std::nullopt;
+
+    uint64_t build_seq = 0;
+    try
+    {
+        size_t consumed = 0;
+        build_seq = std::stoull(seq_str, &consumed);
+        if (consumed != seq_str.size())
+            return std::nullopt;
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+
+    return ListedManifestObject{
+        .ns = RootNamespace{ns_str},
+        .prefix = BuildPrefix{.writer_instance_id = writer, .build_sequence = build_seq},
+        .key = key};
 }
 
 /// The shard's sealed fold cursor (the latest seal's `folded_cursor` for ns/shard), or 0 when no seal
@@ -117,20 +204,24 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
 
 }
 
-bool prefixEligible(Store & store, const BuildPrefix & prefix)
+bool prefixEligible(Store & store, const RootNamespace & ns, const BuildPrefix & prefix)
 {
     /// OQ6: durable watermark fact only. A missing watermark => NOT eligible (control #9: never a
-    /// frozen-seq / judged-dead guess). The retired sentinel (min_active == UINT64_MAX) retires every
-    /// seq; otherwise min_active > build_sequence means this build is below the live floor (retired).
-    const String server_hex = serverHexOf(prefix.writer_instance_id);
-    if (server_hex.size() != 32)
+    /// frozen-seq / judged-dead guess). Compare writer_epoch first, then build_sequence, so old-epoch
+    /// debris drains after a process restart even when its build_sequence is above the current min_active.
+    const auto writer_epoch = writerEpochOf(prefix.writer_instance_id);
+    if (!writer_epoch)
         return false;
 
-    const auto got = store.backend().get(store.layout().serverWatermarkKey(server_hex));
-    if (!got)
-        return false;   /// no durable fact => not eligible
+    const auto watermark = watermarkForNamespace(store, ns);
+    if (!watermark)
+        return false;
 
-    const ServerWatermark w = decodeServerWatermark(got->bytes);
+    const ServerWatermark & w = *watermark;
+    if (*writer_epoch < w.epoch)
+        return true;
+    if (*writer_epoch > w.epoch)
+        return false;
     if (w.min_active == std::numeric_limits<uint64_t>::max())
         return true;   /// farewell/retired sentinel: every seq is retired
     return w.min_active > prefix.build_sequence;
@@ -138,7 +229,7 @@ bool prefixEligible(Store & store, const BuildPrefix & prefix)
 
 void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix)
 {
-    if (!prefixEligible(store, prefix))
+    if (!prefixEligible(store, ns, prefix))
         return;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
 
     const Layout & layout = store.layout();
@@ -225,7 +316,7 @@ std::optional<SweepTarget> pickOneSweepTarget(Store & store)
                 if (!seen.emplace(writer, build_seq).second)
                     continue;
                 const BuildPrefix prefix{.writer_instance_id = writer, .build_sequence = build_seq};
-                if (prefixEligible(store, prefix))
+                if (prefixEligible(store, ns, prefix))
                     return SweepTarget{.ns = ns, .prefix = prefix};
             }
             if (page.next_cursor.empty())
@@ -234,6 +325,86 @@ std::optional<SweepTarget> pickOneSweepTarget(Store & store)
         }
     }
     return std::nullopt;
+}
+
+ManifestSweepResult sweepManifestCursorPage(
+    Store & store,
+    const String & cursor,
+    uint64_t list_budget,
+    uint64_t delete_budget)
+{
+    ManifestSweepResult result;
+    result.next_cursor = cursor;
+    if (list_budget == 0)
+        return result;
+
+    Backend & backend = store.backend();
+    const Layout & layout = store.layout();
+    const ListPage page = backend.list(layout.casManifestsPrefix(), cursor, list_budget);
+
+    std::map<String, bool> eligible_by_prefix;
+    std::map<String, std::set<String>> active_by_ns;
+    for (const ListedKey & listed : page.keys)
+    {
+        ++result.listed;
+        const auto parsed = parseListedManifestObject(layout, listed.key);
+        if (!parsed)
+        {
+            ++result.skipped;
+            continue;
+        }
+
+        if (result.deleted >= delete_budget)
+        {
+            ++result.skipped;
+            continue;
+        }
+
+        const String eligibility_key = parsed->ns.string() + "\n"
+            + parsed->prefix.writer_instance_id + "\n"
+            + std::to_string(parsed->prefix.build_sequence);
+        auto [eligible_it, eligible_inserted] = eligible_by_prefix.emplace(eligibility_key, false);
+        if (eligible_inserted)
+            eligible_it->second = prefixEligible(store, parsed->ns, parsed->prefix);
+        if (!eligible_it->second)
+        {
+            ++result.skipped;
+            continue;
+        }
+
+        auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
+        if (inserted)
+            active_it->second = activeManifestKeys(store, parsed->ns);
+        if (active_it->second.count(parsed->key))
+        {
+            ++result.skipped;
+            continue;
+        }
+
+        Token token;
+        if (listed.token)
+            token = *listed.token;
+        else
+        {
+            const HeadResult head = backend.head(parsed->key);
+            if (!head.exists)
+            {
+                ++result.skipped;
+                continue;
+            }
+            token = head.token;
+        }
+
+        const DeleteOutcome outcome = backend.deleteExact(parsed->key, token);
+        if (outcome.kind == DeleteOutcome::Kind::Deleted)
+            ++result.deleted;
+        else
+            ++result.skipped;
+    }
+
+    result.next_cursor = page.next_cursor;
+    result.wrapped = page.next_cursor.empty();
+    return result;
 }
 
 }

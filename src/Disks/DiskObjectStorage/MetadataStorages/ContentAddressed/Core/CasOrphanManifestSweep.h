@@ -7,7 +7,7 @@
 namespace DB::Cas
 {
 
-/// One writer build prefix under `_manifests`: `<writer_instance_id>/<build_sequence>/`.
+/// One writer build prefix under `cas/manifests/<ns>/`: `<writer_instance_id>/<build_sequence>/`.
 struct BuildPrefix
 {
     String writer_instance_id;
@@ -19,6 +19,15 @@ struct SweepTarget
 {
     RootNamespace ns;
     BuildPrefix prefix;
+};
+
+struct ManifestSweepResult
+{
+    String next_cursor;
+    bool wrapped = false;
+    uint64_t listed = 0;
+    uint64_t deleted = 0;
+    uint64_t skipped = 0;
 };
 
 /// Per-namespace pre-precommit orphan sweep (spec rev. 15 §Orphan-Part-Manifest-Cleanup-Sweep). Deletes
@@ -35,9 +44,18 @@ struct SweepTarget
 ///     exact-token delete only.
 void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix);
 
-/// Whether `prefix` is sweep-eligible by the durable watermark fact alone (OQ6). The watermark is keyed
-/// by the server hex (the segment before ':' in `writer_instance_id`). No watermark => not eligible.
-bool prefixEligible(Store & store, const BuildPrefix & prefix);
+/// Whether `prefix` is sweep-eligible by the durable watermark fact alone (OQ6). The watermark is resolved
+/// from the namespace's server_root_id, not by parsing writer identity. No watermark => not eligible.
+bool prefixEligible(Store & store, const RootNamespace & ns, const BuildPrefix & prefix);
+
+/// Cursor-paced bounded orphan part-manifest sweep over `cas/manifests/`. The cursor is a best-effort
+/// cleanup cursor, never reachability authority. It deletes at most `delete_budget` keys from at most
+/// `list_budget` listed keys.
+ManifestSweepResult sweepManifestCursorPage(
+    Store & store,
+    const String & cursor,
+    uint64_t list_budget,
+    uint64_t delete_budget);
 
 /// Choose one eligible (namespace, build prefix) to sweep this round, or nullopt when there is nothing
 /// eligible. Bounded: at most one namespace + one prefix per round (a rare backstop, not the hot path).
