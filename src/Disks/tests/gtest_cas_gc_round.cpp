@@ -61,6 +61,12 @@ StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
     return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
+StorePtr openTestStoreWithConfig(std::shared_ptr<InMemoryBackend> & out_backend, PoolConfig config)
+{
+    out_backend = std::make_shared<InMemoryBackend>();
+    return Store::open(out_backend, std::move(config));
+}
+
 GcState readState(InMemoryBackend & b, const Store & s)
 {
     const auto got = b.get(s.layout().gcStateKey());
@@ -1189,4 +1195,38 @@ TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
                         || backend->head(store->layout().completionSealKey(g, a)).exists;
         EXPECT_TRUE(seal_present) << "keep==0: seal of generation " << g << " must remain";
     }
+}
+
+TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
+{
+    std::shared_ptr<InMemoryBackend> backend;
+    PoolConfig config;
+    config.pool_prefix = "p";
+    config.server_root_id = "test";
+    config.manifest_sweep_list_budget_keys = 1;
+    config.manifest_sweep_delete_budget_keys = 1;
+    auto store = openTestStoreWithConfig(backend, config);
+
+    const RootNamespace ns{"test/aa@cas@"};
+    registerNamespaceRaw(*backend, store->layout(), ns);
+    const ManifestRef r1 = ref(5, 0xCA01);
+    const ManifestRef r2 = ref(5, 0xCA02);
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    setWatermarkMinActive(*backend, store->layout(), "test", r1.writer_instance_id, /*min_active*/6);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const GcState after_first = readState(*backend, *store);
+    EXPECT_FALSE(after_first.manifest_sweep_cursor.empty());
+
+    const bool first_exists = manifestExists(*backend, store->layout(), ManifestId{ns, r1});
+    const bool second_exists = manifestExists(*backend, store->layout(), ManifestId{ns, r2});
+    EXPECT_NE(first_exists, second_exists);
+
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const GcState after_second = readState(*backend, *store);
+    EXPECT_TRUE(after_second.manifest_sweep_cursor.empty());
+    EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r1}));
+    EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r2}));
 }

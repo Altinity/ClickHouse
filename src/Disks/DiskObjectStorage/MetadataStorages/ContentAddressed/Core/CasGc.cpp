@@ -128,12 +128,11 @@ RoundReport Gc::runRegularRound()
     if (trim_enabled)
         trim(folded, state.round);
 
-    /// Bounded orphan-manifest backstop (spec §Orphan sweep): at most one namespace + one eligible
-    /// prefix per round. Records-and-continues on a 404; never throws (feedback_ca_gc_never_throw_on_404).
+    /// Bounded orphan-manifest backstop (spec §Orphan sweep): cleanup-only cursor progress. A failed
+    /// sweep must not fail the already-completed reachability round.
     try
     {
-        if (auto target = pickOneSweepTarget(*store))
-            sweepNamespace(*store, target->ns, target->prefix);
+        runManifestSweepCursorPass(state, state_token);
     }
     catch (const Exception & e)
     {
@@ -1015,6 +1014,34 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
                     "CAS gc recheck: retired set at {} changed under us (token mismatch on drop)", key);
         }
     }
+}
+
+void Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
+{
+    const uint64_t list_budget = store->poolConfig().manifest_sweep_list_budget_keys;
+    if (list_budget == 0)
+        return;
+
+    const uint64_t delete_budget = store->poolConfig().manifest_sweep_delete_budget_keys;
+    const ManifestSweepResult result = sweepManifestCursorPage(
+        *store, state.manifest_sweep_cursor, list_budget, delete_budget);
+
+    if (result.next_cursor == state.manifest_sweep_cursor)
+        return;
+
+    GcState next = state;
+    next.manifest_sweep_cursor = result.next_cursor;
+    const CasResult res = store->backend().casPut(store->layout().gcStateKey(), encodeGcState(next), state_token);
+    if (res.outcome == CasOutcome::Committed)
+    {
+        state = std::move(next);
+        state_token = res.token;
+        return;
+    }
+
+    LOG_DEBUG(getLogger("CasGc"),
+        "CAS gc orphan sweep cursor progress discarded because gc/state moved (listed {}, deleted {}, skipped {})",
+        result.listed, result.deleted, result.skipped);
 }
 
 void Gc::trim(FoldResult & folded, uint64_t /*round*/)

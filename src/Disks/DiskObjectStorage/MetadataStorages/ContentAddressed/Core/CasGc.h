@@ -243,6 +243,10 @@ private:
     /// into `folded.completion_seal.trim_cursors` for the in-round audit log.
     void trim(FoldResult & folded, uint64_t round);
 
+    /// Best-effort cursor-paced orphan part-manifest sweep. This is cleanup-only state: a lost CAS only
+    /// discards cursor progress and must not fail the already-completed GC round.
+    void runManifestSweepCursorPass(GcState & state, Token & state_token);
+
     /// Discover the namespace universe from the registry (namespaces x ALL root_shards shards); shared by
     /// the fold and the resume re-fence. Absent registry => empty (fresh pool).
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverse();
