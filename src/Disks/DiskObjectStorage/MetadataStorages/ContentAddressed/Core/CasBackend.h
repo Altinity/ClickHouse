@@ -85,7 +85,7 @@ struct ListedKey
 struct ListPage
 {
     std::vector<ListedKey> keys;
-    String next_cursor;       /// empty => no more pages
+    String next_cursor;       /// Last returned key; empty => no more pages.
 };
 
 /// Streaming conditional create (If-None-Match:* semantics). The caller writes the FULL object body

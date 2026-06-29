@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
 
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/WriteMode.h>
 
@@ -563,47 +564,82 @@ DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token 
 
 ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor, size_t limit)
 {
-    /// Enumerate the prefix, then apply cursor/limit over the SORTED keys exactly like the in-memory
-    /// backend (the object storage listing order is unspecified, so we sort to make pagination stable).
-    /// In EmulatedSingleProcess mode physical paths are scoped under the storage root, so we list under
-    /// the resolved physical prefix and strip the root back to the logical key the caller passed in.
+    /// Use the lazy object-storage iterator instead of `listObjects(..., max_keys=0)`: the latter
+    /// materialized the whole prefix, then sliced client-side, so a paginated walk re-fetched the full
+    /// subtree for every page. The backend cursor is "last key returned" (exclusive on resume).
+    ///
+    /// Some backends ignore `start_after`; filtering `key <= cursor` keeps the contract correct there,
+    /// only losing the resume optimization. S3 honors `start_after` and avoids the hot-path re-scan.
+    if (limit == 0)
+        return {};
+
     const String physical_prefix = (mode == Mode::EmulatedSingleProcess) ? emuPath(prefix) : prefix;
     const String strip = (mode == Mode::EmulatedSingleProcess) ? emuPath("") : String{};
-
-    RelativePathsWithMetadata children;
-    object_storage->listObjects(physical_prefix, children, /*max_keys=*/0);
-
-    std::vector<ListedKey> all;
-    all.reserve(children.size());
-    for (const auto & child : children)
+    if (mode == Mode::EmulatedSingleProcess)
     {
+        RelativePathsWithMetadata children;
+        object_storage->listObjects(physical_prefix, children, /*max_keys=*/0);
+
+        std::vector<ListedKey> all;
+        all.reserve(children.size());
+        for (const auto & child : children)
+        {
+            if (child->relative_path.substr(0, physical_prefix.size()) != physical_prefix)
+                continue;
+            ListedKey lk;
+            lk.key = child->relative_path.substr(strip.size());
+            lk.size = child->metadata ? child->metadata->size_bytes : 0;
+            if (child->metadata && !child->metadata->etag.empty())
+                lk.token = Token{child->metadata->etag, TokenType::ETag};
+            all.push_back(std::move(lk));
+        }
+        std::sort(all.begin(), all.end(), [](const ListedKey & a, const ListedKey & b) { return a.key < b.key; });
+
+        ListPage page;
+        auto all_it = cursor.empty()
+            ? std::lower_bound(all.begin(), all.end(), prefix, [](const ListedKey & a, const String & s) { return a.key < s; })
+            : std::upper_bound(all.begin(), all.end(), cursor, [](const String & s, const ListedKey & a) { return s < a.key; });
+        while (all_it != all.end() && page.keys.size() < limit)
+        {
+            page.keys.push_back(*all_it);
+            ++all_it;
+        }
+        if (!page.keys.empty() && all_it != all.end())
+            page.next_cursor = page.keys.back().key;
+        return page;
+    }
+
+    const std::optional<String> start_after = cursor.empty()
+        ? std::nullopt
+        : std::optional<String>(cursor);
+
+    ListPage page;
+    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/0, /*with_tags=*/false, start_after);
+    for (; it->isValid(); it->next())
+    {
+        const auto child = it->current();
         if (child->relative_path.substr(0, physical_prefix.size()) != physical_prefix)
             continue;
+
         ListedKey lk;
         lk.key = child->relative_path.substr(strip.size());
+        if (!cursor.empty() && lk.key <= cursor)
+            continue;
+
         lk.size = child->metadata ? child->metadata->size_bytes : 0;
         /// Surface the per-key incarnation token (matching what `head` would return, see above) so the
         /// `supportsListTokens() == true` capability is honest. A listing without an etag leaves the
         /// token unset, which GC discover treats as Read (fail closed).
         if (child->metadata && !child->metadata->etag.empty())
             lk.token = Token{child->metadata->etag, TokenType::ETag};
-        all.push_back(std::move(lk));
+
+        if (page.keys.size() == limit)
+        {
+            page.next_cursor = page.keys.back().key;
+            break;
+        }
+        page.keys.push_back(std::move(lk));
     }
-    std::sort(all.begin(), all.end(), [](const ListedKey & a, const ListedKey & b) { return a.key < b.key; });
-
-    ListPage page;
-    const String & start = (cursor > prefix) ? cursor : prefix;
-    auto it = std::lower_bound(all.begin(), all.end(), start,
-        [](const ListedKey & a, const String & s) { return a.key < s; });
-
-    while (it != all.end() && page.keys.size() < limit)
-    {
-        page.keys.push_back(*it);
-        ++it;
-    }
-
-    if (it != all.end())
-        page.next_cursor = it->key;
 
     return page;
 }

@@ -186,6 +186,8 @@ TEST(CasInMemory, RangeGetAndHeadAndList)
     EXPECT_TRUE(page.next_cursor.empty());
     auto page1 = b.list("p/", "", 1);                         // pagination
     EXPECT_EQ(page1.keys.size(), 1u);
+    EXPECT_EQ(page1.keys[0].key, "p/a");
+    EXPECT_EQ(page1.next_cursor, "p/a");
     EXPECT_FALSE(page1.next_cursor.empty());
     auto page2 = b.list("p/", page1.next_cursor, 1);
     EXPECT_EQ(page2.keys[0].key, "p/b");

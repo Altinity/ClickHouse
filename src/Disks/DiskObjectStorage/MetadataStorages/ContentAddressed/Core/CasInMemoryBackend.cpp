@@ -248,13 +248,14 @@ DeleteOutcome InMemoryBackend::deleteExact(const String & key, const Token & tok
 
 ListPage InMemoryBackend::list(const String & prefix, const String & cursor, size_t limit)
 {
+    if (limit == 0)
+        return {};
+
     std::lock_guard lock(mutex_);
     ListPage page;
 
-    // Start from max(prefix, cursor) — whichever sorts later
-    const String & start = (cursor > prefix) ? cursor : prefix;
-
-    auto it = store_.lower_bound(start);
+    // Cursor is the last key returned by the previous page.
+    auto it = cursor.empty() ? store_.lower_bound(prefix) : store_.upper_bound(cursor);
 
     size_t count = 0;
     while (it != store_.end() && count < limit)
@@ -272,8 +273,8 @@ ListPage InMemoryBackend::list(const String & prefix, const String & cursor, siz
     }
 
     // Set next_cursor if there are more keys in this prefix
-    if (it != store_.end() && it->first.substr(0, prefix.size()) == prefix)
-        page.next_cursor = it->first;
+    if (!page.keys.empty() && it != store_.end() && it->first.substr(0, prefix.size()) == prefix)
+        page.next_cursor = page.keys.back().key;
 
     return page;
 }
