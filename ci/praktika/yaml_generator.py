@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from typing import List
 
 from . import Artifact, Job, Workflow
@@ -7,6 +8,7 @@ from .parser import WorkflowConfigParser
 from .settings import Settings
 from .utils import Shell, Utils
 
+from .yaml_additional_templates import AltinityWorkflowTemplates
 
 class YamlGenerator:
     class Templates:
@@ -33,8 +35,14 @@ jobs:
 name: {NAME}
 
 on:
-  {EVENT}:
-    branches: [{BRANCHES}]
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: Run without cache
+        required: false
+        type: boolean
+        default: false
+  {EVENT}:{BRANCHES}{TAGS}
 
 env:
   # Force the stdout and stderr streams to be unbuffered
@@ -46,16 +54,15 @@ env:
 jobs:
 {JOBS}\
 """
-        TEMPLATE_GH_TOKEN_PERMISSIONS = """\
-# Allow updating GH commit statuses and PR comments to post an actual job reports link
-permissions: write-all\
-"""
+        TEMPLATE_GH_TOKEN_PERMISSIONS = ""
         TEMPLATE_ENV_CHECKOUT_REF_PR = """\
+  GH_TOKEN: ${{{{ github.token }}}}
   DISABLE_CI_MERGE_COMMIT: ${{{{ vars.DISABLE_CI_MERGE_COMMIT || '0' }}}}
-  DISABLE_CI_CACHE: ${{{{ vars.DISABLE_CI_CACHE || '0' }}}}
+  DISABLE_CI_CACHE: ${{{{ github.event.inputs.no_cache || '0' }}}}
   CHECKOUT_REF: ${{{{ vars.DISABLE_CI_MERGE_COMMIT == '1' && github.event.pull_request.head.sha || '' }}}}\
 """
         TEMPLATE_ENV_CHECKOUT_REF_DEFAULT = """\
+  GH_TOKEN: ${{{{ github.token }}}}
   CHECKOUT_REF: ""\
 """
         TEMPLATE_ENV_SECRET = """\
@@ -212,7 +219,21 @@ jobs:
 
         TEMPLATE_GH_UPLOAD = """
       - name: Upload artifact {NAME}
-        uses: actions/upload-artifact@v4
+        id: upload_{NAME}
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: {NAME}
+          path: {PATH}
+          retention-days: 1
+      - name: Warn on failed upload of {NAME}
+        if: steps.upload_{NAME}.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [{NAME}] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
+"""
+
+        TEMPLATE_GH_UPLOAD_NO_RETENTION = """
+      - name: Upload artifact {NAME}
+        uses: actions/upload-artifact@v7
         with:
           name: {NAME}
           path: {PATH}
@@ -220,7 +241,16 @@ jobs:
 
         TEMPLATE_GH_DOWNLOAD = """
       - name: Download artifact {NAME}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: {NAME}
+          path: {PATH}
+"""
+
+        TEMPLATE_GH_DOWNLOAD_STRICT = """
+      - name: Download artifact {NAME}
+        uses: actions/download-artifact@v8
         with:
           name: {NAME}
           path: {PATH}
@@ -235,7 +265,7 @@ jobs:
 """
 
         TEMPLATE_IF_EXPRESSION_ALWAYS = """
-    if: ${{ always() }}\
+    if: ${{ always() && needs.config_workflow.outputs.pipeline_status != '' }}\
 """
 
     def __init__(self):
@@ -291,6 +321,11 @@ class PullRequestPushYamlGen:
             )
             job_name = job.name
             job_addons = []
+
+            job_addons.append(AltinityWorkflowTemplates.JOB_SETUP_STEPS.format(JOB_NAME_GH = job_name))
+            if job_name == Settings.CI_CONFIG_JOB_NAME:
+                job_addons.append(AltinityWorkflowTemplates.ADDITIONAL_CI_CONFIG_STEPS)
+
             for addon in job.addons:
                 if addon.install_python:
                     job_addons.append(
@@ -309,15 +344,26 @@ class PullRequestPushYamlGen:
                     )
             uploads_github = []
             for artifact in job.artifacts_gh_provides:
+                upload_template = YamlGenerator.Templates.TEMPLATE_GH_UPLOAD
+                if self.workflow_config.name == "Community PR":
+                    upload_template = (
+                        YamlGenerator.Templates.TEMPLATE_GH_UPLOAD_NO_RETENTION
+                    )
                 uploads_github.append(
-                    YamlGenerator.Templates.TEMPLATE_GH_UPLOAD.format(
-                        NAME=artifact.name, PATH=artifact.path
+                    upload_template.format(
+                        NAME=artifact.name,
+                        PATH=os.path.relpath(artifact.path, os.getcwd()),
                     )
                 )
             downloads_github = []
             for artifact in job.artifacts_gh_requires:
+                download_template = YamlGenerator.Templates.TEMPLATE_GH_DOWNLOAD
+                if self.workflow_config.name == "Community PR":
+                    download_template = (
+                        YamlGenerator.Templates.TEMPLATE_GH_DOWNLOAD_STRICT
+                    )
                 downloads_github.append(
-                    YamlGenerator.Templates.TEMPLATE_GH_DOWNLOAD.format(
+                    download_template.format(
                         NAME=artifact.name, PATH=Settings.INPUT_DIR
                     )
                 )
@@ -327,14 +373,23 @@ class PullRequestPushYamlGen:
             )
 
             if_expression = ""
+            # NOTE (strtgbb): We still want the cache logic, we use it for skipping based on PR config
             if (
-                self.workflow_config.config.enable_cache
-                and job_name_normalized != config_job_name_normalized
+                # self.workflow_config.config.enable_cache
+                # and
+                job_name_normalized != config_job_name_normalized
             ):
                 if_expression = YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION.format(
                     WORKFLOW_CONFIG_JOB_NAME=config_job_name_normalized,
                     JOB_NAME_BASE64=Utils.to_base64(job_name),
                 )
+
+            elif self.workflow_config.if_condition:
+                # If this is the config workflow and the workflow template sets an if condition, use it
+                if_expression = (
+                    f"\n    if: ${{{{ {self.workflow_config.if_condition} }}}}"
+                )
+
             if job.run_unless_cancelled:
                 if_expression = (
                     YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION_NOT_CANCELLED
@@ -343,12 +398,14 @@ class PullRequestPushYamlGen:
                 if_expression = YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION_ALWAYS
 
             secrets_envs = []
-            for secret in job.secret_names_gh:
-                secrets_envs.append(
-                    YamlGenerator.Templates.TEMPLATE_SETUP_ENV_SECRETS.format(
-                        SECRET_NAME=secret
-                    )
-                )
+            # note(strtgbb): This adds github secrets to praktika_setup_env.sh
+            # This makes the workflow very verbose and we don't need it
+            # for secret in self.workflow_config.secret_names_gh:
+            #     secrets_envs.append(
+            #         YamlGenerator.Templates.TEMPLATE_SETUP_ENV_SECRETS.format(
+            #             SECRET_NAME=secret
+            #         )
+            #     )
             for var in job.variable_names_gh:
                 secrets_envs.append(
                     YamlGenerator.Templates.TEMPLATE_SETUP_ENV_VARS.format(VAR_NAME=var)
@@ -419,16 +476,21 @@ class PullRequestPushYamlGen:
             Workflow.Event.PUSH,
         ):
             base_template = YamlGenerator.Templates.TEMPLATE_PULL_REQUEST_0
+            branches_formatted = ", ".join(
+                [f"'{branch}'" for branch in self.workflow_config.branches]
+            ) if self.workflow_config.branches else ""
+            tags_formatted = ", ".join(
+                [f"'{tag}'" for tag in self.workflow_config.tags]
+            ) if self.workflow_config.tags else ""
             format_kwargs = {
-                "BRANCHES": ", ".join(
-                    [f"'{branch}'" for branch in self.workflow_config.branches]
-                ),
+                "BRANCHES": f"\n    branches: [{branches_formatted}]" if branches_formatted else "",
                 "EVENT": self.workflow_config.event,
                 "GH_TOKEN_PERMISSIONS": (
                     YamlGenerator.Templates.TEMPLATE_GH_TOKEN_PERMISSIONS
                     # if not Settings.USE_CUSTOM_GH_AUTH
                     # else ""
                 ),
+                "TAGS": f"\n    tags: [{tags_formatted}]" if tags_formatted else "",
             }
             if self.workflow_config.event in (Workflow.Event.PULL_REQUEST,):
                 ENV_CHECKOUT_REFERENCE = (
@@ -479,6 +541,12 @@ class PullRequestPushYamlGen:
                 )
         format_kwargs["ENV_SECRETS"] = GH_VAR_ENVS + SECRET_ENVS
 
+        if self.parser.config.secrets:
+            # Only add global env if there are secrets in workflow config
+            format_kwargs[
+                "ENV_SECRETS"
+            ] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
+
         template_1 = base_template.strip().format(
             NAME=self.workflow_config.name,
             JOBS="{}" * len(job_items),
@@ -486,6 +554,33 @@ class PullRequestPushYamlGen:
             **format_kwargs,
         )
         res = template_1.format(*job_items)
+
+        ALL_JOBS = "\n".join(
+            "      - " + Utils.normalize_string(job.name)
+            for job in self.workflow_config.jobs
+        )
+        if self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ADDITIONAL_JOBS_BANNER
+        if "GrypeScan" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["GrypeScan"]
+            ALL_JOBS += "\n      - GrypeScanServer\n      - GrypeScanKeeper"
+        if "Regression" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["Regression"].replace(
+                "{REGRESSION_HASH}", AltinityWorkflowTemplates.REGRESSION_HASH
+            )
+            ALL_JOBS += (
+                "\n      - RegressionTestsRelease\n      - RegressionTestsAarch64"
+            )
+        if "SignRelease" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["SignRelease"]
+            ALL_JOBS += "\n      - SignRelease\n      - SignAarch64"
+        if "CIReport" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["CIReport"].replace(
+                "{ALL_JOBS}", ALL_JOBS
+            )
+        if "SourceUpload" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["SourceUpload"]
+            ALL_JOBS += "\n      - SourceUpload"
 
         return res
 

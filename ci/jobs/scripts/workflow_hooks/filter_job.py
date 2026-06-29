@@ -8,6 +8,7 @@ from ci.jobs.scripts.workflow_hooks.new_tests_check import (
 )
 from ci.jobs.scripts.workflow_hooks.pr_labels_and_category import Labels
 from ci.praktika.info import Info
+from ci.praktika.settings import Settings
 
 
 def only_docs(changed_files):
@@ -32,10 +33,10 @@ DO_NOT_TEST_JOBS = [
 ]
 
 PRELIMINARY_JOBS = [
-    JobNames.STYLE_CHECK,
+    # JobNames.STYLE_CHECK,
     JobNames.FAST_TEST,
-    "Build (amd_tidy)",
-    "Build (arm_tidy)",
+    # "Build (amd_tidy)",
+    # "Build (arm_tidy)",
 ]
 
 INTEGRATION_TEST_FLAKY_CHECK_JOBS = [
@@ -57,6 +58,19 @@ FUNCTIONAL_TEST_FLAKY_CHECK_JOBS = [
     "Stateless tests (amd_debug, flaky check)",
     "Stateless tests (amd_binary, flaky check)",
 ]
+
+DOCKER_REQUIRED_ARM_JOBS = {
+    "Build (arm_release)",
+    Settings.DOCKER_BUILD_ARM_LINUX_JOB_NAME,
+    Settings.DOCKER_BUILD_MANIFEST_JOB_NAME,
+}
+
+
+def is_ci_excluded_by_tag(job_name, tag):
+    if tag in ("aarch64", "arm") and job_name in DOCKER_REQUIRED_ARM_JOBS:
+        return False
+
+    return tag in job_name.lower()
 
 
 _info_cache = None
@@ -223,23 +237,29 @@ def should_skip_job(job_name):
     ):
         return True, "Skipped, not labeled with 'pr-performance'"
 
-    # If only the functional tests script changed, run only the first batch of stateless tests
-    if changed_files and all(
-        f.startswith("ci/") and f.endswith(".py") for f in changed_files
-    ):
-        if JobNames.STATELESS in job_name:
-            match = re.search(r"(\d)/\d", job_name)
-            if match and match.group(1) != "1" or "sequential" in job_name:
-                return True, "Skipped, only job script changed - run first batch only"
+    ci_exclude_tags = _info_cache.get_kv_data("ci_exclude_tags") or []
+    for tag in ci_exclude_tags:
+        if is_ci_excluded_by_tag(job_name, tag):
+            return True, f"Skipped, job name includes excluded tag '{tag}'"
 
-        if JobNames.INTEGRATION in job_name:
-            match = re.search(r"(\d)/\d", job_name)
-            if (
-                match
-                and match.group(1) != "1"
-                or "sequential" in job_name
-                or "_asan" not in job_name
-            ):
-                return True, "Skipped, only job script changed - run first batch only"
+    # NOTE (strtgbb): disabled this feature for now
+    # If only the functional tests script changed, run only the first batch of stateless tests
+    # if changed_files and all(
+    #     f.startswith("ci/") and f.endswith(".py") for f in changed_files
+    # ):
+    #     if JobNames.STATELESS in job_name:
+    #         match = re.search(r"(\d)/\d", job_name)
+    #         if match and match.group(1) != "1" or "sequential" in job_name:
+    #             return True, "Skipped, only job script changed - run first batch only"
+
+    #     if JobNames.INTEGRATION in job_name:
+    #         match = re.search(r"(\d)/\d", job_name)
+    #         if (
+    #             match
+    #             and match.group(1) != "1"
+    #             or "sequential" in job_name
+    #             or "_asan" not in job_name
+    #         ):
+    #             return True, "Skipped, only job script changed - run first batch only"
 
     return False, ""
