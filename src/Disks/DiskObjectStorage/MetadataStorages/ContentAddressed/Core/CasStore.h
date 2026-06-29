@@ -344,10 +344,10 @@ public:
         backpressure_delay_hook = std::move(hook);
     }
 
-    /// Narrow test seam: mutate a root shard with explicit origin/kind for backpressure
-    /// verification. Production code uses the private `mutateShard` via Build/Gc friend
-    /// classes. This is NOT a general-purpose API — it exists only to let the GC-bypass
-    /// test verify that `RootMutationOrigin::Gc` skips backpressure delay.
+    /// B164b test seam: mutate root shard with explicit origin/kind for backpressure
+    /// verification. Production code uses private `mutateShard` via Build/Gc friend
+    /// classes. Exists only so the GC-bypass test can verify that `RootMutationOrigin::Gc`
+    /// skips backpressure delay without exposing the full mutation API.
     void mutateShardForTest(const RootNamespace & ns, uint64_t shard,
                             std::function<void(RootShard &)> mutate,
                             RootMutationOrigin origin, RootMutationKind kind)
@@ -356,6 +356,7 @@ public:
     }
 
 private:
+
     Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
 
     CasEventSink event_sink_;   /// B170: null = disabled (emitEvent no-op)

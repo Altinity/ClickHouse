@@ -1242,7 +1242,8 @@ TEST(CasStoreBackpressure, HardLimitBlocksPromoteBeforeCommit)
 
     /// publishPart: precommitAdd appends a journal event (body < 200, may delay), then promote tries
     /// to append another event + ref entry. If the body exceeds 200, it throws.
-    /// The hard-limit exception must abort before any write.
+    /// The hard-limit exception must abort before the overflowing promote mutation can
+    /// commit the promoted ref — even though the preceding precommitAdd may have committed.
     ASSERT_THROW(
         publishPart(s, ns.string(), "part_1", "payload_that_makes_the_body_hit_the_hard_limit"),
         DB::Exception);

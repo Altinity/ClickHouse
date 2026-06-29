@@ -810,7 +810,7 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
                         ProfileEvents::CasManifestBackpressureMicroseconds,
                         std::chrono::duration_cast<std::chrono::microseconds>(delay).count());
 
-                    LOG_INFO(getLogger("CasStore"),
+                    LOG_DEBUG(getLogger("CasStore"),
                         "manifest backpressure: ns/shard={}/{} size={} soft={} hard={} delay={}ms kind={}",
                         ns.string(), shard, body.size(), soft_limit, hard_limit,
                         delay_ms, toString(kind));
