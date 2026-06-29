@@ -154,6 +154,19 @@ struct CatalogSettings
     DB::SettingsChanges allChanged() const;
 };
 
+enum class CommitOutcome
+{
+    /// The commit is confirmed live in the catalog. The caller must NOT delete any files.
+    Committed,
+    /// The commit was cleanly rejected and never became visible. The files we wrote are
+    /// orphans and the caller may safely delete them.
+    RejectedCleanly,
+    /// Could not determine whether the commit landed (e.g. the post-failure re-read
+    /// also failed, or the catalog response lacked snapshot state). The caller must
+    /// preserve all files: a recoverable leak is preferable to unrecoverable corruption.
+    Unknown,
+};
+
 /// Base class for catalog implementation.
 /// Used for communication with the catalog.
 class ICatalog
@@ -202,8 +215,9 @@ public:
     /// Creates new table in catalog.
     virtual void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const;
 
-    /// Updates metadata in catalog.
-    virtual bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const;
+    /// Returns a `CommitOutcome` describing whether the commit became live, was cleanly
+    /// rejected, or is of unknown status. Callers must only delete written files on`RejectedCleanly`.
+    virtual CommitOutcome updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const;
 
     /// Drop table from catalog.
     virtual void dropTable(const String & namespace_name, const String & table_name) const;

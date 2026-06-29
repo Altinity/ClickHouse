@@ -1,0 +1,12 @@
+services:
+  rest-proxy:
+    image: python:3.11-slim
+    hostname: rest-proxy
+    environment:
+      UPSTREAM: "http://rest:8181"
+      LISTEN: "0.0.0.0:8181"
+    volumes:
+      - ${PROXY_SCRIPT}:/catalog_fault_proxy.py:ro
+    command: ["python", "/catalog_fault_proxy.py"]
+    ports:
+      - "8999:8181"
