@@ -124,9 +124,12 @@ private:
     /// Overload for callers that already hold a fresh, present HeadResult for `key` (the putBlob
     /// HEAD-before-PUT path), avoiding a redundant second HEAD. `hr.exists` MUST be true.
     uint64_t observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key, const HeadResult & hr);
-    /// INV-1 (revival-from-source): revive a condemned or absent object by re-uploading from source_bytes
-    /// without reading the dying object (no backend().get).
-    void uploadFromSource(ObjectKind kind, const UInt128 & hash, const String & key, std::string_view source_bytes);
+    /// INV-1 (revival-from-source): revive a condemned or absent object by re-uploading from the writer's
+    /// OWN re-readable source without reading the dying object (no backend().get). The source is STREAMED
+    /// into the put sink (header + `source.write_payload`), never materialized into a full in-memory copy;
+    /// `source.write_payload` may be re-invoked on each conditional-write attempt (it re-reads the staged
+    /// temp file / re-emits the captured String), so it is taken by const ref and not consumed.
+    void uploadFromSource(ObjectKind kind, const UInt128 & hash, const String & key, const BlobSource & source);
 
     /// The build's owning root namespace, derived from BuildInfo::intended_ref ("ns/ref" — the ref is the
     /// last `/`-segment; the namespace is everything before it). Sets a manifest body's root_namespace_id.

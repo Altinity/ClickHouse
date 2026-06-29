@@ -110,18 +110,11 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
     const String key = store->layout().blobKey(id);
     const PoolConfig & cfg = store->poolConfig();
 
-    /// Materialize source bytes once — needed both for the primary stream and for uploadFromSource
-    /// (INV-1: condemned-dedup re-upload from writer's own bytes, never reading the dying object).
-    /// Verify the byte count matches the declared size before any I/O to fail early and cleanly.
-    String source_bytes;
-    {
-        WriteBufferFromString wb{source_bytes};
-        source.write_payload(wb);
-        wb.finalize();
-    }
-    if (source_bytes.size() != source.size)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "putBlob: source wrote {} bytes, declared {}", source_bytes.size(), source.size);
+    /// The source is RE-READABLE (the caller's `write_payload` re-reads a staged temp file, or re-emits a
+    /// captured String): it can be invoked MULTIPLE times — the primary streaming PUT plus any INV-1
+    /// re-upload — so we never materialize the whole blob into memory here. The byte count is verified
+    /// against `source.size` at each streaming write site (via the sink buffer's `count()`), not by a
+    /// full pre-materialization, so peak memory is bounded by the write-buffer, not the blob size.
 
     /// B168 P1/P2: HEAD-before-PUT on a likely dedup hit (cache says present) or a large body (where a
     /// wasted body-PUT that 412s is expensive — and on a store that early-closes a doomed conditional
@@ -166,15 +159,15 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
     {
         try
         {
-            uploadFromSource(ObjectKind::Blob, logical_hash, key, source_bytes);
+            uploadFromSource(ObjectKind::Blob, logical_hash, key, source);
             /// P1: this hash is now known-present — future writers can HEAD-first and skip the body.
             store->dedupCacheAdd(logical_hash);
             return BlobRef{id, source.size};
         }
         catch (const Exception & e)
         {
-            /// ABORTED from uploadFromSource is retryable — re-upload from our held source bytes
-            /// (bounded). Two cases produce it:
+            /// ABORTED from uploadFromSource is retryable — re-upload by re-streaming from our re-readable
+            /// source (bounded). Two cases produce it:
             ///   • a racing writer displaced the condemned token before our putOverwrite landed and
             ///     their fresh incarnation is itself already condemned (observeAndAdmit → ABORTED); or
             ///   • the object was GC-deleted during the post-412 revival re-observe (B190 sibling):
@@ -280,12 +273,15 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     return logical_size;
 }
 
-void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String & key, std::string_view source_bytes)
+void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String & key, const BlobSource & source)
 {
     /// INV-1 (revival-from-source): re-upload a condemned or absent object from the writer's OWN
-    /// source bytes — NEVER calls backend().get to read the dying object. W-FRESH-TAG: fresh
+    /// re-readable source — NEVER calls backend().get to read the dying object. W-FRESH-TAG: fresh
     /// incarnation_tag and this build's build_id so the new incarnation is owned by THIS live build
-    /// (the B167 fix — the prior resurrect was the lone gap).
+    /// (the B167 fix — the prior resurrect was the lone gap). The payload is STREAMED into the put sink
+    /// (`source.write_payload`), never materialized into a full in-memory copy on the common
+    /// If-None-Match path; `source.write_payload` is re-invoked on each attempt (it re-reads the staged
+    /// temp file), which is exactly what preserves INV-1 across retries.
     const PoolMeta & meta = store->poolMeta();
     const PoolConfig & cfg = store->poolConfig();
 
@@ -294,7 +290,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         EnvelopeHeader header;
         header.kind = kind;
         header.hash_algo = 1;
-        header.logical_size = source_bytes.size();
+        header.logical_size = source.size;
         header.logical_hash = hash;
         header.domain_id = meta.pool_id;
         header.incarnation_tag = mintU128();
@@ -348,7 +344,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     auto recordDoneAndEmit = [&](Token tok)
     {
         deps[{static_cast<uint8_t>(kind), hash}] =
-            DepEntry{kind, tok, store->retireView().round(), source_bytes.size()};
+            DepEntry{kind, tok, store->retireView().round(), source.size};
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = (kind == ObjectKind::Tree) ? CasEventType::TreePut : CasEventType::BlobPut;
@@ -357,18 +353,34 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
             e.token = tok.value;
             e.round = store->retireView().round();
             e.outcome = "ok";
-            e.reason = "uploadFromSource: fresh incarnation from writer's own source bytes (INV-1)";
-            e.detail = {{"size", std::to_string(source_bytes.size())}, {"build_id", u128ToHex(build_id)}};
+            e.reason = "uploadFromSource: fresh incarnation streamed from writer's own re-readable source (INV-1)";
+            e.detail = {{"size", std::to_string(source.size)}, {"build_id", u128ToHex(build_id)}};
         });
+    };
+
+    /// Stream header + payload into a fresh putIfAbsentStream sink WITHOUT materializing the whole blob.
+    /// `source.write_payload` re-reads the staged temp file (INV-1: the writer's own source, never the
+    /// dying object). The payload byte count is verified against `source.size` via the sink buffer's
+    /// `count()` (total bytes written so far) — the streaming equivalent of the old pre-materialized
+    /// size check, with no full in-memory copy. A mismatch is a LOGICAL_ERROR (a buggy/racing source).
+    auto streamIfAbsent = [&]() -> PutResult
+    {
+        /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
+        WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
+        WriteBuffer & out = sink->buffer();
+        writeString(buildHeader(), out);
+        const size_t before = out.count();
+        source.write_payload(out);
+        const size_t written = out.count() - before;
+        if (written != source.size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "uploadFromSource: source streamed {} bytes, declared {}", written, source.size);
+        return sink->finalize();
     };
 
     /// Phase 1: try If-None-Match upload (object absent or race with another writer).
     {
-        /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
-        WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
-        writeString(buildHeader(), sink->buffer());
-        writeString(source_bytes, sink->buffer());
-        const PutResult res = sink->finalize();
+        const PutResult res = streamIfAbsent();
         if (res.outcome == PutOutcome::Done)
         {
             recordDoneAndEmit(res.token);
@@ -379,18 +391,15 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     /// PreconditionFailed: an incarnation exists. HEAD it to check whether it is condemned or live.
     /// We do NOT read the body (no backend().get) — we only need the token to decide:
     ///   • live (not condemned)  → adopt; this is the standard dedup case.
-    ///   • condemned             → displace via putOverwrite(If-Match: current_token) using our
-    ///                            source_bytes, so we never read the dying object. This is the
+    ///   • condemned             → displace via putOverwrite(If-Match: current_token) by re-reading our
+    ///                            own source, so we never read the dying object. This is the
     ///                            equivalent of the old `resurrect` minus the GET.
     const HeadResult hr = store->backend().head(key);
     if (!hr.exists)
     {
         /// Object vanished between putIfAbsentStream (412d) and our HEAD — a concurrent GC delete.
-        /// The object is now absent; re-try putIfAbsentStream (tail-recurse is safe — bounded by caller).
-        WriteSinkPtr sink2 = store->backend().putIfAbsentStream(key);
-        writeString(buildHeader(), sink2->buffer());
-        writeString(source_bytes, sink2->buffer());
-        const PutResult res2 = sink2->finalize();
+        /// The object is now absent; re-stream from our re-readable source (bounded by caller).
+        const PutResult res2 = streamIfAbsent();
         if (res2.outcome == PutOutcome::Done)
         {
             recordDoneAndEmit(res2.token);
@@ -409,10 +418,26 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         return;
     }
 
-    /// Condemned: displace the condemned incarnation with our fresh source bytes via If-Match.
-    /// CRITICAL: we use putOverwrite (NOT backend().get) — we have the source bytes, so no GET needed.
+    /// Condemned: displace the condemned incarnation with our fresh source via If-Match.
+    /// CRITICAL: we re-read the writer's OWN source (NOT backend().get) — no GET of the dying object.
     /// W-FRESH-TAG: a fresh incarnation_tag minted inside buildHeader() ensures INV-NO-RETURN.
-    const PutResult overwrite_res = store->backend().putOverwrite(key, buildHeader() + String(source_bytes), hr.token);
+    /// putOverwrite is whole-body only (no streaming variant), so this rare condemned-displacement path
+    /// materializes the header+payload on-demand by re-invoking `source.write_payload` (re-reading the
+    /// staged temp file). This is the only path that holds a full in-memory copy, and only when a
+    /// condemned incarnation must actually be displaced — not the common fresh-upload path.
+    String overwrite_body;
+    {
+        WriteBufferFromString wb{overwrite_body};
+        writeString(buildHeader(), wb);
+        const size_t before = wb.count();
+        source.write_payload(wb);
+        wb.finalize();
+        const size_t written = wb.count() - before;
+        if (written != source.size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "uploadFromSource: source wrote {} bytes for overwrite, declared {}", written, source.size);
+    }
+    const PutResult overwrite_res = store->backend().putOverwrite(key, overwrite_body, hr.token);
     if (overwrite_res.outcome == PutOutcome::Done)
     {
         recordDoneAndEmit(overwrite_res.token);
@@ -426,10 +451,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         if (!hr2.exists)
         {
             /// Object deleted in the window — try fresh If-None-Match upload (it is now absent).
-            WriteSinkPtr sink3 = store->backend().putIfAbsentStream(key);
-            writeString(buildHeader(), sink3->buffer());
-            writeString(source_bytes, sink3->buffer());
-            const PutResult res3 = sink3->finalize();
+            const PutResult res3 = streamIfAbsent();
             if (res3.outcome == PutOutcome::Done)
             {
                 recordDoneAndEmit(res3.token);
