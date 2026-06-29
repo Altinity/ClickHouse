@@ -799,6 +799,9 @@ The server successfully detected this situation and will download merged part fr
     M(CasOtherGet,       "CA other get S3 ops", ValueType::Number) \
     M(CasOtherDelete,    "CA other delete S3 ops", ValueType::Number) \
     M(CasOtherList,      "CA other list S3 ops", ValueType::Number) \
+    M(CasManifestBackpressureCount,      "CA root-shard manifest backpressure delay events", ValueType::Number) \
+    M(CasManifestBackpressureMicroseconds, "CA root-shard manifest backpressure total microseconds delayed", ValueType::Number) \
+    M(CasManifestHardLimitExceeded,      "CA root-shard manifest hard-limit exceptions", ValueType::Number) \
     M(S3GetObjectTagging, "Number of S3 API GetObjectTagging calls.", ValueType::Number) \
     M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.", ValueType::Number) \
     M(S3UploadPartCopy, "Number of S3 API UploadPartCopy calls.", ValueType::Number) \

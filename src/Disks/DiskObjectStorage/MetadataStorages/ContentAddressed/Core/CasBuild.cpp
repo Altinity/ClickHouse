@@ -606,7 +606,7 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
                 .ref_name = final_ref_name,
                 .build_id = build_id,
                 .manifest_ref = id.ref}});
-    });
+    }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Precommit);
 
     precommit_target_ns = target_ns;
     precommit_final_ref = final_ref_name;
@@ -740,7 +740,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
         root.refs[final_ref_name] = RootRef{
             .ref_name = final_ref_name, .manifest_ref = id.ref,
             .mutable_files = pending_mutable_files, .published_at_ms = nowMs()};
-    });
+    }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Promote);
 
     precommitted = false;
     store->retireBuildSeq(build_seq);
@@ -786,7 +786,7 @@ void Build::abandon()
                     .build_id = build_id,
                     .manifest_ref = precommit_manifest},
                 .new_binding = std::nullopt});
-        });
+        }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Abandon);
         precommitted = false;
     }
 

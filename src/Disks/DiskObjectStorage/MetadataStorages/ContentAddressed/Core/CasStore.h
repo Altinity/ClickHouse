@@ -13,6 +13,7 @@
 #include <Common/CacheBase.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/HashTable/Hash.h>
+#include <Common/ProfileEvents.h>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -25,6 +26,30 @@
 
 namespace DB::Cas
 {
+
+/// Whether a root-shard mutation originates from the writer path (user-visible publish/drop/precommit)
+/// or from GC/maintenance (trim/fence/reclaim). Writer mutations may be delayed for backpressure; GC
+/// mutations bypass backpressure entirely so cleanup cannot delay itself.
+enum class RootMutationOrigin : uint8_t
+{
+    Writer,
+    Gc,
+};
+
+/// Kind of mutation being applied, used in diagnostic logging and metrics. Does not affect behaviour.
+enum class RootMutationKind : uint8_t
+{
+    Publish,
+    Drop,
+    Precommit,
+    Promote,
+    Abandon,
+    UpdateRefPayload,
+    DropNamespace,
+    Fence,
+    Trim,
+    ReclaimPrecommit,
+};
 
 struct PoolConfig
 {
@@ -70,6 +95,11 @@ struct PoolConfig
     uint64_t gc_trim_body_soft_limit = 8ULL << 20;   /// 8 MiB
     uint64_t manifest_soft_limit = 16ULL << 20;
     uint64_t manifest_hard_limit = 64ULL << 20;
+    /// B164b: max backpressure delay (ms) applied to writer-originated mutations whose encoded root-shard
+    /// body is between `manifest_soft_limit` and `manifest_hard_limit`. 0 disables delay (soft limit acts
+    /// as a warning-only log). At most one delay per mutation call. Delay is linear: 0 at soft_limit →
+    /// `manifest_max_delay_ms` near the hard limit.
+    uint64_t manifest_max_delay_ms = 1000;
     std::chrono::milliseconds watermark_renew_period{5000};
     bool background_watermark = false;       /// tests drive renewOnce explicitly
 
@@ -277,6 +307,13 @@ public:
     /// entirely when the log is disabled (sink null) — a true no-op on the production hot path.
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink_); }
 
+    /// B164b: injectable backpressure delay hook for tests. In production the default
+    /// (std::this_thread::sleep_for) is used. Tests replace this with a no-op counter hook.
+    void setBackpressureDelayHook(std::function<void(std::chrono::milliseconds)> hook)
+    {
+        backpressure_delay_hook = std::move(hook);
+    }
+
 private:
     Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
 
@@ -316,18 +353,25 @@ private:
     /// Single-flight coalescing wrapper around loadShardDecoded.
     std::shared_ptr<const RootShard> coalescedReadShardDecoded(const String & key);
 
+public:
     /// Read-modify-CAS one shard manifest under the manifest size guard. `mutate` edits the in-memory
     /// RootShard (which carries the freshly-read shard_version); the helper bumps shard_version, encodes,
-    /// applies the manifest size guard (soft ⇒ LOG_WARNING, hard ⇒ LIMIT_EXCEEDED), and casPut against the
-    /// observed token (nullopt when the shard was absent — create-if-absent). On Conflict it re-reads and
-    /// retries the WHOLE mutate, bounded (100) then ABORTED ("manifest CAS contention on {}"). Single-writer
-    /// shards make a real storm impossible; the bound is a runaway brake. `mutate` runs on the FRESHLY READ
-    /// root each attempt, so a journal append is never double-applied across retries.
+    /// applies the manifest size guard (soft ⇒ LOG_WARNING + backpressure delay for Writer, hard ⇒
+    /// LIMIT_EXCEEDED), and casPut against the observed token (nullopt when the shard was absent —
+    /// create-if-absent). On Conflict it re-reads and retries the WHOLE mutate, bounded (100) then ABORTED
+    /// ("manifest CAS contention on {}"). Single-writer shards make a real storm impossible; the bound is
+    /// a runaway brake. `mutate` runs on the FRESHLY READ root each attempt, so a journal append is never
+    /// double-applied across retries.
     /// `out_committed_version` (optional) receives the shard_version the successful casPut committed —
     /// the GC fence (R3) records it as the durable per-shard fence position (the model's fencePos[s]).
+    /// `origin` distinguishes Writer mutations (subject to backpressure) from Gc mutations (bypass).
+    /// `kind` is diagnostic-only (logged/metrics) and does not affect behaviour.
     void mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
-                     uint64_t * out_committed_version = nullptr);
+                     uint64_t * out_committed_version = nullptr,
+                     RootMutationOrigin origin = RootMutationOrigin::Writer,
+                     RootMutationKind kind = RootMutationKind::Publish);
 
+private:
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;
@@ -432,6 +476,10 @@ private:
     /// NOTE (M-C2): the manifest journal is never trimmed here — trimming needs folded_cursor
     /// (INV-JOURNAL-COVERAGE), which is GC state landing in M-C3; the manifest size guard
     /// (soft warn / hard throw, in the publish/drop CAS loop) bounds growth meanwhile.
+
+    /// B164b: injectable delay hook for backpressure tests. In production, stores use the default
+    /// (std::this_thread::sleep_for). Tests replace this with a no-op counter hook.
+    std::function<void(std::chrono::milliseconds)> backpressure_delay_hook;
 };
 
 }

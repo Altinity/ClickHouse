@@ -1142,3 +1142,249 @@ TEST(CasStore, ListMirroredChildren)
     EXPECT_EQ(children[0], "bk1");
     EXPECT_EQ(children[1], "bk2");
 }
+
+// =====================================================================
+// B164b writer-path backpressure tests
+// =====================================================================
+
+namespace ProfileEvents
+{
+extern const Event CasManifestBackpressureCount;
+extern const Event CasManifestBackpressureMicroseconds;
+extern const Event CasManifestHardLimitExceeded;
+}
+
+TEST(CasStoreBackpressure, WriterMutationAboveSoftLimitDelaysThenCommits)
+{
+    using namespace DB::Cas;
+    using namespace std::chrono_literals;
+
+    std::atomic<size_t> delay_count{0};
+    std::atomic<uint64_t> total_delayed_ms{0};
+
+    auto b = std::make_shared<InMemoryBackend>();
+    /// Very small limits so even a single publish triggers backpressure.
+    /// root_shards=128 so many refs spread out to avoid same-shard contention.
+    auto s = Store::open(b, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .root_shards = 128,
+        .gc_trim_min_events = 0,
+        .manifest_soft_limit = 1,    /// tiny: every non-empty shard triggers soft limit
+        .manifest_hard_limit = 500,  /// close to soft limit so delay_ms is non-zero
+        .manifest_max_delay_ms = 100,
+    });
+
+    /// Install a recording delay hook.
+    s->setBackpressureDelayHook([&](std::chrono::milliseconds d)
+    {
+        ++delay_count;
+        total_delayed_ms += d.count();
+    });
+
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// Publish two refs. At soft_limit=1, the first publish already produces a body > 1 byte
+    /// (the encoded shard has at least a header + ref payload). Each publishPart calls both
+    /// precommitAdd and promote, each doing one mutateShard → up to 2 delays per publish.
+    publishPart(s, ns.string(), "part_1", "hello");
+    EXPECT_GT(delay_count.load(), 0u)
+        << "backpressure delay should fire on first publish";
+    EXPECT_GT(total_delayed_ms.load(), 0u);
+
+    /// A second publish uses a fresh delay budget (one-per-call for each mutateShard).
+    const auto count_before = delay_count.load();
+    publishPart(s, ns.string(), "part_2", "world");
+    EXPECT_GT(delay_count.load(), count_before)
+        << "second publish also gets delays (one per mutateShard call)";
+
+    /// Both parts should be visible.
+    auto r1 = s->resolveRef(ns, "part_1");
+    ASSERT_TRUE(r1.has_value());
+    auto r2 = s->resolveRef(ns, "part_2");
+    ASSERT_TRUE(r2.has_value());
+
+    /// Metrics counters should reflect the delays.
+    using ProfileEvents::global_counters;
+    EXPECT_GT(global_counters[ProfileEvents::CasManifestBackpressureCount].load(), 0u);
+    EXPECT_GT(global_counters[ProfileEvents::CasManifestBackpressureMicroseconds].load(), 0u);
+}
+
+TEST(CasStoreBackpressure, HardLimitThrowsBeforeWrite)
+{
+    using namespace DB::Cas;
+
+    auto b = std::make_shared<InMemoryBackend>();
+    /// Use root_shards=2 so promote (final_ref based) and precommitAdd target the same shard,
+    /// and hard_limit small enough that the first promote hits it.
+    auto s = Store::open(b, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .root_shards = 2,
+        .gc_trim_min_events = 0,
+        .manifest_soft_limit = 1,          /// tiny
+        .manifest_hard_limit = 100,        /// small — promote body (~170) exceeds this
+        .manifest_max_delay_ms = 100,
+    });
+
+    /// Count delay hook calls; we expect some (precommitAdd may delay), but never commit past hard.
+    std::atomic<size_t> delay_calls{0};
+    s->setBackpressureDelayHook([&](std::chrono::milliseconds) { ++delay_calls; });
+
+    /// Record baseline hard-limit counter.
+    const auto hard_before = ProfileEvents::global_counters[ProfileEvents::CasManifestHardLimitExceeded].load();
+
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// publishPart: precommitAdd appends a journal event (body < 200, may delay), then promote tries
+    /// to append another event + ref entry. If the body exceeds 200, it throws.
+    /// The hard-limit exception must abort before any write.
+    ASSERT_THROW(
+        publishPart(s, ns.string(), "part_1", "payload_that_makes_the_body_hit_the_hard_limit"),
+        DB::Exception);
+
+    /// Hard-limit metric incremented.
+    EXPECT_GT(
+        ProfileEvents::global_counters[ProfileEvents::CasManifestHardLimitExceeded].load(),
+        hard_before);
+    /// Nothing was committed (no ref was published).
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+}
+
+TEST(CasStoreBackpressure, GcMutationBypassesBackpressure)
+{
+    using namespace DB::Cas;
+
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .root_shards = 1,
+        .gc_trim_min_events = 0,
+        .manifest_soft_limit = 1,          /// tiny
+        .manifest_hard_limit = 500,        /// close to soft so delay_ms > 0
+        .manifest_max_delay_ms = 100,
+    });
+
+    std::atomic<size_t> gc_delay_count{0};
+    s->setBackpressureDelayHook([&](std::chrono::milliseconds) { ++gc_delay_count; });
+
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// Populate the shard with a publish so it has content.
+    /// This WILL trigger the delay hook (Writer origin), but we record the count before GC.
+    publishPart(s, ns.string(), "part_1", "content");
+    const size_t delays_from_publish = gc_delay_count.load();
+    EXPECT_GT(delays_from_publish, 0u);   /// publish should have triggered delays
+
+    /// GC mutation (fence): pass RootMutationOrigin::Gc. The encoded body is above soft_limit=1,
+    /// but GC must bypass backpressure — the delay count should NOT increase.
+    /// fence writes fence_round into the shard. This is a GC-owned operation.
+    s->mutateShard(ns, 0, [&](RootShard & root)
+    {
+        root.fence_round = 42;
+    }, nullptr, RootMutationOrigin::Gc, RootMutationKind::Fence);
+
+    /// No additional delay was called despite body > soft limit.
+    EXPECT_EQ(gc_delay_count.load(), delays_from_publish)
+        << "GC mutation must not trigger backpressure delay";
+
+    /// Hard-limit metric — record baseline before this test (shared global counters).
+    const auto hard_before_gc = ProfileEvents::global_counters[ProfileEvents::CasManifestHardLimitExceeded].load();
+
+    /// Hard-limit metric unchanged (we didn't hit the hard limit).
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasManifestHardLimitExceeded].load(), hard_before_gc);
+}
+
+TEST(CasStoreBackpressure, OneDelayPerCallNotPerAttempt)
+{
+    using namespace DB::Cas;
+
+    /// Verify that after one delay + retry on a fresh read, the second iteration does NOT delay
+    /// again (delayed_once guards against infinite delay).
+
+    std::atomic<size_t> delay_count{0};
+
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .root_shards = 1,
+        .gc_trim_min_events = 0,
+        .manifest_soft_limit = 1,          /// tiny
+        .manifest_hard_limit = 500,        /// close to soft so delay_ms > 0
+        .manifest_max_delay_ms = 100,
+    });
+
+    s->setBackpressureDelayHook([&](std::chrono::milliseconds) { ++delay_count; });
+
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// publishPart calls precommitAdd + promote = 2 mutateShard calls, each with its own
+    /// delayed_once flag. So each publishPart causes exactly 2 delays.
+    /// After the first publishPart → 2 delays.
+    const auto b4 = delay_count.load();
+    publishPart(s, ns.string(), "part_1", "hello");
+    EXPECT_EQ(delay_count.load(), b4 + 2)
+        << "exactly 2 delays per publish (precommitAdd + promote), one each";
+
+    /// A second consecutive publish (shard body still above soft limit) also delays exactly twice.
+    publishPart(s, ns.string(), "part_2", "world");
+    EXPECT_EQ(delay_count.load(), b4 + 4)
+        << "second publish: exactly 2 more delays";
+
+    /// Verify the publishes succeeded.
+    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
+    ASSERT_TRUE(s->resolveRef(ns, "part_2").has_value());
+}
+
+TEST(CasStoreBackpressure, ZeroMaxDelayDoesNotDelay)
+{
+    using namespace DB::Cas;
+
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .root_shards = 1,
+        .gc_trim_min_events = 0,
+        .manifest_soft_limit = 1,          /// tiny
+        .manifest_hard_limit = 1ULL << 20,
+        .manifest_max_delay_ms = 0,        /// 0 = backpressure disabled
+    });
+
+    bool hook_called = false;
+    s->setBackpressureDelayHook([&](std::chrono::milliseconds) { hook_called = true; });
+
+    const RootNamespace ns{"srv1/tbl"};
+    publishPart(s, ns.string(), "part_1", "hello");
+
+    EXPECT_FALSE(hook_called) << "with manifest_max_delay_ms=0, no delay should occur";
+    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
+}
+
+TEST(CasStoreBackpressure, BackpressureRequiresHardGtSoft)
+{
+    using namespace DB::Cas;
+
+    /// When hard_limit == soft_limit, backpressure is inactive (delay would be division by zero).
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .root_shards = 1,
+        .gc_trim_min_events = 0,
+        .manifest_soft_limit = 1000,
+        .manifest_hard_limit = 1000,       /// equal — backpressure inactive
+        .manifest_max_delay_ms = 100,
+    });
+
+    bool hook_called = false;
+    s->setBackpressureDelayHook([&](std::chrono::milliseconds) { hook_called = true; });
+
+    const RootNamespace ns{"srv1/tbl"};
+    publishPart(s, ns.string(), "part_1", "hello");
+
+    EXPECT_FALSE(hook_called) << "with soft==hard, no backpressure";
+    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
+}

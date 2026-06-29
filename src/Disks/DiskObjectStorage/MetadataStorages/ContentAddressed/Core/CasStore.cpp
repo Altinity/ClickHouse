@@ -9,6 +9,7 @@
 #include <Common/thread_local_rng.h>
 #include <city.h>
 #include <algorithm>
+#include <thread>
 #include <unordered_set>
 
 namespace DB
@@ -23,6 +24,13 @@ namespace ErrorCodes
     extern const int LIMIT_EXCEEDED;
     extern const int LOGICAL_ERROR;
 }
+}
+
+namespace ProfileEvents
+{
+    extern const Event CasManifestBackpressureCount;
+    extern const Event CasManifestBackpressureMicroseconds;
+    extern const Event CasManifestHardLimitExceeded;
 }
 
 namespace DB::Cas
@@ -720,7 +728,7 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
 }
 
 void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
-                        uint64_t * out_committed_version)
+                        uint64_t * out_committed_version, RootMutationOrigin origin, RootMutationKind kind)
 {
     /// Local write fence (spec §write-fence, Phase 0 Task 6): the shared mutable ref shards are the
     /// state the fence most protects. A superseded/paused writer (lease lost or local deadline passed)
@@ -732,6 +740,21 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
             config.server_root_id);
 
     const String key = pool_layout.rootShardKey(ns, shard);
+
+    /// B164b: at most one backpressure delay per mutation call. After the first delay + retry, the
+    /// subsequent iteration's fresh read may still be above the soft limit but we commit anyway
+    /// (admission is paced, never permanently blocked).
+    bool delayed_once = false;
+
+    const uint64_t soft_limit = config.manifest_soft_limit;
+    const uint64_t hard_limit = config.manifest_hard_limit;
+    const uint64_t max_delay_ms = config.manifest_max_delay_ms;
+    const bool backpressure_active = (hard_limit > soft_limit) && (max_delay_ms > 0);
+
+    /// Rate-limiter for soft-limit warnings — at most one per 30s to avoid log spam under pressure.
+    static std::atomic<std::chrono::steady_clock::time_point> last_soft_warn{
+        std::chrono::steady_clock::time_point::min()};
+
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
     {
         /// Re-read inside the loop so `mutate` always edits the FRESH manifest: on a Conflict retry the
@@ -742,13 +765,67 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
         ++root.shard_version;
         String body = encodeRootShard(root);
 
-        /// Manifest size guard (spec §4): soft ⇒ warn (still commit), hard ⇒ refuse the write.
-        if (body.size() >= config.manifest_hard_limit)
+        /// Hard limit — fail-closed before any consequential write, regardless of origin.
+        if (body.size() >= hard_limit)
+        {
+            ProfileEvents::increment(ProfileEvents::CasManifestHardLimitExceeded);
             throw Exception(ErrorCodes::LIMIT_EXCEEDED,
-                "manifest {} size {} reached hard limit {}", key, body.size(), config.manifest_hard_limit);
-        if (body.size() >= config.manifest_soft_limit)
-            LOG_WARNING(getLogger("CasStore"),
-                "manifest {} size {} crossed soft limit {}", key, body.size(), config.manifest_soft_limit);
+                "manifest {} size {} reached hard limit {} (kind={})",
+                key, body.size(), hard_limit, static_cast<int>(kind));
+        }
+
+        /// Soft limit — warning log + optional backpressure delay for Writer.
+        if (body.size() >= soft_limit)
+        {
+            /// Rate-limited soft-limit warning (at most one per 30s).
+            const auto now = std::chrono::steady_clock::now();
+            auto last = last_soft_warn.load(std::memory_order_relaxed);
+            if (now - last > std::chrono::seconds(30))
+            {
+                if (last_soft_warn.compare_exchange_strong(last, now))
+                {
+                    LOG_WARNING(getLogger("CasStore"),
+                        "manifest {} size {} crossed soft limit {} (hard={}, kind={}, origin={})",
+                        key, body.size(), soft_limit, hard_limit,
+                        static_cast<int>(kind), static_cast<int>(origin));
+                }
+            }
+
+            /// B164b: delay only Writer mutations, only when backpressure is configured, and at most
+            /// once per mutation call.
+            if (origin == RootMutationOrigin::Writer && backpressure_active && !delayed_once)
+            {
+                /// Linear delay: 0 at soft_limit → max_delay_ms near the hard limit.
+                const double fraction = static_cast<double>(body.size() - soft_limit)
+                                      / static_cast<double>(hard_limit - soft_limit);
+                uint64_t delay_ms = static_cast<uint64_t>(fraction * static_cast<double>(max_delay_ms));
+
+                if (delay_ms > 0)
+                {
+                    delayed_once = true;
+                    const auto delay = std::chrono::milliseconds(delay_ms);
+
+                    ProfileEvents::increment(ProfileEvents::CasManifestBackpressureCount);
+                    ProfileEvents::increment(
+                        ProfileEvents::CasManifestBackpressureMicroseconds,
+                        std::chrono::duration_cast<std::chrono::microseconds>(delay).count());
+
+                    LOG_INFO(getLogger("CasStore"),
+                        "manifest backpressure: ns/shard={}/{} size={} soft={} hard={} delay={}ms kind={}",
+                        ns.string(), shard, body.size(), soft_limit, hard_limit,
+                        delay_ms, static_cast<int>(kind));
+
+                    if (backpressure_delay_hook)
+                        backpressure_delay_hook(delay);
+                    else
+                        std::this_thread::sleep_for(delay);
+
+                    /// Retry with a fresh read — avoids CAS with a stale token and re-applies the
+                    /// mutation to the latest shard state.
+                    continue;
+                }
+            }
+        }
 
         if (pool_backend->casPut(key, body, token).outcome == CasOutcome::Committed)
         {
@@ -798,7 +875,7 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
                 .owner_kind = OwnerKind::Committed, .ref_name = ref_name,
                 .build_id = UInt128(0), .manifest_ref = dropped_ref},
             .new_binding = std::nullopt});
-    });
+    }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Drop);
     /// B170: the ref was dropped (a removal RootOwnerEvent GC folds as a true removal). object_hash is
     /// the manifest the ref named, so a part's "publish -> drop" life is reconstructable from the rows.
     if (hasEventSink())
@@ -839,7 +916,7 @@ void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
                 "updateRefPayload must not change manifest_ref; use publish/drop");
 
         it->second = std::move(payload);
-    });
+    }, nullptr, RootMutationOrigin::Writer, RootMutationKind::UpdateRefPayload);
 }
 
 void Store::removeNamespaceFile(const RootNamespace & ns, const String & name)
@@ -890,7 +967,7 @@ void Store::dropNamespace(const RootNamespace & ns)
                         .build_id = UInt128(0), .manifest_ref = payload.manifest_ref},
                     .new_binding = std::nullopt});
             shard_root.refs.clear();
-        });
+        }, nullptr, RootMutationOrigin::Writer, RootMutationKind::DropNamespace);
     }
 
     /// Delete the verbatim files: list → head for the token → deleteExact (single-owner, bounded retry).

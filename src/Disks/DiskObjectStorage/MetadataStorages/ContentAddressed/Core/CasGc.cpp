@@ -638,7 +638,7 @@ void Gc::fence(GcState & state, Token & state_token, FoldResult & folded)
             store->mutateShard(ns, shard, [&](RootShard & root)
             {
                 root.fence_round = std::max(root.fence_round, round);
-            }, &committed);
+            }, &committed, RootMutationOrigin::Gc, RootMutationKind::Fence);
             state.fence_version[round][cursorKey(ns, shard)] = committed;
             folded.completion_seal.fence_positions[cursorKey(ns, shard)] = committed;
         }
@@ -1096,7 +1096,7 @@ void Gc::trim(FoldResult & folded, uint64_t /*round*/)
         {
             std::erase_if(fresh.journal,
                 [&](const RootOwnerEvent & e) { return e.transition_version <= cursor; });
-        });
+        }, nullptr, RootMutationOrigin::Gc, RootMutationKind::Trim);
         /// Record the sealed cursor used for this shard's trim into the in-round completion seal
         /// audit log. The completion seal is already written write-once before trim runs, so this
         /// populates the in-memory context only — it is an audit annotation, not a decision input.
@@ -1676,7 +1676,7 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uin
                 .old_binding = dead[i].binding,
                 .new_binding = std::nullopt});
         fresh.shard_version = base + dead.size() - 1;
-    });
+    }, nullptr, RootMutationOrigin::Gc, RootMutationKind::ReclaimPrecommit);
 
     /// B170: each abandoned precommit reclaimed (its owner edge removed; the next fold releases its blob
     /// edges). Records WHY the build was judged dead — the soak's leak/dangle attribution.

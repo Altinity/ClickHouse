@@ -62,4 +62,26 @@ Ritual: writing-plans (Phase-1 plan) → self-review → subagent-driven TDD →
 - **Phase 0 Task 4 (owner claim + durable-monotone writer_epoch allocator) — DONE `517ccd5`, self-review found 1 fix → resumed.** Functions correct: `claimOwnerOrThrow` (present-equal-ok / present-differ-CORRUPTED / absent-requires-empty-subtree-else-CORRUPTED / putIfAbsent race re-get+compare); `allocateWriterEpoch` (CAS-bump, retry-on-Conflict, missing-epoch-over-data → CORRUPTED); `serverRootSubtreeEmpty` (lists cas/refs+cas/manifests+roots per srid); + layout helpers `serverRootDataPrefix`/`casRefsServerPrefix`/`casManifestsServerPrefix`. 5/5 tests. **FIX (real): the allocator handed out the first writer_epoch as 0, but epoch 0 is a RESERVED sentinel (CasStore.cpp mints process_epoch nonzero "to avoid the 0/UINT64_MAX sentinels"; Task 7 feeds writer_epoch into the watermark epoch). Must reserve 0 → first allocated = 1 (also matches the TLA+ gate's first AllocEpoch=1).** Resumed implementer for the one-line fix + `EXPECT_GE(e1,1)` assertion. (Minor noted, not fixed: 100-retry terminal uses CORRUPTED_DATA vs ABORTED for contention — startup-only, fail-closed, acceptable.)
 - **Phase 0 Task 3 (layout keys + Owner/ServerEpoch/MountLease protos + codecs) — DONE + reviewed/approved `09b0e65`.** 7 files; codecs mirror CasWatermark (own FormatId magic per codec, `checkCompatibility` before field reads, UInt128 BE); FormatId 16/17/18 = CAOW/CAEP/CAML (distinct; both switches); keys `gc/server-roots/<srid>/{owner,epoch,mount,watermark}`; glob picked up the new `.cpp`. 2/2 round-trip tests pass. codex review timed out (tooling) → controller self-verified the risk points (compat-ordering, per-codec magic, both switches, magic distinctness incl. ruling out the `0x4C424143` Blob-comment false-dup, key separators). Dispatching Task 4.
 
-  - **LEAK (resolved):** the FIRST commit `1e15753` swept in the `gtest_cas_build.cpp` `putBlob` streaming test (`PutBlobStreamsSourceOnceNoFullMaterialization`) via the mechanical `server_root_id="test"` edit while the matching `CasBuild.cpp/.h` implementation remained uncommitted. The matching implementation is now committed as standalone technical-debt cleanup, so branch tip is no longer broken-in-isolation on that test. This cleanup is intentionally separate from Phase 3.
+  - **LEAK (resolved):** the FIRST commit `1e15753` swept in the `gtest_cas_build.cpp` `putBlob` streaming test (`PutBlobStreamsSourceOnceNoFullMaterialization`) via the mechanical `server_root_id='test'` edit while the matching `CasBuild.cpp/.h` implementation remained uncommitted. The matching implementation is now committed as standalone technical-debt cleanup, so branch tip is no longer broken-in-isolation on that test. This cleanup is intentionally separate from Phase 3.
+
+## B164b - writer-path backpressure (2026-06-29)
+- **B164b design approved** (review: one-delay-per-call, mandatory `RootMutationOrigin`/`RootMutationKind`, `max_delay_ms=0` disables, soft==hard guard).
+- **Implementation:**
+  - Added `RootMutationOrigin` (Writer/Gc) and `RootMutationKind` (Publish/Drop/.../Fence/Trim) enums.
+  - Added `manifest_max_delay_ms` config field (default 1000ms).
+  - `mutateShard` now applies linear backpressure delay for Writer mutations between `manifest_soft_limit` and `manifest_hard_limit`, at most one delay per mutation call.
+  - GC call sites explicitly pass `RootMutationOrigin::Gc` to bypass backpressure.
+  - Build/Store call sites explicitly pass `RootMutationOrigin::Writer` + kind for diagnostics.
+  - Rate-limited soft-limit warning (max 1 per 30s).
+  - Injectable `backpressure_delay_hook` for tests.
+  - ProfileEvents: `CasManifestBackpressureCount`, `CasManifestBackpressureMicroseconds`, `CasManifestHardLimitExceeded`.
+  - Config validation: backpressure inactive when `hard_limit <= soft_limit` or `max_delay_ms == 0`.
+- **Tests: 6 tests:**
+  - `WriterMutationAboveSoftLimitDelaysThenCommits` - publish delays via hook, metrics show increments.
+  - `HardLimitThrowsBeforeWrite` - hard-limit exception via `publishPart`, counter incremented, no ref committed.
+  - `GcMutationBypassesBackpressure` - `mutateShard` with `RootMutationOrigin::Gc` does NOT trigger delay.
+  - `OneDelayPerCallNotPerAttempt` - each `mutateShard` delays at most once (2 per publishPart = precommit + promote).
+  - `ZeroMaxDelayDoesNotDelay` - `manifest_max_delay_ms=0` produces no delay.
+  - `BackpressureRequiresHardGtSoft` - equal soft/hard limits produce no delay.
+- **Existing suite:** 197 tests, same 196/197 pass (only pre-existing `CaWiringOps.FreezeViaHardLinksIntoShadow`).
+- **Docs updated:** `cas-mergetree-integration.md` B164b marked DONE IMPLEMENTED.

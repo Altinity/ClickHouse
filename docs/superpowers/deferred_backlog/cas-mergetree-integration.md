@@ -26,10 +26,11 @@ Curated from the full inventory by impact lens. HARD = true gate; MED = strongly
 
 **A. LAYOUT / format-freeze (post-release change = migration):** Historical completed items from the
 2026-06-25 format-freeze pass moved to the archive. Live gates:
-- ⏳ **B164b write-path journal backpressure** [HARD] — REMAINING: current `gc_trim_min_events`,
-  `gc_trim_body_soft_limit`, `manifest_soft_limit`, and `manifest_hard_limit` bound root-shard object growth,
-  but they do not pace inserts while GC falls behind. Need a real delay/throw admission policy on the
-  ref/root journal backlog.
+- ✅ **B164b write-path journal backpressure** [HARD] — IMPLEMENTED 2026-06-29: `manifest_soft_limit` now
+  paces writer-originated mutations with a linear backpressure delay (0..`manifest_max_delay_ms`),
+  capped at one delay per mutation call. `manifest_hard_limit` throws before write. GC mutations
+  (trim/fence/reclaim) bypass backpressure. Metrics: `CasManifestBackpressureCount`,
+  `CasManifestBackpressureMicroseconds`, `CasManifestHardLimitExceeded`.
 - ⏳ **B1 replicated manifest-hash guard** [HARD] — REMAINING: single- AND multi-replica work TODAY via
   fetch-by-relink (`test_cas_replicated_relink` passes); true remaining = the `manifest_hash` field on the
   per-replica Keeper `/parts` znode for cross-replica header-divergence detection (not yet in `commitPart`/
