@@ -24,37 +24,13 @@ Source design: `../specs/2026-06-10-ca-incarnation-store-design.md` (incarnation
 
 Curated from the full inventory by impact lens. HARD = true gate; MED = strongly advised. IDs reference the rows below / the archive.
 
-**A. LAYOUT / format-freeze (post-release change = migration):** — STATUS 2026-06-25 (overnight run;
-see `docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.md` +
-`docs/superpowers/cas-unattended-work-log-2026-06-24.md`; branch `cas-vfs-path-mapping`).
-- ✅ **B13 DONE** — the whole schema-evolution framework landed: `CasFormat` (writer_version/
-  min_reader_version, global generation, `gateOnRead`, framing header), Merkle `treeId`, one-header
-  envelope (CABL/CATR, 94-byte hole-free core, `blob_header_len`=256), manifest framing +
-  `published_at_ms`. Unit-green; full server builds.
-- ✅ **B176 envelope DONE** (2b — TLV critical bit, hole-free core). ⛔ old **B176 gc-snap→protobuf** is obsolete: `gc/snap` is retired
-  (old `gc/snap` wording archived; no current action).
-- ✅ **B97/B96/B10 DONE** — packs removed entirely (no reserved slots); one-GET part open delivered via
-  tree-inline of eager files (2d). B96 snap_shards>1 stays deferred (map-reduce GC territory).
-- ✅ **Two-encodings / abandon-JSON DONE** — all 7 mutable JSON objects → protobuf; JSON codec family +
-  monotone `checkVersion` + `CasEnumStrings.h` deleted.
+**A. LAYOUT / format-freeze (post-release change = migration):** Historical completed items from the
+2026-06-25 format-freeze pass moved to the archive. Live gates:
 - ⏳ **B164b journal bound** [HARD] — REMAINING (two settings: `..._to_throw` hard + `..._to_delay` paced).
-- ✅ **B92 adopt-path tree_size** — DONE (2026-06-26, `b44db5dbaf7`): `observeAndAdmit` computes the tree
-  payload size (`hr.size - blob_header_len`) for adopt, so `RefPayload.tree_size` is correct on
-  FREEZE/relink; round-trip test. Row moved to archive.
-- ✅ **Envelope TLV freeze review** — DONE (2026-06-26): envelope is freeze-ready; the one gap (`domain_id`
-  written but unverified) closed by a fail-closed `readTree` check (cross-pool contamination). No dead
-  fields; nothing moves to S3 metadata.
-- ✅ **B64 projection attach** — DONE + archived (commit `d6f6b8345a0`, 2026-06-04; `03822` un-gated, oracle `05001`).
-- ✅ **B8 partition ops (REPLACE_RANGE/MOVE/DROP_PART covering race)** — OBSOLETE/DONE: implemented + tested +
-  un-gated (Phase 3.2 `8fcea70ae3d`, B61(b) `6a0e506533c`; gate lifted in `StorageReplicatedMergeTree.cpp:~7421`).
-  Row removed from the table (2026-06-26 recheck). Multi-ref commit atomicity is tracked separately as B122.
 - ⏳ **B1 replicated** [HARD] — REMAINING as a tracking umbrella: single- AND multi-replica work TODAY via
   fetch-by-relink (`test_cas_replicated_relink` passes); TRUE remaining = the `manifest_hash` field on the
   per-replica Keeper `/parts` znode for cross-replica header-divergence detection (not yet in `commitPart`/
   `getCommitPartOps`).
-- ✅ cosmetic: renamed `cas_root_shard.proto`→`cas_format.proto`, package `DB.Cas.Proto`→
-  `clickhouse.cas.format` — DONE (2026-06-26, `c519a79f684`; grep gate clean, golden codec tests prove
-  the wire bytes are unchanged).
 
 **B. COST / bill control (S3 requests, storage, egress):**
 - B148 HEAD storm (resolveRef per warm hit + retire per candidate/round) — dominant request bill [HARD]

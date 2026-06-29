@@ -848,3 +848,20 @@ rather than copied verbatim where the original text described protocol surfaces 
 | B176 | **OBSOLETE.** The `gc/snap`→protobuf item is obsolete because `gc/snap` is retired. The blob-envelope fixed header remains intentionally hand-binary; any future TLV/protobuf extension should be a separate narrow format item, not this old `gc/snap` migration. | Protocol surface removed. | Historical only. |
 | B204 | **FIXED.** The soak harness now uses a cheap `du`-based pool probe, fails closed on an unmeasurable pool, and wires the disk watchdog (`10fcf585dd3`; follow-up `ca2389f3c9e` for the `None` budget-log guard). | Implemented. | `utils/ca-soak` harness. |
 | B205 | **FIXED.** Long soaks no longer tear down evidence on non-happy finish (`b4cb5660feb`), preserving containers/logs for post-mortem. | Implemented. | `utils/ca-soak/scripts/run_24h.sh`. |
+
+## Groomed 2026-06-29 — format-freeze gate completions {#groomed-2026-06-29-format-freeze}
+
+Moved from the live release-gate summary after the 2026-06-25 format-freeze pass. The live
+`LAYOUT / format-freeze` gate now tracks only the remaining release blockers: B164b and B1.
+
+| ID | Item | Status | Notes |
+|----|------|--------|-------|
+| B13-format | Schema-evolution framework (`CasFormat`, writer/min-reader versions, global generation, `gateOnRead`, framing header), Merkle `treeId`, one-header envelope, `blob_header_len`, manifest framing, and `published_at_ms`. | DONE. | See `docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.md` and `docs/superpowers/cas-unattended-work-log-2026-06-24.md`. The broader B13 migration/rollout row remains live where relevant. |
+| B176-envelope | Envelope TLV critical-bit and hole-free core. | DONE. | The old B176 `gc/snap` to protobuf wording is obsolete because `gc/snap` is retired. |
+| B97/B96/B10-format | Packs removed entirely; one-GET part open delivered via tree-inline eager files. | DONE for the format-freeze concern. | B96 `snap_shards > 1` remains deferred under the map-reduce GC track, not this format-freeze gate. |
+| mutable-protobuf | Mutable JSON object family moved to protobuf; JSON codecs, monotone `checkVersion`, and `CasEnumStrings.h` removed. | DONE. | No live two-encoding / abandon-JSON action remains. |
+| B92 | Adopt-path `tree_size`. | DONE 2026-06-26 (`b44db5dbaf7`). | `observeAndAdmit` records the tree payload size (`hr.size - blob_header_len`) for adopt/FREEZE/relink; round-trip test added. |
+| envelope-tlv-review | Envelope freeze review. | DONE 2026-06-26. | `domain_id` is verified fail-closed on `readTree`; no dead fields and no S3-metadata move. |
+| B64 | Projection attach. | DONE / archived. | Commit `d6f6b8345a0`; `03822` un-gated; oracle `05001`. |
+| B8 | Partition operations (`REPLACE_RANGE` / `MOVE` / `DROP_PART` covering race). | DONE / obsolete. | Implemented, tested, and un-gated; multi-ref commit atomicity remains tracked separately as B122. |
+| proto-rename | `cas_root_shard.proto` to `cas_format.proto`, package `DB.Cas.Proto` to `clickhouse.cas.format`. | DONE 2026-06-26 (`c519a79f684`). | Grep gate clean; golden codec tests prove unchanged wire bytes. |
