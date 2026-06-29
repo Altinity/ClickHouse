@@ -417,11 +417,10 @@ MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 
 std::string ContentAddressedMetadataStorage::serverPrefix() const
 {
-    /// ONE canonical server token everywhere (Phase 6): the 32-hex `u128ToHex(serverIdToU128(server_id))`
-    /// — exactly the form GC already uses for `precommitNs`/`serverWatermarkKey`. Using it as the
-    /// server-prefix here lands a server's live/detached namespaces under the same `roots/<server-hex>/`
-    /// subtree as its watermark and precommits, so "drop a server" is one subtree.
-    return Cas::u128ToHex(serverIdToU128(server_id));
+    /// Phase 1 layout: live namespaces and mirrored live-tree files are rooted by the configured
+    /// `server_root_id`, not by the ClickHouse ServerUUID-derived token. `ServerUUID` is only the
+    /// mount owner token; `server_root_id` is the persistent layout identity.
+    return server_root_id;
 }
 
 std::vector<std::string> ContentAddressedMetadataStorage::listLiveTreeChildren(const std::string & path) const
@@ -437,7 +436,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listLiveTreeChildren(c
 bool ContentAddressedMetadataStorage::liveTreeDirHasChildren(const std::string & path) const
 {
     const std::string canonical = canonicalDiskPath(path);
-    /// The disk root always exists; otherwise a non-empty server-scoped mirrored LIST is the signal.
+    /// The disk root always exists; otherwise a non-empty server-root-scoped mirrored LIST is the signal.
     if (canonical.empty())
         return true;
     const std::string scope = serverPrefix() + "/" + canonical + "/";
@@ -448,7 +447,7 @@ Cas::RootNamespace ContentAddressedMetadataStorage::liveNamespace(const std::str
 {
     /// Path-mirroring (design §5.1): the namespace IS the table's canonical disk path with the
     /// content-addressed boundary marked by `@cas@` on the table-dir segment, prefixed by the
-    /// canonical server token (`serverPrefix`). e.g. `<server-hex>/store/3f2/3f2a…@cas@`.
+    /// configured `server_root_id`. e.g. `<server_root_id>/store/3f2/3f2a…@cas@`.
     return Cas::RootNamespace{serverPrefix() + "/" + ContentAddressed::mirroredArchiveNamespace(table_uuid)};
 }
 
@@ -520,8 +519,8 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     {
         if (auto tf = ContentAddressed::parseTableFilePath(path))
             return store()->getNamespaceFile(liveNamespace(tf->table_uuid), tf->tail).has_value();
-        /// A loose mountpoint object (design §5.2): a plain object at roots/<server>/<path>.
-        return store()->getMountpointObject(server_id + "/" + path).has_value();
+        /// A loose mountpoint object (design §5.2): a plain object at roots/<server_root_id>/<path>.
+        return store()->getMountpointObject(serverPrefix() + "/" + path).has_value();
     }
 
     auto p = ContentAddressed::parsePartFilePath(path);
@@ -612,7 +611,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
     }
 
     /// A generic INTERMEDIATE live-tree directory (disk root, `store`, ...): exists iff a
-    /// server-scoped mirrored LIST finds any object. Keeps `cd`/existence consistent with
+    /// server-root-scoped mirrored LIST finds any object. Keeps `cd`/existence consistent with
     /// listDirectory so `clickhouse-disks` traversal behaves like a normal disk.
     return liveTreeDirHasChildren(path);
 }
@@ -630,7 +629,7 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     if (!ContentAddressed::isPartFilePath(path))
     {
         /// A loose mountpoint object (design §5.2): read and return its byte length.
-        if (auto bytes = store()->getMountpointObject(server_id + "/" + path))
+        if (auto bytes = store()->getMountpointObject(serverPrefix() + "/" + path))
             return bytes->size();
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
     }
@@ -797,7 +796,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
     }
 
     /// A generic INTERMEDIATE live-tree directory (the disk root "", `store`, or any loose-file
-    /// container above a table dir): a server-scoped mirrored LIST. (`store/<u3>` is handled by the
+    /// container above a table dir): a server-root-scoped mirrored LIST. (`store/<u3>` is handled by the
     /// early guard above, since its non-Atomic-table ambiguity would otherwise misroute it here too
     /// late, after parseTableUuid/parseTableFilePath have already claimed it.)
     return listLiveTreeChildren(path);
@@ -845,10 +844,10 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         if (ContentAddressed::parseTableFilePath(path))
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                 "ContentAddressed: table-level verbatim file is in-manifest, not a storage object: {}", path);
-        /// A loose mountpoint object: a real plain object at roots/<server>/<path>. The
+        /// A loose mountpoint object: a real plain object at roots/<server_root_id>/<path>. The
         /// StoredObject key must be the PHYSICAL path (physicalKey-adjusted for Local backends).
-        const std::string pool_key = store()->layout().mountpointObjectKey(server_id + "/" + path);
-        if (store()->getMountpointObject(server_id + "/" + path))
+        const std::string pool_key = store()->layout().mountpointObjectKey(serverPrefix() + "/" + path);
+        if (store()->getMountpointObject(serverPrefix() + "/" + path))
             return {StoredObject(physicalKey(pool_key), path, getFileSize(path))};
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
     }

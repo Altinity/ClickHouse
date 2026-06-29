@@ -562,7 +562,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 });
         }
         /// A loose disk file (the startup write probe): a plain mountpoint object (design §5.2).
-        const std::string key = metadata_storage.serverId() + "/" + path;
+        const std::string key = metadata_storage.serverRootId() + "/" + path;
         std::string prefix_bytes;
         if (mode == WriteMode::Append)
             if (auto existing = metadata_storage.store()->getMountpointObject(key))
@@ -1074,8 +1074,8 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
         }
         /// Loose mountpoint files (rare): read + put + remove plain objects. Same B123 single-writer
         /// contract + idempotent re-drive as the table-verbatim branch above.
-        const std::string src_key = metadata_storage.serverId() + "/" + path_from;
-        const std::string dst_key = metadata_storage.serverId() + "/" + path_to;
+        const std::string src_key = metadata_storage.serverRootId() + "/" + path_from;
+        const std::string dst_key = metadata_storage.serverRootId() + "/" + path_to;
         if (src_key == dst_key)
             return;
         auto bytes = metadata_storage.store()->getMountpointObject(src_key);
@@ -1230,7 +1230,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
         return;
     }
     /// Loose mountpoint file: exact-token delete of the plain object (design §5.2).
-    metadata_storage.store()->removeMountpointObject(metadata_storage.serverId() + "/" + path);
+    metadata_storage.store()->removeMountpointObject(metadata_storage.serverRootId() + "/" + path);
 }
 
 void ContentAddressedTransaction::truncateFile(const std::string &, size_t)

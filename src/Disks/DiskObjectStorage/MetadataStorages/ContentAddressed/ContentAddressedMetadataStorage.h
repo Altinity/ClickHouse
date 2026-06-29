@@ -101,6 +101,7 @@ public:
     /// The opened pool. Throws LOGICAL_ERROR before startup — every caller is post-startup.
     const Cas::StorePtr & store() const;
     const std::string & serverId() const { return server_id; }
+    const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
 
     /// Bytes that live INSIDE pool metadata rather than as their own object: a mutable per-part
@@ -140,17 +141,15 @@ public:
     Cas::RootNamespace liveNamespace(const std::string & table_uuid) const;
     static Cas::RootNamespace shadowNamespace(const std::string & shadow_table_dir);
 
-    /// The canonical server prefix used for server-scoped namespaces: the 32-hex
-    /// `u128ToHex(serverIdToU128(server_id))` — the SAME token GC uses for its watermark and
-    /// precommit namespace (`precommitNs`, `serverWatermarkKey`). A server's mutable control state
-    /// (live/detached namespaces, watermark, precommits) all live under this one token so dropping a
-    /// server is one `roots/<server-hex>/` subtree.
+    /// The configured live-tree root prefix. Phase 1 makes layout identity explicit:
+    /// live/detached namespaces and verbatim live-tree files are rooted by `server_root_id`, while
+    /// `ServerUUID` remains only the mount owner token.
     std::string serverPrefix() const;
     // (genericNamespace removed — loose files are plain mountpoint objects, design §5.2)
 
     /// Enumerate the children of a GENERIC intermediate live-tree directory (the disk root "",
     /// `store`, the `store/<u3>` shard dir, or any loose-file container above a table dir) via a
-    /// server-scoped mirrored S3 LIST of `roots/<server-hex>/<path>/`. `@cas@`-suffixed table-dir
+    /// server-root-scoped mirrored S3 LIST of `roots/<server_root_id>/<path>/`. `@cas@`-suffixed table-dir
     /// segments are surfaced under their logical (unsuffixed) name. This is what makes top-down
     /// `clickhouse-disks` traversal of the live tree behave like a normal disk; concrete
     /// `store/<u3>/<uuid>/<part>/<file>` navigation is still served by the exact-shape branches.

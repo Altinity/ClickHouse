@@ -444,12 +444,17 @@ TEST(CaWiringRead, ShadowFreezeTree)
 TEST(CaWiringRead, VerbatimNamespaceFiles)
 {
     auto storage = openWiringStorage();
+    EXPECT_TRUE(storage->liveNamespace("uuid-1").string().starts_with("test/"))
+        << storage->liveNamespace("uuid-1").string();
+    EXPECT_NE(storage->liveNamespace("uuid-1").string().find("/store/uui/uuid-1@cas@"), std::string::npos)
+        << storage->liveNamespace("uuid-1").string();
+
     publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
     storage->store()->putNamespaceFile(storage->liveNamespace("uuid-1"), "format_version.txt", "1\n");
     storage->store()->putNamespaceFile(
         storage->liveNamespace("uuid-1"), "deduplication_logs/deduplication_log_1.txt", "log-bytes");
     /// Loose disk-root files are plain mountpoint objects (design §5.2), not namespace files.
-    storage->store()->putMountpointObject(storage->serverId() + "/" + "clickhouse_access_check_xyz", "ok");
+    storage->store()->putMountpointObject(storage->serverRootId() + "/" + "clickhouse_access_check_xyz", "ok");
 
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/format_version.txt"));
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/format_version.txt"), 2u);
@@ -1270,8 +1275,8 @@ TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
     /// 2. Read-only object storage over the SAME root => observe-only metadata storage.
     auto ro_os = std::make_shared<DB::LocalObjectStorage>(
         DB::LocalObjectStorageSettings("test", root, /*read_only_=*/true));
-    /// Same server_id as the writer: live namespaces are server-scoped (liveNamespace prepends
-    /// server_id), so an observe-only mount reads the same server's data — the WORM scenario.
+    /// Same `server_root_id` as the writer: live namespaces are rooted by configured layout identity, so an
+    /// observe-only mount reads the same server-root's data — the WORM scenario.
     auto ro = std::make_shared<DB::ContentAddressedMetadataStorage>(
         ro_os, "pool", "srv1", "test", std::filesystem::temp_directory_path() / "ca_ro_scratch2", nullptr);
     ro->startup();   /// must NOT throw (probe skipped — a probe write would fail on a read-only os)
