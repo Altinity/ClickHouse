@@ -18,6 +18,9 @@ public:
     virtual ~IStorageCredentials() = default;
 
     virtual void addCredentialsToEngineArgs(DB::ASTs & engine_args) const = 0;
+
+    /// True when the credentials are unusable (mandatory fields empty); such credentials are not cached.
+    virtual bool isEmpty() const = 0;
 };
 
 class S3Credentials final : public IStorageCredentials
@@ -32,6 +35,11 @@ public:
         , session_token(session_token_)
     {}
 
+<<<<<<< HEAD
+=======
+    bool isEmpty() const override { return access_key_id.empty() || secret_access_key.empty(); }
+
+>>>>>>> cf885680ce4 (Merge pull request #1923 from Altinity/fix/antalya-26.3/iceberg-creds)
     void addCredentialsToEngineArgs(DB::ASTs & engine_args) const override
     {
         if (engine_args.size() != 1)
@@ -108,6 +116,8 @@ public:
 
         engine_args.push_back(DB::make_intrusive<DB::ASTLiteral>(sas_token));
     }
+
+    bool isEmpty() const override { return sas_token.empty(); }
 
 private:
     std::string sas_token;

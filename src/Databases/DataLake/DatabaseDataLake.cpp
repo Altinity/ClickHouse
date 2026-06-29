@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <memory>
 #include <Databases/DataLake/DatabaseDataLake.h>
 #include <Core/SettingsEnums.h>
@@ -63,6 +64,11 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString oauth_server_uri;
     extern const DatabaseDataLakeSettingsBool oauth_server_use_request_body;
     extern const DatabaseDataLakeSettingsBool vended_credentials;
+<<<<<<< HEAD
+=======
+    extern const DatabaseDataLakeSettingsUInt64 vended_credentials_cache_ttl;
+    extern const DatabaseDataLakeSettingsString object_storage_cluster;
+>>>>>>> cf885680ce4 (Merge pull request #1923 from Altinity/fix/antalya-26.3/iceberg-creds)
     extern const DatabaseDataLakeSettingsString aws_access_key_id;
     extern const DatabaseDataLakeSettingsString aws_secret_access_key;
     extern const DatabaseDataLakeSettingsString region;
@@ -313,12 +319,19 @@ void DatabaseDataLake::initialize() const
     }
 }
 
+<<<<<<< HEAD
 std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
 {
     std::lock_guard lock(catalog_mutex);
     /// Lazily build the catalog on first access for databases attached at startup (see ctor).
     if (!catalog_impl)
         initialize();
+=======
+    if (catalog_impl)
+        catalog_impl->setVendedCredentialsCacheTTL(
+            std::chrono::seconds(settings[DatabaseDataLakeSetting::vended_credentials_cache_ttl].value));
+
+>>>>>>> cf885680ce4 (Merge pull request #1923 from Altinity/fix/antalya-26.3/iceberg-creds)
     return catalog_impl;
 }
 

@@ -54,11 +54,21 @@ The following settings are supported:
 | `storage_endpoint`      | Endpoint URL for the underlying storage                                                 |
 | `oauth_server_uri`      | URI of the OAuth2 authorization server for authentication                               |
 | `vended_credentials`    | Boolean indicating whether to use vended credentials from the catalog (supports AWS S3 and Azure ADLS Gen2) |
+<<<<<<< HEAD
 | `aws_access_key_id`     | AWS access key ID for S3/Glue access (if not using vended credentials)                  |
 | `aws_secret_access_key` | AWS secret access key for S3/Glue access (if not using vended credentials)              |
 | `region`                | AWS region for the service (e.g., `us-east-1`)                                          |
 | `dlf_access_key_id`     | Access key ID for DLF access                                                            |
 | `dlf_access_key_secret` | Access key Secret for DLF access                                                        |
+=======
+| `vended_credentials_cache_ttl` | Maximum cache entry lifetime (in seconds) for vended credentials (REST catalogs only). Default `300`; `0` disables caching. |
+| `aws_access_key_id`     | AWS access key ID for S3/Glue access (if not using vended credentials)                        |
+| `aws_secret_access_key` | AWS secret access key for S3/Glue access (if not using vended credentials)                    |
+| `region`                | AWS region for the service (e.g., `us-east-1`)                                                |
+| `dlf_access_key_id`     | Access key ID for DLF access                                                                  |
+| `dlf_access_key_secret` | Access key Secret for DLF access                                                              |
+| `namespaces`            | Comma-separated list of namespaces, implemented for catalog types: `rest`, `glue` and `unity` |
+>>>>>>> cf885680ce4 (Merge pull request #1923 from Altinity/fix/antalya-26.3/iceberg-creds)
 
 ## Examples {#examples}
 
