@@ -70,7 +70,7 @@
     origins:
       - id: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Origins.Items[0].Id }}"
         domain_name: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Origins.Items[0].DomainName }}"
-        origin_path: "{{ new_cloudfront_origin_path | default(omit) }}"
+        origin_path: "/{{ new_cloudfront_origin_path | default(omit) }}"
         custom_origin_config:
           origin_protocol_policy: "http-only"
     aliases:
