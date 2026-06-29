@@ -42,7 +42,7 @@ const UInt128 kGcB = hexToU128("0000000000000000000000000000000b");
 
 ManifestRef ref(uint64_t seq, uint64_t inst)
 {
-    return ManifestRef{.writer_instance_id = "srv-a:1", .build_sequence = seq, .manifest_instance_id = DB::UInt128(inst)};
+    return ManifestRef{.writer_epoch = 1, .build_sequence = seq, .manifest_ordinal = static_cast<uint32_t>(inst)};
 }
 
 bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash)
@@ -1213,7 +1213,7 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     const ManifestRef r2 = ref(5, 0xCA02);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    setWatermarkMinActive(*backend, store->layout(), "test", r1.writer_instance_id, /*min_active*/6);
+    setWatermarkMinActive(*backend, store->layout(), "test", r1.writer_epoch, /*min_active*/6);
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);

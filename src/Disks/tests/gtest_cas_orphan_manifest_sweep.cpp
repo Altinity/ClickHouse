@@ -9,12 +9,11 @@ using namespace DB::Cas::tests;
 
 namespace
 {
-/// A writer_instance_id with the current `<server-hex>:<writer-epoch>` shape.
-const String kWriter = "00000000000000000000000000000abc:7";
+constexpr uint64_t kWriterEpoch = 7;
 const String kServerRoot = "00";
 ManifestRef ref(uint64_t seq, uint64_t inst)
 {
-    return ManifestRef{.writer_instance_id = kWriter, .build_sequence = seq, .manifest_instance_id = DB::UInt128(inst)};
+    return ManifestRef{.writer_epoch = kWriterEpoch, .build_sequence = seq, .manifest_ordinal = static_cast<uint32_t>(inst)};
 }
 }
 
@@ -27,9 +26,9 @@ TEST(CasOrphanManifestSweep, EligibleAndUnownedIsDeleted)
     registerNamespaceRaw(*backend, store->layout(), ns);
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});   // body, no owner
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriter, /*min_active*/6);   // 6 > 5 => eligible
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active*/6);   // 6 > 5 => eligible
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_instance_id = kWriter, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
@@ -42,9 +41,9 @@ TEST(CasOrphanManifestSweep, OwnedBodyIsSkipped)
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);  // now owned
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriter, 6);
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_instance_id = kWriter, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
@@ -56,11 +55,11 @@ TEST(CasOrphanManifestSweep, EmitsNoBlobDeltas)
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriter, 6);
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
     // No GC state / no generation seal exists before the sweep; the sweep must not create one.
     const uint64_t gen_before = currentGenerationOf(*backend, store->layout());
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_instance_id = kWriter, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
     EXPECT_EQ(currentGenerationOf(*backend, store->layout()), gen_before);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
 }
@@ -75,7 +74,7 @@ TEST(CasOrphanManifestSweep, CursorPageAdvancesAndWrapsWithListBudget)
     const ManifestRef r2 = ref(5, 0xE2);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriter, /*min_active*/6);
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active*/6);
 
     const ManifestSweepResult first = sweepManifestCursorPage(*store, "", /*list_budget*/1, /*delete_budget*/0);
     EXPECT_EQ(first.listed, 1u);
@@ -97,7 +96,7 @@ TEST(CasOrphanManifestSweep, NoWatermarkIsNotAuthority)
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     // No setWatermarkMinActive — no durable fact => not eligible.
-    sweepNamespace(*store, ns, BuildPrefix{.writer_instance_id = kWriter, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
@@ -109,7 +108,7 @@ TEST(CasOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
     registerNamespaceRaw(*backend, store->layout(), ns);
     const ManifestRef r = ref(5, 0xAC);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriter, 6);
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
 
     const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_GE(result.listed, 1u);
@@ -127,7 +126,7 @@ TEST(CasOrphanManifestSweep, CursorPageRespectsDeleteBudget)
     const ManifestRef r2 = ref(5, 0xAE);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriter, 6);
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
 
     const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/1);
     EXPECT_EQ(result.deleted, 1u);
@@ -144,7 +143,7 @@ TEST(CasOrphanManifestSweep, CursorPageSkipsOwnedBody)
     const ManifestRef r = ref(5, 0xAF);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriter, 6);
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
 
     const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(result.deleted, 0u);

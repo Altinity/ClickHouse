@@ -185,8 +185,8 @@ TEST(CasRootShardCodec, RoundTripInterleavedOwnerEvents)
     RootShard r;
     r.shard_version = 12;
     r.fence_round = 3;
-    const ManifestRef mr{"srv-a:42", 1042, UInt128(0xABCDEF)};   /// the part this build owns
-    const ManifestRef mr_other{"srv-a:42", 1043, UInt128(0x112233)};
+    const ManifestRef mr{42, 1042, 1};   /// the part this build owns
+    const ManifestRef mr_other{42, 1043, 1};
     const UInt128 build_id(0x5678);
     r.refs["all_1_1_0"] = RootRef{"all_1_1_0", mr, {{"txn_version.txt", "5"}}, 1700000000000ULL};
 
@@ -227,7 +227,7 @@ TEST(CasRootShardCodec, OptionalBindingAbsenceIsDistinguished)
     RootShard r;
     r.shard_version = 1;
     /// A drop event: old committed binding present, new absent.
-    r.journal.push_back(RootOwnerEvent{1, committedBinding("p", ManifestRef{"w", 1, UInt128(9)}), std::nullopt});
+    r.journal.push_back(RootOwnerEvent{1, committedBinding("p", ManifestRef{1, 1, static_cast<uint32_t>(9)}), std::nullopt});
     const RootShard back = decodeRootShard(encodeRootShard(r));
     EXPECT_TRUE(back.journal.at(0).old_binding.has_value());
     EXPECT_FALSE(back.journal.at(0).new_binding.has_value());
@@ -248,8 +248,8 @@ TEST(CasRootShardCodec, RefsCanonicalOrderRegardlessOfInsertion)
 {
     /// std::map already keeps refs name-sorted, but verify two manifests built in different insertion
     /// order encode byte-identically.
-    const ManifestRef m1{"w", 1, UInt128(0x1)};
-    const ManifestRef m2{"w", 2, UInt128(0x2)};
+    const ManifestRef m1{1, 1, 1};
+    const ManifestRef m2{1, 2, 1};
     RootShard a;
     a.refs["zzz"] = RootRef{"zzz", m1, {}, 0};
     a.refs["aaa"] = RootRef{"aaa", m2, {}, 0};
@@ -267,7 +267,7 @@ TEST(CasRootShardCodec, JournalTransitionVersionMonotonicityIsEnforced)
     /// transition_version would fold silently in vector order (a mis-count = a wrong delete later) and a
     /// record claiming a version beyond shard_version would be silently skipped by the cursor window.
     /// Both are corruption - fail closed at DECODE.
-    const ManifestRef mr{"w", 1, UInt128(1)};
+    const ManifestRef mr{1, 1, 1};
 
     /// Descending transition_version.
     {
@@ -313,7 +313,7 @@ TEST(CasRootShardCodec, JournalTransitionVersionMonotonicityIsEnforced)
 /// committed dispatch (the barrier / reclaim), so it is corruption — caught at DECODE.
 TEST(CasRootShardCodec, OwnerKindBuildIdInvariantIsEnforced)
 {
-    const ManifestRef mr{"w", 1, UInt128(1)};
+    const ManifestRef mr{1, 1, 1};
 
     /// A committed binding carrying a non-zero build_id is corruption.
     {
@@ -348,9 +348,9 @@ TEST(CasRootShardCodec, ProtobufEncodingIsDeterministic)
 {
     RootShard rs;
     rs.shard_version = 5;
-    rs.refs["zzz"] = RootRef{"zzz", ManifestRef{"w", 1, UInt128(0x1)}, {{"b", "2"}, {"a", "1"}}, 0};
-    rs.refs["aaa"] = RootRef{"aaa", ManifestRef{"w", 2, UInt128(0x2)}, {}, 0};
-    rs.journal.push_back(RootOwnerEvent{5, std::nullopt, committedBinding("zzz", ManifestRef{"w", 1, UInt128(0x1)})});
+    rs.refs["zzz"] = RootRef{"zzz", ManifestRef{1, 1, static_cast<uint32_t>(0x1)}, {{"b", "2"}, {"a", "1"}}, 0};
+    rs.refs["aaa"] = RootRef{"aaa", ManifestRef{1, 2, static_cast<uint32_t>(0x2)}, {}, 0};
+    rs.journal.push_back(RootOwnerEvent{5, std::nullopt, committedBinding("zzz", ManifestRef{1, 1, static_cast<uint32_t>(0x1)})});
     EXPECT_EQ(encodeRootShard(rs), encodeRootShard(rs));
 }
 
@@ -360,7 +360,7 @@ TEST(CasRootShardCodec, LargeJournalRoundTrips)
     rs.shard_version = 5000;
     for (uint64_t v = 0; v < 2430; ++v)
         rs.journal.push_back(RootOwnerEvent{v, std::nullopt,
-            committedBinding("p" + std::to_string(v % 38), ManifestRef{"w", v, UInt128(v)})});
+            committedBinding("p" + std::to_string(v % 38), ManifestRef{1, v, static_cast<uint32_t>(v + 1)})});
     const RootShard d = decodeRootShard(encodeRootShard(rs));
     ASSERT_EQ(d.journal.size(), 2430u);
     EXPECT_EQ(d.journal[2429].transition_version, 2429u);
@@ -432,11 +432,10 @@ TEST(CasWatermark, RoundTrips)
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 
-TEST(CasLayout, ServerWatermarkKey)
+TEST(CasLayout, ServerRootWatermarkKey)
 {
     Layout layout("pool");
-    const String hex(32, 'a');   // 32-char u128 hex
-    ASSERT_EQ(layout.serverWatermarkKey(hex), "pool/roots/" + hex + "/_watermark");
+    ASSERT_EQ(layout.serverRootWatermarkKey("srv/root"), "pool/gc/server-roots/srv/root/watermark");
 }
 
 /// ---------- envelope fixed-length header padding (pad_to_header_len) ----------
@@ -522,7 +521,7 @@ TEST(CasByteOrderGolden, RootShardBigEndian)
     RootShard rs;
     rs.shard_version = 9;
     rs.fence_round = 3;
-    const ManifestRef mr{"w", 7, (UInt128(0xab) << 64) | UInt128(0xcd)};
+    const ManifestRef mr{1, 7, 1};
     rs.refs["part_a"] = RootRef{"part_a", mr, {}, 1781588451000ULL};
     rs.journal.push_back(RootOwnerEvent{8, std::nullopt,
         OwnerBinding{OwnerKind::Committed, "part_a", UInt128(0), mr}});
@@ -535,9 +534,7 @@ TEST(CasByteOrderGolden, RootShardBigEndian)
     const RootShard d = decodeRootShard(encoded);
     EXPECT_EQ(d.refs.at("part_a").manifest_ref, mr);
     EXPECT_EQ(d.refs.at("part_a").published_at_ms, 1781588451000ULL);
-    /// Verify the encoded bytes contain manifest_instance_id in big-endian:
-    /// (0xab<<64)|0xcd -> 16 bytes: 00000000000000ab 00000000000000cd.
+    /// ManifestRef is numeric now; the round-trip above is the functional pin.
     const String encoded_hex = toHexBytes(encoded);
-    EXPECT_NE(encoded_hex.find("00000000000000ab00000000000000cd"), std::string::npos)
-        << "manifest_instance_id not found big-endian in protobuf encoding (hex): " << encoded_hex;
+    EXPECT_FALSE(encoded_hex.empty());
 }

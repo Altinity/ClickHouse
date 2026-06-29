@@ -78,7 +78,7 @@ TEST(CasBuildRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto s = openTestStore(backend);
-    const RootNamespace ns{"srv1/tbl"};
+    const RootNamespace ns{"test/tbl"};
     const String P = "shared-blob-payload-P";
 
     /// Build A: upload P, publish refA -> manifest -> { data.bin: P }, then release A so its build_seq
@@ -142,7 +142,7 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto s = openTestStore(backend);
-    const RootNamespace ns{"srv1/tbl"};
+    const RootNamespace ns{"test/tbl"};
     const String P = "shared-blob-payload-P-reclaim";
 
     /// Build A: upload P, publish refA -> manifest, retire A so min_active advances past it.
@@ -252,7 +252,7 @@ bool precommitRemovalAppended(InMemoryBackend & backend, const Layout & layout,
 /// shard (keyed by `final_ref_name`), keyed by `OwnerKind::Precommit`. There is no `_precommits`
 /// namespace. The reclaim must therefore scan EVERY table shard the fold visits for live precommit
 /// bindings, derive `(server, build_seq)` from the binding's `manifest_ref`
-/// (`writer_instance_id = "<server_hex>:<epoch>"`, `build_sequence`), judge build-death via the per-server
+/// (`writer_epoch`, `build_sequence`), judge build-death via the per-server
 /// watermark exactly as the orphan sweep does, and append a `PrecommitRemove` `RootOwnerEvent` for dead
 /// builds. The next fold then folds the `-1` and the closure's blobs become zero-in-degree candidates.
 ///
@@ -264,7 +264,7 @@ TEST(CasBuildRoot, AbandonedPrecommitReclaimed)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto s = openTestStore(backend);
-    const RootNamespace ns{"srv1/tbl"};
+    const RootNamespace ns{"test/tbl"};
     const String Q = "exclusive-blob-payload-Q";
 
     /// Build B: upload Q (exclusively owned by this build), assemble a manifest, precommitAdd it. The
@@ -315,7 +315,7 @@ TEST(CasBuildRoot, LivePrecommitNotReclaimed)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto s = openTestStore(backend);
-    const RootNamespace ns{"srv1/tbl"};
+    const RootNamespace ns{"test/tbl"};
     const String Q = "live-build-blob-payload-Q";
 
     /// Build B stays ALIVE: upload Q, assemble, precommitAdd — and we DO NOT retire its seq. So

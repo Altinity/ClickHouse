@@ -53,26 +53,40 @@ void listAll(Backend & backend, const String & prefix, std::unordered_map<String
         on_progress(phase, out.size(), pages);
 }
 
-/// Parse (writer_instance_id, build_sequence) from a manifest object key of the shape
-/// `<manifest-prefix><writer>/<build_seq>/<aa>/<inst>.proto`. Returns false on a malformed key.
+/// Parse (writer_epoch, build_sequence) from a manifest object key of the shape
+/// `<manifest-prefix><writer_epoch>/<build_seq>/<ordinal>.proto`. Returns false on a malformed key.
 bool parseBuildPrefix(const String & key, const String & manifests_prefix, BuildPrefix & out)
 {
     if (!key.starts_with(manifests_prefix))
         return false;
     const String rest = key.substr(manifests_prefix.size());
-    const size_t s1 = rest.find('/');
-    if (s1 == String::npos)
+    const size_t file_sep = rest.rfind('/');
+    if (file_sep == String::npos)
         return false;
-    const size_t s2 = rest.find('/', s1 + 1);
-    if (s2 == String::npos)
+    const size_t build_sep = rest.rfind('/', file_sep == 0 ? 0 : file_sep - 1);
+    if (build_sep == String::npos)
         return false;
-    out.writer_instance_id = rest.substr(0, s1);
-    const String seq_str = rest.substr(s1 + 1, s2 - s1 - 1);
+    const size_t writer_sep = rest.rfind('/', build_sep == 0 ? 0 : build_sep - 1);
+    if (writer_sep != String::npos)
+        return false;
+    const String writer_epoch_str = rest.substr(0, build_sep);
+    const String seq_str = rest.substr(build_sep + 1, file_sep - build_sep - 1);
+    const String file = rest.substr(file_sep + 1);
+    if (writer_epoch_str.empty() || seq_str.empty() || file.size() != 12 || !file.ends_with(".proto"))
+        return false;
     try
     {
         size_t consumed = 0;
+        out.writer_epoch = std::stoull(writer_epoch_str, &consumed);
+        if (consumed != writer_epoch_str.size())
+            return false;
+        consumed = 0;
         out.build_sequence = std::stoull(seq_str, &consumed);
-        return consumed == seq_str.size();
+        if (consumed != seq_str.size())
+            return false;
+        consumed = 0;
+        const uint64_t ordinal = std::stoull(file.substr(0, 6), &consumed);
+        return consumed == 6 && ordinal > 0 && ordinal <= kMaxManifestOrdinal;
     }
     catch (...)
     {

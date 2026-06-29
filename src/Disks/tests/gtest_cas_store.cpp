@@ -86,10 +86,14 @@ ManifestId publishPart(
 /// constants — the read path keys identity by the full ref, so any consistent choice works here.
 ManifestRef manifestRefFor(const String & tag)
 {
+    uint32_t ordinal = 1;
+    for (char c : tag)
+        ordinal = ordinal * 131 + static_cast<unsigned char>(c);
+    ordinal = ordinal % 999999 + 1;
     return ManifestRef{
-        .writer_instance_id = "srv-test:1",
+        .writer_epoch = 1,
         .build_sequence = 1,
-        .manifest_instance_id = DB::Cas::tests::u128Of(tag)};
+        .manifest_ordinal = ordinal};
 }
 
 /// Publish a part holding the given manifest entries verbatim through the real Build. Used by read-path
@@ -662,7 +666,7 @@ TEST(CasStore, ListRefsMergesAllShards)
     {
         const String ref(1, c);
         ASSERT_TRUE(refs.count(ref));
-        EXPECT_EQ(refs.at(ref).manifest_id.ref.manifest_instance_id, u128Of("manifest-" + ref));
+        EXPECT_EQ(refs.at(ref).manifest_id.ref, manifestRefFor("manifest-" + ref));
         EXPECT_EQ(refs.at(ref).manifest_id.root_namespace.string(), ns.string());
     }
 }

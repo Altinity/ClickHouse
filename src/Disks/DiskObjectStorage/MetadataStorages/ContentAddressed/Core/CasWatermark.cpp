@@ -67,10 +67,11 @@ ServerWatermark decodeServerWatermark(std::string_view data)
     return w;
 }
 
-WatermarkKeeper::WatermarkKeeper(BackendPtr backend_, const Layout & layout_, UInt128 server_id_, uint64_t epoch_,
+WatermarkKeeper::WatermarkKeeper(
+    BackendPtr backend_, const Layout & layout_, const String & server_root_id_, UInt128 server_id_, uint64_t epoch_,
                                  std::function<uint64_t()> min_active_fn_)
     : SingleWriterSlot(
-        std::move(backend_), layout_.serverWatermarkKey(u128ToHex(server_id_)), "watermark", "farewell",
+        std::move(backend_), layout_.serverRootWatermarkKey(server_root_id_), "watermark", "farewell",
         "CasWatermarkKeeper")
     , server_id(server_id_)
     , epoch(epoch_)

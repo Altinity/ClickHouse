@@ -45,7 +45,7 @@ ServerWatermark decodeServerWatermark(std::string_view data);
 class WatermarkKeeper final : public SingleWriterSlot
 {
 public:
-    WatermarkKeeper(BackendPtr backend_, const Layout & layout_, UInt128 server_id_, uint64_t epoch_,
+    WatermarkKeeper(BackendPtr backend_, const Layout & layout_, const String & server_root_id_, UInt128 server_id_, uint64_t epoch_,
                     std::function<uint64_t()> min_active_fn_);
 
     /// Claims the per-server slot for our epoch with seq=1 — durable when start returns (W-ANCHOR).

@@ -26,7 +26,7 @@ namespace DB::Cas
 /// (name-sorted refs via std::map; journal in insertion order, which is transition_version order).
 /// Version + fail-closed gating live in the `CasHeader` field 1; `decodeRootShard` checks the magic and
 /// `compatibility_version` BEFORE reading any other field. Fail-closed decode (unknown OwnerKind, a
-/// `manifest_instance_id`/`build_id` whose length != 16, a `RootOwnerEvent` with neither binding set,
+/// `manifest_ordinal`/`build_id` whose length != 16, a `RootOwnerEvent` with neither binding set,
 /// or a bad envelope => CORRUPTED_DATA).
 
 /// Owner of a part manifest in the root journal: a committed ref or a precommit build intent.
@@ -84,7 +84,7 @@ struct RootShard
 };
 
 /// Encodes the manifest. Refs are serialized in name-sorted order (std::map already gives it); the
-/// journal is preserved in insertion order (== transition_version order). Each `manifest_instance_id`
+/// journal is preserved in insertion order (== transition_version order). Each `manifest_ordinal`
 /// and each `build_id` is encoded as exactly 16 bytes.
 String encodeRootShard(const RootShard & root);
 

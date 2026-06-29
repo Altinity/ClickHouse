@@ -117,10 +117,6 @@ public:
     /// it). The {preview} ⊆ {genuinely-unreachable} guarantee holds ONLY at quiescence. No CAS/delete.
     std::vector<PreviewEntry> previewDeletes();
 
-    /// B167 per-server build watermark: start a fresh GC round's watermark observation. Clears the
-    /// PER-ROUND caches; the ACROSS-ROUND maps persist (the K=2 frozen-seq crash detector's memory).
-    void beginWatermarkRound();
-
     /// TEST SEAM (M1 regression): disable the round's journal trim so a folded event stays in the journal
     /// across rounds — exactly the Phase-3 lazy-trim / partial-trim-after-crash condition under which the
     /// next round's fold MUST recover the exact sealed cursor (else it re-folds the event and double-counts
@@ -140,7 +136,7 @@ public:
     /// `OwnerKind::Precommit`) — there is no `_precommits` namespace. The reclaim therefore enumerates the
     /// LIVE precommit bindings from the shard's folded owner state (the journal owner-state replay), and for
     /// each derives `(server, build_seq)` from the binding's `manifest_ref`
-    /// (`writer_instance_id = "<server_hex>:<epoch>"`, `build_sequence`). A build is DEAD iff the server has
+    /// (`writer_epoch`, `build_sequence`). A build is DEAD iff the server has
     /// no watermark, is judged not-live this round (K=2 frozen-seq crash detector), or
     /// `build_sequence < min_active`. Each dead binding is removed by appending a `PrecommitRemove`
     /// RootOwnerEvent (old = the precommit binding, new = none — the SAME encoding `Build::abandon` /
@@ -324,11 +320,6 @@ private:
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
 
-    /// B167: fetch the owning server's watermark for THIS round (cached). On the first fetch of a server
-    /// in a round, this also computes that server's liveness verdict ONCE (frozen-seq K=2). Returns
-    /// nullptr if the server has no watermark object (an unrecognized owner).
-    const ServerWatermark * watermarkOf(UInt128 server_id);
-
     StorePtr store;
     UInt128 gc_id{};              /// this leader's identity (random u128, never 0)
     bool trim_enabled = true;     /// TEST SEAM ONLY (M1): production always trims; see setTrimEnabledForTest
@@ -342,12 +333,6 @@ private:
     UInt128 last_seen_hb_owner{};
     uint64_t last_seen_hb_seq = 0;
 
-    /// B167 per-server build watermark caches. The PER-ROUND maps are cleared by beginWatermarkRound;
-    /// the ACROSS-ROUND maps persist (the K=2 frozen-seq crash detector's memory).
-    std::map<UInt128, ServerWatermark> watermark_cache;   /// per-round: server_id -> its watermark
-    std::map<UInt128, bool> server_live_this_round;       /// per-round: liveness verdict, computed once
-    std::map<UInt128, uint64_t> last_seen_server_seq;     /// across rounds: last seq observed per server
-    std::map<UInt128, uint64_t> server_frozen_rounds;     /// across rounds: consecutive rounds seq unchanged
 };
 
 }

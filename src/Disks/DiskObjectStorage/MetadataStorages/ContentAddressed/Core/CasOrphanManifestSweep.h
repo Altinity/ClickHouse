@@ -7,10 +7,10 @@
 namespace DB::Cas
 {
 
-/// One writer build prefix under `cas/manifests/<ns>/`: `<writer_instance_id>/<build_sequence>/`.
+/// One writer build prefix under `cas/manifests/<ns>/`: `<writer_epoch>/<build_sequence>/`.
 struct BuildPrefix
 {
-    String writer_instance_id;
+    uint64_t writer_epoch = 0;
     uint64_t build_sequence = 0;
 };
 

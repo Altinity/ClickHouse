@@ -186,7 +186,7 @@ TEST(CasGcLeak, DisplacedPartBlobsReclaimedFoldBetween)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
-    const RootNamespace ns{"srv1/tbl"};
+    const RootNamespace ns{"test/tbl"};
     const String ref = "all_0_0_0";
 
     const ManifestId part_a = publishTwoBlobPart(s, ns, ref, "data-A", "mark-A");
@@ -224,7 +224,7 @@ TEST(CasGcLeak, DisplacedPartBlobsReclaimedNoFoldBetween)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
-    const RootNamespace ns{"srv1/tbl"};
+    const RootNamespace ns{"test/tbl"};
     const String ref = "all_0_0_0";
 
     const ManifestId part_a = publishTwoBlobPart(s, ns, ref, "data-A", "mark-A");
@@ -251,7 +251,7 @@ TEST(CasGcLeak, DroppedPartFullyReclaimed)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
-    const RootNamespace ns{"srv1/tbl"};
+    const RootNamespace ns{"test/tbl"};
     const String ref = "all_1_1_0";
 
     const ManifestId id = publishTwoBlobPart(s, ns, ref, "drop-data", "drop-mark");
@@ -299,7 +299,7 @@ TEST(CasGcLeak, AbandonedPrecommitReclaimsOwnBlobs)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
-    const RootNamespace ns{"srv1/tbl"};
+    const RootNamespace ns{"test/tbl"};
     const String ref = "all_2_2_0";
     const String payload = "abandon-unique-blob";
 
@@ -350,7 +350,7 @@ TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
-    const RootNamespace ns{"srv1/tbl"};
+    const RootNamespace ns{"test/tbl"};
     const String B = "shared-blob-payload";
     const String U = "build2-unique-blob";
 

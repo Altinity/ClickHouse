@@ -127,7 +127,7 @@ const UInt128 kGcDiscovery = hexToU128("00000000000000000000000000000001");
 
 ManifestRef discoveryRef(uint64_t seq, uint64_t inst)
 {
-    return ManifestRef{.writer_instance_id = "srv-a:1", .build_sequence = seq, .manifest_instance_id = DB::UInt128(inst)};
+    return ManifestRef{.writer_epoch = 1, .build_sequence = seq, .manifest_ordinal = static_cast<uint32_t>(inst)};
 }
 
 } // namespace

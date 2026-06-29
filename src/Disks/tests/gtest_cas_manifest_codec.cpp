@@ -12,7 +12,7 @@ namespace
 PartManifest sample()
 {
     PartManifest m;
-    m.ref = ManifestRef{"srv-a:7", 1042, UInt128(0x7f3a)};
+    m.ref = ManifestRef{7, 1042, 1};
     m.root_namespace_id = RootNamespace("srv-a/uuid@cas@");
     m.payload_digest = UInt128(0xDEAD);
     ManifestEntry blob;
@@ -169,9 +169,9 @@ TEST(CasManifestCodec, RefMatchesBodyAcceptsExactRef)
 TEST(CasManifestCodec, RefMatchesBodyRejectsEachFieldMismatch)
 {
     const PartManifest m = sample();
-    ManifestRef wrong_writer = m.ref; wrong_writer.writer_instance_id = m.ref.writer_instance_id + "x";
+    ManifestRef wrong_writer = m.ref; wrong_writer.writer_epoch = m.ref.writer_epoch + 1;
     ManifestRef wrong_seq = m.ref;    wrong_seq.build_sequence = m.ref.build_sequence + 1;
-    ManifestRef wrong_inst = m.ref;   wrong_inst.manifest_instance_id = m.ref.manifest_instance_id + UInt128(1);
+    ManifestRef wrong_inst = m.ref;   wrong_inst.manifest_ordinal = m.ref.manifest_ordinal + 1;
     EXPECT_FALSE(refMatchesBody(wrong_writer, m));
     EXPECT_FALSE(refMatchesBody(wrong_seq, m));
     EXPECT_FALSE(refMatchesBody(wrong_inst, m));

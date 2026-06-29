@@ -132,6 +132,34 @@ TEST(CasBuild, PutBlobWritesEnvelopeWithFixedHeader)
     EXPECT_EQ(raw->bytes.substr(h.header_len), "hello world");
 }
 
+TEST(CasBuild, StageManifestUsesPerBuildOrdinals)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"test/tbl@cas@"};
+
+    auto build = startBuildFor(s, ns, "all_1_1_0");
+    const ManifestId first = build->stageManifest({blobManifestEntry("a.bin", "a")});
+    const ManifestId second = build->stageManifest({blobManifestEntry("b.bin", "b")});
+
+    EXPECT_EQ(first.ref.writer_epoch, s->writerEpoch());
+    EXPECT_EQ(first.ref.build_sequence, build->buildSeq());
+    EXPECT_EQ(first.ref.manifest_ordinal, 1u);
+    EXPECT_EQ(second.ref.writer_epoch, first.ref.writer_epoch);
+    EXPECT_EQ(second.ref.build_sequence, first.ref.build_sequence);
+    EXPECT_EQ(second.ref.manifest_ordinal, 2u);
+    EXPECT_EQ(s->layout().manifestKey(first), "p/cas/manifests/test/tbl@cas@/"
+        + std::to_string(s->writerEpoch()) + "/" + std::to_string(build->buildSeq()) + "/000001.proto");
+    EXPECT_EQ(s->layout().manifestKey(second), "p/cas/manifests/test/tbl@cas@/"
+        + std::to_string(s->writerEpoch()) + "/" + std::to_string(build->buildSeq()) + "/000002.proto");
+
+    auto next_build = startBuildFor(s, ns, "all_2_2_0");
+    const ManifestId next = next_build->stageManifest({blobManifestEntry("c.bin", "c")});
+    EXPECT_EQ(next.ref.writer_epoch, first.ref.writer_epoch);
+    EXPECT_NE(next.ref.build_sequence, first.ref.build_sequence);
+    EXPECT_EQ(next.ref.manifest_ordinal, 1u);
+}
+
 /// B171: the `cas_owner` owner-triple stamping (`Build::ownerMeta`) was DELETED — protection is now
 /// the build-root precommit edge (reachability), not revocable object metadata GC reads per-candidate.
 /// The old `CasBuild.BlobCarriesOwnerTripleInMetadata` asserted that stamping; its coverage is replaced

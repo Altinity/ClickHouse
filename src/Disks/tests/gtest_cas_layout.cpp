@@ -43,12 +43,11 @@ TEST(CasLayout, RelocatedRefAndManifestKeys)
     /// manifestKey: same writer/build/aa/inst fan-out, now under cas/manifests/<ns>/ (no /_manifests/ infix).
     ManifestId id;
     id.root_namespace = ns;
-    id.ref.writer_instance_id = "ab:7";
+    id.ref.writer_epoch = 1;
     id.ref.build_sequence = 1042;
-    id.ref.manifest_instance_id = (UInt128(0x7f3aULL) << 112);
+    id.ref.manifest_ordinal = 1;
     const String key = l.manifestKey(id);
-    EXPECT_TRUE(key.starts_with("p/cas/manifests/srid/store/ab/uuid@cas@/")) << key;
-    EXPECT_TRUE(key.ends_with(".proto")) << key;
+    EXPECT_EQ(key, "p/cas/manifests/srid/store/ab/uuid@cas@/1/1042/000001.proto");
     EXPECT_EQ(key.find("/_manifests/"), String::npos) << key;
 }
 
@@ -142,16 +141,13 @@ TEST(CasLayout, ManifestKeyShape)
     Layout l("p");
     ManifestId id;
     id.root_namespace = RootNamespace("srv-a/3f2e-uuid@cas@");
-    id.ref.writer_instance_id = "ab:7";                    /// String token, used verbatim
+    id.ref.writer_epoch = 7;
     id.ref.build_sequence = 1042;
-    id.ref.manifest_instance_id = (UInt128(0x7f3aULL) << 112);   /// top bytes 7f 3a -> aa = "7f"
+    id.ref.manifest_ordinal = 1;
     const String key = l.manifestKey(id);
-    /// Phase 1: <prefix>/cas/manifests/<ns>/<writer_instance_id>/<build_seq>/<aa>/<inst_hex>.proto
-    /// (the `/_manifests/` infix is dropped — the cas/manifests/ prefix conveys it; identity unchanged).
     EXPECT_EQ(key,
         "p/cas/manifests/srv-a/3f2e-uuid@cas@/"
-        "ab:7/1042/7f/"
-        "7f3a0000000000000000000000000000.proto");
+        "7/1042/000001.proto");
 }
 
 TEST(CasLayout, ManifestsSegmentReserved)

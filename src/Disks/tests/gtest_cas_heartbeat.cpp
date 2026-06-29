@@ -18,19 +18,20 @@ TEST(CasWatermarkKeeper, AnchorIsDurableThenRenewBumpsSeq)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
+    const String server_root_id = "test";
     const UInt128 server_id(0x1234);
     uint64_t min_active_now = 5;
-    WatermarkKeeper keeper(backend, layout, server_id, /*epoch=*/9,
+    WatermarkKeeper keeper(backend, layout, server_root_id, server_id, /*epoch=*/9,
                            [&]{ return min_active_now; });
     keeper.start();                                  // anchor durable
-    auto hr = backend->head(layout.serverWatermarkKey(u128ToHex(server_id)));
+    auto hr = backend->head(layout.serverRootWatermarkKey(server_root_id));
     ASSERT_TRUE(hr.exists);
-    auto w = decodeServerWatermark(backend->get(layout.serverWatermarkKey(u128ToHex(server_id)))->bytes);
+    auto w = decodeServerWatermark(backend->get(layout.serverRootWatermarkKey(server_root_id))->bytes);
     ASSERT_EQ(w.epoch, 9u); ASSERT_EQ(w.min_active, 5u); ASSERT_EQ(w.seq, 1u);
 
     min_active_now = 8;
     keeper.renewOnce();
-    w = decodeServerWatermark(backend->get(layout.serverWatermarkKey(u128ToHex(server_id)))->bytes);
+    w = decodeServerWatermark(backend->get(layout.serverRootWatermarkKey(server_root_id))->bytes);
     ASSERT_EQ(w.min_active, 8u); ASSERT_EQ(w.seq, 2u);
 }
 
@@ -38,9 +39,10 @@ TEST(CasWatermarkKeeper, FarewellRetiresEpoch)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
-    WatermarkKeeper keeper(backend, layout, UInt128(0x1234), 9, []{ return 5; });
+    const String server_root_id = "test";
+    WatermarkKeeper keeper(backend, layout, server_root_id, UInt128(0x1234), 9, []{ return 5; });
     keeper.start();
     keeper.farewell();
-    auto w = decodeServerWatermark(backend->get(layout.serverWatermarkKey(u128ToHex(UInt128(0x1234))))->bytes);
+    auto w = decodeServerWatermark(backend->get(layout.serverRootWatermarkKey(server_root_id))->bytes);
     ASSERT_EQ(w.min_active, std::numeric_limits<uint64_t>::max());
 }

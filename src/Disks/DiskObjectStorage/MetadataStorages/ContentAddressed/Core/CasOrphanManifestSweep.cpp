@@ -15,25 +15,6 @@ namespace DB::Cas
 namespace
 {
 
-std::optional<uint64_t> writerEpochOf(const String & writer_instance_id)
-{
-    const size_t colon = writer_instance_id.find(':');
-    if (colon == String::npos)
-        return std::nullopt;
-    try
-    {
-        size_t consumed = 0;
-        const uint64_t epoch = std::stoull(writer_instance_id.substr(colon + 1), &consumed);
-        if (consumed != writer_instance_id.size() - colon - 1)
-            return std::nullopt;
-        return epoch;
-    }
-    catch (...)
-    {
-        return std::nullopt;
-    }
-}
-
 std::optional<ServerWatermark> watermarkForNamespace(Store & store, const RootNamespace & ns)
 {
     /// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
@@ -76,10 +57,7 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
     const size_t file_sep = rest.rfind('/');
     if (file_sep == String::npos)
         return std::nullopt;
-    const size_t aa_sep = rest.rfind('/', file_sep == 0 ? 0 : file_sep - 1);
-    if (aa_sep == String::npos)
-        return std::nullopt;
-    const size_t build_sep = rest.rfind('/', aa_sep == 0 ? 0 : aa_sep - 1);
+    const size_t build_sep = rest.rfind('/', file_sep == 0 ? 0 : file_sep - 1);
     if (build_sep == String::npos)
         return std::nullopt;
     const size_t writer_sep = rest.rfind('/', build_sep == 0 ? 0 : build_sep - 1);
@@ -87,17 +65,28 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
         return std::nullopt;
 
     const String ns_str = rest.substr(0, writer_sep);
-    const String writer = rest.substr(writer_sep + 1, build_sep - writer_sep - 1);
-    const String seq_str = rest.substr(build_sep + 1, aa_sep - build_sep - 1);
-    if (ns_str.empty() || writer.empty() || seq_str.empty())
+    const String writer_epoch_str = rest.substr(writer_sep + 1, build_sep - writer_sep - 1);
+    const String seq_str = rest.substr(build_sep + 1, file_sep - build_sep - 1);
+    const String file = rest.substr(file_sep + 1);
+    if (ns_str.empty() || writer_epoch_str.empty() || seq_str.empty() || file.size() != 12 || !file.ends_with(".proto"))
         return std::nullopt;
 
+    uint64_t writer_epoch = 0;
     uint64_t build_seq = 0;
+    uint64_t ordinal = 0;
     try
     {
         size_t consumed = 0;
+        writer_epoch = std::stoull(writer_epoch_str, &consumed);
+        if (consumed != writer_epoch_str.size())
+            return std::nullopt;
+        consumed = 0;
         build_seq = std::stoull(seq_str, &consumed);
         if (consumed != seq_str.size())
+            return std::nullopt;
+        consumed = 0;
+        ordinal = std::stoull(file.substr(0, 6), &consumed);
+        if (consumed != 6 || ordinal == 0 || ordinal > kMaxManifestOrdinal)
             return std::nullopt;
     }
     catch (...)
@@ -107,7 +96,7 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
 
     return ListedManifestObject{
         .ns = RootNamespace{ns_str},
-        .prefix = BuildPrefix{.writer_instance_id = writer, .build_sequence = build_seq},
+        .prefix = BuildPrefix{.writer_epoch = writer_epoch, .build_sequence = build_seq},
         .key = key};
 }
 
@@ -208,18 +197,14 @@ bool prefixEligible(Store & store, const RootNamespace & ns, const BuildPrefix &
     /// OQ6: durable watermark fact only. A missing watermark => NOT eligible (control #9: never a
     /// frozen-seq / judged-dead guess). Compare writer_epoch first, then build_sequence, so old-epoch
     /// debris drains after a process restart even when its build_sequence is above the current min_active.
-    const auto writer_epoch = writerEpochOf(prefix.writer_instance_id);
-    if (!writer_epoch)
-        return false;
-
     const auto watermark = watermarkForNamespace(store, ns);
     if (!watermark)
         return false;
 
     const ServerWatermark & w = *watermark;
-    if (*writer_epoch < w.epoch)
+    if (prefix.writer_epoch < w.epoch)
         return true;
-    if (*writer_epoch > w.epoch)
+    if (prefix.writer_epoch > w.epoch)
         return false;
     if (w.min_active == std::numeric_limits<uint64_t>::max())
         return true;   /// farewell/retired sentinel: every seq is retired
@@ -236,9 +221,9 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
 
     const std::set<String> active = activeManifestKeys(store, ns);
 
-    /// Enumerate the ONE build prefix: cas/manifests/<ns>/<writer_instance_id>/<build_sequence>/.
+    /// Enumerate the ONE build prefix: cas/manifests/<ns>/<writer_epoch>/<build_sequence>/.
     const String prefix_key = layout.manifestNamespacePrefix(ns)
-        + prefix.writer_instance_id + "/" + std::to_string(prefix.build_sequence) + "/";
+        + std::to_string(prefix.writer_epoch) + "/" + std::to_string(prefix.build_sequence) + "/";
 
     String cursor;
     while (true)
@@ -296,7 +281,7 @@ ManifestSweepResult sweepManifestCursorPage(
         }
 
         const String eligibility_key = parsed->ns.string() + "\n"
-            + parsed->prefix.writer_instance_id + "\n"
+            + std::to_string(parsed->prefix.writer_epoch) + "\n"
             + std::to_string(parsed->prefix.build_sequence);
         auto [eligible_it, eligible_inserted] = eligible_by_prefix.emplace(eligibility_key, false);
         if (eligible_inserted)

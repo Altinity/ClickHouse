@@ -46,9 +46,9 @@ message CasHeader {
 // part manifest. NOT a string key: CasLayout::manifestKey derives the object key from this ref plus the
 // owning root namespace. root_namespace_id is NOT a field here (it comes from the owning context).
 message ManifestRefProto {
-  string writer_instance_id    = 1;  // "<server_id_hex>:<process_epoch>"; used verbatim as a path segment
-  uint64 build_sequence        = 2;  // monotone build sequence inside one writer incarnation
-  bytes  manifest_instance_id  = 3;  // raw 16 bytes (UInt128, big-endian); random, never reused
+  uint64 writer_epoch          = 1;  // durable monotone writer epoch under the mounted server root
+  uint64 build_sequence        = 2;  // monotone build sequence inside one writer epoch
+  uint32 manifest_ordinal      = 3;  // monotone ordinal inside one build, rendered as 000001.proto
 }
 
 enum OwnerKindProto {

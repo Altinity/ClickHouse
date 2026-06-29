@@ -490,13 +490,6 @@ void Build::recordPendingBlobDep(const UInt128 & hash, uint64_t size)
         DepEntry{ObjectKind::Blob, std::nullopt, store->retireView().round(), size};
 }
 
-String Build::writerInstanceId() const
-{
-    /// OQ6: stable server id + durable process epoch. A new process incarnation gets a new epoch, so it
-    /// cannot reuse a prior incarnation's `_manifests/<writer_instance_id>/...` build prefix.
-    return u128ToHex(store->poolConfig().server_id) + ":" + std::to_string(epoch);
-}
-
 RootNamespace Build::manifestNamespace() const
 {
     /// The wiring sets the owning namespace EXPLICITLY (BuildInfo::intended_namespace). This is the
@@ -543,10 +536,13 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED,
             "stageManifest: total inline {} bytes exceeds cap {}", inline_total, kMaxManifestInlineBytesTotal);
 
-    /// Mint the identity. manifest_instance_id is random (NoManifestIdReuse) and never derived from
-    /// payload. With writer_instance_id + build_seq it forms the ManifestRef; with the owning namespace
-    /// it forms the ManifestId.
-    const ManifestRef ref{writerInstanceId(), build_seq, mintU128()};
+    /// Mint the identity. `epoch` is the Store's durable writer_epoch; `build_seq` is monotone inside
+    /// that epoch; `manifest_ordinal` is monotone inside this Build. Together with the owning namespace
+    /// this gives NoManifestIdReuse by construction, with no random manifest instance id.
+    if (next_manifest_ordinal > kMaxManifestOrdinal)
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+            "stageManifest: manifest ordinal cap {} exceeded for build_seq {}", kMaxManifestOrdinal, build_seq);
+    const ManifestRef ref{epoch, build_seq, next_manifest_ordinal++};
 
     /// Build the body. payload_digest is integrity/debug only — never a key, never dedup, never
     /// in-degree. The body repeats its own ref + namespace for fail-closed RefMatchesBody /
@@ -572,7 +568,7 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
     const PutResult res = sink->finalize();
     if (res.outcome != PutOutcome::Done)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "stageManifest: manifest_instance_id collision at {} (PreconditionFailed) — failing closed", key);
+            "stageManifest: manifest ordinal collision at {} (PreconditionFailed) — failing closed", key);
 
     staged_manifests.push_back(id);
     return id;
@@ -753,7 +749,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
         e.type = CasEventType::BuildPublish;
         e.namespace_ = target_ns.string();
         e.ref_name = final_ref_name;
-        e.object_hash = u128ToHex(id.ref.manifest_instance_id);
+        e.object_hash = manifestRefDebugString(id.ref);
         e.token = u128ToHex(promote_build_id);
         e.outcome = "promoted";
         e.reason = "promote: atomic owner move precommit(build_id) -> ref(final_ref_name) after fail-closed reval";

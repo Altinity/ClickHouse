@@ -125,22 +125,17 @@ public:
         return prefix + "/roots/" + ns.string() + "/_files/";
     }
 
-    /// Part manifest body key (spec §S3 Layout; Phase 1 relocation):
-    ///   <prefix>/cas/manifests/<ns>/<writer_instance_id>/<build_sequence>/<aa>/<manifest_instance_id>.proto
-    /// Relocated out of `roots/<ns>/_manifests/` to `cas/manifests/<ns>/` (the `cas/manifests/` prefix
-    /// conveys the old `/_manifests/` infix, which is dropped). The writer/build/aa/inst fan-out is
-    /// UNCHANGED — identity-preserving (Phase 3 reshapes manifest identity).
-    /// `<writer_instance_id>` is the ManifestRef's String token ("<server_id_hex>:<process_epoch>"),
-    /// used verbatim - NOT hex-rendered. `<manifest_instance_id>` is 32-char lowercase hex of the
-    /// 128-bit field; `<aa>` = first 2 hex chars of `manifest_instance_id`. `root_namespace_id` comes
-    /// from the owning context (the `ManifestId`), never from the journal ref.
+    /// Part manifest body key (spec §S3 Layout; Phase 3 identity reshape):
+    ///   <prefix>/cas/manifests/<ns>/<writer_epoch>/<build_sequence>/<000001>.proto
+    /// `writer_epoch` is the durable monotone mount epoch; `manifest_ordinal` is a per-build ordinal
+    /// rendered as a six-digit filename. `root_namespace_id` comes from the owning context
+    /// (the `ManifestId`), never from the journal ref.
     String manifestKey(const ManifestId & id) const
     {
         checkNamespace(id.root_namespace);
-        const String inst_hex = u128ToHex(id.ref.manifest_instance_id);
         return prefix + "/cas/manifests/" + id.root_namespace.string() + "/"
-             + id.ref.writer_instance_id + "/" + std::to_string(id.ref.build_sequence) + "/"
-             + manifestAa(id.ref) + "/" + inst_hex + ".proto";
+             + std::to_string(id.ref.writer_epoch) + "/" + std::to_string(id.ref.build_sequence) + "/"
+             + manifestOrdinalFileName(id.ref.manifest_ordinal);
     }
 
     /// A PLAIN mountpoint object (design §5.2): a loose, non-content-addressed file mirrored at its
@@ -244,14 +239,6 @@ public:
     String checkpointKey(uint64_t version) const
     {
         return prefix + "/gc/checkpoint/" + std::to_string(version);
-    }
-
-    /// Per-server watermark key, under the server's own `roots/<server-hex>/` subtree (Phase 6):
-    /// `<prefix>/roots/<server-hex>/_watermark`. Co-located with the server's precommit namespace
-    /// (`<server-hex>/_precommits`) so a server's mutable control state is one subtree.
-    String serverWatermarkKey(const String & server_id_hex) const
-    {
-        return prefix + "/roots/" + server_id_hex + "/_watermark";
     }
 
     /// Phase 0 (mount safety): per-server-root control subtree, keyed by the configured `server_root_id`

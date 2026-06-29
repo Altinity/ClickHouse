@@ -81,11 +81,10 @@ String encodePartManifest(const PartManifest & m)
     writeBinaryLittleEndian(magic, out);
     writeBinaryLittleEndian(kPartManifestFormatVersion, out);
     writeBinaryLittleEndian(static_cast<uint16_t>(currentWriterVersion()), out);
-    /// ref: writer_instance_id is a String token ("<server_id_hex>:<process_epoch>"), len-prefixed
-    writeBinaryLittleEndian(static_cast<uint32_t>(m.ref.writer_instance_id.size()), out);
-    out.write(m.ref.writer_instance_id.data(), m.ref.writer_instance_id.size());
+    /// ref: durable writer_epoch + build sequence + per-build manifest ordinal.
+    writeBinaryLittleEndian(m.ref.writer_epoch, out);
     writeBinaryLittleEndian(m.ref.build_sequence, out);
-    writeU128LE(out, m.ref.manifest_instance_id);
+    writeBinaryLittleEndian(m.ref.manifest_ordinal, out);
     /// root_namespace_id (len-prefixed)
     writeBinaryLittleEndian(static_cast<uint32_t>(m.root_namespace_id.string().size()), out);
     out.write(m.root_namespace_id.string().data(), m.root_namespace_id.string().size());
@@ -124,11 +123,12 @@ PartManifest decodePartManifest(std::string_view data)
         readBinaryLittleEndian(writer_version, in);
 
         PartManifest m;
-        uint32_t writer_len = 0;
-        readBinaryLittleEndian(writer_len, in);
-        m.ref.writer_instance_id = readFixedBytes(in, writer_len);
+        readBinaryLittleEndian(m.ref.writer_epoch, in);
         readBinaryLittleEndian(m.ref.build_sequence, in);
-        m.ref.manifest_instance_id = readU128LE(in);
+        readBinaryLittleEndian(m.ref.manifest_ordinal, in);
+        if (m.ref.manifest_ordinal == 0 || m.ref.manifest_ordinal > kMaxManifestOrdinal)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "PartManifest: manifest ordinal {} out of range", m.ref.manifest_ordinal);
         uint32_t ns_len = 0;
         readBinaryLittleEndian(ns_len, in);
         m.root_namespace_id = RootNamespace(readFixedBytes(in, ns_len));

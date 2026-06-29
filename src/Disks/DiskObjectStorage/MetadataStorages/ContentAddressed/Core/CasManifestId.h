@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <base/types.h>
 #include <base/extended_types.h>
+#include <fmt/format.h>
 #include <cstdint>
 #include <tuple>
 
@@ -13,32 +14,31 @@ namespace DB::Cas
 /// ref plus the owning root namespace. `root_namespace_id` is deliberately NOT a field here - it
 /// comes from the owning root context and must never be serialized into the journal ref.
 ///
-///   writer_instance_id   - writer-incarnation token, formatted "<server_id_hex>:<process_epoch>"; a
-///                          new process epoch must not reuse the same build prefix. It is a String,
-///                          used verbatim as the `<writer_instance_id>` path segment of `manifestKey`.
+///   writer_epoch         - durable monotone writer epoch allocated under the mounted `server_root_id`;
+///                          never reused for that server root.
 ///   build_sequence       - monotone build sequence inside one writer incarnation; part of identity
 ///                          and of the build-scoped debris prefix.
-///   manifest_instance_id - random 128-bit; gives collision-safety and the never-reused guarantee.
+///   manifest_ordinal     - monotone ordinal inside one build, rendered as `000001.proto` in the key.
 struct ManifestRef
 {
-    String writer_instance_id;
+    uint64_t writer_epoch = 0;
     uint64_t build_sequence = 0;
-    UInt128 manifest_instance_id{};
+    uint32_t manifest_ordinal = 0;
 
     bool operator==(const ManifestRef & o) const = default;
 
     /// Total order for std::map / std::set keys. Field order is arbitrary but stable.
     bool operator<(const ManifestRef & o) const
     {
-        return std::tie(writer_instance_id, build_sequence, manifest_instance_id)
-             < std::tie(o.writer_instance_id, o.build_sequence, o.manifest_instance_id);
+        return std::tie(writer_epoch, build_sequence, manifest_ordinal)
+             < std::tie(o.writer_epoch, o.build_sequence, o.manifest_ordinal);
     }
 };
 
 /// The protocol identity GC uses (spec §Object Identity And Ownership): namespace-qualified
 /// `ManifestId = (root_namespace_id, ManifestRef)`. It keys source edges / blob deltas / cleanup work
 /// and addressing. `ManifestId` is the protocol identity; the TLA+ model abstracts it to
-/// `ManifestSafetyId = (root_namespace, manifest_instance_id)`, a Phase-0 model-only term that never
+/// `ManifestSafetyId = (root_namespace, manifest ref)`, a Phase-0 model-only term that never
 /// appears in this code.
 /// Two namespaces may legally carry the same `ManifestRef` tuple without addressing the same object;
 /// keying source edges / blob deltas / cleanup work by `ManifestRef` alone is the modeled
@@ -58,12 +58,21 @@ struct ManifestId
     }
 };
 
-/// The 2-char fanout segment of a manifest key: the first 2 lowercase-hex chars of
-/// `manifest_instance_id` (spec §S3 Layout: the `<aa>` fanout is derived from `manifest_instance_id`,
-/// NOT from the payload digest). 32-char hex always has >= 2 chars, so this never underflows.
-inline String manifestAa(const ManifestRef & ref)
+inline constexpr uint32_t kMaxManifestOrdinal = 999999;
+
+/// Six-digit filename for a per-build part-manifest ordinal: `000001.proto` through `999999.proto`.
+/// `0` is reserved as an invalid sentinel and is never emitted.
+inline String manifestOrdinalFileName(uint32_t manifest_ordinal)
 {
-    return u128ToHex(ref.manifest_instance_id).substr(0, 2);
+    if (manifest_ordinal == 0 || manifest_ordinal > kMaxManifestOrdinal)
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "Manifest ordinal must be in [1, {}], got {}", kMaxManifestOrdinal, manifest_ordinal);
+    return fmt::format("{:06}.proto", manifest_ordinal);
+}
+
+inline String manifestRefDebugString(const ManifestRef & ref)
+{
+    return fmt::format("{}:{}:{}", ref.writer_epoch, ref.build_sequence, ref.manifest_ordinal);
 }
 
 }
@@ -79,9 +88,9 @@ struct hash<DB::Cas::ManifestRef>
 {
     size_t operator()(const DB::Cas::ManifestRef & r) const
     {
-        const size_t h1 = std::hash<::String>{}(r.writer_instance_id);
+        const size_t h1 = std::hash<uint64_t>{}(r.writer_epoch);
         const size_t h2 = std::hash<uint64_t>{}(r.build_sequence);
-        const size_t h3 = std::hash<::UInt128>{}(r.manifest_instance_id);
+        const size_t h3 = std::hash<uint32_t>{}(r.manifest_ordinal);
         size_t h = h1;
         h ^= h2 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         h ^= h3 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);

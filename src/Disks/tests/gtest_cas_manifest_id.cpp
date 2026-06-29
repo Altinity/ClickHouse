@@ -10,11 +10,9 @@ using namespace DB::Cas;
 namespace
 {
 
-/// writer_instance_id is the String "<server_id_hex>:<process_epoch>"; the helper renders `w` as the
-/// process epoch so the ordering/equality tests below still vary it.
 ManifestRef ref(uint64_t w, uint64_t seq, uint64_t m)
 {
-    return ManifestRef{"srv-a:" + std::to_string(w), seq, UInt128(m)};
+    return ManifestRef{w, seq, static_cast<uint32_t>(m)};
 }
 
 ManifestId id(const char * ns, uint64_t w, uint64_t seq, uint64_t m)
@@ -28,7 +26,7 @@ TEST(CasManifestId, RefEqualityAndOrdering)
 {
     EXPECT_EQ(ref(1, 2, 3), ref(1, 2, 3));
     EXPECT_NE(ref(1, 2, 3), ref(1, 2, 4));
-    /// Strict total order: distinct by manifest_instance_id, then build_sequence, then writer.
+    /// Strict total order: distinct by manifest_ordinal, then build_sequence, then writer_epoch.
     EXPECT_LT(ref(1, 2, 3), ref(1, 2, 4));
     EXPECT_LT(ref(1, 2, 9), ref(1, 3, 0));
     EXPECT_LT(ref(1, 9, 9), ref(2, 0, 0));
@@ -79,15 +77,10 @@ TEST(CasManifestId, UsableInUnorderedContainers)
     EXPECT_EQ(std::hash<ManifestId>{}(id("nsA", 1, 1, 1)), std::hash<ManifestId>{}(id("nsA", 1, 1, 1)));
 }
 
-TEST(CasManifestId, ManifestAaIsFirstTwoHexOfInstanceId)
+TEST(CasManifestId, ManifestOrdinalFileName)
 {
-    /// manifest_instance_id = 0x7f3a...  -> low bytes; u128ToHex is big-endian-ish lowercase hex of
-    /// the 128-bit value, so the leading 2 chars reflect the high half. Pin a concrete value.
-    ManifestRef r;
-    r.manifest_instance_id = (UInt128(0x7f3aULL) << 112);   /// top byte 0x7f, next 0x3a
-    EXPECT_EQ(manifestAa(r), "7f");
-    /// A small value has leading zeros, so aa = "00".
-    ManifestRef z;
-    z.manifest_instance_id = UInt128(0xc1);
-    EXPECT_EQ(manifestAa(z), "00");
+    EXPECT_EQ(manifestOrdinalFileName(1), "000001.proto");
+    EXPECT_EQ(manifestOrdinalFileName(999999), "999999.proto");
+    EXPECT_THROW(manifestOrdinalFileName(0), DB::Exception);
+    EXPECT_THROW(manifestOrdinalFileName(1000000), DB::Exception);
 }

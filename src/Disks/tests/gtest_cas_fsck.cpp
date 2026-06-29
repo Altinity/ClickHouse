@@ -10,11 +10,11 @@ using namespace DB::Cas::tests;
 
 namespace
 {
-const String kWriter = "00000000000000000000000000000abc:7";
+constexpr uint64_t kWriterEpoch = 7;
 const String kServerRoot = "00";
 ManifestRef ref(uint64_t seq, uint64_t inst)
 {
-    return ManifestRef{.writer_instance_id = kWriter, .build_sequence = seq, .manifest_instance_id = DB::UInt128(inst)};
+    return ManifestRef{.writer_epoch = kWriterEpoch, .build_sequence = seq, .manifest_ordinal = static_cast<uint32_t>(inst)};
 }
 }
 
@@ -69,7 +69,7 @@ TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
     registerNamespaceRaw(*backend, store->layout(), ns);
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});   // body, no owner
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriter, 6);   // eligible
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);   // eligible
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());            // not an error
     EXPECT_GE(rep.unreachable, 1u);      // counted as info/unreachable

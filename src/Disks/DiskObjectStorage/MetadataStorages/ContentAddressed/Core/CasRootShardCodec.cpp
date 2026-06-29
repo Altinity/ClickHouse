@@ -49,17 +49,20 @@ OwnerKind ownerKindFromProto(Cas::Proto::OwnerKindProto kind, std::string_view w
 
 void encodeManifestRef(Cas::Proto::ManifestRefProto * p, const ManifestRef & ref)
 {
-    p->set_writer_instance_id(ref.writer_instance_id);
+    p->set_writer_epoch(ref.writer_epoch);
     p->set_build_sequence(ref.build_sequence);
-    p->set_manifest_instance_id(u128ToBytesBE(ref.manifest_instance_id));
+    p->set_manifest_ordinal(ref.manifest_ordinal);
 }
 
 ManifestRef decodeManifestRef(const Cas::Proto::ManifestRefProto & p, std::string_view what)
 {
     ManifestRef ref;
-    ref.writer_instance_id = p.writer_instance_id();
+    ref.writer_epoch = p.writer_epoch();
     ref.build_sequence = p.build_sequence();
-    ref.manifest_instance_id = u128FromBytesBE(p.manifest_instance_id(), what);
+    ref.manifest_ordinal = p.manifest_ordinal();
+    if (ref.manifest_ordinal == 0 || ref.manifest_ordinal > kMaxManifestOrdinal)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS {}: manifest ordinal {} out of range", what, ref.manifest_ordinal);
     return ref;
 }
 

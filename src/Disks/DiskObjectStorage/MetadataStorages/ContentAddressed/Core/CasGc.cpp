@@ -182,7 +182,7 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
                 ev.reason = sign > 0
                     ? "fold: manifest owner activated; +1 blob edge"
                     : "fold: manifest owner removed; -1 blob edge";
-                ev.detail = {{"manifest_ref_instance", u128ToHex(id.ref.manifest_instance_id)},
+                ev.detail = {{"manifest_ref_instance", manifestRefDebugString(id.ref)},
                              {"path", entry.path}};
             });
         }
@@ -197,9 +197,6 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
     FoldResult result;
-
-    /// B171 precommit reclaim uses the per-round watermark caches the K=2 detector accumulates.
-    beginWatermarkRound();
 
     /// 1. Discover the namespace universe FROM THE REGISTRY (LIST is only an accelerator).
     result.root_shards = discoverUniverse();
@@ -935,7 +932,7 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
             e.type = CasEventType::TreeDelete;
             e.namespace_ = id.root_namespace.string();
             e.object_kind = CasEventObjectKind::Tree;
-            e.object_hash = u128ToHex(id.ref.manifest_instance_id);
+            e.object_hash = manifestRefDebugString(id.ref);
             e.token = token.value;
             e.round = round;
             e.gen = completion_generation;
@@ -1572,67 +1569,31 @@ void Gc::pulseHeartbeat(Store & store, UInt128 gc_id)
     store.backend().casPut(key, encodeGcHeartbeat(hb), expected);
 }
 
-void Gc::beginWatermarkRound()
-{
-    watermark_cache.clear();
-    server_live_this_round.clear();
-}
-
-const ServerWatermark * Gc::watermarkOf(UInt128 server_id)
-{
-    if (const auto it = watermark_cache.find(server_id); it != watermark_cache.end())
-        return &it->second;
-
-    const Layout & layout = store->layout();
-    Backend & backend = store->backend();
-    const String key = layout.serverWatermarkKey(u128ToHex(server_id));
-
-    const HeadResult head = backend.head(key);
-    if (!head.exists)
-        return nullptr;
-
-    const auto got = backend.get(key);
-    if (!got)
-        return nullptr;
-
-    const ServerWatermark w = decodeServerWatermark(got->bytes);
-    const auto [it, _] = watermark_cache.emplace(server_id, w);
-
-    bool live;
-    const auto seen_it = last_seen_server_seq.find(server_id);
-    if (seen_it == last_seen_server_seq.end())
-    {
-        live = true;
-        last_seen_server_seq[server_id] = w.seq;
-        server_frozen_rounds[server_id] = 0;
-    }
-    else if (w.seq != seen_it->second)
-    {
-        live = true;
-        server_frozen_rounds[server_id] = 0;
-        seen_it->second = w.seq;
-    }
-    else
-    {
-        const uint64_t frozen = ++server_frozen_rounds[server_id];
-        live = frozen < 2;
-    }
-    server_live_this_round[server_id] = live;
-
-    return &it->second;
-}
-
 namespace
 {
 
-/// The server hex of a `writer_instance_id` "<server_hex>:<process_epoch>" (the watermark slot key). An
-/// id without a ':' has no derivable server (returns empty). Mirrors `serverHexOf` in the orphan sweep.
-String serverHexOfWriter(const String & writer_instance_id)
+std::optional<ServerWatermark> watermarkForNamespace(Store & store, const RootNamespace & ns)
 {
-    const size_t colon = writer_instance_id.find(':');
-    if (colon == String::npos)
-        return {};
-    return writer_instance_id.substr(0, colon);
+    /// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
+    /// slashes. Try namespace prefixes from longest to shortest and accept the first durable watermark.
+    const String & value = ns.string();
+    size_t pos = value.size();
+    while (true)
+    {
+        pos = value.rfind('/', pos == 0 ? 0 : pos - 1);
+        if (pos == String::npos)
+            break;
+
+        const String server_root_id = value.substr(0, pos);
+        if (!server_root_id.empty())
+        {
+            if (const auto got = store.backend().get(store.layout().serverRootWatermarkKey(server_root_id)))
+                return decodeServerWatermark(got->bytes);
+        }
+        if (pos == 0)
+            break;
+    }
+    return std::nullopt;
 }
 
 }
@@ -1643,9 +1604,8 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uin
     /// owner binding into the FUTURE COMMITTED REF's OWN table shard (keyed by `final_ref_name`, kind
     /// `OwnerKind::Precommit`) — there is no `_precommits` namespace. So while the fold visits a shard, this
     /// enumerates the LIVE precommit bindings from the journal owner-state replay (the same
-    /// accumulate-adds/subtract-removals the fold and `Build::promote` do), then for each derives
-    /// `(server, build_seq)` from the binding's `manifest_ref` and judges build-death via the per-server
-    /// watermark (identical to the orphan sweep). It runs BEFORE the fold reads this shard so its
+    /// accumulate-adds/subtract-removals the fold and `Build::promote` do), then judges build-death via
+    /// the namespace's per-server-root watermark (identical to the orphan sweep). It runs BEFORE the fold reads this shard so its
     /// PrecommitRemove is folded in the SAME round (no double-counted `-1`).
 
     /// Read the shard being visited (the fold re-reads it right after, picking up any removal we append).
@@ -1663,6 +1623,11 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uin
             live.push_back(*e.new_binding);
     }
 
+    const auto watermark = watermarkForNamespace(*store, ns);
+    if (!watermark)
+        return;   /// no durable fact => not dead (conservative)
+    const ServerWatermark & w = *watermark;
+
     struct DeadPrecommit { OwnerBinding binding; bool retired_sentinel; };
     std::vector<DeadPrecommit> dead;
     for (const OwnerBinding & binding : live)
@@ -1670,36 +1635,22 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uin
         if (binding.owner_kind != OwnerKind::Precommit)
             continue;
 
-        /// Derive (server, build_seq) from the binding's ManifestRef. A `writer_instance_id` without a
-        /// derivable 32-hex server has no watermark slot — judge CONSERVATIVELY (not dead): a precommit we
-        /// cannot attribute to a server must never be reclaimed (a live build must not be aborted).
-        const String server_hex = serverHexOfWriter(binding.manifest_ref.writer_instance_id);
-        if (server_hex.size() != 32)
-            continue;
-        UInt128 server;
-        try
-        {
-            server = hexToU128(server_hex);
-        }
-        catch (...)
-        {
-            continue;
-        }
-
         /// CONSERVATIVE death judgment, identical to the orphan sweep's `prefixEligible` — a DURABLE
         /// watermark FACT only, never a frozen-seq / judged-dead guess (control #9). A build is provably
         /// DEAD iff the server has a watermark AND either the farewell/retired sentinel
-        /// (`min_active == UINT64_MAX`, every seq retired) or its `build_sequence` is below the live floor
-        /// (`min_active > build_sequence`). A missing watermark, or a build at/above the floor, is NOT dead
-        /// — the precommit is spared. The K=2 frozen-seq crash detector is deliberately NOT consulted here:
+        /// (`min_active == UINT64_MAX`, every seq retired), its `writer_epoch` is older than the live
+        /// watermark epoch, or its `build_sequence` is below the live floor (`min_active > build_sequence`).
+        /// A missing watermark, a future epoch, or a build at/above the floor is NOT dead — the precommit
+        /// is spared. The K=2 frozen-seq crash detector is deliberately NOT consulted here:
         /// it is a liveness heuristic, unsafe as a reclaim trigger (a live but slow-renewing build must
         /// never have its in-flight precommit reclaimed). A wrongful reclaim would still be caught by the
         /// promote guard (fail closed), but conservatism keeps live builds from being needlessly aborted.
-        const ServerWatermark * w = watermarkOf(server);
-        if (w == nullptr)
-            continue;   /// no durable fact => not dead (conservative)
-        const bool retired_sentinel = w->min_active == std::numeric_limits<uint64_t>::max();
-        const bool is_dead = retired_sentinel || w->min_active > binding.manifest_ref.build_sequence;
+        if (binding.manifest_ref.writer_epoch > w.epoch)
+            continue;
+        const bool retired_sentinel = w.min_active == std::numeric_limits<uint64_t>::max();
+        const bool is_dead = binding.manifest_ref.writer_epoch < w.epoch
+            || retired_sentinel
+            || w.min_active > binding.manifest_ref.build_sequence;
         if (is_dead)
             dead.push_back(DeadPrecommit{binding, retired_sentinel});
     }
@@ -1740,8 +1691,8 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uin
             e.reason = dp.retired_sentinel
                 ? "precommit reclaim: owning server posted the farewell/retired sentinel (build gone)"
                 : "precommit reclaim: build_seq below the server's min_active floor (retired build)";
-            e.detail = {{"build_seq", std::to_string(dp.binding.manifest_ref.build_sequence)},
-                        {"writer_instance_id", dp.binding.manifest_ref.writer_instance_id}};
+            e.detail = {{"writer_epoch", std::to_string(dp.binding.manifest_ref.writer_epoch)},
+                        {"build_seq", std::to_string(dp.binding.manifest_ref.build_sequence)}};
         });
 }
 

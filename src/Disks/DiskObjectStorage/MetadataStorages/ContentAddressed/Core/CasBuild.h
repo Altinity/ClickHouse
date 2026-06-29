@@ -64,11 +64,11 @@ public:
     void recordPendingBlobDep(const UInt128 & hash, uint64_t size);
 
     /// Mint a root-local part ManifestId, stream-write its body under
-    /// `_manifests/<writer_instance_id>/<build_sequence>/...` via putIfAbsentStream (NO preliminary HEAD —
-    /// the manifest_instance_id is random). Enforces the OQ7 caps fail-closed BEFORE the body write
+    /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.proto` via putIfAbsentStream (NO preliminary HEAD —
+    /// the manifest_ordinal is per-build monotone). Enforces the OQ7 caps fail-closed BEFORE the body write
     /// returns (and therefore before any owner transition is published). The body is not retained after a
     /// successful write; on retry the caller re-stages from source. NoManifestIdReuse: a fresh random
-    /// manifest_instance_id per call. The id is recorded for best-effort `abandon` cleanup.
+    /// manifest_ordinal per call. The id is recorded for best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
     /// Build-intent owner add, written to the SAME root shard as the future committed ref (spec §Precommit
@@ -101,11 +101,6 @@ public:
     UInt128 buildId() const { return build_id; }
     /// The strictly-increasing per-process build_seq (spec 2026-06-16).
     uint64_t buildSeq() const { return build_seq; }
-
-    /// "<stable_server_id>:<process_epoch>" — the writer-incarnation id (OQ6). Stamped into the manifest
-    /// body `ref` and into the `_manifests/<writer_instance_id>/...` key prefix so a new process epoch
-    /// never reuses a build prefix.
-    String writerInstanceId() const;
 
 private:
     struct DepEntry
@@ -144,6 +139,7 @@ private:
     UInt128 build_id{};
     uint64_t build_seq{};                                 /// per-process monotone seq (spec 2026-06-16)
     uint64_t epoch{};                                     /// owning Store's process_epoch
+    uint32_t next_manifest_ordinal = 1;                   /// per-build monotone manifest ordinal
     BuildInfo info;
     bool alive = true;
     bool precommitted = false;                            /// a create-precommit RootOwnerEvent was appended

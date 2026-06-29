@@ -491,13 +491,11 @@ inline uint64_t foldCursorOf(
 /// Set a server root's durable watermark min_active (so orphan-sweep eligibility can be driven).
 inline void setWatermarkMinActive(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & server_root_id,
-    const String & writer_instance_id, uint64_t min_active)
+    uint64_t writer_epoch, uint64_t min_active)
 {
-    const size_t colon = writer_instance_id.find(':');
-    const String epoch_str = colon == String::npos ? "0" : writer_instance_id.substr(colon + 1);
     DB::Cas::ServerWatermark w;
     w.server_id = DB::UInt128(0);
-    w.epoch = std::stoull(epoch_str);
+    w.epoch = writer_epoch;
     w.min_active = min_active;
     w.seq = 1;
     const String key = layout.serverRootWatermarkKey(server_root_id);

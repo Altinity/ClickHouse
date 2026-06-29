@@ -298,9 +298,9 @@ TEST(CasGcShardCleanup, RoutesByQualifiedManifestIdNotRef)
 {
     /// Shared ManifestRef: identical across both ManifestIds.
     const ManifestRef shared_ref{
-        .writer_instance_id = "deadbeef:42",
+        .writer_epoch = 1,
         .build_sequence = 7,
-        .manifest_instance_id = hexToU128("0102030405060708090a0b0c0d0e0f10"),
+        .manifest_ordinal = 1,
     };
 
     const ManifestId id_a{RootNamespace("ns_alpha"), shared_ref};
@@ -358,10 +358,9 @@ TEST(CasGcShardCleanup, DisjointWorkerCoverage)
         const ManifestId id{
             RootNamespace("ns_" + std::to_string(i % 16)),
             ManifestRef{
-                .writer_instance_id = "writer:" + std::to_string(i / 16),
+                .writer_epoch = 1 + i / 16,
                 .build_sequence = i,
-                .manifest_instance_id = (static_cast<UInt128>(i * 0x9e3779b97f4a7c15ULL) << 64)
-                                      | static_cast<UInt128>(i * 0x6c62272e07bb0142ULL),
+                .manifest_ordinal = static_cast<uint32_t>(i % kMaxManifestOrdinal + 1),
             },
         };
 
@@ -477,10 +476,10 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
     /// contributing +1 independently) but is valid for the fold math test. It directly verifies that
     /// accumulators sum correctly under both paths.
     const RootNamespace ns{"ns-equiv"};
-    const ManifestRef rA1{.writer_instance_id = "srv:1", .build_sequence = 1, .manifest_instance_id = UInt128(0x1)};
-    const ManifestRef rA2{.writer_instance_id = "srv:1", .build_sequence = 2, .manifest_instance_id = UInt128(0x2)};
-    const ManifestRef rB{.writer_instance_id = "srv:1", .build_sequence = 3, .manifest_instance_id = UInt128(0x3)};
-    const ManifestRef rC{.writer_instance_id = "srv:1", .build_sequence = 4, .manifest_instance_id = UInt128(0x4)};
+    const ManifestRef rA1{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = static_cast<uint32_t>(0x1)};
+    const ManifestRef rA2{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = static_cast<uint32_t>(0x2)};
+    const ManifestRef rB{.writer_epoch = 1, .build_sequence = 3, .manifest_ordinal = static_cast<uint32_t>(0x3)};
+    const ManifestRef rC{.writer_epoch = 1, .build_sequence = 4, .manifest_ordinal = static_cast<uint32_t>(0x4)};
 
     /// Helper lambda that sets up a fresh backend + store with the shared scripted journal, runs one GC
     /// round with the given gc_shards, and returns the per-blob in-degrees in the sealed generation.
@@ -717,8 +716,8 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     const Layout & layout = store->layout();
 
     const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r0{.writer_instance_id = "srv-a:1", .build_sequence = 1, .manifest_instance_id = UInt128(0xA0)};
-    const ManifestRef r1{.writer_instance_id = "srv-a:1", .build_sequence = 2, .manifest_instance_id = UInt128(0xA1)};
+    const ManifestRef r0{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = static_cast<uint32_t>(0xA0)};
+    const ManifestRef r1{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = static_cast<uint32_t>(0xA1)};
     const ManifestId id0{ns, r0};
     const ManifestId id1{ns, r1};
 

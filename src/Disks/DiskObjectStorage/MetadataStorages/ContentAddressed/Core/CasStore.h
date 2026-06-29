@@ -160,7 +160,7 @@ public:
     uint64_t epoch() const { return process_epoch; }
     /// The durable-monotone writer_epoch allocated at writable open (spec §writer-epoch-alloc). On a
     /// writable Store this is the value bridged into `process_epoch` (so the watermark + the manifest
-    /// `writer_instance_id` carry it); on a read-only open the random `process_epoch` is unchanged and
+    /// manifest ref carries it); on a read-only open the random `process_epoch` is unchanged and
     /// no durable epoch is allocated. Phase 2's epoch-aware sweep reads this value.
     uint64_t writerEpoch() const { return process_epoch; }
     /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
