@@ -64,10 +64,28 @@ public:
     }
 
     /// Root manifest for a given namespace + shard number.
+    /// Phase 1: relocated out of the shared `roots/` tree to `cas/refs/` (hot/cold split). The
+    /// namespace fan-out (`<ns>/<shard>`) is unchanged — identity-preserving. GC discovery LISTs
+    /// `casRefsPrefix()` (only ref shards, no manifest backlog or verbatim files interleaved).
     String rootShardKey(const RootNamespace & ns, uint64_t shard) const
     {
         checkNamespace(ns);
-        return prefix + "/roots/" + ns.string() + "/" + std::to_string(shard);
+        return prefix + "/cas/refs/" + ns.string() + "/" + std::to_string(shard);
+    }
+
+    /// Pool-wide ref-shard prefix (Phase 1): `<prefix>/cas/refs/`. The base of every `rootShardKey`,
+    /// used by GC discovery for the LIST sweep and the strip-to-cursor-key step.
+    String casRefsPrefix() const
+    {
+        return prefix + "/cas/refs/";
+    }
+
+    /// Prefix that covers all part-manifests of a namespace (Phase 1): `<prefix>/cas/manifests/<ns>/`.
+    /// Replaces the old `rootNamespacePrefix(ns) + "_manifests/"` enumeration (sweep + fsck).
+    String manifestNamespacePrefix(const RootNamespace & ns) const
+    {
+        checkNamespace(ns);
+        return prefix + "/cas/manifests/" + ns.string() + "/";
     }
 
     /// Prefix that covers all root manifest shards of a namespace (for list).
@@ -101,8 +119,11 @@ public:
         return prefix + "/roots/" + ns.string() + "/_files/";
     }
 
-    /// Root-local part manifest body key (spec §S3 Layout):
-    ///   <prefix>/roots/<ns>/_manifests/<writer_instance_id>/<build_sequence>/<aa>/<manifest_instance_id>.proto
+    /// Part manifest body key (spec §S3 Layout; Phase 1 relocation):
+    ///   <prefix>/cas/manifests/<ns>/<writer_instance_id>/<build_sequence>/<aa>/<manifest_instance_id>.proto
+    /// Relocated out of `roots/<ns>/_manifests/` to `cas/manifests/<ns>/` (the `cas/manifests/` prefix
+    /// conveys the old `/_manifests/` infix, which is dropped). The writer/build/aa/inst fan-out is
+    /// UNCHANGED — identity-preserving (Phase 3 reshapes manifest identity).
     /// `<writer_instance_id>` is the ManifestRef's String token ("<server_id_hex>:<process_epoch>"),
     /// used verbatim - NOT hex-rendered. `<manifest_instance_id>` is 32-char lowercase hex of the
     /// 128-bit field; `<aa>` = first 2 hex chars of `manifest_instance_id`. `root_namespace_id` comes
@@ -111,7 +132,7 @@ public:
     {
         checkNamespace(id.root_namespace);
         const String inst_hex = u128ToHex(id.ref.manifest_instance_id);
-        return prefix + "/roots/" + id.root_namespace.string() + "/_manifests/"
+        return prefix + "/cas/manifests/" + id.root_namespace.string() + "/"
              + id.ref.writer_instance_id + "/" + std::to_string(id.ref.build_sequence) + "/"
              + manifestAa(id.ref) + "/" + inst_hex + ".proto";
     }

@@ -224,7 +224,7 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
     for (const String & ns_str : store.listNamespaces(""))
     {
         const RootNamespace ns{ns_str};
-        const String manifests_prefix = layout.rootNamespacePrefix(ns) + "_manifests/";
+        const String manifests_prefix = layout.manifestNamespacePrefix(ns);
         std::unordered_map<String, uint64_t> manifest_bodies;
         listAll(backend, manifests_prefix, manifest_bodies, on_progress, deadline, "listing manifests");
         for (const auto & [mkey, sz] : manifest_bodies)

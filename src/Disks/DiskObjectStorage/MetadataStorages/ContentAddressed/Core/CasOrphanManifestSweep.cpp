@@ -146,8 +146,8 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
 
     const std::set<String> active = activeManifestKeys(store, ns);
 
-    /// Enumerate the ONE build prefix: roots/<ns>/_manifests/<writer_instance_id>/<build_sequence>/.
-    const String prefix_key = layout.rootNamespacePrefix(ns) + "_manifests/"
+    /// Enumerate the ONE build prefix: cas/manifests/<ns>/<writer_instance_id>/<build_sequence>/.
+    const String prefix_key = layout.manifestNamespacePrefix(ns)
         + prefix.writer_instance_id + "/" + std::to_string(prefix.build_sequence) + "/";
 
     String cursor;
@@ -174,7 +174,7 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
 
 std::optional<SweepTarget> pickOneSweepTarget(Store & store)
 {
-    /// Bounded backstop: scan the registry's namespaces, and for each enumerate its `_manifests/<writer>/`
+    /// Bounded backstop: scan the registry's namespaces, and for each enumerate its `cas/manifests/<ns>/<writer>/`
     /// build prefixes, returning the FIRST eligible one. At most one namespace + one prefix per round.
     const Layout & layout = store.layout();
     const auto reg = store.backend().get(layout.rootsRegistryKey());
@@ -185,7 +185,7 @@ std::optional<SweepTarget> pickOneSweepTarget(Store & store)
     for (const String & ns_name : registry.namespaces)
     {
         const RootNamespace ns{ns_name};
-        const String manifests_prefix = layout.rootNamespacePrefix(ns) + "_manifests/";
+        const String manifests_prefix = layout.manifestNamespacePrefix(ns);
 
         /// LIST distinct writer/build prefixes, FOLLOWING next_cursor across ALL pages (mirroring
         /// sweepNamespace). Keys are `<manifests_prefix><writer_instance_id>/<build_sequence>/<aa>/<inst>.proto`;

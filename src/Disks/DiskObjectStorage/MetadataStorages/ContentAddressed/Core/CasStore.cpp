@@ -1000,29 +1000,40 @@ std::vector<String> Store::listNamespaces(const String & prefix)
 
 std::vector<String> Store::listMirroredChildren(const String & prefix)
 {
-    /// Loose LIST of the mirrored subtree under `roots/<prefix>` (design §5.3). Returns the
-    /// distinct next-path-segment names. NOT authoritative — callers must re-check `listRefs`
-    /// per candidate before surfacing it. GC continues to use the compact registry.
-    const String full = pool_layout.rootsPrefix() + prefix;   /// e.g. <pool>/roots/shadow/
+    /// Loose LIST of the mirrored subtree (design §5.3). Returns the distinct next-path-segment
+    /// names. NOT authoritative — callers must re-check `listRefs` per candidate before surfacing
+    /// it. GC continues to use the compact registry.
+    ///
+    /// Phase 1: a namespace's presence is split across two physical subtrees — its ref shards live
+    /// under `cas/refs/<ns>/<shard>` (the relocation target) while its verbatim files and PLAIN
+    /// mountpoint objects stay under `roots/<ns>/_files/…` / `roots/<key>`. The browse therefore
+    /// UNIONs the next-segment names from BOTH subtrees so a namespace discoverable only by its ref
+    /// shards (the common case — mutable per-part files ride inside the RootRef payload, not as
+    /// verbatim `_files`) is still surfaced.
     std::unordered_set<String> children;
-    String cursor;
-    while (true)
+    const String roots_full = pool_layout.rootsPrefix() + prefix;       /// e.g. <pool>/roots/shadow/
+    const String refs_full = pool_layout.casRefsPrefix() + prefix;      /// e.g. <pool>/cas/refs/shadow/
+    for (const String & full : {roots_full, refs_full})
     {
-        ListPage page = pool_backend->list(full, cursor, /*limit*/ 1000);
-        for (const ListedKey & listed : page.keys)
+        String cursor;
+        while (true)
         {
-            const String & key = listed.key;
-            if (!key.starts_with(full))
-                continue;
-            const std::string_view rest(key.data() + full.size(), key.size() - full.size());
-            const size_t slash = rest.find('/');
-            const std::string_view seg = slash == std::string_view::npos ? rest : rest.substr(0, slash);
-            if (!seg.empty())
-                children.emplace(seg);
+            ListPage page = pool_backend->list(full, cursor, /*limit*/ 1000);
+            for (const ListedKey & listed : page.keys)
+            {
+                const String & key = listed.key;
+                if (!key.starts_with(full))
+                    continue;
+                const std::string_view rest(key.data() + full.size(), key.size() - full.size());
+                const size_t slash = rest.find('/');
+                const std::string_view seg = slash == std::string_view::npos ? rest : rest.substr(0, slash);
+                if (!seg.empty())
+                    children.emplace(seg);
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
         }
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
     }
     return {children.begin(), children.end()};
 }

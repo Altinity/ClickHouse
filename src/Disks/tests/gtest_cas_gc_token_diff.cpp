@@ -379,8 +379,8 @@ TEST(CasGcDiscovery, FailsClosedToReadWhenListKeyAmbiguous)
     /// Build a backend that injects a duplicate `ListedKey` for the shard's full key on every `list`
     /// call, while delegating all other ops to the real backend. This simulates an ambiguous LIST
     /// sweep (the same key returned twice in one page or across pages).
-    const String roots_prefix = real_store->layout().rootsPrefix();
-    const String shard_full_key = roots_prefix + ck;   /// e.g. "p/roots/srv1/ambiguous/0"
+    const String refs_prefix = real_store->layout().casRefsPrefix();
+    const String shard_full_key = refs_prefix + ck;   /// e.g. "p/cas/refs/srv1/ambiguous/0"
 
     class DuplicateListBackend final : public InMemoryBackend
     {

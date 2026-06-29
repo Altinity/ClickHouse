@@ -1191,12 +1191,13 @@ public:
     }
 };
 
-/// True for a root-shard manifest key (<...>/roots/<namespace...>/<shard_number>) — the object a
-/// single publish CASes. Tree blobs (blobs/ prefix), the registry (`gc/registry`) and verbatim
+/// True for a root-shard ref key (<...>/cas/refs/<namespace...>/<shard_number>) — the object a
+/// single publish CASes. Phase 1 relocated ref shards out of roots/ to cas/refs/. Tree blobs
+/// (blobs/ prefix), the registry (`gc/registry`), part-manifests (`cas/manifests/...`) and verbatim
 /// files (roots/<ns>/_files/...) are excluded, so counting these isolates publishes one-for-one.
 bool isShardManifestPath(const std::string & path)
 {
-    if (path.find("/roots/") == std::string::npos)
+    if (path.find("/cas/refs/") == std::string::npos)
         return false;
     const auto slash = path.rfind('/');
     if (slash == std::string::npos || slash + 1 >= path.size())
@@ -1327,7 +1328,7 @@ TEST(CaWiring, RootShardsConfigurable)
 /// uses on the commit path — writeObject (PUT), exists + getObjectMetadata (the HEAD), and readObject
 /// (the GET) — as (op_name, logical_key). "Logical" means the bare pool key (without the emu_root
 /// prefix) — the same string the Layout functions produce, so the `/blobs/`, `/trees/`, and
-/// root-shard (`/roots/<ns>/<shard_number>`) substring tests are unambiguous.
+/// root-shard ref (`/cas/refs/<ns>/<shard_number>`) substring tests are unambiguous.
 ///
 /// After commit the test asserts: the FIRST write that appends the create-precommit owner event (the
 /// first durable CAS to the target ROOT SHARD's key — owner_kind == Precommit; the converged rev. 15
@@ -1426,16 +1427,17 @@ std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const s
         DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
 }
 
-/// True for a root-shard manifest key (`<...>/roots/<namespace...>/<shard_number>`) — the object a
-/// precommit (and later a promote) CASes. The converged model (rev. 15) appends the create-precommit
-/// RootOwnerEvent into the TARGET TABLE SHARD's journal (owner_kind == Precommit) keyed by the final
-/// ref name — there is NO `_precommits` namespace on the precommit path. The namespace itself contains
-/// '/', so the discriminator is "under /roots/ AND the last path segment is all digits", which excludes
-/// blobs (`/blobs/`), staged manifests (`/_manifests/...`), the registry (`/gc/registry`), the
-/// watermark (`/_watermark`), and verbatim files (`/_files/...`).
+/// True for a root-shard ref key (`<...>/cas/refs/<namespace...>/<shard_number>`) — the object a
+/// precommit (and later a promote) CASes. Phase 1 relocated ref shards out of roots/ to cas/refs/.
+/// The converged model (rev. 15) appends the create-precommit RootOwnerEvent into the TARGET TABLE
+/// SHARD's journal (owner_kind == Precommit) keyed by the final ref name — there is NO `_precommits`
+/// namespace on the precommit path. The namespace itself contains '/', so the discriminator is
+/// "under /cas/refs/ AND the last path segment is all digits", which excludes blobs (`/blobs/`),
+/// part-manifests (`/cas/manifests/...`), the registry (`/gc/registry`), the watermark
+/// (`/_watermark`), and verbatim files (`/_files/...`).
 bool isRootShardKey(const std::string & key)
 {
-    if (key.find("/roots/") == std::string::npos)
+    if (key.find("/cas/refs/") == std::string::npos)
         return false;
     const auto slash = key.rfind('/');
     if (slash == std::string::npos || slash + 1 >= key.size())
@@ -1550,9 +1552,9 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
         { return r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos; });
     const bool has_tree_write = std::any_of(log.begin(), log.end(),
         [](const RecordingLocalObjectStorage::Record & r)
-        { return r.op == "writeObject" && r.key.find("/_manifests/") != std::string::npos; });
+        { return r.op == "writeObject" && r.key.find("/cas/manifests/") != std::string::npos; });
     EXPECT_TRUE(has_blob_write) << "No /blobs/ write recorded — fresh blob path not exercised";
-    EXPECT_TRUE(has_tree_write) << "No /_manifests/ write recorded — manifest staging path not exercised";
+    EXPECT_TRUE(has_tree_write) << "No /cas/manifests/ write recorded — manifest staging path not exercised";
     EXPECT_FALSE(own_content_keys.empty()) << "No own content keys collected — gate would be vacuous";
 }
 

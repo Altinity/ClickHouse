@@ -1279,7 +1279,7 @@ std::map<String, Token> Gc::listRootShardTokens(std::set<String> & ambiguous_key
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
 
-    const String prefix = layout.rootsPrefix();
+    const String prefix = layout.casRefsPrefix();
     String cursor;
     for (;;)
     {
@@ -1323,9 +1323,9 @@ std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
         return decisions;
 
     /// ONE LIST sweep — the accelerator. Map the full backend keys to cursor-key form ("ns/shard") by
-    /// stripping the roots prefix (`rootShardKey` == rootsPrefix() + "ns/shard"), so they line up with
-    /// `per_ns_shard`. Non-shard keys under `roots/` (e.g. `_files/`, `_manifests/`) cannot match a
-    /// registry-universe cursor key, so they are harmless.
+    /// stripping the refs prefix (`rootShardKey` == casRefsPrefix() + "ns/shard"), so they line up with
+    /// `per_ns_shard`. After the Phase 1 relocation, `cas/refs/` holds ONLY ref shards (the manifest
+    /// backlog and verbatim files stay under `roots/`), so no non-shard key is even listed here.
     ///
     /// AMBIGUITY: `listRootShardTokens` also reports keys it observed MORE THAN ONCE across all pages.
     /// An ambiguous full key is mapped to cursor-key form and added to `ambiguous_cursor_keys` so the
@@ -1333,18 +1333,18 @@ std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
     /// required for Skip — the spec, not a hidden fallback).
     std::set<String> ambiguous_full_keys;
     const std::map<String, Token> listed = listRootShardTokens(ambiguous_full_keys);
-    const String roots_prefix = layout.rootsPrefix();
+    const String refs_prefix = layout.casRefsPrefix();
     std::map<String, Token> listed_by_cursor_key;
     std::set<String> ambiguous_cursor_keys;
     for (const auto & [full_key, token] : listed)
     {
-        if (full_key.starts_with(roots_prefix))
-            listed_by_cursor_key[full_key.substr(roots_prefix.size())] = token;
+        if (full_key.starts_with(refs_prefix))
+            listed_by_cursor_key[full_key.substr(refs_prefix.size())] = token;
     }
     for (const auto & full_key : ambiguous_full_keys)
     {
-        if (full_key.starts_with(roots_prefix))
-            ambiguous_cursor_keys.insert(full_key.substr(roots_prefix.size()));
+        if (full_key.starts_with(refs_prefix))
+            ambiguous_cursor_keys.insert(full_key.substr(refs_prefix.size()));
     }
 
     for (const auto & [ns, shard] : universe)

@@ -21,10 +21,35 @@ TEST(CasLayout, RootNamespaceKeys)
 {
     Layout l("p");
     RootNamespace ns{"srv1/3f2e-uuid"};
-    EXPECT_EQ(l.rootShardKey(ns, 3), "p/roots/srv1/3f2e-uuid/3");
+    /// Phase 1: ref shards relocated out of roots/ to cas/refs/; the namespace fan-out is unchanged.
+    EXPECT_EQ(l.rootShardKey(ns, 3), "p/cas/refs/srv1/3f2e-uuid/3");
+    /// Browse helpers (verbatim `_files` tree) stay under roots/.
     EXPECT_EQ(l.rootNamespacePrefix(ns), "p/roots/srv1/3f2e-uuid/");
     EXPECT_EQ(l.namespaceFileKey(ns, "format_version.txt"), "p/roots/srv1/3f2e-uuid/_files/format_version.txt");
     EXPECT_EQ(l.namespaceFilesPrefix(ns), "p/roots/srv1/3f2e-uuid/_files/");
+}
+
+TEST(CasLayout, RelocatedRefAndManifestKeys)
+{
+    Layout l("p");
+    const RootNamespace ns{"srid/store/ab/uuid@cas@"};
+    /// Ref shards: roots/ -> cas/refs/ (identity-preserving; only the base prefix moves).
+    EXPECT_EQ(l.rootShardKey(ns, 3), "p/cas/refs/srid/store/ab/uuid@cas@/3");
+    /// Pool-wide ref prefix (discovery LIST + strip base).
+    EXPECT_EQ(l.casRefsPrefix(), "p/cas/refs/");
+    /// All manifests of a namespace: cas/manifests/<ns>/ (replaces roots/<ns>/_manifests/).
+    EXPECT_EQ(l.manifestNamespacePrefix(ns), "p/cas/manifests/srid/store/ab/uuid@cas@/");
+
+    /// manifestKey: same writer/build/aa/inst fan-out, now under cas/manifests/<ns>/ (no /_manifests/ infix).
+    ManifestId id;
+    id.root_namespace = ns;
+    id.ref.writer_instance_id = "ab:7";
+    id.ref.build_sequence = 1042;
+    id.ref.manifest_instance_id = (UInt128(0x7f3aULL) << 112);
+    const String key = l.manifestKey(id);
+    EXPECT_TRUE(key.starts_with("p/cas/manifests/srid/store/ab/uuid@cas@/")) << key;
+    EXPECT_TRUE(key.ends_with(".proto")) << key;
+    EXPECT_EQ(key.find("/_manifests/"), String::npos) << key;
 }
 
 TEST(CasLayout, RootNamespaceValidation)
@@ -121,9 +146,10 @@ TEST(CasLayout, ManifestKeyShape)
     id.ref.build_sequence = 1042;
     id.ref.manifest_instance_id = (UInt128(0x7f3aULL) << 112);   /// top bytes 7f 3a -> aa = "7f"
     const String key = l.manifestKey(id);
-    /// <prefix>/roots/<ns>/_manifests/<writer_instance_id>/<build_seq>/<aa>/<inst_hex>.proto
+    /// Phase 1: <prefix>/cas/manifests/<ns>/<writer_instance_id>/<build_seq>/<aa>/<inst_hex>.proto
+    /// (the `/_manifests/` infix is dropped — the cas/manifests/ prefix conveys it; identity unchanged).
     EXPECT_EQ(key,
-        "p/roots/srv-a/3f2e-uuid@cas@/_manifests/"
+        "p/cas/manifests/srv-a/3f2e-uuid@cas@/"
         "ab:7/1042/7f/"
         "7f3a0000000000000000000000000000.proto");
 }
