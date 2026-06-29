@@ -81,6 +81,7 @@ String encodeGcState(const GcState & state)
     msg.set_snap_generation(state.snap_generation);
     msg.set_snap_pruned_through(state.snap_pruned_through);
     msg.set_snap_attempt(state.snap_attempt);
+    msg.set_manifest_sweep_cursor(state.manifest_sweep_cursor);
 
     auto * lease = msg.mutable_lease();
     lease->set_owner(u128ToBytesBE(state.lease.owner));
@@ -135,6 +136,7 @@ GcState decodeGcState(std::string_view data)
     state.snap_generation = msg.snap_generation();
     state.snap_pruned_through = msg.snap_pruned_through();
     state.snap_attempt = msg.snap_attempt();
+    state.manifest_sweep_cursor = msg.manifest_sweep_cursor();
 
     state.lease.owner = u128FromBytesBE(msg.lease().owner(), "gc/state lease owner");
     state.lease.seq = msg.lease().seq();

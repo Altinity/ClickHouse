@@ -17,6 +17,8 @@ TEST(CasGcShardConfig, DefaultIsSingleShard)
 {
     PoolConfig cfg;
     EXPECT_EQ(cfg.gc_shards, 1u);
+    EXPECT_EQ(cfg.manifest_sweep_list_budget_keys, 1000u);
+    EXPECT_EQ(cfg.manifest_sweep_delete_budget_keys, 100u);
 }
 
 TEST(CasGcShardConfig, GcStateRoundTripPreservesShardCount)

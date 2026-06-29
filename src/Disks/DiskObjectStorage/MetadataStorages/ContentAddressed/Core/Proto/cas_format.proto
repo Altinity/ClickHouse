@@ -186,6 +186,7 @@ message GcStateProto {
   GcLeaseProto lease            = 7;
   repeated FenceVersionEntryProto fence_version = 8;
   uint64 snap_attempt           = 9;  // adopted attempt id for the round that produced snap_generation
+  string manifest_sweep_cursor  = 10; // best-effort cleanup cursor; never consulted by reachability
 }
 
 // Namespace registry (gc/registry). Magic CARR, FormatId::RootsRegistry.

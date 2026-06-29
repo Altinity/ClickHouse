@@ -53,6 +53,10 @@ struct PoolConfig
     /// Phase 1d). Creation-time only; the pool is authoritative on reopen, like `root_shards`. This
     /// is the BLOB-HASH-prefix reducer axis, distinct from the root-shard fence axis.
     uint64_t gc_shards = 1;
+    /// Phase 2 cursor-paced orphan part-manifest sweep. The LIST budget bounds cold-prefix enumeration
+    /// per completed GC round; the delete budget separately bounds exact-token destructive work.
+    uint64_t manifest_sweep_list_budget_keys = 1000;
+    uint64_t manifest_sweep_delete_budget_keys = 100;
     /// B12 lazy-trim: compact a root shard's journal ONLY when at least this many events lie at/below
     /// the sealed fold cursor (batch gate), OR the encoded shard body is at/above
     /// `gc_trim_body_soft_limit` (soft-cap gate), OR `Gc::setMaintenanceTrimForTest(true)` is set.

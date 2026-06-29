@@ -52,6 +52,7 @@ struct GcState
     uint64_t snap_generation = 0;  /// monotone; the authoritative snap objects' generation
     uint64_t snap_pruned_through = 0;   /// B174: highest snap generation fully pruned (retention cursor)
     uint64_t snap_attempt = 0;     /// adopted attempt id (folding leader's lease.seq) for snap_generation
+    String manifest_sweep_cursor;  /// best-effort orphan part-manifest cleanup cursor; reachability ignores it
     GcLease lease;
     std::map<uint64_t, std::map<String, uint64_t>> fence_version;   /// round -> ("ns/shard" -> version)
 };

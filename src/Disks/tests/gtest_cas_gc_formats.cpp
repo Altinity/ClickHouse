@@ -85,6 +85,22 @@ TEST(CasGcFormats, SnapAttemptDefaultsZero)
     EXPECT_EQ(DB::Cas::decodeGcState(DB::Cas::encodeGcState(s)).snap_attempt, 0u);
 }
 
+TEST(CasGcFormats, ManifestSweepCursorRoundTrips)
+{
+    DB::Cas::GcState s;
+    s.gc_shards = 1;
+    s.manifest_sweep_cursor = "p/cas/manifests/server/store/abc/table@cas@/writer/42/aa/id.proto";
+    const String bytes = DB::Cas::encodeGcState(s);
+    const DB::Cas::GcState back = DB::Cas::decodeGcState(bytes);
+    EXPECT_EQ(back.manifest_sweep_cursor, s.manifest_sweep_cursor);
+}
+
+TEST(CasGcFormats, ManifestSweepCursorDefaultsEmpty)
+{
+    DB::Cas::GcState s;
+    EXPECT_TRUE(DB::Cas::decodeGcState(DB::Cas::encodeGcState(s)).manifest_sweep_cursor.empty());
+}
+
 TEST(CasGcFormats, GcHeartbeatRoundTrip)
 {
     GcHeartbeat hb;

@@ -52,7 +52,9 @@ public:
         uint64_t dedup_cache_bytes_ = 64ULL << 20,
         uint64_t dedup_head_first_min_bytes_ = 1ULL << 20,
         uint64_t gc_snap_generations_to_keep_ = 3,
-        uint64_t gc_shards_ = 1);
+        uint64_t gc_shards_ = 1,
+        uint64_t manifest_sweep_list_budget_keys_ = 1000,
+        uint64_t manifest_sweep_delete_budget_keys_ = 100);
 
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
@@ -189,6 +191,8 @@ private:
     const uint64_t dedup_head_first_min_bytes;   /// P2 HEAD-before-PUT size threshold (0=off)
     const uint64_t gc_snap_generations_to_keep;  /// B174 gc/snap retention (0=keep all)
     const uint64_t gc_shards;                    /// Phase 4: blob-hash-prefix reducer shard count (creation-time only)
+    const uint64_t manifest_sweep_list_budget_keys;
+    const uint64_t manifest_sweep_delete_budget_keys;
 
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;

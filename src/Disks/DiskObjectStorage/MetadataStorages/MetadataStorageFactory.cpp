@@ -251,6 +251,8 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// Phase 4: blob-hash-prefix reducer sharding. Default 1 (single-shard, identical to Phase 1d).
         /// Creation-time only: the pool's persisted GcState is authoritative on reopen.
         const uint64_t gc_shards = config.getUInt64(config_prefix + ".gc_shards", 1);
+        const uint64_t manifest_sweep_list_budget_keys = config.getUInt64(config_prefix + ".manifest_sweep_list_budget_keys", 1000);
+        const uint64_t manifest_sweep_delete_budget_keys = config.getUInt64(config_prefix + ".manifest_sweep_delete_budget_keys", 100);
         /// Phase 0 (mount safety): the layout subtree identity is explicit and REQUIRED — no default,
         /// so a missing key throws `Poco::NotFoundException`. `ServerUUID` is demoted to an owner token;
         /// the subtree a server owns is named by `server_root_id`. Validated immediately (fail closed).
@@ -259,7 +261,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), server_root_id, local_scratch_path,
             global_context, gc_enabled, gc_interval, root_shards, name, dedup_cache_bytes, dedup_head_first_min_bytes,
-            gc_snap_generations_to_keep, gc_shards);
+            gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys);
 
         return metadata_storage;
     });

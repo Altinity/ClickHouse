@@ -151,7 +151,9 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t dedup_cache_bytes_,
     uint64_t dedup_head_first_min_bytes_,
     uint64_t gc_snap_generations_to_keep_,
-    uint64_t gc_shards_)
+    uint64_t gc_shards_,
+    uint64_t manifest_sweep_list_budget_keys_,
+    uint64_t manifest_sweep_delete_budget_keys_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -167,6 +169,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , dedup_head_first_min_bytes(dedup_head_first_min_bytes_)
     , gc_snap_generations_to_keep(gc_snap_generations_to_keep_)
     , gc_shards(gc_shards_)
+    , manifest_sweep_list_budget_keys(manifest_sweep_list_budget_keys_)
+    , manifest_sweep_delete_budget_keys(manifest_sweep_delete_budget_keys_)
 {
 }
 
@@ -369,6 +373,8 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.dedup_head_first_min_bytes = dedup_head_first_min_bytes;
     pool_config.gc_snap_generations_to_keep = gc_snap_generations_to_keep;
     pool_config.gc_shards = gc_shards;
+    pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
+    pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
 
