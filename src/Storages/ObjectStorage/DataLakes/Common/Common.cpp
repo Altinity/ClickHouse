@@ -45,7 +45,7 @@ void purgeTableDataFiles(IObjectStorage & object_storage, const String & table_p
     /// An empty path would make the prefix empty and list (and delete) the whole bucket.
     if (table_path.empty())
     {
-        LOG_WARNING(getLogger("DataLakeCommon"), "Will notpurge table data: the table path is empty");
+        LOG_WARNING(getLogger("DataLakeCommon"), "Will not purge table data: the table path is empty");
         return;
     }
 
