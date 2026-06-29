@@ -258,10 +258,14 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// the subtree a server owns is named by `server_root_id`. Validated immediately (fail closed).
         const std::string server_root_id = config.getString(config_prefix + ".server_root_id");
         Cas::validateServerRootId(server_root_id);
+        const uint64_t manifest_soft_limit = config.getUInt64(config_prefix + ".manifest_soft_limit", 16ULL << 20);
+        const uint64_t manifest_hard_limit = config.getUInt64(config_prefix + ".manifest_hard_limit", 64ULL << 20);
+        const uint64_t manifest_max_delay_ms = config.getUInt64(config_prefix + ".manifest_max_delay_ms", 1000);
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), server_root_id, local_scratch_path,
             global_context, gc_enabled, gc_interval, root_shards, name, dedup_cache_bytes, dedup_head_first_min_bytes,
-            gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys);
+            gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys,
+            manifest_soft_limit, manifest_hard_limit, manifest_max_delay_ms);
 
         return metadata_storage;
     });

@@ -54,7 +54,10 @@ public:
         uint64_t gc_snap_generations_to_keep_ = 3,
         uint64_t gc_shards_ = 1,
         uint64_t manifest_sweep_list_budget_keys_ = 1000,
-        uint64_t manifest_sweep_delete_budget_keys_ = 100);
+        uint64_t manifest_sweep_delete_budget_keys_ = 100,
+        uint64_t manifest_soft_limit_ = 16ULL << 20,
+        uint64_t manifest_hard_limit_ = 64ULL << 20,
+        uint64_t manifest_max_delay_ms_ = 1000);
 
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
@@ -193,6 +196,10 @@ private:
     const uint64_t gc_shards;                    /// Phase 4: blob-hash-prefix reducer shard count (creation-time only)
     const uint64_t manifest_sweep_list_budget_keys;
     const uint64_t manifest_sweep_delete_budget_keys;
+    /// B164b: root-shard manifest size limits and backpressure delay, passed through to PoolConfig.
+    const uint64_t manifest_soft_limit;
+    const uint64_t manifest_hard_limit;
+    const uint64_t manifest_max_delay_ms;
 
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;

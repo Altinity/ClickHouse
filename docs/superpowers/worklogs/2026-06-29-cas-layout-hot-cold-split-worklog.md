@@ -85,3 +85,9 @@ Ritual: writing-plans (Phase-1 plan) → self-review → subagent-driven TDD →
   - `BackpressureRequiresHardGtSoft` - equal soft/hard limits produce no delay.
 - **Existing suite:** 197 tests, same 196/197 pass (only pre-existing `CaWiringOps.FreezeViaHardLinksIntoShadow`).
 - **Docs updated:** `cas-mergetree-integration.md` B164b marked DONE IMPLEMENTED.
+- **Review fix (2026-06-29):** addressed 4 findings from code review:
+    - **HIGH**: reverted `mutateShard` to `private` with no defaults for `origin`/`kind`; added narrow `mutateShardForTest` test seam for GC-bypass test.
+    - **MEDIUM**: wired `manifest_soft_limit`, `manifest_hard_limit`, `manifest_max_delay_ms` from XML disk config through `MetadataStorageFactory` → `ContentAddressedMetadataStorage` → `PoolConfig`.
+    - **LOW**: renamed hard-limit test to `HardLimitBlocksPromoteBeforeCommit` with precise comment (precommitAdd may commit before promote throws).
+    - **LOW**: added `toString()` helpers for `RootMutationOrigin` and `RootMutationKind`; logs now emit names instead of raw ints.
+- Files changed: `CasStore.h`, `CasStore.cpp`, `ContentAddressedMetadataStorage.h/.cpp`, `MetadataStorageFactory.cpp`, `gtest_cas_store.cpp`.

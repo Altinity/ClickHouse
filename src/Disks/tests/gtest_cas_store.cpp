@@ -1210,13 +1210,17 @@ TEST(CasStoreBackpressure, WriterMutationAboveSoftLimitDelaysThenCommits)
     EXPECT_GT(global_counters[ProfileEvents::CasManifestBackpressureMicroseconds].load(), 0u);
 }
 
-TEST(CasStoreBackpressure, HardLimitThrowsBeforeWrite)
+TEST(CasStoreBackpressure, HardLimitBlocksPromoteBeforeCommit)
 {
     using namespace DB::Cas;
 
     auto b = std::make_shared<InMemoryBackend>();
-    /// Use root_shards=2 so promote (final_ref based) and precommitAdd target the same shard,
-    /// and hard_limit small enough that the first promote hits it.
+    /// publishPart calls precommitAdd then promote. The hard limit fires during promote
+    /// (the encoded body grows past `manifest_hard_limit`). The precommitAdd may have already
+    /// committed (size < hard_limit), but the promoting ref must NOT become visible.
+    /// This tests the invariant: hard limit throws before the overflowing mutation commits,
+    /// not that zero bytes were written on the shard.
+    /// Use root_shards=2 so both precommitAdd and promote land on the same shard (shardOf).
     auto s = Store::open(b, PoolConfig{
         .pool_prefix = "p",
         .server_root_id = "test",
@@ -1280,10 +1284,10 @@ TEST(CasStoreBackpressure, GcMutationBypassesBackpressure)
     /// GC mutation (fence): pass RootMutationOrigin::Gc. The encoded body is above soft_limit=1,
     /// but GC must bypass backpressure — the delay count should NOT increase.
     /// fence writes fence_round into the shard. This is a GC-owned operation.
-    s->mutateShard(ns, 0, [&](RootShard & root)
+    s->mutateShardForTest(ns, 0, [&](RootShard & root)
     {
         root.fence_round = 42;
-    }, nullptr, RootMutationOrigin::Gc, RootMutationKind::Fence);
+    }, RootMutationOrigin::Gc, RootMutationKind::Fence);
 
     /// No additional delay was called despite body > soft limit.
     EXPECT_EQ(gc_delay_count.load(), delays_from_publish)

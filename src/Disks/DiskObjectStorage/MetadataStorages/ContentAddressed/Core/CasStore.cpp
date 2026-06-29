@@ -771,7 +771,7 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
             ProfileEvents::increment(ProfileEvents::CasManifestHardLimitExceeded);
             throw Exception(ErrorCodes::LIMIT_EXCEEDED,
                 "manifest {} size {} reached hard limit {} (kind={})",
-                key, body.size(), hard_limit, static_cast<int>(kind));
+                key, body.size(), hard_limit, toString(kind));
         }
 
         /// Soft limit — warning log + optional backpressure delay for Writer.
@@ -787,7 +787,7 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
                     LOG_WARNING(getLogger("CasStore"),
                         "manifest {} size {} crossed soft limit {} (hard={}, kind={}, origin={})",
                         key, body.size(), soft_limit, hard_limit,
-                        static_cast<int>(kind), static_cast<int>(origin));
+                        toString(kind), toString(origin));
                 }
             }
 
@@ -813,7 +813,7 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
                     LOG_INFO(getLogger("CasStore"),
                         "manifest backpressure: ns/shard={}/{} size={} soft={} hard={} delay={}ms kind={}",
                         ns.string(), shard, body.size(), soft_limit, hard_limit,
-                        delay_ms, static_cast<int>(kind));
+                        delay_ms, toString(kind));
 
                     if (backpressure_delay_hook)
                         backpressure_delay_hook(delay);

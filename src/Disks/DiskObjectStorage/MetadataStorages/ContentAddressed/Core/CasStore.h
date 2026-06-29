@@ -51,6 +51,36 @@ enum class RootMutationKind : uint8_t
     ReclaimPrecommit,
 };
 
+/// Human-readable name for `RootMutationOrigin` (diagnostic logging).
+inline std::string_view toString(RootMutationOrigin origin)
+{
+    switch (origin)
+    {
+        case RootMutationOrigin::Writer: return "Writer";
+        case RootMutationOrigin::Gc:     return "Gc";
+    }
+    return "Unknown";
+}
+
+/// Human-readable name for `RootMutationKind` (diagnostic logging).
+inline std::string_view toString(RootMutationKind kind)
+{
+    switch (kind)
+    {
+        case RootMutationKind::Publish:           return "Publish";
+        case RootMutationKind::Drop:              return "Drop";
+        case RootMutationKind::Precommit:         return "Precommit";
+        case RootMutationKind::Promote:           return "Promote";
+        case RootMutationKind::Abandon:           return "Abandon";
+        case RootMutationKind::UpdateRefPayload:  return "UpdateRefPayload";
+        case RootMutationKind::DropNamespace:     return "DropNamespace";
+        case RootMutationKind::Fence:             return "Fence";
+        case RootMutationKind::Trim:              return "Trim";
+        case RootMutationKind::ReclaimPrecommit:  return "ReclaimPrecommit";
+    }
+    return "Unknown";
+}
+
 struct PoolConfig
 {
     String pool_prefix;
@@ -314,6 +344,17 @@ public:
         backpressure_delay_hook = std::move(hook);
     }
 
+    /// Narrow test seam: mutate a root shard with explicit origin/kind for backpressure
+    /// verification. Production code uses the private `mutateShard` via Build/Gc friend
+    /// classes. This is NOT a general-purpose API — it exists only to let the GC-bypass
+    /// test verify that `RootMutationOrigin::Gc` skips backpressure delay.
+    void mutateShardForTest(const RootNamespace & ns, uint64_t shard,
+                            std::function<void(RootShard &)> mutate,
+                            RootMutationOrigin origin, RootMutationKind kind)
+    {
+        mutateShard(ns, shard, std::move(mutate), nullptr, origin, kind);
+    }
+
 private:
     Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
 
@@ -353,7 +394,6 @@ private:
     /// Single-flight coalescing wrapper around loadShardDecoded.
     std::shared_ptr<const RootShard> coalescedReadShardDecoded(const String & key);
 
-public:
     /// Read-modify-CAS one shard manifest under the manifest size guard. `mutate` edits the in-memory
     /// RootShard (which carries the freshly-read shard_version); the helper bumps shard_version, encodes,
     /// applies the manifest size guard (soft ⇒ LOG_WARNING + backpressure delay for Writer, hard ⇒
@@ -367,11 +407,9 @@ public:
     /// `origin` distinguishes Writer mutations (subject to backpressure) from Gc mutations (bypass).
     /// `kind` is diagnostic-only (logged/metrics) and does not affect behaviour.
     void mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
-                     uint64_t * out_committed_version = nullptr,
-                     RootMutationOrigin origin = RootMutationOrigin::Writer,
-                     RootMutationKind kind = RootMutationKind::Publish);
+                     uint64_t * out_committed_version,
+                     RootMutationOrigin origin, RootMutationKind kind);
 
-private:
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;
