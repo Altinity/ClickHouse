@@ -14,13 +14,6 @@ struct BuildPrefix
     uint64_t build_sequence = 0;
 };
 
-/// A sweep target: one namespace + one eligible build prefix to scan this round.
-struct SweepTarget
-{
-    RootNamespace ns;
-    BuildPrefix prefix;
-};
-
 struct ManifestSweepResult
 {
     String next_cursor;
@@ -56,9 +49,5 @@ ManifestSweepResult sweepManifestCursorPage(
     const String & cursor,
     uint64_t list_budget,
     uint64_t delete_budget);
-
-/// Choose one eligible (namespace, build prefix) to sweep this round, or nullopt when there is nothing
-/// eligible. Bounded: at most one namespace + one prefix per round (a rare backstop, not the hot path).
-std::optional<SweepTarget> pickOneSweepTarget(Store & store);
 
 }

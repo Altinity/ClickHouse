@@ -1,6 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
@@ -261,70 +260,6 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
             break;
         cursor = page.next_cursor;
     }
-}
-
-std::optional<SweepTarget> pickOneSweepTarget(Store & store)
-{
-    /// Bounded backstop: scan the registry's namespaces, and for each enumerate its `cas/manifests/<ns>/<writer>/`
-    /// build prefixes, returning the FIRST eligible one. At most one namespace + one prefix per round.
-    const Layout & layout = store.layout();
-    const auto reg = store.backend().get(layout.rootsRegistryKey());
-    if (!reg)
-        return std::nullopt;
-    const RootsRegistry registry = decodeRootsRegistry(reg->bytes);
-
-    for (const String & ns_name : registry.namespaces)
-    {
-        const RootNamespace ns{ns_name};
-        const String manifests_prefix = layout.manifestNamespacePrefix(ns);
-
-        /// LIST distinct writer/build prefixes, FOLLOWING next_cursor across ALL pages (mirroring
-        /// sweepNamespace). Keys are `<manifests_prefix><writer_instance_id>/<build_sequence>/<aa>/<inst>.proto`;
-        /// parse the first two path segments after the prefix to recover (writer_instance_id, build_sequence).
-        /// A single page that is all live/ineligible prefixes must NOT hide an eligible older build prefix on
-        /// a later page (else pre-precommit debris leaks forever — violates OrphanManifestDebrisDrains).
-        std::set<std::pair<String, uint64_t>> seen;
-        String cursor;
-        while (true)
-        {
-            const ListPage page = store.backend().list(manifests_prefix, cursor, /*limit*/1000);
-            for (const ListedKey & listed : page.keys)
-            {
-                if (!listed.key.starts_with(manifests_prefix))
-                    continue;
-                const String rest = listed.key.substr(manifests_prefix.size());
-                const size_t s1 = rest.find('/');
-                if (s1 == String::npos)
-                    continue;
-                const String writer = rest.substr(0, s1);
-                const size_t s2 = rest.find('/', s1 + 1);
-                if (s2 == String::npos)
-                    continue;
-                const String seq_str = rest.substr(s1 + 1, s2 - s1 - 1);
-                uint64_t build_seq = 0;
-                try
-                {
-                    size_t consumed = 0;
-                    build_seq = std::stoull(seq_str, &consumed);
-                    if (consumed != seq_str.size())
-                        continue;
-                }
-                catch (...)
-                {
-                    continue;
-                }
-                if (!seen.emplace(writer, build_seq).second)
-                    continue;
-                const BuildPrefix prefix{.writer_instance_id = writer, .build_sequence = build_seq};
-                if (prefixEligible(store, ns, prefix))
-                    return SweepTarget{.ns = ns, .prefix = prefix};
-            }
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
-        }
-    }
-    return std::nullopt;
 }
 
 ManifestSweepResult sweepManifestCursorPage(
