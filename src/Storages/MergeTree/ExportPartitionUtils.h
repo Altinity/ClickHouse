@@ -23,6 +23,13 @@ struct ExportReplicatedMergeTreePartitionManifest;
 
 namespace ExportPartitionUtils
 {
+    /// Classifies an export failure as non-retryable (deterministic, retrying cannot help)
+    /// vs retryable (transient: memory pressure, network/object-storage/Keeper hiccups).
+    /// Non-retryable errors fail the whole export task immediately; everything else is
+    /// retried (paced by a per-replica back-off) until the task succeeds or times out.
+    /// This is a conservative denylist: an unrecognized error code is treated as retryable.
+    bool isNonRetryableExportError(int code);
+
     std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
 
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest);
@@ -51,18 +58,19 @@ namespace ExportPartitionUtils
 
     /// Handles a commit-phase failure for a replicated partition export:
     ///  - records the exception via appendExceptionOps in the same multi
-    ///  - increments <entry_path>/commit_attempts (lazy-created)
-    ///  - sets <entry_path>/status to FAILED once attempts >= max_attempts
+    ///  - if `exception_code` is non-retryable (see isNonRetryableExportError), sets
+    ///    <entry_path>/status to FAILED (version-checked against the PENDING read)
+    ///  - otherwise leaves the task PENDING so the commit is retried (by the next
+    ///    last-part success or deferred-commit recovery) until the absolute task timeout
     ///
-    /// The counter is a best-effort, non-atomic get+set(-1). Concurrent failing
-    /// commits may under-count by one (FAILED may fire one retry later than the
-    /// threshold), which is acceptable.
+    /// There is no per-task commit-attempt budget: retryable commit failures retry until
+    /// success or timeout, matching the per-part retry semantics.
     ///
     /// Returns true if this call transitioned the task to FAILED.
     bool handleCommitFailure(
         const zkutil::ZooKeeperPtr & zk,
         const std::string & entry_path,
-        size_t max_attempts,
+        int exception_code,
         const std::string & replica_name,
         const std::string & exception_message,
         const LoggerPtr & log);

@@ -9,6 +9,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <filesystem>
 #include <thread>
+#include <unordered_set>
 #include <Core/Block.h>
 #include <Core/Settings.h>
 #include <DataTypes/Utils.h>
@@ -40,6 +41,16 @@ namespace ErrorCodes
     extern const int NO_SUCH_DATA_PART;
     extern const int CORRUPTED_DATA;
     extern const int NETWORK_ERROR;
+    extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
+    extern const int SUPPORT_IS_DISABLED;
+    extern const int TYPE_MISMATCH;
+    extern const int CANNOT_CONVERT_TYPE;
+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+    extern const int ILLEGAL_COLUMN;
+    extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
+    extern const int INCOMPATIBLE_COLUMNS;
+    extern const int NO_SUCH_COLUMN_IN_TABLE;
 }
 
 namespace Setting
@@ -57,6 +68,31 @@ namespace fs = std::filesystem;
 
 namespace ExportPartitionUtils
 {
+    bool isNonRetryableExportError(int code)
+    {
+        /// Deterministic failures where retrying cannot possibly succeed (schema/type
+        /// incompatibilities, unsupported features, programming errors). Everything else
+        /// (memory limits, network/object-storage/Keeper transient errors, ...) is retryable.
+        /// `QUERY_WAS_CANCELLED` is handled separately by the caller and never reaches here.
+        ///
+        /// ErrorCodes values are runtime `extern const int`, not constant expressions, so they
+        /// cannot be used as `switch` labels; compare against a static set instead.
+        static const std::unordered_set<int> non_retryable_codes = {
+            ErrorCodes::BAD_ARGUMENTS,               /// lossy-cast / schema-incompat guard (verifyExportSchemaCastable)
+            ErrorCodes::TYPE_MISMATCH,
+            ErrorCodes::CANNOT_CONVERT_TYPE,
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            ErrorCodes::ILLEGAL_COLUMN,
+            ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+            ErrorCodes::INCOMPATIBLE_COLUMNS,
+            ErrorCodes::NO_SUCH_COLUMN_IN_TABLE,
+            ErrorCodes::NOT_IMPLEMENTED,
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            ErrorCodes::LOGICAL_ERROR,
+        };
+        return non_retryable_codes.contains(code);
+    }
+
     Block getPartitionSourceBlockForIcebergCommit(
         MergeTreeData & storage, const String & partition_id)
     {
@@ -263,7 +299,7 @@ namespace ExportPartitionUtils
     bool handleCommitFailure(
         const zkutil::ZooKeeperPtr & zk,
         const std::string & entry_path,
-        size_t max_attempts,
+        int exception_code,
         const std::string & replica_name,
         const std::string & exception_message,
         const LoggerPtr & log)
@@ -306,51 +342,19 @@ namespace ExportPartitionUtils
 
         Coordination::Requests ops;
 
-        /// Record the exception in the same multi as the commit-attempts bump and the
-        /// (possible) FAILED transition, so the user-visible last_exception znode is
-        /// updated atomically with the state change that exposes it.
+        /// Record the exception in the same multi as the (possible) FAILED transition, so the
+        /// user-visible last_exception znode is updated atomically with the state change that
+        /// exposes it.
         appendExceptionOps(ops, zk, fs::path(entry_path), replica_name, /*part_name=*/"", exception_message, log);
 
-        /// Bump the global commit_attempts counter (shared across replicas).
-        /// Non-atomic get+set(-1). Under a race, two replicas may see the same value
-        /// and write the same +1, under-counting by one. FAILED then fires one retry
-        /// later than the threshold, which is acceptable.
-        const std::string commit_attempts_path = fs::path(entry_path) / "commit_attempts";
-
-        size_t attempts = 0;
-        std::string attempts_string;
-
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-        if (zk->tryGet(commit_attempts_path, attempts_string))
+        /// A non-retryable error (schema/spec mismatch, ...) can never succeed,
+        /// so fail the task immediately
+        const bool non_retryable = isNonRetryableExportError(exception_code);
+        if (non_retryable)
         {
-            try
-            {
-                attempts = parse<size_t>(attempts_string);
-            }
-            catch (...)
-            {
-                LOG_WARNING(log, "ExportPartition: commit_attempts value '{}' at {} is not a valid integer, treating as 0", attempts_string, commit_attempts_path);
-                attempts = 0;
-            }
-
-            attempts += 1;
-            ops.emplace_back(zkutil::makeSetRequest(commit_attempts_path, std::to_string(attempts), -1));
-        }
-        else
-        {
-            attempts = 1;
-            ops.emplace_back(zkutil::makeCreateRequest(commit_attempts_path, "1", zkutil::CreateMode::Persistent));
-        }
-
-        /// Transition to FAILED if the commit budget is exhausted.
-        /// Uses the same setting as per-part retries (manifest.max_retries) per user decision.
-        /// Version-checked Set: if /status has changed since we read it (e.g. a peer's
-        /// commit() succeeded and wrote COMPLETED), the whole multi aborts with
-        /// ZBADVERSION and we safely do nothing — the winning terminal state stands.
-        const bool exhausted = attempts >= max_attempts;
-        if (exhausted)
-        {
+            /// Version-checked Set: if /status has changed since we read it (e.g. a peer's
+            /// commit() succeeded and wrote COMPLETED), the whole multi aborts with
+            /// ZBADVERSION and we safely do nothing — the winning terminal state stands.
             ops.emplace_back(zkutil::makeSetRequest(
                 status_path,
                 String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::FAILED)).data(),
@@ -363,21 +367,16 @@ namespace ExportPartitionUtils
         const auto rc = zk->tryMulti(ops, responses);
         if (rc != Coordination::Error::ZOK)
         {
-            /// Any error here (ZBADVERSION on /status race or counter race, ZNODEEXISTS on
-            /// lazy-create race, ZNONODE if someone removed the task concurrently) is
-            /// non-fatal: the next attempt re-reads /status and either skips (terminal
-            /// state won) or retries the bookkeeping. Worst case we delay FAILED by one
-            /// poll cycle, which matches the best-effort property of the existing counters.
             LOG_INFO(log, "ExportPartition: Failed to persist commit failure bookkeeping for {}: {}", entry_path, rc);
             return false;
         }
 
         LOG_INFO(log,
-            "ExportPartition: Commit failure recorded for {} (attempt {}/{}){}",
-            entry_path, attempts, max_attempts,
-            exhausted ? ", task transitioned to FAILED" : "");
+            "ExportPartition: Commit failure recorded for {} (code {}){}",
+            entry_path, exception_code,
+            non_retryable ? ", task transitioned to FAILED (non-retryable)" : ", will retry until task timeout");
 
-        return exhausted;
+        return non_retryable;
     }
 
     void appendExceptionOps(

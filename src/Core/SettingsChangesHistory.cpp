@@ -44,6 +44,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
             {"export_merge_tree_partition_task_timeout_seconds", "3600", "86400", "Increase default value to make it more realistic"},
             {"export_merge_tree_part_allow_lossy_cast", false, false, "New setting to gate lossy casts in EXPORT PART/PARTITION behind explicit acknowledgment"},
+            {"export_merge_tree_partition_retry_initial_backoff_ms", 5000, 5000, "New setting for exponential back-off between failed part export retries in an export partition task"},
+            {"export_merge_tree_partition_retry_max_backoff_ms", 60000, 60000, "New setting capping the exponential back-off between failed part export retries in an export partition task"},
+            {"export_merge_tree_partition_max_retries", 3, 3, "Deprecated and ignored: export partition tasks now retry retryable failures until the task timeout and fail immediately on non-retryable errors, instead of using a fixed retry budget"},
         });
         addSettingsChanges(settings_changes_history, "26.3",
         {
