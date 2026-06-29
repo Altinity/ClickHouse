@@ -852,7 +852,7 @@ rather than copied verbatim where the original text described protocol surfaces 
 ## Groomed 2026-06-29 — format-freeze gate completions {#groomed-2026-06-29-format-freeze}
 
 Moved from the live release-gate summary after the 2026-06-25 format-freeze pass. The live
-`LAYOUT / format-freeze` gate now tracks only the remaining release blockers: B164b and B1.
+`LAYOUT / format-freeze` gate now tracks only the remaining B1 `manifest_hash` guard.
 
 | ID | Item | Status | Notes |
 |----|------|--------|-------|
@@ -860,6 +860,7 @@ Moved from the live release-gate summary after the 2026-06-25 format-freeze pass
 | B176-envelope | Envelope TLV critical-bit and hole-free core. | DONE. | The old B176 `gc/snap` to protobuf wording is obsolete because `gc/snap` is retired. |
 | B97/B96/B10-format | Packs removed entirely; one-GET part open delivered via tree-inline eager files. | DONE for the format-freeze concern. | B96 `snap_shards > 1` remains deferred under the map-reduce GC track, not this format-freeze gate. |
 | mutable-protobuf | Mutable JSON object family moved to protobuf; JSON codecs, monotone `checkVersion`, and `CasEnumStrings.h` removed. | DONE. | No live two-encoding / abandon-JSON action remains. |
+| B164b | Root-journal bound. | DONE. | Implemented by lazy/batched trim and size guards: `gc_trim_min_events`, `gc_trim_body_soft_limit`, `manifest_soft_limit`, and `manifest_hard_limit`. This is not the earlier proposed write-path `..._to_throw` / `..._to_delay` pair, but it provides the required bounded root-journal object growth without adding hot-path writes. |
 | B92 | Adopt-path `tree_size`. | DONE 2026-06-26 (`b44db5dbaf7`). | `observeAndAdmit` records the tree payload size (`hr.size - blob_header_len`) for adopt/FREEZE/relink; round-trip test added. |
 | envelope-tlv-review | Envelope freeze review. | DONE 2026-06-26. | `domain_id` is verified fail-closed on `readTree`; no dead fields and no S3-metadata move. |
 | B64 | Projection attach. | DONE / archived. | Commit `d6f6b8345a0`; `03822` un-gated; oracle `05001`. |
