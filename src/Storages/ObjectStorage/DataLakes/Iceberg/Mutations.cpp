@@ -545,9 +545,19 @@ static bool writeMetadataFiles(
             {
                 auto catalog_filename = path_resolver.resolveForCatalog(metadata_info.path);
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                const auto outcome = catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot);
+                if (outcome == DataLake::CommitOutcome::RejectedCleanly)
                 {
                     cleanup();
+                    return false;
+                }
+                if (outcome == DataLake::CommitOutcome::Unknown)
+                {
+                    LOG_ERROR(
+                        getLogger("IcebergMutations"),
+                        "Iceberg mutation commit for {}.{} is of unknown status after a lost response; "
+                        "preserving written files to avoid corrupting a possibly-committed snapshot.",
+                        namespace_name, table_name);
                     return false;
                 }
             }
@@ -1417,7 +1427,8 @@ ExpireSnapshotsResult expireSnapshots(
         {
             auto catalog_filename = persistent_table_components.path_resolver.resolveForCatalog(metadata_info.path);
             const auto & [namespace_name, parsed_table_name] = DataLake::parseTableName(table_name);
-            if (!catalog->updateMetadata(namespace_name, parsed_table_name, catalog_filename, nullptr))
+            const auto outcome = catalog->updateMetadata(namespace_name, parsed_table_name, catalog_filename, nullptr);
+            if (outcome != DataLake::CommitOutcome::Committed)
             {
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR,

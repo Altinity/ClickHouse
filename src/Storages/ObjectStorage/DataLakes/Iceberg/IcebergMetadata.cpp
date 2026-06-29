@@ -719,9 +719,12 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
     if (catalog)
     {
         const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        if (!catalog->updateMetadata(namespace_name, table_name, path_resolver.resolveForCatalog(metadata_info.path), new_snapshot))
+        /// Truncate performs no destructive file cleanup here, so anything other than a
+        /// confirmed commit is surfaced as a failure (preserving files).
+        const auto outcome = catalog->updateMetadata(namespace_name, table_name, path_resolver.resolveForCatalog(metadata_info.path), new_snapshot);
+        if (outcome != DataLake::CommitOutcome::Committed)
             throw Exception(ErrorCodes::INCORRECT_DATA,
-                "Failed to commit Iceberg truncate update to catalog.");
+                "Failed to commit Iceberg truncate update to catalog (commit was not confirmed).");
     }
 }
 
@@ -1811,9 +1814,19 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 auto catalog_filename = resolver.resolveForCatalog(metadata_info.path);
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                const auto outcome = catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot);
+                if (outcome == DataLake::CommitOutcome::RejectedCleanly)
                 {
                     cleanup(true);
+                    return false;
+                }
+                if (outcome == DataLake::CommitOutcome::Unknown)
+                {
+                    LOG_ERROR(
+                        log,
+                        "Iceberg commit for {}.{} is of unknown status after a lost response; "
+                        "preserving written files to avoid corrupting a possibly-committed snapshot.",
+                        namespace_name, table_name);
                     return false;
                 }
 

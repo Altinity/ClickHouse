@@ -1,3 +1,4 @@
+import os
 import pytest
 import logging
 import pyspark
@@ -44,6 +45,12 @@ def started_cluster_iceberg_no_spark():
             user_configs=["configs/users.d/users.xml"],
             stay_alive=True,
         )
+
+        # --- fault-injection proxy for the catalog commit-safety tests ---
+        # Merge the rest-proxy compose file into the cluster's compose args.
+        here = os.path.dirname(os.path.realpath(__file__))
+        os.environ["PROXY_SCRIPT"] = os.path.join(here, "catalog_fault_proxy.py")
+        cluster.base_cmd += ["--file", os.path.join(here, "docker_compose_rest_proxy.yml")]
 
         logging.info("Starting cluster...")
         cluster.start()
