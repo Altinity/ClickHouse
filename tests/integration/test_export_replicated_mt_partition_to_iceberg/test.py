@@ -492,6 +492,99 @@ def test_export_partition_retryable_error_recovers_after_failpoint_cleared(clust
     assert count == 3, f"Expected 3 rows after recovery, got {count}"
 
 
+def test_export_partition_local_backoff_does_not_block_other_replica(cluster):
+    """
+    Back-off is per-replica and in-memory: a part that one replica keeps failing on
+    (and therefore puts into its local back-off) must NOT be prevented from being
+    exported by another replica. This is the whole reason the back-off is local
+    rather than distributed in ZooKeeper.
+
+    replica1 is given a persistent *retryable* failure (export_part_retryable_throw)
+    and is the only replica scheduling at first (moves are stopped on replica2). Once
+    replica1 has recorded a failure and a local back-off entry, replica2's scheduler
+    is enabled. Because the failpoint stays active on replica1 the whole time, the
+    only way the export can reach COMPLETED is replica2 picking up the very part that
+    replica1 keeps failing — proving the back-off does not leak across replicas.
+    """
+    replica1 = cluster.instances["replica1"]
+    replica2 = cluster.instances["replica2"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
+
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1", "replica2"])
+
+    # Phase 1: only replica1 schedules. Stop the export scheduler on replica2 so the
+    # part is guaranteed to be attempted (and fail) on replica1 first.
+    replica2.query(f"SYSTEM STOP MOVES {mt_table}")
+
+    replica1.query("SYSTEM ENABLE FAILPOINT export_part_retryable_throw")
+    try:
+        replica1.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
+            f" SETTINGS export_merge_tree_partition_retry_initial_backoff_ms = 1000,"
+            f"          export_merge_tree_partition_retry_max_backoff_ms = 2000,"
+            f"          allow_insert_into_iceberg = 1"
+        )
+
+        # replica1 attempts the part, fails (retryable), and enters local back-off.
+        # The task must stay PENDING — there is no retry budget to fail it.
+        wait_for_exception_count(replica1, mt_table, iceberg_table, "2020",
+                                 min_exception_count=1, timeout=60)
+        status = replica1.query(
+            f"SELECT status FROM system.replicated_partition_exports"
+            f" WHERE source_table = '{mt_table}'"
+            f"   AND destination_table = '{iceberg_table}'"
+            f"   AND partition_id = '2020'"
+        ).strip()
+        assert status == "PENDING", (
+            f"Retryable failures must keep the task PENDING, got status {status!r}"
+        )
+
+        # The back-off entry must be observable on replica1 (the failing replica).
+        deadline = time.time() + 60
+        backoff_replica1 = "0"
+        while time.time() < deadline:
+            backoff_replica1 = replica1.query(
+                f"SELECT length(local_backoff_per_part) FROM system.replicated_partition_exports"
+                f" WHERE source_table = '{mt_table}'"
+                f"   AND destination_table = '{iceberg_table}'"
+                f"   AND partition_id = '2020'"
+            ).strip()
+            if backoff_replica1 not in ("", "0"):
+                break
+            time.sleep(0.5)
+        assert backoff_replica1 not in ("", "0"), (
+            "Expected replica1 to carry a local back-off entry for the failing part, "
+            f"got {backoff_replica1!r}"
+        )
+
+        # ... and it must NOT have leaked to replica2, which never attempted the part.
+        # This is the core assertion: local back-off state is not shared across replicas.
+        backoff_replica2 = replica2.query(
+            f"SELECT length(local_backoff_per_part) FROM system.replicated_partition_exports"
+            f" WHERE source_table = '{mt_table}'"
+            f"   AND destination_table = '{iceberg_table}'"
+            f"   AND partition_id = '2020'"
+        ).strip()
+        assert backoff_replica2 in ("", "0"), (
+            f"replica2 must not carry replica1's local back-off, got {backoff_replica2!r}"
+        )
+
+        # Phase 2: enable replica2's scheduler. replica1 keeps failing (the failpoint
+        # is still active), so completion can only come from replica2 exporting the
+        # part that replica1 is backing off on.
+        replica2.query(f"SYSTEM START MOVES {mt_table}")
+
+        wait_for_export_status(replica2, mt_table, iceberg_table, "2020", "COMPLETED", timeout=120)
+    finally:
+        replica1.query("SYSTEM DISABLE FAILPOINT export_part_retryable_throw")
+
+    count = int(replica2.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
+    assert count == 3, f"Expected 3 rows after replica2 completed the export, got {count}"
+
+
 def test_export_partition_scheduler_skipped_when_moves_stopped(cluster):
     """
     Verify that selectPartsToExport() skips the scheduler entirely when moves
