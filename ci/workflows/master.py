@@ -65,7 +65,6 @@ workflow = Workflow.Config(
     additional_jobs=[
         "GrypeScan",
         "Regression",
-        "SignRelease",
         "CIReport",
         "SourceUpload",
     ],

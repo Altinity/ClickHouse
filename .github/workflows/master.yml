@@ -5727,25 +5727,6 @@ jobs:
       timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
 
-  SignRelease:
-    needs: [config_workflow, build_amd_release]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_sign.yml
-    secrets: inherit
-    with:
-      test_name: Sign release
-      runner_type: altinity-style-checker
-      data: ${{ needs.config_workflow.outputs.data }}
-  SignAarch64:
-    needs: [config_workflow, build_arm_release]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_sign.yml
-    secrets: inherit
-    with:
-      test_name: Sign aarch64
-      runner_type: altinity-style-checker-aarch64
-      data: ${{ needs.config_workflow.outputs.data }}
-
   FinishCIReport:
     if: ${{ !cancelled() && needs.config_workflow.outputs.pipeline_status != '' }}
     needs:
@@ -5870,8 +5851,6 @@ jobs:
       - GrypeScanKeeper
       - RegressionTestsRelease
       - RegressionTestsAarch64
-      - SignRelease
-      - SignAarch64
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
       - name: Check out repository code
