@@ -99,6 +99,14 @@ SECRETS = [
         name="AWS_SECRET_ACCESS_KEY",
         type=Secret.Type.GH_SECRET,
     ),
+    Secret.Config(
+        name="GPG_BINARY_SIGNING_KEY",
+        type=Secret.Type.GH_SECRET,
+    ),
+    Secret.Config(
+        name="GPG_BINARY_SIGNING_PASSPHRASE",
+        type=Secret.Type.GH_SECRET,
+    ),
 ]
 
 DOCKERS = [

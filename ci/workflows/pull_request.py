@@ -1,5 +1,6 @@
 from praktika import Workflow
 
+from ci.defs.altinity_jobs import AltinityJobConfigs
 from ci.defs.defs import (
     BASE_BRANCH,
     DOCKERS,
@@ -151,8 +152,9 @@ workflow = Workflow.Config(
             .set_name("Keeper Stress Tests (PR)")
             .set_timeout(3 * 3600),
         *JobConfigs.toolchain_build_jobs,
+        AltinityJobConfigs.source_upload_job,
     ],
-    additional_jobs=["GrypeScan", "Regression", "CIReport", "SourceUpload"],
+    additional_jobs=["GrypeScan", "Regression", "CIReport"],
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
         *ArtifactConfigs.clickhouse_binaries,
