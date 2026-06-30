@@ -76,8 +76,6 @@ ExportPartitionTaskScheduler::ExportPartitionTaskScheduler(StorageReplicatedMerg
 
 std::optional<time_t> ExportPartitionTaskScheduler::run()
 {
-    /// Earliest future back-off deadline among parts skipped this tick purely because they are
-    /// still backing off. Lets the caller wake the select task up sooner than the default tick.
     std::optional<time_t> earliest_backoff_retry;
 
     const auto available_move_executors = storage.background_moves_assignee.getAvailableMoveExecutors();
@@ -223,22 +221,9 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
                 continue;
             }
 
-            /// Honor this replica's local back-off deadline for the part. No ZK read and no
-            /// cross-replica coordination: another replica may still pick the part up now.
+            if (shouldBackOff(entry.getTransactionId(), zk_part_name, now, earliest_backoff_retry))
             {
-                std::lock_guard backoff_lock(local_backoff_mutex);
-                if (const auto task_it = local_backoff.find(entry.getTransactionId()); task_it != local_backoff.end())
-                {
-                    if (const auto part_it = task_it->second.find(zk_part_name);
-                        part_it != task_it->second.end() && now < part_it->second.next_retry_time)
-                    {
-                        const auto next_retry_time = part_it->second.next_retry_time;
-                        LOG_TRACE(storage.log, "ExportPartition scheduler task: Part {} is backing off locally, next retry at {} (now {}), skipping", zk_part_name, next_retry_time, now);
-                        earliest_backoff_retry = earliest_backoff_retry
-                            ? std::min(*earliest_backoff_retry, next_retry_time) : next_retry_time;
-                        continue;
-                    }
-                }
+                continue;
             }
 
             const auto part = storage.getPartIfExists(zk_part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
@@ -299,13 +284,39 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
     return earliest_backoff_retry;
 }
 
+bool ExportPartitionTaskScheduler::shouldBackOff(
+    const std::string & transaction_id,
+    const std::string & part_name,
+    time_t now,
+    std::optional<time_t> & earliest_backoff_retry) const
+{
+    std::lock_guard lock(local_backoff_mutex);
+    const auto task_it = local_backoff.find(transaction_id);
+    if (task_it == local_backoff.end())
+        return false;
+
+    const auto part_it = task_it->second.find(part_name);
+    if (part_it == task_it->second.end() || now >= part_it->second.next_retry_time)
+        return false;
+
+    const auto next_retry_time = part_it->second.next_retry_time;
+    LOG_TRACE(storage.log, "ExportPartition scheduler task: Part {} is backing off locally, next retry at {} (now {}), skipping", part_name, next_retry_time, now);
+    earliest_backoff_retry = earliest_backoff_retry
+        ? std::min(*earliest_backoff_retry, next_retry_time) : next_retry_time;
+    return true;
+}
+
 time_t ExportPartitionTaskScheduler::registerLocalBackoff(
     const std::string & transaction_id,
     const std::string & part_name,
     const ExportReplicatedMergeTreePartitionManifest & manifest)
 {
     std::lock_guard lock(local_backoff_mutex);
-    auto & backoff = local_backoff[transaction_id][part_name];
+
+    /// First retryable failure for (transaction_id, part_name): create the map entries.
+    auto & parts = local_backoff.try_emplace(transaction_id).first->second;
+    auto & backoff = parts.try_emplace(part_name).first->second;
+
     ++backoff.attempts;
     const auto backoff_ms = computeRetryBackoffMs(
         backoff.attempts, manifest.retry_initial_backoff_ms, manifest.retry_max_backoff_ms);

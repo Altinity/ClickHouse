@@ -88,6 +88,12 @@ private:
     mutable std::mutex local_backoff_mutex;
     LocalBackoffMap local_backoff;
 
+    bool shouldBackOff(
+        const std::string & transaction_id,
+        const std::string & part_name,
+        time_t now,
+        std::optional<time_t> & earliest_backoff_retry) const;
+
     /// Record a retryable failure for (transaction_id, part_name): grow the attempt counter and
     /// compute the next eligible time. Returns the new absolute deadline.
     time_t registerLocalBackoff(
