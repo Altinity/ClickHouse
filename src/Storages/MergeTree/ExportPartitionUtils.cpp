@@ -52,6 +52,7 @@ namespace ErrorCodes
     extern const int INCOMPATIBLE_COLUMNS;
     extern const int NO_SUCH_COLUMN_IN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
+    extern const int METADATA_MISMATCH;
 }
 
 namespace Setting
@@ -79,18 +80,19 @@ namespace ExportPartitionUtils
         /// ErrorCodes values are runtime `extern const int`, not constant expressions, so they
         /// cannot be used as `switch` labels; compare against a static set instead.
         static const std::unordered_set<int> non_retryable_codes = {
-            ErrorCodes::BAD_ARGUMENTS,               /// lossy-cast / schema-incompat guard (verifyExportSchemaCastable)
+            ErrorCodes::BAD_ARGUMENTS,               /// Iceberg partition-transform / type / metadata-parsing rejections (Iceberg/Utils.cpp)
             ErrorCodes::TYPE_MISMATCH,
             ErrorCodes::CANNOT_CONVERT_TYPE,
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
             ErrorCodes::ILLEGAL_COLUMN,
             ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
-            ErrorCodes::INCOMPATIBLE_COLUMNS,
+            ErrorCodes::INCOMPATIBLE_COLUMNS,        /// positional-cast schema guard (verifyExportSchemaCastable)
             ErrorCodes::NO_SUCH_COLUMN_IN_TABLE,
             ErrorCodes::NOT_IMPLEMENTED,
             ErrorCodes::SUPPORT_IS_DISABLED,
             ErrorCodes::LOGICAL_ERROR,
-            ErrorCodes::FILE_ALREADY_EXISTS,
+            ErrorCodes::FILE_ALREADY_EXISTS,         /// file_already_exists_policy='error': retrying always hits the same file
+            ErrorCodes::METADATA_MISMATCH,           /// schema / partition spec changed mid-export: files were built against the old spec, must restart
         };
         return non_retryable_codes.contains(code);
     }
@@ -581,7 +583,7 @@ namespace ExportPartitionUtils
             const auto & source_column = source_columns[i];
             const auto & destination_column = destination_columns[i];
             if (!canBeSafelyCast(source_column.type, destination_column.type))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
                     "Cannot export to {}: column '{}' requires a lossy cast from {} to {}, "
                     "which may change values. Set `export_merge_tree_part_allow_lossy_cast = 1` "
                     "to allow lossy casts during export.",
