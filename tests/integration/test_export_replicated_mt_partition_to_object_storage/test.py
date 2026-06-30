@@ -1626,8 +1626,8 @@ def test_export_partition_partition_column_castable_type_mismatch(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' "
         f"TO TABLE {s3_table}"
     )
-    assert "BAD_ARGUMENTS" in error, (
-        f"Expected BAD_ARGUMENTS for a lossy partition-column cast, "
+    assert "INCOMPATIBLE_COLUMNS" in error, (
+        f"Expected INCOMPATIBLE_COLUMNS for a lossy partition-column cast, "
         f"got: {error!r}"
     )
     assert "requires a lossy cast" in error and "'year'" in error, (

@@ -23,11 +23,6 @@ struct ExportReplicatedMergeTreePartitionManifest;
 
 namespace ExportPartitionUtils
 {
-    /// Classifies an export failure as non-retryable (deterministic, retrying cannot help)
-    /// vs retryable (transient: memory pressure, network/object-storage/Keeper hiccups).
-    /// Non-retryable errors fail the whole export task immediately; everything else is
-    /// retried (paced by a per-replica back-off) until the task succeeds or times out.
-    /// This is a conservative denylist: an unrecognized error code is treated as retryable.
     bool isNonRetryableExportError(int code);
 
     std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);

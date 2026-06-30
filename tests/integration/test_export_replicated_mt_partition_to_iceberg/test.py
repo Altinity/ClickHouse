@@ -1380,7 +1380,7 @@ def test_export_partition_with_castable_narrowing_values_fit(cluster):
 
 def test_export_partition_lossy_cast_rejected_without_optin(cluster):
     """A lossy narrowing (id Int64 -> Int32) is rejected synchronously with
-    BAD_ARGUMENTS unless export_merge_tree_part_allow_lossy_cast is set."""
+    INCOMPATIBLE_COLUMNS unless export_merge_tree_part_allow_lossy_cast is set."""
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
@@ -1396,7 +1396,7 @@ def test_export_partition_lossy_cast_rejected_without_optin(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} "
         f"SETTINGS allow_insert_into_iceberg = 1"
     )
-    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error!r}"
+    assert "INCOMPATIBLE_COLUMNS" in error, f"Expected INCOMPATIBLE_COLUMNS, got: {error!r}"
     assert "lossy cast" in error, f"Expected 'lossy cast' in error, got: {error!r}"
 
     count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())

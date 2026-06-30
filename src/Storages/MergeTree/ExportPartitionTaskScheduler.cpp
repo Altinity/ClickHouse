@@ -540,8 +540,6 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
 
     Coordination::Requests ops;
 
-    /// Always release our lock so the part can be retried (by us after the back-off, or by
-    /// another replica). Version-checked so a stale callback cannot remove a newer lock.
     ops.emplace_back(zkutil::makeRemoveRequest(export_path / "locks" / part_name, locked_by_stat.version));
 
     if (non_retryable)
