@@ -14,6 +14,7 @@ from helpers.export_partition_helpers import (
     make_iceberg_s3,
     make_rmt,
     unique_suffix,
+    wait_for_exception_count,
     wait_for_export_status,
     wait_for_export_to_start,
 )
@@ -229,43 +230,30 @@ def test_export_partition_all_to_iceberg(cluster):
 
 def test_failure_is_logged_in_system_table(cluster):
     """
-    When S3 is unreachable the export must be marked FAILED in
-    system.replicated_partition_exports with a non-zero exception_count.
+    When a part export fails with a non-retryable error the export must be marked
+    FAILED in system.replicated_partition_exports with a non-zero exception_count.
+
+    Uses the export_part_non_retryable_throw failpoint (throws BAD_ARGUMENTS, a
+    denylisted code) so the task fails fast without consuming any timeout budget.
     """
     node = cluster.instances["replica1"]
-    minio_ip = cluster.minio_ip
-    minio_port = cluster.minio_port
 
     uid = unique_suffix()
     mt_table = f"mt_{uid}"
     iceberg_table = f"iceberg_{uid}"
 
-    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"],
-                 s3_retry_attempts=1)
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
 
-    node.query(f"SYSTEM STOP MOVES {mt_table}")
-
-    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} SETTINGS export_merge_tree_partition_max_retries = 1, allow_insert_into_iceberg = 1")
-
-    with PartitionManager() as pm:
-        pm.add_rule({
-            "instance": node,
-            "destination": node.ip_address,
-            "protocol": "tcp",
-            "source_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        })
-        pm.add_rule({
-            "instance": node,
-            "destination": minio_ip,
-            "protocol": "tcp",
-            "destination_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        })
-
-        node.query(f"SYSTEM START MOVES {mt_table}")
+    node.query("SYSTEM ENABLE FAILPOINT export_part_non_retryable_throw")
+    try:
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+            settings={"allow_insert_into_iceberg": 1},
+        )
 
         wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=60)
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT export_part_non_retryable_throw")
 
     status = node.query(
         f"""
@@ -287,6 +275,9 @@ def test_failure_is_logged_in_system_table(cluster):
     ).strip())
     assert exception_count > 0, "Expected non-zero exception_count in system.replicated_partition_exports"
 
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected 0 rows in Iceberg table after a failed export, got {count}"
+
 
 def test_inject_short_living_failures(cluster):
     """
@@ -306,7 +297,7 @@ def test_inject_short_living_failures(cluster):
 
     node.query(f"SYSTEM STOP MOVES {mt_table}")
 
-    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} SETTINGS export_merge_tree_partition_max_retries = 100, allow_insert_into_iceberg = 1")
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} SETTINGS allow_insert_into_iceberg = 1")
 
     with PartitionManager() as pm:
         pm.add_rule({
@@ -353,6 +344,152 @@ def test_inject_short_living_failures(cluster):
         """
     ).strip())
     assert exception_count >= 1, "Expected at least one transient exception to be recorded"
+
+
+def test_export_partition_non_retryable_error_fails_task_fast(cluster):
+    """
+    A non-retryable part-export error (denylisted code, here BAD_ARGUMENTS injected
+    via the export_part_non_retryable_throw failpoint) must fail the whole export
+    task immediately, without waiting for the absolute task timeout.
+
+    The task timeout is left at its large default, so reaching FAILED quickly proves
+    the transition is driven by error classification rather than by a timeout or a
+    retry budget.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
+
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
+
+    node.query("SYSTEM ENABLE FAILPOINT export_part_non_retryable_throw")
+    try:
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+            settings={"allow_insert_into_iceberg": 1},
+        )
+
+        # No short timeout is set; FAILED within this window can only come from the
+        # non-retryable classification, not from the (default, ~1 day) task timeout.
+        wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=60)
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT export_part_non_retryable_throw")
+
+    exception_count = int(node.query(
+        f"SELECT any(exception_count) FROM system.replicated_partition_exports"
+        f" WHERE source_table = '{mt_table}'"
+        f"   AND destination_table = '{iceberg_table}'"
+        f"   AND partition_id = '2020'"
+    ).strip())
+    assert exception_count > 0, "Expected a non-zero exception_count for the failed export"
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected 0 rows in Iceberg table after a failed export, got {count}"
+
+
+def test_export_partition_retryable_error_killed_on_timeout(cluster):
+    """
+    A retryable part-export error (here FAULT_INJECTED via export_part_retryable_throw)
+    must NOT fail the task on a retry budget: there is no retry budget anymore, so the
+    part keeps retrying until the absolute task timeout fires and the task is KILLED.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
+
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
+
+    node.query("SYSTEM ENABLE FAILPOINT export_part_retryable_throw")
+    try:
+        # Under the old budget model a small retry budget would fail the task after the
+        # first retry. With the new model there is no budget and only the 5s timeout fails it.
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
+            f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5,"
+            f"          allow_insert_into_iceberg = 1"
+        )
+
+        # Give the scheduler time to attempt and fail the part several times. The old
+        # budget would already have transitioned the task to FAILED by now.
+        time.sleep(15)
+        status = node.query(
+            f"SELECT status FROM system.replicated_partition_exports"
+            f" WHERE source_table = '{mt_table}'"
+            f"   AND destination_table = '{iceberg_table}'"
+            f"   AND partition_id = '2020'"
+        ).strip()
+        assert status != "FAILED", (
+            f"Retryable failures must not fail the task on a budget, got status {status!r}"
+        )
+
+        # The timeout (5s) is past; KILLED fires on the next manifest-updater poll cycle.
+        wait_for_export_status(
+            node, mt_table, iceberg_table, "2020", "KILLED", timeout=90
+        )
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT export_part_retryable_throw")
+
+    exception_count = int(node.query(
+        f"SELECT any(exception_count) FROM system.replicated_partition_exports"
+        f" WHERE source_table = '{mt_table}'"
+        f"   AND destination_table = '{iceberg_table}'"
+        f"   AND partition_id = '2020'"
+    ).strip())
+    assert exception_count > 0, "Expected at least one retryable exception to be recorded"
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected 0 rows in Iceberg table after a killed export, got {count}"
+
+
+def test_export_partition_retryable_error_recovers_after_failpoint_cleared(cluster):
+    """
+    A retryable part-export error must keep the task PENDING (not FAILED) while the
+    failure persists, applying a per-replica back-off between attempts. Once the
+    failure clears the export completes successfully — proving the back-off only
+    spaces retries out and never permanently blocks progress.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
+
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
+
+    node.query("SYSTEM ENABLE FAILPOINT export_part_retryable_throw")
+    try:
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
+            f" SETTINGS export_merge_tree_partition_retry_initial_backoff_ms = 1000,"
+            f"          export_merge_tree_partition_retry_max_backoff_ms = 2000,"
+            f"          allow_insert_into_iceberg = 1"
+        )
+
+        # Wait until at least one retryable failure has been recorded; the task must
+        # still be PENDING (retrying), never FAILED.
+        wait_for_exception_count(node, mt_table, iceberg_table, "2020",
+                                 min_exception_count=1, timeout=60)
+        status = node.query(
+            f"SELECT status FROM system.replicated_partition_exports"
+            f" WHERE source_table = '{mt_table}'"
+            f"   AND destination_table = '{iceberg_table}'"
+            f"   AND partition_id = '2020'"
+        ).strip()
+        assert status == "PENDING", (
+            f"Retryable failures must keep the task PENDING, got status {status!r}"
+        )
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT export_part_retryable_throw")
+
+    # With the failpoint cleared the next retry succeeds and the export completes.
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED", timeout=90)
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
+    assert count == 3, f"Expected 3 rows after recovery, got {count}"
 
 
 def test_export_partition_scheduler_skipped_when_moves_stopped(cluster):
@@ -427,7 +564,7 @@ def test_export_partition_resumes_after_stop_moves(cluster):
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-        f" SETTINGS export_merge_tree_partition_max_retries = 50, allow_insert_into_iceberg = 1"
+        f" SETTINGS allow_insert_into_iceberg = 1"
     )
 
     wait_for_export_to_start(node, mt_table, iceberg_table, "2020")
@@ -472,7 +609,7 @@ def test_export_partition_resumes_after_stop_moves_during_export(cluster):
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-        f" SETTINGS export_merge_tree_partition_max_retries = 50, allow_insert_into_iceberg = 1")
+        f" SETTINGS allow_insert_into_iceberg = 1")
 
     wait_for_export_to_start(node, mt_table, iceberg_table, "2020")
 
@@ -748,10 +885,17 @@ def test_partition_key_compatibility_check(cluster):
 
 def test_export_data_files_are_not_cleaned_up_on_commit_failure(cluster):
     """
-    Verify that the data files are not cleaned up on commit failure and the export is retried.
-    This is to avoid data loss.
+    Verify that a commit failure does not delete the already-written data files.
+    `cleanup` only removes the manifest entry / manifest list, never the data files
+    (a peer replica might still commit the same transaction). This guards against
+    data loss / dangling references.
 
-    If the data files were cleaned up, a retry would commit a new snapshot that points to dangling references.
+    The iceberg_writes_non_retry_cleanup failpoint throws BAD_ARGUMENTS while writing
+    the manifest entry, after the data files have been written. BAD_ARGUMENTS is a
+    non-retryable error code, so the task transitions to FAILED; we then confirm the
+    exported data files are still physically present in object storage by reading
+    them directly (the Iceberg manifests were removed by cleanup, so we glob the raw
+    parquet data files instead).
     """
     node = cluster.instances["replica1"]
     uid = unique_suffix()
@@ -760,15 +904,28 @@ def test_export_data_files_are_not_cleaned_up_on_commit_failure(cluster):
     setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
 
     node.query("SYSTEM ENABLE FAILPOINT iceberg_writes_non_retry_cleanup")
+    try:
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+            settings={"allow_insert_into_iceberg": 1},
+        )
+        # BAD_ARGUMENTS from the commit phase is non-retryable -> the task fails fast.
+        wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=60)
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT iceberg_writes_non_retry_cleanup")
 
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
+    # The data files were written before the commit failure; cleanup must have left
+    # them intact. Read them straight from object storage (bypassing the Iceberg
+    # metadata, which cleanup removed) and confirm all 3 exported rows survive.
+    rows = int(node.query(
+        f"SELECT count() FROM s3("
+        f"'http://minio1:9001/root/data/{iceberg_table}/**.parquet', "
+        f"'minio', 'ClickHouse_Minio_P@ssw0rd', 'Parquet')"
+    ).strip())
+    assert rows == 3, (
+        f"Expected the 3 exported rows to still exist as data files after a failed "
+        f"commit (data files must not be cleaned up), got {rows}"
     )
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
-
-    count = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
-    assert count == 3, f"Expected 3 rows after first export, got {count}"
 
 
 def test_post_publish_exception_preserves_snapshot(cluster):
@@ -827,10 +984,9 @@ def test_export_task_timeout_kills_stuck_pending_task(cluster):
     descriptive last_exception.
 
     The export_partition_commit_always_throw failpoint wedges the task in the
-    commit retry loop (REGULAR failpoint, fires on every commit attempt). A very
-    large max_retries budget prevents the commit-attempts path from transitioning
-    to FAILED before the timeout fires, so the timeout branch in tryCleanup is
-    the actual mechanism under test.
+    commit retry loop (REGULAR failpoint, fires on every commit attempt) with a
+    retryable error, so the task never fails on its own and the timeout branch in
+    tryCleanup is the actual mechanism under test.
     """
     node = cluster.instances["replica1"]
     uid = unique_suffix()
@@ -844,7 +1000,6 @@ def test_export_task_timeout_kills_stuck_pending_task(cluster):
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
             f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5,"
-            f"          export_merge_tree_partition_max_retries = 1000000,"
             f"          allow_insert_into_iceberg = 1"
         )
 
@@ -1158,8 +1313,9 @@ def test_export_partition_lossy_cast_rejected_without_optin(cluster):
 def test_export_partition_runtime_cast_failure_propagates_async(cluster):
     """A String value that cannot be parsed as the destination Int32 passes the
     synchronous lossy-cast gate (with export_merge_tree_part_allow_lossy_cast = 1) but
-    fails at runtime in the async worker, marking the export FAILED and leaving Iceberg
-    empty.
+    fails at runtime in the async worker. The parse error is retryable, so the task is
+    not failed on a budget; it retries until the absolute task timeout fires (KILLED),
+    leaving Iceberg empty.
 
     (Integer overflow is not used because the internal cast uses CastType::nonAccurate,
     which wraps rather than throwing.)
@@ -1177,11 +1333,13 @@ def test_export_partition_runtime_cast_failure_propagates_async(cluster):
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} "
-        f"SETTINGS export_merge_tree_partition_max_retries = 1, allow_insert_into_iceberg = 1, "
-        f"export_merge_tree_part_allow_lossy_cast = 1"
+        f"SETTINGS export_merge_tree_partition_task_timeout_seconds = 5, "
+        f"allow_insert_into_iceberg = 1, export_merge_tree_part_allow_lossy_cast = 1"
     )
 
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=60)
+    # The runtime parse error is retryable, so the task keeps retrying until the 5s
+    # timeout fires; KILLED is published on the next manifest-updater poll cycle.
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "KILLED", timeout=90)
 
     exception_count = int(node.query(
         f"SELECT any(exception_count) FROM system.replicated_partition_exports "
@@ -1195,7 +1353,7 @@ def test_export_partition_runtime_cast_failure_propagates_async(cluster):
 
     count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
     assert count == 0, (
-        f"Expected 0 rows in Iceberg table after failed export, got {count}"
+        f"Expected 0 rows in Iceberg table after killed export, got {count}"
     )
 
 

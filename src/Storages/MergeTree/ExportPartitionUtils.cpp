@@ -51,6 +51,7 @@ namespace ErrorCodes
     extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
     extern const int INCOMPATIBLE_COLUMNS;
     extern const int NO_SUCH_COLUMN_IN_TABLE;
+    extern const int FILE_ALREADY_EXISTS;
 }
 
 namespace Setting
@@ -89,6 +90,7 @@ namespace ExportPartitionUtils
             ErrorCodes::NOT_IMPLEMENTED,
             ErrorCodes::SUPPORT_IS_DISABLED,
             ErrorCodes::LOGICAL_ERROR,
+            ErrorCodes::FILE_ALREADY_EXISTS,
         };
         return non_retryable_codes.contains(code);
     }

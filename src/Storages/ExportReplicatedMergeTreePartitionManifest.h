@@ -160,7 +160,6 @@ struct ExportReplicatedMergeTreePartitionManifest
     size_t number_of_parts;
     std::vector<String> parts;
     time_t create_time;
-    size_t max_retries;
     size_t retry_initial_backoff_ms;
     size_t retry_max_backoff_ms;
     size_t task_timeout_seconds;
@@ -203,7 +202,6 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("file_already_exists_policy", String(magic_enum::enum_name(file_already_exists_policy)));
         json.set("filename_pattern", filename_pattern);
         json.set("create_time", create_time);
-        json.set("max_retries", max_retries);
         json.set("retry_initial_backoff_ms", retry_initial_backoff_ms);
         json.set("retry_max_backoff_ms", retry_max_backoff_ms);
         json.set("task_timeout_seconds", task_timeout_seconds);
@@ -229,7 +227,6 @@ struct ExportReplicatedMergeTreePartitionManifest
         manifest.destination_table = json->getValue<String>("destination_table");
         manifest.source_replica = json->getValue<String>("source_replica");
         manifest.number_of_parts = json->getValue<size_t>("number_of_parts");
-        manifest.max_retries = json->getValue<size_t>("max_retries");
 
         manifest.retry_initial_backoff_ms = json->getValue<size_t>("retry_initial_backoff_ms");
         manifest.retry_max_backoff_ms = json->getValue<size_t>("retry_max_backoff_ms");

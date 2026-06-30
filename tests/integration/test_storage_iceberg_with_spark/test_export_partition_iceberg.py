@@ -713,26 +713,24 @@ def test_idempotency_after_commit_crash(export_cluster):
     assert count == 3, f"Expected 3 rows (no duplicates), got {count}"
 
 
-def test_commit_attempts_budget_transitions_to_failed(export_cluster):
+def test_commit_failure_retries_until_timeout(export_cluster):
     """
-    Verify that the commit-attempts budget transitions a stuck task to FAILED
-    instead of leaving it in PENDING forever.
+    Verify that a retryable commit failure does not fail the task on a budget but
+    keeps retrying until the absolute task timeout fires, transitioning the task to
+    KILLED (there is no longer a commit-attempts budget).
 
     Reproduction:
     - Parts export successfully.
     - A REGULAR failpoint (``export_partition_commit_always_throw``) makes every
-      ``ExportPartitionUtils::commit`` attempt throw before talking to Iceberg.
-    - ``ExportPartitionUtils::handleCommitFailure`` bumps ``<entry>/commit_attempts``
-      on each failure and transitions ``/status`` to FAILED once the counter
-      reaches ``export_merge_tree_partition_max_retries``.
+      ``ExportPartitionUtils::commit`` attempt throw ``FAULT_INJECTED`` (a retryable,
+      non-denylisted code) before talking to Iceberg.
+    - ``ExportPartitionUtils::handleCommitFailure`` records the exception and leaves
+      the task PENDING; the task is killed only once
+      ``export_merge_tree_partition_task_timeout_seconds`` elapses.
 
     Expected behaviour:
-    - The first attempt is made synchronously when the last part completes
-      (scheduler's ``handlePartExportSuccess``).
-    - Subsequent attempts come from the manifest-updating task's ``tryCleanup``
-      path, polling every 30s.
-    - With max_retries=2, the task reaches FAILED within roughly one poll cycle.
-    - The ``commit_attempts`` znode reaches at least max_retries.
+    - There is no retry budget, so the task never reaches FAILED on a counter.
+    - The task reaches KILLED after the timeout, on a manifest-updating poll cycle.
     """
     node = export_cluster.instances["node1"]
     spark = export_cluster.spark_session
@@ -759,35 +757,34 @@ def test_commit_attempts_budget_transitions_to_failed(export_cluster):
 
     # try block exists so we can add a finally that disables the failpoint
     try:
-        # max_retries=2 bounds the test: one attempt from handlePartExportSuccess
-        # plus one from the manifest-updating task's next poll (~30s) is enough
-        # to exhaust the budget and flip the task to FAILED.
+        # Under the old budget model a small retry budget would fail the task after a
+        # couple of commit attempts. With the new model there is no budget and only the
+        # 5s timeout transitions the task (to KILLED).
         node.query(
             f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}"
-            f" SETTINGS export_merge_tree_partition_max_retries = 2,"
+            f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5,"
             f" allow_insert_into_iceberg = 1"
+        )
+
+        # Give the commit path time to fail repeatedly; the old budget would already
+        # have flipped the task to FAILED by now.
+        time.sleep(15)
+        status = node.query(
+            f"SELECT status FROM system.replicated_partition_exports"
+            f" WHERE source_table = '{source}'"
+            f"   AND destination_table = '{iceberg}'"
+            f"   AND partition_id = '{pid}'"
+        ).strip()
+        assert status != "FAILED", (
+            f"Retryable commit failures must not fail the task on a budget, got {status!r}"
         )
 
         # Timeout must cover: at least one manifest-updating poll cycle (30s)
         # plus slack for task scheduling and keeper RTT.
         wait_for_export_status(
             node, source, iceberg, pid,
-            expected_status="FAILED",
+            expected_status="KILLED",
             timeout=90,
-        )
-
-        # The commit_attempts znode must have reached (at least) max_retries — the
-        # counter is the direct mechanism that drove the FAILED transition.
-        # Locate the export's ZK root via the RMT's zookeeper_path and the
-        # partition_id_destination_db.destination_table export key convention.
-        export_key = f"{pid}_default.{iceberg}"
-        commit_attempts = int(node.query(
-            f"SELECT value FROM system.zookeeper"
-            f" WHERE path = '/clickhouse/tables/{source}/exports/{export_key}'"
-            f"   AND name = 'commit_attempts'"
-        ).strip())
-        assert commit_attempts >= 2, (
-            f"Expected commit_attempts >= 2 (two commit attempts), got {commit_attempts}"
         )
     finally:
         node.query("SYSTEM DISABLE FAILPOINT export_partition_commit_always_throw")
