@@ -74,8 +74,6 @@ SET(VERSION_STRING {string})
             version = version.with_description(version.flavour)
             version_dict = version.as_dict()
 
-            # preserve githash, not sure if that is going to be usefull, but mimics original implementation
-            version_dict["githash"] = version["githash"]
             return version_dict
 
         # NOTE (strtgbb): Just return, no need for the below logic
