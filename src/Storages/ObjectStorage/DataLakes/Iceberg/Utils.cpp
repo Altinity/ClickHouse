@@ -39,12 +39,13 @@
 #include <Disks/IStoragePolicy.h>
 #include <Functions/FunctionFactory.h>
 #include <Interpreters/sortBlock.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
 #if USE_AVRO
 
 #include <Processors/Formats/Impl/AvroRowInputFormat.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <IO/ReadHelpers.h>
 #include <filesystem>
 #include <regex>
@@ -106,7 +107,6 @@ static constexpr auto MAX_TRANSACTION_RETRIES = 100;
 
 namespace DB::Iceberg
 {
-
 using namespace DB;
 static CompressionMethod getCompressionMethodFromMetadataFile(const String & path)
 {
@@ -1324,6 +1324,11 @@ std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV1Method(const Poco::J
 
 KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context)
 {
+    // sort-orders / default-sort-order-id are optional in Iceberg V1 metadata
+    // (required only from V2); an unsorted table uses the no-op order-id 0.
+    // Treat their absence as "no sort order" rather than dereferencing a missing field.
+    if (!metadata_object->has(f_default_sort_order_id) || !metadata_object->has(f_sort_orders))
+        return KeyDescription{};
     auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
     Poco::JSON::Array::Ptr sort_orders = metadata_object->getArray(f_sort_orders);
     std::unordered_map<Int64, String> source_id_to_column_name;
@@ -1553,3 +1558,29 @@ void sortBlockByKeyDescription(Block & block, const KeyDescription & sort_descri
 }
 
 #endif
+
+namespace DB
+{
+
+ObjectStoragePtr getResolvedStorageFromObjectInfo([[maybe_unused]] const ObjectInfoPtr & object_info, const ObjectStoragePtr & default_storage)
+{
+#if USE_AVRO
+    if (auto iceberg_info = std::dynamic_pointer_cast<IcebergDataObjectInfo>(object_info))
+    {
+        if (auto resolved = iceberg_info->getResolvedStorage())
+            return resolved;
+    }
+#endif
+    return default_storage;
+}
+
+std::optional<String> getMetadataPathFromObjectInfo([[maybe_unused]] const ObjectInfoPtr & object_info)
+{
+#if USE_AVRO
+    if (auto iceberg_info = std::dynamic_pointer_cast<IcebergDataObjectInfo>(object_info))
+        return iceberg_info->getMetadataPath();
+#endif
+    return std::nullopt;
+}
+
+}

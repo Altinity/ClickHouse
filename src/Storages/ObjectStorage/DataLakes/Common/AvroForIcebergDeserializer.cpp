@@ -47,7 +47,7 @@ try
     ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergAvroFileParsingMicroseconds);
 
     auto manifest_file_reader
-        = std::make_unique<avro::DataFileReaderBase>(std::make_unique<AvroInputStreamReadBufferAdapter>(*buffer));
+        = std::make_unique<avro::DataFileReaderBase>(std::make_unique<AvroInputStreamReadBufferAdapter>(*buffer), MAX_AVRO_SCHEMA_DEPTH);
 
     avro::NodePtr root_node = manifest_file_reader->dataSchema().root();
     auto data_type = AvroSchemaReader::avroNodeToDataType(root_node);
@@ -158,8 +158,7 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
         }
     }
 
-
-    const auto file_path_key = IcebergPathFromMetadata::deserialize(
+    const auto file_path_from_metadata = IcebergPathFromMetadata::deserialize(
         getValueFromRowByName(row_index, c_data_file_file_path, TypeIndex::String).safeGet<String>());
     /// NOTE: This is weird, because in manifest file partition looks like this:
     /// {
@@ -248,7 +247,7 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
         case FileContentType::DATA: {
             return std::make_shared<const ParsedManifestFileEntry>(
                 FileContentType::DATA,
-                file_path_key,
+                file_path_from_metadata,
                 row_index,
                 status,
                 sequence_number,
@@ -295,7 +294,7 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
             }
             return std::make_shared<const ParsedManifestFileEntry>(
                 FileContentType::POSITION_DELETE,
-                file_path_key,
+                file_path_from_metadata,
                 row_index,
                 status,
                 sequence_number,
@@ -326,7 +325,7 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                     c_data_file_equality_ids);
             return std::make_shared<const ParsedManifestFileEntry>(
                 FileContentType::EQUALITY_DELETE,
-                file_path_key,
+                file_path_from_metadata,
                 row_index,
                 status,
                 sequence_number,

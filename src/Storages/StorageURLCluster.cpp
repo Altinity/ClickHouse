@@ -167,7 +167,7 @@ RemoteQueryExecutor::Extension StorageURLCluster::getTaskIteratorExtension(
         context->getSettingsRef()[Setting::glob_expansion_max_elements],
         predicate,
         getVirtualsList(),
-        hive_partition_columns_to_read_from_file_path,
+        getHivePartitionColumnsWithoutVirtuals(),
         context
     );
     return RemoteQueryExecutor::Extension{.task_iterator = std::move(callback)};

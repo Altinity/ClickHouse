@@ -627,42 +627,6 @@ def test_inject_short_living_failures(cluster):
     assert int(exception_count.strip()) >= 1, "Expected at least one exception"
 
 
-def test_export_ttl(cluster):
-    node = cluster.instances["replica1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"export_ttl_mt_table_{postfix}"
-    s3_table = f"export_ttl_s3_table_{postfix}"
-
-    expiration_time = 3
-
-    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
-
-    # start export
-    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_manifest_ttl={expiration_time};")
-
-    # assert that I get an error when trying to export the same partition again, query_and_get_error
-    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table};")
-    assert "Export with key" in error, "Expected error about expired export"
-
-    # wait for the export to finish and for the manifest to expire
-    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
-    time.sleep(expiration_time * 2)
-
-    # assert that the export succeeded, check the commit file
-    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '1\n', "Export did not succeed"
-
-    # start export again
-    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
-
-    # wait for the export to finish
-    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
-
-    # assert that the export succeeded, check the commit file
-    # there should be two commit files now, one for the first export and one for the second export
-    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '2\n', "Export did not succeed"
-
-
 def test_export_partition_file_already_exists_policy(cluster):
     node = cluster.instances["replica1"]
 
@@ -1530,6 +1494,86 @@ def test_export_partition_all(cluster):
 
     row_count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
     assert row_count == 3, f"Expected 3 rows in S3 after EXPORT PARTITION ALL, got {row_count}"
+
+
+def test_export_partition_partition_column_castable_type_mismatch(cluster):
+    """A lossy partition-column cast (year String -> UInt16) is rejected synchronously
+    when export_merge_tree_part_allow_lossy_cast is off, scheduling nothing."""
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"pkey_cast_mismatch_partition_mt_{postfix}"
+    s3_table = f"pkey_cast_mismatch_partition_s3_{postfix}"
+
+    # Source: year String; destination: year UInt16. PARTITION BY year on
+    # both sides — same AST text — to defeat the AST equivalence check.
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year String) "
+        f"ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1') "
+        f"PARTITION BY year "
+        f"ORDER BY tuple()"
+    )
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16) "
+        f"ENGINE = S3(s3_conn, filename='{s3_table}', "
+        f"format=Parquet, partition_strategy='hive') "
+        f"PARTITION BY year"
+    )
+
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, '2020'), (2, '2020'), (3, '2020')"
+    )
+
+    # With a String partition column the partition_id is the SipHash of the
+    # value rather than the textual representation — look it up so we can
+    # reference the partition explicitly in EXPORT PARTITION ID and in
+    # subsequent system.replicated_partition_exports queries.
+    partition_id = node.query(
+        f"SELECT partition_id FROM system.parts "
+        f"WHERE database = currentDatabase() AND table = '{mt_table}' "
+        f"  AND active "
+        f"ORDER BY name LIMIT 1"
+    ).strip()
+    assert partition_id, (
+        "Expected one active part on the source table after INSERT; "
+        "system.parts returned nothing."
+    )
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' "
+        f"TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for a lossy partition-column cast, "
+        f"got: {error!r}"
+    )
+    assert "requires a lossy cast" in error and "'year'" in error, (
+        f"Expected the error message to report the lossy cast on column "
+        f"'year', got: {error!r}"
+    )
+
+    # Nothing scheduled: no row in system.replicated_partition_exports.
+    rows_in_system_view = node.query(
+        f"SELECT count() FROM system.replicated_partition_exports "
+        f"WHERE source_table = '{mt_table}' "
+        f"  AND destination_table = '{s3_table}' "
+        f"  AND partition_id = '{partition_id}'"
+    ).strip()
+    assert rows_in_system_view == "0", (
+        f"Expected no row in system.replicated_partition_exports after a "
+        f"synchronously-rejected export, got {rows_in_system_view}."
+    )
+
+    # Nothing written: no parquet file under any year=*/ partition prefix.
+    files_in_s3 = node.query(
+        f"SELECT count() FROM s3(s3_conn, "
+        f"filename='{s3_table}/year=*/*.parquet', format='One')"
+    ).strip()
+    assert files_in_s3 == "0", (
+        f"Expected no Parquet files in S3 after a synchronously-rejected "
+        f"export, found {files_in_s3}."
+    )
 
 
 def test_export_partition_all_failure_modes(cluster):

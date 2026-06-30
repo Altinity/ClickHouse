@@ -49,6 +49,7 @@ workflow = Workflow.Config(
     additional_jobs=["GrypeScan", "SignRelease", "CIReport", "SourceUpload"],
     artifacts=[
         *clickhouse_binaries_with_tags,
+        *ArtifactConfigs.clickhouse_binaries_gh,
         *ArtifactConfigs.clickhouse_debians,
         *ArtifactConfigs.clickhouse_rpms,
         *ArtifactConfigs.clickhouse_tgzs,

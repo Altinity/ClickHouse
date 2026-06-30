@@ -31,6 +31,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 namespace DB
 {
@@ -140,12 +141,14 @@ public:
         const String & transaction_id,
         Int64 original_schema_id,
         Int64 partition_spec_id,
-        const std::vector<Field> & partition_values,
+        const Block & partition_source_block,
         SharedHeader sample_block,
         const std::vector<String> & data_file_paths,
         ContextPtr context) override;
 
     CompressionMethod getCompressionMethod() const { return persistent_components.metadata_compression_method; }
+
+    std::string getTableLocation() const override { return persistent_components.table_location; }
 
     bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override;
     bool supportsDelete() const override { return true; }
@@ -229,6 +232,7 @@ private:
 
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
+    mutable std::shared_ptr<SecondaryStorages> secondary_storages;
     DB::Iceberg::PersistentTableComponents persistent_components;
     const DataLakeStorageSettings & data_lake_settings;
     const String write_format;

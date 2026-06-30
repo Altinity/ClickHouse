@@ -20,6 +20,7 @@
 
 #include <Common/Exception.h>
 #include <Common/CurrentMetrics.h>
+#include <Common/CurrentThread.h>
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
 
@@ -75,6 +76,24 @@ namespace DB::ServerSetting
 {
     extern const ServerSettingsUInt64 s3_max_redirects;
     extern const ServerSettingsUInt64 s3_retry_attempts;
+}
+
+namespace ProfileEvents
+{
+    extern const Event DataLakeGlueCatalogGetDatabases;
+    extern const Event DataLakeGlueCatalogGetDatabasesMicroseconds;
+    extern const Event DataLakeGlueCatalogGetTables;
+    extern const Event DataLakeGlueCatalogGetTablesMicroseconds;
+    extern const Event DataLakeGlueCatalogGetTable;
+    extern const Event DataLakeGlueCatalogGetTableMicroseconds;
+    extern const Event DataLakeGlueCatalogCreateDatabase;
+    extern const Event DataLakeGlueCatalogCreateDatabaseMicroseconds;
+    extern const Event DataLakeGlueCatalogCreateTable;
+    extern const Event DataLakeGlueCatalogCreateTableMicroseconds;
+    extern const Event DataLakeGlueCatalogUpdateTable;
+    extern const Event DataLakeGlueCatalogUpdateTableMicroseconds;
+    extern const Event DataLakeGlueCatalogDropTable;
+    extern const Event DataLakeGlueCatalogDropTableMicroseconds;
 }
 
 namespace CurrentMetrics
@@ -184,7 +203,14 @@ DataLake::ICatalog::Namespaces GlueCatalog::getDatabases(const std::string & pre
     do
     {
         request.SetNextToken(next_token);
-        auto outcome = glue_client->GetDatabases(request);
+
+        Aws::Glue::Model::GetDatabasesOutcome outcome;
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetDatabases);
+            auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetDatabasesMicroseconds);
+            outcome = glue_client->GetDatabases(request);
+        }
+
         if (outcome.IsSuccess())
         {
             const auto & databases_result = outcome.GetResult();
@@ -229,7 +255,12 @@ DB::Names GlueCatalog::getTablesForDatabase(const std::string & db_name, size_t 
     do
     {
         request.SetNextToken(next_token);
-        auto outcome = glue_client->GetTables(request);
+        Aws::Glue::Model::GetTablesOutcome outcome;
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTables);
+            auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTablesMicroseconds);
+            outcome = glue_client->GetTables(request);
+        }
         if (outcome.IsSuccess())
         {
             const auto & tables_result = outcome.GetResult();
@@ -282,6 +313,8 @@ bool GlueCatalog::existsTable(const std::string & database_name, const std::stri
     request.SetDatabaseName(database_name);
     request.SetName(table_name);
 
+    ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTable);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTableMicroseconds);
     auto outcome = glue_client->GetTable(request);
     return outcome.IsSuccess();
 }
@@ -299,7 +332,12 @@ bool GlueCatalog::tryGetTableMetadata(
     request.SetDatabaseName(database_name);
     request.SetName(table_name);
 
-    auto outcome = glue_client->GetTable(request);
+    Aws::Glue::Model::GetTableOutcome outcome;
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTableMicroseconds);
+        outcome = glue_client->GetTable(request);
+    }
     if (outcome.IsSuccess())
     {
         const auto & table_outcome = outcome.GetResult().GetTable();
@@ -435,6 +473,27 @@ void GlueCatalog::setCredentials(TableMetadata & metadata) const
         throw DB::Exception(
             DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Glue catalog support S3 backend for data storage only");
     }
+}
+
+ICatalog::CredentialsRefreshCallback GlueCatalog::getCredentialsConfigurationCallback(const DB::StorageID & storage_id)
+{
+    /// The AWS SDK credentials provider chain (instance profile, STS assume-role,
+    /// web-identity, etc.) refreshes its cached credentials internally before
+    /// expiry. The bug we are fixing is that `setCredentials` captures the result
+    /// of `GetAWSCredentials` once at table-load time and embeds the access key,
+    /// secret, and session token as static literals in the storage args, so the
+    /// S3 client is pinned to a snapshot that goes stale on long reads. This
+    /// callback re-asks the same provider for current credentials each time
+    /// `ReadBufferFromS3` reports an `ExpiredToken`, letting the read recover.
+    return [this, storage_id]() -> std::shared_ptr<IStorageCredentials>
+    {
+        LOG_DEBUG(log, "Refreshing AWS credentials for {} after expired token", storage_id.getNameForLogs());
+        auto credentials = credentials_provider->GetAWSCredentials();
+        return std::make_shared<S3Credentials>(
+            credentials.GetAWSAccessKeyId(),
+            credentials.GetAWSSecretKey(),
+            credentials.GetSessionToken());
+    };
 }
 
 bool GlueCatalog::empty() const
@@ -575,6 +634,8 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name) cons
     db_input.SetName(namespace_name);
     create_request.SetDatabaseInput(db_input);
 
+    ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogCreateDatabase);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogCreateDatabaseMicroseconds);
     glue_client->CreateDatabase(create_request);
 }
 
@@ -612,7 +673,13 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
 
     request.SetTableInput(table_input);
 
-    auto response = glue_client->CreateTable(request);
+    Aws::Glue::Model::CreateTableOutcome response;
+
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogCreateTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogCreateTableMicroseconds);
+        response = glue_client->CreateTable(request);
+    }
 
     if (!response.IsSuccess())
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not create metadata in glue catalog: {}", response.GetError().GetMessage());
@@ -647,7 +714,13 @@ bool GlueCatalog::updateMetadata(const String & namespace_name, const String & t
 
     request.SetTableInput(table_input);
 
-    auto response = glue_client->UpdateTable(request);
+    Aws::Glue::Model::UpdateTableOutcome response;
+
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogUpdateTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogUpdateTableMicroseconds);
+        response = glue_client->UpdateTable(request);
+    }
 
     if (!response.IsSuccess())
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not update metadata in glue catalog {}", response.GetError().GetMessage());
@@ -666,7 +739,13 @@ void GlueCatalog::dropTable(const String & namespace_name, const String & table_
     request.SetDatabaseName(namespace_name);
     request.SetName(table_name);
 
-    auto response = glue_client->DeleteTable(request);
+    Aws::Glue::Model::DeleteTableOutcome response;
+
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogDropTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogDropTableMicroseconds);
+        response = glue_client->DeleteTable(request);
+    }
 
     if (!response.IsSuccess())
         throw DB::Exception(

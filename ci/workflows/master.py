@@ -20,8 +20,16 @@ for artifact in ArtifactConfigs.clickhouse_binaries + ArtifactConfigs.clickhouse
 
 workflow = Workflow.Config(
     name="MasterCI",
-    event=Workflow.Event.PUSH,
-    branches=[BASE_BRANCH, "releases/*", "antalya-*"],
+    event=Workflow.Event.DISPATCH,
+    inputs=[
+        Workflow.Config.InputConfig(
+            name="no_cache",
+            description="Run without cache",
+            is_required=False,
+            input_type="boolean",
+            default_value="false",
+        ),
+    ],
     jobs=[
         # *JobConfigs.tidy_build_arm_jobs,
         *JobConfigs.build_jobs,
@@ -72,6 +80,7 @@ workflow = Workflow.Config(
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
         *clickhouse_binaries_with_tags,
+        *ArtifactConfigs.clickhouse_binaries_gh,
         *ArtifactConfigs.clickhouse_debians,
         *ArtifactConfigs.clickhouse_rpms,
         *ArtifactConfigs.clickhouse_tgzs,
@@ -92,7 +101,7 @@ workflow = Workflow.Config(
     enable_commit_status_on_failure=True,
     enable_slack_feed=False,
     pre_hooks=[
-        "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py", # NOTE (carlosfelipeor): we don't use this in master CI
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
         "python3 ./ci/jobs/scripts/workflow_hooks/parse_ci_tags.py",
         # "python3 ./ci/jobs/scripts/workflow_hooks/merge_sync_pr.py", # NOTE (strtgbb): we don't do this
