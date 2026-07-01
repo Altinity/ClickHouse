@@ -345,15 +345,18 @@ public:
     /// skips backpressure delay without exposing the full mutation API.
     /// Task 2: `birth_incarnation` (default `{}`) is forwarded to the private `mutateShard`
     /// so incarnation-stamp tests can drive the create-if-absent path directly.
-    /// Task 5: `birth_floor` (default 0) is forwarded to the private `mutateShard` so
-    /// self-floor tests can drive the create-if-absent path with an explicit fence_round.
+    /// Task 5: `birth_floor` (default 0) is forwarded to the private `mutateShard` as a
+    /// lazy provider so self-floor tests can drive the create-if-absent path with an
+    /// explicit fence_round. Wraps the eager value in a lambda — the provider is only
+    /// invoked inside the create-if-absent branch (no S3 call on the existing-shard path).
     void mutateShardForTest(const RootNamespace & ns, uint64_t shard,
                             std::function<void(RootShard &)> mutate,
                             RootMutationOrigin origin, RootMutationKind kind,
                             ShardIncarnation birth_incarnation = {},
                             uint64_t birth_floor = 0)
     {
-        mutateShard(ns, shard, std::move(mutate), nullptr, origin, kind, birth_incarnation, birth_floor);
+        std::function<uint64_t()> provider = birth_floor ? std::function<uint64_t()>([birth_floor] { return birth_floor; }) : nullptr;
+        mutateShard(ns, shard, std::move(mutate), nullptr, origin, kind, birth_incarnation, std::move(provider));
     }
 
 private:
@@ -410,16 +413,19 @@ private:
     /// `kind` is diagnostic-only (logged/metrics) and does not affect behaviour.
     /// When the shard does not yet exist (token == nullopt on the first readShard call), the shard is
     /// created fresh: `root.incarnation` is set to `birth_incarnation` AND `root.fence_round` is set
-    /// to `birth_floor` (Task 5 self-floor) BEFORE `mutate` runs. On subsequent mutations (token
-    /// present), both are left untouched (immutable for the shard's life). Callers that never create a
-    /// first object (drop, updateRefPayload, dropNamespace, GC fence) pass the defaults (`{}`, 0) — the
-    /// stamps are no-ops since the shard already exists. Only `precommitAdd` passes a non-zero
-    /// `birth_floor` (the current `gcRound` at the moment of the precommit CAS).
+    /// to the value returned by `birth_floor_provider` (Task 5 self-floor) BEFORE `mutate` runs. On
+    /// subsequent mutations (token present), both are left untouched (immutable for the shard's life).
+    /// Callers that never create a first object (drop, updateRefPayload, dropNamespace, GC fence) pass
+    /// the defaults (`{}`, nullptr) — the stamps are no-ops since the shard already exists.
+    /// Only `precommitAdd` passes a non-null `birth_floor_provider` (a lazy S3 GET of `gc/state`);
+    /// the provider is invoked ONLY on the create-if-absent branch so the common existing-shard path
+    /// incurs ZERO extra S3 round-trips. `fence_round = 0` (fresh pool, no GC) is a valid value and
+    /// is assigned unconditionally (the `if (birth_floor > 0)` guard is a footgun — removed).
     void mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
                      uint64_t * out_committed_version,
                      RootMutationOrigin origin, RootMutationKind kind,
                      ShardIncarnation birth_incarnation = {},
-                     uint64_t birth_floor = 0);
+                     std::function<uint64_t()> birth_floor_provider = nullptr);
 
     BackendPtr pool_backend;
     PoolConfig config;

@@ -596,12 +596,11 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
     /// Task 2: pass the build's own (writer_epoch, build_seq) as the birth incarnation. On the
     /// create-if-absent path (shard doesn't exist yet) mutateShard stamps root.incarnation before
     /// the journal append; on subsequent calls the stamp is skipped (shard already present).
-    /// Task 5: read the current GC round BEFORE the CAS. On the create-if-absent path (NEWBORN shard)
-    /// mutateShard stamps root.fence_round = birth_floor. A shard born during round R is self-floored
-    /// to R so the `promote` gate forces a retire-view refresh to at least R before committing any
-    /// blob — the registry-free THM-NO-RETURN create-ordering guarantee. An existing shard keeps its
-    /// fence (birth_floor is ignored on the non-absent path, same semantics as birth_incarnation).
-    const uint64_t birth_floor = store->currentGcRound();
+    /// Task 5: lazily read the current GC round — only on the NEWBORN create-if-absent branch.
+    /// On the common existing-shard path `mutateShard` never invokes the provider, so ZERO extra
+    /// S3 round-trips are incurred. `currentGcRound` does a `gc/state` GET; hoisting it here (eager)
+    /// would waste one GET per publish on every existing shard, which matters for S3 budget.
+    /// `birth_incarnation` stays eager (reads only Build members, no S3 — do not change).
     store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
     {
         root.journal.push_back(RootOwnerEvent{
@@ -613,7 +612,8 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
                 .build_id = build_id,
                 .manifest_ref = id.ref}});
     }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Precommit,
-    ShardIncarnation{.writer_epoch = epoch, .build_sequence = build_seq}, birth_floor);
+    ShardIncarnation{.writer_epoch = epoch, .build_sequence = build_seq},
+    [this] { return store->currentGcRound(); });
 
     precommit_target_ns = target_ns;
     precommit_final_ref = final_ref_name;

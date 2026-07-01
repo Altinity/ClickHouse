@@ -729,7 +729,7 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
 
 void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
                         uint64_t * out_committed_version, RootMutationOrigin origin, RootMutationKind kind,
-                        ShardIncarnation birth_incarnation, uint64_t birth_floor)
+                        ShardIncarnation birth_incarnation, std::function<uint64_t()> birth_floor_provider)
 {
     /// Local write fence (spec §write-fence, Phase 0 Task 6): the shared mutable ref shards are the
     /// state the fence most protects. A superseded/paused writer (lease lost or local deadline passed)
@@ -771,13 +771,21 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
         /// Task 5: stamp the birth floor (fence_round) on the same create-if-absent path. A NEWBORN
         /// shard born during GC round R is fenced to R so the `promote` gate forces a retire-view
         /// refresh before committing any blob belonging to the new shard — the registry-free THM-NO-RETURN
-        /// create-ordering guarantee. `birth_floor = 0` (the default) leaves `fence_round` at 0 for
-        /// shards created by callers that are not writers (GC fence, drop, dropNamespace).
+        /// create-ordering guarantee. `birth_floor_provider` is LAZY: it is only invoked here (newborn
+        /// path) so the common existing-shard path incurs ZERO extra S3 round-trips. The provider is
+        /// called at most ONCE per `mutateShard` call (cached in `floor` below); a CAS-retry that
+        /// re-reads a now-present shard takes the `token` branch and skips this block entirely.
+        /// Callers that never create a first object (GC fence, drop, dropNamespace) pass nullptr —
+        /// `fence_round` stays at the default 0 (no-op, shard already exists anyway).
+        /// `fence_round = 0` (fresh pool, no GC) is a valid value; assigned unconditionally.
         if (!token)
         {
             root.incarnation = birth_incarnation;
-            if (birth_floor > 0)
-                root.fence_round = birth_floor;
+            if (birth_floor_provider)
+            {
+                const uint64_t floor = birth_floor_provider();
+                root.fence_round = floor;
+            }
         }
         mutate(root);
         ++root.shard_version;
