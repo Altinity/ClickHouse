@@ -94,7 +94,7 @@ Obligations to prove:
 - **INV-NO-ABA (INC-MONO).** Keying the fold cursor by `(ns, shard, incarnation)` with strictly-increasing incarnations never skips a new incarnation's events.
 - **INV-NO-BLOB-LEAK.** Every `-1` removal edge is folded before its carrying shard object is deleted (the token-guarded delete + fold-past-fence ordering). Relies on the already-proven idempotent edge-set fold to make the crash window (delete committed, cursor bookkeeping not yet) safe.
 
-TLA+ is a **gate**: the model and its checked invariants land before the safety-critical implementation phases (§7 phase 4).
+TLA+ is a **phase-0 gate**: the model and its checked invariants land **before any implementation** (§8 phase 0), because they decide whether the registry can be removed at all. The model's first job is to test the **one-vs-two-coordinates** question: does the incarnation alone carry the ordering (one coordinate), or is the pool-global round irreducible (two)? The design claims two; the model confirms or refutes it rather than asserting it.
 
 ## §7 — What gets deleted (simplification ledger) {#deletions}
 
@@ -110,14 +110,14 @@ Added: one immutable `incarnation` field on `RootShard`, one tombstone journal-e
 
 ## §8 — Phasing {#phasing}
 
-Each phase is independently testable (TDD, gtests under `src/Disks/tests/`).
+TLA+ comes **first**, as a gate. Implementation phases are informed by the validated model, and each is independently testable (TDD, gtests under `src/Disks/tests/`).
 
+0. **TLA+ gate (blocks everything).** Model the collapsed two-coordinate design (`CreateShardIncarnation`, `PrecommitThenPromote`, `ReclaimShard`, `Recreate`, shared-blob create/drop race) and check the §6 obligations, THM-NO-RETURN first. **This phase decides whether the design is valid:** if THM-NO-RETURN holds, registry removal proceeds; if it fails, fall back to the ephemeral `pending-newborns` object before a line of implementation is written. It also resolves the one-vs-two-coordinates question (does the incarnation alone suffice, or is the pool-global round irreducible?). No implementation phase starts until this gate is green.
 1. **Incarnation carrier.** Add `incarnation` to `RootShard` + proto + codec; stamp at create; key the fold cursor by `(ns, shard, incarnation)`. Tests: codec round-trip; INC-MONO on drop+recreate; fold picks a fresh cursor on incarnation change.
 2. **Discovery from refs + registry deletion.** Switch `discoverUniverse` and the fence loop to `LIST(cas/refs/)`; delete the registry and migrate `listNamespaces`/FREEZE enumeration. Tests: discovery equals the LIST universe; a namespace with no shard object is absent from discovery; FREEZE enumeration parity.
 3. **Newborn = precommit-shard.** First publish creates a precommit-state shard; create-ordering via the precommit promote-gate; abandoned newborn reclaimed by the existing watermark. Tests: a newborn's precommit `+1` protects a dedup-referenced blob from a concurrent last-ref drop; abandoned newborn drains.
 4. **Tombstone reclaim.** `dropNamespace` writes the tombstone; GC token-guarded `deleteExact` of empty + tombstoned + folded-past-fence shards; revive-races-delete; recreate-after-delete. Tests: dropped namespace's shard objects are deleted; revive aborts the delete; recreate uses a greater incarnation and folds from 0; idle-but-live shard is retained.
-5. **TLA+ gate.** Land the model + checked invariants (§6) — before merging the safety-critical parts of phases 3–4.
-6. **Scenario + soak validation.** S30 residual → 0 (registry + empty shard objects both gone); a create/drop churn scenario shows bounded storage and per-round GC cost ∝ live namespaces; full soak green (`fsck unreachable=0, dangling=0`).
+5. **Scenario + soak validation.** S30 residual → 0 (registry + empty shard objects both gone); a create/drop churn scenario shows bounded storage and per-round GC cost ∝ live namespaces; full soak green (`fsck unreachable=0, dangling=0`).
 
 ## §9 — Testing strategy {#testing}
 
@@ -137,4 +137,4 @@ Each phase is independently testable (TDD, gtests under `src/Disks/tests/`).
 
 - **INC-MONO via `(writer_epoch, build_sequence)`** depends on a recreate always occurring under a strictly greater build coordinate. If a drop+recreate can occur within one build without advancing `build_sequence`, use the dedicated sticky incarnation allocator (the fallback). Resolve in phase 1 by inspecting the build/publish path.
 - **LIST-CONSISTENCY** is now load-bearing. Confirm RustFS and `InMemoryBackend` semantics in phase 2; document any unsupported backend as fail-closed.
-- **THM-NO-RETURN** is the make-or-break: if the precommit-gate cannot be shown to close the shared-blob create race without the registry-fence, fall back to keeping an ephemeral `pending-newborns` object (the prior design's §3). The TLA+ gate (phase 5) decides this before the irreversible registry deletion merges.
+- **THM-NO-RETURN** is the make-or-break: if the precommit-gate cannot be shown to close the shared-blob create race without the registry-fence, fall back to keeping an ephemeral `pending-newborns` object (the prior design's §3). The **phase-0 TLA+ gate** decides this before any implementation begins — the registry deletion is never even started on an unproven ordering argument.
