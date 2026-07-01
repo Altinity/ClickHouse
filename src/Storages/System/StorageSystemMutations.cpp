@@ -41,7 +41,7 @@ ColumnsDescription StorageSystemMutations::getColumnsDescription()
             "0 if the mutation is still in process. "
         },
         { "is_killed", std::make_shared<DataTypeUInt8>(),
-            "Indicates whether a mutation has been killed. Only available in ClickHouse Cloud."
+            "Indicates whether a mutation has been killed."
             "Note: is_killed=1 does not necessarily mean the mutation is completely finalized."
             "It is possible for a mutation to remain in a state where is_killed=1 and is_done=0 for an extended period."
             "This can occur if another long-running mutation is blocking the killed mutation. This is a normal situation."

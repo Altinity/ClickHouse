@@ -1051,16 +1051,16 @@ The policy on how to perform a scheduling of CPU slots specified by `concurrent_
     Disable all insert/alter/delete queries. This setting will be enabled if someone needs read-only nodes to prevent insertion and mutation affect reading performance.
     )", 0) \
     DECLARE(UInt64, parts_kill_delay_period, 30, R"(
-    Period to completely remove parts for SharedMergeTree. Only available in ClickHouse Cloud
+    Period to completely remove parts for SharedMergeTree.
     )", 0) \
     DECLARE(UInt64, parts_kill_delay_period_random_add, 10, R"(
-    Add uniformly distributed value from 0 to x seconds to kill_delay_period to avoid thundering herd effect and subsequent DoS of ZooKeeper in case of very large number of tables. Only available in ClickHouse Cloud
+    Add uniformly distributed value from 0 to x seconds to kill_delay_period to avoid thundering herd effect and subsequent DoS of ZooKeeper in case of very large number of tables.
     )", 0) \
     DECLARE(UInt64, parts_killer_pool_size, 128, R"(
-    Threads for cleanup of shared merge tree outdated threads. Only available in ClickHouse Cloud
+    Threads for cleanup of shared merge tree outdated threads.
     )", 0) \
     DECLARE(UInt64, keeper_multiread_batch_size, 10'000, R"(
-    Maximum size of batch for MultiRead request to [Zoo]Keeper that support batching. If set to 0, batching is disabled. Available only in ClickHouse Cloud.
+    Maximum size of batch for MultiRead request to [Zoo]Keeper that support batching. If set to 0, batching is disabled.
     )", 0) \
     DECLARE(String, license_key, "", "License key for ClickHouse Enterprise Edition", 0) \
     DECLARE(NonZeroUInt64, prefetch_threadpool_pool_size, 100, R"(Size of background pool for prefetches for remote object storages)", 0) \
@@ -1133,7 +1133,7 @@ The policy on how to perform a scheduling of CPU slots specified by `concurrent_
     <process_query_plan_packet>true</process_query_plan_packet>
     ```
     )", 0) \
-    DECLARE(Bool, storage_shared_set_join_use_inner_uuid, true, "If enabled, an inner UUID is generated during the creation of SharedSet and SharedJoin. ClickHouse Cloud only", 0) \
+    DECLARE(Bool, storage_shared_set_join_use_inner_uuid, true, "If enabled, an inner UUID is generated during the creation of SharedSet and SharedJoin.", 0) \
     DECLARE(UInt64, startup_mv_delay_ms, 0, R"(Debug parameter to simulate materizlied view creation delay)", 0) \
     DECLARE(UInt64, os_cpu_busy_time_threshold, 1'000'000, "Threshold of OS CPU busy time in microseconds (OSCPUVirtualTimeMicroseconds metric) to consider CPU doing some useful work, no CPU overload would be considered if busy time was below this value.", 0) \
     DECLARE(Float, min_os_cpu_wait_time_ratio_to_drop_connection, 0, R"(
@@ -1296,7 +1296,7 @@ void ServerSettings::dumpToSystemServerSettingsColumns(ServerSettingColumnsParam
             {"mark_cache_size", {std::to_string(context->getMarkCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"uncompressed_cache_size", {std::to_string(context->getUncompressedCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"index_mark_cache_size", {std::to_string(context->getIndexMarkCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
-            {"index_uncompressed_cache_size", {std::to_string(context->getIndexUncompressedCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
+            {"index_uncompressed_cache_size", {std::to_string(context->getIndexUncompressedCache(/*only_if_enabled=*/ false)->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"mmap_cache_size", {std::to_string(context->getMMappedFileCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"query_condition_cache_size", {std::to_string(context->getQueryConditionCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
 
