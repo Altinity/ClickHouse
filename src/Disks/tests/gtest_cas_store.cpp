@@ -1461,7 +1461,7 @@ TEST(CasStore, RebornShardIncarnationStrictlyGreater)
 
     /// Simulate reclaim (Task 6 does not exist yet): delete the shard object exactly, as
     /// GC reclaim will do when it lands.
-    b->deleteExact(layout.rootShardKey(ns, 0), first_got->token);
+    ASSERT_EQ(b->deleteExact(layout.rootShardKey(ns, 0), first_got->token).kind, DeleteOutcome::Kind::Deleted);
 
     /// Second birth (higher build_sequence within the same writer_epoch): create-if-absent again.
     s->mutateShardForTest(ns, 0, [](RootShard &) {},
