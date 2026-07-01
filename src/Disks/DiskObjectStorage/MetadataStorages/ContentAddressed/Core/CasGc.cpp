@@ -296,7 +296,35 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
 
         const auto [root, manifest_token] = store->readShard(ns, root_shard);
         const auto cursor_it = parent_cursors.find(cursor_key);
-        const uint64_t cursor = cursor_it != parent_cursors.end() ? cursor_it->second.folded_cursor : 0;
+
+        /// ABA-proof cursor: if the sealed incarnation differs from the live shard's incarnation
+        /// (the shard was deleted and recreated at the same path), the prior cursor is stale — it
+        /// was sealed against a different object. Reset to 0 so we re-fold the new shard's full
+        /// journal from scratch.
+        ///
+        /// Within a single fold() call, no deltas for this shard have been accumulated in `deltas`
+        /// at the point we detect the mismatch (the mismatch is detected before the journal loop
+        /// for this shard begins). Stale source-edges already baked into the parent generation's
+        /// in-degree run from prior rounds cannot be removed here — the old shard's data is gone;
+        /// they will be abandoned-orphaned (unreachable source-ids with no live manifest body)
+        /// and are harmless: they prevent a blob from being GC-deleted at most one extra round.
+        /// The cursor reset is the ABA-correctness fix: without it, new events on the recreated
+        /// shard would be skipped by the stale cursor, creating a durable in-degree under-count.
+        const bool incarnation_mismatch = cursor_it != parent_cursors.end()
+            && cursor_it->second.incarnation != root.incarnation;
+        if (incarnation_mismatch)
+            LOG_DEBUG(getLogger("CasGc"),
+                "CAS GC fold: incarnation mismatch for {}/{} "
+                "(sealed={{{},{}}}, live={{{},{}}}); resetting fold cursor to 0",
+                ns.string(), root_shard,
+                cursor_it->second.incarnation.writer_epoch,
+                cursor_it->second.incarnation.build_sequence,
+                root.incarnation.writer_epoch,
+                root.incarnation.build_sequence);
+
+        const uint64_t cursor = (incarnation_mismatch || cursor_it == parent_cursors.end())
+            ? 0
+            : cursor_it->second.folded_cursor;
 
         ShardCoverage cov;
         cov.folded_token = manifest_token.value_or(Token{});
@@ -381,6 +409,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
         }
 
         cov.folded_cursor = resolved_through;
+        cov.incarnation = root.incarnation;   /// stamp live incarnation; next round detects mismatch on ABA
         cov.classification = shard_changed ? 2 : 1;
         result.fold_seal.per_ns_shard[cursor_key] = cov;
         if (shard_changed)
@@ -1404,6 +1433,13 @@ std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
             continue;   /// ambiguous listed key => Read (already defaulted)
 
         /// Skip IFF the listed token equals the sealed post-fence `folded_token` exactly.
+        /// INCARNATION EQUALITY: `RootShard::incarnation` is serialised into the shard body, so
+        /// token equality implies incarnation equality — a recreated shard produces different bytes
+        /// and therefore a different token. The spec's incarnation-equality conjunct is therefore
+        /// subsumed by the token check here. For the rare backend that issues non-content-based
+        /// tokens, `fold()`'s Read path detects the mismatch after `readShard` and resets the
+        /// cursor there (a one-round lag, bounded and safe because the cursor undercount is caught
+        /// before any delete decision — see the ABA-proof cursor comment in `fold()`).
         if (listed_it->second == sealed_it->second.folded_token)
             decisions[ck] = DiscoverDecision::Skip;
     }
