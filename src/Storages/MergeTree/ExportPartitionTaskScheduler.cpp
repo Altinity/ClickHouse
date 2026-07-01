@@ -46,10 +46,10 @@ namespace
     /// Capped exponential back-off, matching the standard ClickHouse convention
     /// (see ZooKeeperRetriesControl): delay = min(initial << (retry_count - 1), max).
     /// `retry_count` is the number of failures so far (>= 1 when a retry is pending).
-    /// The shift is guarded against overflow by saturating to `max_backoff_ms`.
-    size_t computeRetryBackoffMs(size_t retry_count, size_t initial_backoff_ms, size_t max_backoff_ms)
+    /// The shift is guarded against overflow by saturating to `max_backoff_seconds`.
+    size_t computeRetryBackoffSeconds(size_t retry_count, size_t initial_backoff_seconds, size_t max_backoff_seconds)
     {
-        const size_t initial = std::min(initial_backoff_ms, max_backoff_ms);
+        const size_t initial = std::min(initial_backoff_seconds, max_backoff_seconds);
 
         if (retry_count <= 1 || initial == 0)
             return initial;
@@ -59,13 +59,13 @@ namespace
         /// If shifting would overflow size_t, the result is certainly clamped to the cap.
         static constexpr size_t bits = sizeof(size_t) * 8;
         if (shift >= bits)
-            return max_backoff_ms;
+            return max_backoff_seconds;
 
         const size_t headroom = std::numeric_limits<size_t>::max() >> shift;
         if (initial > headroom)
-            return max_backoff_ms;
+            return max_backoff_seconds;
 
-        return std::min(initial << shift, max_backoff_ms);
+        return std::min(initial << shift, max_backoff_seconds);
     }
 }
 
@@ -318,10 +318,12 @@ time_t ExportPartitionTaskScheduler::registerLocalBackoff(
     auto & backoff = parts.try_emplace(part_name).first->second;
 
     ++backoff.attempts;
-    const auto backoff_ms = computeRetryBackoffMs(
-        backoff.attempts, manifest.retry_initial_backoff_ms, manifest.retry_max_backoff_ms);
-    /// Round up to whole seconds so a sub-second initial back-off still defers at least one second.
-    backoff.next_retry_time = time(nullptr) + static_cast<time_t>((backoff_ms + 999) / 1000);
+    const auto backoff_seconds = computeRetryBackoffSeconds(
+        backoff.attempts, manifest.retry_initial_backoff_seconds, manifest.retry_max_backoff_seconds);
+    const auto now = time(nullptr);
+    /// Clamp so a huge configured back-off cannot overflow time_t (now is a normal wall-clock value).
+    const size_t headroom = static_cast<size_t>(std::numeric_limits<time_t>::max() - now);
+    backoff.next_retry_time = now + static_cast<time_t>(std::min(backoff_seconds, headroom));
     return backoff.next_retry_time;
 }
 

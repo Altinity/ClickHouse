@@ -653,8 +653,8 @@ def test_export_partition_retry_backoff(cluster):
     # Large back-off so a single failed attempt parks the part well beyond the
     # ~5s scheduler tick. Kept moderate so the export can still complete promptly
     # once the network is restored.
-    initial_backoff_ms = 30000
-    max_backoff_ms = 30000
+    initial_backoff_seconds = 30
+    max_backoff_seconds = 30
 
     minio_ip = cluster.minio_ip
     minio_port = cluster.minio_port
@@ -679,8 +679,8 @@ def test_export_partition_retry_backoff(cluster):
 
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
-            f"SETTINGS export_merge_tree_partition_retry_initial_backoff_ms = {initial_backoff_ms}, "
-            f"export_merge_tree_partition_retry_max_backoff_ms = {max_backoff_ms}"
+            f"SETTINGS export_merge_tree_partition_retry_initial_backoff_seconds = {initial_backoff_seconds}, "
+            f"export_merge_tree_partition_retry_max_backoff_seconds = {max_backoff_seconds}"
         )
 
         # Wait until the first failure is recorded.

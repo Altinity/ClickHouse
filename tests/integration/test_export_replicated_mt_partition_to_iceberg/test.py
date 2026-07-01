@@ -464,8 +464,8 @@ def test_export_partition_retryable_error_recovers_after_failpoint_cleared(clust
     try:
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-            f" SETTINGS export_merge_tree_partition_retry_initial_backoff_ms = 1000,"
-            f"          export_merge_tree_partition_retry_max_backoff_ms = 2000,"
+            f" SETTINGS export_merge_tree_partition_retry_initial_backoff_seconds = 1,"
+            f"          export_merge_tree_partition_retry_max_backoff_seconds = 2,"
             f"          allow_insert_into_iceberg = 1"
         )
 
@@ -523,8 +523,8 @@ def test_export_partition_local_backoff_does_not_block_other_replica(cluster):
     try:
         replica1.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-            f" SETTINGS export_merge_tree_partition_retry_initial_backoff_ms = 1000,"
-            f"          export_merge_tree_partition_retry_max_backoff_ms = 2000,"
+            f" SETTINGS export_merge_tree_partition_retry_initial_backoff_seconds = 1,"
+            f"          export_merge_tree_partition_retry_max_backoff_seconds = 2,"
             f"          allow_insert_into_iceberg = 1"
         )
 
@@ -1406,9 +1406,13 @@ def test_export_partition_lossy_cast_rejected_without_optin(cluster):
 def test_export_partition_runtime_cast_failure_propagates_async(cluster):
     """A String value that cannot be parsed as the destination Int32 passes the
     synchronous lossy-cast gate (with export_merge_tree_part_allow_lossy_cast = 1) but
-    fails at runtime in the async worker. The parse error is retryable, so the task is
-    not failed on a budget; it retries until the absolute task timeout fires (KILLED),
-    leaving Iceberg empty.
+    fails at runtime in the async worker with CANNOT_PARSE_TEXT. That is a deterministic
+    value-conversion error on the part's immutable data — retrying the same part can
+    never succeed — so it is classified as non-retryable and fails the whole task fast,
+    without waiting for the absolute task timeout, leaving Iceberg empty.
+
+    The task timeout is left at its large default, so reaching FAILED quickly proves the
+    transition is driven by error classification rather than by a timeout.
 
     (Integer overflow is not used because the internal cast uses CastType::nonAccurate,
     which wraps rather than throwing.)
@@ -1426,13 +1430,13 @@ def test_export_partition_runtime_cast_failure_propagates_async(cluster):
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} "
-        f"SETTINGS export_merge_tree_partition_task_timeout_seconds = 5, "
-        f"allow_insert_into_iceberg = 1, export_merge_tree_part_allow_lossy_cast = 1"
+        f"SETTINGS allow_insert_into_iceberg = 1, export_merge_tree_part_allow_lossy_cast = 1"
     )
 
-    # The runtime parse error is retryable, so the task keeps retrying until the 5s
-    # timeout fires; KILLED is published on the next manifest-updater poll cycle.
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "KILLED", timeout=90)
+    # The runtime parse error (CANNOT_PARSE_TEXT) is non-retryable, so the task fails fast.
+    # No short timeout is set; FAILED within this window can only come from the
+    # non-retryable classification, not from the (default, ~1 day) task timeout.
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=60)
 
     exception_count = int(node.query(
         f"SELECT any(exception_count) FROM system.replicated_partition_exports "
@@ -1446,7 +1450,7 @@ def test_export_partition_runtime_cast_failure_propagates_async(cluster):
 
     count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
     assert count == 0, (
-        f"Expected 0 rows in Iceberg table after killed export, got {count}"
+        f"Expected 0 rows in Iceberg table after failed export, got {count}"
     )
 
 

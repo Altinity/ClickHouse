@@ -214,8 +214,8 @@ namespace Setting
     extern const SettingsBool update_sequential_consistency;
     extern const SettingsBool allow_experimental_export_merge_tree_part;
     extern const SettingsBool export_merge_tree_partition_force_export;
-    extern const SettingsUInt64 export_merge_tree_partition_retry_initial_backoff_ms;
-    extern const SettingsUInt64 export_merge_tree_partition_retry_max_backoff_ms;
+    extern const SettingsUInt64 export_merge_tree_partition_retry_initial_backoff_seconds;
+    extern const SettingsUInt64 export_merge_tree_partition_retry_max_backoff_seconds;
     extern const SettingsUInt64 export_merge_tree_partition_task_timeout_seconds;
     extern const SettingsBool output_format_parallel_formatting;
     extern const SettingsBool output_format_parquet_parallel_encoding;
@@ -8510,8 +8510,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.number_of_parts = part_names.size();
     manifest.parts = part_names;
     manifest.create_time = time(nullptr);
-    manifest.retry_initial_backoff_ms = query_context->getSettingsRef()[Setting::export_merge_tree_partition_retry_initial_backoff_ms];
-    manifest.retry_max_backoff_ms = query_context->getSettingsRef()[Setting::export_merge_tree_partition_retry_max_backoff_ms];
+    manifest.retry_initial_backoff_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_retry_initial_backoff_seconds];
+    manifest.retry_max_backoff_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_retry_max_backoff_seconds];
     manifest.task_timeout_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_task_timeout_seconds];
     manifest.max_threads = query_context->getSettingsRef()[Setting::max_threads];
     manifest.parallel_formatting = query_context->getSettingsRef()[Setting::output_format_parallel_formatting];

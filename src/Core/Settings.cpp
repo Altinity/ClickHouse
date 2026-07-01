@@ -7555,16 +7555,14 @@ Overwrite file if it already exists when exporting a merge tree part
     DECLARE(Bool, export_merge_tree_partition_force_export, false, R"(
 Ignore existing partition export and overwrite the zookeeper entry
 )", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_retry_initial_backoff_ms, 5000, R"(
-Initial delay (in milliseconds) before retrying a failed part export in an export partition task.
-The delay grows exponentially with the per-replica retry count (capped doubling): `delay = min(initial << (attempts - 1), max)`, where `max` is `export_merge_tree_partition_retry_max_backoff_ms`.
+    DECLARE(UInt64, export_merge_tree_partition_retry_initial_backoff_seconds, 5, R"(
+Initial delay (in seconds) before retrying a failed part export in an export partition task.
+The delay grows exponentially with the per-replica retry count (capped doubling): `delay = min(initial << (attempts - 1), max)`, where `max` is `export_merge_tree_partition_retry_max_backoff_seconds`.
 The back-off is per-replica in-memory state: it only spaces this replica's retries out in time and never prevents another replica from attempting the same part. Retryable failures are retried until the task succeeds or `export_merge_tree_partition_task_timeout_seconds` elapses.
 To survive a long transient outage (e.g. object storage downtime), raise `export_merge_tree_partition_task_timeout_seconds`.
-
-Note: the effective resolution is bounded by the export select-task tick (~5s), so back-off delays shorter than the tick interval are rounded up to it in practice.
 )", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_retry_max_backoff_ms, 60000, R"(
-Maximum delay (in milliseconds) between retries of a failed part export in an export partition task. Caps the exponential growth controlled by `export_merge_tree_partition_retry_initial_backoff_ms`.
+    DECLARE(UInt64, export_merge_tree_partition_retry_max_backoff_seconds, 60, R"(
+Maximum delay (in seconds) between retries of a failed part export in an export partition task. Caps the exponential growth controlled by `export_merge_tree_partition_retry_initial_backoff_seconds`.
 )", 0) \
     DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 86400, R"(
 Maximum wall-clock duration (in seconds) an export partition task is allowed to remain in the PENDING state before it is auto-killed by the background cleanup loop.
