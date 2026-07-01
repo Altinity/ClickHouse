@@ -53,6 +53,19 @@ namespace ErrorCodes
     extern const int NO_SUCH_COLUMN_IN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
     extern const int METADATA_MISMATCH;
+    extern const int CANNOT_PARSE_TEXT;
+    extern const int CANNOT_PARSE_NUMBER;
+    extern const int CANNOT_PARSE_DATE;
+    extern const int CANNOT_PARSE_DATETIME;
+    extern const int CANNOT_PARSE_BOOL;
+    extern const int CANNOT_PARSE_UUID;
+    extern const int CANNOT_PARSE_IPV4;
+    extern const int CANNOT_PARSE_IPV6;
+    extern const int CANNOT_PARSE_QUOTED_STRING;
+    extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
+    extern const int CANNOT_PARSE_INPUT_ASSERTION_FAILED;
+    extern const int CANNOT_PARSE_DOMAIN_VALUE_FROM_STRING;
+    extern const int VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE;
 }
 
 namespace Setting
@@ -80,19 +93,32 @@ namespace ExportPartitionUtils
         /// ErrorCodes values are runtime `extern const int`, not constant expressions, so they
         /// cannot be used as `switch` labels; compare against a static set instead.
         static const std::unordered_set<int> non_retryable_codes = {
-            ErrorCodes::BAD_ARGUMENTS,               /// Iceberg partition-transform / type / metadata-parsing rejections (Iceberg/Utils.cpp)
+            ErrorCodes::BAD_ARGUMENTS,
             ErrorCodes::TYPE_MISMATCH,
             ErrorCodes::CANNOT_CONVERT_TYPE,
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
             ErrorCodes::ILLEGAL_COLUMN,
             ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
-            ErrorCodes::INCOMPATIBLE_COLUMNS,        /// positional-cast schema guard (verifyExportSchemaCastable)
+            ErrorCodes::INCOMPATIBLE_COLUMNS,
             ErrorCodes::NO_SUCH_COLUMN_IN_TABLE,
             ErrorCodes::NOT_IMPLEMENTED,
             ErrorCodes::SUPPORT_IS_DISABLED,
             ErrorCodes::LOGICAL_ERROR,
-            ErrorCodes::FILE_ALREADY_EXISTS,         /// file_already_exists_policy='error': retrying always hits the same file
-            ErrorCodes::METADATA_MISMATCH,           /// schema / partition spec changed mid-export: files were built against the old spec, must restart
+            ErrorCodes::FILE_ALREADY_EXISTS,
+            ErrorCodes::METADATA_MISMATCH,
+            ErrorCodes::CANNOT_PARSE_TEXT,
+            ErrorCodes::CANNOT_PARSE_NUMBER,
+            ErrorCodes::CANNOT_PARSE_DATE,
+            ErrorCodes::CANNOT_PARSE_DATETIME,
+            ErrorCodes::CANNOT_PARSE_BOOL,
+            ErrorCodes::CANNOT_PARSE_UUID,
+            ErrorCodes::CANNOT_PARSE_IPV4,
+            ErrorCodes::CANNOT_PARSE_IPV6,
+            ErrorCodes::CANNOT_PARSE_QUOTED_STRING,
+            ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE,
+            ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED,
+            ErrorCodes::CANNOT_PARSE_DOMAIN_VALUE_FROM_STRING,
+            ErrorCodes::VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE,
         };
         return non_retryable_codes.contains(code);
     }
