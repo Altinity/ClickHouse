@@ -94,6 +94,8 @@ message RootShardManifest {
   uint64 fence_round    = 3;
   map<string, RootRefProto> refs = 4;
   repeated RootOwnerEventProto journal = 5; // insertion order == transition_version order
+  uint64 incarnation_writer_epoch    = 6;   // ShardIncarnation.writer_epoch; 0 = unstamped
+  uint64 incarnation_build_sequence  = 7;   // ShardIncarnation.build_sequence; 0 = unstamped
 }
 
 // Pool-wide identity and constants (_pool_meta). Magic CAPM, FormatId::PoolMeta.
@@ -234,6 +236,8 @@ message FoldShardCoverageProto {
   uint32 folded_token_type  = 3;  // TokenType enum
   string folded_token_value = 4;
   uint64 folded_cursor      = 5;
+  uint64 incarnation_writer_epoch   = 6;  // ShardIncarnation.writer_epoch; 0 = unstamped
+  uint64 incarnation_build_sequence = 7;  // ShardIncarnation.build_sequence; 0 = unstamped
 }
 
 // FOLD seal (write-once gc/gen/<gen>/fold_seal). Magic CAFS, FormatId::FoldSeal.

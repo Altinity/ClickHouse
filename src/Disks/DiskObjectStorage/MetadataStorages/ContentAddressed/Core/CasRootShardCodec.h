@@ -7,10 +7,25 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace DB::Cas
 {
+
+/// A `{writer_epoch, build_sequence}` pair that identifies the incarnation of a ref-shard.
+/// `{0, 0}` is the unstamped (legacy / never-created) sentinel — a valid value, not an error.
+/// Used in `RootShard::incarnation` and `ShardCoverage::incarnation`.
+struct ShardIncarnation
+{
+    uint64_t writer_epoch = 0;
+    uint64_t build_sequence = 0;
+    bool operator==(const ShardIncarnation &) const = default;
+    bool operator<(const ShardIncarnation & o) const
+    {
+        return std::tie(writer_epoch, build_sequence) < std::tie(o.writer_epoch, o.build_sequence);
+    }
+};
 
 /// Root-shard manifest codec — the only mutable object and the single commit point (protocol spec §3).
 /// CA GC root-local part-manifest redesign (rev. 15): the root journal is ONE ordered stream of
@@ -78,6 +93,7 @@ struct RootShard
 {
     uint64_t shard_version = 0;
     uint64_t fence_round = 0;
+    ShardIncarnation incarnation;              /// {0,0} = unstamped (legacy/never-created); stamped by Task 2+
     std::map<String, RootRef> refs;            /// std::map keeps refs in canonical name order
     std::vector<RootOwnerEvent> journal;       /// ONE ordered stream, folded in transition_version order
     bool operator==(const RootShard &) const = default;

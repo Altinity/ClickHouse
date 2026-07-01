@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
 #include <base/types.h>
 #include <base/extended_types.h>
@@ -30,6 +31,7 @@ struct ShardCoverage
     uint8_t classification = 0;
     Token folded_token;
     uint64_t folded_cursor = 0;
+    ShardIncarnation incarnation;  /// incarnation the cursor was sealed against; {0,0} = unstamped
     bool operator==(const ShardCoverage &) const = default;
 };
 

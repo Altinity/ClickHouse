@@ -109,6 +109,8 @@ String encodeRootShard(const RootShard & root)
 
     msg.set_shard_version(root.shard_version);
     msg.set_fence_round(root.fence_round);
+    msg.set_incarnation_writer_epoch(root.incarnation.writer_epoch);
+    msg.set_incarnation_build_sequence(root.incarnation.build_sequence);
 
     auto & refs = *msg.mutable_refs();
     for (const auto & [name, rr] : root.refs)
@@ -166,6 +168,8 @@ RootShard decodeRootShard(std::string_view data)
     RootShard root;
     root.shard_version = msg.shard_version();
     root.fence_round = msg.fence_round();
+    root.incarnation.writer_epoch = msg.incarnation_writer_epoch();
+    root.incarnation.build_sequence = msg.incarnation_build_sequence();
 
     for (const auto & [name, p] : msg.refs())
     {

@@ -516,6 +516,18 @@ TEST(CasByteOrderGolden, EnvelopeLittleEndian)
 /// appears big-endian in the encoding — bytes ...00 ab ...00 cd — pinning the BE order.
 /// With the converged header model the manifest is pure protobuf (no binary prefix); the CasHeader
 /// is field 1, so the wire starts with field-1 tag (0x0A) then the header sub-message bytes.
+TEST(CasRootShardCodec, IncarnationRoundTrips)
+{
+    RootShard root;
+    root.shard_version = 7;
+    root.fence_round = 3;
+    root.incarnation = ShardIncarnation{.writer_epoch = 5, .build_sequence = 42};
+    const RootShard back = decodeRootShard(encodeRootShard(root));
+    EXPECT_EQ(back.incarnation.writer_epoch, 5u);
+    EXPECT_EQ(back.incarnation.build_sequence, 42u);
+    EXPECT_EQ(back, root);
+}
+
 TEST(CasByteOrderGolden, RootShardBigEndian)
 {
     RootShard rs;
