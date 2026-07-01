@@ -260,7 +260,7 @@ private:
     std::map<String, Token> listRootShardTokens(std::set<String> & ambiguous_keys);
 
     /// Phase-2 token-diff: compute the per-shard `DiscoverDecision` for the upcoming round. The universe
-    /// is ALWAYS the REGISTRY universe (LIST is only an accelerator and can never remove a shard). The
+    /// is the LIST-discovered present-shard set (LIST is the authority; shards absent from LIST are absent). The
     /// default decision is Read (fail closed; the spec, not a hidden fallback). A shard is Skip IFF:
     ///   `supportsListTokens()` is TRUE, AND
     ///   `sealed.per_ns_shard` has prior coverage for the key, AND

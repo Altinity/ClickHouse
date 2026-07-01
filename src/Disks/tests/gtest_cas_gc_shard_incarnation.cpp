@@ -375,6 +375,129 @@ TEST(CasGcShardIncarnation, RecreateAfterReclaimFoldsFromZero)
     }
 }
 
+/// Task 6 (Fix 1 — Guard 4): a shard that is empty (no committed refs) + tombstoned + fully folded
+/// but has a LIVE ACTIVATED (body-present) precommit binding must NOT be reclaimed by GC.
+///
+/// Without Guard 4 (`refs.empty()` alone is insufficient), a drop-namespace that races a live build
+/// passes Guards 1-3: the fold advances past the precommit event because the body IS present (the
+/// fold barrier only clamps for body-ABSENT precommits), the tombstone is covered by the cursor, and
+/// `refs` is empty (the precommit was never promoted). If reclaim fires, the precommit's +1 edge is
+/// already sealed into the generation's in-degree but the matching -1 (from a future abandon /
+/// PrecommitRemove) can never land — the shard is gone → permanent blob leak.
+///
+/// Two scenarios are covered:
+///
+/// Scenario A (safety — Guard 4 blocks premature reclaim):
+///   1. Build starts: precommitAdd (body present / activated). Do NOT promote or abandon.
+///   2. dropNamespace: journal becomes [PrecommitAdd, Tombstone]. Tombstone IS last.
+///   3. GC runs: fold covers both events (body present → no barrier clamp). Guards 1-3 pass.
+///      Guard 4 must block reclaim. Assert shard and manifest body survive all GC rounds.
+///
+/// Scenario B (liveness — reclaim proceeds after precommit is resolved cleanly):
+///   The normal production ordering is: build resolves (abandon/promote) BEFORE dropNamespace
+///   so the tombstone is appended AFTER the PrecommitRemove, making it the LAST event.
+///   After that ordering, all four guards pass and GC reclaims.
+///   1. Build starts: precommitAdd (activated), then abandon (PrecommitRemove appended).
+///   2. dropNamespace: journal becomes [PrecommitAdd, PrecommitRemove, Tombstone].
+///      Tombstone IS last; live_bindings replay yields empty set (Guard 4 passes).
+///   3. GC runs: shard IS reclaimed (all guards pass). Assert shard gone.
+TEST(CasGcShardIncarnation, ActivatedPrecommitBlocksShardReclaim)
+{
+    for (const uint64_t gc_shards : {1u, 4u})
+    {
+        /// ====== Scenario A: dropNamespace races a live activated precommit ======
+        {
+            std::shared_ptr<InMemoryBackend> backend;
+            auto store = makeStoreWithShards(backend, gc_shards);
+            const RootNamespace ns{"srv1/tblPrecommitLeakA"};
+
+            BuildInfo info;
+            info.intended_ref = ns.string() + "/part_0";
+            auto build = store->startBuild(info);
+
+            const ManifestId id = build->stageManifest({});
+            build->precommitAdd(ns, "part_0", id);
+
+            const uint64_t ref_shard = store->shardOf("part_0");
+            const String shard_key = store->layout().rootShardKey(ns, ref_shard);
+            const String manifest_key = store->layout().manifestKey(id);
+
+            ASSERT_TRUE(backend->head(shard_key).exists)
+                << "gc_shards=" << gc_shards << " A: shard must exist after precommitAdd";
+            ASSERT_TRUE(backend->head(manifest_key).exists)
+                << "gc_shards=" << gc_shards << " A: manifest body must be present (activated)";
+
+            /// dropNamespace appends tombstone LAST (no committed refs). Journal: [PrecommitAdd, Tombstone].
+            store->dropNamespace(ns);
+            store->renewWatermarkOnce();
+
+            /// GC rounds: Guards 1-3 pass, Guard 4 must block reclaim (precommit live).
+            {
+                Gc gc(store, hexToU128("0000000000000000000000000000bb01"));
+                for (int i = 0; i < 16; ++i)
+                    gc.runRegularRound();
+            }
+
+            EXPECT_TRUE(backend->head(shard_key).exists)
+                << "gc_shards=" << gc_shards
+                << ": ref-shard must NOT be reclaimed while an activated precommit is live "
+                   "(Guard 4 — blob-leak prevention; Guards 1-3 were all satisfied)";
+
+            EXPECT_TRUE(backend->head(manifest_key).exists)
+                << "gc_shards=" << gc_shards
+                << ": manifest body must NOT be deleted while its precommit is live in the shard";
+
+            build->abandon();   /// best-effort cleanup; abandon does not make the shard reclaim-eligible
+            /// (abandon appends PrecommitRemove AFTER the tombstone, so Guard 2 / tombstone-last fails;
+            /// that is an accepted property of the concurrent-drop scenario — not a regression).
+        }
+
+        /// ====== Scenario B: build resolves (abandon) BEFORE dropNamespace → reclaim proceeds ======
+        {
+            std::shared_ptr<InMemoryBackend> backend;
+            auto store = makeStoreWithShards(backend, gc_shards);
+            const RootNamespace ns{"srv1/tblPrecommitLeakB"};
+
+            BuildInfo info;
+            info.intended_ref = ns.string() + "/part_0";
+            auto build = store->startBuild(info);
+
+            const ManifestId id = build->stageManifest({});
+            build->precommitAdd(ns, "part_0", id);
+
+            const uint64_t ref_shard = store->shardOf("part_0");
+            const String shard_key = store->layout().rootShardKey(ns, ref_shard);
+
+            ASSERT_TRUE(backend->head(shard_key).exists)
+                << "gc_shards=" << gc_shards << " B: shard must exist after precommitAdd";
+
+            /// abandon BEFORE dropNamespace: PrecommitRemove comes BEFORE tombstone.
+            /// Journal will be: [PrecommitAdd, PrecommitRemove, Tombstone].
+            build->abandon();
+
+            /// Now dropNamespace: tombstone appended LAST.
+            store->dropNamespace(ns);
+            store->renewWatermarkOnce();
+
+            /// GC rounds: all guards pass (live_bindings empty, tombstone last) → shard reclaimed.
+            {
+                Gc gc(store, hexToU128("0000000000000000000000000000bb02"));
+                for (int i = 0; i < 16; ++i)
+                {
+                    gc.runRegularRound();
+                    if (!backend->head(shard_key).exists)
+                        break;
+                }
+            }
+
+            EXPECT_FALSE(backend->head(shard_key).exists)
+                << "gc_shards=" << gc_shards
+                << ": ref-shard must be reclaimed when precommit was abandoned before dropNamespace "
+                   "(tombstone is last event, live_bindings empty — all four guards satisfied)";
+        }
+    }
+}
+
 /// Task 6 (Fix 1): a concurrent revive after the tombstone changes the shard's token, so a
 /// `deleteExact` carrying the pre-revive token must be REFUSED (TokenMismatch) and the shard object
 /// must survive. Proves that `reclaimDroppedShards`'s deleteExact is token-guarded, not unconditional.

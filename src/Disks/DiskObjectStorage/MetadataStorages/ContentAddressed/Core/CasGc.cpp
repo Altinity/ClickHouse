@@ -1582,6 +1582,10 @@ bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundRep
     recheck(state, state_token, folded, retired, report);
     if (trim_enabled)
         trim(folded, state.round);
+    /// NOTE: `reclaimDroppedShards` is deliberately NOT called here. Shard reclaim is best-effort —
+    /// skipping it on a crash-resume is safe because it will be retried in the next full regular round.
+    /// Calling it here would require re-reading shards already processed, adding complexity with no
+    /// correctness benefit.
     return true;
 }
 
@@ -1884,6 +1888,40 @@ void Gc::reclaimDroppedShards(const FoldResult & folded)
                 continue;   /// ABA: shard was recreated between fold and here — not safe to reclaim
             if (cov.folded_cursor < tombstone_version)
                 continue;   /// tombstone (or prior events) not yet folded — wait for a later round
+
+            /// Guard 4: NO LIVE OWNER BINDINGS (guards against the activated-precommit blob-leak).
+            ///
+            /// `refs.empty()` (Guard 1) only covers COMMITTED bindings (the promoted refs). A
+            /// PRECOMMIT binding lives solely in the journal, never in `refs` — it is only moved to
+            /// `refs` at `promote`. So a shard that was dropped while a same-namespace build had an
+            /// ACTIVATED (body-present) but unpromoted precommit passes Guards 1-3: `refs` is empty,
+            /// a tombstone was appended, and the fold advanced past the tombstone (the body being
+            /// present meant the fold barrier did NOT clamp the cursor below the precommit event).
+            /// If we reclaim such a shard, the precommit's +1 edge is already folded into the sealed
+            /// generation's in-degree, but the matching -1 (from a future abandon / PrecommitRemove)
+            /// can never land — the shard object is gone. The referenced blob's in-degree never drains
+            /// → permanent blob leak.
+            ///
+            /// Guard: replay the journal's owner-state exactly as `reclaimAbandonedPrecommit` does
+            /// (accumulate `new_binding`, erase on `old_binding`) and refuse reclaim if ANY live owner
+            /// binding remains (Committed OR Precommit). In the normal fully-dropped case all bindings
+            /// have been removed before the tombstone, so the set is empty and reclaim proceeds.
+            ///
+            /// NOTE: the body-ABSENT precommit sub-case is already safe (the fold barrier clamps
+            /// `folded_cursor` below the live precommit, so Guard 3 blocks it). This guard
+            /// additionally covers the body-PRESENT (activated) sub-case.
+            {
+                std::vector<OwnerBinding> live_bindings;
+                for (const RootOwnerEvent & ev : root.journal)
+                {
+                    if (ev.old_binding)
+                        std::erase(live_bindings, *ev.old_binding);
+                    if (ev.new_binding)
+                        live_bindings.push_back(*ev.new_binding);
+                }
+                if (!live_bindings.empty())
+                    continue;   /// live owner binding present — skip reclaim this round
+            }
 
             /// All guards pass. Delete using the token from the GET above (not an extra round-trip;
             /// the GET was already needed for tombstone + empty-refs eligibility). The fence step
