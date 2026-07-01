@@ -68,6 +68,7 @@ CLICKHOUSE_ROOT_DIR = p.join(p.dirname(__file__), "../../..")
 LOCAL_DOCKER_COMPOSE_DIR = p.join(CLICKHOUSE_ROOT_DIR, "tests/integration/compose/")
 DEFAULT_ENV_NAME = ".env"
 
+sensitive_var_pattern = re.compile(r"[A-Z_]*(SECRET|PASSWORD|KEY|TOKEN|AZURE)[A-Z_]*")
 
 def find_default_config_path():
     path = os.environ.get("CLICKHOUSE_TESTS_BASE_CONFIG_DIR", None)
@@ -118,7 +119,8 @@ CLICKHOUSE_ERROR_LOG_FILE = "/var/log/clickhouse-server/clickhouse-server.err.lo
 # Minimum version we use in integration tests to check compatibility with old releases
 # Keep in mind that we only support upgrading between releases that are at most 1 year different.
 # This means that this minimum need to be, at least, 1 year older than the current release
-CLICKHOUSE_CI_MIN_TESTED_VERSION = "23.3"
+# NOTE(vnemkov): this is a docker tag, make sure it doesn't include initial 'v'
+CLICKHOUSE_CI_MIN_TESTED_VERSION = "23.3.19.33.altinitystable"
 
 # `Nullable(Tuple)` experimental feature is introduced in 26.1. This has lead to changes in the output return type
 # of many aggregate functions from `Tuple(...)` to `Nullable(Tuple(...))`. This version can be used as baseline to do
@@ -525,6 +527,8 @@ class ClickHouseCluster:
         with_dolor=False,
     ):
         for param in list(os.environ.keys()):
+            if sensitive_var_pattern.match(param):
+                continue
             logging.debug("ENV %40s %s" % (param, os.environ[param]))
         self.base_path = base_path
         self.base_dir = p.dirname(base_path)
@@ -652,6 +656,8 @@ class ClickHouseCluster:
         self.with_redis = False
         self.with_cassandra = False
         self.with_ldap = False
+        self.with_keycloak = False
+        self.with_mock_oidc = False
         self.with_jdbc_bridge = False
         self.with_nginx = False
         self.with_hive = False
@@ -682,6 +688,9 @@ class ClickHouseCluster:
         self.minio_secret_key = minio_secret_key
 
         self.spark_session = None
+        self.spark_iceberg_external_port = 8080
+        self.spark_iceberg_external_port_2 = 10002
+        self.spark_iceberg_external_port_3 = 10003
         self.with_iceberg_catalog = False
         self.iceberg_rest_catalog_port = 8182
         self.with_glue_catalog = False
@@ -750,6 +759,16 @@ class ClickHouseCluster:
         self.ldap_container = None
         self.ldap_port = 1389
         self.ldap_id = self.get_instance_docker_id(self.ldap_host)
+
+        # available when with_keycloak == True
+        self.keycloak_host = "keycloak"
+        self.keycloak_port = 18080
+        self.base_keycloak_cmd = None
+
+        # available when with_mock_oidc == True
+        self.mock_oidc_host = "mock-oidc"
+        self.mock_oidc_port = 18091
+        self.base_mock_oidc_cmd = None
 
         # available when with_rabbitmq == True
         self.rabbitmq_host = "rabbitmq1"
@@ -895,6 +914,8 @@ class ClickHouseCluster:
         # available when with_letsencrypt_pebble = True
         self._letsencrypt_pebble_api_port = 14000
         self._letsencrypt_pebble_management_port = 15000
+
+        self.iceberg_rest_external_port = 8182
 
         self.docker_client: docker.DockerClient = None
         self.is_up = False
@@ -1262,7 +1283,7 @@ class ClickHouseCluster:
 
         env_variables["keeper_binary"] = binary_path
         env_variables["keeper_cmd_prefix"] = keeper_cmd_prefix
-        env_variables["image"] = "clickhouse/integration-test:" + DOCKER_BASE_TAG
+        env_variables["image"] = "altinityinfra/integration-test:" + DOCKER_BASE_TAG
         env_variables["user"] = str(os.getuid())
         env_variables["keeper_fs"] = "bind"
         for i in range(1, 4):
@@ -1713,6 +1734,10 @@ class ClickHouseCluster:
     def setup_iceberg_catalog_cmd(
         self, instance, env_variables, docker_compose_yml_dir, extra_parameters=None
     ):
+        env_variables["ICEBERG_REST_EXTERNAL_PORT"] = str(self.iceberg_rest_external_port)
+        env_variables["SPARK_ICEBERG_EXTERNAL_PORT"] = str(self.spark_iceberg_external_port)
+        env_variables["SPARK_ICEBERG_EXTERNAL_PORT_2"] = str(self.spark_iceberg_external_port_2)
+        env_variables["SPARK_ICEBERG_EXTERNAL_PORT_3"] = str(self.spark_iceberg_external_port_3)
         self.with_iceberg_catalog = True
         file_name = "docker_compose_iceberg_rest_catalog.yml"
         if extra_parameters is not None and extra_parameters["docker_compose_file_name"] != "":
@@ -1783,6 +1808,44 @@ class ClickHouseCluster:
             p.join(docker_compose_yml_dir, "docker_compose_ldap.yml"),
         )
         return self.base_ldap_cmd
+
+    def setup_keycloak_cmd(self, instance, env_variables, docker_compose_yml_dir):
+        self.with_keycloak = True
+        env_variables["KEYCLOAK_EXTERNAL_PORT"] = str(self.keycloak_port)
+        env_variables["KEYCLOAK_REALM_FILE"] = p.join(
+            self.base_dir,
+            "keycloak",
+            "realm-export.json",
+        )
+        self.base_cmd.extend(
+            ["--file", p.join(docker_compose_yml_dir, "docker_compose_keycloak.yml")]
+        )
+        self.base_keycloak_cmd = self.compose_cmd(
+            "--env-file",
+            instance.env_file,
+            "--file",
+            p.join(docker_compose_yml_dir, "docker_compose_keycloak.yml"),
+        )
+        return self.base_keycloak_cmd
+
+    def setup_mock_oidc_cmd(self, instance, env_variables, docker_compose_yml_dir):
+        self.with_mock_oidc = True
+        env_variables["MOCK_OIDC_EXTERNAL_PORT"] = str(self.mock_oidc_port)
+        env_variables["MOCK_OIDC_CONFIG_FILE"] = p.join(
+            self.base_dir,
+            "mock_oidc",
+            "openid-configuration",
+        )
+        self.base_cmd.extend(
+            ["--file", p.join(docker_compose_yml_dir, "docker_compose_mock_oidc.yml")]
+        )
+        self.base_mock_oidc_cmd = self.compose_cmd(
+            "--env-file",
+            instance.env_file,
+            "--file",
+            p.join(docker_compose_yml_dir, "docker_compose_mock_oidc.yml"),
+        )
+        return self.base_mock_oidc_cmd
 
     def setup_jdbc_bridge_cmd(self, instance, env_variables, docker_compose_yml_dir):
         self.with_jdbc_bridge = True
@@ -1949,6 +2012,8 @@ class ClickHouseCluster:
         with_azurite=False,
         with_cassandra=False,
         with_ldap=False,
+        with_keycloak=False,
+        with_mock_oidc=False,
         with_jdbc_bridge=False,
         with_hive=False,
         with_coredns=False,
@@ -1967,7 +2032,7 @@ class ClickHouseCluster:
         hostname=None,
         env_variables=None,
         instance_env_variables=False,
-        image="clickhouse/integration-test",
+        image="altinityinfra/integration-test",
         tag=None,
         # keep the docker container running when clickhouse server is stopped
         stay_alive=False,
@@ -2091,6 +2156,8 @@ class ClickHouseCluster:
             with_coredns=with_coredns,
             with_cassandra=with_cassandra,
             with_ldap=with_ldap,
+            with_keycloak=with_keycloak,
+            with_mock_oidc=with_mock_oidc,
             with_iceberg_catalog=with_iceberg_catalog,
             with_glue_catalog=with_glue_catalog,
             with_hms_catalog=with_hms_catalog,
@@ -2348,6 +2415,16 @@ class ClickHouseCluster:
         if with_ldap and not self.with_ldap:
             cmds.append(
                 self.setup_ldap_cmd(instance, env_variables, docker_compose_yml_dir)
+            )
+
+        if with_keycloak and not self.with_keycloak:
+            cmds.append(
+                self.setup_keycloak_cmd(instance, env_variables, docker_compose_yml_dir)
+            )
+
+        if with_mock_oidc and not self.with_mock_oidc:
+            cmds.append(
+                self.setup_mock_oidc_cmd(instance, env_variables, docker_compose_yml_dir)
             )
 
         if with_jdbc_bridge and not self.with_jdbc_bridge:
@@ -3323,6 +3400,46 @@ class ClickHouseCluster:
 
         raise Exception("Can't wait LDAP to start")
 
+    def wait_keycloak_to_start(self, timeout=120):
+        discovery_url = (
+            f"http://localhost:{self.keycloak_port}"
+            f"/realms/clickhouse-test/.well-known/openid-configuration"
+        )
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                resp = requests.get(discovery_url, timeout=5)
+                if resp.status_code == 200:
+                    logging.info("Keycloak is online")
+                    return
+            except Exception as ex:
+                logging.warning("Waiting for Keycloak: %s", ex)
+            time.sleep(3)
+        raise Exception("Keycloak did not start in time")
+
+    def get_keycloak_url(self):
+        return f"http://localhost:{self.keycloak_port}"
+
+    def wait_mock_oidc_to_start(self, timeout=60):
+        url = (
+            f"http://localhost:{self.mock_oidc_port}"
+            f"/.well-known/openid-configuration"
+        )
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    logging.info("mock-oidc is online")
+                    return
+            except Exception as ex:
+                logging.warning("Waiting for mock-oidc: %s", ex)
+            time.sleep(2)
+        raise Exception("mock-oidc did not start in time")
+
+    def get_mock_oidc_url(self):
+        return f"http://localhost:{self.mock_oidc_port}"
+
     def wait_prometheus_to_start(self):
         if "writer" in self.prometheus_servers:
             self.prometheus_writer_ip = self.get_instance_ip(self.prometheus_writer_host)
@@ -3393,7 +3510,7 @@ class ClickHouseCluster:
                         "Got exception pulling images: %s", kwargs["exception"]
                     )
 
-            retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=180)
+            retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=600)
 
             def logging_compose_up(**kwargs):
                 if "exception" in kwargs:
@@ -3813,6 +3930,16 @@ class ClickHouseCluster:
                 self.up_called = True
                 self.wait_ldap_to_start()
 
+            if self.with_keycloak and self.base_keycloak_cmd:
+                subprocess_check_call(self.base_keycloak_cmd + ["up", "-d"])
+                self.up_called = True
+                self.wait_keycloak_to_start()
+
+            if self.with_mock_oidc and self.base_mock_oidc_cmd:
+                subprocess_check_call(self.base_mock_oidc_cmd + ["up", "-d"])
+                self.up_called = True
+                self.wait_mock_oidc_to_start()
+
             if self.with_jdbc_bridge and self.base_jdbc_bridge_cmd:
                 os.makedirs(self.jdbc_driver_logs_dir)
                 os.chmod(self.jdbc_driver_logs_dir, stat.S_IRWXU | stat.S_IRWXO)
@@ -3854,7 +3981,7 @@ class ClickHouseCluster:
             if self.with_letsencrypt_pebble and self.base_letsencrypt_pebble_cmd:
                 letsencrypt_pebble_pull_cmd = self.base_letsencrypt_pebble_cmd + ["pull"]
                 retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(
-                    run_and_check, letsencrypt_pebble_pull_cmd, timeout=180
+                    run_and_check, letsencrypt_pebble_pull_cmd, timeout=600
                 )
                 letsencrypt_pebble_start_cmd = self.base_letsencrypt_pebble_cmd + common_opts
                 run_and_check(letsencrypt_pebble_start_cmd)
@@ -4297,6 +4424,8 @@ class ClickHouseInstance:
         with_coredns,
         with_cassandra,
         with_ldap,
+        with_keycloak,
+        with_mock_oidc,
         with_iceberg_catalog,
         with_glue_catalog,
         with_hms_catalog,
@@ -4318,7 +4447,7 @@ class ClickHouseInstance:
         hostname=None,
         env_variables=None,
         instance_env_variables=False,
-        image="clickhouse/integration-test",
+        image="altinityinfra/integration-test",
         tag="latest",
         stay_alive=False,
         ipv4_address=None,
@@ -4420,6 +4549,8 @@ class ClickHouseInstance:
         self.with_azurite = with_azurite
         self.with_cassandra = with_cassandra
         self.with_ldap = with_ldap
+        self.with_keycloak = with_keycloak
+        self.with_mock_oidc = with_mock_oidc
         self.with_jdbc_bridge = with_jdbc_bridge
         self.with_hive = with_hive
         self.with_coredns = with_coredns
@@ -5647,7 +5778,7 @@ class ClickHouseInstance:
 
         if (
             self.randomize_settings
-            and self.image == "clickhouse/integration-test"
+            and self.image == "altinityinfra/integration-test"
             and self.tag == DOCKER_BASE_TAG
             and self.base_config_dir == DEFAULT_BASE_CONFIG_DIR
         ):
@@ -5773,6 +5904,12 @@ class ClickHouseInstance:
 
         if self.with_ldap:
             depends_on.append("openldap")
+
+        if self.with_keycloak:
+            depends_on.append("keycloak")
+
+        if self.with_mock_oidc:
+            depends_on.append("mock-oidc")
 
         if self.with_rabbitmq:
             depends_on.append("rabbitmq1")

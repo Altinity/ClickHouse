@@ -1,6 +1,6 @@
-# docker build -t clickhouse/integration-tests-runner .
+# docker build -t altinityinfra/integration-tests-runner .
 ARG FROM_TAG=latest
-FROM clickhouse/test-base:$FROM_TAG
+FROM altinityinfra/test-base:$FROM_TAG
 
 # ARG for quick switch to a given ubuntu mirror
 ARG apt_archive="http://archive.ubuntu.com"
@@ -80,6 +80,8 @@ org.apache.hudi:hudi-spark3.5-bundle_2.12:1.0.1,\
 org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3,\
 org.apache.hadoop:hadoop-aws:3.3.4,\
 com.amazonaws:aws-java-sdk-bundle:1.12.262,\
+org.apache.hadoop:hadoop-azure:3.3.4,\
+com.microsoft.azure:azure-storage:8.6.6,\
 org.apache.spark:spark-avro_2.12:3.5.1"\
     && /spark-3.5.5-bin-hadoop3/bin/spark-shell --packages "$packages" \
     && find /root/.ivy2/ -name '*.jar' -exec ln -sf {} /spark-3.5.5-bin-hadoop3/jars/ \;
@@ -94,10 +96,10 @@ RUN set -x \
 COPY modprobe.sh /usr/local/bin/modprobe
 COPY misc/ /misc/
 
-COPY --from=clickhouse/cctools:859fb360308eb8ac47ad /opt/gdb /opt/gdb
+COPY --from=altinityinfra/cctools:c0aae9395f33405b6e2b /opt/gdb /opt/gdb
 ENV PATH="/opt/gdb/bin:${PATH}"
 
-COPY --from=clickhouse/cctools:859fb360308eb8ac47ad \
+COPY --from=altinityinfra/cctools:c0aae9395f33405b6e2b \
   /opt/openssl-fips/openssl.cnf \
   /opt/openssl-fips/fipsmodule.cnf \
   /opt/openssl-fips/fips.so \
