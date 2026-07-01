@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
@@ -9,6 +10,12 @@
 
 namespace DB::Cas
 {
+
+/// Deterministic 16-byte id of a source edge (ManifestId, path). Distinctness only — not reconstructable.
+UInt128 sourceEdgeId(const ManifestId & id, const String & path);
+/// 32-byte run key = blob_hash(16 BE) ++ source_id(16 BE); lexicographic == (blob_hash, source_id) order.
+String srcEdgeRunKey(const UInt128 & blob_hash, const UInt128 & source_id);
+bool parseSrcEdgeRunKey(const String & key, UInt128 & blob_hash, UInt128 & source_id);
 
 /// Write-once for a DETERMINISTIC artifact (same inputs => byte-identical bytes): the blob in-degree
 /// runs AND the fold/completion seals. `putIfAbsent`; on a `PreconditionFailed` the key is already

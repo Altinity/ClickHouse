@@ -86,6 +86,34 @@ std::vector<std::pair<UInt128, int64_t>> readGenerationRows(
 
 }
 
+UInt128 sourceEdgeId(const ManifestId & id, const String & path)
+{
+    String canon;
+    canon += id.root_namespace.string();
+    canon += '\0';
+    auto beU64 = [&](uint64_t v) { for (int i = 7; i >= 0; --i) canon += static_cast<char>((v >> (8 * i)) & 0xFF); };
+    auto beU32 = [&](uint32_t v) { for (int i = 3; i >= 0; --i) canon += static_cast<char>((v >> (8 * i)) & 0xFF); };
+    beU64(id.ref.writer_epoch); beU64(id.ref.build_sequence); beU32(id.ref.manifest_ordinal);
+    canon += '\0';
+    canon += path;
+    const auto h = CityHash_v1_0_2::CityHash128(canon.data(), canon.size());
+    return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
+}
+
+String srcEdgeRunKey(const UInt128 & blob_hash, const UInt128 & source_id)
+{
+    return u128ToBytesBE(blob_hash) + u128ToBytesBE(source_id);
+}
+
+bool parseSrcEdgeRunKey(const String & key, UInt128 & blob_hash, UInt128 & source_id)
+{
+    if (key.size() != 32)
+        return false;
+    blob_hash = u128FromBytesBE(key.substr(0, 16), "src-edge run key blob_hash");
+    source_id = u128FromBytesBE(key.substr(16, 16), "src-edge run key source_id");
+    return true;
+}
+
 void putDeterministicArtifact(Backend & backend, const String & key, const String & bytes)
 {
     if (backend.putIfAbsent(key, bytes).outcome == PutOutcome::PreconditionFailed)
