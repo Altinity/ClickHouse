@@ -131,9 +131,9 @@ public:
     /// A PLAIN mountpoint object (design §5.2): a loose, non-content-addressed file mirrored at its
     /// ClickHouse path under `roots/`, with NO namespace and NO `_files` wrapper. `key` is the
     /// server-prefixed mirrored path (e.g. `srv1/clickhouse_access_check_abc`). It must NOT end in a
-    /// reserved area. Shard discovery is via the registry (`listNamespaces`) + static `[0, root_shards)`
-    /// fan-out — not by key classification. The `_files`/`_pool_meta` reservations still apply to its
-    /// segments via the path itself (these never appear in a real ClickHouse loose-file path).
+    /// reserved area. Shard discovery is via `LIST(cas/refs/)` — not by key classification or a registry.
+    /// The `_files`/`_pool_meta` reservations still apply to its segments via the path itself
+    /// (these never appear in a real ClickHouse loose-file path).
     String mountpointObjectKey(const String & key) const
     {
         if (key.empty() || key.front() == '/' || key.back() == '/' || key.find("//") != String::npos)

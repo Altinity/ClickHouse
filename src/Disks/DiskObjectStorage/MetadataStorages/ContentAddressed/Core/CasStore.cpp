@@ -1085,7 +1085,7 @@ std::vector<String> Store::listMirroredChildren(const String & prefix)
 {
     /// Loose LIST of the mirrored subtree (design §5.3). Returns the distinct next-path-segment
     /// names. NOT authoritative — callers must re-check `listRefs` per candidate before surfacing
-    /// it. GC continues to use the compact registry.
+    /// it. GC uses LIST-based discovery (`cas/refs/` prefix) rather than a registry.
     ///
     /// Phase 1: a namespace's presence is split across two physical subtrees — its ref shards live
     /// under `cas/refs/<ns>/<shard>` (the relocation target) while its verbatim files and PLAIN

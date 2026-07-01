@@ -266,13 +266,13 @@ public:
     std::vector<ManifestEntry> listDirectory(const PartManifest & manifest, const String & dir_prefix) const;
     BlobLocation locate(const ManifestEntry & entry) const;       /// Blob placement only
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
-    /// Registered namespaces with the given prefix (one registry GET; opaque strings, sorted).
-    /// Dropped namespaces linger registered until full GC (M-F) — visible-but-empty, never wrong.
+    /// Namespaces with the given prefix: a LIST of `cas/refs/` ∪ `roots/`, results are UNORDERED.
+    /// A dropped namespace's ref-shard objects linger until GC reclaims them (Task 6).
     std::vector<String> listNamespaces(const String & prefix);
 
     /// Scoped LIST of the mirrored subtree (design §5.3): the distinct next-path-segment names under
     /// `roots/<prefix>` (a loose LIST used by browse only; callers re-check `listRefs`/`getFileSize`
-    /// before showing an entry). NOT authoritative — GC still uses the compact registry. `prefix`
+    /// before showing an entry). NOT authoritative — GC uses LIST-based discovery (`cas/refs/`). `prefix`
     /// is a server-relative or shadow-relative path ending in '/'.
     std::vector<String> listMirroredChildren(const String & prefix);
 

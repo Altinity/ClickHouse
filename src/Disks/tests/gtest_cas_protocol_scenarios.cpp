@@ -454,7 +454,7 @@ TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
 }
 
-TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
+TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
 {
     /// Regression test: build B adopts a blob, a GC round retires + deletes it, then B publishes into
     /// a fresh namespace. After Task 4, the fence only touches PRESENT shards (LIST-discovered). For a
@@ -601,5 +601,5 @@ TEST(CasProtocol, DISABLED_AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime)
                     "model's adoptEvidence is deliberately TOKENLESS and performs NO backend call — the "
                     "no-dangle guarantee for an adopted-but-reclaimed leaf is enforced at the promote "
                     "gate (unconditional blob revalidation ⇒ ABORTED), covered by "
-                    "NewNamespacePublishSeesRegistryFenceFloor and FreshEvidenceDepWithViewHitIsResolvedByGate.";
+                    "NewNamespacePublishGatedByShardFenceFloor and FreshEvidenceDepWithViewHitIsResolvedByGate.";
 }

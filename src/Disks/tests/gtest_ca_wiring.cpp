@@ -1198,7 +1198,7 @@ public:
 
 /// True for a root-shard ref key (<...>/cas/refs/<namespace...>/<shard_number>) — the object a
 /// single publish CASes. Phase 1 relocated ref shards out of roots/ to cas/refs/. Tree blobs
-/// (blobs/ prefix), the registry (`gc/registry`), part-manifests (`cas/manifests/...`) and verbatim
+/// (blobs/ prefix), GC state (`gc/`), part-manifests (`cas/manifests/...`) and verbatim
 /// files (roots/<ns>/_files/...) are excluded, so counting these isolates publishes one-for-one.
 bool isShardManifestPath(const std::string & path)
 {
@@ -1438,7 +1438,7 @@ std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const s
 /// SHARD's journal (owner_kind == Precommit) keyed by the final ref name — there is NO `_precommits`
 /// namespace on the precommit path. The namespace itself contains '/', so the discriminator is
 /// "under /cas/refs/ AND the last path segment is all digits", which excludes blobs (`/blobs/`),
-/// part-manifests (`/cas/manifests/...`), the registry (`/gc/registry`), the watermark
+/// part-manifests (`/cas/manifests/...`), GC state (`/gc/`), the watermark
 /// (`/_watermark`), and verbatim files (`/_files/...`).
 bool isRootShardKey(const std::string & key)
 {

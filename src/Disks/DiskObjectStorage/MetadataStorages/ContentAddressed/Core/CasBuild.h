@@ -80,7 +80,7 @@ public:
     void precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id);
 
     /// Atomic commit promotion (spec §Promote Precommit): ONE root-shard CAS in shardOf(final_ref_name).
-    ///  1. (mutateShard refreshes the retire view if the shard/registry fence demands it)
+    ///  1. (mutateShard refreshes the retire view if the shard fence demands it)
     ///  2. stream-read the precommit manifest body; validate RefMatchesBody / ManifestNamespaceMatches;
     ///  3. revalidate EVERY blob leaf listed in the manifest (fail-closed);
     ///  4. body absent | a blob absent | a blob condemned-and-not-recreatable ⇒ ABORTED;

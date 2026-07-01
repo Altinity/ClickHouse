@@ -116,7 +116,7 @@ RoundReport Gc::runRegularRound()
     for (const auto & [shard, set] : retired.blobs)
         report.candidates += set.entries.size();
 
-    /// R3: global registry + all-shard fence; record fence positions into the completion seal.
+    /// R3: fence every present shard (LIST-discovered); record fence positions into the completion seal.
     fence(state, state_token, folded);
 
     /// R4: fold-through-fence recheck + the single content-delete site + exact-token manifest deletes;
@@ -1318,16 +1318,6 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
         cursor = page.next_cursor;
     }
     return universe;
-}
-
-std::vector<uint64_t> Gc::shardsToVisit(const RootNamespace &)
-{
-    std::vector<uint64_t> shards;
-    const uint64_t root_shards_per_ns = store->poolMeta().root_shards;
-    shards.reserve(root_shards_per_ns);
-    for (uint64_t shard = 0; shard < root_shards_per_ns; ++shard)
-        shards.push_back(shard);
-    return shards;
 }
 
 std::map<String, Token> Gc::listRootShardTokens(std::set<String> & ambiguous_keys)

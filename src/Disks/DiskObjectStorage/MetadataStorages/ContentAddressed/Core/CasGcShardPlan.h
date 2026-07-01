@@ -108,8 +108,8 @@ private:
 ///
 /// In a sharded round (`gc_shards > 1`) the work splits into two roles:
 ///
-///   - COORDINATOR (exactly one per round — the lease holder): owns registry-fence, input-seal,
-///     round-visibility, the single GLOBAL fence, and generation-advance. These steps span the whole
+///   - COORDINATOR (exactly one per round — the lease holder): owns input-seal, round-visibility,
+///     the single GLOBAL fence (over all LIST-discovered shards), and generation-advance. These steps span the whole
 ///     fence universe and must NOT be sharded: a publish into one root shard can protect blobs in ANY
 ///     target shard, so an independent per-reducer fence is unsafe (Task 1 `SabotageReducerOwnsFence`).
 ///     `Gc::fence` therefore stays the single coordinator fence over the entire universe.

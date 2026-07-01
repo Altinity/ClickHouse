@@ -96,8 +96,8 @@ public:
     /// WRITE-FREE TEST SEAM: the per-shard discover decisions the NEXT round would make, derived from
     /// the durable sealed `folded_token` (recorded by `recheck` from the POST-FENCE shard token) plus a
     /// single LIST sweep over the roots prefix. Returns a map keyed by "ns/shard" (the same format as
-    /// `CasFoldSeal::per_ns_shard`). The universe is always the REGISTRY universe — LIST cannot shrink it
-    /// (registry authority). No CAS, no delete, no fold. Mirrors the write-free contract of `previewDeletes`.
+    /// `CasFoldSeal::per_ns_shard`). The universe is LIST-discovered (`cas/refs/` prefix).
+    /// No CAS, no delete, no fold. Mirrors the write-free contract of `previewDeletes`.
     std::map<String, DiscoverDecision> discoverDecisionsForTest();
 
     /// One previewed deletion the next regular round would make, with the reason it is eligible.
@@ -272,10 +272,6 @@ private:
     std::map<String, DiscoverDecision> computeDiscoverDecisions(
         const CasFoldSeal & sealed,
         const std::map<String, uint64_t> & fence_positions);
-
-    /// The shard numbers GC must visit for a namespace: the static fan-out [0, root_shards) (every
-    /// namespace — table AND precommit — uses it). The fence mints fence-only manifests for absent ones.
-    std::vector<uint64_t> shardsToVisit(const RootNamespace & ns);
 
     /// CRASH-RESUME (the model: idempotent replay of a crashed round's tail). An INCOMPLETE round is
     /// detectable from durable state alone: a fold_seal exists for the latest generation with no
