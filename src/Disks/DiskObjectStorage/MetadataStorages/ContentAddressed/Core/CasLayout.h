@@ -53,16 +53,6 @@ public:
         return shardedKey("trees", id.string());
     }
 
-    /// The namespace registry (design §5.3): authoritative namespace universe, CAS-appended on
-    /// W-REGISTER, fenced by GC, the source of GC discovery (never LIST). Relocated from
-    /// `roots/_registry` to `gc/registry` — `roots/` is now data only; discovery is infrastructure.
-    /// The CAS-append + fence MECHANISM is unchanged (N5): only the key moves, and it is read/written
-    /// strictly by this computed key.
-    String rootsRegistryKey() const
-    {
-        return prefix + "/gc/registry";
-    }
-
     /// Root manifest for a given namespace + shard number.
     /// Phase 1: relocated out of the shared `roots/` tree to `cas/refs/` (hot/cold split). The
     /// namespace fan-out (`<ns>/<shard>`) is unchanged — identity-preserving. GC discovery LISTs

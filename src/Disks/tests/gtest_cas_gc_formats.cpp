@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
@@ -344,97 +343,10 @@ TEST(CasGcFormats, OutcomeLogValidation)
     }
 }
 
-TEST(CasGcFormats, RootsRegistryRoundTripAndValidation)
-{
-    /// The namespace registry (spec section 4, decision 2026-06-12): the authoritative namespace
-    /// universe, CAS-appended by W-REGISTER and fenced by GC like a shard.
-    RootsRegistry registry;
-    registry.registry_version = 3;
-    registry.fence_round = 2;
-    registry.namespaces = {"srv1/tbl", "srv2/tbl2"};
-    const String bytes = encodeRootsRegistry(registry);
-    ASSERT_FALSE(bytes.empty());
-    EXPECT_NE(bytes.front(), '{');   /// not JSON (pure protobuf with CasHeader)
-    const RootsRegistry d = decodeRootsRegistry(bytes);
-    EXPECT_EQ(d.registry_version, 3u);
-    EXPECT_EQ(d.fence_round, 2u);
-    EXPECT_EQ(d.namespaces, registry.namespaces);
-    EXPECT_EQ(encodeRootsRegistry(d), bytes);                    /// byte-stable re-encode
-
-    /// Empty / garbage bytes => CORRUPTED_DATA.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(String("")); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeRootsRegistry(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    /// Bad magic (wrong FormatId in CasHeader) => CORRUPTED_DATA.
-    {
-        Proto::RootsRegistryProto msg;
-        auto * hdr = msg.mutable_header();
-        hdr->set_magic(magicFor(FormatId::Blob));   /// CABL != CARR
-        hdr->set_compatibility_version(currentCompatibilityVersion());
-        std::string bad_bytes; msg.SerializeToString(&bad_bytes);
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(bad_bytes); });
-    }
-    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION (fail closed on the future).
-    {
-        Proto::RootsRegistryProto msg;
-        auto * hdr = msg.mutable_header();
-        hdr->set_magic(magicFor(FormatId::RootsRegistry));
-        hdr->set_compatibility_version(G_BUILD + 1);
-        std::string bad_bytes; msg.SerializeToString(&bad_bytes);
-        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRootsRegistry(bad_bytes); });
-    }
-    /// codec-specific invariants: empty namespace entry fails closed (post-parse check).
-    {
-        RootsRegistry bad;
-        bad.registry_version = 1;
-        bad.namespaces.insert("");   /// empty namespace — insert bypasses post-parse guard
-        /// encodeRootsRegistry will serialize the empty string, then decodeRootsRegistry must reject it.
-        const String bad_bytes = encodeRootsRegistry(bad);
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(bad_bytes); });
-    }
-    /// duplicate namespace entries fail closed (post-parse check).
-    /// Craft a RootsRegistryProto with valid CasHeader + two duplicate namespaces.
-    {
-        Proto::RootsRegistryProto msg;
-        auto * hdr = msg.mutable_header();
-        hdr->set_magic(magicFor(FormatId::RootsRegistry));
-        hdr->set_compatibility_version(currentCompatibilityVersion());
-        msg.add_namespaces("a");
-        msg.add_namespaces("a");   /// duplicate
-        std::string dup_bytes; msg.SerializeToString(&dup_bytes);
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRootsRegistry(dup_bytes); });
-    }
-}
-
 /// ===================================================================================
 /// CasHeader round-trip goldens — confirm CasHeader is field 1 of each mutable object,
 /// magic + writer_version + compatibility_version are all stamped correctly.
 /// ===================================================================================
-
-TEST(CasHeaderGolden, RootsRegistryCasHeaderRoundTrips)
-{
-    RootsRegistry registry;
-    registry.registry_version = 5;
-    registry.fence_round = 2;
-    registry.namespaces = {"alpha", "beta", "gamma/sub"};
-    const String bytes = encodeRootsRegistry(registry);
-    ASSERT_FALSE(bytes.empty());
-    EXPECT_NE(bytes.front(), '{');   // not JSON
-    Proto::RootsRegistryProto msg;
-    ASSERT_TRUE(msg.ParseFromString(bytes));
-    EXPECT_EQ(msg.header().magic(), magicFor(FormatId::RootsRegistry));
-    EXPECT_EQ(msg.header().writer_version(), currentWriterVersion());
-    EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
-    const RootsRegistry d = decodeRootsRegistry(bytes);
-    EXPECT_EQ(d.registry_version, 5u);
-    EXPECT_EQ(d.fence_round, 2u);
-    EXPECT_EQ(d.namespaces, registry.namespaces);
-    EXPECT_EQ(encodeRootsRegistry(d), bytes);   // byte-stable
-    /// Empty namespaces round-trips.
-    RootsRegistry empty;
-    empty.registry_version = 1;
-    empty.fence_round = 0;
-    EXPECT_TRUE(decodeRootsRegistry(encodeRootsRegistry(empty)).namespaces.empty());
-}
 
 TEST(CasHeaderGolden, GcOutcomesCasHeaderRoundTrips)
 {

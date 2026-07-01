@@ -211,16 +211,17 @@ TEST(CasGcDiscovery, ReadsShardWhenTokenAdvancedOrMissing)
 /// Phase-2 token-diff discover universe is the REGISTRY universe, never shrunk by LIST. Two namespaces
 /// are registered but a publish lands in only ONE; both must still appear in the decisions (a namespace
 /// with no LIST-visible shard token defaults to Read — fail closed — but is never DROPPED from the set).
-TEST(CasGcDiscovery, RegistryUniverseNeverShrunkByList)
+TEST(CasGcDiscovery, UniverseIsPresentRefShardsFromList)
 {
+    /// Task 4: discovery authority is LIST(cas/refs/). A namespace is in the universe iff it has a
+    /// present ref shard. An "empty" namespace with no shard object is NOT discovered (the old
+    /// registry-authority behavior, where a registered-but-empty namespace lingered, is gone).
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
     const RootNamespace ns_a{"srv1/tbl_a"};
     const RootNamespace ns_b{"srv1/tbl_b"};
 
-    /// Register BOTH namespaces (a publish registers its own; register the other explicitly).
-    registerNamespaceRaw(*backend, store->layout(), ns_b);
-
+    /// ns_b has NO shard object written (registerNamespaceRaw is a no-op after Task 4).
     const ManifestRef r = discoveryRef(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     writeManifestRaw(*backend, store->layout(), ns_a, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -232,8 +233,8 @@ TEST(CasGcDiscovery, RegistryUniverseNeverShrunkByList)
 
     const auto decisions = gc.discoverDecisionsForTest();
     EXPECT_TRUE(decisions.contains(cursorKey(ns_a, 0))) << "the published namespace must be present";
-    EXPECT_TRUE(decisions.contains(cursorKey(ns_b, 0)))
-        << "a registered-but-empty namespace must remain in the universe (registry authority, not LIST)";
+    EXPECT_FALSE(decisions.contains(cursorKey(ns_b, 0)))
+        << "an empty namespace with no ref shard must NOT be discovered (LIST authority, Task 4)";
 }
 
 /// ---- Task 5: fail-closed fallback to body reads on any ambiguity ----

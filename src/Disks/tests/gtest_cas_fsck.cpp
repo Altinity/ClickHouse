@@ -66,7 +66,9 @@ TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
-    registerNamespaceRaw(*backend, store->layout(), ns);
+    /// Task 4: discovery is LIST-based; write an actual shard so the namespace is discoverable.
+    /// We use a fence-only shard (no refs) by writing an empty manifest directly.
+    fenceNamespace(*backend, store->layout(), ns, /*n_shards=*/1, /*round=*/0);
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});   // body, no owner
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);   // eligible

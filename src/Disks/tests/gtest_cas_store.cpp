@@ -9,6 +9,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <algorithm>
 #include <condition_variable>
 #include <optional>
 #include <thread>
@@ -850,25 +851,33 @@ TEST(CasStore, DropNamespaceTombstonesAndRemovesFiles)
     EXPECT_TRUE(s->listRefs(ns).empty());
 }
 
-TEST(CasStore, ListNamespacesFromRegistry)
+TEST(CasStore, ListNamespacesFromRefsTree)
 {
-    /// listNamespaces = one registry GET filtered by prefix (the W-REGISTER universe, never LIST).
-    /// The wiring uses it for directory-style enumeration of opaque namespace strings (M-W).
+    /// listNamespaces = LIST-based discovery (Task 4): enumerates distinct full namespace strings
+    /// from ref shards under `cas/refs/`. The wiring uses it for directory-style enumeration of
+    /// opaque namespace strings (M-W).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
-    EXPECT_TRUE(s->listNamespaces("").empty());   /// fresh pool: no registry yet
+    EXPECT_TRUE(s->listNamespaces("").empty());   /// fresh pool: no ref shards yet
 
-    DB::Cas::tests::registerNamespaceRaw(*b, s->layout(), RootNamespace{"srv1/tbl"});
-    DB::Cas::tests::registerNamespaceRaw(*b, s->layout(), RootNamespace{"shadow/bk1/tbl"});
-    DB::Cas::tests::registerNamespaceRaw(*b, s->layout(), RootNamespace{"shadow/bk2/tbl"});
+    /// Write actual ref shards so LIST(cas/refs/) can discover them.
+    DB::Cas::tests::publishCommittedTransition(*b, s->layout(), RootNamespace{"srv1/tbl"},
+        "ref1", std::nullopt, DB::Cas::ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
+    DB::Cas::tests::publishCommittedTransition(*b, s->layout(), RootNamespace{"shadow/bk1/tbl"},
+        "ref1", std::nullopt, DB::Cas::ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
+    DB::Cas::tests::publishCommittedTransition(*b, s->layout(), RootNamespace{"shadow/bk2/tbl"},
+        "ref1", std::nullopt, DB::Cas::ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
 
     const auto all = s->listNamespaces("");
     EXPECT_EQ(all.size(), 3u);
     const auto shadows = s->listNamespaces("shadow/");
-    ASSERT_EQ(shadows.size(), 2u);                /// sorted (registry holds a std::set)
-    EXPECT_EQ(shadows[0], "shadow/bk1/tbl");
-    EXPECT_EQ(shadows[1], "shadow/bk2/tbl");
+    ASSERT_EQ(shadows.size(), 2u);
+    /// listNamespaces returns results from an unordered_set; sort for deterministic comparison.
+    auto sorted_shadows = shadows;
+    std::sort(sorted_shadows.begin(), sorted_shadows.end());
+    EXPECT_EQ(sorted_shadows[0], "shadow/bk1/tbl");
+    EXPECT_EQ(sorted_shadows[1], "shadow/bk2/tbl");
     EXPECT_TRUE(s->listNamespaces("nope/").empty());
 }
 

@@ -954,28 +954,21 @@ TEST(CasBuild, TwoBuildsPublishToSameShardSerialize)
     EXPECT_EQ(root.refs.size(), 2u);
 }
 
-TEST(CasBuild, FirstPublishRegistersNamespace)
+TEST(CasBuild, FirstPublishMakesNamespaceDiscoverable)
 {
-    /// W-REGISTER (spec section 5, decision 2026-06-12): the first transition into a namespace
-    /// CAS-appends it to `gc/registry`; later publishes into the same namespace hit the Store's monotone
-    /// cache and leave the registry untouched. precommitAdd/promote both call ensureRegistered.
+    /// After Task 4 the registry is deleted; a namespace becomes discoverable via LIST(cas/refs/)
+    /// once its first ref shard exists (created by precommitAdd/promote).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv9/fresh"};
 
-    EXPECT_FALSE(b->get(s->layout().rootsRegistryKey()).has_value());
+    EXPECT_TRUE(s->listNamespaces("").empty());
     publishOneBlobPart(s, ns, "part_1", "f", "reg-payload");
 
-    const auto got = b->get(s->layout().rootsRegistryKey());
-    ASSERT_TRUE(got.has_value());
-    const RootsRegistry registry = decodeRootsRegistry(got->bytes);
-    EXPECT_TRUE(registry.namespaces.contains("srv9/fresh"));
-    const uint64_t version_after_first = registry.registry_version;
-
-    /// second publish into the same namespace: cache hit, registry untouched
-    publishOneBlobPart(s, ns, "part_2", "f", "reg-payload");
-    const RootsRegistry again = decodeRootsRegistry(b->get(s->layout().rootsRegistryKey())->bytes);
-    EXPECT_EQ(again.registry_version, version_after_first);
+    /// The namespace is now discoverable via LIST — no registry write needed.
+    const auto all = s->listNamespaces("");
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_EQ(all[0], "srv9/fresh");
 }
 
 TEST(CasBuild, AdoptEvidenceNoBackendOp)

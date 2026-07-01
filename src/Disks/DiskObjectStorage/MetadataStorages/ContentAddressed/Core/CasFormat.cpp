@@ -35,7 +35,6 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
         case FormatId::Watermark:
         case FormatId::PoolMeta:
         case FormatId::Roster:
-        case FormatId::RootsRegistry:
         case FormatId::GcOutcomes:
         case FormatId::PartManifest:
         case FormatId::RunFile:
@@ -61,7 +60,6 @@ uint32_t magicFor(FormatId id)
         case FormatId::Watermark:     return 0x4D574143u; /// "CAWM"
         case FormatId::GcState:       return 0x54474143u; /// "CAGT"
         case FormatId::RetiredSet:    return 0x54524143u; /// "CART"
-        case FormatId::RootsRegistry: return 0x52524143u; /// "CARR"
         case FormatId::GcOutcomes:    return 0x4F474143u; /// "CAGO"
         case FormatId::PartManifest:   return 0x54504143u; /// "CAPT" (NOT "CAPM"; that is PoolMeta)
         case FormatId::RunFile:        return 0x4E524143u; /// "CARN"

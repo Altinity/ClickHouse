@@ -26,7 +26,7 @@ enum class FormatId : uint16_t
     Watermark = 7,
     PoolMeta = 8,
     Roster = 9,
-    RootsRegistry = 10,
+    /// 10 (RootsRegistry) deleted in Task 4 — discovery authority moved to LIST(cas/refs/).
     GcOutcomes = 11,
     /// Phase 1a (CA GC root-local part-manifest redesign):
     PartManifest = 12,    /// immutable root-local part manifest body; magic "CAPT" (see plan note: "CAPM" is taken by PoolMeta)

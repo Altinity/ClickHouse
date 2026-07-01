@@ -590,9 +590,6 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
             "precommitAdd: manifest namespace '{}' != target namespace '{}'",
             id.root_namespace.string(), target_ns.string());
 
-    /// W-REGISTER: the target namespace must be in `gc/registry` before its first transition exists.
-    store->ensureRegistered(target_ns);
-
     /// ONE CAS on the TARGET shard (shardOf(final_ref_name)): append a create-precommit RootOwnerEvent
     /// {old=none, new={Precommit, final_ref_name, build_id, id.ref}} to the single ordered journal. No body
     /// HEAD — a missing body is a legal fail-closed, non-activating intent (spec §Precommit Add).
@@ -638,8 +635,6 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
             "promote: manifest namespace '{}' != target namespace '{}'",
             id.root_namespace.string(), target_ns.string());
 
-    const uint64_t registry_fence = store->ensureRegistered(target_ns);
-
     /// Read + validate the manifest body ONCE (O(manifest entries), one streaming read). Absent or
     /// invalid ⇒ fail closed: a committed ref must never name a missing/mismatched manifest.
     const String manifest_key = store->layout().manifestKey(id);
@@ -661,9 +656,9 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
 
     store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
     {
-        /// Refresh-then-revalidate (W-REGISTER ordering, load-bearing): if the shard's fence_round
-        /// (floored by the registry fence) is ahead of our view, GC advanced — refresh first.
-        if (store->retireView().round() < std::max(root.fence_round, registry_fence))
+        /// Refresh-then-revalidate: if the shard's fence_round is ahead of our view, GC advanced — refresh first.
+        /// Task 5 will replace this with the shard's own incarnation floor; for now gate on the shard fence only.
+        if (store->retireView().round() < root.fence_round)
             store->retireView().refresh();
 
         /// BUG 1 / TLA+ `WPromote` guard (`owner[m] = bld`): a promote is a PURE owner MOVE that emits NO

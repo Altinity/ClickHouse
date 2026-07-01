@@ -16,7 +16,7 @@ TEST(CasFormat, ChangePointsExistForEveryClass)
     for (auto id : {FormatId::Blob, FormatId::Manifest,
                     FormatId::GcState, FormatId::RetiredSet, FormatId::Watermark,
                     FormatId::PoolMeta, FormatId::Roster,
-                    FormatId::RootsRegistry, FormatId::GcOutcomes,
+                    FormatId::GcOutcomes,
                     FormatId::PartManifest, FormatId::RunFile,
                     FormatId::FoldSeal, FormatId::CompletionSeal})
     {
@@ -72,7 +72,6 @@ TEST(CasFormat, MagicForEachMutableObjectClass)
     EXPECT_EQ(le32toStr(magicFor(FormatId::Watermark)),     "CAWM");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcState)),       "CAGT");
     EXPECT_EQ(le32toStr(magicFor(FormatId::RetiredSet)),    "CART");
-    EXPECT_EQ(le32toStr(magicFor(FormatId::RootsRegistry)), "CARR");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcOutcomes)),    "CAGO");
     EXPECT_EQ(le32toStr(magicFor(FormatId::PartManifest)),    "CAPT");
     EXPECT_EQ(le32toStr(magicFor(FormatId::RunFile)),         "CARN");
@@ -107,7 +106,6 @@ TEST(CasFormat, MagicsAreDistinct)
         magicFor(FormatId::Watermark),
         magicFor(FormatId::GcState),
         magicFor(FormatId::RetiredSet),
-        magicFor(FormatId::RootsRegistry),
         magicFor(FormatId::GcOutcomes),
         magicFor(FormatId::PartManifest),
         magicFor(FormatId::RunFile),

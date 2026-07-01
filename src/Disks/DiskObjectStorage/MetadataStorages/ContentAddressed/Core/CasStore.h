@@ -317,16 +317,6 @@ public:
     /// build-root shard with it.
     uint64_t shardOf(const String & ref_name) const;
 
-    /// W-REGISTER (spec §5, decision 2026-06-12): CAS-append `ns` to `gc/registry` if not yet
-    /// present, BEFORE the namespace's first manifest is created — this orders namespace creation
-    /// against the GC fence. Returns the registry's fence_round observed/committed in the
-    /// registering attempt: the GATE FLOOR for a first publish into the namespace (a floor of 0
-    /// when the namespace was already registered — the per-shard fence carries the ordering then,
-    /// because R3 fences ALL shards of every registered namespace each round, minting fence-only
-    /// manifests for absent ones). Registrations are monotone, so a hit in the in-memory cache
-    /// short-circuits without I/O.
-    uint64_t ensureRegistered(const RootNamespace & ns);
-
     /// ---- B170 event audit (system.content_addressed_log) ----
     /// The wiring injects a sink (CasEvent -> SystemLog row) when the log is configured; null sink
     /// (unit tests, log disabled) makes emitEvent a no-op single branch. Build/Gc reach this via
@@ -434,11 +424,6 @@ private:
     /// pool_layout MUST precede retire_view: the ctor init list builds retire_view from pool_layout.
     Layout pool_layout;
     RetireView retire_view;
-
-    /// Namespaces this Store has confirmed registered (monotone — registrations are never undone
-    /// in M-C3; full GC removes a namespace with its final manifests in M-F).
-    std::mutex registered_mutex;
-    std::set<String> registered_cache;
 
     /// Per-server build watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random
     /// nonzero u64 minted once at open: GC checks it for EQUALITY (an object stamped with a different

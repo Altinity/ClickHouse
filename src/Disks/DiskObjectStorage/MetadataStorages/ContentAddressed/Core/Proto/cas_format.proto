@@ -13,7 +13,8 @@ package clickhouse.cas.format;
 //   protoc --decode clickhouse.cas.format.RootShardManifest cas_format.proto < manifest.bin
 // Per-object magic (4 ASCII bytes as little-endian fixed32):
 //   RootShardManifest "CARS" | PoolMetaProto "CAPM" | WatermarkProto "CAWM" | GcStateProto "CAGT"
-//   RetiredSetProto "CART" | RootsRegistryProto "CARR" | GcOutcomeLogProto "CAGO"
+//   RetiredSetProto "CART" | GcOutcomeLogProto "CAGO"
+// (RootsRegistryProto "CARR" deleted in Task 4 — discovery authority moved to LIST(cas/refs/))
 // (gc-snap stays a versioned binary+zstd codec — GC-internal, not an interchange format; B176 defers
 // its protobuf conversion.)
 //
@@ -191,16 +192,6 @@ message GcStateProto {
   string manifest_sweep_cursor  = 10; // best-effort cleanup cursor; never consulted by reachability
 }
 
-// Namespace registry (gc/registry). Magic CARR, FormatId::RootsRegistry.
-// CasHeader is field 1; existing fields renumbered from 2 to free field 1.
-// namespaces: sorted repeated string (deterministic; no proto map<>).
-message RootsRegistryProto {
-  CasHeader header            = 1;  // magic=CARR; set by encoder, checked by decoder
-  uint64 registry_version     = 2;  // monotone, CAS-carried
-  uint64 fence_round          = 3;  // written only by GC; monotone
-  repeated string namespaces  = 4;  // sorted ascending for byte-determinism
-}
-
 // One entry inside a GcOutcomeLogProto.
 // kind: 1=blob, 2=tree (mirrors ObjectKind enum).
 // token_type: 1=etag, 2=generation, 3=emulated (mirrors TokenType enum).
@@ -250,7 +241,7 @@ message FoldSealProto {
   repeated RunRefProto part_manifest_cleanup  = 6;   // sorted by key
 }
 
-// One "ns/shard" (or "_registry") -> version entry inside a CompletionSealProto map.
+// One "ns/shard" -> version entry inside a CompletionSealProto map.
 message SealVersionEntryProto {
   string key     = 1;
   uint64 version = 2;

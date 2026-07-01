@@ -14,7 +14,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 
@@ -122,8 +121,8 @@ inline DB::Cas::BlobId writeBlobRaw(
     return id;
 }
 
-/// Forward declaration: the manifest/transition helpers below call registerNamespaceRaw, which is
-/// defined further down (alongside publishRaw).
+/// Forward declaration: `appendOwnerEvent` (below) calls `registerNamespaceRaw`, which after Task 4
+/// is a no-op (LIST-based discovery needs no explicit registration) defined further down.
 inline void registerNamespaceRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns);
 
@@ -264,28 +263,12 @@ inline void deleteManifestBody(
         backend.deleteExact(key, h.token);
 }
 
-/// Register a namespace in `gc/registry` exactly as a writer's W-REGISTER does (read-modify-CAS
-/// append; no-op if already present). Raw-manifest fixtures MUST register: GC discovers namespaces
-/// from the registry, never LIST — an unregistered namespace's manifests are invisible to it.
+/// Formerly wrote the namespace into `gc/registry` for GC discovery; after Task 4 discovery
+/// is LIST-based and a namespace is visible once any ref shard exists — no explicit registration.
 inline void registerNamespaceRaw(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns)
+    DB::Cas::Backend & /*backend*/, const DB::Cas::Layout & /*layout*/, const DB::Cas::RootNamespace & /*ns*/)
 {
-    while (true)
-    {
-        const auto got = backend.get(layout.rootsRegistryKey());
-        DB::Cas::RootsRegistry registry;
-        if (got)
-            registry = DB::Cas::decodeRootsRegistry(got->bytes);
-        if (registry.namespaces.contains(ns.string()))
-            return;
-        registry.namespaces.insert(ns.string());
-        ++registry.registry_version;
-        const auto outcome = (got
-            ? backend.casPut(layout.rootsRegistryKey(), DB::Cas::encodeRootsRegistry(registry), got->token)
-            : backend.casPut(layout.rootsRegistryKey(), DB::Cas::encodeRootsRegistry(registry), std::nullopt)).outcome;
-        if (outcome == DB::Cas::CasOutcome::Committed)
-            return;
-    }
+    /// No-op: Task 4 deleted the registry; LIST(cas/refs/) is now the discovery authority.
 }
 
 /// Publish a root-shard manifest fresh (create-if-absent CAS). One fresh publish per shard suffices for

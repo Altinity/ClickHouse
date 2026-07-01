@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -201,7 +200,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     const Layout & layout = store->layout();
     FoldResult result;
 
-    /// 1. Discover the namespace universe FROM THE REGISTRY (LIST is only an accelerator).
+    /// 1. Discover the present (namespace, shard) pairs via LIST(cas/refs/) (Task 4 LIST-based discovery).
     result.root_shards = discoverUniverse();
 
     /// Parent cursors — the per-(ns,shard) cursors a prior round sealed. M1: read them from the LATEST
@@ -628,55 +627,30 @@ void Gc::fence(GcState & state, Token & state_token, FoldResult & folded)
 
     const uint64_t round = state.round;
 
-    /// 0. CAS the NAMESPACE REGISTRY's fence_round first — the ordering point for namespace creation.
-    /// The committed-attempt registry is ALSO the shard-fence universe (a superset of the fold-time one).
-    RootsRegistry fence_universe;
+    /// Ensure this round's fence_version vector EXISTS even when the pool holds no shards (fresh pool /
+    /// every namespace dropped). Previously the always-present registry fence guaranteed one entry per
+    /// round; after Task 4 an empty universe would leave `fence_version[round]` unset and `recheck`
+    /// would fail closed ("no fence_version recorded"). An empty (but present) vector says "the fence
+    /// ran this round and covered zero shards" — the correct meaning for an empty pool.
+    state.fence_version[round];
+
+    /// Fence only the PRESENT shards (LIST-discovered, Task 4): `discoverUniverse()` returns
+    /// the (ns, shard) pairs visible under `cas/refs/`. Absent shards are not fenced — a first
+    /// publish into a brand-new namespace creates the shard and stamps incarnation; the shard-
+    /// fence path handles the ordering from there.
+    const std::vector<std::pair<RootNamespace, uint64_t>> present_shards = discoverUniverse();
+    for (const auto & [ns, shard] : present_shards)
     {
-        const String registry_key = layout.rootsRegistryKey();
-        bool registry_fenced = false;
-        for (size_t attempt = 0; attempt < 100 && !registry_fenced; ++attempt)
+        uint64_t committed = 0;
+        store->mutateShard(ns, shard, [&](RootShard & root)
         {
-            const auto got = backend.get(registry_key);
-            RootsRegistry registry;
-            if (got)
-                registry = decodeRootsRegistry(got->bytes);
-            registry.fence_round = std::max(registry.fence_round, round);
-            ++registry.registry_version;
-            const CasOutcome outcome = (got
-                ? backend.casPut(registry_key, encodeRootsRegistry(registry), got->token)
-                : backend.casPut(registry_key, encodeRootsRegistry(registry), std::nullopt)).outcome;
-            if (outcome == CasOutcome::Committed)
-            {
-                state.fence_version[round]["_registry"] = registry.registry_version;
-                folded.completion_seal.fence_positions["_registry"] = registry.registry_version;
-                fence_universe = std::move(registry);
-                registry_fenced = true;
-            }
-        }
-        if (!registry_fenced)
-            throw Exception(ErrorCodes::ABORTED,
-                "CAS gc fence: registry CAS contention (runaway live-lock brake)");
+            root.fence_round = std::max(root.fence_round, round);
+        }, &committed, RootMutationOrigin::Gc, RootMutationKind::Fence);
+        state.fence_version[round][cursorKey(ns, shard)] = committed;
+        folded.completion_seal.fence_positions[cursorKey(ns, shard)] = committed;
     }
 
-    /// 1. CAS fence_round := max(fence_round, round) into EVERY root shard of EVERY namespace in the
-    /// fence-time registry — present or ABSENT shards alike (an absent shard's create-if-absent CAS mints
-    /// a fence-only manifest; the create race against a first publish is the required total order).
-    for (const String & ns_name : fence_universe.namespaces)
-    {
-        const RootNamespace ns{ns_name};
-        for (const uint64_t shard : shardsToVisit(ns))
-        {
-            uint64_t committed = 0;
-            store->mutateShard(ns, shard, [&](RootShard & root)
-            {
-                root.fence_round = std::max(root.fence_round, round);
-            }, &committed, RootMutationOrigin::Gc, RootMutationKind::Fence);
-            state.fence_version[round][cursorKey(ns, shard)] = committed;
-            folded.completion_seal.fence_positions[cursorKey(ns, shard)] = committed;
-        }
-    }
-
-    /// 2. ONE gc/state CAS persists the whole fence_version[round] vector.
+    /// ONE gc/state CAS persists the whole fence_version[round] vector.
     const CasResult fence_res = backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token);
     if (fence_res.outcome == CasOutcome::Committed)
     {
@@ -689,9 +663,9 @@ void Gc::fence(GcState & state, Token & state_token, FoldResult & folded)
             e.round = round;
             e.gen = state.snap_generation;
             e.outcome = "fenced";
-            e.reason = "R3: fenced the registry + every root shard of every registered namespace";
+            e.reason = "R3: fenced every present shard (LIST-discovered, Task 4)";
             e.detail = {{"fence_seq", std::to_string(state.fence_seq)},
-                        {"namespaces", std::to_string(fence_universe.namespaces.size())}};
+                        {"shards", std::to_string(present_shards.size())}};
         });
         return;
     }
@@ -738,8 +712,6 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     std::map<String, Token> post_fence_tokens;
     for (const auto & [cursor_key, fence_version] : fence_it->second)
     {
-        if (cursor_key == "_registry")
-            continue;
         const auto [ns, shard] = parseCursorKey(cursor_key);
         const auto [root, tok] = store->readShard(ns, shard);
         if (tok.has_value())
@@ -1305,16 +1277,45 @@ std::map<String, ShardCoverage> Gc::readSealedCursors(uint64_t generation, uint6
 
 std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
 {
+    /// LIST-based namespace discovery (Task 4): the discovery authority rests on LIST(cas/refs/).
+    /// Consistency requirement: the backend must give read-your-writes LIST enumeration.
+    /// InMemoryBackend: guaranteed (in-memory map). S3: strongly consistent since 2021.
+    /// RustFS: to confirm in soak.
     std::vector<std::pair<RootNamespace, uint64_t>> universe;
-    if (const auto got = store->backend().get(store->layout().rootsRegistryKey()))
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+    const String prefix = layout.casRefsPrefix();
+    String cursor;
+    for (;;)
     {
-        const RootsRegistry registry = decodeRootsRegistry(got->bytes);
-        for (const String & ns_name : registry.namespaces)
+        const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
+        for (const ListedKey & lk : page.keys)
         {
-            const RootNamespace ns{ns_name};
-            for (const uint64_t shard : shardsToVisit(ns))
-                universe.emplace_back(ns, shard);
+            if (!lk.key.starts_with(prefix))
+                continue;
+            const std::string_view rest(lk.key.data() + prefix.size(), lk.key.size() - prefix.size());
+            const size_t slash = rest.rfind('/');
+            if (slash == std::string_view::npos || slash + 1 == rest.size())
+                continue;
+            const std::string_view shard_sv = rest.substr(slash + 1);
+            uint64_t shard = 0;
+            bool valid = !shard_sv.empty();
+            for (const char c : shard_sv)
+            {
+                if (c < '0' || c > '9')
+                {
+                    valid = false;
+                    break;
+                }
+                shard = shard * 10 + static_cast<uint64_t>(c - '0');
+            }
+            if (!valid)
+                continue;
+            universe.emplace_back(RootNamespace{String(rest.substr(0, slash))}, shard);
         }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
     }
     return universe;
 }
@@ -1367,8 +1368,9 @@ std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
 
-    /// Universe is ALWAYS the REGISTRY universe (registry authority) — LIST is only an accelerator and can
-    /// never remove a shard from the set. Default decision is Read (fail closed; the spec, not a fallback).
+    /// Universe is the LIST-discovered present-shard set (Task 4: `discoverUniverse` LISTs `cas/refs/`).
+    /// The token sweep below is only an accelerator on top of it — it decides Read-vs-Skip per shard, never
+    /// removes a shard from the set. Default decision is Read (fail closed; the spec, not a fallback).
     std::map<String, DiscoverDecision> decisions;
     const std::vector<std::pair<RootNamespace, uint64_t>> universe = discoverUniverse();
     for (const auto & [ns, shard] : universe)

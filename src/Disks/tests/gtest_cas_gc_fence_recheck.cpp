@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
 
@@ -39,21 +38,23 @@ TEST(CasGcRetire, ManifestBodyDeletedAfterDecrementsSealed)
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
-/// Fence raises fence_round on every root shard + the registry.
-TEST(CasGcFence, RaisesAllShardAndRegistryFence)
+/// Fence raises fence_round on every present root shard (LIST-discovered, Task 4).
+/// After Task 4 there is no registry object — only present shards are fenced.
+TEST(CasGcFence, RaisesAllShardFence)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
-    registerNamespaceRaw(*backend, store->layout(), ns);
+    /// Write an actual ref shard so the LIST sweep discovers the namespace.
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt,
+        ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
     Gc gc(store, kGc);
     gc.runRegularRound();
     const auto shard0 = backend->get(store->layout().rootShardKey(ns, 0));
     ASSERT_TRUE(shard0.has_value());
     EXPECT_GE(decodeRootShard(shard0->bytes).fence_round, 1u);
-    const auto reg = backend->get(store->layout().rootsRegistryKey());
-    ASSERT_TRUE(reg.has_value());
-    EXPECT_GE(decodeRootsRegistry(reg->bytes).fence_round, 1u);
+    /// No registry object (Task 4 deleted it).
+    EXPECT_FALSE(backend->get("p/gc/registry").has_value());
 }
 
 /// A publish racing the fence (in-degree restored) is SPARED, not deleted (#14).

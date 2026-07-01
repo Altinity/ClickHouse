@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootsRegistry.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
@@ -1013,75 +1012,73 @@ std::pair<RootShard, std::optional<Token>> Store::readShard(const RootNamespace 
     return {decodeRootShard(object->bytes), object->token};
 }
 
-uint64_t Store::ensureRegistered(const RootNamespace & ns)
-{
-    pool_layout.rootShardKey(ns, 0);   /// validate the namespace string early (checkNamespace)
-
-    {
-        std::lock_guard lock(registered_mutex);
-        if (registered_cache.contains(ns.string()))
-            /// Already registered: no gate floor needed — R3 fences ALL shards of every registered
-            /// namespace each round (minting fence-only manifests for absent ones), so the per-shard
-            /// fence carries the publish ordering from here on.
-            return 0;
-    }
-
-    const String key = pool_layout.rootsRegistryKey();
-    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
-    {
-        const std::optional<GetResult> got = pool_backend->get(key);
-        RootsRegistry registry;
-        if (got)
-            registry = decodeRootsRegistry(got->bytes);
-
-        if (registry.namespaces.contains(ns.string()))
-        {
-            /// Another writer (or our own crashed attempt) registered it. Return the observed
-            /// fence_round anyway — for a FIRST publish of THIS Store the floor is cheap and
-            /// strictly conservative (the round-R fence may not have minted this namespace's
-            /// shards yet if registration landed after R3 began).
-            std::lock_guard lock(registered_mutex);
-            registered_cache.insert(ns.string());
-            return registry.fence_round;
-        }
-
-        registry.namespaces.insert(ns.string());
-        ++registry.registry_version;
-        const CasOutcome outcome = (got
-            ? pool_backend->casPut(key, encodeRootsRegistry(registry), got->token)
-            : pool_backend->casPut(key, encodeRootsRegistry(registry), std::nullopt)).outcome;
-        if (outcome == CasOutcome::Committed)
-        {
-            std::lock_guard lock(registered_mutex);
-            registered_cache.insert(ns.string());
-            /// W-REGISTER gate floor: the fence_round READ in the committed attempt. An append that
-            /// lands BELOW a round's registry fence is folded into that round's discovery; an
-            /// append AFTER it observed fence_round >= round here — the caller's publish gate must
-            /// refresh its retire view to at least this round before committing (spec §5).
-            return registry.fence_round;
-        }
-        /// Conflict: a racing registration or the GC fence moved the registry — re-read and retry.
-    }
-    throw Exception(ErrorCodes::ABORTED,
-        "CAS namespace registration contention on {} (runaway live-lock brake)", key);
-}
-
 std::vector<String> Store::listNamespaces(const String & prefix)
 {
-    /// One registry GET — the authoritative namespace universe (W-REGISTER: every published
-    /// namespace is here; never LIST). Absent registry = fresh pool = no namespaces. The wiring
-    /// uses this for directory-style enumeration of opaque namespace strings (e.g. the FREEZE
-    /// shadow tree); registrations of dropped namespaces linger until full GC (M-F) — callers
-    /// resolve refs per namespace, so a lingering empty namespace is visible-but-empty, not wrong.
-    std::vector<String> result;
-    if (const std::optional<GetResult> got = pool_backend->get(pool_layout.rootsRegistryKey()))
+    /// LIST-based discovery authority (Task 4): enumerate distinct full namespace strings
+    /// from ref shards under `cas/refs/` UNION verbatim-file namespaces under `roots/`.
+    ///
+    /// Consistency requirement: the backend must give read-your-writes LIST enumeration.
+    /// InMemoryBackend: guaranteed (in-memory map). S3: strongly consistent since 2021.
+    /// RustFS: to confirm in soak.
+    std::unordered_set<String> found;
+
+    /// `cas/refs/`: keys are `<pool_prefix>/cas/refs/<ns>/<shard>` (shard is a decimal integer).
+    /// Strip the pool prefix, then extract ns = everything before the last '/'.
     {
-        const RootsRegistry registry = decodeRootsRegistry(got->bytes);
-        for (const String & ns : registry.namespaces)
-            if (ns.starts_with(prefix))
-                result.push_back(ns);
+        const String base = pool_layout.casRefsPrefix() + prefix;
+        String cursor;
+        for (;;)
+        {
+            ListPage page = pool_backend->list(base, cursor, /*limit*/ 1000);
+            for (const ListedKey & listed : page.keys)
+            {
+                const String & key = listed.key;
+                if (!key.starts_with(base))
+                    continue;
+                const std::string_view rest(key.data() + pool_layout.casRefsPrefix().size(),
+                    key.size() - pool_layout.casRefsPrefix().size());
+                const size_t last_slash = rest.rfind('/');
+                if (last_slash == std::string_view::npos)
+                    continue;
+                const String ns_str(rest.substr(0, last_slash));
+                if (!ns_str.empty() && ns_str.starts_with(prefix))
+                    found.insert(ns_str);
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
     }
-    return result;
+
+    /// `roots/`: verbatim-file keys are `<pool_prefix>/roots/<ns>/_files/<name>`.
+    /// Extract ns = everything before `/_files/`.
+    {
+        const String base = pool_layout.rootsPrefix() + prefix;
+        String cursor;
+        for (;;)
+        {
+            ListPage page = pool_backend->list(base, cursor, /*limit*/ 1000);
+            for (const ListedKey & listed : page.keys)
+            {
+                const String & key = listed.key;
+                if (!key.starts_with(pool_layout.rootsPrefix()))
+                    continue;
+                const std::string_view rest(key.data() + pool_layout.rootsPrefix().size(),
+                    key.size() - pool_layout.rootsPrefix().size());
+                const size_t files_pos = rest.find("/_files/");
+                if (files_pos == std::string_view::npos)
+                    continue;   /// plain mountpoint object (not a namespaced verbatim file); skip
+                const String ns_str(rest.substr(0, files_pos));
+                if (!ns_str.empty() && ns_str.starts_with(prefix))
+                    found.insert(ns_str);
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+    }
+
+    return {found.begin(), found.end()};
 }
 
 std::vector<String> Store::listMirroredChildren(const String & prefix)

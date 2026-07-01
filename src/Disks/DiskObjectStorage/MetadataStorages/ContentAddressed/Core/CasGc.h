@@ -215,12 +215,12 @@ private:
     /// (ViewableRound). On success `state`/`state_token` carry the committed round.
     RetireResult retire(GcState & state, Token & state_token, const FoldResult & folded, RoundReport & report);
 
-    /// R3 (spec §Global Fence): CAS the NAMESPACE REGISTRY's fence_round first (the ordering point for
-    /// namespace creation), then CAS fence_round := round (monotone max) into EVERY root shard of every
-    /// namespace in the FENCE-TIME registry (minting fence-only manifests for absent shards). Record
-    /// each shard's committed shard_version (and the registry's committed version under "_registry") in
-    /// gc/state.fence_version[round] AND in folded.completion_seal.fence_positions. The manifest CAS
-    /// totally orders the fence against publishes on that shard. One fence covers the whole round.
+    /// R3 (spec §Global Fence, Task 4 LIST-based): CAS fence_round := round (monotone max) into every
+    /// PRESENT root shard discovered by LIST(cas/refs/). Absent shards (namespaces with no prior publish)
+    /// are not fenced — a first publish into a brand-new namespace creates the shard and stamps incarnation;
+    /// promote's unconditional blob revalidation guards against condemned blobs in the brand-new shard.
+    /// Record each shard's committed shard_version in gc/state.fence_version[round] AND in
+    /// folded.completion_seal.fence_positions. One fence covers the whole round.
     void fence(GcState & state, Token & state_token, FoldResult & folded);
 
     /// R4 (spec §Recheck And Delete): fold every fenced shard's owner transitions in (sealed_cursor,
@@ -243,8 +243,9 @@ private:
     /// discards cursor progress and must not fail the already-completed GC round.
     void runManifestSweepCursorPass(GcState & state, Token & state_token);
 
-    /// Discover the namespace universe from the registry (namespaces x ALL root_shards shards); shared by
-    /// the fold and the resume re-fence. Absent registry => empty (fresh pool).
+    /// Discover the present (namespace, shard) pairs from LIST(cas/refs/); shared by the fold and the
+    /// resume re-fence. Returns only shards that have a backend object (absent shards not included).
+    /// Fresh pool (no shards yet) => empty result.
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverse();
 
     /// Phase-2 token-diff: do ONE LIST sweep over `<prefix>/roots/` and return, for each listed key
@@ -339,6 +340,13 @@ public:
                                    std::map<ManifestId, Token> & cleanup)
     {
         return foldManifestEdges(id, activation ? +1 : -1, deltas, cleanup);
+    }
+
+    /// TEST SEAM (Task 4): expose LIST-based namespace/shard discovery so unit tests can assert the
+    /// discovered universe equals the set of present ref shards without driving a full round.
+    std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverseForTest()
+    {
+        return discoverUniverse();
     }
 
 };

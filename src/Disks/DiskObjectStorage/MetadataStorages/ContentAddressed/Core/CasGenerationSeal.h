@@ -58,7 +58,7 @@ struct CasFoldSeal
 struct CasCompletionSeal
 {
     uint64_t generation = 0;
-    std::map<String, uint64_t> fence_positions;     /// "ns/shard" (+ "_registry") -> fenced version
+    std::map<String, uint64_t> fence_positions;     /// "ns/shard" -> fenced version
     std::vector<RunRef> blob_target_runs;           /// the completion (fold-through-fence) gen's in-degree runs
     std::vector<RunRef> delete_outcomes;            /// the outcome-log segments this gen wrote
     std::map<String, uint64_t> trim_cursors;        /// "ns/shard" -> the cursor trim ran to

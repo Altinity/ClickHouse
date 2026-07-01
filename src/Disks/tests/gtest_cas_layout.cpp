@@ -109,12 +109,12 @@ TEST(CasLayout, ShortIdThrows)
     EXPECT_NO_THROW(l.blobKey(BlobId{"ab"}));                // exactly 2 chars is OK
 }
 
-TEST(CasLayout, RegistryKeyMovedToGc)
+TEST(CasLayout, RegistryDeletedGcDiscoveryViaList)
 {
+    /// Task 4: the namespace registry (`gc/registry`) is deleted; discovery authority moved to LIST.
+    /// The `_registry` namespace segment is not reserved (it was only reserved while the registry lived
+    /// under `roots/_registry`, which was already relocated to `gc/registry` before being deleted).
     Layout l("p");
-    EXPECT_EQ(l.rootsRegistryKey(), "p/gc/registry");
-    /// The registry no longer lives under roots/, so a `_registry` namespace segment is no longer
-    /// reserved (design §5.3 bonus cleanup) — but it also never occurs in a real CH path.
     EXPECT_NO_THROW(l.rootShardKey(RootNamespace{"a/_registry@cas@"}, 0));
     /// `_files` and `_pool_meta`-style reservations are unaffected.
     EXPECT_THROW(l.rootShardKey(RootNamespace{"a/_files"}, 0), DB::Exception);

@@ -25,7 +25,7 @@ CasCompletionSeal sampleCompletionSeal()
     CasCompletionSeal seal;
     seal.generation = 7;
     seal.fence_positions["ns1/0"] = 99;
-    seal.fence_positions["_registry"] = 100;
+    seal.fence_positions["ns1/1"] = 100;
     seal.delete_outcomes.push_back(RunRef{.key = "gc/outcomes/2.0/0", .checksum = UInt128(0x55)});
     seal.trim_cursors["ns1/0"] = 42;
     seal.adoptable = true;
@@ -84,7 +84,7 @@ TEST(CasCompletionSeal, RoundTripsAllFields)
     const CasCompletionSeal out = decodeCompletionSeal(encodeCompletionSeal(in));
 
     EXPECT_EQ(out.generation, in.generation);
-    EXPECT_EQ(out.fence_positions.at("_registry"), 100u);
+    EXPECT_EQ(out.fence_positions.at("ns1/1"), 100u);
     EXPECT_EQ(out.fence_positions.at("ns1/0"), 99u);
     ASSERT_EQ(out.delete_outcomes.size(), 1u);
     EXPECT_EQ(out.delete_outcomes[0].key, "gc/outcomes/2.0/0");

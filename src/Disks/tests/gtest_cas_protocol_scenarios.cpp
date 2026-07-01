@@ -456,17 +456,17 @@ TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
 
 TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
 {
-    /// THE ABSENT-SHARD ORDERING HOLE's regression test (spec §5 W-REGISTER). A publish into a BRAND-NEW
-    /// namespace creates its shard with fence_round 0, so the shard alone can never trigger the gate's
-    /// fence-advanced refresh. W-REGISTER makes promote's ensureRegistered observe the REGISTRY's
-    /// fence_round (raised by the GC round) and refresh the view BEFORE revalidating. Re-expressed on the
-    /// manifest model with a blob leaf (the tree object is gone): build B adopts a blob, a GC round
-    /// retires + deletes it, then B publishes into a fresh namespace — promote refreshes (registry floor)
-    /// and revalidates the now-ABSENT blob ⇒ ABORTED. It must NEVER land a manifest naming a deleted blob.
+    /// Regression test: build B adopts a blob, a GC round retires + deletes it, then B publishes into
+    /// a fresh namespace. After Task 4, the fence only touches PRESENT shards (LIST-discovered). For a
+    /// BRAND-NEW namespace its shard doesn't exist at fence time, so fence_round=0 on the shard — the
+    /// promote gate `root.fence_round` is 0 and the view is at round >= 1, so no refresh triggers from
+    /// the fence floor. However, promote's UNCONDITIONAL blob revalidation (step 3) catches the
+    /// condemned blob (HEAD returns its token t0 which is in the retire view) ⇒ ABORTED. The dangle
+    /// is prevented by the unconditional revalidation path, not by the registry fence floor.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
 
-    /// 1. part_1 → a blob in namespace A, through the real Build (registers A).
+    /// 1. part_1 → a blob in namespace A, through the real Build.
     const RootNamespace ns_a{"srv1/tbl"};
     auto build_a = startBuildFor(s, ns_a, "part_1");
     build_a->putBlob(idOf("floor-payload"), BlobSource::fromString("floor-payload"));
@@ -480,8 +480,8 @@ TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
     auto build_b = startBuildFor(s, RootNamespace{"srv2/new"}, "part_x");
     build_b->adoptEvidence(blobEntry("data.bin", "floor-payload"));
 
-    /// 3. drop part_1 from A; a REAL GC round retires the blob at t0, deletes it, and fences the
-    /// registry (fence_round 1). build_a finished, so advancing the watermark floor condemns the blob.
+    /// 3. drop part_1 from A; a REAL GC round retires the blob at t0 and deletes it.
+    /// build_a finished, so advancing the watermark floor condemns the blob.
     s->dropRef(ns_a, "part_1");
     build_a.reset();
     s->renewWatermarkOnce();
@@ -496,8 +496,9 @@ TEST(CasProtocol, NewNamespacePublishSeesRegistryFenceFloor)
     /// The blob (unreachable) was deleted at t0.
     EXPECT_FALSE(b->head(blob_key).exists);
 
-    /// 4. build B publishes into a BRAND-NEW namespace: ensureRegistered returns the registry's
-    /// fence_round (1) > view round (0) ⇒ promote refreshes ⇒ revalidate the blob ⇒ ABSENT ⇒ ABORTED.
+    /// 4. build B publishes into a BRAND-NEW namespace. After Task 4 there is no registry fence floor;
+    /// the shard's fence_round is 0 (shard was absent at fence time). The promote gate does NOT refresh
+    /// from the fence floor. The unconditional blob revalidation catches the condemned blob ⇒ ABORTED.
     /// It must NEVER land — landing would write a manifest naming a deleted blob (the dangle).
     const ManifestId id_b = build_b->stageManifest({blobEntry("data.bin", "floor-payload")});
     build_b->precommitAdd(RootNamespace{"srv2/new"}, "part_x", id_b);
