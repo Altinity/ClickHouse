@@ -333,6 +333,14 @@ private:
     UInt128 last_seen_hb_owner{};
     uint64_t last_seen_hb_seq = 0;
 
+public:
+    /// TEST SEAM: thin public wrapper so unit tests can call foldManifestEdges without driving a full round.
+    bool foldManifestEdgesForTest(const ManifestId & id, bool activation, std::vector<BlobDelta> & deltas,
+                                   std::map<ManifestId, Token> & cleanup)
+    {
+        return foldManifestEdges(id, activation ? +1 : -1, deltas, cleanup);
+    }
+
 };
 
 }

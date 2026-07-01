@@ -168,7 +168,10 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     for (const ManifestEntry & entry : body.entries)
         if (entry.placement == EntryPlacement::Blob)
         {
-            deltas.push_back(BlobDelta{.blob_hash = entry.blob_hash, .delta = sign});
+            deltas.push_back(BlobDelta{
+                .blob_hash = entry.blob_hash,
+                .source_id = sourceEdgeId(id, entry.path),
+                .remove = (sign < 0)});
             /// B170: a folded owner edge over this blob (the manifest-model analog of the old tree
             /// RootAdd/TreeExpand). +1 = the manifest's owner activated this blob's reference; -1 =
             /// the owner was removed, dropping the reference. Reconstructs WHY a blob's in-degree moved.

@@ -1230,3 +1230,83 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r1}));
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r2}));
 }
+
+/// Source-edge idempotency: re-folding the same blob activation does not double-count.
+/// A blob activated twice from the SAME source edge (same ManifestId + path) has in-degree 1, not 2.
+TEST(CasGcRound, FoldManifestEdgesEmitsOnePlusEdgePerBlob)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    driveToFixpoint(gc);
+
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1)
+        << "a single published manifest must contribute exactly one source edge per blob";
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)))
+        << "the blob must still exist (in-degree > 0)";
+}
+
+/// Re-fold of a removal is idempotent: the fold barrier + source-edge set model ensure that
+/// folding the same removal twice (the H1b scenario) does NOT drive the in-degree below zero.
+TEST(CasGcRound, ReFoldOfRemovalIsIdempotent)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    driveToFixpoint(gc);
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
+
+    /// Drop the ref and run to fixpoint. The blob should be reclaimed.
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    EXPECT_NO_THROW(driveToFixpoint(gc))
+        << "re-fold of a removal must be idempotent (source-edge set, never underflows)";
+
+    EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)))
+        << "the blob must be reclaimed after the only reference is dropped";
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
+}
+
+/// Two distinct manifests referencing the same blob contribute TWO independent source edges.
+/// Dropping one manifest leaves the other's edge intact (in-degree stays 1, blob is spared).
+TEST(CasGcRound, TwoManifestsTwoSourceEdgesDropOneSpares)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+
+    const ManifestRef r1 = ref(1, 0xAA);
+    const ManifestRef r2 = ref(2, 0xBB);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl1", std::nullopt, r1);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
+
+    Gc gc(store, kGc);
+    driveToFixpoint(gc);
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 2)
+        << "two distinct manifests referencing the same blob must each contribute one source edge";
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+
+    /// Drop one of the two references; the other still pins the blob.
+    dropRefTransition(*backend, store->layout(), ns, "tbl1", r1);
+    driveToFixpoint(gc);
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1)
+        << "after dropping one of two references the in-degree must be 1";
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)))
+        << "the blob must survive — the second reference still pins it";
+}

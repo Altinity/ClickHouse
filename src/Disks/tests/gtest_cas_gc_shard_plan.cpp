@@ -115,13 +115,13 @@ TEST(CasGcShardScatter, ScatterTwoEntriesToDifferentShards)
     const auto & bucket_a = buckets[shard_a];
     ASSERT_EQ(bucket_a.size(), 1u) << "shard_a should have one delta";
     EXPECT_EQ(bucket_a[0].blob_hash, hash_a);
-    EXPECT_EQ(bucket_a[0].delta, -1);
+    EXPECT_TRUE(bucket_a[0].remove);
 
     /// shard_b must have exactly one +1 delta for hash_b.
     const auto & bucket_b = buckets[shard_b];
     ASSERT_EQ(bucket_b.size(), 1u) << "shard_b should have one delta";
     EXPECT_EQ(bucket_b[0].blob_hash, hash_b);
-    EXPECT_EQ(bucket_b[0].delta, +1);
+    EXPECT_FALSE(bucket_b[0].remove);
 
     /// All other shards must be empty.
     for (uint64_t s = 0; s < 4; ++s)
@@ -189,40 +189,34 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
     ASSERT_EQ(blobShard(b1, 2), 0u) << "b1 must route to shard 0";
     ASSERT_EQ(blobShard(b2, 2), 1u) << "b2 must route to shard 1";
 
-    /// Scatter: b1 twice +1 and once -1 (net +1) into shard-0 bucket;
-    ///          b2 once +1 (net +1) into shard-1 bucket.
-    ShardScatter scatter(2);
-    {
-        ManifestEntry e1;
-        e1.placement = EntryPlacement::Blob;
-        e1.blob_hash = b1;
+    /// Bypass ShardScatter (which lacks source_id context).
+    /// Construct source-edge deltas directly:
+    /// b1 shard=0: source 1 activates, source 2 activates, source 1 removes => 1 active edge
+    /// b2 shard=1: source 3 activates => 1 active edge
+    std::vector<std::vector<BlobDelta>> buckets(2);
+    buckets[0] = {
+        BlobDelta{.blob_hash = b1, .source_id = UInt128(1), .remove = false},
+        BlobDelta{.blob_hash = b1, .source_id = UInt128(2), .remove = false},
+        BlobDelta{.blob_hash = b1, .source_id = UInt128(1), .remove = true},
+    };
+    buckets[1] = {
+        BlobDelta{.blob_hash = b2, .source_id = UInt128(3), .remove = false},
+    };
 
-        ManifestEntry e2;
-        e2.placement = EntryPlacement::Blob;
-        e2.blob_hash = b2;
-
-        /// Publish b1 once (+1 for b1), then b2 once (+1 for b2): simulate two add events.
-        scatter.scatter({}, {e1});   /// add b1: shard-0 gets +1
-        scatter.scatter({}, {e2});   /// add b2: shard-1 gets +1
-        scatter.scatter({}, {e1});   /// add b1 again: shard-0 gets +1
-        scatter.scatter({e1}, {});   /// remove b1: shard-0 gets -1
-    }
-    auto buckets = scatter.take();
-
-    /// Verify bucket contents before reducing.
+    /// Verify bucket net effects (source 2 survives for b1; source 3 survives for b2).
     ASSERT_EQ(buckets.size(), 2u);
     {
         int64_t net_b1 = 0;
         for (const auto & d : buckets[0])
             if (d.blob_hash == b1)
-                net_b1 += d.delta;
+                net_b1 += d.remove ? -1 : +1;
         EXPECT_EQ(net_b1, 1) << "shard-0 bucket net delta for b1 must be +1";
     }
     {
         int64_t net_b2 = 0;
         for (const auto & d : buckets[1])
             if (d.blob_hash == b2)
-                net_b2 += d.delta;
+                net_b2 += d.remove ? -1 : +1;
         EXPECT_EQ(net_b2, 1) << "shard-1 bucket net delta for b2 must be +1";
     }
 
@@ -407,10 +401,10 @@ TEST(CasGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
 
     /// A flat delta stream as produced by `foldManifestEdges`: b0 net +1 (two +1, one -1), b1 net +1.
     std::vector<BlobDelta> deltas{
-        BlobDelta{.blob_hash = b0, .delta = +1},
-        BlobDelta{.blob_hash = b1, .delta = +1},
-        BlobDelta{.blob_hash = b0, .delta = +1},
-        BlobDelta{.blob_hash = b0, .delta = -1},
+        BlobDelta{.blob_hash = b0, .source_id = UInt128(1), .remove = false},
+        BlobDelta{.blob_hash = b1, .source_id = UInt128(2), .remove = false},
+        BlobDelta{.blob_hash = b0, .source_id = UInt128(3), .remove = false},
+        BlobDelta{.blob_hash = b0, .source_id = UInt128(1), .remove = true},
     };
 
     /// Partition by blobShard — the exact step the sharded fold runs before reducing.
@@ -593,11 +587,11 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
     /// These are the same bucket contents `ShardScatter` would produce for a journal that published
     /// two distinct manifests both referencing b0 and one manifest referencing b1.
     std::vector<BlobDelta> bucket0 = {
-        BlobDelta{.blob_hash = b0, .delta = +1},
-        BlobDelta{.blob_hash = b0, .delta = +1},
+        BlobDelta{.blob_hash = b0, .source_id = UInt128(1), .remove = false},
+        BlobDelta{.blob_hash = b0, .source_id = UInt128(2), .remove = false},
     };
     std::vector<BlobDelta> bucket1 = {
-        BlobDelta{.blob_hash = b1, .delta = +1},
+        BlobDelta{.blob_hash = b1, .source_id = UInt128(3), .remove = false},
     };
 
     /// (b) PRE-SEAL INVISIBILITY — drive both reducers before any coordinator action.

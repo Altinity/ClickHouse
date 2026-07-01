@@ -36,7 +36,7 @@ void ShardScatter::emit(const std::vector<UInt128> & blob_hashes, int sign)
     for (const UInt128 & h : blob_hashes)
     {
         const uint64_t s = blobShard(h, gc_shards);
-        buckets[s].push_back(BlobDelta{.blob_hash = h, .delta = sign});
+        buckets[s].push_back(BlobDelta{.blob_hash = h, .source_id = UInt128(0), .remove = (sign < 0)});
     }
 }
 

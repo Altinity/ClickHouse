@@ -23,37 +23,9 @@ namespace DB::Cas
 namespace
 {
 
-/// Run key is the 16-byte big-endian blob_hash (so RunFile's byte ordering == UInt128 numeric order).
-String keyOf(const UInt128 & blob_hash)
-{
-    return u128ToBytesBE(blob_hash);
-}
-
-UInt128 keyToHash(const String & key)
-{
-    return u128FromBytesBE(key, "blob in-degree run key");
-}
-
-/// Payload is an 8-byte little-endian int64 count/delta.
-String payloadOf(int64_t v)
-{
-    String s(8, '\0');
-    auto u = static_cast<uint64_t>(v);
-    for (int i = 0; i < 8; ++i)
-        s[i] = static_cast<char>(static_cast<UInt8>(u >> (8 * i)));
-    return s;
-}
-
-int64_t payloadToInt(std::string_view p)
-{
-    if (p.size() != 8)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS blob in-degree: run payload must be 8 bytes, got {}", p.size());
-    uint64_t u = 0;
-    for (int i = 0; i < 8; ++i)
-        u |= static_cast<uint64_t>(static_cast<UInt8>(p[i])) << (8 * i);
-    return static_cast<int64_t>(u);
-}
+constexpr char kEdgeActive    = 0x01;   // sealed-run row: a surviving active edge
+constexpr char kZeroMarker    = 0x00;   // sealed-run row: blob transitioned to zero this generation
+const UInt128 kZeroSourceId{0};
 
 UInt128 cityHash128(const String & bytes)
 {
@@ -61,13 +33,12 @@ UInt128 cityHash128(const String & bytes)
     return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
 }
 
-/// Read every blob in-degree run segment of (generation, shard) into a flat sorted list of
-/// (hash, count). The segments are written one per generation (seq 0); enumerating seq>0 future-proofs
-/// the multi-segment layout. Returns rows in key order.
-std::vector<std::pair<UInt128, int64_t>> readGenerationRows(
+// Read every (blob_hash, source_id) row of the prior generation's SourceEdge run into a sorted list.
+// Streaming; one RunFileReader. Skips zero-marker rows (they are per-generation, not carried forward).
+std::vector<std::pair<String, char>> readPriorEdges(
     Backend & backend, const Layout & layout, uint64_t generation, uint64_t attempt, uint64_t shard)
 {
-    std::vector<std::pair<UInt128, int64_t>> rows;
+    std::vector<std::pair<String, char>> rows;   // (32-byte key, tag)
     for (uint64_t seq = 0; ; ++seq)
     {
         const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
@@ -76,12 +47,12 @@ std::vector<std::pair<UInt128, int64_t>> readGenerationRows(
             break;
         DB::ReadBufferFromMemory in(got->bytes.data(), got->bytes.size());
         RunFileReader r(in);
-        String k;
-        String p;
+        String k, p;
         while (r.next(k, p))
-            rows.emplace_back(keyToHash(k), payloadToInt(p));
+            if (!p.empty() && p[0] == kEdgeActive)   // carry forward only surviving edges
+                rows.emplace_back(k, kEdgeActive);
     }
-    return rows;
+    return rows;   // already sorted by (blob_hash, source_id): the run is sorted
 }
 
 }
@@ -133,84 +104,87 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs)
 {
-    /// Deterministic input ordering => byte-reproducible output run (OQ5 resume/adoption).
-    std::sort(scattered.begin(), scattered.end(),
-        [](const BlobDelta & a, const BlobDelta & b) { return a.blob_hash < b.blob_hash; });
+    // Deterministic input ordering => byte-reproducible run (OQ5 resume/adoption).
+    // MUST be stable: for the same (blob_hash, source_id) the journal ordering is
+    // activation-before-removal; "last wins" then correctly resolves to removal (edge absent).
+    // An unstable sort can put removal before activation => last=activation => false positive.
+    std::stable_sort(scattered.begin(), scattered.end(),
+        [](const BlobDelta & a, const BlobDelta & b)
+        {
+            if (a.blob_hash != b.blob_hash) return a.blob_hash < b.blob_hash;
+            return a.source_id < b.source_id;
+        });
 
-    /// The prior generation's per-blob counts (one row per key, in key order). A key with count==0 in
-    /// the prior gen is a transitioned-to-0 marker we must NOT carry forward as a fresh candidate.
-    const std::vector<std::pair<UInt128, int64_t>> prior_rows =
-        readGenerationRows(backend, layout, prior_generation, prior_attempt, shard);
+    const auto prior = readPriorEdges(backend, layout, prior_generation, prior_attempt, shard);
 
-    /// Merge prior counts with scattered deltas, both already in key order. For each key sum
-    /// prior_count + Σ deltas. A merged count < 0 is an undercount (would over-delete) — fail closed.
     DB::WriteBufferFromOwnString out;
     RunHeader header;
-    header.kind = RunKind::BlobInDegree;
-    header.key_schema = 0;
+    header.kind = RunKind::SourceEdge;
+    header.key_schema = 0;   // (blob_hash, source_id) 32-byte fixed
     RunFileWriter writer(out, header);
 
-    size_t pi = 0;
-    size_t di = 0;
-    while (pi < prior_rows.size() || di < scattered.size())
-    {
-        /// Pick the smallest key across the two cursors.
-        UInt128 key;
-        bool have = false;
-        if (pi < prior_rows.size())
-        {
-            key = prior_rows[pi].first;
-            have = true;
-        }
-        if (di < scattered.size() && (!have || scattered[di].blob_hash < key))
-        {
-            key = scattered[di].blob_hash;
-            have = true;
-        }
-        chassert(have);
+    // Streaming two-cursor merge over prior edges (by 32-byte key) and this round's edge deltas
+    // (by (blob_hash, source_id)). All rows for one edge key are adjacent in BOTH inputs. We resolve
+    // final presence per edge locally (idempotent: prior present + activate => present; any remove =>
+    // absent), emit surviving edges, and accumulate the current blob's surviving-edge count on the fly
+    // to emit a zero-transition marker. O(block) IO + O(1) per current blob.
+    size_t pi = 0, di = 0;
+    UInt128 cur_blob{0};
+    bool have_blob = false;
+    uint64_t cur_edges = 0;    // surviving edges of cur_blob so far
+    bool cur_touched = false;  // cur_blob had prior edges or deltas this generation
 
-        int64_t prior_count = 0;
-        bool prior_present = false;
-        while (pi < prior_rows.size() && prior_rows[pi].first == key)
+    auto closeBlob = [&]()
+    {
+        if (have_blob && cur_edges == 0 && cur_touched)
+            writer.append(srcEdgeRunKey(cur_blob, kZeroSourceId), String(1, kZeroMarker));
+    };
+    auto openBlobIfNeeded = [&](const UInt128 & b)
+    {
+        if (!have_blob || b != cur_blob)
         {
-            prior_count += prior_rows[pi].second;
-            prior_present = true;
-            ++pi;
+            closeBlob();
+            cur_blob = b; have_blob = true; cur_edges = 0; cur_touched = false;
         }
-        int64_t delta_sum = 0;
-        bool delta_present = false;
-        while (di < scattered.size() && scattered[di].blob_hash == key)
+    };
+
+    while (pi < prior.size() || di < scattered.size())
+    {
+        // Pick the smallest edge key across the two cursors.
+        String key;
+        bool from_prior = false;
+        if (pi < prior.size()) { key = prior[pi].first; from_prior = true; }
+        if (di < scattered.size())
         {
-            delta_sum += scattered[di].delta;
-            delta_present = true;
+            const String dk = srcEdgeRunKey(scattered[di].blob_hash, scattered[di].source_id);
+            if (!from_prior || dk < key) { key = dk; from_prior = false; }
+        }
+
+        UInt128 blob_hash, source_id;
+        if (!parseSrcEdgeRunKey(key, blob_hash, source_id))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: malformed key");
+        openBlobIfNeeded(blob_hash);
+
+        bool present = false;
+        if (from_prior && prior[pi].first == key) { present = true; ++pi; cur_touched = true; }
+        while (di < scattered.size()
+               && scattered[di].blob_hash == blob_hash && scattered[di].source_id == source_id)
+        {
+            present = scattered[di].remove ? false : true;   // apply in order; last wins
+            cur_touched = true;
             ++di;
         }
 
-        const int64_t merged = prior_count + delta_sum;
-        if (merged < 0)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS blob in-degree: merged in-degree {} < 0 for a blob in gen {} shard {} "
-                "(undercount — fail closed rather than over-delete)", merged, new_generation, shard);
-
-        if (merged > 0)
+        if (present)
         {
-            writer.append(keyOf(key), payloadOf(merged));
-        }
-        else
-        {
-            /// merged == 0. Emit an explicit 0-row ONLY when this key actually transitioned to zero this
-            /// generation (it was pinned before and a delta dropped it, OR a fresh +/- cancelled). A key
-            /// that was already 0 in the prior gen and got no delta this gen is stale debris — drop it so
-            /// it is not re-reported as a candidate every round.
-            const bool transitioned = delta_present && (prior_count > 0 || (!prior_present && delta_sum == 0));
-            if (transitioned)
-                writer.append(keyOf(key), payloadOf(0));
+            writer.append(key, String(1, kEdgeActive));
+            ++cur_edges;
         }
     }
+    closeBlob();
 
     writer.finish();
     const String run_bytes = out.str();
-
     const String run_key = layout.blobTargetRunKey(new_generation, attempt, shard, 0);
     putDeterministicArtifact(backend, run_key, run_bytes);
     out_runs.push_back(RunRef{.key = run_key, .checksum = cityHash128(run_bytes)});
@@ -220,10 +194,21 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout
                                         uint64_t generation, uint64_t attempt, uint64_t shard)
 {
     std::vector<BlobCandidate> result;
-    for (const auto & [hash, count] : readGenerationRows(backend, layout, generation, attempt, shard))
+    for (uint64_t seq = 0; ; ++seq)
     {
-        if (count == 0)
-            result.push_back(BlobCandidate{.hash = hash});
+        const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
+        std::optional<GetResult> got = backend.get(key);
+        if (!got) break;
+        DB::ReadBufferFromMemory in(got->bytes.data(), got->bytes.size());
+        RunFileReader r(in);
+        String k, p;
+        while (r.next(k, p))
+            if (!p.empty() && p[0] == kZeroMarker)
+            {
+                UInt128 bh, sid;
+                if (parseSrcEdgeRunKey(k, bh, sid))
+                    result.push_back(BlobCandidate{.hash = bh});
+            }
     }
     return result;
 }
@@ -231,12 +216,24 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout
 int64_t inDegreeInGeneration(Backend & backend, const Layout & layout,
                              uint64_t generation, uint64_t attempt, uint64_t shard, const UInt128 & blob_hash)
 {
-    /// The run is sorted by hash and carries at most one row per key; absent => 0 (never pinned, or a
-    /// prior-gen zero that was dropped). An explicit 0-row (transitioned this gen) also reads as 0.
-    for (const auto & [hash, count] : readGenerationRows(backend, layout, generation, attempt, shard))
-        if (hash == blob_hash)
-            return count;
-    return 0;
+    int64_t count = 0;
+    for (uint64_t seq = 0; ; ++seq)
+    {
+        const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
+        std::optional<GetResult> got = backend.get(key);
+        if (!got) break;
+        DB::ReadBufferFromMemory in(got->bytes.data(), got->bytes.size());
+        RunFileReader r(in);
+        r.seek(u128ToBytesBE(blob_hash));   // sparse-index skip to this blob's edges
+        String k, p;
+        while (r.next(k, p))
+        {
+            UInt128 bh, sid;
+            if (!parseSrcEdgeRunKey(k, bh, sid) || bh != blob_hash) break;   // past this blob
+            if (!p.empty() && p[0] == kEdgeActive) ++count;
+        }
+    }
+    return count;
 }
 
 }

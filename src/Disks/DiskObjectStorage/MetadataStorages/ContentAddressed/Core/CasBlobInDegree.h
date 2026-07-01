@@ -27,11 +27,13 @@ bool parseSrcEdgeRunKey(const String & key, UInt128 & blob_hash, UInt128 & sourc
 /// tokens that two observers may legitimately differ on and keep first-durable-write-wins semantics.
 void putDeterministicArtifact(Backend & backend, const String & key, const String & bytes);
 
-/// A single +1/-1 source-edge update to a blob's in-degree, pre-merge. `delta` is always +1 or -1.
+/// One source-edge update pre-merge: the edge (blob_hash, source_id), and whether it is an activation
+/// (+edge) or a removal (−edge). Idempotent under re-fold at the merge (set membership, not a counter).
 struct BlobDelta
 {
     UInt128 blob_hash{};
-    int64_t delta = 0;
+    UInt128 source_id{};
+    bool remove = false;
 };
 
 /// A blob whose merged in-degree reached exactly zero — a retire candidate.
@@ -40,14 +42,14 @@ struct BlobCandidate
     UInt128 hash{};
 };
 
-/// Merge the prior generation's blob in-degree run for `shard` (absent => empty/zero baseline) with
+/// Merge the prior generation's blob source-edge run for `shard` (absent => empty/zero baseline) with
 /// `scattered` deltas, producing the new generation's write-once run under
 /// blobTargetRunKey(new_generation, attempt, shard, 0). Streaming: prior run + scattered deltas are sorted by
-/// `blob_hash` and merged via `RunMerger`; memory is O(inputs * block_size). The merged per-blob
-/// counter must never go below zero (CORRUPTED_DATA — an undercount that would over-delete). A blob
-/// whose count transitions to exactly 0 this generation is written as an explicit 0-row so
-/// `zeroInDegree` can stream it; rows that are still 0 from a prior generation are dropped. Appends the
-/// produced run's `RunRef` (key + footer checksum) to `out_runs` for the fold seal.
+/// (blob_hash, source_id) and merged via two-cursor scan; the source-edge set is idempotent under re-fold
+/// (identical (blob_hash, source_id) pairs deduplicate). A blob whose active edge set transitions to
+/// exactly empty this generation is written as an explicit zero-marker row so `zeroInDegree` can stream
+/// it; prior-generation zero markers are dropped. Appends the produced run's `RunRef` (key + footer
+/// checksum) to `out_runs` for the fold seal.
 /// `prior_attempt` is the attempt under which the PARENT generation's run was sealed (the prior round's
 /// adopted `snap_attempt`); `attempt` is the attempt under which THIS generation's run is written (the
 /// folding leader's `lease.seq`). They differ whenever the round that produced `prior_generation` adopted
