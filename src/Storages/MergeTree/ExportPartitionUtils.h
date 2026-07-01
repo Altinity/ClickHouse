@@ -80,10 +80,6 @@ namespace ExportPartitionUtils
     /// leaf. Within a single replica the count increment is best-effort and
     /// non-atomic (synchronous tryGet + Set with version -1); concurrent
     /// failing writers may under-count by one, which is accepted.
-    ///
-    /// Intended to be combined with additional ops (for example a version-guarded
-    /// status set) and executed as a single `tryMulti` so the exception record and
-    /// the accompanying state transition commit atomically.
     void appendExceptionOps(
         Coordination::Requests & ops,
         const zkutil::ZooKeeperPtr & zk,

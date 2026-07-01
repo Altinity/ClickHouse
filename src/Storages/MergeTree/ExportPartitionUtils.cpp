@@ -28,6 +28,7 @@ namespace ProfileEvents
     extern const Event ExportPartitionZooKeeperGet;
     extern const Event ExportPartitionZooKeeperGetChildren;
     extern const Event ExportPartitionZooKeeperSet;
+    extern const Event ExportPartitionZooKeeperCreate;
     extern const Event ExportPartitionZooKeeperMulti;
 }
 
@@ -450,10 +451,24 @@ namespace ExportPartitionUtils
         entry.time = ::time(nullptr);
         entry.count += 1;
 
-        if (leaf_exists)
-            ops.emplace_back(zkutil::makeSetRequest(last_exception_path, entry.toJsonString(), -1));
-        else
-            ops.emplace_back(zkutil::makeCreateRequest(last_exception_path, entry.toJsonString(), zkutil::CreateMode::Persistent));
+        if (!leaf_exists)
+        {
+            /// Materialize the leaf out-of-band (idempotently) so the op we hand back to the
+            /// caller's atomic multi is always a conflict-free Set. Two failing parts on the
+            /// same replica whose first failures race would both pick Create here; one of the
+            /// enclosing multis would then abort with ZNODEEXISTS and roll back its own part
+            /// lock removal, stranding that part behind its ephemeral lock until session loss
+            /// or task timeout. A peer thread winning this create (ZNODEEXISTS) is benign.
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperCreate);
+            const auto create_code = zk->tryCreate(last_exception_path, entry.toJsonString(), zkutil::CreateMode::Persistent);
+            if (create_code != Coordination::Error::ZOK && create_code != Coordination::Error::ZNODEEXISTS)
+                LOG_INFO(log, "ExportPartition: could not pre-create last_exception leaf {}: {}", last_exception_path.string(), create_code);
+        }
+
+        /// Always a version -1 Set: it can neither conflict with a peer's create nor abort the
+        /// enclosing multi, so the lock-release / FAILED-set ops it accompanies always commit.
+        ops.emplace_back(zkutil::makeSetRequest(last_exception_path, entry.toJsonString(), -1));
     }
 
 #if USE_AVRO
