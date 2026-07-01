@@ -36,7 +36,7 @@ struct BlobDelta
     bool remove = false;
 };
 
-/// A blob whose merged in-degree reached exactly zero — a retire candidate.
+/// A blob whose active source-edge set became empty this generation — a retire candidate.
 struct BlobCandidate
 {
     UInt128 hash{};

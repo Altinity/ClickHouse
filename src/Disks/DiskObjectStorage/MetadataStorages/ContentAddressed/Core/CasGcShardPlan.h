@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <base/types.h>
@@ -53,57 +52,12 @@ inline uint64_t blobShard(const UInt128 & blob_hash, uint64_t gc_shards)
 ///   - Single-shard equivalence: gc_shards == 1 always returns 0.
 uint64_t manifestCleanupShard(const ManifestId & id, uint64_t gc_shards);
 
-/// Accumulates per-shard `BlobDelta` lists from a stream of `RootOwnerEvent` blob-edge dispatches.
-///
-/// `ScatterScatter` partitions incoming `+1` (new-binding) and `-1` (old-binding) blob deltas into
-/// `gc_shards` buckets keyed by `blobShard(blob_hash, gc_shards)`. The caller drives it by calling
-/// `scatter` for every `RootOwnerEvent`'s blob-edge sets (in fold order), then calls `take` once to
-/// drain the accumulated buckets into the per-shard `std::vector<BlobDelta>` vectors consumed by
-/// `foldDeltasIntoGeneration`.
-///
-/// OWNER-MOVE DEFENSE (SabotageCrossShardDisplacement): when `old_blob_hashes` and `new_blob_hashes`
-/// are both non-empty and equal (a promote at the same `ManifestRef`), NO deltas are emitted — the
-/// event is a pure owner move that carries no blob changes. The fold barrier in `CasGc::fold` already
-/// enforces this at the event level; `ShardScatter` applies the same rule defensively.
-///
-/// A `ShardScatter` is one-shot: `take` drains the internal state; calling `scatter` after `take`
-/// is undefined behavior (the caller must construct a fresh instance per fold generation).
-class ShardScatter
-{
-public:
-    explicit ShardScatter(uint64_t gc_shards_);
-
-    /// Emit `sign * +1` deltas for each hash in `blob_hashes` into the per-shard buckets. `sign`
-    /// must be +1 (new-binding activation) or -1 (old-binding removal). Hashes are routed by
-    /// `blobShard(hash, gc_shards)`.
-    void emit(const std::vector<UInt128> & blob_hashes, int sign);
-
-    /// Scatter one `RootOwnerEvent`'s old- and new-binding blob edge sets. Extracts blob hashes from
-    /// `Blob`-placement `ManifestEntry` lists and emits `-1` / `+1` deltas respectively, UNLESS
-    /// both sides refer to equal hashes in an owner-move event (SabotageCrossShardDisplacement guard:
-    /// equal old/new sets produce no net delta).
-    ///
-    /// Callers must pass the ALREADY-DECODED entry lists — this function has no I/O and no backend
-    /// access. The fold in `CasGc::fold` reads the manifest bodies before dispatching here; the
-    /// reducer tests (Task 4) wire up the full round.
-    void scatter(const std::vector<ManifestEntry> & old_entries,
-                 const std::vector<ManifestEntry> & new_entries);
-
-    /// Drain the accumulated per-shard delta vectors. The returned vector has exactly `gc_shards`
-    /// elements (one `std::vector<BlobDelta>` per target shard, index == shard number). After
-    /// `take` the internal buckets are empty; the object must not be used again.
-    std::vector<std::vector<BlobDelta>> take();
-
-private:
-    uint64_t gc_shards;
-    std::vector<std::vector<BlobDelta>> buckets;   /// buckets[shard] accumulates BlobDelta items
-};
-
 /// Per-shard in-degree reducer for phase 4 of the sharded GC fold (spec §Phase4).
 ///
 /// `ShardReducer` owns exactly ONE target shard (`shard` in [0, `gc_shards`)). It accepts the
-/// shard's slice of blob deltas (from `ShardScatter::take()[shard]`) and merges them into a
-/// per-shard `CasBlobInDegree` generation run via `foldDeltasIntoGeneration`.
+/// caller's per-shard slice of `BlobDelta`s — produced by `foldManifestEdges` and bucketed by
+/// `blobShard` — and merges them into a per-shard `CasBlobInDegree` generation run via
+/// `foldDeltasIntoGeneration`.
 ///
 /// Ownership invariant: a reducer touches ONLY blobs it owns — i.e. `blobShard(h, gc_shards) == shard`.
 /// Two reducers for DIFFERENT shards may run concurrently; their key namespaces are disjoint
@@ -129,17 +83,17 @@ public:
     /// True iff this reducer owns `blob_hash` — i.e. `blobShard(blob_hash, gc_shards) == shard`.
     bool owns(const UInt128 & blob_hash) const;
 
-    /// Merge `shard_deltas` (the `ShardScatter::take()[shard]` slice for this shard) into a
-    /// new in-degree generation for this shard. Writes the sealed run under
-    /// `blobTargetRunKey(new_generation, shard, 0)` via `backend`, appends its `RunRef` to
+    /// Merge `shard_deltas` (the caller's per-shard `BlobDelta` slice produced by `foldManifestEdges`
+    /// and bucketed by `blobShard`) into a new in-degree generation for this shard. Writes the sealed
+    /// run under `blobTargetRunKey(new_generation, shard, 0)` via `backend`, appends its `RunRef` to
     /// `out_runs`, and returns the `RunRef`. The call is idempotent (write-once via `putIfAbsent`).
     ///
     /// `prior_generation` is the generation whose per-shard run forms the baseline (0 = fresh pool).
     /// `new_generation` must be > `prior_generation`.
     ///
     /// PRECONDITION: every `BlobDelta` in `shard_deltas` must be owned by this reducer
-    /// (`blobShard(d.blob_hash, gc_shards) == shard`).  Violations are caught at the
-    /// `foldDeltasIntoGeneration` layer (an undercount would be CORRUPTED_DATA).
+    /// (`blobShard(d.blob_hash, gc_shards) == shard`). This is a caller contract; there is no
+    /// underflow throw backstopping it — pass a misbucketed delta and the fold silently misroutes it.
     std::vector<RunRef> reduce(Backend & backend, const Layout & layout,
                                uint64_t prior_generation, uint64_t prior_attempt,
                                uint64_t new_generation, uint64_t attempt,

@@ -19,7 +19,6 @@ namespace DB::Cas
 /// deterministic so a write-once run is byte-reproducible for resume/adoption (OQ5).
 enum class RunKind : uint8_t
 {
-    BlobInDegree = 1,
     BlobDelta = 2,
     SourceEdge = 3,
     ManifestEntries = 4,

@@ -31,7 +31,7 @@ TEST(CasGcShardConfig, GcStateRoundTripPreservesShardCount)
     EXPECT_EQ(d.round, 7u);
 }
 
-/// ---- blobShard / ShardScatter tests (Phase 4, Task 3) ----
+/// ---- blobShard tests (Phase 4, Task 3) ----
 
 TEST(CasGcShardScatter, DeterministicAndStable)
 {
@@ -69,100 +69,6 @@ TEST(CasGcShardScatter, DisjointCoverageOverManyHashes)
         EXPECT_TRUE(seen[s]) << "shard " << s << " received no hashes (dead shard)";
 }
 
-TEST(CasGcShardScatter, ScatterTwoEntriesToDifferentShards)
-{
-    /// Pick two hashes that route to DIFFERENT shards under gc_shards=4.  We do this
-    /// deterministically: scan 256 candidate pairs until we find one where
-    /// blobShard(a,4) != blobShard(b,4).
-    UInt128 hash_a{};
-    UInt128 hash_b{};
-    bool found = false;
-    for (uint64_t i = 0; i < 256 && !found; ++i)
-    {
-        for (uint64_t j = i + 1; j < 256 && !found; ++j)
-        {
-            const UInt128 a = static_cast<UInt128>(i) << 64;
-            const UInt128 b = static_cast<UInt128>(j) << 64;
-            if (blobShard(a, 4) != blobShard(b, 4))
-            {
-                hash_a = a;
-                hash_b = b;
-                found = true;
-            }
-        }
-    }
-    ASSERT_TRUE(found) << "could not find two hashes in different shards — routing function broken";
-
-    const uint64_t shard_a = blobShard(hash_a, 4);
-    const uint64_t shard_b = blobShard(hash_b, 4);
-
-    /// Build old_entries (hash_a) and new_entries (hash_b).
-    ManifestEntry old_e;
-    old_e.placement = EntryPlacement::Blob;
-    old_e.blob_hash = hash_a;
-
-    ManifestEntry new_e;
-    new_e.placement = EntryPlacement::Blob;
-    new_e.blob_hash = hash_b;
-
-    ShardScatter scatter(4);
-    scatter.scatter({old_e}, {new_e});
-    const auto buckets = scatter.take();
-
-    ASSERT_EQ(buckets.size(), 4u);
-
-    /// shard_a must have exactly one -1 delta for hash_a.
-    const auto & bucket_a = buckets[shard_a];
-    ASSERT_EQ(bucket_a.size(), 1u) << "shard_a should have one delta";
-    EXPECT_EQ(bucket_a[0].blob_hash, hash_a);
-    EXPECT_TRUE(bucket_a[0].remove);
-
-    /// shard_b must have exactly one +1 delta for hash_b.
-    const auto & bucket_b = buckets[shard_b];
-    ASSERT_EQ(bucket_b.size(), 1u) << "shard_b should have one delta";
-    EXPECT_EQ(bucket_b[0].blob_hash, hash_b);
-    EXPECT_FALSE(bucket_b[0].remove);
-
-    /// All other shards must be empty.
-    for (uint64_t s = 0; s < 4; ++s)
-    {
-        if (s != shard_a && s != shard_b)
-            EXPECT_TRUE(buckets[s].empty()) << "shard " << s << " should be empty";
-    }
-}
-
-TEST(CasGcShardScatter, OwnerMoveEmitsNoDelta)
-{
-    /// An owner move (equal old/new hash sets) must emit no deltas to ANY shard.
-    const UInt128 h = hexToU128("aabbccddeeff00112233445566778899");
-
-    ManifestEntry e;
-    e.placement = EntryPlacement::Blob;
-    e.blob_hash = h;
-
-    ShardScatter scatter(4);
-    scatter.scatter({e}, {e});   /// same hash on both sides => owner move
-    const auto buckets = scatter.take();
-
-    for (uint64_t s = 0; s < 4; ++s)
-        EXPECT_TRUE(buckets[s].empty()) << "owner move must not produce any delta on shard " << s;
-}
-
-TEST(CasGcShardScatter, InlineEntriesAreIgnored)
-{
-    /// `Inline`-placement entries carry no blob hash and must not produce any delta.
-    ManifestEntry inline_e;
-    inline_e.placement = EntryPlacement::Inline;
-    inline_e.inline_bytes = "hello";
-
-    ShardScatter scatter(4);
-    scatter.scatter({inline_e}, {inline_e});
-    const auto buckets = scatter.take();
-
-    for (uint64_t s = 0; s < 4; ++s)
-        EXPECT_TRUE(buckets[s].empty()) << "inline entries must not produce any delta on shard " << s;
-}
-
 /// ---- ShardReducer tests (Phase 4, Task 4) ----
 
 /// Build two blob hashes that route to DIFFERENT shards under gc_shards=2.
@@ -189,8 +95,8 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
     ASSERT_EQ(blobShard(b1, 2), 0u) << "b1 must route to shard 0";
     ASSERT_EQ(blobShard(b2, 2), 1u) << "b2 must route to shard 1";
 
-    /// Bypass ShardScatter (which lacks source_id context).
-    /// Construct source-edge deltas directly:
+    /// Construct source-edge deltas directly (the production fold produces these via
+    /// `foldManifestEdges`, bucketed by `blobShard`):
     /// b1 shard=0: source 1 activates, source 2 activates, source 1 removes => 1 active edge
     /// b2 shard=1: source 3 activates => 1 active edge
     std::vector<std::vector<BlobDelta>> buckets(2);
@@ -584,8 +490,9 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentNoPreSealVisibility)
     EXPECT_FALSE(r1.owns(b1) && r0.owns(b1)) << "no hash may be owned by both reducers";
 
     /// Construct disjoint delta streams: b0 gets net +2 in shard 0; b1 gets net +1 in shard 1.
-    /// These are the same bucket contents `ShardScatter` would produce for a journal that published
-    /// two distinct manifests both referencing b0 and one manifest referencing b1.
+    /// In production these buckets are produced by `foldManifestEdges` and partitioned by `blobShard`
+    /// (two distinct manifests both referencing b0 contribute two source edges; one manifest
+    /// referencing b1 contributes one source edge).
     std::vector<BlobDelta> bucket0 = {
         BlobDelta{.blob_hash = b0, .source_id = UInt128(1), .remove = false},
         BlobDelta{.blob_hash = b0, .source_id = UInt128(2), .remove = false},
