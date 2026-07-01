@@ -3003,17 +3003,10 @@ void registerStorageHybrid(StorageFactory & factory)
 
                 // Normalize arguments (evaluate `currentDatabase()`, expand named collections, etc.).
                 // TableFunctionFactory::get mutates the AST in-place inside TableFunctionRemote::parseArguments.
-                ASTPtr normalized_table_function_ast = table_function_ast->clone();
+                replaceCurrentDatabaseFunction(engine_args[i], local_context);
+                ASTPtr normalized_table_function_ast = engine_args[i]->clone();
                 auto additional_table_function = TableFunctionFactory::instance().get(normalized_table_function_ast, local_context);
                 ColumnsDescription segment_columns = additional_table_function->getActualTableStructure(local_context, true);
-                replaceCurrentDatabaseFunction(normalized_table_function_ast, local_context);
-
-                // The clone above is only used for schema validation and in-memory segment
-                // execution. Resolve `currentDatabase()` in the original argument too, so the
-                // value written to the table metadata is a concrete database name. Otherwise
-                // startup ATTACH (which has no session database) resolves it to `default` and
-                // the segment fails to attach with UNKNOWN_TABLE.
-                replaceCurrentDatabaseFunction(engine_args[i], local_context);
 
                 validate_segment_schema(segment_columns, normalized_table_function_ast->formatForLogging());
 
