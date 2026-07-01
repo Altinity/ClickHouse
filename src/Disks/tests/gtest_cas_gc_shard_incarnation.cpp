@@ -374,3 +374,134 @@ TEST(CasGcShardIncarnation, RecreateAfterReclaimFoldsFromZero)
             << "gc_shards=" << gc_shards << ": recreated namespace must have no unreachable blobs";
     }
 }
+
+/// Task 6 (Fix 1): a concurrent revive after the tombstone changes the shard's token, so a
+/// `deleteExact` carrying the pre-revive token must be REFUSED (TokenMismatch) and the shard object
+/// must survive. Proves that `reclaimDroppedShards`'s deleteExact is token-guarded, not unconditional.
+///
+/// Scenario: drive a shard to tombstoned+fully-folded so it WOULD be reclaimed. Capture the
+/// shard's token T (the one GC would use for deleteExact). Simulate a concurrent revive by appending
+/// a fresh owner event to the shard (so its body changes and its token advances to T' ≠ T). Assert
+/// that `deleteExact(key, T)` returns TokenMismatch and the shard still exists. Also assert the
+/// positive counterpart: `deleteExact(key, T')` (the CURRENT token) succeeds.
+///
+/// This is the key safety case for Task 6. We test the token-guard DIRECTLY against the backend —
+/// this is the actual mechanism `reclaimDroppedShards` relies on, independent of GC round timing.
+TEST(CasGcShardIncarnation, ReviveRacesReclaimAborts)
+{
+    for (const uint64_t gc_shards : {1u, 4u})
+    {
+        std::shared_ptr<InMemoryBackend> backend;
+        auto store = makeStoreWithShards(backend, gc_shards);
+        const RootNamespace ns{"srv1/tblReviveRace"};
+
+        /// --- Phase 1: Publish a ref into the namespace. ---
+        {
+            BuildInfo info;
+            info.intended_ref = ns.string() + "/part_0";
+            auto build = store->startBuild(info);
+            const ManifestId id = build->stageManifest({});
+            build->precommitAdd(ns, "part_0", id);
+            build->promote(ns, "part_0", build->buildId(), id);
+        }
+
+        const uint64_t ref_shard = store->shardOf("part_0");
+        const String shard_key = store->layout().rootShardKey(ns, ref_shard);
+
+        /// --- Phase 2: Drop namespace (tombstone) + run GC until fully folded and reclaimed. ---
+        store->dropNamespace(ns);
+        store->renewWatermarkOnce();
+
+        {
+            Gc gc_reclaim(store, hexToU128("0000000000000000000000000000aa01"));
+            for (int i = 0; i < 16; ++i)
+            {
+                gc_reclaim.runRegularRound();
+                if (!backend->head(shard_key).exists)
+                    break;
+            }
+        }
+
+        /// --- Phase 3: Recreate — publish into the same namespace (new incarnation). ---
+        /// The shard is now absent (reclaimed above); a new publish creates a fresh object.
+        {
+            BuildInfo info;
+            info.intended_ref = ns.string() + "/part_1";
+            auto build = store->startBuild(info);
+            const ManifestId id = build->stageManifest({});
+            build->precommitAdd(ns, "part_1", id);
+            build->promote(ns, "part_1", build->buildId(), id);
+        }
+
+        const uint64_t ref_shard_1 = store->shardOf("part_1");
+        const String shard_key_1 = store->layout().rootShardKey(ns, ref_shard_1);
+
+        ASSERT_TRUE(backend->head(shard_key_1).exists)
+            << "gc_shards=" << gc_shards << ": shard must exist after recreate";
+
+        /// Drop the ref (no tombstone yet — the namespace is still live).
+        store->dropRef(ns, "part_1");
+
+        /// --- Phase 4: GC folds the removal event; capture the fold-time token T. ---
+        /// Run enough GC rounds that the shard is folded (cursor covers the drop event). After fold
+        /// but before a full reclaim (the shard has no tombstone yet, so it cannot be reclaimed):
+        /// capture the token that GC would carry into a deleteExact if a tombstone appeared now.
+        {
+            Gc gc_fold(store, hexToU128("0000000000000000000000000000aa02"));
+            for (int i = 0; i < 4; ++i)
+                gc_fold.runRegularRound();
+        }
+
+        /// Capture the shard's current token T (pre-revive / the token GC read at fold/recheck).
+        const HeadResult pre_revive = backend->head(shard_key_1);
+        ASSERT_TRUE(pre_revive.exists)
+            << "gc_shards=" << gc_shards << ": shard must still exist (no tombstone — not yet reclaimable)";
+        const Token stale_token = pre_revive.token;
+
+        /// --- Phase 5: Concurrent revive — append a new publish to the shard. ---
+        /// A real concurrent writer would call precommitAdd + promote. Here we use the test helper
+        /// `appendOwnerEvent` to append a new committed binding directly (an owner event that changes
+        /// the shard's body and mints a fresh backend token T' ≠ T).
+        const ManifestRef revive_ref{.writer_epoch = 2, .build_sequence = 99, .manifest_ordinal = 1};
+        writeManifestRaw(*backend, store->layout(), ns, revive_ref, {});
+        appendOwnerEvent(*backend, store->layout(), ns, ref_shard_1,
+            /*old_binding=*/std::nullopt,
+            OwnerBinding{.owner_kind = OwnerKind::Committed,
+                         .ref_name = "part_revived",
+                         .build_id = {},
+                         .manifest_ref = revive_ref},
+            /*committed_ref_name=*/"part_revived");
+
+        /// Confirm the shard's token changed (the revive mutated the body).
+        const HeadResult post_revive = backend->head(shard_key_1);
+        ASSERT_TRUE(post_revive.exists)
+            << "gc_shards=" << gc_shards << ": shard must still exist after the revive append";
+        const Token current_token = post_revive.token;
+        ASSERT_NE(stale_token.value, current_token.value)
+            << "gc_shards=" << gc_shards
+            << ": the revive must have changed the shard token (pre-revive T == post-revive T' is "
+               "impossible for a mutable object storage that issues content-based tokens)";
+
+        /// --- Assert: deleteExact with the STALE token (T) is REFUSED (TokenMismatch). ---
+        const DeleteOutcome stale_del = backend->deleteExact(shard_key_1, stale_token);
+        EXPECT_EQ(stale_del.kind, DeleteOutcome::Kind::TokenMismatch)
+            << "gc_shards=" << gc_shards
+            << ": deleteExact with a pre-revive (stale) token must return TokenMismatch — "
+               "the shard-reclaim is token-guarded and must not over-delete a revived shard";
+
+        /// The shard must still exist (not deleted by the stale-token attempt).
+        EXPECT_TRUE(backend->head(shard_key_1).exists)
+            << "gc_shards=" << gc_shards
+            << ": shard object must survive a stale-token deleteExact (the revive must prevail)";
+
+        /// --- Positive counterpart: deleteExact with the CURRENT token (T') succeeds. ---
+        const DeleteOutcome current_del = backend->deleteExact(shard_key_1, current_token);
+        EXPECT_EQ(current_del.kind, DeleteOutcome::Kind::Deleted)
+            << "gc_shards=" << gc_shards
+            << ": deleteExact with the current token must succeed (sanity check for token-guard semantics)";
+
+        EXPECT_FALSE(backend->head(shard_key_1).exists)
+            << "gc_shards=" << gc_shards
+            << ": shard must be gone after a successful current-token deleteExact";
+    }
+}

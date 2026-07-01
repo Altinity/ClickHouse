@@ -43,6 +43,7 @@ String toString(CasEventType type)
         case CasEventType::GcSnapPersist:         return "gc_snap_persist";
         case CasEventType::GcCursorAdvance:       return "gc_cursor_advance";
         case CasEventType::GcTrim:                return "gc_trim";
+        case CasEventType::GcShardReclaim:        return "gc_shard_reclaim";
         case CasEventType::GcLeaseAcquire:        return "gc_lease_acquire";
         case CasEventType::GcLeaseSteal:          return "gc_lease_steal";
         case CasEventType::GcLeaseHeartbeat:      return "gc_lease_heartbeat";
