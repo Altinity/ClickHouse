@@ -1,0 +1,11 @@
+"""Scenario cards. Importing this package registers every scenario via the @register decorator."""
+
+from . import s01_s02_huge_blob  # noqa: F401
+from . import s03_s05_scale  # noqa: F401
+from . import s06_s08_manifest_parts  # noqa: F401
+from . import s09_s11_mutations  # noqa: F401
+from . import s12_s14_faults  # noqa: F401
+from . import s15_s18_shards_lifecycle  # noqa: F401
+from . import s19_s22_clone_fetch  # noqa: F401
+from . import s23_s27_misc  # noqa: F401
+from . import s28_s33_corner  # noqa: F401

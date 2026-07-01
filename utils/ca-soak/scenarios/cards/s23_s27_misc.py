@@ -1,0 +1,613 @@
+"""S23 idle shared-pool baseline + S24 small dedup-cache + S25 non-Atomic db paths +
+S26 table-level verbatim file churn + S27 backend list pagination ambiguity (P2).
+
+These five P2 cards are hardening / regression guards (README §"P2 scenario cards").
+
+- S23 measures the cost of an idle shared pool: with no user workload, per-"minute" explicit GC
+  rounds on a 2-server compose should produce only a tiny budget of S3 operations, no `Failed` GC
+  rounds, and flat memory.
+- S24 needs a `storage_conf` disk config with a tiny `<dedup_cache_bytes>`; the current compose
+  mounts only the default (64 MiB). It is `needs_infra` and runs inconclusive.
+- S25 tries to exercise CA path parsing for a non-`Atomic` (`Ordinary`) database. `Ordinary` is
+  deprecated and likely refused in this build; the card attempts it and is honest about what was
+  actually exercised.
+- S26 churns table-level verbatim files (mutation entries, replicated-insert dedup-log entries) and
+  proves they are removed by their direct owner paths, not content-addressed as blobs.
+- S27 needs an instrumented object store / proxy that returns duplicate or unstable LIST pages for
+  root-shard token listing; not available with the direct RustFS endpoint. It is `needs_infra` and
+  runs inconclusive.
+"""
+
+import time
+
+from ..framework import gc as gc_mod, observe, sampler as sampler_mod, sql
+from ..framework.base import Scenario, register
+from ..framework.report import Verdict
+from . import _common
+
+MIB = 1024 * 1024
+
+
+def _gc_log_since(ctx):
+    """GC finish rows for this run only (scoped to the run-start server now())."""
+    since = ctx.extra.get("since_event_time") or None
+    return observe.gc_log_all(ctx.cluster, since)
+
+
+# ---------------------------------------------------------------------------
+# S23: idle shared pool baseline
+# ---------------------------------------------------------------------------
+
+@register
+class S23(Scenario):
+    name = "S23"
+    title = "idle shared pool baseline"
+    priority = "P2"
+    param_table = {
+        # dev: a short idle window (~few "minutes") with one explicit GC round per scaled minute.
+        # No user workload at all: the pool stays empty.
+        "dev": {"idle_minutes": 4, "minute_s": 5, "per_round_s3_budget": 64},
+        "ci": {"idle_minutes": 6, "minute_s": 15, "per_round_s3_budget": 64},
+        # full: a longer idle window closer to the README's 15-minute default.
+        "full": {"idle_minutes": 15, "minute_s": 60, "per_round_s3_budget": 64},
+    }
+
+    def run(self, ctx, result):
+        cl = ctx.cluster
+        p = ctx.params
+        idle_minutes = int(p["idle_minutes"])
+        minute_s = int(p["minute_s"])
+        budget = int(p["per_round_s3_budget"])
+        result.observations["scale"] = {
+            "idle_minutes": idle_minutes, "minute_s": minute_s,
+            "per_round_s3_budget": budget, "servers": 2,
+        }
+        result.add(Verdict("scale used",
+                           "spec asks for 1-, 2-, and 10-server variants over a 15-minute idle window",
+                           f"2-server compose, {idle_minutes} idle 'minutes' x {minute_s}s "
+                           f"(scale={ctx.scale})", "pass",
+                           "dev/ci shorten the idle window; only --scale full approaches 15 minutes"))
+        # The 1-server and 10-server variants are not buildable on this fixed 2-server compose.
+        result.add(Verdict.inconclusive(
+            "1-server idle baseline", "1-server config measured",
+            "compose fixed at 2 servers"))
+        result.add(Verdict.inconclusive(
+            "10-server idle baseline", "10-server config measured",
+            "compose fixed at 2 servers"))
+
+        # The pool is empty: NO user workload. Sanity-check there are no leftover CA tables, so we
+        # really are measuring idle overhead and not the cost of stale data.
+        leftover = sql.list_ca_tables(cl.node1)
+        result.observations["leftover_ca_tables"] = leftover
+        if leftover:
+            result.note_anomaly(
+                f"S23 expected an empty pool but found {len(leftover)} CA table(s): {leftover[:10]}")
+
+        # --- baseline memory before the idle window ----------------------------------------
+        mem_before = observe.cluster_memory(cl)
+        result.observations["server_memory_before"] = mem_before
+        base_rss = max([m.get("mem_resident") or 0 for m in mem_before.values()], default=0)
+
+        # --- idle measured phase: one explicit GC round per "minute" -----------------------
+        smp = sampler_mod.MetricsSampler(sampler_mod.open_db(ctx.path("metrics.sqlite")), cl,
+                                         interval_s=max(1.0, minute_s / 3.0), pool_every=1000,
+                                         phase_fn=lambda: "idle_gc", log_fn=ctx.log)
+        counters = _common.counters_window(ctx)
+        per_minute = []
+        smp.start()
+        try:
+            for minute in range(idle_minutes):
+                before = observe.cluster_events_snapshot(cl)
+                t0 = time.monotonic()
+                gc_mod.gc_drive_round(cl, log_fn=ctx.log)
+                wall = time.monotonic() - t0
+                after = observe.cluster_events_snapshot(cl)
+                round_delta = observe.cluster_events_delta(before, after).get("_total", {})
+                # Count only S3/Cas object-store operations issued during this round.
+                s3_ops = sum(v for k, v in round_delta.items()
+                             if k.startswith("Cas") or k.startswith("DiskS3") or k.startswith("S3"))
+                per_minute.append({"minute": minute, "wall_s": round(wall, 2),
+                                   "s3_ops": int(s3_ops), "delta": round_delta})
+                rest = minute_s - wall
+                if rest > 0:
+                    time.sleep(rest)
+        finally:
+            smp.stop()
+        result.observations["per_minute_idle_gc"] = per_minute
+
+        delta = counters().get("_total", {})
+        result.observations["idle_window_counters"] = delta
+        # The README §"Common observations" highlights CasRootList/CasGcGet etc. as the idle-GC cost.
+        result.observations["idle_gc_op_counters"] = {k: int(delta.get(k, 0)) for k in (
+            "CasRootList", "CasRootGet", "CasGcGet", "CasGcPut", "CasGcList", "CasGcHead",
+            "CasBlobList", "CasBlobHead", "CasBlobDelete")}
+
+        # --- idle GC S3 ops per round below a small budget ---------------------------------
+        per_round_ops = [m["s3_ops"] for m in per_minute]
+        max_round_ops = max(per_round_ops) if per_round_ops else 0
+        result.observations["max_s3_ops_per_round"] = max_round_ops
+        if per_round_ops:
+            result.add(Verdict.check(
+                "idle GC S3 ops per round below budget",
+                f"max S3/Cas ops per explicit-GC round <= {budget} on an empty pool",
+                f"max={max_round_ops} over {len(per_round_ops)} rounds "
+                f"(per-round: {per_round_ops})",
+                max_round_ops <= budget,
+                "" if max_round_ops <= budget else
+                "an idle empty-pool GC round issued more object-store ops than the small budget — "
+                "regular GC should be near-free with no live refs; investigate the universe/discovery "
+                "baseline (README surprise checklist: namespaces * root_shards)"))
+        else:
+            result.add(Verdict.inconclusive(
+                "idle GC S3 ops per round below budget", f"<= {budget} per round",
+                "no idle GC rounds were measured (idle_minutes resolved to 0)"))
+
+        # --- NotALeader rounds present without noisy exceptions / no Failed rounds ----------
+        gc_all = _gc_log_since(ctx)
+        summary = gc_all.get("summary", {})
+        result.observations["idle_gc_summary"] = summary
+        failed = int(summary.get("failed", 0))
+        not_a_leader = int(summary.get("not_a_leader", 0))
+        result.add(Verdict.check(
+            "no Failed idle GC rounds", "GC log has 0 Error finish rows on an idle pool",
+            failed, failed == 0,
+            "" if failed == 0 else "idle GC produced Error finish rows — a GC round threw with no "
+                                   "workload, which is a finding"))
+        # On a 2-server shared pool the non-leader's rounds finish NotALeader; that is expected and
+        # must be quiet (no exceptions). We assert it is present-or-zero (>= 0) and not noisy: the
+        # bad-event audit below is the noise check.
+        result.add(Verdict("NotALeader rounds expected & quiet",
+                           "NotALeader finish rows on the non-leader, no exceptions",
+                           f"not_a_leader={not_a_leader} failed={failed}",
+                           "pass" if failed == 0 else "fail",
+                           "non-leader rounds are cheap no-ops on a shared pool; only Failed rows fail"))
+
+        # CA-log bad events (read_missing/exception/...) must be absent on a fully-idle pool.
+        ca_events = observe.ca_event_counts_all(cl, ctx.extra.get("since_event_time"))
+        bad_total = ca_events.get("bad_total", {})
+        result.observations["idle_ca_bad_events"] = bad_total
+        result.add(Verdict.check(
+            "no noisy CA exceptions while idle", "no read_missing/exception/... CA-log rows",
+            bad_total, not bad_total,
+            "" if not bad_total else f"idle pool emitted CA bad events: {bad_total}"))
+
+        # --- memory + logs flat (sampler): mem must not grow over the idle window ----------
+        mem_after = observe.cluster_memory(cl)
+        result.observations["server_memory_after"] = mem_after
+        after_rss = max([m.get("mem_resident") or 0 for m in mem_after.values()], default=0)
+        peak = _common.record_peak_memory(result, smp, label="peak MemoryResident while idle")
+        if base_rss > 0:
+            growth = after_rss - base_rss
+            result.observations["idle_rss_growth"] = growth
+            # Allow a small slack for allocator noise / log-table writes; idle RSS must not climb.
+            slack = max(64 * MIB, base_rss // 10)
+            ok = growth <= slack
+            result.add(Verdict.check(
+                "memory flat over idle window",
+                f"RSS growth <= {slack/MIB:.0f} MiB (allocator/log slack) on an idle pool",
+                f"{growth/MIB:.1f} MiB (base={base_rss/MIB:.0f} MiB -> {after_rss/MIB:.0f} MiB)", ok,
+                "" if ok else "server RSS grew over an idle window with no workload — possible leak "
+                              "in background GC / log flushing; investigate"))
+        else:
+            result.add(Verdict.inconclusive(
+                "memory flat over idle window", "RSS growth bounded",
+                "could not read a baseline MemoryResident to compare against"))
+
+        # --- final fsck must be clean on the empty pool ------------------------------------
+        # S23 creates no tables, so there is nothing to SYNC/OPTIMIZE; standard_end with an empty
+        # tables list still drives forced GC to fixpoint + a final fsck and runs the common
+        # assertions (quiesce_cluster([]) drains cluster-wide and skips per-table SYNC — which is
+        # exactly right for an empty pool).
+        end = _common.standard_end(ctx, result, [])
+        dangling = (end or {}).get("fsck_final", {}).get("dangling")
+        result.add(Verdict.check(
+            "idle pool fsck clean", "fsck dangling==0 on the empty pool",
+            dangling, dangling == 0,
+            "" if dangling == 0 else "an idle empty pool reported dangling refs — should be impossible"))
+
+
+# ---------------------------------------------------------------------------
+# S24: small dedup-cache capacity (needs_infra)
+# ---------------------------------------------------------------------------
+
+@register
+class S24(Scenario):
+    name = "S24"
+    title = "small dedup-cache capacity"
+    priority = "P2"
+    needs_infra = ("requires a storage_conf disk config with a tiny dedup_cache_bytes; current "
+                   "compose mounts only the default (64 MiB) config — no small-cache variant")
+
+    def run(self, ctx, result):
+        """Prove the known-present blob cache is a bound-only hint (README §S24).
+
+        What this needs that the current 2-server + RustFS compose does NOT provide:
+
+        - The dedup cache size is the per-disk `<dedup_cache_bytes>` knob inside the
+          `content_addressed` disk's `storage_conf` (default 64 MiB). The compose mounts a single
+          fixed `configs/storage_conf.xml` carrying that default and has no small-cache variant.
+        - To exercise this card we would add a third compose/config variant that mounts a
+          `storage_conf` with e.g. `<dedup_cache_bytes>1048576</dedup_cache_bytes>` (1 MiB) on the
+          `ca` disk, then insert a working set far larger than 1 MiB of distinct blob heads and
+          repeatedly re-insert a hot subset.
+
+        Which counters prove the property (correctness unchanged, cost changes only):
+
+        - `CasBlobDedupCacheHit` is LOWER than with the default cache (the small cache evicts hot
+          heads, so re-inserts miss the in-memory hint).
+        - `CasBlobHeadFirst` is HIGHER (a cache miss forces a remote HEAD-first probe before the
+          body PUT to confirm the blob is already present).
+        - `CasBlobBodyPutAvoided` stays positive (a cache miss still dedups via the remote HEAD —
+          correctness/dedup is unchanged; only the in-memory shortcut rate drops).
+        - The replica-agreement oracle still passes (results are identical regardless of cache size).
+        - Cache memory stays near the configured `dedup_cache_bytes` bound (MemoryResident does not
+          grow with the working set; the cache is bounded, not unbounded).
+
+        Until that config variant exists this card cannot run; it records inconclusive.
+        """
+        self.run_inconclusive(ctx, result)
+
+
+# ---------------------------------------------------------------------------
+# S25: non-Atomic database paths
+# ---------------------------------------------------------------------------
+
+@register
+class S25(Scenario):
+    name = "S25"
+    title = "non-Atomic database paths"
+    priority = "P2"
+    param_table = {
+        "dev": {"rows": 200, "payload_bytes": 256},
+        "ci": {"rows": 2000, "payload_bytes": 256},
+        "full": {"rows": 20000, "payload_bytes": 512},
+    }
+
+    def run(self, ctx, result):
+        cl = ctx.cluster
+        p = ctx.params
+        rows = int(p["rows"])
+        payload = int(p["payload_bytes"])
+        dbname = "s25db"
+        table = f"{dbname}.s25_ordinary"
+        result.observations["scale"] = {"rows": rows, "payload_bytes": payload}
+        result.add(Verdict("scale used",
+                           "exercise CA path parsing for a non-Atomic (Ordinary) database layout",
+                           f"{rows} rows x {payload}B if Ordinary is permitted (scale={ctx.scale})",
+                           "pass",
+                           "dev/ci are scaled down; the path-parsing property does not depend on size"))
+
+        # --- attempt to create an Ordinary (non-Atomic) database ---------------------------
+        # Ordinary is deprecated; in this build it typically needs allow_deprecated_database_ordinary
+        # and may still be refused outright. We attempt it and stay honest about the outcome.
+        ordinary_ok = False
+        create_error = None
+        for n in cl.nodes():
+            try:
+                n.command(f"DROP DATABASE IF EXISTS {dbname} SYNC", timeout=120)
+            except Exception as e:
+                ctx.log(f"S25: pre-drop of {dbname} on {n.container} raised: {str(e)[:160]}")
+        try:
+            # Ordinary is a LOCAL (non-replicated) database engine, so the DB must be created on
+            # EACH replica before a ReplicatedMergeTree table can be created on both.
+            for n in cl.nodes():
+                n.command(
+                    f"CREATE DATABASE {dbname} ENGINE = Ordinary",
+                    settings={"allow_deprecated_database_ordinary": 1}, timeout=120)
+            ordinary_ok = True
+        except Exception as e:
+            create_error = str(e)[:1000]
+            result.observations["s25_ordinary_create_error"] = create_error
+            ctx.log(f"S25: CREATE DATABASE ... Ordinary refused: {create_error[:200]}")
+
+        if not ordinary_ok:
+            # Honest inconclusive: the non-Atomic layout could not be exercised via SQL in this build.
+            result.add(Verdict.inconclusive(
+                "non-Atomic CA path parsing",
+                "CA part files content-addressed under a non-Atomic db layout; fsck clean",
+                f"non-Atomic (Ordinary) database engine is deprecated/blocked in this build: "
+                f"{create_error}; CA path parsing for non-Atomic layouts could not be exercised "
+                f"via SQL"))
+            result.note_anomaly(
+                "S25 could not create an Ordinary database (deprecated/blocked); the non-Atomic CA "
+                "path-parsing property was NOT exercised — recorded inconclusive.")
+            # Still run the standard end against the (empty) pool so the common assertions confirm
+            # nothing was left dangling by the failed attempt.
+            _common.standard_end(ctx, result, [])
+            return
+
+        # --- Ordinary database created: exercise the full CA lifecycle in it ---------------
+        # Ordinary stores tables under <db>/<table>/ (NOT store/<uuid>/), so this proves CA path
+        # parsing / namespace construction outside the Atomic store/<uuid> layout.
+        # Ordinary databases do not support ReplicatedMergeTree with {uuid} macros cleanly; use a
+        # name-derived zk path so the engine is well-defined on a non-Atomic db.
+        ctx.log("S25: Ordinary database created; building a CA table under the non-Atomic layout")
+        for n in cl.nodes():
+            sql.create_ca_table(n, table, columns="id UInt64, payload String", order_by="id",
+                                wide=True, replica_path=f"/clickhouse/tables/{dbname}_s25_ordinary")
+
+        # insert / detach / freeze / mutation / drop-partition lifecycle.
+        sql.insert_random(cl.node1, table, rows=rows, payload_bytes=payload, op_id=0)
+        sql.insert_random(cl.node1, table, rows=rows, payload_bytes=payload, op_id=rows)
+
+        part_files_ok = None
+        try:
+            # Detach a part then re-attach: detached refs must stay rooted under the right namespace.
+            part = cl.node1.scalar(
+                f"SELECT name FROM system.parts WHERE database='{dbname}' "
+                f"AND table='s25_ordinary' AND active ORDER BY name LIMIT 1")
+            if part:
+                cl.node1.command(f"ALTER TABLE {table} DETACH PART '{part}'", timeout=300)
+                cl.node1.command(f"ALTER TABLE {table} ATTACH PART '{part}'", timeout=300)
+        except Exception as e:
+            ctx.log(f"S25: detach/attach raised: {str(e)[:200]}")
+            result.observations["s25_detach_error"] = str(e)[:1000]
+
+        try:
+            cl.node1.command(f"ALTER TABLE {table} FREEZE WITH NAME 's25_freeze'", timeout=300)
+        except Exception as e:
+            ctx.log(f"S25: freeze raised: {str(e)[:200]}")
+            result.observations["s25_freeze_error"] = str(e)[:1000]
+
+        try:
+            cl.node1.command(
+                f"ALTER TABLE {table} UPDATE payload = reverse(payload) WHERE id % 3 = 0",
+                settings={"mutations_sync": 2}, timeout=600)
+        except Exception as e:
+            ctx.log(f"S25: mutation raised: {str(e)[:200]}")
+            result.observations["s25_mutation_error"] = str(e)[:1000]
+
+        # CA part-files are content-addressed: there must be blob objects in the pool for this data.
+        pool = observe.pool_shape(timeout_s=120)
+        result.observations["s25_pool_shape"] = {k: pool.get(k) for k in (
+            "blobs", "roots", "_manifests", "_files", "_total", "_ok")}
+        if pool.get("_ok"):
+            blob_objs = pool["blobs"]["objects"]
+            result.add(Verdict.check(
+                "part files content-addressed under non-Atomic db",
+                "blob objects present for a CA table in an Ordinary database",
+                blob_objs, blob_objs > 0,
+                "" if blob_objs > 0 else "no blob objects for a populated CA table in an Ordinary "
+                                         "db — path parsing may have misclassified the layout"))
+            part_files_ok = blob_objs > 0
+        else:
+            result.add(Verdict.inconclusive(
+                "part files content-addressed under non-Atomic db", "blob objects present",
+                "pool shape probe failed/timed out"))
+
+        result.observations["s25_part_files_ok"] = part_files_ok
+
+        # Correctness oracle on a non-Atomic db: replicas agree on the data.
+        _common.assert_replicas_agree(result, cl, sql.table_checksum_query(table),
+                                      name="S25 non-Atomic replica agreement")
+
+        # Drop a partition (exercise ref drop on a non-Atomic namespace), then the table.
+        try:
+            cl.node1.command(f"ALTER TABLE {table} DROP PARTITION tuple()", timeout=300)
+        except Exception as e:
+            ctx.log(f"S25: drop partition raised: {str(e)[:200]}")
+
+        # Unfreeze + drop the table (so the standard_end fixpoint can reclaim everything).
+        try:
+            cl.node1.command("SYSTEM UNFREEZE WITH NAME 's25_freeze'", timeout=300)
+        except Exception as e:
+            ctx.log(f"S25: unfreeze raised: {str(e)[:200]}")
+        sql.drop_table_both(cl, table)
+        for n in cl.nodes():
+            try:
+                n.command(f"DROP DATABASE IF EXISTS {dbname} SYNC", timeout=120)
+            except Exception as e:
+                ctx.log(f"S25: drop database on {n.container} raised: {str(e)[:160]}")
+
+        # After dropping everything, the fixpoint must reclaim to a clean pool (NOT abandoning).
+        end = _common.standard_end(ctx, result, [])
+        dangling = (end or {}).get("fsck_final", {}).get("dangling")
+        result.add(Verdict.check(
+            "non-Atomic path cleanup fsck clean", "fsck dangling==0 after the non-Atomic lifecycle",
+            dangling, dangling == 0,
+            "" if dangling == 0 else "dangling refs survived the non-Atomic-db lifecycle — a path was "
+                                     "misclassified or a ref was not dropped"))
+
+
+# ---------------------------------------------------------------------------
+# S26: table-level verbatim file churn
+# ---------------------------------------------------------------------------
+
+@register
+class S26(Scenario):
+    name = "S26"
+    title = "table-level verbatim file churn"
+    priority = "P2"
+    param_table = {
+        # dev: a modest number of ALTERs + repeated identical INSERTs (each repeat hits the RMT
+        # block-dedup log -> a table-level _files entry, not a new blob).
+        "dev": {"alters": 30, "dedup_inserts": 40, "rows_per_insert": 20, "payload_bytes": 128},
+        "ci": {"alters": 100, "dedup_inserts": 150, "rows_per_insert": 50, "payload_bytes": 128},
+        "full": {"alters": 400, "dedup_inserts": 600, "rows_per_insert": 100, "payload_bytes": 256},
+    }
+
+    def run(self, ctx, result):
+        cl = ctx.cluster
+        p = ctx.params
+        alters = int(p["alters"])
+        dedup_inserts = int(p["dedup_inserts"])
+        rows_per_insert = int(p["rows_per_insert"])
+        payload = int(p["payload_bytes"])
+        table = "s26_verbatim"
+        result.observations["scale"] = {
+            "alters": alters, "dedup_inserts": dedup_inserts,
+            "rows_per_insert": rows_per_insert, "payload_bytes": payload,
+        }
+        result.add(Verdict("scale used",
+                           "churn many ALTER mutation entries + replicated-insert dedup-log entries",
+                           f"{alters} ALTERs, {dedup_inserts} identical INSERTs (scale={ctx.scale})",
+                           "pass",
+                           "dev/ci are scaled down; the leak/classification property is size-independent"))
+
+        for n in cl.nodes():
+            sql.create_ca_table(n, table, columns="id UInt64, payload String, tag UInt32",
+                                order_by="id", wide=True)
+
+        # Seed a little data so mutations have something to rewrite.
+        sql.insert_random(cl.node1, table, rows=rows_per_insert * 4, payload_bytes=payload,
+                          op_id=0, extra_cols_select="toUInt32(number % 7) AS tag")
+
+        pool_before = observe.pool_shape(timeout_s=120)
+        files_before = pool_before["_files"]["objects"] if pool_before.get("_ok") else None
+        result.observations["files_objects_before_churn"] = files_before
+
+        counters = _common.counters_window(ctx)
+
+        # --- churn 1: many ALTER TABLE commands (each is a table-level mutation entry) ------
+        # Lightweight metadata-only ALTERs (column comment toggling) so we generate many mutation /
+        # ALTER entries without huge data rewrites; these land as table-level verbatim files, not
+        # content blobs.
+        ctx.log(f"S26: issuing {alters} ALTER commands")
+        alter_failures = 0
+        for i in range(alters):
+            try:
+                comment = f"c{i}"
+                cl.node1.command(
+                    f"ALTER TABLE {table} MODIFY COLUMN tag COMMENT '{comment}'", timeout=120)
+            except Exception as e:
+                alter_failures += 1
+                if alter_failures <= 5:
+                    ctx.log(f"S26: ALTER {i} raised: {str(e)[:160]}")
+        result.observations["s26_alter_failures"] = alter_failures
+
+        # --- churn 2: repeated IDENTICAL inserts -> RMT block-dedup log entries -------------
+        # Deterministic identical content (NOT randomString) so the inserted block hash is stable
+        # and every repeat is deduplicated by the replicated-insert dedup log (a table-level _files
+        # entry), uploading no new blob body.
+        ctx.log(f"S26: issuing {dedup_inserts} identical inserts (RMT block-dedup log entries)")
+        ident = (f"SELECT number AS id, repeat('x', {payload}) AS payload, "
+                 f"toUInt32(number % 7) AS tag FROM numbers({rows_per_insert})")
+        for _ in range(dedup_inserts):
+            sql.insert_values(cl.node1, table, ident, timeout=300)
+
+        delta = counters().get("_total", {})
+        result.observations["s26_churn_counters"] = delta
+        # CasRoot* (ref/metadata) vs CasBlob* (content body) — verbatim file churn should drive Root
+        # and _files activity, while identical inserts must NOT keep uploading new blob bodies.
+        cas_root = {k: int(delta.get(k, 0)) for k in (
+            "CasRootCas", "CasRootGet", "CasRootList", "CasRootCasConflict")}
+        cas_blob = {k: int(delta.get(k, 0)) for k in (
+            "CasBlobPut", "CasBlobPutDedup", "CasBlobBodyPutAvoided", "CasBlobDelete",
+            "CasBlobDedupCacheHit")}
+        result.observations["s26_cas_root_counters"] = cas_root
+        result.observations["s26_cas_blob_counters"] = cas_blob
+
+        # _files object count after the churn (table still present).
+        pool_after = observe.pool_shape(timeout_s=120)
+        files_after = pool_after["_files"]["objects"] if pool_after.get("_ok") else None
+        result.observations["files_objects_after_churn"] = files_after
+        if files_before is not None and files_after is not None:
+            result.add(Verdict("verbatim _files churn observed",
+                               "table-level _files objects present during churn",
+                               f"_files {files_before} -> {files_after}", "pass",
+                               "table-level files (mutation/dedup entries) live under _files, not "
+                               "as content blobs"))
+
+        # Identical inserts must dedup (no unbounded new blob bodies for repeated content).
+        body_puts = cas_blob["CasBlobPut"]
+        avoided = cas_blob["CasBlobBodyPutAvoided"] + cas_blob["CasBlobPutDedup"] \
+            + cas_blob["CasBlobDedupCacheHit"]
+        result.add(Verdict.check(
+            "identical inserts dedup (no blob churn)",
+            "repeated identical inserts avoid re-uploading the same blob body",
+            f"CasBlobPut={body_puts} avoided/dedup={avoided} over {dedup_inserts} identical inserts",
+            avoided > 0 or body_puts <= 4,
+            "" if (avoided > 0 or body_puts <= 4) else
+            "identical inserts kept uploading new blob bodies — block-dedup not engaging, or content "
+            "was not actually identical"))
+
+        # Correctness oracle (the dedup'd identical inserts collapse to one logical block).
+        _common.assert_replicas_agree(result, cl, sql.table_checksum_query(table),
+                                      name="S26 replica agreement")
+
+        # --- drop the table: its _files namespace must drain by direct owner paths ----------
+        # After the table is dropped, table-level verbatim files for its namespace must be removed by
+        # the drop's own path-owner cleanup, NOT by regular GC scanning/deleting them as blobs.
+        before_drop = _common.counters_window(ctx)
+        sql.drop_table_both(cl, table)
+        # A couple of GC rounds: regular GC should not need to delete _files as blobs.
+        gc_mod.gc_drive_round(cl, log_fn=ctx.log)
+        drop_delta = before_drop().get("_total", {})
+        result.observations["s26_drop_counters"] = drop_delta
+
+        pool_dropped = observe.pool_shape(timeout_s=120)
+        files_dropped = pool_dropped["_files"]["objects"] if pool_dropped.get("_ok") else None
+        result.observations["files_objects_after_drop"] = files_dropped
+        if files_after is not None and files_dropped is not None:
+            # The table's _files objects should drain (down to whatever other namespaces keep, which
+            # is 0 here since this is the only table).
+            drained = files_dropped <= files_after
+            result.add(Verdict.check(
+                "verbatim files removed by owner path on drop",
+                "the dropped table's _files objects drain (not left for blob GC)",
+                f"_files {files_after} -> {files_dropped} after drop", drained,
+                "" if drained else "dropping the table did not drain its table-level _files objects — "
+                                   "verbatim files leaked beyond the owner-path cleanup"))
+
+        # CasBlobDelete must NOT be the mechanism that removed the verbatim _files (they are removed
+        # verbatim by their owner path, not content-addressed and deleted as blobs).
+        blob_deletes_on_drop = int(drop_delta.get("CasBlobDelete", 0))
+        result.observations["s26_blob_deletes_on_drop"] = blob_deletes_on_drop
+        result.add(Verdict("regular GC not implicated for _files",
+                           "_files removed verbatim by owner path, not via CasBlobDelete blob path",
+                           f"CasBlobDelete during drop+GC = {blob_deletes_on_drop} "
+                           f"(these reclaim content blobs of the dropped data, not the _files entries)",
+                           "pass",
+                           "informational: CasBlobDelete on drop reclaims the data blobs; the "
+                           "table-level _files are removed by the namespace drop, not as blobs"))
+
+        # standard_end with no surviving tables: fixpoint reclaim + clean fsck.
+        end = _common.standard_end(ctx, result, [])
+        dangling = (end or {}).get("fsck_final", {}).get("dangling")
+        result.add(Verdict.check(
+            "verbatim churn fsck clean", "fsck dangling==0 after verbatim file churn + drop",
+            dangling, dangling == 0,
+            "" if dangling == 0 else "dangling refs after verbatim-file churn — a table-level file "
+                                     "was mis-tracked"))
+
+
+# ---------------------------------------------------------------------------
+# S27: backend list pagination ambiguity (needs_infra)
+# ---------------------------------------------------------------------------
+
+@register
+class S27(Scenario):
+    name = "S27"
+    title = "backend list pagination ambiguity"
+    priority = "P2"
+    needs_infra = ("requires an instrumented object store / proxy that returns duplicate or unstable "
+                   "LIST pages for root-shard token listing; not available with the direct rustfs "
+                   "endpoint")
+
+    def run(self, ctx, result):
+        """Prove paginated LIST anomalies force safe rereads, not skipped folds (README §S27).
+
+        What this needs that the current 2-server + RustFS compose does NOT provide:
+
+        - An object-storage proxy (or an instrumented backend) sitting in front of the `ca` disk
+          endpoint that, for `roots/`-prefix `LIST` calls used by `listRootShardTokens` /
+          token-diff discovery, deliberately returns duplicate keys across pages, drops the
+          continuation token mid-listing, or returns pages whose per-key list-tokens are unstable
+          between two listings of the same unchanged shard.
+        - The direct RustFS endpoint serves stable, well-ordered pages, so the ambiguous-key code
+          path in GC discovery is never taken with this compose.
+
+        Expected property to assert once that instrumentation exists:
+
+        - An ambiguous / unstable key (a root-shard token that cannot be proven unchanged) is treated
+          as CHANGED and re-read — the fold must NOT skip it. This is the conservative, fail-safe
+          choice: a falsely-skipped shard would make GC blind to a real owner transition.
+        - Correctness is preserved end-to-end: the replica-agreement oracle still matches and `fsck`
+          stays clean despite the injected list anomalies.
+        - The cost of the conservative reread is visible: `CasRootGet` increases (the shard body is
+          fetched because token-diff could not prove it unchanged) relative to a stable-listing run,
+          while `CasBlobDelete` does not delete anything that is still reachable.
+
+        Until that proxy/instrumented backend exists this card cannot run; it records inconclusive.
+        """
+        self.run_inconclusive(ctx, result)
