@@ -1393,3 +1393,88 @@ TEST(CasStoreBackpressure, BackpressureRequiresHardGtSoft)
     EXPECT_FALSE(hook_called) << "with soft==hard, no backpressure";
     ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
+
+/// Task 2: incarnation stamp at shard birth.
+///
+/// When the shard object does not yet exist (create-if-absent path in `mutateShard`),
+/// the birth incarnation passed by the caller must be stamped into `RootShard::incarnation`
+/// before the mutate callback runs.  Subsequent mutations must leave it untouched.
+TEST(CasStore, ShardBornCarriesIncarnation)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .root_shards = 4,
+        .gc_trim_min_events = 0,
+    });
+    const Layout & layout = s->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// Shard 0 does not exist yet — the first mutate is a create-if-absent.
+    /// Pass a non-zero birth incarnation; verify it is stamped on the created shard.
+    s->mutateShardForTest(ns, 0, [](RootShard &) {},
+        RootMutationOrigin::Writer, RootMutationKind::Precommit,
+        ShardIncarnation{.writer_epoch = 9, .build_sequence = 2});
+
+    const auto got = b->get(layout.rootShardKey(ns, 0));
+    ASSERT_TRUE(got.has_value()) << "shard must have been created";
+    const RootShard root = decodeRootShard(got->bytes);
+    EXPECT_EQ(root.incarnation.writer_epoch,   9u);
+    EXPECT_EQ(root.incarnation.build_sequence, 2u);
+}
+
+/// Task 2 INC-MONO test.
+///
+/// Confirm that after the shard object is reclaimed (deleted from the backend — simulating Task 6
+/// reclaim that does not exist yet) and then recreated via a new `precommitAdd`-style mutation, the
+/// reborn shard carries a STRICTLY GREATER incarnation than the first.
+///
+/// INC-MONO decision: within a single Store process `writer_epoch` is constant and `build_sequence`
+/// is strictly-increasing (see `allocateBuildSeq`).  Across process restarts `allocateWriterEpoch`
+/// provides a durable-monotone `writer_epoch`, so a fresh process always opens with a higher epoch.
+/// Therefore `ShardIncarnation{writer_epoch, build_seq}` is a safe incarnation source — strictly
+/// increasing per `(ns, shard)` path on every reclaim-and-recreate event.  No dedicated sticky
+/// counter is needed.
+TEST(CasStore, RebornShardIncarnationStrictlyGreater)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .root_shards = 4,
+        .gc_trim_min_events = 0,
+    });
+    const Layout & layout = s->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// First birth: shard does not exist.
+    s->mutateShardForTest(ns, 0, [](RootShard &) {},
+        RootMutationOrigin::Writer, RootMutationKind::Precommit,
+        ShardIncarnation{.writer_epoch = 9, .build_sequence = 2});
+
+    const auto first_got = b->get(layout.rootShardKey(ns, 0));
+    ASSERT_TRUE(first_got.has_value());
+    const ShardIncarnation first_inc = decodeRootShard(first_got->bytes).incarnation;
+    EXPECT_EQ(first_inc.writer_epoch,   9u);
+    EXPECT_EQ(first_inc.build_sequence, 2u);
+
+    /// Simulate reclaim (Task 6 does not exist yet): delete the shard object exactly, as
+    /// GC reclaim will do when it lands.
+    b->deleteExact(layout.rootShardKey(ns, 0), first_got->token);
+
+    /// Second birth (higher build_sequence within the same writer_epoch): create-if-absent again.
+    s->mutateShardForTest(ns, 0, [](RootShard &) {},
+        RootMutationOrigin::Writer, RootMutationKind::Precommit,
+        ShardIncarnation{.writer_epoch = 9, .build_sequence = 3});
+
+    const auto reborn_got = b->get(layout.rootShardKey(ns, 0));
+    ASSERT_TRUE(reborn_got.has_value());
+    const ShardIncarnation reborn_inc = decodeRootShard(reborn_got->bytes).incarnation;
+    EXPECT_EQ(reborn_inc.writer_epoch,   9u);
+    EXPECT_EQ(reborn_inc.build_sequence, 3u);
+
+    /// The INC-MONO invariant: the reborn incarnation must be strictly greater (lexicographic).
+    EXPECT_LT(first_inc, reborn_inc)
+        << "INC-MONO: reborn shard incarnation must be strictly greater than the first";
+}

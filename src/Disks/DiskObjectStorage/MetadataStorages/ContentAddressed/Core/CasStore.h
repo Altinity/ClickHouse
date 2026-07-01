@@ -348,11 +348,14 @@ public:
     /// verification. Production code uses private `mutateShard` via Build/Gc friend
     /// classes. Exists only so the GC-bypass test can verify that `RootMutationOrigin::Gc`
     /// skips backpressure delay without exposing the full mutation API.
+    /// Task 2: `birth_incarnation` (default `{}`) is forwarded to the private `mutateShard`
+    /// so incarnation-stamp tests can drive the create-if-absent path directly.
     void mutateShardForTest(const RootNamespace & ns, uint64_t shard,
                             std::function<void(RootShard &)> mutate,
-                            RootMutationOrigin origin, RootMutationKind kind)
+                            RootMutationOrigin origin, RootMutationKind kind,
+                            ShardIncarnation birth_incarnation = {})
     {
-        mutateShard(ns, shard, std::move(mutate), nullptr, origin, kind);
+        mutateShard(ns, shard, std::move(mutate), nullptr, origin, kind, birth_incarnation);
     }
 
 private:
@@ -407,9 +410,15 @@ private:
     /// the GC fence (R3) records it as the durable per-shard fence position (the model's fencePos[s]).
     /// `origin` distinguishes Writer mutations (subject to backpressure) from Gc mutations (bypass).
     /// `kind` is diagnostic-only (logged/metrics) and does not affect behaviour.
+    /// When the shard does not yet exist (token == nullopt on the first readShard call), the shard is
+    /// created fresh and `root.incarnation` is set to `birth_incarnation` BEFORE `mutate` runs. On
+    /// subsequent mutations (token present), `incarnation` is left untouched (immutable for the shard's
+    /// life). Callers that never create a first object (drop, updateRefPayload, dropNamespace, GC fence)
+    /// pass the default `{}` — the stamp is a no-op since the shard already exists.
     void mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
                      uint64_t * out_committed_version,
-                     RootMutationOrigin origin, RootMutationKind kind);
+                     RootMutationOrigin origin, RootMutationKind kind,
+                     ShardIncarnation birth_incarnation = {});
 
     BackendPtr pool_backend;
     PoolConfig config;

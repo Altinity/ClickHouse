@@ -728,7 +728,8 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
 }
 
 void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
-                        uint64_t * out_committed_version, RootMutationOrigin origin, RootMutationKind kind)
+                        uint64_t * out_committed_version, RootMutationOrigin origin, RootMutationKind kind,
+                        ShardIncarnation birth_incarnation)
 {
     /// Local write fence (spec §write-fence, Phase 0 Task 6): the shared mutable ref shards are the
     /// state the fence most protects. A superseded/paused writer (lease lost or local deadline passed)
@@ -761,6 +762,14 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
         /// previous attempt's edits are discarded and re-applied to the winner's state, so a journal
         /// append is never double-appended.
         auto [root, token] = readShard(ns, shard);
+        /// Task 2: stamp the birth incarnation on the create-if-absent path (token == nullopt means
+        /// the shard object did not exist before this call). Once the shard exists the incarnation is
+        /// immutable — subsequent mutations leave it untouched. Callers that never create a first
+        /// object (drop, fence, updateRefPayload, dropNamespace) pass the default `{}`, which is the
+        /// unstamped sentinel (a no-op when the shard already carries a real incarnation). A CAS
+        /// Conflict retry re-reads a now-present shard, so the stamp is skipped on retries correctly.
+        if (!token)
+            root.incarnation = birth_incarnation;
         mutate(root);
         ++root.shard_version;
         String body = encodeRootShard(root);

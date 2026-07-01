@@ -596,6 +596,9 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
     /// ONE CAS on the TARGET shard (shardOf(final_ref_name)): append a create-precommit RootOwnerEvent
     /// {old=none, new={Precommit, final_ref_name, build_id, id.ref}} to the single ordered journal. No body
     /// HEAD — a missing body is a legal fail-closed, non-activating intent (spec §Precommit Add).
+    /// Task 2: pass the build's own (writer_epoch, build_seq) as the birth incarnation. On the
+    /// create-if-absent path (shard doesn't exist yet) mutateShard stamps root.incarnation before
+    /// the journal append; on subsequent calls the stamp is skipped (shard already present).
     store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
     {
         root.journal.push_back(RootOwnerEvent{
@@ -606,7 +609,8 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
                 .ref_name = final_ref_name,
                 .build_id = build_id,
                 .manifest_ref = id.ref}});
-    }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Precommit);
+    }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Precommit,
+    ShardIncarnation{.writer_epoch = epoch, .build_sequence = build_seq});
 
     precommit_target_ns = target_ns;
     precommit_final_ref = final_ref_name;
