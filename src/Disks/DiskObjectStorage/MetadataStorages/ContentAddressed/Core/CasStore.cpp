@@ -978,19 +978,19 @@ void Store::removeMountpointObject(const String & key)
 
 void Store::dropNamespace(const RootNamespace & ns)
 {
-    /// Tombstone every TOUCHED shard, then delete the verbatim files. GC removes the manifest OBJECTS
-    /// themselves later (M-C3); here we only clear refs + journal the removals (spec §4: untouched
-    /// shards stay absent — we never mint a manifest just to hold a tombstone).
+    /// Tombstone every PRESENT shard, then delete the verbatim files. GC removes the manifest OBJECTS
+    /// themselves later once the shard is empty + tombstoned + fully folded (Task 6). Spec §4: untouched
+    /// (absent) shards stay absent — we never mint a manifest just to hold a tombstone.
+    ///
+    /// Task 6: for every present shard (with or without refs) we append ref-removal events (one per
+    /// former ref) FOLLOWED by the drop-namespace tombstone as the LAST journal event. The tombstone
+    /// event (`is_tombstone = true`, both bindings absent) is the in-band signal GC reads to decide
+    /// whether the shard object is eligible for reclaim: empty + tombstone + fully folded ⇒ deleteExact.
     for (uint64_t shard = 0; shard < meta.root_shards; ++shard)
     {
         const auto [root, token] = readShard(ns, shard);
         if (!token)
-            continue;                       /// absent shard: stays absent, no manifest minted
-        if (root.refs.empty())
-            /// OPTIMIZATION, not a correctness guard: skip an empty snapshot to avoid a no-op CAS.
-            /// Single-writer-per-namespace makes this snapshot safe to trust; even if it were racy,
-            /// mutateShard re-reads the manifest inside its loop, so correctness never rests here.
-            continue;
+            continue;   /// absent shard: stays absent, no manifest minted
 
         mutateShard(ns, shard, [](RootShard & shard_root)
         {
@@ -1004,6 +1004,13 @@ void Store::dropNamespace(const RootNamespace & ns)
                         .build_id = UInt128(0), .manifest_ref = payload.manifest_ref},
                     .new_binding = std::nullopt});
             shard_root.refs.clear();
+            /// Task 6: append the tombstone as the LAST journal event (after all removal events so the
+            /// fold must cover every -1 removal before reaching the tombstone, preventing phantom in-degree).
+            shard_root.journal.push_back(RootOwnerEvent{
+                .transition_version = shard_root.shard_version + 1,
+                .old_binding = std::nullopt,
+                .new_binding = std::nullopt,
+                .is_tombstone = true});
         }, nullptr, RootMutationOrigin::Writer, RootMutationKind::DropNamespace);
     }
 

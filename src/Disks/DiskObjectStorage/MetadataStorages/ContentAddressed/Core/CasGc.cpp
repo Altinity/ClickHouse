@@ -123,6 +123,21 @@ RoundReport Gc::runRegularRound()
     /// seal the completion generation; drop the round's retired sets.
     recheck(state, state_token, folded, retired, report);
 
+    /// Task 6: reclaim empty+tombstoned+fully-folded ref-shard objects. Must run BEFORE trim so the
+    /// tombstone event is still present in the journal (trim removes events at/below the fold cursor,
+    /// which includes the tombstone). The fully-folded guard compares the fold cursor against the
+    /// tombstone's transition_version (not root.shard_version, which fence may have bumped). Never throws
+    /// (tolerates NotFound/TokenMismatch per feedback_ca_gc_never_throw_on_404). Best-effort: a missed
+    /// reclaim is retried next round.
+    try
+    {
+        reclaimDroppedShards(folded);
+    }
+    catch (const Exception & e)
+    {
+        LOG_WARNING(getLogger("CasGc"), "CAS gc shard reclaim skipped this round: {}", e.message());
+    }
+
     /// Trim journals below the sealed fold cursor.
     if (trim_enabled)
         trim(folded, state.round);
@@ -256,7 +271,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
         discover_ref_seal = *fold;
     /// else: leave discover_ref_seal empty (fresh pool / no adopted seal) => all Read.
     const std::map<String, DiscoverDecision> discover_decisions =
-        computeDiscoverDecisions(discover_ref_seal, discover_fence_positions);
+        computeDiscoverDecisions(discover_ref_seal, discover_fence_positions,
+                                 result.listed_tokens_by_cursor_key);
 
     for (const auto & [ns, root_shard] : result.root_shards)
     {
@@ -1353,7 +1369,8 @@ std::map<String, Token> Gc::listRootShardTokens(std::set<String> & ambiguous_key
 
 std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
     const CasFoldSeal & sealed,
-    const std::map<String, uint64_t> & fence_positions)
+    const std::map<String, uint64_t> & fence_positions,
+    std::map<String, Token> & out_listed_tokens)
 {
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
@@ -1393,6 +1410,16 @@ std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
     {
         if (full_key.starts_with(refs_prefix))
             ambiguous_cursor_keys.insert(full_key.substr(refs_prefix.size()));
+    }
+
+    /// Task 6: export the unambiguous LIST tokens so the caller (`fold`) can thread them into
+    /// `reclaimDroppedShards`. We export only non-ambiguous keys — an ambiguous key's token is
+    /// unreliable and must not be used for a `deleteExact` (it would unconditionally skip reclaim for
+    /// that shard this round, which is correct: the delete would mismatch anyway on a raced re-list).
+    for (const auto & [ck, tok] : listed_by_cursor_key)
+    {
+        if (!ambiguous_cursor_keys.contains(ck))
+            out_listed_tokens[ck] = tok;
     }
 
     for (const auto & [ns, shard] : universe)
@@ -1444,9 +1471,10 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
     /// WRITE-FREE: load the reference tokens from durable state and return the decisions the next round's
     /// discover would make. No CAS, no delete, no fold.
     const auto state_bytes = store->backend().get(store->layout().gcStateKey());
+    std::map<String, Token> dummy_tokens;
     if (!state_bytes)
         /// Fresh pool: no sealed state. `computeDiscoverDecisions` over an empty seal yields all Read.
-        return computeDiscoverDecisions(CasFoldSeal{}, {});
+        return computeDiscoverDecisions(CasFoldSeal{}, {}, dummy_tokens);
 
     const GcState state = decodeGcState(state_bytes->bytes);
 
@@ -1469,7 +1497,7 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
         ref_seal = *fold;
     /// else: empty ref_seal (fresh pool / no adopted seal) => all Read.
 
-    return computeDiscoverDecisions(ref_seal, fence_positions);
+    return computeDiscoverDecisions(ref_seal, fence_positions, dummy_tokens);
 }
 
 std::vector<Gc::PreviewEntry> Gc::previewDeletes()
@@ -1813,6 +1841,94 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
     }
 
     return false;
+}
+
+void Gc::reclaimDroppedShards(const FoldResult & folded)
+{
+    /// Task 6: reclaim ref-shard objects that are empty + tombstoned + fully folded (soak S30).
+    ///
+    /// CORRECTNESS CONSTRAINT — FULLY-FOLDED-BEFORE-RECLAIM (not optional):
+    /// The fold cursor MUST cover the tombstone and every prior -1 removal event before we delete
+    /// the shard object. Deleting before the removal events are folded leaves phantom in-degree on
+    /// the blobs those refs named — a silent blob-retention leak. We enforce this by requiring
+    /// `cov.folded_cursor >= tombstone_version` (the tombstone's `transition_version`).
+    ///
+    /// TOKEN: We use the token from the eligibility GET (`readShard`) for `deleteExact`. The fence
+    /// step modifies every present shard each round (bumps `fence_round` via `mutateShard`), so the
+    /// LIST token from the discovery sweep is always stale by the time we reach this step. The GET is
+    /// already required for eligibility (tombstone present, refs empty), so no extra round-trip is
+    /// incurred for the token.
+    ///
+    /// CONCURRENT REVIVE: a writer appending to the shard after the tombstone changes its body =>
+    /// different token from GET => `deleteExact` returns `TokenMismatch` => shard survives (fail-closed).
+    /// The writer's new publication has a strictly greater incarnation (Task 2), and the next round folds
+    /// from cursor 0 (Task 3 ABA reset).
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+
+    for (const auto & [ns, shard] : folded.root_shards)
+    {
+        const String ck = cursorKey(ns, shard);
+
+        /// Need fold coverage to verify fully-folded-at-current-incarnation.
+        const auto cov_it = folded.fold_seal.per_ns_shard.find(ck);
+        if (cov_it == folded.fold_seal.per_ns_shard.end())
+            continue;   /// shard not covered in this fold (Skipped — cannot verify fully folded)
+        const ShardCoverage & cov = cov_it->second;
+
+        /// Read the shard to check: refs empty, last event is tombstone. This GET also gives us the
+        /// current token for the deleteExact — avoids a separate HEAD/GET for the token.
+        /// IMPORTANT: This must run BEFORE trim() (see runRegularRound): trim removes events at/below
+        /// the fold cursor, which includes the tombstone. After trim the journal is empty and this guard
+        /// would fail. The ordering is trim runs AFTER reclaimDroppedShards.
+        const auto [root, shard_tok] = store->readShard(ns, shard);
+
+        /// Guard 1: refs must be empty (all dropped — the tombstone comes after all -1 events).
+        if (!root.refs.empty())
+            continue;
+
+        /// Guard 2: last journal event must be the tombstone.
+        if (root.journal.empty() || !root.journal.back().is_tombstone)
+            continue;
+        const uint64_t tombstone_version = root.journal.back().transition_version;
+
+        /// Guard 3: FULLY-FOLDED-BEFORE-RECLAIM (the binding correctness constraint, not optional).
+        /// `cov.folded_cursor` is the journal position the fold reached this round.
+        /// `tombstone_version` is the transition_version of the tombstone event. We compare against
+        /// the tombstone's version (not root.shard_version) because fence() may have bumped shard_version
+        /// beyond the tombstone's version without adding a journal entry.
+        /// Fully folded <=> cursor >= tombstone_version AND incarnations match (no ABA).
+        if (cov.incarnation != root.incarnation)
+            continue;   /// ABA: shard was recreated between fold and here — not safe to reclaim
+        if (cov.folded_cursor < tombstone_version)
+            continue;   /// tombstone (or prior events) not yet folded — wait for a later round
+
+        /// All guards pass. Delete using the token from the GET above (not an extra round-trip;
+        /// the GET was already needed for tombstone + empty-refs eligibility). The fence step
+        /// runs between the fold's LIST sweep and here, so the LIST token would be stale.
+        if (!shard_tok)
+            continue;   /// shard vanished between the GET and the delete — concurrent reclaim; skip
+        const String key = layout.rootShardKey(ns, shard);
+        const DeleteOutcome del = backend.deleteExact(key, *shard_tok);
+        /// Tolerate NotFound (raced delete by another leader) and TokenMismatch (concurrent revive:
+        /// a writer appended after the tombstone — the object survives, which is correct).
+        /// Never throw on 404 (feedback_ca_gc_never_throw_on_404).
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::GcTrim;   /// closest existing event kind; a dedicated ShardReclaim
+                                              /// event can be added in a later task if needed
+            e.namespace_ = ns.string();
+            e.object_kind = CasEventObjectKind::Root;
+            e.outcome = del.kind == DeleteOutcome::Kind::Deleted   ? "deleted"
+                      : del.kind == DeleteOutcome::Kind::NotFound  ? "absent"
+                                                                   : "replaced";
+            e.reason = "Task 6: reclaim empty+tombstoned+fully-folded ref-shard object (S30)";
+            e.detail = {{"shard", std::to_string(shard)},
+                        {"key", key},
+                        {"fold_cursor", std::to_string(cov.folded_cursor)},
+                        {"shard_version", std::to_string(root.shard_version)}};
+        });
+    }
 }
 
 }

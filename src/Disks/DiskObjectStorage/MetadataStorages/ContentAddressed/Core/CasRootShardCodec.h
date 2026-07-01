@@ -69,11 +69,14 @@ struct OwnerBinding
 /// publish committed = old none / new {Committed,…}; drop = old {Committed,…} / new none; repoint =
 /// old {Committed,ref,T_old} / new {Committed,ref,T_new}; promote = old {Precommit,final,build,T} /
 /// new {Committed,final,T} (SAME manifest_ref T ⇒ owner move, blob Δ = 0, no cleanup).
+/// Task 6: `is_tombstone = true` marks the drop-namespace tombstone — both bindings absent, the fold
+/// treats it as a no-op, and GC reclaims the shard object once fully folded past this event.
 struct RootOwnerEvent
 {
     uint64_t transition_version = 0;
     std::optional<OwnerBinding> old_binding;
     std::optional<OwnerBinding> new_binding;
+    bool is_tombstone = false;   /// Task 6: set by dropNamespace; fold no-op; GC reclaim trigger
     bool operator==(const RootOwnerEvent &) const = default;
 };
 

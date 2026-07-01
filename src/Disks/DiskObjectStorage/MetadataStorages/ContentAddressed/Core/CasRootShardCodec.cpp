@@ -133,6 +133,8 @@ String encodeRootShard(const RootShard & root)
             encodeOwnerBinding(e->mutable_old_binding(), *ev.old_binding);
         if (ev.new_binding)
             encodeOwnerBinding(e->mutable_new_binding(), *ev.new_binding);
+        if (ev.is_tombstone)
+            e->set_is_tombstone(true);
     }
 
     /// Deterministic serialization (sorts map<> entries) so golden tests are stable. Correctness
@@ -190,10 +192,12 @@ RootShard decodeRootShard(std::string_view data)
             ev.old_binding = decodeOwnerBinding(e.old_binding(), "root shard journal old_binding");
         if (e.has_new_binding())
             ev.new_binding = decodeOwnerBinding(e.new_binding(), "root shard journal new_binding");
+        ev.is_tombstone = e.is_tombstone();
 
-        /// A RootOwnerEvent must remove or add at least one binding (spec §Root Journal Format): an
-        /// event with neither is meaningless and would fold to a no-op — fail closed.
-        if (!ev.old_binding && !ev.new_binding)
+        /// A `RootOwnerEvent` must either remove or add at least one binding, OR be the drop-namespace
+        /// tombstone (both bindings absent, `is_tombstone = true`). A neither-binding-nor-tombstone event
+        /// is meaningless and would fold to a no-op — fail closed (Task 6: tombstone is the sole exception).
+        if (!ev.old_binding && !ev.new_binding && !ev.is_tombstone)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS root shard: journal event at transition_version {} has neither old_binding nor new_binding",
                 ev.transition_version);

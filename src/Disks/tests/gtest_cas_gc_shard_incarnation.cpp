@@ -216,3 +216,161 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
                "missing blob (dangling=" << rep.dangling << ", reachable=" << rep.reachable << ")";
     }
 }
+
+/// Task 6 (S30): an empty+tombstoned+fully-folded ref-shard object is reclaimed by GC.
+/// After `dropNamespace`, the ref-shard object must be deleted by GC (not left as storage debris).
+TEST(CasGcShardIncarnation, DroppedShardObjectIsReclaimed)
+{
+    for (const uint64_t gc_shards : {1u, 4u})
+    {
+        std::shared_ptr<InMemoryBackend> backend;
+        auto store = makeStoreWithShards(backend, gc_shards);
+        const RootNamespace ns{"srv1/tblDrop"};
+
+        /// Publish a ref so the shard object is created.
+        {
+            BuildInfo info;
+            info.intended_ref = ns.string() + "/part_0";
+            auto build = store->startBuild(info);
+            const ManifestId id = build->stageManifest({});
+            build->precommitAdd(ns, "part_0", id);
+            build->promote(ns, "part_0", build->buildId(), id);
+        }
+
+        /// Use the actual shard "part_0" routes to (CityHash64("part_0") % root_shards).
+        const uint64_t ref_shard = store->shardOf("part_0");
+        const String shard_key = store->layout().rootShardKey(ns, ref_shard);
+        ASSERT_TRUE(backend->head(shard_key).exists)
+            << "gc_shards=" << gc_shards << ": shard object must exist after publish";
+
+        /// Drop the namespace (appends removal events + tombstone per shard).
+        store->dropNamespace(ns);
+
+        /// Advance watermark so the build-watermark guard does not spare objects.
+        store->renewWatermarkOnce();
+
+        /// Run GC rounds until the shard object is reclaimed or the round limit is hit.
+        Gc gc(store, hexToU128("000000000000000000000000000000ab"));
+        for (int i = 0; i < 16; ++i)
+        {
+            gc.runRegularRound();
+            if (!backend->head(shard_key).exists)
+                break;
+        }
+
+        EXPECT_FALSE(backend->head(shard_key).exists)
+            << "gc_shards=" << gc_shards
+            << ": ref-shard object must be reclaimed by GC after dropNamespace (soak S30)";
+    }
+}
+
+/// Task 6: a shard that is empty but has NO tombstone (table alive, all parts dropped manually)
+/// must NOT be reclaimed. The tombstone is written only by `dropNamespace`; `dropRef` does not write it.
+TEST(CasGcShardIncarnation, IdleButLiveShardNotReclaimed)
+{
+    for (const uint64_t gc_shards : {1u, 4u})
+    {
+        std::shared_ptr<InMemoryBackend> backend;
+        auto store = makeStoreWithShards(backend, gc_shards);
+        const RootNamespace ns{"srv1/tblLive"};
+
+        /// Publish and then drop the ref — shard exists but no tombstone (table not dropped).
+        {
+            BuildInfo info;
+            info.intended_ref = ns.string() + "/part_0";
+            auto build = store->startBuild(info);
+            const ManifestId id = build->stageManifest({});
+            build->precommitAdd(ns, "part_0", id);
+            build->promote(ns, "part_0", build->buildId(), id);
+        }
+        store->dropRef(ns, "part_0");
+        store->renewWatermarkOnce();
+
+        const uint64_t ref_shard = store->shardOf("part_0");
+        const String shard_key = store->layout().rootShardKey(ns, ref_shard);
+        ASSERT_TRUE(backend->head(shard_key).exists)
+            << "gc_shards=" << gc_shards << ": shard object must exist after dropRef";
+
+        /// Run several GC rounds — shard must NOT be reclaimed (no tombstone).
+        Gc gc(store, hexToU128("000000000000000000000000000000cd"));
+        for (int i = 0; i < 8; ++i)
+            gc.runRegularRound();
+
+        EXPECT_TRUE(backend->head(shard_key).exists)
+            << "gc_shards=" << gc_shards
+            << ": ref-shard object without tombstone must NOT be reclaimed by GC";
+    }
+}
+
+/// Task 6 + Task 3 (ABA): after a shard is reclaimed, a new publish recreates it with a strictly
+/// greater incarnation. GC must fold the new shard from cursor 0 (no stale-cursor double-count),
+/// and the result must satisfy INV-NO-DANGLE + no unreachable blobs.
+TEST(CasGcShardIncarnation, RecreateAfterReclaimFoldsFromZero)
+{
+    for (const uint64_t gc_shards : {1u, 4u})
+    {
+        std::shared_ptr<InMemoryBackend> backend;
+        auto store = makeStoreWithShards(backend, gc_shards);
+        const RootNamespace ns{"srv1/tblRecreate"};
+
+        /// First publish.
+        {
+            BuildInfo info;
+            info.intended_ref = ns.string() + "/part_0";
+            auto build = store->startBuild(info);
+            const ManifestId id = build->stageManifest({});
+            build->precommitAdd(ns, "part_0", id);
+            build->promote(ns, "part_0", build->buildId(), id);
+        }
+
+        /// Use the actual shard "part_0" and "part_1" route to.
+        const uint64_t ref_shard_0 = store->shardOf("part_0");
+        const uint64_t ref_shard_1 = store->shardOf("part_1");
+        const String shard_key = store->layout().rootShardKey(ns, ref_shard_0);
+
+        /// Drop the namespace (tombstone).
+        store->dropNamespace(ns);
+        store->renewWatermarkOnce();
+
+        /// Run GC until the shard is reclaimed.
+        {
+            Gc gc(store, hexToU128("000000000000000000000000000000ef"));
+            for (int i = 0; i < 16; ++i)
+            {
+                gc.runRegularRound();
+                if (!backend->head(shard_key).exists)
+                    break;
+            }
+            ASSERT_FALSE(backend->head(shard_key).exists)
+                << "gc_shards=" << gc_shards << ": shard must be reclaimed before recreate test";
+        }
+
+        /// Recreate: publish a new ref into the same namespace (new incarnation > old).
+        {
+            BuildInfo info;
+            info.intended_ref = ns.string() + "/part_1";
+            auto build = store->startBuild(info);
+            const ManifestId id = build->stageManifest({});
+            build->precommitAdd(ns, "part_1", id);
+            build->promote(ns, "part_1", build->buildId(), id);
+        }
+
+        /// part_1 may route to a different shard than part_0 — check whichever shard holds each.
+        const String shard_key_1 = store->layout().rootShardKey(ns, ref_shard_1);
+        ASSERT_TRUE(backend->head(shard_key_1).exists)
+            << "gc_shards=" << gc_shards << ": shard must be recreated after new publish";
+
+        /// GC should fold the new shard correctly (no double-count, no INV-NO-DANGLE).
+        {
+            Gc gc(store, hexToU128("000000000000000000000000000000ff"));
+            for (int i = 0; i < 8; ++i)
+                gc.runRegularRound();
+        }
+
+        const FsckReport rep = runFsck(*store, /*detail=*/false);
+        EXPECT_EQ(rep.dangling, 0u)
+            << "gc_shards=" << gc_shards << ": recreated namespace must not have dangling refs";
+        EXPECT_EQ(rep.unreachable, 0u)
+            << "gc_shards=" << gc_shards << ": recreated namespace must have no unreachable blobs";
+    }
+}

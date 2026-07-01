@@ -69,10 +69,13 @@ message OwnerBindingProto {
 
 // One ordered owner-change event in the single root journal stream. old_binding/new_binding are
 // proto3 explicit-presence (optional) so absence is distinguishable from a zero binding.
+// is_tombstone: set by dropNamespace as the LAST journal event; both bindings are absent. The fold
+// treats it as a no-op (no blob delta), and GC reclaims the shard object once it is fully folded.
 message RootOwnerEventProto {
   uint64                     transition_version = 1;
   optional OwnerBindingProto old_binding        = 2;
   optional OwnerBindingProto new_binding        = 3;
+  bool                       is_tombstone       = 4;  // Task 6: drop-namespace tombstone marker
 }
 
 // The current committed ref payload in the root journal: the committed ManifestRef plus the mutable

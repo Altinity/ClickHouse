@@ -169,6 +169,12 @@ private:
         CasCompletionSeal completion_seal;
         std::vector<std::pair<RootNamespace, uint64_t>> root_shards;
         std::map<ManifestId, Token> mf_cleanup;
+        /// Task 6: per-cursor-key LIST tokens from the fold's discovery sweep. Keyed by
+        /// "ns/shard" (cursor-key form). Present only when `backend.supportsListTokens()` is
+        /// true. Populated for completeness; `reclaimDroppedShards` uses the GET token from
+        /// the eligibility read instead (the fence step always changes the shard token between
+        /// the LIST sweep and the reclaim step).
+        std::map<String, Token> listed_tokens_by_cursor_key;
     };
 
     /// R1 (spec rev. 15 §Fold Owner Transitions): per changed root shard, stream the ONE ordered
@@ -269,9 +275,18 @@ private:
     ///   the shard is NOT clamped: if `fence_positions` has the key with `fence_pos > 0` and
     ///   `folded_cursor + 1 < fence_pos`, the previous fold was barrier-clamped (unfolded events may
     ///   exist) => forced Read.
+    /// Task 6: `out_listed_tokens` receives the per-cursor-key LIST tokens (keyed by "ns/shard")
+    /// from the discovery LIST sweep, for observability (stored in `FoldResult::listed_tokens_by_cursor_key`).
     std::map<String, DiscoverDecision> computeDiscoverDecisions(
         const CasFoldSeal & sealed,
-        const std::map<String, uint64_t> & fence_positions);
+        const std::map<String, uint64_t> & fence_positions,
+        std::map<String, Token> & out_listed_tokens);
+
+    /// Task 6: for each discovered shard that is empty + tombstoned (last journal event `is_tombstone`)
+    /// + fully folded at current incarnation, issue `deleteExact(rootShardKey, read_token)` using the
+    /// token from the eligibility GET. Tolerates `NotFound` and `TokenMismatch` (never throws on 404
+    /// or a concurrent revive — feedback_ca_gc_never_throw_on_404).
+    void reclaimDroppedShards(const FoldResult & folded);
 
     /// CRASH-RESUME (the model: idempotent replay of a crashed round's tail). An INCOMPLETE round is
     /// detectable from durable state alone: a fold_seal exists for the latest generation with no
