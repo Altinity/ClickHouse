@@ -12,12 +12,14 @@
 ///   Code: 246 CORRUPTED_DATA: CAS blob in-degree: merged in-degree -1 < 0 for a blob ...
 ///
 /// H1 (DeposedFoldAdopt) and H1b (FenceWindowReRemoval) guard against the fence-window re-fold
-/// undercount (now fixed by advancing the sealed cursor past recheck events).
+/// undercount. Fixed STRUCTURALLY by replacing the persisted integer in-degree with an idempotent
+/// source-edge SET: re-folding a fence-window removal across generations is a set-difference no-op,
+/// so the underflow cannot occur (NOT by patching the sealed cursor — that approach was rejected).
 ///
 /// H2 (DropThenRepointIdempotent) guards against the duplicate-remove undercount that existed when
 /// in-degree was a persisted integer: two events both carrying `old=committed(r1)` subtracted -1
-/// twice from blob 2's count, driving it to -1. Fixed by replacing the integer with an idempotent
-/// source-edge SET — the second removal of an already-absent edge is a no-op.
+/// twice from blob 2's count, driving it to -1. Same fix — the second removal of an already-absent
+/// edge is a no-op.
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
