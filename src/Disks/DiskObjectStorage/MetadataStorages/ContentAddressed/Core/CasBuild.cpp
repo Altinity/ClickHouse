@@ -596,6 +596,12 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
     /// Task 2: pass the build's own (writer_epoch, build_seq) as the birth incarnation. On the
     /// create-if-absent path (shard doesn't exist yet) mutateShard stamps root.incarnation before
     /// the journal append; on subsequent calls the stamp is skipped (shard already present).
+    /// Task 5: read the current GC round BEFORE the CAS. On the create-if-absent path (NEWBORN shard)
+    /// mutateShard stamps root.fence_round = birth_floor. A shard born during round R is self-floored
+    /// to R so the `promote` gate forces a retire-view refresh to at least R before committing any
+    /// blob — the registry-free THM-NO-RETURN create-ordering guarantee. An existing shard keeps its
+    /// fence (birth_floor is ignored on the non-absent path, same semantics as birth_incarnation).
+    const uint64_t birth_floor = store->currentGcRound();
     store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
     {
         root.journal.push_back(RootOwnerEvent{
@@ -607,7 +613,7 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
                 .build_id = build_id,
                 .manifest_ref = id.ref}});
     }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Precommit,
-    ShardIncarnation{.writer_epoch = epoch, .build_sequence = build_seq});
+    ShardIncarnation{.writer_epoch = epoch, .build_sequence = build_seq}, birth_floor);
 
     precommit_target_ns = target_ns;
     precommit_final_ref = final_ref_name;
@@ -656,8 +662,15 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
 
     store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
     {
-        /// Refresh-then-revalidate: if the shard's fence_round is ahead of our view, GC advanced — refresh first.
-        /// Task 5 will replace this with the shard's own incarnation floor; for now gate on the shard fence only.
+        /// Task 5 promote gate (registry-free create-ordering, THM-NO-RETURN): if the retire view
+        /// is behind the shard's fence_round, GC has advanced to at least that round and may have
+        /// condemned objects visible to the shard — refresh before the blob revalidation below.
+        /// For a NEWBORN shard (Task 5 self-floor) fence_round equals the GC round at the time the
+        /// precommit CAS ran, so a writer whose view predates that round is forced to refresh and
+        /// will see any condemnations from round fence_round (the shard's birth). For an existing
+        /// shard fence_round was set by the GC fence step (R3) and gates the same way. The refresh
+        /// here (and not before the owner-check above) is correct: the owner check only reads the
+        /// shard journal, not the retire view; the condemn check below is the blob-safety gate.
         if (store->retireView().round() < root.fence_round)
             store->retireView().refresh();
 

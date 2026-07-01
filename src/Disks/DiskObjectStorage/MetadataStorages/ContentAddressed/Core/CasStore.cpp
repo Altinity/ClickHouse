@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
@@ -728,7 +729,7 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
 
 void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
                         uint64_t * out_committed_version, RootMutationOrigin origin, RootMutationKind kind,
-                        ShardIncarnation birth_incarnation)
+                        ShardIncarnation birth_incarnation, uint64_t birth_floor)
 {
     /// Local write fence (spec §write-fence, Phase 0 Task 6): the shared mutable ref shards are the
     /// state the fence most protects. A superseded/paused writer (lease lost or local deadline passed)
@@ -767,8 +768,17 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
         /// object (drop, fence, updateRefPayload, dropNamespace) pass the default `{}`, which is the
         /// unstamped sentinel (a no-op when the shard already carries a real incarnation). A CAS
         /// Conflict retry re-reads a now-present shard, so the stamp is skipped on retries correctly.
+        /// Task 5: stamp the birth floor (fence_round) on the same create-if-absent path. A NEWBORN
+        /// shard born during GC round R is fenced to R so the `promote` gate forces a retire-view
+        /// refresh before committing any blob belonging to the new shard — the registry-free THM-NO-RETURN
+        /// create-ordering guarantee. `birth_floor = 0` (the default) leaves `fence_round` at 0 for
+        /// shards created by callers that are not writers (GC fence, drop, dropNamespace).
         if (!token)
+        {
             root.incarnation = birth_incarnation;
+            if (birth_floor > 0)
+                root.fence_round = birth_floor;
+        }
         mutate(root);
         ++root.shard_version;
         String body = encodeRootShard(root);
@@ -855,6 +865,17 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
         /// Conflict ⇒ someone committed under us; re-read and re-apply the whole mutate.
     }
     throw Exception(ErrorCodes::ABORTED, "manifest CAS contention on {}", key);
+}
+
+uint64_t Store::currentGcRound() const
+{
+    /// Task 5: read `gc/state` once (no CAS loop — a point-in-time read is sufficient; a concurrent
+    /// GC advance only makes the returned round larger, which is strictly more conservative for the
+    /// `precommitAdd` self-floor). Returns 0 when absent (pool never GC'd — no round to floor to).
+    const auto state_bytes = pool_backend->get(pool_layout.gcStateKey());
+    if (!state_bytes)
+        return 0;
+    return decodeGcState(state_bytes->bytes).round;
 }
 
 void Store::dropRef(const RootNamespace & ns, const String & ref_name)

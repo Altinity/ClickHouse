@@ -334,18 +334,26 @@ public:
         backpressure_delay_hook = std::move(hook);
     }
 
+    /// Task 5: read the current GC round from `gc/state`. Returns 0 when `gc/state` is absent (pool
+    /// never GC'd). Used by `precommitAdd` to self-floor a NEWBORN ref-shard to the current round so
+    /// the `promote` gate forces a retire-view refresh before the shard's blobs can be committed.
+    uint64_t currentGcRound() const;
+
     /// B164b test seam: mutate root shard with explicit origin/kind for backpressure
     /// verification. Production code uses private `mutateShard` via Build/Gc friend
     /// classes. Exists only so the GC-bypass test can verify that `RootMutationOrigin::Gc`
     /// skips backpressure delay without exposing the full mutation API.
     /// Task 2: `birth_incarnation` (default `{}`) is forwarded to the private `mutateShard`
     /// so incarnation-stamp tests can drive the create-if-absent path directly.
+    /// Task 5: `birth_floor` (default 0) is forwarded to the private `mutateShard` so
+    /// self-floor tests can drive the create-if-absent path with an explicit fence_round.
     void mutateShardForTest(const RootNamespace & ns, uint64_t shard,
                             std::function<void(RootShard &)> mutate,
                             RootMutationOrigin origin, RootMutationKind kind,
-                            ShardIncarnation birth_incarnation = {})
+                            ShardIncarnation birth_incarnation = {},
+                            uint64_t birth_floor = 0)
     {
-        mutateShard(ns, shard, std::move(mutate), nullptr, origin, kind, birth_incarnation);
+        mutateShard(ns, shard, std::move(mutate), nullptr, origin, kind, birth_incarnation, birth_floor);
     }
 
 private:
@@ -401,14 +409,17 @@ private:
     /// `origin` distinguishes Writer mutations (subject to backpressure) from Gc mutations (bypass).
     /// `kind` is diagnostic-only (logged/metrics) and does not affect behaviour.
     /// When the shard does not yet exist (token == nullopt on the first readShard call), the shard is
-    /// created fresh and `root.incarnation` is set to `birth_incarnation` BEFORE `mutate` runs. On
-    /// subsequent mutations (token present), `incarnation` is left untouched (immutable for the shard's
-    /// life). Callers that never create a first object (drop, updateRefPayload, dropNamespace, GC fence)
-    /// pass the default `{}` — the stamp is a no-op since the shard already exists.
+    /// created fresh: `root.incarnation` is set to `birth_incarnation` AND `root.fence_round` is set
+    /// to `birth_floor` (Task 5 self-floor) BEFORE `mutate` runs. On subsequent mutations (token
+    /// present), both are left untouched (immutable for the shard's life). Callers that never create a
+    /// first object (drop, updateRefPayload, dropNamespace, GC fence) pass the defaults (`{}`, 0) — the
+    /// stamps are no-ops since the shard already exists. Only `precommitAdd` passes a non-zero
+    /// `birth_floor` (the current `gcRound` at the moment of the precommit CAS).
     void mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
                      uint64_t * out_committed_version,
                      RootMutationOrigin origin, RootMutationKind kind,
-                     ShardIncarnation birth_incarnation = {});
+                     ShardIncarnation birth_incarnation = {},
+                     uint64_t birth_floor = 0);
 
     BackendPtr pool_backend;
     PoolConfig config;
