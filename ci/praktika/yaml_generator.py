@@ -571,16 +571,10 @@ class PullRequestPushYamlGen:
             ALL_JOBS += (
                 "\n      - RegressionTestsRelease\n      - RegressionTestsAarch64"
             )
-        if "SignRelease" in self.workflow_config.additional_jobs:
-            res += AltinityWorkflowTemplates.ALTINITY_JOBS["SignRelease"]
-            ALL_JOBS += "\n      - SignRelease\n      - SignAarch64"
         if "CIReport" in self.workflow_config.additional_jobs:
             res += AltinityWorkflowTemplates.ALTINITY_JOBS["CIReport"].replace(
                 "{ALL_JOBS}", ALL_JOBS
             )
-        if "SourceUpload" in self.workflow_config.additional_jobs:
-            res += AltinityWorkflowTemplates.ALTINITY_JOBS["SourceUpload"]
-            ALL_JOBS += "\n      - SourceUpload"
 
         return res
 

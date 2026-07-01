@@ -1,5 +1,6 @@
 from praktika import Workflow
 
+from ci.defs.altinity_jobs import AltinityJobConfigs
 from ci.defs.defs import (
     BASE_BRANCH,
     DOCKERS,
@@ -132,6 +133,7 @@ workflow = Workflow.Config(
             FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
         ),
         *JobConfigs.toolchain_build_jobs,
+        AltinityJobConfigs.source_upload_job,
         # TODO: uncomment when praktika supports depends-on-all-jobs;
         # currently set_dependency requires an explicit list, but CI Results Review
         # should only run after every other job has finished.
@@ -139,7 +141,7 @@ workflow = Workflow.Config(
         #     FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
         # ),
     ],
-    additional_jobs=["GrypeScan", "Regression", "CIReport", "SourceUpload"],
+    additional_jobs=["GrypeScan", "Regression", "CIReport"],
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
         *ArtifactConfigs.clickhouse_binaries,
