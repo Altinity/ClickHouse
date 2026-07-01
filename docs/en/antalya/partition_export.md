@@ -70,7 +70,7 @@ TO TABLE [destination_database.]destination_table
 #### `export_merge_tree_partition_retry_max_backoff_seconds` (Optional)
 
 - **Type**: `UInt64`
-- **Default**: `60`
+- **Default**: `300`
 - **Description**: Maximum delay (in seconds) between retries of a failed part export. Caps the exponential growth controlled by `export_merge_tree_partition_retry_initial_backoff_seconds`.
 
 #### `export_merge_tree_part_file_already_exists_policy` (Optional)
