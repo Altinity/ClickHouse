@@ -86,26 +86,6 @@ class AltinityWorkflowTemplates:
       timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
 """,
-        "SignRelease": r"""
-  SignRelease:
-    needs: [config_workflow, build_amd_release]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_sign.yml
-    secrets: inherit
-    with:
-      test_name: Sign release
-      runner_type: altinity-style-checker
-      data: ${{ needs.config_workflow.outputs.data }}
-  SignAarch64:
-    needs: [config_workflow, build_arm_release]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_sign.yml
-    secrets: inherit
-    with:
-      test_name: Sign aarch64
-      runner_type: altinity-style-checker-aarch64
-      data: ${{ needs.config_workflow.outputs.data }}
-""",
         "CIReport": r"""
   FinishCIReport:
     if: ${{ !cancelled() && needs.config_workflow.outputs.pipeline_status != '' }}
@@ -123,42 +103,6 @@ class AltinityWorkflowTemplates:
         with:
           workflow_config: ${{ toJson(needs) }}
           final: true
-""",
-        "SourceUpload": r"""
-  SourceUpload:
-    needs: [config_workflow, build_amd_release]
-    if: ${{ !cancelled() && needs.config_workflow.outputs.pipeline_status != '' && !contains(needs.*.outputs.pipeline_status, 'failure') }}
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
-    env:
-        COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-        PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
-        VERSION: ${{ fromJson(needs.config_workflow.outputs.data).JOB_KV_DATA.version.string }}
-    steps:
-      - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
-        with:
-          clear-repository: true
-          ref: ${{ fromJson(needs.config_workflow.outputs.data).git_ref }}
-          submodules: true
-          fetch-depth: 0
-          filter: tree:0
-      - name: Install aws cli
-        uses: unfor19/install-aws-cli-action@v1
-        with:
-          version: 2
-          arch: arm64
-      - name: Create source tar
-        run: |
-          cd .. && tar czf $RUNNER_TEMP/build_source.src.tar.gz ClickHouse/
-      - name: Upload source tar
-        run: |
-          if [ "$PR_NUMBER" -eq 0 ]; then
-              S3_PATH="REFs/$GITHUB_REF_NAME/$COMMIT_SHA/build_amd_release"
-          else
-              S3_PATH="PRs/$PR_NUMBER/$COMMIT_SHA/build_amd_release"
-          fi
-
-          aws s3 cp $RUNNER_TEMP/build_source.src.tar.gz s3://altinity-build-artifacts/$S3_PATH/clickhouse-$VERSION.src.tar.gz
 """,
     }
     ADDITIONAL_JOBS_BANNER = r"""
