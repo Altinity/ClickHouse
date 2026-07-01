@@ -7,7 +7,7 @@
 (* TWO coordinates replace the five overlapping "fence" counters + the      *)
 (* namespace registry of the proven CaIncarnationCore.tla:                  *)
 (*   (1) a durable never-reused per-(ns,shard) INCARNATION (sInc, from the  *)
-(*       nextInc allocator) — identity; the fold cursor is keyed by it, so  *)
+(*       sIncMax allocator) — identity; the fold cursor is keyed by it, so  *)
 (*       a delete+recreate at the same path can never be ABA-confused.      *)
 (*   (2) the pool-global GC ROUND — a newborn shard is born fenced to the   *)
 (*       current gcRound (self-floor: the writer reads gc/state.round), and *)
@@ -22,6 +22,12 @@
 (*                             (proves coordinate 1 is irreducible)         *)
 (*   SabotageDeleteBeforeFold: reclaim a shard object before its journal is *)
 (*                             folded -> orphan edge -> blob leak           *)
+(*   SabotageIncarnationReuse: a recreated (ns,shard) reuses a prior        *)
+(*                             incarnation (INC-MONO broken) -> ABA dangle  *)
+(*                             (proves per-shard incarnation monotonicity,  *)
+(*                             not global uniqueness, is what matters — the *)
+(*                             design config ALREADY lets incarnations      *)
+(*                             collide across DIFFERENT shards and holds).   *)
 (*                                                                          *)
 (* Reuses the proven idioms of CaIncarnationCore.tla verbatim: incarnation  *)
 (* tokens on blobs (tokOf/nextTok/deadTok), CondemnedAtView, ViewableRound, *)
@@ -40,7 +46,8 @@ CONSTANTS
     MaxInc,                      \* shard-incarnation allocator bound
     SabotageNewbornNoFloor,      \* TRUE: newborn born-floor 0 (registry removed WRONG) -> must dangle
     SabotagePathKeyedCursor,     \* TRUE: fold cursor keyed by path only (ignore incarnation) -> ABA -> must dangle
-    SabotageDeleteBeforeFold     \* TRUE: reclaim a shard object before its journal is folded -> orphan edge
+    SabotageDeleteBeforeFold,    \* TRUE: reclaim a shard object before its journal is folded -> orphan edge
+    SabotageIncarnationReuse     \* TRUE: a recreated (ns,shard) may REUSE a prior incarnation (INC-MONO broken) -> ABA
 
 Toks == 1..MaxTok
 
@@ -56,7 +63,12 @@ VARIABLES
     \* ---- durable: root shards (NO registry) ----
     sPresent,   \* [Shards -> BOOLEAN]         the ref-shard object exists (=> LIST-discoverable)
     sInc,       \* [Shards -> 0..MaxInc]       the current object's incarnation (0 = absent; coordinate 1)
-    nextInc,    \* 1..MaxInc+1                  durable-monotone incarnation allocator (never reused)
+    sIncMax,    \* [Shards -> 0..MaxInc]        per-shard incarnation high-water: the highest incarnation
+                \*                              ever assigned to this path. A fresh birth draws > sIncMax[s]
+                \*                              (strictly per-shard monotone => INC-MONO; incs MAY collide
+                \*                              across DIFFERENT shards, which is safe — the cursor keys by
+                \*                              (shard, inc)). SabotageIncarnationReuse lets a recreate draw
+                \*                              <= sIncMax[s], reusing a prior incarnation -> ABA.
     refs,       \* [Shards -> SUBSET (Blobs \X Toks)]  committed refs (blob + bound token)
     fence,      \* [Shards -> 0..MaxRound]     the shard's fence_round (writer floor)
     log,        \* [Shards -> Seq(Rec)]        append-only owner journal (fresh per incarnation)
@@ -76,7 +88,7 @@ VARIABLES
     wView,      \* [Writers -> 0..MaxRound]    highest retire round refreshed
     wHave       \* [Writers -> SUBSET (Blobs \X Toks)]  blobs created/held, ready to publish
 
-vars == << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, fence, log, tomb,
+vars == << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, fence, log, tomb,
            gcRound, gcPhase, roundOf, fencedSet, fencePos, cursor, rootEdges,
            everEdged, retired, inflight, wView, wHave >>
 
@@ -110,7 +122,7 @@ Init ==
     /\ deadTok  = [b \in Blobs |-> {}]
     /\ sPresent = [s \in Shards |-> FALSE]
     /\ sInc     = [s \in Shards |-> 0]
-    /\ nextInc  = 1
+    /\ sIncMax  = [s \in Shards |-> 0]
     /\ refs     = [s \in Shards |-> {}]
     /\ fence    = [s \in Shards |-> 0]
     /\ log      = [s \in Shards |-> << >>]
@@ -138,18 +150,18 @@ WCreateBlob(w, b) ==
     /\ tokOf'   = [tokOf   EXCEPT ![b] = nextTok[b]]
     /\ nextTok' = [nextTok EXCEPT ![b] = @ + 1]
     /\ wHave'   = [wHave   EXCEPT ![w] = @ \cup {<<b, nextTok[b]>>}]
-    /\ UNCHANGED << deadTok, sPresent, sInc, nextInc, refs, fence, log, tomb, gcRound, gcPhase,
+    /\ UNCHANGED << deadTok, sPresent, sInc, sIncMax, refs, fence, log, tomb, gcRound, gcPhase,
                     roundOf, fencedSet, fencePos, cursor, rootEdges, everEdged, retired, inflight, wView >>
 
 \* Refresh the writer's retire view to the currently viewable round.
 WRefreshView(w) ==
     /\ wView' = [wView EXCEPT ![w] = ViewableRound]
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, fence, log,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, fence, log,
                     tomb, gcRound, gcPhase, roundOf, fencedSet, fencePos, cursor, rootEdges,
                     everEdged, retired, inflight, wHave >>
 
 \* Publish blob b into shard s (one atomic CAS). If s is a NEWBORN (absent — brand-new OR a path
-\* reclaimed earlier), it is (re)created here: a FRESH incarnation from nextInc (never reused), a
+\* reclaimed earlier), it is (re)created here: a FRESH incarnation from sIncMax (never reused), a
 \* FRESH empty log seeded with this "add", fencePos reset, and the self-floor BornFloor — all made
 \* present (LIST-discoverable) atomically with the committed ref. The publish gate: the writer's
 \* view must reach the shard's floor AND the dependency must not be condemned at that view.
@@ -162,12 +174,19 @@ WPublish(w, s, b) ==
             /\ wView[w] >= fence[s] /\ ~CondemnedAtView(b, tokOf[b], wView[w])
             /\ refs'    = [refs    EXCEPT ![s] = @ \cup {<<b, tokOf[b]>>}]
             /\ log'     = [log     EXCEPT ![s] = Append(@, [op |-> "add", b |-> b])]
-            /\ UNCHANGED << sPresent, sInc, nextInc, fence, fencePos, tomb >>
-       ELSE /\ nextInc <= MaxInc
-            /\ wView[w] >= BornFloor /\ ~CondemnedAtView(b, tokOf[b], wView[w])
+            /\ UNCHANGED << sPresent, sInc, sIncMax, fence, fencePos, tomb >>
+       ELSE /\ wView[w] >= BornFloor /\ ~CondemnedAtView(b, tokOf[b], wView[w])
+            \* Choose this incarnation. Design: strictly per-shard monotone (> sIncMax[s]) — the fresh
+            \* birth; incs may collide with OTHER shards (safe). SabotageIncarnationReuse on a RECREATE
+            \* (sIncMax[s] >= 1) may pick <= sIncMax[s], reusing a prior incarnation -> the cursor keyed
+            \* by (shard, inc) can then match a stale prior fold -> ABA.
+            /\ \E newInc \in 1..MaxInc :
+                 /\ IF SabotageIncarnationReuse /\ sIncMax[s] >= 1
+                    THEN newInc <= sIncMax[s]
+                    ELSE newInc > sIncMax[s]
+                 /\ sInc'    = [sInc    EXCEPT ![s] = newInc]
+                 /\ sIncMax' = [sIncMax EXCEPT ![s] = IF newInc > @ THEN newInc ELSE @]
             /\ sPresent' = [sPresent EXCEPT ![s] = TRUE]
-            /\ sInc'     = [sInc     EXCEPT ![s] = nextInc]
-            /\ nextInc'  = nextInc + 1
             /\ fence'    = [fence    EXCEPT ![s] = BornFloor]
             /\ fencePos' = [fencePos EXCEPT ![s] = 0]
             /\ refs'     = [refs     EXCEPT ![s] = {<<b, tokOf[b]>>}]
@@ -183,7 +202,7 @@ WDrop(s, b) ==
     /\ Len(log[s]) < MaxLog
     /\ refs' = [refs EXCEPT ![s] = { e \in @ : e[1] # b }]
     /\ log'  = [log  EXCEPT ![s] = Append(@, [op |-> "rem", b |-> b])]
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, fence, tomb, gcRound,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, fence, tomb, gcRound,
                     gcPhase, roundOf, fencedSet, fencePos, cursor, rootEdges, everEdged, retired,
                     inflight, wView, wHave >>
 
@@ -193,7 +212,7 @@ WTombstone(s) ==
     /\ Len(log[s]) < MaxLog
     /\ tomb' = [tomb EXCEPT ![s] = TRUE]
     /\ log'  = [log  EXCEPT ![s] = Append(@, [op |-> "tomb", b |-> "none"])]
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, fence, gcRound,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, fence, gcRound,
                     gcPhase, roundOf, fencedSet, fencePos, cursor, rootEdges, everEdged, retired,
                     inflight, wView, wHave >>
 
@@ -201,7 +220,7 @@ WTombstone(s) ==
 WAbandon(w) ==
     /\ wHave[w] # {}
     /\ wHave' = [wHave EXCEPT ![w] = {}]
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, fence, log,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, fence, log,
                     tomb, gcRound, gcPhase, roundOf, fencedSet, fencePos, cursor, rootEdges,
                     everEdged, retired, inflight, wView >>
 
@@ -214,7 +233,7 @@ GStartRound(l) ==
     /\ roundOf'   = [roundOf   EXCEPT ![l] = gcRound + 1]
     /\ gcPhase'   = [gcPhase   EXCEPT ![l] = "retiring"]
     /\ fencedSet' = [fencedSet EXCEPT ![l] = {}]
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, fence, log,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, fence, log,
                     tomb, fencePos, cursor, rootEdges, everEdged, retired, inflight, wView, wHave >>
 
 \* Fold one journal record into the snap (edge-set semantics). INCARNATION-KEYED: if the cursor was
@@ -233,7 +252,7 @@ GFold(s) ==
                                [] rec.op = "tomb"  -> prior
              /\ everEdged' = IF rec.op = "add" THEN everEdged \cup {rec.b} ELSE everEdged
           /\ cursor' = [cursor EXCEPT ![s] = [inc |-> sInc[s], pos |-> base + 1]]
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, fence, log,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, fence, log,
                     tomb, gcRound, gcPhase, roundOf, fencedSet, fencePos, retired, inflight, wView, wHave >>
 
 \* Retire a journal-known, present, in-degree-0 blob at its current token (the HEAD).
@@ -242,7 +261,7 @@ GRetire(l, b) ==
     /\ present[b] /\ b \in everEdged /\ InDeg(b) = 0
     /\ ~\E e \in retired : e.b = b /\ e.t = tokOf[b]
     /\ retired' = retired \cup { [b |-> b, t |-> tokOf[b], r |-> roundOf[l]] }
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, fence, log,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, fence, log,
                     tomb, gcRound, gcPhase, roundOf, fencedSet, fencePos, cursor, rootEdges,
                     everEdged, inflight, wView, wHave >>
 
@@ -259,7 +278,7 @@ GFenceShard(l, s) ==
     /\ gcPhase'  = [gcPhase  EXCEPT ![l] =
                       IF { x \in Shards : sPresent[x] } \subseteq (fencedSet[l] \cup {s})
                       THEN "fenced" ELSE "fencing"]
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, tomb, gcRound,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, tomb, gcRound,
                     roundOf, cursor, rootEdges, everEdged, retired, inflight, wView, wHave >>
 
 \* All present shards fenced => fence phase complete (also covers "no present shard").
@@ -267,7 +286,7 @@ GFenceDone(l) ==
     /\ gcPhase[l] \in {"retiring", "fencing"}
     /\ { x \in Shards : sPresent[x] } \subseteq fencedSet[l]
     /\ gcPhase' = [gcPhase EXCEPT ![l] = "fenced"]
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, fence, log,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, fence, log,
                     tomb, gcRound, roundOf, fencedSet, fencePos, cursor, rootEdges, everEdged,
                     retired, inflight, wView, wHave >>
 
@@ -281,7 +300,7 @@ GRecheckDelete(l, e) ==
        ELSE /\ [b |-> e.b, t |-> e.t] \notin inflight
             /\ retired'  = retired
             /\ inflight' = inflight \cup { [b |-> e.b, t |-> e.t] }
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, fence, log,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, fence, log,
                     tomb, gcRound, gcPhase, roundOf, fencedSet, fencePos, cursor, rootEdges,
                     everEdged, wView, wHave >>
 
@@ -289,7 +308,7 @@ GEndRound(l) ==
     /\ gcPhase[l] = "fenced"
     /\ ~\E e \in retired : e.r = roundOf[l]
     /\ gcPhase' = [gcPhase EXCEPT ![l] = "idle"]
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, nextInc, refs, fence, log,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sPresent, sInc, sIncMax, refs, fence, log,
                     tomb, gcRound, roundOf, fencedSet, fencePos, cursor, rootEdges, everEdged,
                     retired, inflight, wView, wHave >>
 
@@ -303,7 +322,7 @@ GReclaim(s) ==
        \/ (cursor[s].inc = sInc[s] /\ cursor[s].pos >= Len(log[s]))
     /\ sPresent' = [sPresent EXCEPT ![s] = FALSE]
     /\ tomb'     = [tomb     EXCEPT ![s] = FALSE]
-    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sInc, nextInc, refs, fence, log, gcRound,
+    /\ UNCHANGED << present, tokOf, nextTok, deadTok, sInc, sIncMax, refs, fence, log, gcRound,
                     gcPhase, roundOf, fencedSet, fencePos, cursor, rootEdges, everEdged, retired,
                     inflight, wView, wHave >>
 
@@ -315,7 +334,7 @@ Land(m) ==
     /\ deadTok' = [deadTok EXCEPT ![m.b] = @ \cup {m.t}]
     /\ retired' = { e \in retired : ~(e.b = m.b /\ e.t = m.t) }
     /\ inflight'= inflight \ {m}
-    /\ UNCHANGED << tokOf, nextTok, sPresent, sInc, nextInc, refs, fence, log, tomb, gcRound,
+    /\ UNCHANGED << tokOf, nextTok, sPresent, sInc, sIncMax, refs, fence, log, tomb, gcRound,
                     gcPhase, roundOf, fencedSet, fencePos, cursor, rootEdges, everEdged, wView, wHave >>
 
 -----------------------------------------------------------------------------
@@ -337,7 +356,7 @@ Spec == Init /\ [][Next]_vars
 -----------------------------------------------------------------------------
 StateConstraint ==
     /\ gcRound <= MaxRound
-    /\ nextInc <= MaxInc
+    /\ \A s \in Shards : sIncMax[s] <= MaxInc
     /\ \A s \in Shards : Len(log[s]) <= MaxLog
 
 TypeOK ==
@@ -346,6 +365,7 @@ TypeOK ==
     /\ deadTok  \in [Blobs -> SUBSET Toks]
     /\ sPresent \in [Shards -> BOOLEAN]
     /\ sInc     \in [Shards -> 0..MaxInc]
+    /\ sIncMax  \in [Shards -> 0..MaxInc]
     /\ fence    \in [Shards -> 0..MaxRound]
     /\ tomb     \in [Shards -> BOOLEAN]
     /\ gcRound  \in 0..MaxRound
