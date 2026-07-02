@@ -23,7 +23,6 @@ namespace DB::Cas
 ///
 /// Every key is built from a pool prefix and a stable path sub-tree (POOL = pool prefix, S = 2-char shard, ID = full id):
 ///   - content objects:  POOL/blobs/S/ID
-///   - tree objects:     POOL/trees/S/ID
 ///   - root manifests:   POOL/roots/NAMESPACE/SHARD_NUMBER
 ///   - verbatim files:   POOL/roots/NAMESPACE/_files/FILE_NAME
 ///   - GC snapshots:     POOL/gc/snap/GENERATION/SNAP_SHARD
@@ -46,11 +45,6 @@ public:
     String blobKey(const BlobId & id) const
     {
         return shardedKey("blobs", id.string());
-    }
-
-    String treeKey(const TreeId & id) const
-    {
-        return shardedKey("trees", id.string());
     }
 
     /// Root manifest for a given namespace + shard number.
@@ -82,14 +76,6 @@ public:
     String casManifestsPrefix() const
     {
         return prefix + "/cas/manifests/";
-    }
-
-    /// Prefix that covers all root manifest shards of a namespace (for list).
-    /// Note: also covers the "_files/" sub-prefix; listers must skip it.
-    String rootNamespacePrefix(const RootNamespace & ns) const
-    {
-        checkNamespace(ns);
-        return prefix + "/roots/" + ns.string() + "/";
     }
 
     /// Verbatim (non-content-addressed) file stored under a namespace. Names may be NESTED
@@ -190,17 +176,12 @@ public:
                + std::to_string(owner_shard) + "/" + std::to_string(seq);
     }
 
-    /// Prefix that covers all retired-set objects of one (generation, attempt) (for list):
-    ///   <prefix>/gc/gen/<generation>/attempt/<attempt>/retired/
-    String gcGenAttemptRetiredPrefix(uint64_t generation, uint64_t attempt) const
-    {
-        return gcGenAttemptPrefix(generation, attempt) + "retired/";
-    }
-
-    /// Retired-set key: <prefix>/gc/gen/<generation>/attempt/<attempt>/retired/<round>/<shard>
+    /// Retired-set key (the CURRENT retired list, referenced from `gc/state.retired_refs` — readers
+    /// resolve refs, nothing LISTs this subtree):
+    ///   <prefix>/gc/gen/<generation>/attempt/<attempt>/retired/<round>/<shard>
     String retiredKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const
     {
-        return gcGenAttemptRetiredPrefix(generation, attempt) + std::to_string(round) + "/" + std::to_string(shard);
+        return gcGenAttemptPrefix(generation, attempt) + "retired/" + std::to_string(round) + "/" + std::to_string(shard);
     }
 
     /// Outcomes key: <prefix>/gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>
@@ -215,15 +196,8 @@ public:
         return prefix + "/roots/";
     }
 
-    /// Prefixes that cover every content object of one kind (raw object listing for fsck).
+    /// Prefix that covers every content blob (raw object listing for fsck).
     String blobsPrefix() const { return prefix + "/blobs/"; }
-    String treesPrefix() const { return prefix + "/trees/"; }
-
-    /// Checkpoint key: <prefix>/gc/checkpoint/<version>
-    String checkpointKey(uint64_t version) const
-    {
-        return prefix + "/gc/checkpoint/" + std::to_string(version);
-    }
 
     /// Phase 0 (mount safety): per-server-root control subtree, keyed by the configured `server_root_id`
     /// (validated by `DB::Cas::validateServerRootId`). All four control objects live together under
@@ -348,9 +322,11 @@ private:
     }
 };
 
-/// The object key for a (kind, hash) — the single kind→key-shape mapping (blobs/trees).
+/// The object key for a (kind, hash) — the single kind→key-shape mapping.
 /// Shared by `Build` (the publish gate's observe/resurrect) and `Gc` (the retire HEAD and the
-/// exact-token delete): both sides MUST address the same object the same way.
+/// exact-token delete): both sides MUST address the same object the same way. Standalone tree
+/// OBJECTS are a retired concept (the Merkle layer was rejected; `ObjectKind::Tree` survives only
+/// as the event/outcome label for manifest bodies) — addressing one is a logical error.
 inline String objectKey(const Layout & layout, ObjectKind kind, const UInt128 & hash)
 {
     const String id = u128ToHex(hash);
@@ -359,7 +335,8 @@ inline String objectKey(const Layout & layout, ObjectKind kind, const UInt128 & 
         case ObjectKind::Blob:
             return layout.blobKey(BlobId(id));
         case ObjectKind::Tree:
-            return layout.treeKey(TreeId(id));
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
+                "objectKey: standalone tree objects are a retired concept (hash {})", id);
     }
     throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "objectKey: unknown ObjectKind {}", static_cast<uint8_t>(kind));
 }

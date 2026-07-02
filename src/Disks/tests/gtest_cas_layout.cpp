@@ -9,11 +9,9 @@ TEST(CasLayout, KeyShapes)
 {
     Layout l{"p"};
     EXPECT_EQ(l.blobKey(BlobId{"00aabb"}), "p/blobs/00/00aabb");
-    EXPECT_EQ(l.treeKey(TreeId{"ffee01"}), "p/trees/ff/ffee01");
     EXPECT_EQ(l.gcStateKey(), "p/gc/state");
     EXPECT_EQ(l.retiredKey(4, 42, 7, 1), "p/gc/gen/4/attempt/42/retired/7/1");
     EXPECT_EQ(l.outcomesKey(4, 42, 7, 1), "p/gc/gen/4/attempt/42/outcomes/7/1");
-    EXPECT_EQ(l.checkpointKey(12), "p/gc/checkpoint/12");
     EXPECT_EQ(l.poolMetaKey(), "p/_pool_meta");
 }
 
@@ -24,7 +22,6 @@ TEST(CasLayout, RootNamespaceKeys)
     /// Phase 1: ref shards relocated out of roots/ to cas/refs/; the namespace fan-out is unchanged.
     EXPECT_EQ(l.rootShardKey(ns, 3), "p/cas/refs/srv1/3f2e-uuid/3");
     /// Browse helpers (verbatim `_files` tree) stay under roots/.
-    EXPECT_EQ(l.rootNamespacePrefix(ns), "p/roots/srv1/3f2e-uuid/");
     EXPECT_EQ(l.namespaceFileKey(ns, "format_version.txt"), "p/roots/srv1/3f2e-uuid/_files/format_version.txt");
     EXPECT_EQ(l.namespaceFilesPrefix(ns), "p/roots/srv1/3f2e-uuid/_files/");
 }
@@ -96,14 +93,12 @@ TEST(CasLayout, AttemptScopedGenKeys)
     EXPECT_EQ(layout.outcomesKey(5, 42, 7, 3), "p/gc/gen/5/attempt/42/outcomes/7/3");
     EXPECT_EQ(layout.gcGenPrefix(4), "p/gc/gen/4/");
     EXPECT_EQ(layout.gcGenAttemptPrefix(4, 42), "p/gc/gen/4/attempt/42/");
-    EXPECT_EQ(layout.gcGenAttemptRetiredPrefix(4, 42), "p/gc/gen/4/attempt/42/retired/");
 }
 
 TEST(CasLayout, ShortIdThrows)
 {
     Layout l{"p"};
     EXPECT_THROW(l.blobKey(BlobId{"x"}), DB::Exception);    // < 2 chars
-    EXPECT_THROW(l.treeKey(TreeId{""}), DB::Exception);      // empty
     EXPECT_NO_THROW(l.blobKey(BlobId{"ab"}));                // exactly 2 chars is OK
 }
 
