@@ -212,6 +212,23 @@ Round K, leader under the gc lease (lease/attempt-scoping/resume machinery uncha
 6. **Seal:** PUT per-shard coverage/cursor updates for D (O(delta)); the single `gc/state` CAS
    publishes `round := K`, the adopted generation, the retired-list refs, and folded tokens.
 
+(Amendment 2026-07-02, Task 9 — two-phase graduation, `delete_pending`.) The single-CAS round
+structure removes the old protocol's incidental zombie ejection (a deposed leader used to fail one of
+the ~4 per-phase `gc/state` CASes long before reaching the delete site). A deposed leader running the
+one-pass round could otherwise graduate from a STALE retired list: an entry spared by the new leader
+(pipeline reset) and re-condemned at `r' ≥ min_ack` would look floor-passed under its old `r`. Fix:
+graduation is two-phase. A pass marks fresh graduates `delete_pending = true` and KEEPS them in the
+published list (writers still see them condemned → recreate); `deleteExact` executes only for entries
+that were ALREADY published as pending in the PREVIOUS list version, strictly BEFORE the pass's CAS.
+Pending is terminal (no spare is possible: floor-passed ⇒ every live writer sees the entry ⇒ no new
+reference; a pending entry observed with recovered in-degree is spared anyway and logged loudly —
+fail-closed), so re-executing pending deletes is safe at ANY staleness; a zombie's fresh decisions
+never survive its failing CAS. Crash-safety is leak-free: a crash before the CAS leaves the prior
+list still pending → the next pass re-issues. Physical deletion therefore lags condemnation by one
+extra pass (condemn K → pending at floor-pass → deleted next pass) — immaterial. This is strictly
+more conservative than the TLA+ `GComplete` (which deletes at graduation) and is the implementation
+of the model's drop-on-confirmed-outcome discipline.
+
 **Crash-resume:** unchanged regime — attempt-scoped write-once artifacts; a new leader (or the
 same one) re-runs the pass under a fresh attempt; already-executed deletes land on the
 `NotFound` branch; only the adopted attempt is reader-visible.
