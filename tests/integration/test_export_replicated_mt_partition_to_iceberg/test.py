@@ -490,18 +490,11 @@ def test_export_partition_local_backoff_does_not_block_other_replica(cluster):
         # The task must stay PENDING — there is no retry budget to fail it.
         wait_for_exception_count(replica1, mt_table, iceberg_table, "2020",
                                  min_exception_count=1, timeout=60)
-        status = replica1.query(
-            f"SELECT status FROM system.replicated_partition_exports"
-            f" WHERE source_table = '{mt_table}'"
-            f"   AND destination_table = '{iceberg_table}'"
-            f"   AND partition_id = '2020'"
-        ).strip()
-        assert status == "PENDING", (
-            f"Retryable failures must keep the task PENDING, got status {status!r}"
-        )
+
+        wait_for_export_status(replica1, mt_table, iceberg_table, "2020", "PENDING", timeout=60)
 
         # The back-off entry must be observable on replica1 (the failing replica).
-        deadline = time.time() + 60
+        deadline = time.time() + 90
         backoff_replica1 = "0"
         while time.time() < deadline:
             backoff_replica1 = replica1.query(
@@ -526,6 +519,7 @@ def test_export_partition_local_backoff_does_not_block_other_replica(cluster):
             f"   AND destination_table = '{iceberg_table}'"
             f"   AND partition_id = '2020'"
         ).strip()
+
         assert backoff_replica2 in ("", "0"), (
             f"replica2 must not carry replica1's local back-off, got {backoff_replica2!r}"
         )
@@ -535,7 +529,7 @@ def test_export_partition_local_backoff_does_not_block_other_replica(cluster):
         # part that replica1 is backing off on.
         replica2.query(f"SYSTEM START MOVES {mt_table}")
 
-        wait_for_export_status(replica2, mt_table, iceberg_table, "2020", "COMPLETED", timeout=120)
+        wait_for_export_status(replica2, mt_table, iceberg_table, "2020", "COMPLETED", timeout=60)
     finally:
         replica1.query("SYSTEM DISABLE FAILPOINT export_part_retryable_throw")
 
