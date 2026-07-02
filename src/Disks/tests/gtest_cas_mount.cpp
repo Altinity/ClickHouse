@@ -159,6 +159,11 @@ TEST(CasMountMessage, DoubleStartTextHasIdentityAndRemediation)
     EXPECT_NE(msg.find("unique"), std::string::npos);
     EXPECT_NE(msg.find("reclaim the mount on restart"), std::string::npos);
     EXPECT_NE(msg.find("uuid file"), std::string::npos);
+    /// Clock-skew caveat + manual mount-object delete escape hatch.
+    EXPECT_NE(msg.find("CLOCK SKEW"), std::string::npos);
+    EXPECT_NE(msg.find("NTP"), std::string::npos);
+    EXPECT_NE(msg.find("manually delete the mount"), std::string::npos);
+    EXPECT_NE(msg.find("gc/server-roots/replica-a/mount"), std::string::npos);
 }
 
 TEST(CasMountAwaitExpiry, PastExpiryReclaimsImmediatelyNoSleep)

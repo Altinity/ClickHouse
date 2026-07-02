@@ -338,10 +338,15 @@ String mountDoubleStartMessage(const String & srid, const MountLease & existing)
         "server is holding the same CAS namespace. This prevents two ClickHouse servers from writing it.\n"
         " - If the other server is running intentionally, configure a unique <server_root_id> for this disk.\n"
         " - If the other server is a stale/zombie process, stop it; this server will then reclaim the mount on restart.\n"
+        " - CLOCK SKEW CAVEAT: liveness is judged by comparing the lease's wall-clock expires_at_ms against\n"
+        "   THIS server's clock, so a large clock skew between the two servers can misjudge it (a healthy holder\n"
+        "   may look mounted here, or a dead one may look live). Verify both servers' clocks are in sync (NTP).\n"
         " - If the local ClickHouse uuid file was regenerated, restore the old uuid file, or remove the stale\n"
-        "   owner object gc/server-roots/{}/owner only after verifying no server uses this root.",
+        "   owner object gc/server-roots/{}/owner only after verifying no server uses this root.\n"
+        " - As a LAST RESORT, after verifying that NO server is writing this root, manually delete the mount\n"
+        "   object gc/server-roots/{}/mount and restart; this server will then re-claim it.",
         srid, u128ToHex(existing.server_uuid), existing.hostname, existing.pid,
-        existing.seq, existing.expires_at_ms, srid);
+        existing.seq, existing.expires_at_ms, srid, srid);
 }
 
 MountClaimResult claimMountAwaitingExpiry(
