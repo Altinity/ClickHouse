@@ -1544,6 +1544,40 @@ TEST(CasStoreBeat, AckAdvancesOnlyAfterViewLoad)
     EXPECT_EQ(store->retireView().round(), 3u);
 }
 
+TEST(CasStoreBeat, ViewAdvanceEmitsMountBeatEvent)
+{
+    /// Introspection (copy-forward Task 3): a beat that INSTALLS a newer retired view emits exactly
+    /// one `mount_beat` event carrying the installed round, the prior round, and the loaded retired
+    /// entry count; a beat that observes nothing new is silent.
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openStoreForTest(backend);
+    std::vector<CasEvent> seen;
+    store->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
+
+    GcState st;
+    st.round = 3;
+    backend->putIfAbsent(store->layout().gcStateKey(), encodeGcState(st));
+    store->renewWatermarkOnce();
+
+    size_t beats = 0;
+    for (const CasEvent & e : seen)
+        if (e.type == CasEventType::MountBeat)
+        {
+            ++beats;
+            EXPECT_EQ(e.round, 3u);
+            EXPECT_EQ(e.detail.at("from_round"), "0");
+            EXPECT_EQ(e.detail.at("retired_entries"), "0");
+        }
+    EXPECT_EQ(beats, 1u);
+
+    /// Nothing new published: the next beat installs nothing and emits nothing.
+    seen.clear();
+    store->renewWatermarkOnce();
+    for (const CasEvent & e : seen)
+        EXPECT_NE(e.type, CasEventType::MountBeat) << "an unchanged view must not emit mount_beat";
+    store->setEventSink(nullptr);
+}
+
 TEST(CasStoreBeat, GcStateReadFailureLeavesAckUnchanged)
 {
     auto inner = std::make_shared<InMemoryBackend>();

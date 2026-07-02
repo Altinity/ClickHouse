@@ -133,11 +133,12 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::
         fin.objects_replaced = rep.replaced;
         fin.objects_spared = rep.spared;
         fin.manifests_deleted = rep.manifests_deleted;
-        /// rev. 15 part-manifest model has no GC-side cascade / forget (no trees): these log columns
-        /// are retained for schema stability but are always 0 now.
-        fin.children_cascaded = 0;
-        fin.forgotten_on_delete = 0;
-        fin.forgotten_absent = 0;
+        fin.entries_condemned = rep.condemned;
+        fin.entries_graduated = rep.graduated;
+        fin.entries_redeleted = rep.redeleted;
+        fin.fence_outs = rep.fence_outs;
+        fin.min_ack = rep.min_ack;
+        fin.anomalies = rep.anomalies.size();
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         fin.profile_events = collect_profile_events();

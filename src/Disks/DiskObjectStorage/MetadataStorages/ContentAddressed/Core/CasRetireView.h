@@ -47,6 +47,10 @@ public:
 
     bool isCondemnedToken(ObjectKind kind, const UInt128 & hash, const Token & token) const;
 
+    /// Total condemned (kind, hash, token) entries in the installed view — an introspection gauge
+    /// for the beat event (how large a retired list this writer carries), never a protocol input.
+    size_t entryCount() const;
+
 private:
     const BackendPtr backend;
     const Layout layout;

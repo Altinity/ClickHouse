@@ -647,6 +647,8 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     ///    exact body: adoptEvidence over the source manifest entry, stage a FRESH dst manifest,
     ///    precommit, promote.
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    std::vector<CasEvent> seen;
+    s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
     auto build = startBuildFor(s, ns, "detached_part_a");
     build->adoptEvidence(blobManifestEntry("data.bin", "payload-CF"));
     const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "payload-CF")});
@@ -656,6 +658,18 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     ///    AFTER fix: promote succeeds via copy-forward.
     EXPECT_NO_THROW(build->promote(ns, "detached_part_a", build->buildId(), mid));
     EXPECT_TRUE(s->resolveRef(ns, "detached_part_a").has_value());
+    s->setEventSink(nullptr);
+
+    /// Audit trail: exactly one `blob_copy_forward` event, naming the displaced token.
+    size_t copy_forwards = 0;
+    for (const CasEvent & e : seen)
+        if (e.type == CasEventType::BlobCopyForward)
+        {
+            ++copy_forwards;
+            EXPECT_EQ(e.object_hash, u128ToHex(u128Of("payload-CF")));
+            EXPECT_EQ(e.detail.at("displaced_token"), t0.value);
+        }
+    EXPECT_EQ(copy_forwards, 1u);
 
     /// 5. The condemned incarnation was displaced: fresh token, same payload; GC's exact-token
     ///    delete of the listed (hash, t0) entry is now a mismatch no-op (entry drops, new

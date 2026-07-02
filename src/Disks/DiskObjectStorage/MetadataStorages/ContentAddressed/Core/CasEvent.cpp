@@ -58,6 +58,8 @@ String toString(CasEventType type)
         case CasEventType::GateRevalidate:        return "gate_revalidate";
         case CasEventType::GateResurrect:         return "gate_resurrect";
         case CasEventType::WatermarkRenew:        return "watermark_renew";
+        case CasEventType::MountBeat:             return "mount_beat";
+        case CasEventType::MountRemount:          return "mount_remount";
         case CasEventType::RefResolve:            return "ref_resolve";
         case CasEventType::ReadMissing:           return "read_missing";
         case CasEventType::DanglingAccess:        return "dangling_access";

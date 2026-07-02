@@ -124,3 +124,25 @@ sabotage cfg still produces its counterexample.
 ### Validation (queued, not in this plan)
 Fresh soak run on a clean pool replays the S13-adjacent kill-restart chaos; the attach path must
 recover (grep for `BlobCopyForward` events + zero "table will remain readonly" without recovery).
+
+## Implementation notes (landed 2026-07-02)
+
+Landed on `cas-copy-forward` (Tasks 0-3). Deviations and findings, all deliberate:
+
+1. **Corrupt payload throws `CORRUPTED_DATA`, not `ABORTED`.** Data damage is not retryable;
+   the spec's "any mismatch ⇒ ABORTED" was imprecise. 404/lost-race stays `ABORTED`.
+2. **The abandoned copy-forward does NOT self-heal via GC** (found by the failing Task-2 test):
+   fold discovery is transition-driven, so an orphaned fresh incarnation (writer died between the
+   copy-forward PUT and landing the commit) is invisible to the round — an fsck-visible leak, the
+   SAME accepted class as dying between `putBlob` and commit. What IS guaranteed (and tested):
+   the stale `(hash, t0)` entry drops on exact-token mismatch and the fresh incarnation is never
+   wrong-token-deleted. Revisit only if soak shows the class is hot.
+3. **`blob_copy_forward` event + `CasBlobCopyForward` counter landed with Task 2** (the primitive
+   emits them), not Task 3.
+4. **Task 3 was extended with writer/mount introspection insights** (user request, same day):
+   `mount_beat` event per view advance (installed round, `from_round`, `retired_entries` loaded),
+   `mount_remount` event (ok/failed), and the GC round log gained the ack-floor pipeline columns
+   (`entries_condemned/graduated/redeleted`, `fence_outs`, `min_ack`, `anomalies`), replacing the
+   dead always-0 `children_cascaded`/`forgotten_*` columns (pre-release: no compat scaffolding).
+5. **`FreshEvidenceDepWithViewHitIsResolvedByGate` updated**: "caught by the gate" now means
+   resolved by displacement (promote succeeds; the listed token is never bound), not `ABORTED`.

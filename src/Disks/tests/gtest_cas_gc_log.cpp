@@ -122,7 +122,12 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
 
     EXPECT_GT(rows[marking_finish_idx].candidates_marked, 0u);
     EXPECT_GT(rows[deleting_finish_idx].objects_deleted, 0u);
-    /// (the manifest model has no P9 `forgotten_on_delete` cursor prune — that column is now always 0.)
+    /// Ack-floor pipeline pass-through (copy-forward Task 3): the marking round condemned the entry,
+    /// the deleting round executed a pending exact-token delete, and every finish carries the latched
+    /// floor (nonzero once the store's ack advanced past round 0).
+    EXPECT_GT(rows[marking_finish_idx].entries_condemned, 0u);
+    EXPECT_GT(rows[deleting_finish_idx].entries_redeleted, 0u);
+    EXPECT_GT(rows[deleting_finish_idx].min_ack, 0u);
 
     /// Identity + timing fields are set on every record.
     for (const Rec & r : rows)

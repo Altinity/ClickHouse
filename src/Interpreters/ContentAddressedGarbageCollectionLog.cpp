@@ -42,9 +42,12 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"objects_replaced", std::make_shared<DataTypeUInt64>(), "412-saves (a resurrection won the race)."},
         {"objects_spared", std::make_shared<DataTypeUInt64>(), "Candidates spared (in-degree > 0 at recheck)."},
         {"manifests_deleted", std::make_shared<DataTypeUInt64>(), "Owner-removed manifest bodies physically deleted this round (counted separately from blob deletes, B11)."},
-        {"children_cascaded", std::make_shared<DataTypeUInt64>(), "Child edges freed by the cascade."},
-        {"forgotten_on_delete", std::make_shared<DataTypeUInt64>(), "Nodes pruned from the GC snapshot because GC deleted them this round (P9)."},
-        {"forgotten_absent", std::make_shared<DataTypeUInt64>(), "Nodes pruned because a retire HEAD found them already gone (404); >0 in steady state signals split-brain or out-of-band deletes (P9)."},
+        {"entries_condemned", std::make_shared<DataTypeUInt64>(), "Retired entries newly condemned this round (ack-floor pipeline stage 1)."},
+        {"entries_graduated", std::make_shared<DataTypeUInt64>(), "Retired entries newly floor-passed and republished delete_pending this round (stage 2; deleted the NEXT round)."},
+        {"entries_redeleted", std::make_shared<DataTypeUInt64>(), "Pending exact-token blob deletes executed this round (stage 3)."},
+        {"fence_outs", std::make_shared<DataTypeUInt64>(), "Expired mounts fenced out by this round's heartbeat floor."},
+        {"min_ack", std::make_shared<DataTypeUInt64>(), "The heartbeat ack floor (min observed_gc_round over counted mounts) latched at round start; UINT64_MAX = no counted heartbeats."},
+        {"anomalies", std::make_shared<DataTypeUInt64>(), "Fold clamps surfaced (and survived) this round; steady >0 warrants a look at the round log details."},
         {"duration_ms", std::make_shared<DataTypeUInt64>(), "Round wall-clock duration (Finish)."},
         {"error", std::make_shared<DataTypeString>(), "Exception text when outcome = Error."},
         {"ProfileEvents", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeUInt64>()),
@@ -71,9 +74,12 @@ void ContentAddressedGarbageCollectionLogElement::appendToBlock(MutableColumns &
     columns[i++]->insert(objects_replaced);
     columns[i++]->insert(objects_spared);
     columns[i++]->insert(manifests_deleted);
-    columns[i++]->insert(children_cascaded);
-    columns[i++]->insert(forgotten_on_delete);
-    columns[i++]->insert(forgotten_absent);
+    columns[i++]->insert(entries_condemned);
+    columns[i++]->insert(entries_graduated);
+    columns[i++]->insert(entries_redeleted);
+    columns[i++]->insert(fence_outs);
+    columns[i++]->insert(min_ack);
+    columns[i++]->insert(anomalies);
     columns[i++]->insert(duration_ms);
     columns[i++]->insert(error);
     {

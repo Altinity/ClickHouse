@@ -83,4 +83,13 @@ bool RetireView::isCondemnedToken(ObjectKind kind, const UInt128 & hash, const T
     return std::find(it->second.begin(), it->second.end(), token) != it->second.end();
 }
 
+size_t RetireView::entryCount() const
+{
+    std::shared_lock lock(mutex);
+    size_t n = 0;
+    for (const auto & [key, tokens] : condemned)
+        n += tokens.size();
+    return n;
+}
+
 }

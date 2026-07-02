@@ -93,6 +93,12 @@ One `Start` row and one `Finish` row per GC round, emitted by `CasGcScheduler` v
 | `objects_absent` | objects expected but already missing (concurrent delete or bug) |
 | `objects_replaced` | 412-spared objects (live incarnation token displaced the condemned one) |
 | `objects_spared` | objects not deleted for other reasons (e.g. protected by live build) |
+| `entries_condemned` | retired entries newly condemned this round (ack-floor stage 1) |
+| `entries_graduated` | entries newly floor-passed, republished `delete_pending` (stage 2; deleted NEXT round) |
+| `entries_redeleted` | pending exact-token blob deletes executed this round (stage 3) |
+| `fence_outs` | expired mounts fenced out by this round's heartbeat floor |
+| `min_ack` | the ack floor latched at round start (`UINT64_MAX` = no counted heartbeats) |
+| `anomalies` | fold clamps surfaced (and survived) this round |
 | `duration_ms` | wall time for the round |
 | `error` | exception message when `outcome = 'Error'`; empty otherwise |
 | `ProfileEvents` | `Map(String, UInt64)` delta of GC thread `Cas*` + `S3*` counters over the round |
@@ -133,6 +139,14 @@ Key schema columns:
 **Event types the soak harness asserts must NOT appear in positive scenarios**:
 `read_missing`, `dangling_access`, `corrupt_dangle`, `corrupt_decode`,
 `snap_journal_incoherent`, `exception`.
+
+**Writer/mount insight events (2026-07-02)**: `mount_beat` — one row per view ADVANCE (never per
+beat): `round` = the installed round, `detail.from_round`, `detail.retired_entries` = the size of
+the retired list this writer just loaded; answers "when did this writer learn about round N".
+`mount_remount` — a self-remount attempt (`outcome` = `ok`/`failed`, `detail.writer_epoch`).
+`blob_copy_forward` — a condemned incarnation displaced by verified copy-forward at the promote
+gate (`detail.displaced_token`); join by `object_hash` against `blob_retire`/`blob_delete` to trace
+the full incarnation history.
 
 Useful for full object lifetime reconstruction:
 ```sql

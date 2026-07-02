@@ -28,9 +28,13 @@ struct GcRoundLogRecord
     UInt64 objects_replaced = 0;
     UInt64 objects_spared = 0;
     UInt64 manifests_deleted = 0;   /// owner-removed manifest bodies deleted (B11 — distinct from blob deletes)
-    UInt64 children_cascaded = 0;
-    UInt64 forgotten_on_delete = 0;
-    UInt64 forgotten_absent = 0;
+    /// Ack-floor pipeline transitions (RoundReport pass-through, 2026-07-02 copy-forward Task 3).
+    UInt64 entries_condemned = 0;   /// entries newly condemned into the retired list this round
+    UInt64 entries_graduated = 0;   /// entries newly floor-passed (published delete_pending) this round
+    UInt64 entries_redeleted = 0;   /// pending exact-token blob deletes executed this round
+    UInt64 fence_outs = 0;          /// expired mounts fenced-out by the round's heartbeat floor
+    UInt64 min_ack = 0;             /// heartbeat ack floor latched at round start (UINT64_MAX = empty floor set)
+    UInt64 anomalies = 0;           /// fold clamps surfaced (never wedging) this round
     UInt64 duration_ms = 0;
     String error;
     std::map<String, UInt64> profile_events;

@@ -222,7 +222,27 @@ is materialized into memory only once (the rare case), not on the common path.
 
 **INV-1 (revival-from-source)**: a condemned or vanished object is NEVER read/GET-ed to revive it.
 Revival = a fresh re-upload from the writer's own source bytes. `Build::resurrect` (which did a
-GET-from-existing) was deleted; `uploadFromSource` is the sole revival primitive.
+GET-from-existing) was deleted; `uploadFromSource` is the sole sourced revival primitive.
+
+**INV-1 exception — verified copy-forward (spec `2026-07-02-cas-copy-forward-condemned-evidence.md`):**
+a **tokenless W-EVIDENCE dep** (`adoptEvidence` — every call site adopts entries of a COMMITTED
+source manifest: `republishRef` part moves, the fetch receiver, part/file copies) has **no source
+bytes**, yet the blob it names is referenced by a live committed owner right now — resolving its
+condemned incarnation is a reference transfer, not a resurrection of garbage. For exactly these deps
+the promote gate runs a **copy-forward pre-pass** (`Build::copyForwardFromCondemned`): read the
+condemned-but-present incarnation IN FULL, verify fail-closed (envelope decodes + recomputed payload
+hash == content key), re-wrap under a fresh envelope (fresh `incarnation_tag`, this build's
+`build_id` — W-FRESH-TAG), and displace EXACTLY the observed incarnation via token-conditional
+`putOverwrite`. Every failure mode stays fail-closed: absent / deleted mid-flight => `ABORTED`
+(never `putIfAbsent` after a lost delete race), corrupt payload => `CORRUPTED_DATA`; a clean drifted
+token is adopted. TLA+: `WCopyForward` in `CaGcAckFloorCore` (the sourceless instantiation of the
+recreate arm — no `~present` branch); stage-1 clean, witness fires, all sabotages still refute.
+The listed `(hash, old_token)` entry settles at the next fold (exact-token mismatch => entry drops,
+the fresh incarnation untouched); an ABANDONED copy-forward (writer died before landing) leaves an
+fsck-visible orphan — the same accepted class as dying between `putBlob` and commit.
+Motivation: the S13 soak-run-3 liveness brick — `checkParts -> renameToDetached -> moveDirectory ->
+republishRef -> promote ABORTED (condemned)` left the table readonly forever; the attach caller
+never retries.
 
 **Ack-floor commit gate (recreate a retired incarnation, do not adopt it):** under the ack-floor
 protocol a writer checks each blob leaf against its in-memory retired list (refreshed by the merged
@@ -230,8 +250,8 @@ heartbeat, §merged-heartbeat). A listed `(hash, current_token)` is a **condemne
 never referenced**. This recreate is performed by the existing `Build::putBlob` cold-reuse rule —
 the `PreconditionFailed`-then-condemned branch below re-uploads from source with a fresh token
 (`uploadFromSource`, INV-1), on the *retried* build; it is not a new gate code path. The `promote`
-gate itself stays fail-closed `ABORTED` (build-local sources are not retained at promote time; a
-promote-time in-place recreate is a possible follow-up). This closes the condemned-adoption gap: a
+gate fails closed `ABORTED` for SOURCED (tokened) deps and unknown leaves; tokenless-evidence deps
+take the copy-forward pre-pass above. This closes the condemned-adoption gap: a
 plain `putIfAbsent` HEAD-hit would otherwise adopt the condemned incarnation that a GC round is about
 to delete. The write path gains **zero** S3 operations in the common (not-condemned) case.
 

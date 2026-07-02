@@ -463,11 +463,29 @@ bool Store::tryRemountOnce()
         LOG_INFO(getLogger("CasStore"),
             "CAS self-remount '{}': recovered as writer_epoch {} (fresh incarnation; older builds fail closed)",
             srid, writer_epoch);
+        EventEmitter{*this}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::MountRemount;
+            e.round = retire_view.round();
+            e.outcome = "ok";
+            e.reason = "self-remount recovered a fresh mount incarnation after fence-out / renewal failure";
+            e.detail = {{"writer_epoch", std::to_string(writer_epoch)},
+                        {"server_root_id", srid}};
+        });
         return true;
     }
     catch (...)
     {
         tryLogCurrentException(getLogger("CasStore"), "CAS self-remount attempt failed; will retry");
+        EventEmitter{*this}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::MountRemount;
+            e.round = retire_view.round();
+            e.outcome = "failed";
+            e.reason = "self-remount attempt failed; the recovery loop retries with backoff";
+            e.detail = {{"server_root_id", srid},
+                        {"error", getCurrentExceptionMessage(/*with_stacktrace*/ false)}};
+        });
         return false;
     }
 }
@@ -538,6 +556,7 @@ uint64_t Store::refreshViewForBeat()
     /// 2. The DRAIN + install: wait out every in-flight mutateShard (shared holders), then load and
     /// install the newer retired view. The S3 reads inside refresh() run under the exclusive gate —
     /// acceptable at beat cadence (a few small GETs); mutations queue behind it briefly.
+    const uint64_t from_round = retire_view.round();
     try
     {
         std::unique_lock<std::shared_mutex> drain(view_gate);
@@ -547,6 +566,22 @@ uint64_t Store::refreshViewForBeat()
     {
         tryLogCurrentException(getLogger("CasStore"),
             "CAS beat: retired-view refresh failed; observed_gc_round stays at the installed view");
+    }
+
+    /// Introspection: one event per VIEW ADVANCE (not per beat) — an unchanged view is silence, so the
+    /// log answers "when did this writer learn about round N and how big a retired list did it load".
+    /// The advertised ack follows this installed round on the same beat.
+    if (retire_view.round() > from_round)
+    {
+        EventEmitter{*this}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::MountBeat;
+            e.round = retire_view.round();
+            e.outcome = "ok";
+            e.reason = "beat installed a newer retired view; observed_gc_round advances with it";
+            e.detail = {{"from_round", std::to_string(from_round)},
+                        {"retired_entries", std::to_string(retire_view.entryCount())}};
+        });
     }
     return retire_view.round();
 }
