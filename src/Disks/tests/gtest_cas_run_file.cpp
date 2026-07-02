@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include <IO/WriteBufferFromString.h>
-#include <IO/ReadBufferFromMemory.h>
 #include <Common/Exception.h>
 #include <memory>
 #include <vector>
@@ -10,6 +10,7 @@
 namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; extern const int LOGICAL_ERROR; }
 
 using namespace DB::Cas;
+using DB::Cas::tests::CountingBackend;
 
 namespace
 {
@@ -29,10 +30,10 @@ String writeRun(const std::vector<std::pair<String, String>> & recs, uint32_t bl
     return out.str();
 }
 
+/// Read a run in borrowed-memory mode (zero-copy over the caller's bytes).
 std::vector<std::pair<String, String>> readRun(const String & bytes)
 {
-    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
-    RunFileReader r(in);
+    RunFileReader r{std::string_view(bytes)};
     std::vector<std::pair<String, String>> out;
     String k, p;
     while (r.next(k, p))
@@ -95,16 +96,14 @@ TEST(CasRunFile, SeekToKeyRange)
         recs.emplace_back(String(k), std::to_string(i));
     }
     const String bytes = writeRun(recs, /*block_size*/ 24);
-    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
-    RunFileReader r(in);
+    RunFileReader r{std::string_view(bytes)};
     r.seek("k050");
     String k, p;
     ASSERT_TRUE(r.next(k, p));
     EXPECT_EQ(k, "k050");      /// first key >= "k050"
     EXPECT_EQ(p, "50");
     /// Seeking to a key between two stored keys lands on the next-greater.
-    DB::ReadBufferFromMemory in2(bytes.data(), bytes.size());
-    RunFileReader r2(in2);
+    RunFileReader r2{std::string_view(bytes)};
     r2.seek("k0509");          /// no exact match; next is k051
     ASSERT_TRUE(r2.next(k, p));
     EXPECT_EQ(k, "k051");
@@ -116,10 +115,9 @@ TEST(CasRunFile, CorruptedPayloadFailsClosed)
     String bytes = writeRun(recs);
     /// Flip a byte inside the first block payload (well past the header) -> crc mismatch on read.
     bytes[bytes.size() / 2] ^= 0xFF;
-    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
     try
     {
-        RunFileReader r(in);
+        RunFileReader r{std::string_view(bytes)};
         String k, p;
         while (r.next(k, p)) {}
         FAIL() << "expected CORRUPTED_DATA";
@@ -156,8 +154,7 @@ void expectCorruptedData(const char * what, F && body)
 /// Construct a reader over `bytes` and drain it fully (forces footer + every block to be parsed).
 void constructAndDrain(const String & bytes)
 {
-    DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
-    RunFileReader r(in);
+    RunFileReader r{std::string_view(bytes)};
     String k, p;
     while (r.next(k, p)) {}
 }
@@ -263,11 +260,9 @@ TEST(CasRunFile, MergeTwoDisjointRuns)
 {
     const String a = writeRun({{"a", "1"}, {"c", "3"}, {"e", "5"}});
     const String b = writeRun({{"b", "2"}, {"d", "4"}, {"f", "6"}});
-    DB::ReadBufferFromMemory ia(a.data(), a.size());
-    DB::ReadBufferFromMemory ib(b.data(), b.size());
     std::vector<std::unique_ptr<RunFileReader>> rs;
-    rs.push_back(std::make_unique<RunFileReader>(ia));
-    rs.push_back(std::make_unique<RunFileReader>(ib));
+    rs.push_back(std::make_unique<RunFileReader>(std::string_view(a)));
+    rs.push_back(std::make_unique<RunFileReader>(std::string_view(b)));
     RunMerger m(std::move(rs));
     String k;
     std::vector<String> vs;
@@ -285,11 +280,9 @@ TEST(CasRunFile, MergeCoalescesSameKeyAcrossRuns)
     /// Same key "k" present in both runs -> one merged key with both payloads.
     const String a = writeRun({{"k", "from-a"}, {"z", "9"}});
     const String b = writeRun({{"k", "from-b"}});
-    DB::ReadBufferFromMemory ia(a.data(), a.size());
-    DB::ReadBufferFromMemory ib(b.data(), b.size());
     std::vector<std::unique_ptr<RunFileReader>> rs;
-    rs.push_back(std::make_unique<RunFileReader>(ia));
-    rs.push_back(std::make_unique<RunFileReader>(ib));
+    rs.push_back(std::make_unique<RunFileReader>(std::string_view(a)));
+    rs.push_back(std::make_unique<RunFileReader>(std::string_view(b)));
     RunMerger m(std::move(rs));
     String k;
     std::vector<String> vs;
@@ -311,4 +304,155 @@ TEST(CasRunFile, MergeEmptyInput)
     String k;
     std::vector<String> vs;
     EXPECT_FALSE(m.next(k, vs));
+}
+
+/// ---- streaming mode (Backend seam) ----
+
+namespace
+{
+
+/// Build a run that spans several blocks (small block_size) and store it under `key` in `backend`.
+/// Returns the (key, payload) records that were written, for equivalence checks.
+std::vector<std::pair<String, String>> buildMultiBlockRunInBackend(
+    CountingBackend & backend, const String & key, int n_records, uint32_t block_size)
+{
+    std::vector<std::pair<String, String>> recs;
+    for (int i = 0; i < n_records; ++i)
+    {
+        char k[16];
+        std::snprintf(k, sizeof(k), "k%06d", i);
+        recs.emplace_back(String(k), String("payload-value-") + std::to_string(i));
+    }
+    const String bytes = writeRun(recs, block_size);
+    backend.putIfAbsent(key, bytes);
+    return recs;
+}
+
+}
+
+TEST(CasRunFileStreaming, MultiBlockStreamMatchesBorrowed)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const String key = "runs/multi";
+    /// block_size = 4096 with ~2000 records forces many blocks.
+    const auto recs = buildMultiBlockRunInBackend(*backend, key, 2000, 4096);
+
+    /// Borrowed-mode oracle over the materialized bytes.
+    const String materialized = backend->get(key)->bytes;
+    const auto oracle = readRun(materialized);
+    EXPECT_EQ(oracle, recs);
+
+    /// Streaming read yields the identical record sequence.
+    RunFileReader r(*backend, key);
+    std::vector<std::pair<String, String>> streamed;
+    String k, p;
+    while (r.next(k, p))
+        streamed.emplace_back(k, p);
+    EXPECT_EQ(streamed, recs);
+    EXPECT_EQ(r.kind(), RunKind::BlobDelta);
+}
+
+TEST(CasRunFileStreaming, SeekUsesOneRangedGet)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const String key = "runs/seekme";
+    const auto recs = buildMultiBlockRunInBackend(*backend, key, 2000, 4096);
+
+    backend->resetCounts();
+    RunFileReader r(*backend, key);
+    /// Open profile: head=1, tail get=1, body getStream=1.
+    ASSERT_EQ(backend->headCount(key), 1u);
+    ASSERT_EQ(backend->getCount(key), 1u);
+    ASSERT_EQ(backend->getStreamCount(key), 1u);
+
+    const uint64_t gets_before_seek = backend->getCount(key);
+    r.seek("k001000");
+    String k, p;
+    ASSERT_TRUE(r.next(k, p));
+    EXPECT_EQ(k, "k001000");
+    /// The seek touched exactly one block => exactly one extra ranged get.
+    EXPECT_EQ(backend->getCount(key), gets_before_seek + 1);
+    EXPECT_EQ(backend->getStreamCount(key), 1u);   /// no new stream opened
+}
+
+TEST(CasRunFileStreaming, OpenIsThreeRequestsAndBlockBoundedRanges)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const String key = "runs/profile";
+    buildMultiBlockRunInBackend(*backend, key, 3000, 4096);
+
+    backend->resetCounts();
+    {
+        RunFileReader r(*backend, key);
+        String k, p;
+        while (r.next(k, p)) {}   /// drain via the stream (no seeks => no ranged gets)
+    }
+    /// Exactly head=1, tail get=1, body getStream=1.
+    EXPECT_EQ(backend->headCount(key), 1u);
+    EXPECT_EQ(backend->getCount(key), 1u);
+    EXPECT_EQ(backend->getStreamCount(key), 1u);
+    /// No whole-object get of the run key.
+    EXPECT_EQ(backend->wholeGetCount(key), 0u);
+    /// Every ranged-get window <= kRunHardCapBlockSize + 64KB (the resident-memory bound at the seam).
+    EXPECT_LE(backend->maxRangedGetLen(key), static_cast<uint64_t>(kRunHardCapBlockSize) + 64u * 1024u);
+}
+
+TEST(CasRunFileStreaming, TruncatedOrCorruptFailsClosed)
+{
+    /// Truncation mid-block: overwrite the object with a prefix that cuts the body.
+    {
+        auto backend = std::make_shared<CountingBackend>();
+        const String key = "runs/trunc";
+        buildMultiBlockRunInBackend(*backend, key, 2000, 4096);
+        const String full = backend->get(key)->bytes;
+        /// Chop the object in half (well past the header, mid-body). putOverwrite against the token.
+        const auto h = backend->head(key);
+        backend->putOverwrite(key, full.substr(0, full.size() / 2), h.token);
+        expectCorruptedData("truncated stream", [&]
+        {
+            RunFileReader r(*backend, key);
+            String k, p;
+            while (r.next(k, p)) {}
+        });
+    }
+    /// Payload-byte flip: block CRC mismatch surfaces on the next() that reaches the damage.
+    {
+        auto backend = std::make_shared<CountingBackend>();
+        const String key = "runs/badblock";
+        buildMultiBlockRunInBackend(*backend, key, 2000, 4096);
+        String full = backend->get(key)->bytes;
+        full[100] ^= 0xFF;   /// inside the first block body
+        const auto h = backend->head(key);
+        backend->putOverwrite(key, full, h.token);
+        expectCorruptedData("block crc", [&]
+        {
+            RunFileReader r(*backend, key);
+            String k, p;
+            while (r.next(k, p)) {}
+        });
+    }
+    /// Footer-byte flip: footer CRC mismatch fails on construction.
+    {
+        auto backend = std::make_shared<CountingBackend>();
+        const String key = "runs/badfooter";
+        buildMultiBlockRunInBackend(*backend, key, 2000, 4096);
+        String full = backend->get(key)->bytes;
+        full[full.size() - 8] ^= 0xFF;   /// inside the footer body, before the trailer
+        const auto h = backend->head(key);
+        backend->putOverwrite(key, full, h.token);
+        expectCorruptedData("footer crc", [&]
+        {
+            RunFileReader r(*backend, key);
+            String k, p;
+            while (r.next(k, p)) {}
+        });
+    }
+    /// Absent key => CORRUPTED_DATA on construction.
+    {
+        auto backend = std::make_shared<CountingBackend>();
+        expectCorruptedData("absent run", [&]
+        {
+            RunFileReader r(*backend, "runs/does-not-exist");
+        });
+    }
 }

@@ -137,8 +137,8 @@ PartManifest decodePartManifest(std::string_view data)
         uint64_t entries_len = 0;
         readBinaryLittleEndian(entries_len, in);
         const String entries_bytes = readFixedBytes(in, entries_len);
-        ReadBufferFromMemory entries_in(entries_bytes.data(), entries_bytes.size());
-        RunFileReader r(entries_in);
+        /// Borrowed-memory reader over the decoded body (alive through this loop) — no extra copy.
+        RunFileReader r{std::string_view(entries_bytes)};
         String path, payload;
         String prev_path;
         bool have_prev = false;

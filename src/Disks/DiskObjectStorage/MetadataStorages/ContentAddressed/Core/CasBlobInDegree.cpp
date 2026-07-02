@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <IO/WriteBufferFromString.h>
-#include <IO/ReadBufferFromMemory.h>
 #include <Common/Exception.h>
 #include <city.h>
 #include <algorithm>
@@ -45,8 +44,8 @@ std::vector<std::pair<String, char>> readPriorEdges(
         std::optional<GetResult> got = backend.get(key);
         if (!got)
             break;
-        DB::ReadBufferFromMemory in(got->bytes.data(), got->bytes.size());
-        RunFileReader r(in);
+        /// Borrowed-memory reader over the materialized run bytes (Task 4 flips this to true streaming).
+        RunFileReader r{std::string_view(got->bytes)};
         String k, p;
         while (r.next(k, p))
             if (!p.empty() && p[0] == kEdgeActive)   // carry forward only surviving edges
@@ -266,8 +265,7 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout
         const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
         std::optional<GetResult> got = backend.get(key);
         if (!got) break;
-        DB::ReadBufferFromMemory in(got->bytes.data(), got->bytes.size());
-        RunFileReader r(in);
+        RunFileReader r{std::string_view(got->bytes)};
         String k, p;
         while (r.next(k, p))
             if (!p.empty() && p[0] == kZeroMarker)
@@ -289,8 +287,7 @@ int64_t inDegreeInGeneration(Backend & backend, const Layout & layout,
         const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
         std::optional<GetResult> got = backend.get(key);
         if (!got) break;
-        DB::ReadBufferFromMemory in(got->bytes.data(), got->bytes.size());
-        RunFileReader r(in);
+        RunFileReader r{std::string_view(got->bytes)};
         r.seek(u128ToBytesBE(blob_hash));   // sparse-index skip to this blob's edges
         String k, p;
         while (r.next(k, p))

@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
 #include <base/types.h>
@@ -79,10 +80,29 @@ private:
 /// Streaming reader. `next` yields records in stored (sorted) order. `seek(key)` repositions the
 /// cursor to the first record whose key >= `key`, using the sparse footer index to skip whole blocks
 /// (one ranged read region per touched block).
+///
+/// Two modes, one interface (spec 2026-07-02 snapshot-streaming §RunFileReader modes):
+///   - BORROWED: zero-copy over caller-owned bytes; the whole run is already resident (the caller
+///     materialized it). Resident state is the caller's buffer plus one decoded block.
+///   - STREAMING: reads a WRITE-ONCE run object off a `Backend` at O(one block) resident memory. Open
+///     is exactly `head` + one tail ranged `get` (footer) + one body `getStream`; a `seek` costs one
+///     extra ranged `get` per touched block. There is NO whole-run member — the resident-memory proof
+///     is structural.
+///
+/// Fail-closed in BOTH modes: an absent key, a truncated/short stream, or ANY CRC failure throws
+/// CORRUPTED_DATA — never a partial record.
 class RunFileReader
 {
 public:
-    explicit RunFileReader(ReadBuffer & in_);
+    /// Borrowed-memory mode: zero-copy over caller-owned bytes (the caller must keep them alive for
+    /// the reader's lifetime). Replaces the old copying ReadBuffer constructor.
+    explicit RunFileReader(std::string_view bytes);
+
+    /// Streaming mode: head + tail-footer ranged get + body getStream; resident state is the footer
+    /// index + ONE current block (<= kRunHardCapBlockSize). Throws CORRUPTED_DATA on an absent key,
+    /// truncated stream, or any CRC failure.
+    RunFileReader(Backend & backend_, const String & key_);
+
     bool next(String & key, String & payload);
     void seek(std::string_view key);
     RunKind kind() const { return header.kind; }
@@ -96,15 +116,33 @@ private:
         String max_key;
     };
 
-    void loadFooter();
+    /// Parse the 13-byte header out of `head_bytes` (borrowed: the whole run; streaming: bytes drained
+    /// from the front of the body stream) and record `header`. Fail-closed on a short/bad header.
+    void parseHeader(std::string_view head_bytes);
+    /// Parse + CRC-verify the footer over `footer_bytes`, whose LAST byte is the object's last byte;
+    /// `footer_base` is the absolute file offset of `footer_bytes[0]` (0 in borrowed mode, the tail
+    /// window start in streaming mode). Fills `index`, `total_count`, `data_end`.
+    void loadFooter(std::string_view footer_bytes, uint64_t footer_base);
     bool loadBlock(size_t block_no);
+    /// Decode one CRC-verified block frame (block_len prefix already consumed / bounded) from `frame`
+    /// into the current-block cursor. `frame` starts at the `block_len` u32.
+    void installBlockFrame(std::string_view frame, size_t block_no);
+    /// Read exactly `n` bytes from `body_stream` into `out` or throw CORRUPTED_DATA (short stream).
+    void readExactFromStream(String & out, size_t n);
 
-    ReadBuffer & in;
+    bool streaming = false;                     /// false => borrowed (reads `mem`); true => streaming
+    std::string_view mem;                       /// borrowed mode: the whole run bytes (caller-owned)
+    Backend * backend = nullptr;                /// streaming mode
+    String object_key;                          ///   " the run object's key
+    std::unique_ptr<ReadBuffer> body_stream;    ///   " forward stream, positioned just after the header
+    uint64_t body_pos = 0;                      ///   " absolute file offset the stream is positioned at
+    uint64_t object_size = 0;                   ///   " object size from head
+    bool seeked = false;                        ///   " once true, ALL further blocks come via ranged get
+    uint64_t data_end = 0;                      /// first footer byte (both modes)
+
     RunHeader header;
     std::vector<BlockIndexEntry> index;
     uint64_t total_count = 0;
-
-    String full;   /// the materialized run bytes (this layer reads in-memory backends)
 
     /// in-memory cursor over the currently loaded block
     String cur_block;
@@ -121,9 +159,10 @@ private:
 /// across duplicate-key records within one input). Inputs must share a key ordering (they do: keys are
 /// byte-compared).
 ///
-/// Memory: the O(inputs * block_size) bound applies once block-ranged reads replace the Phase-1a
-/// whole-run `full` materialization. TODAY each `RunFileReader` materializes its entire run into
-/// `full`, so resident memory is O(sum of run sizes); the merge front itself is O(inputs * block_size).
+/// Memory: with STREAMING `RunFileReader`s the merge is O(inputs * block_size) resident — each reader
+/// holds only the footer index plus one decoded block, and the merge front is O(inputs). With
+/// BORROWED readers the caller already owns the whole run bytes; the merge adds only the per-reader
+/// block cursor on top.
 class RunMerger
 {
 public:
