@@ -131,12 +131,14 @@ Landed on `cas-copy-forward` (Tasks 0-3). Deviations and findings, all deliberat
 
 1. **Corrupt payload throws `CORRUPTED_DATA`, not `ABORTED`.** Data damage is not retryable;
    the spec's "any mismatch ⇒ ABORTED" was imprecise. 404/lost-race stays `ABORTED`.
-2. **The abandoned copy-forward does NOT self-heal via GC** (found by the failing Task-2 test):
-   fold discovery is transition-driven, so an orphaned fresh incarnation (writer died between the
-   copy-forward PUT and landing the commit) is invisible to the round — an fsck-visible leak, the
-   SAME accepted class as dying between `putBlob` and commit. What IS guaranteed (and tested):
-   the stale `(hash, t0)` entry drops on exact-token mismatch and the fresh incarnation is never
-   wrong-token-deleted. Revisit only if soak shows the class is hot.
+2. **The RAW-displacement test found a non-fact, later corrected (2026-07-02 brainstorm):** the
+   test's "abandoned copy-forward orphan" exists only in the raw shape (a `putOverwrite` with no
+   owner events). In the REAL flow `republishRef` lands `stageManifest` + `precommitAdd` BEFORE
+   the promote pre-pass (reachability-before-content, B188): a writer dying after the copy-forward
+   PUT leaves a folded +1 (spares the old entry), then `reclaimAbandonedPrecommit`'s -1 transitions
+   the blob to zero, a FRESH `(hash, t1)` entry condemns it, and the pipeline deletes it — full
+   self-healing, no orphan. What the test pins (still valid): the stale `(hash, t0)` entry drops on
+   exact-token mismatch and the fresh incarnation is never wrong-token-deleted.
 3. **`blob_copy_forward` event + `CasBlobCopyForward` counter landed with Task 2** (the primitive
    emits them), not Task 3.
 4. **Task 3 was extended with writer/mount introspection insights** (user request, same day):

@@ -238,8 +238,10 @@ hash == content key), re-wrap under a fresh envelope (fresh `incarnation_tag`, t
 token is adopted. TLA+: `WCopyForward` in `CaGcAckFloorCore` (the sourceless instantiation of the
 recreate arm — no `~present` branch); stage-1 clean, witness fires, all sabotages still refute.
 The listed `(hash, old_token)` entry settles at the next fold (exact-token mismatch => entry drops,
-the fresh incarnation untouched); an ABANDONED copy-forward (writer died before landing) leaves an
-fsck-visible orphan — the same accepted class as dying between `putBlob` and commit.
+the fresh incarnation untouched); an ABANDONED copy-forward (writer died before the promote CAS)
+self-heals: the dst precommit + body are durable BEFORE the pre-pass runs
+(INV-2 reachability-before-content), so the reclaim's -1 transitions the blob to zero and a fresh
+`(hash, new_token)` entry reclaims it normally.
 Motivation: the S13 soak-run-3 liveness brick — `checkParts -> renameToDetached -> moveDirectory ->
 republishRef -> promote ABORTED (condemned)` left the table readonly forever; the attach caller
 never retries.
@@ -448,9 +450,16 @@ writer on abandon.
 | `detached/<part>→final` (ATTACH) | `adoptEvidence` + `precommit` + `promote` | Standard write path |
 | Committed-source `createHardLink` | `adoptEvidence` (tokenless, no HEAD before precommit) | Pre-precommit GETs on the source are forbidden (INV-2) |
 
-**INV-2 (precommit-first)**: the build-root precommit is published BEFORE any pool content
-GET/HEAD/PUT of the build's content. `republishRef` and `createHardLink` were audited and fixed to
-comply (B190 / B190-revival-consolidation).
+**INV-2 (precommit-first / reachability-before-content)**: the build-root precommit is published
+BEFORE any pool content GET/HEAD/PUT of the build's content. `republishRef` and `createHardLink`
+were audited and fixed to comply (B190 / B190-revival-consolidation). The full write ordering
+(`publishStaging`, B188) is even stronger: blobs stage into LOCAL temp files, then `stageManifest`
+makes the EDGE-BEARING body durable, then `precommitAdd` lands the owner event, and only then do
+blob uploads reach the pool. GC consequence (2026-07-02 brainstorm): a writer dying mid-upload
+leaves blobs whose edges ALREADY exist in a folded (or foldable) body — `reclaimAbandonedPrecommit`'s
+`-1` transitions them to zero and the normal condemn pipeline reclaims them. There is therefore NO
+structural "orphan blob" class: an object in `blobs/` with no edge-bearing body in history should be
+impossible, and `fsck` may treat one as an anomaly signal, not expected debris.
 
 **Fresh-fetch detached landing** (`FETCH PARTITION`/`FETCH PART` into `detached`): a fresh
 (non-cloned) fetch downloads bytes and writes them into `detached/tmp-fetch_<part>/…`, which parses

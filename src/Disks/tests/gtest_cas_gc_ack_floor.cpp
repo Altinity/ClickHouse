@@ -135,13 +135,14 @@ TEST(CasGcRetire, CopyForwardedBlobSurvivesWhenRepublished)
     EXPECT_EQ(hr.token, res.token);
 }
 
-/// Copy-forward aftermath, abandoned arm: the writer dies between the copy-forward PUT and landing
-/// its commit. The listed (hash, t0) entry graduates and its exact-token delete MISMATCHES — a no-op,
-/// the entry drops, the t1 incarnation is NEVER wrong-token-deleted (no wedge, no unsafe delete).
-/// The orphaned t1 incarnation itself is NOT reclaimed by the round: fold discovery is
-/// transition-driven (a blob with no edges, no deltas, and no entry is invisible), so an abandoned
-/// copy-forward leaves an fsck-visible orphan — the SAME accepted class as a writer dying between
-/// putBlob and its commit. Revisit only if soak shows the class is hot.
+/// Copy-forward aftermath, stale-entry arm: a listed (hash, t0) entry whose incarnation was
+/// displaced (token now t1) with NO accompanying owner events. The entry graduates and its
+/// exact-token delete MISMATCHES — a no-op, the entry drops, the t1 incarnation is NEVER
+/// wrong-token-deleted (no wedge, no unsafe delete). This is a RAW-displacement model, stronger
+/// than the real flow: in real `republishRef` the dst precommit + body are durable BEFORE the
+/// promote pre-pass runs (reachability-before-content, B188), so an abandoned real copy-forward
+/// is fully reclaimed by the pipeline (+1 spare -> reclaim -1 -> transition to zero -> fresh
+/// (hash, t1) entry -> exact delete). The raw shape pins the GC-side invariant in isolation.
 TEST(CasGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -162,8 +163,8 @@ TEST(CasGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
     const auto res = backend->putOverwrite(blob_key, backend->get(blob_key)->bytes, t0);
     ASSERT_EQ(res.outcome, PutOutcome::Done);
 
-    /// No republish lands (writer died). Drive rounds with the store's ack kept current so the
-    /// (1, t0) entry graduates; its exact-token delete mismatches t1 and the entry drops.
+    /// No events land at all (raw displacement). Drive rounds with the store's ack kept current so
+    /// the (1, t0) entry graduates; its exact-token delete mismatches t1 and the entry drops.
     for (int i = 0; i < 6; ++i)
     {
         gc.runRegularRound();
