@@ -1615,10 +1615,13 @@ void Gc::pulseHeartbeat(Store & store, UInt128 gc_id)
 namespace
 {
 
-std::optional<ServerWatermark> watermarkForNamespace(Store & store, const RootNamespace & ns)
+/// The build-watermark floor now rides the per-server mount lease (ack-floor merge, spec 2026-07-02).
+/// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
+/// slashes. Try namespace prefixes from longest to shortest and accept the first durable mount body.
+/// `{writer_epoch, min_active}` are the same durable facts the old watermark's `{epoch, min_active}`
+/// carried on the writable path (CasStore.cpp "THE BRIDGE").
+std::optional<MountLease> floorForNamespace(Store & store, const RootNamespace & ns)
 {
-    /// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
-    /// slashes. Try namespace prefixes from longest to shortest and accept the first durable watermark.
     const String & value = ns.string();
     size_t pos = value.size();
     while (true)
@@ -1630,8 +1633,8 @@ std::optional<ServerWatermark> watermarkForNamespace(Store & store, const RootNa
         const String server_root_id = value.substr(0, pos);
         if (!server_root_id.empty())
         {
-            if (const auto got = store.backend().get(store.layout().serverRootWatermarkKey(server_root_id)))
-                return decodeServerWatermark(got->bytes);
+            if (const auto got = store.backend().get(store.layout().mountKey(server_root_id)))
+                return decodeMountLease(got->bytes);
         }
         if (pos == 0)
             break;
@@ -1666,10 +1669,10 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uin
             live.push_back(*e.new_binding);
     }
 
-    const auto watermark = watermarkForNamespace(*store, ns);
-    if (!watermark)
+    const auto floor = floorForNamespace(*store, ns);
+    if (!floor)
         return;   /// no durable fact => not dead (conservative)
-    const ServerWatermark & w = *watermark;
+    const MountLease & w = *floor;
 
     struct DeadPrecommit { OwnerBinding binding; bool retired_sentinel; };
     std::vector<DeadPrecommit> dead;
@@ -1688,10 +1691,10 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uin
         /// it is a liveness heuristic, unsafe as a reclaim trigger (a live but slow-renewing build must
         /// never have its in-flight precommit reclaimed). A wrongful reclaim would still be caught by the
         /// promote guard (fail closed), but conservatism keeps live builds from being needlessly aborted.
-        if (binding.manifest_ref.writer_epoch > w.epoch)
+        if (binding.manifest_ref.writer_epoch > w.writer_epoch)
             continue;
         const bool retired_sentinel = w.min_active == std::numeric_limits<uint64_t>::max();
-        const bool is_dead = binding.manifest_ref.writer_epoch < w.epoch
+        const bool is_dead = binding.manifest_ref.writer_epoch < w.writer_epoch
             || retired_sentinel
             || w.min_active > binding.manifest_ref.build_sequence;
         if (is_dead)

@@ -62,8 +62,8 @@ inline void validateServerRootId(const String & id)
 }
 
 /// Phase 0 (mount safety) per-server-root control objects. Each is a pure-protobuf mutable object
-/// carrying a CasHeader; the codecs mirror `CasWatermark.cpp` exactly (magic + checkCompatibility,
-/// UInt128 in big-endian 16-byte form). Decode fails closed with CORRUPTED_DATA on bad bytes.
+/// carrying a CasHeader (magic + checkCompatibility, UInt128 in big-endian 16-byte form). Decode
+/// fails closed with CORRUPTED_DATA on bad bytes.
 
 /// Owner anchor (`gc/server-roots/<srid>/owner`): binds the configured `server_root_id` to the
 /// server UUID that owns the subtree.
@@ -191,9 +191,13 @@ MountClaimResult claimMountAwaitingExpiry(
     const std::function<void(uint64_t)> & sleep_ms_fn,
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {});
 
-/// Mount-lease heartbeat (liveness), the sibling of `WatermarkKeeper` over the per-server-root mount
-/// object. Reuses `SingleWriterSlot`: anchors the slot synchronously on `start`, renews it async off
-/// the write path, and fails closed on any foreign touch (`renewOnce` throws on a precondition miss).
+/// Per-server MERGED heartbeat (ack-floor redesign, spec 2026-07-02): one `SingleWriterSlot` over the
+/// per-server-root mount object carries the mount lease (liveness) AND the build-watermark floor
+/// (`min_active`) AND the GC-round acknowledgement (`observed_gc_round`). One beat renews all three,
+/// so the former standalone watermark object is gone. Anchors the slot synchronously on `start`,
+/// renews it async off the write path, and fails closed on any foreign touch (`renewOnce` throws on a
+/// precondition miss). `graceful stop` folds the watermark farewell (`min_active = UINT64_MAX`) into
+/// the terminal already-expired mount body.
 ///
 /// ADOPT RULE (critical): the steady-state flow is `claimMount(...)` writes the live mount under
 /// (our_uuid, our_epoch), THEN `keeper.start()`. So `start`'s `claim` hook must ADOPT a live mount
@@ -208,9 +212,13 @@ MountClaimResult claimMountAwaitingExpiry(
 class MountLeaseKeeper final : public SingleWriterSlot
 {
 public:
+    /// `min_active_fn_` / `observed_round_fn_` are read OFF the state lock on each beat (via
+    /// `prepareRenew`) and stamped into the mount body — the merged watermark floor and the acked GC
+    /// round. Both reach into the Store's own locks, so they must never run under `state_mutex`.
     MountLeaseKeeper(
         BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
-        uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_);
+        uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
+        std::function<uint64_t()> min_active_fn_, std::function<uint64_t()> observed_round_fn_);
 
     /// Claims (adopts) the mount slot for (server_uuid, writer_epoch) with seq following the observed
     /// one — durable when `start` returns.
@@ -245,6 +253,8 @@ private:
     uint64_t writer_epoch;
     std::chrono::milliseconds ttl;
     std::function<uint64_t()> now_ms_fn;
+    std::function<uint64_t()> min_active_fn;
+    std::function<uint64_t()> observed_round_fn;
     std::function<void()> on_renew_ok;
     std::function<void()> on_lost;
 };

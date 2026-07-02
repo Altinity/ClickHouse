@@ -2,7 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
@@ -10,39 +10,120 @@
 
 using namespace DB::Cas;
 
-/// WatermarkKeeper behavior (spec 2026-06-16-ca-build-watermark, rule W-ANCHOR). The per-server
-/// watermark is durable before return, claims a slot that may already exist from a prior process
-/// incarnation, bumps seq on renewal, and retires the epoch (min_active = UINT64_MAX) on farewell.
+/// MountLeaseKeeper behavior after the ack-floor merge (spec 2026-07-02-cas-gc-ack-floor-fence):
+/// the per-server mount lease and the merged build-watermark floor + GC-round acknowledgement all
+/// ride the SAME slot, renewed by one beat. The keeper anchors durably before return, adopts a slot
+/// already written by `claimMount` (same uuid+epoch), re-reads BOTH callbacks on each renew and bumps
+/// `seq`, stamps the farewell sentinel (`min_active = UINT64_MAX`, `expires_at_ms <= now`) on `stop`,
+/// and fails closed on any foreign touch (`renewOnce` throws).
 
-TEST(CasWatermarkKeeper, AnchorIsDurableThenRenewBumpsSeq)
+namespace
 {
-    auto backend = std::make_shared<InMemoryBackend>();
-    Layout layout("pool");
-    const String server_root_id = "test";
-    const UInt128 server_id(0x1234);
-    uint64_t min_active_now = 5;
-    WatermarkKeeper keeper(backend, layout, server_root_id, server_id, /*epoch=*/9,
-                           [&]{ return min_active_now; });
-    keeper.start();                                  // anchor durable
-    auto hr = backend->head(layout.serverRootWatermarkKey(server_root_id));
-    ASSERT_TRUE(hr.exists);
-    auto w = decodeServerWatermark(backend->get(layout.serverRootWatermarkKey(server_root_id))->bytes);
-    ASSERT_EQ(w.epoch, 9u); ASSERT_EQ(w.min_active, 5u); ASSERT_EQ(w.seq, 1u);
-
-    min_active_now = 8;
-    keeper.renewOnce();
-    w = decodeServerWatermark(backend->get(layout.serverRootWatermarkKey(server_root_id))->bytes);
-    ASSERT_EQ(w.min_active, 8u); ASSERT_EQ(w.seq, 2u);
+/// The normal steady-state flow: `claimMount` writes the live (uuid, epoch) mount, THEN the keeper
+/// adopts it. Seed that claim so `start` adopts instead of self-tripping the double-start guard.
+void seedOwnClaim(Backend & b, const Layout & l, const String & srid, UInt128 uuid, uint64_t epoch,
+                  uint64_t now_ms, uint64_t ttl_ms)
+{
+    ASSERT_EQ(claimMount(b, l, srid, uuid, epoch, now_ms, ttl_ms).kind, MountClaimResult::Claimed);
+}
 }
 
-TEST(CasWatermarkKeeper, FarewellRetiresEpoch)
+TEST(CasHeartbeat, AnchorCarriesFloorAndAck)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
-    const String server_root_id = "test";
-    WatermarkKeeper keeper(backend, layout, server_root_id, UInt128(0x1234), 9, []{ return 5; });
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    uint64_t min_active_now = 5;
+    uint64_t observed_round_now = 9;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
+
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
+                            [&] { return now_ms; }, [&] { return min_active_now; }, [&] { return observed_round_now; });
     keeper.start();
-    keeper.farewell();
-    auto w = decodeServerWatermark(backend->get(layout.serverRootWatermarkKey(server_root_id))->bytes);
-    ASSERT_EQ(w.min_active, std::numeric_limits<uint64_t>::max());
+
+    auto hr = backend->head(layout.mountKey(srid));
+    ASSERT_TRUE(hr.exists);
+    auto m = decodeMountLease(backend->get(layout.mountKey(srid))->bytes);
+    EXPECT_EQ(m.writer_epoch, 9u);
+    EXPECT_EQ(m.min_active, 5u);
+    EXPECT_EQ(m.observed_gc_round, 9u);
+    EXPECT_EQ(m.seq, 1u);
+    EXPECT_FALSE(m.gc_fenced);
+}
+
+TEST(CasHeartbeat, RenewRereadsBothCallbacksAndBumpsSeq)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    uint64_t min_active_now = 5;
+    uint64_t observed_round_now = 9;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
+
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
+                            [&] { return now_ms; }, [&] { return min_active_now; }, [&] { return observed_round_now; });
+    keeper.start();
+
+    /// Both dynamic fields move; the renewal re-reads both off the callbacks and bumps seq.
+    now_ms = 1500;
+    min_active_now = 8;
+    observed_round_now = 12;
+    keeper.renewOnce();
+
+    auto m = decodeMountLease(backend->get(layout.mountKey(srid))->bytes);
+    EXPECT_EQ(m.min_active, 8u);
+    EXPECT_EQ(m.observed_gc_round, 12u);
+    EXPECT_EQ(m.seq, 2u);
+    EXPECT_EQ(m.expires_at_ms, 1500u + 100u);
+}
+
+TEST(CasHeartbeat, StopStampsExpiredAndFarewellSentinel)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
+
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
+                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; });
+    keeper.start();
+
+    now_ms = 2000;
+    keeper.stop();
+
+    auto m = decodeMountLease(backend->get(layout.mountKey(srid))->bytes);
+    /// Terminal body stamps the lease already-expired (so a same-server reopen reclaims immediately)
+    /// AND folds the watermark farewell into it (min_active = UINT64_MAX).
+    EXPECT_LE(m.expires_at_ms, now_ms);
+    EXPECT_EQ(m.min_active, std::numeric_limits<uint64_t>::max());
+}
+
+TEST(CasHeartbeat, ForeignTouchMakesRenewThrow)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
+
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
+                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; });
+    keeper.start();
+
+    /// A foreign incarnation overwrites the slot: the single-writer contract fails closed on renew.
+    const HeadResult h = backend->head(layout.mountKey(srid));
+    ASSERT_TRUE(h.exists);
+    MountLease foreign;
+    foreign.server_uuid = uuid;
+    foreign.writer_epoch = 9;
+    foreign.seq = 99;
+    backend->putOverwrite(layout.mountKey(srid), encodeMountLease(foreign), h.token);
+    EXPECT_ANY_THROW(keeper.renewOnce());
 }

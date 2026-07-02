@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <cas_format.pb.h>
@@ -394,36 +393,6 @@ TEST(CasHeaderGolden, PoolMetaCasHeaderRoundTrips)
     EXPECT_EQ(d.min_reader_generation, 0u);
 }
 
-TEST(CasHeaderGolden, WatermarkCasHeaderAndRetiredSentinel)
-{
-    /// Live watermark.
-    {
-        const ServerWatermark w{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                                .epoch = 7, .min_active = 42, .seq = 3};
-        const String bytes = encodeServerWatermark(w);
-        ASSERT_FALSE(bytes.empty());
-        EXPECT_NE(bytes.front(), '{');
-        Proto::WatermarkProto msg;
-        ASSERT_TRUE(msg.ParseFromString(bytes));
-        EXPECT_EQ(msg.header().magic(), magicFor(FormatId::Watermark));
-        EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
-        const ServerWatermark d = decodeServerWatermark(bytes);
-        EXPECT_EQ(d.server_id, w.server_id);
-        EXPECT_EQ(d.epoch, 7u);
-        EXPECT_EQ(d.min_active, 42u);
-        EXPECT_EQ(d.seq, 3u);
-    }
-    /// Retired sentinel (UINT64_MAX) round-trips.
-    {
-        const ServerWatermark w{.server_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                                .epoch = 7, .min_active = std::numeric_limits<uint64_t>::max(), .seq = 9};
-        const String bytes = encodeServerWatermark(w);
-        const ServerWatermark d = decodeServerWatermark(bytes);
-        EXPECT_EQ(d.min_active, std::numeric_limits<uint64_t>::max());
-        EXPECT_EQ(d.seq, 9u);
-    }
-}
-
 TEST(CasHeaderGolden, GcStateCasHeaderRoundTrips)
 {
     GcState s;
@@ -483,20 +452,6 @@ TEST(CasHeaderGolden, PoolMetaFailClosedOnGarbage)
     }
 }
 
-TEST(CasHeaderGolden, WatermarkFailClosedOnGarbage)
-{
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeServerWatermark(String("")); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeServerWatermark(String("\xff\xff\xff\xff\x00\x00\x00\x00", 8)); });
-    /// Future compatibility_version => UNKNOWN_FORMAT_VERSION.
-    {
-        Proto::WatermarkProto msg;
-        auto * hdr = msg.mutable_header();
-        hdr->set_magic(magicFor(FormatId::Watermark));
-        hdr->set_compatibility_version(G_BUILD + 1);
-        std::string bytes; msg.SerializeToString(&bytes);
-        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeServerWatermark(bytes); });
-    }
-}
 
 TEST(CasPoolMeta, ConstantInvariantsPostParse)
 {

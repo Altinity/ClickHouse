@@ -409,34 +409,7 @@ TEST(CasRootShardCodec, CasHeaderRoundTrips)
     EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
 }
 
-/// ===================================================================================
-/// CasWatermark (Task 4)
-/// ===================================================================================
-
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
-
-TEST(CasWatermark, RoundTrips)
-{
-    const ServerWatermark w{.server_id = UInt128(0xABCD), .epoch = 7, .min_active = 42, .seq = 3};
-    const String body = encodeServerWatermark(w);
-    const ServerWatermark r = decodeServerWatermark(body);
-    ASSERT_EQ(r.server_id, w.server_id);
-    ASSERT_EQ(r.epoch, w.epoch);
-    ASSERT_EQ(r.min_active, w.min_active);
-    ASSERT_EQ(r.seq, w.seq);
-}
-
-/// ===================================================================================
-/// CasLayout (Task 5)
-/// ===================================================================================
-
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
-
-TEST(CasLayout, ServerRootWatermarkKey)
-{
-    Layout layout("pool");
-    ASSERT_EQ(layout.serverRootWatermarkKey("srv/root"), "pool/gc/server-roots/srv/root/watermark");
-}
 
 /// ---------- envelope fixed-length header padding (pad_to_header_len) ----------
 

@@ -257,12 +257,6 @@ public:
         return serverRootPrefix(server_root_id) + "mount";
     }
 
-    /// Per-server-root build watermark: `<prefix>/gc/server-roots/<srid>/watermark`.
-    String serverRootWatermarkKey(const String & server_root_id) const
-    {
-        return serverRootPrefix(server_root_id) + "watermark";
-    }
-
     /// The data subtree owned by a server root: `<prefix>/roots/<srid>/`. The mount-safety
     /// empty-root precondition (Phase 0) lists this prefix; data/ref/manifest writes (Phase 1)
     /// will relocate under it.

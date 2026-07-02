@@ -9,6 +9,7 @@
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
 
+#include <limits>
 #include <unistd.h>
 
 namespace DB
@@ -396,21 +397,26 @@ MountClaimResult claimMountAwaitingExpiry(
 
 MountLeaseKeeper::MountLeaseKeeper(
     BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
-    uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_)
+    uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
+    std::function<uint64_t()> min_active_fn_, std::function<uint64_t()> observed_round_fn_)
     : SingleWriterSlot(std::move(backend_), layout_.mountKey(srid_), "mount-lease", "release", "CasMountLeaseKeeper")
     , srid(srid_)
     , server_uuid(server_uuid_)
     , writer_epoch(writer_epoch_)
     , ttl(ttl_)
     , now_ms_fn(std::move(now_ms_fn_))
+    , min_active_fn(std::move(min_active_fn_))
+    , observed_round_fn(std::move(observed_round_fn_))
 {
 }
 
 SingleWriterSlot::RenewPayload MountLeaseKeeper::prepareRenew() const
 {
-    /// Carry the wall-clock `now_ms` reading (off the state lock) so `encodeBody` can stamp a fresh
-    /// `expires_at_ms = now_ms + ttl` for this renewal.
-    return {.value = now_ms_fn()};
+    /// Carry the three dynamic fields (all read OFF the state lock — the merged floor/round callbacks
+    /// reach into the Store's own locks): `value` = wall-clock `now_ms` (so `encodeBody` stamps a
+    /// fresh `expires_at_ms = now_ms + ttl`), `value2` = `min_active` (the build-watermark floor),
+    /// `value3` = `observed_gc_round` (the acked GC round).
+    return {.value = now_ms_fn(), .value2 = min_active_fn(), .value3 = observed_round_fn()};
 }
 
 String MountLeaseKeeper::encodeBody(uint64_t seq_, const RenewPayload & payload) const
@@ -425,6 +431,8 @@ String MountLeaseKeeper::encodeBody(uint64_t seq_, const RenewPayload & payload)
         .started_at_ms = now_ms,
         .seq = seq_,
         .expires_at_ms = now_ms + ttl_ms,
+        .min_active = payload.value2,
+        .observed_gc_round = payload.value3,
     });
 }
 
@@ -493,7 +501,10 @@ void MountLeaseKeeper::onRenewFailed()
 void MountLeaseKeeper::terminate()
 {
     /// Terminal op: retire the lease by stamping it already-expired (expires_at_ms = started_at_ms),
-    /// seq+1, against the token we hold. This makes a same-uuid reopen immediately reclaimable.
+    /// seq+1, against the token we hold. This makes a same-uuid reopen immediately reclaimable. The
+    /// merged watermark farewell folds in HERE: `min_active = UINT64_MAX` is the retired sentinel the
+    /// GC floor treats as "every build_seq of this server is retired" — one release retires both the
+    /// mount lease and the build watermark.
     const uint64_t now_ms = now_ms_fn();
     const String body = encodeMountLease(MountLease{
         .server_uuid = server_uuid,
@@ -503,6 +514,7 @@ void MountLeaseKeeper::terminate()
         .started_at_ms = now_ms,
         .seq = seq + 1,
         .expires_at_ms = now_ms,
+        .min_active = std::numeric_limits<uint64_t>::max(),
     });
     const PutResult res = backend->putOverwrite(key, body, last_token);
     if (res.outcome != PutOutcome::Done)

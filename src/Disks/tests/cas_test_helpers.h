@@ -15,8 +15,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
-
 #include <Common/Exception.h>
 
 #include <base/hex.h>
@@ -471,22 +469,24 @@ inline uint64_t foldCursorOf(
     }
 }
 
-/// Set a server root's durable watermark min_active (so orphan-sweep eligibility can be driven).
+/// Set a server root's durable floor (so orphan-sweep eligibility can be driven). After the ack-floor
+/// merge the floor rides the mount lease body (`mountKey`), so this seeds a MountLease carrying
+/// `{writer_epoch, min_active}` — exactly what `prefixEligible` reads.
 inline void setWatermarkMinActive(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & server_root_id,
     uint64_t writer_epoch, uint64_t min_active)
 {
-    DB::Cas::ServerWatermark w;
-    w.server_id = DB::UInt128(0);
-    w.epoch = writer_epoch;
-    w.min_active = min_active;
-    w.seq = 1;
-    const String key = layout.serverRootWatermarkKey(server_root_id);
+    DB::Cas::MountLease m;
+    m.server_uuid = DB::UInt128(0);
+    m.writer_epoch = writer_epoch;
+    m.min_active = min_active;
+    m.seq = 1;
+    const String key = layout.mountKey(server_root_id);
     const DB::Cas::HeadResult h = backend.head(key);
     if (h.exists)
-        backend.putOverwrite(key, DB::Cas::encodeServerWatermark(w), h.token);
+        backend.putOverwrite(key, DB::Cas::encodeMountLease(m), h.token);
     else
-        backend.putIfAbsent(key, DB::Cas::encodeServerWatermark(w));
+        backend.putIfAbsent(key, DB::Cas::encodeMountLease(m));
 }
 
 /// Counts head/get/putIfAbsent per key for op-count assertions (Pillar B / A1 tests).

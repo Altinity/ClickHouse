@@ -30,7 +30,6 @@ TEST(CasServerRoot, KeysAndCodecsRoundTrip)
     EXPECT_EQ(layout.ownerKey("replica-a"), "p/gc/server-roots/replica-a/owner");
     EXPECT_EQ(layout.epochKey("replica-a"), "p/gc/server-roots/replica-a/epoch");
     EXPECT_EQ(layout.mountKey("replica-a"), "p/gc/server-roots/replica-a/mount");
-    EXPECT_EQ(layout.serverRootWatermarkKey("replica-a"), "p/gc/server-roots/replica-a/watermark");
 
     /// Owner round-trip.
     {
@@ -116,7 +115,8 @@ TEST(CasMountLease, AbsentClaimThenRenewBumpsSeq)
     uint64_t now = 1000;
     auto r = claimMount(*b, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100);
     EXPECT_EQ(r.kind, MountClaimResult::Claimed);
-    MountLeaseKeeper k(b, l, "r", UInt128(1), 7, std::chrono::milliseconds(100), [&] { return now; });
+    MountLeaseKeeper k(b, l, "r", UInt128(1), 7, std::chrono::milliseconds(100), [&] { return now; },
+                       [] { return uint64_t{0}; }, [] { return uint64_t{0}; });
     k.start();
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).seq, 1u);
     k.renewOnce();
@@ -270,12 +270,14 @@ TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
     uint64_t now = 1000;
     // The normal flow: claimMount writes the live mount under (uuid=1, epoch=7), THEN keeper.start().
     ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseKeeper k(b, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100), [&] { return now; });
+    MountLeaseKeeper k(b, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100), [&] { return now; },
+                       [] { return uint64_t{0}; }, [] { return uint64_t{0}; });
     EXPECT_NO_THROW(k.start());     // adopts our own live (uuid=1,epoch=7) mount — NOT a double-start
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 7u);
 
     // A keeper for the SAME uuid but a DIFFERENT live epoch must fail closed (superseded/double-start):
-    MountLeaseKeeper k2(b, l, "r", UInt128(1), /*epoch*/ 8, std::chrono::milliseconds(100), [&] { return now; });
+    MountLeaseKeeper k2(b, l, "r", UInt128(1), /*epoch*/ 8, std::chrono::milliseconds(100), [&] { return now; },
+                        [] { return uint64_t{0}; }, [] { return uint64_t{0}; });
     EXPECT_ANY_THROW(k2.start());
 }
 

@@ -206,9 +206,14 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which
         /// ADOPTS that very (uuid, epoch) slot (Task 5) rather than self-tripping the double-start guard.
         Store * raw = store.get();
+        /// Merged heartbeat (ack-floor redesign): the mount keeper now ALSO carries the per-server
+        /// build-watermark floor (`minActive`) and the acked GC round. `minActive` is read off the
+        /// keeper's state lock (it reaches into the Store's builds_mutex). The observed-round callback
+        /// is a stub {0} until Task 5 wires the real view-load ack — a fresh mount has loaded nothing.
         store->mount_keeper = std::make_unique<MountLeaseKeeper>(
             store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
-            store->config.mount_lease_ttl_ms, now_ms);
+            store->config.mount_lease_ttl_ms, now_ms,
+            [raw] { return raw->minActive(); }, [] { return uint64_t{0}; });
         /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh the
         /// monotonic deadline; on a superseded/foreign renew failure latch the fence to lost. Set BEFORE
         /// startBackground so no renewal can fire before the callbacks are in place.
@@ -221,23 +226,15 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// here ordinary mutations (mutateShard) are fence-gated via mayMutate().
         store->armMountFence(our_uuid, writer_epoch,
             std::chrono::steady_clock::now() + store->config.mount_lease_ttl_ms);
-        /// Gate the background renewer exactly like the watermark below: it runs only in production
+        /// Gate the background renewer with `background_watermark`: it runs only in production
         /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
         /// drive renewOnce explicitly and rely on the armed sub-TTL deadline, never on the loop. The
         /// keeper itself is still started above (it must claim/adopt the mount + arm the fence on every
-        /// writable open); only the renewal thread is conditional.
+        /// writable open); only the renewal thread is conditional. The merged heartbeat renews at
+        /// `mount_renew_period` — the standalone watermark object (and its separate renew period) is
+        /// gone; one beat now renews the lease, the floor and the acked round together.
         if (store->config.background_watermark)
             store->mount_keeper->startBackground(store->config.mount_renew_period);
-
-        /// 5. Per-server watermark — anchored AFTER epoch allocation so it carries the DURABLE
-        ///    writer_epoch (now in `process_epoch`), not the random mint. Must be durable before any
-        ///    ordinary data write.
-        store->watermark = std::make_unique<WatermarkKeeper>(
-            store->pool_backend, store->pool_layout, srid, store->config.server_id, store->process_epoch,
-            [raw] { return raw->minActive(); });
-        store->watermark->start();
-        if (store->config.background_watermark)
-            store->watermark->startBackground(store->config.watermark_renew_period);
     }
 
     return store;
@@ -245,17 +242,9 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
 
 Store::~Store()
 {
-    /// Stop the background renewal cleanly. We deliberately do NOT call farewell here: there is no
-    /// clean-shutdown hook plumbed through to Store dtor, and farewell would retire the epoch even on
-    /// a transient drop. The crash/shutdown path (a frozen seq) is handled by GC's frozen-seq
-    /// liveness detection (spec 2026-06-16-ca-build-watermark), so stopBackground alone is correct.
-    if (watermark)
-        watermark->stopBackground();
-
-    /// Retire the mount lease on a clean Store teardown: stop() runs the keeper's terminal op, which
-    /// stamps the lease already-expired (expires_at_ms = now). Unlike the watermark (whose farewell is
-    /// deliberately skipped — a transient drop must not retire its epoch), retiring the mount is
-    /// correct: it is a recreatable lease, and stamping it expired lets a SAME-server reopen reclaim
+    /// Retire the merged heartbeat on a clean Store teardown: stop() runs the keeper's terminal op,
+    /// which stamps the lease already-expired (expires_at_ms = now) AND folds in the watermark
+    /// farewell (min_active = UINT64_MAX). Stamping it expired lets a SAME-server reopen reclaim
     /// immediately (the durable epoch + owner stay sticky). A throw here (e.g. a foreign incarnation
     /// touched the slot) must not escape the dtor — log and continue tearing down.
     if (mount_keeper)
@@ -370,11 +359,13 @@ uint64_t Store::peekNextBuildSeq()
 
 void Store::renewWatermarkOnce()
 {
-    /// A read-only open never anchored a watermark; there is nothing to renew (fail closed rather
-    /// than fabricate one).
-    if (!watermark)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS watermark: renewWatermarkOnce on a read-only Store");
-    watermark->renewOnce();
+    /// After the ack-floor merge the build-watermark floor rides the merged mount-keeper beat (there
+    /// is no standalone watermark object anymore), so one renewOnce re-reads `minActive` and stamps
+    /// it into the mount body. A read-only open never anchored the keeper; there is nothing to renew
+    /// (fail closed rather than fabricate one).
+    if (!mount_keeper)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renewWatermarkOnce on a read-only Store");
+    mount_keeper->renewOnce();
 }
 
 uint64_t Store::allocateBuildSeq()

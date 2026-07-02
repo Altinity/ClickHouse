@@ -9,7 +9,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
 #include <Common/CacheBase.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/HashTable/Hash.h>
@@ -130,8 +129,7 @@ struct PoolConfig
     /// as a warning-only log). At most one delay per mutation call. Delay is linear: 0 at soft_limit →
     /// `manifest_max_delay_ms` near the hard limit.
     uint64_t manifest_max_delay_ms = 1000;
-    std::chrono::milliseconds watermark_renew_period{5000};
-    bool background_watermark = false;       /// tests drive renewOnce explicitly
+    bool background_watermark = false;       /// tests drive renewOnce explicitly; gates the merged heartbeat's background thread
 
     /// Mount-lease TTL (spec §mount-safety): how long a freshly-renewed mount lease is valid. The local
     /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
@@ -228,9 +226,11 @@ public:
     uint64_t minActive();
     /// Test/assertion accessor for the next-to-allocate build_seq under the lock.
     uint64_t peekNextBuildSeq();
-    /// Renew the per-server watermark once (bump seq, refresh min_active from the live active set).
-    /// In production this is driven by the background renewer (background_watermark); tests with the
-    /// renewer disabled drive it explicitly to make a finished build's floor advance durable.
+    /// Renew the merged heartbeat once (bump seq, refresh min_active/observed_gc_round from the live
+    /// callbacks, stamp a fresh expires_at_ms). The build-watermark floor rides this beat after the
+    /// ack-floor merge — there is no standalone watermark object. In production this is driven by the
+    /// background renewer (background_watermark); tests with the renewer disabled drive it explicitly
+    /// to make a finished build's floor advance durable.
     void renewWatermarkOnce();
 
     /// ---- local write fence (spec §write-fence, Phase 0 Task 6) ----
@@ -446,13 +446,13 @@ private:
     /// nonzero u64 minted once at open: GC checks it for EQUALITY (an object stamped with a different
     /// epoch is from a dead incarnation), never for ordering. next_build_seq is a strictly-increasing
     /// per-process counter (monotonicity is load-bearing — a seq is never reused or lowered);
-    /// active_build_seqs holds the seqs of in-flight builds, so minActive yields the GC floor.
-    /// watermark is the Store-owned per-server renewer (anchored before any object PUT in open).
+    /// active_build_seqs holds the seqs of in-flight builds, so minActive yields the GC floor. After
+    /// the ack-floor merge (spec 2026-07-02) the floor is published by the merged `mount_keeper`
+    /// beat (there is no standalone watermark object anymore).
     uint64_t process_epoch = 0;
     std::mutex builds_mutex;
     uint64_t next_build_seq = 1;
     std::set<uint64_t> active_build_seqs;
-    std::unique_ptr<WatermarkKeeper> watermark;
 
     /// Mount-lease heartbeat (spec §mount-safety, Phase 0 Task 7). Constructed + started on a writable
     /// open AFTER the owner/epoch/mount startup protocol; renews the mount lease async off the write

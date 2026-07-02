@@ -1,6 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasWatermark.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
@@ -15,11 +15,15 @@ namespace DB::Cas
 namespace
 {
 
-std::optional<ServerWatermark> watermarkForNamespace(Store & store, const RootNamespace & ns)
+/// The build-watermark floor now rides the per-server mount lease (ack-floor merge, spec 2026-07-02).
+/// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
+/// slashes. Try namespace prefixes from longest to shortest and accept the first durable mount body.
+/// No mount => no authority => fail open / not eligible. On the writable path the mount's
+/// `writer_epoch` is the same durable value the old watermark's `epoch` carried (CasStore.cpp "THE
+/// BRIDGE"), so `{writer_epoch, min_active}` are consumed exactly where `ServerWatermark::{epoch,
+/// min_active}` were.
+std::optional<MountLease> floorForNamespace(Store & store, const RootNamespace & ns)
 {
-    /// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
-    /// slashes. Try namespace prefixes from longest to shortest and accept the first durable watermark.
-    /// No watermark => no authority => fail open / not eligible.
     const String & value = ns.string();
     size_t pos = value.size();
     while (true)
@@ -31,8 +35,8 @@ std::optional<ServerWatermark> watermarkForNamespace(Store & store, const RootNa
         const String server_root_id = value.substr(0, pos);
         if (!server_root_id.empty())
         {
-            if (const auto got = store.backend().get(store.layout().serverRootWatermarkKey(server_root_id)))
-                return decodeServerWatermark(got->bytes);
+            if (const auto got = store.backend().get(store.layout().mountKey(server_root_id)))
+                return decodeMountLease(got->bytes);
         }
         if (pos == 0)
             break;
@@ -197,14 +201,14 @@ bool prefixEligible(Store & store, const RootNamespace & ns, const BuildPrefix &
     /// OQ6: durable watermark fact only. A missing watermark => NOT eligible (control #9: never a
     /// frozen-seq / judged-dead guess). Compare writer_epoch first, then build_sequence, so old-epoch
     /// debris drains after a process restart even when its build_sequence is above the current min_active.
-    const auto watermark = watermarkForNamespace(store, ns);
-    if (!watermark)
+    const auto floor = floorForNamespace(store, ns);
+    if (!floor)
         return false;
 
-    const ServerWatermark & w = *watermark;
-    if (prefix.writer_epoch < w.epoch)
+    const MountLease & w = *floor;
+    if (prefix.writer_epoch < w.writer_epoch)
         return true;
-    if (prefix.writer_epoch > w.epoch)
+    if (prefix.writer_epoch > w.writer_epoch)
         return false;
     if (w.min_active == std::numeric_limits<uint64_t>::max())
         return true;   /// farewell/retired sentinel: every seq is retired
