@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
@@ -55,11 +56,36 @@ struct BlobCandidate
 /// folding leader's `lease.seq`). They differ whenever the round that produced `prior_generation` adopted
 /// a different attempt than the current fold mints — keeping them distinct lets the fold read the correct
 /// parent baseline while writing under its own attempt.
+/// Outcome of the retired (third) merge cursor (ack-floor redesign, spec 2026-07-02): the same
+/// streaming pass that folds edges settles every prior retired entry and detects new candidates.
+struct RetiredMergeResult
+{
+    std::vector<RetiredEntry> still_retired;   /// carried entries + this pass's new condemnations
+    std::vector<RetiredEntry> graduated;       /// in-degree 0 and condemn_round < min_ack — delete now
+    std::vector<RetiredEntry> spared;          /// in-degree recovered — entry dropped
+};
+
+/// Three-cursor extension (ack-floor redesign): `prior_retired` (Blob entries ONLY, sorted by hash
+/// ascending) rides the same per-blob close-out as the two existing cursors. Settlement rules, in
+/// order, per entry for blob `h` with post-merge in-degree `d`:
+///   d > 0                                -> spared (recovery wins even past the floor);
+///   d = 0 and condemn_round < min_ack    -> graduated (safe to delete: every live writer acked past it);
+///   d = 0 otherwise                      -> still_retired, carried byte-unchanged.
+/// A blob that transitions to zero THIS pass with no prior entry is condemned: `head_blob` captures
+/// the exact incarnation token/size (absent object or empty head_blob -> nothing to delete, skipped)
+/// and the entry is minted at `condemn_round`. Entries for blobs the merged stream never visits
+/// (no edges, no deltas) settle at in-degree 0 by definition. The retired cursor never changes the
+/// snapshot run bytes. Defaults keep the legacy call sites behavior-identical (empty retired,
+/// min_ack 0 => nothing graduates, no head_blob => nothing condemned).
 void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t prior_generation, uint64_t prior_attempt,
                               uint64_t new_generation, uint64_t attempt,
                               uint64_t shard,
-                              std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs);
+                              std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
+                              const std::vector<RetiredEntry> & prior_retired = {},
+                              uint64_t min_ack = 0, uint64_t condemn_round = 0,
+                              const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob = {},
+                              RetiredMergeResult * out_retired = nullptr);
 
 /// Stream the sealed in-degree run for (generation, attempt, shard) and return every blob written at
 /// in-degree 0 (the candidates that transitioned to zero in this generation).

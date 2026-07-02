@@ -102,8 +102,19 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t prior_generation, uint64_t prior_attempt,
                               uint64_t new_generation, uint64_t attempt,
                               uint64_t shard,
-                              std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs)
+                              std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
+                              const std::vector<RetiredEntry> & prior_retired,
+                              uint64_t min_ack, uint64_t condemn_round,
+                              const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob,
+                              RetiredMergeResult * out_retired)
 {
+    /// The retired cursor consumes Blob entries in ascending hash order, in lockstep with the
+    /// ascending merged edge stream (32-byte BE keys order exactly as numeric UInt128).
+    chassert(std::is_sorted(prior_retired.begin(), prior_retired.end(),
+        [](const RetiredEntry & a, const RetiredEntry & bb) { return a.hash < bb.hash; }));
+    RetiredMergeResult sink;
+    RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
+
     // Deterministic input ordering => byte-reproducible run (OQ5 resume/adoption).
     // MUST be stable: for the same (blob_hash, source_id) the journal ordering is
     // activation-before-removal; "last wins" then correctly resolves to removal (edge absent).
@@ -128,22 +139,63 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     // final presence per edge locally (idempotent: prior present + activate => present; any remove =>
     // absent), emit surviving edges, and accumulate the current blob's surviving-edge count on the fly
     // to emit a zero-transition marker. O(block) IO + O(1) per current blob.
-    size_t pi = 0, di = 0;
+    size_t pi = 0, di = 0, ri = 0;
     UInt128 cur_blob{0};
     bool have_blob = false;
     uint64_t cur_edges = 0;    // surviving edges of cur_blob so far
     bool cur_touched = false;  // cur_blob had prior edges or deltas this generation
 
+    auto settleEntry = [&](const RetiredEntry & e, uint64_t indeg)
+    {
+        chassert(e.kind == ObjectKind::Blob);   /// the in-degree merge settles Blob entries only
+        if (indeg > 0)
+            rmr.spared.push_back(e);            /// recovery wins, even past the floor
+        else if (e.condemn_round < min_ack)
+            rmr.graduated.push_back(e);         /// every live writer provably acked past it
+        else
+            rmr.still_retired.push_back(e);     /// carried unchanged until the floor passes it
+    };
+    /// Entries for blobs STRICTLY BELOW `bound` that the merged stream never visits: no surviving
+    /// edges, no deltas this pass => in-degree 0 by definition.
+    auto settleRetiredBelow = [&](const UInt128 & bound)
+    {
+        while (ri < prior_retired.size() && prior_retired[ri].hash < bound)
+            settleEntry(prior_retired[ri++], 0);
+    };
+
     auto closeBlob = [&]()
     {
-        if (have_blob && cur_edges == 0 && cur_touched)
+        if (!have_blob)
+            return;
+        if (cur_edges == 0 && cur_touched)
             writer.append(srcEdgeRunKey(cur_blob, kZeroSourceId), String(1, kZeroMarker));
+        /// Settle the retired entry for the blob being closed, against its post-merge in-degree...
+        if (ri < prior_retired.size() && prior_retired[ri].hash == cur_blob)
+        {
+            settleEntry(prior_retired[ri++], cur_edges);
+        }
+        /// ...or condemn a fresh transition-to-zero (no prior entry). `head_blob` captures the exact
+        /// incarnation token for the later exact-token delete; an absent object needs no entry.
+        else if (cur_edges == 0 && cur_touched && head_blob)
+        {
+            if (const auto hr = head_blob(cur_blob); hr && hr->exists)
+            {
+                RetiredEntry fresh;
+                fresh.kind = ObjectKind::Blob;
+                fresh.hash = cur_blob;
+                fresh.token = hr->token;
+                fresh.size = hr->size;
+                fresh.condemn_round = condemn_round;
+                rmr.still_retired.push_back(std::move(fresh));
+            }
+        }
     };
     auto openBlobIfNeeded = [&](const UInt128 & b)
     {
         if (!have_blob || b != cur_blob)
         {
             closeBlob();
+            settleRetiredBelow(b);   /// no-edge blobs between the closed blob and this one
             cur_blob = b; have_blob = true; cur_edges = 0; cur_touched = false;
         }
     };
@@ -182,6 +234,9 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         }
     }
     closeBlob();
+    /// Entries above the last visited blob: never visited => in-degree 0 by definition.
+    while (ri < prior_retired.size())
+        settleEntry(prior_retired[ri++], 0);
 
     writer.finish();
     const String run_bytes = out.str();
