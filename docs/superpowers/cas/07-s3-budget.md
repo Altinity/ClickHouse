@@ -78,11 +78,13 @@ reduction from the baseline 30+ ops.
 (`CasRootShardCodec.cpp:121`) and written as part of the promote `casPut` — **0 extra S3 ops**
 (**code-derived**).
 
-### 1.4 Watermark renewal {#write-budget-watermark}
+### 1.4 Heartbeat renewal {#write-budget-watermark}
 
-Each writer renews its mount-lease heartbeat via one `PUT` per renewal interval. Removed
-per-build `CasBuildPut` heartbeat (B167c: redundant with the watermark, see P0 table,
-`CasBuildPut` ~21 k/23 min — **modeled/uncertain** whether fully removed).
+Each writer renews **one merged heartbeat** per renewal interval: the mount lease, the build
+watermark (`min_active`), and the GC ack (`observed_gc_round`) ride a single `PUT`, plus one
+`gc/state` `GET` to learn the current round (`03 §merged-heartbeat`). This is **−1 PUT** versus the
+former two separate heartbeats (mount lease + standalone watermark object) and **+1 GET**. The
+per-build `CasBuildPut` heartbeat was already removed earlier (B167c: redundant with the watermark).
 
 ### 1.5 Manifest `casPut` contention (write-tier 412s) {#write-budget-cas-contention}
 
@@ -151,63 +153,73 @@ path is used.**
 
 ## 3. GC Budget — per Round {#gc-budget}
 
-A GC round runs four phases: fold (R1), retire (R2), fence (R3), recheck (R4). The pool has `S`
-active ref shards across all namespaces and `C` zero-in-degree blob/tree candidates from the
-fold.
+The regular round is a **single pass**: a heartbeat ack floor, one LIST discovery sweep, one fold
+that runs the three-cursor merge (verify + graduate + condemn), pre-CAS deletes of previously-pending
+entries, and one `gc/state` CAS (`04 §gc-round`). Let `N` = number of live/mounted servers, `S` =
+active ref shards across all namespaces, `S_changed` = shards whose token advanced since last round,
+`C` = newly-condemned zero-in-degree candidates this round, and `G` = entries graduated to physical
+delete this round. The headline: the round is **O(delta) + O(servers)** requests plus **one** LIST
+sweep — no O(universe) GET or PUT phase.
 
-### 3.1 Fold (R1) {#gc-budget-fold}
+> **History (fence + recheck round, superseded 2026-07-02).** The old round ran four phases —
+> fold (R1), retire (R2), fence (R3), recheck (R4) — and R3/R4 were each ~O(universe): the fence
+> was one GET + one CAS-PUT on **every** present root shard (~2×O(universe) GET + O(universe)
+> CAS-PUT per round), and the recheck re-read every fenced shard body plus a per-candidate
+> `inDegreeInGeneration` whole-run re-read. At 100 000 tables × 8 root shards that was **~2.4 M
+> requests (~$4.6) per round**, repeated every round forever. The ack-floor round replaces both
+> phases with the causal floor + three-cursor merge; for the same slowly-changing pool it is
+> **~2 000–3 000 requests (~$0.001–0.01) and seconds** of wall time. The subsections below describe
+> the current round; the old per-phase tables are folded into this history note.
 
-| Step | Operation | Count | Notes |
-|---|---|---|---|
-| Shard discovery | `LIST` (`cas/refs/`) | ⌈`S` / 1000⌉ | One LIST page per 1000 shards (**code-derived**, `discoverUniverse`, `CasGc.cpp:1286`). Returns shard tokens when backend supports them. |
-| LIST-token skip (accelerator) | 0 GETs for skipped shards | `S - S_changed` | If the listed shard token matches the sealed post-fence token, the shard body GET is skipped entirely — no re-read needed (**code-derived**, `CasGc.cpp:1430`). |
-| Shard body read (changed or new) | `GET` | `S_changed` | Only shards whose token changed since last round (i.e. received new events) are fetched. At steady state `S_changed ≪ S`. |
-| Fold-seal write | `PUT` | 1 | One deterministic write-once `foldSealKey` object per round (**code-derived**, `CasGc.cpp:487`). |
-| GC-state CAS (fold-adopt) | `PUT` (`If-Match`) | 1 | One `casPut` advancing `snap_generation` (**code-derived**, `CasGc.cpp:495`). |
-
-**Per-round fold cost (steady state):** ⌈`S`/1000⌉ LISTs + `S_changed` GETs + 2 PUTs. On a
-pool with 64 shards and few changes: 1 LIST + a handful of GETs + 2 PUTs. On a fully churned
-pool: 1 LIST + 64 GETs + 2 PUTs.
-
-### 3.2 Retire (R2) {#gc-budget-retire}
-
-| Step | Operation | Count | Notes |
-|---|---|---|---|
-| Candidate HEAD | `HEAD` | `C` | One HEAD per zero-in-degree candidate to read the current token for `deleteExact` (**code-derived**, `CasGc.cpp:539`; **measured**: dominant HEAD source under GC livelock — see §4). |
-| Retired-set write | `PUT` | ⌈`C`/shard⌉ | One write-once retired-set object per GC shard (`gc/gen/<g>/attempt/<a>/retired/<shard>`, **code-derived**, `CasGc.cpp:598`). |
-| GC-state CAS (round advance) | `PUT` (`If-Match`) | 1 | One `casPut` advancing the round number (**code-derived**, `CasGc.cpp:621`). |
-
-**Per-round retire cost:** `C` HEADs + (⌈`C` / gc_shards⌉ + 1) PUTs. When GC is livelocked
-(`gc_state` CAS fails because a peer also runs), the same candidate set `C` is re-HEADed every
-round. This was the dominant HEAD storm: **measured 51.2 M HEADs/3.3 h** on the GC leader
-(ch1) at 82% 404 miss rate, with ~225 re-probes of the same already-deleted keys (P9 finding,
-P0 soak). **Fix: P9 — prune confirmed-deleted/absent candidates from the fold snap so they are
-not re-observed (TODO, highest-priority remaining op-count work).**
-
-### 3.3 Fence (R3) {#gc-budget-fence}
+### 3.1 Heartbeat ack floor {#gc-budget-floor}
 
 | Step | Operation | Count | Notes |
 |---|---|---|---|
-| Shard discovery (repeat) | `LIST` (`cas/refs/`) | ⌈`S` / 1000⌉ | Second LIST sweep to discover present shards for fencing (**code-derived**, `CasGc.cpp:649`). |
-| Per-shard fence `casPut` | `PUT` (`If-Match`) | `S` | One fence CAS per present shard — appends a fence event to advance `fence_round` (**code-derived**, `CasGc.cpp:655`). |
-| GC-state CAS (fence) | `PUT` (`If-Match`) | 1 | One `casPut` persisting `fence_version[round]` (**code-derived**, `CasGc.cpp:662`). |
+| Heartbeat enumeration | `LIST` (`gc/server-roots/`) + `GET` | 1 LIST + `N` GETs | LIST the server roots, GET each mount body to classify live/terminated/expired and read `observed_gc_round` (`computeHeartbeatFloor`). `N` is single-digit. |
+| Expired-mount fence-out | `PUT` (`If-Match`) | rare (`≤` expired count) | A token-guarded `putOverwrite` setting `gc_fenced` on a lease-expired mount; only when a server actually died. |
 
-**Per-round fence cost:** 2·⌈`S`/1000⌉ total LISTs (fold + fence) + `S` + 1 PUTs.
-**Desirable optimization:** fence only dirty shards (those with pending retires) rather than all
-`S` shards (P6 proposal — **TODO/DESIRABLE**).
+**Per-round floor cost:** 1 LIST + `N` GETs (+ rare fence-out PUT). This is the round's only clock
+and its only server-proportional cost.
 
-### 3.4 Recheck (R4) {#gc-budget-recheck}
+### 3.2 Discovery + fold + three-cursor merge {#gc-budget-fold}
 
 | Step | Operation | Count | Notes |
 |---|---|---|---|
-| Post-fence shard token read | `HEAD` or LIST-cached | `S_fenced` | Reads the post-fence token for each fenced shard (**code-derived**, `CasGc.cpp:721`). Can use the fence `casPut` response token where the backend returns it; otherwise a HEAD. |
-| Shard body re-read (fold-through-fence) | `GET` | `S_fenced` | Re-reads each fenced shard body to fold the events between cursor and fence (**code-derived**). |
-| `deleteExact` (blob/tree deletes) | `DELETE` | `C_confirmed` | Exact-token deletes for confirmed zero-in-degree candidates (**code-derived**, `CasObjectStorageBackend.cpp:522`). **DELETE is free on AWS.** |
-| Completion-seal write | `PUT` | 1 | One deterministic write-once `completionSealKey` object (**code-derived**, `CasGc.cpp:992`). |
-| GC-state CAS (completion) | `PUT` (`If-Match`) | 1 | One `casPut` finalizing the round (**code-derived**, `CasGc.cpp:1007`). |
+| Shard discovery | `LIST` (`cas/refs/`) | ⌈`S` / 1000⌉ | The round's single LIST sweep of the ref universe (**code-derived**, `discoverUniverse`). Returns shard tokens when the backend supports them. (Currently O(N²) over `roots/` on a real backend — see §backlog GC-DISCOVERY-LIST-QUADRATIC in `08-testing-and-soak.md`.) |
+| LIST-token skip (accelerator) | 0 GETs for skipped shards | `S - S_changed` | If the listed token matches the sealed folded token, the shard body GET is skipped. Clamped-coverage shards (`classification = 4`) are never skipped (`04 §three-cursor-merge`). |
+| Shard body read (changed) | `GET` | `S_changed` | Only shards whose token advanced. At steady state `S_changed ≪ S`. |
+| Prior retired-run read | `GET` | `gc_shards` | One GET per gc-shard for the third merge cursor (the current retired list from `retired_refs`). |
+| Newly-condemned candidate HEAD | `HEAD` | `C` | One HEAD per blob the merge newly condemns, to capture its exact token. Only **new** candidates — a previously-condemned entry stays in the retired list and is re-verified from the fold, not re-HEADed. |
+| In-degree run write | `PUT` | `gc_shards` | New snapshot run per gc-shard (deterministic). |
+| Retired-run write | `PUT` | `gc_shards` | New current retired list per gc-shard (always, even empty; observation-bearing). |
+| Fold-seal write | `PUT` | 1 | One deterministic write-once fold seal per round. |
 
-**Per-round recheck cost:** `S_fenced` HEADs + `S_fenced` GETs + `C_confirmed` DELETEs (free) +
-2 PUTs.
+**Per-round fold cost (steady state):** ⌈`S`/1000⌉ LIST + (`S_changed` + `gc_shards`) GETs + `C`
+HEADs + (2·`gc_shards` + 1) PUTs. The condemn-time HEAD is bounded by `C` (new candidates), not by
+the cumulative deleted set — the P9 node-forgetting + retained retired list keep the old 404-HEAD
+storm (§4) from recurring.
+
+### 3.3 Deletes and the single CAS {#gc-budget-deletes}
+
+| Step | Operation | Count | Notes |
+|---|---|---|---|
+| `deleteExact` (previously-pending graduates) | `DELETE` | `G` | Exact-token deletes for entries published `delete_pending` by the *previous* round (two-phase graduation, `04 §two-phase-graduation`). **DELETE is free on AWS.** |
+| Manifest-body `deleteExact` | `DELETE` | per cleanup | Delete-after-adopted-decrements; free. |
+| Outcome-log write | `PUT` | ⌈outcomes/shard⌉ | Observation-bearing outcome log per gc-shard (`putIfAbsent`-adopt). |
+| Single `gc/state` CAS | `PUT` (`If-Match`) | 1 | The **only** CAS per round: publishes `round`, adopted generation/attempt, `retired_refs`, folded cursors, `snap_pruned_through`. |
+
+**Per-round delete/CAS cost:** `G` (+ cleanup) DELETEs (free) + ⌈outcomes/shard⌉ + 1 PUTs. Physical
+deletion lags condemnation by one pass (condemn → pending → delete), an intentional
+two-phase-graduation property, not extra requests.
+
+### 3.4 Remaining cost axis: snapshot-rewrite bytes {#gc-budget-bytes}
+
+The ack-floor round removed the request-count blow-up, but each pass still **rewrites the full
+snapshot run per gc-shard** — O(active edges) **bytes** (not requests) per round. With rounds now
+cheap and frequent, this byte volume becomes the next dominant GC cost. The fix is delta-runs +
+periodic compaction, which is exactly the deferred O(buffer) streaming-merge work
+(`deferred_backlog/2026-07-01-cas-gc-runfile-obuffer-streaming.md`; also
+`08-testing-and-soak.md §backlog` and `ROADMAP.md`). Out of scope for the fence redesign.
 
 ### 3.5 Snap prune (per round, amortized) {#gc-budget-snap-prune}
 
@@ -218,7 +230,7 @@ Old generation artifacts (`gc/gen/<g>/`) are reclaimed once they age past a rete
 |---|---|---|---|
 | LIST `gc/gen/<g>/` prefix | `LIST` | ≤ 64 × ⌈objects/1000⌉ | One LIST per generation per prune burst (**code-derived**, `CasGc.cpp:1238`). Bounded by `kMaxPrunePerRound = 64`. |
 | DELETE each listed artifact | `DELETE` | objects listed | Free on AWS. |
-| GC-state CAS (snap_pruned_through) | `PUT` (`If-Match`) | included in recheck CAS | Folded into the same `casPut` as the completion seal (**code-derived**). |
+| GC-state CAS (snap_pruned_through) | `PUT` (`If-Match`) | included in the round CAS | `snap_pruned_through` rides the single `gc/state` CAS (§3.3); the prune runs before it. |
 
 **Previous design (removed):** an extra per-round LIST of the current-generation fold prefix to
 clean up deposed-leader debris. This was eliminated in favor of the wholesale generation-retain
@@ -229,16 +241,18 @@ prune, saving one LIST per round on the common (single-leader) path (**code-deri
 
 | Phase | PUTs | HEADs | GETs | LISTs | DELETEs |
 |---|---|---|---|---|---|
-| Fold (R1) | 2 | 0 | `S_changed` | ⌈`S`/1000⌉ | 0 |
-| Retire (R2) | ⌈`C`/gc_shards⌉ + 1 | `C` | 0 | 0 | 0 |
-| Fence (R3) | `S` + 1 | 0 | 0 | ⌈`S`/1000⌉ | 0 |
-| Recheck (R4) | 2 | `S_fenced` | `S_fenced` | 0 | `C_confirmed` (free) |
+| Heartbeat floor | rare fence-out | 0 | `N` | 1 | 0 |
+| Discover + fold + merge | 2·`gc_shards` + 1 | `C` | `S_changed` + `gc_shards` | ⌈`S`/1000⌉ | 0 |
+| Deletes + CAS | ⌈outcomes⌉ + 1 | 0 | 0 | 0 | `G` (+ cleanup, free) |
 | Snap prune | 0 | 0 | 0 | ≤ 64 × pages | `C_pruned` (free) |
-| **Total (steady state, `S`=64, `C`=0)** | **~70** | **~64** | **~64** | **~3** | **0** |
-| **Total (livelocked, `C`=10k)** | **~80** | **~10,064** | **~64** | **~3** | **0** |
+| **Total (steady state, `S`=64, `gc_shards`=8, `N`=2, `C`=0)** | **~20** | **~0** | **~12** | **~2** | **0** |
+| **Total (churned, `C`=64, `G`=64)** | **~20** | **~64** | **~76** | **~2** | **~64 (free)** |
 
-The livelock scenario (P9 finding) shows why `C` must be bounded by pruning confirmed-deleted
-candidates from the in-degree snapshot.
+There is no livelock-amplified O(universe) phase to blow up any more: the fence and recheck are
+gone, `C` counts only **newly** condemned blobs (not the cumulative deleted set, which P9 node
+forgetting keeps out of the candidate set), and the round issues exactly one CAS. On a real backend
+the LIST sweep is still O(N²) over `roots/` today — the outstanding discovery-LIST fix (§backlog) —
+which is the round's remaining scalability item, not a per-phase O(universe) GET/PUT.
 
 ---
 
@@ -257,7 +271,9 @@ Each row is one optimization, the problem it solved, and its measured or modeled
 | **P9 — GC 404-HEAD storm** | Prune confirmed-deleted/absent candidates from the fold in-degree snapshot so they are not re-HEADed on subsequent rounds | Removes the dominant HEAD source: **~90% of all read ops** on the GC leader = ~3.8 M / 23 min = ~367 M / day at `workers=2` (**measured**, P0 soak `CasBlobHeadMiss` + `CasTreeHeadMiss`); eliminates the livelock amplification | **TODO** (P9 proposal) | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P9 |
 | **P3 — replication relink** | Replica `DownloadPart` adopts the existing manifest refs rather than re-downloading each blob | Removes ~15 HEADs + 15 GETs per replicated part (**measured**, ~53 k parts / 95 min at `workers=2`) | **DESIRABLE** (P3 proposal) | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P3 |
 | **P4 batch publishes** | Commit multiple parts in one manifest CAS | Cuts `casPut` count + 35% CAS-conflict rate (**measured**) + per-shard write churn | **DESIRABLE** (B157/B149) | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P4 |
-| **P6 dirty-only fence** | Fence only shards with pending retires rather than all `S` shards | Removes `S - S_dirty` fence PUTs per round | **DESIRABLE** (P6 proposal) | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P6 |
+| **P6 dirty-only fence** | Fence only shards with pending retires rather than all `S` shards | Would have removed `S - S_dirty` fence PUTs per round | **SUPERSEDED** by the ack-floor round | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P6 |
+| **Ack-floor GC round** | Replace the per-round all-shard fence + fold-through-fence recheck with a causal ack floor + one three-cursor merge; deletion gated by `condemn_round < min_ack` over live-server heartbeats | Removes both O(universe) phases: ~2×O(universe) GET + O(universe) CAS-PUT per round → O(delta)+O(servers) + 1 LIST sweep. ~2.4 M req/round → ~2–3 k req/round at 100k tables × 8 shards (**modeled**) | **DONE** (`cas-gc-ack-floor-fence`; soak validation TODO) | `specs/2026-07-02-cas-gc-ack-floor-fence-redesign.md` |
+| **Merged heartbeat** | Fold the per-server build-watermark PUT into the mount-lease beat; add one `gc/state` GET | −1 PUT / +1 GET per writer beat | **DONE** (`cas-gc-ack-floor-fence`) | same spec, Task 6 |
 
 ---
 
@@ -306,5 +322,5 @@ amplification factor, and GC round cadence.
 - `docs/superpowers/reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` — P0–P9 proposals + corrected cost table.
 - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.cpp` — write path; `putBlob`, `precommitAdd`, `promote`.
 - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.cpp` — `readShardDecoded`, `resolveRef`, `readManifest`, dedup-cache API.
-- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp` — GC round: `fold`, `retire`, `fence`, `recheck`, `snapPruneOldGenerations`, `discoverUniverse`, `computeDiscoverDecisions`.
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp` — GC round: `runRegularRound` (heartbeat floor → fold + three-cursor merge → pre-CAS deletes → single CAS), `snapPruneOldGenerations`, `discoverUniverse`, `computeDiscoverDecisions`. `computeHeartbeatFloor` in `CasServerRoot.cpp`.
 - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.cpp` — `nativeConditionalPut` (ETag capture), `deleteExact`.

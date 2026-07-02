@@ -61,8 +61,9 @@ Steps run in strict order; failure at any step aborts the open:
    - Fresh empty root: first epoch handed out is 1 (0 is reserved as the "no epoch" sentinel;
      `UINT64_MAX` is the retired sentinel).
 
-4. **Mount lease — liveness** (`claimMount`, `CasServerRoot.cpp`).
-   The pool key `gc/server-roots/<srid>/mount` holds a `MountLease{server_uuid, writer_epoch, hostname, pid, seq, expires_at_ms}`.
+4. **Mount lease — liveness + merged heartbeat** (`claimMount`, `CasServerRoot.cpp`).
+   The pool key `gc/server-roots/<srid>/mount` holds a
+   `MountLease{server_uuid, writer_epoch, hostname, pid, seq, expires_at_ms, min_active, observed_gc_round, gc_fenced}`.
    - Foreign UUID → `ForeignOwner`, open aborts.
    - Same UUID + same epoch → adopt (idempotent restart, e.g. `seq+1` refresh).
    - Same UUID + different epoch + lease live → `LiveDoubleStart`, open aborts (another incarnation
@@ -71,12 +72,51 @@ Steps run in strict order; failure at any step aborts the open:
    The `MountLeaseKeeper` background thread renews the lease every `mount_renew_period` and on
    failure latches the local write fence (`tripMountLost`). The **local write fence** (checked by
    `mayMutate` before every `mutateShard`) enforces that a superseded writer does not race the
-   live one without any S3 read.
+   live one without any S3 read. A GC fence-out (`gc_fenced`, `04 §heartbeat-floor`) lands as a
+   foreign-touch on the renewal and trips `tripMountLost` permanently for this incarnation.
 
-5. **Per-server watermark** (`WatermarkKeeper`, `CasStore.cpp`).
-   Anchored AFTER epoch allocation so it carries the durable `writer_epoch`. Must be durable before
-   any ordinary data write (W-ANCHOR). The watermark is used by GC to protect in-flight builds
-   from premature condemnation (see §Build lifecycle and `04-gc-protocol.md`).
+   The **build watermark and the GC ack are carried in this same body** — there is no separate
+   watermark object. `min_active` is the orphan-sweep floor (`04 §manifest-cleanup`) and
+   `observed_gc_round` is the ack the GC heartbeat floor reads. See §merged-heartbeat below for the
+   beat itself.
+
+---
+
+### Merged heartbeat: lease + watermark + ack in one beat {#merged-heartbeat}
+
+**Status: DONE** (`cas-gc-ack-floor-fence`, `CasStore.cpp`, `CasServerRoot.cpp`).
+
+The standalone per-server watermark object and its `WatermarkKeeper` are **removed**: the build
+watermark folded into the mount lease, so one `SingleWriterSlot` subclass, one background thread, and
+one PUT per beat carry the lease extension, `min_active`, and the GC ack together (net **−1 PUT** per
+beat versus two heartbeats, **+1 GET** for the `gc/state` probe). The `MountLeaseKeeper`'s
+`observed_round_fn` runs the beat:
+
+`Store::refreshViewForBeat` (every `T_renew`):
+
+1. `GET gc/state`. On failure, skip steps 2–3 (the ack does not advance) but still attempt the
+   lease renewal — lease renewal is availability-critical, and a stale ack only stalls deletions
+   globally, which is safe.
+2. If `gc/state.round > view_round`, `GET` the current retired-list runs (per gc-shard, from
+   `retired_refs`). Any failure leaves the ack unadvanced this beat.
+3. **Drain and swap:** take `view_gate` exclusive — this waits until every in-flight `mutateShard`
+   that started under the old view has fully completed (its CAS response received; `mutateShard`
+   holds `view_gate` shared for its **whole** call) — then install the new retired view.
+4. `putOverwrite` the mount body: lease extension + `min_active` + `observed_gc_round = view_round`.
+   Token-guarded as before; a `PreconditionFailed` is a foreign touch ⇒ `tripMountLost`.
+
+**Drain (the writer-side safety of the ack):** because the ack is advertised strictly *after* every
+old-view commit's CAS response, a heartbeat carrying `observed_gc_round = A` proves no commit with a
+view older than `A` is still in flight from that server. **Monotone-ack invariant:**
+`observed_gc_round` never decreases and is never advertised above a view that is actually installed
+and drained.
+
+**Open ordering (writable open):** claim heartbeat (the S13 claim protocol; `gc_fenced` incarnations
+are simply superseded by the epoch bump) → load `gc/state` + retired list → stamp `observed_gc_round`
+via an immediate beat → **only then** enable mutations. This closes the new-mount-during-pass race:
+a mount the GC enumeration missed necessarily finished its creation PUT after the pass's round was
+already durable, so its first loaded view is ≥ that round. `doStart` anchoring the mount already
+carries an ack from a post-claim `gc/state` read, so the order holds by construction.
 
 ---
 
@@ -184,6 +224,17 @@ is materialized into memory only once (the rare case), not on the common path.
 Revival = a fresh re-upload from the writer's own source bytes. `Build::resurrect` (which did a
 GET-from-existing) was deleted; `uploadFromSource` is the sole revival primitive.
 
+**Ack-floor commit gate (recreate a retired incarnation, do not adopt it):** under the ack-floor
+protocol a writer checks each blob leaf against its in-memory retired list (refreshed by the merged
+heartbeat, §merged-heartbeat). A listed `(hash, current_token)` is a **condemned incarnation and is
+never referenced**. This recreate is performed by the existing `Build::putBlob` cold-reuse rule —
+the `PreconditionFailed`-then-condemned branch below re-uploads from source with a fresh token
+(`uploadFromSource`, INV-1), on the *retried* build; it is not a new gate code path. The `promote`
+gate itself stays fail-closed `ABORTED` (build-local sources are not retained at promote time; a
+promote-time in-place recreate is a possible follow-up). This closes the condemned-adoption gap: a
+plain `putIfAbsent` HEAD-hit would otherwise adopt the condemned incarnation that a GC round is about
+to delete. The write path gains **zero** S3 operations in the common (not-condemned) case.
+
 **Dedup** (HEAD-before-PUT, `CasBlobHeadFirst`): if the dedup cache signals the blob is present, or
 the blob is large (≥ `dedup_head_first_min_bytes`), a HEAD is issued first. A present HEAD →
 `observeAndAdmit` (free, no body upload). A stale/absent HEAD → falls through to `uploadFromSource`.
@@ -207,9 +258,13 @@ Once all blobs are uploaded, `Build::promote` performs the **fail-closed commit*
 1. Read and validate the manifest body (one streaming GET; absent or mismatched → `ABORTED`,
    never commits a dangle).
 2. Check `RefMatchesBody` and `ManifestNamespaceMatches`.
-3. **Retire-view fence gate** (registry-free create-ordering, `fence_round`): if the store's retire
-   view is behind the shard's `fence_round`, refresh it before the blob revalidation. This ensures
-   condemnations from the GC round in which the shard was born are visible before committing.
+3. **Birth-floor retire-view gate** (`fence_round`): if the store's retire view is behind the
+   shard's `fence_round`, refresh it before the blob revalidation. Under the ack-floor protocol
+   `fence_round` is **only the birth floor** stamped once at shard creation (it is no longer bumped
+   per round — `04 §heartbeat-floor` History), so this gate now fires only on a newborn shard,
+   ensuring condemnations from the GC round in which the shard was born are visible before
+   committing. Pool-global retire-view freshness on the steady path comes from the merged heartbeat
+   beat (§merged-heartbeat), not this gate.
 4. Verify the precommit binding is still the live owner (not removed by abandon or GC reclaim).
 5. Append a `promote` `RootOwnerEvent` to the shard — a pure owner MOVE, no blob delta:
    ```
@@ -336,14 +391,15 @@ B199-S2 before full implementation (model the inline-closure expansion + abandon
 
 ## Build lifecycle and GC protection {#build-lifecycle}
 
-**Status: DONE** (watermark: `CasStore.cpp`; precommit protection: `CasBuild.cpp`, `CasGc.cpp`).
+**Status: DONE** (watermark in the merged heartbeat: `CasStore.cpp`, `CasServerRoot.cpp`; precommit protection: `CasBuild.cpp`, `CasGc.cpp`).
 
 A `Build` is in one of three states at any time:
 
 1. **In-flight** (`alive = true`): the build is between `startBuild` and `publish`/`abandon`.
    Protected by two mechanisms:
    - **Watermark**: `build_seq` ≥ `min_active` of the live server with matching epoch → GC skips
-     condemning the build's in-flight objects.
+     condemning the build's in-flight objects. `min_active` is carried in the mount-lease body and
+     refreshed by the merged heartbeat beat (§merged-heartbeat).
    - **Precommit edge**: after `precommitAdd`, every object in the manifest closure has a
      GC-understood build-root edge (in-degree ≥ 1 once the fold barrier activates).
 2. **Finished** (`publish` or `abandon` ran, or dtor): `retireBuildSeq` removes `build_seq` from
@@ -596,7 +652,8 @@ See `07-s3-budget.md` for the full breakdown. Summary per part:
 
 ### DONE {#status-done}
 
-- Mount startup: owner anchor, durable `writer_epoch`, mount lease, watermark anchor.
+- Mount startup: owner anchor, durable `writer_epoch`, mount lease (with the merged build-watermark +
+  GC-ack heartbeat; the standalone watermark object and `WatermarkKeeper` are removed).
 - `build_seq` strictly-monotone active-set watermark; GC condemn guard.
 - Four-phase write path (spill+hash → precommit → upload → promote).
 - Precommit-first invariant (INV-2) enforced at `precommitAdd`, `republishRef`, `createHardLink`.
@@ -631,7 +688,8 @@ See `07-s3-budget.md` for the full breakdown. Summary per part:
   was revocable.
 - **Per-build heartbeat object** (`builds/<build_id>` key, B167 Part B reverted): leaked on
   successful publish (only `abandon` cleaned it up), breaking
-  `DeletedCandidateDoesNotReappear`. Replaced by the per-server watermark.
+  `DeletedCandidateDoesNotReappear`. Replaced by the per-server watermark (now itself merged into the
+  mount-lease heartbeat, §merged-heartbeat).
 - **`resurrect` via GET-from-existing** (`Build::resurrect`, deleted B190): races with GC delete
   in the HEAD→GET window; bodyless gate path had no fallback. Replaced by `uploadFromSource`.
 - **Body retention in RAM** (the `retained_blobs` draft): column blobs can be gigabytes; rejected

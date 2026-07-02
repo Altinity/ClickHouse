@@ -70,20 +70,30 @@ See [`04-gc-protocol.md`](04-gc-protocol.md) for full detail.
 | Item | Status | Notes |
 |------|--------|-------|
 | GC leader election, lease, and advisory heartbeat | **DONE** | Lease prevents concurrent leaders; heartbeat (B160) reduces stale-lease wait |
-| Round: fold → retire → fence → recheck → exact-token delete | **DONE** | Core protocol; TLA+-proved |
+| One-pass ack-floor round (heartbeat floor → three-cursor merge → single `gc/state` CAS) | **DONE** | On `cas-gc-ack-floor-fence`; replaces fence+recheck; O(delta)+O(servers) per round; soak validation TODO. See [`04-gc-protocol.md §gc-round`](04-gc-protocol.md) |
+| Merged heartbeat (mount lease ∪ build watermark ∪ GC ack in one beat) | **DONE** | `WatermarkKeeper` + `CAWM` object removed; `MountLease` carries `min_active`, `observed_gc_round`, `gc_fenced`; −1 PUT/beat |
+| Two-phase graduation (`delete_pending`) | **DONE** | Zombie-safe: pre-CAS deletes only for previously-published pendings; deletion lags condemn by one pass |
+| Ack-floor TLA+ gate (`CaGcAckFloorCore` + `CaGcAckFloorZombie`) | **DONE** | 7 sabotages + 3 witnesses; `delete_pending` proved load-bearing; floor-before-cut order invariant. See [`06-tla-models.md §area-ackfloor`](06-tla-models.md) |
+| Per-round all-shard fence + fold-through-fence recheck | **REJECTED** (replaced by ack-floor) | Were ~2×O(universe) GET + O(universe) CAS-PUT per round; the causal ack floor gives the same create-ordering + spare guarantees without per-shard fence writes |
 | Attempt-scoped generations (deposed leader's artifacts under unadopted attempt) | **DONE** | Fixes GC-CONCURRENT-LEADER-LEAK; every per-round artifact keyed by `(gen, attempt = lease.seq)` |
 | Source-edge in-degree set (replaced integer count) | **DONE** | Eliminates undercount under concurrent leaders; `(blob_hash, source_id)` edge per manifest entry |
 | Snap prune (retention prune of old GC generation artifacts) | **DONE** | Prevents unbounded `gc/gen/*/` growth |
 | D1: shard-object reclaim + shard incarnation (namespace reclaim without a registry) | **DONE** | Prevents monotone GC fanout from repeated create/drop |
 | Orphan part-manifest sweep (reclaim unreachable `cas/manifests/` objects) | **DONE** | `CasOrphanManifestSweep`; uses build watermark |
 | GC-CONCURRENT-LEADER-LEAK (reclaim liveness bug) | **DONE** (see REJECTED / FIXED above) | Root cause: non-atomic fold-seal + `gc/state` CAS; fixed by attempt-scoped generations |
+| Ack-floor round soak validation | **TODO** | Kill-mid-burst spare-then-recondemn (no dangle); SIGSTOP writer holds then releases the floor; O(delta)+O(servers) request-count regression guard. See [`08-testing-and-soak.md §backlog`](08-testing-and-soak.md) |
+| Ack-floor observability (Task 11) | **TODO** | Per-server `observed_gc_round`-vs-round lag ProfileEvent + WARNING when a live server holds the floor; retired-list size / oldest-entry age in the round report |
+| `mayMutate` fence deadline on `CLOCK_BOOTTIME` (Task 12) | **TODO** | `steady_clock` does not advance across a VM suspend; switch the write-fence deadline to a boottime clock so a resumed VM cannot re-arm the fence (container pause already safe) |
+| Delta-runs + compaction for the snapshot (bytes O(edges)/pass) | **DESIRABLE** | With cheap frequent rounds, the full snapshot rewrite per pass is the next dominant cost; the deferred O(buffer) streaming-merge work (`deferred_backlog/2026-07-01-cas-gc-runfile-obuffer-streaming.md`) |
+| `process_epoch` → `writer_epoch` stamp unification | **DESIRABLE** | The writable path already sets `process_epoch = writer_epoch`; unify the manifest `writer_instance_id` stamps |
+| Promote-time in-place recreate of a condemned blob | **DESIRABLE** | Today the promote gate stays fail-closed `ABORTED` (build-local sources not retained at promote); recreate happens on the retried build via `putBlob` cold-reuse |
 | GC discovery O(N²) LIST quadratic over `roots/` | **TODO** | `listRootShardTokens` re-enumerates the whole prefix per page; fix: real paginated list at backend |
 | Common-shard-prefix for GC discovery (IDEA-COMMON-SHARD-PREFIX-SINGLE-LIST) | **DESIRABLE** | Relocate shard objects to one flat prefix → GC discovery = a single LIST; pre-release layout change is free |
 | Run-file O(buffer) streaming | **DESIRABLE** (deferred) | `RunFileReader` materializes whole run in memory; two-cursor merge is streaming but inputs are not; fix requires ranged reads in `CasObjectStorageBackend` + streaming `RunFileReader` interface |
-| `inDegreeInGeneration` O(candidates × runsize) | **DESIRABLE** (B10 minor) | Each recheck re-streams the generation run; revisit if round candidate set grows large |
+| `inDegreeInGeneration` O(candidates × runsize) | **RESOLVED** by the ack-floor round | The per-candidate recheck whole-run re-read is gone — the retired cursor rides the single three-cursor merge; the function remains only for preview/tests |
 | `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION [<disk>]` command | **DONE** | Synchronous explicit GC trigger; logs to `system.content_addressed_garbage_collection_log` |
-| GC S3 budget: HEAD storm (B148) — `resolveRef` HEAD per warm hit + retire HEAD per candidate | **TODO** (HARD release gate) | Dominant request bill; fix requires stored-token or structural caching |
-| B168 op-count reduction program (P4/P6/P7/P8: fewer metadata writes, dirty-only fence/fold) | **PARTIAL** | Some items done; remainder tracked in `07-s3-budget.md §reduction-history` and this roadmap |
+| GC S3 budget: HEAD storm (B148) — `resolveRef` HEAD per warm hit + condemn HEAD per **new** candidate | **PARTIAL** | The retire/recheck O(universe) HEAD+GET phases are gone (ack-floor round); the remaining condemn HEAD is bounded by newly-condemned candidates, and the discovery LIST is now the dominant scale item (see the O(N²)-LIST row) |
+| B168 op-count reduction program (P4/P7: fewer metadata writes) | **PARTIAL** | Some items done; the fence-related items (P6 dirty-only fence) are moot — the fence is gone (ack-floor round). Remainder tracked in `07-s3-budget.md §reduction-history` |
 
 ---
 
@@ -121,7 +131,7 @@ See [`07-s3-budget.md`](07-s3-budget.md) for the full breakdown.
 | HEAD storm at retire (per-candidate HEAD in retire, not stored token) | **TODO** | B148; dominant cost at scale; stored-token optimization deferred (requires manifest schema change) |
 | Root-shard fan-out vs per-object permit cap (B158: raise `root_shards`) | **TODO** | Reduces CAS contention at high insert rate |
 | `RENAME` = one Build/part (B111) | **DESIRABLE** | Currently multiple root-shard updates per rename |
-| Dirty-only fence/fold (B168 P4/P6/P7/P8) | **PARTIAL** | Reduces unnecessary metadata writes |
+| Ack-floor round (removes the O(universe) fence + recheck phases) | **DONE** | The per-round all-shard fence is gone; dirty-only-fence (P6) is superseded. See `07-s3-budget.md §gc-budget` |
 
 ---
 

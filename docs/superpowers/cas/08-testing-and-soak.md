@@ -61,7 +61,7 @@ error — convergence to zero is validated by the soak harness after a forced GC
 
 `clickhouse-disks ca-gc-dryrun --disk <ca_disk_name>` opens the disk read-only and derives the set
 of objects the next GC round **would** delete, from the durable `gc/snap` (in-degree graph) and
-`gc/state` (round/fence/retire epochs) — zero CAS writes and zero deletes.
+`gc/state` (round + `retired_refs`) — zero CAS writes and zero deletes.
 
 The key assertion (verified by the soak harness at every quiesced checkpoint):
 
@@ -149,6 +149,31 @@ FROM system.content_addressed_log
 WHERE disk_name = 'ca' AND ref_name = '<part_name>'
 ORDER BY event_time;
 ```
+
+### 2.3 GC unit-test suites (ack-floor round) {#gc-unit-suites}
+
+The one-pass ack-floor round (`04 §gc-round`) is exercised by these gtest suites (`src/Disks/tests/`,
+`InMemoryBackend` with injected clocks/hooks):
+
+| Suite | File | What it covers |
+|---|---|---|
+| `CasGcAckFloor` | `gtest_cas_gc_ack_floor.cpp` | The protocol: condemn → `delete_pending` → exact-token delete pipeline; `NoOpRoundDoesNotMutateRefShards`; stale-ack-holds-the-floor; pre-ack publish spares; expired-mount fenced-out-and-excluded; recreated-blob delete is `TokenMismatch`-ok. Ported from `gtest_cas_gc_fence_recheck.cpp` (the fence test dropped, recheck/completion tests ported). |
+| `CasHeartbeatFloor` | `gtest_cas_mount.cpp` | `computeHeartbeatFloor` classification (live / terminated / expired) and the token-guarded fence-out (sleeper renewal permanently fails; a concurrent renewal wins ⇒ reclassified live). |
+| `CasStoreBeat` | `gtest_cas_store.cpp` | The merged beat: ack advances only after the view load; the drain blocks the ack while a mutation is in flight; a `gc/state` read failure leaves the ack unchanged. |
+| `CasThreeCursorMerge` | `gtest_cas_blob_indegree.cpp` | The three-cursor merge rules — spare / graduate→pending / condemn, including the `condemn_round = min_ack − 1` vs `= min_ack` boundary. |
+| `CasHeartbeat` | `gtest_cas_mount.cpp` / codecs | The merged keeper body (lease + `min_active` + `observed_gc_round`); `CAWM` watermark object gone. |
+| `CasGcReplay` | `gtest_cas_gc_*` | Crash-replay idempotence (renamed from the old resume suite): crash after artifacts but before the CAS ⇒ re-run under a fresh attempt succeeds; already-executed deletes land on `NotFound`. |
+
+**The reclaim-loop pattern (load-bearing for every reclaim assertion).** Because a blob is no longer
+deleted in the round that folds its removal, a test that asserts deletion must **run enough rounds
+AND advance the ack between them**: the pipeline is condemn at round K → `delete_pending` at the
+first pass whose floor `min_ack > K` → physical delete the pass after that (with all acks current:
+condemn K → pending K+1 → deleted K+2). Helpers `runRoundsUntilAbsent` / `blobAbsent` /
+`currentRetiredSet` drive this; each round calls `store->renewWatermarkOnce()` (runs the beat so
+`observed_gc_round` follows the committed round), and fixpoint loops continue while the current
+retired list still holds an in-flight entry. A test failing because a blob is deleted *later* than
+the old protocol is expected drift; a test failing because a **referenced** blob is deleted, or an
+in-degree double-count appears, is a real bug.
 
 ## 3. Scenario suite (S01–S35) {#scenario-suite}
 
@@ -346,3 +371,10 @@ The authoritative finding log is `utils/ca-soak/scenarios/BACKLOG.md` (newest at
   Deferred until scale demands it (see `deferred_backlog/2026-07-01-cas-gc-runfile-obuffer-streaming.md`).
 - **S10, S19, S20, S21 harness bugs**: replica-agreement race (missing `SYNC REPLICA`), `FINAL` on
   wrong engine type, per-node counter scoping — to be fixed in the harness (not product bugs).
+- **Ack-floor round soak validation** (TODO): the one-pass ack-floor round (`04 §gc-round`) is
+  implemented and unit/TLA+-covered but not yet soak-validated. Needed: hard-KILL a writer
+  mid-commit-burst and verify the next rounds spare-then-recondemn correctly (no dangle in `fsck`);
+  a paused (SIGSTOP) writer holds the floor, then resumes, acks, and the floor advances; a scenario
+  asserting per-round request counts stay O(delta)+O(servers) — a regression guard against
+  reintroducing a universe sweep of GET/PUTs. Deletion latency is now condemn → pending (first
+  floor-pass) → delete (next pass), so soak fixpoint loops must advance acks between rounds.

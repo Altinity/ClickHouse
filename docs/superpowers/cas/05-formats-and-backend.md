@@ -35,7 +35,7 @@ Three object kinds exist; a fourth (`Pack`) was removed (see Rejected section).
 | **Blob** | no | yes | 256-B header (`CABL`) + raw file bytes |
 | **Tree** | no | yes | 256-B header (`CATR`) + catalog + inline-data section |
 | **Root shard** (manifest/journal) | yes | no | protobuf — `clickhouse.cas.format` package |
-| **GC/control objects** (`gc/state`, `watermark`, `pool-meta`, etc.) | yes | no | protobuf |
+| **GC/control objects** (`gc/state`, mount/heartbeat, `pool-meta`, retired list, etc.) | yes | no | protobuf |
 
 The decisive split: **content-addressed ⇒ binary; mutable ⇒ protobuf.** JSON was used for small
 control objects in earlier iterations and is now fully abandoned (`specs/2026-06-24-cas-schema-evolution-framework-design.md`
@@ -63,9 +63,12 @@ The CMake target name `clickhouse_cas_proto` is unchanged.
 
 Every object in the pool carries a self-describing header with three invariants:
 
-- **magic** — 4-byte ASCII type tag (`CABL`, `CATR`, `CARS` root-shard, `CAPM` pool-meta, `CAWM`
-  watermark, `CAGT` gc-state, `CART` retired-set, `CAHB` heartbeat, `CAGO` gc-outcomes). Sanity
+- **magic** — 4-byte ASCII type tag (`CABL`, `CATR`, `CARS` root-shard, `CAPM` pool-meta,
+  `CAGT` gc-state, `CART` retired-set, `CAHB` heartbeat/mount, `CAGO` gc-outcomes). Sanity
   check only — no CRC; integrity comes from S3 ETag and content-addressing for hashed objects.
+  (The standalone `CAWM` watermark object was removed when the build watermark merged into the
+  mount-lease heartbeat — see `03 §merged-heartbeat`; its `min_active` / `observed_gc_round` fields
+  now live in the `CAHB` mount body.)
 - **`writer_version`** — forensic: which build wrote this object.
 - **`compatibility_version`** (`min_reader_version` in earlier plans) — functional write-down-to-floor:
   a reader must fail-closed (`UNKNOWN_FORMAT_VERSION`) if `compatibility_version > G_BUILD`.
@@ -256,20 +259,21 @@ layout exactly.
   roots/<server_root_id>/          per-server mutable state mirror
       _files/<name>                verbatim namespace files
   gc/
-    state                          GC epoch state
-    hb                             advisory heartbeat (B160)
+    state                          GC lease/round state + retired_refs (ack-floor)
+    hb                             advisory GC-leader heartbeat (B160)
     gen/<gen>/attempt/<attempt>/
       fold_seal
-      completion_seal
       blob_target/<shard>/<seq>
       part_manifest_cleanup/<owner_shard>/<seq>
-      retired/<round>/<shard>
+      retired/<round>/<shard>      current retired-list run (referenced by gc/state.retired_refs)
       outcomes/<round>/<shard>
     checkpoint/<version>
     server-roots/<server_root_id>/
-      owner / epoch / mount / watermark
+      owner / epoch / mount        (mount body carries min_active + observed_gc_round)
   _pool_meta                       pool identity + format version
 ```
+
+The `completion_seal` and the standalone `_watermark` object are **gone**: the ack-floor round has one CAS (no completion phase), and the build watermark merged into the `mount` body (`03 §merged-heartbeat`). Each gc-shard's `retired/<round>/<shard>` run is the **current** outstanding-candidate set for that shard — `RetiredEntry` per entry now carries `condemn_round` (the ack-floor graduation gate, GC-only) and `delete_pending` (the two-phase-graduation flag, `04 §two-phase-graduation`), both additive proto fields. `gc/state` gained `retired_refs` (gc-shard → the current run's object key) and **dropped** the per-round `fence_version` map with the fence phase. The refs and the round number are published in one CAS, so a reader that observes round K can always load the complete retired list of version K (the publish-order invariant).
 
 **Key design choices:**
 
@@ -365,10 +369,12 @@ so a backend whose token could repeat across different content would serve stale
 `TokenMismatch` with the object untouched if the token does not match the current incarnation.
 Backends that silently ignore the condition are rejected by `Cas::Probe` at pool open.
 
-This is the safety-critical primitive of the ABA-prevention protocol: the GC computes a delete
-token by observing the object at retire time, then issues `deleteExact` only when `safe_epoch >
-retire_epoch` and a final in-degree recheck passes. A write that arrived after the retire
-observation carries a new token; the exact-token delete mismatches and the object is spared.
+This is the safety-critical primitive of the ABA-prevention protocol: the GC captures a delete token
+by `HEAD`ing the object when the three-cursor merge condemns it (`04 §three-cursor-merge`), then
+issues `deleteExact` only after the entry has graduated through the ack floor to `delete_pending` and
+that pending state was published by a prior round. A write that arrived after the condemn observation
+carries a new token; the exact-token delete mismatches (`TokenMismatch`) and the object is left
+alone.
 
 `Cas::Backend` exposes `casPut(key, bytes, expected_token)` for the root-manifest CAS path (commit
 a manifest iff the expected current token or expected absence matches — corresponding to model

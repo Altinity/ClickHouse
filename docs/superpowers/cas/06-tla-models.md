@@ -432,7 +432,19 @@ Full table in `CaGcRootLocalPartManifestCore_RESULTS.md`.
 - Deposed-leader GC attempts must never be reader-visible: only the ADOPTED attempt's artifact can
   be consulted (Phase 6 `INV_ONLY_ADOPTED_VIEWABLE`).
 
-**Code currency:** CURRENT (R0 gate). The largest and most comprehensive model in the corpus.
+> **Note — fence-era controls document a SUPERSEDED mechanism.** The all-shard fence and its negative
+> controls (`sab_nofence` #14, `sab_lazyfenceunsafe` #25, `sab_reducerownsfence` #26) prove the
+> *fence-based* create-ordering that the ack-floor redesign (Area 11) replaced with a causal
+> acknowledgement floor. They remain valid as evidence that fencing only changed shards or reusing a
+> stale fence position was unsound *within that mechanism* — which is exactly why the mechanism, not a
+> patch of it, was replaced. This model's section is kept as historical evidence and is **not**
+> deleted; the live round protocol and its proofs are `CaGcAckFloorCore.tla` +
+> `CaGcAckFloorZombie.tla` (Area 11). The fold, manifest-cleanup, orphan-sweep, source-edge, and
+> attempt-scoping results above are unaffected by the redesign and stay CURRENT.
+
+**Code currency:** CURRENT for the fold/manifest/attempt-scoping machinery the ack-floor round reuses;
+the fence/recheck phases it models are SUPERSEDED by Area 11 (controls kept as historical evidence).
+The largest and most comprehensive model in the corpus.
 
 ---
 
@@ -507,6 +519,87 @@ an absent/dead-token blob) and `INV_NO_ORPHAN_EDGE` (no folded edge outlives its
 
 ---
 
+## Area 11 — Ack-floor GC fence redesign {#area-ackfloor}
+
+These two focused models prove the one-pass ack-floor round that replaced the per-round all-shard
+fence and the fold-through-fence recheck (spec `2026-07-02-cas-gc-ack-floor-fence-redesign.md`; GC
+protocol `04 §gc-round`). They are the formal gate for that redesign; the fold/manifest machinery
+the round reuses stays proved by `CaGcRootLocalPartManifestCore.tla` (Area 7).
+
+### `CaGcAckFloorCore.tla` — ack-floor round core {#ackfloor-core}
+
+**Files:** `CaGcAckFloorCore.tla`, `CaGcAckFloorCore_stage1.cfg`, `CaGcAckFloorCore_sab_*.cfg`,
+`CaGcAckFloorCore_witness_*.cfg`. Run wrapper: `run_ackfloor.sh`.
+
+**What it proves.** Writers advertise `observed_gc_round` through heartbeats; GC graduates a retired
+entry only when `condemn_round < min_ack` computed over heartbeats that are **live OR
+expired-but-not-fenced**; a fenced heartbeat can never renew or land a commit again. Commits are
+two-step (`WPrepare` = gate evaluation, `WLand` = CAS response) so the in-flight window is a real
+interleaving, and the pass is three steps (`GBegin` / `GFold` / `GComplete`) so a commit landing
+between the fold cut and the deletes is a real interleaving. Invariants: `INV_NO_DANGLE` (no landed
+or folded ref points at an absent blob), `INV_NO_RETURN` (no ref binds a deleted incarnation),
+`INV_ACK_LE_VIEW` (the honest ack never runs ahead of the installed view).
+
+Bounds: `Writers = {w1, w2}`, `Blobs = {b1}`, `MaxRound = 4`, `MaxTok = 4`.
+
+**Seven sabotages (negative controls — each breaks exactly one load-bearing rule and MUST produce a
+counterexample):**
+
+| Config | Rule broken |
+|---|---|
+| `sab_ignorefloor` | graduate ignoring the floor entirely (`condemn_round ≥ min_ack`) |
+| `sab_ackwithoutread` | ack advances without installing the retired view |
+| `sab_ackbeforedrain` | ack advances while an old-view commit is still in flight (no drain) |
+| `sab_sleeperrearm` | the floor excludes expired-UNFENCED heartbeats (assumes dead without a fence-out) |
+| `sab_skipshard` | the fold cut leaves one landed ref unconsumed |
+| `sab_adopttoken` | the commit gate references a visibly-retired token instead of recreating |
+| `sab_openbeforeload` | a fresh mount starts with an unloaded (round-0) view and mutates before loading |
+
+**Witnesses (negated reachability — a TLC "violation" means the state IS reachable):**
+`W_DeleteHappens` (condemn → graduate → delete), `W_SpareHappens` (condemn → recover → spare),
+`W_RecreateHappens` (recreate → `TokenMismatch` on the pending delete).
+
+**Design decisions driven by this model:**
+- Graduation is gated purely by the causal floor (`condemn_round < min_ack`) — no wall clock on the
+  happy path.
+- The ack must not advance without loading the retired list, and not before the drain completes.
+- An expired heartbeat must be fenced-out (not merely assumed dead) before it drops out of the floor.
+- The commit gate must recreate a listed token, never adopt it.
+
+**Code currency:** CURRENT (`cas-gc-ack-floor-fence`).
+
+---
+
+### `CaGcAckFloorZombie.tla` — two-leader `delete_pending` gate {#ackfloor-zombie}
+
+**Files:** `CaGcAckFloorZombie.tla`, `CaGcAckFloorZombie_stage1.cfg`,
+`CaGcAckFloorZombie_sab_eagerdelete.cfg`, `CaGcAckFloorZombie_witness_delete.cfg`. Run wrapper:
+`run_ackfloor_zombie.sh`.
+
+**What it proves.** The two-phase graduation (`delete_pending`, Task-9 amendment; `04
+§two-phase-graduation`) is load-bearing when **two** leaders' passes fully interleave. Each leader
+latches `(round, retired list, fold-cut in-degrees)` at `GBegin`, deletes pre-publish, and its
+publish CAS succeeds only if `(round, retired)` are unchanged since the latch (the `gc/state` token
+guard) — so a deposed leader's merge output evaporates but its deletes do not. Restricting pre-CAS
+deletes to entries **already published pending by a previous round's CAS** keeps a deposed leader's
+arbitrarily-stale snapshot from deleting a live blob.
+
+Bounds: `Writers = {w1, w2}`, `Leaders = {l1, l2}`, `Blobs = {b1}`, `MaxRound = 5`, `MaxTok = 4`.
+Honest stage (`SabotageEagerZombieDelete = FALSE`) is clean (~2 M distinct states) on `INV_NO_DANGLE`
++ `INV_NO_RETURN`. `sab_eagerdelete` (a pass ALSO deletes its FRESH graduations — the pre-amendment
+single-phase behavior) yields the `INV_NO_DANGLE` counterexample, proving `delete_pending`
+load-bearing. `witness_delete` shows the pending-delete path is reachable.
+
+**Order invariant surfaced by this model (the implementation must never lose it):** the ack floor is
+latched **no later than the fold cut**. A floor read *after* the cut would see acks advertised by
+writers whose in-flight commits landed after the cut (invisible to this pass's in-degrees), and a
+fresh graduation could then go pending over a live reference. Pinned as a comment at the
+`computeHeartbeatFloor` call site and in the spec's TLA+ section.
+
+**Code currency:** CURRENT (`cas-gc-ack-floor-fence`).
+
+---
+
 ## Area 10 — Superseded EBR/epoch GC core {#area-ebr}
 
 ### `CaGcCore.tla` — EBR epoch/generation design (superseded) {#cagccore}
@@ -552,9 +645,11 @@ The prose files `README.md` and `RESULTS.md` in this directory are this model's 
 | `CaResurrectLiveness.tla` | Resurrect/B167 | **STALE** (deferred M-F guard) | `<>published` | 1 | upload→publish span not atomic; heartbeat guard load-bearing |
 | `CaBuildWatermark.tla` | Watermark/B167 | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle`, liveness | 3 | monotone `build_seq`, exact min active set, sound crash detection |
 | `CaBuildWatermarkNum.tla` | Watermark numeric | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle` | 2 | monotone `build_seq` (not just unique), per-server scoping |
-| `CaGcRootLocalPartManifestCore.tla` | Part-manifest GC R0 | **CURRENT** | `INV_NO_DANGLE/LOSS/RETURN`, 10 more; liveness | 28 | all-shard fresh fence, single coordinator fence, scatter deltas, stale-token-no-over-delete, attempt-scoped visibility |
+| `CaGcRootLocalPartManifestCore.tla` | Part-manifest GC R0 | **CURRENT** (fold/manifest/attempt-scoping); fence/recheck phases SUPERSEDED by Area 11 | `INV_NO_DANGLE/LOSS/RETURN`, 10 more; liveness | 28 | all-shard fresh fence (superseded), single coordinator fence (superseded), scatter deltas, stale-token-no-over-delete, attempt-scoped visibility |
 | `CaGcIndegRefoldCore.tla` | Indeg re-fold | **CURRENT** | `INV_INDEG_NONNEG` | 1 | seal cursor at `max(foldCursor, fenceVersion)`, not `foldCursor` |
 | `CaGcShardIncarnationCore.tla` | Registry removal D1 | **CURRENT** | `INV_NO_DANGLING`, `INV_NO_ORPHAN_EDGE` | 4 | two-coordinate replacement (incarnation + round self-floor) for registry; per-shard monotonicity |
+| `CaGcAckFloorCore.tla` | Ack-floor round core | **CURRENT** | `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_ACK_LE_VIEW` | 7 | causal floor gates graduation; ack after drain + view load; expired ⇒ fence-out; recreate not adopt |
+| `CaGcAckFloorZombie.tla` | Ack-floor two-leader | **CURRENT** | `INV_NO_DANGLE`, `INV_NO_RETURN` | 1 | `delete_pending` two-phase graduation load-bearing; floor latched ≤ fold cut (order invariant) |
 | `CaGcCore.tla` | EBR GC core | **SUPERSEDED** | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA` | 4 CEs during dev | EBR design record; replaced by incarnation-token |
 
 ---
@@ -590,6 +685,19 @@ done
 # shard incarnation / registry removal
 java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \
   -config CaGcShardIncarnationCore_design.cfg CaGcShardIncarnationCore.tla
+
+# ack-floor GC round core — positive stage + witnesses
+./run_ackfloor.sh CaGcAckFloorCore_stage1
+for w in delete spare recreate; do ./run_ackfloor.sh CaGcAckFloorCore_witness_$w; done  # each MUST report reachable
+# sabotages (each MUST violate):
+for s in ignorefloor ackwithoutread ackbeforedrain sleeperrearm skipshard adopttoken openbeforeload; do
+  ./run_ackfloor.sh CaGcAckFloorCore_sab_$s && echo "UNEXPECTED PASS: $s"
+done
+
+# ack-floor two-leader delete_pending gate
+./run_ackfloor_zombie.sh CaGcAckFloorZombie_stage1                     # clean
+./run_ackfloor_zombie.sh CaGcAckFloorZombie_sab_eagerdelete            # MUST violate INV_NO_DANGLE
+./run_ackfloor_zombie.sh CaGcAckFloorZombie_witness_delete             # pending-delete reachable
 
 # in-degree re-fold
 java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \

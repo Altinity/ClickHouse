@@ -57,7 +57,7 @@ Legend for target column: `01` = `01-architecture.md`, `02` = `02-methodology.md
 | Old doc | Durable content captured | New target |
 |---------|--------------------------|------------|
 | `content_addressed_mergetree.md` | "Git for MergeTree" framing; object model (blobs/refs/manifests); shared-nothing vs shared-state; what it buys / does not buy | `01 §what-cas-is`, `§object-model`, `§what-it-buys` |
-| `incarnation-tagged-cas.md` | Incarnation-token identity; exact-token deletes; blob one-key-per-hash; body-not-key incarnation | `01 §incarnation-identity`, `§rejected-merkle-tree-layer`, `04 §recheck` |
+| `incarnation-tagged-cas.md` | Incarnation-token identity; exact-token deletes; blob one-key-per-hash; body-not-key incarnation | `01 §incarnation-identity`, `§rejected-merkle-tree-layer`, `04 §deletes-publish-cas` |
 | `CAS_MERGETREE_CODE_REVIEW_GUIDE.md` | Reviewer orientation (code map, invariants to check) | mined into `01 §key-invariants`, `02` (method); ephemeral guide dropped |
 | `B140-dangle-HANDOFF.md` | B140 dangle root cause + fix handoff | `04 §trim` (B140 HISTORY), `06 §area-b140`, `02 §tla-b140` |
 | `cas-gc-unattended-execution-log.md` | GC redesign method + TLA+-gate discipline + Phase-1a review blocker | mined into `02 §subagent-driven`, `§tla-gate`; log narration dropped |
@@ -150,7 +150,7 @@ by `03`/`04`/`05`; the milestone sequencing itself is ephemeral.
 | `plans/2026-06-05-ca-gc-s4-lockless-handshake.md` | S4 lockless handshake | `04 §concurrent-leader-summary` (gc_lock REJECTED) |
 | `plans/2026-06-05-ca-gc-s4-review-remediation.md` + `specs/2026-06-05-ca-gc-s4-review-remediation-design.md` | S4 review remediation (biggest GC plan) | `04 §gc-round`, `§concurrent-leader-summary`, `06 §area-incarnation` |
 | `specs/2026-06-16-ca-gc-lease-heartbeat-design.md` + `plans/...gc-lease-heartbeat` | Lease + advisory heartbeat (B160); false-steal fix | `04 §leader-election`, `§advisory-heartbeat`, `06 §cagcleasecore` |
-| `specs/2026-06-17-ca-gc-snap-prune-design.md` + `plans/...gc-snap-prune` | P9 node-forgetting; 46k HEAD storm | `04 §node-pruning`, `07 §gc-budget-retire` |
+| `specs/2026-06-17-ca-gc-snap-prune-design.md` + `plans/...gc-snap-prune` | P9 node-forgetting; 46k HEAD storm | `04 §node-pruning`, `07 §gc-budget-fold` (condemn-time HEAD) |
 | `specs/2026-06-21-ca-gc-snap-generation-retention-design.md` + `plans/...gc-snap-generation-retention` | B174 generation retention; 82% pool storage | `04 §generation-retention` |
 | `specs/2026-06-17-ca-b140-dangle-fix-design.md` | B140 dangle fix v1 | `04 §trim` (B140 HISTORY), `06 §area-b140` |
 | `specs/2026-06-18-ca-b140-dangle-fix-v2-design.md` + `plans/2026-06-18-ca-b140-dangle-fix-v2.md` | B140 fix v2 (cursor-in-snap co-durable) | `04 §trim`, `06 §cab140danglemerge` |
@@ -164,12 +164,13 @@ by `03`/`04`/`05`; the milestone sequencing itself is ephemeral.
 | `plans/2026-06-26-cas-gc-phase1c-read-path.md` | Phase 1c read path | `07 §read-budget` |
 | `plans/2026-06-26-cas-gc-phase1d-gc-fold-indegree-sweep.md` | Phase 1d fold/in-degree sweep (largest plan) | `04 §fold`, `§indegree-source-edge-set` |
 | `plans/2026-06-26-cas-gc-phase2-token-diff-discovery.md` | Phase 2 token-diff discovery | `04 §discovery`, `07 §gc-budget-fold` (LIST-token skip) |
-| `plans/2026-06-26-cas-gc-phase3-lazy-fence-trim.md` | Phase 3 lazy fence/trim | `04 §fence`, `06` (sab_lazyfenceunsafe) |
+| `plans/2026-06-26-cas-gc-phase3-lazy-fence-trim.md` | Phase 3 lazy fence/trim (fence phase since superseded by the ack-floor round) | `04 §gc-round` (History), `06` (sab_lazyfenceunsafe documents the superseded mechanism) |
 | `plans/2026-06-26-cas-gc-phase4-target-sharded-reducers.md` | Phase 4 target-sharded reducers | `04` , `06 §cagcrootlocalpartmanifestcore` |
-| `plans/2026-06-26-cas-gc-phase5-retire-token-opt.md` | Phase 5 retire-token opt | `04 §retire`, `06` |
+| `plans/2026-06-26-cas-gc-phase5-retire-token-opt.md` | Phase 5 retire-token opt (retire folded into the three-cursor merge by the ack-floor round) | `04 §three-cursor-merge`, `06` |
 | `plans/2026-06-26-cas-gc-redesign-overview.md` | Redesign overview | `04 §overview` |
 | `plans/2026-06-28-cas-gc-attempt-scoped-generation.md` | Attempt-scoped gen plan | `04 §attempt-scoped-generations` |
 | `plans/2026-07-01-cas-gc-indegree-source-edge-set.md` | Source-edge-set plan | `04 §indegree-source-edge-set` |
+| `specs/2026-07-02-cas-gc-ack-floor-fence-redesign.md` (+ Task 6/9/TLA amendments) | Ack-floor GC round: causal floor replaces fence+recheck; merged heartbeat; `delete_pending` two-phase graduation; three-cursor merge; `CaGcAckFloorCore`/`CaGcAckFloorZombie` gate | `04 §gc-round`/`§heartbeat-floor`/`§three-cursor-merge`/`§two-phase-graduation`/`§deletes-publish-cas`, `03 §merged-heartbeat`, `05 §layout-keys`, `06 §area-ackfloor`, `07 §gc-budget`, `08 §gc-unit-suites` |
 | `plans/2026-06-29-cas-layout-phase0-mount-safety.md` | Layout phase 0 mount safety | `03 §mount-startup`, `06 §cacasmountcore` |
 | `plans/2026-06-29-cas-layout-phase1-relocation.md` | Layout phase 1 relocation | `01 §pool-layout`, `05 §layout-keys` |
 | `plans/2026-06-29-cas-layout-phase2-cursor-sweep.md` | Layout phase 2 cursor sweep | `04 §fold` (manifest sweep) |
@@ -322,19 +323,20 @@ The CH-path → CAS-namespace mapping rules survive only in `PartPathParser.{h,c
 - `MR-3` / `F2` (`TreeDepsOK`): a tree ref may be published only when all direct children are present
   and non-condemned at publish time (bottom-up build discipline).
 
-**Group C — GC safety rules absent from `04`:** block
-`plans/2026-06-11-ca-core-m-c3.md` and `specs/2026-06-26-cas-gc-streaming-sharded-redesign-design.md`
-→ target `04 §3.4/§3.6`:
-- Retire fail-closed: a candidate absent at retire (HEAD 404) → skip, **never fabricate a token**.
-- Recheck 404 policy: a missing/invalid committed-or-promoted new-binding manifest body in the fence
-  window **clamps/aborts the affected delete (fail-closed, not spare-by-default)** and surfaces to
-  `fsck`; an old-binding removal uses the blob edges already sealed at fold; recheck must never read a
+**Group C — GC safety rules in `04`:** block
+`plans/2026-06-11-ca-core-m-c3.md`, `specs/2026-06-26-cas-gc-streaming-sharded-redesign-design.md`,
+and `specs/2026-07-02-cas-gc-ack-floor-fence-redesign.md`
+→ target `04 §three-cursor-merge` / `§deletes-publish-cas`:
+- Condemn fail-closed: a candidate absent at condemn (HEAD 404) → skip, **never fabricate a token**.
+- Missing manifest-body policy: a missing/invalid committed-or-promoted new-binding body **clamps the
+  affected shard (fail-closed, not spare-by-default; `classification = 4`)** and surfaces to `fsck`;
+  an old-binding removal uses the blob edges already sealed at fold; the merge must never read a
   deleted manifest body.
 - `created_delete_marker → LOGICAL_ERROR` per-delete versioning guard (partially mitigated by the
   startup probe in `01 §backend-contract`).
-- `ViewableRound` operational statement: `gc/state.round` advances only after **every** blob-target
-  shard's retired set and part-manifest cleanup bundle are durable (subset-safety for sharded mode).
-  The invariant name is in `06`; its operational rule is missing from `04`.
+- Publish-order invariant (subsumes `ViewableRound`): the retired-list runs for round K are durable
+  **before** the single `gc/state` CAS that publishes `round := K` and `retired_refs`; refs and round
+  land in one CAS, so round K always has a loadable retired list K. The invariant name is in `06`.
 
 **Group D — architecture / integration decisions (only carrier is the v3 design + incarnation docs):**
 block `specs/content_addressed_shared_mergetree_design.md` and `incarnation-tagged-cas.md`
@@ -416,12 +418,11 @@ source- and code-grounded edits. Per group:
   in protocol terms.
 
 **Group C — GC safety rules.**
-- `04-gc-protocol.md §3.4` — retire fail-closed (never fabricate a token on 404).
-- `04-gc-protocol.md §3.6` — recheck 404 policy (committed/promoted new-binding clamps the delete,
-  precommit non-activating, old-binding uses fold-sealed edges, never read a deleted body) +
-  `created_delete_marker → LOGICAL_ERROR` guard.
-- `04-gc-protocol.md §5` (attempt-scoped) — `ViewableRound` round-advance operational rule
-  (subset-safety for sharded mode).
+- `04-gc-protocol.md §three-cursor-merge` — condemn fail-closed (never fabricate a token on 404);
+  missing manifest-body clamp (committed/promoted new-binding clamps the shard, `classification = 4`;
+  precommit non-activating; old-binding uses fold-sealed edges; never read a deleted body).
+- `04-gc-protocol.md §deletes-publish-cas` — `created_delete_marker → LOGICAL_ERROR` guard; the
+  single-CAS publish-order invariant (subsumes `ViewableRound`).
 
 **Group D — architecture/integration decisions.**
 - `01-architecture.md` — new `§integration-decisions`: DROP-supersession (empty covering tombstone

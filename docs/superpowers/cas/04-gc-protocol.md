@@ -1,5 +1,5 @@
 ---
-description: "Canonical reference for the content-addressed (CAS) MergeTree garbage-collection protocol: leader election, lease + advisory heartbeat, the full round (fold → retire → fence → recheck → trim/reclaim), orphan removal, ref removal, shard-object reclaim, incarnation, registry removal (D1), attempt-scoped generations, snap prune, and concurrent-leader safety."
+description: "Canonical reference for the content-addressed (CAS) MergeTree garbage-collection protocol: leader election, lease + advisory heartbeat, the one-pass ack-floor round (heartbeat floor → three-cursor merge → two-phase graduation → single gc/state CAS), orphan removal, ref removal, shard-object reclaim, incarnation, registry removal (D1), attempt-scoped generations, snap prune, and concurrent-leader safety."
 sidebar_label: "GC protocol"
 sidebar_position: 4
 slug: /superpowers/cas/gc-protocol
@@ -9,7 +9,7 @@ doc_type: reference
 
 # CAS MergeTree — GC Protocol {#gc-protocol}
 
-**Status summary:** see per-section stamps. The core round (fold → retire → fence → recheck → trim) is **DONE** and soak-validated. Attempt-scoped generations (concurrent-leader safety) and the source-edge-set in-degree (H1b fix) are **DONE** (2026-07-01). Shard incarnation + registry removal (D1) is **TLA+ gate GREEN, implementation TODO**. Snap prune and advisory heartbeat are **DONE**.
+**Status summary:** see per-section stamps. The regular round is a **single pass**: a heartbeat ack floor, one three-cursor merge that verifies/graduates/condemns in the same fold, two-phase graduation of deletions, and one `gc/state` CAS. It is **DONE** (implemented on branch `cas-gc-ack-floor-fence`; soak validation TODO). The ack floor replaces the former per-round all-shard fence and fold-through-fence recheck (see the History note in §3). Attempt-scoped generations (concurrent-leader safety) and the source-edge-set in-degree (H1b fix) are **DONE** (2026-07-01). Shard incarnation + registry removal (D1) is **TLA+ gate GREEN, implementation TODO**. Snap prune and advisory heartbeat are **DONE**.
 
 Cross-links: `06-tla-models.md` for formal proofs · `07-s3-budget.md` for per-operation cost.
 
@@ -34,7 +34,7 @@ dynamic root namespace (per-table)
 
 - **Blobs** are content-addressed under `blobs/<aa>/<blob_hash>`. Only blobs are deduplicated across namespaces.
 - **Part manifests** are immutable root-local objects under `roots/<ns>/_manifests/<writer_instance_id>/<build_seq>/<aa>/<manifest_instance_id>.proto`. Each manifest has at most one structural owner at any time.
-- **Root shards** (`cas/refs/<ns>/<shard>`) are mutable CAS objects. Each carries a `RootOwnerEvent` journal, committed `RefRecord`s, and fence state.
+- **Root shards** (`cas/refs/<ns>/<shard>`) are mutable CAS objects. Each carries a `RootOwnerEvent` journal, committed `RefRecord`s, and a `fence_round` birth floor (stamped once at shard creation — see §7; it is no longer bumped per round).
 - **Precommit owners** are journal entries naming a manifest before its committed publish. They protect blobs during the upload window.
 
 ---
@@ -50,23 +50,24 @@ GC leader election is a **clock-free, observation-window steal** over the durabl
 ```
 GcState {
     lease { owner: UInt128,  seq: uint64 }   // current leader identity + monotone sequence
-    fence_seq: uint64                         // per-round fence epoch
     round: uint64                             // monotone GC round counter
     snap_generation: uint64                   // pointer to the authoritative in-degree run set
-    snap_attempt: uint64                      // attempt id that produced snap_generation (NEW — attempt-scoped gen)
+    snap_attempt: uint64                      // attempt id that produced snap_generation (attempt-scoped gen)
     snap_pruned_through: uint64               // retention cursor for old gc/gen generations
-    fence_version: { round → { "ns/shard" → shard_version } }
+    retired_refs: { gc_shard → retired_list_object_key }   // current retired-list runs (ack-floor)
     gc_shards: uint64                         // immutable creation-time blob-target shard count
 }
 ```
 
-The steal is a single **atomic CAS** on `gc/state` that bumps `lease.owner`, `lease.seq`, and `fence_seq` together. Safety of every round step is independent of who holds the lease; the CAS-steal merely prevents redundant work.
+`retired_refs` maps each blob-target gc-shard to the object key of the **current** retired-list run (the outstanding-candidate set); it is published in the same `gc/state` CAS that advances `round`, so a reader that observes round K can always load the retired list of version K (the publish-order invariant, §3.6). The former per-round `fence_seq` epoch and the `fence_version` map are **removed** with the fence phase (see the History note below).
+
+The steal is a single **atomic CAS** on `gc/state` that bumps `lease.owner` and `lease.seq` together. Safety of every round step is independent of who holds the lease; the CAS-steal merely prevents redundant work.
 
 A follower steals only when it has observed the incumbent's `(owner, seq)` **unchanged** across its observation window AND the heartbeat counter is also frozen (see §2.2). This prevents a false steal when a leader is alive but mid-round.
 
 ### 2.2 Advisory heartbeat (B160) {#advisory-heartbeat}
 
-**Problem solved:** a GC round (`fold → retire → fence → recheck → cascade`) can take many seconds on a large pool, longer than the follower's tick interval. A follower that sees `gc/state.seq` frozen (the leader only bumps it once per round) falsely concludes the leader is dead and steals — causing ~70–80% of GC rounds to abort in two-replica soaks.
+**Problem solved:** a GC round can take longer than the follower's tick interval. A follower that sees `gc/state.seq` frozen (the leader only bumps it once per round) falsely concludes the leader is dead and steals — causing ~70–80% of GC rounds to abort in two-replica soaks. (The one-pass ack-floor round is far cheaper than the old fence/recheck round, but the false-steal risk is structural, not cost-driven, so the heartbeat remains load-bearing.)
 
 **Mechanism:** a separate lightweight heartbeat thread writes `gc/hb` (a small `{owner, hb_seq}` object) every `H` seconds independently of round progress. The steal decision is extended:
 
@@ -88,21 +89,50 @@ A live-but-slow leader's heartbeat advances within the observation window → no
 
 ## 3. The GC round {#gc-round}
 
-**Status: DONE** (core round implemented and soak-validated; `CaGcRootLocalPartManifestCore.tla` proves safety at all stages — see `06-tla-models.md §root-local-manifest`).
+**Status: DONE** (one-pass ack-floor round implemented on `cas-gc-ack-floor-fence`; soak validation TODO. `CaGcAckFloorCore.tla` + `CaGcAckFloorZombie.tla` prove the ack-floor safety obligations — see `06-tla-models.md §ackfloor-core`; the fold/manifest machinery it reuses stays proved by `CaGcRootLocalPartManifestCore.tla`).
 
-The round skeleton (unchanged from initial design through all refinements):
+The regular round is **one pass**:
 
 ```
-discover → fold → retire → fence → recheck → exact-token delete → trim
+heartbeat ack floor → discover → fold (three-cursor merge) → pre-CAS deletes of previously-published pending → outcome logs → retired-list publish → single gc/state CAS → post-CAS cleanup
 ```
 
-No cascade step exists in the current implementation (the old tree-expansion cascade is gone with the part-manifest redesign; blob decrements are emitted directly from manifest fold).
+There is **no fence phase, no recheck phase, and no crash-resume step**. The three-cursor merge (§3.4) verifies old candidates, graduates the safe ones, and condemns new ones in a single streaming fold; the ack floor (§3.2) is what makes a delete safe without an all-shard write fence. Physical deletion is two-phase (§3.5): condemnation → `delete_pending` at the first pass whose floor passes the entry → exact-token delete the next pass. No cascade step exists (blob decrements are emitted directly from manifest fold).
+
+> **History (superseded fence/recheck round).** Through 2026-07-02 the round was
+> `discover → fold → retire → fence → recheck → exact-token delete → trim`, with a per-round
+> **fence** (a CAS write to every present root shard bumping `fence_round`, recorded in
+> `GcState.fence_version`) and a **recheck** (re-folding the `(folded_cursor, fence_version]` window
+> per fenced shard). Both phases were O(universe) GET+CAS-PUT every round — ~2.4 M requests at
+> 100k tables × 8 root shards (`07 §gc-budget`) — and the recheck's per-candidate
+> `inDegreeInGeneration` re-reads were the quadratic hot spot that started the investigation. They
+> were replaced by the causal ack floor + three-cursor merge. See
+> `specs/2026-07-02-cas-gc-ack-floor-fence-redesign.md` for the full rationale.
 
 ### 3.1 Discovery {#discovery}
 
 The GC leader discovers the live namespace universe by `LIST(cas/refs/)` — the set of `(ns, shard)` root-shard objects that physically exist. Each object is self-identifying (carries its `incarnation` — see §6.1).
 
 **Registry removal (D1, TODO):** historically discovery read from `gc/registry`, an append-only authority. D1 (§7) replaces this with the LIST-based discovery and deletes the registry. The token-diff optimization (skip body re-read when the listed shard token matches the previously folded token) is retained as a read accelerator.
+
+This one LIST sweep is the round's only universe-proportional operation (O(universe/1000) LIST requests); everything else is O(delta) + O(servers). Discovery runs **after** the heartbeat floor (§3.1a), so any fenced-out writer's last commits are durable before the sweep enumerates them.
+
+### 3.1a Heartbeat ack floor {#heartbeat-floor}
+
+The **heartbeat ack floor** is what lets GC delete a blob without first writing a per-shard fence. Every server maintains one merged heartbeat (`03 §merged-heartbeat`) carrying `observed_gc_round` — the newest GC round whose retired list it has fully loaded. `computeHeartbeatFloor` (`CasServerRoot.cpp`) is the round's first step and its only use of a wall clock:
+
+1. **Enumerate:** LIST `gc/server-roots/` + GET each mount (O(servers), single-digit counts).
+2. **Classify** each heartbeat, using the injected `now_ms_fn` and `skew_margin_ms = mount_lease_ttl_ms / 2` (`classification = live | terminated | expired`):
+   - *terminated* (graceful-shutdown stamp) → **excluded**: its own final write is causal proof no further mutations exist.
+   - *live* (`expires_at_ms + skew_margin > now`) → contributes its `observed_gc_round` to the floor.
+   - *expired* (`now > expires_at_ms + skew_margin`, no terminated stamp) → **fence-out**: one token-guarded `putOverwrite` that preserves the body, sets `gc_fenced`, and bumps `seq`. Success ⇒ the sleeper's next renewal permanently fails (`tripMountLost`; only a full re-open with a fresh view can resume writing) ⇒ excluded. `PreconditionFailed` ⇒ it renewed concurrently ⇒ re-GET and reclassify as live.
+3. **Floor:** `min_ack = min(observed_gc_round)` over all **live** entries (expired-and-then-fenced-out writers no longer contribute; no live heartbeats ⇒ `min_ack = +∞`).
+
+Fence-outs must complete before discovery (step 2 of the round), so every excluded writer's last commits are durable before the sweep.
+
+**Order invariant (load-bearing):** the floor is latched **no later than the fold cut**. Reading the floor after the cut would see acks advertised by writers whose in-flight commits landed after the cut — invisible to this pass's in-degrees — and a fresh graduation could then go pending over a live reference. `CaGcAckFloorZombie.tla` pins this ordering (`06 §ackfloor-zombie`); the implementation latches `min_ack` at the start of the pass, and a comment at the `computeHeartbeatFloor` call site records why.
+
+The floor gates graduation only (§3.4); rounds never block on acknowledgements. A live-but-stale-acking server holds **all** graduations back (the floor is a `min`) — a liveness property, made observable (§Observability) and bounded for dead servers by lease expiry + fence-out.
 
 ### 3.2 Fold {#fold}
 
@@ -121,17 +151,21 @@ Fold reads the incremental diff from each root shard's `RootOwnerEvent` journal 
 
 **Fold barrier (missing-body precommit):** GC does NOT advance the fold cursor past a `RootOwnerEvent` that leaves a live precommit whose manifest body is absent or fails `RefMatchesBody`/`ManifestNamespaceMatches` validation. The cursor advances only when the body activates (emitting its `+1` deltas) or the precommit is abandoned (emitting no deltas). This is the fold barrier that makes promotion always of an activated manifest and keeps Δ = 0 correct for promotions. A stuck missing-body precommit is bounded by the writer-epoch watermark-based precommit reclaim path.
 
+In the ack-floor round the fold does **no internal CAS**: it sets `snap_generation` / `snap_attempt` in memory and the single round CAS (§3.6) commits them. The fold also loads the prior retired list from `gc/state.retired_refs` (GET each gc-shard run; a referenced-but-missing run is `CORRUPTED_DATA` — the integrity of destructive bookkeeping, not a data-plane 404) and feeds it as the third cursor of the merge (§3.4).
+
 **Output artifacts** (all under the attempt namespace — see §5):
 
 ```
 gc/gen/<G_f>/attempt/<a>/fold_seal
-gc/gen/<G_f>/attempt/<a>/blob_target/<shard>/<run>
+gc/gen/<G_f>/attempt/<a>/blob_target/<shard>/<run>            // new in-degree snapshot run
 gc/gen/<G_f>/attempt/<a>/part_manifest_cleanup/<shard>/<run>
+gc/gen/<G_f>/attempt/<a>/retired/<round>/<shard>             // current retired list (published via retired_refs)
+gc/gen/<G_f>/attempt/<a>/outcomes/<round>/<shard>            // per-entry delete/spare outcomes
 ```
 
-The `FoldSeal` records per-`(ns, shard)` coverage: `folded_token`, `folded_cursor`, and the produced run `RunRef`s (key + footer checksum). It is written **write-once** before the fold-adopt CAS; it is a deterministic artifact and any colliding write must be byte-equal or `CORRUPTED_DATA`.
+The `FoldSeal` records per-`(ns, shard)` coverage: `folded_token`, `folded_cursor`, and the produced run `RunRef`s (key + footer checksum). It is written **write-once** before the round CAS; it is a deterministic artifact and any colliding write must be byte-equal or `CORRUPTED_DATA`. Completion seals are a retired concept — the fold seal alone resolves cursors now.
 
-**Cursor advance:** the `gc/state` CAS that advances `snap_generation` (the fold-adopt — see §5.2) also advances `folded_cursor` per shard. These two updates are atomic: a crash before the CAS leaves the prior generation authoritative and the new fold attempt as invisible garbage.
+**Cursor advance:** the single `gc/state` CAS that advances `snap_generation` (§3.6) also advances `folded_cursor` per shard and publishes `retired_refs` and `round` — all atomically. A crash before the CAS leaves the prior generation and the prior retired list authoritative and the new attempt as invisible garbage; the next pass re-runs under a fresh attempt (§3.6 crash-resume).
 
 ### 3.3 In-degree representation: source-edge set {#indegree-source-edge-set}
 
@@ -147,79 +181,65 @@ Fold is **idempotent**: activating a source edge inserts it into the set (union)
 
 **REJECTED: integer refcount.** The implementation previously persisted `(blob_hash → int64 count)` and folded as `prior_count + Σ ±1`. This is **not** idempotent: re-folding a removal (H1b — a fence-window removal whose cursor was not advanced past the fence) drives the count to −1, triggering a fail-closed `CORRUPTED_DATA` throw and wedging GC. The model `CaGcRootLocalPartManifestCore.tla` never caught this because it uses set-based idempotent in-degree — the implementation diverged from the model. The source-edge-set design is what the big model actually proves; the change makes the implementation faithful to it. See `06-tla-models.md §indeg-refold` for the focused model that validated the fix.
 
-### 3.4 Retire {#retire}
+### 3.4 The three-cursor merge (verify, graduate, condemn) {#three-cursor-merge}
 
-Retire scans the blob-target shards for blobs whose source-edge set became empty this generation (`zeroInDegree`), issues a `HEAD` for each candidate to observe its current backend token, and writes a **retired set** (durable, write-once, append-by-unique-path under the attempt namespace).
+The heart of the ack-floor round. Per gc-shard, one streaming pass extends the existing two-cursor `foldDeltasIntoGeneration` (prior snapshot run + sorted incoming edge deltas) with a **third cursor over the prior retired run** — all three inputs sorted by `blob_hash`. The single pass emits the new snapshot run, the new retired run, and the delete list. It **verifies old candidates, graduates the safe ones, and condemns new ones at once**, replacing the separate retire + fence + recheck phases.
 
-The retired set at `gc/gen/<G_f>/attempt/<a>/retired/<round>/<shard>` carries `{kind, hash, observed_token, logical_size}` per entry. It is an **observation-bearing artifact**: the token is the value observed by this specific `HEAD`; two leaders may observe different tokens if a re-incarnation happened between their HEADs. The first durable write wins (read-if-present semantics, not byte-equal-or-`CORRUPTED_DATA`).
+Let `min_ack` be the floor latched in §3.1a and `condemn_round = state.round + 1`. Per blob, at the merge point:
 
-Once the retired set is written, the `RetireView` (the writer-facing barrier) reflects it — writers refreshing their retire view will see the condemned tokens and re-upload rather than referencing a condemned generation.
+| In-degree | Retired? | Action |
+|-----------|----------|--------|
+| `> 0` | yes | **spare** — drop the entry; emit a B170 recheck-verdict event with the recovered in-degree. |
+| `= 0` | retired, `condemn_round < min_ack` | **graduate** — mark the entry `delete_pending` and re-publish it (two-phase, below). |
+| `= 0` | retired, `condemn_round ≥ min_ack` | keep the entry unchanged (not yet provably seen by every live writer). |
+| `= 0` | not retired | **condemn** — `HEAD` the blob to capture its current token (absent ⇒ nothing to delete, skip; `GcSnap::forget`); append `(hash, token, condemn_round)` to the retired output. |
 
-**Retire fail-closed (absent-at-retire):** a candidate whose object is already absent when its
-`HEAD` returns 404 (for example a prior crashed round already deleted it) records **nothing** —
-there is no token to condemn — and it flows to recheck as `Absent`. Retire must **never fabricate a
-token** on a 404. A synthetic token would let a stale exact-token delete match a future, unrelated
-incarnation that reuses the same hash. Fail-closed on the absent path is what preserves
-`INV_NO_RETURN`.
+Because `min_ack ≤ round − 1` always (acks cannot exceed the last published round), an entry condemned in this pass structurally cannot graduate in the same pass — the two-round pipeline falls out of the arithmetic, with no explicit rule.
 
-**Snap prune (delete-time and retire-404):** when a candidate's `HEAD` returns 404, the node is pruned from the in-degree snapshot (`GcSnap::forget`, §4.1). When GC confirms a delete, the node is also pruned. This prevents the 404-HEAD storm where cumulative deleted nodes are re-`HEAD`ed every round. See §4.
+**Condemn fail-closed (absent-at-condemn):** a blob already absent when its `HEAD` returns 404 records **nothing** — there is no token to condemn (`GcSnap::forget`, §4.1). GC must **never fabricate a token** on a 404: a synthetic token would let a stale exact-token delete match a future unrelated incarnation reusing the same hash, violating `INV_NO_RETURN`.
 
-### 3.5 Fence {#fence}
+**Recovery wins over everything, `delete_pending` included** (fail-closed spare): a retired entry whose in-degree recovered to `> 0` is spared even if it was already `delete_pending`. A pending entry observed with recovered in-degree is structurally impossible (floor-passed ⇒ every live writer sees it condemned ⇒ no new reference), so it is spared *and* logged loudly.
 
-The fence is a CAS write to every discovered root shard that advances `fence_round` (monotone, `max` semantics). It records the committed `shard_version` into `GcState.fence_version[round]["ns/shard"]`.
+The retired run is an **observation-bearing artifact**: the token is the value this pass's `HEAD` observed; two leaders may observe different tokens if a re-incarnation happened between their HEADs. The first durable write wins (read-if-present, not byte-equal-or-`CORRUPTED_DATA`). Once the run is published (§3.6), the writer's `RetireView` reflects it — writers see the condemned `(hash, token)` and recreate rather than reference it (`03 §commit-gate`).
 
-**Purpose:** the fence_round in a root shard is the write-ordering barrier. A writer observing `fence_round = R` in a shard must not reference a blob condemned as of round `R` without first refreshing its retire view to `≥ R`. This closes the create-ordering race: a publish after the fence lands at a `shard_version > fence_version[R][shard]`; the recheck fold includes it; the blob is spared.
+**Missing manifest-body policy (inherited from fold, unchanged):** a missing/invalid committed-or-promoted new-binding body **clamps** the affected shard (fail-closed, surfaced to `fsck`, **not** spare-by-default); a missing precommit body is non-activating; an old-binding removal uses edges already sealed at fold and never reads a deleted body. Clamped coverage is now first-class (`ShardCoverage classification = 4`) and forbids the token-diff Skip: a barrier-clamped shard whose listed token never changes (the missing precommit body arrives via a manifest PUT, not a shard rewrite) must still be re-read, or its edges are lost forever. This was a real regression found while porting the merge.
 
-**Registry fence (D1 removes):** previously there was also a registry-fence sub-step that minted fence-only manifests for absent shards. D1 (§7) removes this: only discovered (physically present) shards are fenced; birth ordering is now handled by the precommit gate.
+### 3.5 Two-phase graduation (`delete_pending`) {#two-phase-graduation}
 
-### 3.6 Recheck and exact-token delete {#recheck}
+Physical deletion is **two-phase**, and this is what makes a deposed (zombie) leader's fresh decisions harmless. The single-CAS round removed the old protocol's incidental zombie ejection (a deposed leader used to fail one of the ~4 per-phase CASes long before reaching a delete). A deposed leader running the one-pass round could otherwise graduate from a *stale* retired list — an entry spared by the new leader and re-condemned at `r' ≥ min_ack` would look floor-passed under its old `r`.
 
-**This is the only deletion site.** Four gates must all pass before `deleteExact` fires:
+The fix: graduation is two-phase.
 
-1. **Durable retired set entry** — the token was observed and persisted.
-2. **All-shard fence** — every shard was fenced at ≥ round `R`.
-3. **Fold-through-fence** — the recheck re-folds the fence window `(folded_cursor, fence_version]` into the completion generation. Only blobs whose source-edge set is still empty after this re-fold are deletion candidates.
-4. **Exact observed token** — `deleteExact(key, observed_token)` uses `If-Match`; a 412 (token mismatch) means the object was re-incarnated between retire and delete → outcome `Replaced`, no delete.
+1. A pass that first floor-passes an entry marks it `delete_pending = true` and **keeps it in the published list** (writers still see it condemned → recreate).
+2. `deleteExact` executes only for entries that were **already published as pending in the previous list version**, strictly **before** this pass's CAS (§3.6, "pre-CAS deletes").
 
-The completion generation artifacts:
+Pending is terminal — no spare is possible (floor-passed ⇒ every live writer sees the entry ⇒ no new reference), so re-executing pending deletes is safe at **any** staleness; a zombie's fresh decisions never survive its failing CAS. Crash-safety is leak-free: a crash before the CAS leaves the prior list still pending → the next pass re-issues. Physical deletion therefore lags condemnation by one extra pass (condemn K → pending at the first floor-pass → deleted the next pass) — immaterial in practice. This is strictly more conservative than the TLA+ `GComplete` (which deletes at graduation) and implements the model's drop-on-confirmed-outcome discipline (`06 §ackfloor-zombie`).
 
-```
-gc/gen/<G_c>/attempt/<a>/blob_target/<shard>/<run>    // completion in-degree runs
-gc/gen/<G_c>/attempt/<a>/outcomes/<round>/<shard>     // durable delete outcomes
-gc/gen/<G_c>/attempt/<a>/completion_seal              // written after full outcome coverage
-```
+### 3.6 Deletes, publish, and the single CAS {#deletes-publish-cas}
 
-The completion in-degree runs must be durable **before** any `deleteExact` of that round (so a crash mid-delete can re-derive the candidate set from durable state). Outcome logs are written **after** each delete. The completion advance (CAS #2) requires a complete outcome log for every retired entry.
+The round tail is a fixed sequence of one destructive phase, artifact publication, and exactly one CAS.
 
-**Outcomes:**
-- `Deleted` — `deleteExact` succeeded; object removed.
-- `Absent` — the object was already gone before `deleteExact` (a prior crashed round deleted it). No error.
-- `Replaced` — 412, token mismatch; the object was re-incarnated; not deleted, no data loss.
-- `Spared` — in-degree > 0 after the fold-through-fence recheck; not a candidate after all.
+**Pre-CAS deletes (the single content-delete site).** For each entry that was `delete_pending` in the *previous* published list, `deleteExact(blobKey, token)` uses `If-Match`:
 
-**Recheck 404 policy (context-specific, fail-closed — no blanket "missing body ⇒ spare"):**
-recheck applies the **same context-specific missing-body policy as fold**, keyed on the binding
-kind:
+- `Deleted` → done.
+- `TokenMismatch` (412) → a writer recreated the blob → done (the fresh incarnation is a live object; a future round re-condemns it if unreferenced).
+- `NotFound` → already deleted (crash-resume replay) → done.
 
-- A missing or invalid **committed-or-promoted new-binding** manifest body inside the fence window
-  **clamps/aborts the affected delete** (fail-closed, **not** spare-by-default) and is surfaced to
-  `fsck` — a committed ref must never resolve to a missing manifest, so this is a corruption signal,
-  not a benign absence.
-- A missing **precommit** body is **non-activating** (it contributed no blob edges), not corruption.
-- An **old-binding removal** uses the blob edges **already sealed at fold** (computed while the old
-  body was still required present). **Recheck must never read a deleted manifest body** to compute
-  decrements — the edges were sealed earlier, closing the delete-then-recreate race.
+Each emits a B170 `BlobDelete` + `GcRecheckVerdict` outcome (`Deleted` / `Replaced` / `Absent`). Spared entries emit `Spared` + a verdict event (and a loud WARNING if the spared entry was `delete_pending` — structurally impossible). Manifest-body cleanup (`mfCleanup`, delete-after-adopted-decrements) rides this phase unchanged. These deletes are justified by **previously published** state only, so replay under a fresh attempt is idempotent — which is why no separate crash-resume step exists.
 
-**`created_delete_marker → LOGICAL_ERROR` (per-delete versioning guard):** if a `deleteExact`
-`DeleteOutcome` reports `created_delete_marker = true`, the backend created a versioning tombstone
-instead of a real delete — i.e. the bucket is versioning-enabled, which the startup probe (`01
-§backend-contract`) should already have rejected. GC throws `LOGICAL_ERROR` fail-closed: the pool is
-mis-provisioned, and a delete-marker regime would let an exact-token-deleted object be resurrected
-(`INV_NO_RETURN` violation). This is a per-delete backstop for the startup probe.
+**`created_delete_marker → LOGICAL_ERROR` (per-delete versioning guard):** if a `deleteExact` outcome reports `created_delete_marker = true`, the backend created a versioning tombstone instead of a real delete — the bucket is versioning-enabled, which the startup probe (`01 §backend-contract`) should have rejected. GC throws `LOGICAL_ERROR` fail-closed: a delete-marker regime could resurrect an exact-token-deleted object (`INV_NO_RETURN`).
+
+**Outcome logs & retired-list publish (publish-order invariant).** Outcome logs (observation-bearing ⇒ `putIfAbsent`-adopt) and the per-gc-shard retired-list runs (written **always**, even empty, at `retiredKey(generation, attempt, round, shard)` via `putIfAbsent` + byte-adopt) are durable **before** the CAS. A reader that observes round K can therefore always load retired list K. This subsumes the old retire-visibility barrier / `ViewableRound`.
+
+**The single `gc/state` CAS.** One lease-token CAS publishes, atomically: `round := K`, the adopted `(snap_generation, snap_attempt)`, `retired_refs` (the new per-gc-shard run keys), the per-shard folded tokens/cursors, and `snap_pruned_through`. Superseded-generation prune (§4.2) runs before the CAS (zombie-safe). Failure ⇒ `ABORTED "retry next round"`. This is the **only** CAS per round (the old protocol used ~4: fold-adopt, retire, fence, seal).
+
+**Post-CAS cleanup.** Manifest-body deletes for adopted decrements, `reclaimDroppedShards`, trim (§3.8), and the orphan manifest sweep cursor pass all run after the CAS, exactly as before.
+
+**Crash-resume (no explicit step).** Attempt-scoped write-once artifacts mean a crashed pass leaves only never-adopted debris (pruned by retention). A new leader (or the same one) re-runs the pass under a fresh attempt; already-executed deletes land on the `NotFound` branch; only the adopted attempt is reader-visible. The former `tryResumeIncompleteRound` and completion seals are gone.
 
 ### 3.7 Part-manifest cleanup {#manifest-cleanup}
 
-Part manifests (`_manifests/...`) are deleted when their owning reference is removed. The part-manifest cleanup bundle records `ManifestId`s whose owner was removed and whose blob decrements were sealed into the generation. The delete is an exact-token `deleteExact` issued during the recheck/completion phase, gated by the same fence + fold ordering as blob deletes.
+Part manifests (`_manifests/...`) are deleted when their owning reference is removed. The part-manifest cleanup bundle records `ManifestId`s whose owner was removed and whose blob decrements were sealed into the generation. The delete is an exact-token `deleteExact` issued in the post-CAS cleanup phase (§3.6), gated by the same fold ordering as blob deletes — delete-after-adopted-decrements, one window now (the old recheck double-window skip is gone).
 
 A part manifest has at most one structural owner at any time (`SingleManifestOwner`). An owner removal that leaves no successor is a true removal → the manifest body is debris after its blob decrements are sealed.
 
@@ -227,7 +247,7 @@ A part manifest has at most one structural owner at any time (`SingleManifestOwn
 
 ### 3.8 Trim {#trim}
 
-After the completion seal is durable, `trim` removes journal records from root shards that are at or below the committed `folded_cursor`. This is `INV_JOURNAL_COVERAGE`: only records durably represented in the committed snap generation may be trimmed.
+After the round CAS is durable, `trim` removes journal records from root shards that are at or below the committed `folded_cursor` (there is no separate completion seal any more; `trim` reads the fold seal). This is `INV_JOURNAL_COVERAGE`: only records durably represented in the committed snap generation may be trimmed.
 
 **B140-dangle HISTORY:** the original implementation stored snap edges and `folded_cursor` as two separately-durable objects with no enforced coherence. A lease-steal between the snap write and the `gc/state` CAS could leave `folded_cursor` ahead of the actual snap coverage → `trim` over-trimmed → a live part's edge was permanently lost → in-degree undercount → data loss (`fsck dangling`). The fix (v2, `2026-06-18`) embeds the fold cursor inside the snap codec so the two are always co-durable. The `CaB140DangleMerge.tla` model proved the fix closes the dangle. See `06-tla-models.md §b140-dangle`.
 
@@ -272,8 +292,8 @@ incremental path must not advance it except at a checkpoint.
 
 **Fix:** `GcSnap::forget(kind, hash)` removes a node from `known` the instant GC confirms it is gone:
 
-- **Delete-time prune** (primary): after a `deleteExact` outcome of `Deleted` or `Absent-while-held`, call `snap.forget(kind, hash)`. Rides the existing cascade persist — durable by the time the round's retired sets are dropped.
-- **Retire-404 prune** (defensive): when a candidate `HEAD` returns 404 in the retire loop, call `snap.forget(kind, hash)` and continue. Self-heals the split-brain case where a live leader already deleted a node the follower still observes in its snap.
+- **Delete-time prune** (primary): after a `deleteExact` outcome of `Deleted` or `Absent-while-held`, call `snap.forget(kind, hash)`. Durable in the next snapshot run the round publishes.
+- **Condemn-404 prune** (defensive): when a candidate `HEAD` returns 404 during the three-cursor merge's condemn branch (§3.4), call `snap.forget(kind, hash)` and continue. Self-heals the split-brain case where a live leader already deleted a node the follower still observes in its snap.
 
 A forgotten node that is later re-referenced is re-added to `known` by the ordinary fold (`GFold` re-inserts into `known`). Forgetting is idempotent and can never cause a delete (it only removes a node from candidacy).
 
@@ -321,35 +341,25 @@ gc/gen/<G_f>/attempt/<a>/fold_seal
 gc/gen/<G_f>/attempt/<a>/blob_target/<shard>/<run>
 gc/gen/<G_f>/attempt/<a>/part_manifest_cleanup/<shard>/<run>
 gc/gen/<G_f>/attempt/<a>/retired/<round>/<shard>
-gc/gen/<G_c>/attempt/<a>/blob_target/<shard>/<run>
-gc/gen/<G_c>/attempt/<a>/outcomes/<round>/<shard>
-gc/gen/<G_c>/attempt/<a>/completion_seal
+gc/gen/<G_f>/attempt/<a>/outcomes/<round>/<shard>
 ```
 
 No artifact is written to a final `gc/gen/<g>/…` key outside an `attempt/` prefix before its adopt CAS. Two competing leaders for the same generation write to **different** attempt prefixes (`lease.seq` is unique per steal). Divergent-run and divergent-seal collisions are structurally impossible.
 
-**Round lifecycle:**
+**Round lifecycle (one pass, one CAS):**
 
-1. **Fold (hidden).** Leader writes fold artifacts under `gc/gen/<G_f>/attempt/<a>/`. Nothing is reader-visible. Competing leaders fold under their own `a`.
-2. **Fold adopt (CAS #1 — selects the attempt).** A lease-token `gc/state` CAS sets `snap_generation = G_f, snap_attempt = a`. Commits iff the leader still holds the lease. A deposed leader's adopt fails; its entire attempt is unadopted garbage.
-3. **Tail.** `retire` / `fence` / `recheck` write durable artifacts under the **accepted** `(snap_generation, snap_attempt)`.
-4. **Completion advance (CAS #2 — inherits the attempt).** Once the completion seal + full outcome coverage are durable, a lease-token CAS advances `snap_generation = G_c`, keeping `snap_attempt = a`. A deposed leader's CAS #2 fails.
+1. **Fold + merge (hidden).** The leader latches the ack floor, then writes all attempt artifacts under `gc/gen/<G_f>/attempt/<a>/` — the fold seal, the new in-degree snapshot runs, the retired-list runs, and the outcome logs from the three-cursor merge (§3.4). Nothing is reader-visible. Competing leaders write under their own `a`.
+2. **Pre-CAS deletes.** Executed only for entries **previously published** as `delete_pending` (§3.5) — justified by prior committed state, so idempotent across attempts.
+3. **The single adopt CAS.** One lease-token `gc/state` CAS sets `snap_generation = G_f`, `snap_attempt = a`, `retired_refs`, `round := K`, and the folded cursors atomically. Commits iff the leader still holds the lease; a deposed leader's CAS fails and its entire attempt is unadopted garbage. This replaces the old two CASes (fold-adopt + completion advance) and the intervening fence/retire CASes.
 
 **Artifact-class rule** (how concurrent writes to the same attempt key are reconciled):
 
-- **Deterministic artifacts** (in-degree runs, fold seal, completion seal): byte-reproducible from their inputs. Any producer finding one present must find it **byte-equal → adopt** (deterministic replay) or **divergent → `CORRUPTED_DATA`** (fail-closed, impossible under correct operation). Replaces the old outcome-ignoring `putIfAbsent` in `foldDeltasIntoGeneration`.
-- **Observation-bearing artifacts** (retired sets, outcome logs): carry HEAD-observed tokens that two observers may legitimately differ on (a re-incarnation between their HEADs). **First-durable-write wins** (read-if-present). A later producer reads the present artifact and uses it as authority; it never recomputes-and-compares.
+- **Deterministic artifacts** (in-degree runs, fold seal): byte-reproducible from their inputs. Any producer finding one present must find it **byte-equal → adopt** (deterministic replay) or **divergent → `CORRUPTED_DATA`** (fail-closed, impossible under correct operation).
+- **Observation-bearing artifacts** (retired-list runs, outcome logs): carry HEAD-observed tokens that two observers may legitimately differ on (a re-incarnation between their HEADs). **First-durable-write wins** (read-if-present). A later producer reads the present artifact and uses it as authority; it never recomputes-and-compares.
 
-**`ViewableRound` round-advance rule (sharded subset-safety):** `gc/state.round` advances only
-after **every** blob-target shard's retired set **and** every part-manifest cleanup bundle for the
-round are durable. This preserves `ViewableRound`. In sharded mode the blob-target reducers run in
-parallel over disjoint shards; a writer refreshing its retire view to round `R` must observe the
-**complete** retired-token set, not a partial snapshot from the faster reducers. Advancing the round
-before all shards have written would open a window where a writer publishes against a stale token
-view and dangles. The invariant name is `INV_ONLY_ADOPTED_VIEWABLE` / `ViewableRound` in the model;
-this is its operational statement.
+**Publish-order invariant (subsumes `ViewableRound`):** the retired-list runs (and the snapshot runs) for round K are durable **before** the single `gc/state` CAS that publishes `round := K` and `retired_refs`. Because the refs and the round land in the *same* CAS, a reader that observes round K can always load the complete retired list of version K — there is no window where the round advances ahead of its retired-token set. This is the operational statement of `INV_ONLY_ADOPTED_VIEWABLE`; the old requirement of "advance the round only after every shard's retired set is durable" is now enforced by the single-CAS structure itself.
 
-**Resume** (`tryResumeIncompleteRound`): derives the stopping point from which accepted-attempt artifacts are durable — no stored phase marker. Crash before fold adopt: hidden attempt is garbage; next round folds fresh. Crash after fold adopt but before completion advance: resume the tail, reading present artifacts as authority, producing only the missing ones.
+**Crash-resume (no explicit resume step):** the former `tryResumeIncompleteRound` is removed. One CAS per round means a crash leaves only never-adopted attempt-scoped debris (pruned by retention). The next pass re-runs from scratch under a fresh attempt; already-executed pre-CAS deletes replay idempotently on the `NotFound` branch because they were justified by previously-published state.
 
 **Pruning** (space reclamation, not safety-load-bearing):
 
@@ -364,17 +374,17 @@ this is its operational statement.
 
 ### 6.1 Blob orphan removal {#blob-orphan-removal}
 
-**Status: DONE** (via the normal round — fold detects zero-in-degree blobs; retire/recheck deletes them).
+**Status: DONE** (via the normal round — the three-cursor merge condemns zero-in-degree blobs and, after the ack floor passes them, graduates and deletes them, §3.4–3.6).
 
-A blob becomes an orphan when all manifests referencing it are removed (their edges are folded out). The fold emits explicit zero-transition markers for such blobs; `zeroInDegree` streams them; `retire` observes their token; `recheck` deletes after the fence + fold-through-fence confirmation.
+A blob becomes an orphan when all manifests referencing it are removed (their edges are folded out). The fold emits explicit zero-transition markers for such blobs; the three-cursor merge (§3.4) condemns them (capturing the current token) and, once the ack floor passes them, graduates them to `delete_pending`; the pass after that deletes them exactly (§3.5–3.6).
 
-The only path to blob deletion is through this pipeline. There is no direct delete bypassing the four gates.
+The only path to blob deletion is through this pipeline. There is no direct delete bypassing the merge + two-phase-graduation gates.
 
 ### 6.2 Part-manifest orphan removal {#manifest-orphan-removal}
 
 **Status: DONE** (owner-driven cleanup in part-manifest cleanup bundle; orphan sweep for pre-precommit debris is DONE).
 
-A part manifest is orphaned when its owner (committed ref or precommit) is removed. The fold emits its `ManifestId` into the part-manifest cleanup bundle; the recheck/completion phase issues `deleteExact` for it after the fence confirms no concurrent re-attachment.
+A part manifest is orphaned when its owner (committed ref or precommit) is removed. The fold emits its `ManifestId` into the part-manifest cleanup bundle; the post-CAS cleanup phase (§3.6) issues `deleteExact` for it after the adopted decrements confirm no concurrent re-attachment.
 
 Pre-precommit manifest bodies (written before `PrecommitAdd`) have no owner. The orphan sweep handles them (§3.7).
 
@@ -429,7 +439,7 @@ pin blobs forever — a genuine leak needing a separate long-dead-replica reapin
 
 ### 7.2 Rejected fixes {#d1-rejected}
 
-- **Writer deregisters at `dropNamespace`:** unsafe. The removal `RootOwnerEvent`s carry the `−1` blob-in-degree edges; GC folds them only in the recheck window `(folded_cursor, fence_version]`. If the namespace vanishes from discovery before GC folds that window, the `−1`s are lost → blobs keep phantom in-degree → permanent leak.
+- **Writer deregisters at `dropNamespace`:** unsafe. The removal `RootOwnerEvent`s carry the `−1` blob-in-degree edges; GC folds them only in the shard's fold window `(folded_cursor, current_shard_version]`. If the namespace vanishes from discovery before GC folds that window, the `−1`s are lost → blobs keep phantom in-degree → permanent leak.
 - **GC infers "empty ⇒ retire":** a freshly-created table with no inserts yet is indistinguishable from a dropped empty one.
 - **Path-keyed cursor + delete-and-recreate:** ABA hazard. A recreated shard resets `shard_version` to 0; the old sealed `folded_cursor = K` silently skips events at versions `1..≤K` → lost edges → dangle or leak.
 
@@ -493,15 +503,17 @@ GC is the dominant S3 cost center on a pool with steady ingest/drop churn. Detai
 
 | Phase | Dominant cost |
 |-------|--------------|
-| Discover | 1 LIST per root (token-diff: skip if token unchanged) |
-| Fold | 1 GET per changed root shard; 1 PUT per blob-target-shard in-degree run; 1 PUT fold seal |
-| Retire | 1 HEAD per zero-in-degree candidate; 1 PUT retired set per shard |
-| Fence | 1 CAS per live root shard (bumps `fence_round`) |
-| Recheck | 1 GET per completion in-degree run; `deleteExact` per confirmed deletion |
+| Heartbeat floor | O(servers) GETs (LIST `gc/server-roots/` + GET each); rare fence-out PUT |
+| Discover | 1 LIST sweep of `cas/refs/` (token-diff: skip GET if token unchanged) |
+| Fold + three-cursor merge | 1 GET per changed root shard; 1 GET per prior retired run; 1 HEAD per newly-condemned candidate; 1 PUT per in-degree run + 1 PUT per retired run + 1 PUT fold seal |
+| Deletes | `deleteExact` per previously-published `delete_pending` entry (free on AWS) |
 | Snap prune | `snap_shards × (HEAD + DELETE)` per pruned generation (steady state: 1 generation/round) |
-| Heartbeat | 1 small CAS per `H` seconds |
+| Round CAS | 1 `gc/state` CAS-PUT (the only CAS per round) |
+| Heartbeat | merged into the writer's mount-lease beat (`03 §merged-heartbeat`): +1 `gc/state` GET, −1 PUT per beat |
 
-**P9 snap-prune impact (DONE):** before snap-prune and the node-forgetting mechanism, GC issued ~46k `HEAD`s per idle round (re-`HEAD`ing every previously deleted candidate). Both are now eliminated: the retire-404 path prunes the node on first 404; the delete-time path prunes immediately on deletion. The `gc/` prefix went from 82% of pool storage to bounded sawtooth.
+The ack-floor round is **O(delta) + O(servers)** requests plus the single LIST sweep — no O(universe) GET or PUT phase exists. This is the whole point of replacing fence+recheck; the per-round cost dropped from ~2.4 M requests to ~2 000–3 000 at the 100k-tables example. See `07-s3-budget.md §gc-budget` for the full breakdown.
+
+**P9 snap-prune impact (DONE):** before snap-prune and the node-forgetting mechanism, GC issued ~46k `HEAD`s per idle round (re-`HEAD`ing every previously deleted candidate). Both are now eliminated: the condemn-404 path prunes the node on first 404; the delete-time path prunes immediately on deletion. The `gc/` prefix went from 82% of pool storage to bounded sawtooth.
 
 ---
 
@@ -510,11 +522,13 @@ GC is the dominant S3 cost center on a pool with steady ingest/drop churn. Detai
 **Status: comprehensive gtest suite exists; soak S04/S33/S03/S11 all drain to `fsck unreachable=0, dangling=0, gc_residual=0` with the current binary.**
 
 Key test files:
-- `src/Disks/tests/gtest_cas_gc_round.cpp` — per-step unit tests (fold/retire/fence/recheck/delete/trim/lease)
-- `src/Disks/tests/gtest_cas_gc_scenarios.cpp` — fault-injection scenario battery (split-brain, crash-replay, spared/replaced/absent outcomes)
-- `src/Disks/tests/gtest_cas_gc_undercount_repro.cpp` — H1b regression (fence-window removal re-folded next round); GREEN after source-edge-set fix
+- `src/Disks/tests/gtest_cas_gc_ack_floor.cpp` — the `CasGcAckFloor` protocol suite (condemn → pending → delete pipeline, `NoOpRoundDoesNotMutateRefShards`, stale-ack-holds-the-floor, pre-ack publish spares, expired-mount fence-out, recreated-blob-delete-is-`TokenMismatch`-ok); ported from the old `gtest_cas_gc_fence_recheck.cpp`
+- `src/Disks/tests/gtest_cas_mount.cpp` — `CasHeartbeatFloor` (`computeHeartbeatFloor` classification + fence-out), `CasHeartbeat` (merged keeper)
+- `src/Disks/tests/gtest_cas_store.cpp` — `CasStoreBeat` (ack advances only after view load; drain blocks ack while a mutation is in flight; a `gc/state` read failure leaves the ack unchanged)
+- `src/Disks/tests/gtest_cas_blob_indegree.cpp` — `CasThreeCursorMerge` (spare / graduate→pending / condemn rules, the `condemn_round = min_ack−1 / = min_ack` boundary)
+- `src/Disks/tests/gtest_cas_gc_undercount_repro.cpp` — H1b regression; GREEN after source-edge-set fix
 - `src/Disks/tests/gtest_cas_gc_snap.cpp` — node-forgetting / snap-prune unit tests
-- `utils/ca-soak/scenarios/` — adversarial scenario suite (S01–S35); S30 tests D1 registry growth; S33 tests concurrent GC leaders
+- `utils/ca-soak/scenarios/` — adversarial scenario suite (S01–S35); S30/S34/S35 test D1 create/drop churn; S33 tests concurrent GC leaders
 
 **Known blind spot:** tests running with `gc_shards=1` (the default) do not exercise sharded bugs. All new fold/discovery tests added for D1 must also run with `gc_shards > 1`.
 
@@ -524,9 +538,17 @@ Key test files:
 
 | Area | Status | Note |
 |------|--------|------|
-| Core round (fold → retire → fence → recheck → trim) | **DONE** | Soak-validated |
-| Exact-token delete, four-gate recheck | **DONE** | |
+| One-pass ack-floor round (floor → three-cursor merge → single CAS) | **DONE** | `cas-gc-ack-floor-fence`; soak validation TODO |
+| Heartbeat ack floor + expired-mount fence-out (`computeHeartbeatFloor`) | **DONE** | Round's only clock (injected `now_ms_fn`) |
+| Merged heartbeat (mount lease ∪ build watermark, `observed_gc_round` ack) | **DONE** | `WatermarkKeeper` removed; −1 PUT/beat |
+| Two-phase graduation (`delete_pending`) | **DONE** | Zombie-safe pre-CAS deletes; deletion lags condemn by one pass |
+| `CaGcAckFloorCore.tla` + `CaGcAckFloorZombie.tla` | **DONE** | 7 sabotages + order invariant; `delete_pending` proved load-bearing |
+| Exact-token delete (single content-delete site) | **DONE** | |
 | Source-edge-set in-degree (H1b fix) | **DONE** | 2026-07-01; faithful to big TLA+ model |
+| Per-round all-shard fence (`fence_round` bump, `fence_version`) | **REJECTED** | Replaced by ack-floor; was O(universe) CAS-PUT/round |
+| Fold-through-fence recheck phase | **REJECTED** | Replaced by the three-cursor merge; was O(universe) GET + quadratic `inDegreeInGeneration` |
+| Ack-floor soak validation (spare-then-recondemn under kill; SIGSTOP holds floor; O(delta) request guard) | **TODO** | On `utils/ca-soak`; the round's regression guard against reintroducing a universe sweep |
+| Delta-runs + compaction for the snapshot (bytes O(edges)/pass) | **DESIRABLE** | Next dominant cost; deferred O(buffer) streaming work |
 | Attempt-scoped generations (concurrent-leader safety) | **DONE** | 2026-07-01; `_sab_deposedleaderwritesfinalgen` confirmed |
 | Advisory heartbeat (B160, false-steal fix) | **DONE** | `CaGcLeaseCore.tla` proved |
 | Snap prune — node forgetting (P9) | **DONE** | `GcSnap::forget`; `GForget` added to model |
