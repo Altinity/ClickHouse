@@ -166,6 +166,83 @@ TEST(CasGcFormats, GcStateV3Validation)
     }
 }
 
+/// ---------- Task 6: condemn_round + retired_refs ----------
+
+TEST(CasGcFormats, RetiredEntryCondemnRoundRoundTrips)
+{
+    RetiredSet rs;
+    RetiredEntry e{ObjectKind::Blob, hexToU128("000102030405060708090a0b0c0d0e0f"),
+                   Token{"etag-1", TokenType::ETag}, 1234};
+    e.condemn_round = 9;
+    rs.entries.push_back(e);
+    auto d = decodeRetiredSet(encodeRetiredSet(rs));
+    ASSERT_EQ(d.entries.size(), 1u);
+    EXPECT_EQ(d.entries[0].condemn_round, 9u);
+    /// Defaults to 0 when unset (proto3 zero-value).
+    RetiredSet rs0;
+    rs0.entries.push_back({ObjectKind::Blob, hexToU128("00000000000000000000000000000001"),
+                           Token{"t", TokenType::Emulated}, 0});
+    EXPECT_EQ(decodeRetiredSet(encodeRetiredSet(rs0)).entries[0].condemn_round, 0u);
+}
+
+TEST(CasGcFormats, RetiredSetSortedByKindThenHash)
+{
+    /// Entries fed out of (kind, hash) order come back sorted: Blob before Tree, then hash ascending.
+    RetiredSet rs;
+    const auto h_hi = hexToU128("ff000000000000000000000000000000");
+    const auto h_lo = hexToU128("00000000000000000000000000000001");
+    rs.entries.push_back({ObjectKind::Tree, h_lo, Token{"a", TokenType::Emulated}, 1});
+    rs.entries.push_back({ObjectKind::Blob, h_hi, Token{"b", TokenType::Emulated}, 2});
+    rs.entries.push_back({ObjectKind::Blob, h_lo, Token{"c", TokenType::Emulated}, 3});
+    const auto d = decodeRetiredSet(encodeRetiredSet(rs));
+    ASSERT_EQ(d.entries.size(), 3u);
+    /// Blob@h_lo, Blob@h_hi, Tree@h_lo.
+    EXPECT_EQ(d.entries[0].kind, ObjectKind::Blob);
+    EXPECT_EQ(d.entries[0].hash, h_lo);
+    EXPECT_EQ(d.entries[1].kind, ObjectKind::Blob);
+    EXPECT_EQ(d.entries[1].hash, h_hi);
+    EXPECT_EQ(d.entries[2].kind, ObjectKind::Tree);
+    EXPECT_EQ(d.entries[2].hash, h_lo);
+
+    /// Byte-deterministic: a different input order yields the SAME encoded bytes.
+    RetiredSet shuffled;
+    shuffled.entries.push_back(rs.entries[2]);
+    shuffled.entries.push_back(rs.entries[0]);
+    shuffled.entries.push_back(rs.entries[1]);
+    EXPECT_EQ(encodeRetiredSet(shuffled), encodeRetiredSet(rs));
+}
+
+TEST(CasGcFormats, GcStateRetiredRefsRoundTrip)
+{
+    GcState s;
+    s.round = 5;
+    s.gc_shards = 3;
+    s.retired_refs[0] = "p/gc/gen/4/attempt/2/retired/5/0";
+    s.retired_refs[2] = "p/gc/gen/4/attempt/2/retired/5/2";
+    const auto d = decodeGcState(encodeGcState(s));
+    ASSERT_EQ(d.retired_refs.size(), 2u);
+    EXPECT_EQ(d.retired_refs.at(0), "p/gc/gen/4/attempt/2/retired/5/0");
+    EXPECT_EQ(d.retired_refs.at(2), "p/gc/gen/4/attempt/2/retired/5/2");
+    /// Absent by default.
+    EXPECT_TRUE(decodeGcState(encodeGcState(GcState{})).retired_refs.empty());
+}
+
+TEST(CasGcFormats, GcStateRejectsOldVersionFailClosed)
+{
+    /// Fail-closed on an object whose compatibility_version is beyond this build: the ONLY functional
+    /// version guard in this proto codec. (retired_refs is an ADDITIVE proto field — same regime as
+    /// snap_attempt (commit e9d898d5c44) and fence_version — so there is no per-object "v3" integer to
+    /// reject; the write-down-to-floor branch is deferred until a roster exists (CasFormat.h). The
+    /// forward-incompatible body is what a mixed-version pool would produce and MUST fail closed.)
+    Proto::GcStateProto msg;
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::GcState));
+    hdr->set_compatibility_version(G_BUILD + 1);
+    msg.set_snap_shards(1);
+    std::string bytes; msg.SerializeToString(&bytes);
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeGcState(bytes); });
+}
+
 TEST(CasGcFormats, RetiredSetRoundTrip)
 {
     RetiredSet rs;

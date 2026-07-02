@@ -14,11 +14,12 @@
 namespace DB::Cas
 {
 
-/// The writer-side retire view (spec §5): the set of condemned (kind, hash, token) incarnations
-/// published by GC, plus the round through which the view is current. On storage this is gc/state
-/// (ABSENT object => round 0 — a pool GC never touched) and the union of all currently-present
-/// retired-set objects under gc/retired/. GC drops entries by REWRITING those objects, so reading
-/// current storage state IS the protocol's view.
+/// The writer-side retire view (spec §5, ack-floor redesign): the set of condemned (kind, hash, token)
+/// incarnations published by GC, plus the round through which the view is current. On storage this is
+/// gc/state (ABSENT object => round 0 — a pool GC never touched) and the per-gc-shard retired-list
+/// objects it references via `retired_refs`. The refs and the round come out of the SAME gc/state body,
+/// so the retired list can never be older than the round it is installed for. GC drops entries by
+/// REWRITING those objects, so reading current storage state IS the protocol's view.
 ///
 /// The publish gate (rules W-EVIDENCE / W-PUBLISH-GATE / W-REVALIDATE) consults this view to
 /// decide whether a reused object is condemned.
@@ -33,8 +34,9 @@ class RetireView
 public:
     RetireView(BackendPtr backend_, Layout layout_);
 
-    /// LIST gc/retired/ + GET each set + GET gc/state. Rare by construction: called at Store::open
-    /// and on fence-advanced publish conflicts only — never on per-object hot paths.
+    /// GET gc/state, then GET each retired-list object it references via `retired_refs`. Rare by
+    /// construction: called at Store::open, on each heartbeat beat that observes a newer round, and on
+    /// fence-advanced publish conflicts only — never on per-object hot paths.
     void refresh();
 
     /// The GC round through which this view is current (0 = pool GC never touched).

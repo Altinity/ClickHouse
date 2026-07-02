@@ -618,6 +618,12 @@ Gc::RetireResult Gc::retire(GcState & state, Token & state_token, const FoldResu
     /// ONE gc/state CAS advances .round — the durable "retire phase complete" marker (ViewableRound).
     GcState next = state;
     next.round = round;
+    /// Ack-floor bridge (Task 6): also record each retired set's key in retired_refs so the writer-side
+    /// RetireView (which now reads refs out of gc/state, not a LIST) sees this round's retired sets. The
+    /// keys and the round land in the SAME CAS, satisfying the publish-order invariant. Task 9 replaces
+    /// this per-round-set writer with the single current-list runs, rewriting exactly this code.
+    for (const auto & [shard, set] : result.blobs)
+        next.retired_refs[shard] = layout.retiredKey(folded.fold_seal.generation, state.snap_attempt, round, shard);
     const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
     if (res.outcome != CasOutcome::Committed)
         throw Exception(ErrorCodes::ABORTED,
@@ -995,6 +1001,10 @@ void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, cons
     GcState next = state;
     next.snap_generation = completion_generation;
     std::erase_if(next.fence_version, [&](const auto & kv) { return kv.first <= round; });
+    /// Ack-floor bridge (Task 6): this round's retired sets are dropped just below, so clear the refs
+    /// recorded by `retire` in the SAME CAS — a resumed writer never dereferences a removed set. (Task 9
+    /// replaces this with the current-list model where the refs carry forward, not clear.)
+    next.retired_refs.clear();
 
     /// B9: prune superseded generations. The fold/recheck read ONLY the latest seal at snap_generation
     /// (M1) and its blob-target runs, so any generation below the retention floor is unreferenced. A

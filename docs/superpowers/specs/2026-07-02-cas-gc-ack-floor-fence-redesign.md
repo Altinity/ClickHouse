@@ -64,11 +64,14 @@ Body (existing mount fields plus the watermark's plus the ack):
 
 ```
 server_uuid, writer_epoch, hostname, pid, started_at_ms, seq, expires_at_ms   -- as today (S13)
-process_epoch          -- watermark's random per-open epoch (kept until stamp unification)
 min_active_build_seq   -- watermark's orphan-sweep floor ("retired" sentinel supported)
 observed_gc_round      -- NEW: the ack; monotone, never decreases
 gc_fenced              -- NEW: set only by GC fence-out (see below); terminal for this incarnation
 ```
+
+(Amendment 2026-07-02, Task 6: the separate `process_epoch` field is dropped — the writable path already
+sets `process_epoch = writer_epoch` ("THE BRIDGE" in `CasStore.cpp`), so the merged body's `writer_epoch`
+serves both the mount and the orphan-sweep epoch; no distinct field is needed.)
 
 Beat cadence: one period for everything (proposal: 3–5 s — satisfies the watermark's ~2 s-class
 freshness need, the mount TTL/3 rule for `mount_lease_ttl_ms` = 30 s, and bounds ack latency).
@@ -76,11 +79,19 @@ Net writer S3 delta per beat: **−1 PUT** (two heartbeats become one), **+1 GET
 
 ### Retired list
 
-Per gc-shard sorted run objects (`RunFile` format, new `RunKind::Retired`), key schema
-`blob_hash` (16 bytes BE), payload `{token, condemn_round}`. Written by the GC pass as
-write-once deterministic artifacts under attempt-scoped keys (same regime as snapshot runs),
-referenced (key + checksum) from `gc/state`. This is the **current** outstanding-candidate set —
-small (candidates only), cheap for writers to GET whole.
+Per gc-shard objects encoded with the existing strict `cas_retired_set` codec (proto `RetiredSetProto`,
+magic CART), extended with a per-entry `condemn_round`; entries are sorted by `(kind, hash)` so the
+bytes are byte-deterministic. Written by the GC pass as write-once artifacts under attempt-scoped keys
+(same regime as snapshot runs), referenced from `gc/state.retired_refs` (gc-shard → object key). What
+matters is the determinism and the publish-order property (the refs and the round land in the same
+`gc/state` CAS); a dedicated run format (`RunFile` / `RunKind::Retired`) is unnecessary at
+candidate-set sizes. This is the **current** outstanding-candidate set — small (candidates only), cheap
+for writers to GET whole.
+
+(Amendment 2026-07-02, Task 6: recorded during implementation. The codec is protobuf, not JSON as an
+older header comment implied, and `retired_refs`/`condemn_round` are ADDITIVE proto fields — same regime
+as `snap_attempt` — with no per-object version integer to bump; the only functional version guard is the
+`compatibility_version` fail-closed-on-future check, and mixed-version pools are unsupported pre-release.)
 
 Replaces: per-round retired sets (`retiredKey(...)`) and the multi-round `RetireView` fetch
 protocol. `RetireView` now loads the single current list; `isCondemnedToken(hash, token)` becomes a
@@ -142,9 +153,13 @@ today):
   build-local bytes, expected = current_token)` → reference the fresh incarnation.
   `PreconditionFailed` ⇒ someone else recreated or GC deleted concurrently ⇒ re-HEAD and repeat.
   A retired token itself is **never referenced** (resurrect invariant: revival is a fresh
-  re-upload from source only). This replaces today's `ABORTED`-and-restart-the-build response and
-  resolves the condemned-adoption gap (a plain `putIfAbsent` would adopt the condemned
-  incarnation).
+  re-upload from source only). This resolves the condemned-adoption gap (a plain `putIfAbsent` would
+  adopt the condemned incarnation).
+
+  (Amendment 2026-07-02, Task 6: recreation is performed by the EXISTING `Build::putBlob` cold-reuse
+  rule — condemned ⇒ `uploadFromSource`, token-conditional — on the *retried* build, not a new gate
+  code path. The promote gate itself stays fail-closed `ABORTED` because build-local sources are not
+  retained at promote time; a promote-time in-place recreate is a possible follow-up.)
 - **Present, not retired** → use (as today).
 
 The write path gains **zero** S3 operations in the common case; the recreate PUT happens only in

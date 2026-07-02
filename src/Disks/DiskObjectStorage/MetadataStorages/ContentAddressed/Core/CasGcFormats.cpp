@@ -83,6 +83,15 @@ String encodeGcState(const GcState & state)
     msg.set_snap_attempt(state.snap_attempt);
     msg.set_manifest_sweep_cursor(state.manifest_sweep_cursor);
 
+    /// retired_refs is `repeated` (spec bans new proto map<> for byte-determinism). `state.retired_refs`
+    /// is a std::map<uint64, String>, so iterating it already yields shards ascending — no explicit sort.
+    for (const auto & [shard, key] : state.retired_refs)
+    {
+        auto * ref = msg.add_retired_refs();
+        ref->set_shard(shard);
+        ref->set_key(key);
+    }
+
     auto * lease = msg.mutable_lease();
     lease->set_owner(u128ToBytesBE(state.lease.owner));
     lease->set_seq(state.lease.seq);
@@ -149,6 +158,9 @@ GcState decodeGcState(std::string_view data)
         state.fence_version[entry.round()] = std::move(inner);
     }
 
+    for (const auto & ref : msg.retired_refs())
+        state.retired_refs[ref.shard()] = ref.key();
+
     return state;
 }
 
@@ -162,8 +174,10 @@ String encodeRetiredSet(const RetiredSet & set)
     hdr->set_writer_version(currentWriterVersion());
     hdr->set_compatibility_version(currentCompatibilityVersion());
 
-    /// Sort entries deterministically (kind, hash-BE, token_value, token_type, size) so the
-    /// encoded bytes are stable across encodes — mirrors the JSON encoder's ordered iteration.
+    /// Sort entries by (kind, hash-BE) — the retired set's logical key in the current-list model — so
+    /// the encoded bytes are byte-deterministic regardless of input order (ack-floor spec §"Retired
+    /// list"). token_value / token_type / size stay as tiebreakers so the order is total even if two
+    /// incarnations of the same (kind, hash) ever co-reside in one set.
     std::vector<const RetiredEntry *> sorted;
     sorted.reserve(set.entries.size());
     for (const auto & e : set.entries)
@@ -192,6 +206,7 @@ String encodeRetiredSet(const RetiredSet & set)
         pe->set_token_value(ep->token.value);
         pe->set_token_type(tokenTypeToProto(ep->token.type));
         pe->set_size(ep->size);
+        pe->set_condemn_round(ep->condemn_round);
     }
 
     std::string out;
@@ -227,6 +242,7 @@ RetiredSet decodeRetiredSet(std::string_view data)
         entry.token.value = pe.token_value();
         entry.token.type = tokenTypeFromProto(pe.token_type(), "retired set");
         entry.size = pe.size();
+        entry.condemn_round = pe.condemn_round();
         set.entries.push_back(std::move(entry));
     }
     return set;

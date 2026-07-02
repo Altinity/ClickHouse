@@ -11,10 +11,38 @@
 
 using namespace DB::Cas;
 
-/// RetireView tests inject GC state by writing gc/state and the attempt-scoped retired objects
-/// directly: that is the documented on-storage interface between GC and the writer (spec §5), not a
-/// white-box shortcut. The minimal injected gc/state has snap_generation == snap_attempt == 0, so the
-/// retired sets are written under retiredKey(0, 0, round, shard) — exactly the prefix RetireView LISTs.
+/// RetireView reads the CURRENT retired list by dereferencing `gc/state.retired_refs` (spec §5,
+/// ack-floor redesign) — NOT by LISTing a retired prefix. These tests inject GC state by writing
+/// gc/state (with retired_refs pointing at the retired objects) and the retired objects themselves:
+/// that is the documented on-storage interface between GC and the writer publish gate. `seedRetired`
+/// writes a set at retiredKey(gen, attempt, round, shard) and records the ref in gc/state under that
+/// shard, mirroring what the GC pass's retire bridge does.
+namespace
+{
+
+/// Seed gc/state{round, snap_generation=gen, snap_attempt=attempt} plus per-shard retired sets whose
+/// keys are recorded in retired_refs — the shape RetireView::refresh consumes.
+void seedState(Backend & b, const Layout & layout, uint64_t round, uint64_t gen, uint64_t attempt,
+               const std::map<uint64_t, RetiredSet> & per_shard)
+{
+    GcState state;
+    state.round = round;
+    state.snap_generation = gen;
+    state.snap_attempt = attempt;
+    for (const auto & [shard, set] : per_shard)
+    {
+        const String key = layout.retiredKey(gen, attempt, round, shard);
+        b.putIfAbsent(key, encodeRetiredSet(set));
+        state.retired_refs[shard] = key;
+    }
+    const auto head = b.head(layout.gcStateKey());
+    if (head.exists)
+        b.putOverwrite(layout.gcStateKey(), encodeGcState(state), head.token);
+    else
+        b.putIfAbsent(layout.gcStateKey(), encodeGcState(state));
+}
+
+}
 
 TEST(CasRetireView, EmptyPoolIsRoundZero)
 {
@@ -30,11 +58,10 @@ TEST(CasRetireView, SeesInjectedRetirements)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(2, 1));
     RetiredSet rs;
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
     rs.entries.push_back({ObjectKind::Blob, h, Token{"3", TokenType::Emulated}, 10});
-    b->putIfAbsent(layout.retiredKey(0, 0, 2, 0), encodeRetiredSet(rs));
+    seedState(*b, layout, /*round*/ 2, /*gen*/ 0, /*attempt*/ 0, {{0, rs}});
     RetireView v(b, layout);
     v.refresh();
     EXPECT_EQ(v.round(), 2u);
@@ -49,11 +76,10 @@ TEST(CasRetireView, RefreshDropsRewrittenEntries)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(2, 1));
     RetiredSet rs;
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
     rs.entries.push_back({ObjectKind::Blob, h, Token{"3", TokenType::Emulated}, 10});
-    b->putIfAbsent(layout.retiredKey(0, 0, 2, 0), encodeRetiredSet(rs));
+    seedState(*b, layout, /*round*/ 2, /*gen*/ 0, /*attempt*/ 0, {{0, rs}});
 
     RetireView v(b, layout);
     v.refresh();
@@ -61,44 +87,27 @@ TEST(CasRetireView, RefreshDropsRewrittenEntries)
     ASSERT_TRUE(v.findCondemned(ObjectKind::Blob, h).has_value());
 
     /// GC "drops" the entry by rewriting the retired object WITHOUT it, and bumps gc/state.
-    /// Reading current storage state IS the protocol's view.
-    {
-        auto head = b->head(layout.retiredKey(0, 0, 2, 0));
-        ASSERT_TRUE(head.exists);
-        ASSERT_EQ(b->putOverwrite(layout.retiredKey(0, 0, 2, 0), encodeRetiredSet(RetiredSet{}), head.token).outcome,
-                  PutOutcome::Done);
-    }
-    {
-        auto head = b->head(layout.gcStateKey());
-        ASSERT_TRUE(head.exists);
-        ASSERT_EQ(b->putOverwrite(layout.gcStateKey(), tests::encodeMinimalGcState(3, 1), head.token).outcome,
-                  PutOutcome::Done);
-    }
+    /// Reading current storage state IS the protocol's view. Re-seed at round 3 with an empty set.
+    seedState(*b, layout, /*round*/ 3, /*gen*/ 0, /*attempt*/ 0, {{0, RetiredSet{}}});
 
     v.refresh();
     EXPECT_EQ(v.round(), 3u);
     EXPECT_FALSE(v.findCondemned(ObjectKind::Blob, h).has_value());
 }
 
-TEST(CasRetireView, MultipleRoundsUnion)
+TEST(CasRetireView, MultipleShardsUnion)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(2, 1));
 
-    /// Two retired objects at different (round, fence_seq, shard) keys condemn DIFFERENT tokens
-    /// of the SAME (kind, hash) — the view is the UNION over all present retired objects.
+    /// Two retired objects on DIFFERENT gc-shards condemn DIFFERENT tokens of the SAME (kind, hash) —
+    /// the view is the UNION over all refs recorded in gc/state.
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
-    {
-        RetiredSet rs;
-        rs.entries.push_back({ObjectKind::Blob, h, Token{"7", TokenType::Emulated}, 10});
-        b->putIfAbsent(layout.retiredKey(0, 0, 1, 0), encodeRetiredSet(rs));
-    }
-    {
-        RetiredSet rs;
-        rs.entries.push_back({ObjectKind::Blob, h, Token{"9", TokenType::Emulated}, 10});
-        b->putIfAbsent(layout.retiredKey(0, 0, 2, 3), encodeRetiredSet(rs));
-    }
+    RetiredSet rs0;
+    rs0.entries.push_back({ObjectKind::Blob, h, Token{"7", TokenType::Emulated}, 10});
+    RetiredSet rs1;
+    rs1.entries.push_back({ObjectKind::Blob, h, Token{"9", TokenType::Emulated}, 10});
+    seedState(*b, layout, /*round*/ 2, /*gen*/ 0, /*attempt*/ 0, {{0, rs0}, {3, rs1}});
 
     RetireView v(b, layout);
     v.refresh();
@@ -117,105 +126,112 @@ TEST(CasRetireView, MultipleRoundsUnion)
     EXPECT_FALSE(v.isCondemnedToken(ObjectKind::Blob, h, Token{"8", TokenType::Emulated}));
 }
 
-TEST(CasRetireView, PaginationCoversManyObjects)
-{
-    /// RetireView::refresh lists with an internal page limit of 1000, so five objects would come
-    /// back in ONE page and the cursor-continuation loop would never run. Clamp the backend's page
-    /// size to 2 so refresh MUST follow next_cursor across multiple pages to see all five.
-    class TinyPageBackend : public InMemoryBackend
-    {
-    public:
-        ListPage list(const String & prefix, const String & cursor, size_t limit) override
-        {
-            return InMemoryBackend::list(prefix, cursor, std::min<size_t>(limit, 2));
-        }
-    };
-
-    auto b = std::make_shared<TinyPageBackend>();
-    Layout layout("p");
-    b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(5, 1));
-
-    /// Five retired objects under the adopted attempt's retired prefix, each condemning a distinct
-    /// hash. The view must union ALL of them; with the clamped page size the union completes only if
-    /// the cursor loop is correct.
-    std::vector<UInt128> hashes;
-    for (uint64_t i = 0; i < 5; ++i)
-    {
-        const auto h = UInt128(i + 1);
-        hashes.push_back(h);
-        RetiredSet rs;
-        rs.entries.push_back({ObjectKind::Tree, h, Token{std::to_string(100 + i), TokenType::Emulated}, i});
-        b->putIfAbsent(layout.retiredKey(0, 0, i + 1, i), encodeRetiredSet(rs));
-    }
-
-    RetireView v(b, layout);
-    v.refresh();
-    EXPECT_EQ(v.round(), 5u);
-    for (size_t i = 0; i < hashes.size(); ++i)
-    {
-        auto hit = v.findCondemned(ObjectKind::Tree, hashes[i]);
-        ASSERT_TRUE(hit.has_value()) << "hash " << i;
-        ASSERT_EQ(hit->size(), 1u);
-        EXPECT_EQ((*hit)[0].value, std::to_string(100 + i));
-    }
-}
-
 /// Attempt-scoping (writer-facing leak): a retired set planted under a NON-adopted attempt must be
-/// INVISIBLE to RetireView (the writer publish gate). A deposed GC leader writes its retired set under
-/// its own (unadopted) attempt; RetireView resolves only the adopted `(snap_generation, snap_attempt)`
-/// recorded in gc/state, so that decoy set must never condemn a live writer token. Planting the SAME
-/// token under the ADOPTED attempt then makes it condemned (positive control), proving the test is real.
-TEST(CasRetireView, NonAdoptedAttemptRetiredSetInvisible)
+/// INVISIBLE to RetireView — because refs come out of gc/state, which only records the adopted attempt's
+/// keys. A decoy set that gc/state does NOT reference can never condemn a live writer token. Recording
+/// the ref then makes it condemned (positive control), proving the test is real.
+TEST(CasRetireView, NonReferencedRetiredSetInvisible)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
 
-    /// gc/state adopts (snap_generation=4, snap_attempt=42); round 2.
-    GcState state;
-    state.round = 2;
-    state.snap_generation = 4;
-    state.snap_attempt = 42;
-    b->putIfAbsent(layout.gcStateKey(), encodeGcState(state));
-
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
     const Token tok{"3", TokenType::Emulated};
 
-    /// Decoy: a retired set under a NON-adopted attempt (snap_attempt + 999).
+    /// gc/state adopts (snap_generation=4, snap_attempt=42), round 2, with NO retired_refs (decoy unreferenced).
+    {
+        GcState state;
+        state.round = 2;
+        state.snap_generation = 4;
+        state.snap_attempt = 42;
+        b->putIfAbsent(layout.gcStateKey(), encodeGcState(state));
+    }
+    /// Decoy: a retired set at a plausible key that gc/state does NOT reference.
     {
         RetiredSet rs;
         rs.entries.push_back({ObjectKind::Blob, h, tok, 10});
-        b->putIfAbsent(layout.retiredKey(state.snap_generation, state.snap_attempt + 999, 2, 0),
-                       encodeRetiredSet(rs));
+        b->putIfAbsent(layout.retiredKey(4, 42, 2, 0), encodeRetiredSet(rs));
     }
 
     RetireView v(b, layout);
     v.refresh();
     EXPECT_EQ(v.round(), 2u);
-    /// The token lives ONLY in the decoy under a non-adopted attempt => NOT condemned.
     EXPECT_FALSE(v.isCondemnedToken(ObjectKind::Blob, h, tok))
-        << "a retired set under a non-adopted attempt must be invisible to the writer publish gate";
+        << "a retired set not referenced by gc/state must be invisible to the writer publish gate";
 
-    /// Positive control: plant the SAME token under the ADOPTED attempt; after refresh it IS condemned.
+    /// Positive control: record the ref in gc/state; after refresh it IS condemned.
     {
-        RetiredSet rs;
-        rs.entries.push_back({ObjectKind::Blob, h, tok, 10});
-        b->putIfAbsent(layout.retiredKey(state.snap_generation, state.snap_attempt, 2, 0),
-                       encodeRetiredSet(rs));
+        GcState state;
+        state.round = 2;
+        state.snap_generation = 4;
+        state.snap_attempt = 42;
+        state.retired_refs[0] = layout.retiredKey(4, 42, 2, 0);
+        const auto head = b->head(layout.gcStateKey());
+        b->putOverwrite(layout.gcStateKey(), encodeGcState(state), head.token);
     }
     v.refresh();
     EXPECT_TRUE(v.isCondemnedToken(ObjectKind::Blob, h, tok))
-        << "a retired set under the adopted attempt must be visible to the writer publish gate";
+        << "a retired set referenced by gc/state must be visible to the writer publish gate";
+}
+
+/// An absent ref target (gc/state names a key that has no object) contributes nothing — NOT an error.
+TEST(CasRetireView, AbsentRefKeyIsEmptyNoThrow)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout layout("p");
+    GcState state;
+    state.round = 5;
+    state.retired_refs[0] = layout.retiredKey(0, 0, 5, 0);   /// dangling: no object written
+    b->putIfAbsent(layout.gcStateKey(), encodeGcState(state));
+
+    RetireView v(b, layout);
+    EXPECT_NO_THROW(v.refresh());
+    EXPECT_EQ(v.round(), 5u);
+    EXPECT_FALSE(v.findCondemned(ObjectKind::Blob, hexToU128("000102030405060708090a0b0c0d0e0f")).has_value());
+}
+
+/// Absent gc/state => round 0, empty view (a pool GC never touched).
+TEST(CasRetireView, AbsentGcStateIsRoundZero)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout layout("p");
+    RetireView v(b, layout);
+    EXPECT_NO_THROW(v.refresh());
+    EXPECT_EQ(v.round(), 0u);
+}
+
+/// The view stores tokens regardless of an entry's condemn_round — the writer gate does not consult it
+/// (only GC uses condemn_round). Seed round 5 with entries condemned at rounds 4 and 5; both are visible.
+TEST(CasRetireView, CondemnRoundIgnoredByView)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout layout("p");
+    const auto h4 = hexToU128("00000000000000000000000000000004");
+    const auto h5 = hexToU128("00000000000000000000000000000005");
+    RetiredSet rs;
+    RetiredEntry e4{ObjectKind::Blob, h4, Token{"t4", TokenType::Emulated}, 10};
+    e4.condemn_round = 4;
+    RetiredEntry e5{ObjectKind::Blob, h5, Token{"t5", TokenType::Emulated}, 10};
+    e5.condemn_round = 5;
+    rs.entries.push_back(e4);
+    rs.entries.push_back(e5);
+    seedState(*b, layout, /*round*/ 5, /*gen*/ 0, /*attempt*/ 0, {{0, rs}});
+
+    RetireView v(b, layout);
+    v.refresh();
+    EXPECT_EQ(v.round(), 5u);
+    EXPECT_TRUE(v.isCondemnedToken(ObjectKind::Blob, h4, Token{"t4", TokenType::Emulated}));
+    EXPECT_TRUE(v.isCondemnedToken(ObjectKind::Blob, h5, Token{"t5", TokenType::Emulated}));
 }
 
 TEST(CasRetireView, IsCondemnedTokenIdentity)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    b->putIfAbsent(layout.gcStateKey(), tests::encodeMinimalGcState(1, 1));
     const auto h = hexToU128("000102030405060708090a0b0c0d0e0f");
     RetiredSet rs;
     rs.entries.push_back({ObjectKind::Blob, h, Token{"3", TokenType::Emulated}, 10});
-    b->putIfAbsent(layout.retiredKey(0, 0, 1, 0), encodeRetiredSet(rs));
+    seedState(*b, layout, /*round*/ 1, /*gen*/ 0, /*attempt*/ 0, {{0, rs}});
 
     RetireView v(b, layout);
     v.refresh();

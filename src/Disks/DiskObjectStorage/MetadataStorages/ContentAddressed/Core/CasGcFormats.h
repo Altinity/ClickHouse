@@ -55,22 +55,30 @@ struct GcState
     String manifest_sweep_cursor;  /// best-effort orphan part-manifest cleanup cursor; reachability ignores it
     GcLease lease;
     std::map<uint64_t, std::map<String, uint64_t>> fence_version;   /// round -> ("ns/shard" -> version)
+    std::map<uint64_t, String> retired_refs;   /// gc-shard -> object key of the current retired list
+                                               /// (ack-floor redesign). The writer publish gate loads
+                                               /// the current retired list by dereferencing these keys;
+                                               /// RetireView reads them straight out of this same body,
+                                               /// so a retired set can never be older than the round it
+                                               /// is installed for.
 };
 
-/// One condemned object inside a retired set.
+/// One condemned object inside a retired set. `condemn_round` is the ack-floor addition (spec
+/// 2026-07-02): the round that condemned the incarnation, used by GC's graduation gate.
 struct RetiredEntry
 {
     ObjectKind kind = ObjectKind::Blob;
     UInt128 hash{};
     Token token;          /// the exact incarnation token GC observed (exact-token delete)
     uint64_t size = 0;
+    uint64_t condemn_round = 0;   /// the GC round that condemned this incarnation (ack-floor graduation:
+                                  /// an entry graduates only when condemn_round < min_ack). Consulted by
+                                  /// GC only; the writer publish gate ignores it.
 };
 
-/// Retired set ("cas_retired_set" v1), one object per gc/retired/<round>.<fence_seq>/<shard>:
-///   {"format":"cas_retired_set","version":1,
-///    "entries":[{"kind":"blob","hash":"<32 lowercase hex>","token":"etag-1",
-///                "token_type":"etag","size":1234}]}
-/// kind: "blob" | "tree"; token_type: "etag" | "generation" | "emulated".
+/// Retired set (proto `RetiredSetProto`, magic CART, one object per gc-shard referenced from
+/// `GcState::retired_refs`). Each entry carries (kind, hash, token, size, condemn_round). Entries are
+/// sorted by (kind, hash) before serialization for byte-deterministic bytes (ack-floor spec).
 struct RetiredSet
 {
     std::vector<RetiredEntry> entries;

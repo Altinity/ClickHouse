@@ -181,6 +181,13 @@ message FenceVersionEntryProto {
   FenceVersionInnerProto inner = 2;
 }
 
+// One (gc-shard -> retired-list object key) entry of retired_refs (ack-floor redesign). Spec bans new
+// proto map<> for byte-determinism; we use sorted repeated instead (sorted by shard ascending).
+message RetiredRefEntryProto {
+  uint64 shard = 1;
+  string key   = 2;
+}
+
 // GC controller state (gc/state). Magic CAGT, FormatId::GcState.
 // CasHeader is field 1; existing fields renumbered from 2 to free field 1.
 // fence_version is a list of (round, inner) entries, sorted by round ascending,
@@ -196,6 +203,10 @@ message GcStateProto {
   repeated FenceVersionEntryProto fence_version = 8;
   uint64 snap_attempt           = 9;  // adopted attempt id for the round that produced snap_generation
   string manifest_sweep_cursor  = 10; // best-effort cleanup cursor; never consulted by reachability
+  // ack-floor redesign: gc-shard -> object key of the current retired list. Additive (same regime as
+  // snap_attempt): old readers skip it, but a build that understands the ack-floor protocol reads the
+  // retired list from HERE (not a LIST). Sorted by shard ascending for byte-determinism.
+  repeated RetiredRefEntryProto retired_refs = 11;
 }
 
 // One entry inside a GcOutcomeLogProto.
@@ -276,11 +287,12 @@ message CompletionSealProto {
 // kind: 1=blob, 2=tree (mirrors ObjectKind enum).
 // token_type: 1=etag, 2=generation, 3=emulated (mirrors TokenType enum).
 message RetiredEntryProto {
-  uint32 kind        = 1;
-  bytes  hash        = 2;  // raw 16 bytes (UInt128, big-endian)
-  string token_value = 3;
-  uint32 token_type  = 4;
-  uint64 size        = 5;
+  uint32 kind          = 1;
+  bytes  hash          = 2;  // raw 16 bytes (UInt128, big-endian)
+  string token_value   = 3;
+  uint32 token_type    = 4;
+  uint64 size          = 5;
+  uint64 condemn_round = 6;  // ack-floor: the GC round that condemned this incarnation
 }
 
 // Retired-object set (gc/retired/<round>.<fence_seq>/<shard>). Magic CART, FormatId::RetiredSet.

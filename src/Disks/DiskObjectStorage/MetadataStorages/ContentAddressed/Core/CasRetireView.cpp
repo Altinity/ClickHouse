@@ -7,15 +7,6 @@
 namespace DB::Cas
 {
 
-namespace
-{
-
-/// Refresh is rare by construction (Store::open and fence-advanced publish conflicts only), so a
-/// large page keeps the LIST round-trips minimal; the cursor loop below still covers any size.
-constexpr size_t LIST_PAGE_LIMIT = 1000;
-
-}
-
 RetireView::RetireView(BackendPtr backend_, Layout layout_)
     : backend(std::move(backend_))
     , layout(std::move(layout_))
@@ -27,53 +18,39 @@ void RetireView::refresh()
     /// Build the new map + round in locals — no lock held during backend I/O; readers never see
     /// a half view.
     ///
-    /// ORDERING: read gc/state FIRST, then the retired sets. The view then claims round R while
-    /// its entries reflect storage AT-OR-AFTER R: entries GC drops after we read gc/state are
-    /// handled by the gate's re-observation under W-REVALIDATE, and entries ADDED for round R+1
-    /// are a bonus (strictly more conservative). Reading gc/state last could claim a NEWER round
-    /// over entries observed BEFORE it — overstating how current the view is.
+    /// ORDERING (ack-floor redesign): read gc/state FIRST; the per-shard retired-list refs come out of
+    /// that SAME body, so a set can never be older than the round it is installed for. This subsumes the
+    /// old LIST-vs-state ordering hazard (a flat LIST could observe entries before or after the round it
+    /// was labeled with); now the round and the refs that resolve its list are one atomic read.
     ///
-    /// Two racing refreshes may install views out of round order — each installed view is
-    /// internally coherent and honestly labeled with the round it observed, and a gate needing a
-    /// newer round simply refreshes again; there is deliberately no monotonicity guard.
+    /// Two racing refreshes may install views out of round order — each installed view is internally
+    /// coherent and honestly labeled with the round it observed, and a gate needing a newer round simply
+    /// refreshes again; there is deliberately no monotonicity guard.
     uint64_t new_round = 0;
-    uint64_t snap_generation = 0;
-    uint64_t snap_attempt = 0;
+    std::map<uint64_t, String> retired_refs;
     if (auto state_object = backend->get(layout.gcStateKey()))
     {
         const GcState state = decodeGcState(state_object->bytes);
         new_round = state.round;
-        snap_generation = state.snap_generation;
-        snap_attempt = state.snap_attempt;
+        retired_refs = state.retired_refs;
     }
-    /// ABSENT gc/state => round 0: a pool GC never touched.
+    /// ABSENT gc/state => round 0, empty view: a pool GC never touched.
 
     std::map<std::pair<uint8_t, UInt128>, std::vector<Token>> new_condemned;
 
-    /// Task 3: retired sets are attempt-scoped under the adopted (snap_generation, snap_attempt). LIST
-    /// only that attempt's retired namespace so an unadopted (deposed-leader) retired set is invisible to
-    /// the writer publish gate. (Task 7 refines round/generation coherence; minimal compile-correct here.)
-    const String prefix = layout.gcGenAttemptRetiredPrefix(snap_generation, snap_attempt);
-    String cursor;
-    while (true)
+    /// GET each referenced retired-list object. An absent ref map or an absent object contributes
+    /// nothing — NOT an error: a shard with no outstanding candidates simply has no ref (or a ref whose
+    /// object GC has already emptied/removed). Skipping it means strictly LESS condemnation, safe for the
+    /// WRITER because the publish gate re-observes under W-REVALIDATE.
+    for (const auto & [shard, key] : retired_refs)
     {
-        ListPage page = backend->list(prefix, cursor, LIST_PAGE_LIMIT);
-        for (const auto & listed : page.keys)
-        {
-            auto object = backend->get(listed.key);
-            /// A retired object that disappears between list and get was rewritten/removed by GC —
-            /// skipping it means strictly LESS condemnation, which is the safe direction for the
-            /// WRITER only because the publish gate re-observes under W-REVALIDATE.
-            if (!object)
-                continue;
+        auto object = backend->get(key);
+        if (!object)
+            continue;
 
-            RetiredSet set = decodeRetiredSet(object->bytes);
-            for (auto & entry : set.entries)
-                new_condemned[{static_cast<uint8_t>(entry.kind), entry.hash}].push_back(std::move(entry.token));
-        }
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
+        RetiredSet set = decodeRetiredSet(object->bytes);
+        for (auto & entry : set.entries)
+            new_condemned[{static_cast<uint8_t>(entry.kind), entry.hash}].push_back(std::move(entry.token));
     }
 
     std::unique_lock lock(mutex);

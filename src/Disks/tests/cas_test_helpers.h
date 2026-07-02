@@ -291,33 +291,41 @@ inline String encodeMinimalGcState(uint64_t round, uint64_t fence_seq)
 }
 
 /// Inject GC state so a fresh `Store::open` over the same backend sees the given incarnations as
-/// condemned. Writes `gc/state` ({round, fence_seq}) and one retired-set object under the adopted
-/// `(snap_generation, snap_attempt)` — both 0 in the minimal injected state — that `RetireView::refresh`
-/// LISTs (it lists the whole `gcGenAttemptRetiredPrefix(snap_generation, snap_attempt)` subtree, so the
-/// retired set's round/shard components are irrelevant to RetireView visibility). The Store refreshes its
-/// `retireView` only at open, so the caller injects BEFORE opening the Store whose Build consults the view.
+/// condemned. Writes one retired-set object and records its key in `gc/state.retired_refs[shard]` — the
+/// on-storage interface `RetireView::refresh` dereferences (ack-floor redesign: refs, not a LIST). The
+/// Store refreshes its `retireView` at open (and each beat), so the caller injects BEFORE opening the
+/// Store whose Build consults the view.
 ///
 /// The retired set is written under the reserved round component 0. Real GC rounds start at round 1 and
 /// key their retired sets at `retiredKey(fold_generation, snap_attempt, round>=1, shard)`, so a set under
 /// round 0 is NEVER mistaken for a resumable incomplete round by `Gc::tryResumeIncompleteRound` (which
 /// reads `retiredKey(snap_generation, snap_attempt, state.round, shard)` with `state.round == round >= 1`).
-/// This reproduces the pre-attempt-scoping behavior, where the lease steal's `fence_seq` bump shielded the
-/// injected set from resume while RetireView's flat LIST still saw it.
 inline void injectRetire(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     uint64_t round, uint64_t fence_seq, uint64_t shard, std::vector<DB::Cas::RetiredEntry> entries)
 {
-    const String state = encodeMinimalGcState(round, fence_seq);
+    /// The retired set lives under the reserved round component 0 (a no-real-round sentinel that keeps it
+    /// invisible to resume detection). The minimal injected gc/state has snap_generation == snap_attempt
+    /// == 0, so the set's key is retiredKey(0, 0, 0, shard).
+    const String key = layout.retiredKey(/*generation*/0, /*attempt*/0, /*round*/0, shard);
+    backend.putIfAbsent(key,
+        DB::Cas::encodeRetiredSet(DB::Cas::RetiredSet{.entries = std::move(entries)}));
+
+    /// gc/state carries {round, fence_seq} AND retired_refs[shard] = key: RetireView reads the current
+    /// retired list by dereferencing retired_refs (ack-floor redesign), so the ref must be recorded for
+    /// the injected set to be visible to the writer publish gate.
+    DB::Cas::GcState gc_state;
     const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
+    if (head.exists)
+        gc_state = DB::Cas::decodeGcState(backend.get(layout.gcStateKey())->bytes);
+    gc_state.round = round;
+    gc_state.fence_seq = fence_seq;
+    gc_state.retired_refs[shard] = key;
+    const String state = DB::Cas::encodeGcState(gc_state);
     if (!head.exists)
         backend.putIfAbsent(layout.gcStateKey(), state);
     else
         backend.putOverwrite(layout.gcStateKey(), state, head.token);
-
-    /// The minimal injected gc/state has snap_generation == snap_attempt == 0; round component 0 (a
-    /// no-real-round sentinel) keeps the set RetireView-visible but invisible to resume detection.
-    backend.putIfAbsent(layout.retiredKey(/*generation*/0, /*attempt*/0, /*round*/0, shard),
-        DB::Cas::encodeRetiredSet(DB::Cas::RetiredSet{.entries = std::move(entries)}));
 }
 
 /// Raise the `fence_round` of every shard of a namespace to at least `round`, exactly as a GC leader's
