@@ -511,7 +511,20 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// the fold seal at the adopted (snap_generation, snap_attempt) (the fold seal IS the coverage record).
     /// Absent => fresh pool (cursor 0). A folded event must never be re-folded from 0 (that double-counts
     /// blob in-degree => silent over-pin/leak).
-    const std::map<String, ShardCoverage> parent_cursors = readSealedCursors(state.snap_generation, state.snap_attempt);
+    /// (б)-audit (spec 2026-07-03-cas-gc-rebuild-design.md Part 1): a live gc/state whose adopted
+    /// fold seal OBJECT is MISSING is corrupt bookkeeping, never an empty baseline — treating it as
+    /// empty would re-fold only journal tails and mass-condemn everything the lost snapshot
+    /// protected. NOTE the distinction from a PRESENT seal with an empty per_ns_shard (a legitimate
+    /// empty-universe generation) — the audit keys on object absence, not coverage emptiness.
+    const std::optional<CasFoldSeal> adopted_seal = readFoldSeal(state.snap_generation, state.snap_attempt);
+    if (!adopted_seal && state.snap_generation > 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS GC: the adopted fold seal (generation {}, attempt {}) is missing under a live "
+            "gc/state — GC bookkeeping is corrupt. GC refuses to run; recover with "
+            "SYSTEM CONTENT ADDRESSED GC REBUILD.",
+            state.snap_generation, state.snap_attempt);
+    const std::map<String, ShardCoverage> parent_cursors =
+        adopted_seal ? adopted_seal->per_ns_shard : std::map<String, ShardCoverage>{};
 
     /// Ack-floor: load the CURRENT retired list (published by the previous round's CAS). A ref that
     /// does not resolve is integrity loss of destructive bookkeeping — fail closed (this is GC's own
@@ -687,6 +700,27 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         const uint64_t cursor = (incarnation_mismatch || cursor_it == parent_cursors.end())
             ? 0
             : cursor_it->second.folded_cursor;
+
+        /// Baseline guard (spec 2026-07-03-cas-gc-rebuild-design.md Part 1): a shard with NO sealed
+        /// cursor whose journal PROVES trimmed history means the baseline that folded (and licensed
+        /// trimming) those events is gone — folding it from scratch would mass-condemn every blob
+        /// whose edges lived only in the lost snapshot. Fail closed; the recovery is the explicit
+        /// rebuild. A shard born after the baseline passes (journal starts at transition_version 1);
+        /// an incarnation-mismatch reset passes too (the recreated shard's journal restarts at 1).
+        if (cursor_it == parent_cursors.end() && !incarnation_mismatch)
+        {
+            const bool proves_trim = root.journal.empty()
+                ? root.shard_version > 0
+                : root.journal.front().transition_version > 1;
+            if (proves_trim)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS GC baseline guard: ref shard {}/{} journal starts at transition_version {} "
+                    "(shard_version {}) but no sealed baseline covers it — gc/state was lost or "
+                    "regressed. GC refuses to run; recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
+                    ns.string(), root_shard,
+                    root.journal.empty() ? 0 : root.journal.front().transition_version,
+                    root.shard_version);
+        }
 
         ShardCoverage cov;
         cov.folded_token = manifest_token.value_or(Token{});
