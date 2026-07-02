@@ -32,27 +32,72 @@ UInt128 cityHash128(const String & bytes)
     return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
 }
 
-// Read every (blob_hash, source_id) row of the prior generation's SourceEdge run into a sorted list.
-// Streaming; one RunFileReader. Skips zero-marker rows (they are per-generation, not carried forward).
-std::vector<std::pair<String, char>> readPriorEdges(
-    Backend & backend, const Layout & layout, uint64_t generation, uint64_t attempt, uint64_t shard)
+/// Streams the prior generation's surviving source edges for one shard at O(one block) resident
+/// memory: chains the shard's run segments in `seq` order (absent seq-0 => empty baseline), skips
+/// zero-marker rows (per-generation, never carried forward), and exposes a one-key lookahead the fold
+/// merge consumes. Segment existence is probed with a cheap `head` before opening the streaming reader
+/// (an absent seq ends the chain). The edge stream is globally sorted by (blob_hash, source_id): each
+/// segment is sorted and segments are appended in key order, so `key()` values are non-decreasing.
+class PriorEdgeCursor
 {
-    std::vector<std::pair<String, char>> rows;   // (32-byte key, tag)
-    for (uint64_t seq = 0; ; ++seq)
+public:
+    PriorEdgeCursor(Backend & backend_, const Layout & layout_,
+                    uint64_t generation_, uint64_t attempt_, uint64_t shard_)
+        : backend(backend_), layout(layout_), generation(generation_), attempt(attempt_), shard(shard_)
     {
-        const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
-        std::optional<GetResult> got = backend.get(key);
-        if (!got)
-            break;
-        /// Borrowed-memory reader over the materialized run bytes (Task 4 flips this to true streaming).
-        RunFileReader r{std::string_view(got->bytes)};
-        String k, p;
-        while (r.next(k, p))
-            if (!p.empty() && p[0] == kEdgeActive)   // carry forward only surviving edges
-                rows.emplace_back(k, kEdgeActive);
+        advance();
     }
-    return rows;   // already sorted by (blob_hash, source_id): the run is sorted
-}
+
+    bool valid() const { return has_current; }
+    const String & key() const { return current_key; }
+
+    /// Advance to the next surviving edge, skipping zero markers and crossing segment boundaries.
+    void advance()
+    {
+        while (true)
+        {
+            /// Pull rows from the open segment until a surviving edge or the segment ends.
+            if (reader)
+            {
+                String k;
+                String p;
+                while (reader->next(k, p))
+                {
+                    if (!p.empty() && p[0] == kEdgeActive)   // carry forward only surviving edges
+                    {
+                        current_key = k;
+                        has_current = true;
+                        return;
+                    }
+                    // zero-marker (or empty) row: dropped, not carried forward
+                }
+                reader.reset();
+                ++seq;
+            }
+
+            /// Open the next segment (probe existence with head; absent => the chain is done).
+            const String segment_key = layout.blobTargetRunKey(generation, attempt, shard, seq);
+            if (!backend.head(segment_key).exists)
+            {
+                has_current = false;
+                return;
+            }
+            reader = std::make_unique<RunFileReader>(backend, segment_key);
+        }
+    }
+
+private:
+    Backend & backend;
+    const Layout & layout;
+    uint64_t generation;
+    uint64_t attempt;
+    uint64_t shard;
+
+    uint64_t seq = 0;
+    std::unique_ptr<RunFileReader> reader;
+    String current_key;
+    bool has_current = false;
+};
 
 }
 
@@ -130,7 +175,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             return a.source_id < b.source_id;
         });
 
-    const auto prior = readPriorEdges(backend, layout, prior_generation, prior_attempt, shard);
+    PriorEdgeCursor cursor(backend, layout, prior_generation, prior_attempt, shard);
 
     DB::WriteBufferFromOwnString out;
     RunHeader header;
@@ -143,7 +188,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     // final presence per edge locally (idempotent: prior present + activate => present; any remove =>
     // absent), emit surviving edges, and accumulate the current blob's surviving-edge count on the fly
     // to emit a zero-transition marker. O(block) IO + O(1) per current blob.
-    size_t pi = 0, di = 0, ri = 0;
+    size_t di = 0, ri = 0;
     UInt128 cur_blob{0};
     bool have_blob = false;
     uint64_t cur_edges = 0;    // surviving edges of cur_blob so far
@@ -211,12 +256,12 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         }
     };
 
-    while (pi < prior.size() || di < scattered.size())
+    while (cursor.valid() || di < scattered.size())
     {
         // Pick the smallest edge key across the two cursors.
         String key;
         bool from_prior = false;
-        if (pi < prior.size()) { key = prior[pi].first; from_prior = true; }
+        if (cursor.valid()) { key = cursor.key(); from_prior = true; }
         if (di < scattered.size())
         {
             const String dk = srcEdgeRunKey(scattered[di].blob_hash, scattered[di].source_id);
@@ -229,7 +274,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         openBlobIfNeeded(blob_hash);
 
         bool present = false;
-        if (from_prior && prior[pi].first == key) { present = true; ++pi; cur_touched = true; }
+        if (from_prior && cursor.key() == key) { present = true; cursor.advance(); cur_touched = true; }
         while (di < scattered.size()
                && scattered[di].blob_hash == blob_hash && scattered[di].source_id == source_id)
         {

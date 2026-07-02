@@ -4,6 +4,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
 using namespace DB::Cas;
@@ -293,4 +295,75 @@ TEST(CasThreeCursorMerge, SnapshotBytesUnchanged)
     ASSERT_TRUE(ga.has_value());
     ASSERT_TRUE(gb.has_value());
     EXPECT_EQ(ga->bytes, gb->bytes);
+}
+
+/// A prior run spanning several blocks folds correctly with the streaming prior cursor AND the backend
+/// sees only block-bounded ranged/stream requests for it — never a whole-object get of the prior run
+/// key. Byte-reproducibility of the merged output is the load-bearing canary (the merge logic is
+/// unchanged; only the prior cursor's byte source moved from materialize-whole to stream).
+TEST(CasBlobInDegree, FoldStreamsPriorRunBlockBounded)
+{
+    using DB::Cas::tests::CountingBackend;
+    CountingBackend backend;
+    /// InMemory oracle: the SAME two folds against a plain backend must yield byte-identical runs —
+    /// the streaming cursor changes I/O shape, not bytes.
+    InMemoryBackend oracle;
+    Layout layout{"pool"};
+
+    /// Gen 1 from empty prior: enough edges that the SourceEdge run spills across many 256KB blocks.
+    /// Each record is 4 + 32(key) + 4 + 1(payload) = 41 bytes, so ~20000 edges is ~820KB => several
+    /// blocks under the default block_size, exercising the multi-block streaming path in the fold.
+    std::vector<BlobDelta> gen1;
+    gen1.reserve(20000);
+    for (uint64_t i = 0; i < 20000; ++i)
+        gen1.push_back({b(i), s(1), false});
+
+    std::vector<RunRef> runs1_c;
+    std::vector<RunRef> runs1_o;
+    foldDeltasIntoGeneration(backend, layout, 0, 0, 1, 0, 0, gen1, runs1_c);
+    foldDeltasIntoGeneration(oracle, layout, 0, 0, 1, 0, 0, gen1, runs1_o);
+
+    const String gen1_run_key = layout.blobTargetRunKey(1, 0, 0, 0);
+    const auto gen1_run = backend.get(gen1_run_key);
+    ASSERT_TRUE(gen1_run.has_value());
+    const String gen1_run_bytes = gen1_run->bytes;
+    /// Sanity: the prior run really spans several blocks (else the block-bounded assertions are
+    /// vacuous). Blocks seal at kRunTargetBlockSize (256KB); ~820KB is 3-4 blocks.
+    ASSERT_GT(gen1_run_bytes.size(), static_cast<size_t>(kRunTargetBlockSize) * 3);
+
+    /// Reset counters and fold gen 2 with a small delta: remove one edge and add another. The prior
+    /// gen-1 run must be consumed via the streaming cursor (head + tail get + body getStream + per-seq
+    /// head probe), NEVER a whole-object get.
+    backend.resetCounts();
+    std::vector<BlobDelta> gen2{{b(0), s(1), true}, {b(19999), s(2), false}};
+    std::vector<RunRef> runs2_c;
+    std::vector<RunRef> runs2_o;
+    foldDeltasIntoGeneration(backend, layout, 1, 0, 2, 0, 0, gen2, runs2_c);
+    foldDeltasIntoGeneration(oracle, layout, 1, 0, 2, 0, 0, gen2, runs2_o);
+
+    /// Byte-reproducibility canary: streaming and materialized folds produce identical output bytes.
+    const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
+    const auto gen2_c = backend.get(gen2_run_key);
+    const auto gen2_o = oracle.get(gen2_run_key);
+    ASSERT_TRUE(gen2_c.has_value());
+    ASSERT_TRUE(gen2_o.has_value());
+    EXPECT_EQ(gen2_c->bytes, gen2_o->bytes);
+    ASSERT_EQ(runs2_c.size(), 1u);
+    ASSERT_EQ(runs2_o.size(), 1u);
+    EXPECT_EQ(runs2_c[0].checksum, runs2_o[0].checksum);
+
+    /// The core assertion: no whole-object get of the prior run key — every read carried a Range or a
+    /// stream (the resident-memory proof at the seam).
+    EXPECT_EQ(backend.wholeGetCount(gen1_run_key), 0u);
+    /// The cursor opened the prior run's segment via the streaming reader (head + tail get + getStream).
+    EXPECT_GE(backend.getStreamCount(gen1_run_key), 1u);
+    /// Every ranged-get window on the prior run stays within one block + the footer allowance. This
+    /// bound is strict here because the prior run's footer fits inside the fixed tail probe (only very
+    /// large runs — ~13k blocks — spill the footer past the probe and add one exact-footer get; a note
+    /// for that regime lives in the streaming reader's open comment).
+    EXPECT_LE(backend.maxRangedGetLen(gen1_run_key),
+              static_cast<uint64_t>(kRunHardCapBlockSize) + 64u * 1024u);
+    /// Streaming open touches the prior run's tail probe (and at most one exact-footer get); it is never
+    /// re-materialized whole.
+    EXPECT_LE(backend.getCount(gen1_run_key), 2u);
 }
