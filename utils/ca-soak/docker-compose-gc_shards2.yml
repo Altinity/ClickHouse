@@ -14,7 +14,7 @@ services:
       - "11121"
 
   createbucket:
-    image: minio/mc:latest
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
     depends_on:
       - rustfs1
     entrypoint: >
@@ -52,7 +52,7 @@ services:
     mem_limit: 28g
     volumes:
       - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
-      - ./configs/storage_conf_gc_shards2.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/storage_conf_gc_shards2_ch1.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
       - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
       - ./configs/macros_node1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
@@ -85,7 +85,7 @@ services:
     mem_limit: 28g
     volumes:
       - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
-      - ./configs/storage_conf_gc_shards2.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/storage_conf_gc_shards2_ch2.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
       - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
       - ./configs/macros_node2.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
