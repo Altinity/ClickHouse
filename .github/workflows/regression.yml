@@ -305,8 +305,11 @@ jobs:
 
   OAuth:
     if: |
-      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'oauth')
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.version.string, 'antalya') &&
+      (
+        fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+        contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'oauth')
+      )
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -482,8 +485,11 @@ jobs:
 
   Swarms:
       if: |
-        fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
-        contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'swarms')
+        contains(fromJson(inputs.workflow_config).JOB_KV_DATA.version.string, 'antalya') &&
+        (
+          fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+          contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'swarms')
+        )
       uses: ./.github/workflows/regression-reusable-suite.yml
       with:
         ref: ${{ inputs.commit }}
