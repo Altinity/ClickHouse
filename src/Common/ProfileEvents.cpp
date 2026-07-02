@@ -747,6 +747,10 @@ The server successfully detected this situation and will download merged part fr
     M(CasBlobHeadFirst,  "CA blob HEAD-first attempts (P1 cache hit or P2 size threshold)", ValueType::Number) \
     M(CasBlobBodyPutAvoided, "CA blob body PUTs avoided by a HEAD-first present hit (P1/P2)", ValueType::Number) \
     M(CasBlobCopyForward, "CA condemned blob incarnations displaced by verified copy-forward at the promote gate (tokenless committed-manifest evidence; INV-1 exception)", ValueType::Number) \
+    M(CasShardBatchFlushes, "CA shard-mutation-queue flushes committed (one casPut each); avg batch = CasShardBatchedMutations / this", ValueType::Number) \
+    M(CasShardBatchedMutations, "CA shard mutations committed through the flat-combining queue", ValueType::Number) \
+    M(CasShardBatchScopeCuts, "CA shard-queue carves cut early by the scope rule (same-ref repeat or WholeShard behind)", ValueType::Number) \
+    M(CasShardQueueWaitMicroseconds, "CA total time mutateShard callers spent enqueued (sum over items)", ValueType::Microseconds) \
     M(CasBlobGet,        "CA blob get S3 ops", ValueType::Number) \
     M(CasBlobGetStream,  "CA blob get-stream S3 ops", ValueType::Number) \
     M(CasBlobDelete,     "CA blob delete S3 ops", ValueType::Number) \

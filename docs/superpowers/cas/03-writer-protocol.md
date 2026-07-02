@@ -257,6 +257,24 @@ take the copy-forward pre-pass above. This closes the condemned-adoption gap: a
 plain `putIfAbsent` HEAD-hit would otherwise adopt the condemned incarnation that a GC round is about
 to delete. The write path gains **zero** S3 operations in the common (not-condemned) case.
 
+**Shard-mutation queue (flat combining, spec `2026-07-03-cas-shard-mutation-queue.md`):**
+`Store::mutateShard` serializes intra-server writers per `(namespace, shard)` through a
+leader-caller group commit: callers enqueue `(scope, closure)`; the caller finding the queue
+leaderless FLUSHES batches (one read → apply-all in order with per-closure snapshot isolation →
+ONE `casPut`, `shard_version` bumped per closure so `transition_version`s stay dense) until its own
+item completes, then passes the baton. The carve runs AFTER the flush's first read, so the S3
+read latency IS the batching window — a slower pool makes batches larger (the old positive
+feedback loop of conflicts under load is now negative). Scope rule: at most ONE mutation per ref
+name per flush (per-ref durable histories stay bit-identical to the unbatched protocol; `precommit
+→ promote` of one part can never co-batch anyway — promote awaits the precommit flush, INV-2);
+`WholeShard` closures (trim, fence, dropNamespace, reclaim) flush SOLO; create-if-absent flushes
+solo so birth stamps apply exactly as before. Failure semantics: a throwing closure rolls back only
+its own edits and fails alone; the hard limit degrades a batch to solo re-flushes so exactly the
+offender gets `LIMIT_EXCEEDED`; a CAS conflict (cross-writer only now — e.g. the GC leader's trim
+from another replica) replays the carved batch. Bounded by construction: every queued item is a
+blocked caller thread. Counters: `CasShardBatchFlushes` / `CasShardBatchedMutations` (avg batch),
+`CasShardBatchScopeCuts`, `CasShardQueueWaitMicroseconds`.
+
 **Dedup** (HEAD-before-PUT, `CasBlobHeadFirst`): if the dedup cache signals the blob is present, or
 the blob is large (≥ `dedup_head_first_min_bytes`), a HEAD is issued first. A present HEAD →
 `observeAndAdmit` (free, no body upload). A stale/absent HEAD → falls through to `uploadFromSource`.

@@ -29,6 +29,10 @@ namespace ErrorCodes
 
 namespace ProfileEvents
 {
+    extern const Event CasShardBatchFlushes;
+    extern const Event CasShardBatchedMutations;
+    extern const Event CasShardBatchScopeCuts;
+    extern const Event CasShardQueueWaitMicroseconds;
     extern const Event CasManifestBackpressureCount;
     extern const Event CasManifestBackpressureMicroseconds;
     extern const Event CasManifestHardLimitExceeded;
@@ -985,6 +989,7 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, MutationScope 
 
     const auto qkey = std::make_pair(ns.string(), shard);
     std::shared_ptr<ShardMutationQueue> q;
+    const auto enqueued_at = std::chrono::steady_clock::now();
 
     std::unique_lock<std::mutex> lk(shard_queue_mutex);
     auto & slot = shard_queues[qkey];
@@ -1023,6 +1028,9 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, MutationScope 
     }
     lk.unlock();
 
+    ProfileEvents::increment(ProfileEvents::CasShardQueueWaitMicroseconds,
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - enqueued_at).count());
     if (item->error)
         std::rethrow_exception(item->error);
     if (out_committed_version)
@@ -1133,7 +1141,10 @@ void Store::flushShardBatch(const RootNamespace & ns, uint64_t shard,
                         break;
                     }
                     if (!seen_refs.insert(front->scope.ref_name).second)
+                    {
+                        ProfileEvents::increment(ProfileEvents::CasShardBatchScopeCuts);
                         break;
+                    }
                     batch.push_back(front);
                     q->pending.pop_front();
                 }
@@ -1252,6 +1263,8 @@ void Store::flushShardBatch(const RootNamespace & ns, uint64_t shard,
                     ++shard_write_seq[key];
                     shard_decode_cache.erase(key);
                 }
+                ProfileEvents::increment(ProfileEvents::CasShardBatchFlushes);
+                ProfileEvents::increment(ProfileEvents::CasShardBatchedMutations, batch.size());
                 {
                     std::lock_guard<std::mutex> g(shard_queue_mutex);
                     for (const auto & it : batch)

@@ -351,3 +351,11 @@ amplification factor, and GC round cadence.
 - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.cpp` — `readShardDecoded`, `resolveRef`, `readManifest`, dedup-cache API.
 - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp` — GC round: `runRegularRound` (heartbeat floor → fold + three-cursor merge → pre-CAS deletes → single CAS), `snapPruneOldGenerations`, `discoverUniverse`, `computeDiscoverDecisions`. `computeHeartbeatFloor` in `CasServerRoot.cpp`.
 - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.cpp` — `nativeConditionalPut` (ETag capture), `deleteExact`.
+
+## Shard-mutation queue effect (2026-07-03) {#shard-queue-budget}
+
+Ref-shard `casPut` traffic is grouped per `(namespace, shard)` by the flat-combining queue
+(`03-writer-protocol.md §shard-mutation-queue`): concurrent part publishes/drops on one shard cost
+ONE read + ONE `casPut` per batch instead of one CAS loop per mutation, and intra-server CAS
+conflicts (measured 40-92% of attempts under load, each re-reading the full shard body) are
+structurally eliminated — the only remaining conflict source is the other replica's GC trim.
