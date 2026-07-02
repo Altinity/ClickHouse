@@ -345,10 +345,17 @@ between them; a server that does not recover within the bound is a correctness f
 
 ### 4.6 Known soak limitations {#soak-limitations}
 
-- **4h active-workload chaos soak** at `WORKERS=6` fills the disk in ~60–90 min because RustFS
-  runs scanner off (every CAS-overwrite retained as a distinct on-disk version, never compacted).
-  Mitigation: use `WORKERS=2`. The real fix is lower manifest rewrite rate (B157) or a compacting
-  object store.
+- **4h active-workload chaos soak** at `WORKERS=6` fills the disk in ~60–90 min. ROOT CAUSE
+  identified 2026-07-03: [rustfs#3231](https://github.com/rustfs/rustfs/issues/3231) (open) —
+  overwriting a >128 KiB object in an UN-VERSIONED bucket leaks the previous incarnation's data
+  directory. Every `casPut` of a `cas/refs/<...>/<shard>` body leaks one uuid dir (observed: 1600+
+  dirs on one busy shard key; `cas/refs` = 39 GB of a 45 GB pool vs 7.2 GB of real blob data), and
+  the metacache walk over those dirs is what produces the `list_merged err Io(timeout)` /
+  `walk_dir timeout` LIST storms (reproduce at just ~600k files). Re-enabling the RustFS scanner
+  was tested for one run and showed ZERO reclaim effect (the leak is not versions; the old
+  bring-up failure with the scanner was the unpinned `mc`, since pinned) — the scanner stays off.
+  Mitigations: `WORKERS=2`; durable fix = lower ref-shard `casPut` rate (journal batching, B157
+  family) and/or shard bodies under the 128 KiB inline threshold, or the upstream fix.
 - **Large-pool fsck timeout**: `fsck` at ~150 GB pool times out (>180 s) because
   `ObjectStorageBackend::list` re-enumerates the whole `roots/` prefix per page (O(N²) in the
   manifest backlog). Fix: paginate at source; separate shard objects into a dedicated prefix.
