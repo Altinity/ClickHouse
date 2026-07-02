@@ -55,6 +55,10 @@ String blobKeyOf(const Layout & layout, const UInt128 & hash)
     return layout.blobKey(BlobId(u128ToHex(hash)));
 }
 
+/// Defined below; forward-declared so the post-CAS hand-off delete in `runRegularRound` (Task 7) can
+/// reach the same wholesale LIST-delete helper the retention prune uses.
+uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_t bounded_remaining);
+
 }
 
 uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len)
@@ -177,6 +181,15 @@ RoundReport Gc::runRegularRound()
         e.gen = state.snap_generation;
         e.reason = "R2: one-pass fold (edges x deltas x retired) into a new durable generation";
     });
+
+    /// T0 hand-off (Task 7): capture the PARENT seal's run refs BEFORE fold mutates
+    /// `state.snap_generation`/`snap_attempt` in-memory (CasGc.cpp:838). We compare these against the
+    /// NEW seal's refs post-CAS to detect a ref that moved OFF an already-pruned generation (the
+    /// wholesale prune skipped it while it was still referenced and its cursor advanced past it), and
+    /// hand-off delete that generation's now-unreferenced leftover. Absent parent seal => empty.
+    std::vector<RunRef> parent_seal_runs;
+    if (const auto parent_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
+        parent_seal_runs = parent_seal->blob_target_runs;
 
     /// R2: the pass — discovery, windows, and the three-cursor merge (spare / graduate / condemn).
     FoldResult folded = fold(state, state_token, report, floor.min_ack);
@@ -352,6 +365,41 @@ RoundReport Gc::runRegularRound()
     state_token = res.token;
     report.round = state.round;
     report.candidates += 0;   /// candidates are counted at condemn time (head_blob, inside the fold)
+
+    /// R5b post-CAS: T0 reference-parent HAND-OFF DELETE (Task 7). `pruneSupersededGenerations` SKIPS a
+    /// generation the live seal still references AND advances `snap_pruned_through` PAST it
+    /// (CasGc.cpp:1066 computes the cursor as `g - 1` after the loop increments `g` over every skipped
+    /// generation). So once a skipped generation is behind the cursor, the wholesale prune NEVER revisits
+    /// it — a ref that later moves off it would strand that generation's WHOLE prefix (fold seal, retired/
+    /// outcomes sets, all shards' runs), not just the single carried run object. Reclaim it HERE, now that
+    /// the ref has moved: for every parent ref whose generation is already pruned-through and whose
+    /// generation NO new live ref still references, wholesale-delete that generation's prefix — the exact
+    /// reclaimer the normal prune would have used, deferred until the ref finally moved off. Best-effort:
+    /// a crash between the CAS and here leaks the prefix to fsck (single-crash window, no permanent leak —
+    /// but note the cursor already advanced, so a plain retry will NOT re-attempt it; fsck is the backstop).
+    {
+        std::set<uint64_t> new_referenced_generations;
+        for (const RunRef & r : folded.fold_seal.blob_target_runs)
+            new_referenced_generations.insert(r.generation);
+
+        std::set<uint64_t> handed_off;   /// dedupe: multiple parent refs can share one generation
+        for (const RunRef & old_ref : parent_seal_runs)
+        {
+            /// Only generations the wholesale prune already passed AND that no live ref still pins.
+            if (old_ref.generation > state.snap_pruned_through)
+                continue;   /// not yet pruned-through: the normal prune will reclaim it when it ages out
+            if (new_referenced_generations.count(old_ref.generation))
+                continue;   /// still referenced by a (possibly different-shard) live ref: keep it
+            if (!handed_off.insert(old_ref.generation).second)
+                continue;   /// already reclaimed this round via another shard's ref
+            const uint64_t reclaimed = deletePrefixWholesale(
+                backend, layout.gcGenPrefix(old_ref.generation), std::numeric_limits<uint64_t>::max());
+            LOG_TRACE(getLogger("CasGc"),
+                "CAS GC hand-off: generation {} moved out of the live seal below the retention cursor "
+                "({} objects) — post-CAS wholesale reclaim (the prune had skipped it while referenced)",
+                old_ref.generation, reclaimed);
+        }
+    }
 
     /// R6 post-CAS: owner-removed manifest bodies — deleted ONLY now, after their decrements were
     /// ADOPTED by the round CAS (delete-after-sealed-decrements, control #11). Best-effort: a crash
@@ -1040,7 +1088,9 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
     /// snap_attempt) therefore leaked every non-adopted attempt's debris. Instead, LIST the whole
     /// `gc/gen/<g>/` prefix and delete every listed object — reclaiming ALL attempts of `g`, including
     /// the retired/ and outcomes/ sets that now live under `gc/gen/<g>/attempt/<a>/`. Bounded per round;
-    /// fail-open on 404. snap_pruned_through only advances over generations fully reclaimed this round.
+    /// fail-open on 404. snap_pruned_through advances over every generation the loop VISITS this round —
+    /// both fully-reclaimed AND ref-retained (skipped) ones (`g - 1` after the loop increments past them,
+    /// below). It is a monotone high-water cursor, NOT a proof that everything below it is gone.
     if (adopted_generation > keep)
     {
         const uint64_t prune_floor = adopted_generation - keep;   /// prune generations <= prune_floor
@@ -1051,9 +1101,15 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
             /// T0 (2026-07-02 snapshot-streaming): a generation whose run the LIVE adopted seal still
             /// references (reference-parent carry: an idle shard's current run physically lives at an
             /// older generation's key) must NOT be reclaimed — deleting it would strand the live seal's
-            /// ref. Skip its prefix delete; the run stays alive as long as it is referenced. When a later
-            /// delta REPLACES the carried ref with a fresh run, the superseded object is reclaimed by the
-            /// hand-off delete (Task 7); until then it persists safely (bounded: one small run per shard).
+            /// ref. Skip its prefix delete; the run stays alive as long as it is referenced. NOTE the
+            /// cursor still advances past this skipped generation (see the `g - 1` cursor note above), so
+            /// the wholesale prune NEVER revisits it once it is behind the cursor. LEAK-FREEDOM therefore
+            /// rests on the Task-7 post-CAS hand-off in `runRegularRound`: the round that finally moves the
+            /// ref OFF this generation (a later delta writes a fresh run) wholesale-deletes this whole
+            /// prefix right after its CAS. So every formerly-referenced generation is eventually FULLY
+            /// reclaimed — either here (if the ref moved off before the cursor reached it, WholesalePrune*
+            /// test) or by the hand-off (if the cursor passed it while still referenced, HandOffDeletes*
+            /// test). Until the ref moves it persists safely (bounded: one small run per shard).
             if (referenced_generations.count(g))
             {
                 LOG_TRACE(getLogger("CasGc"),

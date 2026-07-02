@@ -975,6 +975,130 @@ TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
     EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
 }
 
+/// ---- Task 7 (2026-07-02 snapshot-streaming): ref-aware retention + post-CAS hand-off delete ----
+
+/// Retention must NOT reclaim a generation whose run the live seal still references, EVEN once the
+/// retention cursor (`snap_pruned_through`) has advanced past that generation. With `keep=1` and a live
+/// ref that idle-carries across generations, `pruneSupersededGenerations` SKIPS gen-1's prefix every
+/// round while advancing the cursor over it. The gen-1 run object (physically holding the seal's ref)
+/// must survive, and folding/in-degree resolution THROUGH the carried ref must keep working.
+TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// keep=1: the retention floor is aggressive so the cursor reaches gen-1's neighbourhood fast.
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 1});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();   // gen 1: the blob's run is sealed under gen-1's key namespace
+    const GcState st1 = readState(*backend, *store);
+    const uint64_t ref_gen = st1.snap_generation;
+
+    /// The gen-1 seal's ref names gen-1's physical run key — capture it so we can assert the OBJECT
+    /// (not just the generation number) survives retention.
+    const auto seal1 = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
+    ASSERT_EQ(seal1.blob_target_runs.size(), 1u);
+    const String referenced_run_key = seal1.blob_target_runs.front().key;
+    ASSERT_EQ(seal1.blob_target_runs.front().generation, ref_gen);
+    ASSERT_TRUE(backend->head(referenced_run_key).exists);
+
+    /// Several idle rounds: no delta, no retired => pure ref-carry. Each round advances the generation
+    /// and, once adopted_generation > keep, drives the retention prune forward. gen-1 is referenced every
+    /// round, so it is SKIPPED (retained) even as `snap_pruned_through` climbs past it.
+    for (int i = 0; i < 6; ++i)
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const GcState st = readState(*backend, *store);
+    /// The cursor has advanced strictly past the referenced generation (the retention prune SKIPPED it
+    /// but still moved the high-water cursor forward) — this is the exact window Task 7 guards.
+    ASSERT_GT(st.snap_pruned_through, ref_gen)
+        << "the retention cursor must have advanced past the still-referenced generation";
+
+    /// The referenced run object is STILL ALIVE despite the cursor passing its generation.
+    EXPECT_TRUE(backend->head(referenced_run_key).exists)
+        << "a run referenced by the live seal must be retained even after the cursor passes its generation";
+
+    /// The current seal still references that same physical gen-1 object (carried, not reconstructed),
+    /// and in-degree resolution THROUGH the carried ref still works.
+    const auto seal_now = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+    ASSERT_EQ(seal_now.blob_target_runs.size(), 1u);
+    EXPECT_EQ(seal_now.blob_target_runs.front().key, referenced_run_key);
+    EXPECT_EQ(seal_now.blob_target_runs.front().generation, ref_gen);
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1)
+        << "folding still resolves in-degree through the retained, carried parent ref";
+
+    /// No-loss end-to-end: the live blob is intact.
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+}
+
+/// When a later delta finally REPLACES the carried ref with a fresh run, the superseded old-generation
+/// run — whose generation the retention cursor already passed while it was retained — is reclaimed by the
+/// post-CAS HAND-OFF delete in `runRegularRound` (the wholesale prune never revisits a generation behind
+/// its cursor, so the ordinary prune would leak it). The whole `gc/gen/<old>/` prefix must be gone.
+TEST(CasGcRetention, HandOffDeletesSupersededRef)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 1});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref(1, 0xAA);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();   // gen 1: run sealed under gen-1
+    const GcState st1 = readState(*backend, *store);
+    const uint64_t old_gen = st1.snap_generation;
+    const String old_prefix = store->layout().gcGenPrefix(old_gen);
+    ASSERT_FALSE(backend->list(old_prefix, "", 1000).keys.empty()) << "gen-1 prefix must be populated";
+
+    /// Idle-carry the gen-1 ref until the retention cursor has advanced strictly PAST gen-1. Until it
+    /// does, a normal prune could still reclaim gen-1 when the ref moves — the hand-off is only load-
+    /// bearing once gen-1 is BEHIND the cursor.
+    for (int i = 0; i < 6; ++i)
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_GT(readState(*backend, *store).snap_pruned_through, old_gen)
+        << "gen-1 must be behind the retention cursor before the hand-off is exercised";
+    /// gen-1 is retained (referenced) even though the cursor passed it.
+    ASSERT_FALSE(backend->list(old_prefix, "", 1000).keys.empty())
+        << "the referenced gen-1 prefix must still exist before the ref moves off it";
+
+    /// A real delta: swap the ref to a new manifest naming a different blob. The next fold writes a FRESH
+    /// run under the new generation and the seal's shard-0 ref moves OFF gen-1.
+    const ManifestRef r2 = ref(2, 0xBB);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(2));
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);
+
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);   // folds through the carried ref; ref leaves gen-1
+
+    /// The seal no longer references gen-1 ...
+    const GcState st_after = readState(*backend, *store);
+    const auto seal_after = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(st_after.snap_generation, st_after.snap_attempt))->bytes);
+    for (const RunRef & rr : seal_after.blob_target_runs)
+        EXPECT_NE(rr.generation, old_gen) << "the live seal must have moved its ref off gen-1";
+
+    /// ... and the post-CAS hand-off delete reclaimed gen-1's WHOLE prefix (not just the single run
+    /// object): seal, attempt subtree, run — all gone. The ordinary prune would have leaked it because its
+    /// cursor is already past gen-1.
+    const ListPage residue = backend->list(old_prefix, "", 1000);
+    EXPECT_TRUE(residue.keys.empty())
+        << "the superseded gen-1 prefix must be hand-off deleted; left " << residue.keys.size() << " objects";
+
+    /// The now-referenced blob 2 is intact; folding through the fresh run resolves it.
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(2)));
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 1);
+}
+
 /// ---- B12 lazy/batched trim tests ----
 
 /// B12: a shard with FEW (< gc_trim_min_events) trimmable events at/below the sealed fold cursor must
