@@ -135,6 +135,128 @@ TEST(CasMountLease, SameUuidLiveFailsForeignFailsExpiredReclaims)
     EXPECT_EQ(claimMount(*b, l, "r", UInt128(1), 9, 1200, 100).kind, MountClaimResult::Claimed);
 }
 
+TEST(CasMountMessage, DoubleStartTextHasIdentityAndRemediation)
+{
+    MountLease m;
+    m.server_uuid = (UInt128(0xdeadbeefcafef00dULL) << 64) | UInt128(0x0011223344556677ULL);
+    m.writer_epoch = 7;
+    m.hostname = "host-9.example.com";
+    m.pid = 4242;
+    m.seq = 13;
+    m.expires_at_ms = 1700000030000ULL;
+
+    const std::string msg = mountDoubleStartMessage("replica-a", m);
+
+    /// Identity / existing-holder fields.
+    EXPECT_NE(msg.find("server_root_id"), std::string::npos);
+    EXPECT_NE(msg.find("'replica-a'"), std::string::npos);
+    EXPECT_NE(msg.find("hostname=host-9.example.com"), std::string::npos);
+    EXPECT_NE(msg.find("pid=4242"), std::string::npos);
+    EXPECT_NE(msg.find("last_seq=13"), std::string::npos);
+    EXPECT_NE(msg.find("expires_at_ms=1700000030000"), std::string::npos);
+    /// New wait-aware remediation (this server already waited; the lease kept being renewed).
+    EXPECT_NE(msg.find("waited"), std::string::npos);
+    EXPECT_NE(msg.find("unique"), std::string::npos);
+    EXPECT_NE(msg.find("reclaim the mount on restart"), std::string::npos);
+    EXPECT_NE(msg.find("uuid file"), std::string::npos);
+}
+
+TEST(CasMountAwaitExpiry, PastExpiryReclaimsImmediatelyNoSleep)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    /// A prior incarnation (uuid=1, epoch=7) claimed a lease live until 1100.
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+
+    uint64_t now = 1200;                 // already past 1100 → the stale lease is dead
+    int sleeps = 0;
+    auto now_fn = [&] { return now; };
+    auto sleep_fn = [&](uint64_t ms) { now += ms; ++sleeps; };
+
+    const auto r = claimMountAwaitingExpiry(
+        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, /*ttl*/ 100, /*poll*/ 25, /*margin*/ 25, sleep_fn);
+    EXPECT_EQ(r.kind, MountClaimResult::Claimed);
+    EXPECT_EQ(sleeps, 0);                                             // decided on the first attempt
+    EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 8u);   // reclaimed as us
+}
+
+TEST(CasMountAwaitExpiry, FutureExpiryReclaimsAfterClockAdvances)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+
+    uint64_t now = 1000;                 // lease live until 1100, holder does NOT renew
+    auto now_fn = [&] { return now; };
+    auto sleep_fn = [&](uint64_t ms) { now += ms; };
+
+    const auto r = claimMountAwaitingExpiry(
+        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, /*ttl*/ 100, /*poll*/ 50, /*margin*/ 25, sleep_fn);
+    EXPECT_EQ(r.kind, MountClaimResult::Claimed);
+    const auto body = decodeMountLease(b->get(l.mountKey("r"))->bytes);
+    EXPECT_EQ(body.writer_epoch, 8u);
+    EXPECT_EQ(body.seq, 2u);                                         // reclaim continues seq (prev 1 + 1)
+}
+
+TEST(CasMountAwaitExpiry, LiveRenewingTwinTimesOutAsDoubleStart)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+
+    uint64_t now = 1000;
+    auto now_fn = [&] { return now; };
+    /// Each poll: time advances AND the live holder (uuid=1, epoch=7) renews its own lease.
+    auto sleep_fn = [&](uint64_t ms)
+    {
+        now += ms;
+        ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, now, 100).kind, MountClaimResult::Claimed);
+    };
+
+    const auto r = claimMountAwaitingExpiry(
+        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, /*ttl*/ 100, /*poll*/ 20, /*margin*/ 20, sleep_fn);
+    EXPECT_EQ(r.kind, MountClaimResult::LiveDoubleStart);
+    EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 7u);   // still the holder's
+}
+
+TEST(CasMountAwaitExpiry, ForeignUuidFailsClosedImmediately)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    /// A foreign server (uuid=2) holds the mount.
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(2), 1, /*now*/ 1000, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+
+    uint64_t now = 1000;
+    int sleeps = 0;
+    auto now_fn = [&] { return now; };
+    auto sleep_fn = [&](uint64_t ms) { now += ms; ++sleeps; };
+
+    const auto r = claimMountAwaitingExpiry(
+        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, /*ttl*/ 100, /*poll*/ 25, /*margin*/ 25, sleep_fn);
+    EXPECT_EQ(r.kind, MountClaimResult::ForeignOwner);
+    EXPECT_EQ(sleeps, 0);                                            // never waits across UUIDs
+}
+
+TEST(CasMountAwaitExpiry, SkewedFarFutureExpiryIsCappedAtTtlPlusMargin)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    /// A prior incarnation stamped a far-future expiry (killer clock ahead): live until 1000 + 100000,
+    /// but the holder is dead (never renews). The wait must be capped at ~ttl + margin, not block to
+    /// the absurd expiry, and fail closed (LiveDoubleStart) rather than reclaim a still-live-looking lease.
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100000).kind, MountClaimResult::Claimed);
+
+    uint64_t now = 1000;
+    auto now_fn = [&] { return now; };
+    auto sleep_fn = [&](uint64_t ms) { now += ms; };
+
+    const auto r = claimMountAwaitingExpiry(
+        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, /*ttl*/ 100, /*poll*/ 20, /*margin*/ 20, sleep_fn);
+    EXPECT_EQ(r.kind, MountClaimResult::LiveDoubleStart);
+    EXPECT_LE(now, 1000u + 100u + 20u + 20u);                        // bounded ~ start + ttl + margin (+ one poll)
+    EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 7u);   // not reclaimed
+}
+
 TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -245,41 +367,28 @@ TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
     EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
 }
 
-TEST(CasMountStartup, LiveDoubleStartErrorTextHasRemediation)
+TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
 {
     auto b = std::make_shared<InMemoryBackend>();
 
-    /// Server A opens writable and KEEPS its Store alive so its mount lease stays LIVE (the default
-    /// TTL is 30s; the background renewer is off but the claimed mount's expires_at_ms is now+TTL).
+    /// Server A opens writable with a SHORT lease TTL and KEEPS its Store alive with NO background
+    /// renewer (background_watermark defaults false) — i.e. it simulates a crashed process: the mount
+    /// lease survives with a future expires_at_ms but is never renewed.
     auto a = Store::open(b, PoolConfig{
-        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1,
+        .mount_lease_ttl_ms = std::chrono::milliseconds(300),
+        .mount_renew_period = std::chrono::milliseconds(100)});
     ASSERT_NE(a, nullptr);
+    const uint64_t e1 = a->writerEpoch();
 
-    /// A SECOND writable open with the SAME (server_id, server_root_id): the owner gate passes (same
-    /// uuid), allocateWriterEpoch hands out a NEW epoch e2 != e1, so claimMount observes a same-uuid /
-    /// different-epoch / LIVE mount → LiveDoubleStart → throws ABORTED with the actionable text.
-    bool threw = false;
-    try
-    {
-        auto a2 = Store::open(b, PoolConfig{
-            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
-        FAIL() << "second live open of the same (uuid, server_root_id) must throw";
-    }
-    catch (const DB::Exception & e)
-    {
-        threw = true;
-        const std::string msg = e.message();
-        /// Identity / existing-holder fields.
-        EXPECT_NE(msg.find("server_root_id"), std::string::npos);
-        EXPECT_NE(msg.find("'r'"), std::string::npos);
-        EXPECT_NE(msg.find("hostname="), std::string::npos);
-        EXPECT_NE(msg.find("pid="), std::string::npos);
-        EXPECT_NE(msg.find("last_seq="), std::string::npos);
-        EXPECT_NE(msg.find("expires_at_ms="), std::string::npos);
-        /// The three remediation lines (spec §mount-safety).
-        EXPECT_NE(msg.find("configure a unique"), std::string::npos);
-        EXPECT_NE(msg.find("mount lease expires"), std::string::npos);
-        EXPECT_NE(msg.find("stale"), std::string::npos);
-    }
-    EXPECT_TRUE(threw);
+    /// A restart of the SAME server (same uuid) must NOT abort: it waits out the stale lease (<= ~300ms)
+    /// and reclaims the mount, coming up with a strictly higher durable writer_epoch.
+    StorePtr a2;
+    EXPECT_NO_THROW(
+        a2 = Store::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1,
+            .mount_lease_ttl_ms = std::chrono::milliseconds(300),
+            .mount_renew_period = std::chrono::milliseconds(100)}));
+    ASSERT_NE(a2, nullptr);
+    EXPECT_GT(a2->writerEpoch(), e1);
 }

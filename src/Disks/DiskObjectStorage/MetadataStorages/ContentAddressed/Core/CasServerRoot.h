@@ -161,6 +161,31 @@ MountClaimResult claimMount(
     Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     uint64_t now_ms, uint64_t ttl_ms);
 
+/// Format the operator-actionable startup error shown when the mount lease is held by a genuinely
+/// live second server (the same `server_root_id` is mounted twice). Produced only AFTER this server
+/// has already waited for the lease to lapse (see `claimMountAwaitingExpiry`) and it did not — so the
+/// remediation is about a live twin, not about waiting.
+String mountDoubleStartMessage(const String & srid, const MountLease & existing);
+
+/// Bounded wait-for-expiry mount claim (S13 crash-recovery). Wraps `claimMount`:
+///   - first attempt decided immediately for `Claimed` (reclaimed / adopted) or `ForeignOwner`;
+///   - a `LiveDoubleStart` from OUR OWN uuid (a stale lease from a prior incarnation of this server)
+///     is waited out: poll every `poll_interval_ms` (advancing wall-clock via `now_ms_fn`, sleeping via
+///     `sleep_ms_fn`) until the lease lapses and we reclaim it (`Claimed`), or the wait bound elapses.
+/// The wait bound is latched ONCE from the first observed `expires_at_ms + margin_ms`, capped so we never
+/// block longer than `now + ttl_ms + margin_ms` (bounds a forward-clock-skewed expiry). On timeout the
+/// last `LiveDoubleStart` is returned (a genuinely live second server). The reclaim inside `claimMount`
+/// is token-guarded, so a holder that renews after our read can never be stolen from — correctness does
+/// not depend on the poll interval. `now_ms_fn` / `sleep_ms_fn` are injected so tests drive a fake clock
+/// with no real sleeping. `on_wait_start` (default no-op) is invoked once, with the observed lease and
+/// the latched wait deadline, when the function decides to wait — for an operator-visible startup log.
+MountClaimResult claimMountAwaitingExpiry(
+    Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
+    const std::function<uint64_t()> & now_ms_fn,
+    uint64_t ttl_ms, uint64_t poll_interval_ms, uint64_t margin_ms,
+    const std::function<void(uint64_t)> & sleep_ms_fn,
+    const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {});
+
 /// Mount-lease heartbeat (liveness), the sibling of `WatermarkKeeper` over the per-server-root mount
 /// object. Reuses `SingleWriterSlot`: anchors the slot synchronously on `start`, renews it async off
 /// the write path, and fails closed on any foreign touch (`renewOnce` throws on a precondition miss).

@@ -167,23 +167,40 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
                 std::chrono::system_clock::now().time_since_epoch()).count());
         };
         const uint64_t ttl_ms = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
-        const MountClaimResult claim = claimMount(
-            *store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch, now_ms(), ttl_ms);
+        /// Poll twice per renew period so a live holder's renewal is always observed within the wait;
+        /// margin = one poll interval (covers poll granularity + minor wall-clock skew). Derived from
+        /// existing config — no new knob (spec §Config).
+        const uint64_t poll_interval_ms = std::max<uint64_t>(
+            1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
+        const uint64_t margin_ms = poll_interval_ms;
+        const auto sleep_ms = [](uint64_t ms)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        };
+        /// Operator-visible log the moment startup decides to wait out a stale self-mount (the disk-open
+        /// path blocks up to ~ttl here, so a silent block would be confusing).
+        const auto on_wait_start = [&srid](const MountLease & held, uint64_t wait_deadline_ms)
+        {
+            LOG_INFO(getLogger("CasStore"),
+                "CAS mount '{}': a stale mount lease is held by uuid={} epoch={} pid={} hostname={} "
+                "(expires_at_ms={}); waiting for it to lapse, then reclaiming. If a second server is "
+                "genuinely live, startup will abort once the wait bound (wait_deadline_ms={}) elapses.",
+                srid, u128ToHex(held.server_uuid), held.writer_epoch, held.pid, held.hostname,
+                held.expires_at_ms, wait_deadline_ms);
+        };
+
+        /// S13 crash-recovery: a hard-killed prior incarnation leaves a stale, unreleased mount lease.
+        /// Rather than aborting, wait (bounded by ttl + margin) for that lease to lapse and reclaim it;
+        /// a genuinely live second server keeps renewing and is reported as LiveDoubleStart. The reclaim
+        /// is token-guarded (see claimMountAwaitingExpiry), so a live twin is never stolen from.
+        const MountClaimResult claim = claimMountAwaitingExpiry(
+            *store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
+            [&now_ms]() { return now_ms(); }, ttl_ms, poll_interval_ms, margin_ms, sleep_ms, on_wait_start);
         if (claim.kind != MountClaimResult::Claimed)
         {
-            /// Actionable, multi-line startup error (spec §mount-safety). It names the existing mount's
-            /// holder so an operator can decide between "configure a unique server_root_id", "wait for
-            /// the lease to lapse", or "restore the uuid file / remove the stale owner".
-            throw Exception(ErrorCodes::ABORTED,
-                "Content-addressed disk cannot start: server_root_id '{}' is actively mounted by another server.\n"
-                "  Existing mount: server_uuid={} hostname={} pid={} last_seq={} expires_at_ms={}\n"
-                "This prevents two ClickHouse servers from writing the same CAS namespace.\n"
-                " - If the other server is still running, configure a unique <server_root_id> for this disk.\n"
-                " - If it is dead, wait until the mount lease expires and retry (same server only).\n"
-                " - If the local ClickHouse uuid file was regenerated, restore the old uuid file, or remove the stale\n"
-                "   owner object gc/server-roots/{}/owner only after verifying no server uses this root.",
-                srid, u128ToHex(claim.body.server_uuid), claim.body.hostname, claim.body.pid,
-                claim.body.seq, claim.body.expires_at_ms, srid);
+            /// LiveDoubleStart (waited out the bound → a live twin) or ForeignOwner → fail closed with
+            /// the actionable, multi-line startup error (spec §mount-safety).
+            throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));
         }
 
         /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which

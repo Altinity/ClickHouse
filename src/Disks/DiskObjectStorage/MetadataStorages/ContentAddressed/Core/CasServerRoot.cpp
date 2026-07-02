@@ -2,10 +2,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <cas_format.pb.h>
 #include <Common/Exception.h>
 #include <base/getFQDNOrHostName.h>
+#include <fmt/format.h>
 
 #include <unistd.h>
 
@@ -325,6 +327,60 @@ MountClaimResult claimMount(
         /// reclaim. Fail closed.
         return {.kind = MountClaimResult::LiveDoubleStart, .body = body};
     return {.kind = MountClaimResult::Claimed, .body = body};
+}
+
+String mountDoubleStartMessage(const String & srid, const MountLease & existing)
+{
+    return fmt::format(
+        "Content-addressed disk cannot start: server_root_id '{}' is actively mounted by another LIVE server.\n"
+        "  Existing mount: server_uuid={} hostname={} pid={} last_seq={} expires_at_ms={}\n"
+        "This server already waited for the mount lease to lapse, but it kept being renewed — a second\n"
+        "server is holding the same CAS namespace. This prevents two ClickHouse servers from writing it.\n"
+        " - If the other server is running intentionally, configure a unique <server_root_id> for this disk.\n"
+        " - If the other server is a stale/zombie process, stop it; this server will then reclaim the mount on restart.\n"
+        " - If the local ClickHouse uuid file was regenerated, restore the old uuid file, or remove the stale\n"
+        "   owner object gc/server-roots/{}/owner only after verifying no server uses this root.",
+        srid, u128ToHex(existing.server_uuid), existing.hostname, existing.pid,
+        existing.seq, existing.expires_at_ms, srid);
+}
+
+MountClaimResult claimMountAwaitingExpiry(
+    Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
+    const std::function<uint64_t()> & now_ms_fn,
+    uint64_t ttl_ms, uint64_t poll_interval_ms, uint64_t margin_ms,
+    const std::function<void(uint64_t)> & sleep_ms_fn,
+    const std::function<void(const MountLease &, uint64_t)> & on_wait_start)
+{
+    /// A zero poll interval would spin; a single-ms floor keeps the loop a real (bounded) wait.
+    const uint64_t poll = poll_interval_ms == 0 ? 1 : poll_interval_ms;
+
+    MountClaimResult r = claimMount(b, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms);
+    if (r.kind != MountClaimResult::LiveDoubleStart)
+        return r;
+
+    /// A same-uuid, different-epoch, still-live lease from a prior incarnation of THIS server. It is
+    /// either our own crashed process (its keeper died without releasing the lease) or a genuinely live
+    /// twin. Wait for the lease to lapse — a live twin keeps renewing and never lapses, so we time out
+    /// and report it; a dead predecessor lapses within its TTL and we reclaim (token-guarded).
+    const uint64_t start_ms = now_ms_fn();
+    uint64_t wait_deadline = r.body.expires_at_ms + margin_ms;
+    const uint64_t cap = start_ms + ttl_ms + margin_ms;
+    if (wait_deadline > cap)
+        wait_deadline = cap;
+
+    if (on_wait_start)
+        on_wait_start(r.body, wait_deadline);
+
+    while (now_ms_fn() < wait_deadline)
+    {
+        sleep_ms_fn(poll);
+        r = claimMount(b, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms);
+        if (r.kind != MountClaimResult::LiveDoubleStart)
+            return r;
+    }
+
+    /// Timed out still LiveDoubleStart → a genuinely live second server holds the mount.
+    return r;
 }
 
 MountLeaseKeeper::MountLeaseKeeper(
