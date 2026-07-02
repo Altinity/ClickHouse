@@ -1,7 +1,7 @@
 ---
 description: 'Consolidated cross-area DONE / TODO / REJECTED / DESIRABLE roll-up for the CAS MergeTree feature. A single place to see the whole feature state, linking into the section documents.'
 sidebar_label: 'CAS Roadmap'
-sidebar_position: 9
+sidebar_position: 10
 slug: /superpowers/cas/roadmap
 title: 'CAS MergeTree — Roadmap and Status Roll-up'
 doc_type: 'guide'
@@ -122,6 +122,24 @@ See [`07-s3-budget.md`](07-s3-budget.md) for the full breakdown.
 | Root-shard fan-out vs per-object permit cap (B158: raise `root_shards`) | **TODO** | Reduces CAS contention at high insert rate |
 | `RENAME` = one Build/part (B111) | **DESIRABLE** | Currently multiple root-shard updates per rename |
 | Dirty-only fence/fold (B168 P4/P6/P7/P8) | **PARTIAL** | Reduces unnecessary metadata writes |
+
+---
+
+## Read protocol {#area-read-protocol}
+
+See [`09-read-protocol.md`](09-read-protocol.md) for full detail.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `resolveRef` via root-shard decode + TTL/single-flight caches | **DONE** | `CasStore.cpp:530`; shard decode cache at `CasStore.cpp:392` |
+| `(ManifestId, Token)` manifest decode cache | **DONE** | `CasStore.cpp:576`; token-keyed; wholesale-clear bounded |
+| Blob ranged GET (`getBlobViewPlan` + `readBlobPayload`) | **DONE** | One ranged S3 GET per column file per part open |
+| `ReadBufferFromFileView` position-rebase fix (B115) | **DONE** | Commit `440871098a9`; gtest added; latent in `PackedFilesReader` statistics path |
+| Column pruning (structural — per-file `lookupPath`) | **DONE** | Reader requests only needed files; CA layer has no filter list |
+| Inline / mutable / verbatim file reads (0 extra S3 ops) | **DONE** | `tryGetInManifestBytes`, `prepareInManifestRead` |
+| In-flight read-your-writes overlay (B59 — blob + directory) | **DONE** | `tryGetInFlightStorageObjects` / `hasInFlightDirectory`; projection workaround removed |
+| `manifest_size` field in `Resolved` always 0 | **TODO** (minor, B10) | `resolveRef` never sets it; harmless but imprecise |
+| Replication fetch-by-relink (zero byte cost for same-pool parts) | **DONE (base)** | `manifest_hash` on Keeper `/parts` znode still TODO |
 
 ---
 

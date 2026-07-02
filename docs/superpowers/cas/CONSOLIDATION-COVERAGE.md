@@ -1,7 +1,7 @@
 ---
 description: 'Coverage matrix for the CAS documentation consolidation: maps every doc slated for deletion to the new consolidated doc(s) and section that capture its durable content (invariants, decisions, rejected paths, key technical detail). This is the audit artifact for the sanity gate that precedes irreversible deletion.'
 sidebar_label: 'Consolidation coverage matrix'
-sidebar_position: 10
+sidebar_position: 11
 slug: /superpowers/cas/consolidation-coverage
 title: 'CAS Docs — Consolidation Coverage Matrix'
 doc_type: 'reference'
@@ -453,3 +453,22 @@ backlog (the file's content is folded in); B168 remainder now points to `07 §re
   model-checked; the doc carries that caveat.
 - Group D stateless-reader fence: the doc notes the per-server-owned-namespace model narrows but does
   not eliminate the window; the ephemeral-pin mechanism remains the documented answer.
+
+---
+
+## Read-path gap-fill (2026-07-02) — new doc `09-read-protocol.md` {#read-path-gap-fill}
+
+Four read-path docs were deleted in the initial consolidation commit (`3a054b9ffe6`) without being
+mapped to a consolidated target. They were recovered from `3a054b9ffe6~1` and consolidated into
+`09-read-protocol.md`. The table below closes the coverage gap.
+
+| Recovered doc | Status in consolidation | Durable content captured in `09` |
+|---|---|---|
+| `specs/2026-06-04-cas-mergetree-projection-readback-design.md` | Previously unmapped → now covered | B59 root cause (`tmp_proj` read-back fails on CA because `resolveRef` is committed-only); Approach A in-flight overlay design (transaction `tryGetInFlight*`); error handling; risks; testing requirements (`§8`) |
+| `plans/2026-06-04-cas-mergetree-projection-readback.md` | Previously unmapped → now covered | B59 implementation plan (Phase 1–4 task sequence; seam verification of `IMetadataTransaction`, `ContentAddressedTransaction`, `DiskObjectStorageTransaction`, `DataPartStorageOnDiskFull`; un-gate list of 7 tests); plan narration dropped, decisions and seam names preserved (`§8`) |
+| `specs/2026-06-05-ca-projection-dir-readback-design.md` | Previously unmapped → now covered | Directory-granularity overlay (`hasInFlightDirectory`; `existsDirectory` prelude mirroring `existsFile`); retirement of `registerCarriedForwardProjectionForCA` + B63 back-fill; rejected approaches (full `listDirectory` overlay = YAGNI); risks (`§8.3`) |
+| `reports/2026-06-12-readbufferfromfileview-position-corruption.md` | Previously mapped to `02 §systematic-debugging` only → now also fully covered | B115 root cause (`file_offset_of_buffer_end` incremental drift vs `ReadBufferFromS3` buffer-discard); trigger conditions (all three required); fix (`executeWithOriginalBuffer` rebase after every inner-buffer op); latent status in `PackedFilesReader` statistics path; gtest coverage (14/36 fail pre-fix, 36/36 pass post-fix) (`§7`) |
+
+The four docs remain listed as delete-candidates (they were in the original consolidation scope).
+Their durable content is now fully present in `09-read-protocol.md` and in code (commit `440871098a9`
+for B115; `ContentAddressedTransaction.cpp` and `DataPartStorageOnDiskFull.cpp` for B59).

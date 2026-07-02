@@ -33,6 +33,7 @@ zero-copy replication.
 | [`06-tla-models.md`](06-tla-models.md) | Index of every TLA+ model that survives: invariants proved, counterexamples that drove design changes, and code-currency notes. Points to `.tla`/`.cfg` sources (which remain untouched). |
 | [`07-s3-budget.md`](07-s3-budget.md) | The consolidated, detailed S3 op-count breakdown per protocol part (write, read, GC) plus the full reduction history (dedup cache, adaptive HEAD-before-PUT, precommit-first, snap-prune, LIST-token skip). |
 | [`08-testing-and-soak.md`](08-testing-and-soak.md) | The adversarial scenario suite (S01–S35: what each stresses, D2 triage status), the 24h soak harness, `clickhouse-disks fsck` and `ca-gc-dryrun` introspection, the `system.content_addressed_log` and `system.content_addressed_garbage_collection_log` audit tables, and standing findings/backlog. |
+| [`09-read-protocol.md`](09-read-protocol.md) | End-to-end read protocol: ref resolution (`resolveRef`), manifest fetch (`readManifest`), ranged blob reads, column pruning, shard and `(ManifestId, Token)` decode caches, `ReadBufferFromFileView`/`PackedFilesReader` and the B115 position-corruption fix, in-flight read-your-writes (B59, projections), mutable and verbatim file reads, and GC safety. |
 | [`ROADMAP.md`](ROADMAP.md) | Consolidated cross-area DONE / TODO / REJECTED / DESIRABLE roll-up. Single place to see the whole feature state. |
 
 ---
@@ -52,6 +53,7 @@ zero-copy replication.
 | Testing — scenario suite (S01–S35) | **Partial** — 14/32 PASS, 10 INCONCLUSIVE, 8 FAIL (all FAILs are harness/infra/scale issues, zero product bugs in D2); several scenarios need infra extensions | [`08-testing-and-soak.md`](08-testing-and-soak.md) |
 | Testing — soak harness | **Partial** — green-path soak works; chaos soak limited by fsck timeout at large pool and TTL-band oracle; 4h continuous run needs compacting object store | [`08-testing-and-soak.md`](08-testing-and-soak.md) |
 | Introspection (`fsck`, `ca-gc-dryrun`, audit logs) | **DONE** — `clickhouse-disks fsck`, `ca-gc-dryrun`, `system.content_addressed_log`, `system.content_addressed_garbage_collection_log` all implemented | [`08-testing-and-soak.md`](08-testing-and-soak.md) |
+| Read protocol (ref resolution, manifest fetch, ranged blobs, decode caches, read-your-writes) | **DONE** — B59 in-flight overlay, B115 position-corruption fix, shard and manifest decode caches operational | [`09-read-protocol.md`](09-read-protocol.md) |
 | Release readiness | **TODO** — capability gate (B31), real-S3 GC validation, backup/restore runbook, `manifest_hash`, `SYSTEM` control commands (B197), integration tests on RustFS (B125), repo hygiene (B131) | [`ROADMAP.md`](ROADMAP.md) |
 
 ---
