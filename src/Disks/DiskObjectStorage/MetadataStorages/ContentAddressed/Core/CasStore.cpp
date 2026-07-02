@@ -9,6 +9,7 @@
 #include <Common/thread_local_rng.h>
 #include <city.h>
 #include <algorithm>
+#include <ctime>
 #include <thread>
 #include <unordered_set>
 
@@ -65,10 +66,22 @@ void Store::dedupCacheAdd(const UInt128 & blob_hash)
         dedup_cache->set(blob_hash, std::make_shared<DedupPresent>());
 }
 
+uint64_t Store::bootMs()
+{
+    struct timespec ts{};
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
+}
+
+uint64_t Store::bootMsNow() const
+{
+    return config.boot_ms_fn ? config.boot_ms_fn() : bootMs();
+}
+
 bool Store::mayMutate() const
 {
     return !mount_fence.lost.load(std::memory_order_acquire)
-        && std::chrono::steady_clock::now() < mount_fence.deadline.load(std::memory_order_acquire);
+        && bootMsNow() < mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
 }
 
 void Store::tripMountLost()
@@ -76,16 +89,16 @@ void Store::tripMountLost()
     mount_fence.lost.store(true, std::memory_order_release);
 }
 
-void Store::setMountDeadline(std::chrono::steady_clock::time_point d)
+void Store::setMountDeadline(uint64_t deadline_boot_ms)
 {
-    mount_fence.deadline.store(d, std::memory_order_release);
+    mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
 }
 
-void Store::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, std::chrono::steady_clock::time_point deadline)
+void Store::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms)
 {
     mount_fence.server_uuid = server_uuid;
     mount_fence.writer_epoch = writer_epoch;
-    mount_fence.deadline.store(deadline, std::memory_order_release);
+    mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
     mount_fence.lost.store(false, std::memory_order_release);
 }
 
@@ -223,14 +236,14 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// monotonic deadline; on a superseded/foreign renew failure latch the fence to lost. Set BEFORE
         /// startBackground so no renewal can fire before the callbacks are in place.
         store->mount_keeper->setFenceCallbacks(
-            [raw, ttl_ms] { raw->setMountDeadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms)); },
+            [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
             [raw] { raw->tripMountLost(); });
         store->mount_keeper->start();
 
-        /// Arm the local write fence: cache (uuid, epoch) and set the monotonic deadline now + ttl. From
+        /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline now + ttl. From
         /// here ordinary mutations (mutateShard) are fence-gated via mayMutate().
         store->armMountFence(our_uuid, writer_epoch,
-            std::chrono::steady_clock::now() + store->config.mount_lease_ttl_ms);
+            store->bootMsNow() + static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count()));
         /// Gate the background renewer with `background_watermark`: it runs only in production
         /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
         /// drive renewOnce explicitly and rely on the armed sub-TTL deadline, never on the loop. The

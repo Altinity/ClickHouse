@@ -14,8 +14,10 @@
 #include <Common/HashTable/Hash.h>
 #include <Common/ProfileEvents.h>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -144,6 +146,10 @@ struct PoolConfig
     /// decode validated < this many ms ago WITHOUT a HEAD. 0 disables the TTL (all callers force-fresh).
     /// Strict-freshness callers always pass allow_stale=false and always HEAD, regardless of this value.
     std::chrono::milliseconds shard_decode_cache_ttl_ms{200};
+
+    /// The write-fence deadline clock (CLOCK_BOOTTIME milliseconds; see `MountFence`). Empty = the real
+    /// boot clock (`Store::bootMs`); injected by tests to drive the fence deadline deterministically.
+    std::function<uint64_t()> boot_ms_fn = {};
 };
 
 struct Resolved
@@ -184,17 +190,25 @@ using StorePtr = std::shared_ptr<Store>;
 
 /// Local write fence (spec §write-fence, Phase 0 Task 6). A PURELY LOCAL, in-memory check — never a
 /// per-write S3 read. The renewer (the MountLeaseKeeper, Task 7) is the only thing that touches S3 for
-/// the lease; on each successful renew it refreshes `deadline` (an S3 `expires_at_ms` translated to a
-/// monotonic steady-clock instant, so a wall-clock change cannot extend it), and on any supersession
-/// (a foreign uuid / a newer writer_epoch / an unrenewable expired lease) it latches `lost`. A mutable
-/// op proceeds only while `!lost` AND the deadline has not passed. `writer_epoch` is the fencing token.
+/// the lease; on each successful renew it refreshes `deadline_boot_ms` (an S3 `expires_at_ms`
+/// translated to a CLOCK_BOOTTIME instant, so a wall-clock change cannot extend it), and on any
+/// supersession (a foreign uuid / a newer writer_epoch / an unrenewable expired lease) it latches
+/// `lost`. A mutable op proceeds only while `!lost` AND the deadline has not passed. `writer_epoch` is
+/// the fencing token.
+///
+/// WHY BOOTTIME, NOT MONOTONIC: `CLOCK_MONOTONIC` does not advance while a VM is suspended, so a
+/// resumed sleeper would compute the same "not yet expired" verdict it had before the nap even though
+/// wall time (and the GC leader's fence-out) moved far ahead — it could mutate the shared state under
+/// a live writer. `CLOCK_BOOTTIME` includes suspend time, so a resumed sleeper sees its fence expired.
+/// Container pause is already safe under either clock (the process is frozen, so no local check runs).
 struct MountFence
 {
     UInt128 server_uuid{};
     uint64_t writer_epoch = 0;
     /// Permissive default (set in the Store ctor): until something arms a real lease deadline, the
-    /// fence allows mutations — so existing tests and pre-Task-7 behavior are unchanged.
-    std::atomic<std::chrono::steady_clock::time_point> deadline{std::chrono::steady_clock::time_point::max()};
+    /// fence allows mutations — so existing tests and pre-Task-7 behavior are unchanged. UINT64_MAX =
+    /// unarmed (never expires); otherwise a CLOCK_BOOTTIME-milliseconds instant.
+    std::atomic<uint64_t> deadline_boot_ms{std::numeric_limits<uint64_t>::max()};
     std::atomic<bool> lost{false};
 };
 
@@ -242,10 +256,17 @@ public:
     /// Latch the fence to lost (once lost, stays lost). Called by the renewer (Task 7) on a superseded
     /// or foreign observation; the gated mutate chokepoints then fail closed.
     void tripMountLost();
-    /// Refresh the monotonic lease deadline (release). Task 7's keeper renew calls this on success.
-    void setMountDeadline(std::chrono::steady_clock::time_point d);
+    /// Refresh the write-fence deadline (a CLOCK_BOOTTIME-milliseconds instant; release). Task 7's
+    /// keeper renew calls this on success.
+    void setMountDeadline(uint64_t deadline_boot_ms);
     /// Arm the fence at startup (Task 7): set (uuid, epoch, deadline), clear `lost`.
-    void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, std::chrono::steady_clock::time_point deadline);
+    void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms);
+    /// The fence clock: CLOCK_BOOTTIME in milliseconds (includes VM-suspend time, unlike
+    /// CLOCK_MONOTONIC — see `MountFence`). Consults the injected `config.boot_ms_fn` if set (tests),
+    /// otherwise `bootMs`.
+    uint64_t bootMsNow() const;
+    /// The real boot clock: CLOCK_BOOTTIME in milliseconds. Static so tests can compose it.
+    static uint64_t bootMs();
 
     /// ---- write side ----
     BuildPtr startBuild(BuildInfo info);                          /// W-HEARTBEAT durable before return

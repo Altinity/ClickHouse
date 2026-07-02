@@ -20,6 +20,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int ABORTED;
 extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
 extern const int NOT_IMPLEMENTED;
@@ -1610,4 +1611,39 @@ TEST(CasStoreBeat, DrainBlocksAckWhileMutationInFlight)
     mutator.join();
     EXPECT_EQ(beat.get(), 1u);
     EXPECT_EQ(store->retireView().round(), 1u);
+}
+
+/// Task 12: the write-fence deadline is a CLOCK_BOOTTIME instant (boottime includes VM-suspend time,
+/// so a resumed sleeper sees its fence expired — unlike CLOCK_MONOTONIC, which freezes across suspend).
+/// A CLOCK_MONOTONIC freeze cannot be simulated in a unit test, so we exercise the injected-fn seam: a
+/// fake boot clock that we advance past the ttl must flip mayMutate to false and make a gated mutate
+/// fail closed with ABORTED.
+TEST(CasStore, WriteFenceUsesInjectedBootClock)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    uint64_t fake_boot = 1'000'000;   /// arbitrary boottime origin (ms)
+    auto store = DB::Cas::Store::open(backend, DB::Cas::PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .root_shards = 1,
+        .gc_trim_min_events = 0,
+        .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
+        .boot_ms_fn = [&] { return fake_boot; },
+    });
+
+    /// Freshly armed at open (deadline = fake_boot + ttl): well within the ttl, mutations are allowed.
+    EXPECT_TRUE(store->mayMutate());
+    EXPECT_NO_THROW(store->mutateShardForTest(RootNamespace{"ns"}, 0, [](RootShard &) {},
+        RootMutationOrigin::Writer, RootMutationKind::Promote));
+
+    /// Advance the boot clock just short of the deadline — still armed.
+    fake_boot += 29999;
+    EXPECT_TRUE(store->mayMutate());
+
+    /// Cross the deadline (ttl elapsed with no renew — a resumed sleeper's view). The fence expires and
+    /// a gated mutate must fail closed with ABORTED.
+    fake_boot += 2;   /// now fake_boot = origin + 30001 > origin + 30000
+    EXPECT_FALSE(store->mayMutate());
+    EXPECT_THROW(store->mutateShardForTest(RootNamespace{"ns"}, 0, [](RootShard &) {},
+        RootMutationOrigin::Writer, RootMutationKind::Promote), DB::Exception);
 }

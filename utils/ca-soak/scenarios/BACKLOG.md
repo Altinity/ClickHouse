@@ -517,3 +517,41 @@ CLOSED/explained (no action): S16 dangling=racy-fsck FP; disk-growth=inactive-pa
 - **Also — make the residual verdicts PREFIX-AWARE.** Raw `fsck.unreachable` / `gc_residual_unreachable` include non-reclaimable "other" bookkeeping (namespace registry / root-shard / gc-state objects). S05 (2026-07-01, fixed binary) settles at `unreachable=240` but `by_prefix={'other':240, blobs:0, _manifests:0}` — the reclaimable classes drained to 0; the 240 "other" is the known S30 `dropNamespace` monotone-registry growth (200 create/drop cycles), NOT a content leak. A raw-count drain assertion would wrongly FAIL S05. Assert on RECLAIMABLE prefixes (`blobs`, `_manifests`) only; track "other" growth separately against S30.
 - **Proposed action:** (1) key the drain verdict on the CONVERGED `fsck_final` after the end-checkpoint fixpoint, not the mid-run snapshot; (2) scope it to reclaimable prefixes. Touches ~8 cards + `framework/checkpoint.py` + `framework/assertions.py`.
 - **Related:** S30 (dropNamespace monotone registry fanout — the "other" residual); edge-set in-degree fix `55a766e..cb3aefb` (resolved the actual undercount; the benign-error classifier in `framework/observe.py` was broadened for fold/fence/recheck retry variants).
+
+## SCENARIO (proposed): SIGSTOP a writer holds the ack floor, SIGCONT releases it (ack-floor round)
+
+- **Severity:** scenario-proposal (ack-floor liveness/safety)
+- **Observed:** N/A (proposed regression guard for the one-pass ack-floor GC round, `cas-gc-ack-floor-fence`).
+- **Proposed action:** Steps: fresh pool, one writer + one GC leader; publish then drop a ref so a blob is
+  condemned. `SIGSTOP` the writer (its heartbeat stops renewing, but its lease has NOT yet expired, so the
+  floor still counts its `observed_gc_round`). Drive GC rounds: assert the condemned entry NEVER graduates
+  (its `observed_gc_round` is stuck below the condemn round → `min_ack` pins the floor), the blob survives,
+  and `CasGcFloorHeldByStaleAck` fires once the lag exceeds 2. `SIGCONT` the writer, let it beat once so its
+  `observed_gc_round` catches up, then assert graduation resumes and the blob drains to absent. Verifies the
+  floor is genuinely held by a live-but-paused writer's ack and released cleanly — the SIGSTOP-not-KILL path
+  that fence-out does NOT reclaim.
+
+## SCENARIO (proposed): hard-KILL a writer mid-burst → fence-out after TTL → no dangle in fsck
+
+- **Severity:** scenario-proposal (ack-floor fence-out safety)
+- **Observed:** N/A (proposed regression guard for the heartbeat fence-out path).
+- **Proposed action:** Steps: fresh pool, two writers + one GC leader; both writers insert/burst concurrently.
+  `docker kill -s KILL` one writer mid-burst (its lease stops renewing; it holds a stale `observed_gc_round`).
+  Wait past `mount_lease_ttl_ms + skew_margin` and drive GC: assert the round FENCES OUT the dead writer
+  (`RoundReport::fence_outs == 1`, a `gc_fence_out` audit row, its mount body `gc_fenced = true`), the floor
+  advances past its stale ack, and condemned blobs drain. Then run `clickhouse-disks fsck`: assert
+  `dangling == 0` throughout — the fence-out must never let GC delete a blob a still-live writer references
+  (the surviving writer's fresh incarnations are spared). Guards the safety half of fence-out.
+
+## SCENARIO (proposed): round request-budget regression guard — O(delta)+O(servers)
+
+- **Severity:** scenario-proposal (ack-floor cost regression)
+- **Observed:** N/A (proposed regression guard; the ack-floor redesign's headline property is per-round
+  request count no longer scaling with the object universe).
+- **Proposed action:** Instrument a soak run's per-round S3 request count (the `CasGc*` ProfileEvents or the
+  instrumented backend op log). Drive a pool to a large object universe, then a quiescent series of rounds
+  with a small per-round owner-event delta and a handful of servers. Assert the per-round request count stays
+  O(delta) + O(servers) — specifically that it does NOT grow with total object count (the fence+recheck
+  design's ~2×O(universe) GET + O(universe) CAS-PUT is gone). Fail the guard if a round's request count
+  correlates with universe size rather than delta size. Pairs with the ROADMAP "Ack-floor round soak
+  validation" item.
