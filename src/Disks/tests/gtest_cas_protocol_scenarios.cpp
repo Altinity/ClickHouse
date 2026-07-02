@@ -35,6 +35,7 @@ using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::fenceNamespace;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
+using DB::Cas::tests::streamingHexOf;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::writeBlobRaw;
 
@@ -522,12 +523,18 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
 
     /// Pre-inject retire state at round=1 BEFORE opening the store — the store's open-time refresh lands
     /// at round=1, so any dep recorded thereafter is non-stale (observed_view_round == 1).
+    /// The blob is minted with the POOL streaming-hash convention (copy-forward verifies against it).
     DB::Cas::Layout layout("p");
-    writeBlobRaw(*b, layout, "payload-fresh-ev", 256 /*blob_header_len*/, UInt128{} /*pool_id*/);
-    const String blob_key = layout.blobKey(idOf("payload-fresh-ev"));
+    const String hex = streamingHexOf("payload-fresh-ev");
+    {
+        auto s0 = openStore(b);
+        auto build0 = s0->startBuild({});
+        build0->putBlob(BlobId{hex}, BlobSource::fromString("payload-fresh-ev"));
+    }
+    const String blob_key = layout.blobKey(BlobId{hex});
     const Token t0 = b->head(blob_key).token;
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-fresh-ev"), .token = t0, .size = 16}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(hex), .token = t0, .size = 16}});
 
     auto s = openStore(b);
     ASSERT_EQ(s->retireView().round(), 1u);
@@ -535,7 +542,8 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
     /// adoptEvidence records a TOKENLESS dep at observed_view_round = 1 (the current round) — FRESH.
-    const ManifestEntry entry = blobEntry("data.bin", "payload-fresh-ev");
+    ManifestEntry entry = blobEntry("data.bin", "payload-fresh-ev");
+    entry.blob_hash = hexToU128(hex);   /// streaming-convention id (matches the minted blob)
     build->adoptEvidence(entry);
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);

@@ -10,6 +10,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <IO/HashingReadBuffer.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBuffer.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
@@ -30,6 +32,7 @@ using DB::Cas::tests::fenceNamespace;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
 using DB::Cas::tests::shardOfForTest;
+using DB::Cas::tests::streamingHexOf;
 using DB::Cas::tests::u128Of;
 
 namespace
@@ -58,6 +61,28 @@ ManifestEntry blobManifestEntry(const String & path, const String & payload)
     e.blob_hash = u128Of(payload);
     e.blob_size = payload.size();
     return e;
+}
+
+ManifestEntry blobManifestEntryStreaming(const String & path, const String & payload)
+{
+    ManifestEntry e;
+    e.path = path;
+    e.placement = EntryPlacement::Blob;
+    e.blob_hash = hexToU128(streamingHexOf(payload));
+    e.blob_size = payload.size();
+    return e;
+}
+
+/// publishOneBlobPart with the streaming (production-convention) blob id.
+ManifestId publishOneBlobPartStreaming(
+    const StorePtr & s, const RootNamespace & ns, const String & ref, const String & path, const String & payload)
+{
+    auto build = startBuildFor(s, ns, ref);
+    build->putBlob(BlobId{streamingHexOf(payload)}, BlobSource::fromString(payload));
+    const ManifestId id = build->stageManifest({blobManifestEntryStreaming(path, payload)});
+    build->precommitAdd(ns, ref, id);
+    build->promote(ns, ref, build->buildId(), id);
+    return id;
 }
 
 /// The full single-blob write flow: putBlob -> stageManifest(one entry) -> precommitAdd -> promote.
@@ -630,18 +655,18 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     Token t0;
     {
         auto s0 = openStore(b);
-        publishOneBlobPart(s0, ns, "part_a", "data.bin", "payload-CF");
-        t0 = b->head(s0->layout().blobKey(idOf("payload-CF"))).token;
+        publishOneBlobPartStreaming(s0, ns, "part_a", "data.bin", "payload-CF");
+        t0 = b->head(s0->layout().blobKey(BlobId{streamingHexOf("payload-CF")})).token;
     }
 
     DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(idOf("payload-CF"));
+    const String blob_key = layout.blobKey(BlobId{streamingHexOf("payload-CF")});
 
     /// 2. Condemn (Blob, hash(CF), t0) — models the fold having condemned CF after stale-view
     ///    adoptions landed unfolded (the soak chain). Object stays PRESENT (no delete yet: a
     ///    non-pending entry is >= 2 passes from deletion).
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-CF"), .token = t0, .size = 10}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(streamingHexOf("payload-CF")), .token = t0, .size = 10}});
 
     /// 3. Fresh Store (restart: view refreshed at open sees the condemnation) — republishRef's
     ///    exact body: adoptEvidence over the source manifest entry, stage a FRESH dst manifest,
@@ -650,8 +675,8 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     std::vector<CasEvent> seen;
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
     auto build = startBuildFor(s, ns, "detached_part_a");
-    build->adoptEvidence(blobManifestEntry("data.bin", "payload-CF"));
-    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "payload-CF")});
+    build->adoptEvidence(blobManifestEntryStreaming("data.bin", "payload-CF"));
+    const ManifestId mid = build->stageManifest({blobManifestEntryStreaming("data.bin", "payload-CF")});
     build->precommitAdd(ns, "detached_part_a", mid);
 
     /// 4. BEFORE fix: ABORTED (condemned at commit revalidation) — the attach brick.
@@ -666,7 +691,7 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
         if (e.type == CasEventType::BlobCopyForward)
         {
             ++copy_forwards;
-            EXPECT_EQ(e.object_hash, u128ToHex(u128Of("payload-CF")));
+            EXPECT_EQ(e.object_hash, streamingHexOf("payload-CF"));
             EXPECT_EQ(e.detail.at("displaced_token"), t0.value);
         }
     EXPECT_EQ(copy_forwards, 1u);
@@ -727,6 +752,67 @@ private:
     bool fired = false;
 };
 
+/// SOAK 2026-07-03 regression (false CORRUPTED_DATA attach brick): the pool-wide content hash is
+/// the STREAMING HashingWriteBuffer convention (chunked CityHash128, block = 2048 B), which
+/// diverges from a one-shot CityHash128 for any payload larger than one block. Copy-forward's
+/// verification must recompute with the pool convention — this test uses a MULTI-BLOCK payload
+/// whose BlobId is minted exactly as the write path mints it.
+TEST(CasBuild, CopyForwardMultiBlockPayloadVerifies)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    const RootNamespace ns{"srv1/tbl"};
+
+    String payload;
+    payload.reserve(5000);
+    for (size_t i = 0; i < 5000; ++i)
+        payload.push_back(static_cast<char>('a' + (i * 131 + i / 7) % 23));
+    ASSERT_GT(payload.size(), 2 * DBMS_DEFAULT_HASHING_BLOCK_SIZE) << "must span multiple hash blocks";
+
+    /// Mint the id EXACTLY as ContentAddressedWriteBuffers does: streaming hash + lowercase hex.
+    DB::ReadBufferFromMemory in(payload.data(), payload.size());
+    DB::HashingReadBuffer hashing(in);
+    hashing.ignoreAll();
+    const String hash_hex = getHexUIntLowercase(hashing.getHash());
+    const BlobId id{hash_hex};
+    const UInt128 hash = hexToU128(hash_hex);
+
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        auto build = startBuildFor(s0, ns, "part_a");
+        build->putBlob(id, BlobSource::fromString(payload));
+        ManifestEntry e;
+        e.path = "data.bin";
+        e.placement = EntryPlacement::Blob;
+        e.blob_hash = hash;
+        e.blob_size = payload.size();
+        const ManifestId mid0 = build->stageManifest({e});
+        build->precommitAdd(ns, "part_a", mid0);
+        build->promote(ns, "part_a", build->buildId(), mid0);
+        t0 = b->head(s0->layout().blobKey(id)).token;
+    }
+
+    DB::Cas::Layout layout("p");
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hash, .token = t0, .size = payload.size()}});
+
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto build = startBuildFor(s, ns, "detached_part_a");
+    ManifestEntry e;
+    e.path = "data.bin";
+    e.placement = EntryPlacement::Blob;
+    e.blob_hash = hash;
+    e.blob_size = payload.size();
+    build->adoptEvidence(e);
+    const ManifestId mid = build->stageManifest({e});
+    build->precommitAdd(ns, "detached_part_a", mid);
+
+    /// BEFORE fix: one-shot CityHash mismatch => false CORRUPTED_DATA (the soak attach brick).
+    /// AFTER fix: streaming recompute matches => copy-forward displaces and promote succeeds.
+    EXPECT_NO_THROW(build->promote(ns, "detached_part_a", build->buildId(), mid));
+    EXPECT_NE(b->head(layout.blobKey(id)).token, t0);
+}
+
 TEST(CasBuild, CopyForwardTokenDriftAdoptsCleanIncarnation)
 {
     /// Copy-forward race arm: between the pre-pass HEAD (stale condemned token) and the copy-forward
@@ -772,11 +858,11 @@ TEST(CasBuild, CopyForwardCorruptPayloadFailsClosed)
     Token t0;
     {
         auto s0 = openStore(b);
-        publishOneBlobPart(s0, ns, "part_a", "data.bin", "payload-ROT");
-        t0 = b->head(s0->layout().blobKey(idOf("payload-ROT"))).token;
+        publishOneBlobPartStreaming(s0, ns, "part_a", "data.bin", "payload-ROT");
+        t0 = b->head(s0->layout().blobKey(BlobId{streamingHexOf("payload-ROT")})).token;
     }
     DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(idOf("payload-ROT"));
+    const String blob_key = layout.blobKey(BlobId{streamingHexOf("payload-ROT")});
 
     /// Corrupt ONE payload byte in place (valid envelope, damaged content); condemn the CORRUPT
     /// incarnation's token so the pre-pass targets it.
@@ -789,13 +875,13 @@ TEST(CasBuild, CopyForwardCorruptPayloadFailsClosed)
         const auto res = b->putOverwrite(blob_key, damaged, t0);
         ASSERT_EQ(res.outcome, PutOutcome::Done);
         injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-            {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-ROT"), .token = res.token, .size = 11}});
+            {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(streamingHexOf("payload-ROT")), .token = res.token, .size = 11}});
     }
 
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = startBuildFor(s, ns, "detached_part_a");
-    build->adoptEvidence(blobManifestEntry("data.bin", "payload-ROT"));
-    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "payload-ROT")});
+    build->adoptEvidence(blobManifestEntryStreaming("data.bin", "payload-ROT"));
+    const ManifestId mid = build->stageManifest({blobManifestEntryStreaming("data.bin", "payload-ROT")});
     build->precommitAdd(ns, "detached_part_a", mid);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { build->promote(ns, "detached_part_a", build->buildId(), mid); });
