@@ -46,11 +46,18 @@ class S12(Scenario):
     name = "S12"
     title = "ten replicas, shared pool, parallel inserts"
     priority = "P0"
-    needs_infra = ("compose provides only 2 replicas (ch1/ch2); 10-replica shared-pool test requires "
-                   "a new docker compose with 10 ClickHouse services")
+    # The "tenreplicas" compose (docker-compose-10replicas.yml) now exists and defines ch1..ch10
+    # sharing one CA pool + RustFS + Keeper.  What is still missing: the Cluster class in
+    # soak/cluster.py is hardcoded to exactly 2 nodes (node1/node2); it has no mechanism to address
+    # ch3..ch10.  The scenario needs a multi-node Cluster abstraction before it can run.
+    # See scenarios/BACKLOG.md entry NEEDS-INFRA-S12 for the wiring spec.
+    compose_variant = "tenreplicas"
+    needs_infra = ("docker-compose-10replicas.yml (ch1..ch10) exists; remaining gap: "
+                   "soak/cluster.py Cluster is hardcoded to 2 nodes — needs a multi-node "
+                   "abstraction to address ch3..ch10 (see BACKLOG NEEDS-INFRA-S12)")
 
     # No measured workload here — the runner marks this inconclusive on `needs_infra` and never calls
-    # run(). param_table is kept for shape symmetry / a future 10-replica compose.
+    # run(). param_table is kept for shape symmetry / the future multi-node harness wiring.
     param_table = {
         "dev": {"replicas": 10, "rows_per_replica": 1000, "duplicate_fraction": 0.5},
         "ci": {"replicas": 10, "rows_per_replica": 100000, "duplicate_fraction": 0.5},

@@ -356,7 +356,7 @@ class S30(Scenario):
         result.observations["scale"] = {
             "iterations": iterations, "rows": rows, "payload_bytes": payload, "gc_every": gc_every}
         result.add(Verdict(
-            "scale used", "checklist #6 — repeated create/drop leaves a permanent GC fanout",
+            "scale used", "checklist #6 (post-D1) — repeated create/drop must NOT leave a permanent GC fanout",
             f"{iterations} create/insert/drop iterations (scale={ctx.scale})", "pass",
             "dev/ci are scaled down; only --scale full reaches 1000 iterations"))
 
@@ -398,31 +398,28 @@ class S30(Scenario):
                         and last["CasRootGet"] > first["CasRootGet"])
             monotone = grew_dirs or grew_get
             result.observations["fanout_first_vs_last"] = {"first": first, "last": last}
-            # Record-and-flag: this is EXPECTED monotone growth per the checklist, not a hard fail.
-            result.add(Verdict(
-                "GC fanout monotone in ever-created namespaces (characterization)",
-                "checklist #6 — per-round GC cost grows with EVER-created tables, not live tables",
+            # POST-D1 (registry removed + dropNamespace tombstones the shard + GC reclaims it): per-round
+            # GC cost must track LIVE tables, not EVER-created ones. Bounded fanout is now the PASS
+            # condition; growth across create/drop iterations is a REGRESSION of D1 (the old monotone-
+            # registry-fanout bug returning). This verdict flipped when D1 landed — see S34 (the D1 win).
+            result.add(Verdict.check(
+                "GC fanout bounded across ever-created namespaces (D1 registry removal)",
+                "root_dirs / CasRootGet do NOT grow with ever-created (dropped) tables",
                 f"root_dirs {first.get('root_dirs')} -> {last.get('root_dirs')}; "
                 f"CasRootGet {first.get('CasRootGet')} -> {last.get('CasRootGet')}",
-                "pass",
-                "recorded as the documented monotone-registry finding (dropNamespace clears refs but "
-                "does not deregister the namespace); see note_anomaly + checklist #6"))
+                not monotone,
+                "" if not monotone else
+                "REGRESSION vs D1: GC per-round fanout grew across create/drop iterations even though no "
+                "table stayed live — D1 (registry removal + dropped-shard reclaim) must keep it bounded"))
             if monotone:
                 result.note_anomaly(
-                    "S30 confirmed checklist #6: GC per-round fanout (roots/<ns> dir count and/or "
-                    "CasRootGet) grew across create/drop iterations even though no table stayed live "
-                    "— dropNamespace leaves a permanent GC registry entry (monotone fanout). "
-                    "Backlog: namespace registry needs a cleanup/deregister path.")
-            else:
-                result.add(Verdict.inconclusive(
-                    "GC fanout monotone observed",
-                    "root_dirs / CasRootGet grow across iterations",
-                    f"did not observe growth at this scale (first={first}, last={last}) — the "
-                    f"monotone fanout may only be visible at --scale ci/full or if dirs are pruned"))
+                    "S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) "
+                    "grew across create/drop iterations though no table stayed live — the D1 registry-"
+                    "removal / dropped-shard-reclaim guarantee is violated.")
         else:
             result.add(Verdict.inconclusive(
-                "GC fanout monotone in ever-created namespaces (characterization)",
-                "per-round GC cost grows with ever-created tables",
+                "GC fanout bounded across ever-created namespaces (D1 registry removal)",
+                "per-round GC cost stays bounded as ever-created tables grow",
                 f"only {len(per_batch)} GC batch(es) measured — need >=2 to compare growth "
                 f"(increase iterations / lower gc_every)"))
 

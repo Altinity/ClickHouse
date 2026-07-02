@@ -61,17 +61,38 @@ public:
         const Cas::FsckReport report = Cas::runFsck(*ca->store(), detail, on_progress, deadline);
 
         std::cout << "reachable=" << report.reachable << " dangling=" << report.dangling << " unreachable=" << report.unreachable
+                  << " pending_gc=" << report.pending_gc << " awaiting_gc=" << report.awaiting_gc
+                  << " unaccounted=" << report.unaccounted
                   << " physical_bytes=" << report.physical_bytes << " referenced_logical_bytes=" << report.referenced_logical_bytes
                   << " distinct_blobs=" << report.distinct_blobs << " total_blob_refs=" << report.total_blob_refs
                   << " dedup_ratio=" << report.dedupRatio() << "\n";
+
+        /// De-alarm the pipeline classes for humans: on an active pool a nonzero pending/awaiting
+        /// count is the ack-floor deletion pipeline working as designed, not a leak.
+        if (report.pending_gc + report.awaiting_gc > 0)
+            std::cout << "note: " << report.pending_gc + report.awaiting_gc
+                      << " unreferenced object(s) are inside the normal GC deletion pipeline "
+                         "(condemn -> graduate -> exact-token delete takes ~2-3 rounds) — expected, no action needed\n";
+        if (report.unaccounted > 0)
+            std::cout << "note: " << report.unaccounted
+                      << " object(s) are outside the current GC view — normal only as a transient "
+                         "(created+dropped between GC rounds); re-run fsck after the next round and "
+                         "investigate any that persist\n";
 
         if (detail)
         {
             for (const auto & o : report.objects)
             {
-                const char * c = o.cls == Cas::FsckClass::Reachable
-                    ? "reachable"
-                    : (o.cls == Cas::FsckClass::Dangling ? "dangling" : "unreachable");
+                const char * c = "unreachable";
+                switch (o.cls)
+                {
+                    case Cas::FsckClass::Reachable:   c = "reachable"; break;
+                    case Cas::FsckClass::Dangling:    c = "dangling"; break;
+                    case Cas::FsckClass::Unreachable: c = "unreachable"; break;
+                    case Cas::FsckClass::PendingGc:   c = "pending-gc"; break;
+                    case Cas::FsckClass::AwaitingGc:  c = "awaiting-gc"; break;
+                    case Cas::FsckClass::Unaccounted: c = "unaccounted"; break;
+                }
                 std::cout << c << "\t" << o.key << "\t" << o.size;
                 for (const auto & r : o.reachable_from)
                     std::cout << "\t" << r;

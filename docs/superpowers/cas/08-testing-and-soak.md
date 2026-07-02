@@ -46,13 +46,28 @@ pool reachability:
 3. **Classifies** each content key:
    - `reachable` — referenced by at least one live ref and present in the pool.
    - `dangling` — referenced by a live ref but **absent** from the pool. This is an INV-NO-LOSS
-     violation.
-   - `unreachable` — present but not reachable from any live ref (in-grace debris or a leak).
+     violation. The ONLY hard class.
+   - present-but-unreferenced blobs are classified through the GC pipeline view (2026-07-02;
+     read for LABELING only — reachability never consults GC state). Under the ack-floor two-phase
+     pipeline a nonzero, churning unreferenced set is the NORMAL steady state of an active pool, so
+     the old single `unreachable` lump read as a leak when it was the pipeline working:
+     - `pending-gc` — the present incarnation is in the retired set (condemned at round N, or
+       `delete_pending`). Deletion is scheduled ~2-3 rounds out. EXPECTED.
+     - `awaiting-gc` — edges still in the GC snapshot (a drop/reclaim not folded yet), or GC has
+       not run on the pool at all. EXPECTED.
+     - `unaccounted` — outside the whole GC view. Normal only as a transient (created + dropped
+       between rounds); a PERSISTENT `unaccounted` object should be impossible under INV-2
+       (reachability-before-content, `03-writer-protocol.md`) and is the anomaly signal the soak
+       forensics trigger fires on.
+   - `unreachable` remains the class of pre-precommit manifest debris rows (labeled
+     `reclaimable-/in-flight-pre-precommit`); the summary `unreachable=` counter is the TOTAL of
+     all present-but-unreferenced objects, so residual-settling loops keep one monotone number.
 4. Reports `dedup_ratio` = `referenced_bytes / physical_bytes` (logical bytes referenced across all
    parts, divided by distinct blob bytes on disk).
 
-**Exit code** is nonzero iff `dangling > 0`. `unreachable > 0` is reported but never itself an
-error — convergence to zero is validated by the soak harness after a forced GC fixpoint.
+**Exit code** is nonzero iff `dangling > 0`. The tool prints de-alarm `note:` lines when
+`pending_gc`/`awaiting_gc` are nonzero ("inside the normal GC deletion pipeline — expected") and a
+re-run hint when `unaccounted` is nonzero — beta testers should never have to interpret raw counters.
 
 `--detail` adds a per-object row (`key, kind, class, size, reachable_from[]`).
 `--format json|tsv` for machine consumption.

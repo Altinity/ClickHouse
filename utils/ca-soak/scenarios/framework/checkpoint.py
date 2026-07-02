@@ -89,11 +89,14 @@ def end_checkpoint(ctx, cluster, result, tables, *, table_filter=None, abandons=
     except Exception as e:
         ctx.log(f"dump_standard_extracts raised: {e}")
 
-    # Forensics: if any object is dangling or unreachable, capture the full per-object lifetime from
-    # system.content_addressed_log (README anomaly-handling) BEFORE the next run's reset wipes the pool.
+    # Forensics: if any object is dangling, unaccounted (outside the whole GC view — should be
+    # impossible per INV-2 once GC has run), or legacy-unreachable, capture the full per-object
+    # lifetime from system.content_addressed_log BEFORE the next run's reset wipes the pool.
+    # pending-gc / awaiting-gc rows are the deletion pipeline working as designed — NOT forensics
+    # triggers (they churn nonzero on any active pool).
     try:
         det_rows = fsck_det.get("detail", []) if fsck_det else []
-        if any(r.get("class") in ("dangling", "unreachable") for r in det_rows):
+        if any(r.get("class") in ("dangling", "unaccounted", "unreachable") for r in det_rows):
             forensics = observe.dump_object_forensics(ctx, cluster, fsck_det)
             result.observations["forensics"] = forensics
             ctx.log(f"end checkpoint: object forensics captured -> {forensics}")

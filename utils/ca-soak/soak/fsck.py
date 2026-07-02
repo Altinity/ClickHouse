@@ -119,11 +119,13 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
     res["stderr"] = p.stderr
 
     if detail:
-        # Detail rows: TSV with class (reachable/dangling/unreachable) in column 0.
+        # Detail rows: TSV with the object class in column 0. pending-gc / awaiting-gc are the
+        # ack-floor deletion pipeline mid-flight (expected); unaccounted = outside the GC view.
         detail_rows: list[dict] = []
         for ln in p.stdout.splitlines():
             parts = ln.split("\t")
-            if len(parts) >= 3 and parts[0] in ("reachable", "dangling", "unreachable"):
+            if len(parts) >= 3 and parts[0] in (
+                    "reachable", "dangling", "unreachable", "pending-gc", "awaiting-gc", "unaccounted"):
                 detail_rows.append(
                     {"class": parts[0], "key": parts[1], "size": int(parts[2])}
                 )

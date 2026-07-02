@@ -100,3 +100,49 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-01T14:20:01 | S05 | 20260701 | dev | 600s | pass | c7d94e518178 | 20260701T141347_S05_seed20260701 |  |
 | 2026-07-01T14:20:52 | S33 | 20260701 | dev | 600s | pass | c7d94e518178 | 20260701T142001_S33_seed20260701 |  |
 | 2026-07-01T14:21:33 | S03 | 20260701 | dev | 600s | pass | c7d94e518178 | 20260701T142052_S03_seed20260701 |  |
+| 2026-07-01T22:50:16 | S30 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T224936_S30_seed20260702 |  |
+| 2026-07-01T22:51:19 | S34 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T225016_S34_seed20260702 |  |
+| 2026-07-01T22:51:58 | S35 | 20260702 | dev | 900s | fail | fb5934de521b | 20260701T225119_S35_seed20260702 |  |
+| 2026-07-01T22:59:32 | S01 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T225905_S01_seed20260702 |  |
+| 2026-07-01T22:59:57 | S02 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T225932_S02_seed20260702 |  |
+| 2026-07-01T23:00:38 | S03 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T225957_S03_seed20260702 |  |
+| 2026-07-01T23:01:17 | S04 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T230038_S04_seed20260702 |  |
+| 2026-07-01T23:03:17 | S05 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T230117_S05_seed20260702 |  |
+| 2026-07-01T23:04:47 | S06 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T230317_S06_seed20260702 |  |
+| 2026-07-01T23:07:14 | S07 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T230447_S07_seed20260702 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-07-01T23:13:53 | S08 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T230714_S08_seed20260702 |  |
+| 2026-07-01T23:14:19 | S09 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T231353_S09_seed20260702 |  |
+| 2026-07-01T23:14:45 | S10 | 20260702 | dev | 900s | fail | fb5934de521b | 20260701T231419_S10_seed20260702 |  |
+| 2026-07-01T23:15:30 | S11 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T231445_S11_seed20260702 |  |
+| 2026-07-01T23:24:02 | S13 | 20260702 | dev | 900s | fail | fb5934de521b | 20260701T231530_S13_seed20260702 | quiescence failed: <urlopen error [Errno 111] Connection refused> |
+| 2026-07-01T23:25:26 | S14 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T232402_S14_seed20260702 |  |
+| 2026-07-01T23:31:26 | S15 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T232526_S15_seed20260702 |  |
+| 2026-07-01T23:32:19 | S16 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T233126_S16_seed20260702 |  |
+| 2026-07-01T23:32:45 | S17 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T233219_S17_seed20260702 |  |
+| 2026-07-01T23:33:13 | S18 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T233245_S18_seed20260702 | S18 SYSTEM UNFREEZE failed: Node(localhost:8123) HTTP 500: Code: 344. DB::Exception: Support for SYSTEM UNFREEZE query is disabled. You can enable it via 'enable_system_unfreeze' server setting. (SUPPORT_IS_DISABLED) (version 26.6.1.1) / sql=SYSTEM UNFREEZE WITH NAME 's18_snap_20260702' |
+| 2026-07-01T23:33:39 | S19 | 20260702 | dev | 900s | fail | fb5934de521b | 20260701T233313_S19_seed20260702 |  |
+| 2026-07-01T23:34:08 | S20 | 20260702 | dev | 900s | fail | fb5934de521b | 20260701T233339_S20_seed20260702 |  |
+| 2026-07-01T23:34:35 | S21 | 20260702 | dev | 900s | fail | fb5934de521b | 20260701T233408_S21_seed20260702 |  |
+| 2026-07-01T23:35:18 | S23 | 20260702 | dev | 900s | fail | fb5934de521b | 20260701T233435_S23_seed20260702 |  |
+| 2026-07-01T23:35:46 | S24 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T233518_S24_seed20260702 |  |
+| 2026-07-01T23:36:19 | S25 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T233546_S25_seed20260702 |  |
+| 2026-07-01T23:36:45 | S26 | 20260702 | dev | 900s | fail | fb5934de521b | 20260701T233619_S26_seed20260702 |  |
+| 2026-07-01T23:37:11 | S28 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T233645_S28_seed20260702 |  |
+| 2026-07-01T23:37:39 | S29 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260701T233711_S29_seed20260702 |  |
+| 2026-07-01T23:38:16 | S30 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T233739_S30_seed20260702 |  |
+| 2026-07-01T23:43:26 | S31 | 20260702 | dev | 900s | fail | fb5934de521b | 20260701T233816_S31_seed20260702 | cluster did not become healthy after reset |
+| 2026-07-01T23:43:47 | S32 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T234326_S32_seed20260702 |  |
+| 2026-07-01T23:44:17 | S33 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T234347_S33_seed20260702 |  |
+| 2026-07-01T23:45:05 | S34 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T234417_S34_seed20260702 |  |
+| 2026-07-01T23:45:47 | S35 | 20260702 | dev | 900s | pass | fb5934de521b | 20260701T234505_S35_seed20260702 |  |
+| 2026-07-02T05:51:40 | S23 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T055056_S23_seed20260702 |  |
+| 2026-07-02T05:53:37 | S23 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260702T055254_S23_seed20260702 |  |
+| 2026-07-02T05:54:24 | S19 | 20260702 | dev | 900s | pass | fb5934de521b | 20260702T055355_S19_seed20260702 |  |
+| 2026-07-02T05:55:00 | S20 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260702T055430_S20_seed20260702 |  |
+| 2026-07-02T05:55:37 | S21 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260702T055512_S21_seed20260702 |  |
+| 2026-07-02T05:56:17 | S26 | 20260702 | dev | 900s | pass | fb5934de521b | 20260702T055551_S26_seed20260702 |  |
+| 2026-07-02T06:01:31 | S31 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T055623_S31_seed20260702 | cluster did not become healthy after reset |
+| 2026-07-02T06:03:53 | S31 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T060328_S31_seed20260702 | ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 0 but GC reclaimed ~40 (checklist #9). previewDeletes should iterate all target shards, not just shard 0. |
+| 2026-07-02T06:12:51 | S13 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T060416_S13_seed20260702 | quiescence failed: <urlopen error [Errno 111] Connection refused> |
+| 2026-07-02T06:14:56 | S10 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T061431_S10_seed20260702 |  |
+| 2026-07-02T06:17:28 | S10 | 20260702 | dev | 900s | inconclusive | 3a054b9ffe67 | 20260702T061700_S10_seed20260702 |  |

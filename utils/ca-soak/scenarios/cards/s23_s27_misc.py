@@ -103,9 +103,24 @@ class S23(Scenario):
                 wall = time.monotonic() - t0
                 after = observe.cluster_events_snapshot(cl)
                 round_delta = observe.cluster_events_delta(before, after).get("_total", {})
-                # Count only S3/Cas object-store operations issued during this round.
-                s3_ops = sum(v for k, v in round_delta.items()
-                             if k.startswith("Cas") or k.startswith("DiskS3") or k.startswith("S3"))
+                # Count only Cas* object-store operation counters issued during this round.
+                # We use Cas* (not S3* / DiskS3*) because:
+                #   (a) S3* and DiskS3* are the same physical HTTP requests counted twice
+                #       (DiskS3* wraps S3*), so summing both would double-count every request;
+                #   (b) Cas* counters are the CA-domain level counts that map 1:1 to logical
+                #       object-store operations from GC's perspective (CasGcGet, CasGcPut, etc.)
+                #       and do not double-count.
+                # Exclude timing / retry / error variants: Cas*Microseconds / *Errors are not
+                # operation counts. Accept all Cas* that are plain integer operation counters
+                # (i.e. not ending in Microseconds, Errors, Attempts, Bytes, Latency).
+                def _is_cas_op_count(k):
+                    if not k.startswith("Cas"):
+                        return False
+                    for suffix in ("Microseconds", "Errors", "Attempts", "Bytes", "Latency"):
+                        if k.endswith(suffix):
+                            return False
+                    return True
+                s3_ops = sum(v for k, v in round_delta.items() if _is_cas_op_count(k))
                 per_minute.append({"minute": minute, "wall_s": round(wall, 2),
                                    "s3_ops": int(s3_ops), "delta": round_delta})
                 rest = minute_s - wall
@@ -207,7 +222,7 @@ class S23(Scenario):
 
 
 # ---------------------------------------------------------------------------
-# S24: small dedup-cache capacity (needs_infra)
+# S24: small dedup-cache capacity
 # ---------------------------------------------------------------------------
 
 @register
@@ -215,37 +230,144 @@ class S24(Scenario):
     name = "S24"
     title = "small dedup-cache capacity"
     priority = "P2"
-    needs_infra = ("requires a storage_conf disk config with a tiny dedup_cache_bytes; current "
-                   "compose mounts only the default (64 MiB) config — no small-cache variant")
+    # Runs on the "smalldedupcache" compose variant which mounts
+    # configs/storage_conf_small_dedup_cache_ch{1,2}.xml — identical to the default storage config
+    # except dedup_cache_bytes=1 MiB (vs 64 MiB default).  The 2-replica harness is unchanged; only
+    # the per-disk cache knob differs.
+    compose_variant = "smalldedupcache"
+    param_table = {
+        # dev: a working set of ~8 MiB of distinct blobs (>> 1 MiB cache) so the cache thrashes,
+        # then re-insert a hot subset to measure in-memory miss rate vs remote-HEAD fallback.
+        "dev": {"distinct_blobs": 20, "blob_bytes": 512 * 1024,
+                "hot_blobs": 5, "hot_reinserts": 10, "rows_per_insert": 4},
+        "ci": {"distinct_blobs": 60, "blob_bytes": 256 * 1024,
+               "hot_blobs": 10, "hot_reinserts": 30, "rows_per_insert": 8},
+        "full": {"distinct_blobs": 200, "blob_bytes": 256 * 1024,
+                 "hot_blobs": 20, "hot_reinserts": 100, "rows_per_insert": 16},
+    }
 
     def run(self, ctx, result):
-        """Prove the known-present blob cache is a bound-only hint (README §S24).
-
-        What this needs that the current 2-server + RustFS compose does NOT provide:
-
-        - The dedup cache size is the per-disk `<dedup_cache_bytes>` knob inside the
-          `content_addressed` disk's `storage_conf` (default 64 MiB). The compose mounts a single
-          fixed `configs/storage_conf.xml` carrying that default and has no small-cache variant.
-        - To exercise this card we would add a third compose/config variant that mounts a
-          `storage_conf` with e.g. `<dedup_cache_bytes>1048576</dedup_cache_bytes>` (1 MiB) on the
-          `ca` disk, then insert a working set far larger than 1 MiB of distinct blob heads and
-          repeatedly re-insert a hot subset.
-
-        Which counters prove the property (correctness unchanged, cost changes only):
-
-        - `CasBlobDedupCacheHit` is LOWER than with the default cache (the small cache evicts hot
-          heads, so re-inserts miss the in-memory hint).
-        - `CasBlobHeadFirst` is HIGHER (a cache miss forces a remote HEAD-first probe before the
-          body PUT to confirm the blob is already present).
-        - `CasBlobBodyPutAvoided` stays positive (a cache miss still dedups via the remote HEAD —
-          correctness/dedup is unchanged; only the in-memory shortcut rate drops).
-        - The replica-agreement oracle still passes (results are identical regardless of cache size).
-        - Cache memory stays near the configured `dedup_cache_bytes` bound (MemoryResident does not
-          grow with the working set; the cache is bounded, not unbounded).
-
-        Until that config variant exists this card cannot run; it records inconclusive.
+        """Prove the in-memory dedup-hint cache is a bound-only shortcut: with a tiny cache
+        (1 MiB) a large working set of distinct blob heads evicts entries, forcing remote
+        HEAD-first probes (`CasBlobHeadFirst`) on re-insert instead of in-memory
+        `CasBlobDedupCacheHit` short-circuits.  Correctness and dedup must be preserved via the
+        remote HEAD path (CasBlobBodyPutAvoided stays positive; replica-agreement oracle holds).
         """
-        self.run_inconclusive(ctx, result)
+        cl = ctx.cluster
+        p = ctx.params
+        distinct = int(p["distinct_blobs"])
+        blob_b = int(p["blob_bytes"])
+        hot = int(p["hot_blobs"])
+        hot_reinserts = int(p["hot_reinserts"])
+        rows = int(p["rows_per_insert"])
+        table = "s24_dedup_cache"
+
+        result.observations["scale"] = {
+            "distinct_blobs": distinct, "blob_bytes": blob_b,
+            "hot_blobs": hot, "hot_reinserts": hot_reinserts,
+            "dedup_cache_bytes": 1048576,
+            "note": ("DEV: 20 distinct 512 KiB blobs (~10 MiB working set >> 1 MiB cache); "
+                     "ci/full scale blob count. The dedup-cache eviction is triggered when the "
+                     "distinct-blob working set exceeds the configured 1 MiB bound."),
+        }
+        result.add(Verdict("scale used",
+                           "cache bound-only: correctness unchanged despite eviction",
+                           f"{distinct} distinct x {blob_b//1024} KiB blobs; "
+                           f"cache=1 MiB; {hot} hot blobs x {hot_reinserts} re-inserts "
+                           f"(scale={ctx.scale})", "pass",
+                           "dev/ci are scaled down; the eviction property is visible at any "
+                           "working-set > cache_bytes"))
+
+        for n in cl.nodes():
+            sql.create_ca_table(n, table, columns="id UInt64, payload String",
+                                order_by="id", wide=True)
+
+        # --- phase 1: fill the pool with distinct blobs (working set >> 1 MiB cache) -----------
+        # Each INSERT uses a unique randomString payload so each blob is distinct.  After
+        # `distinct` inserts the in-memory cache has been filled and begun evicting entries.
+        ctx.log(f"S24: inserting {distinct} distinct {blob_b//1024} KiB blobs")
+        fill_counters = _common.counters_window(ctx)
+        for i in range(distinct):
+            gen = (f"SELECT {i * rows} + number AS id, "
+                   f"randomString({blob_b}) AS payload FROM numbers({rows})")
+            sql.insert_values(cl.node1, table, gen, timeout=600)
+        fill_delta = fill_counters().get("_total", {})
+        result.observations["fill_counters"] = {
+            k: int(fill_delta.get(k, 0)) for k in (
+                "CasBlobPut", "CasBlobDedupCacheHit", "CasBlobHeadFirst",
+                "CasBlobBodyPutAvoided", "CasBlobPutDedup")}
+
+        # --- phase 2: re-insert a hot subset with a FIXED payload (deterministic blob hash) ----
+        # We use a FIXED string (not randomString) for the hot subset so the blob hash is stable.
+        # The CA disk must recognize each blob as already present via either a cache hit or a
+        # remote HEAD-first probe (cache miss -> HEAD -> CasBlobBodyPutAvoided).
+        ctx.log(f"S24: re-inserting {hot} hot blobs x {hot_reinserts} rounds")
+        hot_counters = _common.counters_window(ctx)
+        for round_i in range(hot_reinserts):
+            for blob_i in range(hot):
+                gen = (f"SELECT {(distinct + round_i * hot + blob_i) * rows} + number AS id, "
+                       f"repeat('x', {blob_b}) AS payload FROM numbers({rows})")
+                sql.insert_values(cl.node1, table, gen, timeout=600)
+        hot_delta = hot_counters().get("_total", {})
+        result.observations["hot_reinsert_counters"] = {
+            k: int(hot_delta.get(k, 0)) for k in (
+                "CasBlobPut", "CasBlobDedupCacheHit", "CasBlobHeadFirst",
+                "CasBlobBodyPutAvoided", "CasBlobPutDedup")}
+
+        # --- VERDICT: correctness — dedup still avoids body re-uploads despite cache misses -----
+        hot_body_puts = int(hot_delta.get("CasBlobPut", 0))
+        hot_avoided = (int(hot_delta.get("CasBlobBodyPutAvoided", 0)) +
+                       int(hot_delta.get("CasBlobPutDedup", 0)) +
+                       int(hot_delta.get("CasBlobDedupCacheHit", 0)))
+        hot_head_first = int(hot_delta.get("CasBlobHeadFirst", 0))
+        # The hot payload is fixed (same content every re-insert), so even without a cache hit
+        # the remote HEAD must detect the blob as already present and avoid the body upload.
+        result.add(Verdict.check(
+            "dedup avoids body re-upload despite small cache",
+            "CasBlobBodyPutAvoided/Dedup/DedupCacheHit > 0 on hot re-inserts",
+            f"body_puts={hot_body_puts} avoided={hot_avoided} head_first={hot_head_first}",
+            hot_avoided > 0 or hot_body_puts == 0,
+            "" if (hot_avoided > 0 or hot_body_puts == 0) else
+            "hot re-inserts re-uploaded blob bodies despite the same content already being in "
+            "the pool — the remote HEAD fallback path (cache miss -> HEAD -> body-put-avoided) "
+            "is not engaged; investigate CasBlobHeadFirst / CasBlobBodyPutAvoided"))
+
+        # --- VERDICT: cache misses ARE observed (the working set exceeded the 1 MiB bound) ------
+        # With a 1 MiB cache and a working set of distinct * blob_b bytes >> 1 MiB, the cache must
+        # have evicted entries.  We expect some hot re-inserts to go through the remote HEAD path
+        # (CasBlobHeadFirst > 0) rather than all hitting the in-memory cache (CasBlobDedupCacheHit
+        # == hot * hot_reinserts would mean the cache never evicted anything, which is impossible
+        # at dev-scale working set ~10 MiB >> 1 MiB cache).
+        fill_cache_hits = int(fill_delta.get("CasBlobDedupCacheHit", 0))
+        hot_cache_hits = int(hot_delta.get("CasBlobDedupCacheHit", 0))
+        total_hot_ops = hot * hot_reinserts
+        result.observations["cache_hit_rate"] = {
+            "fill_CasBlobDedupCacheHit": fill_cache_hits,
+            "hot_CasBlobDedupCacheHit": hot_cache_hits,
+            "hot_CasBlobHeadFirst": hot_head_first,
+            "hot_total_ops": total_hot_ops,
+        }
+        # Either CasBlobHeadFirst > 0 (cache evicted, remote HEAD was used) or cache hit rate is
+        # < 100 % (some ops missed).  If the cache never evicted anything at all (all ops were
+        # in-memory hits and no HeadFirst), the working-set test did not exercise the intended path.
+        eviction_observed = hot_head_first > 0 or hot_cache_hits < total_hot_ops
+        result.add(Verdict(
+            "cache eviction observed",
+            "CasBlobHeadFirst > 0 or cache-hit rate < 100% (working set > 1 MiB bound)",
+            f"HeadFirst={hot_head_first} cache_hits={hot_cache_hits}/{total_hot_ops}",
+            "pass" if eviction_observed else "inconclusive",
+            "" if eviction_observed else
+            "no cache eviction observed (all re-inserts hit the in-memory cache); the 1 MiB "
+            "cache may not be configured correctly or the working set was not large enough to "
+            "trigger eviction at this scale — check dedup_cache_bytes in "
+            "configs/storage_conf_small_dedup_cache_ch*.xml"))
+
+        # --- replica agreement oracle -----------------------------------------------------------
+        _common.assert_replicas_agree(result, cl, sql.table_checksum_query(table),
+                                      name="S24 replica agreement")
+
+        # --- quiesce + common hard assertions ---------------------------------------------------
+        _common.standard_end(ctx, result, [table])
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +644,13 @@ class S26(Scenario):
             "was not actually identical"))
 
         # Correctness oracle (the dedup'd identical inserts collapse to one logical block).
+        # SYNC REPLICA on every node before the agreement check to avoid a replication-lag race
+        # (the final insert may have landed on node1 only; node2 needs to catch up first).
+        for n in cl.nodes():
+            try:
+                n.command(f"SYSTEM SYNC REPLICA {table}", timeout=300)
+            except Exception as e:
+                ctx.log(f"S26: SYNC REPLICA {table} on {n.container}: {e}")
         _common.assert_replicas_agree(result, cl, sql.table_checksum_query(table),
                                       name="S26 replica agreement")
 

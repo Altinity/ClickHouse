@@ -22,7 +22,14 @@ enum class FsckClass : uint8_t
 {
     Reachable,     /// reachable from a live ref AND present in the object store
     Dangling,      /// reachable from a live ref but the object is MISSING — INV-NO-LOSS violation
-    Unreachable,   /// present but not reachable from any ref (in-grace debris or a leak)
+    Unreachable,   /// pre-precommit manifest debris (labeled reclaimable / in-flight)
+    /// Blob pipeline classification (2026-07-02): a present-but-unreferenced blob is NOT one
+    /// suspicious lump — the ack-floor pipeline deletes in explicit stages that fsck can read
+    /// (labels only, NEVER an input to reachability):
+    PendingGc,     /// listed in the retired set (condemned / delete_pending) — deletion is scheduled; EXPECTED
+    AwaitingGc,    /// edges still in the GC snapshot (drop/reclaim not folded yet) or GC never ran — EXPECTED
+    Unaccounted,   /// absent from the whole GC view — transient for a fast create+drop between rounds;
+                   /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content)
 };
 
 struct FsckObject
@@ -38,7 +45,12 @@ struct FsckReport
 {
     uint64_t reachable = 0;
     uint64_t dangling = 0;
+    /// TOTAL of everything present-but-unreferenced (blob pipeline classes below + manifest debris).
+    /// Kept as the sum so residual-settling loops (soak) keep one monotone number to watch.
     uint64_t unreachable = 0;
+    uint64_t pending_gc = 0;     /// blobs in the retired set — deletion scheduled (expected)
+    uint64_t awaiting_gc = 0;    /// blobs whose drop is not folded yet / GC never ran (expected)
+    uint64_t unaccounted = 0;    /// blobs outside the GC view (transient or anomaly)
 
     uint64_t physical_bytes = 0;
     uint64_t referenced_logical_bytes = 0;

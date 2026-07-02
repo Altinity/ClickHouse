@@ -22,6 +22,10 @@ _VARIANT_FILE = {
     None: None,
     "default": None,
     "gc_shards2": "docker-compose-gc_shards2.yml",
+    # S24: 1 MiB dedup cache (vs 64 MiB default) to exercise eviction + remote-HEAD fallback.
+    "smalldedupcache": "docker-compose-small_dedup_cache.yml",
+    # S12: 10-replica shared-pool compose (harness wiring incomplete — see BACKLOG NEEDS-INFRA-S12).
+    "tenreplicas": "docker-compose-10replicas.yml",
 }
 
 

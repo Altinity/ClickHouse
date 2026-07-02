@@ -509,6 +509,42 @@ CLOSED/explained (no action): S16 dangling=racy-fsck FP; disk-growth=inactive-pa
 - **Observed:** GC log has 1 real (non-benign) Error finish row(s)
 
 
+## NEEDS-INFRA-S12: S12 ten-replica harness wiring — compose exists, Cluster abstraction missing
+
+- **Logged (UTC):** 2026-07-02
+- **Severity:** infra / harness gap (not a CA product bug)
+- **Observed:** `docker-compose-10replicas.yml` now defines ch1..ch10 sharing one CA pool on RustFS + Keeper with serialized probe gating (each node waits for the previous to be healthy to avoid the `_probe/token` CAS race). Per-node configs (`storage_conf_10replicas_ch{3..10}.xml`, `macros_node{3..10}.xml`) are committed. Remaining gap: `soak/cluster.py` `Cluster` is hardcoded to exactly two nodes (`node1`/`node2`, ports 8123/8124) via `_DEFAULTS`. The `run.py` runner creates `Cluster()` with no node-count argument; `cluster_boot.wait_healthy`, `_prep_log_dirs`, `archive_server_logs` all assume exactly ch1/ch2. Wiring S12 to run a real 10-node workload requires all of the following:
+  1. Make `Cluster` variadic: accept a list of `(host, port, container)` tuples or a node-count and derive them. Keep the default 2-node path unchanged (additive).
+  2. Make `_prep_log_dirs` and `archive_server_logs` in `cluster_boot.py` enumerate the actual node list from the variant (or accept a `nodes` argument) instead of hardcoding `ch1`/`ch2`.
+  3. Make `wait_healthy` poll all nodes in the cluster (already calls `cluster.nodes()` — only needs the Cluster to carry all 10 nodes).
+  4. Implement S12's `run()`: create a `ReplicatedMergeTree` table on all 10 nodes, run parallel inserts from all 10, assert pool bytes ≈ unique content (not 10x), assert replica convergence across all 10, assert only one GC leader makes progress per round.
+- **Variant registered:** `"tenreplicas"` in `_VARIANT_FILE` → `docker-compose-10replicas.yml`. S12's `needs_infra` reflects the remaining harness gap.
+- **Why deferred:** rewriting `Cluster` risks breaking the 2-node default path shared by all 35 scenarios. The correct approach is additive: extend `Cluster.__init__` to accept an optional `nodes` list; keep the existing 2-node defaults when not supplied. The compose + per-node configs are the larger authoring work and are now done.
+
+## NEEDS-INFRA-S22: S22 object-store throttling — fault-injecting S3 proxy needed
+
+- **Logged (UTC):** 2026-07-02
+- **Severity:** infra gap (not a CA product bug)
+- **Observed:** S22 ("object-store throttling and retry budget") requires a fault-injecting proxy between ClickHouse's `ca` disk endpoint and RustFS that can inject bounded transient faults: `503 SlowDown`, `429 Too Many Requests`, artificial latency, and mid-response TCP resets. The current compose wires the `ca` disk endpoint directly at `http://rustfs1:11121/test/soak_pool/` with no interposer.
+- **Implementation sketch:**
+  1. Add a `toxiproxy` sidecar service to a new `docker-compose-throttle_proxy.yml` (image: `ghcr.io/shopify/toxiproxy`). The proxy listens on a stable port (e.g. `11122`) and forwards to `rustfs1:11121`.
+  2. Override the `ca` disk `endpoint` in a new `storage_conf_throttle_proxy_ch{1,2}.xml` to point at `http://toxiproxy:11122/test/soak_pool/` (no other config changes needed).
+  3. Register a `"throttleproxy"` variant in `_VARIANT_FILE`.
+  4. Implement S22's `run()`: use the toxiproxy HTTP management API (`POST /proxies/rustfs/toxics`) to add/remove `latency`, `slow_close`, and a custom HTTP-status injector; verify `DiskS3*RetryableErrors` counters rise, retry budget is respected (bounded attempt counts), and the replica-agreement oracle + `fsck dangling==0` hold throughout.
+  - Note: toxiproxy injects TCP-level faults (latency, slow_close, connection reset) but does NOT inject HTTP-level 503/429 status codes. For HTTP-status injection a thin Python WSGI proxy (e.g. using the stdlib `http.server`) running as a sidecar would be needed, or a custom mitm container. The toxiproxy path covers latency + connection-close (the higher-risk faults); 503/429 need a separate HTTP-level shim.
+- **Why deferred:** adding a proxy service is a new Docker image dependency + new compose + new storage config + new scenario code — a self-contained but non-trivial unit of work. The fault injection for latency/reset alone (toxiproxy) would be ~2h of authoring; the HTTP-status injection layer adds another ~1h. S22 is P1 priority and should be picked up as a dedicated session.
+
+## NEEDS-INFRA-S27: S27 LIST pagination ambiguity — instrumented LIST proxy needed
+
+- **Logged (UTC):** 2026-07-02
+- **Severity:** infra gap (not a CA product bug)
+- **Observed:** S27 ("backend list pagination ambiguity") requires an object-store proxy that deliberately returns duplicate keys across pages, drops the continuation token mid-listing, or returns unstable per-key list-tokens between two listings of the same unchanged shard — exercising the conservative reread path in `listRootShardTokens`. The direct RustFS endpoint serves stable, well-ordered pages and cannot produce these anomalies.
+- **Implementation sketch:**
+  1. Write a small Python HTTP proxy (`scenarios/proxies/list_fault_proxy.py`, ~150 lines) that sits in front of RustFS and implements the S3 `ListObjectsV2` API. On `roots/`-prefix listings it injects configurable anomalies: (a) duplicate a random key across two consecutive pages; (b) omit the `NextContinuationToken` mid-listing to simulate a truncated page; (c) return a slightly-different `ETag`/list-token for an otherwise-unchanged key. Requests for other prefixes (blobs, GC state) are forwarded transparently.
+  2. Run this proxy as a Docker service (e.g. a `python:3.12-slim` container running the script) in a `docker-compose-list_fault_proxy.yml`, with the `ca` disk `endpoint` pointing at the proxy.
+  3. Register a `"listfaultproxy"` variant; implement S27's `run()` using a control knob (an environment variable or a POST to the proxy's management endpoint) to enable/disable the anomaly injection per phase, and assert that `CasRootGet` increases (conservative rereads) while `CasBlobDelete` stays safe and `fsck dangling==0`.
+- **Why deferred:** the proxy requires a small but new Python HTTP service — new Docker service, new compose, ~150-line proxy shim, new storage config, new scenario code. The proxy's S3 ListObjectsV2 re-implementation must handle authentication (or bypass it), paging tokens, and fault scheduling correctly. This is a self-contained ~3h authoring session; S27 is P2 and is lower priority than S22.
+
 ## HARNESS-DRAIN-VERDICT-CONVERGENCE: "forced GC drives unreachable -> 0" reads a mid-run transient, not the converged state
 
 - **Logged (UTC):** 2026-07-01
@@ -517,6 +553,67 @@ CLOSED/explained (no action): S16 dangling=racy-fsck FP; disk-growth=inactive-pa
 - **Also — make the residual verdicts PREFIX-AWARE.** Raw `fsck.unreachable` / `gc_residual_unreachable` include non-reclaimable "other" bookkeeping (namespace registry / root-shard / gc-state objects). S05 (2026-07-01, fixed binary) settles at `unreachable=240` but `by_prefix={'other':240, blobs:0, _manifests:0}` — the reclaimable classes drained to 0; the 240 "other" is the known S30 `dropNamespace` monotone-registry growth (200 create/drop cycles), NOT a content leak. A raw-count drain assertion would wrongly FAIL S05. Assert on RECLAIMABLE prefixes (`blobs`, `_manifests`) only; track "other" growth separately against S30.
 - **Proposed action:** (1) key the drain verdict on the CONVERGED `fsck_final` after the end-checkpoint fixpoint, not the mid-run snapshot; (2) scope it to reclaimable prefixes. Touches ~8 cards + `framework/checkpoint.py` + `framework/assertions.py`.
 - **Related:** S30 (dropNamespace monotone registry fanout — the "other" residual); edge-set in-degree fix `55a766e..cb3aefb` (resolved the actual undercount; the benign-error classifier in `framework/observe.py` was broadened for fold/fence/recheck retry variants).
+## S07-20260701T230447-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-07-01T23:07:14
+- **Severity:** finding
+- **Run:** 20260701T230447_S07_seed20260702
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S13-20260701T231530-1: quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+- **Logged (UTC):** 2026-07-01T23:24:02
+- **Severity:** suspected-bug
+- **Run:** 20260701T231530_S13_seed20260702
+- **Observed:** quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+## S18-20260701T233245-1: S18 SYSTEM UNFREEZE failed: Node(localhost:8123) HTTP 500: Code: 344. DB::Except
+
+- **Logged (UTC):** 2026-07-01T23:33:13
+- **Severity:** finding
+- **Run:** 20260701T233245_S18_seed20260702
+- **Observed:** S18 SYSTEM UNFREEZE failed: Node(localhost:8123) HTTP 500: Code: 344. DB::Exception: Support for SYSTEM UNFREEZE query is disabled. You can enable it via 'enable_system_unfreeze' server setting. (SUPPORT_IS_DISABLED) (version 26.6.1.1) | sql=SYSTEM UNFREEZE WITH NAME 's18_snap_20260702'
+
+## S31-20260701T233816-1: scenario raised: cluster did not become healthy after reset
+
+- **Logged (UTC):** 2026-07-01T23:43:26
+- **Severity:** suspected-bug
+- **Run:** 20260701T233816_S31_seed20260702
+- **Observed:** scenario raised: cluster did not become healthy after reset
+
+## S31-20260702T055623-1: scenario raised: cluster did not become healthy after reset
+
+- **Logged (UTC):** 2026-07-02T06:01:31
+- **Severity:** suspected-bug
+- **Run:** 20260702T055623_S31_seed20260702
+- **Observed:** scenario raised: cluster did not become healthy after reset
+
+## S31-20260702T060328-1: ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under
+
+- **Logged (UTC):** 2026-07-02T06:03:53
+- **Severity:** suspected-bug
+- **Run:** 20260702T060328_S31_seed20260702
+- **Observed:** ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 0 but GC reclaimed ~40 (checklist #9). previewDeletes should iterate all target shards, not just shard 0.
+
+## S13-20260702T060416-1: quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+- **Logged (UTC):** 2026-07-02T06:12:51
+- **Severity:** suspected-bug
+- **Run:** 20260702T060416_S13_seed20260702
+- **Observed:** quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+
+## PRODUCT BUG (found 2026-07-02, S13) — CA mount ownership has no crash self-recovery
+Symptom: after `docker kill -s KILL` of a CA server, it exits 236 on restart:
+"Content-addressed disk cannot start: server_root_id '<srid>' is actively mounted by another server."
+Root cause: the mount owner anchor (`gc/server-roots/<srid>/owner`, CaServerRoot) is a hard CAS claim with
+no stale-owner recovery / lease-expiry / self-takeover, so the SAME server restarting after a crash sees its
+own prior incarnation's claim and refuses to mount. Any unclean shutdown (crash/OOM/kill-9) permanently
+wedges that server_root_id until the anchor is manually cleared.
+Why deferred: DESIGN-SENSITIVE (must be split-brain safe — distinguish a crashed prior incarnation from a
+live peer). Touches the TLA+-proven mount protocol (CaCasMountCore.tla) → needs a design + model extension
+(e.g. mount lease with fenced-epoch takeover), not an unattended fix. NOT a D1 regression.
+Impact: real deployments cannot auto-restart a crashed CA server. High priority for the mount protocol.
 
 ## SCENARIO (proposed): SIGSTOP a writer holds the ack floor, SIGCONT releases it (ack-floor round)
 

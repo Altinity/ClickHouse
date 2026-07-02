@@ -1,14 +1,20 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 
 #include <Common/Exception.h>
+#include <Common/HashTable/Hash.h>
 
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace DB::ErrorCodes
 {
@@ -215,19 +221,116 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
         }
     }
 
-    /// Unreachable present blobs (in-grace debris or a leak) — info, never an error.
+    /// Present-but-unreferenced blobs: classify through the GC pipeline view instead of one
+    /// suspicious "unreachable" lump (2026-07-02; the two-phase graduation keeps a nonzero churning
+    /// set here on ANY active pool, and beta testers read "unreachable" as a leak). The GC state is
+    /// read for LABELING ONLY — reachability above never consults it.
+    std::unordered_map<UInt128, RetiredEntry, UInt128Hash> retired_by_hash;
+    std::unordered_set<UInt128, UInt128Hash> unref_hashes;
+    std::unordered_set<UInt128, UInt128Hash> in_run_hashes;
+    bool have_gc_state = false;
+
+    for (const auto & [bkey, sz] : present_blobs)
+        if (!reachable_blobs.count(bkey))
+        {
+            const size_t slash = bkey.rfind('/');
+            if (slash != String::npos)
+                unref_hashes.insert(hexToU128(bkey.substr(slash + 1)));
+        }
+
+    if (!unref_hashes.empty())
+    {
+        if (const auto state_got = backend.get(layout.gcStateKey()))
+        {
+            have_gc_state = true;
+            const GcState gc_state = decodeGcState(state_got->bytes);
+            for (const auto & [shard, ref_key] : gc_state.retired_refs)
+            {
+                checkDeadline(deadline, "reading retired sets");
+                if (const auto got = backend.get(ref_key))
+                    for (const RetiredEntry & e : decodeRetiredSet(got->bytes).entries)
+                        if (e.kind == ObjectKind::Blob && unref_hashes.count(e.hash))
+                            retired_by_hash.emplace(e.hash, e);
+            }
+            /// The adopted fold seal names the snapshot runs (T0: resolution is by ref, never by key
+            /// construction). Every row whose hash is in our candidate set marks "known to GC" —
+            /// edges still counted (drop unfolded) or an explicit zero-marker mid-pipeline.
+            if (const auto seal_got = backend.get(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt)))
+            {
+                uint64_t rows = 0;
+                for (const RunRef & run : decodeFoldSeal(seal_got->bytes).blob_target_runs)
+                {
+                    checkDeadline(deadline, "reading gc snapshot runs");
+                    RunFileReader reader(backend, run.key);
+                    String key;
+                    String payload;
+                    while (reader.next(key, payload))
+                    {
+                        UInt128 hash;
+                        UInt128 source_id;
+                        if (parseSrcEdgeRunKey(key, hash, source_id) && unref_hashes.count(hash))
+                            in_run_hashes.insert(hash);
+                        if (on_progress && ++rows % 65536 == 0)
+                            on_progress("reading gc snapshot runs", in_run_hashes.size(), rows);
+                    }
+                }
+            }
+        }
+    }
+
     for (const auto & [bkey, sz] : present_blobs)
     {
         if (reachable_blobs.count(bkey))
             continue;
         ++report.unreachable;
+
+        const size_t slash = bkey.rfind('/');
+        const UInt128 hash = slash != String::npos ? hexToU128(bkey.substr(slash + 1)) : UInt128{};
+
+        FsckClass cls = FsckClass::Unaccounted;
+        String note;
+        if (const auto rit = retired_by_hash.find(hash); rit != retired_by_hash.end()
+            && backend.head(bkey).token == rit->second.token)
+        {
+            /// The PRESENT incarnation is the condemned one — deletion is scheduled. A token
+            /// mismatch means the listed entry belongs to a displaced older incarnation and says
+            /// nothing about this object; fall through to the snapshot check.
+            cls = FsckClass::PendingGc;
+            note = rit->second.delete_pending
+                ? "delete_pending: exact-token delete executes next GC round"
+                : "condemned at round " + std::to_string(rit->second.condemn_round)
+                    + "; graduates once every writer acks past it (expected)";
+        }
+        else if (in_run_hashes.count(hash))
+        {
+            cls = FsckClass::AwaitingGc;
+            note = "edges still in the GC snapshot; the drop has not folded yet (expected)";
+        }
+        else if (!have_gc_state)
+        {
+            cls = FsckClass::AwaitingGc;
+            note = "GC has not run on this pool yet";
+        }
+        else
+        {
+            note = "not in the current GC view — transient for a fast create+drop between rounds; "
+                   "PERSISTENT occurrences violate INV-2 (reachability-before-content), investigate";
+        }
+
+        switch (cls)
+        {
+            case FsckClass::PendingGc:   ++report.pending_gc;   break;
+            case FsckClass::AwaitingGc:  ++report.awaiting_gc;  break;
+            default:                     ++report.unaccounted;  break;
+        }
         if (detail)
         {
             FsckObject o;
             o.key = bkey;
             o.kind = ObjectKind::Blob;
             o.size = sz;
-            o.cls = FsckClass::Unreachable;
+            o.cls = cls;
+            o.reachable_from = {std::move(note)};
             report.objects.push_back(std::move(o));
         }
     }
