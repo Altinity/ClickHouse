@@ -191,6 +191,41 @@ MountClaimResult claimMountAwaitingExpiry(
     const std::function<void(uint64_t)> & sleep_ms_fn,
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {});
 
+/// GC heartbeat gate (ack-floor redesign, spec 2026-07-02, GC round protocol step 1). Run by the GC
+/// leader at the top of a round: LIST `gc/server-roots/` (O(servers), single-digit counts), GET each
+/// mount body, and derive the per-round acknowledgement floor `min_ack`. Classification per body:
+///   - `gc_fenced` already set → excluded (`already_fenced`); a fenced mount is terminal, no PUT;
+///   - terminated (`min_active == UINT64_MAX`, the farewell sentinel stamped by
+///     `MountLeaseKeeper::terminate`) → excluded (`terminated`). `expires_at_ms` alone cannot
+///     distinguish a graceful farewell from a crash, so the sentinel — not the timestamps — is the
+///     terminated marker;
+///   - live (`now_ms <= expires_at_ms + skew_margin_ms`) → contributes `observed_gc_round` to the
+///     floor (`min_ack = min(min_ack, observed_gc_round)`), counted in `live`;
+///   - else expired (past the skew-padded deadline, not terminated, not yet fenced) → FENCE-OUT: one
+///     token-guarded `putOverwrite` preserving the WHOLE body, setting `gc_fenced = true` and `seq +
+///     1`. On `Done` → excluded (`fenced_now`); on `PreconditionFailed` (the holder renewed
+///     concurrently) → re-GET and reclassify from the top (bounded retries; if still contended, count
+///     it as live with its current ack — conservative, never exclude a heartbeat without a landed
+///     fence-out).
+/// No counted heartbeats ⇒ `min_ack` stays `UINT64_MAX` (an infinite floor: nothing graduates).
+///
+/// The fence-out is BOTH safety and liveness. Safety: a sleeper's later renewal permanently fails
+/// (its `putOverwrite` now mismatches the fenced token → `tripMountLost`), so it can never re-arm
+/// without a fresh `open` that loads a fresh retired view. Liveness: a dead server's stale ack must
+/// not hold the floor down forever. Preserving the body keeps S13 recovery intact: a same-uuid reopen
+/// reads the current body and reclaims through the normal expired-our-uuid branch.
+struct HeartbeatFloor
+{
+    uint64_t min_ack = std::numeric_limits<uint64_t>::max();   /// UINT64_MAX = no counted heartbeats
+    size_t live = 0;
+    size_t terminated = 0;
+    size_t fenced_now = 0;
+    size_t already_fenced = 0;
+};
+
+HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now_ms,
+                                     uint64_t skew_margin_ms);
+
 /// Per-server MERGED heartbeat (ack-floor redesign, spec 2026-07-02): one `SingleWriterSlot` over the
 /// per-server-root mount object carries the mount lease (liveness) AND the build-watermark floor
 /// (`min_active`) AND the GC-round acknowledgement (`observed_gc_round`). One beat renews all three,

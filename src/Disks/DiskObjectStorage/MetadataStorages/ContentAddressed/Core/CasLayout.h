@@ -239,6 +239,14 @@ public:
         return prefix + "/gc/server-roots/" + server_root_id + "/";
     }
 
+    /// Pool-wide server-roots prefix: `<prefix>/gc/server-roots/`. The base of every
+    /// `serverRootPrefix`; the GC heartbeat gate LISTs it to enumerate all mount objects (it must
+    /// filter to keys ending in `/mount`, since `/owner` and `/epoch` objects share the subtree).
+    String serverRootsPrefix() const
+    {
+        return prefix + "/gc/server-roots/";
+    }
+
     /// Owner anchor: `<prefix>/gc/server-roots/<srid>/owner`.
     String ownerKey(const String & server_root_id) const
     {

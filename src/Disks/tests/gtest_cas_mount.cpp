@@ -428,3 +428,158 @@ TEST(CasMountLease, RetiredSentinelRoundTrips)
     EXPECT_EQ(decodeMountLease(encodeMountLease(m)).min_active,
               std::numeric_limits<uint64_t>::max());
 }
+
+/// ---- Task 7: GC heartbeat floor (min_ack) with token-guarded fence-out ----
+
+namespace
+{
+/// A fixed, fake "now" — no real clocks in these tests. Lease timestamps are chosen relative to it.
+constexpr uint64_t kNowMs = 1'000'000;
+constexpr uint64_t kSkewMarginMs = 5'000;
+
+/// Seed one mount body under mountKey(srid) via the on-storage codec (`encodeMountLease` +
+/// `putIfAbsent`) — the same interface the keeper writes through.
+MountLease seedMount(
+    Backend & b, const Layout & l, const String & srid, uint64_t observed_round,
+    uint64_t expires_at_ms, bool gc_fenced, uint64_t min_active, uint64_t seq = 1)
+{
+    MountLease m;
+    m.server_uuid = UInt128(srid.back());   // distinct per srid; content is irrelevant to the gate
+    m.writer_epoch = 1;
+    m.hostname = "h-" + srid;
+    m.pid = 100;
+    m.started_at_ms = kNowMs;
+    m.seq = seq;
+    m.expires_at_ms = expires_at_ms;
+    m.min_active = min_active;
+    m.observed_gc_round = observed_round;
+    m.gc_fenced = gc_fenced;
+    b.putIfAbsent(l.mountKey(srid), encodeMountLease(m));
+    return m;
+}
+}
+
+TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+
+    /// live acked 3, live acked 7 — both count into the floor; min is 3.
+    seedMount(*b, l, "s1", /*round*/ 3, /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active*/ 0);
+    seedMount(*b, l, "s2", /*round*/ 7, /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active*/ 0);
+    /// expired-unfenced acked 1 — must be fenced-out by the call, NOT counted.
+    seedMount(*b, l, "s3", /*round*/ 1, /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active*/ 0);
+    /// already-fenced acked 0 — excluded, body byte-identical after the call (no PUT).
+    seedMount(*b, l, "s4", /*round*/ 0, /*expires*/ kNowMs - 60'000, /*fenced*/ true, /*min_active*/ 0);
+    /// terminated (min_active == UINT64_MAX) with expired-looking timestamps — excluded, not fenced.
+    seedMount(*b, l, "s5", /*round*/ 0, /*expires*/ kNowMs - 60'000, /*fenced*/ false,
+              /*min_active*/ std::numeric_limits<uint64_t>::max());
+
+    const auto s3_before = b->get(l.mountKey("s3"));
+    const auto s4_before = b->get(l.mountKey("s4"));
+    ASSERT_TRUE(s3_before.has_value());
+    ASSERT_TRUE(s4_before.has_value());
+
+    const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, kNowMs, kSkewMarginMs);
+
+    EXPECT_EQ(floor.min_ack, 3u);
+    EXPECT_EQ(floor.live, 2u);
+    EXPECT_EQ(floor.terminated, 1u);
+    EXPECT_EQ(floor.fenced_now, 1u);
+    EXPECT_EQ(floor.already_fenced, 1u);
+
+    /// The expired-unfenced body was fenced: gc_fenced set, seq bumped, the rest of the body preserved.
+    const auto s3_after = b->get(l.mountKey("s3"));
+    ASSERT_TRUE(s3_after.has_value());
+    const MountLease s3_prev = decodeMountLease(s3_before->bytes);
+    const MountLease s3_now = decodeMountLease(s3_after->bytes);
+    EXPECT_TRUE(s3_now.gc_fenced);
+    EXPECT_EQ(s3_now.seq, s3_prev.seq + 1);
+    EXPECT_EQ(s3_now.server_uuid, s3_prev.server_uuid);
+    EXPECT_EQ(s3_now.writer_epoch, s3_prev.writer_epoch);
+    EXPECT_EQ(s3_now.hostname, s3_prev.hostname);
+    EXPECT_EQ(s3_now.observed_gc_round, s3_prev.observed_gc_round);
+    EXPECT_EQ(s3_now.expires_at_ms, s3_prev.expires_at_ms);
+
+    /// The already-fenced body was not touched (no PUT).
+    const auto s4_after = b->get(l.mountKey("s4"));
+    ASSERT_TRUE(s4_after.has_value());
+    EXPECT_EQ(s4_after->bytes, s4_before->bytes);
+}
+
+namespace
+{
+/// A delegating backend whose `putOverwrite` of the target mount key first performs an inner renewal
+/// (a real, token-correct overwrite that pushes expiry far into the future and bumps the ack) and THEN
+/// delegates — so the caller's fence-out overwrite lands on a stale token and returns PreconditionFailed.
+/// The inner renewal runs exactly once (`renewed`), modelling a holder that renews concurrently in the
+/// window between the function's GET and its fence-out PUT.
+class RenewOnFenceBackend : public InMemoryBackend
+{
+public:
+    RenewOnFenceBackend(String target_key_, uint64_t renewed_expires_ms_, uint64_t renewed_ack_)
+        : target_key(std::move(target_key_)), renewed_expires_ms(renewed_expires_ms_), renewed_ack(renewed_ack_)
+    {
+    }
+
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
+                           const ObjectMeta & meta = {}) override
+    {
+        if (key == target_key && !renewed)
+        {
+            renewed = true;
+            /// The holder renews under the real current token: fresh far-future expiry, ack bumped.
+            const auto got = InMemoryBackend::get(key);
+            MountLease m = decodeMountLease(got->bytes);
+            m.seq += 1;
+            m.expires_at_ms = renewed_expires_ms;
+            m.observed_gc_round = renewed_ack;
+            const PutResult renew = InMemoryBackend::putOverwrite(key, encodeMountLease(m), got->token);
+            EXPECT_EQ(renew.outcome, PutOutcome::Done);
+        }
+        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+    }
+
+private:
+    String target_key;
+    uint64_t renewed_expires_ms;
+    uint64_t renewed_ack;
+    bool renewed = false;
+};
+}
+
+TEST(CasHeartbeatFloor, FenceOutLosesTokenRaceReclassifiesLive)
+{
+    Layout l("p");
+    auto b = std::make_shared<RenewOnFenceBackend>(
+        l.mountKey("s1"), /*renewed_expires*/ kNowMs + 120'000, /*renewed_ack*/ 11);
+
+    /// One expired-unfenced mount acked 2. The function GETs it (expired), tries to fence it out, the
+    /// decorator renews it concurrently under the real token, the PUT hits PreconditionFailed, the
+    /// function re-GETs and reclassifies it as live — counting the RENEWED ack (11), never fenced.
+    seedMount(*b, l, "s1", /*round*/ 2, /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active*/ 0);
+
+    const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, kNowMs, kSkewMarginMs);
+
+    EXPECT_EQ(floor.fenced_now, 0u);
+    EXPECT_EQ(floor.live, 1u);
+    EXPECT_EQ(floor.min_ack, 11u);
+
+    const auto after = b->get(l.mountKey("s1"));
+    ASSERT_TRUE(after.has_value());
+    EXPECT_FALSE(decodeMountLease(after->bytes).gc_fenced);
+}
+
+TEST(CasHeartbeatFloor, EmptyPrefixYieldsInfiniteFloor)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+
+    const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, kNowMs, kSkewMarginMs);
+
+    EXPECT_EQ(floor.min_ack, std::numeric_limits<uint64_t>::max());
+    EXPECT_EQ(floor.live, 0u);
+    EXPECT_EQ(floor.terminated, 0u);
+    EXPECT_EQ(floor.fenced_now, 0u);
+    EXPECT_EQ(floor.already_fenced, 0u);
+}

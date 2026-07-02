@@ -9,7 +9,9 @@
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <limits>
+#include <string_view>
 #include <unistd.h>
 
 namespace DB
@@ -393,6 +395,83 @@ MountClaimResult claimMountAwaitingExpiry(
 
     /// Timed out still LiveDoubleStart → a genuinely live second server holds the mount.
     return r;
+}
+
+HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now_ms,
+                                     uint64_t skew_margin_ms)
+{
+    HeartbeatFloor floor;
+
+    const String prefix = l.serverRootsPrefix();
+    String cursor;
+    while (true)
+    {
+        const ListPage page = b.list(prefix, cursor, /*limit*/ 1000);
+        for (const auto & listed : page.keys)
+        {
+            /// `/owner` and `/epoch` objects share the subtree — only mount bodies gate the floor.
+            static constexpr std::string_view mount_suffix = "/mount";
+            if (listed.key.size() < mount_suffix.size()
+                || listed.key.compare(listed.key.size() - mount_suffix.size(), mount_suffix.size(), mount_suffix) != 0)
+                continue;
+
+            const String & key = listed.key;
+
+            /// Fence-out on PreconditionFailed re-GETs and reclassifies from the top; bound the retries
+            /// so a pathologically contended holder cannot spin forever. On exhaustion the entry is
+            /// counted as live with its current ack (conservative — never excluded without a landed
+            /// fence-out).
+            constexpr int max_reclassify = 4;
+            for (int attempt = 0; ; ++attempt)
+            {
+                const auto got = b.get(key);
+                if (!got)
+                    break;   /// Raced away (deleted) — nothing to classify.
+
+                const MountLease m = decodeMountLease(got->bytes);
+
+                if (m.gc_fenced)
+                {
+                    ++floor.already_fenced;
+                    break;
+                }
+                if (m.min_active == std::numeric_limits<uint64_t>::max())
+                {
+                    ++floor.terminated;
+                    break;
+                }
+
+                const bool live = now_ms <= m.expires_at_ms + skew_margin_ms;
+                const bool exhausted = attempt >= max_reclassify;
+                if (live || exhausted)
+                {
+                    floor.min_ack = std::min(floor.min_ack, m.observed_gc_round);
+                    ++floor.live;
+                    break;
+                }
+
+                /// Expired, not terminated, not yet fenced → token-guarded fence-out preserving the
+                /// whole body (gc_fenced = true, seq + 1).
+                MountLease fenced = m;
+                fenced.gc_fenced = true;
+                fenced.seq = m.seq + 1;
+                const PutResult res = b.putOverwrite(key, encodeMountLease(fenced), got->token);
+                if (res.outcome == PutOutcome::Done)
+                {
+                    ++floor.fenced_now;
+                    break;
+                }
+                /// PreconditionFailed: the holder renewed between our GET and PUT — re-GET and
+                /// reclassify (it is now live).
+            }
+        }
+
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+
+    return floor;
 }
 
 MountLeaseKeeper::MountLeaseKeeper(
