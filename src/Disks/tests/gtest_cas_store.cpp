@@ -1647,3 +1647,86 @@ TEST(CasStore, WriteFenceUsesInjectedBootClock)
     EXPECT_THROW(store->mutateShardForTest(RootNamespace{"ns"}, 0, [](RootShard &) {},
         RootMutationOrigin::Writer, RootMutationKind::Promote), DB::Exception);
 }
+
+/// ==== self-remount after GC fence-out (liveness counterpart of the fence-out safety rule) ====
+
+namespace
+{
+
+/// GC's fence-out, applied directly: preserve the body, set gc_fenced, bump seq (token-guarded).
+void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
+{
+    const auto got = backend.get(mount_key);
+    ASSERT_TRUE(got.has_value());
+    MountLease m = decodeMountLease(got->bytes);
+    m.gc_fenced = true;
+    m.seq += 1;
+    ASSERT_EQ(backend.putOverwrite(mount_key, encodeMountLease(m), got->token).outcome,
+              DB::Cas::PutOutcome::Done);
+}
+
+}
+
+TEST(CasStoreRemount, FenceOutThenSelfRemountRestoresWrites)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openStoreForTest(backend);
+    const String mount_key = store->layout().mountKey("test");
+    const uint64_t epoch_before = decodeMountLease(backend->get(mount_key)->bytes).writer_epoch;
+    EXPECT_EQ(store->liveWriterEpoch(), epoch_before);
+
+    fenceOutMount(*backend, mount_key);
+
+    /// The keeper's next renewal fails closed (foreign touch — never re-mint).
+    EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
+
+    /// Self-remount claims a FRESH incarnation: epoch bumped, gc_fenced cleared, writes restored.
+    ASSERT_TRUE(store->tryRemountOnce());
+    const MountLease after = decodeMountLease(backend->get(mount_key)->bytes);
+    EXPECT_EQ(after.writer_epoch, epoch_before + 1);
+    EXPECT_FALSE(after.gc_fenced);
+    EXPECT_EQ(store->liveWriterEpoch(), epoch_before + 1);
+
+    /// The renewal path works again (the new keeper owns the slot)...
+    EXPECT_NO_THROW(store->renewWatermarkOnce());
+    /// ...and so does a ref-shard mutation.
+    EXPECT_NO_THROW(store->mutateShardForTest(RootNamespace{"ns"}, 0, [](RootShard &) {},
+                                              RootMutationOrigin::Writer, RootMutationKind::Publish));
+}
+
+TEST(CasStoreRemount, OldEpochBuildFailsClosedAfterRemount)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openStoreForTest(backend);
+    auto build = store->startBuild({});
+
+    fenceOutMount(*backend, store->layout().mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+
+    /// The build was minted under the superseded incarnation — every further step fails closed.
+    expectThrowsCode(DB::ErrorCodes::ABORTED,
+        [&] { build->putBlob(DB::Cas::tests::idOf("x"), DB::Cas::BlobSource::fromString("x")); });
+
+    /// A FRESH build under the live incarnation works.
+    auto fresh = store->startBuild({});
+    EXPECT_NO_THROW(fresh->putBlob(DB::Cas::tests::idOf("y"), DB::Cas::BlobSource::fromString("y")));
+}
+
+TEST(CasStoreRemount, ForeignOwnerIsNeverTakenOver)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openStoreForTest(backend);
+    const String mount_key = store->layout().mountKey("test");
+
+    /// A genuinely foreign uuid holds the mount (live or not — foreign is terminal for the claim).
+    const auto got = backend->get(mount_key);
+    MountLease foreign = decodeMountLease(got->bytes);
+    foreign.server_uuid = foreign.server_uuid + DB::UInt128(1);
+    foreign.seq += 1;
+    ASSERT_EQ(backend->putOverwrite(mount_key, encodeMountLease(foreign), got->token).outcome,
+              DB::Cas::PutOutcome::Done);
+
+    EXPECT_FALSE(store->tryRemountOnce());
+    /// The foreign body is untouched (no takeover, ever).
+    EXPECT_EQ(decodeMountLease(backend->get(mount_key)->bytes).server_uuid, foreign.server_uuid);
+}

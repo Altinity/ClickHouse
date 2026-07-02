@@ -315,6 +315,23 @@ attempt-scoping, and manifest-cleanup machinery.
 - **One inherited timing assumption** (unchanged from today's mount exclusivity): a writer whose
   lease is expired by GC's clock + margin has already stopped mutating via its local fence.
 
+## Self-remount on fence-out (liveness counterpart; added 2026-07-02 after the first soak)
+
+A fence-out is terminal for the INCARNATION, not the server: the keeper never re-mints (sleeper
+re-arm is the TLA+ sabotage), but a live server may recover in place by creating a FRESH
+incarnation — exactly what a restart would do. `Store::tryRemountOnce` re-runs the open-time mount
+protocol (durable `writer_epoch` bump → `claimMountAwaitingExpiry` → new keeper whose anchor loads
+the retired view via the beat → re-armed write fence), and the keeper's renew-failure path schedules
+it with backoff (`scheduleRemount`, production-gated). Two supporting rules:
+- `claimMount` reclaims a same-uuid `gc_fenced` body IMMEDIATELY (no TTL wait): the fenced
+  incarnation can never renew again, so there is no liveness to wait for. Foreign uuids stay
+  untouchable.
+- Builds carry their minting epoch; after a remount every older-epoch build fails closed
+  (`ABORTED`) on its next step and the caller restarts it under the live epoch.
+Model-wise the fresh incarnation is the `WOpen` of `CaGcAckFloorCore` (open-ordering enforced by
+the same wiring); no new TLA+ obligations arise. Found by the first 1h soak: a 51s pause +
+concurrent GC round bricked the writer until a manual restart.
+
 ## Observability
 
 - Heartbeat ack lag: per-server `observed_gc_round` vs current round — ProfileEvents counter +

@@ -61,15 +61,6 @@ def generate_chaos_schedule(seed: int, duration_s: int, mean_interval_s: int):
         target = _TARGETS[(r2 >> 3) % len(_TARGETS)]
         action = _ACTIONS[(r2 >> 7) % len(_ACTIONS)]
         dur = 5 + ((r2 >> 11) % 56)   # 5..60s
-        if action == FaultAction.PAUSE and target in (FaultTarget.CH1, FaultTarget.CH2, FaultTarget.BOTH):
-            # Ack-floor interim (2026-07-02): a CH pause longer than the mount TTL (30s) + skew margin
-            # lets a concurrent GC round FENCE OUT the paused server's expired mount; the keeper then
-            # fails closed permanently ("never re-mint") and the server cannot write until restarted.
-            # That is the DESIGNED safety behavior (sleeper re-arm is forbidden), but the liveness
-            # counterpart — self-remount on fence-out (a fresh incarnation via the S13 open machinery)
-            # — is not implemented yet. Until it lands, cap CH pauses below the fence-out threshold.
-            # KILLs are unaffected: a kill+restart goes through Store::open, which reclaims fine.
-            dur = min(dur, 20)
         if target == FaultTarget.RUSTFS and action == FaultAction.KILL:
             # B145: never hard-kill the (non-crash-durable-for-this-purpose) test object store; a
             # graceful restart lets RustFS flush. Deterministic downgrade KILL -> RESTART.

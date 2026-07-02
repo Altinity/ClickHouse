@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
+#include <Common/logger_useful.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
@@ -324,8 +325,13 @@ MountClaimResult claimMount(
         return {.kind = MountClaimResult::Claimed, .body = body};
     }
 
-    /// Same uuid, DIFFERENT epoch, lease still LIVE → a second incarnation is up → double-start guard.
-    if (existing.expires_at_ms > now_ms)
+    /// Same uuid, DIFFERENT epoch, GC-FENCED → reclaim IMMEDIATELY, expiry regardless. The fence-out
+    /// is terminal for that incarnation by construction (its keeper's every renewal fails the token
+    /// guard forever, so it can never write again) — there is no liveness left to wait for. This is
+    /// what makes self-remount (and a fast restart after a fence-out) instant instead of a TTL wait.
+    /// Same uuid, DIFFERENT epoch, NOT fenced, lease still LIVE → a second incarnation is genuinely
+    /// up → double-start guard.
+    if (!existing.gc_fenced && existing.expires_at_ms > now_ms)
         return {.kind = MountClaimResult::LiveDoubleStart, .body = existing};
 
     /// Same uuid, DIFFERENT epoch, lease EXPIRED → reclaim with a fresh body (seq continues).
@@ -604,8 +610,24 @@ void MountLeaseKeeper::terminate()
     });
     const PutResult res = backend->putOverwrite(key, body, last_token);
     if (res.outcome != PutOutcome::Done)
+    {
+        /// A foreign incarnation on OUR release path has exactly one expected cause: GC fenced this
+        /// mount out after its lease expired (the `gc_fenced` stamp). That is a clean outcome — the
+        /// slot is already released-by-fence and there is nothing left to retire. Anything else on
+        /// this path is a genuine single-writer violation and stays loud.
+        if (const auto got = backend->get(key))
+        {
+            const MountLease current = decodeMountLease(got->bytes);
+            if (current.gc_fenced)
+            {
+                LOG_INFO(getLogger("CasMountLeaseKeeper"),
+                    "CAS mount-lease: '{}' was fenced out by GC (expired lease); release is a no-op", key);
+                return;
+            }
+        }
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS mount-lease: release of key '{}' hit a foreign incarnation — the world is broken", key);
+    }
     recordWrite(seq + 1, res.token);
 }
 

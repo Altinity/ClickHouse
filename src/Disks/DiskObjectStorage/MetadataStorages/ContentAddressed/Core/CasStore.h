@@ -14,6 +14,7 @@
 #include <Common/HashTable/Hash.h>
 #include <Common/ProfileEvents.h>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -329,6 +330,21 @@ public:
     Backend & backend() { return *pool_backend; }
     RetireView & retireView() { return retire_view; }
 
+    /// The writer_epoch of the LIVE mount incarnation. Bumped by `tryRemountOnce` (self-remount
+    /// after a GC fence-out) — a `Build` minted under an older epoch fails closed on its next step.
+    uint64_t liveWriterEpoch() const { return live_writer_epoch.load(std::memory_order_acquire); }
+
+    /// Self-remount after a GC fence-out (liveness counterpart of the fence-out safety rule): the
+    /// OLD incarnation may never write again (the keeper never re-mints), but a FRESH incarnation —
+    /// durable writer_epoch bump + mount reclaim + fresh retired view + re-armed write fence — is
+    /// exactly what a server restart would create, so a live server may create it in place. Runs the
+    /// same claim machinery as `Store::open` (S13); the new keeper's anchor loads the retired view
+    /// through `refreshViewForBeat`, so open-ordering holds for the new incarnation too. Returns
+    /// false (and changes nothing durable beyond the epoch bump) when the mount cannot be claimed
+    /// (foreign owner / a genuinely live twin) — the caller retries. Safe to call concurrently
+    /// (serialized internally); also the synchronous test seam.
+    bool tryRemountOnce();
+
     /// Ack-floor beat (spec 2026-07-02-cas-gc-ack-floor-fence-redesign): probe `gc/state`; when the
     /// published round advanced past the installed view, load the retired view and install it under
     /// the exclusive side of `view_gate` — the DRAIN: it waits out every in-flight `mutateShard`
@@ -498,6 +514,19 @@ private:
     /// superseded/foreign touch). The dtor stops it, whose terminate() retires the lease (so a
     /// same-server reopen can immediately reclaim). Null on a read-only open.
     std::unique_ptr<MountLeaseKeeper> mount_keeper;
+
+    /// Self-remount machinery: `scheduleRemount` (called from the keeper's renew-failure path in
+    /// production; gated on `background_watermark` like every background thread) runs
+    /// `tryRemountOnce` with exponential backoff until it succeeds or the Store tears down.
+    void scheduleRemount();
+    std::atomic<uint64_t> live_writer_epoch{0};
+    std::mutex remount_mutex;              /// serializes tryRemountOnce
+    std::mutex remount_thread_mutex;       /// guards the thread handle below
+    std::atomic<bool> remount_running{false};
+    std::atomic<bool> remount_stop{false};
+    std::condition_variable remount_cv;
+    std::mutex remount_cv_mutex;
+    ThreadFromGlobalPool remount_thread;
 
     /// Local write fence (spec §write-fence). Permissive by default (deadline = time_point::max,
     /// lost = false), so mayMutate() is true until Task 7 arms it with a real lease deadline and the

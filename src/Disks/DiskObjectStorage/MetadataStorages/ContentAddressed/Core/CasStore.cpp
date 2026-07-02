@@ -237,7 +237,12 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// startBackground so no renewal can fire before the callbacks are in place.
         store->mount_keeper->setFenceCallbacks(
             [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
-            [raw] { raw->tripMountLost(); });
+            [raw]
+            {
+                raw->tripMountLost();
+                /// Liveness counterpart of the fence-out: recover in place as a FRESH incarnation.
+                raw->scheduleRemount();
+            });
         store->mount_keeper->start();
 
         /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline now + ttl. From
@@ -253,6 +258,8 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// gone; one beat now renews the lease, the floor and the acked round together.
         if (store->config.background_watermark)
             store->mount_keeper->startBackground(store->config.mount_renew_period);
+
+        store->live_writer_epoch.store(writer_epoch, std::memory_order_release);
     }
 
     return store;
@@ -260,6 +267,15 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
 
 Store::~Store()
 {
+    /// Stop the self-remount recovery loop FIRST: it may otherwise re-create the keeper below us.
+    remount_stop.store(true);
+    remount_cv.notify_all();
+    {
+        std::lock_guard g(remount_thread_mutex);
+        if (remount_thread.joinable())
+            remount_thread.join();
+    }
+
     /// Retire the merged heartbeat on a clean Store teardown: stop() runs the keeper's terminal op,
     /// which stamps the lease already-expired (expires_at_ms = now) AND folds in the watermark
     /// farewell (min_active = UINT64_MAX). Stamping it expired lets a SAME-server reopen reclaim
@@ -375,6 +391,115 @@ uint64_t Store::peekNextBuildSeq()
     return next_build_seq;
 }
 
+bool Store::tryRemountOnce()
+{
+    std::lock_guard serialize(remount_mutex);
+
+    const String & srid = config.server_root_id;
+    const UInt128 our_uuid = config.server_id;
+    const auto now_ms = []() -> uint64_t
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    };
+    const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
+    const uint64_t poll_interval_ms = std::max<uint64_t>(
+        1, static_cast<uint64_t>(config.mount_renew_period.count()) / 2);
+    const uint64_t margin_ms = poll_interval_ms;
+
+    /// The same startup protocol as Store::open steps 2-4, as a FRESH incarnation (the old one is
+    /// dead by the fence-out contract and its keeper never re-mints). Open THROWS on any failure
+    /// (startup is fail-closed); the remount RETURNS false instead — the recovery loop retries.
+    try
+    {
+        claimOwnerOrThrow(*pool_backend, pool_layout, srid, our_uuid);
+        const uint64_t writer_epoch = allocateWriterEpoch(*pool_backend, pool_layout, srid);
+
+        const auto sleep_ms = [](uint64_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        const MountClaimResult claim = claimMountAwaitingExpiry(
+            *pool_backend, pool_layout, srid, our_uuid, writer_epoch,
+            now_ms, ttl_ms, poll_interval_ms, margin_ms, sleep_ms,
+            [&srid](const MountLease & held, uint64_t wait_deadline_ms)
+            {
+                LOG_INFO(getLogger("CasStore"),
+                    "CAS self-remount '{}': waiting out a stale mount (uuid={} epoch={} expires_at_ms={}, "
+                    "wait_deadline_ms={})",
+                    srid, u128ToHex(held.server_uuid), held.writer_epoch, held.expires_at_ms, wait_deadline_ms);
+            });
+        if (claim.kind != MountClaimResult::Claimed)
+        {
+            LOG_WARNING(getLogger("CasStore"),
+                "CAS self-remount '{}': mount not claimable ({}); will retry", srid,
+                claim.kind == MountClaimResult::ForeignOwner ? "foreign owner — never taking over"
+                                                             : "a live twin holds the lease");
+            return false;
+        }
+
+        /// Swap the keeper for the new incarnation. The old keeper's renewal loop already stopped on
+        /// its failed renew; never run its terminal op (the slot now belongs to the new claim).
+        Store * raw = this;
+        if (mount_keeper)
+            mount_keeper->stopBackground();
+        mount_keeper = std::make_unique<MountLeaseKeeper>(
+            pool_backend, pool_layout, srid, our_uuid, writer_epoch,
+            config.mount_lease_ttl_ms, now_ms,
+            [raw] { return raw->minActive(); }, [raw] { return raw->refreshViewForBeat(); });
+        mount_keeper->setFenceCallbacks(
+            [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
+            [raw]
+            {
+                raw->tripMountLost();
+                raw->scheduleRemount();
+            });
+        /// `start` anchors the new incarnation's body; its payload runs `refreshViewForBeat`, so the
+        /// retired view is LOADED (and the advertised ack fresh) before the fence re-arms below —
+        /// the same open-ordering the model's WOpen requires.
+        mount_keeper->start();
+        armMountFence(our_uuid, writer_epoch, bootMsNow() + ttl_ms);
+        if (config.background_watermark)
+            mount_keeper->startBackground(config.mount_renew_period);
+
+        live_writer_epoch.store(writer_epoch, std::memory_order_release);
+        LOG_INFO(getLogger("CasStore"),
+            "CAS self-remount '{}': recovered as writer_epoch {} (fresh incarnation; older builds fail closed)",
+            srid, writer_epoch);
+        return true;
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger("CasStore"), "CAS self-remount attempt failed; will retry");
+        return false;
+    }
+}
+
+void Store::scheduleRemount()
+{
+    if (!config.background_watermark)
+        return;   /// tests drive tryRemountOnce explicitly (the same gate as every background thread)
+    if (remount_running.load())
+        return;
+    std::lock_guard g(remount_thread_mutex);
+    if (remount_running.load())
+        return;
+    if (remount_thread.joinable())
+        remount_thread.join();   /// a PREVIOUS recovery finished; reap it before starting a new one
+    remount_running.store(true);
+    remount_thread = ThreadFromGlobalPool([this]
+    {
+        uint64_t backoff_ms = 1000;
+        while (!remount_stop.load())
+        {
+            if (tryRemountOnce())
+                break;
+            std::unique_lock lk(remount_cv_mutex);
+            remount_cv.wait_for(lk, std::chrono::milliseconds(backoff_ms),
+                                [this] { return remount_stop.load(); });
+            backoff_ms = std::min<uint64_t>(backoff_ms * 2, 30000);
+        }
+        remount_running.store(false);
+    });
+}
+
 uint64_t Store::refreshViewForBeat()
 {
     /// 1. Probe the published round. Absent gc/state = a pool GC never touched (round-0 view is
@@ -463,7 +588,7 @@ BuildPtr Store::startBuild(BuildInfo info)
     /// the Store-owned watermark renews — tracks in-flight builds.
     const uint64_t seq = allocateBuildSeq();
 
-    return std::make_shared<Build>(shared_from_this(), build_id, seq, process_epoch, std::move(info));
+    return std::make_shared<Build>(shared_from_this(), build_id, seq, liveWriterEpoch(), std::move(info));
 }
 
 std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & ns, uint64_t shard, bool allow_stale)

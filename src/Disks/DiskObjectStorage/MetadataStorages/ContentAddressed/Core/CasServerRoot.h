@@ -147,8 +147,10 @@ uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid)
 ///   - same `server_uuid` AND same `writer_epoch` as (our_uuid, our_epoch) → it is OUR OWN claim
 ///     (a replay / the keeper adopting it) → refresh (`putOverwrite` to bump seq + fresh
 ///     `expires_at_ms`) → `Claimed`;
-///   - same `server_uuid`, DIFFERENT `writer_epoch`, lease EXPIRED (`expires_at_ms <= now_ms`) →
-///     reclaim (overwrite with our body, seq = prev + 1) → `Claimed`;
+///   - same `server_uuid`, DIFFERENT `writer_epoch`, lease EXPIRED (`expires_at_ms <= now_ms`) OR
+///     `gc_fenced` (a GC fence-out is terminal for that incarnation — its keeper can never renew
+///     again, so there is no liveness to wait for) → reclaim (overwrite with our body,
+///     seq = prev + 1) → `Claimed`;
 ///   - same `server_uuid`, DIFFERENT `writer_epoch`, lease LIVE (`expires_at_ms > now_ms`) →
 ///     `LiveDoubleStart` (do NOT write — a second incarnation of the same server is already up);
 ///   - different `server_uuid` → `ForeignOwner` (do NOT write, regardless of expiry).
