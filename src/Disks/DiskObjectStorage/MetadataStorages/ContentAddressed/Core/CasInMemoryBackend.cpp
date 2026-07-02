@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
 #include <base/defines.h>
 #include <algorithm>
@@ -53,6 +54,24 @@ private:
 
 }
 
+namespace
+{
+
+/// The windowed slice of `data` for `range`, with the same clamping `get` documents: an offset at or
+/// past EOF yields an empty result; an open-ended length runs to EOF. Shared by `get` and `getStream`
+/// so the two stay in lockstep.
+String sliceWindow(const String & data, Range range)
+{
+    const size_t offset = static_cast<size_t>(range.offset);
+    if (offset >= data.size())
+        return {};
+    if (range.length.has_value())
+        return data.substr(offset, static_cast<size_t>(*range.length));
+    return data.substr(offset);
+}
+
+}
+
 Token InMemoryBackend::mintToken()
 {
     Token t;
@@ -68,28 +87,26 @@ std::optional<GetResult> InMemoryBackend::get(const String & key, Range range)
     if (it == store_.end())
         return std::nullopt;
 
-    const String & data = it->second.bytes;
-    String result;
-    size_t offset = static_cast<size_t>(range.offset);
-    if (offset >= data.size())
-    {
-        result = "";
-    }
-    else if (range.length.has_value())
-    {
-        size_t len = static_cast<size_t>(*range.length);
-        result = data.substr(offset, len);
-    }
-    else
-    {
-        result = data.substr(offset);
-    }
-
     GetResult gr;
-    gr.bytes = std::move(result);
+    gr.bytes = sliceWindow(it->second.bytes, range);
     gr.token = it->second.token;
     gr.attributes = it->second.meta;
     return gr;
+}
+
+std::optional<GetStreamResult> InMemoryBackend::getStream(const String & key, Range range)
+{
+    std::lock_guard lock(mutex_);
+    auto it = store_.find(key);
+    if (it == store_.end())
+        return std::nullopt;
+
+    /// Copy the windowed bytes into an owning buffer — the in-memory backend has no separate storage
+    /// to stream from, so the "stream" reads from a private copy of exactly the requested window.
+    GetStreamResult sr;
+    sr.stream = std::make_unique<ReadBufferFromOwnString>(sliceWindow(it->second.bytes, range));
+    sr.token = it->second.token;
+    return sr;
 }
 
 HeadResult InMemoryBackend::head(const String & key)

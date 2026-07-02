@@ -35,6 +35,11 @@ public:
         return std::nullopt;
     }
 
+    std::optional<GetStreamResult> getStream(const String & /*key*/, Range /*range*/ = {}) override
+    {
+        return std::nullopt;
+    }
+
     HeadResult head(const String & /*key*/) override
     {
         return HeadResult{};

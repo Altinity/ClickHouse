@@ -5,6 +5,7 @@
 #include <Disks/WriteMode.h>
 
 #include <Core/Defines.h>
+#include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadSettings.h>
 #include <IO/WriteBufferFromString.h>
@@ -299,6 +300,33 @@ static String readObjectRanged(IObjectStorage & object_storage, const String & p
     return content;
 }
 
+/// Open a forward-only stream over `range` of the object at `path`, positioned at the window's first
+/// byte and bounded to its last (spec 2026-07-02 snapshot-streaming §Backend seam). Mirrors
+/// `readObjectRanged`'s seek + bound, but RETURNS the buffer instead of draining it — the caller reads
+/// at its own pace, so nothing is materialized whole. Returns nullptr when the offset is at or past EOF
+/// (the empty-window clamp), matching the ranged-get contract.
+static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & object_storage, const String & path, Range range)
+{
+    auto buf = object_storage.readObject(StoredObject(path), getReadSettings(), /*read_hint=*/std::nullopt);
+    if (range.whole())
+        return buf;
+
+    /// Clamp exactly like `readObjectRanged`: an offset at or past EOF yields an empty stream, and
+    /// `seek` past the object size may throw depending on the storage, so fail-close against the known
+    /// size before touching the buffer position.
+    const auto metadata = object_storage.getObjectMetadata(path, /*with_tags=*/false);
+    if (range.offset >= metadata.size_bytes)
+        return std::make_unique<ReadBufferFromString>(std::string_view{});
+
+    /// `setReadUntilPosition` is only a hint (LocalObjectStorage does not honor it), but for a returned
+    /// stream it is the only bound available — the caller drains to EOF, so a storage that DOES honor
+    /// the hint stops at the window end, and one that does not over-reads only the trailing bytes.
+    if (range.length.has_value())
+        buf->setReadUntilPosition(range.offset + *range.length);
+    buf->seek(static_cast<off_t>(range.offset), SEEK_SET);
+    return buf;
+}
+
 /// =========================================================================================
 /// Emulated helpers (caller holds emu_mutex)
 /// =========================================================================================
@@ -398,6 +426,53 @@ std::optional<GetResult> ObjectStorageBackend::get(const String & key, Range ran
     }
     gr.token = emuObserveToken(key);
     return gr;
+}
+
+std::optional<GetStreamResult> ObjectStorageBackend::getStream(const String & key, Range range)
+{
+    if (mode == Mode::Native)
+    {
+        auto hr = nativeHead(key);
+        if (!hr)
+            return std::nullopt;
+
+        /// Same HEAD-then-read race as `get`: the object may be deleted between the HEAD above and the
+        /// stream open below. Honor the `optional` contract on a not-found signal; any other error
+        /// (network, auth, corruption) propagates unchanged — fail-closed by construction.
+        GetStreamResult sr;
+        try
+        {
+            sr.stream = openObjectRangedStream(*object_storage, key, range);
+        }
+        catch (const std::exception & e)
+        {
+            if (isObjectNotFound(e))
+                return std::nullopt;
+            throw;
+        }
+        sr.token = hr->token;
+        return sr;
+    }
+
+    std::lock_guard lock(emu_mutex);
+    if (!emuExists(key))
+        return std::nullopt;
+
+    /// The emulated path holds emu_mutex across the exists-check and the stream open, matching `get`.
+    /// External deletion still converts to nullopt rather than escaping as an unexplained exception.
+    GetStreamResult sr;
+    try
+    {
+        sr.stream = openObjectRangedStream(*object_storage, emuPath(key), range);
+    }
+    catch (const std::exception & e)
+    {
+        if (isObjectNotFound(e))
+            return std::nullopt;
+        throw;
+    }
+    sr.token = emuObserveToken(key);
+    return sr;
 }
 
 HeadResult ObjectStorageBackend::head(const String & key)

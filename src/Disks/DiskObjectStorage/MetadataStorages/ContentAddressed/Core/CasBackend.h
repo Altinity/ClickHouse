@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
+#include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
 #include <base/types.h>
 #include <map>
@@ -27,6 +28,15 @@ struct GetResult
     String bytes;
     Token token;       /// token of the incarnation the bytes came from
     ObjectMeta attributes;
+};
+
+/// A forward-only read of a WRITE-ONCE object (runs, seals): nothing is materialized by the seam.
+/// MUTABLE objects (root shards, gc/state, mounts) MUST keep using `get` — their bytes may change
+/// under an open stream. `token` identifies the incarnation the stream reads, same as `get`.
+struct GetStreamResult
+{
+    std::unique_ptr<ReadBuffer> stream;
+    Token token;
 };
 
 struct HeadResult
@@ -138,6 +148,12 @@ public:
     virtual ~Backend() = default;
 
     virtual std::optional<GetResult> get(const String & key, Range range = {}) = 0;   /// nullopt = absent
+
+    /// Forward-only stream over the object's `range` (default: whole object) for WRITE-ONCE objects
+    /// (runs, seals). The returned `stream` yields exactly the window's bytes and nothing is
+    /// materialized whole by the seam — the caller reads at its own pace. MUTABLE objects (root
+    /// shards, gc/state, mounts) MUST keep using `get`: their bytes can change under an open stream.
+    virtual std::optional<GetStreamResult> getStream(const String & key, Range range = {}) = 0;   /// nullopt = absent
     virtual HeadResult head(const String & key) = 0;
     virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) = 0;
     /// Streaming variant of putIfAbsent — see WriteSink. Large content blobs use this; whole-String

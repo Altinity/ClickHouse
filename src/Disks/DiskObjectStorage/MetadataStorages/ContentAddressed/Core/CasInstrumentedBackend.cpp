@@ -2,7 +2,7 @@
 
 namespace ProfileEvents
 {
-/// B168 P0: the 70 CA per-namespace S3 op events (7 namespaces × 10 ops). Declared in ProfileEvents.cpp.
+/// B168 P0: the CA per-namespace S3 op events (6 namespaces × 11 ops). Declared in ProfileEvents.cpp.
 extern const Event CasBlobPut;
 extern const Event CasBlobPutDedup;
 extern const Event CasBlobOverwrite;
@@ -11,6 +11,7 @@ extern const Event CasBlobCasConflict;
 extern const Event CasBlobHead;
 extern const Event CasBlobHeadMiss;
 extern const Event CasBlobGet;
+extern const Event CasBlobGetStream;
 extern const Event CasBlobDelete;
 extern const Event CasBlobList;
 
@@ -22,6 +23,7 @@ extern const Event CasTreeCasConflict;
 extern const Event CasTreeHead;
 extern const Event CasTreeHeadMiss;
 extern const Event CasTreeGet;
+extern const Event CasTreeGetStream;
 extern const Event CasTreeDelete;
 extern const Event CasTreeList;
 
@@ -33,6 +35,7 @@ extern const Event CasRootCasConflict;
 extern const Event CasRootHead;
 extern const Event CasRootHeadMiss;
 extern const Event CasRootGet;
+extern const Event CasRootGetStream;
 extern const Event CasRootDelete;
 extern const Event CasRootList;
 
@@ -44,6 +47,7 @@ extern const Event CasGcCasConflict;
 extern const Event CasGcHead;
 extern const Event CasGcHeadMiss;
 extern const Event CasGcGet;
+extern const Event CasGcGetStream;
 extern const Event CasGcDelete;
 extern const Event CasGcList;
 
@@ -55,6 +59,7 @@ extern const Event CasServerCasConflict;
 extern const Event CasServerHead;
 extern const Event CasServerHeadMiss;
 extern const Event CasServerGet;
+extern const Event CasServerGetStream;
 extern const Event CasServerDelete;
 extern const Event CasServerList;
 
@@ -66,6 +71,7 @@ extern const Event CasOtherCasConflict;
 extern const Event CasOtherHead;
 extern const Event CasOtherHeadMiss;
 extern const Event CasOtherGet;
+extern const Event CasOtherGetStream;
 extern const Event CasOtherDelete;
 extern const Event CasOtherList;
 }
@@ -79,28 +85,28 @@ static const ProfileEvents::Event cas_event_table[CAS_NS_COUNT][CAS_OP_COUNT] =
 {
     /* Blob   */ {ProfileEvents::CasBlobPut, ProfileEvents::CasBlobPutDedup, ProfileEvents::CasBlobOverwrite,
                   ProfileEvents::CasBlobCas, ProfileEvents::CasBlobCasConflict, ProfileEvents::CasBlobHead,
-                  ProfileEvents::CasBlobHeadMiss, ProfileEvents::CasBlobGet, ProfileEvents::CasBlobDelete,
-                  ProfileEvents::CasBlobList},
+                  ProfileEvents::CasBlobHeadMiss, ProfileEvents::CasBlobGet, ProfileEvents::CasBlobGetStream,
+                  ProfileEvents::CasBlobDelete, ProfileEvents::CasBlobList},
     /* Tree   */ {ProfileEvents::CasTreePut, ProfileEvents::CasTreePutDedup, ProfileEvents::CasTreeOverwrite,
                   ProfileEvents::CasTreeCas, ProfileEvents::CasTreeCasConflict, ProfileEvents::CasTreeHead,
-                  ProfileEvents::CasTreeHeadMiss, ProfileEvents::CasTreeGet, ProfileEvents::CasTreeDelete,
-                  ProfileEvents::CasTreeList},
+                  ProfileEvents::CasTreeHeadMiss, ProfileEvents::CasTreeGet, ProfileEvents::CasTreeGetStream,
+                  ProfileEvents::CasTreeDelete, ProfileEvents::CasTreeList},
     /* Root   */ {ProfileEvents::CasRootPut, ProfileEvents::CasRootPutDedup, ProfileEvents::CasRootOverwrite,
                   ProfileEvents::CasRootCas, ProfileEvents::CasRootCasConflict, ProfileEvents::CasRootHead,
-                  ProfileEvents::CasRootHeadMiss, ProfileEvents::CasRootGet, ProfileEvents::CasRootDelete,
-                  ProfileEvents::CasRootList},
+                  ProfileEvents::CasRootHeadMiss, ProfileEvents::CasRootGet, ProfileEvents::CasRootGetStream,
+                  ProfileEvents::CasRootDelete, ProfileEvents::CasRootList},
     /* Gc     */ {ProfileEvents::CasGcPut, ProfileEvents::CasGcPutDedup, ProfileEvents::CasGcOverwrite,
                   ProfileEvents::CasGcCas, ProfileEvents::CasGcCasConflict, ProfileEvents::CasGcHead,
-                  ProfileEvents::CasGcHeadMiss, ProfileEvents::CasGcGet, ProfileEvents::CasGcDelete,
-                  ProfileEvents::CasGcList},
+                  ProfileEvents::CasGcHeadMiss, ProfileEvents::CasGcGet, ProfileEvents::CasGcGetStream,
+                  ProfileEvents::CasGcDelete, ProfileEvents::CasGcList},
     /* Server */ {ProfileEvents::CasServerPut, ProfileEvents::CasServerPutDedup, ProfileEvents::CasServerOverwrite,
                   ProfileEvents::CasServerCas, ProfileEvents::CasServerCasConflict, ProfileEvents::CasServerHead,
-                  ProfileEvents::CasServerHeadMiss, ProfileEvents::CasServerGet, ProfileEvents::CasServerDelete,
-                  ProfileEvents::CasServerList},
+                  ProfileEvents::CasServerHeadMiss, ProfileEvents::CasServerGet, ProfileEvents::CasServerGetStream,
+                  ProfileEvents::CasServerDelete, ProfileEvents::CasServerList},
     /* Other  */ {ProfileEvents::CasOtherPut, ProfileEvents::CasOtherPutDedup, ProfileEvents::CasOtherOverwrite,
                   ProfileEvents::CasOtherCas, ProfileEvents::CasOtherCasConflict, ProfileEvents::CasOtherHead,
-                  ProfileEvents::CasOtherHeadMiss, ProfileEvents::CasOtherGet, ProfileEvents::CasOtherDelete,
-                  ProfileEvents::CasOtherList},
+                  ProfileEvents::CasOtherHeadMiss, ProfileEvents::CasOtherGet, ProfileEvents::CasOtherGetStream,
+                  ProfileEvents::CasOtherDelete, ProfileEvents::CasOtherList},
 };
 
 CasNs classifyCasNs(const String & key)

@@ -31,6 +31,7 @@ public:
     }
 
     std::optional<GetResult> get(const String & k, Range r = {}) override { return inner->get(k, r); }
+    std::optional<GetStreamResult> getStream(const String & k, Range r = {}) override { return inner->getStream(k, r); }
     ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
     PutResult putIfAbsent(const String & k, const String & b, const ObjectMeta & m = {}) override { return inner->putIfAbsent(k, b, m); }
     PutResult putOverwrite(const String & k, const String & b, const Token & e, const ObjectMeta & m = {}) override { return inner->putOverwrite(k, b, e, m); }

@@ -95,6 +95,7 @@ public:
     }
 
     std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
     DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsent(k, b, meta); }
     DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsentStream(k, meta); }
@@ -337,6 +338,7 @@ TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
                 ++get_count;
             return inner->get(k, r);
         }
+        std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
         DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, m); }
         DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
@@ -409,6 +411,7 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
                 ++get_count;
             return inner->get(k, r);
         }
+        std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
         DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, m); }
         DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
@@ -515,6 +518,7 @@ TEST(CasBuild, PutBlobVanishDuringRevivalReUploadsNotFatal)
             return std::make_unique<ScriptedSink>(inner->putIfAbsentStream(k, meta), force_412);
         }
         std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
+        std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
         DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, m); }
         DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, m); }
@@ -996,6 +1000,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
             return inner->putIfAbsentStream(k, meta);
         }
         std::optional<GetResult> get(const String & k, Range r = {}) override { ++gets; return inner->get(k, r); }
+        std::optional<GetStreamResult> getStream(const String & k, Range r = {}) override { return inner->getStream(k, r); }
         ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
         PutResult putIfAbsent(const String & k, const String & bts, const ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, m); }
         PutResult putOverwrite(const String & k, const String & bts, const Token & e, const ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, m); }

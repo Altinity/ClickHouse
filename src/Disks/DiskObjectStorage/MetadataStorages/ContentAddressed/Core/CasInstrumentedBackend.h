@@ -40,6 +40,7 @@ static constexpr size_t CAS_NS_COUNT = 6;
 ///   casPut                                    → Committed ⇒ Cas ; Conflict ⇒ CasConflict
 ///   head                                      → exists ⇒ Head ; !exists ⇒ HeadMiss (the 404 signal)
 ///   get                                       → Get (all calls, hit or miss)
+///   getStream                                 → GetStream (all calls, hit or miss)
 ///   deleteExact                               → Delete (all outcomes)
 ///   list                                      → List
 enum class CasOp : uint8_t
@@ -52,10 +53,11 @@ enum class CasOp : uint8_t
     Head,
     HeadMiss,
     Get,
+    GetStream,
     Delete,
     List,
 };
-static constexpr size_t CAS_OP_COUNT = 10;
+static constexpr size_t CAS_OP_COUNT = 11;
 
 /// Classify a key into its namespace by substring. See CasNs.
 CasNs classifyCasNs(const String & key);
@@ -72,6 +74,13 @@ public:
     {
         auto result = inner->get(key, range);
         incrementCasEvent(classifyCasNs(key), CasOp::Get);
+        return result;
+    }
+
+    std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override
+    {
+        auto result = inner->getStream(key, range);
+        incrementCasEvent(classifyCasNs(key), CasOp::GetStream);
         return result;
     }
 

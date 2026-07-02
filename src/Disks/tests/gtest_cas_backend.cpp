@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInstrumentedBackend.h>
 #include <Common/ProfileEvents.h>
+#include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 
 #if USE_AWS_S3
@@ -28,6 +29,11 @@ using namespace DB::Cas;
 struct NullBackend final : Backend
 {
     std::optional<GetResult> get(const String & /*key*/, Range /*range*/) override
+    {
+        return std::nullopt;
+    }
+
+    std::optional<GetStreamResult> getStream(const String & /*key*/, Range /*range*/) override
     {
         return std::nullopt;
     }
@@ -255,6 +261,23 @@ TEST(CasInMemoryBackend, RoundTripsUserMetadata)
     const auto gr = backend.get("k/key");
     ASSERT_TRUE(gr.has_value());
     ASSERT_EQ(gr->attributes.at("cas_owner"), "ab:7:42");
+}
+
+// =====================================================================
+// getStream seam (forward-only reads of write-once objects)
+// =====================================================================
+
+TEST(CasBackendStream, StreamsBodyWindow)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    backend->putIfAbsent("k", "0123456789");
+    auto got = backend->getStream("k", DB::Cas::Range{.offset = 2, .length = 5});
+    ASSERT_TRUE(got.has_value());
+    String out;
+    DB::readStringUntilEOF(out, *got->stream);
+    EXPECT_EQ(out, "23456");
+    EXPECT_FALSE(got->token.empty());
+    EXPECT_FALSE(backend->getStream("absent").has_value());
 }
 
 // =====================================================================
@@ -594,6 +617,33 @@ TEST(CasObjectStorageBackend, RangedGetReadsOnlyTheWindow)
     const auto past = backend->get("p/obj", DB::Cas::Range{.offset = 1000000, .length = 10});
     ASSERT_TRUE(past.has_value());
     EXPECT_TRUE(past->bytes.empty());
+}
+
+/// The CountingBackend request-shape recorders that the streaming-memory gates (Task 3/4) consume:
+/// per-key/total getStream counts, the max ranged-get window per key, and the whole-object get flag.
+TEST(CountingBackendShape, RecordsGetStreamAndRangeShape)
+{
+    DB::Cas::tests::CountingBackend backend;
+    backend.putIfAbsent("k", String(1000, 'x'));
+
+    /// A whole-object get flags the resident-memory violation; a ranged get tracks the max window.
+    backend.get("k");
+    backend.get("k", DB::Cas::Range{.offset = 0, .length = 100});
+    backend.get("k", DB::Cas::Range{.offset = 10, .length = 400});
+    EXPECT_EQ(backend.wholeGetCount("k"), 1u);
+    EXPECT_EQ(backend.maxRangedGetLen("k"), 400u);
+
+    /// getStream counters (per-key and total).
+    backend.getStream("k", DB::Cas::Range{.offset = 2, .length = 5});
+    backend.getStream("k");
+    backend.getStream("absent");
+    EXPECT_EQ(backend.getStreamCount("k"), 2u);
+    EXPECT_EQ(backend.getStreamTotal(), 3u);
+
+    backend.resetCounts();
+    EXPECT_EQ(backend.wholeGetCount("k"), 0u);
+    EXPECT_EQ(backend.maxRangedGetLen("k"), 0u);
+    EXPECT_EQ(backend.getStreamTotal(), 0u);
 }
 
 #endif

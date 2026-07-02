@@ -747,6 +747,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasBlobHeadFirst,  "CA blob HEAD-first attempts (P1 cache hit or P2 size threshold)", ValueType::Number) \
     M(CasBlobBodyPutAvoided, "CA blob body PUTs avoided by a HEAD-first present hit (P1/P2)", ValueType::Number) \
     M(CasBlobGet,        "CA blob get S3 ops", ValueType::Number) \
+    M(CasBlobGetStream,  "CA blob get-stream S3 ops", ValueType::Number) \
     M(CasBlobDelete,     "CA blob delete S3 ops", ValueType::Number) \
     M(CasBlobList,       "CA blob list S3 ops", ValueType::Number) \
     M(CasTreePut,        "CA tree put S3 ops", ValueType::Number) \
@@ -757,6 +758,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasTreeHead,       "CA tree head S3 ops", ValueType::Number) \
     M(CasTreeHeadMiss,   "CA tree head-miss S3 ops", ValueType::Number) \
     M(CasTreeGet,        "CA tree get S3 ops", ValueType::Number) \
+    M(CasTreeGetStream,  "CA tree get-stream S3 ops", ValueType::Number) \
     M(CasTreeDelete,     "CA tree delete S3 ops", ValueType::Number) \
     M(CasTreeList,       "CA tree list S3 ops", ValueType::Number) \
     M(CasRootPut,        "CA root put S3 ops", ValueType::Number) \
@@ -767,6 +769,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasRootHead,       "CA root head S3 ops", ValueType::Number) \
     M(CasRootHeadMiss,   "CA root head-miss S3 ops", ValueType::Number) \
     M(CasRootGet,        "CA root get S3 ops", ValueType::Number) \
+    M(CasRootGetStream,  "CA root get-stream S3 ops", ValueType::Number) \
     M(CasRootDelete,     "CA root delete S3 ops", ValueType::Number) \
     M(CasRootList,       "CA root list S3 ops", ValueType::Number) \
     M(CasGcPut,          "CA gc put S3 ops", ValueType::Number) \
@@ -777,6 +780,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasGcHead,         "CA gc head S3 ops", ValueType::Number) \
     M(CasGcHeadMiss,     "CA gc head-miss S3 ops", ValueType::Number) \
     M(CasGcGet,          "CA gc get S3 ops", ValueType::Number) \
+    M(CasGcGetStream,    "CA gc get-stream S3 ops", ValueType::Number) \
     M(CasGcDelete,       "CA gc delete S3 ops", ValueType::Number) \
     M(CasGcList,         "CA gc list S3 ops", ValueType::Number) \
     M(CasServerPut,      "CA server put S3 ops", ValueType::Number) \
@@ -787,6 +791,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasServerHead,     "CA server head S3 ops", ValueType::Number) \
     M(CasServerHeadMiss, "CA server head-miss S3 ops", ValueType::Number) \
     M(CasServerGet,      "CA server get S3 ops", ValueType::Number) \
+    M(CasServerGetStream,"CA server get-stream S3 ops", ValueType::Number) \
     M(CasServerDelete,   "CA server delete S3 ops", ValueType::Number) \
     M(CasServerList,     "CA server list S3 ops", ValueType::Number) \
     M(CasOtherPut,       "CA other put S3 ops", ValueType::Number) \
@@ -797,6 +802,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasOtherHead,      "CA other head S3 ops", ValueType::Number) \
     M(CasOtherHeadMiss,  "CA other head-miss S3 ops", ValueType::Number) \
     M(CasOtherGet,       "CA other get S3 ops", ValueType::Number) \
+    M(CasOtherGetStream, "CA other get-stream S3 ops", ValueType::Number) \
     M(CasOtherDelete,    "CA other delete S3 ops", ValueType::Number) \
     M(CasOtherList,      "CA other list S3 ops", ValueType::Number) \
     M(CasManifestBackpressureCount,      "CA root-shard manifest backpressure delay events", ValueType::Number) \

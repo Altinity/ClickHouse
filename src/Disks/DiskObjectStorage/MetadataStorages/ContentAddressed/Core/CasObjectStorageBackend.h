@@ -39,6 +39,7 @@ public:
     ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_);
 
     std::optional<GetResult> get(const String & key, Range range) override;
+    std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override;
     HeadResult head(const String & key) override;
     /// S3 ETags are content-derived and surfaced in list responses — TRUE for both Native and
     /// EmulatedSingleProcess modes (the emulated mode mints tokens it also surfaces through `list`).

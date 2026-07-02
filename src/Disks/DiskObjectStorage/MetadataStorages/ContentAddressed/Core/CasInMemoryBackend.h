@@ -29,6 +29,7 @@ public:
     // ---- Backend interface ----
 
     std::optional<GetResult> get(const String & key, Range range = {}) override;
+    std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override;
     HeadResult head(const String & key) override;
     /// The in-memory backend mints a monotonic token it surfaces through `list` — TRUE.
     bool supportsListTokens() const override { return true; }
