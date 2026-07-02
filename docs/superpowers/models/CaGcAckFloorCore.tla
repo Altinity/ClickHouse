@@ -21,7 +21,10 @@ CONSTANTS
     SabotageSleeperRearm,        \* floor excludes expired-UNFENCED heartbeats (assumes dead without fence-out)
     SabotageSkipChangedShard,    \* the fold cut leaves one landed ref unconsumed
     SabotageAdoptRetiredToken,   \* the gate references a visibly-retired token instead of recreating
-    SabotageOpenWriteBeforeLoad  \* a fresh mount starts with an unloaded (round-0) view
+    SabotageOpenWriteBeforeLoad, \* a fresh mount starts with an unloaded (round-0) view
+    SabotageRebuildDropEdge,     \* rebuild loses one committed owner's folded ref
+    SabotageRebuildKeepRetired,  \* rebuild carries the old retired entries into the new baseline
+    SabotageRebuildLowRound      \* rebuild mints a round below surviving mount acks
 
 Toks == 1..MaxTok
 Rounds == 0..MaxRound
@@ -42,11 +45,13 @@ VARIABLES
     gcPhase,     \* {"idle","running","folded"}
     minAckL,     \* the floor latched by GBegin (0..MaxRound+1; MaxRound+1 = empty floor set)
     sparedEver, recreatedEver, deletedEver,  \* witness history flags
-    copyForwardEver                          \* witness: sourceless copy-forward taken
+    copyForwardEver,                         \* witness: sourceless copy-forward taken
+    rebuiltEver,                             \* witness: raw rebuild taken
+    lostRefs                                 \* ghost: owner refs a sabotaged rebuild failed to re-emit
 
 vars == << round, present, tok, nextTok, deadTok, retired, landed, folded,
            wStatus, wView, wAck, wPending, gcPhase, minAckL,
-           sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+           sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 Indeg(b) == Cardinality({ rf \in folded : rf.b = b })
 FloorSet == { w \in Writers : wStatus[w] \in
@@ -65,7 +70,7 @@ Init ==
     /\ wPending = [w \in Writers |-> {}]
     /\ gcPhase = "idle" /\ minAckL = 0
     /\ sparedEver = FALSE /\ recreatedEver = FALSE /\ deletedEver = FALSE
-    /\ copyForwardEver = FALSE
+    /\ copyForwardEver = FALSE /\ rebuiltEver = FALSE /\ lostRefs = {}
 
 (* ---- writer actions ---- *)
 
@@ -75,7 +80,7 @@ WOpen(w) ==
     /\ wView' = [wView EXCEPT ![w] = IF SabotageOpenWriteBeforeLoad THEN 0 ELSE round]
     /\ wAck' = [wAck EXCEPT ![w] = IF SabotageOpenWriteBeforeLoad THEN 0 ELSE round]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 WBeat(w) ==
     /\ wStatus[w] = "live"
@@ -83,7 +88,7 @@ WBeat(w) ==
     /\ wView' = IF SabotageAckWithoutRead THEN wView ELSE [wView EXCEPT ![w] = round]
     /\ wAck' = [wAck EXCEPT ![w] = round]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wStatus, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    wStatus, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 (* Gate evaluation. `visible` = the entry for the blob's CURRENT token is in the writer's loaded
    list version. Visible + honest => recreate (fresh incarnation referenced, never the listed one) —
@@ -103,7 +108,7 @@ WPrepare(w, b) ==
                /\ wPending' = [wPending EXCEPT ![w] = { [b |-> b, t |-> tok[b]] }]
                /\ UNCHANGED << present, tok, nextTok, recreatedEver >>
     /\ UNCHANGED << round, deadTok, retired, landed, folded, wStatus, wView, wAck,
-                    gcPhase, minAckL, sparedEver, deletedEver, copyForwardEver >>
+                    gcPhase, minAckL, sparedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 (* Verified copy-forward (spec 2026-07-02-cas-copy-forward-condemned-evidence.md): a SOURCELESS
    writer (tokenless committed-manifest evidence — `adoptEvidence` deps) hits a visible condemned
@@ -123,7 +128,7 @@ WCopyForward(w, b) ==
     /\ wPending' = [wPending EXCEPT ![w] = { [b |-> b, t |-> nextTok[b]] }]
     /\ copyForwardEver' = TRUE
     /\ UNCHANGED << round, present, deadTok, retired, landed, folded, wStatus, wView, wAck,
-                    gcPhase, minAckL, sparedEver, recreatedEver, deletedEver >>
+                    gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, rebuiltEver, lostRefs >>
 
 WLand(w) ==
     /\ wStatus[w] = "live" /\ wPending[w] # {}
@@ -131,19 +136,19 @@ WLand(w) ==
        IN landed' = landed \cup { [b |-> p.b, t |-> p.t, w |-> w] }
     /\ wPending' = [wPending EXCEPT ![w] = {}]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, folded, wStatus,
-                    wView, wAck, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    wView, wAck, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 WDropRef(rf) ==
     /\ rf \in folded
     /\ folded' = folded \ {rf}
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, wStatus,
-                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 WExpire(w) ==
     /\ wStatus[w] = "live"
     /\ wStatus' = [wStatus EXCEPT ![w] = "expired"]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 (* A live-again sleeper: an EXPIRED (never fenced) heartbeat renews successfully. Honest and safe —
    the honest floor still counts expired heartbeats. Becomes lethal only when the floor excludes
@@ -152,13 +157,13 @@ WSleeperRenew(w) ==
     /\ wStatus[w] = "expired"
     /\ wStatus' = [wStatus EXCEPT ![w] = "live"]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 WTerminate(w) ==
     /\ wStatus[w] = "live" /\ wPending[w] = {}                  \* graceful stop drains first
     /\ wStatus' = [wStatus EXCEPT ![w] = "terminated"]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 (* ---- GC actions ---- *)
 
@@ -166,14 +171,14 @@ GFenceOut(w) ==
     /\ wStatus[w] = "expired"
     /\ wStatus' = [wStatus EXCEPT ![w] = "fenced"]              \* token-guarded fence-out: renew dead forever
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 GBegin ==
     /\ gcPhase = "idle" /\ round < MaxRound
     /\ minAckL' = MinAck
     /\ gcPhase' = "running"
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wStatus, wView, wAck, wPending, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    wStatus, wView, wAck, wPending, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 GFold ==
     /\ gcPhase = "running"
@@ -184,7 +189,7 @@ GFold ==
             /\ landed' = {}
     /\ gcPhase' = "folded"
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, wStatus, wView,
-                    wAck, wPending, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    wAck, wPending, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
 
 (* Merge + graduate + condemn + publish, over the folded cut. Refs landing after GFold sit in
    `landed` and are invisible here — exactly the implementation's cut. Exact-token delete: a
@@ -207,7 +212,28 @@ GComplete ==
     /\ round' = round + 1
     /\ gcPhase' = "idle"
     /\ UNCHANGED << tok, nextTok, landed, folded, wStatus, wView, wAck, wPending, minAckL,
-                    recreatedEver, copyForwardEver >>
+                    recreatedEver, copyForwardEver, rebuiltEver, lostRefs >>
+
+(* Raw rebuild (spec 2026-07-03-cas-gc-rebuild-design.md): recompute the baseline from owner
+   state. The model's `folded` IS the owner-derived edge truth an honest rebuild recomputes, so it
+   keeps `folded`; the retired list restarts EMPTY (over-protect: everything re-condemns through
+   the normal pipeline) and the round is minted ABOVE every mount ack so no stale ack can float a
+   fresh condemnation past the floor before its writer re-observed. Runs at idle under the GC
+   lease (mutual exclusion with rounds is by lease, below the model's abstraction). *)
+MaxAckAll == CHOOSE m \in Rounds : /\ \E w \in Writers : wAck[w] = m
+                                   /\ \A w \in Writers : wAck[w] <= m
+GRebuild ==
+    /\ gcPhase = "idle" /\ round < MaxRound
+    /\ LET base == IF SabotageRebuildLowRound THEN 0 ELSE MaxAckAll
+       IN round' = IF base + 1 > MaxRound THEN MaxRound ELSE base + 1
+    /\ retired' = IF SabotageRebuildKeepRetired THEN retired ELSE {}
+    /\ IF SabotageRebuildDropEdge /\ folded # {}
+       THEN LET dropped == CHOOSE rf \in folded : TRUE
+            IN folded' = folded \ {dropped} /\ lostRefs' = lostRefs \cup {dropped}
+       ELSE folded' = folded /\ lostRefs' = lostRefs
+    /\ rebuiltEver' = TRUE
+    /\ UNCHANGED << present, tok, nextTok, deadTok, landed, wStatus, wView, wAck, wPending,
+                    gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
 
 (* Self-loop so bounded counters (round/tok) exhausting is not a TLC deadlock (house pattern). *)
 NoOp == UNCHANGED vars
@@ -217,7 +243,7 @@ Next ==
                           \/ WSleeperRenew(w) \/ WTerminate(w) \/ GFenceOut(w)
     \/ \E w \in Writers, b \in Blobs : WPrepare(w, b) \/ WCopyForward(w, b)
     \/ \E rf \in folded : WDropRef(rf)
-    \/ GBegin \/ GFold \/ GComplete
+    \/ GBegin \/ GFold \/ GComplete \/ GRebuild
     \/ NoOp
 
 Spec == Init /\ [][Next]_vars
@@ -231,8 +257,9 @@ TypeOK ==
                           /\ Cardinality(wPending[w]) <= 1
     /\ \A e \in retired : e.b \in Blobs /\ e.t \in Toks /\ e.r \in Rounds
 
-(* No reference — landed or folded — may point at an absent blob... *)
-INV_NO_DANGLE == \A rf \in (landed \cup folded) : present[rf.b]
+(* No reference — landed, folded, or LOST BY A SABOTAGED REBUILD (the committed owner still
+   exists; the rebuild merely failed to re-emit its edge) — may point at an absent blob. *)
+INV_NO_DANGLE == \A rf \in (landed \cup folded \cup lostRefs) : present[rf.b]
 (* ...or bind a deleted incarnation. *)
 INV_NO_RETURN == \A rf \in (landed \cup folded) : rf.t \notin deadTok[rf.b]
 (* The honest ack never runs ahead of the installed view. *)
@@ -243,5 +270,6 @@ W_DeleteHappens == ~deletedEver
 W_SpareHappens == ~sparedEver
 W_RecreateHappens == ~recreatedEver
 W_CopyForwardHappens == ~copyForwardEver
+W_RebuildHappens == ~rebuiltEver
 
 =============================================================================
