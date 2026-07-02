@@ -1512,11 +1512,10 @@ void Gc::reclaimDroppedShards(const FoldResult & folded)
     /// the blobs those refs named — a silent blob-retention leak. We enforce this by requiring
     /// `cov.folded_cursor >= tombstone_version` (the tombstone's `transition_version`).
     ///
-    /// TOKEN: We use the token from the eligibility GET (`readShard`) for `deleteExact`. The fence
-    /// step modifies every present shard each round (bumps `fence_round` via `mutateShard`), so the
-    /// LIST token from the discovery sweep is always stale by the time we reach this step. The GET is
-    /// already required for eligibility (tombstone present, refs empty), so no extra round-trip is
-    /// incurred for the token.
+    /// TOKEN: We use the token from the eligibility GET (`readShard`) for `deleteExact`. The LIST
+    /// token from the discovery sweep may lag any writer mutation that landed since the sweep, so it
+    /// must never carry a destructive op; the GET is already required for eligibility (tombstone
+    /// present, refs empty), so the fresh token costs no extra round-trip.
     ///
     /// CONCURRENT REVIVE: a writer appending to the shard after the tombstone changes its body =>
     /// different token from GET => `deleteExact` returns `TokenMismatch` => shard survives (fail-closed).

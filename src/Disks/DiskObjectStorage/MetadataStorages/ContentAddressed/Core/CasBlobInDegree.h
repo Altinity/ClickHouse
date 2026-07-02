@@ -69,8 +69,12 @@ struct RetiredMergeResult
 /// Three-cursor extension (ack-floor redesign): `prior_retired` (Blob entries ONLY, sorted by hash
 /// ascending) rides the same per-blob close-out as the two existing cursors. Settlement rules, in
 /// order, per entry for blob `h` with post-merge in-degree `d`:
+///   delete_pending (prior pass)          -> redelete if d = 0 (the caller executes the exact-token
+///                                           delete pre-CAS and the entry drops); d > 0 for a pending
+///                                           entry is structurally impossible — spared + loud log;
 ///   d > 0                                -> spared (recovery wins even past the floor);
-///   d = 0 and condemn_round < min_ack    -> graduated (safe to delete: every live writer acked past it);
+///   d = 0 and condemn_round < min_ack    -> graduated: REPUBLISHED as delete_pending (two-phase
+///                                           graduation, Task-9 amendment) — deleted the NEXT pass;
 ///   d = 0 otherwise                      -> still_retired, carried byte-unchanged.
 /// A blob that transitions to zero THIS pass with no prior entry is condemned: `head_blob` captures
 /// the exact incarnation token/size (absent object or empty head_blob -> nothing to delete, skipped)
@@ -94,8 +98,9 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout
                                         uint64_t generation, uint64_t attempt, uint64_t shard);
 
 /// The in-degree of one blob in the sealed (generation, attempt, shard) run: 0 when the blob is absent
-/// from the run (or written as an explicit transitioned-to-0 row), else its count. Used by the recheck's
-/// per-candidate spare/delete decision and by tests.
+/// from the run (or written as an explicit transitioned-to-0 row), else its count. Used by
+/// `Gc::previewDeletes` and by tests (the round itself settles candidates inside the three-cursor
+/// merge; there is no per-candidate point query anymore).
 int64_t inDegreeInGeneration(Backend & backend, const Layout & layout,
                              uint64_t generation, uint64_t attempt, uint64_t shard, const UInt128 & blob_hash);
 

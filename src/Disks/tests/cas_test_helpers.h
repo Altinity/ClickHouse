@@ -370,8 +370,8 @@ inline DB::Cas::RetiredSet currentRetiredSet(
     return DB::Cas::decodeRetiredSet(got->bytes);
 }
 
-/// Raise the `fence_round` of every shard of a namespace to at least `round`, exactly as a GC leader's
-/// fence step (R3) does. For each shard 0..n_shards-1: read the manifest raw (decodeRootShard) if
+/// Raise the `fence_round` of every shard of a namespace to at least `round`, exactly as the REMOVED
+/// pre-redesign fence step (R3) did — kept to synthesize historical/birth-floor shard state. For each shard 0..n_shards-1: read the manifest raw (decodeRootShard) if
 /// present, `fence_round = max(fence_round, round)`, re-encode, and `casPut` it back against the
 /// observed token. An ABSENT shard is created fresh holding only `fence_round = round` (mirrors GC
 /// fencing a never-published shard) via `casPut(expected = nullopt)`.

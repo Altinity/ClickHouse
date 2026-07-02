@@ -667,8 +667,9 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
         /// condemned objects visible to the shard — refresh before the blob revalidation below.
         /// For a NEWBORN shard (Task 5 self-floor) fence_round equals the GC round at the time the
         /// precommit CAS ran, so a writer whose view predates that round is forced to refresh and
-        /// will see any condemnations from round fence_round (the shard's birth). For an existing
-        /// shard fence_round was set by the GC fence step (R3) and gates the same way. The refresh
+        /// will see any condemnations from round fence_round (the shard's birth). fence_round is
+        /// the BIRTH floor only (the ack-floor redesign removed the per-round fence bump); for
+        /// pre-redesign shards a historical fence-step value gates the same way. The refresh
         /// here (and not before the owner-check above) is correct: the owner check only reads the
         /// shard journal, not the retire view; the condemn check below is the blob-safety gate.
         if (store->retireView().round() < root.fence_round)

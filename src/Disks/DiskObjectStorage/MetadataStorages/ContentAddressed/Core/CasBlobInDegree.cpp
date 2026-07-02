@@ -109,9 +109,14 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               RetiredMergeResult * out_retired)
 {
     /// The retired cursor consumes Blob entries in ascending hash order, in lockstep with the
-    /// ascending merged edge stream (32-byte BE keys order exactly as numeric UInt128).
-    chassert(std::is_sorted(prior_retired.begin(), prior_retired.end(),
-        [](const RetiredEntry & a, const RetiredEntry & bb) { return a.hash < bb.hash; }));
+    /// ascending merged edge stream (32-byte BE keys order exactly as numeric UInt128). An unsorted
+    /// input would silently mis-settle entries (missed/duplicated graduations), so this is a REAL
+    /// release gate, not a chassert: the list is small (outstanding candidates), the check is O(n).
+    if (!std::is_sorted(prior_retired.begin(), prior_retired.end(),
+        [](const RetiredEntry & a, const RetiredEntry & bb) { return a.hash < bb.hash; }))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS gc fold: prior retired list for shard {} is not sorted by hash — refusing the merge",
+            shard);
     RetiredMergeResult sink;
     RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
 

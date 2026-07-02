@@ -64,8 +64,9 @@ struct RoundReport
     }
 };
 
-/// Leader-paced regular GC (spec rev. 15 §Round Protocol): fold -> retire -> fence -> recheck ->
-/// exact-token delete -> trim, over the root-local part-manifest model. The lease is WORK DEDUP ONLY —
+/// Leader-paced regular GC (ack-floor redesign, spec 2026-07-02): ONE pass per round — heartbeat
+/// ack floor -> fold (three-cursor merge) -> pre-CAS deletes of previously-published pending
+/// entries -> single gc/state CAS -> post-CAS cleanup/trim, over the root-local part-manifest model. The lease is WORK DEDUP ONLY —
 /// every step is idempotent and split-brain-safe (monotone gc/state, append-by-unique-path retire/
 /// outcome logs, exact-token deletes); the Phase-0 model (CaGcRootLocalPartManifestCore.tla) proves the
 /// round safe with NO leadership assumption at all. A stale leader can only duplicate work, never roll
@@ -152,8 +153,9 @@ public:
     /// live build is never reclaimed; a wrongful reclaim is caught by the promote guard (fail closed).
     void reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uint64_t round);
 
-    /// DELETE-SITE AUDIT (closeout invariant; grep `deleteExact` under Core/): the recheck holds the
-    /// ONLY content (blob reachability) delete in the whole core, behind the four INV-NO-LOSS gates.
+    /// DELETE-SITE AUDIT (closeout invariant; grep `deleteExact` under Core/): the round's pre-CAS
+    /// redelete phase (R3 in runRegularRound) holds the ONLY content (blob reachability) delete in
+    /// the whole core, restricted to previously-published delete_pending entries.
     /// The recheck's manifest-body exact-token delete (after its decrements are sealed), the retired-set
     /// drop, the resume path (GC metadata), dropNamespace (verbatim files), and the capability probe
     /// (throwaway keys) remove non-content objects they own. Adding a second content-delete site is a
