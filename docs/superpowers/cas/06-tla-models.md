@@ -1,0 +1,603 @@
+---
+description: 'Index of every TLA+ formal model in the CAS MergeTree corpus: what each proves, the counterexamples and sabotages that drove design decisions, and code-currency status.'
+sidebar_label: 'CAS TLA+ model index'
+sidebar_position: 6
+slug: /superpowers/cas/tla-models
+title: 'CAS MergeTree — TLA+ model index'
+doc_type: 'guide'
+---
+
+# CAS MergeTree — TLA+ model index {#cas-tla-model-index}
+
+This document indexes every TLA+ model in `docs/superpowers/models/` for the content-addressed (CAS)
+MergeTree feature. For each model it records: the file(s), what the model proves (key invariants), the
+counterexamples or sabotage traces that drove concrete design decisions, and a code-currency note.
+
+The `.tla` and `.cfg` source files are **not modified**; this doc supersedes the per-model prose files
+(`*_RESULTS.md`, `*_README.md`, `INDEX.md`, `README.md`, `RESULTS.md`,
+`MODEL_CURRENCY_REVIEW_2026-06-22.md`). All bounded-model-checking runs use TLC v2.19 / OpenJDK 21;
+Apalache 0.58.0 is used for inductive-invariant checking.
+
+---
+
+## Area 1 — Incarnation-token GC core {#area-incarnation}
+
+The canonical model of the fold → retire → fence → recheck → exact-token-delete → cascade → trim round.
+Replaces the superseded EBR/epoch design (`CaGcCore.tla`; see §Area 8).
+
+### `CaIncarnationCore.tla` — canonical GC core {#caincarnationcore}
+
+**Files:** `CaIncarnationCore.tla`, `CaIncarnationCore_stage*.cfg`, `CaIncarnationCore_sab_*.cfg`,
+`CaIncarnationCore_hunt_*.cfg`, `CaIncarnationCore_reval_stage2.cfg`
+
+**What it proves.** The safety invariants `INV_NO_DANGLE` (no manifest ref points to an absent object),
+`INV_NO_LOSS` (every reachable object stays present), `INV_NO_RETURN` (a present object's token is
+never in the deleted-token history `deadTok`), and `INV_JOURNAL_COVERAGE` (the trim base never advances
+past the fold cursor) hold across the full adversarial interleaving: concurrent writers and GC leaders,
+split-brain, debris classification, full-GC exact-cut, `WResurrect`/`WOverwrite`, tree expansion and
+atomic cascade, namespace registry + manifest creation (B91), evidence staleness + re-observation (B91).
+
+| Stage | Configs | Adds | Distinct states | Result |
+|---|---|---|---|---|
+| 1 core | `stage1` | publish/drop, fold/retire/fence/recheck, in-flight deletes | 20.9M | PASS |
+| 2 resurrect/evidence | `stage2` | `WResurrect`, `WEvidence`, `WResolveEvidence` | 155K | PASS |
+| 3 trees/cascade | `stage3` | expansion markers, atomic cascade, shared-child survival | 52.8M | PASS |
+| 4a debris/full-GC cut | `stage4_small` | heartbeat-gated debris, two-shard full-GC cut | 16.8M | PASS |
+| 4b journaled-delete + tree rebuild | `stage4_journaltree` | journaled tail + `FGCommit` tree rebuild | 35.6M | PASS |
+| 5 split/overwrite | `stage5_small` | split-brain + `WOverwrite` | 64.4M | PASS |
+| 6a registry | `stage6_registry` | namespace registry + manifest creation (B91) | 3.7M | PASS |
+| 6b evidence staleness | `stage6_evstale` | amended `W-EVIDENCE`, `WEvObserve` (B91) | 10.1M | PASS |
+| 6c cross smoke | `stage6_cross_smoke` | registry × evidence-staleness interaction | 440K | PASS |
+| liveness | `stage2_live` | `NoLeakForever` under `FairSpec` | — | bound-artifact lasso (MaxRound=2 budget, not a design bug) |
+
+Large-bound hunt (2026-06-11, `W-REVALIDATE` mode): 782M distinct states BFS + 8.3B deep random
+visits at enlarged bounds — 0 violations found.
+
+**Sabotages (negative controls — all must produce a counterexample):**
+
+| Config | Rule removed | Violated invariant | Trace summary |
+|---|---|---|---|
+| `sab_nofence` | fence does not write to manifests (horn 2 missing) | `INV_NO_DANGLE` | Post-fence publish not blocked → GC deletes the committed object |
+| `sab_norecheckfold` | recheck does not require fold-through-fence (horn 1 missing) | `INV_NO_DANGLE` | Pre-fence publish missed by the recheck cursor → object deleted before the late publish is folded |
+| `sab_noretireview` | W-PUBLISH-GATE retire-view check removed | `INV_NO_DANGLE` | Stale reuse dep re-published after the fence; GC deletes the object under the stale ref |
+| `sab_unconddelete` | exact-token delete replaced by unconditional delete | `INV_NO_DANGLE` | Stale delete message kills the live token-2 incarnation written by `WResurrect` |
+| `sab_reusedtag` | W-FRESH-TAG / token distinctness removed | `INV_NO_RETURN` | Resurrect reuses the condemned token-1; delete lands, marks token-1 dead; incarnation still present |
+| `sab_cascade` | cascade deferred as a separate pipeline step | `INV_NO_LOSS` | Round-2 GC re-expands a now-live tree's stale `pendCasc` strip, deleting a live child |
+| `sab_cutoverclaim` | full-GC cursor jumps past unincorporated incorporated-state | `INV_NO_DANGLE` | `FGCommit` skips the add record; recheck fires as if the fold covered it; delete lands |
+| `sab_noreobserve` | W-REVALIDATE re-observation conjunct removed (reval mode) | `INV_NO_DANGLE` | Stale dep on a deleted object passes the weakened publish gate |
+| `sab_noregistry` (B91) | namespace registration skipped; no publish-floor | `INV_NO_DANGLE` | Newborn namespace's publish floor stays 0; a publish lands before the registry fence captures it |
+| `sab_foldtimeuniverse` (B91) | GC fences the FOLD-TIME registry universe instead of commit-time | `INV_NO_DANGLE` | A namespace registered between the fold's read and the registry-fence CAS is never fenced → its exact-token delete dangles |
+| `sab_noevreobserve` (B91) | stale evidence admitted without re-observation | `INV_NO_LOSS` | A stale carry-forward dep on a deleted object reaches publish; bytes lost |
+
+**Design decisions driven by this model:**
+
+- The fence writes to EVERY manifest (not just manifests with activity) — established by `sab_nofence`.
+- Recheck requires the fold cursor to have advanced through the fence position — established by `sab_norecheckfold`.
+- Deletes are exact-token — established by `sab_unconddelete`.
+- Cascade is atomic with the delete landing (not a deferred pipeline step) — established by `sab_cascade`.
+- The registry fence must use the COMMITTED (not fold-time) universe — found as a real C++ hole
+  (`commit 724eb5363ff`) during the B91 refresh; `sab_foldtimeuniverse` is the permanent negative
+  control for this shape.
+- `adoptTree` must cold-reuse (`observeAndAdmit`), not accept tokenless evidence — found as a real C++
+  blind-adopt hole (`commit a247e29c125`) during the B91 refresh.
+- The `GFenceShard` fence write must be a monotone-max CAS (never lowers the durable fence under
+  split-brain) — model refinement MR-4.
+
+**Model-refinement findings for the publish gate (MR-1 / MR-2·F1 / MR-3·F2):** three refinements the
+model forced on the writer's publish gate. The literal names below are in `CaIncarnationCore.tla`.
+
+- **MR-1 — publish gate consults durable `deadTok[h]`, not only in-flight `retired`.** A
+  token-bearing dependency `(h, t)` is condemned at view `v` iff
+  `CondemnedAtView(h, t, v) == RetiredHit(h, t, v) ∨ t ∈ deadTok[h]`. Consulting only the live
+  `retired` set is unsafe: the `Land` action consumes the retired entry on delete, so after the
+  message lands a stale unpublished dependency on `(h, t)` would pass `DepOK` even though the token
+  is physically dead. `deadTok[h]` is the durable history of tokens that have stopped being current.
+
+- **MR-2 / F1 — displaced-token push + current-state re-validation.** Any action that makes a token
+  stop being current MUST push the displaced token into `deadTok[h]`: in-place overwrite
+  (`WResurrect`, `WOverwrite`) and physical delete (`Land`). Correspondingly, in `W-REVALIDATE` mode
+  (`EnableReval`) the publish gate re-validates a dependency's **current physical state**
+  (`present[d] ∧ tokOf[d] = observed_token`) in the same CAS, not merely the originally-observed
+  token. Negative control: `sab_reusedtag` re-issues a condemned token and violates `INV_NO_RETURN`;
+  `sab_noreobserve` drops the re-observation conjunct and dangles.
+
+- **MR-3 / F2 (`TreeDepsOK`) — bottom-up tree publish.** A tree ref may be published into a manifest
+  only when **all direct children are present and non-condemned at publish time**
+  (`TreeDepsOK(w, h) == h ∈ TreeHashes ⇒ ∀c ∈ Children[h] : present[c] ∧ ~CondemnedAtView(c, tokOf[c], wView[w])`,
+  called from `WPublish`). Publishing a tree over an absent/condemned child immediately dangles once
+  the fold (`GFold`) expands the tree edges. This is one-level closure in the model (nested subtrees
+  not modeled); the writer's bottom-up build discipline covers the transitive case in code.
+
+**P9 extension (2026-06-17):** `GForget` prunes absent zero-in-degree nodes from `everEdged` to
+eliminate the retire-404-HEAD storm. Frame argument: no safety invariant reads `everEdged`, so
+`GForget` preserves all invariants independent of scope. Re-verified at stages 1–3 (clean). Liveness
+lasso unchanged.
+
+**Code currency:** CURRENT (minor drift). Three discrepancies:
+(1) heartbeat/debris/full-GC-cut actions (`WHb*`, `GDebrisRetire`, `FGRead`, `FGCommit`) are fully
+specified in the model but deferred in code (Milestone-F Full GC, `CasGc.h:121` "API slot reserved");
+(2) `CaBuildRootPrecommit.tla` is the live safety mechanism for B171/B140 — only obliquely modeled
+here (no first-class precommit-root edge);
+(3) the `EnableReval=FALSE` dead-token-oracle gate (`deadTok`/`CondemnedAtView`) has no production
+code path.
+
+---
+
+### `CaIncarnationProofCore.tla` — Apalache inductive invariant {#caincarnationproofcore}
+
+**Files:** `CaIncarnationProofCore.tla`, `Apalache.tla`, `CaIncarnationProofCore_tlc.cfg`,
+`CaIncarnationProofCore_tlc2h.cfg`
+
+**What it proves.** An inductive invariant `IndInv` (19 conjuncts) for the pre-B91, `W-REVALIDATE`
+token-only fragment (single leader, no trees/debris/evidence/split-brain). Apalache 0.58.0 verified
+base case (`Init => IndInv`, 1 s) and step check (`IndInv => IndInv'`, 45–73 s) — both `NoError`. This
+is stronger than TLC bounded-checking: the step check quantifies over ALL states satisfying `IndInv` at
+fixed constant sizes (`|Writers|=2`, `|Shards|=1`, `|Hashes|=2`, `MaxToken=3`, `MaxRound=2`,
+`MaxLog=4`), regardless of trace depth. The prepared CTI journal (12 iterations) is the input for a
+future parametric TLAPS proof.
+
+The heart conjunct is `InflightCurrentUnreferenced` (a delete message in flight for a still-current
+token implies no folded root edge and no unfolded add past the cursor). Found as irredundant by the
+negative control `IndInv_NoICU`; dropping it produces a CTI.
+
+Negative controls: dropping `InflightHeld` or `InflightVsRefs` each leave the step check green
+(documented redundancy — both are corollaries of ICU + the fence-discipline family). Removing the
+`W-REVALIDATE` re-observation conjunct from `WPublish` (`NextNoReval`) produces a counterexample
+breaking `NoDangle` — machine-checking the F1 re-observation requirement.
+
+**Code currency:** STALE (self-flagged). Predates the B91 amendments (namespace registry,
+evidence staleness, `ViewableRound`). Re-derivation is an open follow-up.
+
+---
+
+## Area 2 — Build-root / precommit protection (B140, B171, B199-S2) {#area-precommit}
+
+### `CaBuildRootPrecommit.tla` — precommit-first + fail-closed commit {#cabuildRootPrecommit}
+
+**Files:** `CaBuildRootPrecommit.tla`, `CaBuildRootPrecommit_buggy.cfg`,
+`CaBuildRootPrecommit_buildrootonly.cfg`, `CaBuildRootPrecommit_failclosedonly.cfg`,
+`CaBuildRootPrecommit_fixed.cfg`, `CaBuildRootPrecommit_inlineclosure.cfg`,
+`CaBuildRootPrecommit_lazyleak.cfg`, `CaBuildRootPrecommit_inlineclosure_b2.cfg`,
+`CaBuildRootPrecommit_b2_witness.cfg`
+
+**What it proves.** The 2×2 necessity/sufficiency matrix for the B140/B171 fix — build-root structural
+reachability (`UseBuildRoot`) and fail-closed commit (`FailClosedCommit`) — and the B199-S2
+inline-closure liveness fix (`InlineClosure`).
+
+| `UseBuildRoot` | `FailClosedCommit` | `InlineClosure` | Spec | Result | States |
+|---|---|---|---|---|---|
+| F | F | T | `Spec` | `INV_NO_DANGLE_COMMITTED` violated | ~505 (to CE) |
+| T | F | T | `Spec` | `INV_NO_DANGLE_COMMITTED` violated | ~3031 (to CE) |
+| F | T | T | `Spec` | clean (safety) | 2193 |
+| T | T | T | `Spec` | **clean** (all 4 invariants) | 45161 |
+| T | T | T | `FairSpec` | **clean** (safety + `INV_NO_LEAK` HOLDS) | 45161 |
+| T | T | F | `FairSpec` | `INV_NO_LEAK` **VIOLATED** — S2 leak reproduced | 71953 (to CE) |
+| T | T | T (b1+b2) | `FairSpec` | **clean** (safety + `INV_NO_LEAK` HOLDS) | 310993 |
+
+**B140-dangle counterexample (buggy cfg, 6 states):** `WriteBlob(bld1,b1)` → `AdoptBlob(bld2,b1)` [owner stays `bld1`] → `BuildDie(bld1)` [owner gone, `OwnerProtected(b1)=FALSE`] → `GcDelete(b1)` [in-degree 0, unprotected] → `Commit(bld2,t1)` [no presence re-check, blind publish] → **committed manifest references absent `b1`**. This is adopt-without-ownership-transfer → owner retires → GC deletes → blind commit dangles.
+
+**Why build-root alone is insufficient (buggy `buildrootonly` counterexample):** `WriteBlob(bld1,b1)` → `GcDelete(b1)` (no precommit yet, so in-degree 0) → `Precommit` → blind `Commit` → dangle. The precommit must exist **before** the blob can reach in-degree 0 AND the commit must re-check presence.
+
+**B199-S2 inline-closure leak (`lazyleak`, 6 states + stutter):** `Precommit(bld2,t2)` while tree object `t2` **absent** → lazy path records `closure[bld2]={}` (empty) → `b1` never enters `everSnapped` → `GcDelete` can never fire on `b1` → `b1` leaks forever. Inline closure (IC=TRUE) closes this by construction: the writer records the closure at precommit time, from the staged structure it already holds in memory.
+
+**Reachability witnesses (non-vacuity):** all four negated witnesses are reachable: `W_GcDeleteReached`, `W_BuildRootProtectReached`, `W_LiveFrozenReclaimDeleteReached`, `W_PrematureReclaimAbortReached`. The two-blob run confirms shared blobs are spared and unique blobs are reclaimed.
+
+**Design decisions driven by this model:**
+
+- Build-root reachability (structural, not revocable liveness hint) is required — adopter builds must
+  precommit before relying on the adoption.
+- Fail-closed commit (presence re-check on the whole closure) is independently necessary — it catches
+  the ordering-window case where the blob is deleted before the precommit edge exists.
+- Both halves are necessary and jointly sufficient.
+- The precommit must record its closure **inline at precommit time** — not lazily from a tree-object
+  read at GC fold time (which can 404 if the tree is already condemned/deleted).
+
+**Code currency:** CURRENT. This is the live B171/B140 fix model. The flat (one-level) model does not
+cover nested subtrees; that recursion fix is validated by the C++ gtest in
+`src/Disks/tests/gtest_cas_gc_leak.cpp`.
+
+---
+
+## Area 3 — GC lease heartbeat (B160) {#area-lease}
+
+### `CaGcLeaseCore.tla` — GC leader lease / advisory heartbeat {#cagcleasecore}
+
+**Files:** `CaGcLeaseCore.tla`, `CaGcLeaseCore_heartbeat.cfg`,
+`CaGcLeaseCore_safety_noheartbeat.cfg`, `CaGcLeaseCore_sab_noheartbeat.cfg`
+
+**What it proves.** `NoEpochCollision` (no two leaders commit a retire at the same fence epoch — the
+atomic single-CAS steal + `fence_seq` epoch isolation is safe regardless of timing) and `NoFalseSteal`
+(no steal fires against an alive mid-round incumbent when the advisory heartbeat is enabled).
+
+| Config | `EnableHeartbeat` | Invariants | States | Result |
+|---|---|---|---|---|
+| `_heartbeat` | TRUE (fix) | `NoEpochCollision`, `NoFalseSteal` | 8,633 | PASS |
+| `_safety_noheartbeat` | FALSE | `NoEpochCollision` | 10,777 | PASS |
+| `_sab_noheartbeat` | FALSE (sabotage) | `NoFalseSteal` | 618 (to CE) | VIOLATED |
+
+**B160 counterexample (`sab_noheartbeat`, 7 states):** `Tick, Tick` → `Create(L2)` (L2 mid-round, `seq` frozen) → `ObserveOrSteal(L1)` (records frozen obs) → `Tick` (full window; heartbeat OFF, `hb` frozen) → `ObserveOrSteal(L1)` (owner, seq, AND hb all frozen → L1 steals from the alive, mid-round L2 → `falseSteal=TRUE`). With heartbeat ON, the second `Tick` bumps L2's `hb`; L1 backs off.
+
+**Design decisions driven by this model:**
+- Safety is independent of the heartbeat — the epoch-fence CAS alone prevents double-commit.
+- The advisory heartbeat is the minimal addition that eliminates false steals from a mid-round leader
+  whose `seq` is frozen for the round's duration.
+
+**Code currency:** CURRENT. Untouched by B171.
+
+---
+
+## Area 4 — Mount ownership and server-root identity {#area-mount}
+
+### `CaCasMountCore.tla` — mount ownership safety gate {#cacasmountcore}
+
+**Files:** `CaCasMountCore.tla`, `CaCasMountCore_stage1.cfg`, `CaCasMountCore_sab_epochreset.cfg`,
+`CaCasMountCore_sab_foreigntakeover.cfg`, `CaCasMountCore_sab_supersededwrites.cfg`,
+`CaCasMountCore_witness_reclaim.cfg`
+
+**What it proves.** Five invariants over the sticky-owner / durable-monotone-epoch / TTL-lease
+three-object mount protocol: `NoTwoServerUuidsOwnSameServerRoot` (owner is sticky),
+`ForeignUuidNeverAutoTakesOver` (mount is never held by a non-owner), `WriterEpochMonotoneUnique`
+(no two actors share a written epoch; the durable counter is a monotone ceiling),
+`SupersededWriterMakesNoMutation` (a superseded actor makes no new mutations).
+
+| Config | Sabotage | Invariant | States | Result |
+|---|---|---|---|---|
+| `stage1` | none | all 5 | 6,085 | PASS |
+| `sab_foreigntakeover` | owner guard dropped on expired branch | `ForeignUuidNeverAutoTakesOver` | 933 (to CE) | VIOLATED |
+| `sab_epochreset` | epoch reset to 0 after allocation | `WriterEpochMonotoneUnique` | 653 (to CE) | VIOLATED |
+| `sab_supersededwrites` | lost-actor epoch/not-lost conjunct dropped | `SupersededWriterMakesNoMutation` | 681 (to CE) | VIOLATED |
+| `witness_reclaim` | none | `W_SameUuidReclaimsExpired` (reachability) | 811 | VIOLATED (expected — state reachable) |
+
+**Design decisions driven by this model:**
+- An expired-mount reclaim branch must still check `owner = uuid` — dropping it lets a foreign actor
+  install a mount on another server's root object.
+- The epoch object must never be reset; the durable counter is a strict monotone ceiling.
+- A `localLost` actor is blocked from all mutations by the epoch/not-lost conjunct.
+
+**Code currency:** CURRENT.
+
+---
+
+## Area 5 — B140 dangle: faithful reproduction and fix proof {#area-b140}
+
+Three models form a deliberate progression from initial reproduction to fix proof.
+
+### `CaB140DangleMerge.tla` — faithful B140 reproduction + fix proof {#cab140danglemerge}
+
+**Files:** `CaB140DangleMerge.tla`, `m_both_buggy.cfg`, `m_cursorskip.cfg`,
+`m_trimonly.cfg`, `m_merged.cfg`
+
+**What it proves.** The 2×2 necessity/sufficiency of the trim-gate + cursor-in-snap fix for the
+trim-before-durable dangle across a GC lease handoff.
+
+| `TrimGated` | `CursorInSnap` | Config | Result | States |
+|---|---|---|---|---|
+| F | F | `m_both_buggy` | `INV_NO_LOSS` violated | 0.71M (to CE) |
+| T | F | `m_cursorskip` | `INV_NO_LOSS` violated | 0.85M (to CE) |
+| F | T | `m_trimonly` | `INV_NO_LOSS` violated | 0.34M (to CE) |
+| T | T | `m_merged` | **clean** | 5.33M |
+
+**B140 counterexample (17 states):** L1 folds `add t2` (edge `t2→b1`) into in-memory wip → `GTrim` uses L1's in-memory cursor (trim-before-durable) → L1 loses lease, wip discarded → L2 rebuilds from empty committed snap → L2 GAP-skips trimmed `add t2` → `t2→b1` never enters any durable snap → L2 retires and deletes `b1` while live `t2` still references it.
+
+**Cursor-skip counterexample:** `GCommitCursor` publishes cursor=1 while committed edges still point at empty gen-0 → `GTrim` (gated by committed cursor) trims `add t2` → the cursor ran ahead of the edges, so the gate over-trims. This shows trim-gate alone is insufficient: the cursor it trusts must be coherent with the committed edges, which is exactly what cursor-in-snap guarantees.
+
+**Design decisions driven by this model:**
+- The committed snap is one atomic write-once object carrying its own fold cursor (no separate `GCommitCursor` step independent of edge commit).
+- The journal may be trimmed only up to the committed snap's cursor.
+- Neither half alone closes the dangle; both are necessary and jointly sufficient.
+
+**Code currency:** CURRENT (as history record). The live B140 protection model is `CaBuildRootPrecommit.tla`.
+
+---
+
+### `CaB140DangleFaithful.tla` — faithful refutation of Phase-1 mechanism {#cab140danglefaithful}
+
+**Files:** `CaB140DangleFaithful.tla`, `CaB140DangleFaithful_shared.cfg`
+
+**What it proves.** Clean over 9.1M states — the Phase-1 B140 fix (faithful producers: no marker-retaining strip, no field-mixed generation adoption) does not exhibit the dangle under the original Phase-1 mechanism. Supersedes `CaB140Dangle.tla` as the faithful producer model.
+
+Results are recorded inside `CaB140DangleMerge_RESULTS.md`.
+
+**Code currency:** CURRENT as historical record.
+
+---
+
+### `CaB140Dangle.tla` — Phase-1 B140 reproduction (superseded as producer) {#cab140dangle}
+
+**Files:** `CaB140Dangle.tla`, `CaB140Dangle_adopt.cfg`, `CaB140Dangle_blob.cfg`,
+`CaB140Dangle_loss.cfg`, `CaB140Dangle_producer.cfg`, `CaB140Dangle_safe.cfg`
+
+An initial Phase-1 reproduction with unfaithful producers (marker-retaining strip, field-mixed generation adoption). Superseded as a producer model by `CaB140DangleFaithful.tla`. Kept as a record of the Phase-1 investigation.
+
+**Code currency:** SUPERSEDED as producer. Kept as historical record.
+
+---
+
+## Area 6 — Build watermark and resurrect liveness (B167) {#area-watermark-resurrect}
+
+These three models are now **stale against shipped code** — they model a per-candidate blob-guard
+(`protectedByLiveBuild`) that B171 removed and a condemn-time `HeartbeatGuard` never implemented
+(deferred M-F Full GC). Their safety role fully migrated into `CaBuildRootPrecommit.tla`. They are
+kept as a record of the investigation and as documentation of the B167 livelock shape.
+
+### `CaResurrectLiveness.tla` — abstract resurrect-liveness (B167) {#caresurrectliveness}
+
+**Files:** `CaResurrectLiveness.tla`, `CaResurrectLiveness_guard.cfg`,
+`CaResurrectLiveness_noguard.cfg`
+
+**What it proves.** The abstract `HeartbeatGuard` boolean is load-bearing for resurrect liveness:
+guard ON → `<>published` holds (4 states); guard OFF → livelock lasso (7 states).
+
+**B167 livelock (noguard lasso):** `present=T, condemned=T` (dedup hit on stale incarnation) → `GcDelete` → `BuildUpload` (fresh incarnation, `freshOwned=T`) → `GcCondemn` (guard OFF: GC re-condemns the build's OWN fresh incarnation) → `GcDelete` → ... loop, `published` never TRUE. The key insight: the stale-incarnation upload→publish span is NOT atomic; GC can re-condemn in the gap.
+
+**Design decision:** writer-side re-upload alone is starvable; a guard that blocks GC from condemning a freshly-owned incarnation is required.
+
+**Code currency:** STALE vs shipped. Models the deferred M-F `HeartbeatGuard` (condemn-time guard on live `build_id`). The shipped protection is precommit-first reachability (`CaBuildRootPrecommit.tla`).
+
+---
+
+### `CaBuildWatermark.tla` — concrete watermark oracle (B167) {#cabuildwatermark}
+
+**Files:** `CaBuildWatermark.tla`, `CaBuildWatermark_guard.cfg`, `CaBuildWatermark_noguard.cfg`,
+`CaBuildWatermark_staleactive.cfg`, `CaBuildWatermark_unsounddetect.cfg`,
+`CaBuildWatermark_crash.cfg`
+
+**What it proves.** The concrete `min_active` scalar watermark oracle converges (safety: `Inv_ProtectedNeverCondemned`, `Inv_NoDangle` hold in all five configs; liveness: `<>(published=Builds)` holds with guard ON and crashes are leak-free). Three negative controls show the three independent failure modes each reproduce the B167 starvation lasso: no guard, stale active set (floor advances past in-flight builds), unsound crash detection (false-positive `gcDead`).
+
+**Design decisions driven by this model:**
+- `build_seq` must be allocated from a **monotone counter** (not just unique) — `CaBuildWatermarkNum` finding.
+- The active-set floor (`min_active`) must be the exact minimum of in-flight build sequences.
+- Crash detection must be sound (frozen-seq-across-K-passes discipline; false-positive death is fatal to liveness).
+
+**Code currency:** STALE vs shipped. The per-candidate blob-guard (`protectedByLiveBuild`) was removed by B171 (replaced by precommit-first reachability). The watermark floor lemma (`monotone build_seq`) survives for precommit-ref reclaim (`CasGc.cpp:1877`), not blob protection.
+
+---
+
+### `CaBuildWatermarkNum.tla` — numeric watermark validation {#cabuildwatermarknum}
+
+**Files:** `CaBuildWatermarkNum.tla`, `CaBuildWatermarkNum_correct.cfg`,
+`CaBuildWatermarkNum_confused.cfg`, `CaBuildWatermarkNum_nonmonotonic.cfg`
+
+**What it proves.** Safety (`Inv_ProtectedNeverCondemned`, `Inv_NoDangle`) of the concrete numeric floor with two servers, real `epoch` watermarks, and real `build_seq` allocation. Key finding: monotone `build_seq` allocation is load-bearing — uniqueness alone is insufficient; a non-monotone allocation lets `min_active` be pulled back below a finished build's seq, re-protecting a condemned blob (a leak). The `_confused` config (wrong server's watermark) violates `Inv_ProtectedNeverCondemned`.
+
+**Code currency:** STALE vs shipped (same as `CaBuildWatermark.tla`). The monotone-`build_seq` floor lemma survives for precommit-ref reclaim.
+
+---
+
+## Area 7 — Root-local part-manifest GC (streaming sharded redesign) {#area-partmanifest}
+
+### `CaGcRootLocalPartManifestCore.tla` — root-local part-manifest GC R0 gate {#cagcrootlocalpartmanifestcore}
+
+**Files:** `CaGcRootLocalPartManifestCore.tla`, `CaGcRootLocalPartManifestCore_stage*.cfg`,
+`CaGcRootLocalPartManifestCore_sab_*.cfg`, `CaGcRootLocalPartManifestCore_witness_*.cfg`,
+`CaGcRootLocalPartManifestCore_live.cfg`
+
+**What it proves.** The full root-local part-manifest GC protocol (spec
+`2026-06-26-cas-gc-streaming-sharded-redesign-design.md` rev.15), including precommit + missing-body
+states, owner transitions, orphan sweep, mutable manifests, token-diff discovery (Phase 2), lazy trim
+(Phase 3, all-shard fresh fence only), target-sharded reducers (Phase 4), retire-token optimization
+(Phase 5), and attempt-scoped generation visibility (Phase 6). Invariants: `INV_NO_DANGLE`,
+`INV_NO_LOSS`, `INV_NO_RETURN`, `INV_JOURNAL_COVERAGE`, `NoManifestIdReuse`, `RefMatchesBody`,
+`ManifestNamespaceMatches`, `SingleManifestOwner`, `CommittedManifestBodyRequired`,
+`CommittedNoMissingBlob`, `NoCommittedDangle`, `BlobInDegreeMatchesActiveManifests`,
+`FoldedEdgesAreActive`, `ManifestActivationMatchesEdges`; action property `MonotoneGC`. Liveness:
+`OrphanManifestDebrisDrains` and `NoLeakForever` under `FairSpec`.
+
+**Positive stages (all HOLD):**
+
+| Stage | Config | Distinct states | Wall |
+|---|---|---|---|
+| 0 type/journal coverage | `stage0` | 19,846 | 0s |
+| 1 identity + body validation | `stage1` | 402,034 | 2s |
+| 2 owner transitions + precommit + promote | `stage2` | 68.6M | 7m11s |
+| 3 full GC pipeline | `stage3` | 365.6M | 27m45s |
+| 4 manifest cleanup + orphan sweep + mutable | `stage4` | 27.4M | 3m29s |
+| 5 token-diff discovery | `stage5_tokendiff` | 8.3M | 28s |
+| 5 lazy trim (Phase 3) | `stage5_lazytrim` | 338.8M | ~21m |
+| 5 target-sharded reducers (Phase 4) | `stage5_sharding` | 983.9M | ~65m |
+| 5 retire-token optimization (Phase 5) | `stage5_retiretoken` | 3.5M | <1m |
+| liveness | `live` | 17.8M | 30m10s |
+| Phase 6 attempt-scoping | `stage6_attemptscoping` | 11.7M | — |
+
+**28 negative controls — all produce their named counterexample (no unexpected pass):**
+
+Selected critical sabotages:
+
+| # | Config | Rule removed | Violated |
+|---|---|---|---|
+| 3 | `sab_splitpromote` | promote = two CAS with a gap, no fail-closed | `INV_NO_DANGLE` |
+| 5 | `sab_commitskipblobreval` | committed publish skips blob revalidation | `INV_NO_DANGLE` |
+| 7 | `sab_noorphansweep` | omit pre-precommit debris sweep | `OrphanManifestDebrisDrains` |
+| 11 | `sab_deletebodybeforedecrements` | delete body before decrements durable | `NoLeakForever` |
+| 12 | `sab_cutoverclaim` | cursor past unsealed deltas | `INV_NO_DANGLE` |
+| 14 | `sab_nofence` | skip global fence | `INV_NO_DANGLE` |
+| 25 | `sab_lazyfenceunsafe` | reuse stale parent fence position | `INV_NO_DANGLE` (24.5M states) |
+| 26 | `sab_reducerownsfence` | target reducer fences only its own shard | `INV_NO_DANGLE` |
+| 27 | `sab_crosssharddisplacement` | scatter drops displaced old-binding `-1` deltas | `INV_NO_LOSS` |
+| 28 | `sab_staletokenoverdelete` | stale stored token triggers destructive `Land` | `INV_NO_LOSS` |
+
+Full table in `CaGcRootLocalPartManifestCore_RESULTS.md`.
+
+**Key design decisions driven by this model:**
+
+- The fence is always all-shard fresh (reusing a stale parent fence position is load-bearing-unsafe —
+  `sab_lazyfenceunsafe` is a permanent negative control for this shape).
+- The target-sharded fold uses ONE global coordinator fence (`GCoordFence` over every root shard) —
+  independent per-shard fences by a reducer leave another shard's fence stale-low.
+- The scatter must emit paired `-1` old-binding deltas; inferring the old target from the new ref alone
+  under-counts in-degree for a cross-shard surviving ref.
+- The retire-token source (`storedTok`) must never over-delete: the destructive `Land` gate uses the
+  STORED token only if it matches the exact current `tokOf` (the stale-disjunct sabotage shows
+  `INV_NO_LOSS` not `INV_NO_RETURN` is the violation when a live re-incarnated object is over-deleted).
+- Deposed-leader GC attempts must never be reader-visible: only the ADOPTED attempt's artifact can
+  be consulted (Phase 6 `INV_ONLY_ADOPTED_VIEWABLE`).
+
+**Code currency:** CURRENT (R0 gate). The largest and most comprehensive model in the corpus.
+
+---
+
+## Area 8 — In-degree re-fold undercount (B-indeg fix) {#area-indeg-refold}
+
+### `CaGcIndegRefoldCore.tla` — in-degree re-fold undercount {#cagcindegrefoldcore}
+
+**Files:** `CaGcIndegRefoldCore.tla`, `CaGcIndegRefoldCore_fix.cfg`, `CaGcIndegRefoldCore_sab.cfg`
+
+**What it proves.** The minimal model of the bug H1b: the completion-seal cursor must be persisted at
+`max(foldCursor, fenceVersion)` (past what recheck already folded), not at `foldCursor` (the
+pre-window fold-time cursor). If the seal persists `foldCursor`, the next round's fold reconstructs its
+parent cursor from that seal and re-folds the fence-window removal, driving the integer in-degree
+counter to `-1` → `INV_INDEG_NONNEGATIVE` violated (in the C++, `merged < 0` → `CORRUPTED_DATA`).
+
+Invariant: `INV_INDEG_NONNEGATIVE` (`∀ b : indeg[b] >= 0`). Bounds: `Blobs={b1}`, `MaxLog=4`,
+`MaxRound=3`.
+
+| Config | `SabotageCompletionCursorAtFold` | Result |
+|---|---|---|
+| `_fix` | FALSE (fix: cursor = `max(foldCursor, fenceVersion)`) | PASS |
+| `_sab` | TRUE (bug: cursor = `foldCursor`) | `INV_INDEG_NONNEGATIVE` VIOLATED |
+
+**Why this model is necessary (not caught by `CaGcRootLocalPartManifestCore`):** the large model
+recomputes in-degree from a folded EDGE SET — set-difference recompute is idempotent, so re-folding is
+a no-op there. The C++ accumulates in-degree as a NON-idempotent INTEGER delta stream; re-folding an
+already-absorbed removal drives the counter negative. This minimal model targets that concrete
+implementation class directly.
+
+**Design decision:** the `Seal` action must advance `persistedCursor` to `fenceVersion` (not remain at
+`foldCursor`) so the next round's `parentCursor` starts past the events recheck already consumed.
+
+**Code currency:** CURRENT.
+
+---
+
+## Area 9 — Shard incarnation and registry removal (D1) {#area-shard-incarnation}
+
+### `CaGcShardIncarnationCore.tla` — registry removal gate (D1 Phase 0) {#cagcshardincarnationcore}
+
+**Files:** `CaGcShardIncarnationCore.tla`, `CaGcShardIncarnationCore_design.cfg`,
+`CaGcShardIncarnationCore_sab_newbornnofloor.cfg`, `CaGcShardIncarnationCore_sab_pathkeyedcursor.cfg`,
+`CaGcShardIncarnationCore_sab_deletebeforefold.cfg`, `CaGcShardIncarnationCore_sab_incarnationreuse.cfg`
+
+**What it proves.** With the namespace registry removed (proven load-bearing in `CaIncarnationCore` via
+`sab_noregistry`), two replacement coordinates keep the safety invariants: (1) a durable never-reused
+per-`(ns,shard)` incarnation (`sInc`, from a per-shard high-water `sIncMax`), and (2) a newborn shard
+born fenced to the current `gcRound` (self-floor). Invariants: `INV_NO_DANGLING` (no committed ref to
+an absent/dead-token blob) and `INV_NO_ORPHAN_EDGE` (no folded edge outlives its shard object).
+
+| Config | Flags | Result | States |
+|---|---|---|---|
+| `_design` | none | ✅ No error | 5,872,030 |
+| `_sab_newbornnofloor` | drop round self-floor, keep incarnation | ❌ `INV_NO_DANGLING` violated | — |
+| `_sab_pathkeyedcursor` | drop incarnation from cursor, keep round | ❌ `INV_NO_DANGLING` violated (ABA) | — |
+| `_sab_deletebeforefold` | delete before journal fully folded | ❌ `INV_NO_ORPHAN_EDGE` violated | — |
+| `_sab_incarnationreuse` | recreate draws ≤ `sIncMax` (same-path ABA) | ❌ `INV_NO_DANGLING` violated | — |
+
+**Design decisions driven by this model:**
+
+- Neither coordinate alone suffices: the pool-global round closes the publish-race the registry
+  previously closed; the per-shard incarnation prevents ABA confusion of a delete+recreate at the same
+  path. The design's two-coordinate model is minimal.
+- Per-shard monotonicity is the invariant, not global uniqueness. Cross-shard incarnation collision is
+  safe (the fold cursor keys by `(shard, incarnation)`, so the same value in two shards is not ABA);
+  same-shard reuse across a delete+recreate IS dangerous.
+- Reclaim ordering is load-bearing: delete must wait until the journal is fully folded (tombstone
+  included).
+- The registry can be deleted — the spec's `pending-newborns` ephemeral fallback is NOT needed.
+
+**Code currency:** CURRENT (D1 Phase 0 gate, 2026-07-01).
+
+---
+
+## Area 10 — Superseded EBR/epoch GC core {#area-ebr}
+
+### `CaGcCore.tla` — EBR epoch/generation design (superseded) {#cagccore}
+
+**Files:** `CaGcCore.tla`, `CaGcCore_stage*.cfg`
+
+The original GC core, based on Epoch-Based Reclamation (EBR) with a monotone `epoch_current` counter,
+per-writer `O_W` pins, and a `+`/`-` event fold. Checked at stages 1–4 (full adversarial: expiry gap,
+split-brain, total Keeper wipe); all four stages PASS (`INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA`,
+`TypeOK`). **Superseded** by `CaIncarnationCore.tla` (incarnation-token design, 2026-06-10+). Four
+counterexamples found during EBR model development encoded the four load-bearing rules:
+
+- **CE-1** (`INV_NO_LOSS`): flush-`+`-then-advance must cover the decide→`+`-durable window. A writer
+  advancing `O_W` before its `+` is durable allows GC to condemn and delete the epoch while the writer
+  still holds an unpublished ref.
+- **CE-2** (`INV_NO_LOSS`): the reuse decision must target an epoch the writer currently observes
+  (`e ≥ O_W[w]`); reusing an epoch the writer already advanced past means its live lease no longer
+  covers the dependency.
+- **CE-3** (modeling artifact): a shared `plusDurable` boolean collapsed all `+(e)` into one flag;
+  a drop removed another writer's in-flight reuse pin. Fixed by per-writer `pin` sets.
+- **CE-4** (real design constraint, `INV_NO_LOSS`): failing on `Disconnected` alone does not close the
+  `[t_expire, t_aware]` session-expiry gap. A self-fence on a local elapsed-time deadline strictly
+  inside `T_session` is required.
+
+The prose files `README.md` and `RESULTS.md` in this directory are this model's documentation.
+
+**Code currency:** SUPERSEDED. Replaced by the incarnation-token design. Kept as historical record.
+
+---
+
+## Summary table {#summary-table}
+
+| Model | Area | Status | Key invariant(s) | Sabotages | Design decisions |
+|---|---|---|---|---|---|
+| `CaIncarnationCore.tla` | GC core | **CURRENT** (minor drift) | `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN`, `INV_JOURNAL_COVERAGE` | 11 | fence, recheck, exact-token delete, atomic cascade, registry fence-time universe, evidence re-observation |
+| `CaIncarnationProofCore.tla` | GC core (Apalache) | **STALE** (pre-B91; re-derive needed) | `IndInv` (19 conjuncts) inductive at fixed bounds | 5 negative controls | `W-REVALIDATE` is load-bearing (F1 machine-checked); `InflightCurrentUnreferenced` is irredundant |
+| `CaBuildRootPrecommit.tla` | Precommit/B140/B199-S2 | **CURRENT** | `INV_NO_DANGLE_COMMITTED`, `INV_BUILDROOT_PROTECTS`, `INV_COMMIT_FAILCLOSED`, `INV_NO_LEAK` | 2 + 1 liveness | build-root + fail-closed commit jointly necessary; inline closure at precommit time |
+| `CaGcLeaseCore.tla` | Lease/B160 | **CURRENT** | `NoEpochCollision`, `NoFalseSteal` | 1 | advisory heartbeat eliminates false steals; safety independent of heartbeat |
+| `CaCasMountCore.tla` | Mount | **CURRENT** | `NoTwoServerUuids…`, `ForeignUuid…`, `WriterEpochMonotoneUnique`, `SupersededWriter…` | 3 | sticky owner, monotone epoch, lost-actor write block |
+| `CaB140DangleMerge.tla` | B140 fix proof | **CURRENT** (history record) | `INV_NO_LOSS` | 2×2 matrix | trim-gate + cursor-in-snap jointly necessary |
+| `CaB140DangleFaithful.tla` | B140 history | **CURRENT** (history record) | `INV_NO_LOSS` | — | Phase-1 mechanism clean with faithful producers |
+| `CaB140Dangle.tla` | B140 history | **SUPERSEDED** (unfaithful producers) | — | — | Phase-1 investigation record |
+| `CaResurrectLiveness.tla` | Resurrect/B167 | **STALE** (deferred M-F guard) | `<>published` | 1 | upload→publish span not atomic; heartbeat guard load-bearing |
+| `CaBuildWatermark.tla` | Watermark/B167 | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle`, liveness | 3 | monotone `build_seq`, exact min active set, sound crash detection |
+| `CaBuildWatermarkNum.tla` | Watermark numeric | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle` | 2 | monotone `build_seq` (not just unique), per-server scoping |
+| `CaGcRootLocalPartManifestCore.tla` | Part-manifest GC R0 | **CURRENT** | `INV_NO_DANGLE/LOSS/RETURN`, 10 more; liveness | 28 | all-shard fresh fence, single coordinator fence, scatter deltas, stale-token-no-over-delete, attempt-scoped visibility |
+| `CaGcIndegRefoldCore.tla` | Indeg re-fold | **CURRENT** | `INV_INDEG_NONNEG` | 1 | seal cursor at `max(foldCursor, fenceVersion)`, not `foldCursor` |
+| `CaGcShardIncarnationCore.tla` | Registry removal D1 | **CURRENT** | `INV_NO_DANGLING`, `INV_NO_ORPHAN_EDGE` | 4 | two-coordinate replacement (incarnation + round self-floor) for registry; per-shard monotonicity |
+| `CaGcCore.tla` | EBR GC core | **SUPERSEDED** | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA` | 4 CEs during dev | EBR design record; replaced by incarnation-token |
+
+---
+
+## Running the models {#running-models}
+
+All models run from `docs/superpowers/models/`. TLC jar expected at `../../../tmp/tla2tools.jar`
+(v2.19). Shell wrappers: `run_tlc.sh`, `run_gc_partmanifest.sh`, `run_mount.sh`,
+`run_apalache.sh`. Apalache binary at `../../../tmp/apalache/bin/apalache-mc` (v0.58.0+).
+
+```bash
+# incarnation core — main staged suite
+./run_tlc.sh CaIncarnationCore_stage1.cfg
+# ... stages 2, 3, 4_small, 4_journaltree, 5_small, 6_registry, 6_evstale
+# sabotages (all MUST exit non-zero):
+for c in nofence norecheckfold noretireview unconddelete reusedtag cascade \
+         cutoverclaim noreobserve noregistry foldtimeuniverse noevreobserve; do
+  ./run_tlc.sh CaIncarnationCore_sab_$c.cfg && echo "UNEXPECTED PASS: $c"
+done
+
+# build-root / precommit
+for cfg in buggy buildrootonly failclosedonly fixed inlineclosure lazyleak inlineclosure_b2; do
+  java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \
+    -config CaBuildRootPrecommit_$cfg.cfg CaBuildRootPrecommit.tla
+done
+
+# part-manifest GC
+./run_gc_partmanifest.sh stage3
+./run_gc_partmanifest.sh stage4
+./run_gc_partmanifest.sh live
+# ... all stage5_* and sab_* configs
+
+# shard incarnation / registry removal
+java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \
+  -config CaGcShardIncarnationCore_design.cfg CaGcShardIncarnationCore.tla
+
+# in-degree re-fold
+java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \
+  -config CaGcIndegRefoldCore_fix.cfg CaGcIndegRefoldCore.tla
+java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \
+  -config CaGcIndegRefoldCore_sab.cfg CaGcIndegRefoldCore.tla  # MUST violate INV_INDEG_NONNEGATIVE
+
+# Apalache inductive invariant (proof core)
+./run_apalache.sh base check --cinit=CInit --init=Init --inv=IndInv --length=0 CaIncarnationProofCore.tla
+./run_apalache.sh step check --cinit=CInit --init=IndInvInit --inv=IndInv --length=1 CaIncarnationProofCore.tla
+```
