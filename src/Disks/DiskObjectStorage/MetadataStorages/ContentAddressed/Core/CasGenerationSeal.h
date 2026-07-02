@@ -22,7 +22,10 @@ struct RunRef
 
 /// What a round did to ONE (namespace, shard). classification is a small enum byte:
 ///   0 = Absent (shard not present / fresh-pool), 1 = Unchanged (token matched persisted; skipped),
-///   2 = Folded (records in (folded_cursor, shard_version] were folded), 3 = Minted (fence-only).
+///   2 = Folded (records in (folded_cursor, shard_version] were folded), 3 = Minted (fence-only,
+///   retired concept), 4 = Clamped (the fold was barrier/anomaly-clamped below the journal end:
+///   unfolded events exist or may become foldable, so the token-diff Skip is FORBIDDEN — the next
+///   round must re-read this shard regardless of an unchanged token).
 /// folded_token is the shard's observed manifest token at fold time; folded_cursor is the position
 /// the fold folded TO (the shard_version). Together they make `SabotageCutOverclaim` defensible: the
 /// recheck can prove the cursor never ran past the sealed deltas.

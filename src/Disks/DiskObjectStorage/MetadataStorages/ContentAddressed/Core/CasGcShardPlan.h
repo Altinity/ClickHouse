@@ -97,7 +97,11 @@ public:
     std::vector<RunRef> reduce(Backend & backend, const Layout & layout,
                                uint64_t prior_generation, uint64_t prior_attempt,
                                uint64_t new_generation, uint64_t attempt,
-                               std::vector<BlobDelta> shard_deltas);
+                               std::vector<BlobDelta> shard_deltas,
+                               const std::vector<RetiredEntry> & prior_retired = {},
+                               uint64_t min_ack = 0, uint64_t condemn_round = 0,
+                               const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob = {},
+                               RetiredMergeResult * out_retired = nullptr);
 
 private:
     uint64_t shard;

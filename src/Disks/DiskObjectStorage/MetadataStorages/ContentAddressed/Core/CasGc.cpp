@@ -57,14 +57,21 @@ uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob
     return object_size - blob_header_len;
 }
 
-Gc::Gc(StorePtr store_, UInt128 gc_id_)
+Gc::Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_)
     : store(std::move(store_))
     , gc_id(gc_id_)
+    , now_ms_fn(std::move(now_ms_fn_))
 {
     if (!store)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cas::Gc: store must not be null");
     if (gc_id == UInt128(0))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cas::Gc: gc_id must not be 0 (reserved for 'lease never held')");
+    if (!now_ms_fn)
+        now_ms_fn = []() -> uint64_t
+        {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        };
 }
 
 RoundReport Gc::runRegularRound()
@@ -76,27 +83,50 @@ RoundReport Gc::runRegularRound()
     if (!report.acquired_lease)
         return report;
 
-    /// CRASH-RESUME first: an incomplete prior round (its fold_seal durable, completion_seal absent,
-    /// retired sets present) is finished from durable state before any new round starts.
-    if (tryResumeIncompleteRound(state, state_token, report))
-        return report;
+    /// ONE-PASS ack-floor round (spec 2026-07-02 + Task-9 amendment). There is no crash-resume step
+    /// anymore: the round commits everything in the SINGLE gc/state CAS at the end, so a crashed pass
+    /// leaves only attempt-scoped debris that is never adopted (retention prunes it), and every
+    /// destructive PRE-CAS action below is justified by PREVIOUSLY PUBLISHED durable state only
+    /// (delete_pending entries), so replay under a fresh attempt is idempotent.
 
-    /// B170: fold begins — the round's R1. round here is state.round (pre-retire); generation is the
-    /// authoritative one being folded.
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+    const uint64_t new_round = state.round + 1;
+
+    /// R1: the heartbeat ack floor + token-guarded fence-out of expired mounts. The ONLY clock in the
+    /// round (the inherited lease-expiry contract); margin = ttl/2 (poll granularity + wall skew).
+    const uint64_t skew_margin_ms =
+        static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
+    const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
+    /// B170: the round's floor — the fence's successor record (what gates this round's graduations).
+    EventEmitter{*store}.emit([&](CasEvent & e)
+    {
+        e.type = CasEventType::GcFence;
+        e.object_kind = CasEventObjectKind::Snap;
+        e.round = new_round;
+        e.gen = state.snap_generation;
+        e.outcome = "floor";
+        e.reason = "R1: heartbeat ack floor (min over live + expired-unfenced observed_gc_round)";
+        e.detail = {{"min_ack", floor.min_ack == UINT64_MAX ? String("inf") : std::to_string(floor.min_ack)},
+                    {"live", std::to_string(floor.live)},
+                    {"terminated", std::to_string(floor.terminated)},
+                    {"fenced_now", std::to_string(floor.fenced_now)},
+                    {"already_fenced", std::to_string(floor.already_fenced)}};
+    });
+
+    /// B170: fold begins — the round's single pass.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::GcFoldBegin;
         e.object_kind = CasEventObjectKind::Snap;
         e.round = state.round;
         e.gen = state.snap_generation;
-        e.reason = "R1: fold the RootOwnerEvent journals into a new durable blob in-degree generation";
+        e.reason = "R2: one-pass fold (edges x deltas x retired) into a new durable generation";
     });
 
-    /// R1: fold the ONE ordered RootOwnerEvent journal into blob deltas, seal them into a write-once
-    /// blob in-degree generation (the fold cursor advances only on activation/removal — the barrier).
-    FoldResult folded = fold(state, state_token, report);
+    /// R2: the pass — discovery, windows, and the three-cursor merge (spare / graduate / condemn).
+    FoldResult folded = fold(state, state_token, report, floor.min_ack);
 
-    /// B170: fold ended — the new sealed generation (advanced past every clamp-free shard).
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::GcFoldEnd;
@@ -104,39 +134,194 @@ RoundReport Gc::runRegularRound()
         e.round = state.round;
         e.gen = state.snap_generation;
         e.outcome = "ok";
-        e.reason = "R1 complete";
+        e.reason = "R2 complete";
         e.detail = {{"shards", std::to_string(folded.root_shards.size())},
                     {"anomalies", std::to_string(report.anomalies.size())}};
     });
 
-    /// R2: HEAD-observe each zero-in-degree blob's current token, write the round's retire sets, advance
-    /// .round. Threaded (state, token) — never re-read (zombie-steal protection).
-    const RetireResult retired = retire(state, state_token, folded, report);
+    const uint64_t generation = state.snap_generation;   /// set in-memory by fold; committed below
+    const uint64_t attempt = state.snap_attempt;
+
+    /// R3: PRE-CAS deletes — ONLY entries the PREVIOUS pass published as delete_pending (justified by
+    /// durable state, safe at any leader staleness — Task-9 amendment), plus outcome bookkeeping for
+    /// every settled entry. THE SINGLE CONTENT-DELETE SITE.
+    std::map<uint64_t, OutcomeLog> outcomes;
+    for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
+    {
+        RetiredMergeResult & merge = folded.retired_merge[shard];
+        for (const RetiredEntry & entry : merge.redelete)
+        {
+            const DeleteOutcome del = backend.deleteExact(blobKeyOf(layout, entry.hash), entry.token);
+            if (del.created_delete_marker)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "CAS gc: delete of blob {} created a delete marker — versioning is enabled "
+                    "on the pool (mis-provisioned; the capability probe must reject this)", u128ToHex(entry.hash));
+            OutcomeEntry outcome{.kind = entry.kind, .hash = entry.hash, .token = entry.token,
+                                 .outcome = del.kind == DeleteOutcome::Kind::Deleted ? OutcomeKind::Deleted
+                                          : del.kind == DeleteOutcome::Kind::NotFound ? OutcomeKind::Absent
+                                          : OutcomeKind::Replaced};
+            const String del_outcome = outcome.outcome == OutcomeKind::Deleted ? "deleted"
+                                     : outcome.outcome == OutcomeKind::Absent ? "absent" : "replaced";
+            /// B170: the single content-delete site — attributable per row. TokenMismatch (a writer
+            /// recreated the incarnation) is terminal-OK: the fresh incarnation is a live object.
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::BlobDelete;
+                e.object_kind = CasEventObjectKind::Blob;
+                e.object_hash = u128ToHex(entry.hash);
+                e.token = entry.token.value;
+                e.round = new_round;
+                e.gen = generation;
+                e.outcome = del_outcome;
+                e.reason = "delete_pending published by a prior pass; exact-token delete (pre-CAS)";
+                e.detail = {{"condemn_round", std::to_string(entry.condemn_round)},
+                            {"key", blobKeyOf(layout, entry.hash)}};
+            });
+            outcomes[shard].entries.push_back(std::move(outcome));
+        }
+        for (const RetiredEntry & entry : merge.spared)
+        {
+            if (entry.delete_pending)
+                LOG_WARNING(getLogger("CasGc"),
+                    "CAS gc: delete_pending blob {} recovered in-degree — structurally impossible under "
+                    "the ack floor (spared anyway, fail-closed); investigate",
+                    u128ToHex(entry.hash));
+            /// B170: the spare verdict — a publish re-pinned the candidate before graduation.
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::GcRecheckVerdict;
+                e.object_kind = CasEventObjectKind::Blob;
+                e.object_hash = u128ToHex(entry.hash);
+                e.token = entry.token.value;
+                e.round = new_round;
+                e.gen = generation;
+                e.outcome = "spared";
+                e.reason = "in-degree recovered in the pass merge; entry dropped";
+            });
+            outcomes[shard].entries.push_back(OutcomeEntry{.kind = entry.kind, .hash = entry.hash,
+                                                           .token = entry.token, .outcome = OutcomeKind::Spared});
+        }
+        for (const RetiredEntry & entry : merge.graduated)
+        {
+            /// B170: floor-passed — republished pending; the NEXT pass executes the delete.
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::GcRecheckVerdict;
+                e.object_kind = CasEventObjectKind::Blob;
+                e.object_hash = u128ToHex(entry.hash);
+                e.token = entry.token.value;
+                e.round = new_round;
+                e.gen = generation;
+                e.outcome = "pending";
+                e.reason = "condemn_round < min_ack; published delete_pending (two-phase graduation)";
+                e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}};
+            });
+        }
+    }
+
+    /// Outcome logs: write-once + byte-adopt (observation-bearing HEAD tokens — never the
+    /// deterministic-artifact path). Tally the report from the FINAL durable logs.
+    for (auto & [shard, log] : outcomes)
+    {
+        const String key = layout.outcomesKey(generation, attempt, new_round, shard);
+        const String body = encodeOutcomeLog(log);
+        if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
+        {
+            const auto existing = backend.get(key);
+            if (!existing)
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS gc: outcome log at {} vanished between putIfAbsent and read", key);
+            if (existing->bytes != body)
+            {
+                try { log = decodeOutcomeLog(existing->bytes); }
+                catch (const Exception & e)
+                {
+                    throw Exception(ErrorCodes::ABORTED,
+                        "CAS gc: undecodable outcome log at {} cannot be adopted: {}", key, e.message());
+                }
+            }
+        }
+        for (const OutcomeEntry & o : log.entries)
+        {
+            switch (o.outcome)
+            {
+                case OutcomeKind::Deleted: ++report.deleted; break;
+                case OutcomeKind::Absent: ++report.absent; break;
+                case OutcomeKind::Replaced: ++report.replaced; break;
+                case OutcomeKind::Spared: ++report.spared; break;
+            }
+        }
+    }
+
+    /// R4: PUBLISH ORDER — the new current retired list (per gc-shard, ALWAYS written so the refs in
+    /// gc/state always resolve) is durable BEFORE the CAS that publishes the round. Observation-bearing
+    /// (HEAD tokens) => write-once + byte-adopt, attempt-scoped keys.
+    std::map<uint64_t, String> new_refs;
+    for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
+    {
+        RetiredSet set;
+        set.entries = std::move(folded.retired_merge[shard].still_retired);
+        const String key = layout.retiredKey(generation, attempt, new_round, shard);
+        const String body = encodeRetiredSet(set);
+        if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
+        {
+            const auto existing = backend.get(key);
+            if (!existing)
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS gc: retired list at {} vanished between putIfAbsent and read", key);
+            /// A byte-divergent occupant under OUR OWN attempt key is a replay that observed different
+            /// HEAD tokens; adopt it (first-durable-write-wins, exactly like the old retire sets).
+        }
+        new_refs[shard] = key;
+    }
+
+    /// R5: the SINGLE round CAS — round, adopted (generation, attempt), retired refs, retention cursor.
+    GcState next = state;
+    next.round = new_round;
+    next.retired_refs = std::move(new_refs);
+    next.fence_version.clear();   /// fence machinery retired (field removed entirely in cleanup)
+    pruneSupersededGenerations(generation, attempt, next);
+    const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
+    if (res.outcome != CasOutcome::Committed)
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS gc round: gc/state moved during the round (another leader advanced it); retry next round");
+    state = std::move(next);
+    state_token = res.token;
     report.round = state.round;
-    for (const auto & [shard, set] : retired.blobs)
-        report.candidates += set.entries.size();
+    report.candidates += 0;   /// candidates are counted at condemn time (head_blob, inside the fold)
 
-    /// R3: fence every present shard (LIST-discovered); record fence positions into the completion seal.
-    fence(state, state_token, folded);
-
-    /// R4: fold-through-fence recheck + the single content-delete site + exact-token manifest deletes;
-    /// seal the completion generation; drop the round's retired sets.
-    recheck(state, state_token, folded, retired, report);
+    /// R6 post-CAS: owner-removed manifest bodies — deleted ONLY now, after their decrements were
+    /// ADOPTED by the round CAS (delete-after-sealed-decrements, control #11). Best-effort: a crash
+    /// here leaks bodies to the orphan sweep, never a dangle.
+    for (const auto & [id, token] : folded.mf_cleanup)
+    {
+        const DeleteOutcome mdel = backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
+        if (mdel.kind == DeleteOutcome::Kind::Deleted)
+            ++report.manifests_deleted;
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::TreeDelete;
+            e.namespace_ = id.root_namespace.string();
+            e.object_kind = CasEventObjectKind::Tree;
+            e.object_hash = manifestRefDebugString(id.ref);
+            e.token = token.value;
+            e.round = new_round;
+            e.gen = generation;
+            e.outcome = mdel.kind == DeleteOutcome::Kind::Deleted ? "deleted"
+                      : mdel.kind == DeleteOutcome::Kind::NotFound ? "absent" : "replaced";
+            e.reason = "owner-removed manifest body; exact-token delete after decrements adopted";
+        });
+    }
 
     /// Task 6: reclaim empty+tombstoned+fully-folded ref-shard objects. Must run BEFORE trim so the
-    /// tombstone event is still present in the journal (trim removes events at/below the fold cursor,
-    /// which includes the tombstone). The fully-folded guard compares the fold cursor against the
-    /// tombstone's transition_version (not root.shard_version, which fence may have bumped). Never throws
-    /// (per-shard error isolation: a bad shard logs and continues, never aborts the whole reclaim pass
-    /// or lets trim prematurely erase a pending tombstone). Best-effort: a missed reclaim retries next round.
+    /// tombstone event is still present in the journal.
     reclaimDroppedShards(folded);
 
     /// Trim journals below the sealed fold cursor.
     if (trim_enabled)
         trim(folded, state.round);
 
-    /// Bounded orphan-manifest backstop (spec §Orphan sweep): cleanup-only cursor progress. A failed
-    /// sweep must not fail the already-completed reachability round.
+    /// Bounded orphan-manifest backstop: cleanup-only cursor progress; never fails the round.
     try
     {
         runManifestSweepCursorPass(state, state_token);
@@ -202,7 +387,7 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     return true;
 }
 
-Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & report)
+Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report, uint64_t min_ack)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
@@ -219,6 +404,72 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     /// fresh pool (cursor 0). This is independent of trim — a folded-but-untrimmed event must never be
     /// re-folded from 0 (that double-counts blob in-degree => silent over-pin/leak).
     const std::map<String, ShardCoverage> parent_cursors = readSealedCursors(state.snap_generation, state.snap_attempt);
+
+    /// Ack-floor: load the CURRENT retired list (published by the previous round's CAS). A ref that
+    /// does not resolve is integrity loss of destructive bookkeeping — fail closed (this is GC's own
+    /// metadata, not a data-plane 404; losing entries would silently reset condemnation pipelines and
+    /// leak pending deletes).
+    const uint64_t condemn_round = state.round + 1;
+    std::vector<std::vector<RetiredEntry>> prior_retired(state.gc_shards);
+    for (const auto & [retired_shard, retired_key] : state.retired_refs)
+    {
+        if (retired_shard >= state.gc_shards)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS gc fold: retired ref for shard {} exceeds gc_shards {}", retired_shard, state.gc_shards);
+        const auto got = backend.get(retired_key);
+        if (!got)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS gc fold: current retired list at {} (shard {}) is missing — refusing the round",
+                retired_key, retired_shard);
+        RetiredSet set = decodeRetiredSet(got->bytes);
+        prior_retired[retired_shard] = std::move(set.entries);
+    }
+    result.retired_merge.resize(state.gc_shards);
+
+    /// Condemn-time observation: ONE HEAD per new zero-transition captures the exact incarnation token
+    /// the eventual delete carries (absent => a prior landed delete => nothing to condemn). Emits the
+    /// B170 candidate trail (IndegZero / GcRetireObserve / BlobRetire) exactly where the decision is made.
+    const auto head_blob = [&](const UInt128 & hash) -> std::optional<HeadResult>
+    {
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::IndegZero;
+            e.object_kind = CasEventObjectKind::Blob;
+            e.object_hash = u128ToHex(hash);
+            e.round = condemn_round;
+            e.gen = state.snap_generation + 1;
+            e.reason = "last folded owner edge dropped; in-degree reached 0";
+        });
+        const HeadResult observed = backend.head(blobKeyOf(layout, hash));
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::GcRetireObserve;
+            e.object_kind = CasEventObjectKind::Blob;
+            e.object_hash = u128ToHex(hash);
+            e.token = observed.exists ? observed.token.value : "";
+            e.round = condemn_round;
+            e.gen = state.snap_generation + 1;
+            e.outcome = observed.exists ? "present" : "absent";
+            e.reason = "zero-in-degree candidate; HEAD-observe the current token";
+        });
+        if (!observed.exists)
+            return std::nullopt;
+        ++report.candidates;
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::BlobRetire;
+            e.object_kind = CasEventObjectKind::Blob;
+            e.object_hash = u128ToHex(hash);
+            e.token = observed.token.value;
+            e.round = condemn_round;
+            e.gen = state.snap_generation + 1;
+            e.outcome = "retired";
+            e.reason = "condemned zero-in-degree candidate; entering the current retired list";
+        });
+        HeadResult adjusted = observed;
+        adjusted.size = retiredLogicalSize(ObjectKind::Blob, observed.size, store->poolMeta().blob_header_len);
+        return adjusted;
+    };
 
     const uint64_t new_generation = state.snap_generation + 1;
     /// The fold mints THIS round's attempt id from `lease.seq` (the renew/steal paths bump it every
@@ -253,18 +504,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     /// `readFoldSeal(g, snap_attempt)` is the wrong key (nullopt only by accident). A direct read at the
     /// adopted pair (else empty) is conservative — fail-closed to all-Read, never an older generation.
     CasFoldSeal discover_ref_seal;
-    std::map<String, uint64_t> discover_fence_positions;
-    if (const auto completion = readCompletionSeal(state.snap_generation, state.snap_attempt))
-    {
-        discover_ref_seal.generation = state.snap_generation;
-        discover_ref_seal.per_ns_shard = completion->folded_cursors;
-        discover_fence_positions = completion->fence_positions;
-    }
-    else if (const auto fold = readFoldSeal(state.snap_generation, state.snap_attempt))
-        discover_ref_seal = *fold;
-    /// else: leave discover_ref_seal empty (fresh pool / no adopted seal) => all Read.
+    if (const auto fold_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
+        discover_ref_seal = *fold_seal;
+    /// else: leave discover_ref_seal empty (fresh pool / no adopted seal) => all Read. (The one-pass
+    /// round writes only fold seals; completion seals are a retired concept. `folded_token` is now the
+    /// FOLD-time shard token — conservative: any later write changes it => Read next round.)
     const std::map<String, DiscoverDecision> discover_decisions =
-        computeDiscoverDecisions(discover_ref_seal, discover_fence_positions);
+        computeDiscoverDecisions(discover_ref_seal);
 
     for (const auto & [ns, root_shard] : result.root_shards)
     {
@@ -417,7 +663,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
 
         cov.folded_cursor = resolved_through;
         cov.incarnation = root.incarnation;   /// stamp live incarnation; next round detects mismatch on ABA
-        cov.classification = shard_changed ? 2 : 1;
+        /// Clamped coverage (4) is load-bearing for the token-diff: a barrier/anomaly clamp leaves
+        /// unfolded events that a manifest-body arrival can make foldable WITHOUT touching the shard
+        /// (token unchanged) — Skip would park them forever.
+        cov.classification = clamped ? 4 : (shard_changed ? 2 : 1);
         result.fold_seal.per_ns_shard[cursor_key] = cov;
         if (shard_changed)
             folded_any = true;
@@ -435,13 +684,17 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
             /// (no delta) by sealing a fresh generation whose in-degree equals the parent.
             foldDeltasIntoGeneration(backend, layout, state.snap_generation, state.snap_attempt,
                                      new_generation, attempt, /*shard*/0,
-                                     {}, result.fold_seal.blob_target_runs);
+                                     {}, result.fold_seal.blob_target_runs,
+                                     prior_retired[0], min_ack, condemn_round, head_blob,
+                                     &result.retired_merge[0]);
         }
         else
         {
             foldDeltasIntoGeneration(backend, layout, state.snap_generation, state.snap_attempt,
                                      new_generation, attempt, /*shard*/0,
-                                     std::move(deltas), result.fold_seal.blob_target_runs);
+                                     std::move(deltas), result.fold_seal.blob_target_runs,
+                                     prior_retired[0], min_ack, condemn_round, head_blob,
+                                     &result.retired_merge[0]);
         }
     }
     else
@@ -470,7 +723,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
             std::vector<RunRef> shard_runs =
                 reducer.reduce(backend, layout, state.snap_generation, state.snap_attempt,
                                new_generation, attempt,
-                               std::move(buckets[shard]));
+                               std::move(buckets[shard]),
+                               prior_retired[shard], min_ack, condemn_round, head_blob,
+                               &result.retired_merge[shard]);
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
         }
@@ -487,552 +742,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & state_token, RoundReport & repo
     putDeterministicArtifact(backend, layout.foldSealKey(new_generation, attempt),
                              encodeFoldSeal(result.fold_seal));
 
-    /// Fold-adopt CAS #1: commit (snap_generation, snap_attempt) together under the lease token. After
-    /// this, the whole round operates at `attempt` (== this leader's lease.seq); in-round readers
-    /// (retire/recheck) and the next round's parent-generation reads resolve through `state.snap_attempt`.
+    /// One-pass round: the fold NO LONGER CASes gc/state. (new_generation, attempt) are adopted
+    /// in-memory here and committed — together with the round, the retired refs, and the retention
+    /// cursor — by the SINGLE round CAS in runRegularRound. A deposed leader's whole pass therefore
+    /// evaporates at that one CAS; its attempt-scoped artifacts are never adopted.
     state.snap_generation = new_generation;
     state.snap_attempt = attempt;
-    const CasResult fold_res = backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token);
-    if (fold_res.outcome != CasOutcome::Committed)
-        throw Exception(ErrorCodes::ABORTED,
-            "CAS gc fold: gc/state moved during the fold (lease lost / another leader advanced); retry next round");
-    state_token = fold_res.token;
     return result;
-}
-
-Gc::RetireResult Gc::retire(GcState & state, Token & state_token, const FoldResult & folded, RoundReport &)
-{
-    const Layout & layout = store->layout();
-    Backend & backend = store->backend();
-    chassert(state.lease.owner == gc_id);
-    const uint64_t round = state.round + 1;
-
-    RetireResult result;
-    result.mf_cleanup = folded.mf_cleanup;   /// tokens captured during fold; deferred to recheck
-
-    /// Blob candidates: zero-in-degree in the sealed fold generation (blob-only). ONE HEAD per candidate
-    /// observes the current token; an absent object is SKIPPED (a prior round's landed delete — never
-    /// fabricate a token, never GET a condemned body).
-    /// Scan EVERY blob-target shard's sealed run, not just shard 0: `fold`/`ShardReducer` write one run
-    /// per `state.gc_shards`, so a zero-in-degree blob owned by shard 1..N would never be retired if we
-    /// only scanned shard 0 (it would leak forever under `gc_shards > 1`). Each candidate is owned by the
-    /// shard whose run it came from, so it goes into that shard's retired set.
-    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
-    {
-        for (const BlobCandidate & cand : zeroInDegree(backend, layout, folded.fold_seal.generation, state.snap_attempt, shard))
-        {
-            /// B170: the blob's in-degree transitioned to 0 in this generation — the moment it became a
-            /// retire candidate. The cause is the fold's last -1 edge (its RootRemove row above for the same
-            /// object_hash), so a blob's "why did it become collectable" is a row-level join.
-            EventEmitter{*store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::IndegZero;
-                e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = u128ToHex(cand.hash);
-                e.round = round;
-                e.gen = folded.fold_seal.generation;
-                e.reason = "last folded owner edge dropped; in-degree reached 0";
-            });
-
-            /// DESIGN NOTE (B14 / Phase-5 retire-token; decided 2026-06-27 = keep the HEAD, "variant c").
-            /// One `HEAD` per zero-in-degree candidate, here, fetches the CURRENT incarnation token that the
-            /// eventual exact-token `deleteExact` will carry. This HEAD CAN be eliminated by instead sourcing
-            /// the token from sealed generation state captured at fold time (the `EnableRetireTokenSource`
-            /// stage of `CaGcRootLocalPartManifestCore` proves that variant safe). We deliberately keep the
-            /// HEAD because:
-            ///   + (this path) zero schema change; the token is always fresh, so few wasted delete attempts.
-            ///   - (the alternative) the fold only sees a blob's CONTENT hash, not its storage token, so the
-            ///     writer would have to record the ETag into the manifest body (`ManifestEntry`) — an on-disk
-            ///     schema change that couples the content plane to storage incarnations and grows manifests;
-            ///   - a fold-time token is staler than this HEAD: a re-incarnation between fold and delete makes
-            ///     it stale, the exact-token delete then misses (`TokenMismatch`) and the blob is SPARED and
-            ///     retried next round — safe, but it delays reclamation. So the win is only partial.
-            /// SAFETY is independent of the token SOURCE: `deleteExact` is the guarantee — a stale/foreign
-            /// token fails the exact match and the blob is spared, NEVER over-deleted (proved by the Phase-5
-            /// model: `stage5_retiretoken` HOLDs `INV_NO_RETURN`/`INV_NO_LOSS` + `RetireTokenSourceComplete`,
-            /// while `sab_staletokenoverdelete` shows that bypassing exactness violates `INV_NO_LOSS`). Concurrent
-            /// writers / repeated re-incarnations never threaten safety — the model advances a blob's token
-            /// freely (`WUploadBlob`, no in-degree guard) and the whole suite stays green. Revisit the
-            /// stored-token variant only if profiling shows these per-candidate HEADs are a hot-path cost.
-            const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
-            /// B170: HEAD-observe — the current incarnation token, the only token the eventual exact-token
-            /// delete may carry (absent => skipped: a prior round's landed delete).
-            EventEmitter{*store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::GcRetireObserve;
-                e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = u128ToHex(cand.hash);
-                e.token = observed.exists ? observed.token.value : "";
-                e.round = round;
-                e.gen = folded.fold_seal.generation;
-                e.outcome = observed.exists ? "present" : "absent";
-                e.reason = "zero-in-degree candidate; HEAD-observe the current token";
-            });
-            if (!observed.exists)
-                continue;
-            RetiredEntry entry;
-            entry.kind = ObjectKind::Blob;
-            entry.hash = cand.hash;
-            entry.token = observed.token;
-            entry.size = retiredLogicalSize(ObjectKind::Blob, observed.size, store->poolMeta().blob_header_len);
-            /// B170: the retire entry written for this incarnation (per RetiredEntry).
-            EventEmitter{*store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::BlobRetire;
-                e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = u128ToHex(cand.hash);
-                e.token = observed.token.value;
-                e.round = round;
-                e.gen = folded.fold_seal.generation;
-                e.outcome = "retired";
-                e.reason = "condemned zero-in-degree candidate written to the round's retired set";
-                e.detail = {{"size", std::to_string(entry.size)}};
-            });
-            result.blobs[shard].entries.push_back(std::move(entry));
-        }
-    }
-
-    /// Write each shard's retired set write-once (adopt a byte-equal occupant as our crash-replay).
-    for (auto & [shard, set] : result.blobs)
-    {
-        const String key = layout.retiredKey(folded.fold_seal.generation, state.snap_attempt, round, shard);
-        const String body = encodeRetiredSet(set);
-        if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
-        {
-            const auto existing = backend.get(key);
-            if (!existing)
-                throw Exception(ErrorCodes::ABORTED,
-                    "CAS gc retire: retired set at {} vanished between putIfAbsent and read", key);
-            if (existing->bytes != body)
-            {
-                try { set = decodeRetiredSet(existing->bytes); }
-                catch (const Exception & e)
-                {
-                    throw Exception(ErrorCodes::ABORTED,
-                        "CAS gc retire: undecodable occupant at {} cannot be adopted: {}", key, e.message());
-                }
-            }
-        }
-    }
-
-    /// ONE gc/state CAS advances .round — the durable "retire phase complete" marker (ViewableRound).
-    GcState next = state;
-    next.round = round;
-    /// Ack-floor bridge (Task 6): also record each retired set's key in retired_refs so the writer-side
-    /// RetireView (which now reads refs out of gc/state, not a LIST) sees this round's retired sets. The
-    /// keys and the round land in the SAME CAS, satisfying the publish-order invariant. Task 9 replaces
-    /// this per-round-set writer with the single current-list runs, rewriting exactly this code.
-    for (const auto & [shard, set] : result.blobs)
-        next.retired_refs[shard] = layout.retiredKey(folded.fold_seal.generation, state.snap_attempt, round, shard);
-    const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
-    if (res.outcome != CasOutcome::Committed)
-        throw Exception(ErrorCodes::ABORTED,
-            "CAS gc retire: gc/state moved during retire (another leader advanced it); retry next round");
-    state = std::move(next);
-    state_token = res.token;
-    return result;
-}
-
-void Gc::fence(GcState & state, Token & state_token, FoldResult & folded)
-{
-    const Layout & layout = store->layout();
-    Backend & backend = store->backend();
-    chassert(state.lease.owner == gc_id);
-
-    const uint64_t round = state.round;
-
-    /// Ensure this round's fence_version vector EXISTS even when the pool holds no shards (fresh pool /
-    /// every namespace dropped). Previously the always-present registry fence guaranteed one entry per
-    /// round; after Task 4 an empty universe would leave `fence_version[round]` unset and `recheck`
-    /// would fail closed ("no fence_version recorded"). An empty (but present) vector says "the fence
-    /// ran this round and covered zero shards" — the correct meaning for an empty pool.
-    state.fence_version[round];
-
-    /// Fence only the PRESENT shards (LIST-discovered, Task 4): `discoverUniverse()` returns
-    /// the (ns, shard) pairs visible under `cas/refs/`. Absent shards are not fenced — a first
-    /// publish into a brand-new namespace creates the shard and stamps incarnation; the shard-
-    /// fence path handles the ordering from there.
-    const std::vector<std::pair<RootNamespace, uint64_t>> present_shards = discoverUniverse();
-    for (const auto & [ns, shard] : present_shards)
-    {
-        uint64_t committed = 0;
-        store->mutateShard(ns, shard, [&](RootShard & root)
-        {
-            root.fence_round = std::max(root.fence_round, round);
-        }, &committed, RootMutationOrigin::Gc, RootMutationKind::Fence);
-        state.fence_version[round][cursorKey(ns, shard)] = committed;
-        folded.completion_seal.fence_positions[cursorKey(ns, shard)] = committed;
-    }
-
-    /// ONE gc/state CAS persists the whole fence_version[round] vector.
-    const CasResult fence_res = backend.casPut(layout.gcStateKey(), encodeGcState(state), state_token);
-    if (fence_res.outcome == CasOutcome::Committed)
-    {
-        state_token = fence_res.token;
-        /// B170: the monotone fence committed — the durable point the recheck folds through.
-        EventEmitter{*store}.emit([&](CasEvent & e)
-        {
-            e.type = CasEventType::GcFence;
-            e.object_kind = CasEventObjectKind::Snap;
-            e.round = round;
-            e.gen = state.snap_generation;
-            e.outcome = "fenced";
-            e.reason = "R3: fenced every present shard (LIST-discovered, Task 4)";
-            e.detail = {{"fence_seq", std::to_string(state.fence_seq)},
-                        {"shards", std::to_string(present_shards.size())}};
-        });
-        return;
-    }
-
-    const auto current = backend.get(layout.gcStateKey());
-    if (!current)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc fence: gc/state vanished during the fence");
-    const GcState observed = decodeGcState(current->bytes);
-    if (observed.lease.owner != gc_id)
-        throw Exception(ErrorCodes::ABORTED,
-            "CAS gc fence: lease lost during fence (stolen by {}); retry next round",
-            u128ToHex(observed.lease.owner));
-    throw Exception(ErrorCodes::ABORTED,
-        "CAS gc fence: gc/state moved during the fence while the lease is still ours; retry next round");
-}
-
-void Gc::recheck(GcState & state, Token & state_token, FoldResult & folded, const RetireResult & retired,
-                 RoundReport & report)
-{
-    const Layout & layout = store->layout();
-    Backend & backend = store->backend();
-    chassert(state.lease.owner == gc_id);
-    const uint64_t round = state.round;
-
-    const auto fence_it = state.fence_version.find(round);
-    if (fence_it == state.fence_version.end())
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS gc recheck: no fence_version recorded for round {} — refusing to delete", round);
-
-    /// 1. FOLD-THROUGH-FENCE (FoldedThroughFence; defends SabotageCutOverclaim #12). Re-stream every
-    /// fenced shard's owner transitions in (sealed_cursor, fence_version] and emit deltas into a
-    /// completion generation merged on top of the fold generation. The window starts at the (possibly
-    /// fold-clamped) folded_cursor, so an unresolved anomaly the fold surfaced is NOT re-deleted here.
-    /// recheck only adds spare-side +/-1, so a missing edge can only spare, never over-delete — never
-    /// throw on a 404 (record-and-continue). mf_cleanup additions here are spare-side only.
-    std::vector<BlobDelta> window;
-    std::map<ManifestId, Token> recheck_cleanup;
-    /// Phase-2 token-diff: capture each shard's POST-FENCE token (recheck runs AFTER fence in the
-    /// canonical round order, so `readShard` below observes the token the fence's per-shard `mutateShard`
-    /// produced). This is recorded into the completion seal's `folded_cursors[ck].folded_token` so the
-    /// NEXT round's discover can compare a listed token against it and skip an unchanged shard. It is the
-    /// post-fence (NOT post-trim) token by design: trim runs after recheck, so a shard trim mutates this
-    /// round is conservatively Read next round (a 1-round settle); see `computeDiscoverDecisions`.
-    std::map<String, Token> post_fence_tokens;
-    for (const auto & [cursor_key, fence_version] : fence_it->second)
-    {
-        const auto [ns, shard] = parseCursorKey(cursor_key);
-        const auto [root, tok] = store->readShard(ns, shard);
-        if (tok.has_value())
-            post_fence_tokens[cursor_key] = *tok;
-        const auto cov_it = folded.fold_seal.per_ns_shard.find(cursor_key);
-        const uint64_t lo = cov_it != folded.fold_seal.per_ns_shard.end() ? cov_it->second.folded_cursor : 0;
-        for (const RootOwnerEvent & e : root.journal)
-        {
-            if (e.transition_version <= lo || e.transition_version > fence_version)
-                continue;
-            const bool has_old = e.old_binding.has_value();
-            const bool has_new = e.new_binding.has_value();
-            if (has_old && has_new && e.old_binding->manifest_ref == e.new_binding->manifest_ref)
-                continue;   /// owner move: no edge change
-            if (has_old)
-                foldManifestEdges(ManifestId{ns, e.old_binding->manifest_ref}, -1, window, recheck_cleanup);
-            if (has_new)
-                foldManifestEdges(ManifestId{ns, e.new_binding->manifest_ref}, +1, window, recheck_cleanup);
-        }
-    }
-    const uint64_t completion_generation = state.snap_generation + 1;
-    /// Task 3 placeholder: recheck INHERITS the adopted attempt (never mints a new one). `snap_attempt`
-    /// is 0 pre-Task-5, so reads/writes here use the same attempt as the fold/retire — no behavior change.
-    const uint64_t attempt = state.snap_attempt;
-    if (state.gc_shards == 1)
-    {
-        /// SINGLE-SHARD PATH: all deltas fold into shard 0 of the completion generation.
-        foldDeltasIntoGeneration(backend, layout, state.snap_generation, attempt,
-                                 completion_generation, attempt, /*shard*/0,
-                                 std::move(window), folded.completion_seal.blob_target_runs);
-    }
-    else
-    {
-        /// SHARDED PATH (gc_shards > 1): scatter window deltas by blob hash, then fold each shard
-        /// into its own target run (blobTargetRunKey(completion_generation, shard, 0)).
-        /// Mirrors the sharded path in fold() — each shard's run is independent and keyed by shard
-        /// number, so two replicas reducing disjoint shards never collide.
-        std::vector<std::vector<BlobDelta>> buckets(state.gc_shards);
-        for (BlobDelta & d : window)
-            buckets[blobShard(d.blob_hash, state.gc_shards)].push_back(std::move(d));
-        for (uint64_t sh = 0; sh < state.gc_shards; ++sh)
-        {
-            ShardReducer reducer{sh, state.gc_shards};
-            std::vector<RunRef> shard_runs =
-                reducer.reduce(backend, layout, state.snap_generation, attempt,
-                               completion_generation, attempt,
-                               std::move(buckets[sh]));
-            for (RunRef & r : shard_runs)
-                folded.completion_seal.blob_target_runs.push_back(std::move(r));
-        }
-    }
-
-    /// 2. Per retired blob: spare if in-degree > 0 in the completion generation, else exact-token delete.
-    std::map<uint64_t, OutcomeLog> computed;
-    for (const auto & [shard, set] : retired.blobs)
-    {
-        for (const RetiredEntry & entry : set.entries)
-        {
-            OutcomeEntry outcome{.kind = entry.kind, .hash = entry.hash, .token = entry.token,
-                                 .outcome = OutcomeKind::Spared};
-            /// Route to the correct target shard — mirrors blobShard routing in fold() and the
-            /// sharded path above. For gc_shards==1 this always produces 0 (identity).
-            const uint64_t entry_shard = blobShard(entry.hash, state.gc_shards);
-            const int64_t indeg_at_recheck =
-                inDegreeInGeneration(backend, layout, completion_generation, attempt, entry_shard, entry.hash);
-            if (indeg_at_recheck > 0)
-            {
-                /// B170: a fold-through-fence publish re-pinned this candidate — record the verdict +
-                /// the in-degree it found, so "why wasn't it deleted" is answerable from the rows.
-                EventEmitter{*store}.emit([&](CasEvent & e)
-                {
-                    e.type = CasEventType::GcRecheckVerdict;
-                    e.object_kind = CasEventObjectKind::Blob;
-                    e.object_hash = u128ToHex(entry.hash);
-                    e.token = entry.token.value;
-                    e.round = round;
-                    e.gen = completion_generation;
-                    e.outcome = "spared";
-                    e.reason = "in-degree > 0 after fold-through-fence; a publish re-pinned it";
-                    e.detail = {{"indeg_at_recheck", std::to_string(indeg_at_recheck)},
-                                {"fence_seq", std::to_string(state.fence_seq)}};
-                });
-            }
-            else
-            {
-                /// ==================== THE SINGLE CONTENT-DELETE SITE (blob) ====================
-                const DeleteOutcome del = backend.deleteExact(blobKeyOf(layout, entry.hash), entry.token);
-                if (del.created_delete_marker)
-                    throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "CAS gc recheck: delete of blob {} created a delete marker — versioning is enabled "
-                        "on the pool (mis-provisioned; the capability probe must reject this)", u128ToHex(entry.hash));
-                outcome.outcome = del.kind == DeleteOutcome::Kind::Deleted ? OutcomeKind::Deleted
-                                : del.kind == DeleteOutcome::Kind::NotFound ? OutcomeKind::Absent
-                                : OutcomeKind::Replaced;
-                const String del_outcome = outcome.outcome == OutcomeKind::Deleted ? "deleted"
-                                         : outcome.outcome == OutcomeKind::Absent ? "absent" : "replaced";
-                /// B170: the single content-delete site. This is the ONLY place Gc deletes a content
-                /// object, so a `blob_delete` row makes any "reachable object MISSING" finding
-                /// attributable. Carries the full decision context + the exact-token verdict.
-                EventEmitter{*store}.emit([&](CasEvent & e)
-                {
-                    e.type = CasEventType::BlobDelete;
-                    e.object_kind = CasEventObjectKind::Blob;
-                    e.object_hash = u128ToHex(entry.hash);
-                    e.token = entry.token.value;
-                    e.round = round;
-                    e.gen = completion_generation;
-                    e.outcome = del_outcome;
-                    e.reason = "in-degree 0 through the fence; recheck confirmed 0; exact-token delete";
-                    e.detail = {{"fence_seq", std::to_string(state.fence_seq)},
-                                {"indeg_at_recheck", "0"},
-                                {"token_outcome", del_outcome},
-                                {"key", blobKeyOf(layout, entry.hash)}};
-                });
-                /// B170: the recheck verdict for the delete arm; pairs with the blob_delete above so a
-                /// verdict exists for every candidate.
-                EventEmitter{*store}.emit([&](CasEvent & e)
-                {
-                    e.type = CasEventType::GcRecheckVerdict;
-                    e.object_kind = CasEventObjectKind::Blob;
-                    e.object_hash = u128ToHex(entry.hash);
-                    e.token = entry.token.value;
-                    e.round = round;
-                    e.gen = completion_generation;
-                    e.outcome = del_outcome;
-                    e.reason = "in-degree 0 through fold-through-fence; exact-token delete issued";
-                });
-            }
-            computed[shard].entries.push_back(std::move(outcome));
-        }
-    }
-
-    /// Write outcome logs write-once (adopt a byte-equal occupant), then tally from the FINAL logs.
-    for (auto & [shard, log] : computed)
-    {
-        const String key = layout.outcomesKey(completion_generation, attempt, round, shard);
-        const String body = encodeOutcomeLog(log);
-        /// The DURABLE bytes that actually live at `key`: our own `body` on a clean win, or the adopted
-        /// occupant's bytes on PreconditionFailed. The completion seal's `delete_outcomes` RunRef must
-        /// checksum THESE bytes (not a fresh re-encode of `log`), so the seal references exactly what is
-        /// durable — a re-encode could differ from a byte-divergent-but-decodable adopted occupant.
-        String sealed_body = body;
-        if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
-        {
-            const auto existing = backend.get(key);
-            if (!existing)
-                throw Exception(ErrorCodes::ABORTED,
-                    "CAS gc recheck: outcome log at {} vanished between putIfAbsent and read", key);
-            if (existing->bytes != body)
-            {
-                try { log = decodeOutcomeLog(existing->bytes); }
-                catch (const Exception & e)
-                {
-                    throw Exception(ErrorCodes::ABORTED,
-                        "CAS gc recheck: undecodable outcome log at {} cannot be adopted: {}", key, e.message());
-                }
-            }
-            sealed_body = existing->bytes;
-        }
-        folded.completion_seal.delete_outcomes.push_back(
-            RunRef{.key = key, .checksum = cityHash128(sealed_body)});
-        for (const OutcomeEntry & o : log.entries)
-        {
-            switch (o.outcome)
-            {
-                case OutcomeKind::Deleted: ++report.deleted; break;
-                case OutcomeKind::Absent: ++report.absent; break;
-                case OutcomeKind::Replaced: ++report.replaced; break;
-                case OutcomeKind::Spared: ++report.spared; break;
-            }
-        }
-    }
-
-    /// OUTCOME-COVERAGE GATE (CAS #2 precondition): the completion-advance below MUST NOT commit unless
-    /// EVERY retired entry of this round has a recorded outcome in the FINAL (post-adopt) durable outcome
-    /// logs keyed under the accepted `(completion_generation, attempt)`. By construction `computed` collects
-    /// one outcome per retired entry (the per-entry loops above push exactly one, unconditionally), so
-    /// coverage holds by construction in the steady state. The outcome log is OBSERVATION-BEARING (first-
-    /// durable-write-wins): the adopt path may have REPLACED a shard's `log` with another observer's durable
-    /// log. That winner observed the SAME accepted retired set under the SAME adopted attempt, so it MUST
-    /// cover the same entries. If it does not, the durable record is incomplete and sealing the completion
-    /// generation here would persist a "rechecked + done" marker over an outcome log that does not account
-    /// for every retired blob — an integrity violation. FAIL-CLOSE with `CORRUPTED_DATA` BEFORE the
-    /// completion seal / CAS #2 rather than completing the round on a partial durable log (a deposed-leader
-    /// divergent occupant or a genuine corruption); the round retries. `chassert` is a no-op in release, so
-    /// the gate is enforced by this throw, not by the assertion.
-    for (const auto & [shard, set] : retired.blobs)
-    {
-        const OutcomeLog & log = computed[shard];
-        for (const RetiredEntry & entry : set.entries)
-        {
-            const bool covered = std::any_of(log.entries.begin(), log.entries.end(),
-                [&](const OutcomeEntry & o)
-                { return o.kind == entry.kind && o.hash == entry.hash && o.token == entry.token; });
-            if (!covered)
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS gc recheck: durable outcome log for shard {} under (gen {}, attempt {}) does not "
-                    "cover retired blob {} (token {}) — refusing to seal the completion generation over an "
-                    "incomplete outcome log; the round will retry", shard, completion_generation, attempt,
-                    u128ToHex(entry.hash), entry.token.value);
-        }
-    }
-
-    /// 3. Manifest exact-token deletes — ONLY now, after the owner-removal decrements are sealed into the
-    /// fold generation (control #11). recheck never READS the body to recompute decrements (they were
-    /// produced at fold from the present body); it deletes by the token captured at fold. A manifest the
-    /// fold-through-fence re-pinned (its owner restored) is kept.
-    for (const auto & [id, token] : folded.mf_cleanup)
-    {
-        if (recheck_cleanup.count(id))
-            continue;   /// re-removed in the fence window too: SKIP the body delete this round (the
-                        /// fence-window removal's own decrements aren't sealed into this fold generation,
-                        /// so a later round folds them and deletes the body then — control #11 ordering)
-        const DeleteOutcome mdel = backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
-        /// B11: count manifest-body deletes separately from blob deletes in the round summary.
-        if (mdel.kind == DeleteOutcome::Kind::Deleted)
-            ++report.manifests_deleted;
-        /// B170: the owner-removed manifest body delete (the tree-delete analog in the manifest model) —
-        /// deleted ONLY after its blob decrements were sealed into the fold generation (control #11).
-        EventEmitter{*store}.emit([&](CasEvent & e)
-        {
-            e.type = CasEventType::TreeDelete;
-            e.namespace_ = id.root_namespace.string();
-            e.object_kind = CasEventObjectKind::Tree;
-            e.object_hash = manifestRefDebugString(id.ref);
-            e.token = token.value;
-            e.round = round;
-            e.gen = completion_generation;
-            e.outcome = mdel.kind == DeleteOutcome::Kind::Deleted ? "deleted"
-                      : mdel.kind == DeleteOutcome::Kind::NotFound ? "absent" : "replaced";
-            e.reason = "recheck: owner-removed manifest body; exact-token delete after decrements sealed";
-        });
-    }
-
-    /// 4. Seal the completion generation (write-once) + advance the pointer + drop the round's retired
-    /// sets. WHICH seal exists IS the durable "rechecked + deleted + done" marker (the resume rule).
-    folded.completion_seal.generation = completion_generation;
-    folded.completion_seal.adoptable = true;
-    /// Fence positions are taken from the DURABLE `state.fence_version[round]` (the authoritative copy
-    /// persisted by `fence`'s gc/state CAS), NOT from whatever `fence` happened to populate into the
-    /// in-memory `folded.completion_seal` this process. On the RESUME path `fence` is skipped (the round
-    /// already fenced), so the in-memory seal's `fence_positions` would be empty — making the recomputed
-    /// completion seal diverge from the original leader's and trip `putDeterministicArtifact`'s
-    /// byte-equal guard. Sourcing them here from durable state makes the seal byte-identical whether
-    /// recheck is reached fresh or via resume (the determinism the strict put depends on).
-    folded.completion_seal.fence_positions = fence_it->second;
-    /// M1: carry the round's fold cursor coverage forward into the completion seal. After this round the
-    /// snap_generation pointer is the COMPLETION generation, whose fold_seal lives at the parent (fold)
-    /// generation — so readFoldSeal(snap_generation) is nullopt and the next fold's sealedCursorOf would
-    /// reset every per-shard cursor to 0. Persisting the coverage HERE lets the next round recover the
-    /// exact per-(ns,shard) folded_cursor from the latest seal at snap_generation, with NO dependence on
-    /// trim having run (a folded-but-untrimmed event must not be re-folded => no blob in-degree double-count).
-    folded.completion_seal.folded_cursors = folded.fold_seal.per_ns_shard;
-    /// Phase-2 token-diff: overwrite each shard's `folded_token` with the POST-FENCE token observed at
-    /// recheck time (captured above). The fold-seal token is the FOLD-time token; the fence (which runs
-    /// between fold and recheck) bumped it via `mutateShard`. Recording the post-fence token here is the
-    /// reference the next round's `discoverDecisionsForTest`/`computeDiscoverDecisions` compares the
-    /// listed token against. A shard whose token did not change since this point (no writer publish and
-    /// no trim mutation) is safely skippable next round.
-    for (auto & [ck, cov] : folded.completion_seal.folded_cursors)
-    {
-        const auto tok_it = post_fence_tokens.find(ck);
-        if (tok_it != post_fence_tokens.end())
-            cov.folded_token = tok_it->second;
-    }
-    /// The completion seal is DETERMINISTIC (same recheck inputs => byte-identical seal); route it through
-    /// `putDeterministicArtifact` (byte-equal replay adopts, divergent bytes => `CORRUPTED_DATA`). The
-    /// retired set and outcome log above stay observation-bearing (first-durable-write-wins) — they carry
-    /// HEAD-observed tokens two observers may legitimately differ on, so they must NOT go through here.
-    putDeterministicArtifact(backend, layout.completionSealKey(completion_generation, attempt),
-                             encodeCompletionSeal(folded.completion_seal));
-
-    GcState next = state;
-    next.snap_generation = completion_generation;
-    std::erase_if(next.fence_version, [&](const auto & kv) { return kv.first <= round; });
-    /// Ack-floor bridge (Task 6): this round's retired sets are dropped just below, so clear the refs
-    /// recorded by `retire` in the SAME CAS — a resumed writer never dereferences a removed set. (Task 9
-    /// replaces this with the current-list model where the refs carry forward, not clear.)
-    next.retired_refs.clear();
-
-    /// B9: prune superseded generations. The fold/recheck read ONLY the latest seal at snap_generation
-    /// (M1) and its blob-target runs, so any generation below the retention floor is unreferenced. A
-    /// leader more than `keep` generations behind has lost its lease (its round-commit CAS fails), so
-    /// keeping `keep` generations covers any in-flight/resuming leader. Walk forward from the durable
-    /// cursor, bounded per round; fold snap_pruned_through into the SAME gc/state CAS below. If a stale
-    /// leader pruned and then loses the CAS, the deletes were still below the winner's even-higher floor.
-    pruneSupersededGenerations(completion_generation, attempt, next);
-
-    const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
-    if (res.outcome != CasOutcome::Committed)
-        throw Exception(ErrorCodes::ABORTED,
-            "CAS gc recheck: gc/state moved during the recheck persist (another leader advanced it); retry");
-    state = std::move(next);
-    state_token = res.token;
-
-    /// Drop the round's retired-set objects on their confirmed outcomes (a GC-metadata delete).
-    for (const auto & [shard, set] : retired.blobs)
-    {
-        const String key = layout.retiredKey(folded.fold_seal.generation, attempt, round, shard);
-        if (const auto got = backend.get(key))
-        {
-            const DeleteOutcome dropped = backend.deleteExact(key, got->token);
-            if (dropped.kind == DeleteOutcome::Kind::TokenMismatch)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "CAS gc recheck: retired set at {} changed under us (token mismatch on drop)", key);
-        }
-    }
 }
 
 void Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
@@ -1119,10 +835,6 @@ void Gc::trim(FoldResult & folded, uint64_t /*round*/)
             std::erase_if(fresh.journal,
                 [&](const RootOwnerEvent & e) { return e.transition_version <= cursor; });
         }, nullptr, RootMutationOrigin::Gc, RootMutationKind::Trim);
-        /// Record the sealed cursor used for this shard's trim into the in-round completion seal
-        /// audit log. The completion seal is already written write-once before trim runs, so this
-        /// populates the in-memory context only — it is an audit annotation, not a decision input.
-        folded.completion_seal.trim_cursors[cursor_key] = cursor;
         /// B170: the journal trim for this shard (events provably folded into the durable generation).
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
@@ -1282,12 +994,9 @@ std::optional<CasCompletionSeal> Gc::readCompletionSeal(uint64_t generation, uin
 
 std::map<String, ShardCoverage> Gc::readSealedCursors(uint64_t generation, uint64_t attempt)
 {
-    /// M1: the per-(ns,shard) fold cursor coverage as of `generation`, from the LATEST seal there: the
-    /// completion seal if the round that produced this generation finished (it overwrote snap_generation
-    /// with its completion generation and carried the cursors into folded_cursors), else the fold seal
-    /// (a mid-round fold sealed but not yet completed). Absent both => empty (fresh pool, cursor 0).
-    if (const auto completion = readCompletionSeal(generation, attempt))
-        return completion->folded_cursors;
+    /// One-pass round: the fold seal at the adopted (generation, attempt) IS the coverage record
+    /// (completion seals are a retired concept — pre-cutover pools are unsupported, pre-release).
+    /// Absent => empty (fresh pool, cursor 0).
     if (const auto fold = readFoldSeal(generation, attempt))
         return fold->per_ns_shard;
     return {};
@@ -1369,9 +1078,7 @@ std::map<String, Token> Gc::listRootShardTokens(std::set<String> & ambiguous_key
     return result;
 }
 
-std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
-    const CasFoldSeal & sealed,
-    const std::map<String, uint64_t> & fence_positions)
+std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(const CasFoldSeal & sealed)
 {
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
@@ -1421,17 +1128,11 @@ std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(
         if (sealed_it == sealed.per_ns_shard.end())
             continue;   /// no prior coverage (new shard since last round) => Read (already defaulted)
 
-        /// CLAMP guard: if the previous fold was barrier-clamped, the cursor sits below the fence-time
-        /// shard_version and unfolded events may exist (or may become foldable). `fence_position` is the
-        /// shard_version AFTER fence (+1 over the fold position), so fully-folded => cursor == fence_pos - 1
-        /// and clamped => cursor + 1 < fence_pos. A clamped shard is forced Read.
-        const auto fence_it = fence_positions.find(ck);
-        if (fence_it != fence_positions.end() && fence_it->second > 0)
-        {
-            const uint64_t fence_pos = fence_it->second;
-            if (sealed_it->second.folded_cursor + 1 < fence_pos)
-                continue;   /// clamped => Read (already defaulted)
-        }
+        /// CLAMP guard: a barrier/anomaly-clamped fold (classification 4) left unfolded events that can
+        /// become foldable with NO shard write (e.g. the missing precommit body arrives) — the token
+        /// comparison is blind to that, so a clamped shard is forced Read.
+        if (sealed_it->second.classification == 4)
+            continue;   /// clamped => Read (already defaulted)
 
         const auto listed_it = listed_by_cursor_key.find(ck);
         if (listed_it == listed_by_cursor_key.end())
@@ -1464,30 +1165,18 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
     const auto state_bytes = store->backend().get(store->layout().gcStateKey());
     if (!state_bytes)
         /// Fresh pool: no sealed state. `computeDiscoverDecisions` over an empty seal yields all Read.
-        return computeDiscoverDecisions(CasFoldSeal{}, {});
+        return computeDiscoverDecisions(CasFoldSeal{});
 
     const GcState state = decodeGcState(state_bytes->bytes);
 
-    /// Prefer the parent generation's completion seal — its `folded_cursors` carry the post-fence tokens
-    /// (recorded by `recheck`) that the next round's LIST compares against, plus `fence_positions` for the
-    /// clamp guard. Fall back to the latest fold seal for a mid-round state (a Skip cannot fire there:
-    /// the fold seal carries fold-time tokens and no fence positions, so the token comparison fails Read).
-    /// Mirror `fold`'s reference-seal resolution (B2): read directly at the adopted `(snap_generation,
-    /// snap_attempt)` — completion seal else fold seal else empty. No back-scan: a prior generation's
-    /// adopted attempt was a different `lease.seq`, unreachable via the single stored `snap_attempt`.
+    /// One-pass round: the adopted fold seal IS the reference (fold-time tokens; conservative — any
+    /// later shard write changes the token => Read). Mirrors `fold`'s reference-seal resolution.
     CasFoldSeal ref_seal;
-    std::map<String, uint64_t> fence_positions;
-    if (const auto completion = readCompletionSeal(state.snap_generation, state.snap_attempt))
-    {
-        ref_seal.generation = state.snap_generation;
-        ref_seal.per_ns_shard = completion->folded_cursors;
-        fence_positions = completion->fence_positions;
-    }
-    else if (const auto fold = readFoldSeal(state.snap_generation, state.snap_attempt))
+    if (const auto fold = readFoldSeal(state.snap_generation, state.snap_attempt))
         ref_seal = *fold;
     /// else: empty ref_seal (fresh pool / no adopted seal) => all Read.
 
-    return computeDiscoverDecisions(ref_seal, fence_positions);
+    return computeDiscoverDecisions(ref_seal);
 }
 
 std::vector<Gc::PreviewEntry> Gc::previewDeletes()
@@ -1521,82 +1210,6 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
         }
     }
     return out;
-}
-
-bool Gc::tryResumeIncompleteRound(GcState & state, Token & state_token, RoundReport & report)
-{
-    const Layout & layout = store->layout();
-    Backend & backend = store->backend();
-
-    const uint64_t round = state.round;
-    if (round == 0)
-        return false;
-
-    /// Detect an incomplete round from durable state: retired sets still present at
-    /// (snap_generation, snap_attempt, round). They drop only at the very end of a completed round
-    /// (recheck step 4), so their presence is the
-    /// durable incompleteness signal. The fold for this round already committed (retire's CAS advanced
-    /// .round AFTER the fold's CAS), so a fold_seal exists for the current generation.
-    RetireResult retired;
-    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
-        if (const auto got = backend.get(layout.retiredKey(state.snap_generation, state.snap_attempt, round, shard)))
-            retired.blobs.emplace(shard, decodeRetiredSet(got->bytes));
-    if (retired.blobs.empty())
-        return false;
-
-    report.round = round;
-    for (const auto & [shard, set] : retired.blobs)
-        report.candidates += set.entries.size();
-
-    /// Reconstruct the FoldResult tail from the durable fold seal of the current generation. The seal
-    /// carries the per-shard cursors the recheck folds through; root_shards is re-discovered; the
-    /// part-manifest cleanup is re-read from the durable bundle so the manifest deletes re-issue (recheck
-    /// deletes by the bundle's token, never the deleted body).
-    FoldResult folded;
-    if (const auto seal = readFoldSeal(state.snap_generation, state.snap_attempt))
-        folded.fold_seal = *seal;
-    else
-        /// No fold seal but retired sets present is out-of-model; fail closed rather than guess.
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS gc resume: retired sets present at round {} but no fold seal for generation {}",
-            round, state.snap_generation);
-    folded.root_shards = discoverUniverse();
-
-    /// Re-read the cleanup bundle (manifestKey -> token) so recheck re-issues the deferred deletes.
-    for (uint64_t seq = 0; ; ++seq)
-    {
-        const auto got = backend.get(layout.partManifestCleanupKey(state.snap_generation, state.snap_attempt, /*owner_shard*/0, seq));
-        if (!got)
-            break;
-        DB::ReadBufferFromMemory in(got->bytes.data(), got->bytes.size());
-        RunFileReader r(in);
-        String key;
-        String value;
-        while (r.next(key, value))
-        {
-            /// The bundle stores the object key directly; recheck issues deleteExact on it. We cannot
-            /// reconstruct the ManifestId from the key cheaply, so resume issues the deletes here
-            /// directly (idempotent: NotFound/TokenMismatch tolerated), keeping the recheck path simple.
-            backend.deleteExact(key, Token{value});
-        }
-    }
-
-    /// Re-fence when the durable state lacks the round's vector (a crash between retire and the fence's
-    /// gc/state CAS). The monotone max makes re-fencing idempotent; higher replayed versions are more
-    /// conservative coverage.
-    if (!state.fence_version.contains(round))
-        fence(state, state_token, folded);
-
-    /// Re-run recheck (deletes are exact-token idempotent) and trim. recheck folds the fence window into
-    /// a completion generation, deletes/spares the durable retired blobs, seals completion, drops the sets.
-    recheck(state, state_token, folded, retired, report);
-    if (trim_enabled)
-        trim(folded, state.round);
-    /// NOTE: `reclaimDroppedShards` is deliberately NOT called here. Shard reclaim is best-effort —
-    /// skipping it on a crash-resume is safe because it will be retried in the next full regular round.
-    /// Calling it here would require re-reading shards already processed, adding complexity with no
-    /// correctness benefit.
-    return true;
 }
 
 void Gc::rememberObservation(const GcLease & lease)

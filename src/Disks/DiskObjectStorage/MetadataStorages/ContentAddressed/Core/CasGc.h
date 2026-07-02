@@ -74,7 +74,10 @@ struct RoundReport
 class Gc
 {
 public:
-    Gc(StorePtr store_, UInt128 gc_id_);
+    /// `now_ms_fn` is the ONLY clock in Gc (injected for tests): the ack-floor heartbeat gate uses it
+    /// for the inherited lease-expiry classification (spec: the single timing assumption). Everything
+    /// else in the round stays deterministic/clock-free.
+    Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_ = {});
 
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
     RoundReport runRegularRound();
@@ -165,9 +168,11 @@ private:
     struct FoldResult
     {
         CasFoldSeal fold_seal;
-        CasCompletionSeal completion_seal;
         std::vector<std::pair<RootNamespace, uint64_t>> root_shards;
         std::map<ManifestId, Token> mf_cleanup;
+        /// Ack-floor one-pass round: the retired-cursor outcome per gc-shard (settled entries, new
+        /// condemnations, floor-passed pendings, and the prior pendings to delete pre-CAS).
+        std::vector<RetiredMergeResult> retired_merge;
     };
 
     /// R1 (spec rev. 15 §Fold Owner Transitions): per changed root shard, stream the ONE ordered
@@ -188,7 +193,10 @@ private:
     /// guess a delta, never throw/wedge (feedback_ca_gc_never_throw_on_404).
     /// On success `state` carries the committed snap_generation and `state_token` the committed gc/state
     /// token. The committed pair is THREADED into retire, never re-read (zombie-steal protection).
-    FoldResult fold(GcState & state, Token & state_token, RoundReport & report);
+    /// Ack-floor: `min_ack` is the heartbeat floor computed at round start; the fold's three-cursor
+    /// merge graduates/condemns against it (condemn_round = state.round + 1). The fold no longer CASes
+    /// gc/state — it sets (snap_generation, snap_attempt) in-memory; the SINGLE round CAS commits them.
+    FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t min_ack);
 
     /// Read ONE part manifest named by `id`, validate it, and append sign*(+1) blob deltas for each
     /// blob entry to `deltas`. On sign<0 queue (id -> token) into mf_cleanup. Returns whether a body was
@@ -197,39 +205,8 @@ private:
     bool foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
                            std::map<ManifestId, Token> & mf_cleanup);
 
-    /// What one R2 retire produced. `blobs` is the per-shard retired set (the input to R4 recheck);
-    /// `mf_cleanup` carries the owner-removed manifest bodies' tokens straight through from the fold
-    /// (captured at fold time; their exact-token delete is deferred to recheck, after decrements sealed).
-    struct RetireResult
-    {
-        std::map<uint64_t, RetiredSet> blobs;
-        std::map<ManifestId, Token> mf_cleanup;
-    };
 
-    /// R2 (spec §Retire): the round being executed is state.round + 1. Blob candidates are the
-    /// zero-in-degree blobs in the sealed fold generation; ONE HEAD per candidate observes its CURRENT
-    /// token (an absent object is SKIPPED — never fabricate a token; never GET a condemned body). The
-    /// per-shard retired sets are written by unique path (putIfAbsent, byte-equal crashed-attempt
-    /// adoption) BEFORE one gc/state CAS advances .round — the durable "retire phase complete" marker
-    /// (ViewableRound). On success `state`/`state_token` carry the committed round.
-    RetireResult retire(GcState & state, Token & state_token, const FoldResult & folded, RoundReport & report);
 
-    /// R3 (spec §Global Fence, Task 4 LIST-based): CAS fence_round := round (monotone max) into every
-    /// PRESENT root shard discovered by LIST(cas/refs/). Absent shards (namespaces with no prior publish)
-    /// are not fenced — a first publish into a brand-new namespace creates the shard and stamps incarnation;
-    /// promote's unconditional blob revalidation guards against condemned blobs in the brand-new shard.
-    /// Record each shard's committed shard_version in gc/state.fence_version[round] AND in
-    /// folded.completion_seal.fence_positions. One fence covers the whole round.
-    void fence(GcState & state, Token & state_token, FoldResult & folded);
-
-    /// R4 (spec §Recheck And Delete): fold every fenced shard's owner transitions in (sealed_cursor,
-    /// fence_version] into a completion generation merged on top of the fold generation (FoldedThroughFence
-    /// — defends SabotageCutOverclaim #12); per retired blob spare (in-degree > 0 in the completion
-    /// generation) or exact-token delete (THE SINGLE CONTENT-DELETE SITE); then exact-token-delete the
-    /// owner-removed manifest bodies whose decrements are now sealed (control #11). Seals the completion
-    /// generation + advances the pointer + drops the round's retired sets in one CAS.
-    void recheck(GcState & state, Token & state_token, FoldResult & folded, const RetireResult & retired,
-                 RoundReport & report);
 
     /// Trim (INV-JOURNAL-COVERAGE): drop owner events with transition_version <= the sealed fold cursor,
     /// sourced from `CasFoldSeal::per_ns_shard[cursorKey].folded_cursor` (the generation carrying those
@@ -268,9 +245,7 @@ private:
     ///   the shard is NOT clamped: if `fence_positions` has the key with `fence_pos > 0` and
     ///   `folded_cursor + 1 < fence_pos`, the previous fold was barrier-clamped (unfolded events may
     ///   exist) => forced Read.
-    std::map<String, DiscoverDecision> computeDiscoverDecisions(
-        const CasFoldSeal & sealed,
-        const std::map<String, uint64_t> & fence_positions);
+    std::map<String, DiscoverDecision> computeDiscoverDecisions(const CasFoldSeal & sealed);
 
     /// Task 6: for each discovered shard that is empty + tombstoned (last journal event `is_tombstone`)
     /// + fully folded at current incarnation, issue `deleteExact(rootShardKey, read_token)` using the
@@ -278,13 +253,6 @@ private:
     /// or a concurrent revive — feedback_ca_gc_never_throw_on_404).
     void reclaimDroppedShards(const FoldResult & folded);
 
-    /// CRASH-RESUME (the model: idempotent replay of a crashed round's tail). An INCOMPLETE round is
-    /// detectable from durable state alone: a fold_seal exists for the latest generation with no
-    /// completion_seal (and retired sets at (state.round, fence_seq) are present). The resume re-runs the
-    /// round TAIL (fence -> recheck -> trim) from the durable fold_seal; exact-token deletes are
-    /// idempotent (NotFound => Absent). Returns true if a resume ran. WHICH seal exists IS the durable
-    /// phase marker (completion_seal => done; fold_seal only => resume at recheck; neither => redo fold).
-    bool tryResumeIncompleteRound(GcState & state, Token & state_token, RoundReport & report);
 
     /// Write the part-manifest cleanup bundle(s) for one fold generation: a write-once record listing
     /// every owner-removed (ManifestId, token) whose body delete is deferred to recheck. Keyed by
@@ -323,7 +291,8 @@ private:
     void rememberObservation(const GcLease & lease);
 
     StorePtr store;
-    UInt128 gc_id{};              /// this leader's identity (random u128, never 0)
+    UInt128 gc_id{};
+    std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock              /// this leader's identity (random u128, never 0)
     bool trim_enabled = true;     /// TEST SEAM ONLY (M1): production always trims; see setTrimEnabledForTest
     bool maintenance_trim = false; /// B12 TEST SEAM: bypass lazy-trim thresholds for one round (full compaction); see setMaintenanceTrimForTest
 
