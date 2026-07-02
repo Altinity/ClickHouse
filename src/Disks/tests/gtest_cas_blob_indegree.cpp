@@ -29,10 +29,10 @@ TEST(CasBlobInDegree, FoldStartsFromEmptyPriorGeneration)
         {b(2), s(1), false},
     };
     std::vector<RunRef> runs;
-    foldDeltasIntoGeneration(backend, layout, /*prior*/0, /*prior_attempt*/0, /*new*/1, /*attempt*/0, /*shard*/0, deltas, runs);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, /*new*/1, /*attempt*/0, /*shard*/0, deltas, runs);
     ASSERT_FALSE(runs.empty());
 
-    const auto zero = zeroInDegree(backend, layout, /*gen*/1, /*attempt*/0, /*shard*/0);
+    const auto zero = zeroInDegree(backend, runs);
     EXPECT_TRUE(zero.empty());   /// nothing at zero yet
 }
 
@@ -43,15 +43,15 @@ TEST(CasBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)
 
     /// Gen 1: activate edge (b1,s1) and (b2,s1).
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, 0, /*prior_attempt*/0, 1, /*attempt*/0, 0,
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
         {{b(1), s(1), false}, {b(2), s(1), false}}, runs1);
 
-    /// Generation 2 merges prior gen-1 run with removal of (b1,s1): indeg(b1)=0, indeg(b2)=1.
+    /// Generation 2 merges prior gen-1 run (resolved via runs1 refs) with removal of (b1,s1): indeg(b1)=0, indeg(b2)=1.
     std::vector<RunRef> runs2;
-    foldDeltasIntoGeneration(backend, layout, /*prior*/1, /*prior_attempt*/0, /*new*/2, /*attempt*/0, 0,
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, /*new*/2, /*attempt*/0, 0,
         {{b(1), s(1), true}}, runs2);
 
-    const auto zero = zeroInDegree(backend, layout, 2, /*attempt*/0, 0);
+    const auto zero = zeroInDegree(backend, runs2);
     ASSERT_EQ(zero.size(), 1u);
     EXPECT_EQ(zero[0].hash, b(1));
 }
@@ -64,9 +64,9 @@ TEST(CasBlobInDegree, RunsAreByteDeterministic)
     std::vector<RunRef> ra;
     std::vector<RunRef> rb;
     /// Same deltas in a DIFFERENT input order must produce the same sealed run bytes (sorted by key).
-    foldDeltasIntoGeneration(a,  layout, 0, /*prior_attempt*/0, 1, /*attempt*/0, 0,
+    foldDeltasIntoGeneration(a,  layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
         {{b(3), s(1), false}, {b(1), s(1), false}, {b(2), s(1), false}}, ra);
-    foldDeltasIntoGeneration(b2, layout, 0, /*prior_attempt*/0, 1, /*attempt*/0, 0,
+    foldDeltasIntoGeneration(b2, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
         {{b(1), s(1), false}, {b(2), s(1), false}, {b(3), s(1), false}}, rb);
     const auto ga = a.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
     const auto gb = b2.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
@@ -90,13 +90,13 @@ TEST(CasBlobInDegree, SameEdgeActivatedTwiceCountsOnce)
         {b(1), s(1), false},   // same edge again — must deduplicate
     };
     std::vector<RunRef> runs;
-    foldDeltasIntoGeneration(backend, layout, 0, /*prior_attempt*/0, 1, /*attempt*/0, 0, deltas, runs);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0, deltas, runs);
     ASSERT_FALSE(runs.empty());
 
-    const int64_t deg = inDegreeInGeneration(backend, layout, 1, /*attempt*/0, 0, b(1));
+    const int64_t deg = inDegreeInGeneration(backend, runs, b(1));
     EXPECT_EQ(deg, 1);   /// deduplicated, not 2
 
-    const auto zero = zeroInDegree(backend, layout, 1, /*attempt*/0, 0);
+    const auto zero = zeroInDegree(backend, runs);
     EXPECT_TRUE(zero.empty());   /// b1 still has an active edge
 }
 
@@ -107,9 +107,9 @@ TEST(CasBlobInDegree, FoldDeltaByteEqualReplayAdopts)
     std::vector<BlobDelta> deltas{{b(1), s(1), false}};
     std::vector<RunRef> runs1;
     std::vector<RunRef> runs2;
-    foldDeltasIntoGeneration(backend, layout, 0, /*prior_attempt*/7, 1, /*attempt*/7, /*shard*/0, deltas, runs1);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs1);
     /// Same inputs, same attempt => byte-identical run already present => adopt, no throw.
-    EXPECT_NO_THROW(foldDeltasIntoGeneration(backend, layout, 0, /*prior_attempt*/7, 1, /*attempt*/7, /*shard*/0, deltas, runs2));
+    EXPECT_NO_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs2));
     EXPECT_EQ(runs1, runs2);
 }
 
@@ -121,7 +121,7 @@ TEST(CasBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
     backend.putIfAbsent(layout.blobTargetRunKey(1, /*attempt*/7, /*shard*/0, /*seq*/0), "not-a-valid-run");
     std::vector<BlobDelta> deltas{{b(1), s(1), false}};
     std::vector<RunRef> runs;
-    EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, 0, /*prior_attempt*/7, 1, /*attempt*/7, /*shard*/0, deltas, runs),
+    EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs),
                  DB::Exception);
 }
 
@@ -165,11 +165,11 @@ TEST(CasThreeCursorMerge, FloorBoundary)
     /// all (in-degree 0 by definition). A was condemned at round 2, B at round 3; min_ack = 3:
     /// strictly-below graduates, at-the-floor stays.
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, 0, 0, 1, 0, 0, {{b(9), s(1), false}}, runs1);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{b(9), s(1), false}}, runs1);
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, 1, 0, 2, 0, 0, {}, runs2,
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {}, runs2,
         {entry(1, 2), entry(2, 3)}, /*min_ack*/3, /*condemn_round*/4, {}, &rmr);
 
     /// Two-phase graduation: the floor-passed entry is REPUBLISHED pending (still in the list);
@@ -199,7 +199,7 @@ TEST(CasThreeCursorMerge, PendingRedeletesAndDrops)
 
     std::vector<RunRef> runs;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, 0, 0, 1, 0, 0, {}, runs,
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {}, runs,
         {pending}, /*min_ack*/9, /*condemn_round*/9, {}, &rmr);
 
     ASSERT_EQ(rmr.redelete.size(), 1u);
@@ -218,7 +218,7 @@ TEST(CasThreeCursorMerge, RecoverySpares)
     /// delta adds an edge to it: recovery WINS over graduation, the entry is dropped as spared.
     std::vector<RunRef> runs;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, 0, 0, 1, 0, 0, {{b(1), s(1), false}}, runs,
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{b(1), s(1), false}}, runs,
         {entry(1, 1)}, /*min_ack*/5, /*condemn_round*/6, {}, &rmr);
 
     ASSERT_EQ(rmr.spared.size(), 1u);
@@ -235,11 +235,11 @@ TEST(CasThreeCursorMerge, NewCandidateCondemned)
     /// Gen 1: C (=b3) has one edge. Gen 2 removes it => transition to zero, not retired =>
     /// condemned with the head-captured token at THIS pass's condemn_round.
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, 0, 0, 1, 0, 0, {{b(3), s(1), false}}, runs1);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{b(3), s(1), false}}, runs1);
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, 1, 0, 2, 0, 0, {{b(3), s(1), true}}, runs2,
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{b(3), s(1), true}}, runs2,
         {}, /*min_ack*/0, /*condemn_round*/7, headPresent("t9", 42), &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 1u);
@@ -259,11 +259,11 @@ TEST(CasThreeCursorMerge, AbsentBlobNotCondemned)
     /// Same transition-to-zero as above, but the blob object is already gone at condemn time:
     /// nothing to delete later, so no entry is minted.
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, 0, 0, 1, 0, 0, {{b(3), s(1), false}}, runs1);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{b(3), s(1), false}}, runs1);
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, 1, 0, 2, 0, 0, {{b(3), s(1), true}}, runs2,
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{b(3), s(1), true}}, runs2,
         {}, /*min_ack*/0, /*condemn_round*/7,
         [](const UInt128 &) -> std::optional<HeadResult> { return std::nullopt; }, &rmr);
 
@@ -281,12 +281,12 @@ TEST(CasThreeCursorMerge, SnapshotBytesUnchanged)
     Layout layout{"pool"};
 
     std::vector<RunRef> r1;
-    foldDeltasIntoGeneration(plain, layout, 0, 0, 1, 0, 0,
+    foldDeltasIntoGeneration(plain, layout, /*prior_runs*/{}, 1, 0, 0,
         {{b(1), s(1), false}, {b(2), s(1), false}, {b(2), s(2), true}}, r1);
 
     std::vector<RunRef> r2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(engaged, layout, 0, 0, 1, 0, 0,
+    foldDeltasIntoGeneration(engaged, layout, /*prior_runs*/{}, 1, 0, 0,
         {{b(1), s(1), false}, {b(2), s(1), false}, {b(2), s(2), true}}, r2,
         {entry(1, 1), entry(5, 2)}, /*min_ack*/9, /*condemn_round*/3, headPresent("t", 1), &rmr);
 
@@ -320,8 +320,8 @@ TEST(CasBlobInDegree, FoldStreamsPriorRunBlockBounded)
 
     std::vector<RunRef> runs1_c;
     std::vector<RunRef> runs1_o;
-    foldDeltasIntoGeneration(backend, layout, 0, 0, 1, 0, 0, gen1, runs1_c);
-    foldDeltasIntoGeneration(oracle, layout, 0, 0, 1, 0, 0, gen1, runs1_o);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_c);
+    foldDeltasIntoGeneration(oracle, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_o);
 
     const String gen1_run_key = layout.blobTargetRunKey(1, 0, 0, 0);
     const auto gen1_run = backend.get(gen1_run_key);
@@ -338,8 +338,8 @@ TEST(CasBlobInDegree, FoldStreamsPriorRunBlockBounded)
     std::vector<BlobDelta> gen2{{b(0), s(1), true}, {b(19999), s(2), false}};
     std::vector<RunRef> runs2_c;
     std::vector<RunRef> runs2_o;
-    foldDeltasIntoGeneration(backend, layout, 1, 0, 2, 0, 0, gen2, runs2_c);
-    foldDeltasIntoGeneration(oracle, layout, 1, 0, 2, 0, 0, gen2, runs2_o);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1_c, 2, 0, 0, gen2, runs2_c);
+    foldDeltasIntoGeneration(oracle, layout, /*prior_runs*/runs1_o, 2, 0, 0, gen2, runs2_o);
 
     /// Byte-reproducibility canary: streaming and materialized folds produce identical output bytes.
     const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
@@ -387,16 +387,16 @@ TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
 
     std::vector<RunRef> runs1_c;
     std::vector<RunRef> runs1_o;
-    foldDeltasIntoGeneration(backend, layout, 0, 0, 1, 0, 0, gen1, runs1_c);
-    foldDeltasIntoGeneration(oracle, layout, 0, 0, 1, 0, 0, gen1, runs1_o);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_c);
+    foldDeltasIntoGeneration(oracle, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_o);
 
     /// Gen 2 removes every edge on two of the blobs => two zero-transition markers in the gen-2 run,
     /// which is itself multi-block (the surviving-edge rows still span blocks).
     std::vector<BlobDelta> gen2{{b(0), s(1), true}, {b(19999), s(1), true}};
     std::vector<RunRef> runs2_c;
     std::vector<RunRef> runs2_o;
-    foldDeltasIntoGeneration(backend, layout, 1, 0, 2, 0, 0, gen2, runs2_c);
-    foldDeltasIntoGeneration(oracle, layout, 1, 0, 2, 0, 0, gen2, runs2_o);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1_c, 2, 0, 0, gen2, runs2_c);
+    foldDeltasIntoGeneration(oracle, layout, /*prior_runs*/runs1_o, 2, 0, 0, gen2, runs2_o);
 
     const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
     const auto gen2_run = backend.get(gen2_run_key);
@@ -405,8 +405,8 @@ TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
     ASSERT_GT(gen2_run->bytes.size(), static_cast<size_t>(kRunTargetBlockSize) * 3);
 
     backend.resetCounts();
-    const auto zero_c = zeroInDegree(backend, layout, 2, 0, 0);
-    const auto zero_o = zeroInDegree(oracle, layout, 2, 0, 0);
+    const auto zero_c = zeroInDegree(backend, runs2_c);
+    const auto zero_o = zeroInDegree(oracle, runs2_o);
 
     /// Equivalence with the borrowed-mode (InMemory oracle) result: same candidates, in the same order.
     ASSERT_EQ(zero_c.size(), zero_o.size());

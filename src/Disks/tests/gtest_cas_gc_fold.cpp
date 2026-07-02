@@ -322,3 +322,114 @@ TEST(CasGcFold, IncarnationMismatchRestartsFoldAtZeroMultiShard)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1)
         << "gc_shards=2: incarnation mismatch must reset cursor to 0 and apply the new shard's events";
 }
+
+/// T0 (2026-07-02 snapshot-streaming): an idle round — no journal changes, no retired entries — touches
+/// ZERO run objects. After one populated round, reset the counters and run a no-op round; the fold must
+/// carry the parent generation's `RunRef` verbatim into the new fold_seal (same key, same checksum, same
+/// generation) and NOT read or write any `.../blob_target/...` object.
+TEST(CasGcFold, EmptyDeltaShardCarriesParentRunRef)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();   // round 1: folds the +1, seals the gen-1 blob_target run
+
+    const auto st1 = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    const auto parent_seal = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
+    ASSERT_EQ(parent_seal.blob_target_runs.size(), 1u);
+    const RunRef parent_ref = parent_seal.blob_target_runs.front();
+
+    backend->resetCounts();
+    gc.runRegularRound();   // round 2: no changes => pure ref-carry, zero run I/O
+
+    EXPECT_EQ(backend->ioCountForKeysContaining("/blob_target/"), 0u)
+        << "idle round must not GET/getStream/PUT any blob_target run object";
+
+    const auto st2 = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    EXPECT_GT(st2.snap_generation, st1.snap_generation);
+    const auto new_seal = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(st2.snap_generation, st2.snap_attempt))->bytes);
+    ASSERT_EQ(new_seal.blob_target_runs.size(), 1u);
+    const RunRef carried = new_seal.blob_target_runs.front();
+    EXPECT_EQ(carried.key, parent_ref.key) << "carried ref points at the PARENT generation's run key";
+    EXPECT_EQ(carried.checksum, parent_ref.checksum);
+    EXPECT_EQ(carried.shard, 0u);
+    EXPECT_EQ(carried.generation, st1.snap_generation)
+        << "the carried ref names the generation whose key namespace physically holds the object";
+}
+
+/// The round AFTER a ref-carry, with a real delta, folds THROUGH the carried ref: the new generation's
+/// run is produced from the OLD-generation run (resolved via the carried ref, not by key construction)
+/// merged with the delta, and the resulting in-degree is correct.
+TEST(CasGcFold, FoldResolvesThroughCarriedRef)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref("srv-a:1", 1, 0xAA);
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();   // gen 1: blob 1 in-degree 1
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
+
+    gc.runRegularRound();   // gen 2: no delta => carries the gen-1 ref
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1)
+        << "in-degree resolves through the carried parent ref";
+
+    // A real delta on the NEXT round must fold through the carried ref and drop blob 1 to zero.
+    const ManifestRef r2 = ref("srv-a:2", 2, 0xBB);
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);
+
+    gc.runRegularRound();   // gen 3: -1 on blob 1 (old owner dropped), +1 on blob 2
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0)
+        << "fold through the carried ref applied the -1 correctly";
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 1);
+}
+
+/// previewDeletes resolves runs through the current seal's refs, not by key construction. After a
+/// pure ref-carry round the current seal's `blob_target_runs` point at an OLDER generation's key; the
+/// preview must open that physical object via the ref and report the correct in-degree — here blob 1 is
+/// still referenced, so its carried-ref-resolved in-degree is 1 and it is NOT surfaced as a candidate.
+/// (A carried ref that the preview failed to resolve would mis-open the run and either throw or spuriously
+/// surface the still-referenced blob.)
+TEST(CasGcFold, PreviewResolvesCarriedRef)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();   // gen 1: blob referenced, in-degree 1
+    const auto st1 = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+
+    gc.runRegularRound();   // gen 2: no delta, no retired => pure ref-carry (ref points back at gen 1)
+    const auto st2 = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    ASSERT_GT(st2.snap_generation, st1.snap_generation);
+    const auto seal2 = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(st2.snap_generation, st2.snap_attempt))->bytes);
+    ASSERT_EQ(seal2.blob_target_runs.size(), 1u);
+    ASSERT_EQ(seal2.blob_target_runs.front().generation, st1.snap_generation)
+        << "the current seal's ref physically lives at the parent generation (carried, not reconstructed)";
+
+    // The preview resolves the carried ref (a gen-1 physical key) and computes in-degree 1 => blob 1 is
+    // not a delete candidate. Resolution-by-ref is the property under test.
+    const auto preview = gc.previewDeletes();
+    for (const auto & e : preview)
+        EXPECT_NE(e.hash, blob) << "still-referenced blob must not be surfaced (carried ref resolved to in-degree 1)";
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), blob), 1)
+        << "in-degree through the carried parent ref is 1";
+}

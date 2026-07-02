@@ -35,6 +35,8 @@ void addRuns(google::protobuf::RepeatedPtrField<Proto::RunRefProto> * field, con
         e->set_key(r->key);
         e->set_checksum_hi(static_cast<uint64_t>(r->checksum >> 64));
         e->set_checksum_lo(static_cast<uint64_t>(r->checksum));
+        e->set_shard(r->shard);
+        e->set_generation(r->generation);
     }
 }
 
@@ -42,7 +44,9 @@ void readRuns(const google::protobuf::RepeatedPtrField<Proto::RunRefProto> & fie
 {
     for (const auto & e : field)
         runs.push_back(RunRef{.key = e.key(),
-            .checksum = (UInt128(e.checksum_hi()) << 64) | UInt128(e.checksum_lo())});
+            .checksum = (UInt128(e.checksum_hi()) << 64) | UInt128(e.checksum_lo()),
+            .shard = e.shard(),
+            .generation = e.generation()});
 }
 
 }

@@ -13,10 +13,20 @@ namespace DB::Cas
 
 /// A reference to one write-once run object plus its content checksum (RunFooter checksum), so a
 /// resuming round can verify it adopted the exact bytes a prior attempt sealed (spec §Resume).
+///
+/// `shard` and `generation` (2026-07-02 snapshot-streaming, T0) let consumers resolve a run through the
+/// seal's refs instead of constructing `blobTargetRunKey`: with reference-parent carry a run sealed for
+/// generation G may physically live under an OLDER generation's key namespace, so the key alone no longer
+/// implies the generation, and per-shard association must not parse the key path. `blob_target_runs`
+/// refs SET both at every write point (the fold's `foldDeltasIntoGeneration` and the ref-carry copy).
+/// `part_manifest_cleanup` and other outcome RunRefs are per-generation-local and MAY leave the defaults
+/// (0/0) — those consumers still key by construction and never resolve through the shard/generation here.
 struct RunRef
 {
     String key;
     UInt128 checksum{};
+    uint64_t shard = 0;        /// gc-shard this run belongs to (REQUIRED for blob_target_runs)
+    uint64_t generation = 0;   /// generation whose key namespace physically holds the object (for retention)
     bool operator==(const RunRef &) const = default;
 };
 

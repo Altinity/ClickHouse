@@ -32,18 +32,19 @@ UInt128 cityHash128(const String & bytes)
     return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
 }
 
-/// Streams the prior generation's surviving source edges for one shard at O(one block) resident
-/// memory: chains the shard's run segments in `seq` order (absent seq-0 => empty baseline), skips
+/// Streams a shard's prior surviving source edges at O(one block) resident memory: chains the run
+/// SEGMENTS the caller resolved from the parent seal (`blob_target_runs` filtered to one shard), skips
 /// zero-marker rows (per-generation, never carried forward), and exposes a one-key lookahead the fold
-/// merge consumes. Segment existence is probed with a cheap `head` before opening the streaming reader
-/// (an absent seq ends the chain). The edge stream is globally sorted by (blob_hash, source_id): each
-/// segment is sorted and segments are appended in key order, so `key()` values are non-decreasing.
+/// merge consumes. Resolution is BY REF (2026-07-02 T0): the caller passes the exact object keys, so a
+/// run sealed for generation G that physically lives under an older generation's key is reached without
+/// key construction. An empty `segments` is the fresh-pool / empty baseline. The edge stream is globally
+/// sorted by (blob_hash, source_id): each segment is sorted and segments are ordered by key, so `key()`
+/// values are non-decreasing.
 class PriorEdgeCursor
 {
 public:
-    PriorEdgeCursor(Backend & backend_, const Layout & layout_,
-                    uint64_t generation_, uint64_t attempt_, uint64_t shard_)
-        : backend(backend_), layout(layout_), generation(generation_), attempt(attempt_), shard(shard_)
+    PriorEdgeCursor(Backend & backend_, const std::vector<RunRef> & segments_)
+        : backend(backend_), segments(segments_)
     {
         advance();
     }
@@ -72,28 +73,24 @@ public:
                     // zero-marker (or empty) row: dropped, not carried forward
                 }
                 reader.reset();
-                ++seq;
+                ++seg_idx;
             }
 
-            /// Open the next segment (probe existence with head; absent => the chain is done).
-            const String segment_key = layout.blobTargetRunKey(generation, attempt, shard, seq);
-            if (!backend.head(segment_key).exists)
+            /// Open the next resolved segment; the segment list is exhausted => the chain is done.
+            if (seg_idx >= segments.size())
             {
                 has_current = false;
                 return;
             }
-            reader = std::make_unique<RunFileReader>(backend, segment_key);
+            reader = std::make_unique<RunFileReader>(backend, segments[seg_idx].key);
         }
     }
 
 private:
     Backend & backend;
-    const Layout & layout;
-    uint64_t generation;
-    uint64_t attempt;
-    uint64_t shard;
+    const std::vector<RunRef> & segments;
 
-    uint64_t seq = 0;
+    size_t seg_idx = 0;
     std::unique_ptr<RunFileReader> reader;
     String current_key;
     bool has_current = false;
@@ -143,7 +140,7 @@ void putDeterministicArtifact(Backend & backend, const String & key, const Strin
 }
 
 void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
-                              uint64_t prior_generation, uint64_t prior_attempt,
+                              const std::vector<RunRef> & prior_runs,
                               uint64_t new_generation, uint64_t attempt,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
@@ -175,7 +172,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             return a.source_id < b.source_id;
         });
 
-    PriorEdgeCursor cursor(backend, layout, prior_generation, prior_attempt, shard);
+    PriorEdgeCursor cursor(backend, prior_runs);
 
     DB::WriteBufferFromOwnString out;
     RunHeader header;
@@ -298,21 +295,19 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     const String run_bytes = out.str();
     const String run_key = layout.blobTargetRunKey(new_generation, attempt, shard, 0);
     putDeterministicArtifact(backend, run_key, run_bytes);
-    out_runs.push_back(RunRef{.key = run_key, .checksum = cityHash128(run_bytes)});
+    out_runs.push_back(RunRef{.key = run_key, .checksum = cityHash128(run_bytes),
+                              .shard = shard, .generation = new_generation});
 }
 
-std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout,
-                                        uint64_t generation, uint64_t attempt, uint64_t shard)
+std::vector<BlobCandidate> zeroInDegree(Backend & backend, const std::vector<RunRef> & runs)
 {
     std::vector<BlobCandidate> result;
-    for (uint64_t seq = 0; ; ++seq)
+    for (const RunRef & run : runs)
     {
-        /// Probe segment existence with a cheap `head` before opening the streaming reader (an absent
-        /// seq ends the chain) — the streaming reader throws on an absent key. The run is streamed at
-        /// O(one block) resident memory, never materialized whole.
-        const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
-        if (!backend.head(key).exists) break;
-        RunFileReader r{backend, key};
+        /// Resolution is by ref (2026-07-02 T0): the caller passed the exact object key, so a run sealed
+        /// for a later generation but physically living under an older key is reached directly. The run is
+        /// streamed at O(one block) resident memory, never materialized whole.
+        RunFileReader r{backend, run.key};
         String k, p;
         while (r.next(k, p))
             if (!p.empty() && p[0] == kZeroMarker)
@@ -325,18 +320,15 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout
     return result;
 }
 
-int64_t inDegreeInGeneration(Backend & backend, const Layout & layout,
-                             uint64_t generation, uint64_t attempt, uint64_t shard, const UInt128 & blob_hash)
+int64_t inDegreeInGeneration(Backend & backend, const std::vector<RunRef> & runs, const UInt128 & blob_hash)
 {
     int64_t count = 0;
-    for (uint64_t seq = 0; ; ++seq)
+    for (const RunRef & run : runs)
     {
-        /// Probe segment existence with `head` (absent => chain done), then stream the run at O(block).
-        /// The `seek` below is now the ranged-get path: it lands the cursor on the target blob's block
-        /// via the sparse footer index rather than scanning a resident whole-run buffer.
-        const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
-        if (!backend.head(key).exists) break;
-        RunFileReader r{backend, key};
+        /// Stream the resolved run at O(block). The `seek` below is the ranged-get path: it lands the
+        /// cursor on the target blob's block via the sparse footer index rather than scanning a resident
+        /// whole-run buffer.
+        RunFileReader r{backend, run.key};
         r.seek(u128ToBytesBE(blob_hash));   // sparse-index skip to this blob's edges
         String k, p;
         while (r.next(k, p))

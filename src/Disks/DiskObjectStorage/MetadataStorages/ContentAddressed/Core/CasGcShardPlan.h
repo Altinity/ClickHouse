@@ -88,14 +88,15 @@ public:
     /// run under `blobTargetRunKey(new_generation, shard, 0)` via `backend`, appends its `RunRef` to
     /// `out_runs`, and returns the `RunRef`. The call is idempotent (write-once via `putIfAbsent`).
     ///
-    /// `prior_generation` is the generation whose per-shard run forms the baseline (0 = fresh pool).
-    /// `new_generation` must be > `prior_generation`.
+    /// `prior_runs` are the parent generation's run segments for this shard, resolved BY THE CALLER from
+    /// the parent fold seal's `blob_target_runs` filtered to `shard` (2026-07-02 T0). An empty vector is
+    /// the fresh-pool / empty baseline.
     ///
     /// PRECONDITION: every `BlobDelta` in `shard_deltas` must be owned by this reducer
     /// (`blobShard(d.blob_hash, gc_shards) == shard`). This is a caller contract; there is no
     /// underflow throw backstopping it — pass a misbucketed delta and the fold silently misroutes it.
     std::vector<RunRef> reduce(Backend & backend, const Layout & layout,
-                               uint64_t prior_generation, uint64_t prior_attempt,
+                               const std::vector<RunRef> & prior_runs,
                                uint64_t new_generation, uint64_t attempt,
                                std::vector<BlobDelta> shard_deltas,
                                const std::vector<RetiredEntry> & prior_retired = {},

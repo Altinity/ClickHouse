@@ -881,6 +881,12 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     backend->putIfAbsent(decoy_seal, "decoy-seal");
     backend->putIfAbsent(decoy_run, "decoy-run");
 
+    /// Drop the ref so the next fold writes a FRESH run under a newer generation and the adopted seal's
+    /// blob_target ref moves OFF `old_gen`. Under T0 reference-parent carry, a still-referenced generation
+    /// is deliberately retained (its run is live), so `old_gen` can only age out once nothing references
+    /// its run anymore — which the drop guarantees.
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+
     /// Age generation 1 well past the retention floor (keep=3): several more quiescent rounds.
     for (int i = 0; i < 8; ++i)
         ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -899,9 +905,14 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     EXPECT_TRUE(residue.keys.empty()) << "old generation prefix must be fully reclaimed; left "
                                       << residue.keys.size() << " objects";
 
-    /// No-loss: the live data is intact.
+    /// The drop was necessary to move the seal's blob_target ref off `old_gen` so it could age out (under
+    /// T0 a still-referenced generation is deliberately retained — see the comment above). The blob is
+    /// condemned by the drop but stays present: these rounds never advance the mount ack floor
+    /// (`renewWatermarkOnce`), so it never graduates to a delete — retire drain is not the property under
+    /// test here.
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
-    EXPECT_TRUE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
+    /// The owner-removed manifest body IS reclaimed by the part-manifest cleanup pass over the aging rounds.
+    EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
 }
 
 /// Reclaim-VIA-RETENTION of a non-adopted current-generation attempt orphan (KISS prune model). A

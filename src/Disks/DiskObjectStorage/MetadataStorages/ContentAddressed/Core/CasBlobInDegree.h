@@ -43,19 +43,20 @@ struct BlobCandidate
     UInt128 hash{};
 };
 
-/// Merge the prior generation's blob source-edge run for `shard` (absent => empty/zero baseline) with
-/// `scattered` deltas, producing the new generation's write-once run under
-/// blobTargetRunKey(new_generation, attempt, shard, 0). Streaming: prior run + scattered deltas are sorted by
-/// (blob_hash, source_id) and merged via two-cursor scan; the source-edge set is idempotent under re-fold
-/// (identical (blob_hash, source_id) pairs deduplicate). A blob whose active edge set transitions to
-/// exactly empty this generation is written as an explicit zero-marker row so `zeroInDegree` can stream
-/// it; prior-generation zero markers are dropped. Appends the produced run's `RunRef` (key + footer
-/// checksum) to `out_runs` for the fold seal.
-/// `prior_attempt` is the attempt under which the PARENT generation's run was sealed (the prior round's
-/// adopted `snap_attempt`); `attempt` is the attempt under which THIS generation's run is written (the
-/// folding leader's `lease.seq`). They differ whenever the round that produced `prior_generation` adopted
-/// a different attempt than the current fold mints — keeping them distinct lets the fold read the correct
-/// parent baseline while writing under its own attempt.
+/// Merge the prior generation's blob source-edge run for `shard` with `scattered` deltas, producing the
+/// new generation's write-once run under blobTargetRunKey(new_generation, attempt, shard, 0). Streaming:
+/// prior run + scattered deltas are sorted by (blob_hash, source_id) and merged via two-cursor scan; the
+/// source-edge set is idempotent under re-fold (identical (blob_hash, source_id) pairs deduplicate). A blob
+/// whose active edge set transitions to exactly empty this generation is written as an explicit zero-marker
+/// row so `zeroInDegree` can stream it; prior-generation zero markers are dropped. Appends the produced
+/// run's `RunRef` (key + footer checksum + `shard` + `new_generation`) to `out_runs` for the fold seal.
+///
+/// `prior_runs` are the PARENT generation's run segments for this shard, RESOLVED BY THE CALLER from the
+/// parent fold seal's `blob_target_runs` (filtered to `shard`). An empty vector is the fresh-pool / empty
+/// baseline. Resolution moves to the caller (2026-07-02 snapshot-streaming, T0) because with reference-
+/// parent carry a run sealed for the parent generation may physically live under an OLDER generation's key
+/// — the seal ref names the real key, key construction would not. `new_generation`/`attempt`/`shard` name
+/// only the OUTPUT run's key namespace.
 /// Outcome of the retired (third) merge cursor (ack-floor redesign, spec 2026-07-02): the same
 /// streaming pass that folds edges settles every prior retired entry and detects new candidates.
 struct RetiredMergeResult
@@ -83,7 +84,7 @@ struct RetiredMergeResult
 /// snapshot run bytes. Defaults keep the legacy call sites behavior-identical (empty retired,
 /// min_ack 0 => nothing graduates, no head_blob => nothing condemned).
 void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
-                              uint64_t prior_generation, uint64_t prior_attempt,
+                              const std::vector<RunRef> & prior_runs,
                               uint64_t new_generation, uint64_t attempt,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
@@ -92,16 +93,15 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob = {},
                               RetiredMergeResult * out_retired = nullptr);
 
-/// Stream the sealed in-degree run for (generation, attempt, shard) and return every blob written at
-/// in-degree 0 (the candidates that transitioned to zero in this generation).
-std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout,
-                                        uint64_t generation, uint64_t attempt, uint64_t shard);
+/// Stream the sealed in-degree run named by `runs` (the current seal's `blob_target_runs` filtered to one
+/// shard) and return every blob written at in-degree 0 (the candidates that transitioned to zero). An
+/// empty `runs` is an empty baseline. Resolution is by ref (2026-07-02 T0), never by key construction.
+std::vector<BlobCandidate> zeroInDegree(Backend & backend, const std::vector<RunRef> & runs);
 
-/// The in-degree of one blob in the sealed (generation, attempt, shard) run: 0 when the blob is absent
-/// from the run (or written as an explicit transitioned-to-0 row), else its count. Used by
-/// `Gc::previewDeletes` and by tests (the round itself settles candidates inside the three-cursor
-/// merge; there is no per-candidate point query anymore).
-int64_t inDegreeInGeneration(Backend & backend, const Layout & layout,
-                             uint64_t generation, uint64_t attempt, uint64_t shard, const UInt128 & blob_hash);
+/// The in-degree of one blob in the sealed run named by `runs` (the seal's `blob_target_runs` for one
+/// shard): 0 when the blob is absent from the run (or written as an explicit transitioned-to-0 row), else
+/// its count. Used by `Gc::previewDeletes` and by tests (the round itself settles candidates inside the
+/// three-cursor merge; there is no per-candidate point query anymore).
+int64_t inDegreeInGeneration(Backend & backend, const std::vector<RunRef> & runs, const UInt128 & blob_hash);
 
 }

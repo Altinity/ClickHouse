@@ -338,7 +338,12 @@ RoundReport Gc::runRegularRound()
     GcState next = state;
     next.round = new_round;
     next.retired_refs = std::move(new_refs);
-    pruneSupersededGenerations(generation, attempt, next);
+    /// T0: the generations the adopted seal's runs physically live in (reference-parent carry can point a
+    /// current shard's run back at an older generation's key). Retention must never reclaim these.
+    std::set<uint64_t> referenced_generations;
+    for (const RunRef & r : folded.fold_seal.blob_target_runs)
+        referenced_generations.insert(r.generation);
+    pruneSupersededGenerations(generation, attempt, next, referenced_generations);
     const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
     if (res.outcome != CasOutcome::Committed)
         throw Exception(ErrorCodes::ABORTED,
@@ -728,25 +733,50 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             folded_any = true;
     }
 
+    /// T0 (2026-07-02 snapshot-streaming): the parent generation's per-shard run segments, resolved from
+    /// the parent fold seal's `blob_target_runs` and grouped by the ref's explicit `shard`. The same seal
+    /// `discover_ref_seal` the token-diff already read is the run source — consumers resolve runs THROUGH
+    /// refs (a run sealed for the parent generation may physically live under an older generation's key),
+    /// never by `blobTargetRunKey` construction.
+    std::map<uint64_t, std::vector<RunRef>> parent_runs_by_shard;
+    for (const RunRef & r : discover_ref_seal.blob_target_runs)
+        parent_runs_by_shard[r.shard].push_back(r);
+
+    /// PURE REF-CARRY (spec §T0, plan's governing interpretation): a gc-shard with an EMPTY delta bucket
+    /// AND an EMPTY retired input list neither reads nor writes its run — the new fold_seal copies the
+    /// parent's `RunRef`s VERBATIM (key/checksum/shard/generation) so the next round resolves them. This
+    /// is deterministic (same refs for the same inputs), so seal determinism / crash-replay adoption hold.
+    /// An empty delta with a NON-EMPTY retired list still runs the merge: settlement must happen every
+    /// pass (carried/graduated/redeleted entries), and that pass reads the run to recompute in-degrees.
+    auto carryParentRefs = [&](uint64_t shard)
+    {
+        const auto it = parent_runs_by_shard.find(shard);
+        if (it != parent_runs_by_shard.end())
+            for (const RunRef & r : it->second)
+                result.fold_seal.blob_target_runs.push_back(r);   /// verbatim: parent key/checksum/gen
+    };
+    auto priorRunsFor = [&](uint64_t shard) -> const std::vector<RunRef> &
+    {
+        static const std::vector<RunRef> empty;
+        const auto it = parent_runs_by_shard.find(shard);
+        return it != parent_runs_by_shard.end() ? it->second : empty;
+    };
+
     if (state.gc_shards == 1)
     {
-        /// SINGLE-SHARD PATH (gc_shards == 1) — UNCHANGED from Phase 1d. Every blob routes to shard 0,
-        /// so the entire delta stream folds into one `blobTargetRunKey(new_generation, 0, 0)` run. Task 7
-        /// asserts this path reproduces Phase 1d byte-for-byte; keep it isolated and untouched.
-        if (!folded_any)
+        /// SINGLE-SHARD PATH (gc_shards == 1). Every blob routes to shard 0, so the entire delta stream
+        /// folds into one `blobTargetRunKey(new_generation, 0, 0)` run.
+        if (!folded_any && prior_retired[0].empty())
         {
-            /// Nothing new this round; still seal the (empty-delta) generation so the cursor coverage is
-            /// durable and the resume rule has a fold_seal to key off. Reuse the prior generation's blob run
-            /// (no delta) by sealing a fresh generation whose in-degree equals the parent.
-            foldDeltasIntoGeneration(backend, layout, state.snap_generation, state.snap_attempt,
-                                     new_generation, attempt, /*shard*/0,
-                                     {}, result.fold_seal.blob_target_runs,
-                                     prior_retired[0], min_ack, condemn_round, head_blob,
-                                     &result.retired_merge[0]);
+            /// Pure ref-carry: nothing changed and no retired entries to settle => zero run I/O. Carry the
+            /// parent shard-0 refs into the seal so coverage/resume stay durable.
+            carryParentRefs(0);
         }
         else
         {
-            foldDeltasIntoGeneration(backend, layout, state.snap_generation, state.snap_attempt,
+            /// Either a real delta or a non-empty retired list: run the merge (empty deltas still settle
+            /// the retired cursor). The prior runs are the parent seal's shard-0 refs.
+            foldDeltasIntoGeneration(backend, layout, priorRunsFor(0),
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
                                      prior_retired[0], min_ack, condemn_round, head_blob,
@@ -764,20 +794,23 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// is why cross-shard displacement needs no special handling: each delta routes independently and
         /// deterministically to whichever target shard owns its blob; the old/new pair is solved at the
         /// source, not by a cross-shard fixup.
-        ///
-        /// Every shard is sealed (even with an empty bucket) so the generation has a complete per-shard
-        /// run set for `zeroInDegree`/`retire` consumers; an empty bucket reuses the parent in-degree.
         std::vector<std::vector<BlobDelta>> buckets(state.gc_shards);
         for (BlobDelta & d : deltas)
             buckets[blobShard(d.blob_hash, state.gc_shards)].push_back(std::move(d));
 
         for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
         {
+            if (buckets[shard].empty() && prior_retired[shard].empty())
+            {
+                /// Pure ref-carry for this shard: empty delta + empty retired => zero run I/O.
+                carryParentRefs(shard);
+                continue;
+            }
             /// A reducer owns exactly one disjoint shard. Two replicas may run reducers for DIFFERENT
             /// shards concurrently (CasGcScheduler ownership); their run-key namespaces never collide.
             ShardReducer reducer{shard, state.gc_shards};
             std::vector<RunRef> shard_runs =
-                reducer.reduce(backend, layout, state.snap_generation, state.snap_attempt,
+                reducer.reduce(backend, layout, priorRunsFor(shard),
                                new_generation, attempt,
                                std::move(buckets[shard]),
                                prior_retired[shard], min_ack, condemn_round, head_blob,
@@ -988,7 +1021,8 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 }
 }
 
-void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next)
+void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next,
+                                    const std::set<uint64_t> & referenced_generations)
 {
     const uint64_t keep = store->poolConfig().gc_snap_generations_to_keep;
     if (keep == 0)
@@ -1013,7 +1047,22 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
         uint64_t g = next.snap_pruned_through + 1;
         uint64_t pruned = 0;
         for (; g <= prune_floor && pruned < kMaxPrunePerRound; ++g, ++pruned)
+        {
+            /// T0 (2026-07-02 snapshot-streaming): a generation whose run the LIVE adopted seal still
+            /// references (reference-parent carry: an idle shard's current run physically lives at an
+            /// older generation's key) must NOT be reclaimed — deleting it would strand the live seal's
+            /// ref. Skip its prefix delete; the run stays alive as long as it is referenced. When a later
+            /// delta REPLACES the carried ref with a fresh run, the superseded object is reclaimed by the
+            /// hand-off delete (Task 7); until then it persists safely (bounded: one small run per shard).
+            if (referenced_generations.count(g))
+            {
+                LOG_TRACE(getLogger("CasGc"),
+                    "CAS GC prune: retaining generation {} — still referenced by the live adopted seal",
+                    g);
+                continue;
+            }
             deletePrefixWholesale(backend, layout.gcGenPrefix(g), std::numeric_limits<uint64_t>::max());
+        }
         next.snap_pruned_through = g - 1;   /// highest generation fully processed this round
     }
 
@@ -1240,11 +1289,23 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
 
+    /// Resolve the run objects THROUGH the adopted seal's refs (2026-07-02 T0), never by
+    /// `blobTargetRunKey` construction: with reference-parent carry a shard's current run may physically
+    /// live under an older generation's key, and the seal ref is the only authority for the real key.
+    /// Group the adopted `blob_target_runs` by the ref's explicit `shard`. Absent seal => no candidates.
+    std::map<uint64_t, std::vector<RunRef>> runs_by_shard;
+    if (const auto adopted = readFoldSeal(state.snap_generation, state.snap_attempt))
+        for (const RunRef & r : adopted->blob_target_runs)
+            runs_by_shard[r.shard].push_back(r);
+
     /// Scan every blob-target shard (see `retire`): a preview that only looked at shard 0 would miss the
     /// zero-in-degree candidates owned by shards 1..N under `gc_shards > 1`.
     for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
     {
-        for (const BlobCandidate & cand : zeroInDegree(backend, layout, state.snap_generation, state.snap_attempt, shard))
+        const auto it = runs_by_shard.find(shard);
+        static const std::vector<RunRef> kEmptyRuns;
+        const std::vector<RunRef> & shard_runs = it != runs_by_shard.end() ? it->second : kEmptyRuns;
+        for (const BlobCandidate & cand : zeroInDegree(backend, shard_runs))
         {
             const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
             if (!observed.exists)

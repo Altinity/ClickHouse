@@ -207,6 +207,12 @@ message RunRefProto {
   string key         = 1;
   uint64 checksum_hi = 2;  // high 64 bits of the UInt128 checksum
   uint64 checksum_lo = 3;  // low 64 bits
+  // 2026-07-02 snapshot-streaming (T0). Additive: old readers skip these and get 0. Consumers resolve
+  // blob_target runs through these refs (not by key construction) once reference-parent carry means a
+  // run sealed for generation G may live under an older generation's key. Set for blob_target_runs;
+  // part_manifest_cleanup / outcome refs leave them 0.
+  uint64 shard       = 4;  // gc-shard this run belongs to
+  uint64 generation  = 5;  // generation whose key namespace physically holds the object
 }
 
 // One (namespace, shard) coverage entry inside a FoldSealProto.

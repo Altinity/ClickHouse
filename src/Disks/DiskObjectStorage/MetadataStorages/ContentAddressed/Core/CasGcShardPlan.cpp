@@ -41,7 +41,7 @@ bool ShardReducer::owns(const UInt128 & blob_hash) const
 }
 
 std::vector<RunRef> ShardReducer::reduce(Backend & backend, const Layout & layout,
-                                         uint64_t prior_generation, uint64_t prior_attempt,
+                                         const std::vector<RunRef> & prior_runs,
                                          uint64_t new_generation, uint64_t attempt,
                                          std::vector<BlobDelta> shard_deltas,
                                          const std::vector<RetiredEntry> & prior_retired,
@@ -50,7 +50,7 @@ std::vector<RunRef> ShardReducer::reduce(Backend & backend, const Layout & layou
                                          RetiredMergeResult * out_retired)
 {
     std::vector<RunRef> out_runs;
-    foldDeltasIntoGeneration(backend, layout, prior_generation, prior_attempt, new_generation, attempt, shard,
+    foldDeltasIntoGeneration(backend, layout, prior_runs, new_generation, attempt, shard,
                              std::move(shard_deltas), out_runs,
                              prior_retired, min_ack, condemn_round, head_blob, out_retired);
     return out_runs;

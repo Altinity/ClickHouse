@@ -484,11 +484,34 @@ inline uint64_t currentAttemptOf(DB::Cas::Backend & backend, const DB::Cas::Layo
     return DB::Cas::decodeGcState(got->bytes).snap_attempt;
 }
 
+/// The current seal's `blob_target_runs` filtered to `shard` (2026-07-02 T0: consumers resolve runs
+/// through seal refs, not by key construction). Scans downward from the current generation for the most
+/// recent existing fold seal (mirrors `foldCursorOf`'s reasoning); absent => empty.
+inline std::vector<DB::Cas::RunRef> runsForShard(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t shard)
+{
+    const uint64_t gen = currentGenerationOf(backend, layout);
+    const uint64_t attempt = currentAttemptOf(backend, layout);
+    for (uint64_t g = gen; ; --g)
+    {
+        if (const auto got = backend.get(layout.foldSealKey(g, attempt)))
+        {
+            const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
+            std::vector<DB::Cas::RunRef> out;
+            for (const DB::Cas::RunRef & r : seal.blob_target_runs)
+                if (r.shard == shard)
+                    out.push_back(r);
+            return out;
+        }
+        if (g == 0)
+            return {};
+    }
+}
+
 /// The in-degree of a blob in the current GC generation's sealed run (0 when absent/zeroed).
 inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
-    return DB::Cas::inDegreeInGeneration(backend, layout, currentGenerationOf(backend, layout),
-                                         currentAttemptOf(backend, layout), /*shard*/0, hash);
+    return DB::Cas::inDegreeInGeneration(backend, runsForShard(backend, layout, /*shard*/0), hash);
 }
 
 /// The cursor key "ns/shard" — matches CasGcCursorKey::cursorKey.
@@ -607,6 +630,21 @@ public:
     uint64_t getTotal() const { std::lock_guard lock(count_mutex); return get_total; }
     uint64_t putTotal() const { std::lock_guard lock(count_mutex); return put_total; }
     uint64_t getStreamTotal() const { std::lock_guard lock(count_mutex); return get_stream_total; }
+
+    /// The total number of get + getStream + putIfAbsent operations against any key whose path
+    /// CONTAINS `substr` (T0 idle-round gate: zero run I/O touches every `.../blob_target/...` key).
+    uint64_t ioCountForKeysContaining(const String & substr) const
+    {
+        std::lock_guard lock(count_mutex);
+        uint64_t total = 0;
+        for (const auto & [key, n] : get_counts)
+            if (key.find(substr) != String::npos) total += n;
+        for (const auto & [key, n] : get_stream_counts)
+            if (key.find(substr) != String::npos) total += n;
+        for (const auto & [key, n] : put_counts)
+            if (key.find(substr) != String::npos) total += n;
+        return total;
+    }
 
     void resetCounts()
     {

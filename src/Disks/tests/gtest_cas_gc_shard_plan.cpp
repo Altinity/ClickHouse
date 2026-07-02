@@ -138,9 +138,9 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
     EXPECT_TRUE(r1.owns(b2)) << "r1 must own b2";
     EXPECT_FALSE(r1.owns(b1)) << "r1 must not own b1";
 
-    const auto runs0 = r0.reduce(*backend, layout, /*prior_generation=*/0, /*prior_attempt=*/0, /*new_generation=*/1, /*attempt=*/0,
+    const auto runs0 = r0.reduce(*backend, layout, /*prior_runs=*/{}, /*new_generation=*/1, /*attempt=*/0,
                                  std::move(buckets[0]));
-    const auto runs1 = r1.reduce(*backend, layout, /*prior_generation=*/0, /*prior_attempt=*/0, /*new_generation=*/1, /*attempt=*/0,
+    const auto runs1 = r1.reduce(*backend, layout, /*prior_runs=*/{}, /*new_generation=*/1, /*attempt=*/0,
                                  std::move(buckets[1]));
 
     ASSERT_EQ(runs0.size(), 1u) << "shard-0 reduce must produce exactly one RunRef";
@@ -149,16 +149,16 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
     /// The keys must be distinct (disjoint shard namespaces).
     EXPECT_NE(runs0[0].key, runs1[0].key) << "shard-0 and shard-1 run keys must be distinct";
 
-    /// Read back in-degree from the sealed runs.
-    const int64_t indeg_b1 = inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/0, b1);
-    const int64_t indeg_b2 = inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/1, b2);
+    /// Read back in-degree from the sealed runs (resolved via each reduce's returned refs).
+    const int64_t indeg_b1 = inDegreeInGeneration(*backend, runs0, b1);
+    const int64_t indeg_b2 = inDegreeInGeneration(*backend, runs1, b2);
     EXPECT_EQ(indeg_b1, 1) << "b1 in-degree after reduce must be 1";
     EXPECT_EQ(indeg_b2, 1) << "b2 in-degree after reduce must be 1";
 
     /// Cross-shard reads: shard-0's run must not contain b2; shard-1's run must not contain b1.
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/0, b2), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runs0, b2), 0)
         << "shard-0 run must not mention b2";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/1, b1), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runs1, b1), 0)
         << "shard-1 run must not mention b1";
 }
 
@@ -321,20 +321,21 @@ TEST(CasGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
+    std::vector<std::vector<RunRef>> shard_runs(kGcShards);
     for (uint64_t shard = 0; shard < kGcShards; ++shard)
     {
         ShardReducer reducer{shard, kGcShards};
-        reducer.reduce(*backend, layout, /*prior_generation=*/0, /*prior_attempt=*/0, /*new_generation=*/1, /*attempt=*/0,
-                       std::move(buckets[shard]));
+        shard_runs[shard] = reducer.reduce(*backend, layout, /*prior_runs=*/{}, /*new_generation=*/1, /*attempt=*/0,
+                                           std::move(buckets[shard]));
     }
 
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/0, b0), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, shard_runs[0], b0), 1)
         << "b0 must fold into shard-0 with in-degree 1";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/1, b1), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, shard_runs[1], b1), 1)
         << "b1 must fold into shard-1 with in-degree 1";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/1, b0), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, shard_runs[1], b0), 0)
         << "b0 must NOT appear in shard-1's run";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, 1, /*attempt=*/0, /*shard=*/0, b1), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, shard_runs[0], b1), 0)
         << "b1 must NOT appear in shard-0's run";
 }
 
@@ -419,11 +420,10 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
         /// After runRegularRound the snap_generation points at the COMPLETION generation; the fold
         /// generation is snap_generation - 1 for the first full round. Use inDegreeOf (which reads
         /// currentGenerationOf = completion generation) for the final in-degrees.
-        const uint64_t gen = currentGenerationOf(*backend, layout);
-        const uint64_t att = currentAttemptOf(*backend, layout);
-        const int64_t iA = inDegreeInGeneration(*backend, layout, gen, att, /*shard=*/0, hA);
-        const int64_t iB = inDegreeInGeneration(*backend, layout, gen, att, /*shard=*/0, hB);
-        const int64_t iC = inDegreeInGeneration(*backend, layout, gen, att, /*shard=*/0, hC);
+        const std::vector<RunRef> shard0 = runsForShard(*backend, layout, /*shard=*/0);
+        const int64_t iA = inDegreeInGeneration(*backend, shard0, hA);
+        const int64_t iB = inDegreeInGeneration(*backend, shard0, hB);
+        const int64_t iC = inDegreeInGeneration(*backend, shard0, hC);
         return {iA, iB, iC};
     };
 
@@ -463,7 +463,6 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
 TEST(CasGcShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
 {
     constexpr uint64_t kGcShards = 2;
-    constexpr uint64_t kPriorGen = 0;
     constexpr uint64_t kNewGen = 1;
     constexpr uint64_t kAttempt = 0;
 
@@ -499,11 +498,11 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
     /// (b) PER-SHARD RUNS — drive both reducers.
     ///
     /// Run shard-0 reducer (simulates the shard-0 replica's work).
-    const auto runs0 = r0.reduce(*backend, layout, kPriorGen, kAttempt, kNewGen, kAttempt, std::move(bucket0));
+    const auto runs0 = r0.reduce(*backend, layout, /*prior_runs=*/{}, kNewGen, kAttempt, std::move(bucket0));
     ASSERT_FALSE(runs0.empty()) << "shard-0 reducer must produce at least one RunRef";
 
     /// Run shard-1 reducer (simulates the shard-1 replica's work, interleaved from the test thread).
-    const auto runs1 = r1.reduce(*backend, layout, kPriorGen, kAttempt, kNewGen, kAttempt, std::move(bucket1));
+    const auto runs1 = r1.reduce(*backend, layout, /*prior_runs=*/{}, kNewGen, kAttempt, std::move(bucket1));
     ASSERT_FALSE(runs1.empty()) << "shard-1 reducer must produce at least one RunRef";
 
     /// The blob-target runs for both shards are durably present (the reducer's write-once `putIfAbsent`),
@@ -514,14 +513,14 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
         << "shard-1 blob-target run must be durably written by r1.reduce";
 
     /// (c) MERGED IN-DEGREE — the merged in-degrees across both shards equal the expected edge multiset.
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/0, b0), 2)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runs0, b0), 2)
         << "b0 in-degree must be 2 in shard-0 run";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/1, b1), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runs1, b1), 1)
         << "b1 in-degree must be 1 in shard-1 run";
     /// Cross-shard: each blob must be absent from the other shard's run.
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/0, b1), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runs0, b1), 0)
         << "b1 must NOT appear in shard-0's run (cross-shard disjointness)";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, kNewGen, kAttempt, /*shard=*/1, b0), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runs1, b0), 0)
         << "b0 must NOT appear in shard-1's run (cross-shard disjointness)";
 }
 
@@ -628,9 +627,9 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     const GcState live = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     ASSERT_GT(live.snap_generation, 0u);
     ASSERT_EQ(live.gc_shards, kGcShards) << "the pool must be running with gc_shards=2";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, live.snap_generation, live.snap_attempt, /*shard=*/0, blob_shard0), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/0), blob_shard0), 1)
         << "shard-0 blob in-degree must be 1 while live";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, live.snap_generation, live.snap_attempt, /*shard=*/1, blob_shard1), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/1), blob_shard1), 1)
         << "shard-1 blob in-degree must be 1 while live";
     EXPECT_TRUE(blobExists(blob_shard0));
     EXPECT_TRUE(blobExists(blob_shard1));
@@ -643,10 +642,9 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     /// After drop + fixpoint: BOTH blobs are retired and exact-token deleted, and BOTH owner-removed
     /// manifest bodies are collected. The shard-1 blob is the regression's teeth — pre-`5f5fa5f` it
     /// would still exist here because retire/previewDeletes never scanned shard 1.
-    const GcState dead = decodeGcState(backend->get(layout.gcStateKey())->bytes);
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, dead.snap_generation, dead.snap_attempt, /*shard=*/0, blob_shard0), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/0), blob_shard0), 0)
         << "shard-0 blob in-degree must be 0 after drop";
-    EXPECT_EQ(inDegreeInGeneration(*backend, layout, dead.snap_generation, dead.snap_attempt, /*shard=*/1, blob_shard1), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/1), blob_shard1), 0)
         << "shard-1 blob in-degree must be 0 after drop";
     EXPECT_FALSE(blobExists(blob_shard0)) << "shard-0 droppable blob must be reclaimed";
     EXPECT_FALSE(blobExists(blob_shard1))

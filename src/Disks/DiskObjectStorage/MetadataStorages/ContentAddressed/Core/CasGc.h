@@ -279,7 +279,8 @@ private:
     /// current-generation debris is bounded space that waits at most `keep` completion-advances for the
     /// wholesale prune to reclaim it. keep==0 prunes nothing (keep-all forensics mode). `attempt` is the
     /// adopted attempt (`next.snap_attempt`); it is currently unused (retention keys on generation alone).
-    void pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next);
+    void pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next,
+                                    const std::set<uint64_t> & referenced_generations);
 
     /// Read the fold seal for (generation, attempt) (nullopt when absent). Used by resume + parent-cursor reads.
     std::optional<CasFoldSeal> readFoldSeal(uint64_t generation, uint64_t attempt);
