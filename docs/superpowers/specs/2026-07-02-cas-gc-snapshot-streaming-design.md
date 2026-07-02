@@ -1,6 +1,6 @@
 # CAS GC snapshot streaming (O(buffer) memory) + reference-parent runs — design
 
-**Status:** DESIGN (2026-07-02). **Branch:** TBD off `cas-gc-ack-floor-fence`.
+**Status:** DESIGN (2026-07-02). **Branch:** `cas-gc-snapshot-streaming` (off `cas-gc-ack-floor-fence`).
 **Supersedes:** `docs/superpowers/deferred_backlog/2026-07-01-cas-gc-runfile-obuffer-streaming.md`
 (A1 + A3; written before the ack-floor redesign — the per-candidate `inDegreeInGeneration` seek
 path it worried about was removed structurally by the one-pass round).
