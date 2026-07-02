@@ -96,6 +96,86 @@ TEST(CasGcRecheck, UnreferencedBlobDeletedExactToken)
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
+/// Copy-forward aftermath, republished arm (spec 2026-07-02-cas-copy-forward-condemned-evidence.md):
+/// after a condemned incarnation (hash, t0) is displaced by a verified copy-forward (fresh token t1)
+/// and the republished part's +1 lands, the listed (hash, t0) entry settles WITHOUT touching the new
+/// incarnation: its exact-token delete is a mismatch no-op and the entry drops; the blob survives at t1.
+TEST(CasGcRetire, CopyForwardedBlobSurvivesWhenRepublished)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+    gc.runRegularRound();   /// -1 folds => in-degree 0 => entry (1, t0) condemned
+    ASSERT_TRUE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
+
+    /// The raw equivalent of Build::copyForwardFromCondemned: displace EXACTLY t0 with the same
+    /// verified bytes under a fresh token t1, then republish a part referencing the blob (the
+    /// promoted dst ref of a republishRef move).
+    const String blob_key = store->layout().blobKey(BlobId{u128ToHex(DB::UInt128(1))});
+    const Token t0 = backend->head(blob_key).token;
+    const auto res = backend->putOverwrite(blob_key, backend->get(blob_key)->bytes, t0);
+    ASSERT_EQ(res.outcome, PutOutcome::Done);
+    const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_detached", std::nullopt, r2);
+
+    /// The +1 folds => spared; the (1, t0) entry drops; the t1 incarnation is never deleted.
+    for (int i = 0; i < 4; ++i)
+        gc.runRegularRound();
+    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
+    const HeadResult hr = backend->head(blob_key);
+    ASSERT_TRUE(hr.exists);
+    EXPECT_EQ(hr.token, res.token);
+}
+
+/// Copy-forward aftermath, abandoned arm: the writer dies between the copy-forward PUT and landing
+/// its commit. The listed (hash, t0) entry graduates and its exact-token delete MISMATCHES — a no-op,
+/// the entry drops, the t1 incarnation is NEVER wrong-token-deleted (no wedge, no unsafe delete).
+/// The orphaned t1 incarnation itself is NOT reclaimed by the round: fold discovery is
+/// transition-driven (a blob with no edges, no deltas, and no entry is invisible), so an abandoned
+/// copy-forward leaves an fsck-visible orphan — the SAME accepted class as a writer dying between
+/// putBlob and its commit. Revisit only if soak shows the class is hot.
+TEST(CasGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+    gc.runRegularRound();
+    ASSERT_TRUE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
+
+    const String blob_key = store->layout().blobKey(BlobId{u128ToHex(DB::UInt128(1))});
+    const Token t0 = backend->head(blob_key).token;
+    const auto res = backend->putOverwrite(blob_key, backend->get(blob_key)->bytes, t0);
+    ASSERT_EQ(res.outcome, PutOutcome::Done);
+
+    /// No republish lands (writer died). Drive rounds with the store's ack kept current so the
+    /// (1, t0) entry graduates; its exact-token delete mismatches t1 and the entry drops.
+    for (int i = 0; i < 6; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value())
+        << "the stale (hash, t0) entry must settle (mismatch redelete drops it), not wedge the list";
+    const HeadResult hr = backend->head(blob_key);
+    ASSERT_TRUE(hr.exists) << "the fresh incarnation must never be deleted under the stale token";
+    EXPECT_EQ(hr.token, res.token);
+}
+
 /// A completed round adopts the SAME attempt its fold minted (the round's single gc/state CAS commits the
 /// fold's (snap_generation, snap_attempt) together). Completion seals are a retired concept, so the durable
 /// index of the adopted round is the FOLD seal at (snap_generation, snap_attempt). Across rounds each

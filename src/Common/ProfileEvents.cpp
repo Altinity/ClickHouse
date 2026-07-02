@@ -746,6 +746,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasBlobDedupCacheHit, "CA blob known-present dedup-cache hit (P1)", ValueType::Number) \
     M(CasBlobHeadFirst,  "CA blob HEAD-first attempts (P1 cache hit or P2 size threshold)", ValueType::Number) \
     M(CasBlobBodyPutAvoided, "CA blob body PUTs avoided by a HEAD-first present hit (P1/P2)", ValueType::Number) \
+    M(CasBlobCopyForward, "CA condemned blob incarnations displaced by verified copy-forward at the promote gate (tokenless committed-manifest evidence; INV-1 exception)", ValueType::Number) \
     M(CasBlobGet,        "CA blob get S3 ops", ValueType::Number) \
     M(CasBlobGetStream,  "CA blob get-stream S3 ops", ValueType::Number) \
     M(CasBlobDelete,     "CA blob delete S3 ops", ValueType::Number) \

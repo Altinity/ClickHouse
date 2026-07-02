@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <city.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
@@ -15,6 +16,7 @@ namespace ProfileEvents
     extern const Event CasBlobDedupCacheHit;
     extern const Event CasBlobHeadFirst;
     extern const Event CasBlobBodyPutAvoided;
+    extern const Event CasBlobCopyForward;
 }
 
 namespace DB
@@ -475,6 +477,112 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     }
 }
 
+Token Build::copyForwardFromCondemned(const UInt128 & hash, const String & key, HeadResult hr)
+{
+    /// See the header comment: the narrow INV-1 exception for tokenless committed-manifest evidence.
+    /// Blob-only: adoptEvidence never records tree deps (trees are recreatable from retained payloads).
+    const PoolMeta & meta = store->poolMeta();
+    const PoolConfig & cfg = store->poolConfig();
+
+    constexpr int max_attempts = 8;
+    for (int attempt = 0; attempt < max_attempts; ++attempt)
+    {
+        /// 1. Read the dying object IN FULL. Absent ⇒ the delete won; with no source this is
+        ///    fail-closed ABORTED (never putIfAbsent after a lost race — that would revive deleted
+        ///    data). The GET is atomic per object: we see one whole incarnation or nothing.
+        const auto got = store->backend().get(key);
+        if (!got)
+            throw Exception(ErrorCodes::ABORTED,
+                "copyForwardFromCondemned: object {} vanished before the copy-forward read — "
+                "the exact-token delete won; failing closed (retry the operation)", key);
+        if (got->token != hr.token)
+        {
+            /// The incarnation moved under us. A clean (not condemned) token is someone else's
+            /// recreate/copy-forward — adopt it; a condemned one is the new copy-forward target.
+            if (!store->retireView().isCondemnedToken(ObjectKind::Blob, hash, got->token))
+                return got->token;
+            hr.token = got->token;
+        }
+
+        /// 2. Verify fail-closed before re-publishing a single byte: the envelope must decode (header
+        ///    CRC), declare a Blob of this pool, and the PAYLOAD must re-hash to the content key.
+        const EnvelopeHeader header_in = decodeEnvelopeHeader(got->bytes, got->bytes.size(), ObjectKind::Blob);
+        const std::string_view payload{got->bytes.data() + header_in.header_len,
+                                       got->bytes.size() - header_in.header_len};
+        const auto h2 = CityHash_v1_0_2::CityHash128(payload.data(), payload.size());
+        const UInt128 payload_hash = (static_cast<UInt128>(h2.high64) << 64) | static_cast<UInt128>(h2.low64);
+        if (payload_hash != hash || header_in.logical_hash != hash)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "copyForwardFromCondemned: object {} payload does not verify against its content key "
+                "(payload hash {}, header hash {}, expected {}) — refusing to copy forward",
+                key, u128ToHex(payload_hash), u128ToHex(header_in.logical_hash), u128ToHex(hash));
+
+        /// 3. Re-wrap under a fresh envelope: fresh incarnation_tag + THIS build's build_id
+        ///    (W-FRESH-TAG, B167 — the new incarnation is owned by this live build).
+        EnvelopeHeader header;
+        header.kind = ObjectKind::Blob;
+        header.hash_algo = 1;
+        header.logical_size = payload.size();
+        header.logical_hash = hash;
+        header.domain_id = meta.pool_id;
+        header.incarnation_tag = mintU128();
+        header.build_id = build_id;
+        header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
+        header.intended_ref = info.intended_ref;
+        header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
+        String bytes_out;
+        try
+        {
+            bytes_out = encodeEnvelopeHeader(header);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() != ErrorCodes::BAD_ARGUMENTS)
+                throw;
+            /// intended_ref is diagnostic-only: when it makes the header exceed blob_header_len, drop it.
+            header.intended_ref.reset();
+            bytes_out = encodeEnvelopeHeader(header);
+        }
+        bytes_out.append(payload);
+
+        /// 4. Displace EXACTLY the incarnation we read and verified — token-conditional, so a
+        ///    concurrent exact-token delete or a racing recreate surfaces as PreconditionFailed,
+        ///    never as a blind resurrection.
+        const PutResult res = store->backend().putOverwrite(key, bytes_out, hr.token);
+        if (res.outcome == PutOutcome::Done)
+        {
+            ProfileEvents::increment(ProfileEvents::CasBlobCopyForward);
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::BlobCopyForward;
+                e.object_kind = CasEventObjectKind::Blob;
+                e.object_hash = u128ToHex(hash);
+                e.token = res.token.value;
+                e.round = store->retireView().round();
+                e.outcome = "ok";
+                e.reason = "verified copy-forward of a condemned incarnation still referenced by a "
+                           "committed source manifest (tokenless evidence dep; INV-1 exception)";
+                e.detail = {{"displaced_token", hr.token.value},
+                            {"size", std::to_string(payload.size())},
+                            {"build_id", u128ToHex(build_id)}};
+            });
+            return res.token;
+        }
+
+        /// PreconditionFailed: re-observe and re-decide (absent ⇒ fail closed at the top of the loop;
+        /// clean token ⇒ adopt; condemned again ⇒ another bounded attempt).
+        const HeadResult hr2 = store->backend().head(key);
+        if (!hr2.exists)
+            throw Exception(ErrorCodes::ABORTED,
+                "copyForwardFromCondemned: object {} deleted between the verified read and the "
+                "token-conditional overwrite — failing closed (retry the operation)", key);
+        hr = hr2;
+    }
+    throw Exception(ErrorCodes::ABORTED,
+        "copyForwardFromCondemned: exhausted {} attempts for {} — every observed incarnation was "
+        "re-condemned under us; failing closed (retry the operation)", max_attempts, key);
+}
+
 void Build::adoptEvidence(const ManifestEntry & entry)
 {
     requireAlive();
@@ -660,6 +768,30 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
         throw Exception(ErrorCodes::ABORTED, "promote: RefMatchesBody failed for {}", manifest_key);
     if (!manifestNamespaceMatches(target_ns, body))
         throw Exception(ErrorCodes::ABORTED, "promote: ManifestNamespaceMatches failed for {}", manifest_key);
+
+    /// Copy-forward pre-pass (spec 2026-07-02-cas-copy-forward-condemned-evidence.md): a blob leaf
+    /// whose dep is TOKENLESS W-EVIDENCE (adoptEvidence — always from a COMMITTED source manifest;
+    /// republishRef / fetch-receiver / part copy) has NO source bytes to re-upload from, so the
+    /// in-closure condemned gate below used to be a liveness brick for it (S13: ATTACH's
+    /// renameToDetached aborted forever, table readonly). Displace each condemned-but-present such
+    /// incarnation via verified copy-forward BEFORE entering the shard CAS loop (GET+PUT do not
+    /// belong inside a retried mutation closure). Sourced (tokened) deps and unknown leaves keep the
+    /// fail-closed abort. The in-closure gate stays as the backstop: a condemnation surfacing only
+    /// in a mid-closure view refresh still aborts (rare, retryable-by-caller, exactly as before).
+    for (const ManifestEntry & e : body.entries)
+    {
+        if (e.placement != EntryPlacement::Blob)
+            continue;
+        const auto dep = deps.find({static_cast<uint8_t>(ObjectKind::Blob), e.blob_hash});
+        if (dep == deps.end() || dep->second.token.has_value())
+            continue;
+        const String blob_key = store->layout().blobKey(BlobId{u128ToHex(e.blob_hash)});
+        const HeadResult hr = store->backend().head(blob_key);
+        if (!hr.exists)
+            continue;   /// absent with no source: the gate below fails closed (ABORTED)
+        if (store->retireView().isCondemnedToken(ObjectKind::Blob, e.blob_hash, hr.token))
+            copyForwardFromCondemned(e.blob_hash, blob_key, hr);
+    }
 
     /// The OwnerBinding that the create-precommit event installed (precommitAdd). The promote is a pure
     /// owner MOVE off EXACTLY this binding (spec §Promote Precommit step 5; TLA+ `WPromote` old-binding).

@@ -19,6 +19,7 @@ String toString(CasEventType type)
         case CasEventType::BlobPut:               return "blob_put";
         case CasEventType::BlobReuseAdopt:        return "blob_reuse_adopt";
         case CasEventType::BlobReuseResurrect:    return "blob_reuse_resurrect";
+        case CasEventType::BlobCopyForward:       return "blob_copy_forward";
         case CasEventType::BlobRetire:            return "blob_retire";
         case CasEventType::BlobDelete:            return "blob_delete";
         case CasEventType::BlobForget:            return "blob_forget";

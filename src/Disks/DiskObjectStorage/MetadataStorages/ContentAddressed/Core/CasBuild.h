@@ -126,6 +126,18 @@ private:
     /// temp file / re-emits the captured String), so it is taken by const ref and not consumed.
     void uploadFromSource(ObjectKind kind, const UInt128 & hash, const String & key, const BlobSource & source);
 
+    /// Verified copy-forward (spec 2026-07-02-cas-copy-forward-condemned-evidence.md): the narrow,
+    /// deliberate exception to INV-1's "never read the dying object" — allowed ONLY for tokenless
+    /// W-EVIDENCE deps (`adoptEvidence`: every call site adopts from a COMMITTED source manifest, so
+    /// the blob is referenced by a live committed owner and this is a reference transfer, not a
+    /// resurrection). Reads the condemned-but-present incarnation IN FULL, verifies fail-closed
+    /// (envelope decodes + recomputed payload hash == `hash`), re-wraps under a fresh envelope
+    /// (fresh incarnation_tag, this build's build_id — W-FRESH-TAG), and displaces EXACTLY the
+    /// observed incarnation via token-conditional putOverwrite. Every failure mode (absent, corrupt,
+    /// lost delete race) throws ABORTED — never a blind PUT, never putIfAbsent after a lost race.
+    /// Returns the fresh (or adopted-clean) token. O(blob) resident memory — recovery path only.
+    Token copyForwardFromCondemned(const UInt128 & hash, const String & key, HeadResult hr);
+
     /// The build's owning root namespace, derived from BuildInfo::intended_ref ("ns/ref" — the ref is the
     /// last `/`-segment; the namespace is everything before it). Sets a manifest body's root_namespace_id.
     RootNamespace manifestNamespace() const;

@@ -514,7 +514,10 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
 {
     /// A TOKENLESS (W-EVIDENCE) leaf recorded at the CURRENT view round (fresh — no stale-refresh) whose
     /// blob is condemned by hash MUST still be caught by promote's unconditional blob revalidation.
-    /// Discriminating assertion: promote throws ABORTED (condemned blob, no source) — NOT a dangle.
+    /// Since the copy-forward pre-pass (spec 2026-07-02-cas-copy-forward-condemned-evidence.md) "caught"
+    /// no longer means ABORTED: a condemned-but-PRESENT incarnation is displaced by a verified
+    /// copy-forward and promote SUCCEEDS. The underlying invariant is unchanged and asserted here:
+    /// the listed token t0 is never bound — the committed ref stands over a FRESH incarnation.
     auto b = std::make_shared<InMemoryBackend>();
 
     /// Pre-inject retire state at round=1 BEFORE opening the store — the store's open-time refresh lands
@@ -538,12 +541,11 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     build->precommitAdd(ns, "part_1", id);
 
     /// No fence advance (round stays 1): promote does NOT refresh, but its blob revalidation is
-    /// unconditional — HEAD t0 condemned ⇒ ABORTED.
-    expectThrowsCode(DB::ErrorCodes::ABORTED,
-        [&] { build->promote(ns, "part_1", build->buildId(), id); });
+    /// unconditional — HEAD t0 condemned ⇒ verified copy-forward displaces it; promote succeeds.
+    EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
 
-    EXPECT_EQ(b->head(blob_key).token, t0);
-    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+    EXPECT_NE(b->head(blob_key).token, t0) << "the listed token must never be bound — fresh incarnation only";
+    EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 
 TEST(CasProtocol, AdoptedLeafCarriesRealBlobSize)

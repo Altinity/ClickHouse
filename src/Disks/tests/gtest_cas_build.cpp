@@ -21,6 +21,7 @@ extern const int FILE_DOESNT_EXIST;
 extern const int LOGICAL_ERROR;
 extern const int NOT_IMPLEMENTED;
 extern const int ABORTED;
+extern const int CORRUPTED_DATA;
 }
 
 using namespace DB::Cas;
@@ -561,9 +562,12 @@ TEST(CasBuild, PromoteBodylessCondemnedDepThrowsAbortedRetryable)
     /// B137/B190: the promote gate's fail-closed blob revalidation (CasBuild.cpp promote step 3) HEADs
     /// EVERY blob leaf named by the manifest. A blob whose hash is condemned (or that vanishes in the
     /// HEAD window) must surface as ABORTED ("retry the operation") — a retryable transient, NOT a hard
-    /// FILE_DOESNT_EXIST (which became an HTTP-500 INSERT failure). Under INV-1 the gate never reads the
-    /// dying object: it does a HEAD only; a condemned HEAD ⇒ ABORTED (the caller retries from source).
-    /// Even with a concurrent exact-token delete racing the HEAD, the outcome is the same retryable ABORTED.
+    /// FILE_DOESNT_EXIST (which became an HTTP-500 INSERT failure).
+    /// Since the copy-forward pre-pass (spec 2026-07-02-cas-copy-forward-condemned-evidence.md) a
+    /// tokenless-evidence dep DOES read the condemned-but-present object to copy it forward; with the
+    /// hook's exact-token delete landing right after the pre-pass HEAD, that read finds the object
+    /// ABSENT and fails closed — this test now pins the copy-forward "deleted mid-flight ⇒ ABORTED,
+    /// nothing written" contract (never putIfAbsent after a lost delete race).
     auto b = std::make_shared<InMemoryBackend>();
     const RootNamespace ns{"srv1/tbl"};
 
@@ -665,6 +669,123 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     ASSERT_TRUE(stored.has_value());
     const auto h = decodeEnvelopeHeader(stored->bytes, stored->bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(stored->bytes.substr(h.header_len), "payload-CF") << "payload must survive byte-identical";
+}
+
+/// A one-shot hook: the FIRST head(target_key) returns the (stale) result and THEN displaces the
+/// incarnation via putOverwrite(target_key, <same bytes>, expected) — a racing writer's recreate /
+/// copy-forward landing in the observe->GET window. The fresh token is captured in `displaced_to`.
+class HeadThenDisplaceOnceBackend final : public DB::Cas::Backend
+{
+public:
+    HeadThenDisplaceOnceBackend(BackendPtr inner_, String target_key_, DB::Cas::Token expected_)
+        : inner(std::move(inner_)), target_key(std::move(target_key_)), expected(expected_) {}
+
+    DB::Cas::HeadResult head(const String & k) override
+    {
+        const DB::Cas::HeadResult hr = inner->head(k);
+        if (k == target_key && !fired)
+        {
+            fired = true;
+            const auto bytes = inner->get(target_key);
+            const auto res = inner->putOverwrite(target_key, bytes->bytes, expected);
+            EXPECT_EQ(res.outcome, DB::Cas::PutOutcome::Done);
+            displaced_to = res.token;
+        }
+        return hr;
+    }
+
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsent(k, b, meta); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsentStream(k, meta); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putOverwrite(k, b, e, meta); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->casPut(k, b, e, meta); }
+    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+    DB::Cas::Token displaced_to;
+
+private:
+    BackendPtr inner;
+    String target_key;
+    DB::Cas::Token expected;
+    bool fired = false;
+};
+
+TEST(CasBuild, CopyForwardTokenDriftAdoptsCleanIncarnation)
+{
+    /// Copy-forward race arm: between the pre-pass HEAD (stale condemned token) and the copy-forward
+    /// read, a racing writer displaces the condemned incarnation (their recreate landed first). The
+    /// copy-forward must ADOPT the racer's clean token — one incarnation, not a second displacement.
+    auto b = std::make_shared<InMemoryBackend>();
+    const RootNamespace ns{"srv1/tbl"};
+
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        publishOneBlobPart(s0, ns, "part_a", "data.bin", "payload-DRIFT");
+        t0 = b->head(s0->layout().blobKey(idOf("payload-DRIFT"))).token;
+    }
+    DB::Cas::Layout layout("p");
+    const String blob_key = layout.blobKey(idOf("payload-DRIFT"));
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-DRIFT"), .token = t0, .size = 13}});
+
+    auto hook = std::make_shared<HeadThenDisplaceOnceBackend>(b, blob_key, t0);
+    auto s = Store::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto build = startBuildFor(s, ns, "detached_part_a");
+    build->adoptEvidence(blobManifestEntry("data.bin", "payload-DRIFT"));
+    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "payload-DRIFT")});
+    build->precommitAdd(ns, "detached_part_a", mid);
+    EXPECT_NO_THROW(build->promote(ns, "detached_part_a", build->buildId(), mid));
+
+    /// The final incarnation is the RACER's (adopted), not a third token from a second displacement.
+    const HeadResult hr = b->head(blob_key);
+    ASSERT_TRUE(hr.exists);
+    EXPECT_EQ(hr.token, hook->displaced_to) << "clean drifted token must be adopted, not displaced again";
+    EXPECT_NE(hr.token, t0);
+}
+
+TEST(CasBuild, CopyForwardCorruptPayloadFailsClosed)
+{
+    /// Copy-forward verification arm: the condemned-but-present object's payload no longer re-hashes
+    /// to its content key (bit rot / partial write). Copy-forward must REFUSE to re-publish the bytes
+    /// (CORRUPTED_DATA), never mint a fresh incarnation over damaged content.
+    auto b = std::make_shared<InMemoryBackend>();
+    const RootNamespace ns{"srv1/tbl"};
+
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        publishOneBlobPart(s0, ns, "part_a", "data.bin", "payload-ROT");
+        t0 = b->head(s0->layout().blobKey(idOf("payload-ROT"))).token;
+    }
+    DB::Cas::Layout layout("p");
+    const String blob_key = layout.blobKey(idOf("payload-ROT"));
+
+    /// Corrupt ONE payload byte in place (valid envelope, damaged content); condemn the CORRUPT
+    /// incarnation's token so the pre-pass targets it.
+    {
+        auto got = b->get(blob_key);
+        ASSERT_TRUE(got.has_value());
+        const auto h = decodeEnvelopeHeader(got->bytes, got->bytes.size(), ObjectKind::Blob);
+        String damaged = got->bytes;
+        damaged[h.header_len] = static_cast<char>(damaged[h.header_len] ^ 0xFF);
+        const auto res = b->putOverwrite(blob_key, damaged, t0);
+        ASSERT_EQ(res.outcome, PutOutcome::Done);
+        injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+            {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-ROT"), .token = res.token, .size = 11}});
+    }
+
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto build = startBuildFor(s, ns, "detached_part_a");
+    build->adoptEvidence(blobManifestEntry("data.bin", "payload-ROT"));
+    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "payload-ROT")});
+    build->precommitAdd(ns, "detached_part_a", mid);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { build->promote(ns, "detached_part_a", build->buildId(), mid); });
+    EXPECT_FALSE(s->resolveRef(ns, "detached_part_a").has_value());
 }
 
 TEST(CasBuild, GateBodylessAdoptFullyDeletedObjectThrowsAbortedNotFatal)
