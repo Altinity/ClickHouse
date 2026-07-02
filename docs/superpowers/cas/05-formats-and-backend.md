@@ -317,7 +317,10 @@ namespace `srv1/foo`, shard `7`.
 **Non-nesting namespace invariant.** No registered namespace may be a path-prefix of another, because
 GC enumerates a namespace's shards by prefix-LIST and a nested namespace would let a parent's LIST
 sweep a child's keys. Live-vs-shadow diverge at their first segment (`store/…@cas@` vs
-`shadow/<backup>/store/…@cas@`) so neither is a prefix of the other. **Detached parts (B181)** are
+`shadow/<backup>/store/…@cas@`) so neither is a prefix of the other. FREEZE publishes **one ref per
+frozen part** under `shadow/<backup>/…/refs/<part>` (not a shared container ref) deliberately, to avoid
+a shared-`detached`-style read-modify-write on a shared ref under concurrent freeze — the B66a torn-read
+hazard (source: `plans/2026-06-04-cas-mergetree-freeze.md §3.2/§7d`; see also `08 §scenario-table` S18). **Detached parts (B181)** are
 handled by folding them **into the table's own namespace** as refs keyed by `kDetachedRefPrefix =
 "detached/"` (a `detached/PART` ref versus a live `PART` ref) — one namespace per table, no
 live-vs-detached name collision (the old sibling `detachedNamespace` is gone). The `TABLE/detached`

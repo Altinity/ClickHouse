@@ -312,6 +312,27 @@ This lets `loadProjections` find the staged projection the normal way, making th
 `registerCarriedForwardProjectionForCA` workaround (and its manual `rows_count`/index back-fill)
 unnecessary. The workaround was removed.
 
+### 8.4 Committed-path projection-subdir awareness {#committed-projection-subdir}
+
+The overlay above covers only the **in-flight** projection. Discovering a **committed** projection
+needs `ContentAddressedMetadataStorage` to present the manifest's nested `<proj>.proj/*` keys as a
+directory (source: `specs/2026-06-03-cas-mergetree-projections-design.md §4.2`). Two branches mirror
+the existing detached-part-dir handling:
+
+- **`existsDirectory("<uuid>/<part>/<proj>.proj")`** → `true` iff the part's manifest (or per-ref
+  sidecar) carries any key with the `<proj>.proj/` prefix. This is the branch that lets
+  `IMergeTreeDataPart::loadProjections` (which probes `existsDirectory(<name>.proj)` per metadata
+  projection) discover a committed projection at all.
+- **`listDirectory("<uuid>/<part>/<proj>.proj")`** → the projection's inner file names, stripping the
+  `<proj>.proj/` prefix, so the projection's child storage can enumerate and read them.
+- **`listDirectory("<uuid>/<part>")`** (the parent part dir) → **first-component collapse**: every
+  `<proj>.proj/*` key collapses to a single `<proj>.proj` directory entry alongside the top-level
+  files, so `iterate`-based discovery sees the `.proj` subdir as a directory rather than a flood of
+  nested files.
+
+No change is needed to `writeFile`/`getStorageObjects`/`existsFile`/`getFileSize`/`createHardLink`:
+each keys the manifest by the full post-part-dir path, which is already the nested projection key.
+
 ---
 
 ## 9. Mutable and verbatim-file reads {#mutable-and-verbatim}

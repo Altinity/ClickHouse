@@ -279,6 +279,11 @@ under-lock `commitTransaction`). This was the fix for B151 (manifest publish hel
 it would add a second manifest PUT per part (op-count regression). The eager `moveDirectory`
 dispatch achieves the same lock-free property with one PUT.
 
+This section covers only the **storage substrate** for the mutable per-ref files. The writer-side
+MVCC transaction machinery that *drives* rewrites of these files (the transaction gate, the
+mutable-only commit branch, `replaceFile` routing, rollback, and the multi-part disk transaction) is
+`§transactions-mvcc` below.
+
 ### Verbatim (non-content-addressed) files {#verbatim-files}
 
 **Status: DONE** (`CasLayout.h`, `CasStore.h`; sources `specs/2026-06-19-ca-vfs-contract.md`,
@@ -370,6 +375,156 @@ writer on abandon.
 **INV-2 (precommit-first)**: the build-root precommit is published BEFORE any pool content
 GET/HEAD/PUT of the build's content. `republishRef` and `createHardLink` were audited and fixed to
 comply (B190 / B190-revival-consolidation).
+
+**Fresh-fetch detached landing** (`FETCH PARTITION`/`FETCH PART` into `detached`): a fresh
+(non-cloned) fetch downloads bytes and writes them into `detached/tmp-fetch_<part>/…`, which parses
+into the table's detached namespace (`kDetachedRefPrefix`). Unlike DETACH (which clones from an
+already-committed active ref), the fetch's files exist only as the transaction's `recorded` blobs, so
+the commit must **publish a `detached` ref by folding those `recorded` blobs** — the same publish as
+`republishCommittedPartIntoDetached`, but sourcing from the in-transaction `recorded` set rather than
+a re-keyed source manifest. The subsequent `detached/tmp-fetch_<part>` → `detached/<part>` rename is a
+**detached→detached re-key** (`rekeyDetachedPartDir`, the same operation that stages
+`attaching_<part>`), re-keying `<old_dir>/` → `<new_dir>/` within the shared detached ref's
+manifest/sidecar. This is separate from the `final↔detached` rows above: it is the staging→final
+landing of a *freshly-fetched* part. Source: `specs/2026-06-04-cas-mergetree-fetch-partition-design.md §3.3`.
+
+---
+
+## Transactions and MVCC (writer-side) {#transactions-mvcc}
+
+**Status: DONE** (B39 gate + single-part; B67 layer 2 multi-part; `ContentAddressedTransaction.cpp`,
+`ContentAddressedMetadataStorage.{h,cpp}`, `StorageMergeTree.cpp`). Sources:
+`specs/2026-06-04-cas-mergetree-transactions-design.md`,
+`specs/2026-06-04-cas-mergetree-multipart-transaction-design.md`.
+
+This is the writer-side layer that makes MergeTree transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, implicit
+transactions, snapshot isolation, mutation/`DELETE`-in-transaction) work on a CAS disk. The MVCC
+**engine** — snapshot/CSN assignment, `TransactionLog`, visibility, the in-memory `DataPartsLock`
+serialization — is storage-agnostic and unchanged; the CAS-side job is solely to satisfy the per-part
+`txn_version.txt` storage contract. `txn_version.txt` (`VersionMetadata` / `VersionMetadataOnDisk`) is
+one of the `isMutablePerPartFile` set (with `uuid.txt`, `metadata_version.txt`): excluded from
+`computePartId` and stored in the per-ref sidecar, not the immutable manifest (§mutable-vs-immutable).
+
+### The transaction gate is decoupled from append {#txn-gate}
+
+Ordinary S3-backed MergeTree gets transactions from
+`MetadataStorageFromDisk::supportWritingWithAppend` returning `true`. CAS is content-addressed and
+cannot append, so it inherits the base `false` — which historically also blocked transactions.
+
+The fix is a **distinct capability**: `IMetadataStorage::supportsTransactionalMutableFiles` (base
+returns `false`; `ContentAddressedMetadataStorage` overrides to `true`,
+`ContentAddressedMetadataStorage.h:76`). `StorageMergeTree::supportTransaction`
+(`StorageMergeTree.cpp:178`) now also accepts a disk whose metadata storage
+`supportsTransactionalMutableFiles`, rather than gating purely on `supportWritingWithAppend`.
+
+**Decision — do NOT make CAS `supportWritingWithAppend` return `true`.** Transactions provably do not
+need append: `txn_version.txt` is rewritten via tmp + `replaceFile`, never `WriteMode::Append`; the
+only append user, `MergeTreeDeduplicationLog`, already has a no-append rewrite fallback that CAS's
+dedup window relies on. Flipping `supportWritingWithAppend` would defeat that dedup-log fallback and
+disarm the `DiskObjectStorageTransaction` append guard (CAS's content-addressed write branch cannot
+append). So a *narrow* new capability, not the easy reuse of the append flag.
+
+### `replaceFile` for mutable-file destinations {#txn-replacefile}
+
+`VersionMetadataOnDisk` rewrites `txn_version.txt` as `txn_version.txt.tmp` (Rewrite) then
+`replaceFile(tmp, txn_version.txt)` **inside the part-commit transaction**.
+`ContentAddressedTransaction::replaceFile` (`ContentAddressedTransaction.cpp:1163`) is `moveFile` that
+overwrites the destination: for a mutable per-part-file destination it routes the bytes into the
+part's `recorded_mutable` (sidecar) staging (`isMutablePerPartFile(dst->file)`), dropping any staged
+destination state first; a content-file destination keeps the blob `moveFile` behavior.
+
+A mutable file's `.tmp` must **itself** match `isMutablePerPartFile` — i.e. `<mutable>.tmp`
+(`txn_version.txt.tmp`) is recognized as mutable. Otherwise a standalone autocommit of the `.tmp`
+would treat it as ordinary content, republish a one-file manifest, and **clobber the part**.
+
+### The mutable-only commit branch (single most important invariant) {#txn-mutable-only}
+
+Filling in the **creation CSN** on `COMMIT`, and **locking/unlocking the removal TID**
+(`tryLockRemovalTID`/`unlockRemovalTID`) when a `DELETE`/mutation/`DROP`/`TRUNCATE`-in-transaction
+marks an **already-committed** part for removal, both rewrite `txn_version.txt` on a part whose ref is
+already published — via a fresh autocommit transaction. The naive commit path would build
+`manifest.blobs = recorded` (empty, since no content changed) and republish the ref to an **empty
+manifest**, recomputing `part_id` over nothing and **clobbering the part**.
+
+The fix is the mutable-only branch in `publishStaging` (`ContentAddressedTransaction.cpp:251`): detect
+**`recorded` (content) empty + `recorded_mutable`/`recorded_mutable_removed` non-empty + a ref already
+exists** for `(namespace, ref)`. In that case:
+
+- Do **not** stage a manifest, do **not** recompute `part_id`, do **not** republish the ref. Instead
+  call `updateRefPayload` to merge the changed mutable files into the existing ref's
+  `RootRef.mutable_files` map in place (and erase removed ones), **keeping the existing
+  `part_id`/manifest/ref**.
+
+The whole-part INSERT path is unaffected: it has content in `recorded`, so the mutable-only branch does
+not trigger.
+
+**Fail closed.** If `recorded` is empty and `recorded_mutable` is non-empty but staged **entries exist
+without a Build** where a content commit is required (no existing ref to update), that is a real
+error — `publishStaging` throws `LOGICAL_ERROR` rather than publish a standalone empty sidecar / a
+one-file manifest. A mutable rewrite of a non-existent part never fabricates a part.
+
+### Rollback and the MVCC-on-CAS lifecycle {#txn-rollback}
+
+An **uncommitted** INSERT inside an open transaction still publishes a CAS ref (its blobs stay
+GC-reachable — a `WriteSession` pins them until the ref lands), and the part is made *logically
+invisible* by its `txn_version.txt` creation CSN, exactly like the existing precommitted-part model (a
+part physically present but invisible until commit). **`ROLLBACK`** removes the ref
+(`removeRecursive`/`removeDirectory` unlinks it); the blobs then become **GC-eligible** — see
+`04-gc-protocol.md` for the ROLLBACK→unreferenced→sweepable edge, which is the same
+publish-a-ref-then-drop-a-ref path GC already handles.
+
+**Rollback-reload hardening.** The rollback path stats an in-flight part via
+`VersionMetadataOnDisk::removeTmpMetadataFile` → `getLastModified`. On a ref-less in-flight part CAS
+must resolve this via the in-flight read-your-writes overlay (B59, `09-read-protocol.md §8`) rather
+than throw `FILE_DOESNT_EXIST`, so the rollback completes and removes the in-flight ref/blobs.
+
+**Concurrency argument.** The engine serializes per-part `txn_version.txt` writes under
+`DataPartsLock` *before* calling the disk; CAS's per-part sidecar objects do not contend across parts;
+the mutable-only branch re-validates **no** blobs (it adds none), so no new CAS-level lock is
+introduced. The `gc_lock` in the content commit still guards blob re-validation (§write-path).
+Force-fresh (`allow_stale = false`) `resolveRef` on the mutable-file read side guarantees
+read-your-writes for the transaction version (`09-read-protocol.md §9.1`).
+
+### The multi-part disk transaction (B67 layer 2) {#txn-multipart}
+
+This is a **multi-part *disk* transaction — NOT S3 multipart upload.** A transactional merge/mutation
+runs one `DiskObjectStorageTransaction` that spans several parts, so a single
+`ContentAddressedTransaction` must hold and commit writes for more than one part.
+
+Two things make one transaction span parts:
+
+- **Deferred rename window.** `preparePartForCommit` with `rename_in_transaction=true` adds the
+  merge-output part with `need_rename` and defers the `tmp_merge_X → X` rename to
+  `Transaction::renameParts`. In the window between add and rename the part's logical name is the final
+  `X` while the transaction is still keyed to `tmp_merge_X` — a `txn_version.txt`/CSN write landing here
+  targets `X` while the transaction holds `tmp_merge_X`.
+- **Covered source parts.** On commit, `addNewPartAndRemoveCovered → lockRemovalTID` rewrites
+  `txn_version.txt` on each covered SOURCE part (so a rollback can un-cover them); these rewrites can
+  land on the same transaction as the merge output.
+
+The transaction is therefore keyed by a **per-part staging map** rather than a single
+`(table_uuid, part_name)`: `parts` maps a `(namespace, ref)` key to a `PartStaging`
+(`ContentAddressedTransaction.cpp`) holding that part's own `recorded` blobs, `recorded_mutable`
+(sidecar files), `recorded_mutable_removed`, and pending blobs. The former single-part assertion in
+`rememberTarget` is gone — multiple keys are legal; every staging op (`recordBlob`/`writeFile`/
+`unlinkFile`/`replaceFile`/the in-flight read helpers) parses the path and routes to
+`parts[{namespace, ref}]`. The single-part case (every INSERT) is exactly one map entry.
+
+The **rename re-key**: `moveDirectory(tmp_merge_X → X)` moves the staging entry from the source key to
+the destination key, **merging** into any destination entry that a deferred-window `txn_version.txt`
+write already created — so after the re-key part `X` carries both its content blobs and the mutable
+file. `commit` takes the `gc_lock` once, then iterates `parts`: content entries take the normal
+whole-part publish, mutable-only entries take the branch above.
+
+**§3.0 atomicity argument (why no new cross-part atomicity requirement).** On a local disk a
+transactional merge is **not** filesystem-atomic — it renames the output and rewrites each source
+`txn_version.txt` as individual ops. MVCC visibility is gated by the per-part **CSN/TID in
+`txn_version.txt`**, not by disk-op atomicity. So CAS may publish parts **one at a time**; a crash
+mid-`commit` leaves some refs published and some not, and those orphan refs are GC-reclaimed exactly as
+any uncommitted-then-abandoned build — identical to the local-disk story. No cross-part atomic flip is
+introduced. (Note: there is still no multi-ref atomic publish, so a publish that throws after earlier
+parts published leaves a *partial* commit at the disk layer; MVCC governs visibility, and the durable
+orphan refs are reclaimed by GC — B122.)
 
 ---
 

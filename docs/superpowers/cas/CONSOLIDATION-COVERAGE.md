@@ -134,9 +134,9 @@ by `03`/`04`/`05`; the milestone sequencing itself is ephemeral.
 | `specs/2026-06-03-cas-mergetree-shared-pool-design.md` | Shared pool / per-server trees | `01 §shared-blobs-per-server-trees` |
 | `specs/2026-06-04-cas-mergetree-fetch-partition-design.md` + `plans/...fetch-partition` | Fetch partition = relink refs | `01 §what-it-buys`, `RM §area-writer` (relink) |
 | `specs/2026-06-04-cas-mergetree-freeze-design.md` + `plans/...freeze` | FREEZE = shadow-tree ref pins | `04 §d1-design` (listNamespaces→LIST), `08 §scenario-table` S18; `RM §area-operability` (B3/B186 freeze gtest) |
-| `specs/2026-06-04-cas-mergetree-multipart-transaction-design.md` + `plans/...multipart-transaction` | Multipart upload transaction | `03 §phase-upload` (multipart), `RM` |
+| `specs/2026-06-04-cas-mergetree-multipart-transaction-design.md` + `plans/...multipart-transaction` | Multi-part **disk** transaction (NOT S3-multipart-upload): per-part staging map, deferred `tmp_merge→final` rename re-key, covered-source `txn_version.txt` rewrites, §3.0 atomicity argument | `03 §transactions-mvcc` (`§txn-multipart`) |
 | `specs/2026-06-04-cas-mergetree-replication-design.md` + `plans/...replication` | Replication fetch-by-relink; zero-byte cross-replica | `01 §what-it-buys`, `07 §read-budget-replication`, `RM §area-writer` (manifest_hash TODO) |
-| `specs/2026-06-04-cas-mergetree-transactions-design.md` + `plans/...transactions` | Transaction (txn_version) handling | `03 §mutable-vs-immutable` |
+| `specs/2026-06-04-cas-mergetree-transactions-design.md` + `plans/...transactions` | Transaction/MVCC writer machinery: gate decoupling (`supportsTransactionalMutableFiles`), `replaceFile`/`.tmp` routing, the mutable-only commit branch, rollback/MVCC lifecycle. (The `txn_version.txt` *storage substrate* is `03 §mutable-vs-immutable`.) | `03 §transactions-mvcc` |
 | `specs/2026-06-05-cas-mergetree-backup-restore-design.md` + `plans/...backup-restore` | Backup/restore runbook | `RM §area-operability` (B198 backup/restore TODO) |
 
 ### GC specs / plans {#gc-specs}
@@ -472,3 +472,124 @@ mapped to a consolidated target. They were recovered from `3a054b9ffe6~1` and co
 The four docs remain listed as delete-candidates (they were in the original consolidation scope).
 Their durable content is now fully present in `09-read-protocol.md` and in code (commit `440871098a9`
 for B115; `ContentAddressedTransaction.cpp` and `DataPartStorageOnDiskFull.cpp` for B59).
+
+---
+
+## Second-pass audit (2026-07-02) — feature-area deep-check {#second-pass-audit}
+
+The first pass was sample-based (~12 of ~188 docs) and mapped, but did **not** deep-check, the
+feature-area design/plan docs. This pass recovered each feature-area doc from
+`3a054b9ffe6~1` (all except `plans/2026-06-03-cas-mergetree-m9w2-partition-clone.md`, deleted in
+`a5df01e9f1c`) and verified — line by line — that its load-bearing invariants / decisions /
+rejected-paths / key mechanisms survive in the new set. Areas covered: replication, fetch
+partition, backup/restore, freeze, transactions/MVCC, projections, mutations/patch-parts,
+multipart(multi-part) transaction, shared pool, cleanup-simplification, milestones (m1/m4/m6/m8/m9w2).
+
+**Verdict: GAPS.** Most areas PASS; the transactional-commit machinery (writer-side MVCC) is a real
+**significant gap** — a whole load-bearing layer with no home — and there are four smaller real
+losses. Two mapping lines in this coverage doc are themselves inaccurate and are what hid the big gap.
+
+### SIGNIFICANT GAP — transactional-commit machinery (writer-side MVCC) has no home {#gap-transactions}
+
+Two old docs describe one coherent, load-bearing writer-side layer that is **absent** from the new
+set (only an incidental `replaceFile` mention exists in `02-methodology.md:301`). This is the
+mechanism that makes transactional merges/mutations and the Tier-2 isolation test class
+(`01168_mutations_isolation`, `01174_select_insert_isolation`, `01167_isolation_hermitage`, …) work
+on a CA disk.
+
+| Old doc | Missing load-bearing item | Target new doc/section |
+|---|---|---|
+| `specs/2026-06-04-cas-mergetree-transactions-design.md §3.1` | **Capability-gate decoupling**: a new `IMetadataStorage::supportsTransactionalMutableFiles` (distinct from `supportWritingWithAppend`), and the explicit rationale for **not** making CA's `supportWritingWithAppend` return `true` (would defeat the dedup-log no-append fallback and disarm the append guard). A "why we did NOT take the easy path" decision. | new `03 §transactions-mvcc` |
+| `specs/2026-06-04-cas-mergetree-transactions-design.md §3.3` | **The mutable-only commit branch** (author-flagged "load-bearing"): when a txn stages only mutable per-part files against an already-committed part (creation-CSN fill-in on `COMMIT`; removal-TID lock/unlock on `DELETE`/mutation/`DROP`/`TRUNCATE`-in-txn), `commit` must detect `recorded` empty + `recorded_mutable` non-empty + existing ref and update **only the sidecar in place, keeping the existing `part_id`/manifest/ref** — else the normal path recomputes `part_id` over an empty manifest and **clobbers the part**. Plus the fail-close rule (no ref → throw, never publish a standalone empty sidecar). The single most important invariant of the feature. | new `03 §transactions-mvcc` |
+| `specs/2026-06-04-cas-mergetree-transactions-design.md §3.2` | **`replaceFile` for a mutable-file destination** routed to `recorded_mutable` (so `txn_version.txt.tmp → txn_version.txt` lands in the sidecar), and that a mutable file's `.tmp` must itself match `isMutablePerPartFile` (`<mutable>.tmp`) or a standalone autocommit republishes a one-file manifest and clobbers the part. | new `03 §transactions-mvcc` |
+| `specs/2026-06-04-cas-mergetree-transactions-design.md §3.4, §4, §5` | **MVCC-on-CAS lifecycle**: an uncommitted INSERT publishes a CA ref (blobs stay GC-reachable), governed-invisible by `txn_version.txt`; `ROLLBACK` removes the ref → blobs GC-eligible (mirrors precommitted-part model); the rollback-reload hardening (`getLastModified` on a ref-less in-flight part must resolve via the in-flight overlay, not throw `FILE_DOESNT_EXIST`); the concurrency argument (MVCC serializes per-part `txn_version.txt` under `DataPartsLock`; per-part sidecars don't contend; mutable-only branch re-validates no blobs). | new `03 §transactions-mvcc` (cross-link `04` for the ROLLBACK→GC-eligible edge and `09 §9.1` for the read side) |
+| `specs/2026-06-04-cas-mergetree-multipart-transaction-design.md` (whole) | **Multi-part *disk* transaction** — NOT S3-multipart-upload. The per-part staging map (`std::map<{table_uuid, part_name}, PartStaging>` replacing the single-part `recorded`/`recorded_mutable`; removal of the one-part assertion in `rememberTarget`); why a transactional merge spans multiple parts (deferred `tmp_merge_X → X` rename window + `addNewPartAndRemoveCovered → lockRemovalTID` rewriting each covered SOURCE part's `txn_version.txt`); the `moveDirectory(tmp_merge_X → X)` rename re-key merging staging entries; and **§3.0's atomicity argument** (CA publishes parts one-at-a-time; MVCC visibility is CSN/TID-gated, not disk-op-atomic; crash → orphan refs GC-reclaimed — no new cross-part atomicity requirement). | new `03 §transactions-mvcc` (same section; this is the multi-part extension of the commit machinery above) |
+
+**Recommendation:** add one new section **`03-writer-protocol.md §transactions-mvcc`** carrying all of
+the above (it sits naturally beside `§mutable-vs-immutable` and `§renames`). Keep `§mutable-vs-immutable`
+scoped to the storage substrate and add a "see §transactions-mvcc" pointer. Cross-link `01 §drop-supersession`
+and `04` (ROLLBACK→GC-eligible) and `09 §9.1` (force-fresh mutable reads).
+
+**Coverage-matrix corrections (these mis-mappings hid the gap):**
+- `CONSOLIDATION-COVERAGE.md` line 137 maps the multipart-transaction spec to "`03 §phase-upload`
+  (multipart)" — a mis-read of "multipart" as S3-multipart-upload. The two are unrelated; the spec is
+  the multi-part disk transaction above.
+- `CONSOLIDATION-COVERAGE.md` line 139 maps the transactions design to "`03 §mutable-vs-immutable`
+  (txn_version handling)" — that paragraph is only the storage substrate; the transactions *design*
+  (gate decoupling, mutable-only commit, `replaceFile`/`.tmp`, rollback/MVCC lifecycle) is a distinct
+  layer not carried there.
+
+### Smaller real gaps {#second-pass-smaller-gaps}
+
+| Old doc | Missing load-bearing item | Target new doc/section |
+|---|---|---|
+| `specs/2026-06-03-cas-mergetree-projections-design.md §2/§3` | **Projection storage model**: a projection is NOT a separate part/ref/sub-manifest but **nested `<proj>.proj/<file>` keys inside the parent part's single `PartManifest` (Approach A)**, and the rejection of Approach B (nested sub-manifests) and Approach C (separate `projections/` ref namespace). A genuine rejected-path + key-mechanism loss (09 §8 covers only *reading* a carried-forward projection; 01 covers only that projection blobs hash into `part_id`). | new short subsection in `01 §object-model` (projection representation + rejected alternatives) |
+| `specs/2026-06-03-cas-mergetree-projections-design.md §4.2` | **Committed-path projection-subdir awareness**: the `existsDirectory`/`listDirectory` projection-subdir branches and the parent-part-listing first-component collapse (`<proj>.proj/*` → one `<proj>.proj` entry) that let `loadProjections` discover a *committed* projection. 09 §8.3 covers only the *in-flight* overlay. | `09 §8` (committed-path note) or `05-formats-and-backend.md` |
+| `specs/2026-06-04-cas-mergetree-replication-design.md §3, §11` | **`pool_uuid` for same-pool relink detection**: same-pool detection must use a stable minted `pool_uuid` in `_pool_meta`, **not** endpoint+prefix string-matching (DNS aliases / path-vs-vhost / trailing-slash → false negatives; shared proxy → false positive → relink to absent blobs). A fail-closed correctness rationale for how relink decides two replicas share a pool. New set mentions `_pool_meta` holds "pool identity" but never ties relink to it or records why endpoint-matching was rejected. | `01-architecture.md` (near `_pool_meta` / relink) or `03` |
+| `specs/2026-06-04-cas-mergetree-fetch-partition-design.md §3.3` | **Fresh-fetch detached-landing mechanism** (FETCH is marked DONE): a fresh (non-cloned) detached-staging write must commit a `detached` ref by folding the transaction's `recorded` blobs into the shared `detached` ref (mirroring `republishCommittedPartIntoDetached` but sourcing from `recorded`), and the `detached/tmp-fetch_<part>` → `detached/<part>` detached→detached re-key (`rekeyDetachedPartDir`). `03 §renames` covers `final↔detached` but not fresh-fetch landing / the `tmp-fetch_` staging re-key. | `03 §renames` (add a fresh-fetch/`tmp-fetch_` row) or a note in `01` |
+| `specs/2026-06-04-cas-mergetree-freeze-design.md §3.2/§7d` | **Freeze concurrency rationale**: one ref **per frozen part** (not a shared container) chosen deliberately to avoid the shared-`detached` RMW / B66a torn-read hazard under concurrent freeze. The reachability *fact* survives (fragmented across `01 §freeze-materializes-bytes`, `04 §d1-design`, `05`, `08 S18`); the *why-per-part* concurrency decision is lost. | one sentence in `05` (near shadow/detached namespace) or `08 S18` |
+
+### PASS areas (verified, with landing spots) {#second-pass-pass}
+
+- **Replication (core)** — fetch-by-relink, cross-replica GC safety / union-of-refs, benign
+  cross-replica divergence, `manifest_hash` TODO (B1), dead-replica stale-ref leak, zero-copy
+  coexistence: all present across `01`, `03 §renames`, `04`, `ROADMAP`. (Only the two smaller gaps
+  above.)
+- **Mutations / patch parts / lightweight deletes** — carry-forward (Wide-only), MUTATE_PART manifest
+  build, mutable sidecar files, cancelled-mutation fail-close, patch-part reachability (new doc is
+  *richer*: first-class patch ref with transitive base-blob reachability, superseding the old plain-part
+  model): `01 §what-it-buys`/`§what-it-does-not-buy`, `03`, `04 §reachability-roots`, `08 S09–S11`.
+- **Backup/restore** — the "collapses to B198 TODO" mapping is **justified, not a gap**: the old doc is a
+  thin RESTORE-side bug-fix spec ("BACKUP already works; 13 tests fail on one RESTORE root cause"), not an
+  architecture; its load-bearing decisions are restatements of invariants documented elsewhere. Optional
+  half-line for `ROADMAP` B198: "`BACKUP` read-side works; `RESTORE` must materialize each part via one
+  whole-part commit, not per-file autocommit."
+- **Freeze (core)** — FREEZE materializes real bytes (stated more strongly in `01 §freeze-materializes-bytes`);
+  `shadow/` as GC-reachability root; UNFREEZE releases refs: `01`, `04 §d1-design`, `05`, `08 S18`. (Only
+  the per-part concurrency-rationale gap above.)
+- **Shared pool (spec + m8)** — bucket-as-single-source-of-truth, `create-if-absent` CAS as the one
+  primitive, lease-as-liveness-not-safety, fencing tokens, write-session pins, fenced GC-leader lock,
+  `INV-S3-COMPLETE`: `01 §shared-nothing`/`§incarnation-identity`, `03 §mount-startup`, `04`, `05`.
+- **m1 / m4** — foundational + GC-milestone scope; the intermediate grace-based-GC designs were
+  self-superseded (their own "post-review revision" banners replace grace-GC with pin+lease+fence),
+  now the incarnation/fence model in `04`. Intended supersession, not loss.
+- **m6-dropin (north star)** — drop-in `metadata_type = content_addressed` with no DDL/engine change:
+  `01 §what-cas-is`, `README`; acceptance requirements land as `ROADMAP` items (B31 gate, un-tagging,
+  no-leftovers GC). The literal "north star" phrase is intended-drop framing.
+- **m9w2 (partition clone)** — one ref to source `part_id`, zero byte copy for whole-part clone
+  (ATTACH/REPLACE/MOVE PARTITION same-disk): `01 §what-it-buys`, `03 §renames`, `09 §8.3`.
+- **Cleanup-simplification (06-23)** — all documented removals survive: vestigial `trees/` /
+  `ObjectKind::Tree` (`01 §rejected-merkle-tree-layer`), eliminated `_disk` namespace
+  (`03 §verbatim-files`), removed registry (`01 §rejected-namespace-registry`, `04 §d1`),
+  `Placement::Pack` removal (`05 §gen1-freeze`), config-key unification (`05` + settings). R1–R14
+  refactor task list is intended-drop.
+
+### Second-pass gap-fill (2026-07-02) {#second-pass-gap-fill}
+
+All second-pass gaps were filled with additive, source- and code-grounded edits; the two mis-mapping
+lines above (multipart-transaction, transactions design) were corrected to point at
+`03 §transactions-mvcc`.
+
+- **SIGNIFICANT — transactional-commit machinery.** New section `03-writer-protocol.md §transactions-mvcc`
+  (`{#transactions-mvcc}`) with subsections: gate decoupling (`§txn-gate`), `replaceFile`/`.tmp`
+  (`§txn-replacefile`), the mutable-only commit branch + fail-close (`§txn-mutable-only`), rollback +
+  MVCC lifecycle (`§txn-rollback`), and the multi-part disk transaction + §3.0 atomicity (`§txn-multipart`).
+  `§mutable-vs-immutable` got a "see §transactions-mvcc" pointer. Cross-links `04` (ROLLBACK→GC-eligible)
+  and `09 §8`/`§9.1`. Grounded against `ContentAddressedTransaction.cpp` (`publishStaging` mutable-only
+  branch at `:251`; `replaceFile` at `:1163`; per-part `parts` staging map), `StorageMergeTree.cpp:178`,
+  and `ContentAddressedMetadataStorage.h:76`.
+- **Projection storage model** → `01 §object-model` new `#projections-in-manifest`: nested `<proj>.proj/<file>`
+  keys in the parent `PartManifest` (Approach A) + rejected B (sub-manifests) / C (`projections/` namespace).
+- **Committed-path projection-subdir awareness** → `09 §8` new `#committed-projection-subdir`:
+  `existsDirectory`/`listDirectory` projection branches + parent first-component collapse.
+- **`pool_uuid` same-pool relink** → `01` new `#pool-uuid-relink` near `_pool_meta`: minted `pool_id`
+  vs endpoint matching, fail-closed rationale; grounded against `DataPartsExchange.cpp:232` and
+  `ContentAddressedMetadataStorage.cpp:388`.
+- **Fresh-fetch detached-landing** → `03 §renames`: commit a `detached` ref from `recorded`,
+  `tmp-fetch_` → final detached→detached re-key (`rekeyDetachedPartDir`).
+- **Freeze concurrency rationale** → one sentence in `05 §path-mapping` (near shadow/detached): per-part
+  frozen ref avoids shared-`detached` RMW / B66a torn read.
+
+**Still-open / caveats (not invented):** the transactions-design "iterative tail" (further
+`txn_version.txt`-family touchpoints surfaced only by running Tier-2 isolation tests) is a testing
+observation, not a documented invariant, and is intentionally not carried as a spec claim.

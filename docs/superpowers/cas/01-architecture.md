@@ -115,6 +115,26 @@ never reused, so identity is unique by construction without relying on random-co
 **Status:** DONE. Phase 3 `manifest_ordinal` reshape (replacing the earlier random `manifest_instance_id`)
 is DONE on branch `cas-layout-hot-cold-split`.
 
+#### Projections in the manifest {#projections-in-manifest}
+
+A projection is **not** a separate part, ref, or sub-manifest. On disk it lives at
+`<part>/<projection_name>.proj/<files>`, and MergeTree hands the projection a **child**
+`IDataPartStorage` whose `part_dir` is `<name>.proj`, sharing the parent part's transaction. So every
+projection file resolves to a **nested key in the parent part's single `PartManifest`**:
+`<proj>.proj/<file>` (e.g. `p_sum.proj/data.bin`) sits in the same `blobs` map as the top-level
+`columns.txt`, `data.bin`, etc. This is the same flat-manifest-with-nested-keys generalization already
+used for detached parts (`detached/<part>/<file>`) — **Approach A** in
+`specs/2026-06-03-cas-mergetree-projections-design.md §2/§3`. Two consequences fall out: merges rebuild
+projections (fresh projection blobs in the merged manifest, no carry-forward logic), and `part_id`
+naturally includes the projection blobs (ADD/DROP/MATERIALIZE PROJECTION yields a new part version, no
+false dedup).
+
+**Rejected alternatives** (§3): **B — nested sub-manifests** (each projection its own sub-`PartManifest`
++ `part_id` behind a `projections` footer): a format/version change and a recursive resolver, for
+identity projections never use (always read as children, rebuilt on merge) — YAGNI. **C — projections
+as a separate `projections/` ref namespace** lifecycle-linked to the parent: a second namespace + GC
+coupling for no benefit (projections are cloned/detached/dropped with their parent).
+
 ### Incarnation identity (`server_root_id`, `writer_epoch`) {#incarnation-identity}
 
 The durable, per-`server_root_id` identity is built from three sticky objects under
@@ -336,6 +356,25 @@ both blob sets are GC'd when the part is later superseded; the duplicate lives o
 lifetime). A homogeneous cluster with deterministic compression produces identical bytes → identical
 blob hash → dedup with no check at all. This rationale governs the `manifest_hash`-on-znode item
 (`ROADMAP.md §area-writer`): it is a dedup optimization, not a safety fix.
+
+### Same-pool relink uses `pool_uuid`, not endpoint matching {#pool-uuid-relink}
+
+Fetch-by-relink (the CAS analogue of zero-copy replication: a replica publishes a ref to
+already-present shared blobs instead of downloading bytes) is only correct when the two replicas share
+one pool. Same-pool detection uses a **stable minted `pool_uuid`**, not endpoint+prefix string
+matching. `_pool_meta` carries `owner_server_id` + `claimed_at_unix` **and** a `pool_id` minted at
+first pool claim; `ContentAddressedMetadataStorage::getPoolUUID` exposes it
+(`ContentAddressedMetadataStorage.cpp:388`, `pool_uuid = u128ToHex(poolMeta().pool_id)`). The
+part-exchange handshake advertises `content_addressed_pool_uuid`, and the sender relinks **only** when
+the receiver's advertised `pool_uuid` equals its own (`DataPartsExchange.cpp:232`); anything else falls
+back to the byte fetch (correct on CAS — downloaded files content-address and dedup).
+
+Endpoint+prefix string matching was **rejected as unsafe**: DNS aliases, path-vs-vhost S3
+addressing, and trailing-slash normalization give **false negatives** (a needless byte fetch), while a
+shared proxy endpoint fronting two different buckets gives a **false positive** → a relink to blobs
+that are not in the receiver's pool → a dangling ref. `pool_uuid` fails closed on both. Adding it was a
+`_pool_meta` `CURRENT_VERSION` bump that fails closed on older readers. Source:
+`specs/2026-06-04-cas-mergetree-replication-design.md §3/§11`.
 
 ### Logical-hash-collision → quarantine (fail-closed) {#hash-collision-quarantine}
 
