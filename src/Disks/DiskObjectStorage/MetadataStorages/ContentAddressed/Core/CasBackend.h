@@ -153,6 +153,9 @@ public:
     /// (runs, seals). The returned `stream` yields exactly the window's bytes and nothing is
     /// materialized whole by the seam — the caller reads at its own pace. MUTABLE objects (root
     /// shards, gc/state, mounts) MUST keep using `get`: their bytes can change under an open stream.
+    /// CAVEAT: the window END is advisory on storages where `setReadUntilPosition` is a hint
+    /// (LocalObjectStorage) — the stream may yield bytes past the window; consumers MUST bound their
+    /// own consumption (RunFileReader bounds to its data_end). The window START is always exact.
     virtual std::optional<GetStreamResult> getStream(const String & key, Range range = {}) = 0;   /// nullopt = absent
     virtual HeadResult head(const String & key) = 0;
     virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) = 0;

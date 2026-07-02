@@ -267,7 +267,8 @@ static bool isObjectNotFound(const std::exception & e)
 /// Read `range` of the object at `path` as a TRUE ranged read: seek to the offset and bound the
 /// read window (spec 2026-07-02 snapshot-streaming §Backend seam). Never read-whole-then-substr —
 /// the snapshot runs this serves are GBs at scale and the caller's memory budget is O(block).
-static String readObjectRanged(IObjectStorage & object_storage, const String & path, Range range)
+static String readObjectRanged(IObjectStorage & object_storage, const String & path, Range range,
+                               uint64_t known_size = 0)
 {
     auto buf = object_storage.readObject(StoredObject(path), getReadSettings(), /*read_hint=*/std::nullopt);
     String content;
@@ -280,14 +281,17 @@ static String readObjectRanged(IObjectStorage & object_storage, const String & p
     /// Clamp exactly like the old substr path: an offset at or past EOF yields an empty result.
     /// `seek` past the object size may throw depending on the storage, so fail-close the window
     /// against the known size before touching the buffer position.
-    const auto metadata = object_storage.getObjectMetadata(path, /*with_tags=*/false);
-    if (range.offset >= metadata.size_bytes)
+    /// M1 (final review): callers on the Native path already HEAD'ed the key — threading that size
+    /// here saves one metadata round-trip per ranged read against real S3. 0 = unknown, fetch.
+    const uint64_t object_size = known_size != 0 ? known_size
+        : static_cast<uint64_t>(object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes);
+    if (range.offset >= object_size)
         return {};
 
     /// The readable window, clamped to EOF. `setReadUntilPosition` is only a hint (not every object
     /// storage honors it — LocalObjectStorage does not), so the exact byte count below is what bounds
     /// the read; the hint lets storages that DO honor it avoid over-fetching.
-    const uint64_t available = metadata.size_bytes - range.offset;
+    const uint64_t available = object_size - range.offset;
     const uint64_t to_read = range.length.has_value() ? std::min(*range.length, available) : available;
 
     if (range.length.has_value())
@@ -305,7 +309,8 @@ static String readObjectRanged(IObjectStorage & object_storage, const String & p
 /// `readObjectRanged`'s seek + bound, but RETURNS the buffer instead of draining it — the caller reads
 /// at its own pace, so nothing is materialized whole. Returns nullptr when the offset is at or past EOF
 /// (the empty-window clamp), matching the ranged-get contract.
-static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & object_storage, const String & path, Range range)
+static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & object_storage, const String & path, Range range,
+                                                          uint64_t known_size = 0)
 {
     auto buf = object_storage.readObject(StoredObject(path), getReadSettings(), /*read_hint=*/std::nullopt);
     if (range.whole())
@@ -314,8 +319,11 @@ static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & objec
     /// Clamp exactly like `readObjectRanged`: an offset at or past EOF yields an empty stream, and
     /// `seek` past the object size may throw depending on the storage, so fail-close against the known
     /// size before touching the buffer position.
-    const auto metadata = object_storage.getObjectMetadata(path, /*with_tags=*/false);
-    if (range.offset >= metadata.size_bytes)
+    /// M1 (final review): callers on the Native path already HEAD'ed the key — threading that size
+    /// here saves one metadata round-trip per ranged read against real S3. 0 = unknown, fetch.
+    const uint64_t object_size = known_size != 0 ? known_size
+        : static_cast<uint64_t>(object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes);
+    if (range.offset >= object_size)
         return std::make_unique<ReadBufferFromString>(std::string_view{});
 
     /// `setReadUntilPosition` is only a hint (LocalObjectStorage does not honor it), but for a returned
@@ -393,7 +401,7 @@ std::optional<GetResult> ObjectStorageBackend::get(const String & key, Range ran
         GetResult gr;
         try
         {
-            gr.bytes = readObjectRanged(*object_storage, key, range);
+            gr.bytes = readObjectRanged(*object_storage, key, range, hr->size);
         }
         catch (const std::exception & e)
         {
@@ -442,7 +450,7 @@ std::optional<GetStreamResult> ObjectStorageBackend::getStream(const String & ke
         GetStreamResult sr;
         try
         {
-            sr.stream = openObjectRangedStream(*object_storage, key, range);
+            sr.stream = openObjectRangedStream(*object_storage, key, range, hr->size);
         }
         catch (const std::exception & e)
         {
