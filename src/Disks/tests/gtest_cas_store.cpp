@@ -6,11 +6,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
+#include <future>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -1486,4 +1489,125 @@ TEST(CasStore, RebornShardIncarnationStrictlyGreater)
     /// The INC-MONO invariant: the reborn incarnation must be strictly greater (lexicographic).
     EXPECT_LT(first_inc, reborn_inc)
         << "INC-MONO: reborn shard incarnation must be strictly greater than the first";
+}
+
+/// ==== ack-floor beat (spec 2026-07-02-cas-gc-ack-floor-fence-redesign) ====
+
+namespace
+{
+
+/// Delegating backend whose `get` of one armed key throws — drives the beat's fail-closed ack path.
+class GetFailingBackend final : public DB::Cas::Backend
+{
+public:
+    explicit GetFailingBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
+    String fail_key;   /// empty = fault disarmed
+
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override
+    {
+        if (!fail_key.empty() && k == fail_key)
+            throw DB::Exception(DB::ErrorCodes::FILE_DOESNT_EXIST, "injected gc/state read fault");
+        return inner->get(k, r);
+    }
+    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
+    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, b, m); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, b, e, m); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, b, e, m); }
+    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+private:
+    std::shared_ptr<DB::Cas::Backend> inner;
+};
+
+}
+
+TEST(CasStoreBeat, AckAdvancesOnlyAfterViewLoad)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openStoreForTest(backend);
+
+    /// Publish gc/state at round 3 (empty retired list); the next beat must load and advertise it.
+    GcState st;
+    st.round = 3;
+    backend->putIfAbsent(store->layout().gcStateKey(), encodeGcState(st));
+    store->renewWatermarkOnce();
+
+    const auto got = backend->get(store->layout().mountKey("test"));
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(decodeMountLease(got->bytes).observed_gc_round, 3u);
+    EXPECT_EQ(store->retireView().round(), 3u);
+}
+
+TEST(CasStoreBeat, GcStateReadFailureLeavesAckUnchanged)
+{
+    auto inner = std::make_shared<InMemoryBackend>();
+    auto failing = std::make_shared<GetFailingBackend>(inner);
+    auto store = DB::Cas::Store::open(failing,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_trim_min_events = 0});
+
+    GcState st;
+    st.round = 2;
+    inner->putIfAbsent(store->layout().gcStateKey(), encodeGcState(st));
+    store->renewWatermarkOnce();
+    const auto before_got = inner->get(store->layout().mountKey("test"));
+    ASSERT_TRUE(before_got.has_value());
+    const MountLease before = decodeMountLease(before_got->bytes);
+    EXPECT_EQ(before.observed_gc_round, 2u);
+
+    /// Arm the fault: gc/state unreadable. The beat still renews the lease (seq advances), but the
+    /// ack must not move — an ack may never claim a view that was not actually loaded.
+    failing->fail_key = store->layout().gcStateKey();
+    store->renewWatermarkOnce();
+    const auto after_got = inner->get(store->layout().mountKey("test"));
+    ASSERT_TRUE(after_got.has_value());
+    const MountLease after = decodeMountLease(after_got->bytes);
+    EXPECT_EQ(after.observed_gc_round, 2u);
+    EXPECT_EQ(after.seq, before.seq + 1);
+}
+
+TEST(CasStoreBeat, DrainBlocksAckWhileMutationInFlight)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openStoreForTest(backend);
+
+    GcState st;
+    st.round = 1;
+    backend->putIfAbsent(store->layout().gcStateKey(), encodeGcState(st));
+
+    std::promise<void> entered, release;
+    std::atomic<bool> released{false};
+
+    std::thread mutator([&]
+    {
+        store->mutateShardForTest(RootNamespace{"ns"}, 0, [&](RootShard &)
+        {
+            entered.set_value();
+            release.get_future().wait();
+        }, RootMutationOrigin::Writer, RootMutationKind::Promote);
+    });
+    entered.get_future().wait();
+
+    /// The beat must park on the drain while the mutation is in flight (the mutation holds the
+    /// shared side of the view gate for its whole call).
+    auto beat = std::async(std::launch::async, [&]
+    {
+        const uint64_t r = store->refreshViewForBeat();
+        /// Order proof: by the time the beat returns, the mutation MUST have been released — the
+        /// drain forbids installing a view over an in-flight old-view mutation.
+        EXPECT_TRUE(released.load());
+        return r;
+    });
+
+    /// Bounded negative wait: this asserts the blocking occurred (it is an assertion on an
+    /// intentionally-parked thread, not a sleep papering over a race).
+    ASSERT_EQ(beat.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+
+    released.store(true);
+    release.set_value();
+    mutator.join();
+    EXPECT_EQ(beat.get(), 1u);
+    EXPECT_EQ(store->retireView().round(), 1u);
 }

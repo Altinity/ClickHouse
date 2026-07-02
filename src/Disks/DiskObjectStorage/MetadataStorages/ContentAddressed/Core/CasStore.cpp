@@ -207,13 +207,18 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// ADOPTS that very (uuid, epoch) slot (Task 5) rather than self-tripping the double-start guard.
         Store * raw = store.get();
         /// Merged heartbeat (ack-floor redesign): the mount keeper now ALSO carries the per-server
-        /// build-watermark floor (`minActive`) and the acked GC round. `minActive` is read off the
-        /// keeper's state lock (it reaches into the Store's builds_mutex). The observed-round callback
-        /// is a stub {0} until Task 5 wires the real view-load ack — a fresh mount has loaded nothing.
+        /// build-watermark floor (`minActive`) and the acked GC round. Both are read off the
+        /// keeper's state lock (`prepareRenew` is the off-lock hook): `minActive` reaches into
+        /// builds_mutex; the observed-round callback runs the BEAT (`refreshViewForBeat` — gc/state
+        /// probe + retired-view load + drain + install). Open-ordering falls out of the wiring:
+        /// `doStart` computes the payload through this very callback, so the anchored mount body
+        /// carries an ack from a gc/state read that happened AFTER `claimMountAwaitingExpiry` wrote
+        /// the mount — a mount the GC's enumeration missed therefore still opened with a view at
+        /// least as fresh as any round that was durable before the miss.
         store->mount_keeper = std::make_unique<MountLeaseKeeper>(
             store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
             store->config.mount_lease_ttl_ms, now_ms,
-            [raw] { return raw->minActive(); }, [] { return uint64_t{0}; });
+            [raw] { return raw->minActive(); }, [raw] { return raw->refreshViewForBeat(); });
         /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh the
         /// monotonic deadline; on a superseded/foreign renew failure latch the fence to lost. Set BEFORE
         /// startBackground so no renewal can fire before the callbacks are in place.
@@ -355,6 +360,57 @@ uint64_t Store::peekNextBuildSeq()
 {
     std::lock_guard lk(builds_mutex);
     return next_build_seq;
+}
+
+uint64_t Store::refreshViewForBeat()
+{
+    /// 1. Probe the published round. Absent gc/state = a pool GC never touched (round-0 view is
+    /// current by definition). Any failure leaves the installed view — and therefore the advertised
+    /// ack — untouched.
+    std::optional<GetResult> got;
+    try
+    {
+        got = pool_backend->get(pool_layout.gcStateKey());
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger("CasStore"),
+            "CAS beat: gc/state probe failed; observed_gc_round stays at the installed view");
+        return retire_view.round();
+    }
+    if (!got)
+        return retire_view.round();
+
+    uint64_t published = 0;
+    try
+    {
+        published = decodeGcState(got->bytes).round;
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger("CasStore"),
+            "CAS beat: gc/state undecodable; observed_gc_round stays at the installed view");
+        return retire_view.round();
+    }
+
+    /// Monotone: never re-install (or regress to) a round the view already covers.
+    if (published <= retire_view.round())
+        return retire_view.round();
+
+    /// 2. The DRAIN + install: wait out every in-flight mutateShard (shared holders), then load and
+    /// install the newer retired view. The S3 reads inside refresh() run under the exclusive gate —
+    /// acceptable at beat cadence (a few small GETs); mutations queue behind it briefly.
+    try
+    {
+        std::unique_lock<std::shared_mutex> drain(view_gate);
+        retire_view.refresh();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger("CasStore"),
+            "CAS beat: retired-view refresh failed; observed_gc_round stays at the installed view");
+    }
+    return retire_view.round();
 }
 
 void Store::renewWatermarkOnce()
@@ -739,6 +795,12 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<
                         uint64_t * out_committed_version, RootMutationOrigin origin, RootMutationKind kind,
                         ShardIncarnation birth_incarnation, std::function<uint64_t()> birth_floor_provider)
 {
+    /// Ack-floor drain (spec 2026-07-02): hold the SHARED side of the view gate for the WHOLE call —
+    /// condemn-gate evaluations inside `mutate` through the CAS response — so a beat advertising a
+    /// newer `observed_gc_round` can never overtake an in-flight mutation that gated on the older
+    /// view. Lock order (never inverted elsewhere): view_gate, then RetireView's internal mutex.
+    std::shared_lock<std::shared_mutex> view_guard(view_gate);
+
     /// Local write fence (spec §write-fence, Phase 0 Task 6): the shared mutable ref shards are the
     /// state the fence most protects. A superseded/paused writer (lease lost or local deadline passed)
     /// must not race the live one. Purely local — no S3 read. Permissive until Task 7 arms it, so
