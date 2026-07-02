@@ -291,29 +291,28 @@ inline String encodeMinimalGcState(uint64_t round, uint64_t fence_seq)
 }
 
 /// Inject GC state so a fresh `Store::open` over the same backend sees the given incarnations as
-/// condemned. Writes one retired-set object and records its key in `gc/state.retired_refs[shard]` — the
-/// on-storage interface `RetireView::refresh` dereferences (ack-floor redesign: refs, not a LIST). The
-/// Store refreshes its `retireView` at open (and each beat), so the caller injects BEFORE opening the
+/// condemned. Writes one CURRENT retired-set object and records its key in `gc/state.retired_refs[shard]`
+/// — the on-storage interface `RetireView::refresh` dereferences (ack-floor redesign: refs, not a LIST).
+/// The Store refreshes its `retireView` at open (and each beat), so the caller injects BEFORE opening the
 /// Store whose Build consults the view.
 ///
-/// The retired set is written under the reserved round component 0. Real GC rounds start at round 1 and
-/// key their retired sets at `retiredKey(fold_generation, snap_attempt, round>=1, shard)`, so a set under
-/// round 0 is NEVER mistaken for a resumable incomplete round by `Gc::tryResumeIncompleteRound` (which
-/// reads `retiredKey(snap_generation, snap_attempt, state.round, shard)` with `state.round == round >= 1`).
+/// ACK-FLOOR: entries carry a `condemn_round` (and optionally `delete_pending`) — the caller supplies
+/// them fully-formed in `entries` (default-constructed entries have condemn_round 0, delete_pending false).
+/// The set is written under the reserved round component 0 (no-real-round sentinel), keyed
+/// retiredKey(0, 0, 0, shard); the minimal injected gc/state has snap_generation == snap_attempt == 0. The
+/// call sites' semantics are unchanged: a condemned token the writer publish gate must see after refresh.
 inline void injectRetire(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     uint64_t round, uint64_t fence_seq, uint64_t shard, std::vector<DB::Cas::RetiredEntry> entries)
 {
-    /// The retired set lives under the reserved round component 0 (a no-real-round sentinel that keeps it
-    /// invisible to resume detection). The minimal injected gc/state has snap_generation == snap_attempt
-    /// == 0, so the set's key is retiredKey(0, 0, 0, shard).
     const String key = layout.retiredKey(/*generation*/0, /*attempt*/0, /*round*/0, shard);
     backend.putIfAbsent(key,
         DB::Cas::encodeRetiredSet(DB::Cas::RetiredSet{.entries = std::move(entries)}));
 
     /// gc/state carries {round, fence_seq} AND retired_refs[shard] = key: RetireView reads the current
     /// retired list by dereferencing retired_refs (ack-floor redesign), so the ref must be recorded for
-    /// the injected set to be visible to the writer publish gate.
+    /// the injected set to be visible to the writer publish gate. Read-modify-CAS so multiple injectRetire
+    /// calls for different shards accumulate refs rather than clobbering.
     DB::Cas::GcState gc_state;
     const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
     if (head.exists)
@@ -326,6 +325,49 @@ inline void injectRetire(
         backend.putIfAbsent(layout.gcStateKey(), state);
     else
         backend.putOverwrite(layout.gcStateKey(), state, head.token);
+}
+
+/// Whether blob `hash` is absent from the backend (its exact-token content object is gone).
+inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
+{
+    return !backend.head(layout.blobKey(DB::Cas::BlobId(DB::Cas::u128ToHex(hash)))).exists;
+}
+
+/// ACK-FLOOR reclaim loop (the canonical pipeline driver): run regular rounds, advancing the store's own
+/// mount ack after each round (`renewWatermarkOnce` runs the beat, so `observed_gc_round` follows the
+/// freshly-committed gc/state.round and the heartbeat floor advances). A blob condemned at round K is
+/// deleted by round K+3 with acks kept current (condemn K -> pending at first pass whose min_ack > K ->
+/// physical delete the pass after that). Returns true as soon as the blob became absent.
+inline bool runRoundsUntilAbsent(
+    const DB::Cas::StorePtr & store, DB::Cas::Gc & gc, DB::Cas::Backend & backend,
+    const DB::Cas::Layout & layout, const DB::UInt128 & hash, int max_rounds = 8)
+{
+    for (int i = 0; i < max_rounds; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        if (blobAbsent(backend, layout, hash))
+            return true;
+    }
+    return blobAbsent(backend, layout, hash);
+}
+
+/// The decoded CURRENT retired set for `shard` (dereferenced through gc/state.retired_refs). Empty when
+/// gc/state or the ref is absent. Used by ack-floor tests to assert an entry's pending/condemn state.
+inline DB::Cas::RetiredSet currentRetiredSet(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t shard)
+{
+    const auto st = backend.get(layout.gcStateKey());
+    if (!st)
+        return {};
+    const DB::Cas::GcState gc_state = DB::Cas::decodeGcState(st->bytes);
+    const auto it = gc_state.retired_refs.find(shard);
+    if (it == gc_state.retired_refs.end())
+        return {};
+    const auto got = backend.get(it->second);
+    if (!got)
+        return {};
+    return DB::Cas::decodeRetiredSet(got->bytes);
 }
 
 /// Raise the `fence_round` of every shard of a namespace to at least `round`, exactly as a GC leader's

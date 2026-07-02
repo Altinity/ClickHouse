@@ -80,9 +80,11 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
         store, std::chrono::seconds(1), "test::gc", "ca",
         [&](const Rec & r) { rows.push_back(r); });
 
-    /// Drive rounds until we observe both a marking round and a deletion round (a few rounds: the
-    /// dead subgraph drains in tree-round + blob-round + a confirm round). Each call appends exactly
-    /// a Start then a Finish.
+    /// Drive rounds until we observe both a marking round and a deletion round. Under the ack-floor
+    /// pipeline a candidate is marked (condemned) in one round and physically deleted a few rounds later,
+    /// once the mount's ack floor graduates it — so advance the store's own mount ack after each round
+    /// (renewWatermarkOnce runs the beat) and give the pipeline a generous round budget. Each
+    /// runOneRoundNow call appends exactly a Start then a Finish.
     bool saw_marked = false;
     bool saw_deleted = false;
     size_t marking_finish_idx = 0;
@@ -92,6 +94,7 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
     {
         const size_t before = rows.size();
         sched.runOneRoundNow(Rec::Trigger::Manual);
+        store->renewWatermarkOnce();
 
         /// Each call emits exactly one Start then one Finish.
         ASSERT_EQ(rows.size(), before + 2u) << "each round must emit exactly one Start + one Finish";

@@ -15,7 +15,7 @@ extern const int ABORTED;
 }
 
 /// Unit-level GC-CONCURRENT-LEADER-LEAK regression (the original bug the attempt-scoped-generation fix
-/// closes).
+/// closes), ported to the one-pass ack-floor round.
 ///
 /// The historical wedge: two GC leaders fold the same generation. A DEPOSED leader writes its
 /// `fold_seal(G_f)` to a FINAL `gc/gen/<G_f>/fold_seal` key just before its lease-guarded `gc/state` CAS
@@ -29,11 +29,10 @@ extern const int ABORTED;
 /// only the adopted `(snap_generation, snap_attempt)`. The next honest round renews the lease (a fresh
 /// `lease.seq`), folds under a DIFFERENT attempt, never collides, and drains.
 ///
-/// This test proves it at the unit level: deny exactly the fold-adopt `gc/state` CAS #1 of a round that
-/// processes a drop (leaving the deposed fold seal under `a1`), then run an honest GC to a fixpoint and
-/// assert it drains the now-unreachable blob to zero without throwing `CORRUPTED_DATA`/`ABORTED`-wedge.
-/// On a PRE-FIX tree (final-key seal) step 2's first fold would adopt-collide with the deposed seal and
-/// wedge forever; here it does not.
+/// In the ONE-PASS round there is a SINGLE `gc/state` CAS per round (fold/publish/deletes all precede it),
+/// so the deposition point is simply that single round-commit CAS. This test denies it once (leaving the
+/// deposed fold seal under `a1`), then runs an honest GC to a fixpoint and asserts it drains the
+/// now-unreachable blob to zero without wedging.
 
 namespace
 {
@@ -51,10 +50,27 @@ bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash
     return b.head(layout.blobKey(BlobId(u128ToHex(hash)))).exists;
 }
 
-/// Drive regular GC to a fixpoint. A round that only retired/fenced without deleting has not reached a
-/// fixpoint: the delete-cascade for a just-retired blob lands in a SUBSEQUENT round, so the loop stays
-/// alive while ANY work counter is nonzero. (Copied from gtest_cas_gc_leak.cpp — per-file helper.)
-size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
+/// Whether the CURRENT retired list (any gc-shard) still holds an entry — the ack-floor deletion pipeline
+/// is in flight while this is true.
+bool anyRetiredPending(const StorePtr & s)
+{
+    const auto st = s->backend().get(s->layout().gcStateKey());
+    if (!st)
+        return false;
+    const GcState gc_state = decodeGcState(st->bytes);
+    for (const auto & [shard, key] : gc_state.retired_refs)
+    {
+        const auto got = s->backend().get(key);
+        if (got && !decodeRetiredSet(got->bytes).entries.empty())
+            return true;
+    }
+    return false;
+}
+
+/// Drive regular GC to a fixpoint over the ACK-FLOOR round (advancing the store's own mount ack after each
+/// round so the floor follows the committed round; stay alive while any work counter is nonzero OR the
+/// current retired list still holds an in-flight entry).
+size_t runGcToFixpoint(const StorePtr & s, Gc & gc, size_t max_rounds = 64)
 {
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
@@ -62,22 +78,22 @@ size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
         const RoundReport rep = gc.runRegularRound();
         if (!rep.acquired_lease)
             continue;
-        if (rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
-            && rep.replaced == 0 && rep.spared == 0)
+        s->renewWatermarkOnce();
+        const bool no_work = rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
+            && rep.replaced == 0 && rep.spared == 0;
+        if (no_work && !anyRetiredPending(s))
             break;
     }
     return rounds;
 }
 
-/// A backend that throws ONCE on the FOLD-ADOPT `gc/state` CAS #1 — the casPut that advances
-/// snap_generation while NO retired set is durable yet (fold runs before retire writes any retired key,
-/// so the absence of a `/retired/` key uniquely distinguishes CAS #1 from the recheck CAS #2, mirroring
-/// gtest_cas_gc_resume.cpp's InterruptRecheckBackend which keys on the PRESENCE of a retired set). This
-/// isolates the fold-adopt CAS without fragile ordinal counting, so it stays correct across refactors.
-class InterruptFoldAdoptBackend : public InMemoryBackend
+/// A backend that throws ONCE on the SINGLE round-commit `gc/state` CAS — the casPut that advances
+/// snap_generation (the one-pass round has exactly one such CAS; the lease-acquire CAS does not advance
+/// snap_generation, so "advances snap_generation" uniquely picks the round commit).
+class InterruptRoundCasBackend : public InMemoryBackend
 {
 public:
-    explicit InterruptFoldAdoptBackend(String gc_state_key_) : gc_state_key(std::move(gc_state_key_)) {}
+    explicit InterruptRoundCasBackend(String gc_state_key_) : gc_state_key(std::move(gc_state_key_)) {}
 
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
                      const ObjectMeta & meta = {}) override
@@ -87,13 +103,11 @@ public:
             const auto stored = get(key);
             const uint64_t stored_gen = stored ? decodeGcState(stored->bytes).snap_generation : 0;
             const uint64_t next_gen = decodeGcState(bytes).snap_generation;
-            /// Fold-adopt CAS #1: advances snap_generation with no retired set yet. (The recheck CAS #2
-            /// also advances snap_generation, but only AFTER retire has written durable retired sets.)
-            if (next_gen > stored_gen && !hasDurableRetiredSet())
+            if (next_gen > stored_gen)
             {
-                arm_interrupt = false;   /// one-shot: only depose the first fold-adopt CAS
+                arm_interrupt = false;   /// one-shot: only depose the first round-commit CAS
                 throw DB::Exception(DB::ErrorCodes::ABORTED,
-                    "test-injected: fold-adopt CAS #1 denied (leader deposed mid-fold; lease lost)");
+                    "test-injected: round-commit gc/state CAS denied (leader deposed mid-round; lease lost)");
             }
         }
         return InMemoryBackend::casPut(key, bytes, expected, meta);
@@ -102,32 +116,17 @@ public:
     bool arm_interrupt = false;
 
 private:
-    bool hasDurableRetiredSet()
-    {
-        String cursor;
-        for (;;)
-        {
-            const ListPage page = list("", cursor, 1024);
-            for (const auto & item : page.keys)
-                if (item.key.find("/retired/") != String::npos)
-                    return true;
-            if (page.next_cursor.empty())
-                return false;
-            cursor = page.next_cursor;
-        }
-    }
-
     String gc_state_key;
 };
 
 }
 
-/// A leader whose fold-adopt CAS #1 is denied (lease lost mid-fold) leaves its fold seal ONLY under its
+/// A leader whose round-commit CAS is denied (lease lost mid-round) leaves its fold seal ONLY under its
 /// own attempt `a1`; it never occupies the adopted attempt, so a subsequent honest round is not wedged
 /// and drains the now-unreachable blob to zero.
 TEST(CasGcAttempt, DeposedFoldAttemptDoesNotWedge)
 {
-    auto backend = std::make_shared<InterruptFoldAdoptBackend>(/*gc_state_key*/ "p/gc/state");
+    auto backend = std::make_shared<InterruptRoundCasBackend>(/*gc_state_key*/ "p/gc/state");
     auto store = openStoreForTest(backend);
     ASSERT_EQ(store->layout().gcStateKey(), "p/gc/state");   // guard the injected key against layout drift
 
@@ -152,22 +151,22 @@ TEST(CasGcAttempt, DeposedFoldAttemptDoesNotWedge)
     store->renewWatermarkOnce();
 
     // Round 2 (DEPOSED): the round folds the -1 and writes its fold seal under its own attempt `a1`, then
-    // its fold-adopt CAS #1 is DENIED (lease lost mid-fold). The round must throw and must NOT advance the
-    // adopted (snap_generation, snap_attempt).
+    // its single round-commit CAS is DENIED (lease lost mid-round). The round must throw and must NOT
+    // advance the adopted (snap_generation, snap_attempt).
     backend->arm_interrupt = true;
-    EXPECT_ANY_THROW(gc.runRegularRound());   // ABORTED: fold-adopt CAS #1 denied
+    EXPECT_ANY_THROW(gc.runRegularRound());   // ABORTED: round-commit CAS denied
     backend->arm_interrupt = false;
 
     const auto after_deposed = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
     EXPECT_EQ(after_deposed.snap_generation, after_fold.snap_generation)
-        << "the denied fold-adopt CAS must NOT advance the adopted generation";
+        << "the denied round-commit CAS must NOT advance the adopted generation";
     EXPECT_EQ(after_deposed.snap_attempt, after_fold.snap_attempt)
-        << "the denied fold-adopt CAS must NOT advance the adopted attempt";
+        << "the denied round-commit CAS must NOT advance the adopted attempt";
 
     // The deposed leader DID write its fold seal under its OWN attempt `a1` (= the lease.seq it renewed
     // for round 2, which is strictly past the still-adopted attempt) at its fold generation `G_f`
-    // (= snap_generation + 1; fold mints the next generation, completion adopts it later). That orphan is
-    // pure debris: it is under an attempt that gc/state never adopted, so no reader resolving
+    // (= snap_generation + 1; fold mints the next generation, the round-commit CAS adopts it). That orphan
+    // is pure debris: it is under an attempt that gc/state never adopted, so no reader resolving
     // (snap_generation, snap_attempt) can see it. On a PRE-FIX tree this seal would instead sit at the
     // FINAL `gc/gen/<G_f>/fold_seal` key and wedge every future round's fold at the same G_f.
     const uint64_t a1 = after_fold.lease.seq + 1;       // round 2 renewed the lease => seq bumped once
@@ -182,7 +181,7 @@ TEST(CasGcAttempt, DeposedFoldAttemptDoesNotWedge)
     // the next honest fold mints a FRESH attempt (a different lease.seq), never collides with the deposed
     // seal under a1, and drains the unreachable blob. On a pre-fix (final-key) tree, the next fold would
     // adopt-collide with the deposed final-key seal's divergent bytes and throw forever (GC wedged).
-    EXPECT_NO_THROW(runGcToFixpoint(gc));
+    EXPECT_NO_THROW(runGcToFixpoint(store, gc));
 
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)))
         << "the dropped blob must be reclaimed (GC drained past the deposed attempt)";

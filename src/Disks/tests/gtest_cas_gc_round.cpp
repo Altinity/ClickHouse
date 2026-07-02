@@ -16,17 +16,17 @@ extern const int CORRUPTED_DATA;
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 
-/// ROUND-LEVEL end-to-end GC tests over the root-local part-manifest model (spec rev. 15 §Round
-/// Protocol: fold -> retire -> fence -> recheck -> exact-token delete -> trim).
+/// ROUND-LEVEL end-to-end GC tests over the root-local part-manifest model (one-pass ack-floor round:
+/// heartbeat floor -> fold with the three-cursor merge -> pre-CAS exact-token deletes -> single CAS -> trim).
 ///
 /// This file is the survivor of the old snap/cascade-based `gtest_cas_gc_round.cpp`. The per-STEP
 /// behaviours it used to cover have moved to the dedicated GC-core suites and are intentionally NOT
 /// re-tested here:
 ///   - fold edge dispatch (committed/precommit/promote/removal +/-1, 404 clamp/anomaly, fold barrier,
 ///     ref-mismatch fail-closed) -> gtest_cas_gc_fold.cpp
-///   - retire/fence/recheck (manifest body deferred delete, fence raises shard+registry, publish racing
-///     the fence is spared, unreferenced blob exact-token delete) -> gtest_cas_gc_fence_recheck.cpp
-///   - trim of folded owner events + idempotent resume -> gtest_cas_gc_resume.cpp
+///   - condemn/graduate/delete + spare (manifest body deferred delete, publish racing the pass is spared,
+///     unreferenced blob exact-token delete) -> gtest_cas_gc_ack_floor.cpp
+///   - trim of folded owner events + idempotent crash replay -> gtest_cas_gc_resume.cpp
 /// What remains here is what those step suites do NOT cover: the LEASE/leadership protocol (the round's
 /// only stateful concurrency), the cursor-key codec, and the multi-round END-TO-END reclaim scenarios
 /// driven to fixpoint (publish->drop->reclaim, multi-ref sharing, spare-on-recheck race, idempotent
@@ -78,10 +78,30 @@ GcState readState(InMemoryBackend & b, const Store & s)
     return decodeGcState(got->bytes);
 }
 
-/// Drive a Gc to fixpoint (no candidates/deletes/etc. produced by a round, OR no lease this round).
-/// Returns the number of rounds that actually held the lease and did work. Bounded so a non-converging
-/// core never hangs the test (it would fail downstream assertions instead).
-size_t driveToFixpoint(Gc & gc)
+/// Whether the CURRENT retired list (any gc-shard, dereferenced through gc/state.retired_refs) holds any
+/// entry — the ack-floor deletion pipeline is still in flight while this is true.
+bool anyRetiredPending(InMemoryBackend & b, const Store & s)
+{
+    const auto st = b.get(s.layout().gcStateKey());
+    if (!st)
+        return false;
+    const GcState gc_state = decodeGcState(st->bytes);
+    for (const auto & [shard, key] : gc_state.retired_refs)
+    {
+        const auto got = b.get(key);
+        if (got && !decodeRetiredSet(got->bytes).entries.empty())
+            return true;
+    }
+    return false;
+}
+
+/// Drive a Gc to fixpoint over the ACK-FLOOR round: run rounds, advancing the store's own mount ack after
+/// each (`renewWatermarkOnce` runs the beat so `observed_gc_round` follows the committed round and the
+/// heartbeat floor advances). A condemned blob traverses the multi-round condemn -> graduate -> delete
+/// pipeline, so "fixpoint" is reached only when a round did NO work AND the current retired list is empty
+/// (nothing still in flight). Returns the number of rounds that held the lease and did work. Bounded so a
+/// non-converging core fails downstream assertions rather than hanging.
+size_t driveToFixpoint(InMemoryBackend & backend, const StorePtr & store, Gc & gc)
 {
     size_t working_rounds = 0;
     for (size_t r = 0; r < 64; ++r)
@@ -89,10 +109,13 @@ size_t driveToFixpoint(Gc & gc)
         const RoundReport rep = gc.runRegularRound();
         if (!rep.acquired_lease)
             continue;
-        if (rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
-            && rep.replaced == 0 && rep.spared == 0)
+        store->renewWatermarkOnce();
+        const bool no_work = rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
+            && rep.replaced == 0 && rep.spared == 0;
+        if (no_work && !anyRetiredPending(backend, *store))
             break;
-        ++working_rounds;
+        if (!no_work)
+            ++working_rounds;
     }
     return working_rounds;
 }
@@ -345,14 +368,14 @@ TEST(CasGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     /// While live: the blob's in-degree is 1 and NOTHING is collected (no-loss).
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
     EXPECT_TRUE(manifestExists(*backend, store->layout(), id));
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     /// After drop + fixpoint: the blob's only edge is gone, the blob is collected, the owner-removed
     /// manifest body is collected, and the in-degree generation reflects zero (no-leak / no-dangle).
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
@@ -360,7 +383,7 @@ TEST(CasGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
     EXPECT_FALSE(manifestExists(*backend, store->layout(), id));
 
     /// Idempotent: re-running to fixpoint changes nothing and never throws.
-    EXPECT_NO_THROW(driveToFixpoint(gc));
+    EXPECT_NO_THROW(driveToFixpoint(*backend, store, gc));
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }
 
@@ -419,28 +442,33 @@ TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    driveToFixpoint(gc);   /// fold the publish; no delete yet
+    driveToFixpoint(*backend, store, gc);   /// fold the publish; no delete yet
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
 
-    /// Drive rounds until at least one manifest-body delete happens. Capture the FIRST report
-    /// that deletes anything (the reclaiming round).
-    RoundReport reclaim_report;
+    /// Ack-floor drift: the owner-removed manifest body is deleted in the CONDEMNING round (post-CAS,
+    /// after its -1 is adopted), while the blob's exact-token delete happens a few rounds later once the
+    /// ack floor graduates its retired entry. So the two deletes fall in DIFFERENT reports now — accumulate
+    /// across the pipeline (renewing the ack each round so the floor advances) and assert both were counted.
+    uint64_t total_manifests_deleted = 0;
+    uint64_t total_blob_deleted = 0;
     for (size_t i = 0; i < 64; ++i)
     {
-        reclaim_report = gc.runRegularRound();
-        if (reclaim_report.acquired_lease
-            && (reclaim_report.deleted > 0 || reclaim_report.absent > 0
-                || reclaim_report.manifests_deleted > 0))
+        const RoundReport rep = gc.runRegularRound();
+        if (!rep.acquired_lease)
+            continue;
+        store->renewWatermarkOnce();
+        total_manifests_deleted += rep.manifests_deleted;
+        total_blob_deleted += rep.deleted;
+        if (total_manifests_deleted > 0 && total_blob_deleted > 0)
             break;
     }
 
-    ASSERT_TRUE(reclaim_report.acquired_lease);
     /// B11: the manifest-body delete must be counted separately from the blob delete.
-    EXPECT_GE(reclaim_report.manifests_deleted, 1u)
+    EXPECT_GE(total_manifests_deleted, 1u)
         << "round summary must count the owner-removed manifest body delete (B11 — manifests_deleted)";
     /// Blobs and manifests are separately countable: the blob delete (deleted >= 1) is independent.
-    EXPECT_GE(reclaim_report.deleted, 1u)
+    EXPECT_GE(total_blob_deleted, 1u)
         << "the blob exact-token delete must still be counted in deleted";
     /// The manifest body is gone and the blob is gone — no-leak / no-dangle.
     EXPECT_FALSE(manifestExists(*backend, store->layout(), id));
@@ -505,29 +533,29 @@ TEST(CasGcRound, SharedBlobSparedUntilBothRefsDrop)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
 
     Gc gc(store, kGc);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 2);   /// two source edges
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 
     /// Drop the FIRST ref: in-degree falls to 1, blob STILL pinned by tbl2 (spared).
     dropRefTransition(*backend, store->layout(), ns, "tbl1", r1);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)))
         << "shared blob must survive while a second ref still names it";
 
     /// Drop the SECOND ref: in-degree reaches 0, blob is finally collected.
     dropRefTransition(*backend, store->layout(), ns, "tbl2", r2);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }
 
-/// Spare-on-recheck race, multi-blob discrimination: a drop condemns two blobs; in the SAME window
-/// before the next round folds, one of them is re-referenced under a fresh ref. The round must collect
-/// ONLY the genuinely-unreferenced blob and SPARE the re-referenced one (#14, recheck folds the racing
-/// publish on top of the fold generation before deleting). The discriminating assertion: gone vs. spared
-/// in one round.
+/// Spare-during-the-pass, multi-blob discrimination: a drop condemns two blobs; in the SAME window
+/// between rounds (before the next pass folds), one of them is re-referenced under a fresh ref. The pass
+/// folds the racing publish and SPARES the re-referenced blob (recovery wins in the pass merge, dropping
+/// its retired entry), while the genuinely-unreferenced blob proceeds through the condemn -> graduate ->
+/// delete pipeline. The discriminating assertion: at fixpoint, one is spared (kept) and the other gone.
 TEST(CasGcRound, RepublishDuringFenceWindowSparesOnlyReReferencedBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -543,19 +571,19 @@ TEST(CasGcRound, RepublishDuringFenceWindowSparesOnlyReReferencedBlob)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
 
     Gc gc(store, kGc);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 1);
 
-    /// Repoint the ref from r1 to r2 in the same window: ONE event {old=committed(r1), new=committed(r2)}.
+    /// Repoint the ref from r1 to r2 between rounds: ONE event {old=committed(r1), new=committed(r2)}.
     /// The -1 (r1's body: blobs 1 AND 2) and +1 (r2's body: blob 1 only) net to in-degree 1 for blob 1
-    /// (re-referenced => SPARED) and 0 for blob 2 (genuinely unreferenced => collected). (A separate drop
-    /// THEN repoint would double-count the -1 on r1's blobs and drive blob 2 to -1 — an undercount the
-    /// in-degree fold fails closed on.)
+    /// (re-referenced => SPARED in the pass merge) and 0 for blob 2 (genuinely unreferenced => condemned,
+    /// then reclaimed by the ack-floor pipeline). (A separate drop THEN repoint would double-count the -1
+    /// on r1's blobs and drive blob 2 to -1 — an undercount the in-degree fold fails closed on.)
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);
 
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     /// Blob 1 is re-referenced (net in-degree 1) => SPARED; blob 2 is genuinely unreferenced => GONE.
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)))
         << "the racing republish must spare blob 1";
@@ -581,7 +609,7 @@ TEST(CasGcRound, IdempotentRerunAtFixpointIsNoOp)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     const uint64_t gen0 = currentGenerationOf(*backend, store->layout());
 
     /// At quiescence: a fresh round does NO work (no candidates/deletes/spares) and changes nothing.
@@ -591,7 +619,7 @@ TEST(CasGcRound, IdempotentRerunAtFixpointIsNoOp)
     EXPECT_EQ(quiescent.deleted, 0u);
     EXPECT_EQ(quiescent.spared, 0u);
 
-    EXPECT_NO_THROW(driveToFixpoint(gc));
+    EXPECT_NO_THROW(driveToFixpoint(*backend, store, gc));
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));   /// no-loss
     EXPECT_TRUE(manifestExists(*backend, store->layout(), id));          /// no-loss
     /// The CONTENT no-op invariant: the live blob's durable in-degree is unchanged (still pinned). The
@@ -635,8 +663,8 @@ TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
 
     /// Both leaders now drive rounds. The blob is collected exactly once; duplicate attempts are
     /// harmless. No round throws.
-    EXPECT_NO_THROW(driveToFixpoint(gc2));
-    EXPECT_NO_THROW(driveToFixpoint(gc1));   /// the revived stale leader backs off / duplicates harmlessly
+    EXPECT_NO_THROW(driveToFixpoint(*backend, store, gc2));
+    EXPECT_NO_THROW(driveToFixpoint(*backend, store, gc1));   /// the revived stale leader backs off / duplicates harmlessly
 
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)))
         << "the dropped blob must be collected exactly once across both leaders";
@@ -741,12 +769,13 @@ TEST(CasGcRound, TrimOnlyBelowSealedCoverage)
 ///   - CasGcRetire.{Observes*, AbsentCandidate*, DeletedCandidate*, DeleteTimePrune*, BlobOnlyPrune*,
 ///     RetireForgets*, RetireSetsDurable*, Diverged*, BlobHeaderUnderflow*, RetireUsesFoldCommitted*,
 ///     RetireReplayAdoptsOwnCrashedAttempt} — retire-step behaviour now split between
-///     gtest_cas_gc_fence_recheck.cpp and the retire-view suite.
+///     gtest_cas_gc_ack_floor.cpp and the retire-view suite.
 ///   - CasGcRecheck.{SparedWhenPublishRacesTheFence, ReplacedWhenResurrectionWins, AbsentWhenAlreadyGone}
 ///     — now CasGcRecheck.{PublishRacingFenceSparesBlob, UnreferencedBlobDeletedExactToken}.
-///   - CasGcFence.* / CasGcDiscovery.UsesRegistryNotList — now
-///     gtest_cas_gc_fence_recheck.cpp::CasGcFence.RaisesAllShardAndRegistryFence (+ helper
-///     registerNamespaceRaw discovery is exercised by every fold test).
+///   - CasGcFence.* / CasGcDiscovery.UsesRegistryNotList — the fence machinery is retired; the equivalent
+///     no-op-round-does-not-mutate-ref-shards property is gtest_cas_gc_ack_floor.cpp::
+///     CasGcAckFloor.NoOpRoundDoesNotMutateRefShards (+ helper registerNamespaceRaw discovery is
+///     exercised by every fold test).
 ///   - CasGcCascade.* — the cascade/closure model is REMOVED; in-degree is per-blob, so a shared
 ///     child surviving one parent's deletion is now CasGcRound.SharedBlobSparedUntilBothRefsDrop above,
 ///     and "never cascades on replaced" is CasGcRound.RepublishDuringFenceWindowSparesOnlyReReferencedBlob.
@@ -986,21 +1015,21 @@ TEST(CasGcRound, LazyTrimSkipsSmallJournalAndKeepsTokenStable)
     EXPECT_EQ(root_after.journal.size(), 3u)
         << "lazy trim must NOT compact a journal with fewer than gc_trim_min_events trimmable events";
 
-    /// (b) The shard token recorded in the completion seal (post-fence) equals the CURRENT token
-    /// of the shard object — i.e., trim did NOT mutate the shard and bump its token.
-    /// Read the completion seal's per-shard folded_token for the shard.
+    /// (b) The shard token recorded in the FOLD seal (fold-time token — completion seals are a retired
+    /// concept in the one-pass round) equals the CURRENT token of the shard object — i.e., trim did NOT
+    /// mutate the shard and bump its token. Read the fold seal's per-shard folded_token for the shard.
     const GcState st = readState(*backend, *store);
-    const auto completion = backend->get(store->layout().completionSealKey(st.snap_generation, st.snap_attempt));
-    ASSERT_TRUE(completion.has_value()) << "completion seal must exist after a successful round";
-    const CasCompletionSeal seal = decodeCompletionSeal(completion->bytes);
+    const auto fold_seal_obj = backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt));
+    ASSERT_TRUE(fold_seal_obj.has_value()) << "fold seal must exist after a successful round";
+    const CasFoldSeal seal = decodeFoldSeal(fold_seal_obj->bytes);
     const String ck = cursorKeyForTest(ns, 0);
-    const auto cov_it = seal.folded_cursors.find(ck);
-    ASSERT_NE(cov_it, seal.folded_cursors.end()) << "completion seal must carry coverage for ns/0";
-    /// The stored post-fence token must equal the current shard token (no trim mutation).
+    const auto cov_it = seal.per_ns_shard.find(ck);
+    ASSERT_NE(cov_it, seal.per_ns_shard.end()) << "fold seal must carry coverage for ns/0";
+    /// The stored fold-time token must equal the current shard token (no trim mutation).
     const auto current_head = backend->head(store->layout().rootShardKey(ns, 0));
     ASSERT_TRUE(current_head.exists);
     EXPECT_EQ(cov_it->second.folded_token, current_head.token)
-        << "lazy trim must not bump the shard token; the completion-seal post-fence token "
+        << "lazy trim must not bump the shard token; the fold-seal fold-time token "
            "must equal the live shard token (no settling re-read needed next round)";
 
     /// (c) The next round's discover step must Skip the shard (no settling re-read): the listed token
@@ -1245,7 +1274,7 @@ TEST(CasGcRound, FoldManifestEdgesEmitsOnePlusEdgePerBlob)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
 
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1)
         << "a single published manifest must contribute exactly one source edge per blob";
@@ -1267,12 +1296,12 @@ TEST(CasGcRound, ReFoldOfRemovalIsIdempotent)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
 
     /// Drop the ref and run to fixpoint. The blob should be reclaimed.
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    EXPECT_NO_THROW(driveToFixpoint(gc))
+    EXPECT_NO_THROW(driveToFixpoint(*backend, store, gc))
         << "re-fold of a removal must be idempotent (source-edge set, never underflows)";
 
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)))
@@ -1297,14 +1326,14 @@ TEST(CasGcRound, TwoManifestsTwoSourceEdgesDropOneSpares)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
 
     Gc gc(store, kGc);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 2)
         << "two distinct manifests referencing the same blob must each contribute one source edge";
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 
     /// Drop one of the two references; the other still pins the blob.
     dropRefTransition(*backend, store->layout(), ns, "tbl1", r1);
-    driveToFixpoint(gc);
+    driveToFixpoint(*backend, store, gc);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1)
         << "after dropping one of two references the in-degree must be 1";
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)))

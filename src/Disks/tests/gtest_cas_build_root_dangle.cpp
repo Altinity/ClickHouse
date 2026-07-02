@@ -200,7 +200,7 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
     Gc gc(s, u128Of("gc-b171-reclaim"));
     for (int round = 0; round < 32; ++round)
     {
-        try { gc.runRegularRound(); }
+        try { gc.runRegularRound(); s->renewWatermarkOnce(); }
         catch (const DB::Exception &) { break; }
     }
 
@@ -297,7 +297,7 @@ TEST(CasBuildRoot, AbandonedPrecommitReclaimed)
     Gc gc(s, u128Of("gc-b8-reclaim"));
     for (int round = 0; round < 32; ++round)
     {
-        try { gc.runRegularRound(); }
+        try { gc.runRegularRound(); s->renewWatermarkOnce(); }
         catch (const DB::Exception &) { break; }
     }
 

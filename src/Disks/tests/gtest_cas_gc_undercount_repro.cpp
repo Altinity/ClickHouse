@@ -129,10 +129,14 @@ TEST(CasGcUndercount, H2_DropThenRepointFromSameOldIsIdempotentNoUnderflow)
     appendRawOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), std::nullopt);
     appendRawOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), committed("tbl", r2));
 
-    /// Drive GC to fixpoint: must complete without throwing, collect blob 2, spare blob 1.
+    /// Drive GC to fixpoint (advancing the mount ack each round so the ack floor graduates the condemned
+    /// blob 2): must complete without throwing, collect blob 2, spare blob 1.
     ASSERT_NO_THROW({
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < 12; ++i)
+        {
             gc.runRegularRound();
+            store->renewWatermarkOnce();
+        }
     }) << "H2 regression: drop-then-repoint-from-same-old must NOT underflow; idempotent edge set absorbs the duplicate removal";
 
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 0)
@@ -148,17 +152,17 @@ TEST(CasGcUndercount, H2_DropThenRepointFromSameOldIsIdempotentNoUnderflow)
 
 /// ============================ H1: CURSOR RE-FOLD UNDER ABORT ============================
 ///
-/// Hypothesis H1: a removal `-1` is folded, but the fold-adopt CAS that would durably advance the cursor
-/// past that removal LOSES to a concurrent leader (ABORTED). The cursor is NOT advanced, so a later
+/// Hypothesis H1: a removal `-1` is folded, but the SINGLE round-commit CAS that would durably advance the
+/// cursor past that removal LOSES to a concurrent leader (ABORTED). The cursor is NOT advanced, so a later
 /// honest round RE-FOLDS the same removal against a parent generation whose in-degree for that blob has
 /// already reached 0 => -1.
 ///
-/// We reproduce the deposed-fold-adopt injection from gtest_cas_gc_attempt.cpp
-/// (DeposedFoldAttemptDoesNotWedge): deny exactly the fold-adopt gc/state CAS #1 of the round that folds
-/// the drop's -1. If the durable in-degree parent used by the retry has ALREADY absorbed the -1 (i.e. the
-/// deposed round left a partial durable in-degree run adopted by a later reader), the retry re-applies the
-/// -1 and underflows.
-class InterruptFoldAdoptBackend : public InMemoryBackend
+/// We reproduce the deposed-round-commit injection from gtest_cas_gc_attempt.cpp
+/// (DeposedFoldAttemptDoesNotWedge): deny the SINGLE round-commit gc/state CAS (the one that advances
+/// snap_generation) of the round that folds the drop's -1. The deposed round left only never-adopted
+/// attempt-scoped debris, so the retry re-folds the -1 against the still-adopted parent (in-degree 1),
+/// producing a clean 0 — never a double-applied -1.
+class InterruptRoundCasBackend : public InMemoryBackend
 {
 public:
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
@@ -169,11 +173,11 @@ public:
             const auto stored = get(key);
             const uint64_t stored_gen = stored ? decodeGcState(stored->bytes).snap_generation : 0;
             const uint64_t next_gen = decodeGcState(bytes).snap_generation;
-            if (next_gen > stored_gen && !hasDurableRetiredSet())
+            if (next_gen > stored_gen)
             {
                 arm_interrupt = false;
                 throw DB::Exception(DB::ErrorCodes::ABORTED,
-                    "test-injected: fold-adopt CAS #1 denied (leader deposed mid-fold; lease lost)");
+                    "test-injected: round-commit gc/state CAS denied (leader deposed mid-round; lease lost)");
             }
         }
         return InMemoryBackend::casPut(key, bytes, expected, meta);
@@ -181,27 +185,11 @@ public:
 
     bool arm_interrupt = false;
     String gc_state_key = "p/gc/state";
-
-private:
-    bool hasDurableRetiredSet()
-    {
-        String cursor;
-        for (;;)
-        {
-            const ListPage page = list("", cursor, 1024);
-            for (const auto & item : page.keys)
-                if (item.key.find("/retired/") != String::npos)
-                    return true;
-            if (page.next_cursor.empty())
-                return false;
-            cursor = page.next_cursor;
-        }
-    }
 };
 
 TEST(CasGcUndercount, H1_DrainAfterDeposedRemovalFoldDoesNotUnderflow)
 {
-    auto backend = std::make_shared<InterruptFoldAdoptBackend>();
+    auto backend = std::make_shared<InterruptRoundCasBackend>();
     auto store = openStoreForTest(backend);
     ASSERT_EQ(store->layout().gcStateKey(), "p/gc/state");
 
@@ -214,25 +202,29 @@ TEST(CasGcUndercount, H1_DrainAfterDeposedRemovalFoldDoesNotUnderflow)
     Gc gc(store, kGc);
     /// Round 1 (honest): fold +1, pin blob 1.
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    store->renewWatermarkOnce();
     ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
 
     /// Drop the only ref and advance the watermark floor.
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     store->renewWatermarkOnce();
 
-    /// Round 2 (DEPOSED): fold the -1, then the fold-adopt CAS #1 is denied (ABORTED). The adopted
+    /// Round 2 (DEPOSED): fold the -1, then the round-commit CAS is denied (ABORTED). The adopted
     /// (snap_generation, snap_attempt) must NOT advance.
     backend->arm_interrupt = true;
     EXPECT_ANY_THROW(gc.runRegularRound());
     backend->arm_interrupt = false;
 
-    /// Honest drive to fixpoint. H1 predicts the re-fold of the -1 underflows; the current code predicts a
-    /// clean drain. Capture whichever happens.
+    /// Honest drive to fixpoint (advancing the mount ack each round). H1 predicts the re-fold of the -1
+    /// underflows; the current code predicts a clean drain. Capture whichever happens.
     bool threw_undercount = false;
     try
     {
         for (int i = 0; i < 32; ++i)
+        {
             gc.runRegularRound();
+            store->renewWatermarkOnce();
+        }
     }
     catch (const DB::Exception & e)
     {
@@ -256,31 +248,25 @@ TEST(CasGcUndercount, H1_DrainAfterDeposedRemovalFoldDoesNotUnderflow)
     }
 }
 
-/// ==================== H1b: FENCE-WINDOW REMOVAL RE-FOLDED NEXT ROUND ====================
+/// ==================== H1b: A CONCURRENT-DROP REMOVAL IS FOLDED ONCE (IDEMPOTENCE) ====================
 ///
-/// A NATURAL (write-path-legal) mechanism that produces the SAME doubled `-1` as H2 without any
-/// hand-crafted "old=r1 twice" event. The round order is fold -> retire -> fence -> recheck -> trim.
-///   * fold seals the per-shard cursor at `folded_cursor` (= shard_version at fold time).
-///   * recheck RE-STREAMS the window (folded_cursor, fence_version] and folds its deltas into the
-///     COMPLETION generation (CasGc.cpp:717-730).
-///   * BUT the completion seal carries `folded_cursors = fold_seal.per_ns_shard` (CasGc.cpp:963) — the
-///     PRE-window fold cursor. It does NOT advance past the events recheck just folded.
-///   * trim removes only events <= folded_cursor, so a window event (> folded_cursor) SURVIVES.
-/// => The NEXT round's fold re-reads `folded_cursor` and RE-FOLDS the window's `-1` on top of the
-///    completion generation that already absorbed it. Blob dropped to 0 in the completion gen goes to -1.
+/// The idempotence claim that survives the redesign, without the (retired) fence-window framing: a removal
+/// that lands AFTER a round's fold sealed its cursor but BEFORE that round's single commit CAS must be
+/// folded EXACTLY ONCE by a later round — never re-folded to drive the blob in-degree below zero.
 ///
-/// To land a removal in the fence window we drop the ref DURING the round, after the fold sealed its
-/// cursor but before the fence observes shard_version. We inject at the retire gc/state CAS (which runs
-/// after fold, before fence): the injection appends the drop event to the shard journal exactly once.
-class DropAtRetireBackend : public InMemoryBackend
+/// In the one-pass round there is a single gc/state CAS (fold -> publish -> commit). We inject the drop
+/// just before that commit CAS lands, so the event (v2) is above the fold's sealed cursor (v1) this round.
+/// The committed round adopts the fold seal at cursor v1; the next round folds (v1, v2] as an ordinary -1
+/// against the still-live parent (blob 1 at in-degree 1 => 0). The source-edge SET model makes a re-fold
+/// of the same removal a set-difference no-op, so the in-degree never underflows.
+class DropAtCommitBackend : public InMemoryBackend
 {
 public:
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
                      const ObjectMeta & meta = {}) override
     {
-        /// The retire CAS advances gc/state.round without advancing snap_generation (fold already did
-        /// that). Detect it: gc/state key, snap_generation unchanged, round increased. Fire the injected
-        /// drop ONCE, just before that CAS commits — so the event is > folded_cursor and <= fence_version.
+        /// The one-pass round has a SINGLE gc/state CAS that advances snap_generation. Fire the injected
+        /// drop ONCE, just before that CAS commits — so the drop event is above this round's sealed cursor.
         if (arm_drop && key == gc_state_key)
         {
             const auto stored = get(key);
@@ -288,11 +274,11 @@ public:
             {
                 const GcState prev = decodeGcState(stored->bytes);
                 const GcState next = decodeGcState(bytes);
-                if (next.snap_generation == prev.snap_generation && next.round > prev.round)
+                if (next.snap_generation > prev.snap_generation)
                 {
                     arm_drop = false;
-                    if (on_retire)
-                        on_retire();
+                    if (on_commit)
+                        on_commit();
                 }
             }
         }
@@ -301,12 +287,12 @@ public:
 
     bool arm_drop = false;
     String gc_state_key = "p/gc/state";
-    std::function<void()> on_retire;
+    std::function<void()> on_commit;
 };
 
 TEST(CasGcUndercount, H1b_FenceWindowRemovalReFoldedNextRoundUnderflows)
 {
-    auto backend = std::make_shared<DropAtRetireBackend>();
+    auto backend = std::make_shared<DropAtCommitBackend>();
     auto store = openStoreForTest(backend);
     ASSERT_EQ(store->layout().gcStateKey(), "p/gc/state");
 
@@ -319,35 +305,31 @@ TEST(CasGcUndercount, H1b_FenceWindowRemovalReFoldedNextRoundUnderflows)
     Gc gc(store, kGc);
     /// Round 1 (honest): fold +1, pin blob 1 at in-degree 1. Cursor sealed at v1.
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    store->renewWatermarkOnce();
     ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
 
-    store->renewWatermarkOnce();
-
-    /// Round 2: at the retire CAS (after fold sealed its cursor at v1, before the fence observes the
-    /// journal) inject the DROP as v2. The fold this round saw only up to v1 (no change), so folded_cursor
-    /// stays v1; the fence then observes shard_version = v2; recheck folds (v1, v2] => -1 on blob 1 into
-    /// the completion generation, driving it to 0. The completion seal keeps folded_cursor = v1.
+    /// Round 2: just before the round-commit CAS lands (after the fold sealed its cursor at v1), inject the
+    /// DROP as v2. The fold this round saw only up to v1 (no change), so the sealed cursor stays v1; the
+    /// drop event v2 is above it and survives trim. The NEXT round folds (v1, v2] => -1 on blob 1 against
+    /// the still-live parent (in-degree 1 => 0). It must NOT be re-folded a second time.
     backend->arm_drop = true;
-    backend->on_retire = [&]
+    backend->on_commit = [&]
     {
         dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     };
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     backend->arm_drop = false;
 
-    /// After round 2: blob 1's in-degree in the completion generation is 0 (recheck folded the -1).
-    /// The drop event v2 is STILL in the journal (trim only removes <= folded_cursor = v1).
-    /// Round 3's fold re-reads folded_cursor = v1 and re-folds (v1, v2] => a SECOND -1 on top of the
-    /// completion generation that already has blob 1 at 0 => -1 => the in-degree fold fails closed.
-    ///
-    /// CORRECT behaviour (what this test asserts, so it fails RED on the buggy tree): a concurrent drop
-    /// landing in the fence window must reclaim blob 1 exactly once and leave GC quiescent — NEVER throw
-    /// the undercount. The throw below is the BUG (S04): a fence-window removal folded by recheck is
-    /// re-folded by the next round because the sealed cursor was not advanced past it.
+    /// CORRECT behaviour: the concurrently-dropped blob is reclaimed exactly once and GC stays quiescent —
+    /// the removal folds ONCE (idempotent source-edge set), NEVER driving the in-degree below zero. Advance
+    /// the mount ack each round so the ack floor graduates and deletes the condemned blob.
     EXPECT_NO_THROW({
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < 12; ++i)
+        {
             gc.runRegularRound();
-    }) << "S04 undercount: a fence-window removal was re-folded next round and drove the blob in-degree < 0";
+            store->renewWatermarkOnce();
+        }
+    }) << "undercount: a concurrent-drop removal was re-folded and drove the blob in-degree < 0";
 
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)))
         << "the concurrently-dropped blob must be reclaimed";

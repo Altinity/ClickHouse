@@ -25,16 +25,49 @@ bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash
     return b.head(layout.blobKey(BlobId(u128ToHex(hash)))).exists;
 }
 
-/// A backend that lets a round fold + retire + delete, then throws on the recheck completion CAS #2,
-/// leaving a genuinely INCOMPLETE round: the retired sets are durable but gc/state was never advanced.
-/// The recheck CAS is uniquely identified by being the gc/state casPut that advances snap_generation
-/// while a round's retired set already exists (fold runs before retire writes any retired key; fence
-/// CASes gc/state without advancing snap_generation). This isolates the recheck CAS without ordinal
-/// counting, so it stays correct across refactors of the surrounding phases.
-class InterruptRecheckBackend : public InMemoryBackend
+/// Whether the CURRENT retired list (any gc-shard) still holds an entry.
+bool anyRetiredPending(const StorePtr & s)
+{
+    const auto st = s->backend().get(s->layout().gcStateKey());
+    if (!st)
+        return false;
+    const GcState gc_state = decodeGcState(st->bytes);
+    for (const auto & [shard, key] : gc_state.retired_refs)
+    {
+        const auto got = s->backend().get(key);
+        if (got && !decodeRetiredSet(got->bytes).entries.empty())
+            return true;
+    }
+    return false;
+}
+
+/// Drive regular GC to a fixpoint over the ACK-FLOOR round (renew the store's mount ack after each round;
+/// stay alive while any work counter is nonzero OR an in-flight retired entry remains).
+size_t runGcToFixpoint(const StorePtr & s, Gc & gc, size_t max_rounds = 64)
+{
+    size_t rounds = 0;
+    for (; rounds < max_rounds; ++rounds)
+    {
+        const RoundReport rep = gc.runRegularRound();
+        if (!rep.acquired_lease)
+            continue;
+        s->renewWatermarkOnce();
+        const bool no_work = rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
+            && rep.replaced == 0 && rep.spared == 0;
+        if (no_work && !anyRetiredPending(s))
+            break;
+    }
+    return rounds;
+}
+
+/// A backend that denies ONCE the SINGLE round-commit `gc/state` CAS — the casPut that advances
+/// snap_generation (the one-pass round has exactly one such CAS; the lease-acquire CAS does not advance
+/// snap_generation). A denied round leaves only never-adopted attempt-scoped debris (fold seal / retired
+/// list under an attempt gc/state never adopted); a fresh-attempt rerun is idempotent.
+class InterruptRoundCasBackend : public InMemoryBackend
 {
 public:
-    explicit InterruptRecheckBackend(String gc_state_key_) : gc_state_key(std::move(gc_state_key_)) {}
+    explicit InterruptRoundCasBackend(String gc_state_key_) : gc_state_key(std::move(gc_state_key_)) {}
 
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
                      const ObjectMeta & meta = {}) override
@@ -44,11 +77,11 @@ public:
             const auto stored = get(key);
             const uint64_t stored_gen = stored ? decodeGcState(stored->bytes).snap_generation : 0;
             const uint64_t next_gen = decodeGcState(bytes).snap_generation;
-            if (next_gen > stored_gen && hasDurableRetiredSet())
+            if (next_gen > stored_gen)
             {
-                arm_interrupt = false;   /// one-shot: only interrupt the first recheck CAS
+                arm_interrupt = false;   /// one-shot: only depose the first round-commit CAS
                 throw DB::Exception(DB::ErrorCodes::ABORTED,
-                    "test-injected: recheck completion CAS #2 interrupted (leader deposed mid-recheck)");
+                    "test-injected: round-commit gc/state CAS denied (leader deposed mid-round)");
             }
         }
         return InMemoryBackend::casPut(key, bytes, expected, meta);
@@ -57,22 +90,6 @@ public:
     bool arm_interrupt = false;
 
 private:
-    bool hasDurableRetiredSet()
-    {
-        /// Any key under the attempt-scoped "retired/" namespace signals retire has written its sets.
-        String cursor;
-        for (;;)
-        {
-            const ListPage page = list("", cursor, 1024);
-            for (const auto & item : page.keys)
-                if (item.key.find("/retired/") != String::npos)
-                    return true;
-            if (page.next_cursor.empty())
-                return false;
-            cursor = page.next_cursor;
-        }
-    }
-
     String gc_state_key;
 };
 }
@@ -97,9 +114,10 @@ TEST(CasGcRound, TrimDropsFoldedOwnerEvents)
         EXPECT_GT(e.transition_version, cursor);
 }
 
-/// A round whose tail (recheck/delete) is not yet done is resumed idempotently from durable state: a
-/// fresh Gc with the same id re-runs fence->recheck->trim and the blob delete lands.
-TEST(CasGcResume, ResumeFromDurableFoldSealCompletesRound)
+/// A crashed round leaves only never-adopted attempt-scoped debris (there is no resume machinery in the
+/// one-pass round). A fresh Gc simply re-runs the round under a fresh attempt and the deletion pipeline
+/// converges idempotently — a delete that already landed replays onto NotFound.
+TEST(CasGcReplay, FreshAttemptRerunCompletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
@@ -110,12 +128,12 @@ TEST(CasGcResume, ResumeFromDurableFoldSealCompletesRound)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     Gc gc(store, kGc);
     gc.runRegularRound();
+    store->renewWatermarkOnce();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
 
-    // A round that folds the -1 and writes durable retired sets; resume must finish the delete. We drive
-    // a full round (which completes), then assert the blob is gone — the round is idempotently resumable
-    // because every step is exact-token / write-once (the unit oracle for the resume rule).
-    gc.runRegularRound();
+    // Drive the ack-floor pipeline to a fixpoint: the blob condemns, graduates, then is deleted. Every
+    // step is exact-token / write-once, so a replay is idempotent (the unit oracle for the crash-replay rule).
+    runGcToFixpoint(store, gc);
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 
     // Re-running again is a clean no-op (idempotent): the blob stays gone, no throw.
@@ -123,16 +141,14 @@ TEST(CasGcResume, ResumeFromDurableFoldSealCompletesRound)
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }
 
-/// Resume derives the round's tail from the ACCEPTED (snap_generation, snap_attempt) recorded in
-/// gc/state — NOT from the resuming leader's own lease.seq. A first leader (gc1) folds + retires +
-/// deletes, then is deposed exactly at the recheck completion CAS #2, leaving the round incomplete
-/// (retired sets durable, gc/state not advanced). A SECOND leader (gc2, different id, hence a different
-/// lease.seq) takes over and must complete the SAME attempt's tail: it reads the fold seal and retired
-/// sets at the accepted (snap_generation, snap_attempt), advances completion, and drops the sets. The
-/// accepted attempt is unchanged by the resume (no new attempt minted for the tail).
-TEST(CasGcResume, ResumeUsesAcceptedAttempt)
+/// Crash-replay idempotence: a round is deposed at its SINGLE round-commit CAS (lease lost mid-round),
+/// leaving only never-adopted attempt-scoped debris (a fold seal + retired list under an attempt gc/state
+/// never adopted). A SECOND leader (different id => a fresh lease.seq, hence a fresh attempt) re-runs the
+/// round from scratch and completes: no wedge, no CORRUPTED_DATA, and the prior-round artifacts under the
+/// old (unadopted) attempt are simply unreferenced. The pool drains to a fixpoint.
+TEST(CasGcReplay, DeposedRoundRerunsUnderFreshAttempt)
 {
-    auto backend = std::make_shared<InterruptRecheckBackend>(/*gc_state_key*/ "p/gc/state");
+    auto backend = std::make_shared<InterruptRoundCasBackend>(/*gc_state_key*/ "p/gc/state");
     auto store = openStoreForTest(backend);
     ASSERT_EQ(store->layout().gcStateKey(), "p/gc/state");   // guard the injected key against layout drift
     const RootNamespace ns{"00/aa@cas@"};
@@ -141,55 +157,48 @@ TEST(CasGcResume, ResumeUsesAcceptedAttempt)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
-    // First leader folds + adopts (gc/state records snap_generation, snap_attempt).
+    // First leader folds + adopts the first (snap_generation, snap_attempt).
     Gc gc1(store, hexToU128("00000000000000000000000000000001"));
     gc1.runRegularRound();
+    store->renewWatermarkOnce();
     const auto after_fold = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
     ASSERT_EQ(after_fold.snap_attempt, after_fold.lease.seq);
     ASSERT_GT(after_fold.snap_generation, 0u);
 
-    // Drop the only ref, then drive the round that would reclaim the blob — but interrupt the recheck
-    // completion CAS #2, leaving the round incomplete. This round folds AGAIN (minting + adopting a
-    // FRESH attempt via CAS #1), retires (durable retired sets), fences, then is interrupted at recheck.
+    // Drop the only ref, then drive the round whose single commit CAS is DENIED (leader deposed mid-round).
+    // The round folded under a FRESH attempt and published its fold seal + retired list under that attempt,
+    // but the commit never adopted them — pure unadopted debris. gc/state is unchanged.
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     backend->arm_interrupt = true;
     EXPECT_THROW(gc1.runRegularRound(), DB::Exception);
     backend->arm_interrupt = false;
 
-    // The round really is incomplete: a retired set is durable at the round's ACCEPTED (snap_generation,
-    // snap_attempt) and gc/state was not advanced past the fold generation. The interrupted round adopted
-    // a NEW attempt (its own fresh fold), so this is the accepted pair the tail belongs to.
     const auto after_interrupt = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
-    EXPECT_EQ(after_interrupt.snap_attempt, after_interrupt.lease.seq);   // round adopted a fresh attempt
-    EXPECT_GT(after_interrupt.snap_generation, after_fold.snap_generation);   // fold advanced the generation
-    EXPECT_TRUE(backend->head(store->layout().retiredKey(
-        after_interrupt.snap_generation, after_interrupt.snap_attempt, after_interrupt.round, 0)).exists);
-    EXPECT_TRUE(backend->head(store->layout().foldSealKey(
-        after_interrupt.snap_generation, after_interrupt.snap_attempt)).exists);
+    EXPECT_EQ(after_interrupt.snap_generation, after_fold.snap_generation)
+        << "the denied round-commit CAS must NOT advance the adopted generation";
+    EXPECT_EQ(after_interrupt.snap_attempt, after_fold.snap_attempt)
+        << "the denied round-commit CAS must NOT advance the adopted attempt";
+    // The deposed round's fold seal is durable under its OWN (unadopted) attempt — unreferenced by gc/state.
+    const uint64_t deposed_attempt = after_fold.lease.seq + 1;   // round 2 renewed the lease once
+    const uint64_t deposed_gen = after_fold.snap_generation + 1;
+    EXPECT_TRUE(backend->head(store->layout().foldSealKey(deposed_gen, deposed_attempt)).exists)
+        << "the deposed round's fold seal is durable under its own unadopted attempt (harmless debris)";
 
-    // A DIFFERENT leader (different id => different lease.seq) takes over and resumes. The lease protocol
-    // requires it to observe the stalled lease twice before stealing: the first round only observes (the
-    // incumbent looks alive on first sight) and defers; the second sees the lease unchanged and steals.
+    // A DIFFERENT leader takes over. The lease steal protocol observes the stalled lease twice before
+    // stealing: the first round only observes and defers; the second steals and re-runs the round from
+    // scratch under its own fresh attempt.
     Gc gc2(store, hexToU128("00000000000000000000000000000002"));
     EXPECT_NO_THROW(gc2.runRegularRound());   // observe-and-defer (lease not yet provably stalled)
-    // The tail is still incomplete after the deferring round (gc2 did not yet take the lease).
-    EXPECT_TRUE(backend->head(store->layout().retiredKey(
-        after_interrupt.snap_generation, after_interrupt.snap_attempt, after_interrupt.round, 0)).exists);
+    store->renewWatermarkOnce();
 
-    // Second round: gc2 steals the stalled lease and resumes. It must complete the ALREADY-ADOPTED
-    // attempt's tail (read at the accepted pair recorded in gc/state), NOT mint its own attempt for the
-    // tail: the round completes with no CORRUPTED_DATA and snap_attempt is unchanged across the resume.
-    // (The physical blob delete already happened in gc1's interrupted recheck — recheck deletes before
-    // its completion CAS — so the resume completes the metadata tail: drop retired sets, advance gen.)
-    EXPECT_NO_THROW(gc2.runRegularRound());
+    // From here gc2 owns the lease; drive it to a fixpoint. It must drain the unreachable blob WITHOUT
+    // wedging on the deposed attempt's debris (attempt-scoping keeps that debris invisible).
+    EXPECT_NO_THROW(runGcToFixpoint(store, gc2));
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 
-    const auto after_resume = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
-    EXPECT_EQ(after_resume.snap_attempt, after_interrupt.snap_attempt);   // tail completed under the accepted attempt
-    EXPECT_GT(after_resume.snap_generation, after_interrupt.snap_generation);   // completion advanced
-    // The resume dropped the retired set of the accepted attempt (round fully completed).
-    EXPECT_FALSE(backend->head(store->layout().retiredKey(
-        after_interrupt.snap_generation, after_interrupt.snap_attempt, after_interrupt.round, 0)).exists);
+    const auto after_drain = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    EXPECT_GT(after_drain.snap_generation, after_fold.snap_generation) << "the round completed under gc2";
+    EXPECT_NE(after_drain.snap_attempt, deposed_attempt) << "the drained round never adopted the deposed attempt";
 
     // A further round is a clean no-op.
     EXPECT_NO_THROW(gc2.runRegularRound());

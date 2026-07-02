@@ -456,13 +456,11 @@ TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
 
 TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
 {
-    /// Regression test: build B adopts a blob, a GC round retires + deletes it, then B publishes into
-    /// a fresh namespace. After Task 4, the fence only touches PRESENT shards (LIST-discovered). For a
-    /// BRAND-NEW namespace its shard doesn't exist at fence time, so fence_round=0 on the shard — the
-    /// promote gate `root.fence_round` is 0 and the view is at round >= 1, so no refresh triggers from
-    /// the fence floor. However, promote's UNCONDITIONAL blob revalidation (step 3) catches the
-    /// condemned blob (HEAD returns its token t0 which is in the retire view) ⇒ ABORTED. The dangle
-    /// is prevented by the unconditional revalidation path, not by the registry fence floor.
+    /// Regression test: build B adopts a blob, the ack-floor GC pipeline retires + deletes it, then B
+    /// publishes into a fresh namespace. The fence machinery is gone; the dangle is prevented by promote's
+    /// UNCONDITIONAL blob revalidation (step 3): it re-HEADs every blob leaf and, seeing the adopted blob
+    /// absent (GC deleted it) — or its condemned token in the ack-fresh retire view — fails closed (ABORTED).
+    /// The gate does not depend on any registry/shard fence floor; it is the revalidation path.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
 
@@ -480,26 +478,26 @@ TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
     auto build_b = startBuildFor(s, RootNamespace{"srv2/new"}, "part_x");
     build_b->adoptEvidence(blobEntry("data.bin", "floor-payload"));
 
-    /// 3. drop part_1 from A; a REAL GC round retires the blob at t0 and deletes it.
-    /// build_a finished, so advancing the watermark floor condemns the blob.
+    /// 3. drop part_1 from A; the ack-floor GC pipeline retires the blob at t0 and deletes it. build_a
+    /// finished, so advancing the watermark floor condemns the blob. Drive rounds advancing the store's
+    /// own mount ack after each (so the floor graduates the condemned entry and the delete lands).
     s->dropRef(ns_a, "part_1");
     build_a.reset();
     s->renewWatermarkOnce();
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
-    for (size_t r = 0; r < 8; ++r)
+    for (size_t r = 0; r < 16; ++r)
     {
         const RoundReport rep = gc.runRegularRound();
-        if (rep.acquired_lease && rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
-            && rep.replaced == 0 && rep.spared == 0)
+        s->renewWatermarkOnce();
+        if (!b->head(blob_key).exists)
             break;
     }
     /// The blob (unreachable) was deleted at t0.
     EXPECT_FALSE(b->head(blob_key).exists);
 
-    /// 4. build B publishes into a BRAND-NEW namespace. After Task 4 there is no registry fence floor;
-    /// the shard's fence_round is 0 (shard was absent at fence time). The promote gate does NOT refresh
-    /// from the fence floor. The unconditional blob revalidation catches the condemned blob ⇒ ABORTED.
-    /// It must NEVER land — landing would write a manifest naming a deleted blob (the dangle).
+    /// 4. build B publishes into a BRAND-NEW namespace. The unconditional blob revalidation catches the
+    /// now-absent (condemned) blob ⇒ ABORTED. It must NEVER land — landing would write a manifest naming a
+    /// deleted blob (the dangle).
     const ManifestId id_b = build_b->stageManifest({blobEntry("data.bin", "floor-payload")});
     build_b->precommitAdd(RootNamespace{"srv2/new"}, "part_x", id_b);
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&]

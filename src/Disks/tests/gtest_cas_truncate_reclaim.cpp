@@ -68,10 +68,28 @@ ManifestId publishPart2(
     return id;
 }
 
-/// Run regular GC rounds until the round does no further reclamation work (a fixpoint). The soak's
-/// grace-aware bound waits for `unreachable==0`; here we drive rounds deterministically and stop
-/// when a round neither retires nor deletes nor cascades anything new.
-size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
+/// Whether the CURRENT retired list (any gc-shard) still holds an entry — the ack-floor deletion pipeline
+/// (condemn -> graduate -> delete) is in flight while this is true.
+bool anyRetiredPending(const StorePtr & s)
+{
+    const auto st = s->backend().get(s->layout().gcStateKey());
+    if (!st)
+        return false;
+    const GcState gc_state = decodeGcState(st->bytes);
+    for (const auto & [shard, key] : gc_state.retired_refs)
+    {
+        const auto got = s->backend().get(key);
+        if (got && !decodeRetiredSet(got->bytes).entries.empty())
+            return true;
+    }
+    return false;
+}
+
+/// Run regular GC rounds until a fixpoint over the ACK-FLOOR round. A condemned blob is deleted only a
+/// few rounds after its removal folds (condemn -> graduate once the ack floor passes it -> delete), so the
+/// loop advances the store's own mount ack after each round (`renewWatermarkOnce` runs the beat) and stays
+/// alive while ANY work counter is nonzero OR the current retired list still holds an in-flight entry.
+size_t runGcToFixpoint(const StorePtr & s, Gc & gc, size_t max_rounds = 64)
 {
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
@@ -79,8 +97,10 @@ size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
         const RoundReport rep = gc.runRegularRound();
         if (!rep.acquired_lease)
             continue;
-        if (rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
-            && rep.replaced == 0 && rep.spared == 0)
+        s->renewWatermarkOnce();
+        const bool no_work = rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
+            && rep.replaced == 0 && rep.spared == 0;
+        if (no_work && !anyRetiredPending(s))
             break;
     }
     return rounds;
@@ -122,7 +142,7 @@ TEST(CasTruncateReclaim, PerRefDropOfSharedBlobsReclaimsToZero)
     /// Steady-state GC has nothing to reclaim while the refs are live.
     {
         Gc gc(s, hexToU128("00000000000000000000000000000001"));
-        runGcToFixpoint(gc);
+        runGcToFixpoint(s, gc);
         const FsckReport before = runFsck(*s, /*detail=*/false);
         EXPECT_EQ(before.unreachable, 0u) << "live pool must have no unreachable debris";
         EXPECT_EQ(before.dangling, 0u);
@@ -141,7 +161,7 @@ TEST(CasTruncateReclaim, PerRefDropOfSharedBlobsReclaimsToZero)
     /// Drive GC to a fixpoint and require full reclamation — this is the B140 assertion.
     {
         Gc gc(s, hexToU128("00000000000000000000000000000001"));
-        const size_t rounds = runGcToFixpoint(gc);
+        const size_t rounds = runGcToFixpoint(s, gc);
         const FsckReport after = runFsck(*s, /*detail=*/false);
         EXPECT_EQ(after.dangling, 0u) << "TRUNCATE must never lose a reachable object";
         EXPECT_EQ(after.unreachable, 0u)
@@ -201,14 +221,16 @@ TEST(CasTruncateReclaim, TruncateThenKeepInsertingStillReclaims)
     /// Drive to a fixpoint. unreachable must reach 0 (the pre-truncate orphans are gone) while the
     /// post-truncate refs stay reachable.
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
-    const size_t rounds = runGcToFixpoint(gc);
+    const size_t rounds = runGcToFixpoint(s, gc);
     const FsckReport after = runFsck(*s, /*detail=*/false);
     EXPECT_EQ(after.dangling, 0u);
     EXPECT_EQ(after.unreachable, 0u)
         << "B140: pre-truncate orphans survived after " << rounds << " GC rounds";
     EXPECT_GT(after.reachable, 0u) << "post-truncate refs must stay reachable";
-    /// Tight round bound: the dead subgraph drains in tree-round + blob-round + a confirm round.
-    EXPECT_LE(rounds, 4u) << "reclamation took too many rounds (soak budget is ~6 at 30s/round)";
+    /// Round bound: the ack-floor pipeline adds a bounded, constant number of rounds over the old
+    /// fold+delete (condemn -> graduate once the ack floor passes -> delete, with the ack kept current
+    /// each round). The dead subgraph still drains in a small, constant number of rounds — not O(orphans).
+    EXPECT_LE(rounds, 8u) << "reclamation took too many rounds (ack-floor pipeline is a small constant)";
 }
 
 /// The DROP TABLE path: removeRecursive of a table dir calls dropNamespace, which journals one
@@ -235,7 +257,7 @@ TEST(CasTruncateReclaim, DropNamespaceOfSharedBlobsReclaimsToZero)
 
     {
         Gc gc(s, hexToU128("00000000000000000000000000000001"));
-        runGcToFixpoint(gc);
+        runGcToFixpoint(s, gc);
     }
 
     /// DROP TABLE: the whole namespace is tombstoned at once (one Remove per ref in the journal).
@@ -247,7 +269,7 @@ TEST(CasTruncateReclaim, DropNamespaceOfSharedBlobsReclaimsToZero)
 
     {
         Gc gc(s, hexToU128("00000000000000000000000000000001"));
-        const size_t rounds = runGcToFixpoint(gc);
+        const size_t rounds = runGcToFixpoint(s, gc);
         const FsckReport after = runFsck(*s, /*detail=*/false);
         EXPECT_EQ(after.dangling, 0u);
         EXPECT_EQ(after.unreachable, 0u)

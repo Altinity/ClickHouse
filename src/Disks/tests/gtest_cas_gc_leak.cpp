@@ -46,10 +46,29 @@ StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
     return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
 }
 
-/// Drive regular GC to a fixpoint. A round that only retired/fenced without deleting has not reached a
-/// fixpoint: the delete-cascade for a just-retired blob lands in a SUBSEQUENT round, so the loop stays
-/// alive while ANY of the work counters is nonzero (candidates/deleted/absent/replaced/spared).
-size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
+/// Whether the CURRENT retired list (any gc-shard) still holds an entry — the ack-floor deletion pipeline
+/// (condemn -> graduate -> delete) is in flight while this is true.
+bool anyRetiredPending(const StorePtr & s)
+{
+    const auto st = s->backend().get(s->layout().gcStateKey());
+    if (!st)
+        return false;
+    const GcState gc_state = decodeGcState(st->bytes);
+    for (const auto & [shard, key] : gc_state.retired_refs)
+    {
+        const auto got = s->backend().get(key);
+        if (got && !decodeRetiredSet(got->bytes).entries.empty())
+            return true;
+    }
+    return false;
+}
+
+/// Drive regular GC to a fixpoint over the ACK-FLOOR round. A condemned blob is not deleted in the round
+/// that folds its removal: it condemns, then graduates once the ack floor passes it, then the NEXT pass
+/// deletes it. So the loop advances the store's own mount ack after each round (`renewWatermarkOnce` runs
+/// the beat so `observed_gc_round` follows the committed round) and stays alive while ANY work counter is
+/// nonzero OR the current retired list still holds an in-flight entry.
+size_t runGcToFixpoint(const StorePtr & s, Gc & gc, size_t max_rounds = 64)
 {
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
@@ -57,8 +76,10 @@ size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
         const RoundReport rep = gc.runRegularRound();
         if (!rep.acquired_lease)
             continue;
-        if (rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
-            && rep.replaced == 0 && rep.spared == 0)
+        s->renewWatermarkOnce();
+        const bool no_work = rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
+            && rep.replaced == 0 && rep.spared == 0;
+        if (no_work && !anyRetiredPending(s))
             break;
     }
     return rounds;
@@ -171,7 +192,7 @@ FsckReport displaceAndGc(
     /// not spared as in-flight, then run GC to a fixpoint.
     s->renewWatermarkOnce();
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
-    runGcToFixpoint(gc);
+    runGcToFixpoint(s, gc);
     return runFsck(*s, /*detail=*/false);
 }
 
@@ -195,7 +216,7 @@ TEST(CasGcLeak, DisplacedPartBlobsReclaimedFoldBetween)
     /// each of partA's blobs into the durable in-degree generation.
     {
         Gc gc(s, hexToU128("00000000000000000000000000000001"));
-        runGcToFixpoint(gc);
+        runGcToFixpoint(s, gc);
     }
     EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of("data-A")), 1) << "partA's data blob is pinned (+1)";
     EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of("mark-A")), 1) << "partA's mark blob is pinned (+1)";
@@ -257,7 +278,7 @@ TEST(CasGcLeak, DroppedPartFullyReclaimed)
     const ManifestId id = publishTwoBlobPart(s, ns, ref, "drop-data", "drop-mark");
     {
         Gc gc(s, hexToU128("00000000000000000000000000000002"));
-        runGcToFixpoint(gc);
+        runGcToFixpoint(s, gc);
     }
     EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of("drop-data")), 1);
     EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of("drop-mark")), 1);
@@ -266,7 +287,7 @@ TEST(CasGcLeak, DroppedPartFullyReclaimed)
     s->renewWatermarkOnce();   /// advance the floor so the now-unreferenced closure is not spared
 
     Gc gc(s, hexToU128("00000000000000000000000000000002"));
-    runGcToFixpoint(gc);
+    runGcToFixpoint(s, gc);
 
     const FsckReport after = runFsck(*s, /*detail=*/false);
     EXPECT_EQ(after.dangling, 0u) << "drop INV-NO-LOSS: nothing reachable was lost";
@@ -321,11 +342,12 @@ TEST(CasGcLeak, AbandonedPrecommitReclaimsOwnBlobs)
     /// The automatic reclaim (B8) appends the PrecommitRemove DURING the first round's fold, but that round
     /// still sees the precommit's +1 pinning the blob (the removal is folded only in the NEXT round), so it
     /// reports no candidates — `runGcToFixpoint` would stop on that first empty round before the cascade.
-    /// Drive a fixed, generous number of rounds so the -1 folds and the blob is condemned and deleted.
+    /// Drive a fixed, generous number of rounds so the -1 folds, the blob condemns, and the ack-floor
+    /// pipeline (advancing the mount ack after each round) graduates and deletes it.
     Gc gc(s, hexToU128("00000000000000000000000000000003"));
     for (int round = 0; round < 32; ++round)
     {
-        try { gc.runRegularRound(); }
+        try { gc.runRegularRound(); s->renewWatermarkOnce(); }
         catch (const DB::Exception &) { break; }
     }
 
@@ -382,7 +404,7 @@ TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
     /// GC reclaims build1's manifest and the now-unreferenced B to a fixpoint, completing the rounds.
     {
         Gc gc(s, u128Of("gc-reuse-race"));
-        runGcToFixpoint(gc);
+        runGcToFixpoint(s, gc);
     }
     ASSERT_FALSE(blobPresent(b, s->layout(), B))
         << "GC must have deleted the now-unreferenced reused blob B";

@@ -631,6 +631,25 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     {
         return backend->head(layout.manifestKey(id)).exists;
     };
+    /// Whether ANY gc-shard's current retired list still holds an entry (the ack-floor deletion pipeline
+    /// is in flight while this is true) — dereferenced through gc/state.retired_refs (all shards).
+    auto anyRetiredPending = [&]
+    {
+        const auto st = backend->get(layout.gcStateKey());
+        if (!st)
+            return false;
+        const GcState gc_state = decodeGcState(st->bytes);
+        for (const auto & [shard, key] : gc_state.retired_refs)
+        {
+            const auto got = backend->get(key);
+            if (got && !decodeRetiredSet(got->bytes).entries.empty())
+                return true;
+        }
+        return false;
+    };
+    /// Drive to a fixpoint over the ACK-FLOOR round: advance the store's mount ack each round (so the floor
+    /// follows the committed round) and stay alive while any work counter is nonzero OR an in-flight
+    /// retired entry remains in ANY shard.
     auto driveToFixpoint = [&](Gc & gc)
     {
         for (size_t r = 0; r < 64; ++r)
@@ -638,8 +657,10 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
             const RoundReport rep = gc.runRegularRound();
             if (!rep.acquired_lease)
                 continue;
-            if (rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
-                && rep.replaced == 0 && rep.spared == 0)
+            store->renewWatermarkOnce();
+            const bool no_work = rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
+                && rep.replaced == 0 && rep.spared == 0;
+            if (no_work && !anyRetiredPending())
                 break;
         }
     };

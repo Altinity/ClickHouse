@@ -71,15 +71,35 @@ String publishOneBlobPart(const StorePtr & s, const String & ns, const String & 
     return u128ToHex(u128Of(payload));
 }
 
-void runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
+/// Whether the CURRENT retired list (any gc-shard) still holds an entry (ack-floor pipeline in flight).
+bool anyRetiredPending(const StorePtr & s)
+{
+    const auto st = s->backend().get(s->layout().gcStateKey());
+    if (!st)
+        return false;
+    const GcState gc_state = decodeGcState(st->bytes);
+    for (const auto & [shard, key] : gc_state.retired_refs)
+    {
+        const auto got = s->backend().get(key);
+        if (got && !decodeRetiredSet(got->bytes).entries.empty())
+            return true;
+    }
+    return false;
+}
+
+/// Drive regular GC to a fixpoint over the ACK-FLOOR round (renew the store's mount ack after each round;
+/// stay alive while any work counter is nonzero OR an in-flight retired entry remains).
+void runGcToFixpoint(const StorePtr & s, Gc & gc, size_t max_rounds = 64)
 {
     for (size_t r = 0; r < max_rounds; ++r)
     {
         const RoundReport rep = gc.runRegularRound();
         if (!rep.acquired_lease)
             continue;
-        if (rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
-            && rep.replaced == 0 && rep.spared == 0)
+        s->renewWatermarkOnce();
+        const bool no_work = rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
+            && rep.replaced == 0 && rep.spared == 0;
+        if (no_work && !anyRetiredPending(s))
             break;
     }
 }
@@ -123,7 +143,7 @@ TEST(CasEvent, LifecycleReconstructionFromRows)
 
     /// GC reclaims the tree and the blob to a fixpoint.
     Gc gc(s, u128Of("gc-event-log"));
-    runGcToFixpoint(gc);
+    runGcToFixpoint(s, gc);
 
     /// The blob must actually be gone (the delete fired).
     ASSERT_FALSE(b->head(s->layout().blobKey(BlobId{blob_hash})).exists)

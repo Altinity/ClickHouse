@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
 
@@ -17,6 +18,15 @@ ManifestRef ref(const String &, uint64_t seq, uint64_t inst)
 bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash)
 {
     return b.head(layout.blobKey(BlobId(u128ToHex(hash)))).exists;
+}
+
+/// The current retired entry for `hash` (dereferenced through gc/state.retired_refs, shard 0), or nullopt.
+std::optional<RetiredEntry> currentEntryFor(Backend & backend, const Layout & layout, const UInt128 & hash)
+{
+    for (const RetiredEntry & e : currentRetiredSet(backend, layout, /*shard*/0).entries)
+        if (e.hash == hash)
+            return e;
+    return std::nullopt;
 }
 }
 
@@ -38,26 +48,7 @@ TEST(CasGcRetire, ManifestBodyDeletedAfterDecrementsSealed)
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
-/// Fence raises fence_round on every present root shard (LIST-discovered, Task 4).
-/// After Task 4 there is no registry object — only present shards are fenced.
-TEST(CasGcFence, RaisesAllShardFence)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    /// Write an actual ref shard so the LIST sweep discovers the namespace.
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt,
-        ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
-    Gc gc(store, kGc);
-    gc.runRegularRound();
-    const auto shard0 = backend->get(store->layout().rootShardKey(ns, 0));
-    ASSERT_TRUE(shard0.has_value());
-    EXPECT_GE(decodeRootShard(shard0->bytes).fence_round, 1u);
-    /// No registry object (Task 4 deleted it).
-    EXPECT_FALSE(backend->get("p/gc/registry").has_value());
-}
-
-/// A publish racing the fence (in-degree restored) is SPARED, not deleted (#14).
+/// A publish racing the pass (in-degree restored) is SPARED, not deleted (#14).
 TEST(CasGcRecheck, PublishRacingFenceSparesBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -80,7 +71,10 @@ TEST(CasGcRecheck, PublishRacingFenceSparesBlob)
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }
 
-/// A genuinely unreferenced blob is deleted with its exact token (the single content-delete site).
+/// A genuinely unreferenced blob is deleted with its exact token (the single content-delete site). Under
+/// the ack-floor round the delete is no longer one-round-after-drop: the entry condemns, then graduates
+/// once the mount's ack passes the condemn round, then the NEXT pass executes the exact-token delete. The
+/// reclaim loop keeps the store's own ack current after each round, so the pipeline converges.
 TEST(CasGcRecheck, UnreferencedBlobDeletedExactToken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -93,16 +87,15 @@ TEST(CasGcRecheck, UnreferencedBlobDeletedExactToken)
     Gc gc(store, kGc);
     gc.runRegularRound();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    gc.runRegularRound();   // round 2: fold -1, retire, fence, recheck deletes blob 1
-    EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+    // The drop's -1 condemns blob 1; the ack-floor pipeline (condemn -> graduate -> delete) reclaims it.
+    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(1)));
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
-/// CAS #2 (completion-advance) INHERITS CAS #1's (fold-adopt's) attempt WITHIN the same round: it never
-/// re-mints. After a full round the adopted `snap_attempt` equals the `lease.seq` that folded that round,
-/// and the completion seal is durable at the adopted `(snap_generation, snap_attempt)` pair. Across rounds
-/// each `runRegularRound` re-acquires the lease (bumping `lease.seq`), so the next round mints a FRESH
-/// attempt for ITS fold and the completion inherits that one — never the prior round's.
+/// A completed round adopts the SAME attempt its fold minted (the round's single gc/state CAS commits the
+/// fold's (snap_generation, snap_attempt) together). Completion seals are a retired concept, so the durable
+/// index of the adopted round is the FOLD seal at (snap_generation, snap_attempt). Across rounds each
+/// `runRegularRound` re-acquires the lease (bumping `lease.seq`), so a later round mints a FRESH attempt.
 TEST(CasGcRecheck, CompletionInheritsFoldAttempt)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -114,22 +107,327 @@ TEST(CasGcRecheck, CompletionInheritsFoldAttempt)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     Gc gc(store, kGc);
 
-    gc.runRegularRound();          // round 1: fold-adopt (CAS #1) -> ... -> completion-advance (CAS #2)
+    gc.runRegularRound();          // round 1: one pass, single CAS commits (snap_generation, snap_attempt)
     const auto after_round1 = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
-    // CAS #2 inherited the fold attempt of THIS round: snap_attempt == the lease.seq that folded it.
+    // The round adopted the attempt of THIS round's fold: snap_attempt == the lease.seq that folded it.
     EXPECT_EQ(after_round1.snap_attempt, after_round1.lease.seq);
     EXPECT_GT(after_round1.snap_generation, 0u);
-    // The completion seal is durable under the adopted (snap_generation, snap_attempt) pair.
+    // The fold seal is durable under the adopted (snap_generation, snap_attempt) pair (no completion seal).
     EXPECT_TRUE(backend->head(store->layout()
-        .completionSealKey(after_round1.snap_generation, after_round1.snap_attempt)).exists);
+        .foldSealKey(after_round1.snap_generation, after_round1.snap_attempt)).exists);
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    gc.runRegularRound();          // round 2: re-acquire (bump lease.seq) -> fold-adopt -> completion-advance
+    gc.runRegularRound();          // round 2: re-acquire (bump lease.seq) -> fresh attempt at its fold
     const auto after_round2 = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
-    // Round 2 minted a FRESH attempt at its fold; the completion inherited THAT one.
     EXPECT_EQ(after_round2.snap_attempt, after_round2.lease.seq);
     EXPECT_GT(after_round2.snap_attempt, after_round1.snap_attempt);   // per-round monotone attempt
     EXPECT_GT(after_round2.snap_generation, after_round1.snap_generation);
     EXPECT_TRUE(backend->head(store->layout()
-        .completionSealKey(after_round2.snap_generation, after_round2.snap_attempt)).exists);
+        .foldSealKey(after_round2.snap_generation, after_round2.snap_attempt)).exists);
+}
+
+/// ---- ack-floor round protocol suite (spec 2026-07-02 + Task-9 amendment) ----
+
+/// A round performs NO fence writes to ref shards: the fence machinery is gone. A no-op round (no owner
+/// events, nothing to fold) leaves the discovered ref shard's token byte-unchanged (the old fence step
+/// would have bumped fence_round and rewritten the shard).
+TEST(CasGcAckFloor, NoOpRoundDoesNotMutateRefShards)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt,
+        ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
+    Gc gc(store, kGc);
+    gc.runRegularRound();   // first round folds the publish
+    const auto before = backend->head(store->layout().rootShardKey(ns, 0));
+    ASSERT_TRUE(before.exists);
+    gc.runRegularRound();   // a second, no-op round must not touch the ref shard
+    const auto after = backend->head(store->layout().rootShardKey(ns, 0));
+    ASSERT_TRUE(after.exists);
+    EXPECT_EQ(before.token.value, after.token.value);   // no fence write, token unchanged
+    // The registry object is gone (Task 4); the fence never existed to write it.
+    EXPECT_FALSE(backend->get("p/gc/registry").has_value());
+}
+
+/// The canonical pipeline: a blob condemned at round K stays present after the condemning round; the pass
+/// that graduates it (once every mount's ack passes K) publishes it delete_pending — the blob still
+/// exists; the NEXT pass executes the exact-token delete and the blob becomes absent.
+TEST(CasGcAckFloor, CondemnThenDeleteNextRoundAfterAcks)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, kGc);
+
+    gc.runRegularRound();                 // round 1: folds the +1; blob referenced
+    store->renewWatermarkOnce();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+
+    // The condemning round: the -1 drops in-degree to 0; the blob is condemned into the current retired
+    // list but NOT deleted. The entry is present and NOT yet pending.
+    gc.runRegularRound();
+    store->renewWatermarkOnce();
+    EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
+    {
+        const auto e = currentEntryFor(*backend, store->layout(), blob);
+        ASSERT_TRUE(e.has_value());
+        EXPECT_FALSE(e->delete_pending);   // condemned, floor has not passed it yet
+    }
+
+    // Drive rounds until the entry graduates (published delete_pending). It is still present at that pass.
+    bool saw_pending = false;
+    for (int i = 0; i < 6 && !saw_pending; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        const auto e = currentEntryFor(*backend, store->layout(), blob);
+        if (e && e->delete_pending)
+        {
+            saw_pending = true;
+            EXPECT_TRUE(blobExists(*backend, store->layout(), blob));   // pending: still present this pass
+        }
+    }
+    ASSERT_TRUE(saw_pending) << "entry never reached delete_pending";
+
+    // The pass AFTER the pending publish executes the exact-token delete; the blob becomes absent and the
+    // entry is dropped from the current retired list.
+    gc.runRegularRound();
+    store->renewWatermarkOnce();
+    EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
+    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
+}
+
+/// A mount whose ack is stuck below the condemn round holds the floor down: the entry never graduates
+/// (stays non-pending, blob survives) — but the round itself still completes and advances gc/state.round.
+TEST(CasGcAckFloor, StaleAckHoldsTheFloorWithoutBlockingTheRound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, kGc);
+
+    gc.runRegularRound();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+
+    // Run rounds WITHOUT renewWatermarkOnce: the mount's observed_gc_round never advances, so min_ack
+    // stays pinned at the round the mount last acked (0 — the store opened before any round committed).
+    uint64_t prev_round = decodeGcState(backend->get(store->layout().gcStateKey())->bytes).round;
+    for (int i = 0; i < 5; ++i)
+    {
+        gc.runRegularRound();
+        const auto st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+        EXPECT_GT(st.round, prev_round);   // the round still advances
+        prev_round = st.round;
+        // The entry is condemned but never graduates: delete_pending stays false, blob survives.
+        const auto e = currentEntryFor(*backend, store->layout(), blob);
+        if (e)
+            EXPECT_FALSE(e->delete_pending);
+        EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
+    }
+}
+
+/// A publish re-referencing the condemned blob before graduation is folded and SPARES the entry: the entry
+/// is dropped (recovery wins even past the floor) and the blob survives.
+TEST(CasGcAckFloor, PreAckPublishSpares)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
+    const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
+    const UInt128 blob = DB::UInt128(1);
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    Gc gc(store, kGc);
+
+    gc.runRegularRound();
+    store->renewWatermarkOnce();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+    gc.runRegularRound();   // condemns blob 1 (in-degree 0)
+    store->renewWatermarkOnce();
+    ASSERT_TRUE(currentEntryFor(*backend, store->layout(), blob).has_value());
+
+    // Re-publish a committed ref pointing at the same blob BEFORE it graduates: the next pass folds the +1,
+    // the merge sees in-degree 1, and the entry is spared (dropped from the retired list).
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r2);
+    gc.runRegularRound();
+    store->renewWatermarkOnce();
+    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());   // spared: entry dropped
+    EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
+
+    // Keep running: the re-referenced blob must never be deleted.
+    for (int i = 0; i < 4; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+    EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
+}
+
+/// An expired mount is fenced out by the round's floor step: gc_fenced is set on its body (a token-guarded
+/// rewrite that bumps seq), so the floor no longer counts its stale ack — deletion proceeds. The fenced
+/// mount's own subsequent renew then fails closed, because the fence invalidated the token it held.
+TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    // A live store (the GC leader's own mount, on the SYSTEM clock) plus a SECOND server's keeper on a
+    // FAKE clock that we freeze — so GC's own fake clock can jump past it deterministically.
+    auto store = openStoreForTest(backend);
+    const Layout & layout = store->layout();
+
+    // srid2's keeper: started at fake now=1000 with ttl=100 => lease expires_at = 1100. Its ack is stuck
+    // at 0 (observed_round callback returns 0), so if it stayed live it would pin the floor at 0.
+    const String srid2 = "stale-server";
+    uint64_t srid2_now = 1000;
+    MountLeaseKeeper srid2_keeper(backend, layout, srid2, DB::UInt128(0x2222), /*writer_epoch=*/1,
+        std::chrono::milliseconds(100), [&] { return srid2_now; }, [] { return 0u; }, [] { return 0u; });
+    srid2_keeper.start();
+    ASSERT_FALSE(decodeMountLease(backend->get(layout.mountKey(srid2))->bytes).gc_fenced);
+
+    // GC runs on a fake clock jumped well past srid2's deadline + margin (ttl/2 = 15000 for the store's
+    // 30s ttl). The store's own mount carries a SYSTEM-clock expires_at (~1.7e12 ms), far above the fake
+    // GC clock, so it stays live and governs the floor once srid2 is fenced.
+    uint64_t gc_now = 1100 + 60000;
+    Gc gc(store, kGc, [&] { return gc_now; });
+
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(7);
+    writeBlobBody(*backend, layout, blob);
+    writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+    gc.runRegularRound();
+    store->renewWatermarkOnce();
+
+    // The round's floor step fenced srid2 out (expired on the GC clock).
+    const MountLease fenced = decodeMountLease(backend->get(layout.mountKey(srid2))->bytes);
+    EXPECT_TRUE(fenced.gc_fenced);
+
+    // srid2's writer comes back and tries to renew: its held token was invalidated by the fence rewrite,
+    // so renewOnce fails closed. (It renews on its own clock; liveness is irrelevant — the token guard
+    // trips regardless.)
+    srid2_now = 1050;
+    EXPECT_THROW(srid2_keeper.renewOnce(), DB::Exception);
+
+    // With srid2 fenced (excluded from the floor), the live store mount governs the floor and the blob is
+    // reclaimed through the normal pipeline.
+    dropRefTransition(*backend, layout, ns, "tbl", r);
+    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, layout, blob));
+}
+
+/// deleteExact against a blob the writer RECREATED (fresh incarnation, different token) between the pending
+/// publish and the deleting pass lands TokenMismatch — a terminal-OK outcome recorded as a replace: the
+/// fresh incarnation is a live object and survives. report.replaced counts it.
+TEST(CasGcAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    const BlobId blob_id(u128ToHex(blob));
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, kGc);
+
+    gc.runRegularRound();
+    store->renewWatermarkOnce();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    gc.runRegularRound();   // condemn (captures the ORIGINAL token)
+    store->renewWatermarkOnce();
+
+    // Drive rounds until the entry is delete_pending (the token it holds is the original observation).
+    bool pending = false;
+    for (int i = 0; i < 6 && !pending; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        const auto e = currentEntryFor(*backend, store->layout(), blob);
+        pending = e && e->delete_pending;
+    }
+    ASSERT_TRUE(pending);
+
+    // The writer recreates the blob with a FRESH incarnation before the deleting pass: the current token no
+    // longer matches the pending entry's captured token.
+    displaceBlobToken(*backend, store->layout(), blob_id);
+
+    // The deleting pass issues deleteExact(entry.token) → TokenMismatch → Replaced. The fresh incarnation
+    // survives; the entry is dropped.
+    const RoundReport rep = gc.runRegularRound();
+    store->renewWatermarkOnce();
+    EXPECT_EQ(rep.replaced, 1u);
+    EXPECT_TRUE(blobExists(*backend, store->layout(), blob));   // the recreated incarnation is live
+    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
+}
+
+/// Idempotent replay of a crashed round: a fresh Gc instance (new lease seq = new attempt) re-runs a round
+/// and completes; a delete that already landed under a prior pass replays onto NotFound (Absent outcome)
+/// and the round still completes. We model the crash-after-delete-before-CAS replay by manually deleting
+/// the pending blob (its exact token) BEFORE the deleting pass, then asserting the pass reports the delete
+/// as absent (report.absent == 1) and completes (round advances).
+TEST(CasGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    const BlobId blob_id(u128ToHex(blob));
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    // A fresh Gc per round (each acquires the lease, bumping lease.seq = a fresh attempt) — the replay
+    // property: no wedging, each round completes under its own fresh attempt.
+    {
+        Gc gc(store, kGc);
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+
+    RetiredEntry pending_entry;
+    bool pending = false;
+    for (int i = 0; i < 6 && !pending; ++i)
+    {
+        Gc gc(store, kGc);
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        const auto e = currentEntryFor(*backend, store->layout(), blob);
+        if (e && e->delete_pending)
+        {
+            pending = true;
+            pending_entry = *e;
+        }
+    }
+    ASSERT_TRUE(pending);
+
+    // Simulate a crashed deleting pass that DID land the exact-token delete but crashed before the gc/state
+    // CAS. The next (fresh-attempt) pass replays the delete → the object is already gone → NotFound → the
+    // pass records Absent and completes.
+    ASSERT_EQ(backend->deleteExact(store->layout().blobKey(blob_id), pending_entry.token).kind,
+              DeleteOutcome::Kind::Deleted);
+
+    const uint64_t round_before = decodeGcState(backend->get(store->layout().gcStateKey())->bytes).round;
+    Gc gc2(store, kGc);
+    const RoundReport rep = gc2.runRegularRound();
+    store->renewWatermarkOnce();
+    EXPECT_EQ(rep.absent, 1u);   // the replayed delete found the object already gone
+    const uint64_t round_after = decodeGcState(backend->get(store->layout().gcStateKey())->bytes).round;
+    EXPECT_GT(round_after, round_before);   // the round completed (no wedge)
+    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
 }
