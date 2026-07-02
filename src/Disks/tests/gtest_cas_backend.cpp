@@ -12,6 +12,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include <Disks/WriteMode.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/S3Common.h>
@@ -568,6 +569,31 @@ TEST(CasObjectStorageBackend, NativeModeGetReturnsNulloptOnMidGetNoSuchKey)
     Backend & iface = backend;
     const auto result = iface.get(key);
     EXPECT_FALSE(result.has_value());
+}
+
+/// A ranged `get` over a real `LocalObjectStorage` returns exactly the requested window, with the
+/// same clamping the old read-whole-then-substr path had: a window whose offset is at or past EOF
+/// yields an empty result. The only-the-window I/O property (no whole-object read) is enforced by
+/// the `readObjectRanged` rewrite and cross-checked by the request-size gate in a later task.
+TEST(CasObjectStorageBackend, RangedGetReadsOnlyTheWindow)
+{
+    auto backend = std::make_shared<ObjectStorageBackend>(
+        tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+
+    const String payload = String(300000, 'a') + String(300000, 'b') + String(300000, 'c');
+    backend->putIfAbsent("p/obj", payload);
+
+    const auto mid = backend->get("p/obj", DB::Cas::Range{.offset = 300000, .length = 300000});
+    ASSERT_TRUE(mid.has_value());
+    EXPECT_EQ(mid->bytes, String(300000, 'b'));
+
+    const auto tail = backend->get("p/obj", DB::Cas::Range{.offset = 600000, .length = std::nullopt});
+    ASSERT_TRUE(tail.has_value());
+    EXPECT_EQ(tail->bytes, String(300000, 'c'));
+
+    const auto past = backend->get("p/obj", DB::Cas::Range{.offset = 1000000, .length = 10});
+    ASSERT_TRUE(past.has_value());
+    EXPECT_TRUE(past->bytes.empty());
 }
 
 #endif

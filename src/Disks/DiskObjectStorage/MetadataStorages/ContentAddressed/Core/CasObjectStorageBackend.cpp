@@ -263,24 +263,40 @@ static bool isObjectNotFound(const std::exception & e)
     return false;
 }
 
-/// Read the whole object at `path` and honor `range` by substr. Objects on this path are small (root
-/// manifests, tree/blob bodies in tests), so read-whole + substr is the correct and simplest way to
-/// serve a sub-range — no seek/limit machinery needed.
+/// Read `range` of the object at `path` as a TRUE ranged read: seek to the offset and bound the
+/// read window (spec 2026-07-02 snapshot-streaming §Backend seam). Never read-whole-then-substr —
+/// the snapshot runs this serves are GBs at scale and the caller's memory budget is O(block).
 static String readObjectRanged(IObjectStorage & object_storage, const String & path, Range range)
 {
     auto buf = object_storage.readObject(StoredObject(path), getReadSettings(), /*read_hint=*/std::nullopt);
     String content;
-    readStringUntilEOF(content, *buf);
-
     if (range.whole())
+    {
+        readStringUntilEOF(content, *buf);
         return content;
+    }
 
-    const size_t offset = static_cast<size_t>(range.offset);
-    if (offset >= content.size())
+    /// Clamp exactly like the old substr path: an offset at or past EOF yields an empty result.
+    /// `seek` past the object size may throw depending on the storage, so fail-close the window
+    /// against the known size before touching the buffer position.
+    const auto metadata = object_storage.getObjectMetadata(path, /*with_tags=*/false);
+    if (range.offset >= metadata.size_bytes)
         return {};
+
+    /// The readable window, clamped to EOF. `setReadUntilPosition` is only a hint (not every object
+    /// storage honors it — LocalObjectStorage does not), so the exact byte count below is what bounds
+    /// the read; the hint lets storages that DO honor it avoid over-fetching.
+    const uint64_t available = metadata.size_bytes - range.offset;
+    const uint64_t to_read = range.length.has_value() ? std::min(*range.length, available) : available;
+
     if (range.length.has_value())
-        return content.substr(offset, static_cast<size_t>(*range.length));
-    return content.substr(offset);
+        buf->setReadUntilPosition(range.offset + *range.length);
+    buf->seek(static_cast<off_t>(range.offset), SEEK_SET);
+
+    content.resize(to_read);
+    const size_t got = buf->read(content.data(), to_read);
+    content.resize(got);
+    return content;
 }
 
 /// =========================================================================================
