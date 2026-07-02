@@ -15,6 +15,7 @@
 #include <Common/ProfileEvents.h>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -423,6 +424,16 @@ public:
         mutateShard(ns, shard, MutationScope::wholeShard(), std::move(mutate), nullptr, origin, kind, birth_incarnation, std::move(provider));
     }
 
+    /// Queue depth for the shard-mutation-queue tests: how many mutations are enqueued (the
+    /// leader's own item stays counted until its batch is carved, which happens after the flush's
+    /// first read — so a blocked-in-read leader plus one waiter reads as depth 2).
+    size_t shardQueuePendingForTest(const RootNamespace & ns, uint64_t shard)
+    {
+        std::lock_guard<std::mutex> g(shard_queue_mutex);
+        const auto it = shard_queues.find(std::make_pair(ns.string(), shard));
+        return it == shard_queues.end() ? 0 : it->second->pending.size();
+    }
+
     /// Scoped variant for the shard-mutation-queue tests (spec 2026-07-03): exposes the scope so
     /// batching/cut semantics are testable; returns the committed version.
     uint64_t mutateShardScopedForTest(const RootNamespace & ns, uint64_t shard, MutationScope scope,
@@ -503,6 +514,41 @@ private:
                      RootMutationOrigin origin, RootMutationKind kind,
                      ShardIncarnation birth_incarnation = {},
                      std::function<uint64_t()> birth_floor_provider = nullptr);
+
+    /// ==== flat-combining shard-mutation queue (spec 2026-07-03-cas-shard-mutation-queue) ====
+    /// One queued item = one BLOCKED mutateShard caller (bounded by writer-thread count by
+    /// construction). Map entries exist only while work is in flight; ONE mutex guards the map and
+    /// every item's completion fields; per-queue cv wakes that queue's waiters only.
+    struct ShardMutationItem
+    {
+        MutationScope scope;
+        std::function<void(RootShard &)> mutate;
+        RootMutationOrigin origin = RootMutationOrigin::Writer;
+        RootMutationKind kind = RootMutationKind::Publish;
+        ShardIncarnation birth_incarnation;
+        std::function<uint64_t()> birth_floor_provider;
+        bool done = false;                       /// guarded by shard_queue_mutex
+        std::exception_ptr error;                /// guarded by shard_queue_mutex
+        uint64_t committed_version = 0;          /// written by the leader before done = true
+    };
+    struct ShardMutationQueue
+    {
+        std::deque<std::shared_ptr<ShardMutationItem>> pending;
+        bool leader_active = false;
+        uint64_t force_solo = 0;                 /// hard-limit degrade: next N carves are solo
+        std::condition_variable cv;
+    };
+    static constexpr size_t kMaxShardBatch = 128;
+    std::mutex shard_queue_mutex;
+    std::map<std::pair<String, uint64_t>, std::shared_ptr<ShardMutationQueue>> shard_queues;
+
+    /// Leader loop: flush batches until the leader's OWN item completes (fairness baton pass).
+    void runShardQueueLeader(const RootNamespace & ns, uint64_t shard,
+                             const std::shared_ptr<ShardMutationQueue> & q,
+                             const std::shared_ptr<ShardMutationItem> & own);
+    /// One carved batch through one CAS loop; NEVER throws (outcomes land in the items).
+    void flushShardBatch(const RootNamespace & ns, uint64_t shard,
+                         const std::shared_ptr<ShardMutationQueue> & q);
 
     BackendPtr pool_backend;
     PoolConfig config;

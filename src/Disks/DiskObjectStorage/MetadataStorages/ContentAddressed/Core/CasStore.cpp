@@ -969,30 +969,125 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, MutationScope 
                         uint64_t * out_committed_version, RootMutationOrigin origin, RootMutationKind kind,
                         ShardIncarnation birth_incarnation, std::function<uint64_t()> birth_floor_provider)
 {
-    /// Task 1 (shard-mutation-queue): the scope is threaded from every call site but not consumed
-    /// yet — Task 2's flat-combining batch builder keys on it.
-    (void)scope;
+    /// Flat-combining shard-mutation queue (spec 2026-07-03-cas-shard-mutation-queue): callers
+    /// enqueue (scope, closure, promise-like item) per (ns, shard); the caller that finds the queue
+    /// leaderless becomes the LEADER and flushes batches (one read -> apply-all -> one casPut) until
+    /// its OWN item completes, then hands the baton to a woken waiter. Bounded by construction:
+    /// every queued item is a BLOCKED caller thread, so total queued items across all shards never
+    /// exceeds the writer-thread count; the map entry lives only while work is in flight.
+    auto item = std::make_shared<ShardMutationItem>();
+    item->scope = std::move(scope);
+    item->mutate = std::move(mutate);
+    item->origin = origin;
+    item->kind = kind;
+    item->birth_incarnation = birth_incarnation;
+    item->birth_floor_provider = std::move(birth_floor_provider);
 
-    /// Ack-floor drain (spec 2026-07-02): hold the SHARED side of the view gate for the WHOLE call —
-    /// condemn-gate evaluations inside `mutate` through the CAS response — so a beat advertising a
-    /// newer `observed_gc_round` can never overtake an in-flight mutation that gated on the older
+    const auto qkey = std::make_pair(ns.string(), shard);
+    std::shared_ptr<ShardMutationQueue> q;
+
+    std::unique_lock<std::mutex> lk(shard_queue_mutex);
+    auto & slot = shard_queues[qkey];
+    if (!slot)
+        slot = std::make_shared<ShardMutationQueue>();
+    q = slot;
+    q->pending.push_back(item);
+
+    while (!item->done)
+    {
+        if (!q->leader_active)
+        {
+            q->leader_active = true;
+            lk.unlock();
+            runShardQueueLeader(ns, shard, q, item);
+            lk.lock();
+            q->leader_active = false;
+            /// Baton pass: our item is done; a woken waiter with pending work self-promotes.
+            q->cv.notify_all();
+        }
+        else
+        {
+            q->cv.wait(lk);
+        }
+    }
+
+    /// Last one out removes the (empty, leaderless) queue — an idle pool holds an EMPTY map.
+    /// Erase ONLY when the map still holds OUR queue: a slow-exiting waiter must not evict a
+    /// successor queue (same key, fresh entry) whose leader is mid-flush — that would allow a
+    /// second leader on the shard (two-leader CAS conflicts, found by the stress test).
+    if (q->pending.empty() && !q->leader_active)
+    {
+        const auto it = shard_queues.find(qkey);
+        if (it != shard_queues.end() && it->second == q)
+            shard_queues.erase(it);
+    }
+    lk.unlock();
+
+    if (item->error)
+        std::rethrow_exception(item->error);
+    if (out_committed_version)
+        *out_committed_version = item->committed_version;
+}
+
+void Store::runShardQueueLeader(const RootNamespace & ns, uint64_t shard,
+                                const std::shared_ptr<ShardMutationQueue> & q,
+                                const std::shared_ptr<ShardMutationItem> & own)
+{
+    /// The leader serves flushes only until ITS caller's work is done (fairness: no caller thread is
+    /// held hostage flushing strangers' work after its own completed) — the baton then passes.
+    while (true)
+    {
+        {
+            std::lock_guard<std::mutex> g(shard_queue_mutex);
+            if (own->done)
+                return;
+        }
+        flushShardBatch(ns, shard, q);
+    }
+}
+
+void Store::flushShardBatch(const RootNamespace & ns, uint64_t shard,
+                            const std::shared_ptr<ShardMutationQueue> & q)
+{
+    /// One flush = one carved batch through one CAS loop. NEVER throws: every outcome lands in the
+    /// affected items (done + error/version) so waiters always wake.
+    const String key = pool_layout.rootShardKey(ns, shard);
+
+    auto complete_error = [&](const std::vector<std::shared_ptr<ShardMutationItem>> & items, std::exception_ptr e)
+    {
+        std::lock_guard<std::mutex> g(shard_queue_mutex);
+        for (const auto & it : items)
+        {
+            it->error = e;
+            it->done = true;
+        }
+        q->cv.notify_all();
+    };
+    auto carve_all_pending = [&]() -> std::vector<std::shared_ptr<ShardMutationItem>>
+    {
+        std::lock_guard<std::mutex> g(shard_queue_mutex);
+        std::vector<std::shared_ptr<ShardMutationItem>> all(q->pending.begin(), q->pending.end());
+        q->pending.clear();
+        return all;
+    };
+
+    /// Ack-floor drain (spec 2026-07-02): the SHARED side of the view gate spans the whole flush —
+    /// condemn-gate evaluations inside the closures through the CAS response — so a beat advertising
+    /// a newer `observed_gc_round` can never overtake an in-flight batch that gated on the older
     /// view. Lock order (never inverted elsewhere): view_gate, then RetireView's internal mutex.
     std::shared_lock<std::shared_mutex> view_guard(view_gate);
 
-    /// Local write fence (spec §write-fence, Phase 0 Task 6): the shared mutable ref shards are the
-    /// state the fence most protects. A superseded/paused writer (lease lost or local deadline passed)
-    /// must not race the live one. Purely local — no S3 read. Permissive until Task 7 arms it, so
-    /// existing flows (GC/build/bootstrap writes) are unaffected.
+    /// Local write fence (spec §write-fence): a superseded/paused writer must not race the live one.
+    /// The fence fails the WHOLE queue — every caller would have gotten the same refusal alone.
     if (!mayMutate())
-        throw Exception(ErrorCodes::ABORTED,
+    {
+        complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
             "CAS mount lost / lease expired — refusing to mutate ref shard for server_root '{}'",
-            config.server_root_id);
+            config.server_root_id)));
+        return;
+    }
 
-    const String key = pool_layout.rootShardKey(ns, shard);
-
-    /// B164b: at most one backpressure delay per mutation call. After the first delay + retry, the
-    /// subsequent iteration's fresh read may still be above the soft limit but we commit anyway
-    /// (admission is paced, never permanently blocked).
+    /// B164b: at most one backpressure delay per FLUSH (was: per mutation call).
     bool delayed_once = false;
 
     const uint64_t soft_limit = config.manifest_soft_limit;
@@ -1004,123 +1099,180 @@ void Store::mutateShard(const RootNamespace & ns, uint64_t shard, MutationScope 
     static std::atomic<std::chrono::steady_clock::time_point> last_soft_warn{
         std::chrono::steady_clock::time_point::min()};
 
-    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
+    std::vector<std::shared_ptr<ShardMutationItem>> batch;   /// carved once, after the first read
+
+    try
     {
-        /// Re-read inside the loop so `mutate` always edits the FRESH manifest: on a Conflict retry the
-        /// previous attempt's edits are discarded and re-applied to the winner's state, so a journal
-        /// append is never double-appended.
-        auto [root, token] = readShard(ns, shard);
-        /// Task 2: stamp the birth incarnation on the create-if-absent path (token == nullopt means
-        /// the shard object did not exist before this call). Once the shard exists the incarnation is
-        /// immutable — subsequent mutations leave it untouched. Callers that never create a first
-        /// object (drop, fence, updateRefPayload, dropNamespace) pass the default `{}`, which is the
-        /// unstamped sentinel (a no-op when the shard already carries a real incarnation). A CAS
-        /// Conflict retry re-reads a now-present shard, so the stamp is skipped on retries correctly.
-        /// Task 5: stamp the birth floor (fence_round) on the same create-if-absent path. A NEWBORN
-        /// shard born during GC round R is fenced to R so the `promote` gate forces a retire-view
-        /// refresh before committing any blob belonging to the new shard — the registry-free THM-NO-RETURN
-        /// create-ordering guarantee. `birth_floor_provider` is LAZY: it is only invoked here (newborn
-        /// path) so the common existing-shard path incurs ZERO extra S3 round-trips. The provider is
-        /// called at most ONCE per `mutateShard` call (cached in `floor` below); a CAS-retry that
-        /// re-reads a now-present shard takes the `token` branch and skips this block entirely.
-        /// Callers that never create a first object (GC fence, drop, dropNamespace) pass nullptr —
-        /// `fence_round` stays at the default 0 (no-op, shard already exists anyway).
-        /// `fence_round = 0` (fresh pool, no GC) is a valid value; assigned unconditionally.
-        if (!token)
+        for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
         {
-            root.incarnation = birth_incarnation;
-            if (birth_floor_provider)
-            {
-                const uint64_t floor = birth_floor_provider();
-                root.fence_round = floor;
-            }
-        }
-        mutate(root);
-        ++root.shard_version;
-        String body = encodeRootShard(root);
+            /// Re-read inside the loop so closures always edit the FRESH shard state: on a Conflict
+            /// retry the previous attempt's edits are discarded and re-applied to the winner's state,
+            /// so a journal append is never double-appended.
+            auto [root, token] = readShard(ns, shard);
 
-        /// Hard limit — fail-closed before any consequential write, regardless of origin.
-        if (body.size() >= hard_limit)
-        {
-            ProfileEvents::increment(ProfileEvents::CasManifestHardLimitExceeded);
-            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
-                "manifest {} size {} reached hard limit {} (kind={})",
-                key, body.size(), hard_limit, toString(kind));
-        }
-
-        /// Soft limit — warning log + optional backpressure delay for Writer.
-        if (body.size() >= soft_limit)
-        {
-            /// Rate-limited soft-limit warning (at most one per 30s).
-            const auto now = std::chrono::steady_clock::now();
-            auto last = last_soft_warn.load(std::memory_order_relaxed);
-            if (now - last > std::chrono::seconds(30))
+            /// Carve AFTER the first read: everything enqueued while the read was in flight joins
+            /// this batch (the read IS the batching window). Scope rule: at most one mutation per
+            /// ref name per flush; WholeShard flushes SOLO; create-if-absent flushes SOLO so the
+            /// creator's birth stamps apply exactly as in the unbatched protocol.
+            if (batch.empty())
             {
-                if (last_soft_warn.compare_exchange_strong(last, now))
+                std::lock_guard<std::mutex> g(shard_queue_mutex);
+                size_t cap = kMaxShardBatch;
+                if (!token || q->force_solo > 0)
+                    cap = 1;
+                std::set<String> seen_refs;
+                while (!q->pending.empty() && batch.size() < cap)
                 {
-                    LOG_WARNING(getLogger("CasStore"),
-                        "manifest {} size {} crossed soft limit {} (hard={}, kind={}, origin={})",
-                        key, body.size(), soft_limit, hard_limit,
-                        toString(kind), toString(origin));
+                    const auto & front = q->pending.front();
+                    if (front->scope.kind == MutationScope::Kind::WholeShard)
+                    {
+                        if (!batch.empty())
+                            break;
+                        batch.push_back(front);
+                        q->pending.pop_front();
+                        break;
+                    }
+                    if (!seen_refs.insert(front->scope.ref_name).second)
+                        break;
+                    batch.push_back(front);
+                    q->pending.pop_front();
+                }
+                if (q->force_solo > 0)
+                    --q->force_solo;
+            }
+            if (batch.empty())
+                return;   /// raced: everything was carved by a previous flush of this leader
+
+            if (!token)
+            {
+                /// Create-if-absent (solo by the carve rule): the creator's birth stamps.
+                root.incarnation = batch.front()->birth_incarnation;
+                if (batch.front()->birth_floor_provider)
+                    root.fence_round = batch.front()->birth_floor_provider();
+            }
+
+            /// Apply closures in queue order with per-closure SNAPSHOT isolation: a throwing closure
+            /// (validation, promote owner-check) rolls back ONLY its own edits, completes with its
+            /// exception, and drops out of the batch — exactly today's no-retry-on-throw semantics.
+            std::vector<std::shared_ptr<ShardMutationItem>> survivors;
+            survivors.reserve(batch.size());
+            for (const auto & it : batch)
+            {
+                RootShard snapshot = root;
+                try
+                {
+                    it->mutate(root);
+                    ++root.shard_version;
+                    it->committed_version = root.shard_version;
+                    survivors.push_back(it);
+                }
+                catch (...)
+                {
+                    root = std::move(snapshot);
+                    complete_error({it}, std::current_exception());
+                }
+            }
+            batch = std::move(survivors);
+            if (batch.empty())
+                return;
+
+            String body = encodeRootShard(root);
+
+            /// Hard limit — fail-closed before any consequential write. With a batch, degrade to
+            /// SOLO re-flushes so exactly the offending mutation gets LIMIT_EXCEEDED and innocent
+            /// co-batched neighbors proceed.
+            if (body.size() >= hard_limit)
+            {
+                if (batch.size() == 1)
+                {
+                    ProfileEvents::increment(ProfileEvents::CasManifestHardLimitExceeded);
+                    complete_error({batch.front()}, std::make_exception_ptr(Exception(ErrorCodes::LIMIT_EXCEEDED,
+                        "manifest {} size {} reached hard limit {} (kind={})",
+                        key, body.size(), hard_limit, toString(batch.front()->kind))));
+                    return;
+                }
+                std::lock_guard<std::mutex> g(shard_queue_mutex);
+                for (auto rit = batch.rbegin(); rit != batch.rend(); ++rit)
+                    q->pending.push_front(*rit);
+                q->force_solo = batch.size();
+                return;
+            }
+
+            /// Soft limit — warning + optional backpressure delay when ANY batched item is Writer.
+            if (body.size() >= soft_limit)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                auto last = last_soft_warn.load(std::memory_order_relaxed);
+                if (now - last > std::chrono::seconds(30))
+                {
+                    if (last_soft_warn.compare_exchange_strong(last, now))
+                    {
+                        LOG_WARNING(getLogger("CasStore"),
+                            "manifest {} size {} crossed soft limit {} (hard={}, kind={}, origin={})",
+                            key, body.size(), soft_limit, hard_limit,
+                            toString(batch.front()->kind), toString(batch.front()->origin));
+                    }
+                }
+
+                const bool any_writer = std::any_of(batch.begin(), batch.end(),
+                    [](const auto & it) { return it->origin == RootMutationOrigin::Writer; });
+                if (any_writer && backpressure_active && !delayed_once)
+                {
+                    const double fraction = static_cast<double>(body.size() - soft_limit)
+                                          / static_cast<double>(hard_limit - soft_limit);
+                    uint64_t delay_ms = static_cast<uint64_t>(fraction * static_cast<double>(max_delay_ms));
+                    if (delay_ms > 0)
+                    {
+                        delayed_once = true;
+                        const auto delay = std::chrono::milliseconds(delay_ms);
+                        ProfileEvents::increment(ProfileEvents::CasManifestBackpressureCount);
+                        ProfileEvents::increment(
+                            ProfileEvents::CasManifestBackpressureMicroseconds,
+                            std::chrono::duration_cast<std::chrono::microseconds>(delay).count());
+                        LOG_DEBUG(getLogger("CasStore"),
+                            "manifest backpressure: ns/shard={}/{} size={} soft={} hard={} delay={}ms batch={}",
+                            ns.string(), shard, body.size(), soft_limit, hard_limit,
+                            delay_ms, batch.size());
+                        if (backpressure_delay_hook)
+                            backpressure_delay_hook(delay);
+                        else
+                            std::this_thread::sleep_for(delay);
+                        continue;   /// fresh read, batch stays carved
+                    }
                 }
             }
 
-            /// B164b: delay only Writer mutations, only when backpressure is configured, and at most
-            /// once per mutation call.
-            if (origin == RootMutationOrigin::Writer && backpressure_active && !delayed_once)
+            if (pool_backend->casPut(key, body, token).outcome == CasOutcome::Committed)
             {
-                /// Linear delay: 0 at soft_limit → max_delay_ms near the hard limit.
-                const double fraction = static_cast<double>(body.size() - soft_limit)
-                                      / static_cast<double>(hard_limit - soft_limit);
-                uint64_t delay_ms = static_cast<uint64_t>(fraction * static_cast<double>(max_delay_ms));
-
-                if (delay_ms > 0)
+                /// Read-your-writes (Pillar B): invalidate this shard's decode cache so a same-Store
+                /// allow_stale read cannot serve the pre-write decode; bumping shard_write_seq under
+                /// the SAME lock fences any in-flight reader (B157).
                 {
-                    delayed_once = true;
-                    const auto delay = std::chrono::milliseconds(delay_ms);
-
-                    ProfileEvents::increment(ProfileEvents::CasManifestBackpressureCount);
-                    ProfileEvents::increment(
-                        ProfileEvents::CasManifestBackpressureMicroseconds,
-                        std::chrono::duration_cast<std::chrono::microseconds>(delay).count());
-
-                    LOG_DEBUG(getLogger("CasStore"),
-                        "manifest backpressure: ns/shard={}/{} size={} soft={} hard={} delay={}ms kind={}",
-                        ns.string(), shard, body.size(), soft_limit, hard_limit,
-                        delay_ms, toString(kind));
-
-                    if (backpressure_delay_hook)
-                        backpressure_delay_hook(delay);
-                    else
-                        std::this_thread::sleep_for(delay);
-
-                    /// Retry with a fresh read — avoids CAS with a stale token and re-applies the
-                    /// mutation to the latest shard state.
-                    continue;
+                    std::lock_guard cache_lock(shard_decode_cache_mutex);
+                    ++shard_write_seq[key];
+                    shard_decode_cache.erase(key);
                 }
+                {
+                    std::lock_guard<std::mutex> g(shard_queue_mutex);
+                    for (const auto & it : batch)
+                        it->done = true;
+                    q->cv.notify_all();
+                }
+                return;
             }
+            /// Conflict (cross-writer only: e.g. the GC leader on another replica) => re-read and
+            /// REPLAY the carved batch — identical to today's single-mutation retry semantics.
         }
-
-        if (pool_backend->casPut(key, body, token).outcome == CasOutcome::Committed)
-        {
-            /// Read-your-writes (Pillar B): invalidate this shard's decode cache so a same-Store
-            /// allow_stale read (bounded-TTL fast-path) cannot serve the pre-write decode. A LOCAL
-            /// write is reflected immediately; cross-node staleness stays bounded by the TTL.
-            /// Bumping shard_write_seq under the SAME lock fences any in-flight reader (B157): a
-            /// reader whose get() straddled this casPut sees the seq change before it populates and
-            /// declines to cache its now-superseded decode (which the erase below could not remove).
-            {
-                std::lock_guard cache_lock(shard_decode_cache_mutex);
-                ++shard_write_seq[key];
-                shard_decode_cache.erase(key);
-            }
-            if (out_committed_version)
-                *out_committed_version = root.shard_version;
-            return;
-        }
-        /// Conflict ⇒ someone committed under us; re-read and re-apply the whole mutate.
+        complete_error(batch, std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+            "manifest CAS contention on {}", key)));
     }
-    throw Exception(ErrorCodes::ABORTED, "manifest CAS contention on {}", key);
+    catch (...)
+    {
+        /// A flush-level failure (readShard/backend error) fails the carved batch — or, when the
+        /// first read itself threw, everything currently pending (each caller would have hit the
+        /// same storage error alone).
+        complete_error(batch.empty() ? carve_all_pending() : batch, std::current_exception());
+    }
 }
 
 uint64_t Store::currentGcRound() const

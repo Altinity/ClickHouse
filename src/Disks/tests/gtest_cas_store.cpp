@@ -1820,11 +1820,15 @@ public:
     DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putOverwrite(k, b, e, meta); }
     DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta = {}) override
     {
-        ++cas_puts;
-        if (cas_conflict_hook)
+        /// Count REF-SHARD traffic only: Store bootstrap (owner/epoch adopt) and mount renewals
+        /// also casPut, and their adopt-existing Conflicts are normal — not the queue's concern.
+        const bool is_ref_shard = k.find("cas/refs/") != String::npos;
+        if (is_ref_shard)
+            ++cas_puts;
+        if (is_ref_shard && cas_conflict_hook)
             cas_conflict_hook();
         const auto res = inner->casPut(k, b, e, meta);
-        if (res.outcome == DB::Cas::CasOutcome::Conflict)
+        if (is_ref_shard && res.outcome == DB::Cas::CasOutcome::Conflict)
             ++cas_conflicts;
         return res;
     }
@@ -1881,11 +1885,10 @@ TEST(CasShardQueue, CoBatchesTwoRefsIntoOneCasPut)
     blocking->awaitEntered();   /// leader (t_a) is inside the flush read; enqueue a second mutation
     uint64_t v_b = 0;
     std::thread t_b([&] { v_b = store->mutateShardScopedForTest(ns, 0, MutationScope::ref("part_b"), appendEventFor("part_b")); });
-    /// t_b must be ENQUEUED (not leading) before release; it blocks on the queue, so give it no way
-    /// to run a second read: release only after its item is visible. The queue is internal — the
-    /// observable contract below (ONE casPut) is the assertion that it joined the batch.
-    while (blocking->cas_puts.load() != 0) {}
-    std::this_thread::yield();
+    /// Deterministic co-batching: the leader's item stays in the queue until the carve (which runs
+    /// AFTER the blocked read), so depth 2 == t_b is enqueued and will join the leader's batch.
+    while (store->shardQueuePendingForTest(ns, 0) < 2)
+        std::this_thread::yield();
     blocking->release();
     t_a.join();
     t_b.join();
@@ -1918,7 +1921,8 @@ TEST(CasShardQueue, SameRefMutationsSplitAcrossFlushes)
     std::thread t_a([&] { store->mutateShardScopedForTest(ns, 0, MutationScope::ref("part_x"), appendEventFor("part_x")); });
     blocking->awaitEntered();
     std::thread t_b([&] { store->mutateShardScopedForTest(ns, 0, MutationScope::ref("part_x"), appendEventFor("part_x")); });
-    std::this_thread::yield();
+    while (store->shardQueuePendingForTest(ns, 0) < 2)
+        std::this_thread::yield();
     blocking->release();
     t_a.join();
     t_b.join();
@@ -1965,7 +1969,8 @@ TEST(CasShardQueue, ThrowingClosureIsIsolatedFromBatch)
     });
     blocking->awaitEntered();
     std::thread t_b([&] { store->mutateShardScopedForTest(ns, 0, MutationScope::ref("good"), appendEventFor("good")); });
-    std::this_thread::yield();
+    while (store->shardQueuePendingForTest(ns, 0) < 2)
+        std::this_thread::yield();
     blocking->release();
     t_a.join();
     t_b.join();
