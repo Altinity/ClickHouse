@@ -964,10 +964,15 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
     return result;
 }
 
-void Store::mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
+void Store::mutateShard(const RootNamespace & ns, uint64_t shard, MutationScope scope,
+                        std::function<void(RootShard &)> mutate,
                         uint64_t * out_committed_version, RootMutationOrigin origin, RootMutationKind kind,
                         ShardIncarnation birth_incarnation, std::function<uint64_t()> birth_floor_provider)
 {
+    /// Task 1 (shard-mutation-queue): the scope is threaded from every call site but not consumed
+    /// yet — Task 2's flat-combining batch builder keys on it.
+    (void)scope;
+
     /// Ack-floor drain (spec 2026-07-02): hold the SHARED side of the view gate for the WHOLE call —
     /// condemn-gate evaluations inside `mutate` through the CAS response — so a beat advertising a
     /// newer `observed_gc_round` can never overtake an in-flight mutation that gated on the older
@@ -1136,7 +1141,7 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
     /// new_binding is none (true removal ⇒ GC folds -1 + cleanup of the named manifest).
     ManifestRef dropped_ref;
     uint64_t at_version = 0;
-    mutateShard(ns, shardOf(ref_name), [&](RootShard & root)
+    mutateShard(ns, shardOf(ref_name), MutationScope::ref(ref_name), [&](RootShard & root)
     {
         auto it = root.refs.find(ref_name);
         if (it == root.refs.end())
@@ -1177,7 +1182,7 @@ void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
                              std::function<void(RootRef &)> mutator)
 {
     /// Mutable-fields-only update (design §3): no reachability change ⇒ NO journal event.
-    mutateShard(ns, shardOf(ref_name), [&](RootShard & root)
+    mutateShard(ns, shardOf(ref_name), MutationScope::ref(ref_name), [&](RootShard & root)
     {
         auto it = root.refs.find(ref_name);
         if (it == root.refs.end())
@@ -1235,7 +1240,7 @@ void Store::dropNamespace(const RootNamespace & ns)
         if (!token)
             continue;   /// absent shard: stays absent, no manifest minted
 
-        mutateShard(ns, shard, [](RootShard & shard_root)
+        mutateShard(ns, shard, MutationScope::wholeShard(), [](RootShard & shard_root)
         {
             /// Append one removal RootOwnerEvent per former ref (iterate before clearing), then clear
             /// all refs. Each event: old_binding = the committed binding being removed / new_binding none.

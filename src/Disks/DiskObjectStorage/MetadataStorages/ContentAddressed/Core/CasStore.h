@@ -39,6 +39,21 @@ enum class RootMutationOrigin : uint8_t
     Gc,
 };
 
+/// The write-scope of one `mutateShard` closure (shard-mutation-queue spec 2026-07-03): which part
+/// of the shard the closure touches. The flat-combining batch builder admits at most ONE mutation
+/// per ref name into a single flush (per-ref durable histories stay bit-identical to the unbatched
+/// protocol) and flushes `WholeShard` closures SOLO (trim, GC fence, dropNamespace, reclaim —
+/// anything touching multiple refs or the journal wholesale).
+struct MutationScope
+{
+    enum class Kind : uint8_t { Ref, WholeShard };
+    Kind kind = Kind::WholeShard;
+    String ref_name;   /// set iff kind == Ref
+
+    static MutationScope ref(String name) { return {Kind::Ref, std::move(name)}; }
+    static MutationScope wholeShard() { return {Kind::WholeShard, {}}; }
+};
+
 /// Kind of mutation being applied, used in diagnostic logging and metrics. Does not affect behaviour.
 enum class RootMutationKind : uint8_t
 {
@@ -405,7 +420,7 @@ public:
                             uint64_t birth_floor = 0)
     {
         std::function<uint64_t()> provider = birth_floor ? std::function<uint64_t()>([birth_floor] { return birth_floor; }) : nullptr;
-        mutateShard(ns, shard, std::move(mutate), nullptr, origin, kind, birth_incarnation, std::move(provider));
+        mutateShard(ns, shard, MutationScope::wholeShard(), std::move(mutate), nullptr, origin, kind, birth_incarnation, std::move(provider));
     }
 
 private:
@@ -470,7 +485,8 @@ private:
     /// the provider is invoked ONLY on the create-if-absent branch so the common existing-shard path
     /// incurs ZERO extra S3 round-trips. `fence_round = 0` (fresh pool, no GC) is a valid value and
     /// is assigned unconditionally (the `if (birth_floor > 0)` guard is a footgun — removed).
-    void mutateShard(const RootNamespace & ns, uint64_t shard, std::function<void(RootShard &)> mutate,
+    void mutateShard(const RootNamespace & ns, uint64_t shard, MutationScope scope,
+                     std::function<void(RootShard &)> mutate,
                      uint64_t * out_committed_version,
                      RootMutationOrigin origin, RootMutationKind kind,
                      ShardIncarnation birth_incarnation = {},

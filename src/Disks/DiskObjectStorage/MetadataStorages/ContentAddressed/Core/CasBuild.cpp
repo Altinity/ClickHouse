@@ -716,7 +716,7 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
     /// S3 round-trips are incurred. `currentGcRound` does a `gc/state` GET; hoisting it here (eager)
     /// would waste one GET per publish on every existing shard, which matters for S3 budget.
     /// `birth_incarnation` stays eager (reads only Build members, no S3 — do not change).
-    store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
+    store->mutateShard(target_ns, store->shardOf(final_ref_name), MutationScope::ref(final_ref_name), [&](RootShard & root)
     {
         root.journal.push_back(RootOwnerEvent{
             .transition_version = root.shard_version + 1,
@@ -799,7 +799,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
         .owner_kind = OwnerKind::Precommit, .ref_name = final_ref_name,
         .build_id = promote_build_id, .manifest_ref = id.ref};
 
-    store->mutateShard(target_ns, store->shardOf(final_ref_name), [&](RootShard & root)
+    store->mutateShard(target_ns, store->shardOf(final_ref_name), MutationScope::ref(final_ref_name), [&](RootShard & root)
     {
         /// Task 5 promote gate (registry-free create-ordering, THM-NO-RETURN): if the retire view
         /// is behind the shard's fence_round, GC has advanced to at least that round and may have
@@ -928,7 +928,7 @@ void Build::abandon()
     /// leave the precommit binding live without its body's GC release queued.
     if (precommitted)
     {
-        store->mutateShard(precommit_target_ns, store->shardOf(precommit_final_ref), [&](RootShard & root)
+        store->mutateShard(precommit_target_ns, store->shardOf(precommit_final_ref), MutationScope::ref(precommit_final_ref), [&](RootShard & root)
         {
             root.journal.push_back(RootOwnerEvent{
                 .transition_version = root.shard_version + 1,

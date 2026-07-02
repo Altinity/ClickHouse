@@ -967,7 +967,7 @@ void Gc::trim(FoldResult & folded, uint64_t /*round*/)
                                  : size_gate       ? "soft-limit"
                                                    : "threshold";
 
-        store->mutateShard(ns, shard, [&](RootShard & fresh)
+        store->mutateShard(ns, shard, MutationScope::wholeShard(), [&](RootShard & fresh)
         {
             std::erase_if(fresh.journal,
                 [&](const RootOwnerEvent & e) { return e.transition_version <= cursor; });
@@ -1502,7 +1502,7 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uin
     /// `mutateShard` does a single `++shard_version` AFTER this callback, so the LAST event we append must
     /// carry `shard_version + dead.size()` and we pre-advance shard_version to one below that; the trailing
     /// `++` lands it exactly on the last event's transition_version (no gap, contiguous versions).
-    store->mutateShard(ns, shard, [&](RootShard & fresh)
+    store->mutateShard(ns, shard, MutationScope::wholeShard(), [&](RootShard & fresh)
     {
         const uint64_t base = fresh.shard_version;
         for (size_t i = 0; i < dead.size(); ++i)
