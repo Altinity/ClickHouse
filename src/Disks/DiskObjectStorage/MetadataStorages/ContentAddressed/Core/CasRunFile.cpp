@@ -215,7 +215,35 @@ RunFileReader::RunFileReader(Backend & backend_, const String & key_)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: run object vanished mid-open: {}", object_key);
     if (tail->bytes.size() != tail_window)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: short tail read for {}", object_key);
-    loadFooter(tail->bytes, tail_base);
+
+    /// The tail probe may be SMALLER than the footer of a large run: the sparse index grows with the
+    /// block count (offset u64 + two length-prefixed boundary keys per block), so a multi-GB run's
+    /// footer exceeds any fixed probe (~13k blocks already overflow this one). Read the footer_len
+    /// trailer from the probe and, when the footer does not fit, re-read the EXACT footer window with
+    /// one more ranged get — the open profile becomes 4 requests for such runs, and the resident bound
+    /// stays footer + one block (the index IS part of the reader's documented resident state).
+    if (tail->bytes.size() < 4)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: truncated (no footer_len trailer): {}", object_key);
+    const auto trailer_le32 = [&](size_t off) -> uint32_t
+    {
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i)
+            v |= static_cast<uint32_t>(static_cast<uint8_t>(tail->bytes[off + i])) << (8 * i);
+        return v;
+    };
+    const uint32_t footer_len = trailer_le32(tail->bytes.size() - 4);
+    if (footer_len > object_size)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: bad footer_len {} for {}", footer_len, object_key);
+    if (footer_len > tail->bytes.size())
+    {
+        const uint64_t footer_base = object_size - footer_len;
+        auto footer = backend->get(object_key, Range{.offset = footer_base, .length = footer_len});
+        if (!footer || footer->bytes.size() != footer_len)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: short footer read for {}", object_key);
+        loadFooter(footer->bytes, footer_base);
+    }
+    else
+        loadFooter(tail->bytes, tail_base);
 
     /// Open the forward body stream at offset 0 and drain the 13-byte header from it, leaving the
     /// stream positioned at the first block. Bounding the stream to `data_end` keeps it to the run body

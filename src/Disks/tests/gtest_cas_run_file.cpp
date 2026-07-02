@@ -456,3 +456,43 @@ TEST(CasRunFileStreaming, TruncatedOrCorruptFailsClosed)
         });
     }
 }
+
+TEST(CasRunFileStreaming, LargeFooterBeyondTailProbeReadsExactWindow)
+{
+    /// A footer larger than the fixed tail probe (kRunHardCapBlockSize + allowance) must trigger ONE
+    /// extra ranged get of the exact footer window — large multi-GB runs are the design case, not a
+    /// pathology. Long boundary keys inflate the per-block index entry so ~600 blocks overflow the
+    /// probe without writing gigabytes.
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    const String key = "p/big_footer_run";
+    {
+        String out_bytes;
+        DB::WriteBufferFromString out(out_bytes);
+        RunHeader header;
+        header.kind = RunKind::SourceEdge;
+        header.block_size = 4096;
+        RunFileWriter writer(out, header);
+        String big_key(1024, 'k');
+        for (int i = 0; i < 1800; ++i)
+        {
+            /// Ascending keys: vary a suffix (big_key base keeps footer entries ~2KB each).
+            String k = big_key + fmt::format("{:08}", i);
+            writer.append(k, "p");
+        }
+        writer.finish();
+        out.finalize();
+        backend->putIfAbsent(key, out_bytes);
+    }
+
+    backend->resetCounts();
+    RunFileReader r(*backend, key);
+    String k, p;
+    size_t n = 0;
+    while (r.next(k, p))
+        ++n;
+    EXPECT_EQ(n, 1800u);
+    /// Open profile for a large-footer run: head + tail probe + exact footer window + body stream.
+    EXPECT_EQ(backend->headCount(key), 1u);
+    EXPECT_EQ(backend->getCount(key), 2u);
+    EXPECT_EQ(backend->getStreamCount(key), 1u);
+}
