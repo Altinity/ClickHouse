@@ -606,6 +606,67 @@ TEST(CasBuild, PromoteBodylessCondemnedDepThrowsAbortedRetryable)
         [&] { build->promote(ns, "part_1", build->buildId(), mid); });
 }
 
+TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
+{
+    /// S13 soak run 3 / spec 2026-07-02-cas-copy-forward-condemned-evidence.md: `republishRef`
+    /// (part move: ATTACH renameToDetached, DETACH, merge-result rename) records its deps via
+    /// adoptEvidence — tokenless W-EVIDENCE from a COMMITTED source manifest, NO source bytes in
+    /// hand. When the referenced blob's current token is condemned in the writer's fresh retire
+    /// view, the old gate threw ABORTED "retry the op" — but the attach caller never retries and
+    /// the table stays readonly forever (a liveness brick, not a safety save).
+    ///
+    /// Post-fix contract (verified copy-forward): the gate reads the PRESENT dying object, verifies
+    /// payload hash == key hash, re-wraps under a fresh envelope, putOverwrite@observed-token ⇒
+    /// fresh incarnation; promote succeeds referencing ONLY the fresh token.
+    auto b = std::make_shared<InMemoryBackend>();
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// 1. Publish part A over blob CF — the committed SOURCE ref republishRef reads its entries
+    ///    from (condition (a) of the invariant exception: a live committed owner references CF).
+    Token t0;
+    {
+        auto s0 = openStore(b);
+        publishOneBlobPart(s0, ns, "part_a", "data.bin", "payload-CF");
+        t0 = b->head(s0->layout().blobKey(idOf("payload-CF"))).token;
+    }
+
+    DB::Cas::Layout layout("p");
+    const String blob_key = layout.blobKey(idOf("payload-CF"));
+
+    /// 2. Condemn (Blob, hash(CF), t0) — models the fold having condemned CF after stale-view
+    ///    adoptions landed unfolded (the soak chain). Object stays PRESENT (no delete yet: a
+    ///    non-pending entry is >= 2 passes from deletion).
+    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-CF"), .token = t0, .size = 10}});
+
+    /// 3. Fresh Store (restart: view refreshed at open sees the condemnation) — republishRef's
+    ///    exact body: adoptEvidence over the source manifest entry, stage a FRESH dst manifest,
+    ///    precommit, promote.
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto build = startBuildFor(s, ns, "detached_part_a");
+    build->adoptEvidence(blobManifestEntry("data.bin", "payload-CF"));
+    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "payload-CF")});
+    build->precommitAdd(ns, "detached_part_a", mid);
+
+    /// 4. BEFORE fix: ABORTED (condemned at commit revalidation) — the attach brick.
+    ///    AFTER fix: promote succeeds via copy-forward.
+    EXPECT_NO_THROW(build->promote(ns, "detached_part_a", build->buildId(), mid));
+    EXPECT_TRUE(s->resolveRef(ns, "detached_part_a").has_value());
+
+    /// 5. The condemned incarnation was displaced: fresh token, same payload; GC's exact-token
+    ///    delete of the listed (hash, t0) entry is now a mismatch no-op (entry drops, new
+    ///    incarnation untouched).
+    const HeadResult hr = b->head(blob_key);
+    ASSERT_TRUE(hr.exists);
+    EXPECT_NE(hr.token, t0) << "copy-forward must mint a FRESH incarnation, never bind the listed token";
+    EXPECT_NE(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::Deleted)
+        << "the listed token must no longer match the object";
+    const auto stored = b->get(blob_key);
+    ASSERT_TRUE(stored.has_value());
+    const auto h = decodeEnvelopeHeader(stored->bytes, stored->bytes.size(), ObjectKind::Blob);
+    EXPECT_EQ(stored->bytes.substr(h.header_len), "payload-CF") << "payload must survive byte-identical";
+}
+
 TEST(CasBuild, GateBodylessAdoptFullyDeletedObjectThrowsAbortedNotFatal)
 {
     /// B190 residual (soak bug): the promote gate revalidating a blob leaf whose object is FULLY
