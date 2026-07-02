@@ -91,7 +91,7 @@ class AltinityWorkflowTemplates:
     if: ${{ !cancelled() && needs.config_workflow.outputs.pipeline_status != '' }}
     needs:
 {ALL_JOBS}
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6

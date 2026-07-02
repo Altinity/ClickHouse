@@ -33,7 +33,7 @@ env:
 jobs:
 
   config_workflow:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: []
     name: "Config Workflow"
     outputs:
@@ -257,7 +257,7 @@ jobs:
           PYTHONUNBUFFERED=1 python3 -m praktika run 'Keeper Stress (Faults)' --workflow "NightlyKeeperFaults" --ci --timestamp
 
   finish_workflow:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [build_arm_binary, config_workflow, dockers_build_amd, dockers_build_arm, keeper_stress_faults]
     if: ${{ always() && needs.config_workflow.outputs.pipeline_status != '' }}
     name: "Finish Workflow"

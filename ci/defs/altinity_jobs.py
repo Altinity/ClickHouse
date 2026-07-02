@@ -51,7 +51,7 @@ class AltinityJobConfigs:
         ),
         Job.ParamSet(
             parameter="arm_release",
-            runs_on=RunnerLabels.STYLE_CHECK_ARM,
+            runs_on=RunnerLabels.STYLE_CHECK_AMD,
             requires=[
                 ArtifactNames.DEB_ARM_RELEASE,
                 ArtifactNames.RPM_ARM_RELEASE,
@@ -65,7 +65,7 @@ class AltinityJobConfigs:
     # commit, so it must never be skipped by the content-addressed CI cache.
     source_upload_job = Job.Config(
         name=AltinityJobNames.SOURCE_UPLOAD,
-        runs_on=RunnerLabels.STYLE_CHECK_ARM,
+        runs_on=RunnerLabels.STYLE_CHECK_AMD,
         command="python3 ./ci/jobs/source_upload.py",
         timeout=3600,
     )
