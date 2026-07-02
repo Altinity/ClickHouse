@@ -423,6 +423,18 @@ public:
         mutateShard(ns, shard, MutationScope::wholeShard(), std::move(mutate), nullptr, origin, kind, birth_incarnation, std::move(provider));
     }
 
+    /// Scoped variant for the shard-mutation-queue tests (spec 2026-07-03): exposes the scope so
+    /// batching/cut semantics are testable; returns the committed version.
+    uint64_t mutateShardScopedForTest(const RootNamespace & ns, uint64_t shard, MutationScope scope,
+                                      std::function<void(RootShard &)> mutate,
+                                      RootMutationOrigin origin = RootMutationOrigin::Writer,
+                                      RootMutationKind kind = RootMutationKind::Publish)
+    {
+        uint64_t v = 0;
+        mutateShard(ns, shard, std::move(scope), std::move(mutate), &v, origin, kind, {}, nullptr);
+        return v;
+    }
+
 private:
 
     Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);

@@ -1766,3 +1766,311 @@ TEST(CasStoreRemount, ForeignOwnerIsNeverTakenOver)
     /// The foreign body is untouched (no takeover, ever).
     EXPECT_EQ(decodeMountLease(backend->get(mount_key)->bytes).server_uuid, foreign.server_uuid);
 }
+
+/// ==== shard-mutation queue (spec 2026-07-03-cas-shard-mutation-queue) ====
+
+namespace
+{
+
+/// Deterministic co-batching harness: get(target_key) BLOCKS while armed (signalling arrival), so a
+/// test can enqueue more mutations while the leader sits inside its flush's first read. The carve
+/// happens AFTER that read by design — everything enqueued during the read joins the batch.
+class BlockingGetBackend final : public DB::Cas::Backend
+{
+public:
+    explicit BlockingGetBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
+
+    void arm(const String & key)
+    {
+        std::lock_guard g(m);
+        target = key;
+        armed = true;
+        entered = false;
+    }
+    void awaitEntered()
+    {
+        std::unique_lock lk(m);
+        cv.wait(lk, [&] { return entered; });
+    }
+    void release()
+    {
+        std::lock_guard g(m);
+        armed = false;
+        cv.notify_all();
+    }
+
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override
+    {
+        {
+            std::unique_lock lk(m);
+            if (armed && k == target)
+            {
+                entered = true;
+                cv.notify_all();
+                cv.wait(lk, [&] { return !armed; });
+            }
+        }
+        return inner->get(k, r);
+    }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
+    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsent(k, b, meta); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsentStream(k, meta); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putOverwrite(k, b, e, meta); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta = {}) override
+    {
+        ++cas_puts;
+        if (cas_conflict_hook)
+            cas_conflict_hook();
+        const auto res = inner->casPut(k, b, e, meta);
+        if (res.outcome == DB::Cas::CasOutcome::Conflict)
+            ++cas_conflicts;
+        return res;
+    }
+    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+    std::atomic<size_t> cas_puts{0};
+    std::atomic<size_t> cas_conflicts{0};
+    std::function<void()> cas_conflict_hook;   /// runs BEFORE forwarding each casPut
+
+private:
+    std::shared_ptr<DB::Cas::Backend> inner;
+    std::mutex m;
+    std::condition_variable cv;
+    String target;
+    bool armed = false;
+    bool entered = false;
+};
+
+/// Append one journal event under `name` — the minimal Ref-scoped mutation for queue tests.
+std::function<void(RootShard &)> appendEventFor(const String & name)
+{
+    return [name](RootShard & root)
+    {
+        root.journal.push_back(RootOwnerEvent{
+            .transition_version = root.shard_version + 1,
+            .old_binding = std::nullopt,
+            .new_binding = OwnerBinding{.owner_kind = OwnerKind::Committed, .ref_name = name,
+                                        .build_id = UInt128(0), .manifest_ref = ManifestRef{1, 1, 1}},
+            .is_tombstone = false});
+    };
+}
+
+}
+
+/// Two concurrent mutations of DIFFERENT refs on one shard co-batch into ONE casPut (the second
+/// arrives while the leader sits in the flush's first read; the carve runs after that read).
+TEST(CasShardQueue, CoBatchesTwoRefsIntoOneCasPut)
+{
+    auto inner = std::make_shared<InMemoryBackend>();
+    auto blocking = std::make_shared<BlockingGetBackend>(inner);
+    auto store = DB::Cas::Store::open(blocking,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_trim_min_events = 0});
+    const RootNamespace ns{"srv1/tbl"};
+    /// Materialize the shard first so the batch path is the common existing-shard one.
+    store->mutateShardScopedForTest(ns, 0, MutationScope::ref("seed"), appendEventFor("seed"));
+
+    const String shard_key = store->layout().rootShardKey(ns, 0);
+    blocking->cas_puts = 0;
+    blocking->arm(shard_key);
+
+    uint64_t v_a = 0;
+    std::thread t_a([&] { v_a = store->mutateShardScopedForTest(ns, 0, MutationScope::ref("part_a"), appendEventFor("part_a")); });
+    blocking->awaitEntered();   /// leader (t_a) is inside the flush read; enqueue a second mutation
+    uint64_t v_b = 0;
+    std::thread t_b([&] { v_b = store->mutateShardScopedForTest(ns, 0, MutationScope::ref("part_b"), appendEventFor("part_b")); });
+    /// t_b must be ENQUEUED (not leading) before release; it blocks on the queue, so give it no way
+    /// to run a second read: release only after its item is visible. The queue is internal — the
+    /// observable contract below (ONE casPut) is the assertion that it joined the batch.
+    while (blocking->cas_puts.load() != 0) {}
+    std::this_thread::yield();
+    blocking->release();
+    t_a.join();
+    t_b.join();
+
+    EXPECT_EQ(blocking->cas_puts.load(), 1u) << "both mutations must land in ONE casPut";
+    EXPECT_EQ(blocking->cas_conflicts.load(), 0u);
+    ASSERT_NE(v_a, 0u);
+    ASSERT_NE(v_b, 0u);
+    EXPECT_EQ(std::max(v_a, v_b), std::min(v_a, v_b) + 1) << "distinct consecutive transition versions";
+
+    const auto root = decodeRootShard(inner->get(store->layout().rootShardKey(ns, 0))->bytes);
+    EXPECT_EQ(root.shard_version, std::max(v_a, v_b));
+}
+
+/// The scope rule: two mutations of the SAME ref never share a flush — the second goes to the next
+/// casPut (per-ref durable histories stay identical to the unbatched protocol).
+TEST(CasShardQueue, SameRefMutationsSplitAcrossFlushes)
+{
+    auto inner = std::make_shared<InMemoryBackend>();
+    auto blocking = std::make_shared<BlockingGetBackend>(inner);
+    auto store = DB::Cas::Store::open(blocking,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_trim_min_events = 0});
+    const RootNamespace ns{"srv1/tbl"};
+    store->mutateShardScopedForTest(ns, 0, MutationScope::ref("seed"), appendEventFor("seed"));
+
+    const String shard_key = store->layout().rootShardKey(ns, 0);
+    blocking->cas_puts = 0;
+    blocking->arm(shard_key);
+
+    std::thread t_a([&] { store->mutateShardScopedForTest(ns, 0, MutationScope::ref("part_x"), appendEventFor("part_x")); });
+    blocking->awaitEntered();
+    std::thread t_b([&] { store->mutateShardScopedForTest(ns, 0, MutationScope::ref("part_x"), appendEventFor("part_x")); });
+    std::this_thread::yield();
+    blocking->release();
+    t_a.join();
+    t_b.join();
+
+    EXPECT_EQ(blocking->cas_puts.load(), 2u) << "same-ref mutations must flush separately (scope cut)";
+    const auto root = decodeRootShard(inner->get(store->layout().rootShardKey(ns, 0))->bytes);
+    size_t events_for_x = 0;
+    for (const auto & e : root.journal)
+        if (e.new_binding && e.new_binding->ref_name == "part_x")
+            ++events_for_x;
+    EXPECT_EQ(events_for_x, 2u);
+}
+
+/// A throwing closure is isolated: its caller gets the exception, the co-batched neighbor lands,
+/// and the journal contains ONLY the survivor's event (snapshot restore).
+TEST(CasShardQueue, ThrowingClosureIsIsolatedFromBatch)
+{
+    auto inner = std::make_shared<InMemoryBackend>();
+    auto blocking = std::make_shared<BlockingGetBackend>(inner);
+    auto store = DB::Cas::Store::open(blocking,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_trim_min_events = 0});
+    const RootNamespace ns{"srv1/tbl"};
+    store->mutateShardScopedForTest(ns, 0, MutationScope::ref("seed"), appendEventFor("seed"));
+
+    const String shard_key = store->layout().rootShardKey(ns, 0);
+    blocking->arm(shard_key);
+
+    std::exception_ptr thrown;
+    std::thread t_a([&]
+    {
+        try
+        {
+            store->mutateShardScopedForTest(ns, 0, MutationScope::ref("bad"), [](RootShard & root)
+            {
+                root.journal.push_back(RootOwnerEvent{.transition_version = root.shard_version + 1,
+                    .old_binding = std::nullopt, .new_binding = std::nullopt, .is_tombstone = false});
+                throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "validation failed after partial edit");
+            });
+        }
+        catch (...)
+        {
+            thrown = std::current_exception();
+        }
+    });
+    blocking->awaitEntered();
+    std::thread t_b([&] { store->mutateShardScopedForTest(ns, 0, MutationScope::ref("good"), appendEventFor("good")); });
+    std::this_thread::yield();
+    blocking->release();
+    t_a.join();
+    t_b.join();
+
+    EXPECT_TRUE(thrown != nullptr) << "the throwing closure's caller must receive the exception";
+    const auto root = decodeRootShard(inner->get(store->layout().rootShardKey(ns, 0))->bytes);
+    size_t tombstoneless_null_events = 0;
+    size_t good_events = 0;
+    for (const auto & e : root.journal)
+    {
+        if (!e.old_binding && !e.new_binding && !e.is_tombstone)
+            ++tombstoneless_null_events;
+        if (e.new_binding && e.new_binding->ref_name == "good")
+            ++good_events;
+    }
+    EXPECT_EQ(tombstoneless_null_events, 0u) << "the failed closure's partial edit must be rolled back";
+    EXPECT_EQ(good_events, 1u) << "the innocent co-batched mutation must land";
+}
+
+/// A cross-writer CAS conflict (the only kind left: e.g. the GC leader on another replica) replays
+/// the whole batch once — every mutation lands exactly once.
+TEST(CasShardQueue, ConflictReplaysBatchExactlyOnce)
+{
+    auto inner = std::make_shared<InMemoryBackend>();
+    auto blocking = std::make_shared<BlockingGetBackend>(inner);
+    auto store = DB::Cas::Store::open(blocking,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_trim_min_events = 0});
+    const RootNamespace ns{"srv1/tbl"};
+    store->mutateShardScopedForTest(ns, 0, MutationScope::ref("seed"), appendEventFor("seed"));
+    const String shard_key = store->layout().rootShardKey(ns, 0);
+
+    /// Foreign write between the leader's read and its casPut: the hook fires before the FIRST
+    /// casPut forward and displaces the token once.
+    bool fired = false;
+    blocking->cas_conflict_hook = [&]
+    {
+        if (fired)
+            return;
+        fired = true;
+        const auto got = inner->get(shard_key);
+        ASSERT_TRUE(got.has_value());
+        inner->putOverwrite(shard_key, got->bytes, got->token);   /// token displaced => leader's CAS conflicts
+    };
+
+    blocking->cas_puts = 0;
+    store->mutateShardScopedForTest(ns, 0, MutationScope::ref("part_c"), appendEventFor("part_c"));
+    blocking->cas_conflict_hook = nullptr;
+
+    EXPECT_EQ(blocking->cas_conflicts.load(), 1u);
+    EXPECT_EQ(blocking->cas_puts.load(), 2u) << "one conflicted attempt + one committed replay";
+    const auto root = decodeRootShard(inner->get(store->layout().rootShardKey(ns, 0))->bytes);
+    size_t c_events = 0;
+    for (const auto & e : root.journal)
+        if (e.new_binding && e.new_binding->ref_name == "part_c")
+            ++c_events;
+    EXPECT_EQ(c_events, 1u) << "replay must not duplicate the event";
+}
+
+/// Stress: many threads over few shards — every mutation lands exactly once, versions are dense,
+/// and intra-server conflicts are structurally IMPOSSIBLE (one leader per shard at a time).
+TEST(CasShardQueue, StressNoConflictsNoLostMutations)
+{
+    auto inner = std::make_shared<InMemoryBackend>();
+    auto blocking = std::make_shared<BlockingGetBackend>(inner);
+    auto store = DB::Cas::Store::open(blocking,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 4, .gc_trim_min_events = 0});
+    const RootNamespace ns{"srv1/tbl"};
+
+    constexpr size_t kThreads = 16;
+    constexpr size_t kPerThread = 50;
+    std::vector<std::thread> threads;
+    std::atomic<size_t> failures{0};
+    for (size_t t = 0; t < kThreads; ++t)
+        threads.emplace_back([&, t]
+        {
+            for (size_t i = 0; i < kPerThread; ++i)
+            {
+                const String name = "p" + std::to_string(t) + "_" + std::to_string(i);
+                const uint64_t shard = (t * kPerThread + i) % 4;
+                try
+                {
+                    store->mutateShardScopedForTest(ns, shard, MutationScope::ref(name), appendEventFor(name));
+                }
+                catch (...)
+                {
+                    ++failures;
+                }
+            }
+        });
+    for (auto & th : threads)
+        th.join();
+
+    EXPECT_EQ(failures.load(), 0u);
+    EXPECT_EQ(blocking->cas_conflicts.load(), 0u) << "a single leader per shard makes intra-server conflicts impossible";
+    uint64_t total_events = 0;
+    uint64_t total_version = 0;
+    for (uint64_t shard = 0; shard < 4; ++shard)
+    {
+        const auto root = decodeRootShard(inner->get(store->layout().rootShardKey(ns, shard))->bytes);
+        total_events += root.journal.size();
+        total_version += root.shard_version;
+        /// Versions dense: every mutation bumped exactly once.
+        EXPECT_EQ(root.shard_version, root.journal.empty() ? root.shard_version : root.journal.back().transition_version);
+    }
+    EXPECT_EQ(total_events, kThreads * kPerThread);
+    EXPECT_EQ(total_version, kThreads * kPerThread);
+    EXPECT_LE(blocking->cas_puts.load(), kThreads * kPerThread);
+}
