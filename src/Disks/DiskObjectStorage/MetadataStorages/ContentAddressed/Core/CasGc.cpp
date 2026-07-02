@@ -8,12 +8,23 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <base/defines.h>
 #include <city.h>
 #include <algorithm>
 #include <limits>
 #include <set>
+
+namespace ProfileEvents
+{
+    extern const Event CasGcRetiredCondemned;
+    extern const Event CasGcRetiredSpared;
+    extern const Event CasGcRetiredGraduated;
+    extern const Event CasGcRetiredRedeleted;
+    extern const Event CasGcHeartbeatFenceOuts;
+    extern const Event CasGcFloorHeldByStaleAck;
+}
 
 namespace DB
 {
@@ -102,6 +113,45 @@ RoundReport Gc::runRegularRound()
     const uint64_t skew_margin_ms =
         static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
     const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
+    report.min_ack = floor.min_ack;
+    report.fence_outs = floor.fenced_now;
+    if (floor.fenced_now > 0)
+        ProfileEvents::increment(ProfileEvents::CasGcHeartbeatFenceOuts, floor.fenced_now);
+
+    /// Stale-ack watchdog (Task 11): a live heartbeat whose ack lags the last-published round by more
+    /// than 2 is holding the graduation floor down while still alive (a stuck view-refresh, not a dead
+    /// server the fence-out reclaims). Name each such server so the operator can act BEFORE the fence.
+    bool floor_held_by_stale_ack = false;
+    for (const auto & [srid, ack] : floor.lagging)
+    {
+        if (state.round > 2 && ack < state.round - 2)
+        {
+            floor_held_by_stale_ack = true;
+            LOG_WARNING(getLogger("CasGc"),
+                "CAS gc: live heartbeat '{}' acked round {} but the published round is {} (lag > 2); it "
+                "holds the graduation floor down — investigate a stuck view refresh on that server",
+                srid, ack, state.round);
+        }
+    }
+    if (floor_held_by_stale_ack)
+        ProfileEvents::increment(ProfileEvents::CasGcFloorHeldByStaleAck);
+
+    /// GcFenceOut audit row per expired mount fenced-out this round: the round latched a fence-out to
+    /// re-arm a sleeper's write fence (its held token is now invalid) AND stop its stale ack from
+    /// pinning the floor forever. One row per srid so the log reconstructs which mount was reclaimed.
+    for (const String & srid : floor.fenced_srids)
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::GcFenceOut;
+            e.object_kind = CasEventObjectKind::Snap;
+            e.round = new_round;
+            e.gen = state.snap_generation;
+            e.outcome = "fenced";
+            e.reason = "expired mount lease past skew margin; token-guarded fence-out re-arms the write "
+                       "fence (prevents a resumed sleeper from mutating) and drops its stale ack from the floor";
+            e.detail = {{"srid", srid}};
+        });
+
     /// B170: the round's floor — the fence's successor record (what gates this round's graduations).
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -182,6 +232,8 @@ RoundReport Gc::runRegularRound()
                             {"key", blobKeyOf(layout, entry.hash)}};
             });
             outcomes[shard].entries.push_back(std::move(outcome));
+            ++report.redeleted;
+            ProfileEvents::increment(ProfileEvents::CasGcRetiredRedeleted);
         }
         for (const RetiredEntry & entry : merge.spared)
         {
@@ -204,9 +256,12 @@ RoundReport Gc::runRegularRound()
             });
             outcomes[shard].entries.push_back(OutcomeEntry{.kind = entry.kind, .hash = entry.hash,
                                                            .token = entry.token, .outcome = OutcomeKind::Spared});
+            ProfileEvents::increment(ProfileEvents::CasGcRetiredSpared);
         }
         for (const RetiredEntry & entry : merge.graduated)
         {
+            ++report.graduated;
+            ProfileEvents::increment(ProfileEvents::CasGcRetiredGraduated);
             /// B170: floor-passed — republished pending; the NEXT pass executes the delete.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
@@ -455,6 +510,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         if (!observed.exists)
             return std::nullopt;
         ++report.candidates;
+        ++report.condemned;
+        ProfileEvents::increment(ProfileEvents::CasGcRetiredCondemned);
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::BlobRetire;

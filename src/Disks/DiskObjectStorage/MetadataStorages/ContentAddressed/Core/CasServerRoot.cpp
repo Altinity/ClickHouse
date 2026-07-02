@@ -417,6 +417,11 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
 
             const String & key = listed.key;
 
+            /// The srid is the path segment between `serverRootsPrefix()` and the `/mount` suffix
+            /// (`<prefix>/gc/server-roots/<srid>/mount`). Used only for observability (lagging / fenced).
+            const String srid = key.substr(prefix.size(),
+                key.size() - prefix.size() - mount_suffix.size());
+
             /// Fence-out on PreconditionFailed re-GETs and reclassifies from the top; bound the retries
             /// so a pathologically contended holder cannot spin forever. On exhaustion the entry is
             /// counted as live with its current ack (conservative — never excluded without a landed
@@ -447,6 +452,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                 {
                     floor.min_ack = std::min(floor.min_ack, m.observed_gc_round);
                     ++floor.live;
+                    floor.lagging.emplace_back(srid, m.observed_gc_round);
                     break;
                 }
 
@@ -459,6 +465,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                 if (res.outcome == PutOutcome::Done)
                 {
                     ++floor.fenced_now;
+                    floor.fenced_srids.push_back(srid);
                     break;
                 }
                 /// PreconditionFailed: the holder renewed between our GET and PUT — re-GET and

@@ -802,6 +802,12 @@ The server successfully detected this situation and will download merged part fr
     M(CasManifestBackpressureCount,      "CA root-shard manifest backpressure delay events", ValueType::Number) \
     M(CasManifestBackpressureMicroseconds, "CA root-shard manifest backpressure total microseconds delayed", ValueType::Number) \
     M(CasManifestHardLimitExceeded,      "CA root-shard manifest hard-limit exceptions", ValueType::Number) \
+    M(CasGcRetiredCondemned,   "CA gc entries newly condemned into the retired list this round", ValueType::Number) \
+    M(CasGcRetiredSpared,      "CA gc retired entries spared (in-degree recovered before graduation)", ValueType::Number) \
+    M(CasGcRetiredGraduated,   "CA gc retired entries newly floor-passed and published delete_pending", ValueType::Number) \
+    M(CasGcRetiredRedeleted,   "CA gc pending deletes executed this round (exact-token blob deletes)", ValueType::Number) \
+    M(CasGcHeartbeatFenceOuts, "CA gc expired-mount fence-outs performed by the heartbeat floor", ValueType::Number) \
+    M(CasGcFloorHeldByStaleAck, "CA gc rounds where a live heartbeat ack lagged the published round by more than 2", ValueType::Number) \
     M(S3GetObjectTagging, "Number of S3 API GetObjectTagging calls.", ValueType::Number) \
     M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.", ValueType::Number) \
     M(S3UploadPartCopy, "Number of S3 API UploadPartCopy calls.", ValueType::Number) \

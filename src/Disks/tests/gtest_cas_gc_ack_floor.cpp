@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <optional>
+#include <vector>
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
@@ -170,37 +174,46 @@ TEST(CasGcAckFloor, CondemnThenDeleteNextRoundAfterAcks)
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
 
     // The condemning round: the -1 drops in-degree to 0; the blob is condemned into the current retired
-    // list but NOT deleted. The entry is present and NOT yet pending.
-    gc.runRegularRound();
-    store->renewWatermarkOnce();
-    EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
+    // list but NOT deleted. The entry is present and NOT yet pending. report.condemned counts it.
     {
+        const RoundReport rep = gc.runRegularRound();
+        store->renewWatermarkOnce();
+        EXPECT_EQ(rep.condemned, 1u);        // one blob condemned this round
+        EXPECT_EQ(rep.graduated, 0u);        // floor has not passed the condemn round yet
+        EXPECT_EQ(rep.redeleted, 0u);        // nothing pending to delete yet
+        EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
         const auto e = currentEntryFor(*backend, store->layout(), blob);
         ASSERT_TRUE(e.has_value());
         EXPECT_FALSE(e->delete_pending);   // condemned, floor has not passed it yet
     }
 
-    // Drive rounds until the entry graduates (published delete_pending). It is still present at that pass.
+    // Drive rounds until the entry graduates (published delete_pending). It is still present at that pass,
+    // and the round that graduates it reports graduated == 1.
     bool saw_pending = false;
     for (int i = 0; i < 6 && !saw_pending; ++i)
     {
-        gc.runRegularRound();
+        const RoundReport rep = gc.runRegularRound();
         store->renewWatermarkOnce();
         const auto e = currentEntryFor(*backend, store->layout(), blob);
         if (e && e->delete_pending)
         {
             saw_pending = true;
+            EXPECT_EQ(rep.graduated, 1u);   // the graduating round reports the floor-pass
+            EXPECT_EQ(rep.redeleted, 0u);   // the delete lands on the NEXT pass, not this one
             EXPECT_TRUE(blobExists(*backend, store->layout(), blob));   // pending: still present this pass
         }
     }
     ASSERT_TRUE(saw_pending) << "entry never reached delete_pending";
 
     // The pass AFTER the pending publish executes the exact-token delete; the blob becomes absent and the
-    // entry is dropped from the current retired list.
-    gc.runRegularRound();
-    store->renewWatermarkOnce();
-    EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
-    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
+    // entry is dropped from the current retired list. report.redeleted counts the executed pending delete.
+    {
+        const RoundReport rep = gc.runRegularRound();
+        store->renewWatermarkOnce();
+        EXPECT_EQ(rep.redeleted, 1u);        // the pending delete executed this round
+        EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
+        EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
+    }
 }
 
 /// A mount whose ack is stuck below the condemn round holds the floor down: the entry never graduates
@@ -303,18 +316,37 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
     uint64_t gc_now = 1100 + 60000;
     Gc gc(store, kGc, [&] { return gc_now; });
 
+    // Capture the emitted events so we can assert the round emits exactly one GcFenceOut row for srid2.
+    std::vector<CasEvent> events;
+    store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(7);
     writeBlobBody(*backend, layout, blob);
     writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", blob)});
     publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
-    gc.runRegularRound();
+    const RoundReport rep = gc.runRegularRound();
     store->renewWatermarkOnce();
 
     // The round's floor step fenced srid2 out (expired on the GC clock).
+    EXPECT_EQ(rep.fence_outs, 1u);   // exactly one expired mount fenced-out this round
     const MountLease fenced = decodeMountLease(backend->get(layout.mountKey(srid2))->bytes);
     EXPECT_TRUE(fenced.gc_fenced);
+
+    // Exactly one GcFenceOut audit row was emitted, naming srid2 in its detail.
+    size_t fence_out_rows = 0;
+    for (const CasEvent & e : events)
+        if (e.type == CasEventType::GcFenceOut)
+        {
+            ++fence_out_rows;
+            EXPECT_EQ(e.outcome, "fenced");
+            EXPECT_FALSE(e.reason.empty());
+            const auto it = e.detail.find("srid");
+            ASSERT_NE(it, e.detail.end());
+            EXPECT_EQ(it->second, srid2);
+        }
+    EXPECT_EQ(fence_out_rows, 1u);
 
     // srid2's writer comes back and tries to renew: its held token was invalidated by the fence rewrite,
     // so renewOnce fails closed. (It renews on its own clock; liveness is irrelevant — the token guard

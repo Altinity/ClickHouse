@@ -6,7 +6,10 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace DB
 {
@@ -221,6 +224,11 @@ struct HeartbeatFloor
     size_t terminated = 0;
     size_t fenced_now = 0;
     size_t already_fenced = 0;
+    /// Observability (ack-floor): the (srid, observed_gc_round) of every live heartbeat, so the caller
+    /// can name which server pins the floor when an ack lags the published round.
+    std::vector<std::pair<String, uint64_t>> lagging;
+    /// The srids of every mount fenced-out THIS call (one GcFenceOut audit event each).
+    std::vector<String> fenced_srids;
 };
 
 HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now_ms,

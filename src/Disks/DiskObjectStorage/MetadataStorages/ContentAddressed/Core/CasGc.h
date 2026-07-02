@@ -42,6 +42,12 @@ struct RoundReport
     uint64_t replaced = 0;        /// 412-saves — a health metric
     uint64_t spared = 0;
     uint64_t manifests_deleted = 0;  /// owner-removed manifest bodies deleted (B11 — distinct from blob deletes)
+    /// Ack-floor observability (Task 11): the retired-cursor pipeline's per-round transitions.
+    size_t condemned = 0;         /// entries newly condemned into the retired list this round
+    size_t graduated = 0;         /// entries newly floor-passed (published delete_pending) this round
+    size_t redeleted = 0;         /// pending deletes executed this round (exact-token blob deletes)
+    size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
+    uint64_t min_ack = 0;         /// the heartbeat ack floor latched at round start (UINT64_MAX = no counted heartbeats)
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
 
     /// Record a fold/recheck anomaly (a clamped cursor). Surfacing, never throwing.
