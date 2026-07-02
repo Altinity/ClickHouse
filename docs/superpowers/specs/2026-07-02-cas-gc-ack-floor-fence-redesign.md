@@ -353,6 +353,12 @@ arithmetic, and the one-pass merge as a single action family.
   7. `SabotageOpenWriteBeforeLoad` — a fresh mount mutates before loading the view.
 - **Witnesses (reachability):** condemn → graduate → delete; condemn → recover → spare;
   recreate → `TokenMismatch` on the pending delete.
+- **Two-leader companion `CaGcAckFloorZombie`** (added with the Task-9 amendment): leaders latch
+  (floor, round, retired list, fold-cut in-degrees) at pass start, delete pre-publish, and publish
+  through a token-guarded CAS. Honest stage clean; `SabotageEagerZombieDelete` (single-phase deletes
+  of fresh graduations — the pre-amendment behavior) yields the INV_NO_DANGLE counterexample, proving
+  `delete_pending` load-bearing. The model also pins an ORDER invariant: the floor must be latched no
+  later than the fold cut (a post-cut floor read re-opens the in-flight-adopt race).
 
 ## Testing plan
 

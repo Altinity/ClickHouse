@@ -95,6 +95,10 @@ RoundReport Gc::runRegularRound()
 
     /// R1: the heartbeat ack floor + token-guarded fence-out of expired mounts. The ONLY clock in the
     /// round (the inherited lease-expiry contract); margin = ttl/2 (poll granularity + wall skew).
+    /// ORDER INVARIANT (CaGcAckFloorZombie): the floor MUST be latched BEFORE the fold cut. A floor
+    /// (re-)read after folding would see acks advertised by writers whose in-flight commits landed
+    /// AFTER the cut — invisible to this pass's in-degrees — and a fresh graduation could go pending
+    /// over a live reference. Never move this call below fold, never refresh the floor mid-pass.
     const uint64_t skew_margin_ms =
         static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
     const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
