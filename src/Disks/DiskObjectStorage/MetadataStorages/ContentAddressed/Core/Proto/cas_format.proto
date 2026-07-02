@@ -293,6 +293,8 @@ message RetiredEntryProto {
   uint32 token_type    = 4;
   uint64 size          = 5;
   uint64 condemn_round = 6;  // ack-floor: the GC round that condemned this incarnation
+  bool   delete_pending = 7; // ack-floor two-phase graduation: floor-passed, published for deletion;
+                             // the NEXT pass executes deleteExact (pre-CAS) and drops the entry
 }
 
 // Retired-object set (gc/retired/<round>.<fence_seq>/<shard>). Magic CART, FormatId::RetiredSet.

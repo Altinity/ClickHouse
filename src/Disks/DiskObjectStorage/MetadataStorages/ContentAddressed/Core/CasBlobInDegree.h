@@ -60,9 +60,10 @@ struct BlobCandidate
 /// streaming pass that folds edges settles every prior retired entry and detects new candidates.
 struct RetiredMergeResult
 {
-    std::vector<RetiredEntry> still_retired;   /// carried entries + this pass's new condemnations
-    std::vector<RetiredEntry> graduated;       /// in-degree 0 and condemn_round < min_ack — delete now
+    std::vector<RetiredEntry> still_retired;   /// carried + newly-condemned + newly-PENDING entries (the next list)
+    std::vector<RetiredEntry> graduated;       /// newly floor-passed this pass — published pending, deleted NEXT pass
     std::vector<RetiredEntry> spared;          /// in-degree recovered — entry dropped
+    std::vector<RetiredEntry> redelete;        /// pending in the PRIOR list — execute deleteExact pre-CAS, drop
 };
 
 /// Three-cursor extension (ack-floor redesign): `prior_retired` (Blob entries ONLY, sorted by hash

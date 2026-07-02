@@ -170,11 +170,40 @@ TEST(CasThreeCursorMerge, FloorBoundary)
     foldDeltasIntoGeneration(backend, layout, 1, 0, 2, 0, 0, {}, runs2,
         {entry(1, 2), entry(2, 3)}, /*min_ack*/3, /*condemn_round*/4, {}, &rmr);
 
+    /// Two-phase graduation: the floor-passed entry is REPUBLISHED pending (still in the list);
+    /// its physical delete belongs to the NEXT pass.
     ASSERT_EQ(rmr.graduated.size(), 1u);
     EXPECT_EQ(rmr.graduated[0].hash, b(1));
-    ASSERT_EQ(rmr.still_retired.size(), 1u);
-    EXPECT_EQ(rmr.still_retired[0].hash, b(2));
-    EXPECT_EQ(rmr.still_retired[0].condemn_round, 3u);   /// carried unchanged, not re-stamped
+    EXPECT_TRUE(rmr.graduated[0].delete_pending);
+    ASSERT_EQ(rmr.still_retired.size(), 2u);
+    EXPECT_EQ(rmr.still_retired[0].hash, b(1));
+    EXPECT_TRUE(rmr.still_retired[0].delete_pending);
+    EXPECT_EQ(rmr.still_retired[1].hash, b(2));
+    EXPECT_FALSE(rmr.still_retired[1].delete_pending);
+    EXPECT_EQ(rmr.still_retired[1].condemn_round, 3u);   /// carried unchanged, not re-stamped
+    EXPECT_TRUE(rmr.spared.empty());
+    EXPECT_TRUE(rmr.redelete.empty());
+}
+
+TEST(CasThreeCursorMerge, PendingRedeletesAndDrops)
+{
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+
+    /// An entry the PRIOR pass published as delete_pending: this pass hands it to `redelete`
+    /// (executed pre-CAS by the caller) and drops it from the list output.
+    RetiredEntry pending = entry(1, 1);
+    pending.delete_pending = true;
+
+    std::vector<RunRef> runs;
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(backend, layout, 0, 0, 1, 0, 0, {}, runs,
+        {pending}, /*min_ack*/9, /*condemn_round*/9, {}, &rmr);
+
+    ASSERT_EQ(rmr.redelete.size(), 1u);
+    EXPECT_EQ(rmr.redelete[0].hash, b(1));
+    EXPECT_TRUE(rmr.still_retired.empty());
+    EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
 }
 

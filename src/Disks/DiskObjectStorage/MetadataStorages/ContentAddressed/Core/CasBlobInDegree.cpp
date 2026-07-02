@@ -149,9 +149,16 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     {
         chassert(e.kind == ObjectKind::Blob);   /// the in-degree merge settles Blob entries only
         if (indeg > 0)
-            rmr.spared.push_back(e);            /// recovery wins, even past the floor
+            rmr.spared.push_back(e);            /// recovery wins, even past the floor (pending too — fail closed)
+        else if (e.delete_pending)
+            rmr.redelete.push_back(e);          /// published pending by a PRIOR pass — execute + drop
         else if (e.condemn_round < min_ack)
-            rmr.graduated.push_back(e);         /// every live writer provably acked past it
+        {
+            RetiredEntry pending = e;           /// newly floor-passed: publish pending; delete NEXT pass
+            pending.delete_pending = true;
+            rmr.graduated.push_back(pending);
+            rmr.still_retired.push_back(std::move(pending));
+        }
         else
             rmr.still_retired.push_back(e);     /// carried unchanged until the floor passes it
     };

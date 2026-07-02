@@ -207,6 +207,7 @@ String encodeRetiredSet(const RetiredSet & set)
         pe->set_token_type(tokenTypeToProto(ep->token.type));
         pe->set_size(ep->size);
         pe->set_condemn_round(ep->condemn_round);
+        pe->set_delete_pending(ep->delete_pending);
     }
 
     std::string out;
@@ -243,6 +244,7 @@ RetiredSet decodeRetiredSet(std::string_view data)
         entry.token.type = tokenTypeFromProto(pe.token_type(), "retired set");
         entry.size = pe.size();
         entry.condemn_round = pe.condemn_round();
+        entry.delete_pending = pe.delete_pending();
         set.entries.push_back(std::move(entry));
     }
     return set;

@@ -74,6 +74,11 @@ struct RetiredEntry
     uint64_t condemn_round = 0;   /// the GC round that condemned this incarnation (ack-floor graduation:
                                   /// an entry graduates only when condemn_round < min_ack). Consulted by
                                   /// GC only; the writer publish gate ignores it.
+    bool delete_pending = false;  /// two-phase graduation (spec Task-9 amendment): floor-passed and
+                                  /// published for deletion; the NEXT pass executes the exact-token
+                                  /// delete (pre-CAS, safe at any leader staleness) and drops the entry.
+                                  /// Terminal: a pending entry is never un-pended (writers keep seeing
+                                  /// it condemned and recreate).
 };
 
 /// Retired set (proto `RetiredSetProto`, magic CART, one object per gc-shard referenced from
