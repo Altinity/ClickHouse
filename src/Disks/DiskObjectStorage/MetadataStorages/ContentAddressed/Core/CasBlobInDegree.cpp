@@ -307,10 +307,12 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const Layout & layout
     std::vector<BlobCandidate> result;
     for (uint64_t seq = 0; ; ++seq)
     {
+        /// Probe segment existence with a cheap `head` before opening the streaming reader (an absent
+        /// seq ends the chain) — the streaming reader throws on an absent key. The run is streamed at
+        /// O(one block) resident memory, never materialized whole.
         const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
-        std::optional<GetResult> got = backend.get(key);
-        if (!got) break;
-        RunFileReader r{std::string_view(got->bytes)};
+        if (!backend.head(key).exists) break;
+        RunFileReader r{backend, key};
         String k, p;
         while (r.next(k, p))
             if (!p.empty() && p[0] == kZeroMarker)
@@ -329,10 +331,12 @@ int64_t inDegreeInGeneration(Backend & backend, const Layout & layout,
     int64_t count = 0;
     for (uint64_t seq = 0; ; ++seq)
     {
+        /// Probe segment existence with `head` (absent => chain done), then stream the run at O(block).
+        /// The `seek` below is now the ranged-get path: it lands the cursor on the target blob's block
+        /// via the sparse footer index rather than scanning a resident whole-run buffer.
         const String key = layout.blobTargetRunKey(generation, attempt, shard, seq);
-        std::optional<GetResult> got = backend.get(key);
-        if (!got) break;
-        RunFileReader r{std::string_view(got->bytes)};
+        if (!backend.head(key).exists) break;
+        RunFileReader r{backend, key};
         r.seek(u128ToBytesBE(blob_hash));   // sparse-index skip to this blob's edges
         String k, p;
         while (r.next(k, p))

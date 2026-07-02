@@ -367,3 +367,60 @@ TEST(CasBlobInDegree, FoldStreamsPriorRunBlockBounded)
     /// re-materialized whole.
     EXPECT_LE(backend.getCount(gen1_run_key), 2u);
 }
+
+/// The preview consumer `zeroInDegree` streams a multi-block run instead of materializing it whole: the
+/// backend sees only block-bounded ranged/stream requests for the run key (never a whole-object get), and
+/// the candidate set equals the pre-change (borrowed-mode) result. Byte-parity against an InMemory oracle
+/// is the load-bearing canary — the scan logic is unchanged; only the byte source moved to the stream.
+TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
+{
+    using DB::Cas::tests::CountingBackend;
+    CountingBackend backend;
+    InMemoryBackend oracle;
+    Layout layout{"pool"};
+
+    /// Gen 1 from empty prior: ~20000 active edges spill the SourceEdge run across several 256KB blocks.
+    std::vector<BlobDelta> gen1;
+    gen1.reserve(20000);
+    for (uint64_t i = 0; i < 20000; ++i)
+        gen1.push_back({b(i), s(1), false});
+
+    std::vector<RunRef> runs1_c;
+    std::vector<RunRef> runs1_o;
+    foldDeltasIntoGeneration(backend, layout, 0, 0, 1, 0, 0, gen1, runs1_c);
+    foldDeltasIntoGeneration(oracle, layout, 0, 0, 1, 0, 0, gen1, runs1_o);
+
+    /// Gen 2 removes every edge on two of the blobs => two zero-transition markers in the gen-2 run,
+    /// which is itself multi-block (the surviving-edge rows still span blocks).
+    std::vector<BlobDelta> gen2{{b(0), s(1), true}, {b(19999), s(1), true}};
+    std::vector<RunRef> runs2_c;
+    std::vector<RunRef> runs2_o;
+    foldDeltasIntoGeneration(backend, layout, 1, 0, 2, 0, 0, gen2, runs2_c);
+    foldDeltasIntoGeneration(oracle, layout, 1, 0, 2, 0, 0, gen2, runs2_o);
+
+    const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
+    const auto gen2_run = backend.get(gen2_run_key);
+    ASSERT_TRUE(gen2_run.has_value());
+    /// Sanity: the run genuinely spans several blocks (else the block-bounded assertions are vacuous).
+    ASSERT_GT(gen2_run->bytes.size(), static_cast<size_t>(kRunTargetBlockSize) * 3);
+
+    backend.resetCounts();
+    const auto zero_c = zeroInDegree(backend, layout, 2, 0, 0);
+    const auto zero_o = zeroInDegree(oracle, layout, 2, 0, 0);
+
+    /// Equivalence with the borrowed-mode (InMemory oracle) result: same candidates, in the same order.
+    ASSERT_EQ(zero_c.size(), zero_o.size());
+    ASSERT_EQ(zero_c.size(), 2u);
+    for (size_t i = 0; i < zero_c.size(); ++i)
+        EXPECT_EQ(zero_c[i].hash, zero_o[i].hash);
+
+    /// The core assertion: no whole-object get of the run key — every read carried a Range or a stream.
+    EXPECT_EQ(backend.wholeGetCount(gen2_run_key), 0u);
+    /// The scan opened the run via the streaming reader (head + tail get + getStream).
+    EXPECT_GE(backend.getStreamCount(gen2_run_key), 1u);
+    /// Every ranged-get window stays within one block + the footer allowance (the seam memory bound).
+    EXPECT_LE(backend.maxRangedGetLen(gen2_run_key),
+              static_cast<uint64_t>(kRunHardCapBlockSize) + 64u * 1024u);
+    /// Streaming open touches the tail probe (and at most one exact-footer get); never re-materialized whole.
+    EXPECT_LE(backend.getCount(gen2_run_key), 2u);
+}
