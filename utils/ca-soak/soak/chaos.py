@@ -76,9 +76,20 @@ def _containers(target: FaultTarget):
         return [_CONTAINER[FaultTarget.CH1], _CONTAINER[FaultTarget.CH2]]
     return [_CONTAINER[target]]
 
+def _is_running(container: str) -> bool:
+    """Return True iff the container is in 'running' state."""
+    r = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Status}}", container],
+        capture_output=True, text=True, timeout=30)
+    return r.returncode == 0 and r.stdout.strip() == "running"
+
+
 def apply_fault(fault: Fault):
     """Execute a fault via docker. Thin wrapper; the driver schedules these. KILL is followed by a
-    `docker start` after duration_s (so the node recovers); PAUSE is unpause after duration_s."""
+    `docker start` after duration_s (so the node recovers); PAUSE is unpause after duration_s.
+
+    After `docker start`, polls until the container is in 'running' state (up to 30s) so the caller's
+    `wait_healthy` polling starts from a known container-running baseline."""
     import time
     cs = _containers(fault.target)
     if fault.action == FaultAction.KILL:
@@ -87,6 +98,13 @@ def apply_fault(fault: Fault):
         time.sleep(fault.duration_s)
         for c in cs:
             subprocess.run(["docker", "start", c], capture_output=True)
+        # Wait for container to reach 'running' state before returning
+        for c in cs:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if _is_running(c):
+                    break
+                time.sleep(2)
     elif fault.action == FaultAction.RESTART:
         for c in cs:
             subprocess.run(["docker", "restart", c], capture_output=True)
