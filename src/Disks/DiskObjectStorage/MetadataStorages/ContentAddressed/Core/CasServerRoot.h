@@ -88,6 +88,11 @@ struct MountLease
     uint64_t started_at_ms = 0;
     uint64_t seq = 0;
     uint64_t expires_at_ms = 0;
+    /// Merged heartbeat fields (ack-floor redesign): the per-server build-watermark floor and the
+    /// GC-round acknowledgement ride the SAME object as the lease, so one beat renews all three.
+    uint64_t min_active = 0;          /// oldest in-flight build_seq; UINT64_MAX = retired (farewell)
+    uint64_t observed_gc_round = 0;   /// newest gc round whose retired list this server has loaded
+    bool gc_fenced = false;           /// set ONLY by GC fence-out of an expired lease; terminal
 };
 
 String encodeOwner(const OwnerObject & o);

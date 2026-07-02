@@ -151,6 +151,9 @@ message MountLeaseProto {
   uint64    started_at_ms = 6;
   uint64    seq           = 7;
   uint64    expires_at_ms = 8;
+  uint64    min_active     = 9;   // oldest in-flight build_seq; UINT64_MAX = retired (farewell)
+  uint64    observed_gc_round = 10;  // newest gc round whose retired list this server has loaded
+  bool      gc_fenced      = 11;  // set ONLY by GC fence-out of an expired lease; terminal
 }
 
 // GC lease embedded inside GcStateProto.

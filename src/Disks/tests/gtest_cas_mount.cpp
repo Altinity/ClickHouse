@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 
 #include <chrono>
+#include <limits>
 #include <string>
 
 using namespace DB::Cas;
@@ -396,4 +397,32 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
             .mount_renew_period = std::chrono::milliseconds(100)}));
     ASSERT_NE(a2, nullptr);
     EXPECT_GT(a2->writerEpoch(), e1);
+}
+
+TEST(CasMountLease, BodyCarriesFloorAckAndFence)
+{
+    MountLease m;
+    m.server_uuid = UInt128(0xAB);
+    m.writer_epoch = 7;
+    m.hostname = "h";
+    m.pid = 42;
+    m.started_at_ms = 1000;
+    m.seq = 3;
+    m.expires_at_ms = 2000;
+    m.min_active = 5;
+    m.observed_gc_round = 9;
+    m.gc_fenced = true;
+    const MountLease d = decodeMountLease(encodeMountLease(m));
+    EXPECT_EQ(d.min_active, 5u);
+    EXPECT_EQ(d.observed_gc_round, 9u);
+    EXPECT_TRUE(d.gc_fenced);
+    EXPECT_EQ(d.writer_epoch, 7u);
+}
+
+TEST(CasMountLease, RetiredSentinelRoundTrips)
+{
+    MountLease m;
+    m.min_active = std::numeric_limits<uint64_t>::max();
+    EXPECT_EQ(decodeMountLease(encodeMountLease(m)).min_active,
+              std::numeric_limits<uint64_t>::max());
 }

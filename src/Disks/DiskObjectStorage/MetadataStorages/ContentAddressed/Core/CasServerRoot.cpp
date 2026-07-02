@@ -117,6 +117,9 @@ String encodeMountLease(const MountLease & m)
     msg.set_started_at_ms(m.started_at_ms);
     msg.set_seq(m.seq);
     msg.set_expires_at_ms(m.expires_at_ms);
+    msg.set_min_active(m.min_active);
+    msg.set_observed_gc_round(m.observed_gc_round);
+    msg.set_gc_fenced(m.gc_fenced);
 
     std::string out;
     if (!msg.SerializeToString(&out))
@@ -147,6 +150,9 @@ MountLease decodeMountLease(std::string_view data)
     m.started_at_ms = msg.started_at_ms();
     m.seq = msg.seq();
     m.expires_at_ms = msg.expires_at_ms();
+    m.min_active = msg.min_active();
+    m.observed_gc_round = msg.observed_gc_round();
+    m.gc_fenced = msg.gc_fenced();
     return m;
 }
 
