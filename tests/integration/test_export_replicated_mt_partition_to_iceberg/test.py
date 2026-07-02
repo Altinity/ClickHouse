@@ -251,7 +251,8 @@ def test_failure_is_logged_in_system_table(cluster):
             settings={"allow_insert_into_iceberg": 1},
         )
 
-        wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=60)
+        # short timeout to exercise the fast fail path for non retryable errors
+        wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=20)
     finally:
         node.query("SYSTEM DISABLE FAILPOINT export_part_non_retryable_throw")
 
@@ -344,49 +345,6 @@ def test_inject_short_living_failures(cluster):
         """
     ).strip())
     assert exception_count >= 1, "Expected at least one transient exception to be recorded"
-
-
-def test_export_partition_non_retryable_error_fails_task_fast(cluster):
-    """
-    A non-retryable part-export error (denylisted code, here BAD_ARGUMENTS injected
-    via the export_part_non_retryable_throw failpoint) must fail the whole export
-    task immediately, without waiting for the absolute task timeout.
-
-    The task timeout is left at its large default, so reaching FAILED quickly proves
-    the transition is driven by error classification rather than by a timeout or a
-    retry budget.
-    """
-    node = cluster.instances["replica1"]
-
-    uid = unique_suffix()
-    mt_table = f"mt_{uid}"
-    iceberg_table = f"iceberg_{uid}"
-
-    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
-
-    node.query("SYSTEM ENABLE FAILPOINT export_part_non_retryable_throw")
-    try:
-        node.query(
-            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
-            settings={"allow_insert_into_iceberg": 1},
-        )
-
-        # No short timeout is set; FAILED within this window can only come from the
-        # non-retryable classification, not from the (default, ~1 day) task timeout.
-        wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=60)
-    finally:
-        node.query("SYSTEM DISABLE FAILPOINT export_part_non_retryable_throw")
-
-    exception_count = int(node.query(
-        f"SELECT any(exception_count) FROM system.replicated_partition_exports"
-        f" WHERE source_table = '{mt_table}'"
-        f"   AND destination_table = '{iceberg_table}'"
-        f"   AND partition_id = '2020'"
-    ).strip())
-    assert exception_count > 0, "Expected a non-zero exception_count for the failed export"
-
-    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
-    assert count == 0, f"Expected 0 rows in Iceberg table after a failed export, got {count}"
 
 
 def test_export_partition_retryable_error_killed_on_timeout(cluster):
