@@ -190,6 +190,8 @@ See [`08-testing-and-soak.md`](08-testing-and-soak.md) for full detail.
 | S24 (small dedup-cache) | **TODO** | Requires disk config variant |
 | S27 (list pagination ambiguity) | **TODO** | Requires instrumented object-store proxy |
 | S31 (`ca-gc-dryrun` under `gc_shards > 1`) | **TODO** | `previewDeletes` previews only shard 0; multi-shard coverage needed |
+| D3: full GC round test under `gc_shards > 1` (edge-set fold) | **TODO** | Cover fold → retire → reclaim over the source-edge-set (D1) with multiple GC shards; `gc_shards=1` tests hide sharded fold bugs (see [[feedback_review_blindspots_shards_chassert]]) |
+| B5: reconcile shared-pool integration tests to per-server-tree | **TODO** (separate/larger) | Integration tests still assume the old shared-pool layout; reconcile to the per-`server_root_id` tree (`cas/refs/<srid>`, `cas/manifests/<srid>`, `roots/<srid>`) after Phase 1 relocation |
 | Stateless test suite gated CA un-tagging | **PARTIAL** | Most `no-content-addressed-storage` tags removed; remaining are feature gaps (B31 capability gate, B66a concurrent-fetch, freeze/WORM edge cases) |
 
 ---
