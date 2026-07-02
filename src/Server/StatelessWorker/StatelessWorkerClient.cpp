@@ -31,9 +31,9 @@ String doSendTask(const String & endpoint_uri, const String & task_id, std::func
     timeouts.receive_timeout = Poco::Timespan(100 * 1000 * 1000);
     ReadSettings read_settings;
     /// Not safe to retry: worker would schedule a duplicate task.
-    read_settings.http_settings.max_tries = 1;
-    read_settings.http_settings.retry_initial_backoff_ms = 500;
-    read_settings.http_settings.retry_max_backoff_ms = 1000;
+    read_settings.http_max_tries = 1;
+    read_settings.http_retry_initial_backoff_ms = 500;
+    read_settings.http_retry_max_backoff_ms = 1000;
 
     Poco::URI uri(endpoint_uri);
     uri.addQueryParameter("operation",   "start");
@@ -99,16 +99,16 @@ DistributedQueryTaskStatus getTaskStatus(const String & endpoint_uri, const Stri
         /// server-side wait plus a small network margin, and a failed poll must not retry.
         timeouts.send_timeout = Poco::Timespan(2 * 1000 * 1000);
         timeouts.receive_timeout = Poco::Timespan((wait_for_ms + 2000) * 1000);
-        read_settings.http_settings.max_tries = 1;
+        read_settings.http_max_tries = 1;
     }
     else
     {
         timeouts.send_timeout = Poco::Timespan(100 * 1000 * 1000);
         timeouts.receive_timeout = Poco::Timespan(100 * 1000 * 1000);
         /// Safe to retry: read-only.
-        read_settings.http_settings.max_tries = 3;
-        read_settings.http_settings.retry_initial_backoff_ms = 200;
-        read_settings.http_settings.retry_max_backoff_ms = 1000;
+        read_settings.http_max_tries = 3;
+        read_settings.http_retry_initial_backoff_ms = 200;
+        read_settings.http_retry_max_backoff_ms = 1000;
     }
 
     Poco::URI uri(endpoint_uri);
@@ -150,9 +150,9 @@ void cancelTask(const String & endpoint_uri, const String & task_id, const Conte
     timeouts.receive_timeout = Poco::Timespan(5 * 1000 * 1000);
     ReadSettings read_settings;
     /// Safe to retry: idempotent.
-    read_settings.http_settings.max_tries = 3;
-    read_settings.http_settings.retry_initial_backoff_ms = 200;
-    read_settings.http_settings.retry_max_backoff_ms = 1000;
+    read_settings.http_max_tries = 3;
+    read_settings.http_retry_initial_backoff_ms = 200;
+    read_settings.http_retry_max_backoff_ms = 1000;
 
     Poco::URI uri(endpoint_uri);
     uri.addQueryParameter("operation",   "cancel");
@@ -187,9 +187,9 @@ void forgetTask(const String & endpoint_uri, const String & task_id, const Conte
     timeouts.receive_timeout = Poco::Timespan(100 * 1000 * 1000);
     ReadSettings read_settings;
     /// Safe to retry: idempotent.
-    read_settings.http_settings.max_tries = 3;
-    read_settings.http_settings.retry_initial_backoff_ms = 200;
-    read_settings.http_settings.retry_max_backoff_ms = 1000;
+    read_settings.http_max_tries = 3;
+    read_settings.http_retry_initial_backoff_ms = 200;
+    read_settings.http_retry_max_backoff_ms = 1000;
 
     Poco::URI uri(endpoint_uri);
     uri.addQueryParameter("operation",   "forget");

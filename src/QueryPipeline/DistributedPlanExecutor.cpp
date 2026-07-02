@@ -627,12 +627,10 @@ void doExecuteTask(const DistributedQueryTaskDescription & task_description, Obj
     /// swaps the join sides while the others don't), breaking exchange partitioning.
     optimization_settings.join_swap_table = std::make_optional(false);
     optimization_settings.query_plan_optimize_join_order_limit = 0;
-    optimization_settings.query_plan_optimize_join_order_randomize = 0;
     optimization_settings.convert_join_to_in = false;
     optimization_settings.convert_outer_join_to_inner_join = false;
     optimization_settings.convert_any_join_to_semi_or_anti_join = false;
     optimization_settings.merge_filter_into_join_condition = false;
-    optimization_settings.top_k_through_join = false;
 
     /// The fragment's read is bucketed; re-introducing the implicit count projection would count the
     /// whole part per bucket. Keep it off so counts read the bucket's mark ranges.

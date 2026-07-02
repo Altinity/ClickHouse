@@ -619,12 +619,6 @@ void optimizeExchanges(QueryPlan::Node & root)
 
                     bool can_move_gather_up = true;
 
-                    /// Per-block functions (`rowNumberInAllBlocks`, `blockNumber`, `nowInBlock`, ...)
-                    /// depend on the whole block stream; below a gather they would run per shard and
-                    /// produce different values. Keep such a step above the gather.
-                    if (dag && dagContainsNonDeterministicFunction(*dag))
-                        can_move_gather_up = false;
-
                     /// Moving the sorted GatherExchange above the step is only valid if every sort column
                     /// survives the step unchanged - otherwise GatherReceive would merge by a sort
                     /// description that no longer matches the data. Expression/Filter may recompute or

@@ -7,6 +7,7 @@
 #include <Interpreters/Context_fwd.h>
 #include <Columns/IColumn_fwd.h>
 #include <QueryPipeline/QueryPlanResourceHolder.h>
+#include <Processors/QueryPlan/ExchangeLookup.h>
 #include <Parsers/IAST_fwd.h>
 
 #include <list>
@@ -112,6 +113,9 @@ public:
     void resolveStorages(const ContextPtr & context);
 
     void optimize(const QueryPlanOptimizationSettings & optimization_settings);
+    /// Converts the original plan to distributed plan and replaces the original plan with a plan that
+    /// contains a step that executes the distributed plan and a step that receives the result.
+    void convertToDistributed(const QueryPlanOptimizationSettings & optimization_settings);
 
     QueryPipelineBuilderPtr buildQueryPipeline(
         const QueryPlanOptimizationSettings & optimization_settings,
