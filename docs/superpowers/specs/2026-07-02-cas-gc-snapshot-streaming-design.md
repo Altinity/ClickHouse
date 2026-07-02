@@ -142,3 +142,30 @@ simply indexes into the materialized `full` today.
 - Compression codecs for runs (high-entropy keys; rejected in the run-format design).
 - Streaming the scattered delta input (bounded by the journal window; not a memory driver).
 - Any change to blob/content read paths (this is GC-metadata plumbing only).
+
+## Implementation notes (landed 2026-07-02)
+
+Landed on branch `cas-gc-snapshot-streaming` across eight commits (true ranged `get` → `getStream`
+seam → `RunFileReader` two modes → streaming prior cursor → preview consumers → T0 seal-ref
+resolution → ref-aware retention + hand-off delete → docs). Two governing deviations from the design
+above, both deliberate:
+
+1. **Large-footer runs are a 4th request, not 3.** The design's "3 requests" open profile
+   (`head` + tail `get` + body `getStream`) assumes the tail probe
+   (`min(object_size, kRunHardCapBlockSize + 64 KiB)` suffix) covers the whole footer. A run whose
+   footer exceeds that probe reads its exact footer window with **one additional ranged `get`**, so
+   a large run opens in four requests. The resident-memory bound is unaffected (the footer index
+   plus one block); only the request count differs, and it is bounded (one extra `get`, never a
+   per-block storm). See `04-gc-protocol.md §snapshot-run-reads` and `07-s3-budget.md §gc-budget-bytes`.
+
+2. **Retention is generation-granularity skip + whole-prefix hand-off, driven by the cursor
+   high-water mark.** The design's ref-aware retention says the prune "skips exactly those keys" and
+   the hand-off "deletes the superseded old-generation run object". As implemented,
+   `pruneSupersededGenerations` skips at **generation granularity**, and its cursor
+   (`snap_pruned_through`) is a monotone high-water mark over every generation it *visits* — a
+   skipped (still-referenced) generation is left behind the cursor and never revisited. A single-run
+   hand-off would therefore permanently leak the rest of that generation's prefix (fold seal,
+   attempt subtree, retired/outcome sets, other shards' runs). The hand-off consequently
+   wholesale-deletes the whole `gc/gen/<g>/` prefix post-CAS once the ref moves off it. The
+   leak-freedom argument (two disjoint reclaim paths; fsck-visible single-crash window) is in
+   `04-gc-protocol.md §ref-aware-retention`.

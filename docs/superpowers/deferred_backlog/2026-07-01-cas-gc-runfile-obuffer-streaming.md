@@ -1,5 +1,20 @@
 # Deferred: O(buffer) streaming for CA GC run-file merge (A1 + A3)
 
+> **SUPERSEDED + IMPLEMENTED (2026-07-02).** This backlog item is superseded by
+> `docs/superpowers/specs/2026-07-02-cas-gc-snapshot-streaming-design.md` (T2 streaming reads +
+> T0 reference-parent runs), landed on branch `cas-gc-snapshot-streaming`.
+> - **A1 (backend ranged read + RunFileReader ranged consumption): IMPLEMENTED.** True ranged
+>   `get` (seek + bounded window) + a `getStream` seam in the backend; `RunFileReader` gained a
+>   streaming mode (`head` + tail-footer ranged `get` + body `getStream`) and the whole-run `full`
+>   member is gone. Resident memory is O(block). See `04-gc-protocol.md §snapshot-run-reads`.
+> - **A3 (`readPriorEdges` streams): IMPLEMENTED.** `readPriorEdges` is deleted; the fold's prior
+>   cursor is a streaming `PriorEdgeCursor` over seal-resolved run segments.
+> - **A2: already DROPPED (not a debt) — unchanged** (see the §"Related items" note below).
+>
+> The follow-on byte-volume work (delta-runs + compaction, T1) remains DESIRABLE and is the NEXT
+> spec, building on the T2/T0 primitives unchanged. The rest of this document is the original
+> 2026-07-01 scoping, kept for history.
+
 **Status:** DEFERRED backlog (optimization, NOT a correctness bug). Recorded 2026-07-01.
 **Origin:** the source-edge in-degree fix (`docs/superpowers/specs/2026-07-01-cas-gc-indegree-refold-undercount-design.md`, §streaming) stated an O(buffer)-memory HARD requirement for the snapshot merge. The merge *algorithm* meets it (O(1) per current blob); the *inputs* do not — they materialize whole runs in memory. The spec overstated the status; this doc is the honest scope.
 

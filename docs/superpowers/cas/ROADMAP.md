@@ -85,12 +85,15 @@ See [`04-gc-protocol.md`](04-gc-protocol.md) for full detail.
 | Self-remount on GC fence-out (a fenced live server re-opens a FRESH incarnation via the S13 mount machinery: epoch bump + immediate `gc_fenced` reclaim + fresh view + build invalidation) | **DONE** | Found by the 2026-07-02 ack-floor soak: a 51s CH pause + concurrent GC round fenced the mount; the keeper fails closed by design (sleeper re-arm is the TLA+ sabotage), liveness needs the fresh-incarnation path. Interim: ca-soak chaos caps CH pauses at 20s. Also soften the `Store` teardown release message for the `gc_fenced` case (a foreign incarnation there is the EXPECTED fence-out outcome, not corruption) |
 | Ack-floor observability (Task 11) | **DONE** | `CasGcRetired{Condemned,Spared,Graduated,Redeleted}` + `CasGcHeartbeatFenceOuts` + `CasGcFloorHeldByStaleAck` ProfileEvents; `gc_fence_out` audit event; WARNING when a live heartbeat's ack lags the round by > 2; `RoundReport` carries condemned/graduated/redeleted/fence_outs/min_ack |
 | `mayMutate` fence deadline on `CLOCK_BOOTTIME` (Task 12) | **DONE** | `steady_clock` does not advance across a VM suspend; the write-fence deadline is now a `CLOCK_BOOTTIME`-ms instant (`Store::bootMs`, injectable via `PoolConfig::boot_ms_fn`) so a resumed VM sees its fence expired (container pause already safe) |
-| Delta-runs + compaction for the snapshot (bytes O(edges)/pass) | **DESIRABLE** | With cheap frequent rounds, the full snapshot rewrite per pass is the next dominant cost; the deferred O(buffer) streaming-merge work (`deferred_backlog/2026-07-01-cas-gc-runfile-obuffer-streaming.md`) |
+| Snapshot streaming reads (memory O(block); true ranged `get` + `getStream` seam + streaming `RunFileReader`) | **DONE** (T2) | 2026-07-02; opening a run is 3 requests (`head` + tail `get` + body `getStream`), 4 for a large footer; `seek` = +1 ranged `get`/block; the whole-run `full` member is gone. See [`04-gc-protocol.md §snapshot-run-reads`](04-gc-protocol.md), `specs/2026-07-02-cas-gc-snapshot-streaming-design.md` |
+| Reference-parent runs for empty-delta gc-shards (idle rounds touch zero run objects) | **DONE** (T0) | 2026-07-02; an empty-delta + empty-retired shard is pure ref-carry (zero run I/O); `RunRef` gains `shard` + `generation`; consumers resolve runs via seal refs; ref-aware retention + post-CAS hand-off delete. See [`04-gc-protocol.md §ref-aware-retention`](04-gc-protocol.md) |
+| Delta-runs + compaction for the snapshot (bytes O(edges)/pass) | **DESIRABLE** (T1) | The HOT-pool full snapshot rewrite per pass is the next dominant byte cost; builds on the T2/T0 primitives (streaming reader with `seek`, `getStream`, ranged `get`, seal-ref resolution) unchanged. NEXT spec; source `specs/2026-07-02-cas-gc-snapshot-streaming-design.md §what-deliberately-does-not-change` |
+| GC round progress observability (round-duration watchdog, LIST/window progress events, alert on `gc_fold_begin` without `gc_fold_end`) | **TODO** | Motivated by the 2026-07-02 soak forensics: a long/wedged round is currently only visible after the fact; emit a round-duration watchdog + LIST/fold-window progress events + an alert on an unbalanced `gc_fold_begin`/`gc_fold_end` pair |
 | `process_epoch` → `writer_epoch` stamp unification | **DESIRABLE** | The writable path already sets `process_epoch = writer_epoch`; unify the manifest `writer_instance_id` stamps |
 | Promote-time in-place recreate of a condemned blob | **DESIRABLE** | Today the promote gate stays fail-closed `ABORTED` (build-local sources not retained at promote); recreate happens on the retried build via `putBlob` cold-reuse |
 | GC discovery O(N²) LIST quadratic over `roots/` | **TODO** | `listRootShardTokens` re-enumerates the whole prefix per page; fix: real paginated list at backend |
 | Common-shard-prefix for GC discovery (IDEA-COMMON-SHARD-PREFIX-SINGLE-LIST) | **DESIRABLE** | Relocate shard objects to one flat prefix → GC discovery = a single LIST; pre-release layout change is free |
-| Run-file O(buffer) streaming | **DESIRABLE** (deferred) | `RunFileReader` materializes whole run in memory; two-cursor merge is streaming but inputs are not; fix requires ranged reads in `CasObjectStorageBackend` + streaming `RunFileReader` interface |
+| Run-file O(buffer) streaming | **DONE** (T2, 2026-07-02) | `RunFileReader` streaming mode (borrowed-memory + streaming); true ranged reads in `CasObjectStorageBackend` + `getStream` seam; the whole-run `full` member is gone. See the T2 row under [GC protocol](#area-gc) |
 | `inDegreeInGeneration` O(candidates × runsize) | **RESOLVED** by the ack-floor round | The per-candidate recheck whole-run re-read is gone — the retired cursor rides the single three-cursor merge; the function remains only for preview/tests |
 | `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION [<disk>]` command | **DONE** | Synchronous explicit GC trigger; logs to `system.content_addressed_garbage_collection_log` |
 | GC S3 budget: HEAD storm (B148) — `resolveRef` HEAD per warm hit + condemn HEAD per **new** candidate | **PARTIAL** | The retire/recheck O(universe) HEAD+GET phases are gone (ack-floor round); the remaining condemn HEAD is bounded by newly-condemned candidates, and the discovery LIST is now the dominant scale item (see the O(N²)-LIST row) |
@@ -219,11 +222,12 @@ this roadmap. The items below are the still-actionable highlights not already co
 - **B66b relink-into-detached** (desirable): same-pool `to_detached` FETCH currently byte-streams
   even though a zero-cost relink is possible; extend `Fetcher::relinkPartToDisk` to honor
   `to_detached`.
-- **GC run-file streaming** (scalability, deferred): `RunFileReader` materializes the full run;
-  fix requires real ranged reads in `CasObjectStorageBackend::get` + a streaming `RunFileReader`
-  interface shared by all run consumers. Three-layer change; pick up with `superpowers:writing-plans`
-  + TDD when scale demands it.
-  See `deferred_backlog/2026-07-01-cas-gc-runfile-obuffer-streaming.md`.
+- **GC run-file streaming** (scalability): **DONE** (T2, 2026-07-02). `RunFileReader` now has a
+  streaming mode over true ranged reads in `CasObjectStorageBackend::get` + the `getStream` seam,
+  shared by all run consumers; the whole-run `full` member is gone. The follow-on byte-volume work
+  (delta-runs + compaction, T1) stays DESIRABLE. See
+  `specs/2026-07-02-cas-gc-snapshot-streaming-design.md`; the superseded plan is
+  `deferred_backlog/2026-07-01-cas-gc-runfile-obuffer-streaming.md`.
 - **B1 manifest_hash on Keeper `/parts` znode** (HARD release gate): cross-replica header-divergence
   detection requires a CA-specific field in `commitPart` / `getCommitPartOps`.
 - **S23 idle RSS +82 MiB over budget**: confirm not unbounded in a long soak run.

@@ -167,6 +167,26 @@ The `FoldSeal` records per-`(ns, shard)` coverage: `folded_token`, `folded_curso
 
 **Cursor advance:** the single `gc/state` CAS that advances `snap_generation` (§3.6) also advances `folded_cursor` per shard and publishes `retired_refs` and `round` — all atomically. A crash before the CAS leaves the prior generation and the prior retired list authoritative and the new attempt as invisible garbage; the next pass re-runs under a fresh attempt (§3.6 crash-resume).
 
+### 3.2a Snapshot-run reads: streaming + reference-parent runs {#snapshot-run-reads}
+
+**Status: DONE** (T2 streaming reads + T0 reference-parent runs, 2026-07-02; `specs/2026-07-02-cas-gc-snapshot-streaming-design.md`). The in-degree snapshot run (the per-`(generation, shard)` `RunKind::SourceEdge` artifact, §3.3) is read at **O(block) resident memory**, and an empty-delta shard reads nothing at all.
+
+**Streaming reads (T2).** Every run consumer — the prior cursor of the three-cursor merge and the preview helpers `zeroInDegree` / `inDegreeInGeneration` — reads a run through `RunFileReader` in **streaming mode**, never materializing the whole run. Opening a run is a fixed request profile:
+
+1. `head(key)` — the object size.
+2. one ranged `get` of the tail suffix (`min(object_size, kRunHardCapBlockSize + 64 KiB)`) — carries the footer (the `footer_len` trailer + the CRC'd sparse block index).
+3. `getStream(key, {header_end, data_end})` — a forward-only body stream over a **write-once** object, positioned at the first block; the 13-byte header is drained from its front so it needs no extra request.
+
+So a linear scan is **exactly three requests** (`head` + tail `get` + body `getStream`), plus **one exact-footer ranged `get`** for a run whose footer exceeds the tail probe — a large run is four requests. Resident state is the footer index plus **one** current block (`cur_block.size() <= kRunHardCapBlockSize`); the whole-run member is gone. A `seek` after open costs one extra ranged `get` per touched block (the sparse index locates it); after a `seek`, every subsequent block comes via ranged `get` — the pure-linear fold path never seeks. The block-by-block ranged-`get` alternative for full scans was rejected (an 8 GB run is ~32 000 blocks = a per-shard request storm); it survives only as the `seek` implementation.
+
+`getStream` is contractually for **write-once objects only** (runs, seals): their bytes cannot change under an open stream. Mutable objects (root shards, `gc/state`, mounts) stay on `get`. Fail-closed is unchanged: per-block CRC and the footer CRC verify exactly as the borrowed-memory path does; a short/truncated stream read or any CRC failure is `CORRUPTED_DATA`, never a partial parse. `RunFileWriter` is untouched, so output runs are byte-identical and `putDeterministicArtifact` semantics are unaffected.
+
+**Reference-parent runs (T0).** When a gc-shard's delta bucket is empty for a pass, the fold **neither reads nor writes that shard's run**: the new `fold_seal` carries the parent generation's `RunRef` for that shard verbatim (key + checksum + shard + generation). `RunRef` gains explicit `shard` (which gc-shard the run belongs to) and `generation` (whose key namespace physically holds the object) fields — both additive proto — so per-shard association and retention never parse key paths. This is deterministic by construction (same inputs ⇒ same refs), so seal determinism and crash-replay adoption are unchanged.
+
+A shard with an empty delta AND an empty retired list is **pure ref-carry: zero run I/O**. A shard with an empty delta but a non-empty retired list still runs the merge with empty deltas — settlement of retired entries must happen every pass — so the ref-carry shortcut requires **both** buckets empty. A fully idle round (no journal changes anywhere, no retired entries) therefore touches **zero** run objects: no GET, no PUT.
+
+**Consumers resolve runs through seal refs, never by key construction.** Because the run for generation `G` may physically live under an older generation's key namespace, no consumer builds a run key from `(generation, shard)`. The fold reads the parent seal's `blob_target_runs` and resolves each shard's run through the seal's `RunRef`s; `previewDeletes` resolves `gc/state → adopted seal → refs`. See §4.3 for how retention keeps a referenced older-generation run alive.
+
 ### 3.3 In-degree representation: source-edge set {#indegree-source-edge-set}
 
 **Status: DONE** (H1b fix, 2026-07-01; `CaGcIndegRefoldCore.tla` validated the fix — see `06-tla-models.md §indeg-refold`).
@@ -317,6 +337,16 @@ for g in (snap_pruned_through, prune_floor]:
 **Safety:** pruning runs before the `gc/state` CAS, when `gc/state` still names the prior generation. `prune_floor = adopted_generation - keep` is strictly below the committed generation and `keep−1` above it. If the subsequent CAS fails (lease lost), the already-issued deletes are harmless (the winning leader's floor is even higher). The cursor is not durably advanced on CAS failure, so the next round re-attempts idempotently.
 
 **Scope:** prunes only GC's internal `gc/gen/` bookkeeping. Does NOT touch data objects (blobs, manifests, refs).
+
+### 4.3 Ref-aware retention + hand-off delete {#ref-aware-retention}
+
+**Status: DONE** (T0 reference-parent runs, 2026-07-02; `specs/2026-07-02-cas-gc-snapshot-streaming-design.md`). Reference-parent runs (§3.2a) mean the live adopted seal may reference a run object that physically lives under an **older** generation's key namespace. Wholesale generation prune (§4.2) must not delete such a run out from under the live seal.
+
+**Retention skip (generation granularity).** `pruneSupersededGenerations` takes the set of generations still referenced by the adopted seal's `blob_target_runs` and **skips** any such generation in its wholesale-delete loop (one log line per retained generation). The skip is at **generation granularity**: the prune cursor is a monotone high-water mark over every generation it *visits*, retained ones included. The loop starts at `snap_pruned_through + 1`, runs `g <= prune_floor`, and on a referenced generation does `continue` without deleting — but `g` still increments, and after the loop `snap_pruned_through = g − 1`. Consequence: once a retained generation is behind the cursor, the wholesale prune **never revisits it**.
+
+**Post-CAS hand-off delete.** Because the cursor advances past a retained generation, the run that finally REPLACES a shard's parent-ref must clean up the whole superseded generation, not just its one carried run object. In `runRegularRound`, for every parent ref whose `generation <= snap_pruned_through` (already behind the cursor) and whose generation no NEW live ref references, the round wholesale-deletes that generation's entire `gc/gen/<g>/` prefix **post-CAS** (best-effort; `NotFound` / `TokenMismatch` tolerated). A single-run hand-off would permanently leak the rest of that generation's prefix (fold seal, attempt subtree, retired/outcome sets, other shards' runs), so the whole-prefix delete is the one that matches the generation-granularity skip.
+
+**Leak-freedom.** Every formerly-referenced generation is eventually fully reclaimed by exactly one of two disjoint paths: (1) the ref moves off it **before** the cursor reaches it → the normal wholesale prune reclaims it when it ages past `keep`; or (2) the cursor passes it while it is still referenced (skipped) → the round that finally moves the ref off it hand-off deletes its whole prefix post-CAS. The single-crash window between the CAS and the hand-off strands at most one generation's prefix and is **fsck-visible best-effort**, like the rest of post-CAS cleanup (§3.6); a plain retry does not re-attempt it (the cursor already advanced), so fsck is the backstop — no permanent leak.
 
 ---
 

@@ -212,14 +212,41 @@ storm (§4) from recurring.
 deletion lags condemnation by one pass (condemn → pending → delete), an intentional
 two-phase-graduation property, not extra requests.
 
-### 3.4 Remaining cost axis: snapshot-rewrite bytes {#gc-budget-bytes}
+### 3.4 Snapshot-run reads and idle-round bytes {#gc-budget-bytes}
 
-The ack-floor round removed the request-count blow-up, but each pass still **rewrites the full
-snapshot run per gc-shard** — O(active edges) **bytes** (not requests) per round. With rounds now
-cheap and frequent, this byte volume becomes the next dominant GC cost. The fix is delta-runs +
-periodic compaction, which is exactly the deferred O(buffer) streaming-merge work
-(`deferred_backlog/2026-07-01-cas-gc-runfile-obuffer-streaming.md`; also
-`08-testing-and-soak.md §backlog` and `ROADMAP.md`). Out of scope for the fence redesign.
+**Status: DONE** (T2 streaming reads + T0 reference-parent runs, 2026-07-02;
+`specs/2026-07-02-cas-gc-snapshot-streaming-design.md`). Two properties of the per-gc-shard snapshot
+run set the read/write byte budget (`04 §snapshot-run-reads`):
+
+**Streaming reads — O(block) memory, fixed request profile.** Every run consumer opens a run with a
+fixed request profile rather than reading the whole object into RAM:
+
+| Step | Operation | Count | Notes |
+|---|---|---|---|
+| Object size | `HEAD` | 1 | `head(key)`. |
+| Footer (tail suffix) | `GET` (ranged) | 1 | Ranged `get` of `min(object_size, kRunHardCapBlockSize + 64 KiB)` — carries the `footer_len` trailer + CRC'd block index. |
+| Body stream | `GET` (stream) | 1 | `getStream` over the write-once body, positioned at the first block. |
+| Exact footer (large runs only) | `GET` (ranged) | 0–1 | +1 exact-footer ranged `get` when the footer exceeds the tail probe. |
+
+A linear scan is therefore **3 requests** (`head` + tail `get` + body `getStream`), or **4** for a
+large-footer run. A `seek` costs **+1 ranged `get` per touched block**; the pure-linear fold path
+never seeks. Resident memory is **O(block)** — the footer index plus one current block
+(≤ `kRunHardCapBlockSize` = 1 MiB) — regardless of run size, replacing the former
+3 × O(active edges) materialization (`get`-whole-then-`substr` + reader `full` copy + prior-edge
+`std::vector`).
+
+**Idle-round bytes — zero.** With reference-parent runs, an empty-delta gc-shard's new `fold_seal`
+carries the parent generation's `RunRef` verbatim and the fold neither reads nor writes that shard's
+run. A shard with an empty delta AND an empty retired list is pure ref-carry (zero run I/O); a fully
+idle round (no journal changes, no retired entries) touches **zero** run objects — no GET, no PUT.
+Combined with the ack-floor request profile, an idle round is one LIST sweep + `N` heartbeat GETs +
+one `gc/state` CAS and nothing else. This removes the former per-round 2 × snapshot-bytes idle churn
+(each pass previously re-read and rewrote a byte-identical successor run per shard).
+
+**Remaining byte axis (T1, DESIRABLE).** A HOT pool still rewrites the full snapshot run per changed
+gc-shard — O(active edges) **bytes** per round. The fix is delta-runs + periodic compaction (T1),
+the NEXT spec; it builds on this spec's streaming reader, `getStream` seam, ranged `get`, and
+seal-ref resolution unchanged. See `04-gc-protocol.md §snapshot-run-reads` and `ROADMAP.md`.
 
 ### 3.5 Snap prune (per round, amortized) {#gc-budget-snap-prune}
 
