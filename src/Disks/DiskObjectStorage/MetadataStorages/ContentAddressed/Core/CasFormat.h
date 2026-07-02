@@ -23,7 +23,8 @@ enum class FormatId : uint16_t
     Manifest = 3,
     GcState = 5,
     RetiredSet = 6,
-    Watermark = 7,
+    /// 7 (Watermark) retired with the ack-floor merge — the build-watermark floor rides the mount-lease
+    /// beat (MountLease), there is no standalone watermark object anymore.
     PoolMeta = 8,
     Roster = 9,
     /// 10 (RootsRegistry) deleted in Task 4 — discovery authority moved to LIST(cas/refs/).
@@ -31,9 +32,9 @@ enum class FormatId : uint16_t
     /// Phase 1a (CA GC root-local part-manifest redesign):
     PartManifest = 12,    /// immutable root-local part manifest body; magic "CAPT" (see plan note: "CAPM" is taken by PoolMeta)
     RunFile = 13,         /// dense block-framed sorted binary data-plane run; magic "CARN"
-    /// rev. 15 splits the old single generation seal into two write-once phase seals:
     FoldSeal = 14,        /// write-once gc/gen/<gen>/fold_seal (coverage + blob_target/cleanup runs); magic "CAFS"
-    CompletionSeal = 15,  /// write-once gc/gen/<gen>/completion_seal (fence/recheck/delete/trim + adoptable); magic "CACS"
+    /// 15 (CompletionSeal) retired with the one-pass ack-floor round (fence/recheck/delete/trim phases
+    /// removed) — the fold seal is now the sole per-generation coverage record.
     /// Phase 0 (mount safety): per-server-root control objects under gc/server-roots/<server_root_id>/.
     Owner = 16,           /// owner anchor (server_root_id -> server UUID); magic "CAOW"
     ServerEpoch = 17,     /// writer-epoch fence (next_writer_epoch); magic "CAEP"

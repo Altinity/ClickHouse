@@ -823,20 +823,17 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
     EXPECT_EQ(st.snap_pruned_through, floor)
         << "retention cursor must reach the floor (snap_generation - keep)";
 
-    /// Every generation at or below the floor is fully gone (fold seal + completion seal absent).
+    /// Every generation at or below the floor is fully gone (fold seal absent).
     for (uint64_t g = 1; g <= floor; ++g)
     {
         EXPECT_FALSE(backend->head(store->layout().foldSealKey(g, st.snap_attempt)).exists)
             << "fold seal of pruned generation " << g << " must be gone";
-        EXPECT_FALSE(backend->head(store->layout().completionSealKey(g, st.snap_attempt)).exists)
-            << "completion seal of pruned generation " << g << " must be gone";
         EXPECT_FALSE(backend->head(store->layout().blobTargetRunKey(g, st.snap_attempt, /*shard*/0, /*seq*/0)).exists)
             << "blob-target run of pruned generation " << g << " must be gone";
     }
 
-    /// The latest seal at the current generation survives (the live in-degree view).
-    EXPECT_TRUE(backend->head(store->layout().completionSealKey(st.snap_generation, st.snap_attempt)).exists
-                || backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists)
+    /// The fold seal at the current generation survives (the live in-degree view).
+    EXPECT_TRUE(backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists)
         << "the current generation's seal must NOT be pruned";
 
     /// No-loss: the live blob and owner body are intact throughout retention pruning.
@@ -1220,8 +1217,7 @@ TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
     {
         bool seal_present = false;
         for (uint64_t a = 0; a <= st.snap_attempt && !seal_present; ++a)
-            seal_present = backend->head(store->layout().foldSealKey(g, a)).exists
-                        || backend->head(store->layout().completionSealKey(g, a)).exists;
+            seal_present = backend->head(store->layout().foldSealKey(g, a)).exists;
         EXPECT_TRUE(seal_present) << "keep==0: seal of generation " << g << " must remain";
     }
 }

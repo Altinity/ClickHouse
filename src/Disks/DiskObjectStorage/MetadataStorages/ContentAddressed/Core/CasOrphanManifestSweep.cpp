@@ -109,12 +109,10 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
 /// folded+sealed, so the precommit's manifest body is still load-bearing (delete-after-sealed-decrements).
 ///
 /// B2 — resolve the seal DIRECTLY at the adopted `(snap_generation, snap_attempt)` (mirrors
-/// `Gc::readSealedCursors`): the completion seal if the adopted round finished (it carries the cursors
-/// forward into `folded_cursors`), else the fold seal at the same pair (mid-round: fold sealed, completion
-/// not yet advanced, so `snap_generation == G_f`), else cursor 0 (fresh pool). The old `for g downto 1`
-/// back-scan was UNSOUND with a single stored `snap_attempt`: a prior generation's adopted attempt was a
-/// different `lease.seq`, recorded nowhere, so its key is unreachable here — the scan never legitimately
-/// reached a prior round.
+/// `Gc::readSealedCursors`): the one-pass round's fold seal at that pair carries the cursors, else cursor 0
+/// (fresh pool). The old `for g downto 1` back-scan was UNSOUND with a single stored `snap_attempt`: a
+/// prior generation's adopted attempt was a different `lease.seq`, recorded nowhere, so its key is
+/// unreachable here — the scan never legitimately reached a prior round.
 uint64_t sealedFoldCursor(Store & store, const RootNamespace & ns, uint64_t shard)
 {
     const Layout & layout = store.layout();
@@ -126,12 +124,6 @@ uint64_t sealedFoldCursor(Store & store, const RootNamespace & ns, uint64_t shar
     const uint64_t attempt = state.snap_attempt;
     const String key = cursorKey(ns, shard);
 
-    if (const auto got = store.backend().get(layout.completionSealKey(gen, attempt)))
-    {
-        const CasCompletionSeal seal = decodeCompletionSeal(got->bytes);
-        const auto it = seal.folded_cursors.find(key);
-        return it != seal.folded_cursors.end() ? it->second.folded_cursor : 0;
-    }
     if (const auto got = store.backend().get(layout.foldSealKey(gen, attempt)))
     {
         const CasFoldSeal seal = decodeFoldSeal(got->bytes);

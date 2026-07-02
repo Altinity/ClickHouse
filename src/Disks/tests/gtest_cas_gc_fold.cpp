@@ -40,16 +40,9 @@ TEST(CasGcFold, FoldAdoptsAttemptEqualsLeaseSeq)
     const auto st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
     EXPECT_EQ(st.snap_attempt, st.lease.seq);
     EXPECT_GT(st.snap_generation, 0u);
-    /// The round's seal is durable under (snap_generation, snap_attempt) — a completed round leaves the
-    /// completion seal at snap_generation; a fold-only round leaves the fold seal there. Either way the
-    /// adopted attempt locates it (a seal under any other attempt would be unadopted debris).
-    EXPECT_TRUE(backend->head(store->layout().completionSealKey(st.snap_generation, st.snap_attempt)).exists
-                || backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists);
-    /// The fold seal specifically lives under the adopted attempt at the fold generation (G_f = G_c - 1
-    /// after completion; = snap_generation for a fold-only round).
-    const uint64_t fold_gen = backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists
-        ? st.snap_generation : st.snap_generation - 1;
-    EXPECT_TRUE(backend->head(store->layout().foldSealKey(fold_gen, st.snap_attempt)).exists);
+    /// The one-pass round's fold seal is durable under (snap_generation, snap_attempt) — the adopted
+    /// attempt locates it (a seal under any other attempt would be unadopted debris).
+    EXPECT_TRUE(backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists);
 }
 
 TEST(CasGcFold, CommittedAddEmitsPlusOnePerBlob)

@@ -26,16 +26,10 @@ namespace DB::Cas
 /// (wrong format / unknown key / missing key / wrong type / bad enum string / bad hash hex /
 /// malformed document => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
 
-/// gc/state ("cas_gc_state" v3):
-///   {"format":"cas_gc_state","version":3,
-///    "round":7,"fence_seq":3,"gc_shards":1,"snap_generation":12,
-///    "lease":{"owner":"<32hex>","seq":5},
-///    "fence_version":{"<round>":{"<ns>/<root_shard>":4}}}
-/// fence_version is indexed by ROOT shard ("ns/shard" strings — the journal sources); the snap /
-/// retired / outcome OBJECTS are indexed by target-hash-prefix snap shard. Two distinct sharding
-/// axes (spec §4). fence_version outer keys are the round as a decimal string (JSON object keys
-/// are strings). NOTE: the fold cursor (folded_cursor) moved from gc/state into the snap
-/// (GcSnap::folded_cursor, B140-dangle fix) so (edges, cursor) are one write-once unit.
+/// gc/state (proto `GcStateProto`, magic CAGT): the GC lease, snap config, and the ack-floor
+/// `retired_refs` (gc-shard -> current retired-list object key). NOTE: the fold cursor (folded_cursor)
+/// lives in the write-once fold seal (`CasFoldSeal::per_ns_shard`), not gc/state, so (edges, cursor)
+/// are one write-once unit.
 struct GcLease
 {
     UInt128 owner{};          /// gc leader id (random u128); 0 = never held
@@ -54,7 +48,6 @@ struct GcState
     uint64_t snap_attempt = 0;     /// adopted attempt id (folding leader's lease.seq) for snap_generation
     String manifest_sweep_cursor;  /// best-effort orphan part-manifest cleanup cursor; reachability ignores it
     GcLease lease;
-    std::map<uint64_t, std::map<String, uint64_t>> fence_version;   /// round -> ("ns/shard" -> version)
     std::map<uint64_t, String> retired_refs;   /// gc-shard -> object key of the current retired list
                                                /// (ack-floor redesign). The writer publish gate loads
                                                /// the current retired list by dereferencing these keys;

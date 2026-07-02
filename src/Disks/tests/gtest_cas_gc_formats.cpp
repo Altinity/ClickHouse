@@ -30,8 +30,6 @@ TEST(CasGcFormats, GcStateV3RoundTrip)
     s.snap_generation = 12;
     s.lease.owner = hexToU128("00000000000000000000000000000005");
     s.lease.seq = 5;
-    s.fence_version[7]["srv1/tbl/0"] = 4;
-    s.fence_version[7]["srv1/tbl/1"] = 9;
     auto d = decodeGcState(encodeGcState(s));
     EXPECT_EQ(d.round, 7u);
     EXPECT_EQ(d.fence_seq, 3u);
@@ -39,7 +37,6 @@ TEST(CasGcFormats, GcStateV3RoundTrip)
     EXPECT_EQ(d.snap_generation, 12u);
     EXPECT_EQ(d.lease.owner, hexToU128("00000000000000000000000000000005"));
     EXPECT_EQ(d.lease.seq, 5u);
-    EXPECT_EQ(d.fence_version.at(7).at("srv1/tbl/0"), 4u);
 }
 
 TEST(CasGcFormats, GcStateSnapPrunedThroughRoundTrip)
@@ -124,7 +121,6 @@ TEST(CasGcFormats, GcStateV3DefaultsAndEncodingIsBinary)
     EXPECT_NE(bytes.front(), '{');               /// not JSON (pure protobuf with CasHeader)
     auto d = decodeGcState(bytes);
     EXPECT_EQ(d.round, 0u);
-    EXPECT_TRUE(d.fence_version.empty());
     EXPECT_EQ(d.lease.owner, DB::UInt128{});
 }
 
@@ -231,7 +227,7 @@ TEST(CasGcFormats, GcStateRejectsOldVersionFailClosed)
 {
     /// Fail-closed on an object whose compatibility_version is beyond this build: the ONLY functional
     /// version guard in this proto codec. (retired_refs is an ADDITIVE proto field — same regime as
-    /// snap_attempt (commit e9d898d5c44) and fence_version — so there is no per-object "v3" integer to
+    /// snap_attempt (commit e9d898d5c44) — so there is no per-object "v3" integer to
     /// reject; the write-down-to-floor branch is deferred until a roster exists (CasFormat.h). The
     /// forward-incompatible body is what a mixed-version pool would produce and MUST fail closed.)
     Proto::GcStateProto msg;

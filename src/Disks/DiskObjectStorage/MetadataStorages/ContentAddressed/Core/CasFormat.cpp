@@ -32,14 +32,12 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
         case FormatId::Manifest:
         case FormatId::GcState:
         case FormatId::RetiredSet:
-        case FormatId::Watermark:
         case FormatId::PoolMeta:
         case FormatId::Roster:
         case FormatId::GcOutcomes:
         case FormatId::PartManifest:
         case FormatId::RunFile:
         case FormatId::FoldSeal:
-        case FormatId::CompletionSeal:
         case FormatId::Owner:
         case FormatId::ServerEpoch:
         case FormatId::MountLease:
@@ -57,14 +55,12 @@ uint32_t magicFor(FormatId id)
         case FormatId::Blob:          return 0x4C424143u; /// "CABL"
         case FormatId::Manifest:      return 0x53524143u; /// "CARS"
         case FormatId::PoolMeta:      return 0x4D504143u; /// "CAPM"
-        case FormatId::Watermark:     return 0x4D574143u; /// "CAWM"
         case FormatId::GcState:       return 0x54474143u; /// "CAGT"
         case FormatId::RetiredSet:    return 0x54524143u; /// "CART"
         case FormatId::GcOutcomes:    return 0x4F474143u; /// "CAGO"
         case FormatId::PartManifest:   return 0x54504143u; /// "CAPT" (NOT "CAPM"; that is PoolMeta)
         case FormatId::RunFile:        return 0x4E524143u; /// "CARN"
         case FormatId::FoldSeal:       return 0x53464143u; /// "CAFS"
-        case FormatId::CompletionSeal: return 0x53434143u; /// "CACS"
         case FormatId::Owner:          return 0x574F4143u; /// "CAOW"
         case FormatId::ServerEpoch:    return 0x50454143u; /// "CAEP"
         case FormatId::MountLease:     return 0x4C4D4143u; /// "CAML"

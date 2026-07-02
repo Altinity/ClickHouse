@@ -12,7 +12,7 @@ package clickhouse.cas.format;
 // The object is PURE PROTOBUF — no binary prefix, decodable directly with protoc:
 //   protoc --decode clickhouse.cas.format.RootShardManifest cas_format.proto < manifest.bin
 // Per-object magic (4 ASCII bytes as little-endian fixed32):
-//   RootShardManifest "CARS" | PoolMetaProto "CAPM" | WatermarkProto "CAWM" | GcStateProto "CAGT"
+//   RootShardManifest "CARS" | PoolMetaProto "CAPM" | GcStateProto "CAGT"
 //   RetiredSetProto "CART" | GcOutcomeLogProto "CAGO"
 // (RootsRegistryProto "CARR" deleted in Task 4 — discovery authority moved to LIST(cas/refs/))
 // (gc-snap stays a versioned binary+zstd codec — GC-internal, not an interchange format; B176 defers
@@ -112,16 +112,8 @@ message PoolMetaProto {
   uint64 min_reader_generation  = 5;  // startup gate: if G_BUILD < min_reader_generation => UNKNOWN_FORMAT_VERSION
 }
 
-// Per-server build watermark (_watermark under roots/<server-hex>/). Magic CAWM, FormatId::Watermark.
-// CasHeader is field 1; existing fields renumbered from 2 to free field 1.
-// min_active == UINT64_MAX encodes the "retired" sentinel (farewell epoch).
-message WatermarkProto {
-  CasHeader header  = 1;          // magic=CAWM; set by encoder, checked by decoder
-  bytes  server_id  = 2;          // raw 16 bytes (UInt128, big-endian)
-  uint64 epoch      = 3;
-  uint64 min_active = 4;          // UINT64_MAX (0xFFFFFFFFFFFFFFFF) = retired sentinel
-  uint64 seq        = 5;
-}
+// (WatermarkProto "CAWM" retired with the ack-floor merge — the build-watermark floor rides the
+// mount-lease beat (MountLeaseProto), there is no standalone watermark object anymore.)
 
 // CA Phase 0 (mount safety): per-server-root control objects under gc/server-roots/<server_root_id>/.
 // Each is a pure-protobuf mutable object carrying a CasHeader as field 1.
@@ -162,25 +154,6 @@ message GcLeaseProto {
   uint64 seq   = 2;
 }
 
-// One shard entry of fence_version inner map: "ns/shard" -> uint64 version.
-// Spec bans new proto map<> for byte-determinism; we use sorted repeated instead
-// (a proto map<string,uint64> and repeated{key=1,value=2} share the same wire shape).
-message FenceVersionShardProto {
-  string shard_name = 1;
-  uint64 version    = 2;
-}
-
-// Inner map of fence_version: list of shard entries, sorted by shard_name ascending.
-message FenceVersionInnerProto {
-  repeated FenceVersionShardProto shards = 1;
-}
-
-// One outer entry of fence_version: round -> inner shard map.
-message FenceVersionEntryProto {
-  uint64 round                 = 1;
-  FenceVersionInnerProto inner = 2;
-}
-
 // One (gc-shard -> retired-list object key) entry of retired_refs (ack-floor redesign). Spec bans new
 // proto map<> for byte-determinism; we use sorted repeated instead (sorted by shard ascending).
 message RetiredRefEntryProto {
@@ -190,9 +163,9 @@ message RetiredRefEntryProto {
 
 // GC controller state (gc/state). Magic CAGT, FormatId::GcState.
 // CasHeader is field 1; existing fields renumbered from 2 to free field 1.
-// fence_version is a list of (round, inner) entries, sorted by round ascending,
-// and within each, shards sorted by shard_name ascending — for byte-determinism.
 message GcStateProto {
+  reserved 8;                         // fence_version (retired with the one-pass ack-floor round)
+  reserved "fence_version";
   CasHeader header              = 1;  // magic=CAGT; set by encoder, checked by decoder
   uint64 round                  = 2;
   uint64 fence_seq              = 3;
@@ -200,7 +173,6 @@ message GcStateProto {
   uint64 snap_generation        = 5;
   uint64 snap_pruned_through    = 6;
   GcLeaseProto lease            = 7;
-  repeated FenceVersionEntryProto fence_version = 8;
   uint64 snap_attempt           = 9;  // adopted attempt id for the round that produced snap_generation
   string manifest_sweep_cursor  = 10; // best-effort cleanup cursor; never consulted by reachability
   // ack-floor redesign: gc-shard -> object key of the current retired list. Additive (same regime as
@@ -229,7 +201,7 @@ message GcOutcomeLogProto {
   repeated GcOutcomeEntryProto entries     = 2;
 }
 
-// CA GC root-local part-manifest redesign (rev. 15) — two write-once generation seals.
+// CA GC root-local part-manifest redesign (rev. 15) — the one-pass round's write-once fold seal.
 // A reference to one write-once run object plus its content checksum (RunFooter checksum).
 message RunRefProto {
   string key         = 1;
@@ -258,30 +230,8 @@ message FoldSealProto {
   repeated RunRefProto part_manifest_cleanup  = 6;   // sorted by key
 }
 
-// One "ns/shard" -> version entry inside a CompletionSealProto map.
-message SealVersionEntryProto {
-  string key     = 1;
-  uint64 version = 2;
-}
-
-// COMPLETION seal (write-once gc/gen/<gen>/completion_seal). Magic CACS, FormatId::CompletionSeal.
-message CompletionSealProto {
-  CasHeader header                          = 1;
-  uint64 generation                         = 2;
-  repeated SealVersionEntryProto fence_positions = 3;  // sorted by key
-  repeated RunRefProto delete_outcomes      = 4;       // sorted by key
-  repeated SealVersionEntryProto trim_cursors = 5;     // sorted by key
-  bool adoptable                            = 6;
-  // M2: the completion (fold-through-fence) generation's in-degree run segments. CasCompletionSeal
-  // declared this field and recheck fills it, but it was never (de)serialized => silent coverage loss.
-  repeated RunRefProto blob_target_runs     = 7;  // sorted by key
-  // M1: the completion gen overwrites the snap_generation pointer with the completion generation, whose
-  // fold_seal lives at the PARENT (fold) generation, not here. Carry the per-(ns,shard) fold cursor
-  // coverage forward so the NEXT round's fold recovers the exact sealed cursor from the LATEST seal at
-  // snap_generation (completion seal => these folded_cursors), independent of whether trim ran. Without
-  // this, sealedCursorOf falls back to 0 and a folded-but-untrimmed event is re-folded => double-count.
-  repeated FoldShardCoverageProto folded_cursors = 8;  // sorted by key
-}
+// (CompletionSealProto / SealVersionEntryProto "CACS" retired with the one-pass ack-floor round —
+// fence/recheck/delete/trim phases removed; the fold seal is now the sole per-generation coverage record.)
 
 // One condemned object inside a RetiredSetProto.
 // kind: 1=blob, 2=tree (mirrors ObjectKind enum).

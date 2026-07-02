@@ -283,7 +283,6 @@ RoundReport Gc::runRegularRound()
     GcState next = state;
     next.round = new_round;
     next.retired_refs = std::move(new_refs);
-    next.fence_version.clear();   /// fence machinery retired (field removed entirely in cleanup)
     pruneSupersededGenerations(generation, attempt, next);
     const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
     if (res.outcome != CasOutcome::Committed)
@@ -400,13 +399,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// 1. Discover the present (namespace, shard) pairs via LIST(cas/refs/) (Task 4 LIST-based discovery).
     result.root_shards = discoverUniverse();
 
-    /// Parent cursors — the per-(ns,shard) cursors a prior round sealed. M1: read them from the LATEST
-    /// seal at snap_generation. After a COMPLETED round the snap_generation pointer is the completion
-    /// generation (whose fold_seal lives at the PARENT generation, so readFoldSeal(snap_generation) is
-    /// nullopt); the cursors were carried forward into that completion seal's folded_cursors. Mid-round
-    /// (fold sealed, completion not yet) the fold seal at snap_generation carries them. Absent both =>
-    /// fresh pool (cursor 0). This is independent of trim — a folded-but-untrimmed event must never be
-    /// re-folded from 0 (that double-counts blob in-degree => silent over-pin/leak).
+    /// Parent cursors — the per-(ns,shard) cursors a prior round sealed. One-pass round: read them from
+    /// the fold seal at the adopted (snap_generation, snap_attempt) (the fold seal IS the coverage record).
+    /// Absent => fresh pool (cursor 0). A folded event must never be re-folded from 0 (that double-counts
+    /// blob in-degree => silent over-pin/leak).
     const std::map<String, ShardCoverage> parent_cursors = readSealedCursors(state.snap_generation, state.snap_attempt);
 
     /// Ack-floor: load the CURRENT retired list (published by the previous round's CAS). A ref that
@@ -542,11 +538,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         }
 
         /// B8: reclaim ABANDONED precommits BEFORE reading the shard for the fold, so the reclaim's
-        /// PrecommitRemove event is folded IN THIS SAME ROUND — its `-1` lands in this round's deltas, the
-        /// fold cursor advances to cover it, and the fence_version stays consistent with the fold cursor.
-        /// (Appending it AFTER sealing the cursor would leave an event below the fence but above the sealed
-        /// cursor, which the round's recheck fold-through-fence AND the next round's fold would both apply
-        /// — a double-counted `-1`.) The reclaim PIGGYBACKS on this per-shard visit: it reads the shard
+        /// PrecommitRemove event is folded IN THIS SAME ROUND — its `-1` lands in this round's deltas and the
+        /// fold cursor advances to cover it. (Appending it AFTER sealing the cursor would leave an event above
+        /// the sealed cursor, which the next round's fold would apply — a double-counted `-1`.) The reclaim
+        /// PIGGYBACKS on this per-shard visit: it reads the shard
         /// already being visited, no extra LIST / no separate enumeration stage. It judges build-death from
         /// each live `OwnerKind::Precommit` binding's `manifest_ref` (server + build_seq) via the watermark.
         reclaimAbandonedPrecommit(ns, root_shard, state.round + 1);
@@ -986,13 +981,6 @@ std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attemp
 {
     if (const auto got = store->backend().get(store->layout().foldSealKey(generation, attempt)))
         return decodeFoldSeal(got->bytes);
-    return std::nullopt;
-}
-
-std::optional<CasCompletionSeal> Gc::readCompletionSeal(uint64_t generation, uint64_t attempt)
-{
-    if (const auto got = store->backend().get(store->layout().completionSealKey(generation, attempt)))
-        return decodeCompletionSeal(got->bytes);
     return std::nullopt;
 }
 

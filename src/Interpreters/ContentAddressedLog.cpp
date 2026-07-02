@@ -36,7 +36,7 @@ ColumnsDescription ContentAddressedLogElement::getColumnsDescription()
         {"thread_id", std::make_shared<DataTypeUInt64>(), "OS thread that emitted the event."},
         {"query_id", std::make_shared<DataTypeString>(), "Query id for correlation with system.query_log (empty if N/A)."},
         {"detail", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeString>()),
-            "Structured event-specific facts (e.g. prev_indeg, dropped_by, fence_version, freed, cursor, code, site)."},
+            "Structured event-specific facts (e.g. prev_indeg, dropped_by, freed, cursor, code, site)."},
     };
 }
 

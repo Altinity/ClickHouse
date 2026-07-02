@@ -174,12 +174,6 @@ public:
         return gcGenAttemptPrefix(generation, attempt) + "fold_seal";
     }
 
-    /// Per-(generation, attempt) COMPLETION seal (write-once): <prefix>/gc/gen/<generation>/attempt/<attempt>/completion_seal.
-    String completionSealKey(uint64_t generation, uint64_t attempt) const
-    {
-        return gcGenAttemptPrefix(generation, attempt) + "completion_seal";
-    }
-
     /// One blob-target in-degree/delta run segment:
     ///   <prefix>/gc/gen/<generation>/attempt/<attempt>/blob_target/<shard>/<seq>
     String blobTargetRunKey(uint64_t generation, uint64_t attempt, uint64_t shard, uint64_t seq) const

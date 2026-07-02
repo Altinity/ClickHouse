@@ -14,11 +14,11 @@ TEST(CasFormat, ChangePointsExistForEveryClass)
 {
     /// Every registered class has a non-empty, gen-1 baseline.
     for (auto id : {FormatId::Blob, FormatId::Manifest,
-                    FormatId::GcState, FormatId::RetiredSet, FormatId::Watermark,
+                    FormatId::GcState, FormatId::RetiredSet,
                     FormatId::PoolMeta, FormatId::Roster,
                     FormatId::GcOutcomes,
                     FormatId::PartManifest, FormatId::RunFile,
-                    FormatId::FoldSeal, FormatId::CompletionSeal})
+                    FormatId::FoldSeal})
     {
         auto cps = changePoints(id);
         ASSERT_FALSE(cps.empty());
@@ -69,14 +69,12 @@ TEST(CasFormat, MagicForEachMutableObjectClass)
     EXPECT_EQ(le32toStr(magicFor(FormatId::Blob)),          "CABL");
     EXPECT_EQ(le32toStr(magicFor(FormatId::Manifest)),      "CARS");
     EXPECT_EQ(le32toStr(magicFor(FormatId::PoolMeta)),      "CAPM");
-    EXPECT_EQ(le32toStr(magicFor(FormatId::Watermark)),     "CAWM");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcState)),       "CAGT");
     EXPECT_EQ(le32toStr(magicFor(FormatId::RetiredSet)),    "CART");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcOutcomes)),    "CAGO");
     EXPECT_EQ(le32toStr(magicFor(FormatId::PartManifest)),    "CAPT");
     EXPECT_EQ(le32toStr(magicFor(FormatId::RunFile)),         "CARN");
     EXPECT_EQ(le32toStr(magicFor(FormatId::FoldSeal)),        "CAFS");
-    EXPECT_EQ(le32toStr(magicFor(FormatId::CompletionSeal)),  "CACS");
     /// Guard the documented collision: PartManifest must NOT reuse PoolMeta's "CAPM".
     EXPECT_NE(magicFor(FormatId::PartManifest), magicFor(FormatId::PoolMeta));
 }
@@ -103,14 +101,12 @@ TEST(CasFormat, MagicsAreDistinct)
         magicFor(FormatId::Blob),
         magicFor(FormatId::Manifest),
         magicFor(FormatId::PoolMeta),
-        magicFor(FormatId::Watermark),
         magicFor(FormatId::GcState),
         magicFor(FormatId::RetiredSet),
         magicFor(FormatId::GcOutcomes),
         magicFor(FormatId::PartManifest),
         magicFor(FormatId::RunFile),
         magicFor(FormatId::FoldSeal),
-        magicFor(FormatId::CompletionSeal),
     };
     for (size_t i = 0; i < std::size(magics); ++i)
         for (size_t j = i + 1; j < std::size(magics); ++j)
