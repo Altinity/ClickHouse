@@ -139,9 +139,15 @@ struct PoolConfig
     /// (compact on >= 1 event — the previous eager behaviour, useful for tests).
     uint64_t gc_trim_min_events = 256;
     /// B12: encoded root-shard body size at/above which trim is forced regardless of event count. This
-    /// prevents unbounded journal growth when event rate is high. Defaults to half the manifest soft
-    /// cap so a shard trimmed at or near the soft limit never hits the hard limit before the next round.
-    uint64_t gc_trim_body_soft_limit = 8ULL << 20;   /// 8 MiB
+    /// prevents unbounded journal growth when event rate is high.
+    /// 2026-07-03: default lowered from 8 MiB to 96 KiB so a trimmed shard body stays UNDER the
+    /// 128 KiB inline threshold of RustFS — https://github.com/rustfs/rustfs/issues/3231 (open)
+    /// leaks the previous data dir on every overwrite of a LARGER-than-inline object in an
+    /// un-versioned bucket, and the leaked dirs are what degrade LIST into timeout storms. An
+    /// inline-sized body sidesteps the leak entirely; the cost is a trim casPut per ~96 KiB of
+    /// journal growth per shard (coalesced through the shard-mutation queue anyway). Soak measured
+    /// live-refs ~5 KB per shard — the body is journal-tail-dominated, so the cap binds the tail.
+    uint64_t gc_trim_body_soft_limit = 96ULL << 10;   /// 96 KiB (see rustfs#3231 note above)
     /// gc-rebuild (spec 2026-07-03): max in-memory edges per gc-shard batch during rebuildBaseline
     /// (~32 B each => default ~256 MB); each full batch folds into the next attempt number with the
     /// previous attempt's runs as priors, so memory is O(budget), never O(edges).
