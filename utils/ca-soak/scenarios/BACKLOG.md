@@ -652,3 +652,31 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
   design's ~2×O(universe) GET + O(universe) CAS-PUT is gone). Fail the guard if a round's request count
   correlates with universe size rather than delta size. Pairs with the ROADMAP "Ack-floor round soak
   validation" item.
+## S07-20260703T012854-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-07-03T01:31:00
+- **Severity:** finding
+- **Run:** 20260703T012854_S07_seed20260703
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S12-20260703T013923-1: NOT RUN — docker-compose-10replicas.yml (ch1..ch10) exists; remaining gap: soak/
+
+- **Logged (UTC):** 2026-07-03T01:39:23
+- **Severity:** finding
+- **Run:** 20260703T013923_S12_seed20260703
+- **Observed:** NOT RUN — docker-compose-10replicas.yml (ch1..ch10) exists; remaining gap: soak/cluster.py Cluster is hardcoded to 2 nodes — needs a multi-node abstraction to address ch3..ch10 (see BACKLOG NEEDS-INFRA-S12)
+
+## S22-20260703T014845-1: NOT RUN — requires a fault-injecting S3 proxy (503/429/slow/connection-close) be
+
+- **Logged (UTC):** 2026-07-03T01:48:46
+- **Severity:** finding
+- **Run:** 20260703T014845_S22_seed20260703
+- **Observed:** NOT RUN — requires a fault-injecting S3 proxy (503/429/slow/connection-close) between ClickHouse and RustFS; not in the current compose (direct rustfs1 endpoint)
+
+## S27-20260703T015057-1: NOT RUN — requires an instrumented object store / proxy that returns duplicate o
+
+- **Logged (UTC):** 2026-07-03T01:50:58
+- **Severity:** finding
+- **Run:** 20260703T015057_S27_seed20260703
+- **Observed:** NOT RUN — requires an instrumented object store / proxy that returns duplicate or unstable LIST pages for root-shard token listing; not available with the direct rustfs endpoint
+

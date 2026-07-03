@@ -146,3 +146,41 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-02T06:12:51 | S13 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T060416_S13_seed20260702 | quiescence failed: <urlopen error [Errno 111] Connection refused> |
 | 2026-07-02T06:14:56 | S10 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T061431_S10_seed20260702 |  |
 | 2026-07-02T06:17:28 | S10 | 20260702 | dev | 900s | inconclusive | 3a054b9ffe67 | 20260702T061700_S10_seed20260702 |  |
+| 2026-07-03T01:24:28 | S01 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T012359_S01_seed20260703 |  |
+| 2026-07-03T01:24:52 | S02 | 20260703 | dev | 900s | pass | 80ab8b69abf3 | 20260703T012428_S02_seed20260703 |  |
+| 2026-07-03T01:25:32 | S03 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T012452_S03_seed20260703 |  |
+| 2026-07-03T01:26:14 | S04 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T012532_S04_seed20260703 |  |
+| 2026-07-03T01:27:34 | S05 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T012614_S05_seed20260703 |  |
+| 2026-07-03T01:28:54 | S06 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T012734_S06_seed20260703 |  |
+| 2026-07-03T01:31:00 | S07 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T012854_S07_seed20260703 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-07-03T01:37:45 | S08 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T013100_S08_seed20260703 |  |
+| 2026-07-03T01:38:12 | S09 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T013745_S09_seed20260703 |  |
+| 2026-07-03T01:38:38 | S10 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T013812_S10_seed20260703 |  |
+| 2026-07-03T01:39:23 | S11 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T013838_S11_seed20260703 |  |
+| 2026-07-03T01:39:23 | S12 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T013923_S12_seed20260703 | NOT RUN — docker-compose-10replicas.yml (ch1..ch10) exists; remaining gap: soak/cluster.py Cluster is hardcoded to 2 nodes — needs a multi-node abstraction to address ch3..ch10 (see BACKLOG NEEDS-INFRA-S12) |
+| 2026-07-03T01:42:13 | S13 | 20260703 | dev | 900s | fail | 80ab8b69abf3 | 20260703T013923_S13_seed20260703 |  |
+| 2026-07-03T01:43:29 | S14 | 20260703 | dev | 900s | pass | 80ab8b69abf3 | 20260703T014213_S14_seed20260703 |  |
+| 2026-07-03T01:45:16 | S15 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T014329_S15_seed20260703 |  |
+| 2026-07-03T01:46:24 | S16 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T014516_S16_seed20260703 |  |
+| 2026-07-03T01:46:50 | S17 | 20260703 | dev | 900s | pass | 80ab8b69abf3 | 20260703T014624_S17_seed20260703 |  |
+| 2026-07-03T01:47:23 | S18 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T014650_S18_seed20260703 |  |
+| 2026-07-03T01:47:51 | S19 | 20260703 | dev | 900s | pass | 80ab8b69abf3 | 20260703T014723_S19_seed20260703 |  |
+| 2026-07-03T01:48:21 | S20 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T014751_S20_seed20260703 |  |
+| 2026-07-03T01:48:45 | S21 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T014821_S21_seed20260703 |  |
+| 2026-07-03T01:48:46 | S22 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T014845_S22_seed20260703 | NOT RUN — requires a fault-injecting S3 proxy (503/429/slow/connection-close) between ClickHouse and RustFS; not in the current compose (direct rustfs1 endpoint) |
+| 2026-07-03T01:49:27 | S23 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T014846_S23_seed20260703 |  |
+| 2026-07-03T01:49:53 | S24 | 20260703 | dev | 900s | pass | 80ab8b69abf3 | 20260703T014927_S24_seed20260703 |  |
+| 2026-07-03T01:50:26 | S25 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T014953_S25_seed20260703 |  |
+| 2026-07-03T01:50:57 | S26 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T015026_S26_seed20260703 |  |
+| 2026-07-03T01:50:58 | S27 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T015057_S27_seed20260703 | NOT RUN — requires an instrumented object store / proxy that returns duplicate or unstable LIST pages for root-shard token listing; not available with the direct rustfs endpoint |
+| 2026-07-03T01:51:23 | S28 | 20260703 | dev | 900s | pass | 80ab8b69abf3 | 20260703T015058_S28_seed20260703 |  |
+| 2026-07-03T01:51:49 | S29 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T015123_S29_seed20260703 |  |
+| 2026-07-03T01:52:30 | S30 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T015149_S30_seed20260703 |  |
+| 2026-07-03T01:53:08 | S31 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T015230_S31_seed20260703 |  |
+| 2026-07-03T01:53:32 | S32 | 20260703 | dev | 900s | pass | 80ab8b69abf3 | 20260703T015308_S32_seed20260703 |  |
+| 2026-07-03T01:54:08 | S33 | 20260703 | dev | 900s | pass | 80ab8b69abf3 | 20260703T015332_S33_seed20260703 |  |
+| 2026-07-03T01:54:53 | S34 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T015408_S34_seed20260703 |  |
+| 2026-07-03T01:55:36 | S35 | 20260703 | dev | 900s | inconclusive | 80ab8b69abf3 | 20260703T015453_S35_seed20260703 |  |
+| 2026-07-03T02:00:37 | S13 | 20260703 | dev | 900s | pass | 80ab8b69abf3 | 20260703T015746_S13_seed20260703 |  |
+| 2026-07-03T03:24-03:56 | S01-S35 sweep | 20260703 | dev | 900s | 8 pass / 1 fail (S13) / rest inconclusive (scale- and infra-gated) | night binary (queue+copy-forward-hashfix+clamp-suppression+guard/rebuild) | logs/scenarios_night_sweep.log | ALL seven previously-FAILing scenarios (S10 S19 S20 S21 S23 S26 S31) no longer fail; S19 full PASS |
+| 2026-07-03T04:00 | S13 | 20260703 | dev | 900s | pass (11/11) | night binary | logs/s13_retest.log | after the sync-gated oracle fix: the sweep's S13 'divergence' was replication-in-flight (oracle ran before any sync) — no data loss under kill chaos |

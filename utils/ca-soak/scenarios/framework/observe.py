@@ -398,6 +398,10 @@ def object_lifetime(node, object_hash: str = None, token: str = None, limit: int
 RAW_EXTRACTS = [
     ("gc_log", GC_LOG, "1", "event_time"),
     ("ca_events_summary", CA_LOG, "1", "event_time"),
+    # S13 forensics gap (2026-07-03): a replica-divergence verdict without the replication state is
+    # undiagnosable after the next scenario resets the pool. Both are tiny tables.
+    ("replication_queue", "system.replication_queue", "1", "table, position"),
+    ("replicas", "system.replicas", "1", "table"),
 ]
 
 

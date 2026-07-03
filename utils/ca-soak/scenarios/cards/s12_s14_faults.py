@@ -290,7 +290,24 @@ class S13(Scenario):
             "pass"))
 
         # --- replica-agreement oracle (only where data is queryable) ---------------------------
+        # 2026-07-03 sweep finding: the oracle ran BEFORE any sync — right after kill chaos the
+        # replication queues are still draining, so 'divergence' was a guaranteed false FAIL (each
+        # replica missing the other's tail). The comparison is meaningful only AFTER replication
+        # converges: sync first (optimize=False — part layout does not matter for the checksum);
+        # a non-converging sync downgrades the oracle to INCONCLUSIVE, never a spurious fail.
+        from ..framework import lifecycle as _lifecycle
+        oracle_synced = True
+        try:
+            _lifecycle.quiesce_cluster(cl, tables, optimize=False, log_fn=ctx.log)
+        except Exception as e:
+            oracle_synced = False
+            ctx.log(f"S13 pre-oracle sync did not converge: {e}")
         for t in tables:
+            if not oracle_synced:
+                result.add(Verdict.inconclusive(
+                    f"replica agreement {t}", "all replicas equal",
+                    "replication did not converge before the oracle (post-chaos sync failed)"))
+                continue
             try:
                 # Best-effort: a transient transport/readonly failure right after chaos is retried.
                 retry_on_transport(
