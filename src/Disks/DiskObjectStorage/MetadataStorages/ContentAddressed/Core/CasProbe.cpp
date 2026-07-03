@@ -78,7 +78,13 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
 
         // ---- Step 3: putOverwrite wrong token → PreconditionFailed; bytes intact. ----
         {
-            Token wrong_token{"totally-wrong-token", TokenType::Emulated};
+            /// Wrong-token values are NUMERIC on purpose: a generation-dialect backend (GCS)
+            /// validates the If-Match FORMAT client-side and throws on a non-numeric value (an
+            /// ETag-kind token leaking into a generation dialect) — the probe's synthetic wrong
+            /// tokens must be format-valid for EVERY token kind, merely guaranteed-wrong. A huge
+            /// numeric is a wrong ETag on AWS (412), a wrong generation on GCS (412), and a wrong
+            /// sequence on the emulated backends (TokenMismatch).
+            Token wrong_token{"900000000000000001", TokenType::Emulated};
             const auto outcome = backend.putOverwrite(key, "clobbered", wrong_token).outcome;
             if (outcome != PutOutcome::PreconditionFailed)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
@@ -128,7 +134,7 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
         }
         // 5c: conflict on stale token.
         {
-            Token stale{"stale-token", TokenType::Emulated};
+            Token stale{"900000000000000002", TokenType::Emulated};   /// numeric: see step 3
             const auto outcome = backend.casPut(cas_key, "cas-s1y", stale).outcome;
             if (outcome != CasOutcome::Conflict)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
@@ -159,7 +165,7 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
 
         // ---- Step 6: deleteExact wrong token → TokenMismatch AND the object still readable. ----
         {
-            Token wrong_token{"wrong-delete-token", TokenType::Emulated};
+            Token wrong_token{"900000000000000003", TokenType::Emulated};   /// numeric: see step 3
             const auto d = backend.deleteExact(key, wrong_token);
             if (d.kind != DeleteOutcome::Kind::TokenMismatch)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
