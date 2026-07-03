@@ -7,6 +7,8 @@
 #if USE_AWS_S3
 
 #include <IO/S3/PocoHTTPClient.h>
+#include <IO/S3/GCSConditionalDialect.h>
+#include <IO/S3/GOOG4Signer.h>
 #include <IO/S3/Requests.h>
 
 #include <algorithm>
@@ -24,6 +26,7 @@
 #include <IO/S3/ProviderType.h>
 #include <Interpreters/Context.h>
 
+#include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/http/HttpRequest.h>
 #include <smithy/tracing/NoopTelemetryProvider.h>
 #include <aws/core/http/HttpResponse.h>
@@ -89,6 +92,7 @@ namespace DB::ErrorCodes
     extern const int DNS_ERROR;
     extern const int AUTHENTICATION_FAILED;
     extern const int BAD_ARGUMENTS;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace HistogramMetrics
@@ -227,6 +231,7 @@ PocoHTTPClient::PocoHTTPClient(const PocoHTTPClientConfiguration & client_config
     , http_max_field_value_size(client_configuration.http_max_field_value_size)
     , enable_s3_requests_logging(client_configuration.enable_s3_requests_logging)
     , for_disk_s3(client_configuration.for_disk_s3)
+    , gcs_conditional_dialect(client_configuration.gcs_conditional_dialect)
     , request_throttler(client_configuration.request_throttler)
     , extra_headers(client_configuration.extra_headers)
 {
@@ -743,6 +748,17 @@ void PocoHTTPClient::makeRequestInternalImpl(
             response->SetResponseCode(static_cast<Aws::Http::HttpResponseCode>(status_code));
             response->SetContentType(poco_response.getContentType());
 
+            auto apply_gcs_generation_etag_override = [&]
+            {
+                if (gcs_conditional_dialect)
+                {
+                    /// The generation IS the incarnation token on GCS: surface it as the ETag so the
+                    /// entire existing ETag/token plumbing works unchanged (see GCSConditionalDialect.h).
+                    if (auto etag_override = gcsGenerationETagOverride(poco_response))
+                        response->AddHeader("ETag", *etag_override);
+                }
+            };
+
             if (enable_s3_requests_logging)
             {
                 WriteBufferFromOwnString headers_ss;
@@ -751,12 +767,14 @@ void PocoHTTPClient::makeRequestInternalImpl(
                     response->AddHeader(header_name, header_value);
                     headers_ss << header_name << ": " << header_value << "; ";
                 }
+                apply_gcs_generation_etag_override();
                 LOG_TEST(log, "Received headers: {}", headers_ss.str());
             }
             else
             {
                 for (const auto & [header_name, header_value] : poco_response)
                     response->AddHeader(header_name, header_value);
+                apply_gcs_generation_etag_override();
             }
 
             /// Request is successful but for some special requests we can have actual error message in body
@@ -885,6 +903,9 @@ void PocoHTTPClientGCPOAuth::makeRequestInternal(
     Aws::Utils::RateLimits::RateLimiterInterface * readLimiter,
     Aws::Utils::RateLimits::RateLimiterInterface * writeLimiter) const
 {
+    if (gcs_conditional_dialect)
+        applyGcsConditionalDialectToRequest(request);
+
     {
         std::lock_guard lock(mutex);
         if (!bearer_token || std::chrono::system_clock::now() > bearer_token->is_valid_to)
@@ -970,6 +991,26 @@ PocoHTTPClientGCPOAuth::BearerToken PocoHTTPClientGCPOAuth::requestBearerTokenFr
         .token = std::move(result.access_token),
         .is_valid_to = std::chrono::system_clock::now() + std::chrono::seconds(result.expires_in * 9 / 10)
     };
+}
+
+PocoHTTPClientGCSHMAC::PocoHTTPClientGCSHMAC(const PocoHTTPClientConfiguration & client_configuration)
+    : PocoHTTPClient(client_configuration)
+    , credentials_provider(client_configuration.gcs_hmac_credentials_provider)
+{
+    if (!credentials_provider)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "PocoHTTPClientGCSHMAC requires a credentials provider (http_client = gcs_hmac wiring bug)");
+}
+
+void PocoHTTPClientGCSHMAC::makeRequestInternal(
+    Aws::Http::HttpRequest & request,
+    std::shared_ptr<PocoHTTPResponse> & response,
+    Aws::Utils::RateLimits::RateLimiterInterface * readLimiter,
+    Aws::Utils::RateLimits::RateLimiterInterface * writeLimiter) const
+{
+    applyGcsConditionalDialectToRequest(request);
+    signRequestGOOG4(request, credentials_provider->GetAWSCredentials(), std::chrono::system_clock::now());
+    PocoHTTPClient::makeRequestInternal(request, response, readLimiter, writeLimiter);
 }
 
 }

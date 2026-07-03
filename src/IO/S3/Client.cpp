@@ -24,6 +24,7 @@
 
 #include <Poco/Net/NetException.h>
 #include <Poco/Exception.h>
+#include <Poco/String.h>
 
 #include <IO/Expect404ResponseScope.h>
 #include <IO/S3/Requests.h>
@@ -296,7 +297,14 @@ Client::Client(
         /// find credential keys we can simply behave as the underlying storage is S3
         /// otherwise, we need to be aware we are making requests to GCS
         /// and replace all headers with a valid prefix when needed
-        if (credentials_provider)
+        if (Poco::toLower(client_configuration.http_client) == "gcs_hmac")
+        {
+            /// GOOG4-HMAC mode: all requests are re-signed with x-goog headers at the HTTP layer,
+            /// so the SDK-side GCS accommodations (x-amz header renames, x-amz-api-version
+            /// deletion) must be active even though credentials are present.
+            api_mode = ApiMode::GCS;
+        }
+        else if (credentials_provider)
         {
             auto credentials = credentials_provider->GetAWSCredentials();
             if (credentials.IsEmpty())
@@ -1227,6 +1235,14 @@ std::unique_ptr<S3::Client> ClientFactory::create( // NOLINT
         credentials_configuration.use_environment_credentials || (credentials.IsEmpty() && !credentials_configuration.role_arn.empty());
 
     auto credentials_provider = getCredentialsProvider(client_configuration, credentials, credentials_configuration);
+
+    if (Poco::toLower(client_configuration.http_client) == "gcs_hmac")
+    {
+        client_configuration.gcs_conditional_dialect = true;
+        client_configuration.gcs_hmac_credentials_provider = credentials_provider;
+    }
+    else if (Poco::toLower(client_configuration.http_client) == "gcp_oauth")
+        client_configuration.gcs_conditional_dialect = true;
 
     /// Disable per-thread retry loops if global retry coordination is in use.
     if (client_configuration.s3_slow_all_threads_after_retryable_error)
