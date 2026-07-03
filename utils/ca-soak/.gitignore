@@ -5,3 +5,5 @@ tmp/
 # Structured failure reproducer dumped by soak.run on a failed run.
 failure.json
 __pycache__/
+# Live AWS credentials for the real-S3 validation (docker-compose-awss3.yml). NEVER commit.
+configs/aws.env
