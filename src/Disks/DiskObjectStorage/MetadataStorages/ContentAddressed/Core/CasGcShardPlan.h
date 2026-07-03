@@ -102,7 +102,8 @@ public:
                                const std::vector<RetiredEntry> & prior_retired = {},
                                uint64_t min_ack = 0, uint64_t condemn_round = 0,
                                const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob = {},
-                               RetiredMergeResult * out_retired = nullptr);
+                               RetiredMergeResult * out_retired = nullptr,
+                               bool suppress_destructive = false);
 
 private:
     uint64_t shard;

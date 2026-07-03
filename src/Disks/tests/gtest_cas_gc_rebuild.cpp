@@ -357,3 +357,68 @@ TEST(CasGcRebuild, LeaseConflictRefuses)
     EXPECT_NE(rep.refusal.find("lease"), String::npos) << rep.refusal;
     EXPECT_NE(rep.refusal.find("leader"), String::npos) << rep.refusal;
 }
+
+/// CLAMP SUPPRESSION regression (2026-07-03 night soak: 31 dangling blobs). A committed +1 for
+/// blob X lands on a shard whose fold cursor is CLAMPED (behind a bodiless precommit — the fold
+/// barrier), while X's only FOLDED edge (a committed ref on ANOTHER shard) drops. Without
+/// suppression the pipeline condemns, graduates and DELETES X while its landed +1 sits unfolded
+/// behind the clamp; the clamp release then folds the +1 into a DANGLING reference (the model's
+/// SabotageSkipChangedShard, realized). With suppression a clamped pass neither graduates nor
+/// redeletes; X survives until the clamp clears, after which the +1 folds and X is SPARED.
+TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// Folded baseline: blob X referenced by committed tbl_a (manifest m1) on shard 1.
+    const ManifestRef m1 = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, m1, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_a", std::nullopt, m1, /*shard*/1);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    store->renewWatermarkOnce();
+
+    /// The CLAMP on shard 0: a bodiless precommit (fold barrier — its manifest body never written).
+    const ManifestRef pre = ref(9, 0xEE);
+    addPrecommitTransition(*backend, store->layout(), ns, /*build_id*/ DB::UInt128(0x99), "part_pre",
+                           std::nullopt, pre, /*shard*/0);
+
+    /// BEHIND the clamp: a committed +1 for X (manifest m2, tbl_b) on shard 0 — landed, unfoldable
+    /// until the barrier clears. Then tbl_a drops on shard 1 — X's only FOLDED edge disappears.
+    const ManifestRef m2 = ref(2, 0xB2);
+    writeManifestRaw(*backend, store->layout(), ns, m2, {blobEntryFor("b", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_b", std::nullopt, m2, /*shard*/0);
+    dropRefTransition(*backend, store->layout(), ns, "tbl_a", m1, /*shard*/1);
+
+    /// Rounds with acks current: X reaches folded in-degree 0 and is condemned, but every pass is
+    /// CLAMPED (the bodiless precommit persists), so nothing may graduate or delete.
+    const String blob_key = store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))));
+    for (int i = 0; i < 6; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        ASSERT_TRUE(backend->head(blob_key).exists)
+            << "round " << i << ": X was deleted while its landed +1 sat unfolded behind the clamp";
+    }
+
+    /// Release the clamp: the precommit's body lands (the build finished staging). The next rounds
+    /// fold through the barrier, m2's +1 lands, and X is SPARED (entry dropped, blob intact).
+    writeManifestRaw(*backend, store->layout(), ns, pre, {blobEntryFor("p", DB::UInt128(1))});
+    for (int i = 0; i < 4; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+    EXPECT_TRUE(backend->head(blob_key).exists);
+    /// And the pipeline is unwedged: a genuinely-unreferenced blob still gets reclaimed.
+    const ManifestRef m3 = ref(3, 0xC3);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(5));
+    writeManifestRaw(*backend, store->layout(), ns, m3, {blobEntryFor("c", DB::UInt128(5))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_c", std::nullopt, m3, /*shard*/1);
+    gc.runRegularRound();
+    store->renewWatermarkOnce();
+    dropRefTransition(*backend, store->layout(), ns, "tbl_c", m3, /*shard*/1);
+    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(5)));
+}

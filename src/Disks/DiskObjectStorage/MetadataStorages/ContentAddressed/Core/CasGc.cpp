@@ -19,6 +19,7 @@
 
 namespace ProfileEvents
 {
+    extern const Event CasGcClampSuppressedPasses;
     extern const Event CasGcRetiredCondemned;
     extern const Event CasGcRetiredSpared;
     extern const Event CasGcRetiredGraduated;
@@ -845,6 +846,23 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         return it != parent_runs_by_shard.end() ? it->second : empty;
     };
 
+
+    /// CLAMP SUPPRESSION (2026-07-03, spec amendment; found live as 31 dangling blobs): any clamp
+    /// this pass means landed-before-cut events may be UNFOLDED behind a clamped cursor — the
+    /// floor's "landed before cut => folded before graduation" lemma does not hold, so this pass
+    /// must not graduate NOR execute pending deletes (the merge carries everything; condemnation
+    /// and sparing continue). Deletes resume on the first clamp-free pass. This is the honest-mode
+    /// counterpart of the model's SabotageSkipChangedShard counterexample.
+    const bool suppress_destructive = !report.anomalies.empty();
+    if (suppress_destructive)
+    {
+        ProfileEvents::increment(ProfileEvents::CasGcClampSuppressedPasses);
+        LOG_WARNING(getLogger("CasGc"),
+            "CAS GC fold: {} clamp anomaly(ies) this pass — graduations and pending deletes are "
+            "SUPPRESSED (carried) until a clamp-free pass; landed events may be unfolded behind "
+            "the clamps", report.anomalies.size());
+    }
+
     if (state.gc_shards == 1)
     {
         /// SINGLE-SHARD PATH (gc_shards == 1). Every blob routes to shard 0, so the entire delta stream
@@ -863,7 +881,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
                                      prior_retired[0], min_ack, condemn_round, head_blob,
-                                     &result.retired_merge[0]);
+                                     &result.retired_merge[0], suppress_destructive);
         }
     }
     else
@@ -897,7 +915,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                new_generation, attempt,
                                std::move(buckets[shard]),
                                prior_retired[shard], min_ack, condemn_round, head_blob,
-                               &result.retired_merge[shard]);
+                               &result.retired_merge[shard], suppress_destructive);
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
         }

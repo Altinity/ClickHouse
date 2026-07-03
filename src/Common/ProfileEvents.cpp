@@ -751,6 +751,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasShardBatchedMutations, "CA shard mutations committed through the flat-combining queue", ValueType::Number) \
     M(CasShardBatchScopeCuts, "CA shard-queue carves cut early by the scope rule (same-ref repeat or WholeShard behind)", ValueType::Number) \
     M(CasShardQueueWaitMicroseconds, "CA total time mutateShard callers spent enqueued (sum over items)", ValueType::Microseconds) \
+    M(CasGcClampSuppressedPasses, "CA GC passes whose fold clamped a shard: graduations and pending deletes were suppressed (carried) to preserve the ack-floor lemma", ValueType::Number) \
     M(CasBlobGet,        "CA blob get S3 ops", ValueType::Number) \
     M(CasBlobGetStream,  "CA blob get-stream S3 ops", ValueType::Number) \
     M(CasBlobDelete,     "CA blob delete S3 ops", ValueType::Number) \

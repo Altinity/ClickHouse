@@ -147,7 +147,8 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               const std::vector<RetiredEntry> & prior_retired,
                               uint64_t min_ack, uint64_t condemn_round,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob,
-                              RetiredMergeResult * out_retired)
+                              RetiredMergeResult * out_retired,
+                              bool suppress_destructive)
 {
     /// The retired cursor consumes Blob entries in ascending hash order, in lockstep with the
     /// ascending merged edge stream (32-byte BE keys order exactly as numeric UInt128). An unsorted
@@ -197,8 +198,13 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         if (indeg > 0)
             rmr.spared.push_back(e);            /// recovery wins, even past the floor (pending too — fail closed)
         else if (e.delete_pending)
-            rmr.redelete.push_back(e);          /// published pending by a PRIOR pass — execute + drop
-        else if (e.condemn_round < min_ack)
+        {
+            if (suppress_destructive)
+                rmr.still_retired.push_back(e); /// clamp-suppressed pass: carry pending UNCHANGED
+            else
+                rmr.redelete.push_back(e);      /// published pending by a PRIOR pass — execute + drop
+        }
+        else if (!suppress_destructive && e.condemn_round < min_ack)
         {
             RetiredEntry pending = e;           /// newly floor-passed: publish pending; delete NEXT pass
             pending.delete_pending = true;

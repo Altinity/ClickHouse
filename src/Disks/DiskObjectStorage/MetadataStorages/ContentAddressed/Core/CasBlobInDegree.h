@@ -77,6 +77,14 @@ struct RetiredMergeResult
 ///   d = 0 and condemn_round < min_ack    -> graduated: REPUBLISHED as delete_pending (two-phase
 ///                                           graduation, Task-9 amendment) — deleted the NEXT pass;
 ///   d = 0 otherwise                      -> still_retired, carried byte-unchanged.
+/// CLAMP SUPPRESSION (2026-07-03, found live: 31 dangling in the night soak): when the pass's fold
+/// CLAMPED any shard, landed-before-cut events may sit UNFOLDED behind the clamp — the ack-floor
+/// lemma "landed before the cut => folded before graduation" does not hold, so graduating or
+/// executing pending deletes over this pass's in-degrees can delete a blob whose +1 is pending
+/// behind the clamp (the model's SabotageSkipChangedShard counterexample, realized). With
+/// `suppress_destructive` the merge neither graduates nor redeletes: pending entries carry
+/// UNCHANGED (still delete_pending) and floor-passed entries stay condemned-only. Condemnation and
+/// sparing remain (both non-destructive).
 /// A blob that transitions to zero THIS pass with no prior entry is condemned: `head_blob` captures
 /// the exact incarnation token/size (absent object or empty head_blob -> nothing to delete, skipped)
 /// and the entry is minted at `condemn_round`. Entries for blobs the merged stream never visits
@@ -91,7 +99,8 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               const std::vector<RetiredEntry> & prior_retired = {},
                               uint64_t min_ack = 0, uint64_t condemn_round = 0,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob = {},
-                              RetiredMergeResult * out_retired = nullptr);
+                              RetiredMergeResult * out_retired = nullptr,
+                              bool suppress_destructive = false);
 
 /// Stream the sealed in-degree run named by `runs` (the current seal's `blob_target_runs` filtered to one
 /// shard) and return every blob written at in-degree 0 (the candidates that transitioned to zero). An
