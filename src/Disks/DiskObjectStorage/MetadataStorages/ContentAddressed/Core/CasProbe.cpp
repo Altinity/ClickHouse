@@ -199,8 +199,13 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
                     "CasProbe: deleteExact with the correct token was not Deleted — backend rejected a valid token-exact delete");
             if (d.created_delete_marker)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
-                    "CasProbe: deleteExact succeeded but created a versioning delete marker — "
-                    "backend has object versioning enabled on the pool prefix; current-object mode requires versioning disabled");
+                    "CasProbe: deleteExact succeeded but created a versioning delete marker — the bucket has "
+                    "object VERSIONING enabled, and a content-addressed pool cannot run on a versioned bucket: "
+                    "every GC delete would archive a noncurrent version instead of reclaiming storage (the bucket "
+                    "grows forever), and the constantly-rewritten ref objects would pile up versions on every "
+                    "commit. This is NOT ignorable and has no override. Use a bucket where versioning was NEVER "
+                    "enabled — note that merely SUSPENDING versioning is not enough (deletes on a "
+                    "versioning-suspended bucket still mint delete markers, so this probe will refuse again)");
             const auto g = backend.get(key);
             if (g.has_value())
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
