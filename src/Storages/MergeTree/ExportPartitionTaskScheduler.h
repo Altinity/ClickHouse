@@ -86,7 +86,7 @@ private:
     using LocalBackoffMap = std::unordered_map<TransactionID, PartNameToBackOffMap>;
 
     mutable std::mutex local_backoff_mutex;
-    LocalBackoffMap local_backoff;
+    LocalBackoffMap local_backoff TSA_GUARDED_BY(local_backoff_mutex);
 
     bool shouldBackOff(
         const std::string & transaction_id,
