@@ -58,8 +58,16 @@ namespace
 
 [[noreturn]] void notYet(const char * op)
 {
-    /// M-W skeleton (plan 2026-06-12, T2): the write path lands task by task (T3-T9).
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ContentAddressedTransaction::{} not wired yet (M-W)", op);
+    /// Historical note: these were the M-W milestone skeleton stubs (plan 2026-06-12); the ones
+    /// still standing are generic disk-transaction operations that have no content-addressed
+    /// equivalent or are not wired yet. Keep the message self-explanatory — operators see it.
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "The operation '{}' is not implemented for a content-addressed disk: it belongs to the "
+        "generic disk-transaction surface that the content-addressed write path does not use. "
+        "Hitting it usually means the disk is wrapped by a layer that bypasses the "
+        "content-addressed write path — e.g. a <type>cache</type> disk over a content-addressed "
+        "disk, which is not supported yet (use the content-addressed disk directly in the storage "
+        "policy).", op);
 }
 
 /// Inline candidates above this size spill to a blob instead of riding the tree object — a tuning
