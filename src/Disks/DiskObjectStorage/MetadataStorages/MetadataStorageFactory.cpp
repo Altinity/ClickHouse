@@ -243,8 +243,10 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         const bool gc_enabled = config.getBool(config_prefix + ".gc_enabled", true);
         const auto gc_interval = std::chrono::seconds(
             config.getUInt64(config_prefix + ".gc_interval_sec", 60));
-        /// Creation-time shard fanout (#4): default 8, configurable to spread manifest CAS writes.
-        const uint64_t root_shards = config.getUInt64(config_prefix + ".root_shards", 8);
+        /// Creation-time shard fanout (#4): default 32 (matches `PoolConfig::root_shards` — the
+        /// weighed batching-vs-body-size default; see the comment there). Configurable to spread
+        /// manifest CAS writes across more keys.
+        const uint64_t root_shards = config.getUInt64(config_prefix + ".root_shards", 32);
         const uint64_t dedup_cache_bytes = config.getUInt64(config_prefix + ".dedup_cache_bytes", 64ULL << 20);
         const uint64_t dedup_head_first_min_bytes = config.getUInt64(config_prefix + ".dedup_head_first_min_bytes", 1ULL << 20);
         const uint64_t gc_snap_generations_to_keep = config.getUInt64(config_prefix + ".gc_snap_generations_to_keep", 3);
@@ -256,7 +258,12 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// Phase 0 (mount safety): the layout subtree identity is explicit and REQUIRED — no default,
         /// so a missing key throws `Poco::NotFoundException`. `ServerUUID` is demoted to an owner token;
         /// the subtree a server owns is named by `server_root_id`. Validated immediately (fail closed).
-        const std::string server_root_id = config.getString(config_prefix + ".server_root_id");
+        /// Macros expand here exactly as in the s3 `endpoint` (ObjectStorageFactory): on a
+        /// multi-replica stand every replica mounts ONE shared pool (same endpoint) and must own a
+        /// DISTINCT subtree, so the natural single-template config is
+        /// `<server_root_id>{replica}</server_root_id>`. An unknown macro throws (fail closed).
+        const std::string server_root_id = global_context->getMacros()->expand(
+            config.getString(config_prefix + ".server_root_id"));
         Cas::validateServerRootId(server_root_id);
         const uint64_t manifest_soft_limit = config.getUInt64(config_prefix + ".manifest_soft_limit", 16ULL << 20);
         const uint64_t manifest_hard_limit = config.getUInt64(config_prefix + ".manifest_hard_limit", 64ULL << 20);

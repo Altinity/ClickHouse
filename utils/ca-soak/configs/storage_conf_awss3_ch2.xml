@@ -18,9 +18,7 @@
                 <region>us-east-1</region>
                 <use_environment_credentials>1</use_environment_credentials>
                 <server_root_id>ca_live_ch2</server_root_id>
-                <content_addressed_allow_shared_pool>1</content_addressed_allow_shared_pool>
                 <gc_enabled>1</gc_enabled>
-                <content_addressed_gc_grace_sec>5</content_addressed_gc_grace_sec>
                 <gc_interval_sec>10</gc_interval_sec>
             </ca>
 
@@ -33,7 +31,6 @@
                 <region>us-east-1</region>
                 <use_environment_credentials>1</use_environment_credentials>
                 <server_root_id>ca_live_ch2</server_root_id>
-                <content_addressed_allow_shared_pool>1</content_addressed_allow_shared_pool>
                 <gc_enabled>0</gc_enabled>
                 <readonly>true</readonly>
             </ca_ro>
