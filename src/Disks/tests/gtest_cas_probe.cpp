@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
@@ -113,4 +114,16 @@ TEST(CasProbe, FailsClosedOnStorePreconditions)
     EXPECT_THROW(runCapabilityProbe(*b, "p/.cas_probe"), DB::Exception);
     /// The hook fires FIRST: no probe keys may have been written.
     EXPECT_TRUE(b->list("p/.cas_probe", "", 10).keys.empty());
+}
+
+/// `Store::open` wraps the pool backend in `InstrumentedBackend` BEFORE calling `runCapabilityProbe`
+/// (see CasStore.cpp), so the hook must actually fire THROUGH the wrapper on the real mount path —
+/// not just on a raw backend, which `FailsClosedOnStorePreconditions` above already covers.
+TEST(CasProbe, StorePreconditionsFireThroughInstrumentedWrapper)
+{
+    auto inner = std::make_shared<PreconditionRefusingBackend>();
+    InstrumentedBackend wrapped(inner);
+    EXPECT_THROW(runCapabilityProbe(wrapped, "p/.cas_probe"), DB::Exception);
+    /// The hook fires FIRST: no probe keys may have been written to the inner backend.
+    EXPECT_TRUE(inner->list("p/.cas_probe", "", 10).keys.empty());
 }

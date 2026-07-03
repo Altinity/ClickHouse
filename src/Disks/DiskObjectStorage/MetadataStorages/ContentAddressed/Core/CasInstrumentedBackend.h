@@ -70,6 +70,8 @@ class InstrumentedBackend final : public Backend
 public:
     explicit InstrumentedBackend(BackendPtr inner_) : inner(std::move(inner_)) {}
 
+    void checkStorePreconditions() override { inner->checkStorePreconditions(); }
+
     std::optional<GetResult> get(const String & key, Range range = {}) override
     {
         auto result = inner->get(key, range);
