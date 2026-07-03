@@ -16,17 +16,17 @@ namespace DB::Cas
 /// backend-level chokepoint to attribute the S3 op-count (PUTs/HEADs/404s/412s/LISTs) by CA op type.
 
 /// Namespace of a CA key, classified by substring of the key path (6 classes).
-///   <prefix>/blobs/..   → Blob
-///   <prefix>/trees/..   → Tree
+///   <prefix>/blobs/..        → Blob
+///   <prefix>/cas/manifests/.. → Manifest
 ///   <prefix>/roots/<server-hex>/_watermark     → Server  (checked before the generic /roots/)
 ///   <prefix>/roots/<server-hex>/_precommits/.. → Server  (checked before the generic /roots/)
-///   <prefix>/roots/..   → Root  (incl. /roots/<ns>/_files/ and mountpoint objects)
-///   <prefix>/gc/..      → Gc
+///   <prefix>/roots/..        → Root  (incl. /roots/<ns>/_files/ and mountpoint objects)
+///   <prefix>/gc/..           → Gc
 ///   else (e.g. _pool_meta, _probe) → Other
 enum class CasNs : uint8_t
 {
     Blob = 0,
-    Tree,
+    Manifest,
     Root,
     Gc,
     Server,

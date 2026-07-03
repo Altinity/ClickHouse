@@ -50,35 +50,10 @@ TEST(CasEnvelope, BlobRoundTrip)
     EXPECT_EQ(obj.substr(payloadOffset(h)), payload);
 }
 
-TEST(CasEnvelope, TreeRoundTrip)
-{
-    const std::string payload = "tree payload bytes";
-    const std::string obj = buildObject(ObjectKind::Tree, 0xbeef, payload);
-    const EnvelopeHeader h = decodeEnvelopeHeader(obj, obj.size(), ObjectKind::Tree);
-    EXPECT_EQ(h.kind, ObjectKind::Tree);
-    EXPECT_EQ(obj.substr(payloadOffset(h)), payload);
-}
-
 TEST(CasEnvelope, MagicEncodesKind)
 {
     const std::string blob = buildObject(ObjectKind::Blob, 0x1, "p");
-    const std::string tree = buildObject(ObjectKind::Tree, 0x1, "p");
     EXPECT_EQ(blob.substr(0, 4), "CABL");
-    EXPECT_EQ(tree.substr(0, 4), "CATR");
-}
-
-TEST(CasEnvelope, WrongMagicForExpectedKindThrows)
-{
-    const std::string blob = buildObject(ObjectKind::Blob, 0x1, "p");
-    try
-    {
-        decodeEnvelopeHeader(blob, blob.size(), ObjectKind::Tree);   // expect Tree, got CABL
-        FAIL() << "expected CORRUPTED_DATA";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-    }
 }
 
 TEST(CasEnvelope, BadMagicThrows)

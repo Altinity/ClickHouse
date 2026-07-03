@@ -35,7 +35,6 @@ ObjectKind objectKindFromProto(uint32_t v, std::string_view what)
     switch (v)
     {
         case static_cast<uint32_t>(ObjectKind::Blob): return ObjectKind::Blob;
-        case static_cast<uint32_t>(ObjectKind::Tree): return ObjectKind::Tree;
         default:
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS {}: invalid object kind {} in retired entry", what, v);

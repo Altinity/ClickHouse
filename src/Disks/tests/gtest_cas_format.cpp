@@ -35,15 +35,15 @@ TEST(CasFormat, CurrentVersionsAreGBuild)
 
 TEST(CasFormat, CheckCompatibilityPassesWhenKnown)
 {
-    EXPECT_NO_THROW(checkCompatibility(1u, "tree"));
-    EXPECT_NO_THROW(checkCompatibility(G_BUILD, "tree"));
+    EXPECT_NO_THROW(checkCompatibility(1u, "manifest"));
+    EXPECT_NO_THROW(checkCompatibility(G_BUILD, "manifest"));
 }
 
 TEST(CasFormat, CheckCompatibilityFailsClosedOnFuture)
 {
     try
     {
-        checkCompatibility(G_BUILD + 1, "tree");
+        checkCompatibility(G_BUILD + 1, "manifest");
         FAIL() << "expected UNKNOWN_FORMAT_VERSION";
     }
     catch (const DB::Exception & e)

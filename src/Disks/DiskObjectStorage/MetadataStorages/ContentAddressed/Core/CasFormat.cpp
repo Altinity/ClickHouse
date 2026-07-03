@@ -49,7 +49,7 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
 uint32_t magicFor(FormatId id)
 {
     /// Each magic is 4 ASCII bytes stored as little-endian fixed32.
-    /// "CABL" = 0x4C424143, "CATR" = 0x52544143, etc.
+    /// "CABL" = 0x4C424143, "CARS" = 0x53524143, etc.
     switch (id)
     {
         case FormatId::Blob:          return 0x4C424143u; /// "CABL"

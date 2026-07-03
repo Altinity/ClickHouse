@@ -15,17 +15,17 @@ extern const Event CasBlobGetStream;
 extern const Event CasBlobDelete;
 extern const Event CasBlobList;
 
-extern const Event CasTreePut;
-extern const Event CasTreePutDedup;
-extern const Event CasTreeOverwrite;
-extern const Event CasTreeCas;
-extern const Event CasTreeCasConflict;
-extern const Event CasTreeHead;
-extern const Event CasTreeHeadMiss;
-extern const Event CasTreeGet;
-extern const Event CasTreeGetStream;
-extern const Event CasTreeDelete;
-extern const Event CasTreeList;
+extern const Event CasManifestPut;
+extern const Event CasManifestPutDedup;
+extern const Event CasManifestOverwrite;
+extern const Event CasManifestCas;
+extern const Event CasManifestCasConflict;
+extern const Event CasManifestHead;
+extern const Event CasManifestHeadMiss;
+extern const Event CasManifestGet;
+extern const Event CasManifestGetStream;
+extern const Event CasManifestDelete;
+extern const Event CasManifestList;
 
 extern const Event CasRootPut;
 extern const Event CasRootPutDedup;
@@ -87,10 +87,10 @@ static const ProfileEvents::Event cas_event_table[CAS_NS_COUNT][CAS_OP_COUNT] =
                   ProfileEvents::CasBlobCas, ProfileEvents::CasBlobCasConflict, ProfileEvents::CasBlobHead,
                   ProfileEvents::CasBlobHeadMiss, ProfileEvents::CasBlobGet, ProfileEvents::CasBlobGetStream,
                   ProfileEvents::CasBlobDelete, ProfileEvents::CasBlobList},
-    /* Tree   */ {ProfileEvents::CasTreePut, ProfileEvents::CasTreePutDedup, ProfileEvents::CasTreeOverwrite,
-                  ProfileEvents::CasTreeCas, ProfileEvents::CasTreeCasConflict, ProfileEvents::CasTreeHead,
-                  ProfileEvents::CasTreeHeadMiss, ProfileEvents::CasTreeGet, ProfileEvents::CasTreeGetStream,
-                  ProfileEvents::CasTreeDelete, ProfileEvents::CasTreeList},
+    /* Manifest */ {ProfileEvents::CasManifestPut, ProfileEvents::CasManifestPutDedup, ProfileEvents::CasManifestOverwrite,
+                  ProfileEvents::CasManifestCas, ProfileEvents::CasManifestCasConflict, ProfileEvents::CasManifestHead,
+                  ProfileEvents::CasManifestHeadMiss, ProfileEvents::CasManifestGet, ProfileEvents::CasManifestGetStream,
+                  ProfileEvents::CasManifestDelete, ProfileEvents::CasManifestList},
     /* Root   */ {ProfileEvents::CasRootPut, ProfileEvents::CasRootPutDedup, ProfileEvents::CasRootOverwrite,
                   ProfileEvents::CasRootCas, ProfileEvents::CasRootCasConflict, ProfileEvents::CasRootHead,
                   ProfileEvents::CasRootHeadMiss, ProfileEvents::CasRootGet, ProfileEvents::CasRootGetStream,
@@ -113,8 +113,6 @@ CasNs classifyCasNs(const String & key)
 {
     if (key.find("/blobs/") != String::npos)
         return CasNs::Blob;
-    if (key.find("/trees/") != String::npos)
-        return CasNs::Tree;
     /// Post-relocation layout (hot/cold split): ref shards live under `cas/refs/<ns>/<shard>` and
     /// part manifests under `cas/manifests/<ns>/...`. Without these two rules every ref-shard and
     /// manifest request misclassified as Other — the 2026-07-03 operator-stand CREATE TABLE storm
@@ -123,7 +121,7 @@ CasNs classifyCasNs(const String & key)
     if (key.find("/cas/refs/") != String::npos)
         return CasNs::Root;
     if (key.find("/cas/manifests/") != String::npos)
-        return CasNs::Tree;
+        return CasNs::Manifest;
     /// Phase 6: a server's mutable control state lives under its own `roots/<server-hex>/` subtree —
     /// the watermark at `.../_watermark` and the precommit shards under `.../_precommits/`. Both are
     /// key-wise under `/roots/`, so classify them by their distinguishing suffix/segment BEFORE the

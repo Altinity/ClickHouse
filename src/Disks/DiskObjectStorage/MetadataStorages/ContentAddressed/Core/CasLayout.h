@@ -333,9 +333,9 @@ private:
 
 /// The object key for a (kind, hash) — the single kind→key-shape mapping.
 /// Shared by `Build` (the publish gate's observe/resurrect) and `Gc` (the retire HEAD and the
-/// exact-token delete): both sides MUST address the same object the same way. Standalone tree
-/// OBJECTS are a retired concept (the Merkle layer was rejected; `ObjectKind::Tree` survives only
-/// as the event/outcome label for manifest bodies) — addressing one is a logical error.
+/// exact-token delete): both sides MUST address the same object the same way. The standalone tree
+/// object kind (the rejected Merkle layer) was excised 2026-07-03 (rev. 15 `PartManifest` redesign);
+/// `Blob` is the only surviving `ObjectKind`.
 inline String objectKey(const Layout & layout, ObjectKind kind, const UInt128 & hash)
 {
     const String id = u128ToHex(hash);
@@ -343,9 +343,6 @@ inline String objectKey(const Layout & layout, ObjectKind kind, const UInt128 & 
     {
         case ObjectKind::Blob:
             return layout.blobKey(BlobId(id));
-        case ObjectKind::Tree:
-            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
-                "objectKey: standalone tree objects are a retired concept (hash {})", id);
     }
     throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "objectKey: unknown ObjectKind {}", static_cast<uint8_t>(kind));
 }

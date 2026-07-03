@@ -40,14 +40,12 @@ constexpr size_t HEADER_HASH_OFFSET = 86;
 constexpr size_t HEADER_HASH_LEN = 8;
 
 constexpr std::string_view MAGIC_BLOB = "CABL";
-constexpr std::string_view MAGIC_TREE = "CATR";
 
 std::string_view magicFor(ObjectKind kind)
 {
     switch (kind)
     {
         case ObjectKind::Blob: return MAGIC_BLOB;
-        case ObjectKind::Tree: return MAGIC_TREE;
     }
     throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
         "CHCA envelope: unexpected ObjectKind {}", static_cast<int>(kind));
@@ -200,8 +198,6 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
         const String magic = readFixedBytes(in, 4);
         if (magic == MAGIC_BLOB)
             h.kind = ObjectKind::Blob;
-        else if (magic == MAGIC_TREE)
-            h.kind = ObjectKind::Tree;
         else
             throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CHCA envelope: bad magic");
         if (h.kind != expected_kind)

@@ -30,7 +30,7 @@ struct OutcomeEntry
 
 /// Outcome log ("cas_gc_outcomes" v1), one object per gc/outcomes/<round>.<fence_seq>/<snap_shard>:
 ///   {"format":"cas_gc_outcomes","version":1,
-///    "entries":[{"kind":"tree","hash":"<32 lowercase hex>","token":"etag-1",
+///    "entries":[{"kind":"blob","hash":"<32 lowercase hex>","token":"etag-1",
 ///                "token_type":"etag","outcome":"deleted"}]}
 /// outcome: "deleted" | "absent" | "replaced" | "spared"; kind/token_type as in the retired set.
 struct OutcomeLog

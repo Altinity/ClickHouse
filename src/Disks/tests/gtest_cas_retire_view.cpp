@@ -69,7 +69,6 @@ TEST(CasRetireView, SeesInjectedRetirements)
     ASSERT_TRUE(hit.has_value());
     EXPECT_EQ(hit->size(), 1u);
     EXPECT_EQ((*hit)[0].value, "3");
-    EXPECT_FALSE(v.findCondemned(ObjectKind::Tree, h).has_value());   /// kind is part of the identity
 }
 
 TEST(CasRetireView, RefreshDropsRewrittenEntries)

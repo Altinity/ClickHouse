@@ -9,24 +9,27 @@
 namespace DB::Cas
 {
 
-/// The CHCA object envelope — protocol spec §3.1. Every blob and tree object on storage begins
-/// with this fixed 94-byte little-endian core header, optionally followed by TLV extensions up to
-/// header_len, then the payload. The header is the "incarnation zone": excluded from logical_hash,
-/// it may differ between incarnations of the same logical object. The 4-byte magic encodes the
-/// kind: `CABL` for blobs, `CATR` for trees; there is no separate kind byte.
+/// The CHCA object envelope — protocol spec §3.1. Every blob object on storage begins with this
+/// fixed 94-byte little-endian core header, optionally followed by TLV extensions up to header_len,
+/// then the payload. The header is the "incarnation zone": excluded from logical_hash, it may
+/// differ between incarnations of the same logical object. The 4-byte magic encodes the kind:
+/// `CABL` for blobs (the standalone tree object kind was retired in the rev. 15 `PartManifest`
+/// redesign; see `ObjectKind` below).
 ///
 /// The binary core layout (all little-endian):
 ///   magic[4] + writer_version[2] + compatibility_version[2] + hash_algo[1] + flags[1] + header_len[4]
 ///   + logical_size[8] + four u128s[64] + header_hash[8] = 94 bytes.
 /// compatibility_version (formerly named min_reader_version) encodes the write-down-to-floor for
-/// the tree payload format: a reader must fail-closed if compatibility_version > G_BUILD.
-/// For blobs the payload is raw data; compatibility_version still follows the same rule.
+/// the payload format: a reader must fail-closed if compatibility_version > G_BUILD.
 /// (Aligned with the converged header model 2026-06-25.)
 
+/// The standalone `Tree` object kind (Merkle layer) was rejected and excised 2026-07-03 (rev. 15
+/// `PartManifest` redesign superseded it). `Blob` is the only surviving kind; the enum is kept as a
+/// switch-friendly type at existing call sites rather than force-collapsed into a bare constant
+/// (see `docs/superpowers/cas/ROADMAP.md` for a follow-up note on whether it still earns its keep).
 enum class ObjectKind : uint8_t
 {
     Blob = 1,
-    Tree = 2,
 };
 
 enum class ProvenanceOp : uint8_t
@@ -54,9 +57,8 @@ struct EnvelopeHeader
     uint8_t hash_algo = 1;                  /// 1 = cityHash128
     uint16_t writer_version = 0;            /// set by decode; encode derives it from `kind` via CasFormat
     uint16_t compatibility_version = 0;     /// set by decode; encode derives it from `kind` via CasFormat
-                                            /// (write-down-to-floor: for trees, stamp the floor the payload
-                                            ///  targets; blobs carry raw payload and do not branch on this.
-                                            ///  No tree-format-v2 exists yet — always G_BUILD for now.)
+                                            /// (write-down-to-floor: blobs carry raw payload and do not
+                                            ///  branch on this — always G_BUILD for now.)
     /// Bytes covered by logical_hash = [header_len, EOF) = object_size - header_len, UNIFORMLY for
     /// all kinds (spec §3.1).
     uint64_t logical_size = 0;

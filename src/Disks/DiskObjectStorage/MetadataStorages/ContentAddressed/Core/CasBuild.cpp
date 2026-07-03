@@ -244,16 +244,14 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
 {
     /// `hr.exists` is guaranteed by the caller (the 3-arg wrapper checked it; the putBlob HEAD-first
     /// path only calls this on a present HEAD). Avoids a redundant second HEAD on the dedup-hit path.
-    /// Logical (payload) size = object size minus the pool's fixed blob header. A tree object is laid
-    /// out as [blob_header_len envelope][encodeTree payload], so the same formula applies. GUARD against
+    /// Logical (payload) size = object size minus the pool's fixed blob header. GUARD against
     /// unsigned underflow: a truncated/corrupt object whose size is below the header length must surface
     /// as CORRUPTED_DATA, never wrap to a huge value. Mirrors the GC path's `retiredLogicalSize`.
-    /// B92: trees previously reported 0 ("would need a decode"); the layout makes that unnecessary.
     const uint64_t header_len = store->poolMeta().blob_header_len;
     if (hr.size < header_len)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "Build: {} object {} size {} is below the pool blob header length {}",
-            kind == ObjectKind::Blob ? "blob" : "tree", key, hr.size, header_len);
+            kind == ObjectKind::Blob ? "blob" : "manifest", key, hr.size, header_len);
     const uint64_t logical_size = hr.size - header_len;
 
     const CasEventObjectKind ev_kind = toEventKind(kind);
@@ -372,7 +370,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
             DepEntry{kind, tok, store->retireView().round(), source.size};
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
-            e.type = (kind == ObjectKind::Tree) ? CasEventType::TreePut : CasEventType::BlobPut;
+            e.type = CasEventType::BlobPut;
             e.object_kind = ev_kind;
             e.object_hash = u128ToHex(hash);
             e.token = tok.value;

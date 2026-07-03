@@ -756,17 +756,17 @@ The server successfully detected this situation and will download merged part fr
     M(CasBlobGetStream,  "CA blob get-stream S3 ops", ValueType::Number) \
     M(CasBlobDelete,     "CA blob delete S3 ops", ValueType::Number) \
     M(CasBlobList,       "CA blob list S3 ops", ValueType::Number) \
-    M(CasTreePut,        "CA tree put S3 ops", ValueType::Number) \
-    M(CasTreePutDedup,   "CA tree put-dedup S3 ops", ValueType::Number) \
-    M(CasTreeOverwrite,  "CA tree overwrite S3 ops", ValueType::Number) \
-    M(CasTreeCas,        "CA tree cas S3 ops", ValueType::Number) \
-    M(CasTreeCasConflict,"CA tree cas-conflict S3 ops", ValueType::Number) \
-    M(CasTreeHead,       "CA tree head S3 ops", ValueType::Number) \
-    M(CasTreeHeadMiss,   "CA tree head-miss S3 ops", ValueType::Number) \
-    M(CasTreeGet,        "CA tree get S3 ops", ValueType::Number) \
-    M(CasTreeGetStream,  "CA tree get-stream S3 ops", ValueType::Number) \
-    M(CasTreeDelete,     "CA tree delete S3 ops", ValueType::Number) \
-    M(CasTreeList,       "CA tree list S3 ops", ValueType::Number) \
+    M(CasManifestPut,        "CA manifest put S3 ops", ValueType::Number) \
+    M(CasManifestPutDedup,   "CA manifest put-dedup S3 ops", ValueType::Number) \
+    M(CasManifestOverwrite,  "CA manifest overwrite S3 ops", ValueType::Number) \
+    M(CasManifestCas,        "CA manifest cas S3 ops", ValueType::Number) \
+    M(CasManifestCasConflict,"CA manifest cas-conflict S3 ops", ValueType::Number) \
+    M(CasManifestHead,       "CA manifest head S3 ops", ValueType::Number) \
+    M(CasManifestHeadMiss,   "CA manifest head-miss S3 ops", ValueType::Number) \
+    M(CasManifestGet,        "CA manifest get S3 ops", ValueType::Number) \
+    M(CasManifestGetStream,  "CA manifest get-stream S3 ops", ValueType::Number) \
+    M(CasManifestDelete,     "CA manifest delete S3 ops", ValueType::Number) \
+    M(CasManifestList,       "CA manifest list S3 ops", ValueType::Number) \
     M(CasRootPut,        "CA root put S3 ops", ValueType::Number) \
     M(CasRootPutDedup,   "CA root put-dedup S3 ops", ValueType::Number) \
     M(CasRootOverwrite,  "CA root overwrite S3 ops", ValueType::Number) \

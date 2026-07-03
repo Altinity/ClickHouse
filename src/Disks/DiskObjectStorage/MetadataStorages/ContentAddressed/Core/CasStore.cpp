@@ -787,7 +787,7 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
         _ev0.type = CasEventType::RefResolve;
         _ev0.namespace_ = ns.string();
         _ev0.ref_name = ref_name;
-        _ev0.object_kind = CasEventObjectKind::Tree;
+        _ev0.object_kind = CasEventObjectKind::Manifest;
         _ev0.object_hash = manifestRefDebugString(payload.manifest_ref);
         _ev0.outcome = "resolved";
         _ev0.reason = "read-side resolve of a ref to its part manifest";
@@ -829,7 +829,7 @@ PartManifest Store::readManifest(const ManifestId & id)
         {
             CasEvent _ev1;
             _ev1.type = CasEventType::ReadMissing;
-            _ev1.object_kind = CasEventObjectKind::Tree;
+            _ev1.object_kind = CasEventObjectKind::Manifest;
             _ev1.object_hash = manifestRefDebugString(id.ref);
             _ev1.outcome = "missing";
             _ev1.reason = "live ref names manifest but its object is missing (INV-NO-DANGLE)";
@@ -862,7 +862,7 @@ PartManifest Store::readManifest(const ManifestId & id)
         {
             CasEvent _ev2;
             _ev2.type = CasEventType::CorruptDecode;
-            _ev2.object_kind = CasEventObjectKind::Tree;
+            _ev2.object_kind = CasEventObjectKind::Manifest;
             _ev2.object_hash = manifestRefDebugString(id.ref);
             _ev2.outcome = "corrupt";
             _ev2.reason = "manifest body `ref` does not match the journal ManifestRef (refMatchesBody)";
@@ -881,7 +881,7 @@ PartManifest Store::readManifest(const ManifestId & id)
         {
             CasEvent _ev3;
             _ev3.type = CasEventType::CorruptDecode;
-            _ev3.object_kind = CasEventObjectKind::Tree;
+            _ev3.object_kind = CasEventObjectKind::Manifest;
             _ev3.object_hash = manifestRefDebugString(id.ref);
             _ev3.outcome = "corrupt";
             _ev3.reason = "manifest body root_namespace_id does not match the owning namespace (manifestNamespaceMatches)";
@@ -1376,7 +1376,7 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
         _ev3.type = CasEventType::RefDrop;
         _ev3.namespace_ = ns.string();
         _ev3.ref_name = ref_name;
-        _ev3.object_kind = CasEventObjectKind::Tree;
+        _ev3.object_kind = CasEventObjectKind::Manifest;
         _ev3.object_hash = manifestRefDebugString(dropped_ref);
         _ev3.at_version = at_version;
         _ev3.outcome = "ok";

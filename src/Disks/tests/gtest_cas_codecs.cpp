@@ -104,13 +104,6 @@ TEST(CasEnvelope, FutureCompatibilityVersionThrows)
         [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
 }
 
-TEST(CasEnvelope, WrongKindThrows)
-{
-    EnvelopeHeader h = makeBlobHeader();
-    String bytes = encodeEnvelopeHeader(h);
-    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Tree), DB::Exception);
-}
-
 TEST(CasEnvelope, BadHeaderLenThrows)
 {
     EnvelopeHeader h = makeBlobHeader();

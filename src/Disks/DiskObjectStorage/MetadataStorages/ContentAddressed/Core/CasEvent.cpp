@@ -23,11 +23,11 @@ String toString(CasEventType type)
         case CasEventType::BlobRetire:            return "blob_retire";
         case CasEventType::BlobDelete:            return "blob_delete";
         case CasEventType::BlobForget:            return "blob_forget";
-        case CasEventType::TreePut:               return "tree_put";
-        case CasEventType::TreeExpand:            return "tree_expand";
-        case CasEventType::TreeRetire:            return "tree_retire";
-        case CasEventType::TreeDelete:            return "tree_delete";
-        case CasEventType::TreeStrip:             return "tree_strip";
+        case CasEventType::ManifestPut:           return "manifest_put";
+        case CasEventType::ManifestExpand:        return "manifest_expand";
+        case CasEventType::ManifestRetire:        return "manifest_retire";
+        case CasEventType::ManifestDelete:        return "manifest_delete";
+        case CasEventType::ManifestStrip:         return "manifest_strip";
         case CasEventType::RefPublish:            return "ref_publish";
         case CasEventType::RefDrop:               return "ref_drop";
         case CasEventType::RefRepoint:            return "ref_repoint";
@@ -82,7 +82,7 @@ String toString(CasEventObjectKind kind)
     {
         case CasEventObjectKind::None: return "none";
         case CasEventObjectKind::Blob: return "blob";
-        case CasEventObjectKind::Tree: return "tree";
+        case CasEventObjectKind::Manifest: return "manifest";
         case CasEventObjectKind::Root: return "root";
         case CasEventObjectKind::Snap: return "snap";
     }

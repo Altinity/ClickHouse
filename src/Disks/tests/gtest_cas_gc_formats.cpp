@@ -181,30 +181,25 @@ TEST(CasGcFormats, RetiredEntryCondemnRoundRoundTrips)
     EXPECT_EQ(decodeRetiredSet(encodeRetiredSet(rs0)).entries[0].condemn_round, 0u);
 }
 
-TEST(CasGcFormats, RetiredSetSortedByKindThenHash)
+TEST(CasGcFormats, RetiredSetSortedByHash)
 {
-    /// Entries fed out of (kind, hash) order come back sorted: Blob before Tree, then hash ascending.
+    /// Entries fed out of hash order come back hash-ascending (byte-deterministic encoding).
     RetiredSet rs;
     const auto h_hi = hexToU128("ff000000000000000000000000000000");
     const auto h_lo = hexToU128("00000000000000000000000000000001");
-    rs.entries.push_back({ObjectKind::Tree, h_lo, Token{"a", TokenType::Emulated}, 1});
     rs.entries.push_back({ObjectKind::Blob, h_hi, Token{"b", TokenType::Emulated}, 2});
     rs.entries.push_back({ObjectKind::Blob, h_lo, Token{"c", TokenType::Emulated}, 3});
     const auto d = decodeRetiredSet(encodeRetiredSet(rs));
-    ASSERT_EQ(d.entries.size(), 3u);
-    /// Blob@h_lo, Blob@h_hi, Tree@h_lo.
+    ASSERT_EQ(d.entries.size(), 2u);
     EXPECT_EQ(d.entries[0].kind, ObjectKind::Blob);
     EXPECT_EQ(d.entries[0].hash, h_lo);
     EXPECT_EQ(d.entries[1].kind, ObjectKind::Blob);
     EXPECT_EQ(d.entries[1].hash, h_hi);
-    EXPECT_EQ(d.entries[2].kind, ObjectKind::Tree);
-    EXPECT_EQ(d.entries[2].hash, h_lo);
 
     /// Byte-deterministic: a different input order yields the SAME encoded bytes.
     RetiredSet shuffled;
-    shuffled.entries.push_back(rs.entries[2]);
-    shuffled.entries.push_back(rs.entries[0]);
     shuffled.entries.push_back(rs.entries[1]);
+    shuffled.entries.push_back(rs.entries[0]);
     EXPECT_EQ(encodeRetiredSet(shuffled), encodeRetiredSet(rs));
 }
 
@@ -244,7 +239,7 @@ TEST(CasGcFormats, RetiredSetRoundTrip)
     RetiredSet rs;
     rs.entries.push_back({ObjectKind::Blob, hexToU128("000102030405060708090a0b0c0d0e0f"),
                           Token{"etag-1", TokenType::ETag}, 1234});
-    rs.entries.push_back({ObjectKind::Tree, hexToU128("ffffffffffffffffffffffffffffffff"),
+    rs.entries.push_back({ObjectKind::Blob, hexToU128("ffffffffffffffffffffffffffffffff"),
                           Token{"42", TokenType::Emulated}, 0});
     auto bytes = encodeRetiredSet(rs);
     auto d = decodeRetiredSet(bytes);
@@ -254,7 +249,7 @@ TEST(CasGcFormats, RetiredSetRoundTrip)
     EXPECT_EQ(d.entries[0].token.value, "etag-1");
     EXPECT_EQ(d.entries[0].token.type, TokenType::ETag);
     EXPECT_EQ(d.entries[0].size, 1234u);
-    EXPECT_EQ(d.entries[1].kind, ObjectKind::Tree);
+    EXPECT_EQ(d.entries[1].kind, ObjectKind::Blob);
     EXPECT_EQ(d.entries[1].hash, hexToU128("ffffffffffffffffffffffffffffffff"));
     EXPECT_EQ(d.entries[1].token.value, "42");
     EXPECT_EQ(d.entries[1].token.type, TokenType::Emulated);
@@ -271,20 +266,20 @@ TEST(CasGcFormats, EmptyRetiredSetRoundTrips)
 TEST(CasGcFormats, OutcomeLogRoundTrip)
 {
     OutcomeLog log;
-    log.entries.push_back({ObjectKind::Tree, hexToU128("aa00000000000000000000000000000a"),
+    log.entries.push_back({ObjectKind::Blob, hexToU128("aa00000000000000000000000000000a"),
                            Token{"etag-1", TokenType::ETag}, OutcomeKind::Deleted});
     log.entries.push_back({ObjectKind::Blob, hexToU128("bb00000000000000000000000000000b"),
                            Token{"7", TokenType::Emulated}, OutcomeKind::Spared});
     log.entries.push_back({ObjectKind::Blob, hexToU128("cc00000000000000000000000000000c"),
                            Token{"8", TokenType::Emulated}, OutcomeKind::Replaced});
-    log.entries.push_back({ObjectKind::Tree, hexToU128("dd00000000000000000000000000000d"),
+    log.entries.push_back({ObjectKind::Blob, hexToU128("dd00000000000000000000000000000d"),
                            Token{"9", TokenType::Emulated}, OutcomeKind::Absent});
     auto bytes = encodeOutcomeLog(log);
     ASSERT_FALSE(bytes.empty());
     EXPECT_NE(bytes.front(), '{');   /// not JSON (pure protobuf with CasHeader)
     auto d = decodeOutcomeLog(bytes);
     ASSERT_EQ(d.entries.size(), 4u);
-    EXPECT_EQ(d.entries[0].kind, ObjectKind::Tree);
+    EXPECT_EQ(d.entries[0].kind, ObjectKind::Blob);
     EXPECT_EQ(d.entries[0].hash, hexToU128("aa00000000000000000000000000000a"));
     EXPECT_EQ(d.entries[0].outcome, OutcomeKind::Deleted);
     EXPECT_EQ(d.entries[1].outcome, OutcomeKind::Spared);
@@ -423,7 +418,7 @@ TEST(CasGcFormats, OutcomeLogValidation)
 TEST(CasHeaderGolden, GcOutcomesCasHeaderRoundTrips)
 {
     OutcomeLog log;
-    log.entries.push_back({ObjectKind::Tree, hexToU128("aa00000000000000000000000000000a"),
+    log.entries.push_back({ObjectKind::Blob, hexToU128("aa00000000000000000000000000000a"),
                            Token{"etag-1", TokenType::ETag}, OutcomeKind::Deleted});
     log.entries.push_back({ObjectKind::Blob, hexToU128("bb00000000000000000000000000000b"),
                            Token{"7", TokenType::Emulated}, OutcomeKind::Spared});
@@ -437,7 +432,7 @@ TEST(CasHeaderGolden, GcOutcomesCasHeaderRoundTrips)
     EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
     const OutcomeLog d = decodeOutcomeLog(bytes);
     ASSERT_EQ(d.entries.size(), 2u);
-    EXPECT_EQ(d.entries[0].kind, ObjectKind::Tree);
+    EXPECT_EQ(d.entries[0].kind, ObjectKind::Blob);
     EXPECT_EQ(d.entries[0].hash, hexToU128("aa00000000000000000000000000000a"));
     EXPECT_EQ(d.entries[0].outcome, OutcomeKind::Deleted);
     EXPECT_EQ(d.entries[1].outcome, OutcomeKind::Spared);
@@ -490,7 +485,7 @@ TEST(CasHeaderGolden, RetiredSetCasHeaderRoundTrips)
     RetiredSet rs;
     rs.entries.push_back({ObjectKind::Blob, hexToU128("000102030405060708090a0b0c0d0e0f"),
                           Token{"etag-1", TokenType::ETag}, 1234});
-    rs.entries.push_back({ObjectKind::Tree, hexToU128("ffffffffffffffffffffffffffffffff"),
+    rs.entries.push_back({ObjectKind::Blob, hexToU128("ffffffffffffffffffffffffffffffff"),
                           Token{"42", TokenType::Emulated}, 0});
     const String bytes = encodeRetiredSet(rs);
     ASSERT_FALSE(bytes.empty());
@@ -501,10 +496,10 @@ TEST(CasHeaderGolden, RetiredSetCasHeaderRoundTrips)
     EXPECT_EQ(msg.header().compatibility_version(), currentCompatibilityVersion());
     const RetiredSet d = decodeRetiredSet(bytes);
     ASSERT_EQ(d.entries.size(), 2u);
-    /// Order after sort (Blob < Tree by kind).
+    /// Order after sort (ascending hash).
     EXPECT_EQ(d.entries[0].kind, ObjectKind::Blob);
     EXPECT_EQ(d.entries[0].token.value, "etag-1");
-    EXPECT_EQ(d.entries[1].kind, ObjectKind::Tree);
+    EXPECT_EQ(d.entries[1].kind, ObjectKind::Blob);
     EXPECT_EQ(d.entries[1].token.value, "42");
 }
 

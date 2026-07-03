@@ -17,7 +17,7 @@ namespace DB::Cas
 enum class CasEventType
 {
     BlobPut, BlobReuseAdopt, BlobReuseResurrect, BlobCopyForward, BlobRetire, BlobDelete, BlobForget,
-    TreePut, TreeExpand, TreeRetire, TreeDelete, TreeStrip,
+    ManifestPut, ManifestExpand, ManifestRetire, ManifestDelete, ManifestStrip,
     RefPublish, RefDrop, RefRepoint, RootAdd, RootRemove, RootRepoint, IndegZero,
     GcFoldBegin, GcFoldEnd, GcRetireObserve, GcRetireDecision, GcRecheckVerdict,
     GcFence, GcSnapPersist, GcCursorAdvance, GcTrim, GcShardReclaim, GcFenceOut, GcRebuild, GcFoldClamp,
@@ -28,7 +28,7 @@ enum class CasEventType
     CorruptDangle, CorruptDecode, SnapJournalIncoherent, Exception,
 };
 
-enum class CasEventObjectKind { None, Blob, Tree, Root, Snap };
+enum class CasEventObjectKind { None, Blob, Manifest, Root, Snap };
 
 /// Map an internal `ObjectKind` to the audit-log `CasEventObjectKind`. Single source for the mapping
 /// previously open-coded as a ternary at each emission site.
@@ -37,7 +37,6 @@ inline CasEventObjectKind toEventKind(ObjectKind kind)
     switch (kind)
     {
         case ObjectKind::Blob: return CasEventObjectKind::Blob;
-        case ObjectKind::Tree: return CasEventObjectKind::Tree;
     }
 }
 

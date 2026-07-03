@@ -27,7 +27,7 @@ TEST(CasEvent, ConstructAndCopyAndName)
     EXPECT_EQ(toString(CasEventType::BlobDelete), "blob_delete");
     EXPECT_EQ(toString(CasEventType::IndegZero), "indeg_zero");
     EXPECT_EQ(toString(CasEventType::GcRecheckVerdict), "gc_recheck_verdict");
-    EXPECT_EQ(toString(CasEventObjectKind::Tree), "tree");
+    EXPECT_EQ(toString(CasEventObjectKind::Manifest), "manifest");
 }
 
 TEST(CasEvent, StoreEmitsToSink)
@@ -149,7 +149,7 @@ TEST(CasEvent, LifecycleReconstructionFromRows)
     ASSERT_FALSE(b->head(s->layout().blobKey(BlobId{blob_hash})).exists)
         << "GC must have deleted the now-unreferenced blob";
 
-    /// (a) the expected taxonomy was emitted across the lifecycle (manifest model: no trees).
+    /// (a) the expected taxonomy was emitted across the lifecycle (manifest model: no standalone trees).
     EXPECT_TRUE(hasType(events, CasEventType::BlobPut));
     EXPECT_TRUE(hasType(events, CasEventType::RootAdd))
         << "a fold must have recorded the manifest owner's blob edge (+1)";
@@ -159,7 +159,7 @@ TEST(CasEvent, LifecycleReconstructionFromRows)
         || hasType(events, CasEventType::GcRetireDecision)
         || hasType(events, CasEventType::GcRecheckVerdict))
         << "a GC retire/recheck transition must be recorded";
-    EXPECT_TRUE(hasType(events, CasEventType::BlobDelete) || hasType(events, CasEventType::TreeDelete))
+    EXPECT_TRUE(hasType(events, CasEventType::BlobDelete) || hasType(events, CasEventType::ManifestDelete))
         << "the single content-delete site must emit a delete row";
 
     /// (b) completeness mandate: every emitted event has a non-empty reason (the human WHY).
