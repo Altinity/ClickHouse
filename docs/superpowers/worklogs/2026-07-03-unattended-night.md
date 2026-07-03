@@ -80,6 +80,26 @@ content_addressed_log default-ON in programs/server/config.xml (experimental => 
 recommendation); soak root_shards 64 -> 8 (16 files); gc_trim_body_soft_limit 8 MiB -> 96 KiB
 (bodies stay under the RustFS 128 KiB inline threshold => rustfs#3231 leak sidestepped).
 
-## 6. 1h soak (pending: after subagent lands Tasks 4-5 + full rebuild of the binary)
+- Tasks 4-5 DONE by the subagent (`44d06a1e57a`, `fcf630bded7`): SYSTEM CONTENT ADDRESSED GC
+  REBUILD [FORCE] (reuses the GC access type; refusal => BAD_ARGUMENTS with the reason),
+  clickhouse-disks ca-gc-rebuild (read-only open + fresh gc_id + key=value report), operator
+  runbook + 04-gc-protocol §gc-rebuild + ROADMAP row. CasGcRebuild+Guard 11/11; full link x2.
+  Deviation noted: no dedicated gc-round-log row for rebuild (LOG_INFO + the gc_rebuild
+  content_addressed_log event carry the audit); follow-up candidate.
+
+## 6. 1h validation soak — RUNNING (seed 20260704, compressed 1h plan, 20 faults)
+
+First sample (~T+15m, warmup): pool 565 MB; **CasShardBatchedMutations=12985 with
+refs-conflicts=5** — the flat-combining queue works in production (vs 257k conflicts/h on the
+previous binary). Monitor samples every 15 min (pool, shard body size vs the 96 KiB cap,
+conflicts, batching).
+
+## 7. Docker image — DONE
+
+`cas-nightly:20260703` (1.72 GB): stock clickhouse-server:25.8 base + the night's binary
+(strip-debug, 926 MB) with symlinked server/client/disks. Smoke: `clickhouse-server --version`
+= 26.6.1.1 (our build). Dockerfile in tmp/docker-cas-nightly/.
+
+## 8. Scenarios (pending: after the soak frees the cluster)
 
 
