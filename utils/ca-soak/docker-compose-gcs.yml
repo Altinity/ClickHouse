@@ -11,7 +11,7 @@
 #      (--env-file feeds the ${GCS_*} interpolations below; ClickHouse itself reads the AWS_* names)
 #   3. Fresh-run cleanup (the bucket persists between runs, unlike `down -v` on RustFS); each
 #      run uses a UNIQUE prefix (bump the date/rN suffix in storage_conf_gcs_*.xml):
-#        gcloud storage rm -r gs://content-adressable-test-mfilimonov/ca_live_20260703_g1/
+#        gcloud storage rm -r gs://content-adressable-test-mfilimonov/ca_live_20260703_g2/
 #
 # NOTE: the CA capability probe runs on mount and is itself the FIRST validation step here — it
 # demands the store enforce conditional ops (wrong-token DELETE must fail with 412). If AWS
@@ -55,6 +55,7 @@ services:
       - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
       - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
       - ./configs/ca_server_settings.xml:/etc/clickhouse-server/config.d/ca_server_settings.xml:ro
+      - ./configs/fsck_only_gcs.xml:/etc/clickhouse-server/fsck-only.xml:ro
       - ./logs/ch1:/var/log/clickhouse-server
       - ch1_data:/var/lib/clickhouse
     ports:
@@ -91,6 +92,7 @@ services:
       - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
       - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
       - ./configs/ca_server_settings.xml:/etc/clickhouse-server/config.d/ca_server_settings.xml:ro
+      - ./configs/fsck_only_gcs.xml:/etc/clickhouse-server/fsck-only.xml:ro
       - ./logs/ch2:/var/log/clickhouse-server
       - ch2_data:/var/lib/clickhouse
     ports:

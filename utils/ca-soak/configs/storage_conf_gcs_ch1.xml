@@ -16,24 +16,16 @@
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
                 <metadata_type>content_addressed</metadata_type>
-                <endpoint>https://storage.googleapis.com/content-adressable-test-mfilimonov/ca_live_20260703_g1/soak_pool/</endpoint>
+                <endpoint>https://storage.googleapis.com/content-adressable-test-mfilimonov/ca_live_20260703_g2/soak_pool/</endpoint>
                 <use_environment_credentials>1</use_environment_credentials>
+                <!-- The GCS Generation-token binding (spec 2026-07-03): GOOG4-HMAC signing +
+                     x-goog conditional dialect. Without this the S3-compat surface silently
+                     ignores every precondition and the probe refuses the mount (measured). -->
+                <http_client>gcs_hmac</http_client>
                 <server_root_id>ca_live_{replica}</server_root_id>
                 <gc_enabled>1</gc_enabled>
                 <gc_interval_sec>10</gc_interval_sec>
             </ca>
-
-            <!-- Read-only fsck view over the SAME live pool (mirrors storage_conf_ch1.xml). -->
-            <ca_ro>
-                <type>object_storage</type>
-                <object_storage_type>s3</object_storage_type>
-                <metadata_type>content_addressed</metadata_type>
-                <endpoint>https://storage.googleapis.com/content-adressable-test-mfilimonov/ca_live_20260703_g1/soak_pool/</endpoint>
-                <use_environment_credentials>1</use_environment_credentials>
-                <server_root_id>ca_live_{replica}</server_root_id>
-                <gc_enabled>0</gc_enabled>
-                <readonly>true</readonly>
-            </ca_ro>
         </disks>
         <policies>
             <ca>
