@@ -57,6 +57,15 @@ public:
         return prefix + "/cas/refs/" + ns.string() + "/" + std::to_string(shard);
     }
 
+    /// Namespace-scoped ref-shard prefix: `<prefix>/cas/refs/<ns>/` — the parent of every
+    /// `rootShardKey(ns, shard)`. One LIST of it enumerates the namespace's PRESENT shard
+    /// objects (listRefs uses it to avoid a HEAD per shard; the 2026-07-03 CREATE storm).
+    String refsNamespacePrefix(const RootNamespace & ns) const
+    {
+        checkNamespace(ns);
+        return prefix + "/cas/refs/" + ns.string() + "/";
+    }
+
     /// Pool-wide ref-shard prefix (Phase 1): `<prefix>/cas/refs/`. The base of every `rootShardKey`,
     /// used by GC discovery for the LIST sweep and the strip-to-cursor-key step.
     String casRefsPrefix() const

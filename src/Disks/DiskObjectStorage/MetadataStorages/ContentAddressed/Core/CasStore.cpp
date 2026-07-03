@@ -948,11 +948,53 @@ BlobLocation Store::locate(const ManifestEntry & entry) const
 
 std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
 {
-    /// Refs are sharded by name across all root shards; the full ref set is the union over every shard.
-    /// Listing tolerates a point-in-time snapshot: pass allow_stale=true to benefit from the TTL
-    /// fast-path and skip a HEAD per shard when a recent decode is already cached.
+    /// Refs are sharded by name across all root shards; the full ref set is the union over every PRESENT
+    /// shard. LIST-first (2026-07-03 CREATE/load HEAD storm): looping HEAD over every one of
+    /// `meta.root_shards` (32 by default) to find which shards exist made an empty/new namespace cost a
+    /// HEAD per shard on every CREATE/table-load — ~100 HEAD-misses across the three existsDirectory/
+    /// listDirectory/table-load sweeps. Instead, ONE LIST of the namespace's ref-shard prefix
+    /// (`refsNamespacePrefix`) learns which shard objects EXIST; only those are decoded. An empty
+    /// namespace now costs exactly 1 LIST and zero HEAD/GET. Listing tolerates a point-in-time snapshot:
+    /// pass allow_stale=true to benefit from the per-shard TTL fast-path (unchanged, still PRESENT-shard
+    /// only by design).
     std::map<String, Resolved> result;
-    for (uint64_t shard = 0; shard < meta.root_shards; ++shard)
+    const String prefix = pool_layout.refsNamespacePrefix(ns);
+    std::vector<uint64_t> present_shards;
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = pool_backend->list(prefix, cursor, /*limit=*/1024);
+        for (const ListedKey & lk : page.keys)
+        {
+            if (!lk.key.starts_with(prefix))
+                continue;
+            const std::string_view rest(lk.key.data() + prefix.size(), lk.key.size() - prefix.size());
+            const size_t slash = rest.rfind('/');
+            const std::string_view shard_sv = slash == std::string_view::npos ? rest : rest.substr(slash + 1);
+            uint64_t shard = 0;
+            bool valid = !shard_sv.empty();
+            for (const char c : shard_sv)
+            {
+                if (c < '0' || c > '9')
+                {
+                    valid = false;
+                    break;
+                }
+                shard = shard * 10 + static_cast<uint64_t>(c - '0');
+            }
+            /// A stray non-numeric key or an out-of-range shard index is a foreign/corrupt object under
+            /// the namespace prefix — skip it defensively rather than throw (listing is a read path; one
+            /// bad object must never break listRefs for every caller).
+            if (!valid || shard >= meta.root_shards)
+                continue;
+            present_shards.push_back(shard);
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+
+    for (const uint64_t shard : present_shards)
     {
         const auto root = readShardDecoded(ns, shard, /*allow_stale=*/true);
         for (const auto & [ref_name, payload] : root->refs)

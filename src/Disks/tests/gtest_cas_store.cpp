@@ -677,6 +677,103 @@ TEST(CasStore, ListRefsMergesAllShards)
     }
 }
 
+/// Task A (2026-07-03 CREATE/load HEAD storm): an empty namespace must cost exactly one LIST of the
+/// namespace's ref-shard prefix and ZERO HEADs — not one HEAD per root shard (32 by default). Measure
+/// deltas around the listRefs call: Store::open itself may LIST (probe/pool-meta), so the pre-call
+/// counts are the baseline.
+TEST(CasStore, ListRefsEmptyNamespaceCostsOneListZeroHeads)
+{
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    RootNamespace ns{"srv1/tbl"};
+
+    const uint64_t heads_before = b->headTotal();
+    const uint64_t lists_before = b->listTotal();
+
+    auto refs = s->listRefs(ns);
+
+    EXPECT_TRUE(refs.empty());
+    EXPECT_EQ(b->headTotal() - heads_before, 0u)
+        << "empty-namespace listRefs must not HEAD any shard (the CREATE/load storm)";
+    EXPECT_EQ(b->listTotal() - lists_before, 1u)
+        << "empty-namespace listRefs must cost exactly one LIST of the namespace's ref-shard prefix";
+}
+
+/// listRefs, after switching to LIST-first shard discovery, must still return exactly the same content
+/// as the old HEAD-every-shard loop, and must HEAD no more than the number of PRESENT shards (not
+/// root_shards).
+TEST(CasStore, ListRefsReturnsSameContentAsBefore)
+{
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    Layout layout("p");
+    RootNamespace ns{"srv1/tbl"};
+    const uint64_t shards = s->poolMeta().root_shards;
+
+    /// Publish refs "a", "m", "z" — chosen so they are highly likely to land in different shards
+    /// (shardOfForTest hashes the ref name); collect the actual set of PRESENT shards below.
+    std::map<uint64_t, RootShard> by_shard;
+    for (const String & ref : {String("a"), String("m"), String("z")})
+    {
+        const ManifestRef mref = manifestRefFor("manifest-" + ref);
+        RootRef rr;
+        rr.ref_name = ref;
+        rr.manifest_ref = mref;
+        by_shard[shardOfForTest(ref, shards)].refs[ref] = rr;
+    }
+    for (auto & [shard, root] : by_shard)
+    {
+        root.shard_version = 1;
+        publishRaw(*b, layout, ns, shard, root);
+    }
+    const uint64_t present_shards = by_shard.size();
+
+    const uint64_t heads_before = b->headTotal();
+
+    auto refs = s->listRefs(ns);
+
+    ASSERT_EQ(refs.size(), 3u);
+    for (const String & ref : {String("a"), String("m"), String("z")})
+    {
+        ASSERT_TRUE(refs.count(ref));
+        EXPECT_EQ(refs.at(ref).manifest_id.ref, manifestRefFor("manifest-" + ref));
+        EXPECT_EQ(refs.at(ref).manifest_id.root_namespace.string(), ns.string());
+    }
+    EXPECT_LE(b->headTotal() - heads_before, present_shards)
+        << "listRefs must HEAD only the PRESENT shards, never every root shard";
+}
+
+/// A stray non-numeric key under the namespace's ref-shard prefix (a foreign/corrupt object) must not
+/// break listRefs — it is skipped defensively, listRefs still returns the legit refs and never throws.
+TEST(CasStore, ListRefsSkipsForeignKeys)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    Layout layout("p");
+    RootNamespace ns{"srv1/tbl"};
+    const uint64_t shards = s->poolMeta().root_shards;
+
+    const String ref = "legit";
+    const ManifestRef mref = manifestRefFor("manifest-" + ref);
+    RootRef rr;
+    rr.ref_name = ref;
+    rr.manifest_ref = mref;
+    RootShard root;
+    root.shard_version = 1;
+    root.refs[ref] = rr;
+    const uint64_t shard = shardOfForTest(ref, shards);
+    publishRaw(*b, layout, ns, shard, root);
+
+    /// A stray non-numeric key directly under the namespace's ref-shard prefix.
+    b->putIfAbsent(layout.refsNamespacePrefix(ns) + "garbage", "not-a-shard");
+
+    std::map<String, Resolved> refs;
+    EXPECT_NO_THROW(refs = s->listRefs(ns));
+    ASSERT_EQ(refs.size(), 1u);
+    ASSERT_TRUE(refs.count(ref));
+    EXPECT_EQ(refs.at(ref).manifest_id.ref, mref);
+}
+
 /// readManifest fails CLOSED on a corrupt or kind-mismatched manifest body addressed by a live id.
 TEST(CasStore, ReadManifestFailsClosed)
 {

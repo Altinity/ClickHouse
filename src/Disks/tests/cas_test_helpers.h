@@ -621,6 +621,16 @@ public:
         return InMemoryBackend::getStream(key, range);
     }
 
+    DB::Cas::ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++list_counts[prefix];
+            ++list_total;
+        }
+        return InMemoryBackend::list(prefix, cursor, limit);
+    }
+
     DB::Cas::PutResult putIfAbsent(const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta = {}) override
     {
         {
@@ -635,6 +645,7 @@ public:
     uint64_t getCount(const String & key) const { return lookup(get_counts, key); }
     uint64_t putCount(const String & key) const { return lookup(put_counts, key); }
     uint64_t getStreamCount(const String & key) const { return lookup(get_stream_counts, key); }
+    uint64_t listCount(const String & prefix) const { return lookup(list_counts, prefix); }
     /// The max ranged-get window length observed for `key` (0 if only whole-object gets, or none).
     uint64_t maxRangedGetLen(const String & key) const { return lookup(max_ranged_get_len, key); }
     /// How many whole-object gets (range.whole()) hit `key` — nonzero flags a resident-memory
@@ -644,6 +655,7 @@ public:
     uint64_t getTotal() const { std::lock_guard lock(count_mutex); return get_total; }
     uint64_t putTotal() const { std::lock_guard lock(count_mutex); return put_total; }
     uint64_t getStreamTotal() const { std::lock_guard lock(count_mutex); return get_stream_total; }
+    uint64_t listTotal() const { std::lock_guard lock(count_mutex); return list_total; }
 
     /// The total number of get + getStream + putIfAbsent operations against any key whose path
     /// CONTAINS `substr` (T0 idle-round gate: zero run I/O touches every `.../blob_target/...` key).
@@ -667,9 +679,10 @@ public:
         get_counts.clear();
         put_counts.clear();
         get_stream_counts.clear();
+        list_counts.clear();
         max_ranged_get_len.clear();
         whole_get_counts.clear();
-        head_total = get_total = put_total = get_stream_total = 0;
+        head_total = get_total = put_total = get_stream_total = list_total = 0;
     }
 
 private:
@@ -685,12 +698,14 @@ private:
     std::map<String, uint64_t> get_counts;
     std::map<String, uint64_t> put_counts;
     std::map<String, uint64_t> get_stream_counts;
+    std::map<String, uint64_t> list_counts;
     std::map<String, uint64_t> max_ranged_get_len;
     std::map<String, uint64_t> whole_get_counts;
     uint64_t head_total = 0;
     uint64_t get_total = 0;
     uint64_t put_total = 0;
     uint64_t get_stream_total = 0;
+    uint64_t list_total = 0;
 };
 
 }
