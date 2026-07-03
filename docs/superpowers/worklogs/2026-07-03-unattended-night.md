@@ -87,12 +87,37 @@ recommendation); soak root_shards 64 -> 8 (16 files); gc_trim_body_soft_limit 8 
   Deviation noted: no dedicated gc-round-log row for rebuild (LOG_INFO + the gc_rebuild
   content_addressed_log event carry the audit); follow-up candidate.
 
-## 6. 1h validation soak — RUNNING (seed 20260704, compressed 1h plan, 20 faults)
+## 6. 1h validation soak (seed 20260704) — THE BIG SAFETY FIND + queue validation
 
-First sample (~T+15m, warmup): pool 565 MB; **CasShardBatchedMutations=12985 with
-refs-conflicts=5** — the flat-combining queue works in production (vs 257k conflicts/h on the
-previous binary). Monitor samples every 15 min (pool, shard body size vs the 96 KiB cap,
-conflicts, batching).
+**Queue validated in production**: 200,675 mutations / 87,594 casPuts = 2.3x compression;
+intra-server refs conflicts **11 total** (vs 257k/h on the previous binary); CasOtherCas ==
+flushes exactly. Self-remounts + chaos kills survived.
+
+**Config-physics finding (root_shards=8 + 96 KiB trim cap):** the cap cannot bind the body at 8
+shards — trim only cuts BELOW the sealed cursor, and the tail-above-cursor is round-cadence-bound
+(5-9 min of 8x-concentrated traffic = 300-600 KB). Observed body 588 KB; 8,471 leaked rustfs#3231
+dirs on ONE key; refs plane 64 GB in 30 min. CONCLUSION for morning: at 8 shards the only body
+lever is round cadence; either keep more shards on soak until the upstream fix, or accept the
+leak, or drive rounds faster. (The cap is still right for healthy pools.)
+
+**THE SAFETY BUG (fixed tonight, `c47d10d01ec`): clamped shards break the ack-floor graduation
+lemma.** Chaos checkpoint went `persistent-dangling`: **31 dangling blobs + 1 dangling manifest**
+(committed refs -> absent objects) — INV-NO-LOSS violated on the pre-fix binary. Forensics
+(archive: `logs/archive_night_validation_20260703/`, full event+gc logs both replicas): 11 shards
+CLAMPED continuously rounds 25-51; blob df30f113 condemned r32 -> pending r34 -> DELETED r35 while
+its landed +1 sat UNFOLDED behind a clamp; the +1 folded at r52 => dangle. 'landed before the cut
+=> folded before graduation' simply does not hold for clamped shards — the model's
+SabotageSkipChangedShard counterexample realized (the sanctioned clamp path IS an unconsumed-
+landed-events skip; nothing compensated).
+**Fix (conservative, restores the lemma's precondition):** a pass whose fold recorded ANY clamp
+anomaly is destruction-suppressed — no graduations, no redeletes (pending entries carry
+UNCHANGED); condemn/spare continue; deletes resume on the first clamp-free pass. LOG_WARNING +
+CasGcClampSuppressedPasses counter. Regression test reconstructs the incident exactly: RED without
+the fix (blob deleted by round ~3), GREEN with it. Cas* 450/450.
+**Morning follow-ups:** (1) why 11 clamps persisted 30 min (clamp REASONS are in the archived
+server logs — true-removal-missing-body vs bodiless precommit attribution); (2) liveness under
+long clamps (suppression stalls deletes — clamp-unsticking may need its own work); (3) TLA+ model
+extension for clamps+suppression (currently argued, not machine-checked).
 
 ## 7. Docker image — DONE
 
