@@ -73,6 +73,7 @@ private:
     void syncMerges();
 
     void runContentAddressedGarbageCollection(const String & disk_name);
+    void runContentAddressedGcRebuild(const String & disk_name, bool force);
 
     void loadPrimaryKeys();
     void unloadPrimaryKeys();

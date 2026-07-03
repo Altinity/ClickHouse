@@ -334,3 +334,26 @@ TEST(CasGcRebuild, UnownedAliveManifestOverProtected)
     }
     EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(9))))).exists);
 }
+
+/// Task 4 (SYSTEM CONTENT ADDRESSED GC REBUILD): a rebuild refuses when ANOTHER Gc instance holds
+/// the lease, even under FORCE (FORCE bypasses the "healthy state" refusal, not the lease). Gc A's
+/// runRegularRound freshly acquires/renews the lease; Gc B (a different gc_id) must see it as live.
+TEST(CasGcRebuild, LeaseConflictRefuses)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc_a(store, kGc);
+    gc_a.runRegularRound();   /// Gc A acquires/renews the lease.
+
+    Gc gc_b(store, hexToU128("00000000000000000000000000000002"));
+    const RebuildReport rep = gc_b.rebuildBaseline(/*force*/ true);
+    EXPECT_FALSE(rep.performed);
+    EXPECT_NE(rep.refusal.find("lease"), String::npos) << rep.refusal;
+    EXPECT_NE(rep.refusal.find("leader"), String::npos) << rep.refusal;
+}

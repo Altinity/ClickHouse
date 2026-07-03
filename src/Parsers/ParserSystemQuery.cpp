@@ -474,6 +474,23 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
             }
             break;
         }
+        case Type::CONTENT_ADDRESSED_GC_REBUILD:
+        {
+            /// SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] [<disk>] [ON CLUSTER cluster]. FORCE is an
+            /// optional keyword preceding the (also optional) disk name; mirror the GC-collection
+            /// branch above for the disk/ON CLUSTER handling.
+            res->content_addressed_gc_rebuild_force = ParserKeyword{Keyword::FORCE}.ignore(pos, expected);
+            auto saved_pos = pos;
+            Expected target_expected = expected;
+            if (!parseQueryWithOnClusterAndTarget(res, pos, target_expected, SystemQueryTargetType::Disk))
+            {
+                pos = saved_pos;
+                res->disk.clear();
+                if (!parseQueryWithOnCluster(res, pos, expected))
+                    return false;
+            }
+            break;
+        }
         /// FLUSH DISTRIBUTED requires table
         /// START/STOP DISTRIBUTED SENDS does not require table
         case Type::STOP_DISTRIBUTED_SENDS:

@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
@@ -16,6 +17,7 @@
 #include <Common/DateLUT.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <Common/thread_local_rng.h>
 #include <chrono>
 #include <filesystem>
 #include <ctime>
@@ -306,6 +308,19 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
             store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
             disk_name, makeGcRoundLogger());
     return gc_scheduler->runOneRoundNow(ContentAddressed::GcRoundLogRecord::Trigger::Manual);
+}
+
+Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force)
+{
+    if (read_only || !gc_enabled)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Garbage collection is not enabled on this content-addressed disk");
+    /// A one-shot Gc instance is fine here (unlike the scheduler's stable-instance requirement for
+    /// the lease's observation-window steal protocol): rebuildBaseline does its own lease
+    /// acquire/steal check internally and this command runs exactly one round.
+    const UInt128 gc_id = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
+    Cas::Gc gc(store(), gc_id);
+    return gc.rebuildBaseline(force);
 }
 
 void ContentAddressedMetadataStorage::startup()

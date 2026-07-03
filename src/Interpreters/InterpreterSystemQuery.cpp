@@ -1005,6 +1005,12 @@ BlockIO InterpreterSystemQuery::execute()
             runContentAddressedGarbageCollection(query.disk);
             break;
         }
+        case Type::CONTENT_ADDRESSED_GC_REBUILD:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GARBAGE_COLLECTION);
+            runContentAddressedGcRebuild(query.disk, query.content_addressed_gc_rebuild_force);
+            break;
+        }
         case Type::FLUSH_LOGS:
         {
             getContext()->checkAccess(AccessType::SYSTEM_FLUSH_LOGS);
@@ -2209,6 +2215,63 @@ void InterpreterSystemQuery::runContentAddressedGarbageCollection(const String &
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "No content-addressed disks are configured on this node");
 }
 
+void InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk_name, bool force)
+{
+    /// Same content-addressed-disk detection as runContentAddressedGarbageCollection: plain
+    /// (non-object-storage) disks throw NOT_IMPLEMENTED from getMetadataStorage - that simply means
+    /// "not content-addressed" for our purposes.
+    auto content_addressed_storage_of = [](const DiskPtr & disk) -> ContentAddressedMetadataStorage *
+    {
+        MetadataStoragePtr md;
+        try
+        {
+            md = disk->getMetadataStorage();
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::NOT_IMPLEMENTED)
+                return nullptr;
+            throw;
+        }
+        if (!md || !md->isContentAddressed())
+            return nullptr;
+        return dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
+    };
+
+    auto log_and_check = [&](const String & name, const Cas::RebuildReport & rep)
+    {
+        if (!rep.performed)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "CAS GC rebuild refused: {}", rep.refusal);
+        LOG_INFO(log,
+            "CAS GC rebuild on disk '{}' completed: round={} generation={} namespaces={} shards={} "
+            "committed_refs={} live_precommits={} unowned_alive_manifests={} edges={} clamped_shards={}",
+            name, rep.round, rep.generation, rep.namespaces, rep.shards, rep.committed_refs,
+            rep.live_precommits, rep.unowned_alive_manifests, rep.edges, rep.clamped_shards);
+    };
+
+    if (!disk_name.empty())
+    {
+        auto disk = getContext()->getDisk(disk_name);
+        auto * ca = content_addressed_storage_of(disk);
+        if (!ca)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
+        log_and_check(disk_name, ca->runGcRebuildNow(force));   /// synchronous, one rebuild
+        return;
+    }
+
+    size_t ran = 0;
+    for (const auto & [name, disk] : getContext()->getDisksMap())
+    {
+        if (auto * ca = content_addressed_storage_of(disk))
+        {
+            log_and_check(name, ca->runGcRebuildNow(force));   /// synchronous, one rebuild
+            ++ran;
+        }
+    }
+    if (ran == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No content-addressed disks are configured on this node");
+}
+
 void InterpreterSystemQuery::loadPrimaryKeys()
 {
     loadOrUnloadPrimaryKeysImpl(true);
@@ -2761,6 +2824,7 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
             break;
         }
         case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
+        case Type::CONTENT_ADDRESSED_GC_REBUILD:
         {
             required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GARBAGE_COLLECTION);
             break;

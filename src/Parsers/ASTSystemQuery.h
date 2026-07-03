@@ -147,6 +147,7 @@ public:
         INSTRUMENT_REMOVE,
         RESET_DDL_WORKER,
         CONTENT_ADDRESSED_GARBAGE_COLLECTION,
+        CONTENT_ADDRESSED_GC_REBUILD,
         END
     };
 
@@ -177,6 +178,9 @@ public:
     String storage_policy;
     String volume;
     String disk;
+    /// SYSTEM CONTENT ADDRESSED GC REBUILD FORCE [<disk>] — the raw baseline-rebuild disaster
+    /// recovery command's optional FORCE keyword (bypass the "healthy state" refusal).
+    bool content_addressed_gc_rebuild_force = false;
     UInt64 seconds{};
     UInt64 untracked_memory_size{};
 

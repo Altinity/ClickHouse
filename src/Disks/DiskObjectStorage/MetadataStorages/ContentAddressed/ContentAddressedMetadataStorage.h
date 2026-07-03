@@ -67,6 +67,14 @@ public:
     /// BAD_ARGUMENTS when GC is disabled (read-only disk or gc_enabled=false).
     Cas::RoundReport runGarbageCollectionRoundNow();
 
+    /// SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE]: the gc/state disaster-recovery command (spec
+    /// 2026-07-03). Constructs a fresh `Cas::Gc` with a freshly minted gc_id (the same one-shot
+    /// pattern as `runGarbageCollectionRoundNow`/`CasGcScheduler::runOneRoundNow`) and calls
+    /// `Gc::rebuildBaseline`. A refused rebuild (`report.performed == false`) writes nothing; the
+    /// caller (the SYSTEM interpreter) is responsible for surfacing `report.refusal` loudly. Throws
+    /// BAD_ARGUMENTS when GC is disabled (read-only disk or gc_enabled=false) — same gate as above.
+    Cas::RebuildReport runGcRebuildNow(bool force);
+
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
     const std::string & getPath() const override { return storage_path_full; }
     bool supportsChmod() const override { return false; }
