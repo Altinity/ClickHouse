@@ -41,6 +41,7 @@ namespace DB::ErrorCodes
 extern const int BAD_ARGUMENTS;
 extern const int LOGICAL_ERROR;
 extern const int LIMIT_EXCEEDED;
+extern const int DATALAKE_DATABASE_ERROR;
 }
 
 namespace DB::DataLakeStorageSetting
@@ -442,6 +443,10 @@ static bool writeMetadataFiles(
         }
     };
 
+    /// Becomes true when the catalog's commit response was lost (CommitOutcome::Unknown): the
+    /// commit may have already landed, so retrying would double-apply the mutation.
+    bool commit_outcome_unknown = false;
+
     try
     {
         for (const auto & [partition_key, delete_filename] : delete_filenames.delete_file)
@@ -553,18 +558,24 @@ static bool writeMetadataFiles(
                 }
                 if (outcome == DataLake::CommitOutcome::Unknown)
                 {
-                    LOG_ERROR(
-                        getLogger("IcebergMutations"),
+                    commit_outcome_unknown = true;
+                    throw Exception(
+                        ErrorCodes::DATALAKE_DATABASE_ERROR,
                         "Iceberg mutation commit for {}.{} is of unknown status after a lost response; "
-                        "preserving written files to avoid corrupting a possibly-committed snapshot.",
+                        "the commit may have already landed, so it is not safe to retry. "
+                        "Written files are preserved and manual verification against the catalog "
+                        "is required before retrying.",
                         namespace_name, table_name);
-                    return false;
                 }
             }
         }
     }
     catch (...)
     {
+        if (commit_outcome_unknown)
+        {
+            throw;
+        }
         cleanup();
         throw;
     }

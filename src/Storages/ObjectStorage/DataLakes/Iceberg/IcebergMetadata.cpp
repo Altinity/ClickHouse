@@ -113,6 +113,7 @@ extern const int S3_ERROR;
 extern const int TABLE_ALREADY_EXISTS;
 extern const int SUPPORT_IS_DISABLED;
 extern const int INCORRECT_DATA;
+extern const int DATALAKE_DATABASE_ERROR;
 }
 
 namespace Setting
@@ -1648,6 +1649,9 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     /// snapshot and must NOT be deleted by the outer failure cleanup, otherwise the
     /// already-published snapshot becomes unreadable.
     bool published = false;
+    /// Becomes true when the catalog's commit response was lost (CommitOutcome::Unknown): the
+    /// commit may have already landed, so retrying would risk double-applying it.
+    bool commit_outcome_unknown = false;
 
     auto cleanup = [&](bool retry_because_of_metadata_conflict)
     {
@@ -1822,12 +1826,14 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 }
                 if (outcome == DataLake::CommitOutcome::Unknown)
                 {
-                    LOG_ERROR(
-                        log,
+                    commit_outcome_unknown = true;
+                    throw Exception(
+                        ErrorCodes::DATALAKE_DATABASE_ERROR,
                         "Iceberg commit for {}.{} is of unknown status after a lost response; "
-                        "preserving written files to avoid corrupting a possibly-committed snapshot.",
+                        "the commit may have already landed, so it is not safe to retry. "
+                        "Written files are preserved and manual verification against the catalog "
+                        "is required before retrying.",
                         namespace_name, table_name);
-                    return false;
                 }
 
                 /// Catalog has accepted the commit - the new snapshot is now live and references
@@ -1864,6 +1870,12 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     }
     catch (...)
     {
+        if (commit_outcome_unknown)
+        {
+            /// The commit outcome is ambiguous, not confirmed - do not swallow this into a
+            /// retry, and do not clean up files that may belong to an already-landed commit.
+            throw;
+        }
         if (published)
         {
             /// Commit has already become visible to readers. The failure is in trailing

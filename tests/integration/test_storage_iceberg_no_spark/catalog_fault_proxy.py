@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Transparent reverse proxy for an Iceberg REST catalog with controllable fault injection.
+"""
+A stand-in for the Iceberg REST catalog that can inject a controlled failure.
 
-Forwards every request unchanged by default. A test arms a one-shot fault via the
-/__fault control API; once armed, the proxy forwards the matching commit POST upstream
-(so the catalog commits), consumes the upstream response, then RSTs the client connection
-without returning that response. ClickHouse then retries the identical POST into a now
-stale-assert state, reproducing the "commit succeeded, response lost" window.
-
-Request bodies (including Transfer-Encoding: chunked) are fully decoded before being
-forwarded, and the upstream status plus forwarded body length of every /tables/ POST are
-recorded and exposed via /__fault/status for the test to assert on.
+Normally it passes every request through to the real catalog. But a test can
+arm (register) a one-time failure: the proxy lets the commit reach the catalog
+(so it really commits), then cuts the client connection before the response returns.
+ClickHouse assumes the commit failed and retries, but the catalog refuses, since the commit
+already landed. This recreates the "commit succeeded, response lost" situation the
+fix targets.
 """
 
 import http.client
@@ -45,8 +43,9 @@ UP_HOST, UP_PORT = _parse_upstream(UPSTREAM)
 class _Fault:
     def __init__(self):
         self.lock = threading.Lock()
-        self.armed = None
-        self.budget = 0
+        self.chain = []   # ordered one-shot rules; consumed strictly in sequence
+        self.step = 0     # index of the currently active rule in self.chain
+        self.budget = 0   # remaining matches for the currently active rule
         self.seen = 0
         self.faulted = 0
         self.fault_upstream_status = None
@@ -54,8 +53,9 @@ class _Fault:
 
     def arm(self, rule):
         with self.lock:
-            self.armed = rule
-            self.budget = int(rule.get("count", 1))
+            self.chain = list(rule["chain"]) if "chain" in rule else [rule]
+            self.step = 0
+            self.budget = int(self.chain[0].get("count", 1)) if self.chain else 0
             self.seen = 0
             self.faulted = 0
             self.fault_upstream_status = None
@@ -63,20 +63,25 @@ class _Fault:
 
     def disarm(self):
         with self.lock:
-            self.armed = None
+            self.chain = []
+            self.step = 0
             self.budget = 0
 
     def should_fault(self, method, path):
         with self.lock:
-            if not self.armed or self.budget <= 0:
+            if self.step >= len(self.chain) or self.budget <= 0:
                 return False
-            if self.armed.get("method", "POST").upper() != method.upper():
+            current = self.chain[self.step]
+            if current.get("method", "POST").upper() != method.upper():
                 return False
-            if self.armed.get("match_path_substr", "/tables/") not in path:
+            if current.get("match_path_substr", "/tables/") not in path:
                 return False
             self.seen += 1
             self.budget -= 1
             self.faulted += 1
+            if self.budget <= 0 and self.step + 1 < len(self.chain):
+                self.step += 1
+                self.budget = int(self.chain[self.step].get("count", 1))
             return True
 
     def record_commit(self, status, faulted, body_len):
@@ -88,8 +93,9 @@ class _Fault:
 
     def status(self):
         with self.lock:
+            current = self.chain[self.step] if self.step < len(self.chain) else None
             return {
-                "armed": self.armed, "budget": self.budget,
+                "armed": current, "budget": self.budget,
                 "seen": self.seen, "faulted": self.faulted,
                 "fault_upstream_status": self.fault_upstream_status,
                 "commit_posts": list(self.commit_posts),

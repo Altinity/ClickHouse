@@ -103,6 +103,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int NOT_IMPLEMENTED;
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
+    extern const int DATALAKE_DATABASE_ERROR;
 }
 
 namespace FailPoints
@@ -1304,6 +1305,9 @@ bool IcebergStorageSink::initializeMetadata()
     /// references the manifest entry / manifest list we wrote). From that point any failure
     /// must NOT delete those files, otherwise the live snapshot is corrupted.
     bool published = false;
+    /// Becomes true when the catalog's commit response was lost (CommitOutcome::Unknown): the
+    /// commit may have already landed, so retrying would risk double-applying it.
+    bool commit_outcome_unknown = false;
 
     try
     {
@@ -1405,13 +1409,14 @@ bool IcebergStorageSink::initializeMetadata()
                 }
                 if (outcome == DataLake::CommitOutcome::Unknown)
                 {
-                    LOG_ERROR(
-                        log,
+                    commit_outcome_unknown = true;
+                    throw Exception(
+                        ErrorCodes::DATALAKE_DATABASE_ERROR,
                         "Iceberg commit for {}.{} is of unknown status after a lost response; "
-                        "preserving written files to avoid corrupting a possibly-committed snapshot. "
-                        "Orphaned files may need manual cleanup if the commit did not actually land.",
+                        "the commit may have already landed, so it is not safe to retry. "
+                        "Written files are preserved and manual verification against the catalog "
+                        "is required before retrying.",
                         namespace_name, table_name);
-                    return false;
                 }
                 /// Committed: the snapshot is now live.
                 published = true;
@@ -1430,6 +1435,10 @@ bool IcebergStorageSink::initializeMetadata()
     }
     catch (...)
     {
+        if (commit_outcome_unknown)
+        {
+            throw;
+        }
         if (published)
         {
             /// The commit is already live in the catalog. A failure in trailing post-publish
