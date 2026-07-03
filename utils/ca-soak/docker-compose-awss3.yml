@@ -8,8 +8,9 @@
 # Usage:
 #   1. Fill in configs/aws.env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY). It is git-ignored.
 #   2. docker compose -f docker-compose-awss3.yml up -d
-#   3. Fresh-run cleanup (the bucket persists between runs, unlike `down -v` on RustFS):
-#        aws s3 rm --recursive s3://test-altinity-support-team/ca_live/
+#   3. Fresh-run cleanup (the bucket persists between runs, unlike `down -v` on RustFS); each
+#      run uses a UNIQUE prefix (bump the date/rN suffix in storage_conf_awss3_*.xml):
+#        aws s3 rm --recursive s3://test-altinity-support-team/ca_live_20260703_r1/
 #
 # NOTE: the CA capability probe runs on mount and is itself the FIRST validation step here — it
 # demands the store enforce conditional ops (wrong-token DELETE must fail with 412). If AWS
