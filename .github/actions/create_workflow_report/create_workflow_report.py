@@ -781,12 +781,17 @@ def get_cves(pr_number, commit_sha, branch):
     rows = []
     for scan_result in results:
         for match in scan_result["matches"]:
+            artifact = match.get("artifact", {})
+            artifact_name = artifact.get("name", "")
+            artifact_version = artifact.get("version", "")
+            affected_component = f"{artifact_name} {artifact_version}".strip()
             rows.append(
                 {
                     "docker_image": scan_result["source"]["target"]["userInput"],
                     "severity": match["vulnerability"]["severity"],
                     "identifier": match["vulnerability"]["id"],
                     "namespace": match["vulnerability"]["namespace"],
+                    "affected_component": html.escape(affected_component),
                 }
             )
 
