@@ -55,6 +55,35 @@ content-hash keys cache perfectly; control-plane refs bypass the cache by constr
 
 `/var/lib/clickhouse` MUST be persistent (PVC): the local uuid file is the CAS identity.
 
+## GCS leg — measurement complete (2026-07-03, same day) {#gcs-measurement}
+
+Bucket `content-adressable-test-mfilimonov` (service-account HMAC pair in git-ignored
+`configs/gcs.env`; stand: `docker-compose-gcs.yml` + `storage_conf_gcs_*.xml`).
+
+**Verdict: GCS's S3-compatible surface enforces NONE of the conditional ops CAS needs, but the
+same HMAC pair over the same XML endpoint with GOOG4-HMAC-SHA256 signing enforces ALL of them.**
+
+| Capability | AWS S3 (sigv4) | GCS S3-compat (sigv4) | GCS XML + GOOG4 signing |
+|---|---|---|---|
+| create-if-absent (`If-None-Match: *` / `x-goog-if-generation-match: 0`) | 412 enforced | **silently ignored** (probe step 2 caught it; mount refused, exit 48) | 412 enforced |
+| conditional overwrite (`If-Match` / generation) | 412 enforced | **silently ignored** | 412 enforced |
+| conditional delete (`If-Match` / generation) | 412 enforced | **silently ignored — wrong-ETag DELETE deleted the object** | 412 enforced |
+| mixing `x-goog-*` preconditions into sigv4 requests | n/a | rejected: `ExcessHeaderValues` ("cannot specify both x-amz and x-goog") | n/a (all headers are `x-goog-*`) |
+| token in PUT response | ETag | — | `x-goog-generation` (no extra HEAD needed) |
+
+Full 12-step battery: `utils/ca-soak/scripts/gcs_goog4_probe.py` (12/12 OK — create-if-absent,
+wrong/correct-generation overwrite and delete, body-intact checks, HEAD generation, 404 after
+delete, generation changes on every write).
+
+Design implication for the `TokenType::Generation` binding: GOOG4-HMAC-SHA256 is structurally
+sigv4 with renamed constants (`GOOG4` key prefix, `goog4_request` scope, `x-goog-date`/
+`x-goog-content-sha256` headers) — a signer variant plus a precondition-header mapping
+(`If-None-Match: *` -> `x-goog-if-generation-match: 0`, `If-Match: <etag>` ->
+`x-goog-if-generation-match: <generation>`) and token extraction from `x-goog-generation` could
+carry the ENTIRE existing CAS backend to GCS natively. Not started — needs a brainstorm/spec pass.
+
 ## Remaining for gate #1 {#remaining}
 
-GCS (needs the `Generation` token binding — currently fail-closed-unprobed) and Azure.
+GCS: capability measurement DONE (above); the `Generation` binding implementation + the full
+validation cycle (probe -> replication -> churn -> two-phase reclaim -> fsck -> DROP-to-zero)
+remain. Azure: not started.

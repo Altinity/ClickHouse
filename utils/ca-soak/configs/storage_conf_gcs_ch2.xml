@@ -1,0 +1,48 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- Real-GCS variant of the CA soak disk (release-gate: real-S3 GC validation, GCS leg).
+                 The endpoint is GCS's S3-compatible XML API; the credentials are a service-account
+                 HMAC pair injected as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from the
+                 git-ignored configs/gcs.env by docker-compose-gcs.yml (use_environment_credentials)
+                 — no secrets in this committed file. EXPECTATION: the capability probe decides —
+                 GCS's native preconditions are x-goog-if-generation-match, and how much of the
+                 AWS-style If-Match/If-None-Match surface the S3-compat layer enforces is exactly
+                 what this stand measures (TokenType::Generation binding is fail-closed until then).
+                 root_shards is left at the CODE DEFAULT (32) on purpose: real S3 has no
+                 rustfs#3231 overwrite-leak, and the validation should exercise what we ship.
+                 expect_continue_min_bytes override (B187) is rustfs-specific and dropped too. -->
+            <ca>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>content_addressed</metadata_type>
+                <endpoint>https://storage.googleapis.com/content-adressable-test-mfilimonov/ca_live_20260703_g1/soak_pool/</endpoint>
+                <use_environment_credentials>1</use_environment_credentials>
+                <server_root_id>ca_live_{replica}</server_root_id>
+                <gc_enabled>1</gc_enabled>
+                <gc_interval_sec>10</gc_interval_sec>
+            </ca>
+
+            <!-- Read-only fsck view over the SAME live pool (mirrors storage_conf_ch1.xml). -->
+            <ca_ro>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>content_addressed</metadata_type>
+                <endpoint>https://storage.googleapis.com/content-adressable-test-mfilimonov/ca_live_20260703_g1/soak_pool/</endpoint>
+                <use_environment_credentials>1</use_environment_credentials>
+                <server_root_id>ca_live_{replica}</server_root_id>
+                <gc_enabled>0</gc_enabled>
+                <readonly>true</readonly>
+            </ca_ro>
+        </disks>
+        <policies>
+            <ca>
+                <volumes>
+                    <main>
+                        <disk>ca</disk>
+                    </main>
+                </volumes>
+            </ca>
+        </policies>
+    </storage_configuration>
+</clickhouse>

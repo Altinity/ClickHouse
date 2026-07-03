@@ -7,3 +7,5 @@ failure.json
 __pycache__/
 # Live AWS credentials for the real-S3 validation (docker-compose-awss3.yml). NEVER commit.
 configs/aws.env
+# Live GCS HMAC credentials for the real-GCS validation (docker-compose-gcs.yml). NEVER commit.
+configs/gcs.env
