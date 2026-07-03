@@ -88,6 +88,42 @@ Note: `ca-gc-dryrun` currently previews `zeroInDegree` only for target shard 0 w
 
 Both commands reject non-CA disks with a clear message.
 
+### 1.4 `gc/state` disaster recovery runbook {#gc-rebuild-runbook}
+
+**Symptom:** `system.content_addressed_garbage_collection_log` shows the round stuck at
+`outcome = 'Error'` with an `error` message containing `CORRUPTED_DATA` — the baseline guard
+(`04-gc-protocol.md §gc-rebuild`) has refused every regular round because it found a shard journal
+proving trimmed history with no healthy adopted baseline under `gc/state` (e.g. after an operator
+`mc rm` of `gc/state`, or backend corruption). GC makes NO further progress and deletes NOTHING while
+in this state — the guard is fail-closed by design.
+
+**Remedy — pick one:**
+
+1. **A live replica is up** (preferred): run
+   ```sql
+   SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] [<disk>]
+   ```
+   on any server that mounts the affected disk. Omit `<disk>` to rebuild every content-addressed disk
+   on that node. The command throws with the refusal text if the rebuild itself refuses (e.g. another
+   leader holds the lease, or a committed ref names a missing manifest — real data loss that needs
+   `fsck` forensics before reaching for `FORCE`). On success it logs the rebuilt `round`, `generation`,
+   `namespaces`, `shards`, `committed_refs`, `live_precommits`, `unowned_alive_manifests`, `edges`, and
+   `clamped_shards` counters.
+
+2. **No server is up** (e.g. investigating an offline pool): from a host with `clickhouse-disks`,
+   ```bash
+   clickhouse-disks --disk <ca_disk_name> ca-gc-rebuild [--force]
+   ```
+   Requires the disk to be configured `<readonly>true</readonly>` in the `clickhouse-disks` config —
+   same rule as `fsck`/`ca-gc-dryrun`: this tool must never claim a live server's mount. It prints the
+   report as `key=value` pairs and exits nonzero (with a `refusal=` line) if the rebuild refuses.
+
+**After the rebuild:** regular GC rounds resume; `fsck` converges to `dangling=0` over the next few
+rounds as the ack-floor pipeline drains `pending-gc`/`awaiting-gc`. A rebuilt baseline is
+conservative — it may over-protect a trimmed-but-live build's manifest (design delta 2 in
+`04-gc-protocol.md §gc-rebuild`), so a small, bounded, `fsck`-visible `unaccounted`/leaked set settling
+over a rebuild-to-rebuild window is expected, not a regression.
+
 ## 2. Audit log tables {#audit-logs}
 
 ### 2.1 `system.content_addressed_garbage_collection_log` {#gc-log}

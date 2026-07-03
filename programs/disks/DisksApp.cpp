@@ -339,6 +339,7 @@ void DisksApp::registerCommands()
     command_descriptions.emplace("touch", makeCommandTouch());
     command_descriptions.emplace("fsck", makeCommandFsck());
     command_descriptions.emplace("ca-gc-dryrun", makeCommandCaGcDryRun());
+    command_descriptions.emplace("ca-gc-rebuild", makeCommandCaGcRebuild());
     command_descriptions.emplace("help", makeCommandHelp(*this));
 #if CLICKHOUSE_CLOUD
     command_descriptions.emplace("packed-io", makeCommandPackedIO());

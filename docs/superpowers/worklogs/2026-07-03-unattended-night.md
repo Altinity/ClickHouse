@@ -52,5 +52,34 @@ convention the verifier rightly refuses). Cas* 434/434 (+4 expected-red CasShard
 
 ## 3. Shard-mutation-queue (spec 2026-07-03-cas-shard-mutation-queue)
 
-Red tests committed (`2eb3e7c362c`). Implementing the flat-combining queue.
+DONE: queue `20e21d96f8a`, metrics+docs `11ef5ec5146`. Cas* 438/438; CasShardQueue 5/5 x8.
+Two real races found by the stress test during implementation:
+- slow-exiting waiter erased a SUCCESSOR queue by key => two leaders => conflicts; erase is now
+  identity-checked (map entry must still be OUR queue);
+- test-harness: counters had to be filtered to cas/refs keys (bootstrap adopts + mount renewals
+  also casPut), and co-batching made deterministic via a queue-depth probe.
+
+## 4. GC rebuild (spec+plan 2026-07-03-cas-gc-rebuild)
+
+- Task 1 TLA+ gate DONE (`bd16aff956d`): GRebuild + witness + 3 sabotages; SabotageRebuildDropEdge
+  needed a `lostRefs` ghost set (dropping the folded ref also dropped the invariant's witness).
+  Stage-1 clean; all old cfgs re-verified.
+- Task 2 guard DONE (`6bd21f28c78`): per-shard trim-evidence refusal + (б) absent-seal audit.
+  First cut keyed the audit on coverage EMPTINESS and tripped 9 tests — a present seal with empty
+  per_ns_shard is a legitimate empty-universe generation; re-keyed on OBJECT absence.
+- Task 3 rebuildBaseline DONE (`24b3362bfb8`): engine = existing bricks; health check gates FORCE
+  (gen-0 bootstrap over trim-proving journals is NOT healthy); REAL FIND during testing —
+  **pipeline blindness**: a blob with zero rebuilt edges has no run row and never transitions to
+  zero => never reclaimed; the rebuild now condemns zero-edge physical blobs itself (head-captured
+  tokens, minted round, floor-gated graduation). CasGcRebuild 7/7, Cas* 448/448.
+- Tasks 4-5 (SYSTEM + clickhouse-disks wiring + docs) dispatched to a sonnet subagent.
+
+## 5. Config changes — DONE (`cbe0ffb7608`)
+
+content_addressed_log default-ON in programs/server/config.xml (experimental => keep enabled
+recommendation); soak root_shards 64 -> 8 (16 files); gc_trim_body_soft_limit 8 MiB -> 96 KiB
+(bodies stay under the RustFS 128 KiB inline threshold => rustfs#3231 leak sidestepped).
+
+## 6. 1h soak (pending: after subagent lands Tasks 4-5 + full rebuild of the binary)
+
 

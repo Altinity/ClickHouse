@@ -493,6 +493,84 @@ The fold cursor is keyed by `(ns, shard, incarnation)` instead of `(ns, shard)`.
 
 ---
 
+## 7a. GC baseline guard + raw rebuild {#gc-rebuild}
+
+**Status: DONE (2026-07-03).** Spec: `2026-07-03-cas-gc-rebuild-design.md`. Answers the question every
+prior section assumes away: what happens when `gc/state` itself is lost or corrupted (an operator
+`mc rm`, a botched migration, backend corruption) over a pool whose per-shard journals have already
+been **trimmed** past the point a from-scratch fold could recover? Without a guard, a fresh
+`runRegularRound` would fold only the surviving journal tails, under-count every blob referenced by
+trimmed history, and mass-delete live data — the one class of event `INV_NO_LOSS` cannot survive
+without an explicit baseline.
+
+**The guard (Part 1 — ships ahead of the rebuild, fails closed by default).** Before folding, the
+round classifies `gc/state` as healthy or not: healthy means it decodes AND, when it claims a
+baseline (`snap_generation > 0`), the fold seal for that `(generation, attempt)` is present AND every
+run/retired-list it references is HEAD-present. A `gen == 0` state additionally requires that **no**
+shard journal proves trimmed history (`journal.empty() && shard_version > 0`, or a surviving
+journal's earliest record has `transition_version > 1`) — a fresh-pool-shaped state sitting over
+trimmed journals is exactly the disaster this guard exists to catch, not a legitimately-empty pool.
+Any journal proving trim with no adopted seal under live state throws `CORRUPTED_DATA` and aborts
+the round — never a silent under-count.
+
+**The rebuild algorithm (Part 2 — `Gc::rebuildBaseline(bool force)`).** Reuses the round's own
+bricks; no new scanner or merge class:
+
+1. **Health check** (the same classification above) — refuses with `performed=false` unless `force`
+   is set, so an operator never discards live bookkeeping by accident.
+2. **Lease** — `acquireOrRenewLease` (Part 1's protocol, unchanged): refuses if another leader (a
+   regular round, or a concurrent rebuild) currently holds it.
+3. **Numbering** — mint a `generation` strictly above every surviving `gc/gen/<n>/` prefix (so
+   `putDeterministicArtifact` can never collide with debris from the lost era).
+4. **Universe replay** — `discoverUniverse` (the same `LIST(cas/refs/)` sweep the regular round
+   uses) drives, per shard: committed refs (`root.refs` is the authoritative committed state) →
+   `foldManifestEdges(+1)`; live precommits (journal replay: apply `old_binding` erases / `new_binding`
+   inserts, keep what remains `Precommit`) → edges when the body is present, else clamp the shard's
+   cursor below that transition (the fold-barrier semantics from §3.2).
+5. **`foldDeltasIntoGeneration`**, attempt-iterated per gc-shard bucket (empty priors, budget-bounded
+   memory — the same primitive the regular round's three-cursor merge uses), builds the rebuilt
+   in-degree runs and the fold seal.
+6. **Zero-edge condemnation** — a blob with a rebuilt in-degree of zero has no transition to trigger
+   the normal condemn path (the fold discovers candidates by transition-to-zero, and a rebuild-time
+   zero-edge blob never transitions). The rebuild condemns it directly: every physically-present blob
+   outside the rebuilt edge set enters the retired list with a **head-captured exact token at the
+   minted round**. Graduation still waits for every mount to ack past that round — the normal
+   two-phase floor (§3.5), not a shortcut.
+7. **Round mint** — `round = max(heartbeat-floor max_ack, max shard fence_round seen, the old
+   state.round, max_gen) + 1`. Minting above every surviving mount ack (not just the old round) closes
+   a skew hazard: a stale mount's ack could otherwise float a fresh condemnation past its own floor
+   before that mount re-observes the rebuilt list.
+8. **Single CAS** — one `gc/state` write publishes the new `(round, generation, attempt, retired_refs)`
+   atomically, same as a regular round. A refused rebuild (any step above) writes nothing; `gc/state`
+   is untouched.
+
+**Over-protection, not under-protection (design delta 2 — a deliberate, bounded leak class).** A
+build alive across trim has no journal evidence (the evidence was trimmed); its manifests look
+unowned. The rebuild cannot tell "unowned because dead" from "unowned because trimmed-but-live", so
+it includes edges for every **unowned** manifest that is **not provably build-dead** (the live
+watermark fact) — i.e. it over-protects. An unowned manifest that later dies with no journal evidence
+leaks its blob's edges until a future rebuild reclaims it. This is documented, bounded (one
+rebuild-to-rebuild window, `fsck`-visible as `unaccounted`), and strictly preferred to the
+alternative: `INV_OVER_COUNT_ONLY` — over-count, never under-count — is the invariant a
+disaster-recovery tool must never violate.
+
+**Refusals (all fail-closed, all write nothing):**
+- gc/state and every referenced artifact are already healthy (bypass with `FORCE`).
+- another GC leader holds the lease.
+- a **committed** ref names a missing or invalid manifest body — real data loss the rebuild refuses
+  to bless; the refusal names the offending owner so `fsck` forensics can follow up before anyone
+  reaches for `FORCE`.
+
+**The two command forms** (§8/§testing tie-in: `08-testing-and-soak.md §gc-rebuild-runbook`):
+- `SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] [<disk>]` — on any live replica; synchronous, one
+  rebuild attempt, throws with `report.refusal` on refusal, `LOG_INFO`s the report's counters on
+  success.
+- `clickhouse-disks --disk <ca> ca-gc-rebuild [--force]` — when no server is up; requires the disk to
+  be opened `<readonly>true</readonly>` (same rule as `fsck`/`ca-gc-dryrun`: this tool must never
+  claim a live server's mount), prints the report as `key=value` pairs, exits nonzero on refusal.
+
+---
+
 ## 8. Safety invariants {#safety-invariants}
 
 The following invariants are the formal safety obligations. Sources: `CaGcRootLocalPartManifestCore.tla` (primary big model), supplemented by focused models for specific sub-problems.
