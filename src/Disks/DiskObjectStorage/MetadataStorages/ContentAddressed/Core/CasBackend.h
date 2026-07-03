@@ -182,6 +182,13 @@ public:
     /// TRUE  ⇒ `discover` may skip an unchanged root-shard body read when the listed token equals
     ///          the persisted folded token, saving a GET per unchanged shard.
     virtual bool supportsListTokens() const = 0;
+
+    /// Store-level preconditions beyond per-op conditional semantics — checked by the capability
+    /// probe BEFORE the op battery. Default: nothing to check. The S3 backend fails closed here
+    /// when a generation-dialect (GCS) bucket has object versioning enabled: every token-exact
+    /// DELETE would archive a noncurrent generation instead of reclaiming storage, so GC
+    /// "reclaim" would silently stop reclaiming.
+    virtual void checkStorePreconditions() {}
 };
 
 using BackendPtr = std::shared_ptr<Backend>;

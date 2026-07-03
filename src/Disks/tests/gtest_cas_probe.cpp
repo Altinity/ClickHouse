@@ -4,6 +4,15 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/Exception.h>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
+}
+}
 
 using namespace DB::Cas;
 
@@ -82,4 +91,26 @@ TEST(CasProbe, ConcurrentMountsDoNotCollide)
 
     /// The seeded fixed-key artifact is untouched (the probe never collided with it).
     EXPECT_TRUE(b->get("p/_probe/token").has_value());
+}
+
+/// The probe must consult the backend's store-preconditions hook BEFORE the op battery: a
+/// generation-dialect store on a VERSIONED bucket passes every conditional-op check, but its
+/// token-exact DELETEs archive noncurrent generations instead of reclaiming storage — only the
+/// hook can see that, so a throwing hook must fail the probe closed.
+class PreconditionRefusingBackend : public InMemoryBackend
+{
+public:
+    void checkStorePreconditions() override
+    {
+        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
+            "test: store precondition violated (e.g. bucket versioning enabled)");
+    }
+};
+
+TEST(CasProbe, FailsClosedOnStorePreconditions)
+{
+    auto b = std::make_shared<PreconditionRefusingBackend>();
+    EXPECT_THROW(runCapabilityProbe(*b, "p/.cas_probe"), DB::Exception);
+    /// The hook fires FIRST: no probe keys may have been written.
+    EXPECT_TRUE(b->list("p/.cas_probe", "", 10).keys.empty());
 }

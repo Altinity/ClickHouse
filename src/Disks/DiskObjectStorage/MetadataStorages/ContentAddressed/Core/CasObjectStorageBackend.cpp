@@ -12,6 +12,7 @@
 #include <IO/WriteSettings.h>
 
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
 
 #include <base/defines.h>
 
@@ -28,6 +29,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
+    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -41,6 +43,40 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 {
     if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens())
         native_token_type = TokenType::Generation;
+}
+
+/// See Backend::checkStorePreconditions. Only the Native, generation-dialect (GCS) combination has
+/// anything to check: a token-exact DELETE on a versioned bucket archives a noncurrent generation
+/// instead of reclaiming storage, so GC "reclaim" would silently stop reclaiming.
+void ObjectStorageBackend::checkStorePreconditions()
+{
+    if (mode != Mode::Native || native_token_type != TokenType::Generation)
+        return;
+
+    const auto versioned = object_storage->isBucketVersioningEnabled();
+    if (!versioned.has_value())
+    {
+        /// The check itself could not be verified — either the GetBucketVersioning-equivalent call
+        /// failed (e.g. permissions) or the storage does not support answering it. We proceed on the
+        /// ASSUMPTION that versioning is off rather than fail-closing the mount on an unknown: a
+        /// confirmed Enabled below is what actually breaks reclaim, and an outright refusal to mount
+        /// whenever the check is inconclusive would be too aggressive. This is intentionally logged
+        /// (not silent) so an operator can confirm the bucket's real state.
+        LOG_WARNING(getLogger("CasObjectStorageBackend"),
+            "CAS on GCS: could not VERIFY the bucket-versioning precondition (the versioning check "
+            "request failed or is not supported by this backend) — proceeding on the assumption that "
+            "bucket versioning is OFF. If versioning is actually enabled, token-exact DELETEs will "
+            "archive noncurrent generations instead of reclaiming storage and GC will silently stop "
+            "reclaiming space. Please verify the bucket's versioning setting manually.");
+        return;
+    }
+
+    if (*versioned)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "CAS on GCS: the bucket has object VERSIONING enabled. A token-exact DELETE on a "
+            "versioned bucket archives a noncurrent generation instead of reclaiming storage — GC "
+            "would silently stop reclaiming space. Disable versioning on the bucket (and prefer "
+            "soft-delete duration 0 for CAS pools) and retry the mount.");
 }
 
 /// =========================================================================================

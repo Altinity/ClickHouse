@@ -43,6 +43,9 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
 
     try
     {
+        // ---- Step 0: store-level preconditions (backend-specific; throws = mount refused). ----
+        backend.checkStorePreconditions();
+
         // ---- Step 1: putIfAbsent fresh → Done; read-after-write returns the bytes. ----
         Token t1;
         {

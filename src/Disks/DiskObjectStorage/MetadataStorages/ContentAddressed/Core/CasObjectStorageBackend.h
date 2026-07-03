@@ -55,6 +55,10 @@ public:
     DeleteOutcome deleteExact(const String & key, const Token & token) override;
     ListPage list(const String & prefix, const String & cursor, size_t limit) override;
 
+    /// Store-level precondition: on a Native, generation-dialect (GCS) backend, fail closed if the
+    /// bucket has object versioning enabled — see Backend::checkStorePreconditions.
+    void checkStorePreconditions() override;
+
     /// The token kind this backend's object storage mints: TokenType::ETag for AWS-compatible
     /// stores, TokenType::Generation when the storage runs the GCS conditional dialect (the
     /// generation rides the ETag plumbing; the VALUE stays opaque either way).
