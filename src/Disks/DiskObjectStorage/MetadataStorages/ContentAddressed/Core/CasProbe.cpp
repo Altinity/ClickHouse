@@ -25,8 +25,20 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
     // We capture the keys we need to clean up.
     auto cleanup = [&]() noexcept
     {
-        try { backend.deleteExact(key, backend.head(key).token); } catch (...) {}
-        try { backend.deleteExact(cas_key, backend.head(cas_key).token); } catch (...) {}
+        // Skip the delete when HEAD says the key is already gone (the happy path: step 8 deleted
+        // it). A deleteExact with the absent HeadResult's EMPTY token is a malformed conditional
+        // op — AWS S3 answers 400 InvalidArgument ("If-Match cannot be empty"), which lands as a
+        // scary AWSClient <Error> log line on every mount even though the catch swallows it.
+        for (const auto & k : {key, cas_key})
+        {
+            try
+            {
+                const auto h = backend.head(k);
+                if (h.exists)
+                    backend.deleteExact(k, h.token);
+            }
+            catch (...) {} /// NOLINT(bugprone-empty-catch)
+        }
     };
 
     try

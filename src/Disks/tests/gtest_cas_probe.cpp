@@ -14,6 +14,30 @@ TEST(CasProbe, PassesOnEnforcingBackend)
     EXPECT_TRUE(b->list("p/.cas_probe", "", 10).keys.empty());   // probe cleans up after itself
 }
 
+/// AWS S3 answers 400 InvalidArgument to a conditional DELETE with an EMPTY If-Match, and the
+/// probe's exit cleanup used to issue exactly that (deleteExact with the absent HeadResult's empty
+/// token) after step 8 had already deleted the probe keys — two scary AWSClient <Error> log lines
+/// on every real-S3 mount. The cleanup must HEAD-gate the delete instead of firing blindly.
+class EmptyTokenDeleteRecorder : public InMemoryBackend
+{
+public:
+    size_t empty_token_deletes = 0;
+
+    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    {
+        if (token.empty())
+            ++empty_token_deletes;
+        return InMemoryBackend::deleteExact(key, token);
+    }
+};
+
+TEST(CasProbe, CleanupNeverDeletesWithEmptyToken)
+{
+    auto b = std::make_shared<EmptyTokenDeleteRecorder>();
+    EXPECT_NO_THROW(runCapabilityProbe(*b, "p/.cas_probe"));
+    EXPECT_EQ(b->empty_token_deletes, 0u);
+}
+
 TEST(CasProbe, FailsClosedOnNonEnforcingDelete)
 {
     auto b = std::make_shared<InMemoryBackend>();
