@@ -536,13 +536,16 @@ entry only when `condemn_round < min_ack` computed over heartbeats that are **li
 expired-but-not-fenced**; a fenced heartbeat can never renew or land a commit again. Commits are
 two-step (`WPrepare` = gate evaluation, `WLand` = CAS response) so the in-flight window is a real
 interleaving, and the pass is three steps (`GBegin` / `GFold` / `GComplete`) so a commit landing
-between the fold cut and the deletes is a real interleaving. Invariants: `INV_NO_DANGLE` (no landed
-or folded ref points at an absent blob), `INV_NO_RETURN` (no ref binds a deleted incarnation),
-`INV_ACK_LE_VIEW` (the honest ack never runs ahead of the installed view).
+between the fold cut and the deletes is a real interleaving. The model also includes disaster-recovery
+rebuild (`GRebuild`, spec `2026-07-03-cas-gc-rebuild-design.md`, with a `lostRefs` ghost variable for a
+sabotaged rebuild's dropped edges), sourceless copy-forward (`WCopyForward`), and an honest fold clamp
+(`clampedL` / `clampedEver`) with a suppression guard in `GComplete`. Invariants: `INV_NO_DANGLE` (no
+landed, folded, or rebuild-lost ref points at an absent blob), `INV_NO_RETURN` (no ref binds a deleted
+incarnation), `INV_ACK_LE_VIEW` (the honest ack never runs ahead of the installed view).
 
 Bounds: `Writers = {w1, w2}`, `Blobs = {b1}`, `MaxRound = 4`, `MaxTok = 4`.
 
-**Seven sabotages (negative controls — each breaks exactly one load-bearing rule and MUST produce a
+**Eleven sabotages (negative controls — each breaks exactly one load-bearing rule and MUST produce a
 counterexample):**
 
 | Config | Rule broken |
@@ -554,10 +557,16 @@ counterexample):**
 | `sab_skipshard` | the fold cut leaves one landed ref unconsumed |
 | `sab_adopttoken` | the commit gate references a visibly-retired token instead of recreating |
 | `sab_openbeforeload` | a fresh mount starts with an unloaded (round-0) view and mutates before loading |
+| `sab_rebuilddropedge` | rebuild loses one committed owner's folded ref |
+| `sab_rebuildkeepretired` | rebuild carries the old retired entries into the new baseline |
+| `sab_rebuildlowround` | rebuild mints a round below surviving mount acks |
+| `sab_clampnosuppress` | graduation ignores a declared clamp — reproduces the 2026-07-03 night incident |
 
-**Witnesses (negated reachability — a TLC "violation" means the state IS reachable):**
+**Six witnesses (negated reachability — a TLC "violation" means the state IS reachable):**
 `W_DeleteHappens` (condemn → graduate → delete), `W_SpareHappens` (condemn → recover → spare),
-`W_RecreateHappens` (recreate → `TokenMismatch` on the pending delete).
+`W_RecreateHappens` (recreate → `TokenMismatch` on the pending delete), `W_CopyForwardHappens`
+(sourceless copy-forward taken), `W_RebuildHappens` (raw rebuild taken), `W_ClampHappens` (an honest
+clamped pass occurred).
 
 **Design decisions driven by this model:**
 - Graduation is gated purely by the causal floor (`condemn_round < min_ack`) — no wall clock on the
@@ -565,8 +574,10 @@ counterexample):**
 - The ack must not advance without loading the retired list, and not before the drain completes.
 - An expired heartbeat must be fenced-out (not merely assumed dead) before it drops out of the floor.
 - The commit gate must recreate a listed token, never adopt it.
+- Rebuild must discard the old retired list and mint a round above every surviving mount ack (see
+  §area-clamp-suppression for the clamp/rebuild/copy-forward extension detail).
 
-**Code currency:** CURRENT (`cas-gc-ack-floor-fence`).
+**Code currency:** CURRENT (`cas-gc-ack-floor-fence`). Honest stage-1 clean at 83.9M distinct states.
 
 ---
 
@@ -648,7 +659,7 @@ The prose files `README.md` and `RESULTS.md` in this directory are this model's 
 | `CaGcRootLocalPartManifestCore.tla` | Part-manifest GC R0 | **CURRENT** (fold/manifest/attempt-scoping); fence/recheck phases SUPERSEDED by Area 11 | `INV_NO_DANGLE/LOSS/RETURN`, 10 more; liveness | 28 | all-shard fresh fence (superseded), single coordinator fence (superseded), scatter deltas, stale-token-no-over-delete, attempt-scoped visibility |
 | `CaGcIndegRefoldCore.tla` | Indeg re-fold | **CURRENT** | `INV_INDEG_NONNEG` | 1 | seal cursor at `max(foldCursor, fenceVersion)`, not `foldCursor` |
 | `CaGcShardIncarnationCore.tla` | Registry removal D1 | **CURRENT** | `INV_NO_DANGLING`, `INV_NO_ORPHAN_EDGE` | 4 | two-coordinate replacement (incarnation + round self-floor) for registry; per-shard monotonicity |
-| `CaGcAckFloorCore.tla` | Ack-floor round core | **CURRENT** | `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_ACK_LE_VIEW` | 7 | causal floor gates graduation; ack after drain + view load; expired ⇒ fence-out; recreate not adopt |
+| `CaGcAckFloorCore.tla` | Ack-floor round core | **CURRENT** | `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_ACK_LE_VIEW` | 11 | causal floor gates graduation; ack after drain + view load; expired ⇒ fence-out; recreate not adopt; rebuild discards retired list + mints round above all acks; clamp suppression gates graduation |
 | `CaGcAckFloorZombie.tla` | Ack-floor two-leader | **CURRENT** | `INV_NO_DANGLE`, `INV_NO_RETURN` | 1 | `delete_pending` two-phase graduation load-bearing; floor latched ≤ fold cut (order invariant) |
 | `CaGcCore.tla` | EBR GC core | **SUPERSEDED** | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA` | 4 CEs during dev | EBR design record; replaced by incarnation-token |
 
@@ -688,9 +699,10 @@ java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \
 
 # ack-floor GC round core — positive stage + witnesses
 ./run_ackfloor.sh CaGcAckFloorCore_stage1
-for w in delete spare recreate; do ./run_ackfloor.sh CaGcAckFloorCore_witness_$w; done  # each MUST report reachable
+for w in delete spare recreate copyforward rebuild clamp; do ./run_ackfloor.sh CaGcAckFloorCore_witness_$w; done  # each MUST report reachable
 # sabotages (each MUST violate):
-for s in ignorefloor ackwithoutread ackbeforedrain sleeperrearm skipshard adopttoken openbeforeload; do
+for s in ignorefloor ackwithoutread ackbeforedrain sleeperrearm skipshard adopttoken openbeforeload \
+         rebuilddropedge rebuildkeepretired rebuildlowround clampnosuppress; do
   ./run_ackfloor.sh CaGcAckFloorCore_sab_$s && echo "UNEXPECTED PASS: $s"
 done
 
@@ -724,3 +736,14 @@ counterexample; `W_ClampHappens` witnesses a reachable honest clamped pass. Hone
 clean at 83.9M distinct states (the held ref persisting across passes multiplies configurations;
 the hold is bounded to one ref — any dangle of this class needs a single held `+1`, and the
 suppression rule reads only the boolean declaration).
+
+The same revision adds disaster-recovery rebuild (`GRebuild`, spec
+`2026-07-03-cas-gc-rebuild-design.md`) and sourceless copy-forward (`WCopyForward`) to the model.
+`GRebuild` recomputes the baseline from owner state at idle: the retired list restarts empty
+(over-protect — everything re-condemns through the normal pipeline) and the round is minted above
+every mount's advertised ack, so no stale ack can float a fresh condemnation past the floor before
+its writer re-observes. A `lostRefs` ghost set records any owner ref a sabotaged rebuild failed to
+re-emit (`sab_rebuilddropedge`); `INV_NO_DANGLE` is checked over `landed ∪ folded ∪ lostRefs` so a
+dropped edge is caught even though the rebuild itself doesn't retain it. `sab_rebuildkeepretired`
+and `sab_rebuildlowround` are the other two rebuild sabotages; `W_RebuildHappens` and
+`W_CopyForwardHappens` are the corresponding reachability witnesses.

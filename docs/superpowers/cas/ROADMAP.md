@@ -47,6 +47,7 @@ See [`03-writer-protocol.md`](03-writer-protocol.md) for full detail.
 | Item | Status | Notes |
 |------|--------|-------|
 | Build → precommit → upload → promote write path | **DONE** | |
+| Staging area inside the bucket (2026-07-03) | **TODO (needs brainstorm/spec)** | Support a dedicated staging prefix in the pool bucket: objects uploaded out-of-band (bulk load, backup restore, external tooling) land under staging and are ADOPTED into the pool via the verified copy-forward/adopt path (hash-verify, then publish) instead of being trusted in place; scope and exact semantics to be specced |
 | Durable-monotone `writer_epoch` / `build_sequence` identity | **DONE** | Prevents stale-epoch cross-publish |
 | Mutable vs immutable file classification | **DONE** | `.bin`, mark files, `primary.idx` → blobs; others → verbatim or inline |
 | Streaming `Build::putBlob` (no whole-blob memory materialization) | **DONE** | Was materializing `BlobSource` into a `String`; now streams from staged temp file; peak memory ~2x instead of ~6.5x |
@@ -149,6 +150,7 @@ See [`07-s3-budget.md`](07-s3-budget.md) for the full breakdown.
 | Root-shard fan-out vs per-object permit cap (B158) | **DONE** (superseded) | The flat-combining shard-mutation queue removed intra-server CAS contention structurally; `root_shards` default weighed to 32 (2026-07-03) for body-size/batching/discovery balance, not contention |
 | `RENAME` = one Build/part (B111) | **DESIRABLE** | Currently multiple root-shard updates per rename |
 | Ack-floor round (removes the O(universe) fence + recheck phases) | **DONE** | The per-round all-shard fence is gone; dirty-only-fence (P6) is superseded. See `07-s3-budget.md §gc-budget` |
+| Capacity model: GC cadence + snapshot size under typical load (2026-07-03) | **TODO** | Estimate, from measured per-insert/merge event volume, how often GC must run and how large the per-shard in-degree runs / fold seals / retired lists get at a typical production load (inserts/s, parts/day, root_shards=32); validate the estimate against a soak's `system.content_addressed_garbage_collection_log`. Feeds the `gc_interval_sec` default and the trim gates; live-AWS data point: a round takes 30-40 s |
 
 ---
 
@@ -193,7 +195,7 @@ See [`09-read-protocol.md`](09-read-protocol.md) for full detail.
 | `CaWiringOps.FreezeViaHardLinksIntoShadow` gtest failure (B3 / B186) | **TODO** (HARD) | `removeRecursive("shadow/bk1")` + commit leaves `existsDirectory("shadow/bk1")` true; one red gtest in the CA battery |
 | Migration path for existing tables (B13) | **TODO** | `ALTER TABLE … MOVE PARTITION` to a `content_addressed` disk re-packs; rollout safety spec needed |
 | Server OOM at hour-4 soak (~49 GiB RSS, B165) | **TODO** (HARD) | Not reproduced since the `putBlob` streaming fix; re-run long soak to confirm |
-| Expedited/compliance delete (GDPR right-to-erasure, B14) | **DESIRABLE** | Under GC lock, confirm no live ref, then delete bypassing grace; no layout change |
+| Expedited/compliance delete (GDPR right-to-erasure, B14) | **DESIRABLE** | Under GC lock, confirm no live ref, then delete bypassing the two-phase ack-floor graduation delay (the old grace_sec is gone); no layout change |
 | Encryption-at-rest × content-addressing (B17) | **DESIRABLE** | Dedup scope per-encryption-key; local to key/hash derivation |
 | Local / NFS / shared-fs as a first-class backend (B26, + B135 multi-mount safety) | **DESIRABLE** | Unit-tested over `LocalObjectStorage`; needs server-level doc + the put-if-absent atomicity caveat (racy multi-writer on local/NFS) + multi-mount safety notes |
 | Namespace registry unbounded growth (B129) | **PARTIAL** (D1 fixes the create/drop fanout) | D1 shard-incarnation removes monotone fanout; registry itself removed by D1 |
@@ -272,6 +274,7 @@ See [`08-testing-and-soak.md`](08-testing-and-soak.md) for full detail.
 | Item | Status | Notes |
 |------|--------|-------|
 | Adversarial scenario suite S01–S35 | **PARTIAL** | 2026-07-03 night sweep (dev scale): 8 PASS, ZERO real fails (the one S13 'fail' was a card bug — oracle before sync; fixed, re-run PASS 11/11); all seven previously-FAILing scenarios clean; remaining inconclusives are honest scale gates ('rerun at ci/full') and infra gates (S12/S22/S27). NEXT: one ci/full-scale sweep |
+| Pool-hash vs `checksums.txt` consistency test (2026-07-03) | **TODO** | A test proving the CAS blob hash convention (streaming chunked `CityHash128`, 2048-byte blocks) yields the same value as the part's `checksums.txt` entry for each file it covers — the dedup/adopt paths silently rely on this equivalence; a drift (e.g. a future hash change on either side) must fail a test, not corrupt dedup |
 | S01 memory bloat fix (streaming `putBlob`) | **DONE** | Confirmed < 2x peak vs ~6.5x before |
 | S33 concurrent-leader reclaim-leak guard | **DONE** (now a real regression guard) | Attempt-scoped generations fix means S33 PASS = no leak |
 | S30/S34/S35 D1 regression guards | **DONE** | All PASS in D2 |

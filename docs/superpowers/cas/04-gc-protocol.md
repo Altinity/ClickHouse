@@ -9,7 +9,7 @@ doc_type: reference
 
 # CAS MergeTree — GC Protocol {#gc-protocol}
 
-**Status summary:** see per-section stamps. The regular round is a **single pass**: a heartbeat ack floor, one three-cursor merge that verifies/graduates/condemns in the same fold, two-phase graduation of deletions, and one `gc/state` CAS. It is **DONE** (implemented on branch `cas-gc-ack-floor-fence`; soak validation TODO). The ack floor replaces the former per-round all-shard fence and fold-through-fence recheck (see the History note in §3). Attempt-scoped generations (concurrent-leader safety) and the source-edge-set in-degree (H1b fix) are **DONE** (2026-07-01). Shard incarnation + registry removal (D1) is **TLA+ gate GREEN, implementation TODO**. Snap prune and advisory heartbeat are **DONE**.
+**Status summary:** see per-section stamps. The regular round is a **single pass**: a heartbeat ack floor, one three-cursor merge that verifies/graduates/condemns in the same fold, two-phase graduation of deletions, and one `gc/state` CAS. It is **DONE** (implemented on branch `cas-gc-ack-floor-fence`; soak-validated, including a live-AWS S3 run, 2026-07-03 — the night soak that ran under this round found and fixed the clamp-suppression gap below). The ack floor replaces the former per-round all-shard fence and fold-through-fence recheck (see the History note in §3). Attempt-scoped generations (concurrent-leader safety) and the source-edge-set in-degree (H1b fix) are **DONE** (2026-07-01). Shard incarnation + registry removal (D1) is **DONE** (TLA+ gate GREEN 2026-07-01, all five implementation phases landed). Snap prune and advisory heartbeat are **DONE**.
 
 Cross-links: `06-tla-models.md` for formal proofs · `07-s3-budget.md` for per-operation cost.
 
@@ -89,7 +89,7 @@ A live-but-slow leader's heartbeat advances within the observation window → no
 
 ## 3. The GC round {#gc-round}
 
-**Status: DONE** (one-pass ack-floor round implemented on `cas-gc-ack-floor-fence`; soak validation TODO. `CaGcAckFloorCore.tla` + `CaGcAckFloorZombie.tla` prove the ack-floor safety obligations — see `06-tla-models.md §ackfloor-core`; the fold/manifest machinery it reuses stays proved by `CaGcRootLocalPartManifestCore.tla`).
+**Status: DONE** (one-pass ack-floor round implemented on `cas-gc-ack-floor-fence`; soak-validated live on AWS S3, 2026-07-03. `CaGcAckFloorCore.tla` + `CaGcAckFloorZombie.tla` prove the ack-floor safety obligations — see `06-tla-models.md §ackfloor-core`; the fold/manifest machinery it reuses stays proved by `CaGcRootLocalPartManifestCore.tla`).
 
 The regular round is **one pass**:
 
@@ -113,7 +113,7 @@ There is **no fence phase, no recheck phase, and no crash-resume step**. The thr
 
 The GC leader discovers the live namespace universe by `LIST(cas/refs/)` — the set of `(ns, shard)` root-shard objects that physically exist. Each object is self-identifying (carries its `incarnation` — see §6.1).
 
-**Registry removal (D1, TODO):** historically discovery read from `gc/registry`, an append-only authority. D1 (§7) replaces this with the LIST-based discovery and deletes the registry. The token-diff optimization (skip body re-read when the listed shard token matches the previously folded token) is retained as a read accelerator.
+**Registry removal (D1, DONE):** historically discovery read from `gc/registry`, an append-only authority. D1 (§7) replaces this with the LIST-based discovery and deletes the registry (`discoverUniverse` now LISTs `cas/refs/` directly). The token-diff optimization (skip body re-read when the listed shard token matches the previously folded token) is retained as a read accelerator.
 
 This one LIST sweep is the round's only universe-proportional operation (O(universe/1000) LIST requests); everything else is O(delta) + O(servers). Discovery runs **after** the heartbeat floor (§3.1a), so any fenced-out writer's last commits are durable before the sweep enumerates them.
 
@@ -216,6 +216,8 @@ Let `min_ack` be the floor latched in §3.1a and `condemn_round = state.round + 
 
 Because `min_ack ≤ round − 1` always (acks cannot exceed the last published round), an entry condemned in this pass structurally cannot graduate in the same pass — the two-round pipeline falls out of the arithmetic, with no explicit rule.
 
+**Clamp suppression (`suppress_destructive`, 2026-07-03):** the table above is overridden pass-wide the instant the fold recorded **any** clamp anomaly (§absent-at-head): a `suppress_destructive` flag is threaded `Gc::runRegularRound` → `foldDeltasIntoGeneration` / `ShardReducer::reduce` → `settleEntry`. While set, no entry graduates to `delete_pending` and no already-`delete_pending` entry is re-delivered for `deleteExact`; every retired entry (pending or not) is carried unchanged to `still_retired`. Condemning and sparing are unaffected. This restores the ack-floor lemma "landed before the cut ⇒ folded before graduation," which a clamped shard's frozen cursor otherwise violates — found live in the night soak as 31 dangling blobs. Deletes resume on the first clamp-free pass.
+
 **Condemn fail-closed (absent-at-condemn):** a blob already absent when its `HEAD` returns 404 records **nothing** — there is no token to condemn (`GcSnap::forget`, §4.1). GC must **never fabricate a token** on a 404: a synthetic token would let a stale exact-token delete match a future unrelated incarnation reusing the same hash, violating `INV_NO_RETURN`.
 
 **Recovery wins over everything, `delete_pending` included** (fail-closed spare): a retired entry whose in-degree recovered to `> 0` is spared even if it was already `delete_pending`. A pending entry observed with recovered in-degree is structurally impossible (floor-passed ⇒ every live writer sees it condemned ⇒ no new reference), so it is spared *and* logged loudly.
@@ -268,6 +270,8 @@ A part manifest has at most one structural owner at any time (`SingleManifestOwn
 ### 3.8 Trim {#trim}
 
 After the round CAS is durable, `trim` removes journal records from root shards that are at or below the committed `folded_cursor` (there is no separate completion seal any more; `trim` reads the fold seal). This is `INV_JOURNAL_COVERAGE`: only records durably represented in the committed snap generation may be trimmed.
+
+**Lazy-trim gate (B12):** trim does not compact a shard's journal on every pass it could. A shard is compacted only when the trimmable-event count reaches `gc_trim_min_events` (default 256; 0 = eager, always compact) **OR** the shard's encoded body size reaches `gc_trim_body_soft_limit` (default 8 MiB, a backstop that bounds journal growth even if the count gate never fires) — plus an explicit one-round maintenance-compaction bypass. Below both gates the shard is skipped so its listed token stays stable for the discovery token-diff Skip.
 
 **B140-dangle HISTORY:** the original implementation stored snap edges and `folded_cursor` as two separately-durable objects with no enforced coherence. A lease-steal between the snap write and the `gc/state` CAS could leave `folded_cursor` ahead of the actual snap coverage → `trim` over-trimmed → a live part's edge was permanently lost → in-degree undercount → data loss (`fsck dangling`). The fix (v2, `2026-06-18`) embeds the fold cursor inside the snap codec so the two are always co-durable. The `CaB140DangleMerge.tla` model proved the fix closes the dangle. See `06-tla-models.md §b140-dangle`.
 
@@ -461,11 +465,11 @@ pin blobs forever — a genuine leak needing a separate long-dead-replica reapin
 
 ## 7. Ref removal and shard-object reclaim (D1) {#d1-registry-removal}
 
-**Status: TLA+ gate GREEN (2026-07-01); implementation phases 1–5 TODO.** `CaGcShardIncarnationCore.tla` `_design.cfg` holds `INV_NO_DANGLING` + `INV_NO_ORPHAN_EDGE` across 724,944 distinct states. See `06-tla-models.md §shard-incarnation`.
+**Status: TLA+ gate GREEN (2026-07-01); implementation phases 1–5 DONE** (Tasks 2–6: `ShardIncarnation` stamped on `RootShard`, `discoverUniverse` LIST-based over `cas/refs/`, `RootsRegistry` deleted, the newborn self-floor in `CasBuild.cpp`, and `Gc::reclaimDroppedShards` tombstone reclaim are all in code). `CaGcShardIncarnationCore.tla` `_design.cfg` holds `INV_NO_DANGLING` + `INV_NO_ORPHAN_EDGE` across 724,944 distinct states. See `06-tla-models.md §shard-incarnation`.
 
 ### 7.1 Problem: `dropNamespace` never deregisters {#drop-namespace-problem}
 
-`dropNamespace` (`CasStore.cpp:942-995`) tombstones each touched shard (appends removal `RootOwnerEvent`s, clears refs via `mutateShard`), but leaves the namespace in `gc/registry`. GC discovers from `registry.namespaces × shardsToVisit` and fences the full cartesian product — so per-round GC cost is proportional to **every table ever created**, not the live ones. The empty shard objects and registry entries accumulate without bound (S30 scenario). A scalability defect, not a correctness bug.
+Before this fix, `dropNamespace` (`CasStore.cpp:1392-1452`) tombstoned each touched shard (appends removal `RootOwnerEvent`s, clears refs via `mutateShard`), but left the namespace in `gc/registry`. GC discovered from `registry.namespaces × shardsToVisit` and fenced the full cartesian product — so per-round GC cost was proportional to **every table ever created**, not the live ones. The empty shard objects and registry entries accumulated without bound (S30 scenario). A scalability defect, not a correctness bug.
 
 ### 7.2 Rejected fixes {#d1-rejected}
 
@@ -646,10 +650,11 @@ Key test files:
 
 | Area | Status | Note |
 |------|--------|------|
-| One-pass ack-floor round (floor → three-cursor merge → single CAS) | **DONE** | `cas-gc-ack-floor-fence`; soak validation TODO |
+| One-pass ack-floor round (floor → three-cursor merge → single CAS) | **DONE** | `cas-gc-ack-floor-fence`; soak-validated live on AWS S3, 2026-07-03 |
 | Heartbeat ack floor + expired-mount fence-out (`computeHeartbeatFloor`) | **DONE** | Round's only clock (injected `now_ms_fn`) |
 | Merged heartbeat (mount lease ∪ build watermark, `observed_gc_round` ack) | **DONE** | `WatermarkKeeper` removed; −1 PUT/beat |
 | Two-phase graduation (`delete_pending`) | **DONE** | Zombie-safe pre-CAS deletes; deletion lags condemn by one pass |
+| Clamp-suppressed passes (`suppress_destructive`) | **DONE** | 2026-07-03 night-soak safety fix; no graduation/redelete while any shard is clamped (§three-cursor-merge) |
 | `CaGcAckFloorCore.tla` + `CaGcAckFloorZombie.tla` | **DONE** | 7 sabotages + order invariant; `delete_pending` proved load-bearing |
 | Exact-token delete (single content-delete site) | **DONE** | |
 | Source-edge-set in-degree (H1b fix) | **DONE** | 2026-07-01; faithful to big TLA+ model |
@@ -663,11 +668,11 @@ Key test files:
 | Snap prune — generation retention (B174) | **DONE** | 3 gen default; sawtooth gc/ storage |
 | Part-manifest cleanup (owner-driven) | **DONE** | |
 | Orphan part-manifest sweep (pre-precommit debris) | **DONE** | Bounded per round |
-| Shard incarnation (D1 phase 1) | **TODO** | TLA+ gate GREEN 2026-07-01 |
-| LIST-based discovery + registry deletion (D1 phase 2) | **TODO** | Depends on phase 1 |
-| Newborn = precommit-shard (D1 phase 3) | **TODO** | Depends on phase 2 |
-| Shard tombstone reclaim (D1 phase 4) | **TODO** | Depends on phase 3 |
-| S30 soak validation (D1 phase 5) | **TODO** | Depends on phase 4 |
+| Shard incarnation (D1 phase 1) | **DONE** | `ShardIncarnation` stamped on `RootShard` (Task 2) |
+| LIST-based discovery + registry deletion (D1 phase 2) | **DONE** | `discoverUniverse` over `cas/refs/`; `RootsRegistry` deleted (Task 3–4) |
+| Newborn = precommit-shard (D1 phase 3) | **DONE** | Newborn self-floor in `CasBuild.cpp` (Task 5) |
+| Shard tombstone reclaim (D1 phase 4) | **DONE** | `Gc::reclaimDroppedShards` (Task 6) |
+| S30 soak validation (D1 phase 5) | **DONE** | Task 6 commit message cites the S30 scenario |
 | Distributed `gc_shards > 1` parallel GC | **DESIRABLE** | Attempt-scoped gen is its prerequisite; shard claim/scheduler not yet built |
 | Integer refcount persisted artifact | **REJECTED** | H1b underflow; replaced by source-edge set |
 | `gc_lock` in-process mutex | **REJECTED** | Blocks writers; replaced by exact-token + attempt-scoped gen |

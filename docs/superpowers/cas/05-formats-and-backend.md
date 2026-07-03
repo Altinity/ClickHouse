@@ -9,10 +9,12 @@ doc_type: 'reference'
 
 # CAS MergeTree — Formats and Backend {#title}
 
-**Status:** covers generation-1 decisions: the envelope format (`DONE`), the encoding taxonomy and
-proto rename (`DONE`), `putDeterministicArtifact` (`DONE`), the `Backend` seam (`DONE`), layout keys
-(`DONE`); inline-data section (`DONE`), schema-evolution rollout machinery (`TODO`/deferred — Part IV);
-GCS/Azure binding (`TODO`); Merkle `treeId` tree-layer (`REJECTED`).
+**Status:** covers generation-1 decisions: the envelope format (`DONE`, blob only — see below), the
+encoding taxonomy and proto rename (`DONE`), `putDeterministicArtifact` (`DONE`, GC-internal artifacts
+only), the `Backend` seam (`DONE`), layout keys (`DONE`); the standalone `Tree` object kind, its
+inline-data section, and the Merkle `treeId` rule (**not implemented as of 2026-07-03** — superseded by
+the rev. 15 `PartManifest` redesign), schema-evolution rollout machinery (`TODO`/deferred — Part IV);
+GCS/Azure binding (`TODO`); Merkle `treeId` tree-layer intermediate object (`REJECTED`).
 
 Sources: `specs/2026-06-07-ca-merkle-store-design.md`, `specs/2026-06-08-ca-merkle-store-requirements.md`,
 `plans/2026-06-24-cas-2b-envelope-one-header.md`, `plans/2026-06-24-cas-2a-merkle-tree-id.md`,
@@ -26,14 +28,26 @@ Grounded against `Core/CasEnvelope.{h,cpp}`, `Core/CasBackend.h`, `Core/CasLayou
 
 ## Object kinds {#object-kinds}
 
-**Status: DONE**
+**Status: DONE, but see superseded-Tree note below**
 
-Three object kinds exist; a fourth (`Pack`) was removed (see Rejected section).
+Three object kinds were designed; a fourth (`Pack`) was removed (see Rejected section). **As of the
+rev. 15 root-local part-manifest redesign, `Tree` is no longer produced on the write path** (not
+implemented as of 2026-07-03): `CasManifestCodec.h` states explicitly "No `Subtree`: there are no
+nested tree objects in this design; a directory is a path prefix, not a placement." Part contents
+are described by a `PartManifest` (protobuf; see `Core/CasManifestCodec.h`) whose entries are either
+`EntryPlacement::Inline` (bytes embedded in the manifest body) or `EntryPlacement::Blob` (content-addressed
+blob). `ObjectKind::Tree` and the `CATR` magic still exist in `CasEnvelope.h`/`CasFormat.h` and are
+exercised by unit tests, but `CasBuild` never calls `uploadFromSource`/`observeAndAdmit` with
+`ObjectKind::Tree`, and `FormatId::Tree` is explicitly retired ("2 (Tree) ... retired in the rev. 15
+root-local part-manifest redesign — no on-disk compat to honor"). `Cas::Layout` correspondingly has
+no `treeKey` builder; `objectKey(layout, ObjectKind::Tree, hash)` throws `LOGICAL_ERROR` ("standalone
+tree objects are a retired concept").
 
 | Kind | Mutable? | Content-addressed? | Encoding |
 |------|----------|--------------------|----------|
 | **Blob** | no | yes | 256-B header (`CABL`) + raw file bytes |
-| **Tree** | no | yes | 256-B header (`CATR`) + catalog + inline-data section |
+| **Tree** (superseded, not produced — see above) | no | yes | 256-B header (`CATR`) + catalog + inline-data section |
+| **Part manifest** (`PartManifest`, part of a root-shard manifest body) | no | no (referenced by ref, not by content hash) | protobuf — `clickhouse.cas.format` package |
 | **Root shard** (manifest/journal) | yes | no | protobuf — `clickhouse.cas.format` package |
 | **GC/control objects** (`gc/state`, mount/heartbeat, `pool-meta`, retired list, etc.) | yes | no | protobuf |
 
@@ -151,8 +165,12 @@ A blob or tree produced by a given build is **deterministic**: same logical cont
 payload bytes → identical `logical_hash` key. This is the core dedup property. Determinism
 requirements:
 
-- **Blobs** — raw file bytes; the hash is `cityHash128(payload)`. Identity is independent of the
-  header incarnation zone.
+- **Blobs** — raw file bytes; the hash is the pool-wide streaming content-hash convention: chunked
+  `CityHash128` chained via `HashingWriteBuffer`/`HashingReadBuffer` per `DBMS_DEFAULT_HASHING_BLOCK_SIZE`
+  = 2048-byte blocks (`Core/CasBuild.cpp`, `poolContentHash`), hex-formatted via `getHexUIntLowercase` —
+  **not** a one-shot `CityHash128` of the whole payload; a one-shot hash diverges from the streaming hash
+  for any payload larger than one hash block (this caused a live false `CORRUPTED_DATA` in the 2026-07-03
+  soak). Identity is independent of the header incarnation zone.
 - **Trees** — the catalog is sorted by entry name (byte-wise) and uses a fixed field layout with no
   nondeterministic fields (`mtime`, `uid`, and any host-dependent attribute are excluded). Two trees
   with the same logical content therefore hash identically, enabling recursive directory dedup.
@@ -160,16 +178,29 @@ requirements:
   order, explicit `kind` byte for domain separation, no optional fields in the identity-sensitive
   input.
 
-The `putDeterministicArtifact` write path (`CasBuild`) derives the content hash **before**
-serializing the full payload and uses it as the object key. On `putIfAbsent` the object-storage
-backend returns `PreconditionFailed` if the key already exists — a dedup hit — and no bytes are
-transferred. This is why the write path is `O(new-content)`, not `O(all-content).`
+Blob upload (`Build::putBlob`, `Core/CasBuild.cpp`) derives the content hash **before** serializing/
+uploading the payload (the caller supplies the already-hashed `BlobId`) and uses it as the object key.
+On `putIfAbsent`/`putIfAbsentStream` the object-storage backend returns `PreconditionFailed` if the key
+already exists — a dedup hit — and no bytes are transferred. This is why the write path is
+`O(new-content)`, not `O(all-content)`.
+
+`putDeterministicArtifact(Backend&, key, bytes)` (`Core/CasBlobInDegree.cpp`) is a distinct, narrower
+helper: it is used only for **GC-internal** deterministic artifacts (fold seals, run files) where a
+replay is expected to reproduce byte-identical output. It calls `putIfAbsent`, and on
+`PreconditionFailed` re-`get`s the existing bytes and throws `CORRUPTED_DATA` if they differ from what
+was about to be written (divergent bytes at a supposedly-deterministic key); a byte-equal collision is
+treated as an idempotent no-op adoption. It is not part of the blob/tree content-addressed write path.
 
 **Blob-hash-over-payload domain:** the blob hash covers only `[header_len, EOF)` — the raw payload
 bytes — not the header. A header TLV or incarnation-zone change never rekeys a blob. A test in the
 gtest suite (`CasEnvelope.IncarnationZoneDoesNotAffectPayloadOrId`) asserts this.
 
 ### Tree codec and inline-data section {#tree-codec}
+
+**Not implemented as of 2026-07-03:** the standalone `Tree` object kind described in this section was
+superseded by the rev. 15 root-local part-manifest redesign. There is no `CasTreeCodec.{h,cpp}` in the
+tree; part contents are described by `PartManifest` (`Core/CasManifestCodec.h`), whose entries carry
+`EntryPlacement::Inline` or `EntryPlacement::Blob` directly — see `§object-kinds` above.
 
 The tree payload layout is **catalog-first, inline-data-last** (not interleaved):
 
@@ -187,13 +218,18 @@ catalog but are **outside identity** and may evolve freely.
 single tree GET at part open. `Placement::Blob` is used for lazy per-column data (`.bin`, `.mrk`),
 preserving column selectivity.
 
-Code: `Core/CasTreeCodec.{h,cpp}`.
+Code: `Core/CasTreeCodec.{h,cpp}` (not implemented as of 2026-07-03 — no such file exists; superseded by
+`Core/CasManifestCodec.{h,cpp}`, see above).
 
 ---
 
 ## Merkle `treeId` identity rule {#merkle-tree-id}
 
-**Status: DONE**
+**Status: not implemented as of 2026-07-03** — superseded by the rev. 15 root-local part-manifest
+redesign. There is no `merkleTreeId` function and no `CasTreeCodec.{h,cpp}` in the tree; a `PartManifest`
+is addressed by its journal-assigned `ManifestRef` (`writer_epoch`/`build_sequence`/`manifest_ordinal`),
+not by a content hash of its entries. The description below documents a design that was implemented in
+an earlier generation and is retained for historical context only.
 
 `treeId = CityHash128( "CAMT" || u8(1) || u32(entry_count) || per-entry[(u16 name_len || name || u8 node_kind || u128 child_hash)] )`
 
@@ -215,7 +251,8 @@ The old rule was `CityHash128(encodeTree(...))` — identity from the serialized
 was fragile: any catalog encoding change would rekey all trees, breaking dedup. The Merkle rule
 decouples identity from serialization entirely.
 
-Code: `Core/CasTreeCodec.{h,cpp}` (`merkleTreeId`); `Core/CasBuild.cpp` (`stageTree`).
+Code: `Core/CasTreeCodec.{h,cpp}` (`merkleTreeId`); `Core/CasBuild.cpp` (`stageTree`). (Not implemented
+as of 2026-07-03 — see status note above; the current write path is `CasBuild::stageManifest`.)
 
 ---
 
@@ -238,8 +275,10 @@ with explicit intermediate objects stored in the pool. The rationale for rejecti
 3. **GC complexity.** Every new object kind adds a GC edge type and a retire/delete path. The
    decision was to keep the object model to exactly two content-addressed kinds: blob and tree.
 
-The Merkle `treeId` *rule* (§5) is DONE and in production. What is REJECTED is the idea of an
-additional intermediate tree-layer object as a distinct `ObjectKind`.
+The Merkle `treeId` *rule* (§5) was implemented in an earlier generation but is **not implemented as of
+2026-07-03** (superseded by the rev. 15 root-local part-manifest redesign — see `§merkle-tree-id`).
+What remains REJECTED regardless is the idea of an additional intermediate tree-layer object as a
+distinct `ObjectKind`.
 
 ---
 
@@ -253,7 +292,6 @@ layout exactly.
 ```
 <prefix>/
   blobs/<shard2>/<blobId>          content blob (immutable)
-  trees/<shard2>/<treeId>          content tree (immutable)
   cas/refs/<ns>/<shard_number>     root-shard manifest (Phase 1 hot/cold split)
   cas/manifests/<ns>/<writer_epoch>/<build_seq>/<ordinal>.proto   part-manifest body
   roots/<server_root_id>/          per-server mutable state mirror
@@ -277,9 +315,11 @@ The `completion_seal` and the standalone `_watermark` object are **gone**: the a
 
 **Key design choices:**
 
-- `<shard2>` = first two hex characters of the id — identical sharding for blobs and trees.
-  `Layout::blobKey` / `Layout::treeKey` are the canonical builders; `objectKey(layout, kind, hash)`
-  unifies them for code paths that address both (GC retire + Build publish-gate).
+- `<shard2>` = first two hex characters of the id. `Layout::blobKey` is the canonical builder for
+  content blobs. `objectKey(layout, kind, hash)` dispatches on `ObjectKind` but only implements
+  `ObjectKind::Blob`; calling it with `ObjectKind::Tree` throws `LOGICAL_ERROR` ("standalone tree
+  objects are a retired concept") — there is no `Layout::treeKey` (not implemented as of 2026-07-03;
+  see `§object-kinds`).
 - Namespaces are opaque strings to the core; the wiring composes e.g. `<server_id>/<table_uuid>`.
   `_files`, `_manifests`, `_precommits` are reserved segments. Numeric-only shard keys and `_files`
   cannot collide.
@@ -348,8 +388,9 @@ index/GC leftovers that a repair/prune step must reconcile.
 
 **Status: DONE** (`Core/CasBackend.h`)
 
-`Backend` is an ~8-operation storage seam providing token-aware object access. It has three
-concrete implementations:
+`Backend` is a token-aware storage seam with 9 pure-virtual operations: `get`, `getStream`, `head`,
+`putIfAbsent`, `putIfAbsentStream`, `putOverwrite`, `casPut`, `deleteExact`, `list` (plus the
+capability query `supportsListTokens`). It has three concrete implementations:
 
 - `ObjectStorageBackend` — production, wraps `IObjectStorage` (S3, GCS, Azure).
 - `CasInMemoryBackend` — in-process fake for unit tests, mints monotonic tokens.
@@ -504,9 +545,12 @@ The following byte-level decisions are frozen (irreversible after first release)
 - Single header for blob and tree; magic set `CABL`/`CATR`; exact core size 94 bytes;
   `blob_header_len = 256` for both.
 - Version field width: 2 bytes (`uint16` LE) for `writer_version` and `compatibility_version`.
-- Merkle `treeId` rule: `CityHash128("CAMT" || u8(1) || sorted(name, node_kind, child_hash))`.
-- Blob hash over payload only (not the header).
-- Catalog-first / inline-data-last tree layout.
+- Merkle `treeId` rule: `CityHash128("CAMT" || u8(1) || sorted(name, node_kind, child_hash))`
+  (not implemented as of 2026-07-03 — superseded by the rev. 15 `PartManifest` redesign; see
+  `§merkle-tree-id`).
+- Blob hash is the streaming chunked convention (`§codecs-and-determinism`), over payload only
+  (not the header).
+- Catalog-first / inline-data-last tree layout (not implemented as of 2026-07-03 — see `§tree-codec`).
 - `Placement::Pack` fully removed (was never produced; no reserved slot — YAGNI).
 - Format id set (`CABL`/`CATR`/`CARS`/…).
 - Single error code `UNKNOWN_FORMAT_VERSION` for future format and unknown critical TLV.
@@ -528,9 +572,9 @@ unknown field. A **breaking change** (semantics of an existing field changes, or
 section) uses a branch and waits for the floor to rise. The ladder is pruned after a completed
 upgrade cycle.
 
-For trees, `treeId` is Merkle over logical children — so a breaking serialization change does NOT
-rekey objects. Old builds refuse to parse the new tree (fail-closed); objects dedup correctly across
-the boundary.
+For trees, `treeId` was designed to be Merkle over logical children — so a breaking serialization
+change would not rekey objects (not implemented as of 2026-07-03; see `§merkle-tree-id`). Old builds
+refuse to parse the new tree (fail-closed); objects dedup correctly across the boundary.
 
 ### Deferred rollout machinery (Part IV) {#deferred-rollout}
 
@@ -560,11 +604,12 @@ converted off JSON for cleanup but their protobuf is not an interchange contract
 
 | Item | Status | Notes |
 |---|---|---|
-| One 256-B header for blob+tree (`CABL`/`CATR`), 94-byte hole-free core | DONE | `CasEnvelope.{h,cpp}` |
+| One 256-B header for blob+tree (`CABL`/`CATR`), 94-byte hole-free core | DONE (envelope format only; `Tree` no longer produced — see below) | `CasEnvelope.{h,cpp}` |
 | `compatibility_version` (formerly `min_reader_version`) + `gateOnRead` | DONE | `CasFormat.{h,cpp}` |
-| Blob hash over payload, not header | DONE | test asserts this |
-| Merkle `treeId` rule (2a) | DONE | `merkleTreeId` in `CasTreeCodec` |
-| Catalog-first / inline-data-last tree layout | DONE | `CasTreeCodec` |
+| Blob hash over payload, not header | DONE (streaming chunked hash, not one-shot — see `§codecs-and-determinism`) | test asserts this |
+| Standalone `Tree` object kind / `Layout::treeKey` | **not implemented as of 2026-07-03** | superseded by `PartManifest` (`CasManifestCodec.h`), rev. 15 redesign |
+| Merkle `treeId` rule (2a) | **not implemented as of 2026-07-03** | no `merkleTreeId`/`CasTreeCodec` in tree; superseded by rev. 15 |
+| Catalog-first / inline-data-last tree layout | **not implemented as of 2026-07-03** | no `CasTreeCodec`; superseded by rev. 15 |
 | `Placement::Pack` removed | DONE | no code, no on-disk data |
 | proto rename → `cas_format.proto`, `clickhouse.cas.format` | DONE | `CasObjectStorageBackend` |
 | JSON codec family deleted | DONE | `CasCodecUtil.h` |

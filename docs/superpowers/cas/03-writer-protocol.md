@@ -61,14 +61,17 @@ Steps run in strict order; failure at any step aborts the open:
    - Fresh empty root: first epoch handed out is 1 (0 is reserved as the "no epoch" sentinel;
      `UINT64_MAX` is the retired sentinel).
 
-4. **Mount lease — liveness + merged heartbeat** (`claimMount`, `CasServerRoot.cpp`).
+4. **Mount lease — liveness + merged heartbeat** (`claimMountAwaitingExpiry` wrapping `claimMount`,
+   `CasServerRoot.cpp`).
    The pool key `gc/server-roots/<srid>/mount` holds a
    `MountLease{server_uuid, writer_epoch, hostname, pid, seq, expires_at_ms, min_active, observed_gc_round, gc_fenced}`.
    - Foreign UUID → `ForeignOwner`, open aborts.
    - Same UUID + same epoch → adopt (idempotent restart, e.g. `seq+1` refresh).
-   - Same UUID + different epoch + lease live → `LiveDoubleStart`, open aborts (another incarnation
-     is up).
-   - Same UUID + different epoch + lease expired → reclaim with a fresh body.
+   - Same UUID + different epoch + lease live → `Store::open` bounds-waits (up to the lease TTL plus a
+     poll margin) for the stale lease to lapse, then reclaims it (S13 crash-recovery self-remount); only
+     if a genuinely live second incarnation keeps renewing through that whole wait does open abort with
+     `LiveDoubleStart`.
+   - Same UUID + different epoch + lease already expired → reclaim with a fresh body immediately.
    The `MountLeaseKeeper` background thread renews the lease every `mount_renew_period` and on
    failure latches the local write fence (`tripMountLost`). The **local write fence** (checked by
    `mayMutate` before every `mutateShard`) enforces that a superseded writer does not race the
@@ -516,7 +519,7 @@ cannot append, so it inherits the base `false` — which historically also block
 
 The fix is a **distinct capability**: `IMetadataStorage::supportsTransactionalMutableFiles` (base
 returns `false`; `ContentAddressedMetadataStorage` overrides to `true`,
-`ContentAddressedMetadataStorage.h:76`). `StorageMergeTree::supportTransaction`
+`ContentAddressedMetadataStorage.h:84`). `StorageMergeTree::supportTransaction`
 (`StorageMergeTree.cpp:178`) now also accepts a disk whose metadata storage
 `supportsTransactionalMutableFiles`, rather than gating purely on `supportWritingWithAppend`.
 
@@ -665,8 +668,13 @@ The `stageManifest` inline caps (OQ7, enforced fail-closed before any body write
 When a root shard's encoded size crosses `manifest_soft_limit`, `mutateShard` introduces a linear
 write delay for Writer-origin mutations (GC mutations are not delayed). The delay is 0 at the soft
 limit and `manifest_max_delay_ms` near `manifest_hard_limit`. At or above `manifest_hard_limit`
-the mutation is rejected with `LIMIT_EXCEEDED`. This paces writers to give GC time to fold+trim
-the journal. One delay per `mutateShard` call (not per CAS retry).
+the mutation is rejected with `LIMIT_EXCEEDED`; with the flat-combining shard-mutation queue
+(the "Shard-mutation queue" part of §phase-upload above) a batch at the hard limit degrades to solo
+re-flushes so exactly the offending mutation gets `LIMIT_EXCEEDED` and its innocent co-batched
+neighbors proceed. This paces
+writers to give GC time to fold+trim the journal. One delay per **flush** (not per queued mutation,
+and not per CAS retry) — since 2026-07-03 a flush may batch several callers' mutations into one
+`casPut`.
 
 ---
 

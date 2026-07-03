@@ -11,7 +11,7 @@ doc_type: 'guide'
 
 This folder holds the canonical, structured documentation for the **content-addressed (CAS)
 MergeTree** feature of ClickHouse. It replaces the previous collection of ~150 dated spec, plan,
-worklog, and report files in `docs/superpowers/` with eight focused, topic-structured documents
+worklog, and report files in `docs/superpowers/` with nine focused, topic-structured documents
 and two navigation aids (this file and `ROADMAP.md`).
 
 **What CAS is in one sentence:** a new `metadata_type = content_addressed` disk back-end for
@@ -50,7 +50,7 @@ zero-copy replication.
 | Formats and backend abstraction | **DONE** — one-header envelope, protobuf codecs, schema-evolution stance, `putDeterministicArtifact` | [`05-formats-and-backend.md`](05-formats-and-backend.md) |
 | TLA+ models | **DONE** — multiple models; GC safety + liveness + attempt-scoped generation proved | [`06-tla-models.md`](06-tla-models.md) |
 | S3 op-count reduction | **Partial** — dedup cache, adaptive HEAD, precommit-first, snap-prune done; HEAD-storm (B148), B168 program ongoing | [`07-s3-budget.md`](07-s3-budget.md) |
-| Testing — scenario suite (S01–S35) | **Partial** — 14/32 PASS, 10 INCONCLUSIVE, 8 FAIL (all FAILs are harness/infra/scale issues, zero product bugs in D2); several scenarios need infra extensions | [`08-testing-and-soak.md`](08-testing-and-soak.md) |
+| Testing — scenario suite (S01–S35) | **Partial** — 2026-07-03 re-triage: 8 PASS, ZERO real fails (all old D2 FAILs resolved/superseded/card bugs); remaining inconclusives are ci/full scale gates + infra gates (S12/S22/S27) | [`08-testing-and-soak.md`](08-testing-and-soak.md) |
 | Testing — soak harness | **Partial** — green-path soak works; chaos soak limited by fsck timeout at large pool and TTL-band oracle; 4h continuous run needs compacting object store | [`08-testing-and-soak.md`](08-testing-and-soak.md) |
 | Introspection (`fsck`, `ca-gc-dryrun`, audit logs) | **DONE** — `clickhouse-disks fsck`, `ca-gc-dryrun`, `system.content_addressed_log`, `system.content_addressed_garbage_collection_log` all implemented | [`08-testing-and-soak.md`](08-testing-and-soak.md) |
 | Read protocol (ref resolution, manifest fetch, ranged blobs, decode caches, read-your-writes) | **DONE** — B59 in-flight overlay, B115 position-corruption fix, shard and manifest decode caches operational | [`09-read-protocol.md`](09-read-protocol.md) |
@@ -66,7 +66,8 @@ per-model `*_RESULTS.md` and `*_README.md` prose files.
 
 ## Active in-flight work {#active-work}
 
-The D1 shard-incarnation and registry-removal work landed merge-ready as of 2026-07-02. Its
-spec is `specs/2026-07-01-cas-shard-incarnation-and-registry-removal-design.md` and its plan
-is `plans/2026-07-01-cas-shard-incarnation-and-registry-removal.md`; these stay as the live
-spec/plan until D1 fully lands in the branch.
+The D1 shard-incarnation and registry-removal work is fully landed (2026-07-02/03: `gc/registry`
+deleted, `ShardIncarnation` stamping in `CasRootShardCodec.h`, LIST-based `discoverUniverse`,
+regression guards S30/S34/S35 PASS). Its spec
+(`specs/2026-07-01-cas-shard-incarnation-and-registry-removal-design.md`) and plan
+(`plans/2026-07-01-cas-shard-incarnation-and-registry-removal.md`) are kept as the historical record.

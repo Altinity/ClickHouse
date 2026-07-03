@@ -64,9 +64,10 @@ Four kinds of durable objects exist in the pool.
 
 ### Blobs {#blobs}
 
-A blob is the content-addressed bytes of one file. Its identity `H` = `cityHash128` of the raw file bytes,
-taken from `checksums.txt` (no re-read, no re-hash on the write path; an attach-time re-hash is the
-fallback). The storage key is `blobs/<H[:2]>/<H>`.
+A blob is the content-addressed bytes of one file. Its identity `H` is a streaming, chunked `cityHash128`
+computed incrementally over the bytes as they are written (via `HashingWriteBuffer`, block size
+`DBMS_DEFAULT_HASHING_BLOCK_SIZE` = 2048), not a one-shot hash of a pre-existing buffer and not read from
+`checksums.txt`. The storage key is `blobs/<H[:2]>/<H>`.
 
 Blobs are **pool-global and shared across servers**. The `blobs/` prefix is not rooted under any server
 identity; dedup spans replicas and tables by construction.
@@ -74,11 +75,14 @@ identity; dedup spans replicas and tables by construction.
 ### Ref shards (mutable) {#ref-shards}
 
 The only mutable objects. Each `(namespace, shard)` pair has one **RefShard** object at
-`cas/refs/<server_root_id>/<ns>/<shard>`. Its body is a JSON shard manifest containing:
+`cas/refs/<ns>/<shard>`, where `<ns>` is an opaque namespace string composed by the caller (typically
+embedding the `server_root_id`, e.g. `srv1/<table_uuid>`) — the key-building code (`rootShardKey` in
+`CasLayout.h`) does not hardcode a separate `<server_root_id>` path segment itself. Its body is a JSON
+shard manifest containing:
 
 - `refs` — a map `part_name → PartManifestRef` (the current part-manifest pointer + mutable per-part fields
   like `txn_version.txt`, `metadata_version.txt`).
-- `journal` — an append-only log of `+/-` ownership events, kept until GC folds past its fence.
+- `journal` — an append-only log of `+/-` ownership events; events are retained until the GC trim (gated by `gc_trim_min_events`/`gc_trim_body_soft_limit`) advances past the sealed fold cursor covering them (INV-JOURNAL-COVERAGE).
 - `incarnation` — a durable, strictly monotone pair `(writer_epoch, build_sequence)` stamped at
   (re)creation and never changed for that object's life. Closes the ABA hazard: a fold cursor keyed by
   `(ns, shard, incarnation)` can never silently skip a recreated shard's events.
@@ -87,8 +91,10 @@ The only mutable objects. Each `(namespace, shard)` pair has one **RefShard** ob
 A publish is **one CAS `PUT`** updating `refs` and appending the journal record atomically. The active set
 for a table is exactly the union of refs across its shards.
 
-**Status:** DONE. `server_root_id`-rooted hot/cold split (Phase 1 of the layout redesign) is DONE.
-Per-shard `incarnation` field and cursor-key extension (D1 Phase 1) is TODO as of 2026-07-02.
+**Status:** DONE. `server_root_id`-rooted hot/cold split (Phase 1 of the layout redesign) is DONE. Per-shard
+`incarnation` field and cursor-key extension (D1) is also DONE as of 2026-07-03 (see
+[`#d1-registry-removal`](#d1-registry-removal)); this line previously said "TODO as of 2026-07-02", which
+is stale.
 
 ### Part manifests (immutable) {#part-manifests}
 
@@ -98,22 +104,27 @@ A PartManifest is an immutable protobuf object that records the complete file li
 (file_name → blob_hash, size, placement) for each content-addressed file
 ```
 
-Placement is one of three kinds:
-- `inline` — tiny files embedded in the manifest body (part-open cost = 1 GET).
-- `blob` — large standalone file at `blobs/<H>` (the common case for `.bin`, marks).
-- `pack_slice` — member of a pack object at `(pack_hash, abs_offset, length)` (reserved; not yet produced).
+Placement (`EntryPlacement`) currently has two kinds:
+- `Inline` — tiny files embedded in the manifest body (part-open cost = 1 GET).
+- `Blob` — large standalone file at `blobs/<H>` (the common case for `.bin`, marks).
+
+A third kind, `pack_slice` — member of a pack object at `(pack_hash, abs_offset, length)` — was designed as
+a reserved placement but has no `EntryPlacement` enum value in the current code (not implemented as of
+2026-07-03).
 
 The per-part mutable files (`uuid.txt`, `txn_version.txt`, `metadata_version.txt`) are **excluded from the
 manifest** and kept in the ref shard's `RefPayload` for that part. This is what lets two parts with
 identical content share one manifest while having distinct identity and transaction state.
 
-PartManifest bodies live at `cas/manifests/<server_root_id>/<ns>/<writer_epoch>/<build_sequence>/<ordinal>.proto`.
-The identity of a manifest is the `PartManifestId` =
-`(root_namespace, writer_epoch, build_sequence, manifest_ordinal)`. Every component is durable-monotone and
-never reused, so identity is unique by construction without relying on random-collision improbability.
+PartManifest bodies live at `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/<ordinal>.proto` (as with ref
+shards, `<ns>` is the opaque namespace string that typically embeds `server_root_id`; `<ordinal>` is a
+6-digit zero-padded filename, e.g. `000001.proto`). The identity of a manifest is `ManifestId` = a
+`root_namespace` paired with a nested `ManifestRef` of `(writer_epoch, build_sequence, manifest_ordinal)` —
+not a type literally named `PartManifestId`. Every component is durable-monotone and never reused, so
+identity is unique by construction without relying on random-collision improbability.
 
 **Status:** DONE. Phase 3 `manifest_ordinal` reshape (replacing the earlier random `manifest_instance_id`)
-is DONE on branch `cas-layout-hot-cold-split`.
+is DONE (developed on branch `cas-layout-hot-cold-split`; landed in the current CAS lineage — the layout below is what the code builds today).
 
 #### Projections in the manifest {#projections-in-manifest}
 
@@ -155,7 +166,7 @@ A superseded writer (its `writer_epoch` no longer matches the live mount) issues
 the write-path lease fence is a local in-memory check (no per-write S3 read) that trips the disk to
 `lost/fail-closed` on any supersession.
 
-**Status:** DONE (Phase 0 of the layout redesign, on branch `cas-layout-hot-cold-split`).
+**Status:** DONE (Phase 0 of the layout redesign; developed on branch `cas-layout-hot-cold-split`, landed in the current CAS lineage).
 
 ---
 
@@ -184,13 +195,17 @@ quadratic GC discovery that arose when manifests and ref shards lived under the 
       <server_root_id>/
         owner                  sticky identity (server_uuid_hex); putIfAbsent once
         epoch                  sticky durable-monotone writer_epoch counter
-        mount                  expirable heartbeat lease
-        watermark              active-build floor for the manifest sweep
+        mount                  expirable heartbeat lease + build-watermark floor (see note below)
     state                      GcState (lease, round, fold cursors, fence versions)
     gen/<gen>/attempt/<att>/   per-round GC artifacts (fold seals, blob targets, retired sets, outcomes)
-    checkpoint/<n>             full-GC checkpoints (reachable-set summary)
   _pool_meta                   pool identity, format version, capability proof
 ```
+
+The standalone `watermark` object and the `gc/checkpoint/<n>` full-GC checkpoint path shown in earlier
+revisions of this diagram do not exist in the current code. The build-watermark floor (`min_active`) was
+merged into the `mount` object as part of the ack-floor GC redesign — there is no separate sticky
+`watermark` object anymore (not implemented as of 2026-07-03). `gc/checkpoint/<n>` has no corresponding
+key-builder in `CasLayout.h` (not implemented as of 2026-07-03).
 
 ### Why the split exists {#why-the-split}
 
@@ -228,8 +243,10 @@ and ownership are scoped per server to avoid cross-server locking.
 
 A MergeTree INSERT or merge produces a part locally, then publishes it to the pool:
 
-1. **Heartbeat** — a build heartbeat (`builds/<build_id>`) is durable in the pool before the first blob PUT.
-   GC uses this to distinguish live in-flight builds from dead debris.
+1. **Heartbeat** — a build heartbeat is durable in the pool before the first blob PUT, via the pool-wide
+   `gc/hb` pulse plus the writer's `mount` object build-watermark floor (there is no separate
+   `builds/<build_id>` object in the current layout). GC uses this to distinguish live in-flight builds
+   from dead debris.
 2. **Upload by placement** — each content file is hashed (from `checksums.txt`) and placed into the pool:
    - New content: `PUT If-None-Match:*` (idempotent; dedup hit → skip upload).
    - Cold reuse of an existing blob: observe its current backend token; check the GC retire view —
@@ -246,19 +263,25 @@ A crash anywhere before the publish leaves uploaded objects as **debris** attrib
 heartbeat. GC's full-GC tier reclaims them after heartbeat expiry. Nothing dangles: no ref ever named
 the new objects before the publish CAS landed.
 
-**Status:** DONE for the core write/drop path. `pack_slice` placement is reserved (encoded in the format,
-not yet produced).
+**Status:** DONE for the core write/drop path. `pack_slice` placement is a reserved design idea, not
+encoded in the current `EntryPlacement` format (not implemented as of 2026-07-03).
 
 ---
 
 ## GC overview {#gc-overview}
 
-**Status:** Core regular-GC protocol (fold → retire → fence → recheck → delete) is DONE and soak-validated.
-D1 (shard incarnation + registry removal) is TLA+ gate GREEN, implementation TODO.
+**Status (2026-07-03): stale.** The step-by-step protocol below (fold → retire → fence → recheck →
+delete) describes an earlier design. The code (`Gc` class, `CasGc.h`) now implements a **leader-paced
+ack-floor redesign** (spec 2026-07-02): one pass per round — heartbeat ack floor over
+`MountLease.observed_gc_round` → three-cursor merge fold → two-phase condemn/graduation deletion → a
+single `gc/state` CAS. The old `fence_round`/recheck terminology survives only as fossil comments/variable
+names in the current code. See `docs/superpowers/cas/04-gc-protocol.md` for the current protocol if it has
+been reconciled; otherwise treat the steps below as historical context for the no-return safety argument,
+which still holds under the new design.
 
 GC operates in two tiers that share one deletion tail.
 
-### Regular GC {#regular-gc}
+### Regular GC (historical description — see status note above) {#regular-gc}
 
 `O(delta)` — folds only journal-known nodes, never scans the full blob space:
 
@@ -282,7 +305,10 @@ incarnation can never affect a newer current incarnation — this relies on the 
 
 ### Shard incarnation and registry removal (D1) {#d1-registry-removal}
 
-**Status:** TLA+ gate GREEN (2026-07-01, `CaGcShardIncarnationCore.tla`, 724,944 states). Implementation TODO.
+**Status:** TLA+ gate GREEN (2026-07-01, `CaGcShardIncarnationCore.tla`, 724,944 states). Implementation
+DONE as of 2026-07-03 — `gc/registry` has been deleted from the code and discovery is `LIST(cas/refs/)`
+(verified by `gtest_cas_layout.cpp` and `gtest_cas_gc_ack_floor.cpp`, which assert `gc/registry` is
+absent). This section previously said "implementation TODO"; that is stale.
 
 Before D1: GC discovered namespaces from `gc/registry` and fenced the Cartesian product
 `registry × root_shards`, so per-round cost grew with every table ever created. Dropped namespaces were
@@ -300,9 +326,11 @@ After D1:
 ### Full GC {#full-gc}
 
 Rare. Finds **debris** (objects no journal ever knew — crashed builds) and repairs **drift** (snap
-diverging from truth). Debris candidates are range-read for their `build_id`, then one GET of
-`builds/<build_id>` checks heartbeat liveness by GC-observed monotone `heartbeat_seq` change — no writer
-clocks. Both tiers share the same `retire → fence → recheck → deleteExact` tail.
+diverging from truth). Debris candidates are range-read for their `build_id`, then checked against the
+writer's heartbeat (the `gc/hb` pulse plus the `mount` object's build-watermark; there is no separate
+`builds/<build_id>` object) via GC-observed monotone `heartbeat_seq` change — no writer clocks. Both tiers
+share the same deletion tail (condemn → graduation → exact-token delete under the current ack-floor
+design; historically described as `retire → fence → recheck → deleteExact`, see status note above).
 
 ---
 
@@ -363,8 +391,9 @@ Fetch-by-relink (the CAS analogue of zero-copy replication: a replica publishes 
 already-present shared blobs instead of downloading bytes) is only correct when the two replicas share
 one pool. Same-pool detection uses a **stable minted `pool_uuid`**, not endpoint+prefix string
 matching. `_pool_meta` carries `owner_server_id` + `claimed_at_unix` **and** a `pool_id` minted at
-first pool claim; `ContentAddressedMetadataStorage::getPoolUUID` exposes it
-(`ContentAddressedMetadataStorage.cpp:388`, `pool_uuid = u128ToHex(poolMeta().pool_id)`). The
+first pool claim; `ContentAddressedMetadataStorage::getPoolUUID` exposes it (defined inline in
+`ContentAddressedMetadataStorage.h`; the field is assigned in `ContentAddressedMetadataStorage.cpp` via
+`pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id)`). The
 part-exchange handshake advertises `content_addressed_pool_uuid`, and the sender relinks **only** when
 the receiver's advertised `pool_uuid` equals its own (`DataPartsExchange.cpp:232`); anything else falls
 back to the byte fetch (correct on CAS — downloaded files content-address and dedup).
@@ -401,7 +430,7 @@ required durable per-hash floors, epochs, per-build pins, a quiescence machinery
 component.
 
 **What replaced it:** The incarnation-token design (spec `2026-06-10-ca-incarnation-store-design.md`). Part
-identity becomes a `PartManifestId` (monotone composite, not a content hash); blobs remain one-key-per-hash;
+identity becomes a `ManifestId` (monotone composite, not a content hash); blobs remain one-key-per-hash;
 incarnation lives in the object body (not the key), so resurrecting a blob produces a distinct backend token
 without changing any parent's hash or key. The `404→LIST` path is gone.
 
@@ -511,8 +540,8 @@ not enforce it.
 
 | Backend | Token | v1 status |
 |---------|-------|-----------|
-| AWS S3 (versioning off) | `ETag` | Primary target, probe-gated. `DeleteObject If-Match` GA Sep 2025. |
-| RustFS 1.0.0-beta.8 | `ETag` | Empirically verified 2026-06-11. Leading open-source CI candidate. |
+| AWS S3 (versioning off) | `ETag` | Fully conforming, validated live 2026-07-03 (probe-gated at startup). `DeleteObject If-Match` GA Sep 2025. |
+| RustFS 1.0.0-beta.8 | `ETag` | Empirically verified 2026-06-11; leading open-source CI candidate. Known issue `rustfs#3231` (overwrite-leak of objects above the store's inline threshold, e.g. RustFS 128 KiB, in unversioned buckets) can produce metacache LIST storms and false 404s on HEAD — the only source of GC fold clamps observed to date. |
 | Azure Blob | `ETag` (write-sensitive) | Supported, probe-gated. Versioning/soft-delete must be off. |
 | GCS | `generation` | Binding specified; implementation deferred; fail-closed until probed. |
 | MinIO OSS (archived 2026-02) | — | `If-Match` on DELETE silently ignored — confirmed 2026-06-11. **Fail-closed.** |

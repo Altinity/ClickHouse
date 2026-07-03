@@ -42,7 +42,7 @@ protocol mechanics, not the per-operation counts.
 
 ## 2. Ref resolution (`resolveRef`) {#resolve-ref}
 
-**Status: DONE** (`CasStore.cpp:530`, `ContentAddressedMetadataStorage.cpp:513`)
+**Status: DONE** (`CasStore.cpp:771`, `Store::resolveRef`; called from `ContentAddressedMetadataStorage::resolveRouted` at `ContentAddressedMetadataStorage.cpp:529`)
 
 ```
 resolveRef(ns, ref_name, allow_stale) → std::optional<Resolved>
@@ -67,7 +67,7 @@ on the read path.
 
 ## 3. Part-manifest fetch (`readManifest`) {#read-manifest}
 
-**Status: DONE** (`CasStore.cpp:576`)
+**Status: DONE** (`CasStore.cpp:817`, `Store::readManifest`)
 
 ```
 readManifest(ManifestId) → PartManifest
@@ -98,7 +98,7 @@ The fetch sequence:
 
 ## 4. Blob ranged reads (`CasObjectStorageBackend::get`) {#blob-ranged-reads}
 
-**Status: DONE** (`CasObjectStorageBackend.cpp:336`, `ContentAddressedMetadataStorage.cpp:950–987`)
+**Status: DONE** (`CasObjectStorageBackend.cpp:388`, `ObjectStorageBackend::get`; `ContentAddressedMetadataStorage.cpp:968–1004`)
 
 Once the manifest is decoded, `lookupPath(manifest, file_name)` finds the `ManifestEntry` for the
 requested file. `locate(entry)` returns a `BlobLocation{key, offset, length}` where:
@@ -123,8 +123,11 @@ requested file. `locate(entry)` returns a `BlobLocation{key, offset, length}` wh
    that exposes only the `[payload_offset, payload_end)` window to its consumer (see §7).
 
 For `Backend::get` at the control-object level (root shards, manifests, GC state), ranged reads are
-done via `readObjectRanged`, which reads the whole object and substrings the `Range`; those objects
-are small and this is not on the blob-read hot path.
+done via `readObjectRanged`, which as of the 2026-07-02 snapshot-streaming rework is a TRUE ranged
+read (`seek` + `setReadUntilPosition` + a bounded `read`, clamped against a HEAD-supplied or fetched
+object size) — it no longer reads the whole object and substrings the `Range`. This path is shared
+with the snapshot-streaming GC reads, which can be GB-scale, so the whole-object-then-substring
+approach was replaced to keep the caller's memory budget at O(block).
 
 The `NoSuchKey`/404 contract: if the object is deleted between HEAD and GET inside `Backend::get`,
 the exception is caught and `std::nullopt` is returned — a legitimate concurrent-delete window
@@ -158,7 +161,7 @@ There are two independent decode caches, one per object kind on the read path.
 
 ### 6.1 Shard decode cache {#shard-decode-cache}
 
-**Source:** `CasStore.cpp:392–528`, `CasStore.h`
+**Source:** `CasStore.cpp:633–765` (`readShardDecoded`, `coalescedReadShardDecoded`), `CasStore.h`
 
 Caches `key → ShardDecodeCacheEntry{token, shard, validated_at}`. A root shard is immutable
 within a token (ETag), so a token match means the decoded `RootShard` is still valid.
@@ -183,7 +186,7 @@ a stale decode from being re-inserted after its invalidation erase has already r
 
 ### 6.2 `(ManifestId, Token)` decode cache {#manifest-decode-cache}
 
-**Source:** `CasStore.cpp:563–663`
+**Source:** `CasStore.cpp:817–899` (`Store::readManifest`)
 
 Caches `ManifestCacheKey{manifest_id, token} → shared_ptr<const PartManifest>`. Part manifests
 are immutable content-addressed objects — the same `(manifest_id, token)` pair always denotes
@@ -371,7 +374,8 @@ Neither kind goes through the blob/manifest pipeline; both are plain `IObjectSto
 
 ## 10. GC safety — the reader fence {#gc-safety}
 
-**Status: DONE (design); ephemeral-pin mechanism implemented**
+**Status: DONE (structural protection, current ack-floor GC); ephemeral-pin mechanism NOT
+implemented as of 2026-07-03 — design only**
 
 For the full GC fence protocol see [`04-gc-protocol.md §6.4`](04-gc-protocol.md#reachability-roots).
 Summary relevant to the read path:
@@ -379,14 +383,20 @@ Summary relevant to the read path:
 **Structural protection.** A blob that is referenced by a live committed manifest ref is safe from
 GC deletion: the GC fold only marks a blob as a zero-in-degree candidate when no reachability root
 (ref entry in a root shard) names it. As long as the read holds a decoded `PartManifest` in memory
-and the ref has not been dropped, the GC's in-degree count for those blobs is ≥ 1.
+and the ref has not been dropped, the GC's in-degree count for those blobs is ≥ 1. Deletion is also
+two-phase (condemn → `delete_pending` → graduate only once the heartbeat ack floor has passed the
+condemning round, `04-gc-protocol.md §3.5`), which bounds how quickly a freshly-unreferenced blob
+can actually be deleted.
 
-**Stateless / ref-less reader fence.** A `SELECT` that opens a part for reading increments a
-per-process `use_count` (shared-ptr ownership) on the decoded manifest. As long as `use_count > 1`,
-the GC's `safe_epoch` advance is blocked for that object's generation. The GC fence
-(`04-gc-protocol.md §3.5`) also issues a per-shard `casPut` before recheck; any writer (including
-a ref-drop that makes the blob unreachable) that committed after the GC's fold snapshot is visible
-to the recheck — so a blob being read mid-query cannot be garbage-collected within that GC round.
+**Stateless / ref-less reader fence.** There is no CAS-GC-specific `use_count`/`safe_epoch` fence.
+The only related mechanism in the codebase is the generic MergeTree `isSharedPtrUnique` check
+(`use_count() == 1`) that keeps an `Outdated` `DataPart` shared_ptr alive past `old_parts_lifetime`
+while any local reader still holds it — this is not CAS-specific and does not participate in the
+CAS GC fold at all. Per `04-gc-protocol.md §6.4`, this local mechanism is a valid fence only for
+replicas that hold a `/parts` ref; it does **not** cover a stateless/ref-less cross-node reader. The
+documented fix — an ephemeral Keeper (or equivalent) pin created at query start and auto-released on
+session end, folded into the GC's reachability MARK union — is a design only (not implemented as of
+2026-07-03).
 
 **The per-server-owned-namespace model** (per-server root shards, D1) narrows but does not
 eliminate the ref-less cross-node read window. The documented mechanism for the cross-node case
@@ -406,11 +416,11 @@ is intentionally empty to avoid duplication; all budget figures live in `07`.
 
 | Item | Status | Notes |
 |---|---|---|
-| `resolveRef` via shard decode cache | **DONE** | `CasStore.cpp:530`; TTL + single-flight |
-| Shard decode cache (TTL + token-validate) | **DONE** | `CasStore.cpp:392`; B157 write-coherence |
-| `(ManifestId, Token)` manifest decode cache | **DONE** | `CasStore.cpp:576`; token-keyed immutable decode |
+| `resolveRef` via shard decode cache | **DONE** | `CasStore.cpp:771`; TTL + single-flight |
+| Shard decode cache (TTL + token-validate) | **DONE** | `CasStore.cpp:633`; B157 write-coherence |
+| `(ManifestId, Token)` manifest decode cache | **DONE** | `CasStore.cpp:817`; token-keyed immutable decode |
 | `readManifest` fail-closed (INV-NO-DANGLE) | **DONE** | `CORRUPTED_DATA`/`FILE_DOESNT_EXIST` on any identity check failure |
-| Blob ranged GET via `getBlobViewPlan` + `readBlobPayload` | **DONE** | `ContentAddressedMetadataStorage.cpp:950` |
+| Blob ranged GET via `getBlobViewPlan` + `readBlobPayload` | **DONE** | `ContentAddressedMetadataStorage.cpp:968` |
 | `ReadBufferFromFileView` position-rebase fix (B115) | **DONE** | Commit `440871098a9`; gtest added |
 | `PackedFilesReader` latent B115 (statistics path) | **DONE (fix in place)** | Upstream-relevant; current statistics consumer is still sequential, so not yet triggered |
 | Column pruning (structural — per-file `lookupPath`) | **DONE** | No separate filter; reader requests only needed files |
@@ -420,7 +430,7 @@ is intentionally empty to avoid duplication; all budget figures live in `07`.
 | In-flight read-your-writes overlay (B59, blobs) | **DONE** | `tryGetInFlightStorageObjects` / `tryReadFileInFlight` / `tryGetInFlightFileSize` |
 | In-flight read-your-writes overlay (B59, directory) | **DONE** | `hasInFlightDirectory` + `existsDirectory` prelude |
 | Projection carry-forward workaround removed | **DONE** | `registerCarriedForwardProjectionForCA` deleted |
-| Ephemeral reader pin (cross-node GC fence) | **DONE (design)** | Per-server-owned-namespace model narrows window; ephemeral-pin mechanism is the documented cross-node answer |
+| Ephemeral reader pin (cross-node GC fence) | **TODO** (not implemented as of 2026-07-03) | Per-server-owned-namespace model narrows window; ephemeral-pin mechanism is the documented cross-node answer, design only |
 | Replication fetch-by-relink (zero byte cost) | **DONE (base)** | See `03-writer-protocol.md`; `manifest_hash` on Keeper znode is TODO |
 | `manifest_size` always 0 in `Resolved` | **TODO** (minor) | B10 finding; `CasStore::resolveRef` never sets it |
 

@@ -90,9 +90,18 @@ per-build `CasBuildPut` heartbeat was already removed earlier (B167c: redundant 
 
 Every `casPut` is an `If-Match` conditional PUT. On a conflict (concurrent writer or GC fence)
 it 412s, re-reads the shard (1 `GET`), and retries. Measured conflict rate: **35%** of
-`casPut` calls at `workers=2` (`CasRootCasConflict` 49 k / `CasRootCas` 93 k, P0 soak). At
-`root_shards=64` (after B168 #4) contention is reduced but not eliminated. Each conflict costs
-one extra `PUT` (412d) + one `GET` (**measured**).
+`casPut` calls at `workers=2` (`CasRootCasConflict` 49 k / `CasRootCas` 93 k, P0 soak, at the
+then-widened `root_shards=64` soak config). Each conflict costs one extra `PUT` (412d) + one
+`GET` (**measured**).
+
+**Superseded by the flat-combining shard-mutation queue (2026-07-03).** `casPut` calls on the
+same `(namespace, shard)` are now grouped by a leader-caller batch builder (`Store::mutateShard`,
+`CasStore.cpp:971`) into one read + one `casPut` per flush instead of one independent CAS loop
+per mutation. This is now the primary contention lever, not shard fan-out: soak-validated ~2.3×
+CAS-write compression with the intra-server conflict rate dropping from ~257k/h to ~11/h. The
+shipped `root_shards` default was correspondingly changed to **32** (see §4), chosen to balance
+per-shard journal body size and GC discovery cost rather than to spread CAS contention, since the
+queue removes most of the contention argument for large shard counts (`CasStore.h:110-114`).
 
 ---
 
@@ -292,12 +301,14 @@ Each row is one optimization, the problem it solved, and its measured or modeled
 | **ETag fix (#1)** | `WriteBufferFromS3` captures the response ETag from `PutObject`/`CompleteMultipartUpload`; `nativeConditionalPut` uses it directly — no follow-up HEAD needed | ~73% of all HEADs (head-after-put was the single largest HEAD source, **measured**: `CasDbgMetaHit` 458 k ≈ `S3WriteRequestsCount` 340 k at 1:1 ratio) | **DONE** (commit `2a13fe5cc0f`) | `reports/2026-06-15-unattended-night-opcount-fixes.md` §#1; `CasObjectStorageBackend.cpp:127` |
 | **P1 dedup cache** | LRU byte-bounded set of known-present content hashes; on a cache hit the blob PUT is replaced by a cheap HEAD-first check | Eliminates body-PUT + follow-up HEAD on 64% of blob creates (dedup hit rate, **measured**, P0 instrumentation) | **DONE** (B168; `CasStore.cpp:57`) | `specs/2026-06-20-ca-dedup-cache-head-before-put-design.md` |
 | **P2 adaptive HEAD-before-PUT** | For blobs ≥ `dedup_head_first_min_bytes` (default 1 MiB), send a HEAD first even on a cache miss — converts a body-PUT+HEAD (write tier) into a single HEAD (read tier) on a dedup hit | Downgrades large-blob dedup cost from write-tier PUT to read-tier HEAD; protects against broken-pipe storms on large-body 412s (B187) | **DONE** (B168; `CasBuild.cpp:119`) | `specs/2026-06-20-ca-dedup-cache-head-before-put-design.md` |
-| **root_shards widen** | Raised default `root_shards` from 8 to 64 | Spreads per-key CAS contention + per-key 64-permit I/O cap (RustFS 503 congestion) across 64 shards; GC retire-contention failure rate dropped from ~78% to ~21% (**measured**, soak #6 t=343s) | **DONE** (commit `d0194412d0b`) | `reports/2026-06-15-unattended-night-opcount-fixes.md` §#4 |
+| **root_shards widen (soak config)** | Raised the soak fanout `root_shards` from 8 to 64 | Spreads per-key CAS contention + per-key 64-permit I/O cap (RustFS 503 congestion) across 64 shards; GC retire-contention failure rate dropped from ~78% to ~21% (**measured**, soak #6 t=343s) | **DONE** (commit `d0194412d0b`) | `reports/2026-06-15-unattended-night-opcount-fixes.md` §#4 |
+| **root_shards factory default fix** | Factory default for `root_shards` was silently 8 (mismatched `PoolConfig`'s already-32 default) — fixed to **32**, weighed against per-shard journal body size vs. GC discovery cost | Shipped default is now 32, not 64: with the flat-combining queue (below) removing most of the CAS-contention argument for large shard counts, 32 keeps a hot table's journal tail small without over-multiplying discovery `LIST` keys | **DONE** (commit `aa04ac9c3fb`) | `MetadataStorageFactory.cpp`, `CasStore.h:110-114` |
+| **Flat-combining shard-mutation queue** | Group concurrent `casPut` mutations to the same `(namespace, shard)` into one leader-driven read + one `casPut` per flush (`MutationScope`, `Store::mutateShard`) | Soak-validated ~2.3× CAS-write compression; intra-server conflicts dropped from ~257k/h to ~11/h (**measured**) | **DONE** (spec `2026-07-03-cas-shard-mutation-queue`) | `CasStore.h`/`CasStore.cpp` (`runShardQueueLeader`); `03-writer-protocol.md §shard-mutation-queue` |
 | **LIST-token skip** | Fold compares each shard's LIST-returned token against the sealed post-fence token; if equal, skips the shard body GET entirely | Reduces fold GETs to `S_changed` rather than `S` at every round; at steady state `S_changed ≪ S` | **DONE** (`CasGc.cpp:1430`) | `specs/2026-06-14-ca-reduce-s3-op-count-design.md` §2 |
 | **Snap prune LIST elimination** | Removed per-round LIST of current-generation fold prefix for deposed-leader debris; wholesale generation-retain prune handles it lazily | Saves 1 `LIST` per round on the common single-leader path | **DONE** (`CasGc.cpp:1242`) | Code comment in `CasGc.cpp` |
-| **P9 — GC 404-HEAD storm** | Prune confirmed-deleted/absent candidates from the fold in-degree snapshot so they are not re-HEADed on subsequent rounds | Removes the dominant HEAD source: **~90% of all read ops** on the GC leader = ~3.8 M / 23 min = ~367 M / day at `workers=2` (**measured**, P0 soak `CasBlobHeadMiss` + `CasTreeHeadMiss`); eliminates the livelock amplification | **TODO** (P9 proposal) | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P9 |
+| **P9 — GC 404-HEAD storm** | Prune confirmed-deleted/absent candidates from the fold in-degree snapshot (`GcSnap::forget`) so they are not re-HEADed on subsequent rounds | Removes the dominant HEAD source: **~90% of all read ops** on the GC leader = ~3.8 M / 23 min = ~367 M / day at `workers=2` (**measured**, P0 soak `CasBlobHeadMiss` + `CasTreeHeadMiss`); eliminates the livelock amplification; idle-round `HEAD`s went from ~46k to ~0 | **DONE** (TLA+-verified, soak-validated) | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P9; `04-gc-protocol.md §node-pruning` |
 | **P3 — replication relink** | Replica `DownloadPart` adopts the existing manifest refs rather than re-downloading each blob | Removes ~15 HEADs + 15 GETs per replicated part (**measured**, ~53 k parts / 95 min at `workers=2`) | **DESIRABLE** (P3 proposal) | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P3 |
-| **P4 batch publishes** | Commit multiple parts in one manifest CAS | Cuts `casPut` count + 35% CAS-conflict rate (**measured**) + per-shard write churn | **DESIRABLE** (B157/B149) | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P4 |
+| **P4 batch publishes** | Commit multiple parts in one manifest CAS | Cuts `casPut` count + 35% CAS-conflict rate (**measured**) + per-shard write churn | **Largely subsumed** by the flat-combining shard-mutation queue (2026-07-03), which batches concurrent publishes into one `casPut` per shard; remaining delta is a deliberate multi-part single-commit API (B157/B149) | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P4 |
 | **P6 dirty-only fence** | Fence only shards with pending retires rather than all `S` shards | Would have removed `S - S_dirty` fence PUTs per round | **SUPERSEDED** by the ack-floor round | `reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` §P6 |
 | **Ack-floor GC round** | Replace the per-round all-shard fence + fold-through-fence recheck with a causal ack floor + one three-cursor merge; deletion gated by `condemn_round < min_ack` over live-server heartbeats | Removes both O(universe) phases: ~2×O(universe) GET + O(universe) CAS-PUT per round → O(delta)+O(servers) + 1 LIST sweep. ~2.4 M req/round → ~2–3 k req/round at 100k tables × 8 shards (**modeled**) | **DONE** (`cas-gc-ack-floor-fence`; soak validation TODO) | `specs/2026-07-02-cas-gc-ack-floor-fence-redesign.md` |
 | **Merged heartbeat** | Fold the per-server build-watermark PUT into the mount-lease beat; add one `gc/state` GET | −1 PUT / +1 GET per writer beat | **DONE** (`cas-gc-ack-floor-fence`) | same spec, Task 6 |
@@ -308,7 +319,7 @@ Each row is one optimization, the problem it solved, and its measured or modeled
 
 | Section | Confidence | Method |
 |---|---|---|
-| ETag-fix HEAD reduction (~73%) | **Measured** | `CasDbgMetaHit` / `S3WriteRequestsCount` ratio, instrumented soak (2026-06-15, seed 20260616) |
+| ETag-fix HEAD reduction (~73%) | **Measured** | `CasDbgMetaHit` / `S3WriteRequestsCount` ratio, instrumented soak (2026-06-15, seed 20260616); `CasDbgMetaHit` was a throwaway diagnostic ProfileEvent, since removed (commit `87d97826711`) — the ratio is a historical measurement, not a live-queryable metric |
 | Blob dedup hit rate (64%) | **Measured** | `CasBlobPutDedup` / (`CasBlobPutDedup` + `CasBlobPut`), P0 instrumentation run (~23 min) |
 | GC HEAD storm magnitude | **Measured** | `CasBlobHeadMiss` + `CasTreeHeadMiss` ~3.81 M / 23 min (ch1 only); `S3HeadObject` 23.7 M / 3.2 h (run #5 aged pool) |
 | 412 manifest-CAS conflict rate (35%) | **Measured** | `CasRootCasConflict` 49 k / `CasRootCas` 93 k, P0 soak |
@@ -316,7 +327,7 @@ Each row is one optimization, the problem it solved, and its measured or modeled
 | LIST-token skip savings | **Code-derived** | `computeDiscoverDecisions` logic, `CasGc.cpp:1430`; not yet separately instrumented |
 | Replication HEAD+GET per part (~15+15) | **Measured** | `part_log` attribution, `DownloadPart` 53,796 events / ~95 min (P0 soak) |
 | Mutable-files S3 cost (0 ops) | **Code-derived** | `CasRootShardCodec.cpp:121` inline encoding |
-| P9 estimated savings (~90% of read ops) | **Measured basis** | `CasBlobHeadMiss`+`CasTreeHeadMiss` ≈ 90% of all `S3HeadObject`, P0 soak; fix not yet implemented |
+| P9 savings (~90% of read ops) | **Measured basis** | `CasBlobHeadMiss`+`CasTreeHeadMiss` ≈ 90% of all `S3HeadObject`, P0 soak; fix shipped (`GcSnap::forget`), post-fix idle-round re-measurement not yet separately captured here |
 | revalidateDeps per-promote HEAD count | **Modeled/uncertain** | `CasBuild.cpp:729`; exact count depends on dep count + cache state; not separately instrumented |
 
 ---
@@ -331,11 +342,12 @@ Extrapolated to per-day (×7.18) using the corrected P0 soak measurement:
 | Write (PUT + LIST) | ~73 M | ~$365 | ~$178 = 412-waste (dedup body-PUT + manifest-CAS retries) |
 | DELETE | many | $0 | — |
 | **Total (pre-P1/P2/P9)** | | **~$571/day** | **~57% is eliminable waste** |
-| **Estimated floor after P1/P2/P9** | | **~$245/day** | Modeled/uncertain |
+| **Estimated floor after P1/P2/P9** | | **~$245/day** | Modeled/uncertain; P1/P2/P9 have since all shipped (see §4) but this table has not been re-run against the fixed pipeline |
 
-Figures are for the soak workload (`workers=2`, `root_shards=64`, no chaos, MergeTree with 18× merge
-amplification). A production workload's per-request ratios depend heavily on dedup hit rate, merge
-amplification factor, and GC round cadence.
+Figures are for the soak workload at the time of measurement (`workers=2`, `root_shards=64` — the
+then-widened soak fanout, not today's shipped default of 32; see §4), no chaos, MergeTree with 18×
+merge amplification. A production workload's per-request ratios depend heavily on dedup hit rate,
+merge amplification factor, and GC round cadence.
 
 ---
 

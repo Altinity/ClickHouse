@@ -15,7 +15,8 @@ harness (`utils/ca-soak/`), the independent pool-inspection tooling (`clickhouse
 `ca-gc-dryrun`), and the two in-server audit log tables.
 
 Related documents: `04-gc-protocol.md` (GC protocol), `07-s3-budget.md` (S3 op budgets).
-Spec sources: `specs/2026-06-13-ca-soak-test-design.md`, `specs/2026-06-13-ca-fsck-readonly-design.md`.
+Spec sources: `specs/2026-06-13-ca-soak-test-design.md`, `specs/2026-06-13-ca-fsck-readonly-design.md`
+(paths not found under `docs/superpowers/specs/` as of 2026-07-03; verify location before relying on them).
 
 ## 1. Introspection layer {#introspection}
 
@@ -69,8 +70,10 @@ pool reachability:
 `pending_gc`/`awaiting_gc` are nonzero ("inside the normal GC deletion pipeline — expected") and a
 re-run hint when `unaccounted` is nonzero — beta testers should never have to interpret raw counters.
 
-`--detail` adds a per-object row (`key, kind, class, size, reachable_from[]`).
-`--format json|tsv` for machine consumption.
+`--detail` adds a per-object row (tab-separated `class, key, size[, reachable_from...]`) after the
+summary line. `--timeout <seconds>` aborts the scan with a clear error instead of hanging (default
+600; 0 = unbounded). There is no `--format json|tsv` option (not implemented as of 2026-07-03) —
+output is a plain `key=value` summary line plus optional tab-separated detail rows.
 
 ### 1.3 `clickhouse-disks ca-gc-dryrun` {#gc-dryrun}
 
@@ -144,6 +147,7 @@ One `Start` row and one `Finish` row per GC round, emitted by `CasGcScheduler` v
 | `objects_absent` | objects expected but already missing (concurrent delete or bug) |
 | `objects_replaced` | 412-spared objects (live incarnation token displaced the condemned one) |
 | `objects_spared` | objects not deleted for other reasons (e.g. protected by live build) |
+| `manifests_deleted` | owner-removed manifest bodies deleted this round (B11) |
 | `entries_condemned` | retired entries newly condemned this round (ack-floor stage 1) |
 | `entries_graduated` | entries newly floor-passed, republished `delete_pending` (stage 2; deleted NEXT round) |
 | `entries_redeleted` | pending exact-token blob deletes executed this round (stage 3) |
@@ -176,15 +180,17 @@ Key schema columns:
 | column | description |
 |--------|-------------|
 | `event_type` | taxonomy value (see below) |
+| `disk_name` | the CA disk the event occurred on |
 | `namespace` | `roots/<ns>` (server/table) |
 | `ref_name` | part name or ref identifier |
-| `object_kind` | `Enum8('none','blob','tree','pack','root','snap')` |
+| `object_kind` | `LowCardinality(String)`: `none`, `blob`, `tree`, `root`, `snap` |
 | `object_hash` | lowercase hex content hash |
 | `token` | incarnation token (S3 ETag or equivalent) |
 | `round` / `gen` | GC round and snap generation numbers |
 | `at_version` | manifest shard version driving the journal record |
 | `outcome` | `ok`, `adopt`, `resurrect`, `deleted`, `replaced`, `spared`, `absent`, etc. |
 | `reason` | human-readable *why* of the decision (mandatory, never decorative) |
+| `thread_id` / `query_id` | thread and query context of the event, when applicable |
 | `detail` | `Map(String,String)` structured facts for full reconstruction |
 
 **Event types the soak harness asserts must NOT appear in positive scenarios**:
@@ -278,7 +284,7 @@ Every positive scenario must satisfy:
 | S09 | P0 | Mutation carry-forward | Only changed columns are re-uploaded; identity updates produce zero large blob growth | INCONCLUSIVE |
 | S10 | P1 | Patch parts and lightweight deletes | No dangling refs during patch-part create/merge/remove | FAIL (harness scale/timing issue, not a product bug) |
 | S11 | P0 | Heavy `ALTER TABLE ... DELETE` | Mutation latency, queue depth, GC reclaim bounded after deletions | FAIL (GC Error rows — pre-existing) |
-| S12 | P1 | Ten replicas, shared pool, parallel inserts | Leader election, dedup across replicas, no data-size amplification | NOT RUN (compose provides only 2 replicas) |
+| S12 | P1 | Ten replicas, shared pool, parallel inserts | Leader election, dedup across replicas, no data-size amplification | NOT RUN (`docker-compose-10replicas.yml` now exists (ch1..ch10); gap is `soak/cluster.py`'s `Cluster` class, hardcoded to 2 nodes) |
 | S13 | P0 | Process loss during write and GC | Abandoned precommits are safe; stale GC leaders cannot over-delete | FAIL (chaos kill/restart connection refused — harness issue) |
 | S14 | P0 | Restart with many refs | Startup time scales with table metadata, not blob count | FAIL (GC Error rows — pre-existing) |
 | S15 | P1 | GC target shard comparison (`gc_shards` 1/2/8) | Correctness is identical across shard counts; per-round memory decreases | not shown in D2 |
@@ -290,7 +296,7 @@ Every positive scenario must satisfy:
 | S21 | P1 | Read-heavy many-ref workload | Read-path caching; column-subset queries fetch only required blobs | FAIL (`FINAL` on plain `ReplicatedMergeTree` → `ILLEGAL_FINAL` — harness bug) |
 | S22 | P1 | Object-store throttling and retry budget | Retryable errors visible; successful statements remain correct | NOT RUN (needs fault-injecting S3 proxy) |
 | S23 | P2 | Idle shared pool baseline | Background GC op count is minimal; memory flat; non-leaders quiet | FAIL (metric bug: `s3_ops` summed `*Microseconds` not op counts; real ops are tiny) |
-| S24 | P2 | Small dedup-cache capacity | Cache miss changes cost, not correctness; cache memory bounded | NOT RUN (needs small-cache disk config variant) |
+| S24 | P2 | Small dedup-cache capacity | Cache miss changes cost, not correctness; cache memory bounded | RUNNABLE (`docker-compose-small_dedup_cache.yml` wired as the `smalldedupcache` compose variant; `needs_infra` unset on the `S24` class) |
 | S25 | P2 | Non-`Atomic` database paths | Path parsing correct outside `store/<uuid>` layout | FAIL (test setup bug — DB created on one node only) |
 | S26 | P2 | Table-level verbatim file churn | Verbatim files not accidentally content-addressed; regular GC does not need to scan them | FAIL (missing `SYNC REPLICA` — harness bug) |
 | S27 | P2 | Backend list pagination ambiguity | Ambiguous keys treated as changed and re-read; correctness preserved | NOT RUN (needs instrumented S3 proxy) |
@@ -303,8 +309,14 @@ Every positive scenario must satisfy:
 | S34 | P0 | Create/drop churn (D1 namespace-reclaim win) | Per-round GC fanout does not grow across create/drop iterations after D1 | PASS |
 | S35 | P0 | Rapid same-name rotation (D1 corner case) | Shard incarnation handles same-namespace repeated create/drop safely | PASS |
 
-**D2 summary (2026-07-02, post-D1 sweep, seed 20260702)**: 14 PASS, 10 INCONCLUSIVE, 8 FAIL.
+**D2 summary (2026-07-02, post-D1 sweep, seed 20260702)**: 8 PASS, 8 INCONCLUSIVE, 14 FAIL, 3 NOT RUN,
+1 RUNNABLE (S24, since wired to the `smalldedupcache` compose variant), S15 not shown in D2.
 Every FAIL is a pre-existing harness/infra/scale issue — zero D1 regressions.
+**2026-07-03 night re-triage**: the D2 FAILs were re-classified against the fixed stack — all of them
+resolved, superseded, or card bugs (the one real-looking S13 'fail' was the card comparing replicas
+before `SYSTEM SYNC REPLICA`; card fixed, re-run PASS 11/11). Current standing: 8 PASS, ZERO real
+fails; remaining inconclusives are honest scale gates (rerun at ci/full) and infra gates
+(S12/S22/S27). See `ROADMAP.md §area-testing` and `utils/ca-soak/scenarios/BACKLOG.md`.
 
 ### 3.3 Running a scenario {#running-scenarios}
 
@@ -334,6 +346,11 @@ Two `ReplicatedMergeTree` replicas (`ch1`, `ch2`) share one CA pool on `rustfs1`
 `keeper1`. RustFS runs with `RUSTFS_SCANNER_ENABLED=false RUSTFS_HEAL_ENABLED=false` (stability
 fix from B93). `clickhouse-disks fsck` runs read-only against the same pool from a node
 container at quiesced checkpoints.
+
+`docker-compose.yml` is the default RustFS-backed topology. A second compose,
+`docker-compose-awss3.yml`, targets a live AWS S3 bucket instead of RustFS for the release-gate
+real-S3 GC validation; it uses named Docker volumes for state and reads bucket credentials from
+the git-ignored `configs/aws.env`. The live-AWS variant was validated 2026-07-03.
 
 ### 4.2 Workload and oracle {#workload-oracle}
 
@@ -428,10 +445,11 @@ The authoritative finding log is `utils/ca-soak/scenarios/BACKLOG.md` (newest at
   shard objects into one flat prefix so GC discovery is a single LIST).
 - **S31 `ca-gc-dryrun` under `gc_shards > 1`**: `previewDeletes` previews `zeroInDegree` only
   for target shard 0, so the dry-run oracle can be blind to candidates in other shards.
-- **S12 / 10-replica test**: requires a docker-compose with 10 ClickHouse services; current compose
-  provides only 2.
+- **S12 / 10-replica test**: `docker-compose-10replicas.yml` (`ch1`..`ch10`) exists and is wired
+  as the `tenreplicas` compose variant; the remaining gap is `soak/cluster.py`'s `Cluster` class,
+  which is hardcoded to 2 nodes and has no mechanism to address `ch3`..`ch10` (see `BACKLOG.md`
+  entry `NEEDS-INFRA-S12`).
 - **S22 / throttling**: requires a fault-injecting S3 proxy (not in current compose).
-- **S24 / small dedup-cache**: requires a disk config variant with tiny `dedup_cache_bytes`.
 - **S27 / list pagination ambiguity**: requires an instrumented object-store proxy.
 - **S23 idle RSS +82 MiB**: above the 64 MiB budget; confirm it does not grow unbounded in the 4h
   soak.
