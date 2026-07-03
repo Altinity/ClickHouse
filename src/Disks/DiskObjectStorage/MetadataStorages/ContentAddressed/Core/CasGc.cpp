@@ -1248,7 +1248,10 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
                 continue;
             const std::string_view shard_sv = rest.substr(slash + 1);
             uint64_t shard = 0;
-            bool valid = !shard_sv.empty();
+            /// Length guard: >9 digits cannot be a real shard index (root_shards is tiny) and could
+            /// wrap uint64 into a small in-range value, sneaking a foreign/corrupt key past the
+            /// bounds check below — reject by length before parsing (review follow-up, task A).
+            bool valid = !shard_sv.empty() && shard_sv.size() <= 9;
             for (const char c : shard_sv)
             {
                 if (c < '0' || c > '9')
