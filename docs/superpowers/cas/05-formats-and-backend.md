@@ -493,7 +493,7 @@ be used as a CAS pool without a workaround. The current design records this as a
 | AWS S3 | `If-None-Match: *` via `WriteSettings` | `removeObjectIfTokenMatches` (ETag) | yes | `true` | Full production path |
 | MinIO / RustFS | same S3 API | same | yes | `true` | Used in soak/test harness |
 | Azure Blob | ETags; Azure conditional PUT | yes | yes | `true` | Code path identical to S3 |
-| GCS | generation-based | generation-based | yes (generation) | `true` but semantics gap | See generation-token gap above |
+| GCS | `x-goog-if-generation-match: 0` (dialect-mapped from `If-None-Match: *`) | generation-exact delete (dialect-mapped `If-Match`) | NO — list tokens disabled (XML LIST bodies carry MD5 ETags) | `false` on generation stores | **Validated live 2026-07-03** via `http_client = gcs_hmac` (GOOG4-HMAC + conditional dialect); versioned buckets refused by the probe; conditional writes single-PUT only (`gcs_max_conditional_put_bytes`) |
 
 **LIST consistency requirement:** the protocol's GC `discover` step LISTs `cas/refs/` and expects
 the list to be consistent: an object PUT before the LIST boundary must appear in the list. S3 and
@@ -618,7 +618,7 @@ converted off JSON for cleanup but their protobuf is not an interchange contract
 | `Cas::Layout` key builders | DONE | `CasLayout.h` |
 | AWS S3 full support | DONE | production path |
 | rustfs soak harness + orphan-reaper workaround | DONE | `utils/ca-soak/scripts/` |
-| GCS generation-token binding | TODO | fail-closed until probed |
+| GCS generation-token binding | **DONE 2026-07-03** | `http_client = gcs_hmac`: GOOG4-HMAC signer + wire-boundary conditional dialect (response `ETag := generation`); full live validation cycle green (spec `2026-07-03-cas-gcs-generation-binding-design`) |
 | LIST consistency probe in `Cas::Probe` | TODO | see §10 |
 | Durable roster + `max_content_addressable_pool_format` setting | DEFERRED | Part IV, pre-release |
 | gc-snap → protobuf | DEFERRED | lowest-priority; keep binary+zstd |

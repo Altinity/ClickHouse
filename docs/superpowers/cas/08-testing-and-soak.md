@@ -351,6 +351,12 @@ container at quiesced checkpoints.
 `docker-compose-awss3.yml`, targets a live AWS S3 bucket instead of RustFS for the release-gate
 real-S3 GC validation; it uses named Docker volumes for state and reads bucket credentials from
 the git-ignored `configs/aws.env`. The live-AWS variant was validated 2026-07-03.
+The live-GCS variant (`docker-compose-gcs.yml`, `storage_conf_gcs_*.xml` with
+`<http_client>gcs_hmac</http_client>`, HMAC pair in git-ignored `configs/gcs.env`) was validated
+the same day: probe + replication + two-phase reclaim + DROP-to-zero + fsck all green. NOTE: the
+read-only fsck disk lives in the standalone `configs/fsck_only_gcs.xml` passed only to
+`clickhouse-disks -C` — a `ca_ro` disk in the SERVER config breaks table load on restart
+(`UNKNOWN_DISK`; ROADMAP prod-gate row).
 
 ### 4.2 Workload and oracle {#workload-oracle}
 

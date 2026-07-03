@@ -89,8 +89,26 @@ sigv4 with renamed constants (`GOOG4` key prefix, `goog4_request` scope, `x-goog
 `x-goog-if-generation-match: <generation>`) and token extraction from `x-goog-generation` could
 carry the ENTIRE existing CAS backend to GCS natively. Not started — needs a brainstorm/spec pass.
 
+## GCS leg — binding implemented + full cycle GREEN (2026-07-03, same day) {#gcs-cycle}
+
+The Generation binding landed (spec `2026-07-03-cas-gcs-generation-binding-design`, 9-task SDD
+run, final whole-branch review MERGE-READY): GOOG4-HMAC signer, wire-boundary conditional dialect,
+`http_client = gcs_hmac` opt-in, `TokenType::Generation` stamping, single-PUT guard, probe
+versioning fail-close. Live cycle on prefix `ca_live_20260703_g2`: probe PASS (first CAS mount on
+GCS), replication + equal checksums (100k + 250k churn), two-phase reclaim observed against the
+bucket (11 condemned -> graduated -> deleted), `DROP TABLE` to 51 objects / 20.8 KB pool metadata,
+final fsck all-zero, `dedup_ratio=2`, `blob_storage_log` 100 deletes / 0 errors.
+
+Three bugs found live and fixed in-branch (each one caught fail-closed by the dialect/probe, no
+data damage): (1) probe wrong-tokens were non-numeric -> dialect format guard killed the mount
+(`1f58e7f2fef`); (2) LIST-derived tokens are MD5 ETags on GCS (XML LIST bodies are not rewritten)
+-> poisoned `If-Match` in GC; list tokens now disabled on generation stores (`86f44c8061c`);
+(3) `Expect: 100-continue` did not recognize the dialect header -> B118-class stall risk
+(`01b4b92a945`, from the final review). Plus one stand/product finding: a `ca_ro` shadow disk in
+the server config breaks table load on restart (`UNKNOWN_DISK`) — workaround shipped
+(`fsck_only_gcs.xml`), product fix is a ROADMAP prod-gate row.
+
 ## Remaining for gate #1 {#remaining}
 
-GCS: capability measurement DONE (above); the `Generation` binding implementation + the full
-validation cycle (probe -> replication -> churn -> two-phase reclaim -> fsck -> DROP-to-zero)
-remain. Azure: not started.
+Azure: not started. GCS production-grade follow-ups (compose finalize for >1 GiB conditional
+writes, `gcp_oauth` validation, generation-aware LIST discovery) are DESIRABLE rows.

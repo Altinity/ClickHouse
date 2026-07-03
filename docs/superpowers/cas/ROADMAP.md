@@ -130,7 +130,7 @@ See [`05-formats-and-backend.md`](05-formats-and-backend.md) for full detail.
 | `Cas::Backend` abstraction over `IObjectStorage` | **DONE** | Enables testing over `LocalObjectStorage`; composes with any object-storage type |
 | Schema-evolution stance: no compat scaffolding during pre-release dev | **DONE** | Spec `2026-06-24-cas-schema-evolution-framework-design.md`; first persisted-data release will freeze the format |
 | rustfs testbed (scanner/heal off for stability) | **DONE** | Production deployment needs a compacting object store |
-| Real-S3 GC validation (confirm GC deletes actually reclaim on production AWS/GCS/Azure) | **AWS DONE 2026-07-03**; GCS/Azure TODO (HARD release gate) | AWS: probe/replication/dedup/two-phase reclaim/DROP-to-zero all verified live (see §release-required #1); rustfs beta.8 does not compact tombstones |
+| Real-S3 GC validation (confirm GC deletes actually reclaim on production AWS/GCS/Azure) | **AWS + GCS DONE 2026-07-03**; Azure TODO (HARD release gate) | AWS: probe/replication/dedup/two-phase reclaim/DROP-to-zero all verified live (see §release-required #1); rustfs beta.8 does not compact tombstones |
 | LIST consistency on real S3 (token-diff accelerator behavior under eventual consistency) | **TODO** | S3's LIST may not reflect a just-PUT key; the code handles this conservatively but needs real-S3 testing |
 | `B196` cap `s3_max_connections` to backend permits | **TODO** (HARD, cheap) | Prevents 503 + retry storm under high concurrency |
 
@@ -225,7 +225,14 @@ Validation campaign (one coherent block):
    is 30-40 s (vs ~5-10 s rustfs) — the default `gc_interval_sec=60` is sane. Fixes shipped from the
    run: probe empty-`If-Match` cleanup 400s; foreign-owner message; `blob_storage_log` conditional
    deletes; factory `root_shards` default 8->32; `server_root_id` macro expansion.
-   **Remaining: GCS + Azure** (the GCS `Generation` token binding is still fail-closed-unprobed).
+   **GCS part DONE 2026-07-03** (bucket `content-adressable-test-mfilimonov`, prefix `ca_live_20260703_g2`,
+   `http_client = gcs_hmac` Generation binding): probe passes end-to-end (first CAS mount on GCS),
+   replication + checksums, two-phase reclaim verified against the bucket (11 condemned -> graduated ->
+   deleted; DROP-to-zero: 51 objects / 20.8 KB pool metadata), fsck all-zero, `dedup_ratio=2`,
+   `blob_storage_log` records deletes. Three live-found fixes landed: numeric probe wrong-tokens
+   (`1f58e7f2fef`), no LIST-derived tokens on generation stores — XML LIST bodies carry MD5 ETags
+   (`86f44c8061c`), `Expect: 100-continue` sees `x-goog-if-generation-match` (`01b4b92a945`).
+   **Remaining: Azure** (not started).
 2. **Long chaos soak (4h+) on a compacting store** — confirms B165 (OOM at hour 4) resolved and the
    whole night-fix stack under sustained chaos; gated by B207 (below) for honest verdicts.
 3. **B207 fsck phantom-dangling race fix** — release validation is only as честный as its oracle.
@@ -258,6 +265,10 @@ Operability/hygiene gates:
 
 - T1 delta-runs + compaction (GC byte volume on hot pools); GC round progress watchdog.
 - Per-namespace `root_shards`; adaptive shard splits (see their rows).
+- GCS follow-ups (validation-grade -> production-grade): compose-based conditional finalize for
+  blobs above `gcs_max_conditional_put_bytes`; `gcp_oauth` dialect probe validation (ADC creds);
+  generation-aware LIST discovery (GC re-reads every shard on GCS since list tokens are disabled —
+  cost only); signed `x-goog-*` extra_headers on `gcs_hmac` (currently unsigned, CAS configures none).
 - B202 inline-by-size (+ threshold setting); one-GET part open; B121 per-blob-GET read cost.
 - Streaming `putOverwrite` (B98 huge-blob displacement); promote-time recreate for SOURCED deps.
 - B66b relink-into-detached; B66a local-storage concurrent-fetch atomicity.
