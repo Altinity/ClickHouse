@@ -64,6 +64,7 @@ namespace ErrorCodes
     extern const int S3_ERROR;
     extern const int INVALID_CONFIG_PARAMETER;
     extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
 struct WriteBufferFromS3::PartData
@@ -406,6 +407,15 @@ void WriteBufferFromS3::writeMultipartUpload()
 
 void WriteBufferFromS3::createMultipartUpload()
 {
+    if (write_settings.s3_force_single_part_upload)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "A conditional write would start a MULTIPART upload, but the target store enforces no "
+            "preconditions on CompleteMultipartUpload (GCS, measured 2026-07-03) — refusing "
+            "(silent-data-loss risk). The single-PUT budget is governed by the disk setting "
+            "gcs_max_conditional_put_bytes; the production-grade path for bigger blobs "
+            "(unconditional multipart to a temp key + conditional Compose) is not implemented yet. {}",
+            getShortLogDetails());
+
     LOG_TEST(limited_log, "Create multipart upload. {}", getShortLogDetails());
 
     S3::CreateMultipartUploadRequest req;

@@ -45,3 +45,23 @@ TEST(CasBackendGeneration, CheckStorePreconditionsNoOpOnEtagDialect)
 
     EXPECT_NO_THROW(b->checkStorePreconditions());
 }
+
+/// GCS enforces NO preconditions on CompleteMultipartUpload (measured 2026-07-03), so a conditional
+/// write on a generation-token store must never take the multipart path. conditionalWriteSettings
+/// must force the single-PUT path (and raise the single-part cap to conditional_single_put_cap) when
+/// the backend's native token kind is Generation, and stay a no-op otherwise (ETag dialect).
+TEST(CasBackendGeneration, ConditionalWriteSettingsForceSinglePutOnGenerationStores)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native,
+        /*conditional_single_put_cap=*/123);
+    b->setNativeTokenTypeForTest(TokenType::Generation);
+    const auto ws = b->conditionalWriteSettingsForTest();
+    EXPECT_TRUE(ws.s3_force_single_part_upload);
+    EXPECT_EQ(ws.s3_single_part_upload_max_bytes_override, 123u);
+
+    b->setNativeTokenTypeForTest(TokenType::ETag);
+    const auto ws2 = b->conditionalWriteSettingsForTest();
+    EXPECT_FALSE(ws2.s3_force_single_part_upload);
+    EXPECT_EQ(ws2.s3_single_part_upload_max_bytes_override, 0u);
+}

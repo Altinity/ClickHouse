@@ -36,9 +36,10 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_)
+ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_, uint64_t conditional_single_put_cap_)
     : object_storage(std::move(object_storage_))
     , mode(mode_)
+    , conditional_single_put_cap(conditional_single_put_cap_)
     , emu_root(object_storage->getCommonKeyPrefix())
 {
     if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens())
@@ -550,10 +551,22 @@ HeadResult ObjectStorageBackend::head(const String & key)
 /// contention (observed live against RustFS: a publish's manifest CAS raced the GC fence and the
 /// mismatch TERMINATED the server from the upload worker, M-W T13). Integrity for these keys is
 /// the conditional PUT outcome + the observed token - a recheck adds nothing and races by design.
-static WriteSettings casWriteSettings()
+///
+/// On a generation-token store (GCS), a conditional write must ALSO never take the multipart path:
+/// GCS enforces no preconditions on CompleteMultipartUpload (measured 2026-07-03), so a lost
+/// precondition on a multipart write would silently overwrite instead of failing. Force single-PUT
+/// and raise the single-part cap to conditional_single_put_cap (RAM-buffered) to keep the fast path
+/// available for bodies up to that size; a bigger body throws NOT_IMPLEMENTED from
+/// WriteBufferFromS3::createMultipartUpload.
+WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
 {
     WriteSettings ws;
     ws.s3_skip_check_objects_after_upload = true;
+    if (native_token_type == TokenType::Generation)
+    {
+        ws.s3_force_single_part_upload = true;
+        ws.s3_single_part_upload_max_bytes_override = conditional_single_put_cap;
+    }
     return ws;
 }
 
@@ -561,7 +574,7 @@ PutResult ObjectStorageBackend::putIfAbsent(const String & key, const String & b
 {
     if (mode == Mode::Native)
     {
-        WriteSettings ws = casWriteSettings();
+        WriteSettings ws = conditionalWriteSettings();
         ws.object_storage_write_if_none_match = "*";
         return nativeConditionalPut(key, bytes, ws, meta);
     }
@@ -582,7 +595,7 @@ WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, const O
     {
         /// Same WriteSettings construction as putIfAbsent — the condition rides on the write buffer
         /// and is checked when finalize completes the object.
-        WriteSettings ws = casWriteSettings();
+        WriteSettings ws = conditionalWriteSettings();
         ws.object_storage_write_if_none_match = "*";
         std::optional<ObjectAttributes> attrs;
         if (!meta.empty())
@@ -599,7 +612,7 @@ PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & 
 {
     if (mode == Mode::Native)
     {
-        WriteSettings ws = casWriteSettings();
+        WriteSettings ws = conditionalWriteSettings();
         ws.object_storage_write_if_match = expected.value;
         return nativeConditionalPut(key, bytes, ws, meta);
     }
@@ -620,7 +633,7 @@ CasResult ObjectStorageBackend::casPut(const String & key, const String & bytes,
 {
     if (mode == Mode::Native)
     {
-        WriteSettings ws = casWriteSettings();
+        WriteSettings ws = conditionalWriteSettings();
         if (expected.has_value())
             ws.object_storage_write_if_match = expected->value;
         else

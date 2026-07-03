@@ -36,7 +36,10 @@ class ObjectStorageBackend final : public Backend
 public:
     enum class Mode { Native, EmulatedSingleProcess };
 
-    ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_);
+    /// conditional_single_put_cap_: the GCS single-PUT budget for conditional writes on a
+    /// generation-token store (see conditionalWriteSettings) — irrelevant on ETag-dialect stores.
+    /// Defaulted so existing call sites (AWS/ETag stores, tests) compile unchanged.
+    ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_, uint64_t conditional_single_put_cap_ = 1ULL << 30);
 
     std::optional<GetResult> get(const String & key, Range range) override;
     std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override;
@@ -65,10 +68,17 @@ public:
     TokenType nativeTokenType() const { return native_token_type; }
     void setNativeTokenTypeForTest(TokenType t) { native_token_type = t; }
 
+    /// Base WriteSettings for every Native conditional write — see the .cpp for the full rationale
+    /// (skips the post-upload existence/size HEAD; forces single-PUT on generation-token stores).
+    WriteSettings conditionalWriteSettings() const;
+    WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(); }
+
 private:
     const ObjectStoragePtr object_storage;
     const Mode mode;
     TokenType native_token_type = TokenType::ETag;
+    /// GCS single-PUT budget for conditional writes (generation-token stores only); see ctor.
+    const uint64_t conditional_single_put_cap;
 
     /// EmulatedSingleProcess state: per-key current token (monotone counter as string).
     std::mutex emu_mutex;

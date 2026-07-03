@@ -57,7 +57,8 @@ public:
         uint64_t manifest_sweep_delete_budget_keys_ = 100,
         uint64_t manifest_soft_limit_ = 16ULL << 20,
         uint64_t manifest_hard_limit_ = 64ULL << 20,
-        uint64_t manifest_max_delay_ms_ = 1000);
+        uint64_t manifest_max_delay_ms_ = 1000,
+        uint64_t gc_max_conditional_put_bytes_ = 1ULL << 30);
 
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
@@ -208,6 +209,9 @@ private:
     const uint64_t manifest_soft_limit;
     const uint64_t manifest_hard_limit;
     const uint64_t manifest_max_delay_ms;
+    /// GCS single-PUT budget for conditional writes (generation-token stores only): threaded into
+    /// the ObjectStorageBackend construction site in startup(). Irrelevant on ETag stores (AWS et al).
+    const uint64_t gc_max_conditional_put_bytes;
 
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;

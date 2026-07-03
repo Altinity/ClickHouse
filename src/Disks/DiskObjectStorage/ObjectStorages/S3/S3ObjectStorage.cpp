@@ -67,6 +67,8 @@ namespace S3RequestSetting
     extern const S3RequestSettingsBool check_objects_after_upload;
     extern const S3RequestSettingsUInt64 list_object_keys_size;
     extern const S3RequestSettingsUInt64 objects_chunk_size_to_delete;
+    extern const S3RequestSettingsUInt64 max_single_part_upload_size;
+    extern const S3RequestSettingsUInt64 min_upload_part_size;
 }
 
 
@@ -303,6 +305,16 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
 
     if (write_settings.s3_skip_check_objects_after_upload)
         request_settings[S3RequestSetting::check_objects_after_upload] = false;
+
+    if (write_settings.s3_single_part_upload_max_bytes_override)
+    {
+        /// Keep the whole body in ONE buffered part so the single-PUT path stays available up to
+        /// the cap (conditional writes on generation-token stores; see WriteSettings).
+        request_settings[S3RequestSetting::max_single_part_upload_size]
+            = write_settings.s3_single_part_upload_max_bytes_override;
+        request_settings[S3RequestSetting::min_upload_part_size]
+            = write_settings.s3_single_part_upload_max_bytes_override;
+    }
 
     ThreadPoolCallbackRunnerUnsafe<void> scheduler;
     if (write_settings.s3_allow_parallel_part_upload)

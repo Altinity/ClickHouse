@@ -158,7 +158,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t manifest_sweep_delete_budget_keys_,
     uint64_t manifest_soft_limit_,
     uint64_t manifest_hard_limit_,
-    uint64_t manifest_max_delay_ms_)
+    uint64_t manifest_max_delay_ms_,
+    uint64_t gc_max_conditional_put_bytes_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -179,6 +180,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , manifest_soft_limit(manifest_soft_limit_)
     , manifest_hard_limit(manifest_hard_limit_)
     , manifest_max_delay_ms(manifest_max_delay_ms_)
+    , gc_max_conditional_put_bytes(gc_max_conditional_put_bytes_)
 {
 }
 
@@ -337,7 +339,7 @@ void ContentAddressedMetadataStorage::startup()
     const auto mode = object_storage->getType() == ObjectStorageType::Local
         ? Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess
         : Cas::ObjectStorageBackend::Mode::Native;
-    auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode);
+    auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode, gc_max_conditional_put_bytes);
 
     /// EmulatedSingleProcess emulates the conditional-op / exact-token semantics in-process (local
     /// object storage has none). That emulation is per-process: two servers pointed at the SAME local
