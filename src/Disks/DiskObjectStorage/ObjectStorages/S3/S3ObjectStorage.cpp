@@ -479,6 +479,23 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatches(const Stored
         err.GetMessage(), static_cast<size_t>(err.GetErrorType()), err.GetExceptionName(), object.remote_path);
 }
 
+bool S3ObjectStorage::conditionalOpsUseGenerationTokens() const
+{
+    return client.get()->usesGcsConditionalDialect();
+}
+
+std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled() const
+{
+    S3::GetBucketVersioningRequest request;
+    request.SetBucket(uri.bucket);
+
+    auto outcome = client.get()->GetBucketVersioning(request);
+    if (!outcome.IsSuccess())
+        return std::nullopt;
+
+    return outcome.GetResult().GetStatus() == Aws::S3::Model::BucketVersioningStatus::Enabled;
+}
+
 static void putObjectsTagOnS3(
     const std::shared_ptr<const S3::Client> & s3_client,
     const String & bucket,

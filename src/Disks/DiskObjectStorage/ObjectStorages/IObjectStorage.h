@@ -340,6 +340,17 @@ public:
 
     virtual bool supportParallelWrite() const { return false; }
 
+    /// True when the incarnation tokens this storage returns from writes/HEADs are GCS generation
+    /// numbers riding the ETag plumbing (http_client = gcs_hmac / gcp_oauth conditional dialect).
+    /// Consumers (the CAS backend) stamp TokenType::Generation and route conditional writes
+    /// through the single-PUT path (GCS enforces no preconditions on CompleteMultipartUpload).
+    virtual bool conditionalOpsUseGenerationTokens() const { return false; }
+
+    /// Whether the underlying bucket has object versioning enabled; nullopt when unknown or not
+    /// applicable. Used by the CAS capability probe to fail closed on GCS: on a versioned bucket
+    /// a token-exact DELETE archives a noncurrent generation instead of reclaiming storage.
+    virtual std::optional<bool> isBucketVersioningEnabled() const { return std::nullopt; }
+
     virtual ReadSettings patchSettings(const ReadSettings & read_settings) const;
 
     virtual WriteSettings patchSettings(const WriteSettings & write_settings) const;

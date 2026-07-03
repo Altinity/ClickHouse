@@ -518,6 +518,12 @@ Model::GetObjectTaggingOutcome Client::GetObjectTagging(GetObjectTaggingRequest 
         doRequest(request, [this](const Model::GetObjectTaggingRequest & req) { return GetObjectTagging(req); }));
 }
 
+Model::GetBucketVersioningOutcome Client::GetBucketVersioning(GetBucketVersioningRequest & request) const
+{
+    return processRequestResult(
+        doRequest(request, [this](const Model::GetBucketVersioningRequest & req) { return GetBucketVersioning(req); }));
+}
+
 Model::ListObjectsV2Outcome Client::ListObjectsV2(ListObjectsV2Request & request) const
 {
     return doRequestWithRetryNetworkErrors</*IsReadMethod*/ true>(

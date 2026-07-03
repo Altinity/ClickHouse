@@ -197,6 +197,7 @@ public:
 
     Model::HeadObjectOutcome HeadObject(HeadObjectRequest & request) const;
     Model::GetObjectTaggingOutcome GetObjectTagging(GetObjectTaggingRequest & request) const;
+    Model::GetBucketVersioningOutcome GetBucketVersioning(GetBucketVersioningRequest & request) const;
     Model::ListObjectsV2Outcome ListObjectsV2(ListObjectsV2Request & request) const;
     Model::ListObjectsOutcome ListObjects(ListObjectsRequest & request) const;
     Model::GetObjectOutcome GetObject(GetObjectRequest & request) const;
@@ -262,6 +263,7 @@ private:
     /// otherwise region and endpoint redirection won't work
     using Aws::S3::S3Client::HeadObject;
     using Aws::S3::S3Client::GetObjectTagging;
+    using Aws::S3::S3Client::GetBucketVersioning;
     using Aws::S3::S3Client::ListObjectsV2;
     using Aws::S3::S3Client::ListObjects;
     using Aws::S3::S3Client::GetObject;

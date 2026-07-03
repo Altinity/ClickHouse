@@ -152,6 +152,10 @@ public:
 
     bool isReadOnly() const override { return s3_settings.get()->request_settings[S3RequestSetting::read_only]; }
 
+    bool conditionalOpsUseGenerationTokens() const override;
+
+    std::optional<bool> isBucketVersioningEnabled() const override;
+
     std::shared_ptr<const S3::Client> getS3StorageClient() override;
     std::shared_ptr<const S3::Client> tryGetS3StorageClient() override;
 
