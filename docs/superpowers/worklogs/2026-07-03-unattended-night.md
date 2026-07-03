@@ -125,6 +125,30 @@ extension for clamps+suppression (currently argued, not machine-checked).
 (strip-debug, 926 MB) with symlinked server/client/disks. Smoke: `clickhouse-server --version`
 = 26.6.1.1 (our build). Dockerfile in tmp/docker-cas-nightly/.
 
-## 8. Scenarios (pending: after the soak frees the cluster)
+## 8. Scenario sweep (S01-S35, dev scale, fixed binary) — DONE
+
+**Zero real failures.** 8 PASS (S02 S14 S17 S19 S24 S28 S32 S33); the ONE fail (S13 replica
+divergence) was a CARD bug — the replica-agreement oracle ran BEFORE any sync, comparing replicas
+with replication still draining after kill chaos; with the sync-gated oracle S13 re-ran PASS 11/11
+(=> no data loss under kill chaos on the night binary). All seven scenarios that FAILED on the
+previous binary (S10 S19 S20 S21 S23 S26 S31) are clean. Remaining inconclusives are honest gates:
+scale-gated verdicts ("rerun at ci/full") and infra gates (S12 needs a multi-node Cluster
+abstraction; S22/S27 need a fault-injecting / LIST-instrumented S3 proxy) — recorded in BACKLOG.
+Framework improvements landed: replication_queue+replicas in standard extracts; S18 unblocked by
+enable_system_unfreeze (7/8 now, was hard-error).
+
+## 9. Night close-out
+
+- Docker image `cas-nightly:20260703` REBUILT after the clamp-suppression fix (the safety fix is in).
+- Branches: `cas-copy-forward` -> `cas-shard-mutation-queue` -> `cas-gc-rebuild` (linear; night work
+  on the last one from `9f92b3f5e92` through this commit).
+- Harness tests 148/148; Cas* unit suite 450/450; full binary link clean.
+- MORNING QUEUE (complex/deferred): (1) clamp attribution — why 11 shards stayed clamped for 30 min
+  (server logs archived; suspect true-removal-missing-body after mf_cleanup vs ABA re-fold);
+  (2) clamp liveness — suppression stalls deletes while clamps persist; clamp-unsticking work;
+  (3) TLA+ model extension for clamps+suppression; (4) root_shards-vs-leak physics decision for
+  soak (8 shards concentrates rustfs#3231 8x; body is cursor-age-bound, not trim-bound);
+  (5) rebuild follow-ups: dedicated gc-round-log row; fsck Orphan-class test gap;
+  (6) S12/S22/S27 infra (multi-node Cluster, S3 fault proxy).
 
 
