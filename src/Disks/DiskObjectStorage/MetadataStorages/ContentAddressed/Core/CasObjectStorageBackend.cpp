@@ -39,6 +39,8 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
     , mode(mode_)
     , emu_root(object_storage->getCommonKeyPrefix())
 {
+    if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens())
+        native_token_type = TokenType::Generation;
 }
 
 /// =========================================================================================
@@ -54,7 +56,7 @@ std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
     HeadResult hr;
     hr.exists = true;
     hr.size = metadata->size_bytes;
-    hr.token = Token{metadata->etag, TokenType::ETag};
+    hr.token = Token{metadata->etag, native_token_type};
     hr.attributes = ObjectMeta(metadata->attributes.begin(), metadata->attributes.end());
     return hr;
 }
@@ -126,7 +128,7 @@ PutResult ObjectStorageBackend::nativeConditionalPut(const String & key, const S
     /// (local files) returns nullopt and we fall back to the HEAD (a cheap local stat there).
     Token token;
     if (auto etag = buf->getResultObjectETag(); etag && !etag->empty())
-        token = Token{*etag, TokenType::ETag};
+        token = Token{*etag, native_token_type};
     else
     {
         /// No write-time ETag (local files) or an (anomalous) empty one: fall back to the HEAD —
@@ -147,7 +149,7 @@ namespace
 class NativeStreamingSink final : public WriteSink
 {
 public:
-    NativeStreamingSink(Backend & backend_, String key_, std::unique_ptr<WriteBufferFromFileBase> write_buf_)
+    NativeStreamingSink(ObjectStorageBackend & backend_, String key_, std::unique_ptr<WriteBufferFromFileBase> write_buf_)
         : backend(backend_)
         , key(std::move(key_))
         , write_buf(std::move(write_buf_))
@@ -169,7 +171,7 @@ public:
         /// we fall back to the HEAD (a cheap local stat there).
         Token token;
         if (auto etag = write_buf->getResultObjectETag(); etag && !etag->empty())
-            token = Token{*etag, TokenType::ETag};
+            token = Token{*etag, backend.nativeTokenType()};
         else
         {
             /// No write-time ETag (local) or an (anomalous) empty one: fall back to the HEAD.
@@ -192,7 +194,7 @@ public:
     }
 
 private:
-    Backend & backend;
+    ObjectStorageBackend & backend;
     const String key;
     std::unique_ptr<WriteBufferFromFileBase> write_buf;
     bool done = false;
@@ -689,7 +691,7 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
             lk.key = child->relative_path.substr(strip.size());
             lk.size = child->metadata ? child->metadata->size_bytes : 0;
             if (child->metadata && !child->metadata->etag.empty())
-                lk.token = Token{child->metadata->etag, TokenType::ETag};
+                lk.token = Token{child->metadata->etag, native_token_type};
             all.push_back(std::move(lk));
         }
         std::sort(all.begin(), all.end(), [](const ListedKey & a, const ListedKey & b) { return a.key < b.key; });
@@ -730,7 +732,7 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
         /// `supportsListTokens() == true` capability is honest. A listing without an etag leaves the
         /// token unset, which GC discover treats as Read (fail closed).
         if (child->metadata && !child->metadata->etag.empty())
-            lk.token = Token{child->metadata->etag, TokenType::ETag};
+            lk.token = Token{child->metadata->etag, native_token_type};
 
         if (page.keys.size() == limit)
         {
