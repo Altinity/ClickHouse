@@ -709,3 +709,18 @@ java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \
 ./run_apalache.sh base check --cinit=CInit --init=Init --inv=IndInv --length=0 CaIncarnationProofCore.tla
 ./run_apalache.sh step check --cinit=CInit --init=IndInvInit --inv=IndInv --length=1 CaIncarnationProofCore.tla
 ```
+
+## Clamp + destruction-suppression extension (2026-07-03) {#area-clamp-suppression}
+
+`CaGcAckFloorCore` models the fold-clamp mechanism honestly: `GFold` may hold back one landed ref
+— the abstraction of a per-shard cursor frozen at an unreadable manifest body (a false 404, a
+bodiless precommit) — but DECLARES it (`clampedL`), unlike `SabotageSkipChangedShard`, which holds
+one back silently and remains the lethal lying-fold counterexample. `GComplete`'s graduation is
+guarded by `~clampedL` (the implementation's clamp-suppressed pass: no graduations, no pending
+deletes while any shard is clamped); held refs stay in `landed`, so a later clamp-free pass
+consumes them — the clamp release needs no extra machinery. `SabotageClampNoSuppress` removes only
+the guard and reproduces the 2026-07-03 night incident (31 dangling blobs) as an `INV_NO_DANGLE`
+counterexample; `W_ClampHappens` witnesses a reachable honest clamped pass. Honest stage-1 is
+clean at 83.9M distinct states (the held ref persisting across passes multiplies configurations;
+the hold is bounded to one ref — any dangle of this class needs a single held `+1`, and the
+suppression rule reads only the boolean declaration).

@@ -24,7 +24,8 @@ CONSTANTS
     SabotageOpenWriteBeforeLoad, \* a fresh mount starts with an unloaded (round-0) view
     SabotageRebuildDropEdge,     \* rebuild loses one committed owner's folded ref
     SabotageRebuildKeepRetired,  \* rebuild carries the old retired entries into the new baseline
-    SabotageRebuildLowRound      \* rebuild mints a round below surviving mount acks
+    SabotageRebuildLowRound,     \* rebuild mints a round below surviving mount acks
+    SabotageClampNoSuppress      \* graduation ignores a declared clamp (the 2026-07-03 night bug)
 
 Toks == 1..MaxTok
 Rounds == 0..MaxRound
@@ -47,11 +48,14 @@ VARIABLES
     sparedEver, recreatedEver, deletedEver,  \* witness history flags
     copyForwardEver,                         \* witness: sourceless copy-forward taken
     rebuiltEver,                             \* witness: raw rebuild taken
-    lostRefs                                 \* ghost: owner refs a sabotaged rebuild failed to re-emit
+    lostRefs,                                \* ghost: owner refs a sabotaged rebuild failed to re-emit
+    clampedL,                                \* fold of THIS pass declared a clamp (landed suffix held back)
+    clampedEver                              \* witness: an honest clamped pass happened
 
 vars == << round, present, tok, nextTok, deadTok, retired, landed, folded,
            wStatus, wView, wAck, wPending, gcPhase, minAckL,
-           sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+           sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs,
+           clampedL, clampedEver >>
 
 Indeg(b) == Cardinality({ rf \in folded : rf.b = b })
 FloorSet == { w \in Writers : wStatus[w] \in
@@ -71,6 +75,7 @@ Init ==
     /\ gcPhase = "idle" /\ minAckL = 0
     /\ sparedEver = FALSE /\ recreatedEver = FALSE /\ deletedEver = FALSE
     /\ copyForwardEver = FALSE /\ rebuiltEver = FALSE /\ lostRefs = {}
+    /\ clampedL = FALSE /\ clampedEver = FALSE
 
 (* ---- writer actions ---- *)
 
@@ -80,7 +85,7 @@ WOpen(w) ==
     /\ wView' = [wView EXCEPT ![w] = IF SabotageOpenWriteBeforeLoad THEN 0 ELSE round]
     /\ wAck' = [wAck EXCEPT ![w] = IF SabotageOpenWriteBeforeLoad THEN 0 ELSE round]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
 WBeat(w) ==
     /\ wStatus[w] = "live"
@@ -88,7 +93,7 @@ WBeat(w) ==
     /\ wView' = IF SabotageAckWithoutRead THEN wView ELSE [wView EXCEPT ![w] = round]
     /\ wAck' = [wAck EXCEPT ![w] = round]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wStatus, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    wStatus, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
 (* Gate evaluation. `visible` = the entry for the blob's CURRENT token is in the writer's loaded
    list version. Visible + honest => recreate (fresh incarnation referenced, never the listed one) —
@@ -108,7 +113,7 @@ WPrepare(w, b) ==
                /\ wPending' = [wPending EXCEPT ![w] = { [b |-> b, t |-> tok[b]] }]
                /\ UNCHANGED << present, tok, nextTok, recreatedEver >>
     /\ UNCHANGED << round, deadTok, retired, landed, folded, wStatus, wView, wAck,
-                    gcPhase, minAckL, sparedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    gcPhase, minAckL, sparedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
 (* Verified copy-forward (spec 2026-07-02-cas-copy-forward-condemned-evidence.md): a SOURCELESS
    writer (tokenless committed-manifest evidence — `adoptEvidence` deps) hits a visible condemned
@@ -128,7 +133,7 @@ WCopyForward(w, b) ==
     /\ wPending' = [wPending EXCEPT ![w] = { [b |-> b, t |-> nextTok[b]] }]
     /\ copyForwardEver' = TRUE
     /\ UNCHANGED << round, present, deadTok, retired, landed, folded, wStatus, wView, wAck,
-                    gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, rebuiltEver, lostRefs >>
+                    gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
 WLand(w) ==
     /\ wStatus[w] = "live" /\ wPending[w] # {}
@@ -136,19 +141,19 @@ WLand(w) ==
        IN landed' = landed \cup { [b |-> p.b, t |-> p.t, w |-> w] }
     /\ wPending' = [wPending EXCEPT ![w] = {}]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, folded, wStatus,
-                    wView, wAck, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    wView, wAck, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
 WDropRef(rf) ==
     /\ rf \in folded
     /\ folded' = folded \ {rf}
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, wStatus,
-                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
 WExpire(w) ==
     /\ wStatus[w] = "live"
     /\ wStatus' = [wStatus EXCEPT ![w] = "expired"]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
 (* A live-again sleeper: an EXPIRED (never fenced) heartbeat renews successfully. Honest and safe —
    the honest floor still counts expired heartbeats. Becomes lethal only when the floor excludes
@@ -157,13 +162,13 @@ WSleeperRenew(w) ==
     /\ wStatus[w] = "expired"
     /\ wStatus' = [wStatus EXCEPT ![w] = "live"]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
 WTerminate(w) ==
     /\ wStatus[w] = "live" /\ wPending[w] = {}                  \* graceful stop drains first
     /\ wStatus' = [wStatus EXCEPT ![w] = "terminated"]
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
 (* ---- GC actions ---- *)
 
@@ -171,22 +176,38 @@ GFenceOut(w) ==
     /\ wStatus[w] = "expired"
     /\ wStatus' = [wStatus EXCEPT ![w] = "fenced"]              \* token-guarded fence-out: renew dead forever
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    wView, wAck, wPending, gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
 GBegin ==
     /\ gcPhase = "idle" /\ round < MaxRound
     /\ minAckL' = MinAck
     /\ gcPhase' = "running"
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, landed, folded,
-                    wStatus, wView, wAck, wPending, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    wStatus, wView, wAck, wPending, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs, clampedL, clampedEver >>
 
+(* The fold consumes the landed set. Two departures from full consumption:
+   - SabotageSkipChangedShard: an UNDECLARED skip (the fold lies about coverage) — lethal, the
+     original sabotage counterexample;
+   - the honest CLAMP (2026-07-03): the fold may hold back ANY nonempty suffix but DECLARES it via
+     clampedL — the abstraction of a per-shard cursor frozen at an unreadable manifest body (a
+     false 404, a bodiless precommit). GComplete's suppression rule reads the declaration; held
+     refs stay in `landed`, so a later clamp-free pass consumes them (the clamp release). *)
 GFold ==
     /\ gcPhase = "running"
     /\ IF SabotageSkipChangedShard /\ landed # {}
        THEN \E skip \in landed : /\ folded' = folded \cup (landed \ {skip})
                                  /\ landed' = {skip}
-       ELSE /\ folded' = folded \cup landed
-            /\ landed' = {}
+                                 /\ clampedL' = FALSE            \* the LIE: skipped, undeclared
+                                 /\ clampedEver' = clampedEver
+       (* Hold at most ONE ref: sufficient generality for a bounded checker — any dangle of this
+          class needs a single held +1, and the suppression rule reads only the boolean
+          declaration, never the held count. Full SUBSET nondeterminism blew the state space
+          (52M+ distinct) without adding distinguishable behaviors. *)
+       ELSE \E hold \in {{}} \cup { {x} : x \in landed } :
+                /\ folded' = folded \cup (landed \ hold)
+                /\ landed' = hold
+                /\ clampedL' = (hold # {})
+                /\ clampedEver' = (clampedEver \/ hold # {})
     /\ gcPhase' = "folded"
     /\ UNCHANGED << round, present, tok, nextTok, deadTok, retired, wStatus, wView,
                     wAck, wPending, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver, rebuiltEver, lostRefs >>
@@ -197,7 +218,11 @@ GFold ==
 GComplete ==
     /\ gcPhase = "folded"
     /\ LET grads == { e \in retired : Indeg(e.b) = 0
-                                      /\ (SabotageIgnoreAckFloor \/ e.r < minAckL) }
+                                      /\ (SabotageIgnoreAckFloor \/ e.r < minAckL)
+                                      (* CLAMP SUPPRESSION (2026-07-03): a pass whose fold declared
+                                         a clamp holds landed-but-unfolded refs; graduating (and so
+                                         deleting) over its in-degrees is the night bug. *)
+                                      /\ (SabotageClampNoSuppress \/ ~clampedL) }
            spares == { e \in retired : Indeg(e.b) > 0 }
            kills == { e \in grads : tok[e.b] = e.t }            \* exact-token delete lands
            newly == { [b |-> b, t |-> tok[b], r |-> round + 1] :
@@ -211,8 +236,9 @@ GComplete ==
           /\ deletedEver' = (deletedEver \/ kills # {})
     /\ round' = round + 1
     /\ gcPhase' = "idle"
+    /\ clampedL' = FALSE                                        \* the declaration is per-pass
     /\ UNCHANGED << tok, nextTok, landed, folded, wStatus, wView, wAck, wPending, minAckL,
-                    recreatedEver, copyForwardEver, rebuiltEver, lostRefs >>
+                    recreatedEver, copyForwardEver, rebuiltEver, lostRefs, clampedEver >>
 
 (* Raw rebuild (spec 2026-07-03-cas-gc-rebuild-design.md): recompute the baseline from owner
    state. The model's `folded` IS the owner-derived edge truth an honest rebuild recomputes, so it
@@ -233,7 +259,8 @@ GRebuild ==
        ELSE folded' = folded /\ lostRefs' = lostRefs
     /\ rebuiltEver' = TRUE
     /\ UNCHANGED << present, tok, nextTok, deadTok, landed, wStatus, wView, wAck, wPending,
-                    gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver >>
+                    gcPhase, minAckL, sparedEver, recreatedEver, deletedEver, copyForwardEver,
+                    clampedL, clampedEver >>
 
 (* Self-loop so bounded counters (round/tok) exhausting is not a TLC deadlock (house pattern). *)
 NoOp == UNCHANGED vars
@@ -271,5 +298,6 @@ W_SpareHappens == ~sparedEver
 W_RecreateHappens == ~recreatedEver
 W_CopyForwardHappens == ~copyForwardEver
 W_RebuildHappens == ~rebuiltEver
+W_ClampHappens == ~clampedEver
 
 =============================================================================
