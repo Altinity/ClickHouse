@@ -7,12 +7,13 @@ ARG DEBIAN_FRONTEND=noninteractive
 # ARG for quick switch to a given ubuntu mirror
 ARG apt_archive="http://archive.ubuntu.com"
 
-# We shouldn't use `apt upgrade` to not change the upstream image. It's updated biweekly
+# Upgrade already installed Ubuntu packages to apply available security fixes
+# without installing recommended packages.
 
 # user/group precreated explicitly with fixed uid/gid on purpose.
 # It is especially important for rootless containers: in that case entrypoint
 # can't do chown and owners of mounted volumes should be configured externally.
-# We do that in advance at the begining of Dockerfile before any packages will be
+# We do that in advance at the beginning of Dockerfile before any packages will be
 # installed to prevent picking those uid / gid by some unrelated software.
 # The same uid / gid (101) is used both for alpine and ubuntu.
 # Update gpgv to resolve CVE-2025-68973
@@ -27,7 +28,9 @@ RUN sed -i "s|http://archive.ubuntu.com|${apt_archive}|g" /etc/apt/sources.list 
         tzdata \
         wget \
         gpgv \
+    && apt-get upgrade --yes --no-install-recommends \
     && busybox --install -s \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
 #docker-official-library:off
