@@ -741,6 +741,21 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             report.recordAnomaly(ns, root_shard, id, what);
             resolved_through = at_version > 0 ? at_version - 1 : 0;
             clamped = true;
+            /// 2026-07-03 forensics gap: clamp details previously lived only in the in-memory
+            /// RoundReport (the gc log stores just the COUNT) — attributing the night's 30-minute
+            /// clamp era took an hour of indirect cursor archaeology. One row makes it instant.
+            EventEmitter{*store}.emit([&](CasEvent & ev)
+            {
+                ev.type = CasEventType::GcFoldClamp;
+                ev.namespace_ = ns.string();
+                ev.object_kind = CasEventObjectKind::Root;
+                ev.object_hash = manifestRefDebugString(id.ref);
+                ev.at_version = at_version;
+                ev.outcome = "clamped";
+                ev.reason = what;
+                ev.detail = {{"shard", std::to_string(root_shard)},
+                             {"resolved_through", std::to_string(resolved_through)}};
+            });
         };
 
         /// ONE ordered RootOwnerEvent stream, transition_version order. Dispatch each event by comparing

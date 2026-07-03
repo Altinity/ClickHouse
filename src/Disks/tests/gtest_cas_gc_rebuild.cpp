@@ -394,6 +394,9 @@ TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
 
     /// Rounds with acks current: X reaches folded in-degree 0 and is condemned, but every pass is
     /// CLAMPED (the bodiless precommit persists), so nothing may graduate or delete.
+    /// Observability (2026-07-03): every clamp emits a gc_fold_clamp event with the reason.
+    std::vector<CasEvent> seen;
+    store->setEventSink([&](const CasEvent & e){ if (e.type == CasEventType::GcFoldClamp) seen.push_back(e); });
     const String blob_key = store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))));
     for (int i = 0; i < 6; ++i)
     {
@@ -402,6 +405,11 @@ TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
         ASSERT_TRUE(backend->head(blob_key).exists)
             << "round " << i << ": X was deleted while its landed +1 sat unfolded behind the clamp";
     }
+
+    ASSERT_FALSE(seen.empty()) << "each clamped pass must emit a gc_fold_clamp event";
+    EXPECT_NE(seen.front().reason.find("fold barrier"), String::npos);
+    EXPECT_EQ(seen.front().detail.at("shard"), "0");
+    store->setEventSink(nullptr);
 
     /// Release the clamp: the precommit's body lands (the build finished staging). The next rounds
     /// fold through the barrier, m2's +1 lands, and X is SPARED (entry dropped, blob intact).

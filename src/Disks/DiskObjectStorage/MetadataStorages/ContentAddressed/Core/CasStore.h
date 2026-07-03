@@ -108,7 +108,15 @@ struct PoolConfig
     /// Phase 0). Required + validated (clean relative path); `ServerUUID`/`server_id` is demoted to an
     /// owner token. Validated via `Cas::validateServerRootId`.
     String server_root_id;
-    uint64_t root_shards = 8;                 /// creation-time only; pool is authoritative on reopen
+    /// Creation-time only; the pool is authoritative on reopen. Default WEIGHED 2026-07-03 (night
+    /// forensics): per-shard journal tail = mutation_rate/N x fold-cursor age; with the
+    /// flat-combining queue the contention argument for large N is gone, so N trades BODY SIZE
+    /// (flush latency, read-modify-write bytes, object-store inline thresholds) against DISCOVERY
+    /// keys (∝N per namespace per round) and queue batching (dies as N grows). 8 concentrated a
+    /// hot table's writes badly (100 KB+ tails, 600 KB under cursor-lag storms); 128 over-shards
+    /// (batching ~1x, discovery x16, tail already tiny at 64). 32 keeps a hot table's tail ~25 KB
+    /// healthy / ~165 KB under a 10-minute storm with batching ~1.4x and discovery x4.
+    uint64_t root_shards = 32;
     uint64_t blob_header_len = 256;           /// creation-time only; ditto
     /// P1 (dedup cache): byte ceiling for the per-disk known-present blob-hash LRU set. 0 disables the
     /// cache (every create misses → P2-only). A hint cache; correctness never depends on it (a stale
@@ -139,15 +147,14 @@ struct PoolConfig
     /// (compact on >= 1 event — the previous eager behaviour, useful for tests).
     uint64_t gc_trim_min_events = 256;
     /// B12: encoded root-shard body size at/above which trim is forced regardless of event count. This
-    /// prevents unbounded journal growth when event rate is high.
-    /// 2026-07-03: default lowered from 8 MiB to 96 KiB so a trimmed shard body stays UNDER the
-    /// 128 KiB inline threshold of RustFS — https://github.com/rustfs/rustfs/issues/3231 (open)
-    /// leaks the previous data dir on every overwrite of a LARGER-than-inline object in an
-    /// un-versioned bucket, and the leaked dirs are what degrade LIST into timeout storms. An
-    /// inline-sized body sidesteps the leak entirely; the cost is a trim casPut per ~96 KiB of
-    /// journal growth per shard (coalesced through the shard-mutation queue anyway). Soak measured
-    /// live-refs ~5 KB per shard — the body is journal-tail-dominated, so the cap binds the tail.
-    uint64_t gc_trim_body_soft_limit = 96ULL << 10;   /// 96 KiB (see rustfs#3231 note above)
+    /// is the BACKSTOP against unbounded journal growth, not the working trimmer: the count gate
+    /// (gc_trim_min_events = 256 events ≈ 21 KB) fires long before any reasonable size cap, and NO
+    /// cap can cut events above the sealed fold cursor — the body is CURSOR-AGE-bound, not
+    /// trim-bound (2026-07-03 night: a 96 KiB cap experiment could not hold a hot table's body;
+    /// the real levers are root_shards and fold cadence). Keeping shard bodies under an object
+    /// store's inline threshold (e.g. RustFS 128 KiB, relevant while rustfs#3231 leaks data dirs
+    /// on big-object overwrite) is achieved by root_shards sizing, not by this cap.
+    uint64_t gc_trim_body_soft_limit = 8ULL << 20;   /// 8 MiB (backstop)
     /// gc-rebuild (spec 2026-07-03): max in-memory edges per gc-shard batch during rebuildBaseline
     /// (~32 B each => default ~256 MB); each full batch folds into the next attempt number with the
     /// previous attempt's runs as priors, so memory is O(budget), never O(edges).

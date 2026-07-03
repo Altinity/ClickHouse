@@ -22,7 +22,7 @@
                 <!-- #4: widen shard fanout (default 8) so manifest CAS writes spread across more
                      keys — drops per-key 64-permit congestion (503) and per-key overwrite-orphan
                      pileup. Creation-time; the fresh per-run pool picks it up. -->
-                <root_shards>8</root_shards>
+                <root_shards>64</root_shards> <!-- rustfs#3231 margin: 64 keeps shard bodies inline (<128 KiB) even under 10-min fold-cursor lag; the code default is 32 -->
                 <!-- Phase-4 sharded fold: 2 blob-target reducer shards. Blobs hash-route to either
                      gc/gen/<gen>/blob_target/0/ or gc/gen/<gen>/blob_target/1/; the two replicas
                      can reduce disjoint shards. One coordinator owns the global fence+seal.

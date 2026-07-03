@@ -151,4 +151,22 @@ enable_system_unfreeze (7/8 now, was hard-error).
   (5) rebuild follow-ups: dedicated gc-round-log row; fsck Orphan-class test gap;
   (6) S12/S22/S27 infra (multi-node Cluster, S3 fault proxy).
 
+## 10. Morning session: clamp attribution + defaults weighing (post-night)
 
+**Attribution SOLVED (event-log archaeology, archive `logs/archive_night_validation_20260703/`):**
+the 11 clamps were `owner-removal: edge-bearing committed body missing at removal-fold` — but the
+bodies were NEVER deleted (no `tree_delete` for the pinned manifests; their `+1` folds read them
+seconds earlier; the release fold read them again). **RustFS returned FALSE 404s on HEAD during the
+#3231-degraded metacache storm (00:37-00:55)** — clamps rose with the storm and self-released with
+it (r52 ≈ 01:01). Full causal chain: leak -> dir bloat -> metacache storm -> false 404s -> clamps
+-> (pre-fix) graduation over unfolded landed events -> 31 dangles. The clamp-suppression fix is
+exactly right and sufficient for safety; clamp-unsticking work is DOWNGRADED (these clamps
+self-heal); NEW upstream candidate: RustFS false-404-under-load report.
+
+**Defaults weighed and changed:** root_shards default 8 -> 32 (queue killed the contention
+argument; N trades body size / RMW bytes / flush latency vs discovery keys and batching; 32 =
+25 KB healthy tail, ~1.4x batching, x4 discovery); soak configs -> 64 (rustfs#3231 margin: inline
+bodies even under 10-min cursor lag); gc_trim_body_soft_limit restored to 8 MiB backstop (the
+96 KiB experiment could not bind the body — it is cursor-age-bound; the 256-event count gate is
+the working trimmer). Observability gaps closed: `gc_fold_clamp` event per clamp (ns/shard/
+manifest/reason/at_version) — the forensics that took an hour becomes one query.

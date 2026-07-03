@@ -676,3 +676,22 @@ Key test files:
 | Registry as authority for namespace universe | **REJECTED** → D1 | Monotone growth; being replaced by LIST-based discovery |
 | "empty ⇒ deregister" inference | **REJECTED** | Indistinguishable from idle-but-live namespace |
 | Path-keyed fold cursor without incarnation | **REJECTED** | ABA hazard on drop+recreate |
+
+## Absent-at-HEAD is not durably-absent {#absent-at-head}
+
+Named rule (2026-07-03 forensics). An object store may answer `HEAD -> 404` for an object that
+exists: the night-soak clamp era was caused by RustFS returning FALSE 404s on live manifest bodies
+while its metacache was degraded by the rustfs#3231 leak storm (proof: the clamping manifests'
+`+1` folds read the bodies seconds BEFORE the clamps; no deletion event exists for them; the
+release fold at the storm's end read them again). Consequences, both already enforced:
+
+- the FOLD treats an unreadable body as a **clamp** (cursor freeze), never a guess and never a
+  wedge (`gc_fold_clamp` event carries namespace/shard/manifest/reason since 2026-07-03);
+- a clamped pass is **destruction-suppressed** — no graduations, no pending deletes — because
+  landed events behind a clamp are exactly the references a false 404 would otherwise let the
+  floor delete over.
+
+The rule generalizes: no DESTRUCTIVE decision may treat a single point-in-time absence observation
+as durable truth; only exact-token deletes over entries that survived the full condemn -> floor ->
+graduate pipeline qualify. (Upstream: false-404-under-load is worth a RustFS report of its own,
+tied to rustfs#3231 degradation.)

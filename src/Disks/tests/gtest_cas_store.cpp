@@ -360,7 +360,7 @@ TEST(CasStore, OpenCreatesPoolMetaAndReopens)
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "srv-1"});
     auto s2 = Store::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(2), .server_root_id = "srv-2", .root_shards = 4});
-    EXPECT_EQ(s2->poolMeta().root_shards, 8u);                      /// pool authoritative
+    EXPECT_EQ(s2->poolMeta().root_shards, 32u);   /// the PoolConfig default (2026-07-03 weighing)                      /// pool authoritative
     EXPECT_EQ(s1->poolMeta().pool_id, s2->poolMeta().pool_id);
 }
 
