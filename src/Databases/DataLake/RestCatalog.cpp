@@ -1,3 +1,4 @@
+#include <Poco/Exception.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/Net/HTTPRequest.h>
@@ -1242,6 +1243,13 @@ CommitOutcome RestCatalog::updateMetadata(const String & namespace_name, const S
         return classifyCommitOutcomeAfterFailure(namespace_name, table_name, new_snapshot);
     }
     catch (const Poco::Net::NetException &)
+    {
+        return classifyCommitOutcomeAfterFailure(namespace_name, table_name, new_snapshot);
+    }
+    /// Deliberately four narrow catches rather than one catch (Poco::Exception &):
+    /// only failure modes that can mean "response lost" should be re-classified;
+    /// anything else (auth logic bugs, parse errors) must keep propagating loudly.
+    catch (const Poco::TimeoutException &)
     {
         return classifyCommitOutcomeAfterFailure(namespace_name, table_name, new_snapshot);
     }

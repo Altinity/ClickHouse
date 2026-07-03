@@ -1,40 +1,39 @@
 #!/usr/bin/env python3
-"""Tests for the Iceberg REST catalog commit-safety bug.
+"""
+Tests for the Iceberg REST catalog commit-safety bug.
 
-Bug: on a network failure AFTER the catalog commit succeeds, ClickHouse's HTTP
-layer retries the byte-identical commit POST, the catalog returns 409 (its
-assert-ref-snapshot-id no longer matches), and -- before the fix --
-`RestCatalog::updateMetadata` collapsed that 409 to `return false`, so the caller
-ran cleanup() and deleted files the now-live snapshot references.
+The bug: after the catalog commit succeeds, a network failure loses the response.
+ClickHouse's HTTP layer retries the identical commit POST, the catalog returns 409
+(its assert-ref-snapshot-id no longer matches), and -- before the fix --
+RestCatalog::updateMetadata collapsed that 409 to `return false`. The caller read
+that as a rejection, ran cleanup(), and deleted files the now-live snapshot
+references.
 
-These tests interpose `catalog_fault_proxy.py` between ClickHouse and the real
-REST catalog to make the "commit succeeds, response lost" window deterministic,
-then assert the corruption invariant:
+These tests put catalog_fault_proxy.py between ClickHouse and the real REST catalog
+to make the "commit succeeds, response lost" window deterministic, then assert one
+invariant:
 
-    NO catalog-referenced snapshot may point at a manifest list that is missing
+    No catalog-referenced snapshot may point at a manifest list that is missing
     from object storage.
 
-Wiring (already in place):
-  * conftest.py merges docker_compose_rest_proxy.yml into the cluster; that runs
-    the `rest-proxy` service on the shared network and publishes 8999:8181.
-  * ClickHouse reaches the catalog THROUGH the proxy (CREATE DATABASE below uses
-    `http://rest-proxy:8181/v1`); pyiceberg keeps talking to the real catalog at
-    localhost:8182, so it observes true committed state.
-  * proxy_control_url() returns http://localhost:8999, the host-published port.
+The fix, on a failed commit, updateMetadata re-reads and classifies by snapshot-id,
+then the catalog and returns a typed CommitOutcome:
+  * Committed       : snapshot-id is the catalog's current, or is in
+                       snapshots[] (we landed, then were superseded). Skip cleanup.
+  * RejectedCleanly : the re-read succeeded and our snapshot-id is provably
+                       absent. Only here is cleanup safe.
+  * Unknown         : the re-read failed or carried no snapshot state. Preserve
+                       all files: a recoverable leak beats unrecoverable corruption.
+Making the 409 non-retriable is an optional efficiency, not the fix -- classification
+removes the corruption regardless of retry behavior.
 
-The fix is re-read-and-classify by snapshot-id. On a failed commit,
-`RestCatalog::updateMetadata` re-reads the catalog and returns a typed
-`CommitOutcome`:
-  * Committed       -- our snapshot-id is the catalog's current-snapshot-id, or is
-                       present in snapshots[] (we landed, then were superseded).
-                       Callers skip cleanup.
-  * RejectedCleanly -- the re-read succeeded and our snapshot-id is provably absent
-                       from populated snapshot state. Only here is cleanup safe.
-  * Unknown         -- the re-read failed or carried no snapshot state. Callers
-                       preserve all files, because a recoverable leak beats
-                       unrecoverable corruption.
-Making 409 non-retriable at the HTTP layer is an optional efficiency, not the
-correctness fix: classification removes the corruption regardless of retry behavior.
+Wiring
+  * conftest.py merges docker_compose_rest_proxy.yml into the cluster, running the
+    rest-proxy service on the shared network (publishes 8999:8181).
+  * ClickHouse reaches the catalog THROUGH the proxy (http://rest-proxy:8181/v1);
+    pyiceberg talks to the real catalog at localhost:8182, so it sees true
+    committed state.
+  * proxy_control_url() returns http://localhost:8999, the host-published port.
 """
 
 import uuid
@@ -240,3 +239,78 @@ def test_insert_commit_response_loss_is_handled(started_cluster_iceberg_no_spark
         f"corrupted: {[s.snapshot_id for s in missing]}")
     assert int(instance.query(
         f"SELECT count() FROM {namespace}.{ch_ident}").strip()) == 2
+
+
+def test_insert_commit_unknown_aborts_without_retry(started_cluster_iceberg_no_spark):
+    """
+    When a commit's outcome can't be confirmed (response lost and re-read failed,
+    i.e. CommitOutcome::Unknown), the write aborts instead of retrying: retrying a
+    possibly-committed commit would duplicate the write, and cleaning up would
+    delete files the committed snapshot may still reference. So the fix raises and
+    preserves the files rather than guessing.
+    """ 
+    cluster = started_cluster_iceberg_no_spark
+    catalog, namespace, ch_ident, identifier, snap_N, instance = \
+        _setup_table_with_one_snapshot(cluster, "insert_unknown")
+
+    pre_count = int(instance.query(
+        f"SELECT count() FROM {namespace}.{ch_ident}").strip())
+
+    # Drop the response of the commit POST, AND drop the response of the GET
+    # that RestCatalog::classifyCommitOutcomeAfterFailure immediately issues
+    # to re-read the table and classify the outcome. Losing both is exactly
+    # what turns the classification into CommitOutcome::Unknown.
+    arm_fault(cluster, {"chain": [
+        {"method": "POST", "match_path_substr": "/tables/t",
+         "mode": "commit_then_drop", "count": 1},
+        {"method": "GET", "match_path_substr": "/tables/t",
+         "mode": "commit_then_drop", "count": 15},
+    ]})
+
+    insert_error = None
+    try:
+        instance.query(
+            f"INSERT INTO {namespace}.{ch_ident} VALUES (2, 'B')",
+            settings={"allow_experimental_insert_into_iceberg": 1},
+        )
+    except Exception as e:
+        insert_error = str(e)
+
+    st = fault_status(cluster)
+    http_max_tries_default = 10
+    expected_faulted = 1 + http_max_tries_default
+    assert st["faulted"] == expected_faulted, (
+        f"expected the commit POST to be faulted once and every classification-GET "
+        f"retry attempt ({http_max_tries_default}) to be faulted too, staging Unknown: {st}")
+
+    after = catalog.load_table(identifier)
+    missing = snapshots_with_missing_manifest_list(cluster, after)
+    post_count = int(instance.query(
+        f"SELECT count() FROM {namespace}.{ch_ident}").strip())
+
+    print("INSERT raised:", insert_error,
+          "| current_snapshot:", after.metadata.current_snapshot_id,
+          "| missing:", [s.snapshot_id for s in missing],
+          "| pre_count:", pre_count, "| post_count:", post_count)
+
+    # An ambiguous commit must abort the retry loop, not silently succeed by
+    # retrying: the caller (finalizeBuffers) cannot know whether the one commit
+    # attempt already landed, so it must not attempt a second one.
+    assert insert_error is not None, (
+        "an INSERT whose commit outcome is unknown must raise, not retry silently")
+    assert "DATALAKE_DATABASE_ERROR" in insert_error, (
+        f"expected the Unknown-commit abort to surface as DATALAKE_DATABASE_ERROR "
+        f"(a DataLake-layer runtime condition, not LOGICAL_ERROR/an internal-bug "
+        f"signal), got: {insert_error}")
+
+    # Files must be preserved either way: Unknown must not run cleanup().
+    assert not missing, (
+        "no catalog-referenced snapshot may point at a deleted manifest list; "
+        f"corrupted: {[s.snapshot_id for s in missing]}")
+
+    # Unknown means the client can't tell if the one commit attempt landed, so
+    # pre_count or pre_count+1 are both fine after aborting on the first try.
+    # pre_count+2 is what's forbidden: a retried second commit appending the row
+    # twice, which raises the corruption this throw-instead-of-retry fix prevents.
+    assert post_count in (pre_count, pre_count + 1), (
+        f"commit was retried and double-applied: pre={pre_count} post={post_count}")
