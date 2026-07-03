@@ -67,6 +67,9 @@ namespace ErrorCodes
     extern const int CANNOT_PARSE_INPUT_ASSERTION_FAILED;
     extern const int CANNOT_PARSE_DOMAIN_VALUE_FROM_STRING;
     extern const int VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE;
+    extern const int ATTEMPT_TO_READ_AFTER_EOF;
+    extern const int CANNOT_READ_ARRAY_FROM_TEXT;
+    extern const int DECIMAL_OVERFLOW;
 }
 
 namespace Setting
@@ -120,6 +123,9 @@ namespace ExportPartitionUtils
             ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED,
             ErrorCodes::CANNOT_PARSE_DOMAIN_VALUE_FROM_STRING,
             ErrorCodes::VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE,
+            ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF,
+            ErrorCodes::CANNOT_READ_ARRAY_FROM_TEXT,
+            ErrorCodes::DECIMAL_OVERFLOW,
         };
         return non_retryable_codes.contains(code);
     }
