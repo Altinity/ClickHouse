@@ -183,7 +183,7 @@ Key schema columns:
 | `disk_name` | the CA disk the event occurred on |
 | `namespace` | `roots/<ns>` (server/table) |
 | `ref_name` | part name or ref identifier |
-| `object_kind` | `LowCardinality(String)`: `none`, `blob`, `tree`, `root`, `snap` |
+| `object_kind` | `LowCardinality(String)`: `none`, `blob`, `manifest`, `root`, `snap` |
 | `object_hash` | lowercase hex content hash |
 | `token` | incarnation token (S3 ETag or equivalent) |
 | `round` / `gen` | GC round and snap generation numbers |

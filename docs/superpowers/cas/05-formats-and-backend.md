@@ -12,9 +12,10 @@ doc_type: 'reference'
 **Status:** covers generation-1 decisions: the envelope format (`DONE`, blob only — see below), the
 encoding taxonomy and proto rename (`DONE`), `putDeterministicArtifact` (`DONE`, GC-internal artifacts
 only), the `Backend` seam (`DONE`), layout keys (`DONE`); the standalone `Tree` object kind, its
-inline-data section, and the Merkle `treeId` rule (**not implemented as of 2026-07-03** — superseded by
-the rev. 15 `PartManifest` redesign), schema-evolution rollout machinery (`TODO`/deferred — Part IV);
-GCS/Azure binding (`TODO`); Merkle `treeId` tree-layer intermediate object (`REJECTED`).
+inline-data section, and the Merkle `treeId` rule (**removed 2026-07-03** — superseded by
+the rev. 15 `PartManifest` redesign, then excised from the code entirely), schema-evolution rollout
+machinery (`TODO`/deferred — Part IV); GCS/Azure binding (`TODO`); Merkle `treeId` tree-layer
+intermediate object (`REJECTED`).
 
 Sources: `specs/2026-06-07-ca-merkle-store-design.md`, `specs/2026-06-08-ca-merkle-store-requirements.md`,
 `plans/2026-06-24-cas-2b-envelope-one-header.md`, `plans/2026-06-24-cas-2a-merkle-tree-id.md`,
@@ -28,25 +29,23 @@ Grounded against `Core/CasEnvelope.{h,cpp}`, `Core/CasBackend.h`, `Core/CasLayou
 
 ## Object kinds {#object-kinds}
 
-**Status: DONE, but see superseded-Tree note below**
+**Status: DONE, but see removed-Tree note below**
 
 Three object kinds were designed; a fourth (`Pack`) was removed (see Rejected section). **As of the
-rev. 15 root-local part-manifest redesign, `Tree` is no longer produced on the write path** (not
-implemented as of 2026-07-03): `CasManifestCodec.h` states explicitly "No `Subtree`: there are no
-nested tree objects in this design; a directory is a path prefix, not a placement." Part contents
-are described by a `PartManifest` (protobuf; see `Core/CasManifestCodec.h`) whose entries are either
-`EntryPlacement::Inline` (bytes embedded in the manifest body) or `EntryPlacement::Blob` (content-addressed
-blob). `ObjectKind::Tree` and the `CATR` magic still exist in `CasEnvelope.h`/`CasFormat.h` and are
-exercised by unit tests, but `CasBuild` never calls `uploadFromSource`/`observeAndAdmit` with
-`ObjectKind::Tree`, and `FormatId::Tree` is explicitly retired ("2 (Tree) ... retired in the rev. 15
-root-local part-manifest redesign — no on-disk compat to honor"). `Cas::Layout` correspondingly has
-no `treeKey` builder; `objectKey(layout, ObjectKind::Tree, hash)` throws `LOGICAL_ERROR` ("standalone
-tree objects are a retired concept").
+rev. 15 root-local part-manifest redesign, `Tree` was no longer produced on the write path**, and it
+was excised from the code entirely on 2026-07-03: `CasManifestCodec.h` states explicitly "No
+`Subtree`: there are no nested tree objects in this design; a directory is a path prefix, not a
+placement." Part contents are described by a `PartManifest` (protobuf; see `Core/CasManifestCodec.h`)
+whose entries are either `EntryPlacement::Inline` (bytes embedded in the manifest body) or
+`EntryPlacement::Blob` (content-addressed blob). `ObjectKind::Tree` and the `CATR` magic are **removed
+2026-07-03** from `CasEnvelope.h`/`CasFormat.h` — `ObjectKind` now has `Blob` as its sole enumerator.
+`Cas::Layout` correspondingly has no `treeKey` builder; `objectKey` only ever addresses `Blob` (the
+`ObjectKind::Tree` LOGICAL_ERROR thrower it used to carry was removed along with the enumerator).
 
 | Kind | Mutable? | Content-addressed? | Encoding |
 |------|----------|--------------------|----------|
 | **Blob** | no | yes | 256-B header (`CABL`) + raw file bytes |
-| **Tree** (superseded, not produced — see above) | no | yes | 256-B header (`CATR`) + catalog + inline-data section |
+| **Tree** (removed 2026-07-03 — see above) | no | yes | 256-B header (`CATR`) + catalog + inline-data section |
 | **Part manifest** (`PartManifest`, part of a root-shard manifest body) | no | no (referenced by ref, not by content hash) | protobuf — `clickhouse.cas.format` package |
 | **Root shard** (manifest/journal) | yes | no | protobuf — `clickhouse.cas.format` package |
 | **GC/control objects** (`gc/state`, mount/heartbeat, `pool-meta`, retired list, etc.) | yes | no | protobuf |
@@ -316,10 +315,9 @@ The `completion_seal` and the standalone `_watermark` object are **gone**: the a
 **Key design choices:**
 
 - `<shard2>` = first two hex characters of the id. `Layout::blobKey` is the canonical builder for
-  content blobs. `objectKey(layout, kind, hash)` dispatches on `ObjectKind` but only implements
-  `ObjectKind::Blob`; calling it with `ObjectKind::Tree` throws `LOGICAL_ERROR` ("standalone tree
-  objects are a retired concept") — there is no `Layout::treeKey` (not implemented as of 2026-07-03;
-  see `§object-kinds`).
+  content blobs. `objectKey(layout, kind, hash)` dispatches on `ObjectKind`, which has `Blob` as its
+  sole enumerator — the `ObjectKind::Tree` LOGICAL_ERROR thrower and `Layout::treeKey` were removed
+  2026-07-03 along with the enumerator (see `§object-kinds`).
 - Namespaces are opaque strings to the core; the wiring composes e.g. `<server_id>/<table_uuid>`.
   `_files`, `_manifests`, `_precommits` are reserved segments. Numeric-only shard keys and `_files`
   cannot collide.
@@ -542,8 +540,8 @@ issue.
 
 The following byte-level decisions are frozen (irreversible after first release):
 
-- Single header for blob and tree; magic set `CABL`/`CATR`; exact core size 94 bytes;
-  `blob_header_len = 256` for both.
+- Single header for blob (and, until removed 2026-07-03, tree); magic `CABL` (`CATR` removed along
+  with `ObjectKind::Tree`); exact core size 94 bytes; `blob_header_len = 256`.
 - Version field width: 2 bytes (`uint16` LE) for `writer_version` and `compatibility_version`.
 - Merkle `treeId` rule: `CityHash128("CAMT" || u8(1) || sorted(name, node_kind, child_hash))`
   (not implemented as of 2026-07-03 — superseded by the rev. 15 `PartManifest` redesign; see
@@ -552,7 +550,7 @@ The following byte-level decisions are frozen (irreversible after first release)
   (not the header).
 - Catalog-first / inline-data-last tree layout (not implemented as of 2026-07-03 — see `§tree-codec`).
 - `Placement::Pack` fully removed (was never produced; no reserved slot — YAGNI).
-- Format id set (`CABL`/`CATR`/`CARS`/…).
+- Format id set (`CABL`/`CARS`/… — `CATR` removed 2026-07-03).
 - Single error code `UNKNOWN_FORMAT_VERSION` for future format and unknown critical TLV.
 
 ### Write-down-to-floor discipline {#write-down-to-floor}
@@ -604,10 +602,10 @@ converted off JSON for cleanup but their protobuf is not an interchange contract
 
 | Item | Status | Notes |
 |---|---|---|
-| One 256-B header for blob+tree (`CABL`/`CATR`), 94-byte hole-free core | DONE (envelope format only; `Tree` no longer produced — see below) | `CasEnvelope.{h,cpp}` |
+| One 256-B header for blob (`CABL`), 94-byte hole-free core | DONE (envelope format only; `Tree`/`CATR` removed 2026-07-03 — see below) | `CasEnvelope.{h,cpp}` |
 | `compatibility_version` (formerly `min_reader_version`) + `gateOnRead` | DONE | `CasFormat.{h,cpp}` |
 | Blob hash over payload, not header | DONE (streaming chunked hash, not one-shot — see `§codecs-and-determinism`) | test asserts this |
-| Standalone `Tree` object kind / `Layout::treeKey` | **not implemented as of 2026-07-03** | superseded by `PartManifest` (`CasManifestCodec.h`), rev. 15 redesign |
+| Standalone `Tree` object kind / `Layout::treeKey` | **removed 2026-07-03** | superseded by `PartManifest` (`CasManifestCodec.h`), rev. 15 redesign, then excised from the code (`ObjectKind` now has `Blob` as its sole enumerator) |
 | Merkle `treeId` rule (2a) | **not implemented as of 2026-07-03** | no `merkleTreeId`/`CasTreeCodec` in tree; superseded by rev. 15 |
 | Catalog-first / inline-data-last tree layout | **not implemented as of 2026-07-03** | no `CasTreeCodec`; superseded by rev. 15 |
 | `Placement::Pack` removed | DONE | no code, no on-disk data |
