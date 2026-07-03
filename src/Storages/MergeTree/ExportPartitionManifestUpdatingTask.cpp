@@ -352,7 +352,7 @@ void ExportPartitionManifestUpdatingTask::poll()
             std::string metadata_json;
             if (!zk->tryGet(fs::path(entry_path) / "metadata.json", metadata_json))
             {
-                LOG_DEBUG(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: missing metadata.json", key);
+                LOG_WARNING(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: missing metadata.json", key);
                 continue;
             }
 
