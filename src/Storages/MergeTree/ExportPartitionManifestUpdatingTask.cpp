@@ -402,7 +402,7 @@ void ExportPartitionManifestUpdatingTask::poll()
 
             if (status_string.empty())
             {
-                LOG_DEBUG(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: missing status", key);
+                LOG_WARNING(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: missing status", key);
                 continue;
             }
 
