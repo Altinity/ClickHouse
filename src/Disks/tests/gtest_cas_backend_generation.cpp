@@ -50,6 +50,19 @@ TEST(CasBackendGeneration, CheckStorePreconditionsNoOpOnEtagDialect)
 /// write on a generation-token store must never take the multipart path. conditionalWriteSettings
 /// must force the single-PUT path (and raise the single-part cap to conditional_single_put_cap) when
 /// the backend's native token kind is Generation, and stay a no-op otherwise (ETag dialect).
+TEST(CasBackendGeneration, ListTokensDisabledOnGenerationStores)
+{
+    /// XML LIST bodies carry MD5-style ETags that the dialect cannot rewrite to generations; a
+    /// list-derived token on a generation store is a poisoned If-Match (live GC on GCS died there).
+    auto b = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    EXPECT_TRUE(b->supportsListTokens());
+    b->setNativeTokenTypeForTest(TokenType::Generation);
+    EXPECT_FALSE(b->supportsListTokens());
+    b->setNativeTokenTypeForTest(TokenType::ETag);
+    EXPECT_TRUE(b->supportsListTokens());
+}
+
 TEST(CasBackendGeneration, ConditionalWriteSettingsForceSinglePutOnGenerationStores)
 {
     auto b = std::make_shared<ObjectStorageBackend>(

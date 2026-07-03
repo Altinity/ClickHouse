@@ -44,9 +44,14 @@ public:
     std::optional<GetResult> get(const String & key, Range range) override;
     std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override;
     HeadResult head(const String & key) override;
-    /// S3 ETags are content-derived and surfaced in list responses — TRUE for both Native and
-    /// EmulatedSingleProcess modes (the emulated mode mints tokens it also surfaces through `list`).
-    bool supportsListTokens() const override { return true; }
+    /// S3 ETags are content-derived and surfaced in list responses — TRUE for ETag-token Native
+    /// and EmulatedSingleProcess modes. FALSE on a generation-token store (GCS): the XML LIST
+    /// surfaces MD5-style ETags in the response BODY, which the conditional dialect's header-level
+    /// rewrite cannot map to generations — a list-derived "token" is a poisoned `If-Match` (the
+    /// first live GC round on GCS died exactly there, fail-closed by the dialect's format guard).
+    /// Consumers already treat absent list tokens as Read/fail-closed (GC discover re-reads every
+    /// shard — a cost, not a correctness change).
+    bool supportsListTokens() const override { return native_token_type != TokenType::Generation; }
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override;
 
     /// Native mode: true streaming — bytes flow straight into the object storage's write buffer with

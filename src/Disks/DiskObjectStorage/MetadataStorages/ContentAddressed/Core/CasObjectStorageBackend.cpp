@@ -780,7 +780,7 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
         /// Surface the per-key incarnation token (matching what `head` would return, see above) so the
         /// `supportsListTokens() == true` capability is honest. A listing without an etag leaves the
         /// token unset, which GC discover treats as Read (fail closed).
-        if (child->metadata && !child->metadata->etag.empty())
+        if (supportsListTokens() && child->metadata && !child->metadata->etag.empty())
             lk.token = Token{child->metadata->etag, native_token_type};
 
         if (page.keys.size() == limit)
