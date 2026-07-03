@@ -222,6 +222,9 @@ MountClaimResult claimMountAwaitingExpiry(
 struct HeartbeatFloor
 {
     uint64_t min_ack = std::numeric_limits<uint64_t>::max();   /// UINT64_MAX = no counted heartbeats
+    /// MAX observed_gc_round over EVERY decoded mount body (fenced/terminated included — a stale ack
+    /// from any mount poisons a low rebuild round). Used by `Gc::rebuildBaseline`'s round mint.
+    uint64_t max_ack = 0;
     size_t live = 0;
     size_t terminated = 0;
     size_t fenced_now = 0;

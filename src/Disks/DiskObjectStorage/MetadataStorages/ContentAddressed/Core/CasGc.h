@@ -32,6 +32,24 @@ struct RoundAnomaly
 };
 
 /// What one runRegularRound did (counters are health metrics, not protocol state).
+/// Outcome of `Gc::rebuildBaseline` (spec 2026-07-03-cas-gc-rebuild-design.md): either performed
+/// (with the minted numbering + coverage counters) or refused (fail-closed; `refusal` says why and
+/// nothing was committed — gc/state is untouched by a refused rebuild).
+struct RebuildReport
+{
+    bool performed = false;
+    String refusal;
+    uint64_t round = 0;
+    uint64_t generation = 0;
+    uint64_t namespaces = 0;
+    uint64_t shards = 0;
+    uint64_t committed_refs = 0;
+    uint64_t live_precommits = 0;
+    uint64_t unowned_alive_manifests = 0;   /// over-protected trimmed-but-live class (design delta 2)
+    uint64_t edges = 0;
+    uint64_t clamped_shards = 0;
+};
+
 struct RoundReport
 {
     bool acquired_lease = false;  /// false => another leader is alive; nothing else was done
@@ -125,6 +143,14 @@ public:
     /// OVER-REPORT a blob a since-landed publish re-referenced (the real round folds first and spares
     /// it). The {preview} ⊆ {genuinely-unreachable} guarantee holds ONLY at quiescence. No CAS/delete.
     std::vector<PreviewEntry> previewDeletes();
+
+    /// Raw baseline rebuild — the gc/state disaster-recovery command (spec 2026-07-03). Recomputes
+    /// the in-degree snapshot from raw owner state (committed refs + live precommits + the unowned
+    /// not-provably-dead over-protection), mints round/generation above every surviving ack/number,
+    /// publishes EMPTY retired lists, and CASes gc/state. Live-conservative; fail-closed refusals.
+    RebuildReport rebuildBaseline(bool force);
+
+    void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
     /// TEST SEAM (M1 regression): disable the round's journal trim so a folded event stays in the journal
     /// across rounds — exactly the Phase-3 lazy-trim / partial-trim-after-crash condition under which the
@@ -296,6 +322,7 @@ private:
 
     StorePtr store;
     UInt128 gc_id{};
+    uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
     std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock              /// this leader's identity (random u128, never 0)
     bool trim_enabled = true;     /// TEST SEAM ONLY (M1): production always trims; see setTrimEnabledForTest
     bool maintenance_trim = false; /// B12 TEST SEAM: bypass lazy-trim thresholds for one round (full compaction); see setMaintenanceTrimForTest

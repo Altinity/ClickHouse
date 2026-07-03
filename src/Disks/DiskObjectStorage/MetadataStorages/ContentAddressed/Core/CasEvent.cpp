@@ -46,6 +46,7 @@ String toString(CasEventType type)
         case CasEventType::GcTrim:                return "gc_trim";
         case CasEventType::GcShardReclaim:        return "gc_shard_reclaim";
         case CasEventType::GcFenceOut:            return "gc_fence_out";
+        case CasEventType::GcRebuild:             return "gc_rebuild";
         case CasEventType::GcLeaseAcquire:        return "gc_lease_acquire";
         case CasEventType::GcLeaseSteal:          return "gc_lease_steal";
         case CasEventType::GcLeaseHeartbeat:      return "gc_lease_heartbeat";

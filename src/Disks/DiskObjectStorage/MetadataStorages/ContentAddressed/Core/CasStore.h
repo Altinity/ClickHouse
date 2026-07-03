@@ -142,6 +142,10 @@ struct PoolConfig
     /// prevents unbounded journal growth when event rate is high. Defaults to half the manifest soft
     /// cap so a shard trimmed at or near the soft limit never hits the hard limit before the next round.
     uint64_t gc_trim_body_soft_limit = 8ULL << 20;   /// 8 MiB
+    /// gc-rebuild (spec 2026-07-03): max in-memory edges per gc-shard batch during rebuildBaseline
+    /// (~32 B each => default ~256 MB); each full batch folds into the next attempt number with the
+    /// previous attempt's runs as priors, so memory is O(budget), never O(edges).
+    uint64_t rebuild_edge_budget = 8000000;
     uint64_t manifest_soft_limit = 16ULL << 20;
     uint64_t manifest_hard_limit = 64ULL << 20;
     /// B164b: max backpressure delay (ms) applied to writer-originated mutations whose encoded root-shard

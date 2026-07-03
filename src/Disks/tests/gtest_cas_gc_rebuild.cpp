@@ -91,3 +91,246 @@ TEST(CasGcBaselineGuard, AbsentAdoptedSealFailsClosed)
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.runRegularRound(); });
 }
+
+/// (а): lose gc/state on a lived-in pool -> guard blocks rounds -> rebuild -> rounds converge:
+/// the dropped blob is reclaimed, the live blob intact, the round minted above every mount ack.
+TEST(CasGcRebuild, RecoversLostStateAndConverges)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef live_r = ref(1, 0xA1);
+    const ManifestRef dead_r = ref(2, 0xA2);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeBlobBody(*backend, store->layout(), DB::UInt128(2));
+    writeManifestRaw(*backend, store->layout(), ns, live_r, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, store->layout(), ns, dead_r, {blobEntryFor("b", DB::UInt128(2))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_live", std::nullopt, live_r);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_dead", std::nullopt, dead_r);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    dropRefTransition(*backend, store->layout(), ns, "tbl_dead", dead_r);
+    gc.runRegularRound();   /// -1 folds; eager trim cuts the journal
+    store->renewWatermarkOnce();   /// the mount ack advances to the current round
+
+    const HeadResult st = backend->head(store->layout().gcStateKey());
+    ASSERT_EQ(backend->deleteExact(store->layout().gcStateKey(), st.token).kind, DeleteOutcome::Kind::Deleted);
+
+    Gc gc2(store, hexToU128("00000000000000000000000000000003"));
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc2.runRegularRound(); });
+
+    const RebuildReport rep = gc2.rebuildBaseline(/*force*/ false);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_EQ(rep.committed_refs, 1u);
+    EXPECT_EQ(rep.namespaces, 1u);
+
+    /// Round strictly above the mount's surviving ack.
+    const auto mount_got = backend->get(store->layout().mountKey("test"));
+    ASSERT_TRUE(mount_got.has_value());
+    EXPECT_GT(rep.round, decodeMountLease(mount_got->bytes).observed_gc_round);
+
+    /// Regular rounds converge: blob 2 (unreferenced) reclaimed, blob 1 intact.
+    EXPECT_TRUE(runRoundsUntilAbsent(store, gc2, *backend, store->layout(), DB::UInt128(2)));
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))))).exists);
+}
+
+/// (б): a run object named by a healthy state is lost -> the regular round fails closed -> the
+/// PLAIN rebuild (no FORCE) recovers, and rounds converge afterwards.
+TEST(CasGcRebuild, RecoversLostGenerationArtifact)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+
+    /// Lose one snapshot run object out from under the healthy state.
+    const GcState st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    const auto seal = decodeFoldSeal(backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+    ASSERT_FALSE(seal.blob_target_runs.empty());
+    const String run_key = seal.blob_target_runs.front().key;
+    const HeadResult rh = backend->head(run_key);
+    ASSERT_TRUE(rh.exists);
+    ASSERT_EQ(backend->deleteExact(run_key, rh.token).kind, DeleteOutcome::Kind::Deleted);
+
+    /// A pure ref-carry round would not read the lost run; land a REAL delta so the fold's
+    /// three-cursor merge must stream the prior run — and fails closed on its absence.
+    const ManifestRef r2 = ref(2, 0xB7);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(3));
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("c", DB::UInt128(3))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.runRegularRound(); });
+
+    const RebuildReport rep = gc.rebuildBaseline(/*force*/ false);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_NO_THROW(gc.runRegularRound());
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))))).exists);
+}
+
+/// FORCE: a healthy state refuses the plain rebuild; FORCE rebuilds; rounds run clean after.
+TEST(CasGcRebuild, HealthyStateRequiresForce)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+
+    const RebuildReport refused = gc.rebuildBaseline(/*force*/ false);
+    EXPECT_FALSE(refused.performed);
+    EXPECT_NE(refused.refusal.find("FORCE"), String::npos);
+
+    const RebuildReport forced = gc.rebuildBaseline(/*force*/ true);
+    ASSERT_TRUE(forced.performed) << forced.refusal;
+    EXPECT_NO_THROW(gc.runRegularRound());
+}
+
+/// Refusal: a committed owner with a MISSING manifest body is data loss — the rebuild refuses,
+/// names the owner, and writes nothing (gc/state stays absent).
+TEST(CasGcRebuild, MissingCommittedManifestRefuses)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef a = ref(1, 0xA1);
+    const ManifestRef b = ref(2, 0xB2);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, a, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, store->layout(), ns, b, {blobEntryFor("b", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_a", std::nullopt, a);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_b", std::nullopt, b);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    gc.runRegularRound();   /// trim
+
+    /// Disaster pair: gc/state lost AND tbl_b's manifest body lost.
+    const HeadResult st = backend->head(store->layout().gcStateKey());
+    backend->deleteExact(store->layout().gcStateKey(), st.token);
+    const String mkey = store->layout().manifestKey(ManifestId{ns, b});
+    const HeadResult mh = backend->head(mkey);
+    ASSERT_TRUE(mh.exists);
+    backend->deleteExact(mkey, mh.token);
+
+    Gc gc2(store, hexToU128("00000000000000000000000000000004"));
+    const RebuildReport rep = gc2.rebuildBaseline(/*force*/ false);
+    EXPECT_FALSE(rep.performed);
+    EXPECT_NE(rep.refusal.find("tbl_b"), String::npos) << rep.refusal;
+    /// The lease acquire minted a gen-0 bootstrap body (that is the acquire's contract, not the
+    /// rebuild's); the rebuild's own contract is that NO baseline was blessed by the refusal.
+    const auto post = backend->get(store->layout().gcStateKey());
+    ASSERT_TRUE(post.has_value());
+    const GcState post_state = decodeGcState(post->bytes);
+    EXPECT_EQ(post_state.snap_generation, 0u) << "a refused rebuild must not adopt a baseline";
+    EXPECT_TRUE(post_state.retired_refs.empty());
+}
+
+/// A live precommit with a durable body contributes edges (no clamp); the rebuilt baseline
+/// protects its blob from condemnation.
+TEST(CasGcRebuild, LivePrecommitEdgesIncluded)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef pre = ref(7, 0xC1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(9));
+    writeManifestRaw(*backend, store->layout(), ns, pre, {blobEntryFor("p", DB::UInt128(9))});
+    addPrecommitTransition(*backend, store->layout(), ns, /*build_id*/ DB::UInt128(0x77), "part_pre", std::nullopt, pre);
+
+    /// No round before the rebuild: the journal still carries the create-precommit event (a round's
+    /// eager trim would cut it — the trimmed-but-live case is the next test). gc/state absent =>
+    /// the plain rebuild is allowed.
+    Gc gc2(store, hexToU128("00000000000000000000000000000005"));
+    const RebuildReport rep = gc2.rebuildBaseline(/*force*/ false);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_EQ(rep.live_precommits, 1u);
+    EXPECT_EQ(rep.clamped_shards, 0u);
+
+    /// The precommit's blob is edge-protected: rounds never reclaim it while the precommit lives.
+    for (int i = 0; i < 4; ++i)
+    {
+        gc2.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(9))))).exists);
+}
+
+/// O(budget) attempt iteration: a tiny edge budget forces multi-batch folding; the rebuilt
+/// baseline still protects every committed blob (same convergence as the single-batch path).
+TEST(CasGcRebuild, BatchedRebuildProtectsAllRefs)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    for (uint64_t i = 1; i <= 6; ++i)
+    {
+        writeBlobBody(*backend, store->layout(), DB::UInt128(i));
+        const ManifestRef r = ref(i, 0xA0 + i);
+        writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("f", DB::UInt128(i))});
+        publishCommittedTransition(*backend, store->layout(), ns, "tbl_" + std::to_string(i), std::nullopt, r);
+    }
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    gc.runRegularRound();
+    const HeadResult st = backend->head(store->layout().gcStateKey());
+    backend->deleteExact(store->layout().gcStateKey(), st.token);
+
+    Gc gc2(store, hexToU128("00000000000000000000000000000006"));
+    gc2.setRebuildEdgeBudgetForTest(2);   /// forces multiple attempt-iterated batches
+    const RebuildReport rep = gc2.rebuildBaseline(/*force*/ false);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_EQ(rep.committed_refs, 6u);
+
+    for (int i = 0; i < 5; ++i)
+    {
+        gc2.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+    for (uint64_t i = 1; i <= 6; ++i)
+        EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(i))))).exists)
+            << "blob " << i;
+}
+
+/// Trimmed-but-live (design delta 2): the precommit's journal evidence is gone (trim), the build
+/// is NOT provably dead (a live build holds min_active down) — the unowned-alive sweep must
+/// over-protect the manifest's edges.
+TEST(CasGcRebuild, UnownedAliveManifestOverProtected)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// A LIVE build pins min_active at its build_seq, so higher build sequences are not provably dead.
+    auto live_build = store->startBuild({});
+    store->renewWatermarkOnce();
+
+    /// An unowned manifest from build_seq 7 (no journal events at all — the trimmed shape).
+    const ManifestRef pre = ref(7, 0xC1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(9));
+    writeManifestRaw(*backend, store->layout(), ns, pre, {blobEntryFor("p", DB::UInt128(9))});
+    /// The namespace must be discoverable: give it one committed ref on another manifest.
+    const ManifestRef anchor = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, anchor, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, anchor);
+
+    Gc gc(store, hexToU128("00000000000000000000000000000007"));
+    const RebuildReport rep = gc.rebuildBaseline(/*force*/ false);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_EQ(rep.unowned_alive_manifests, 1u);
+
+    /// Over-protected: rounds never reclaim the unowned-alive manifest's blob.
+    for (int i = 0; i < 4; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(9))))).exists);
+}

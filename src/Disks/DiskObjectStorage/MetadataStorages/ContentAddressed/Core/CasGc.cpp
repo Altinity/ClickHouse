@@ -12,6 +12,7 @@
 #include <Common/logger_useful.h>
 #include <base/defines.h>
 #include <city.h>
+#include <unordered_set>
 #include <algorithm>
 #include <limits>
 #include <set>
@@ -1365,6 +1366,387 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
     /// else: empty ref_seal (fresh pool / no adopted seal) => all Read.
 
     return computeDiscoverDecisions(ref_seal);
+}
+
+RebuildReport Gc::rebuildBaseline(bool force)
+{
+    /// The gc/state disaster-recovery command (spec 2026-07-03-cas-gc-rebuild-design.md Part 2).
+    /// DRY: the engine is the round's own bricks — discoverUniverse for the universe,
+    /// foldManifestEdges(+1) for edge emission, foldDeltasIntoGeneration with EMPTY priors
+    /// (attempt-iterated for O(budget) memory), computeHeartbeatFloor for the round mint.
+    /// Writes ONLY the gc plane; never touches ref shards, manifests, or blobs; never deletes.
+    RebuildReport rep;
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+
+    /// Health check BEFORE the lease (the lease acquire on an absent state CREATES a bootstrap
+    /// body, which must not make scenario (а) look healthy). Healthy = decodes AND, when a baseline
+    /// is claimed, the seal + every referenced run + every retired list are HEAD-present.
+    bool healthy = false;
+    {
+        const auto got = backend.get(layout.gcStateKey());
+        if (got)
+        {
+            try
+            {
+                const GcState st = decodeGcState(got->bytes);
+                healthy = true;
+                if (st.snap_generation == 0)
+                {
+                    /// A gen-0 state (fresh-pool shape — possibly a bootstrap body minted by a
+                    /// lease acquire AFTER the real state was lost) is healthy ONLY when no shard
+                    /// journal proves trimmed history — the guard's own probe.
+                    for (const auto & [ns, root_shard] : discoverUniverse())
+                    {
+                        const auto [root, tok] = store->readShard(ns, root_shard);
+                        const bool proves_trim = root.journal.empty()
+                            ? root.shard_version > 0
+                            : root.journal.front().transition_version > 1;
+                        if (proves_trim)
+                        {
+                            healthy = false;
+                            break;
+                        }
+                    }
+                }
+                if (st.snap_generation > 0)
+                {
+                    const auto seal = readFoldSeal(st.snap_generation, st.snap_attempt);
+                    if (!seal)
+                        healthy = false;
+                    else
+                        for (const RunRef & r : seal->blob_target_runs)
+                            if (!backend.head(r.key).exists)
+                                healthy = false;
+                }
+                for (const auto & [shard, retired_key] : st.retired_refs)
+                    if (!backend.head(retired_key).exists)
+                        healthy = false;
+            }
+            catch (...)
+            {
+                healthy = false;   /// undecodable state = scenario (а)
+            }
+        }
+    }
+    if (healthy && !force)
+    {
+        rep.refusal = "gc/state and every referenced artifact are healthy — a rebuild would discard "
+                      "live bookkeeping; re-run with FORCE to rebuild deliberately";
+        return rep;
+    }
+
+    /// Lease: single leader vs regular rounds and other rebuilds. On an absent state this CREATES
+    /// a lease-bearing bootstrap body whose token anchors our final CAS.
+    GcState state;
+    Token state_token;
+    if (!acquireOrRenewLease(state, state_token))
+    {
+        rep.refusal = "another GC leader holds the lease";
+        return rep;
+    }
+
+    /// Numbering, part 1: generation above ANY surviving gc/gen prefix (putDeterministicArtifact
+    /// must never collide with debris of the lost era).
+    uint64_t max_gen = state.snap_generation;
+    {
+        const String gen_prefix = layout.gcGenPrefix(0);
+        const String top = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
+        String cursor;
+        for (;;)
+        {
+            const ListPage page = backend.list(top, cursor, 1000);
+            for (const auto & k : page.keys)
+            {
+                const size_t from = top.size();
+                const size_t slash = k.key.find('/', from);
+                if (slash == String::npos)
+                    continue;
+                try
+                {
+                    max_gen = std::max(max_gen, static_cast<uint64_t>(std::stoull(k.key.substr(from, slash - from))));
+                }
+                catch (...) {}   /// foreign key shape under gc/gen — debris, not a numbering input
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+    }
+    const uint64_t generation = max_gen + 1;
+    const uint64_t budget = rebuild_edge_budget_override ? rebuild_edge_budget_override
+                                                         : store->poolConfig().rebuild_edge_budget;
+
+    /// Per-gc-shard attempt-iterated fold state: batch k folds with attempt k and the previous
+    /// attempt's runs as priors; the FINAL attempt's runs go into the seal.
+    const uint64_t gc_shards = state.gc_shards ? state.gc_shards : store->poolConfig().gc_shards;
+    std::vector<std::vector<BlobDelta>> buckets(gc_shards);
+    std::vector<std::vector<RunRef>> prior_runs(gc_shards);
+    std::vector<uint64_t> attempt_of(gc_shards, 0);
+    auto flush_shard = [&](uint64_t shard)
+    {
+        if (buckets[shard].empty())
+            return;
+        std::vector<RunRef> out;
+        foldDeltasIntoGeneration(backend, layout, prior_runs[shard], generation, ++attempt_of[shard],
+                                 shard, std::move(buckets[shard]), out);
+        buckets[shard].clear();
+        prior_runs[shard] = std::move(out);
+    };
+    std::unordered_set<UInt128, UInt128Hash> edge_bearing;   /// O(distinct blobs) — maintenance op
+    auto route_deltas = [&](std::vector<BlobDelta> & deltas)
+    {
+        rep.edges += deltas.size();
+        for (BlobDelta & d : deltas)
+        {
+            edge_bearing.insert(d.blob_hash);
+            const uint64_t shard = blobShard(d.blob_hash, gc_shards);
+            buckets[shard].push_back(std::move(d));
+            if (buckets[shard].size() >= budget)
+                flush_shard(shard);
+        }
+        deltas.clear();
+    };
+
+    /// Universe scan: owner replay per ref shard, edges per owned manifest.
+    const auto universe = discoverUniverse();
+    std::set<String> seen_ns;
+    std::set<String> owned_manifest_keys;
+    CasFoldSeal seal;
+    seal.generation = generation;
+    seal.parent_generation = state.snap_generation;
+    uint64_t max_fence_round = 0;
+    std::map<ManifestId, Token> mf_cleanup_unused;
+
+    for (const auto & [ns, root_shard] : universe)
+    {
+        seen_ns.insert(ns.string());
+        const auto [root, token] = store->readShard(ns, root_shard);
+        ++rep.shards;
+        max_fence_round = std::max(max_fence_round, root.fence_round);
+
+        ShardCoverage cov;
+        cov.classification = 2;   /// Folded (full coverage) unless a bodiless precommit clamps below
+        cov.folded_token = token.value_or(Token{});
+        cov.folded_cursor = root.shard_version;
+        cov.incarnation = root.incarnation;
+
+        /// Committed owners: the refs map IS the authoritative committed state.
+        std::vector<BlobDelta> deltas;
+        for (const auto & [ref_name, rref] : root.refs)
+        {
+            const ManifestId id{ns, rref.manifest_ref};
+            owned_manifest_keys.insert(layout.manifestKey(id));
+            if (!foldManifestEdges(id, +1, deltas, mf_cleanup_unused))
+            {
+                rep.refusal = "committed ref '" + ns.string() + "/" + ref_name
+                    + "' names a missing or invalid part manifest — that is DATA LOSS the rebuild "
+                      "must not bless; run fsck forensics first";
+                return rep;
+            }
+            ++rep.committed_refs;
+        }
+
+        /// Live precommits: replay the journal (old_binding erases, new_binding inserts); what
+        /// remains with owner_kind Precommit is live. A live precommit whose body is present
+        /// contributes edges; a bodiless one CLAMPS this shard's cursor below its transition (the
+        /// fold-barrier semantics — the first regular round folds it once the body lands).
+        std::vector<std::pair<uint64_t, OwnerBinding>> live;   /// (transition_version, binding)
+        for (const RootOwnerEvent & e : root.journal)
+        {
+            if (e.old_binding)
+                std::erase_if(live, [&](const auto & p) { return p.second == *e.old_binding; });
+            if (e.new_binding)
+                live.emplace_back(e.transition_version, *e.new_binding);
+        }
+        for (const auto & [transition, binding] : live)
+        {
+            if (binding.owner_kind != OwnerKind::Precommit)
+                continue;
+            const ManifestId id{ns, binding.manifest_ref};
+            owned_manifest_keys.insert(layout.manifestKey(id));
+            if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused))
+            {
+                ++rep.live_precommits;
+            }
+            else
+            {
+                cov.classification = 4;   /// Clamped
+                cov.folded_cursor = std::min(cov.folded_cursor, transition - 1);
+                ++rep.clamped_shards;
+            }
+        }
+        route_deltas(deltas);
+        seal.per_ns_shard[ns.string() + "/" + std::to_string(root_shard)] = cov;
+    }
+    rep.namespaces = seen_ns.size();
+
+    /// Trimmed-but-live precommits (design delta 2): a build alive across trim has NO journal
+    /// evidence; its manifests look unowned. Include edges of every manifest that is unowned AND
+    /// not provably build-dead (the watermark fact) — over-protect. An unowned manifest that later
+    /// dies without journal evidence leaks its edges until a future rebuild (documented, bounded,
+    /// fsck-visible); provably-dead ones stay excluded (the orphan sweep owns their bodies).
+    for (const String & ns_str : seen_ns)
+    {
+        const RootNamespace ns{ns_str};
+        const String mprefix = layout.manifestNamespacePrefix(ns);
+        String cursor;
+        std::vector<BlobDelta> deltas;
+        for (;;)
+        {
+            const ListPage page = backend.list(mprefix, cursor, 1000);
+            for (const auto & k : page.keys)
+            {
+                if (owned_manifest_keys.contains(k.key))
+                    continue;
+                /// Parse <writer_epoch>/<build_seq>/<ordinal>.proto (mirrors fsck's parseBuildPrefix).
+                const String rest = k.key.substr(mprefix.size());
+                const size_t s1 = rest.find('/');
+                const size_t s2 = s1 == String::npos ? String::npos : rest.find('/', s1 + 1);
+                if (s2 == String::npos || !rest.ends_with(".proto"))
+                    continue;   /// foreign key shape — debris
+                ManifestRef mref;
+                try
+                {
+                    mref.writer_epoch = std::stoull(rest.substr(0, s1));
+                    mref.build_sequence = std::stoull(rest.substr(s1 + 1, s2 - s1 - 1));
+                    mref.manifest_ordinal = static_cast<uint32_t>(std::stoull(rest.substr(s2 + 1)));
+                }
+                catch (...)
+                {
+                    continue;
+                }
+                if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}))
+                    continue;   /// provably dead — the orphan sweep's territory, never an edge
+                const ManifestId id{ns, mref};
+                if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused))
+                {
+                    ++rep.unowned_alive_manifests;
+                    route_deltas(deltas);
+                }
+                /// A missing/invalid UNOWNED body is debris (no owner claims it) — skip, never refuse.
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+    }
+
+    for (uint64_t shard = 0; shard < gc_shards; ++shard)
+    {
+        flush_shard(shard);
+        for (const RunRef & r : prior_runs[shard])
+            seal.blob_target_runs.push_back(r);
+    }
+
+    /// Pipeline blindness repair (found by the convergence test): the fold discovers candidates by
+    /// TRANSITIONS to zero, but a blob whose edges are entirely gone by rebuild time has NO row in
+    /// the rebuilt baseline — it would never transition and never be reclaimed. The rebuild holds
+    /// FULL-TRAVERSAL knowledge, so it condemns them itself: every physically-present blob with
+    /// zero rebuilt edges enters the retired list with a head-captured exact token at the minted
+    /// round. Graduation still waits for every mount to ack past that round (the normal floor) —
+    /// in model terms this is exactly the GComplete condemnation the next pass would perform if the
+    /// fold were omniscient.
+    std::vector<std::vector<RetiredEntry>> zero_condemned(gc_shards);
+    {
+        const String bprefix = layout.blobsPrefix();
+        String cursor;
+        for (;;)
+        {
+            const ListPage page = backend.list(bprefix, cursor, 1000);
+            for (const auto & k : page.keys)
+            {
+                const size_t slash = k.key.rfind('/');
+                if (slash == String::npos)
+                    continue;
+                UInt128 hash{};
+                try
+                {
+                    hash = hexToU128(k.key.substr(slash + 1));
+                }
+                catch (...)
+                {
+                    continue;   /// foreign key shape under blobs/ — not ours to condemn
+                }
+                if (edge_bearing.contains(hash))
+                    continue;
+                const HeadResult hr = backend.head(k.key);
+                if (!hr.exists)
+                    continue;
+                zero_condemned[blobShard(hash, gc_shards)].push_back(RetiredEntry{
+                    .kind = ObjectKind::Blob, .hash = hash, .token = hr.token, .size = hr.size});
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+    }
+
+    /// Numbering, part 2: the round above EVERY surviving ack — a low round would let stale mount
+    /// acks float fresh condemnations past the floor before any writer re-observed the new list.
+    const uint64_t skew_margin_ms =
+        static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
+    const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
+    const uint64_t round = std::max({floor.max_ack, max_fence_round, state.round, max_gen}) + 1;
+
+    /// Seal (deterministic artifact) + the single state CAS. attempt = the max per-shard attempt
+    /// (>= 1 so the seal key is stable даже for an empty universe).
+    uint64_t seal_attempt = 1;
+    for (uint64_t a : attempt_of)
+        seal_attempt = std::max(seal_attempt, a);
+    putDeterministicArtifact(backend, layout.foldSealKey(generation, seal_attempt), encodeFoldSeal(seal));
+
+    GcState next = state;
+    next.round = round;
+    next.snap_generation = generation;
+    next.snap_attempt = seal_attempt;
+    next.retired_refs = {};
+    next.manifest_sweep_cursor = "";
+    uint64_t zero_total = 0;
+    for (uint64_t shard = 0; shard < gc_shards; ++shard)
+    {
+        if (zero_condemned[shard].empty())
+            continue;
+        for (RetiredEntry & e : zero_condemned[shard])
+            e.condemn_round = round;
+        std::sort(zero_condemned[shard].begin(), zero_condemned[shard].end(),
+                  [](const RetiredEntry & a, const RetiredEntry & b) { return a.hash < b.hash; });
+        zero_total += zero_condemned[shard].size();
+        RetiredSet set;
+        set.entries = std::move(zero_condemned[shard]);
+        const String rkey = layout.retiredKey(generation, seal_attempt, round, shard);
+        backend.putIfAbsent(rkey, encodeRetiredSet(set));   /// first-durable-write-wins (as the round)
+        next.retired_refs[shard] = rkey;
+    }
+    const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
+    if (res.outcome != CasOutcome::Committed)
+    {
+        rep.refusal = "gc/state changed under the rebuild (a competing writer) — re-run";
+        return rep;
+    }
+
+    rep.performed = true;
+    rep.round = round;
+    rep.generation = generation;
+    EventEmitter{*store}.emit([&](CasEvent & e)
+    {
+        e.type = CasEventType::GcRebuild;
+        e.object_kind = CasEventObjectKind::Snap;
+        e.round = round;
+        e.gen = generation;
+        e.outcome = "performed";
+        e.reason = "raw baseline rebuild from owner state (gc/state disaster recovery)";
+        e.detail = {{"namespaces", std::to_string(rep.namespaces)},
+                    {"shards", std::to_string(rep.shards)},
+                    {"committed_refs", std::to_string(rep.committed_refs)},
+                    {"live_precommits", std::to_string(rep.live_precommits)},
+                    {"unowned_alive_manifests", std::to_string(rep.unowned_alive_manifests)},
+                    {"edges", std::to_string(rep.edges)},
+                    {"clamped_shards", std::to_string(rep.clamped_shards)},
+                    {"zero_condemned", std::to_string(zero_total)},
+                    {"force", force ? "1" : "0"}};
+    });
+    return rep;
 }
 
 std::vector<Gc::PreviewEntry> Gc::previewDeletes()

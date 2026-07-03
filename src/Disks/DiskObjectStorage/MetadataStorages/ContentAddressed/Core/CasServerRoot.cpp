@@ -440,6 +440,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                     break;   /// Raced away (deleted) — nothing to classify.
 
                 const MountLease m = decodeMountLease(got->bytes);
+                floor.max_ack = std::max(floor.max_ack, m.observed_gc_round);
 
                 if (m.gc_fenced)
                 {
