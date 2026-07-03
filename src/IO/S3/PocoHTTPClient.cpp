@@ -652,10 +652,14 @@ void PocoHTTPClient::makeRequestInternalImpl(
             /// blob PUTs also reject-before-body instead of streaming a doomed body that the store
             /// closes mid-upload → a transport Broken pipe → the 500×5s retry storm that wedges merges.
             const size_t min_body_size_for_expect_continue = expect_continue_min_bytes;
+            /// `x-goog-if-generation-match` is the GCS conditional dialect's rename of If-None-Match /
+            /// If-Match (applied BEFORE this point) — without it every conditional PUT on GCS would
+            /// stream its full body before the 412 (the exact mid-upload stall B118 fixed).
             const bool conditional_write
                 = method == Poco::Net::HTTPRequest::HTTP_PUT
                 && content_body_size >= min_body_size_for_expect_continue
-                && (poco_request.has("if-none-match") || poco_request.has("if-match"));
+                && (poco_request.has("if-none-match") || poco_request.has("if-match")
+                    || poco_request.has("x-goog-if-generation-match"));
             if (conditional_write)
                 poco_request.setExpectContinue(true);
 
