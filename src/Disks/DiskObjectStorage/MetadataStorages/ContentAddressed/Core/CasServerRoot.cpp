@@ -194,9 +194,17 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
         const OwnerObject owner = decodeOwner(got->bytes);
         if (owner.server_uuid == our_uuid)
             return;
+        /// Mirror mountDoubleStartMessage's operator guidance: the by-far most common cause is a
+        /// REGENERATED local ClickHouse uuid file (wiped /var/lib/clickhouse, a pod rescheduled
+        /// without a persistent volume) while the pool kept the old identity — name it and the
+        /// recovery options instead of a bare refusal.
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS server-root '{}' is owned by a different server (foreign owner) — refusing to claim",
-            srid);
+            "CAS server-root '{}' is owned by a different server (owner server_uuid={}, ours={}) — refusing to claim. "
+            "This usually means THIS server's local uuid file was regenerated (e.g. /var/lib/clickhouse was wiped, "
+            "or the container/pod was recreated without a persistent volume) while the pool kept the old identity. "
+            "Recover by restoring the old local uuid file; or configure a fresh <server_root_id> for this disk; "
+            "or — only after verifying that NO server uses this root — manually delete the owner object '{}' and restart.",
+            srid, u128ToHex(owner.server_uuid), u128ToHex(our_uuid), key);
     }
 
     /// Owner absent. Claiming is allowed ONLY over a provably-empty subtree; an absent owner over

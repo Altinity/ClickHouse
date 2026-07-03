@@ -446,6 +446,17 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatches(const Stored
 
     auto outcome = client.get()->DeleteObject(request);
 
+    /// Mirror removeObjectImpl (deleteFileFromS3): every conditional delete lands in
+    /// system.blob_storage_log too — GC reclaim was invisible there otherwise. TokenMismatch
+    /// and NotFound are routine protocol outcomes, recorded with the S3 error for filtering.
+    if (auto blob_storage_log = BlobStorageLogWriter::create(disk_name))
+        blob_storage_log->addEvent(BlobStorageLogElement::EventType::Delete,
+                                   uri.bucket, object.remote_path,
+                                   object.local_path, object.bytes_size,
+                                   /* elapsed_microseconds */ 0,
+                                   outcome.IsSuccess() ? 0 : static_cast<Int32>(outcome.GetError().GetErrorType()),
+                                   outcome.IsSuccess() ? "" : outcome.GetError().GetMessage());
+
     if (outcome.IsSuccess())
         return {ConditionalRemoveOutcome::Removed, outcome.GetResult().GetDeleteMarker()};
 

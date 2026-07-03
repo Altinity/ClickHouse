@@ -14,10 +14,10 @@
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
                 <metadata_type>content_addressed</metadata_type>
-                <endpoint>https://test-altinity-support-team.s3.us-east-1.amazonaws.com/ca_live_20260703_r1/soak_pool/</endpoint>
+                <endpoint>https://test-altinity-support-team.s3.us-east-1.amazonaws.com/ca_live_20260703_r3/soak_pool/</endpoint>
                 <region>us-east-1</region>
                 <use_environment_credentials>1</use_environment_credentials>
-                <server_root_id>ca_live_ch2</server_root_id>
+                <server_root_id>ca_live_{replica}</server_root_id>
                 <gc_enabled>1</gc_enabled>
                 <gc_interval_sec>10</gc_interval_sec>
             </ca>
@@ -27,10 +27,10 @@
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
                 <metadata_type>content_addressed</metadata_type>
-                <endpoint>https://test-altinity-support-team.s3.us-east-1.amazonaws.com/ca_live_20260703_r1/soak_pool/</endpoint>
+                <endpoint>https://test-altinity-support-team.s3.us-east-1.amazonaws.com/ca_live_20260703_r3/soak_pool/</endpoint>
                 <region>us-east-1</region>
                 <use_environment_credentials>1</use_environment_credentials>
-                <server_root_id>ca_live_ch2</server_root_id>
+                <server_root_id>ca_live_{replica}</server_root_id>
                 <gc_enabled>0</gc_enabled>
                 <readonly>true</readonly>
             </ca_ro>
