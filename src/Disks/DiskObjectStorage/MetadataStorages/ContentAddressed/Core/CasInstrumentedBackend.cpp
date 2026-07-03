@@ -115,6 +115,15 @@ CasNs classifyCasNs(const String & key)
         return CasNs::Blob;
     if (key.find("/trees/") != String::npos)
         return CasNs::Tree;
+    /// Post-relocation layout (hot/cold split): ref shards live under `cas/refs/<ns>/<shard>` and
+    /// part manifests under `cas/manifests/<ns>/...`. Without these two rules every ref-shard and
+    /// manifest request misclassified as Other — the 2026-07-03 operator-stand CREATE TABLE storm
+    /// showed up as `CasOtherHeadMiss=102` when it was really 3 all-shard ref sweeps (see
+    /// `Store::listRefs`).
+    if (key.find("/cas/refs/") != String::npos)
+        return CasNs::Root;
+    if (key.find("/cas/manifests/") != String::npos)
+        return CasNs::Tree;
     /// Phase 6: a server's mutable control state lives under its own `roots/<server-hex>/` subtree —
     /// the watermark at `.../_watermark` and the precommit shards under `.../_precommits/`. Both are
     /// key-wise under `/roots/`, so classify them by their distinguishing suffix/segment BEFORE the
