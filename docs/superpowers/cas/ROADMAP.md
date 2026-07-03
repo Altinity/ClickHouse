@@ -81,7 +81,7 @@ See [`04-gc-protocol.md`](04-gc-protocol.md) for full detail.
 | D1: shard-object reclaim + shard incarnation (namespace reclaim without a registry) | **DONE** | Prevents monotone GC fanout from repeated create/drop |
 | Orphan part-manifest sweep (reclaim unreachable `cas/manifests/` objects) | **DONE** | `CasOrphanManifestSweep`; uses build watermark |
 | GC-CONCURRENT-LEADER-LEAK (reclaim liveness bug) | **DONE** (see REJECTED / FIXED above) | Root cause: non-atomic fold-seal + `gc/state` CAS; fixed by attempt-scoped generations |
-| Ack-floor round soak validation | **TODO** | Kill-mid-burst spare-then-recondemn (no dangle); SIGSTOP writer holds then releases the floor; O(delta)+O(servers) request-count regression guard. See [`08-testing-and-soak.md §backlog`](08-testing-and-soak.md) |
+| Ack-floor round soak validation | **PARTIAL** | 2026-07-03 night: kill-chaos soaks exercised the floor end-to-end and FOUND+FIXED the clamp-graduation hole (see the clamp-suppression row); still-unrun named checks: SIGSTOP writer holds-then-releases the floor; O(delta)+O(servers) request-count regression guard (proposed scenario cards exist in `scenarios/BACKLOG.md`) |
 | Self-remount on GC fence-out (a fenced live server re-opens a FRESH incarnation via the S13 mount machinery: epoch bump + immediate `gc_fenced` reclaim + fresh view + build invalidation) | **DONE** | Found by the 2026-07-02 ack-floor soak: a 51s CH pause + concurrent GC round fenced the mount; the keeper fails closed by design (sleeper re-arm is the TLA+ sabotage), liveness needs the fresh-incarnation path. Interim: ca-soak chaos caps CH pauses at 20s. Also soften the `Store` teardown release message for the `gc_fenced` case (a foreign incarnation there is the EXPECTED fence-out outcome, not corruption) |
 | Ack-floor observability (Task 11) | **DONE** | `CasGcRetired{Condemned,Spared,Graduated,Redeleted}` + `CasGcHeartbeatFenceOuts` + `CasGcFloorHeldByStaleAck` ProfileEvents; `gc_fence_out` audit event; WARNING when a live heartbeat's ack lags the round by > 2; `RoundReport` carries condemned/graduated/redeleted/fence_outs/min_ack |
 | `mayMutate` fence deadline on `CLOCK_BOOTTIME` (Task 12) | **DONE** | `steady_clock` does not advance across a VM suspend; the write-fence deadline is now a `CLOCK_BOOTTIME`-ms instant (`Store::bootMs`, injectable via `PoolConfig::boot_ms_fn`) so a resumed VM sees its fence expired (container pause already safe) |
@@ -90,10 +90,14 @@ See [`04-gc-protocol.md`](04-gc-protocol.md) for full detail.
 | Delta-runs + compaction for the snapshot (bytes O(edges)/pass) | **DESIRABLE** (T1) | The HOT-pool full snapshot rewrite per pass is the next dominant byte cost; builds on the T2/T0 primitives (streaming reader with `seek`, `getStream`, ranged `get`, seal-ref resolution) unchanged. NEXT spec; source `specs/2026-07-02-cas-gc-snapshot-streaming-design.md §what-deliberately-does-not-change` |
 | GC round progress observability (round-duration watchdog, LIST/window progress events, alert on `gc_fold_begin` without `gc_fold_end`) | **TODO** | Motivated by the 2026-07-02 soak forensics: a long/wedged round is currently only visible after the fact; emit a round-duration watchdog + LIST/fold-window progress events + an alert on an unbalanced `gc_fold_begin`/`gc_fold_end` pair |
 | `process_epoch` → `writer_epoch` stamp unification | **DESIRABLE** | The writable path already sets `process_epoch = writer_epoch`; unify the manifest `writer_instance_id` stamps |
+| Clamp-suppressed GC passes (no graduation / no pending deletes while any shard is clamped) | **DONE** | 2026-07-03 night SAFETY fix (`c47d10d01ec`): clamps break the ack-floor lemma 'landed before the cut => folded before graduation' (the model's SabotageSkipChangedShard, realized — 31 dangling in the night soak, caused by RustFS false 404s under the #3231 storm); a clamped pass carries everything, deletes resume on the first clamp-free pass; `gc_fold_clamp` event per clamp. See `04-gc-protocol.md §absent-at-head` |
+| TLA+ model extension: clamps + destruction suppression | **TODO (release gate)** | The night fix is argued, not machine-checked: add an honest clamp action (fold may leave a shard's landed suffix unconsumed) + the suppression rule to `CaGcAckFloorCore`; the un-suppressed variant must reproduce the SabotageSkipChangedShard counterexample, the suppressed one must be clean |
+| B207 fsck consistency race (phantom dangling under concurrent GC) | **TODO (release gate)** | Restored from the pre-consolidation backlog (lost in the fold): `runFsck`'s ref-walk and HEAD-confirm are minutes apart with no snapshot — a re-published ref + a legitimate GC delete manufactures a false `dangling`. FIX: at the HEAD-absent branch, RE-RESOLVE the referencing ref(s) (labels already collected); only a CURRENT ref over an absent object is dangling. Gates honest release-validation soaks (B185/B206/B144 were all this race) |
 | Verified copy-forward for condemned tokenless-evidence deps at the promote gate | **DONE** | 2026-07-02, `specs/2026-07-02-cas-copy-forward-condemned-evidence.md`: fixes the S13 soak-run-3 attach brick (`republishRef` -> promote `ABORTED` -> table readonly forever). Narrow INV-1 exception (committed-source evidence only; full content verification; token-conditional `putOverwrite`); TLA+ `WCopyForward` gate; `blob_copy_forward` event + `CasBlobCopyForward` counter. See [`03-writer-protocol.md`](03-writer-protocol.md) |
 | Promote-time in-place recreate of a condemned SOURCED blob | **DESIRABLE** | For tokened (sourced) deps the promote gate stays fail-closed `ABORTED` (build-local sources not retained at promote); recreate happens on the retried build via `putBlob` cold-reuse. The tokenless-evidence case is DONE (copy-forward above) |
 | fsck pipeline classification (`pending-gc` / `awaiting-gc` / `unaccounted` replace the suspicious `unreachable` lump for blobs; de-alarm notes) | **DONE** | 2026-07-03, from the raw-audit RFC triage: deletion lag of the two-phase pipeline is now labeled as the expected state it is; `unaccounted` (outside the whole GC view) is the anomaly signal (INV-2). See `08-testing-and-soak.md §fsck` |
 | Raw GC rebuild (`gc/state` disaster recovery) | **DONE** | 2026-07-03, `specs/2026-07-03-cas-gc-rebuild-design.md`: the "план Б" survivor of the 2026-06-30 raw-audit RFC. A fail-closed baseline guard (`CORRUPTED_DATA` when a shard journal proves trimmed history with no healthy adopted seal) ships ahead of `Gc::rebuildBaseline(force)` — derived-bookkeeping only, over-protect only (synthetic baseline from owner replay + EMPTY retired lists + round minted above every surviving mount ack/fence-round/generation), single `gc/state` CAS. Surfaced as `SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] [<disk>]` and `clickhouse-disks ca-gc-rebuild [--force]` (read-only-open required). Registry-repair/orphan-sweep/debris-prune parts of that RFC are obsolete (registry removed by D1; sweeps live in regular rounds; no structural orphan-blob class per INV-2). See `04-gc-protocol.md §gc-rebuild`, `08-testing-and-soak.md §gc-rebuild-runbook` |
+| B94 full-GC/check backstop for physical debris/drift | **DONE** (by composition) | `clickhouse-disks fsck` (pipeline-classified) + `ca-gc-dryrun` + the raw GC rebuild cover the audit/backstop surface; regular GC stays incremental by design (raw-audit RFC non-goal) |
 | RustFS false-404-under-load upstream report (HEAD returns 404 for live objects while the metacache is degraded by rustfs#3231 dir bloat; caused the 2026-07-03 clamp era) | **TODO** | Build a repro on top of the rustfs#3231 repro (bloated dirs + concurrent stat); our side is already safe (clamp + destruction suppression, `04-gc-protocol.md §absent-at-head`) |
 | Per-namespace `root_shards` (chosen at table creation) | **DESIRABLE (next)** | 2026-07-03 weighing: GC needs no N (`discoverUniverse` LISTs, the fold digests what exists) — only the owning writer's/readers' `shardOf` does, so a per-namespace meta object (putIfAbsent at first publish, immutable) + a DDL hint (`SETTINGS cas_root_shards=N`) suffices. Payoff is at the 100k-table scale: discovery keys ∝ Σ N over all tables — cold tables at N=1-4 collapse it while hot tables keep 32-64. No resharding: a wrong guess lives like today's pool constant, per-table |
 | Adaptive shard SPLITS (hash-prefix radix, writer-local) | **DESIRABLE** | Avoids the killer (mass cross-shard renames = two-owner/zero-owner windows): N is a power of two, shard = top hash bits; splitting hot shard k into k0/k1 partitions refs deterministically by the next bit — a LOCAL single-writer op. Load-bearing precondition: split only when the shard is FULLY FOLDED AND TRIMMED (cursor == shard_version, no clamps, no live precommits) so children start with empty journals; incarnation stamps already handle new-object-at-path (ABA); GC edges unaffected (source_id is shard-independent). Reader routing = radix over shard object names ("0","10","11") with a self-healing re-LIST cache. The writer feels its own heat (flush latency = body size) and splits itself; merge-back for cold shards by the same shape. Real cost: spec + TLA+ for split x fold/trim/precommit interleavings + fsck awareness. Main prize: the cold tail of large installations + insurance for wrong per-table hints |
@@ -142,7 +146,7 @@ See [`07-s3-budget.md`](07-s3-budget.md) for the full breakdown.
 | LIST-token skip (skip unchanged root shards using `ETag` token diff) | **DONE** | |
 | Streaming `Build::putBlob` (eliminates duplicate memory copies during upload) | **DONE** | |
 | HEAD storm at retire (per-candidate HEAD in retire, not stored token) | **TODO** | B148; dominant cost at scale; stored-token optimization deferred (requires manifest schema change) |
-| Root-shard fan-out vs per-object permit cap (B158: raise `root_shards`) | **TODO** | Reduces CAS contention at high insert rate |
+| Root-shard fan-out vs per-object permit cap (B158) | **DONE** (superseded) | The flat-combining shard-mutation queue removed intra-server CAS contention structurally; `root_shards` default weighed to 32 (2026-07-03) for body-size/batching/discovery balance, not contention |
 | `RENAME` = one Build/part (B111) | **DESIRABLE** | Currently multiple root-shard updates per rename |
 | Ack-floor round (removes the O(universe) fence + recheck phases) | **DONE** | The per-round all-shard fence is gone; dirty-only-fence (P6) is superseded. See `07-s3-budget.md §gc-budget` |
 
@@ -161,6 +165,9 @@ See [`09-read-protocol.md`](09-read-protocol.md) for full detail.
 | Column pruning (structural — per-file `lookupPath`) | **DONE** | Reader requests only needed files; CA layer has no filter list |
 | Inline / mutable / verbatim file reads (0 extra S3 ops) | **DONE** | `tryGetInManifestBytes`, `prepareInManifestRead` |
 | In-flight read-your-writes overlay (B59 — blob + directory) | **DONE** | `tryGetInFlightStorageObjects` / `hasInFlightDirectory`; projection workaround removed |
+| B121 per-blob-GET read cost on large parts (one ranged GET per column file per part open) | **DESIRABLE** | Restored from the pre-consolidation backlog; relates to B202/one-GET-open below |
+| B202 inline placement by SIZE only (+ threshold as a disk setting) | **DESIRABLE (design pass)** | Restored: drop the file-type predicate, inline everything < ~512 KiB; weigh the wide-part-medium-column selectivity regression (hybrid: keep a `.bin` carve-out). Pure perf/request-count tradeoff, no safety dimension |
+| One-GET part open (pack small files; serve from memory) | **DESIRABLE** | Restored (was B10 #7): with B202 small parts open in ~1 GET |
 | `manifest_size` field in `Resolved` always 0 | **TODO** (minor, B10) | `resolveRef` never sets it; harmless but imprecise |
 | Replication fetch-by-relink (zero byte cost for same-pool parts) | **DONE (base)** | `manifest_hash` on Keeper `/parts` znode still TODO |
 
@@ -178,7 +185,7 @@ See [`09-read-protocol.md`](09-read-protocol.md) for full detail.
 | `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION` command | **DONE** | |
 | Capability gate: reject unsupported ops at `CREATE`/`ATTACH` with clear error (B31) | **TODO** (HARD) | Currently `supportsHardLinks` / `supportZeroCopyReplication` advertise wrong capabilities |
 | `SYSTEM` control commands: START/STOP GC, POOL READONLY, CHECK (B197) | **TODO** (HARD) | |
-| `system.*` views for pool/blob/part refcounts + GC status + frozen snapshots (B15/B99) | **PARTIAL** | GC log and event log done; per-part/ref views not yet |
+| `system.*` views for pool/blob/part refcounts + GC status + frozen snapshots (B15/B99/B169/B159) | **PARTIAL** | GC log + event log + fsck/dryrun/rebuild CLI done; per-part/ref views and a `clickhouse-disks` decode/introspect (top-down traversal) surface not yet |
 | Backup/restore runbook (B198) | **TODO** (HARD) | |
 | Pool-format version breadcrumb (B180) | **TODO** | Self-describing pool meta for version identification |
 | Integration tests on RustFS (not MinIO) (B125) | **TODO** (HARD) | Current integration tests use MinIO; production uses S3-compatible backends |
@@ -188,10 +195,65 @@ See [`09-read-protocol.md`](09-read-protocol.md) for full detail.
 | Server OOM at hour-4 soak (~49 GiB RSS, B165) | **TODO** (HARD) | Not reproduced since the `putBlob` streaming fix; re-run long soak to confirm |
 | Expedited/compliance delete (GDPR right-to-erasure, B14) | **DESIRABLE** | Under GC lock, confirm no live ref, then delete bypassing grace; no layout change |
 | Encryption-at-rest × content-addressing (B17) | **DESIRABLE** | Dedup scope per-encryption-key; local to key/hash derivation |
-| Local / NFS / shared-fs as a first-class backend (B26) | **DESIRABLE** | Unit-tested over `LocalObjectStorage`; needs server-level doc and multi-writer atomicity note |
+| Local / NFS / shared-fs as a first-class backend (B26, + B135 multi-mount safety) | **DESIRABLE** | Unit-tested over `LocalObjectStorage`; needs server-level doc + the put-if-absent atomicity caveat (racy multi-writer on local/NFS) + multi-mount safety notes |
 | Namespace registry unbounded growth (B129) | **PARTIAL** (D1 fixes the create/drop fanout) | D1 shard-incarnation removes monotone fanout; registry itself removed by D1 |
-| Shutdown hang in `clickhouse local` + CA disk (B48) | **TODO** | GC thread / `BackgroundSchedulePool` not reaped on `LocalServer` exit |
+| Shutdown hang in `clickhouse local` + CA disk (B48, + B167a/f graceful server shutdown wiring) | **TODO (release gate)** | GC thread / `BackgroundSchedulePool` not reaped on `LocalServer` exit; server-side graceful-shutdown ordering (stop scheduler -> release lease -> farewell beat) needs an explicit pass |
 | Forbidden-term event names in `content_addressed_log` (B192) | **TODO** | Event type names review |
+
+---
+
+## Release readiness — first production release {#release-gates-2026-07-03}
+
+Groomed 2026-07-03 (supersedes the 2026-06-24 grooming from the pre-consolidation backlog; the fold
+had dropped several live items — B94/B98/B121/B202/B206/B207/B135/B169 — now restored above).
+
+### REQUIRED before the first production release {#release-required}
+
+Validation campaign (one coherent block):
+1. **Real-S3 GC validation** — reclaim actually reclaims on AWS/GCS/Azure; LIST consistency of the
+   token-diff discovery; rustfs is NOT a release-quality store (leak #3231 + false 404s).
+2. **Long chaos soak (4h+) on a compacting store** — confirms B165 (OOM at hour 4) resolved and the
+   whole night-fix stack under sustained chaos; gated by B207 (below) for honest verdicts.
+3. **B207 fsck phantom-dangling race fix** — release validation is only as честный as its oracle.
+4. **ci/full-scale scenario sweep** — the dev-scale inconclusives (RSS attribution, manifest caps)
+   must run at their designed scale at least once.
+5. **Test debt that hides real bugs**: D3 (`gc_shards > 1` full-round tests), B5 (per-server-tree
+   integration reconcile), the SIGSTOP-floor + request-budget scenario cards.
+6. **TLA+ clamps + suppression extension** — the night's safety fix must be machine-checked.
+
+Feature/safety gates:
+7. **B1 `manifest_hash` on the Keeper `/parts` znode** — cross-replica header-divergence detection.
+8. **B31 capability gate** — honest advertisement; reject unsupported ops at `CREATE`/`ATTACH`.
+9. **B197 `SYSTEM` control surface** — START/STOP GC, POOL READONLY, CHECK.
+10. **B13 migration path + mixed-version rollout rule** (read-new-before-write-new; the format
+    self-check already fails closed) — users need a way in.
+11. **Format freeze + B180 pool-format version breadcrumb** — first persisted-data release freezes
+    the format (the schema-evolution framework is in place); stamp the pool self-describingly.
+12. **B192 event/log naming review** — names freeze with the logs.
+
+Operability/hygiene gates:
+13. **B198 backup/restore runbook.**
+14. **B48 (+B167a/f) clean shutdown** — `clickhouse local` hang + server graceful-shutdown ordering.
+15. **B196 `s3_max_connections` cap to backend permits** (cheap; kills 503/retry storms).
+16. **GC discovery O(N²) LIST fix** — self-inflicted scale DoS; cheap (real pagination).
+17. **B3/B186 red `FreezeViaHardLinksIntoShadow` gtest** — fix or explicitly waive FREEZE support
+    via B31.
+18. **B131 repo hygiene + the M-W comment sweep** — a clean upstream PR.
+
+### DESIRABLE before release (not gating) {#release-desirable}
+
+- T1 delta-runs + compaction (GC byte volume on hot pools); GC round progress watchdog.
+- Per-namespace `root_shards`; adaptive shard splits (see their rows).
+- B202 inline-by-size (+ threshold setting); one-GET part open; B121 per-blob-GET read cost.
+- Streaming `putOverwrite` (B98 huge-blob displacement); promote-time recreate for SOURCED deps.
+- B66b relink-into-detached; B66a local-storage concurrent-fetch atomicity.
+- B15/B99/B169/B159 completion: per-part/ref `system.*` views + disks decode/introspect.
+- B14 expedited/GDPR delete; B17 encryption-at-rest interaction; B26+B135 local/NFS first-class.
+- Dedicated gc-round-log row for `rebuildBaseline`; `process_epoch` → `writer_epoch` unification;
+  common-shard-prefix single-LIST discovery; fsck Orphan-class test gap.
+- S12/S22/S27 scenario infra (multi-node Cluster abstraction; fault-injecting / LIST-instrumented
+  S3 proxy); B206 soak settle-gate tuning.
+- RustFS upstream reports: #3231 follow-through + the false-404-under-load repro.
 
 ---
 
@@ -201,7 +263,7 @@ See [`08-testing-and-soak.md`](08-testing-and-soak.md) for full detail.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| Adversarial scenario suite S01–S35 | **PARTIAL** | 14 PASS / 10 INCONCLUSIVE / 8 FAIL (D2); all FAILs are harness/infra/scale |
+| Adversarial scenario suite S01–S35 | **PARTIAL** | 2026-07-03 night sweep (dev scale): 8 PASS, ZERO real fails (the one S13 'fail' was a card bug — oracle before sync; fixed, re-run PASS 11/11); all seven previously-FAILing scenarios clean; remaining inconclusives are honest scale gates ('rerun at ci/full') and infra gates (S12/S22/S27). NEXT: one ci/full-scale sweep |
 | S01 memory bloat fix (streaming `putBlob`) | **DONE** | Confirmed < 2x peak vs ~6.5x before |
 | S33 concurrent-leader reclaim-leak guard | **DONE** (now a real regression guard) | Attempt-scoped generations fix means S33 PASS = no leak |
 | S30/S34/S35 D1 regression guards | **DONE** | All PASS in D2 |
@@ -210,9 +272,9 @@ See [`08-testing-and-soak.md`](08-testing-and-soak.md) for full detail.
 | 4h continuous chaos soak | **TODO** | Blocked by: compacting object store, streaming fsck, TTL-robust oracle |
 | S12 (10-replica shared pool) | **TODO** | Requires docker-compose with 10 ClickHouse services |
 | S22 (throttling/retry) | **TODO** | Requires fault-injecting S3 proxy |
-| S24 (small dedup-cache) | **TODO** | Requires disk config variant |
+| S24 (small dedup-cache) | **DONE** | smalldedupcache variant wired; night sweep PASS 9/9 |
 | S27 (list pagination ambiguity) | **TODO** | Requires instrumented object-store proxy |
-| S31 (`ca-gc-dryrun` under `gc_shards > 1`) | **TODO** | `previewDeletes` previews only shard 0; multi-shard coverage needed |
+| S31 (`ca-gc-dryrun` under `gc_shards > 1`) | **DONE** | `previewDeletes` iterates every target shard (fixed during ack-floor); gc_shards2 variant in the night sweep 8/9 (scale-gated remainder) |
 | D3: full GC round test under `gc_shards > 1` (edge-set fold) | **TODO** | Cover fold → retire → reclaim over the source-edge-set (D1) with multiple GC shards; `gc_shards=1` tests hide sharded fold bugs (see [[feedback_review_blindspots_shards_chassert]]) |
 | B5: reconcile shared-pool integration tests to per-server-tree | **TODO** (separate/larger) | Integration tests still assume the old shared-pool layout; reconcile to the per-`server_root_id` tree (`cas/refs/<srid>`, `cas/manifests/<srid>`, `roots/<srid>`) after Phase 1 relocation |
 | Stateless test suite gated CA un-tagging | **PARTIAL** | Most `no-content-addressed-storage` tags removed; remaining are feature gaps (B31 capability gate, B66a concurrent-fetch, freeze/WORM edge cases) |

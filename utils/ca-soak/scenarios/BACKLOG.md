@@ -1,5 +1,23 @@
 # Scenario suite backlog
 
+> **TRIAGE SWEEP 2026-07-03** (night binary: queue + copy-forward hash fix + clamp suppression +
+> guard/rebuild). Status of the recurring entry classes below:
+> - **RESOLVED**: `GC-CONCURRENT-LEADER-LEAK` (attempt-scoped generations, marked inline);
+>   `S31-*-dryrun-shard0` (previewDeletes iterates all target shards); `S18-*-UNFREEZE`
+>   (`enable_system_unfreeze` in soak configs); `S13-*-quiescence`/replica-divergence class (the
+>   card compared replicas BEFORE any sync — sync-gated oracle landed, S13 PASS 11/11);
+>   `S01-*-RSS-384MiB` (streaming putBlob); `S02 TOO_LARGE_STRING` (card SQL fixed earlier).
+> - **SUPERSEDED**: `S03/S04-*-residual-unreachable` findings — the fsck pipeline classification
+>   (`pending-gc`/`awaiting-gc`/`unaccounted`) makes the two-phase deletion lag an expected state;
+>   residual-settling loops keep the summary counter. `HARNESS-DRAIN-VERDICT-CONVERGENCE` — same.
+> - **STILL OPEN**: `NEEDS-INFRA-S12/S22/S27`; the three `SCENARIO (proposed)` ack-floor cards
+>   (SIGSTOP floor hold, kill-mid-burst fence-out, request-budget guard — now release-gate items,
+>   see `docs/superpowers/cas/ROADMAP.md §release-gates-2026-07-03`); `S07` manifest-cap needs
+>   ci/full scale; B206 settle-gate tuning; B207 fsck phantom-dangling race (RESTORED to the
+>   roadmap as a release gate).
+> - `PRODUCT BUG (S13 mount self-recovery)` — RESOLVED by self-remount (2026-07-02, marked inline).
+
+
 Findings, anomalies, missing instrumentation, flaky/inconclusive cases, suspected bugs, and proposed
 fixes discovered while building and running the content-addressed scenario suite. Newest at the
 bottom. Each entry: a short id/title, the run it came from, what was observed, and a proposed action.
