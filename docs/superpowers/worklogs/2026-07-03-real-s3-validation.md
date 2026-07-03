@@ -75,6 +75,13 @@ Full 12-step battery: `utils/ca-soak/scripts/gcs_goog4_probe.py` (12/12 OK — c
 wrong/correct-generation overwrite and delete, body-intact checks, HEAD generation, 404 after
 delete, generation changes on every write).
 
+Follow-up battery (`gcs_goog4_mp_probe.py`, same day): `CompleteMultipartUpload` **silently
+ignores** `x-goog-if-generation-match` (both `0`-against-existing and a wrong generation returned
+200 and overwrote) — conditional writes must not use multipart on GCS. `Compose` **enforces** the
+precondition (5/5) — the production-grade big-blob path is multipart-to-temp-key (unconditional)
+-> `Compose(temp -> final)` with the precondition -> delete temp. The 412 XML body code is
+literally `PreconditionFailed` — the same string the ClickHouse-side detectors already match.
+
 Design implication for the `TokenType::Generation` binding: GOOG4-HMAC-SHA256 is structurally
 sigv4 with renamed constants (`GOOG4` key prefix, `goog4_request` scope, `x-goog-date`/
 `x-goog-content-sha256` headers) — a signer variant plus a precondition-header mapping

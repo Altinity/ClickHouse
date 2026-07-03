@@ -91,3 +91,20 @@ c, h, b = req('DELETE', KEY, {'x-goog-if-generation-match': gen2})
 show('9 delete correct gen', 204, c)
 c, h, b = req('GET', KEY)
 show('9b gone after delete', 404, c)
+
+
+# ============================================================================
+# Part 2 (2026-07-03, run with MODE=multipart): multipart + compose preconditions.
+# MEASURED RESULTS on live GCS:
+#   - CompleteMultipartUpload SILENTLY IGNORES x-goog-if-generation-match (both
+#     if-generation-match:0 against an existing object and a wrong generation
+#     returned 200 and overwrote) -> conditional writes must NOT use multipart.
+#   - Compose ENFORCES x-goog-if-generation-match (0-on-existing -> 412,
+#     wrong gen -> 412, correct gen -> 200) -> the production-grade big-blob
+#     path is: multipart (unconditional) to a temp key -> Compose(temp -> final)
+#     with the precondition -> delete temp.
+#   - The 412 XML body code is literally `PreconditionFailed` (same string AWS
+#     uses), so the existing ClickHouse-side detection needs no change.
+# The battery itself is committed next to this file: gcs_goog4_mp_probe.py
+# (same signer extended with a canonical-query-string parameter).
+# ============================================================================
