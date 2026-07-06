@@ -11,6 +11,8 @@
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <QueryPipeline/Pipe.h>
 #include <Interpreters/Context.h>
+#include <Common/Exception.h>
+#include <Common/logger_useful.h>
 #include <base/hex.h>
 
 #include <chrono>
@@ -117,7 +119,20 @@ Pipe StorageSystemContentAddressedMounts::read(
         }
 
         const uint64_t skew_margin_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
-        for (const auto & m : Cas::listMounts(store->backend(), store->layout(), now_ms, skew_margin_ms))
+        std::vector<Cas::MountInfo> mounts;
+        try
+        {
+            mounts = Cas::listMounts(store->backend(), store->layout(), now_ms, skew_margin_ms);
+        }
+        catch (...)
+        {
+            /// This table exists for incident-time diagnosis: one disk's transient backend error
+            /// must not blind the operator to the other disks' rows. Skip the disk, keep the rest.
+            tryLogCurrentException(getLogger("StorageSystemContentAddressedMounts"),
+                                   "listing mounts for disk '" + disk_name + "'");
+            continue;
+        }
+        for (const auto & m : mounts)
         {
             col_disk->insert(disk_name);
             col_srid->insert(m.srid);

@@ -23,6 +23,12 @@ def assert_fsck_clean(result, fsck: dict):
         return [result.add(Verdict.inconclusive(
             "fsck dangling", "0", "fsck summary unavailable (timeout or parse failure)"))]
     dangling = fsck.get("dangling")
+    # A PARTIAL scan (deadline hit, `--partial`) is a lower bound: dangling>0 is a real finding,
+    # but dangling==0 proves nothing about the unwalked remainder — never let a partial clean pass.
+    if fsck.get("partial") and dangling == 0:
+        return [result.add(Verdict.inconclusive(
+            "fsck dangling", "0",
+            f"fsck partial (deadline): walked subset clean, remainder unproven ({fsck.get('reason', '')})"))]
     v = result.add(Verdict.check("fsck dangling", "0", dangling, dangling == 0))
     result.observations["fsck_final"] = {
         k: fsck.get(k) for k in ("reachable", "unreachable", "dangling", "physical_bytes",
