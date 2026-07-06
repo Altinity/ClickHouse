@@ -27,6 +27,10 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 - **Fix (F1 propagation):** stripped `ca_ro` from `storage_conf_gc_shards2_ch{1,2}.xml` and mounted `fsck_only_ca.xml` in `docker-compose-gc_shards2.yml` (both nodes). Re-run: **INCONCLUSIVE (9/10)** — both dangling verdicts now PASS (`default=0`, `gc_shards2=0`); the single remaining INCONCLUSIVE is `gc_shards=8 comparison` = unavailable (no gc_shards8 compose exists; only 1 and 2). That's a scale/infra gap, not a failure.
 - **Verdict: sharded-GC correctness VALIDATED** — identical results at gc_shards 1 and 2, dangling=0 both, reducer memory flat (0.60 → 0.61 GB), orphan backlog drained. The gc_shards=8 arm is unavailable (would need a gc_shards8 compose). No CAS defect. (Reminder for later: `10replicas`/`awss3` server configs still embed `ca_ro` + lack the fsck-only mount — same F1 propagation needed before their scenarios' fsck works.)
 
+## S16 — hot content cycle with GC {#s16}
+
+**Dev-scale (seed 20260707): INCONCLUSIVE 9/10 — effectively PASS.** 9 verdicts pass (all safety: `fsck dangling=0`, replica agreement, orphan drained, event audit clean, GC no failed rounds, no unbounded leftovers); the 1 INCONCLUSIVE is `resurrection counters recorded` — an observability gate (the condemned-blob revival/W-REVALIDATE counter wasn't exercised in the short dev window, like S13's precommit-reclaim gate). **No dangling, no wedge** — the hot-content overwrite churn at dev scale stayed under the #3231 threshold. (Full-scale hot-content churn would be #3231-limited like S13; validated at dev.) Note: BACKLOG had a historical S16 `dangling=1` forensics investigation (GC-CONCURRENT-LEADER-DANGLING) — **not reproduced here** (dangling=0).
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
