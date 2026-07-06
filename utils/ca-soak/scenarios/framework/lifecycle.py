@@ -166,7 +166,11 @@ def settle_fsck(container: str = DEFAULT_FSCK_CONTAINER, disk: str = DEFAULT_FSC
     while True:
         try:
             last = fsck_summary(container, disk)
-            key = (last.get("reachable"), last.get("unreachable"), last.get("dangling"))
+            # Stability key deliberately EXCLUDES `unreachable`: background GC churns it while
+            # draining (S05 full: oscillated 1200->414->1203 for the whole 300 s budget and settle
+            # never stabilized). Settle only gates "workload publishes stopped moving" —
+            # `unreachable` convergence is owned by the forced_gc_to_fixpoint step that follows.
+            key = (last.get("reachable"), last.get("dangling"))
         except fsck_mod.FsckTimeout:
             log_fn("settle_fsck: summary fsck timed out; returning last")
             return last
