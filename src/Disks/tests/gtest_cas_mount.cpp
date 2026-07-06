@@ -622,3 +622,22 @@ TEST(CasListMounts, ClassifiesEveryStateReadOnly)
             EXPECT_EQ(m.state, "expired");
         }
 }
+
+/// A `srid` may itself contain `/` (e.g. `shard-01/replica-a` — legal per
+/// `CasServerRootId.ValidationAcceptsCleanPathsRejectsBad`). Slicing the key by the last `/` before
+/// the `/mount` suffix (as opposed to by `serverRootsPrefix()` length) truncates it to `replica-a`.
+TEST(CasListMounts, NestedSridIsNotTruncated)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const uint64_t now_ms = 1'000'000;
+    const uint64_t ttl_ms = 10'000;
+
+    ASSERT_EQ(claimMount(*backend, layout, "shard-01/replica-a", UInt128{1}, /*writer_epoch=*/1, now_ms, ttl_ms).kind,
+              MountClaimResult::Claimed);
+
+    auto mounts = listMounts(*backend, layout, now_ms, /*skew_margin_ms=*/ttl_ms / 2);
+    ASSERT_EQ(mounts.size(), 1u);
+    EXPECT_EQ(mounts[0].srid, "shard-01/replica-a");
+    EXPECT_EQ(mounts[0].state, "live");
+}

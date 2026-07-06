@@ -499,10 +499,11 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
 std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint64_t now_ms, uint64_t skew_margin_ms)
 {
     std::vector<MountInfo> out;
+    const String prefix = layout.serverRootsPrefix();
     String cursor;
     while (true)
     {
-        const ListPage page = backend.list(layout.serverRootsPrefix(), cursor, 1000);
+        const ListPage page = backend.list(prefix, cursor, 1000);
         for (const auto & k : page.keys)
         {
             static constexpr std::string_view suffix = "/mount";
@@ -512,9 +513,10 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
             if (!got)
                 continue;   /// raced a delete — read-only view, skip the row
             MountInfo info;
-            const size_t end = k.key.size() - suffix.size();
-            const size_t start = k.key.rfind('/', end - 1);
-            info.srid = k.key.substr(start + 1, end - start - 1);
+            /// The srid is the path segment between `serverRootsPrefix()` and the `/mount` suffix —
+            /// may itself contain `/` (e.g. `shard-01/replica-a`), so slice by prefix length rather
+            /// than `rfind('/')`, matching `computeHeartbeatFloor`'s extraction.
+            info.srid = k.key.substr(prefix.size(), k.key.size() - prefix.size() - suffix.size());
             try
             {
                 info.lease = decodeMountLease(got->bytes);
