@@ -287,6 +287,23 @@ private:
     ///   exist) => forced Read.
     std::map<String, DiscoverDecision> computeDiscoverDecisions(const CasFoldSeal & sealed);
 
+    /// Task 3 (Phase 4 Lever A): the two cheap pre-fold GC round-defer signals — both computed from
+    /// state already reachable before the fold's snapshot merge (O(retired)/O(shards), no snapshot
+    /// read), so `runRegularRound` can decide DEFER-vs-FOLD before paying the fold's cost.
+    ///
+    /// True iff any entry in the CURRENT retired lists (dereferenced through `state.retired_refs`) is
+    /// due to delete/graduate this round (`delete_pending` OR `condemn_round < min_ack`). This is the
+    /// load-bearing SAFETY signal (Task-1 TLA+ gate, GREEN): it forces a fold before any destructive
+    /// decision. FAIL-CLOSED: a missing retired list is corrupt destructive bookkeeping — returns TRUE
+    /// (forces a fold so the round's own fail-closed path surfaces it), matching `fold`'s existing
+    /// throw-on-missing-retired-list treatment; a round must never silently defer on corrupt bookkeeping.
+    bool graduationDue(const GcState & state, uint64_t min_ack);
+
+    /// The number of present shards whose LIST-discovered token differs from what the adopted fold seal
+    /// recorded (= the count of non-`Skip` `DiscoverDecision`s `computeDiscoverDecisions` would make
+    /// against the seal at `state.snap_generation`/`snap_attempt`).
+    size_t changedShardCount(const GcState & state);
+
     /// Task 6: for each discovered shard that is empty + tombstoned (last journal event `is_tombstone`)
     /// + fully folded at current incarnation, issue `deleteExact(rootShardKey, read_token)` using the
     /// token from the eligibility GET. Tolerates `NotFound` and `TokenMismatch` (never throws on 404
@@ -356,6 +373,18 @@ public:
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverseForTest()
     {
         return discoverUniverse();
+    }
+
+    /// TEST SEAM (Task 3): expose the two cheap pre-fold GC round-defer signals so unit tests can
+    /// assert them directly without driving a full round.
+    bool graduationDueForTest(const GcState & state, uint64_t min_ack)
+    {
+        return graduationDue(state, min_ack);
+    }
+
+    size_t changedShardCountForTest(const GcState & state)
+    {
+        return changedShardCount(state);
     }
 
 };

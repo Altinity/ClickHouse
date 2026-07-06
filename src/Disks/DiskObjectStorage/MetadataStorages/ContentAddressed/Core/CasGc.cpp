@@ -1416,6 +1416,36 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
     return computeDiscoverDecisions(ref_seal);
 }
 
+bool Gc::graduationDue(const GcState & state, uint64_t min_ack)
+{
+    Backend & backend = store->backend();
+    for (const auto & [retired_shard, retired_key] : state.retired_refs)
+    {
+        const auto got = backend.get(retired_key);
+        if (!got)
+            /// Missing retired list = corrupt destructive bookkeeping (same fail-closed rule as fold).
+            /// Force a fold so the round's existing fail-closed path surfaces it, never silently defer.
+            return true;
+        for (const RetiredEntry & e : decodeRetiredSet(got->bytes).entries)
+            if (e.delete_pending || e.condemn_round < min_ack)
+                return true;
+    }
+    return false;
+}
+
+size_t Gc::changedShardCount(const GcState & state)
+{
+    CasFoldSeal ref_seal;
+    if (const auto seal = readFoldSeal(state.snap_generation, state.snap_attempt))
+        ref_seal = *seal;
+    const std::map<String, DiscoverDecision> decisions = computeDiscoverDecisions(ref_seal);
+    size_t changed = 0;
+    for (const auto & [ck, dec] : decisions)
+        if (dec != DiscoverDecision::Skip)
+            ++changed;
+    return changed;
+}
+
 RebuildReport Gc::rebuildBaseline(bool force)
 {
     /// The gc/state disaster-recovery command (spec 2026-07-03-cas-gc-rebuild-design.md Part 2).
