@@ -10,6 +10,11 @@
 
 using namespace DB::Cas;
 
+namespace DB::ErrorCodes
+{
+extern const int CAS_MOUNT_FENCED;
+}
+
 /// MountLeaseKeeper behavior after the ack-floor merge (spec 2026-07-02-cas-gc-ack-floor-fence):
 /// the per-server mount lease and the merged build-watermark floor + GC-round acknowledgement all
 /// ride the SAME slot, renewed by one beat. The keeper anchors durably before return, adopts a slot
@@ -244,4 +249,53 @@ TEST(CasHeartbeat, StopBeforeStartIsQuietNoOp)
     /// start() never called.
     EXPECT_NO_THROW(keeper.stop());
     EXPECT_NO_THROW(keeper.stop());
+}
+
+/// "A fence costs an epoch" at the keeper layer: the GC fenced our fresh lease before we adopted it
+/// (the lease expired mid-open — e.g. a slow first beat). This must fail closed with a TYPED,
+/// RECOVERABLE error (`CAS_MOUNT_FENCED`), distinct from the generic "touched by a foreign writer"
+/// `LOGICAL_ERROR` — the open path (Task 4) tells "re-open with a fresh epoch" apart from "fail hard"
+/// by this code, not by parsing message text.
+TEST(CasMountAudit, KeeperAdoptRefusesFencedSelfWithTypedError)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+
+    /// mint (uuid, epoch 9), then fence it in place (what computeHeartbeatFloor does on expiry):
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
+    {
+        auto got = backend->get(layout.mountKey(srid));
+        MountLease fenced = decodeMountLease(got->bytes);
+        fenced.gc_fenced = true;
+        fenced.seq += 1;
+        ASSERT_EQ(backend->putOverwrite(layout.mountKey(srid), encodeMountLease(fenced), got->token).outcome,
+                  PutOutcome::Done);
+    }
+
+    std::vector<CasEvent> seen;
+    CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
+    /// A keeper for the SAME (uuid, epoch) tries to adopt the now-fenced slot.
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
+                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; }, sink);
+
+    bool threw = false;
+    try
+    {
+        keeper.start();
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CAS_MOUNT_FENCED);
+        EXPECT_NE(e.message().find("fenced by GC"), String::npos) << e.message();
+        EXPECT_EQ(e.message().find("foreign writer"), String::npos) << e.message();
+    }
+    EXPECT_TRUE(threw);
+
+    ASSERT_FALSE(seen.empty());
+    EXPECT_EQ(seen.back().type, CasEventType::MountConflict);
+    EXPECT_EQ(seen.back().detail.at("branch"), "fenced_by_gc");
 }

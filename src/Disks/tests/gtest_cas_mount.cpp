@@ -641,3 +641,32 @@ TEST(CasListMounts, NestedSridIsNotTruncated)
     EXPECT_EQ(mounts[0].srid, "shard-01/replica-a");
     EXPECT_EQ(mounts[0].state, "live");
 }
+
+/// "A fence costs an epoch": a same-(uuid, epoch) re-claim must NOT refresh a `gc_fenced` body in
+/// place — that would resurrect a fenced incarnation. It is terminal for THIS epoch; only a
+/// DIFFERENT (fresh) epoch may reclaim the slot.
+TEST(CasClaimMount, SameEpochFencedIsNotRefreshable)
+{
+    using namespace DB::Cas;
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    /// mint for (uuid 1, epoch 1), then fence it in place (what computeHeartbeatFloor does):
+    ASSERT_EQ(claimMount(*backend, layout, "a", DB::UInt128{1}, 1, 1000, 10'000).kind,
+              MountClaimResult::Claimed);
+    {
+        auto got = backend->get(layout.mountKey("a"));
+        MountLease fenced = decodeMountLease(got->bytes);
+        fenced.gc_fenced = true;
+        fenced.seq += 1;
+        ASSERT_EQ(backend->putOverwrite(layout.mountKey("a"), encodeMountLease(fenced), got->token).outcome,
+                  PutOutcome::Done);
+    }
+    /// Same (uuid, epoch) re-claim must NOT refresh a fenced body — a fence costs an epoch:
+    const auto r = claimMount(*backend, layout, "a", DB::UInt128{1}, 1, 2000, 10'000);
+    EXPECT_EQ(r.kind, MountClaimResult::FencedSelf);
+    /// The body on the backend is still the fenced one (no write happened):
+    EXPECT_TRUE(decodeMountLease(backend->get(layout.mountKey("a"))->bytes).gc_fenced);
+    /// A DIFFERENT epoch reclaims immediately (existing branch, unchanged):
+    EXPECT_EQ(claimMount(*backend, layout, "a", DB::UInt128{1}, 2, 2000, 10'000).kind,
+              MountClaimResult::Claimed);
+}

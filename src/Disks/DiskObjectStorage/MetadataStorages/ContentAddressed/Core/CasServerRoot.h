@@ -146,8 +146,10 @@ uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid)
 /// slot. Decision over `get(mountKey)`:
 ///   - absent → write our body via `putIfAbsent` → `Claimed`;
 ///   - same `server_uuid` AND same `writer_epoch` as (our_uuid, our_epoch) → it is OUR OWN claim
-///     (a replay / the keeper adopting it) → refresh (`putOverwrite` to bump seq + fresh
-///     `expires_at_ms`) → `Claimed`;
+///     (a replay / the keeper adopting it):
+///       - `gc_fenced` → terminal for THIS (uuid, epoch) — a fence costs an epoch, so refreshing it
+///         in place would resurrect a fenced incarnation → `FencedSelf` (no write);
+///       - otherwise → refresh (`putOverwrite` to bump seq + fresh `expires_at_ms`) → `Claimed`;
 ///   - same `server_uuid`, DIFFERENT `writer_epoch`, lease EXPIRED (`expires_at_ms <= now_ms`) OR
 ///     `gc_fenced` (a GC fence-out is terminal for that incarnation — its keeper can never renew
 ///     again, so there is no liveness to wait for) → reclaim (overwrite with our body,
@@ -163,6 +165,10 @@ struct MountClaimResult
         Claimed,
         LiveDoubleStart,
         ForeignOwner,
+        /// Same (uuid, epoch) as ours, but the body is `gc_fenced`: terminal for THIS epoch — a fence
+        /// costs an epoch. The caller must re-open with a fresh `writer_epoch` (see Task 4's open
+        /// retry); refreshing/adopting a fenced body in place is never correct.
+        FencedSelf,
     };
     Kind kind = ForeignOwner;
     MountLease body;

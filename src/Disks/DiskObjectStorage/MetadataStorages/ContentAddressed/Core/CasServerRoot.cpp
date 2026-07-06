@@ -21,6 +21,7 @@ namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int CAS_MOUNT_FENCED;
 }
 }
 
@@ -368,9 +369,19 @@ MountClaimResult claimMount(
         return {.kind = MountClaimResult::ForeignOwner, .body = existing};
     }
 
-    /// Same uuid + same epoch → it is OUR OWN claim (replay / adopt). Refresh seq + expiry.
+    /// Same uuid + same epoch: it is OUR OWN claim — but a FENCED body is terminal for this
+    /// (uuid, epoch): the GC dropped its ack from the floor when it fenced. Refreshing it in place
+    /// would resurrect a fenced incarnation (TLA+ `FenceCostsEpoch` sabotage) — the caller must
+    /// re-open with a fresh writer_epoch instead ("a fence costs an epoch").
     if (existing.writer_epoch == our_epoch)
     {
+        if (existing.gc_fenced)
+        {
+            emitMountEvent(sink, CasEventType::MountConflict, srid, "fenced_by_gc", &existing,
+                "own (uuid, epoch) mount slot is GC-fenced — terminal for this incarnation; "
+                "recover with a fresh writer_epoch");
+            return {.kind = MountClaimResult::FencedSelf, .body = existing};
+        }
         const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
         const PutResult put = b.putOverwrite(key, encodeMountLease(body), got->token);
         if (put.outcome != PutOutcome::Done)
@@ -692,19 +703,47 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
             key, observed.writer_epoch, writer_epoch, describeMountHolder(observed));
     }
 
+    /// Same (uuid, epoch) but FENCED: the GC fenced our fresh lease before we adopted it (the
+    /// lease expired mid-open — e.g. a slow first beat). Terminal for THIS epoch; the open path
+    /// recovers by allocating a fresh writer_epoch and re-claiming (TLA+ `NoPermanentWedge`).
+    if (observed.gc_fenced)
+    {
+        emitMountEvent(event_sink, CasEventType::MountConflict, srid, "fenced_by_gc", &observed,
+            "own mount slot fenced by GC after lease expiry — recoverable with a fresh writer_epoch");
+        throw Exception(ErrorCodes::CAS_MOUNT_FENCED,
+            "CAS mount-lease: key '{}' was fenced by GC after lease expiry ({}) — "
+            "recoverable: re-open with a fresh writer_epoch", key, describeMountHolder(observed));
+    }
+
     /// Same uuid AND same epoch → it is OUR OWN claim → ADOPT: overwrite against the observed token
     /// to refresh seq/expiry. (`body` is encoded for seq=1 by the base `doStart`; that is fine —
     /// renewals advance from there.)
     const PutResult res = backend->putOverwrite(key, body, got->token);
     if (res.outcome != PutOutcome::Done)
     {
-        /// The observed body above (same uuid+epoch as ours) is the best CURRENT identity known —
-        /// something touched the slot between our GET and this PUT.
-        emitMountEvent(event_sink, CasEventType::MountConflict, srid, "adopt", &observed,
-            "mount slot was touched while adopting our own mount slot — failing closed");
+        /// The slot moved between our GET and PUT. Diagnose by the CURRENT body, not the token
+        /// (2026-07-06 root cause: the only same-(uuid,epoch)-preserving toucher is the GC fence).
+        const auto reread = backend->get(key);
+        if (reread)
+        {
+            const MountLease current = decodeMountLease(reread->bytes);
+            if (current.server_uuid == server_uuid && current.gc_fenced)
+            {
+                emitMountEvent(event_sink, CasEventType::MountConflict, srid, "fenced_by_gc", &current,
+                    "GC fenced our mount between the adopt's read and write — recoverable with a "
+                    "fresh writer_epoch");
+                throw Exception(ErrorCodes::CAS_MOUNT_FENCED,
+                    "CAS mount-lease: key '{}' was fenced by GC inside the adopt window ({}) — "
+                    "recoverable: re-open with a fresh writer_epoch", key, describeMountHolder(current));
+            }
+            emitMountEvent(event_sink, CasEventType::MountConflict, srid, "adopt", &current,
+                "mount slot was touched while adopting our own mount slot — failing closed");
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS mount-lease: key '{}' was touched while adopting our own mount slot ({}) — failing closed",
+                key, describeMountHolder(current));
+        }
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS mount-lease: key '{}' was touched while adopting our own mount slot ({}) — failing closed",
-            key, describeMountHolder(observed));
+            "CAS mount-lease: key '{}' vanished while adopting our own mount slot — failing closed", key);
     }
     emitMountEvent(event_sink, CasEventType::MountClaim, srid, "adopt", &observed,
         "adopted our own already-live (uuid, epoch) mount slot");
