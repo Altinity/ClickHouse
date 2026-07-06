@@ -13,6 +13,7 @@ These apply to every positive scenario unless it declares a stricter or negative
     nonzero residual must be classified.
 """
 
+from . import observe
 from .report import Verdict
 
 
@@ -98,20 +99,9 @@ RECLAIMABLE_UNREACHABLE_PREFIXES = ("blobs", "_manifests")
 
 
 def _classify_key(key: str) -> str:
-    rel = key
-    for marker in ("/blobs/", "/roots/", "/gc/", "/_pool_meta"):
-        i = rel.find(marker)
-        if i >= 0:
-            rel = rel[i + 1:]
-            break
-    if "/_manifests/" in rel:
-        return "_manifests"
-    if "/_files/" in rel:
-        return "_files"
-    head = rel.split("/", 1)[0]
-    if head.startswith("_pool_meta"):
-        return "_pool_meta"
-    return head if head in ("blobs", "gc", "roots") else "other"
+    """Bucket a pool key by prefix — delegates to the shared layout-aware classifier
+    (`observe.classify_pool_path`); see its docstring for the 2026-07 relocation rationale."""
+    return observe.classify_pool_path(key)
 
 
 def classify_unreachable(fsck_detail_res: dict) -> dict:

@@ -45,3 +45,17 @@ def test_pool_meta_and_other():
 def test_cas_segment_without_manifests_or_refs_is_not_anchored():
     # A stray 'cas' path segment with an unknown child must not classify as manifests/refs.
     assert classify_pool_path("cas/unknown/zzz") == "other"
+
+
+def test_unreachable_manifest_is_reclaimable_not_bookkeeping():
+    """Regression: an unreachable part-manifest must land in the '_manifests' (RECLAIMABLE) bucket."""
+    from scenarios.framework.assertions import classify_unreachable
+
+    detail = {"detail": [
+        {"class": "unreachable", "key": "soak_pool/cas/manifests/ca_soak_ch1/store/aa/uuid/1/2/000001.proto"},
+        {"class": "unreachable", "key": "soak_pool/blobs/ab/abcdef0123"},
+        {"class": "unreachable", "key": "soak_pool/gc/gen/5/attempt/2/run"},
+        {"class": "reachable",   "key": "soak_pool/blobs/cd/cdef"},
+    ]}
+    buckets = classify_unreachable(detail)
+    assert buckets == {"_manifests": 1, "blobs": 1, "gc": 1}
