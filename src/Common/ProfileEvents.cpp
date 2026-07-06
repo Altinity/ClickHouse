@@ -1549,6 +1549,10 @@ The server successfully detected this situation and will download merged part fr
     M(DataLakeRestCatalogGetTableMetadataMicroseconds, "Total time of 'get table metadata' requests to Iceberg REST catalog.", ValueType::Microseconds) \
     M(DataLakeRestCatalogGetCredentials, "Number of 'get credentials' requests to Iceberg REST catalog.", ValueType::Number) \
     M(DataLakeRestCatalogGetCredentialsMicroseconds, "Total time of 'get credentials' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogAuthTokenCacheHits, "Number of requests to Iceberg REST catalog that reused a cached access token and did not fetch a new one.", ValueType::Number) \
+    M(DataLakeRestCatalogAuthTokenRefreshed, "Number of new access tokens fetched for Iceberg REST catalog (OAuth client-credentials or GCP metadata/ADC).", ValueType::Number) \
+    M(DataLakeRestCatalogAuthTokenRefreshedMicroseconds, "Total time spent fetching access tokens for Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized, "Number of Iceberg REST catalog HTTP requests retried with a new access token after HTTP 401 or 403.", ValueType::Number) \
     M(DataLakeRestCatalogCreateNamespace, "Number of 'create namespace' requests to Iceberg REST catalog.", ValueType::Number) \
     M(DataLakeRestCatalogCreateNamespaceMicroseconds, "Total time of 'create namespace' requests to Iceberg REST catalog.", ValueType::Microseconds) \
     M(DataLakeRestCatalogCreateTable, "Number of 'create table' requests to Iceberg REST catalog.", ValueType::Number) \
@@ -1588,6 +1592,8 @@ The server successfully detected this situation and will download merged part fr
     M(ObjectStorageClusterSentToNonMatchedReplica, "Number of tasks in ObjectStorageCluster request sent to non-matched replica.", ValueType::Number) \
     M(ObjectStorageClusterProcessedTasks, "Number of processed tasks in ObjectStorageCluster request.", ValueType::Number) \
     M(ObjectStorageClusterWaitingMicroseconds, "Time of waiting for tasks in ObjectStorageCluster request.", ValueType::Microseconds) \
+    M(DataLakePaimonRestCatalogAuthTokenRefreshedOnUnauthorized, "Number of Paimon REST catalog DLF HTTP requests retried with a new authorization signature after HTTP 401.", ValueType::Number) \
+
 
 #ifdef APPLY_FOR_EXTERNAL_EVENTS
     #define APPLY_FOR_EVENTS(M) APPLY_FOR_BUILTIN_EVENTS(M) APPLY_FOR_EXTERNAL_EVENTS(M)

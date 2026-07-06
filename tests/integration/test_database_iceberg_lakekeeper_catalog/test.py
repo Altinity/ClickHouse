@@ -414,6 +414,85 @@ def get_credentials_profile_events(node, query_id):
     return vended, hits
 
 
+def get_auth_token_profile_events(node, query_id):
+    node.query("SYSTEM FLUSH LOGS")
+    refreshed = int(node.query(
+        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenRefreshed'] "
+        f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+    ))
+    cache_hits = int(node.query(
+        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenCacheHits'] "
+        f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+    ))
+    refreshed_on_unauthorized = int(node.query(
+        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized'] "
+        f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+    ))
+    return refreshed, cache_hits, refreshed_on_unauthorized
+
+
+def test_auth_token_profile_events(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_auth_token_profile_events_{uuid.uuid4().hex[:8]}"
+    db_name = f"{test_ref}_database"
+    namespace = (f"{test_ref}_namespace",)
+    table_name = f"{test_ref}_table"
+
+    catalog = load_catalog_impl(started_cluster)
+    if namespace not in catalog.list_namespaces():
+        catalog.create_namespace(namespace)
+
+    schema = Schema(
+        NestedField(field_id=1, name="id", field_type=IntegerType(), required=False),
+        NestedField(field_id=2, name="data", field_type=StringType(), required=False),
+    )
+    catalog.create_table(
+        namespace + (table_name,),
+        schema=schema,
+        properties={"write.metadata.compression-codec": "none"},
+    )
+
+    create_qid = f"{test_ref}-create-{uuid.uuid4()}"
+    settings = {
+        "catalog_type": "rest",
+        "warehouse": "demo",
+        "storage_endpoint": "http://minio:9000/warehouse-rest",
+        "catalog_credential": "SECRET_1",
+    }
+    node.query(
+        f"""
+DROP DATABASE IF EXISTS {db_name};
+SET allow_experimental_database_iceberg=true;
+CREATE DATABASE {db_name} ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', '{minio_secret_key}')
+SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
+        """,
+        query_id=create_qid,
+    )
+    refreshed, _, _ = get_auth_token_profile_events(node, create_qid)
+    assert refreshed >= 1
+
+    qid1 = f"{test_ref}-show-1-{uuid.uuid4()}"
+    node.query(f"SHOW TABLES FROM {db_name}", query_id=qid1)
+    refreshed, cache_hits, _ = get_auth_token_profile_events(node, qid1)
+    assert refreshed == 0 and cache_hits >= 1
+
+    qid2 = f"{test_ref}-show-2-{uuid.uuid4()}"
+    node.query(f"SHOW TABLES FROM {db_name}", query_id=qid2)
+    refreshed, cache_hits, _ = get_auth_token_profile_events(node, qid2)
+    assert refreshed == 0 and cache_hits >= 1
+
+
+def test_vended_credentials_cache(started_cluster):
+    node = started_cluster.instances["node1"]
+    catalog = load_catalog_impl(started_cluster)
+
+    test_ref = f"test_vended_credentials_cache_{uuid.uuid4().hex[:8]}"
+    namespace = (f"{test_ref}_namespace",)
+    table_name = f"{test_ref}_table"
+    db_name = f"{test_ref}_database"
+
+
 def create_int_table(catalog, namespace, table_name, rows=1):
     if namespace not in catalog.list_namespaces():
         catalog.create_namespace(namespace)

@@ -37,10 +37,16 @@
 #include <Poco/MD5Engine.h>
 #include <Poco/String.h>
 #include <Common/Base64.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/Logger.h>
 #include <Common/OpenSSLHelpers.h>
 #include <Common/logger_useful.h>
+
+namespace ProfileEvents
+{
+    extern const Event DataLakePaimonRestCatalogAuthTokenRefreshedOnUnauthorized;
+}
 
 
 namespace DB::ErrorCodes
@@ -311,6 +317,7 @@ DB::ReadWriteBufferFromHTTPPtr PaimonRestCatalog::createReadBuffer(
     {
         if (e.code() == Poco::Net::HTTPResponse::HTTP_UNAUTHORIZED && refresh_token && token->token_provider == "dlf")
         {
+            ProfileEvents::increment(ProfileEvents::DataLakePaimonRestCatalogAuthTokenRefreshedOnUnauthorized);
             refresh_token = false;
             token->dlf_generated_authorization = "";
             return create_buffer();
