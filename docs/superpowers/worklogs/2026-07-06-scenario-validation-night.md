@@ -66,6 +66,10 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **Dev-scale (seed 20260707): INCONCLUSIVE 14/16 — effectively PASS.** 14 pass (all safety: `dangling=0`, no leftovers, event audit clean); the 2 INCONCLUSIVE are `1-server idle baseline` + `10-server idle baseline` — recorded-only idle-GC-cost observations (no fixed budget; the 10-server arm needs the unavailable 10-replica infra). Corroborates the documented S3-BUDGET idle-GC-cost item; no CAS defect.
 
+## S24 — small dedup-cache capacity {#s24}
+
+**Dev-scale (seed 20260707, small_dedup_cache variant, F1-fixed): FAIL 9/10 — but it's a HARNESS-TIMING false-FAIL, NOT a CAS bug.** The `S24 replica agreement` verdict saw ch1=280 rows / ch2=272 at check time (8-row gap). **Live re-check (post-run): both replicas 280 rows with IDENTICAL checksum `8663329780789566770`, queue_size=0, absolute_delay=0 — fully converged.** So ch2 was transiently mid-replication when the S24 card checked agreement (the card checks agreement WITHOUT a preceding `SYSTEM SYNC REPLICA`, unlike S13/S14 which use `sync_replica_with_readonly_retry`). Data is consistent; the small dedup cache (a correctness-neutral hint) caused no divergence. 9 other verdicts pass, `dangling=0`, residual=0. **Harness fix (minor): add a pre-agreement SYNC to the S24 card.** No CAS defect. (The small_dedup_cache variant also got the F1 fix — ca_ro out of server config + fsck-only mount — before this run.)
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
