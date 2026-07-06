@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Common/CurrentMetrics.h>
 #include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
@@ -9,6 +10,12 @@
 #include <Common/thread_local_rng.h>
 #include <algorithm>
 #include <optional>
+
+namespace CurrentMetrics
+{
+    extern const Metric CasGcIsLeader;
+    extern const Metric CasGcPendingReclaimEntries;
+}
 
 namespace DB::ContentAddressed
 {
@@ -125,6 +132,10 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::
     try
     {
         const Cas::RoundReport rep = gc.runRegularRound();
+        CurrentMetrics::set(CurrentMetrics::CasGcIsLeader, rep.acquired_lease ? 1 : 0);
+        if (rep.acquired_lease)
+            CurrentMetrics::add(CurrentMetrics::CasGcPendingReclaimEntries,
+                                static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted));
         fin.outcome = rep.acquired_lease ? Rec::Outcome::Success : Rec::Outcome::NotALeader;
         fin.round = rep.round;
         fin.candidates_marked = rep.candidates;

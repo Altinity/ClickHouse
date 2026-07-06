@@ -228,6 +228,9 @@
     M(DiskPlainRewritableS3DirectoryMapSize, "Number of local-to-remote path entries in the 'plain_rewritable' in-memory map for S3ObjectStorage.") \
     M(DiskPlainRewritableS3FileCount, "Number of file entries in the 'plain_rewritable' in-memory map for S3ObjectStorage.") \
     \
+    M(CasGcIsLeader, "1 while this server holds the content-addressed GC leadership lease (set at each round end; 0 after a round where the lease was not acquired).") \
+    M(CasGcPendingReclaimEntries, "Content-addressed GC two-phase deletion backlog observed by this process: cumulative condemned entries minus executed exact-token deletes. Process-local (resets on restart).") \
+    \
     M(MergeTreeFetchPartitionThreads, "Number of threads for ALTER TABLE FETCH PARTITION") \
     M(MergeTreeFetchPartitionThreadsActive, "Number of threads for ALTER TABLE FETCH PARTITION fetching part") \
     M(MergeTreeFetchPartitionThreadsScheduled, "Number of queued or active part fetches in ALTER TABLE FETCH PARTITION") \
