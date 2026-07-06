@@ -153,7 +153,10 @@ TEST(CasMountAudit, ClaimReleaseAndForeignConflictEmitEvents)
     ASSERT_FALSE(seen.empty());
     EXPECT_EQ(seen.back().type, CasEventType::MountConflict);
     EXPECT_EQ(seen.back().detail.at("srid"), "a");
-    EXPECT_FALSE(seen.back().detail.at("holder_uuid").empty());
+    /// The conflict must carry the ORIGINAL holder's identity (uuid 1, the minter) — not the
+    /// foreign claimer's (uuid 2).
+    EXPECT_EQ(seen.back().detail.at("holder_uuid"), u128ToHex(UInt128{1}));
+    EXPECT_NE(seen.back().detail.at("holder_uuid"), u128ToHex(UInt128{2}));
 }
 
 /// The MountLeaseKeeper wiring: `start` adopting an already-claimed slot emits mount_claim, `stop`
@@ -184,4 +187,44 @@ TEST(CasMountAudit, KeeperAdoptEmitsClaimAndTerminateEmitsRelease)
     ASSERT_EQ(seen.size(), 1u);
     EXPECT_EQ(seen[0].type, CasEventType::MountRelease);
     EXPECT_EQ(seen[0].detail.at("branch"), "farewell");
+}
+
+/// Keeper-level foreign-conflict refusal: the mount slot is already held by a FOREIGN uuid (X) when
+/// a keeper for a DIFFERENT uuid (Y) tries to claim it. This must fail closed, emit a MountConflict
+/// carrying X's identity, AND — since the mount-audit sink is not yet installed at first-open — name
+/// X in the thrown exception's message text (the only identity carrier in err.log at that point).
+TEST(CasMountAudit, KeeperForeignConflictRefusesAndNamesHolder)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid_x(0x1111);
+    const UInt128 uuid_y(0x2222);
+    uint64_t now_ms = 1000;
+
+    /// Foreign holder X claims the slot first.
+    ASSERT_EQ(claimMount(*backend, layout, srid, uuid_x, /*epoch=*/1, now_ms, /*ttl_ms=*/100).kind,
+              MountClaimResult::Claimed);
+
+    std::vector<CasEvent> seen;
+    CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
+    MountLeaseKeeper keeper(backend, layout, srid, uuid_y, /*writer_epoch=*/1, std::chrono::milliseconds(100),
+                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; }, sink);
+
+    bool threw = false;
+    try
+    {
+        keeper.start();
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        /// The enriched refusal message must name the OBSERVED holder (X), not the caller (Y).
+        EXPECT_NE(e.message().find(u128ToHex(uuid_x)), String::npos) << e.message();
+    }
+    EXPECT_TRUE(threw);
+
+    ASSERT_FALSE(seen.empty());
+    EXPECT_EQ(seen.back().type, CasEventType::MountConflict);
+    EXPECT_EQ(seen.back().detail.at("holder_uuid"), u128ToHex(uuid_x));
 }

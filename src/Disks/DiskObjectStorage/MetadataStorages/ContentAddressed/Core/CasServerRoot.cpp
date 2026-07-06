@@ -296,6 +296,15 @@ MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t no
     };
 }
 
+/// Mirrors `mountDoubleStartMessage`'s identity fields. The mount-audit sink is not yet installed
+/// during `Store::open`, so at first-open these refusal messages are the only holder-identity
+/// carrier in err.log — name the toucher inline rather than just the key.
+String describeMountHolder(const MountLease & m)
+{
+    return fmt::format("server_uuid={} hostname={} pid={} writer_epoch={} seq={} expires_at_ms={}",
+        u128ToHex(m.server_uuid), m.hostname, m.pid, m.writer_epoch, m.seq, m.expires_at_ms);
+}
+
 /// The mount-slot writer audit (the P1 "foreign writer" instrument): every mount-slot WRITE
 /// (`MountClaim`/`MountRelease`) and every OBSERVED foreign/conflicting body (`MountConflict`)
 /// becomes one `system.content_addressed_log` row. `observed` is the CURRENT decoded body at the
@@ -667,7 +676,8 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
         emitMountEvent(event_sink, CasEventType::MountConflict, srid, "adopt", &observed,
             "mount slot is held by a foreign server — failing closed, never taking over");
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS mount-lease: key '{}' is held by a foreign server — failing closed, never taking over", key);
+            "CAS mount-lease: key '{}' is held by a foreign server ({}) — failing closed, never taking over",
+            key, describeMountHolder(observed));
     }
 
     /// Same uuid but a DIFFERENT epoch → a newer incarnation superseded us (or a concurrent
@@ -678,8 +688,8 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
             fmt::format("mount slot is held by a different writer_epoch ({} != ours {}) — superseded, failing closed",
                 observed.writer_epoch, writer_epoch));
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS mount-lease: key '{}' is held by a different writer_epoch ({} != ours {}) — superseded, failing closed",
-            key, observed.writer_epoch, writer_epoch);
+            "CAS mount-lease: key '{}' is held by a different writer_epoch ({} != ours {}) — superseded, failing closed ({})",
+            key, observed.writer_epoch, writer_epoch, describeMountHolder(observed));
     }
 
     /// Same uuid AND same epoch → it is OUR OWN claim → ADOPT: overwrite against the observed token
@@ -693,7 +703,8 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
         emitMountEvent(event_sink, CasEventType::MountConflict, srid, "adopt", &observed,
             "mount slot was touched while adopting our own mount slot — failing closed");
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS mount-lease: key '{}' was touched while adopting our own mount slot — failing closed", key);
+            "CAS mount-lease: key '{}' was touched while adopting our own mount slot ({}) — failing closed",
+            key, describeMountHolder(observed));
     }
     emitMountEvent(event_sink, CasEventType::MountClaim, srid, "adopt", &observed,
         "adopted our own already-live (uuid, epoch) mount slot");
