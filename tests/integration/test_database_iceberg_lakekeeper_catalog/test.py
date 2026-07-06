@@ -20,6 +20,7 @@ from helpers.config_cluster import minio_secret_key, minio_access_key
 from helpers.test_tools import TSV, csv_compare
 
 BASE_URL = "http://lakekeeper:8181/catalog"
+MOCK_OAUTH_URL = "http://mock-oauth:9999/token"
 CATALOG_NAME = "demo"
 WAREHOUSE_NAME = "demo"
 
@@ -424,11 +425,7 @@ def get_auth_token_profile_events(node, query_id):
         f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenCacheHits'] "
         f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
     ))
-    refreshed_on_unauthorized = int(node.query(
-        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized'] "
-        f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
-    ))
-    return refreshed, cache_hits, refreshed_on_unauthorized
+    return refreshed, cache_hits
 
 
 def test_auth_token_profile_events(started_cluster):
@@ -453,33 +450,28 @@ def test_auth_token_profile_events(started_cluster):
         properties={"write.metadata.compression-codec": "none"},
     )
 
-    create_qid = f"{test_ref}-create-{uuid.uuid4()}"
-    settings = {
-        "catalog_type": "rest",
-        "warehouse": "demo",
-        "storage_endpoint": "http://minio:9000/warehouse-rest",
-        "catalog_credential": "SECRET_1",
-    }
-    node.query(
-        f"""
-DROP DATABASE IF EXISTS {db_name};
-SET allow_experimental_database_iceberg=true;
-CREATE DATABASE {db_name} ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', '{minio_secret_key}')
-SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
-        """,
-        query_id=create_qid,
+    # The catalog client is initialized lazily on the first database access,
+    # not during CREATE DATABASE. OAuth credentials must use client_id:client_secret
+    # format; oauth_server_uri points to a mock token endpoint in docker compose.
+    create_clickhouse_iceberg_database(
+        started_cluster,
+        node,
+        db_name,
+        additional_settings={
+            "catalog_credential": "test:secret",
+            "oauth_server_uri": MOCK_OAUTH_URL,
+        },
     )
-    refreshed, _, _ = get_auth_token_profile_events(node, create_qid)
-    assert refreshed >= 1
 
     qid1 = f"{test_ref}-show-1-{uuid.uuid4()}"
     node.query(f"SHOW TABLES FROM {db_name}", query_id=qid1)
-    refreshed, cache_hits, _ = get_auth_token_profile_events(node, qid1)
-    assert refreshed == 0 and cache_hits >= 1
+    assert table_name in node.query(f"SHOW TABLES FROM {db_name}")
+    refreshed, cache_hits = get_auth_token_profile_events(node, qid1)
+    assert refreshed >= 1
 
     qid2 = f"{test_ref}-show-2-{uuid.uuid4()}"
     node.query(f"SHOW TABLES FROM {db_name}", query_id=qid2)
-    refreshed, cache_hits, _ = get_auth_token_profile_events(node, qid2)
+    refreshed, cache_hits = get_auth_token_profile_events(node, qid2)
     assert refreshed == 0 and cache_hits >= 1
 
 
