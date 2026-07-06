@@ -875,3 +875,16 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
   crash-loops or restarts within the lease TTL could wedge itself out of its own pool.
 - **NOTE vs prior:** the ledger's "S13 mount self-recovery — RESOLVED (self-remount 2026-07-02)"
   handled the simple stale-self case; this is a RACE gap in that path under rapid repeated kills.
+
+## INTROSPECTION FOLLOW-UP — first-open mount claim is invisible to the audit-event trail
+- **Logged (UTC):** 2026-07-06 (fix-plan Phase 2 Task 6 live validation)
+- **Severity:** follow-up (compensated, not blocking)
+- **Observed:** the `mount_claim`/`mount_conflict` audit events (Phase 2) cannot capture the claim
+  made DURING `Store::open` — the `CasEventSink` is installed after `open` returns. A kill-restart
+  cycle showed only `mount_beat` rows while the plain server log proved the reclaim fired
+  ("a stale mount lease is held by uuid=...; waiting for it to lapse, then reclaiming").
+- **Compensation in place:** the three keeper refusal exception messages now carry the observed
+  holder identity (uuid/hostname/pid/epoch/seq/expires), so err.log names the toucher at first-open.
+- **Fix direction:** synthesize one `mount_claim` event describing the open-time claim as soon as
+  the sink is installed (the lease body is at hand), or install the sink before `Store::open`'s
+  mount step. Small; touches `ContentAddressedMetadataStorage` startup wiring only.
