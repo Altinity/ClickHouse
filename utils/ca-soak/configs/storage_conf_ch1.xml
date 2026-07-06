@@ -28,22 +28,13 @@
                 <expect_continue_min_bytes>65536</expect_continue_min_bytes>
             </ca>
 
-            <!-- Read-only fsck view over the SAME endpoint. <readonly>true</readonly> is parsed by
-                 S3Settings into S3RequestSetting::read_only, which makes S3ObjectStorage::isReadOnly
-                 return true (sub-project A's read-only-mode trigger). GC must stay disabled here so
-                 the read-only mount never attempts a reclaim. -->
-            <ca_ro>
-                <type>object_storage</type>
-                <object_storage_type>s3</object_storage_type>
-                <metadata_type>content_addressed</metadata_type>
-                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
-                <access_key_id>clickhouse</access_key_id>
-                <secret_access_key>clickhouse</secret_access_key>
-                <server_root_id>ca_soak_ch1</server_root_id>
-                <gc_enabled>0</gc_enabled>
-                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
-                <readonly>true</readonly>
-            </ca_ro>
+            <!-- The read-only fsck view (ca_ro) is DELIBERATELY NOT here. A ca_ro disk over the SAME
+                 pool makes MergeTree part discovery find every part twice and fail table load with
+                 UNKNOWN_DISK on any server restart with CA tables attached (ROADMAP "Read-only fsck
+                 shadow disk breaks table load on restart"; confirmed on the RustFS stand 2026-07-06).
+                 It lives in `configs/fsck_only_ca.xml`, mounted at /etc/clickhouse-server/fsck-only.xml
+                 (OUTSIDE config.d), and is used only by `clickhouse disks -C .../fsck-only.xml`
+                 (soak/fsck.py). -->
         </disks>
         <policies>
             <ca>

@@ -89,7 +89,12 @@ def parse_dryrun(text: str) -> dict:
 # it explicitly to be defensive about non-standard container entrypoints.
 _CLICKHOUSE_DISKS = [
     "clickhouse", "disks",
-    "--config-file", "/etc/clickhouse-server/config.xml",
+    # Standalone fsck-only config (the ca_ro read-only disk lives here, NOT in the server's
+    # config.d — see configs/fsck_only_ca.xml). A ca_ro disk over the same pool in the SERVER config
+    # breaks table load on restart with UNKNOWN_DISK (ROADMAP "Read-only fsck shadow disk breaks table
+    # load on restart"; confirmed on the RustFS stand 2026-07-06). Every compose that runs fsck must
+    # mount its fsck_only_*.xml at this path.
+    "--config-file", "/etc/clickhouse-server/fsck-only.xml",
 ]
 
 
