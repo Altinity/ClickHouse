@@ -764,6 +764,18 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
   path apparently does not take that shortcut.
 
 ## S3-BUDGET — idle GC has a high fixed per-round cost on a large static pool
+- **RESOLVED (idle / small-delta case) 2026-07-06, `436714d80f0`..`3cba4f812f8` (Phase 4 Lever A,
+  "GC round skip-unchanged").** A round that makes no destructive decision now DEFERs: it re-adopts
+  the sealed in-degree generation instead of rebuilding it from a full snapshot read, so an idle round
+  no longer re-reads the prior-generation runs. Mechanism: `shouldDeferRound` (config
+  `gc_fold_threshold`, default 1) decides DEFER vs FOLD from cheap pre-fold signals
+  (`changedShardCount`, `graduationDue`); `graduationDue` force-folds before a bounded deferral window
+  elapses (`gc_fold_max_defer_rounds`, default 8), so no candidate is starved of eventual fold. Safety
+  gated by the TLA+ model `CaGcRoundDeferCore` (`NoOverDelete` + `EventuallyFolded`). Verified by a
+  soak-harness ops-budget assertion (`S03`, `utils/ca-soak/scenarios/cards/s03_s05_scale.py`): an
+  isolated idle round's `CasGcGet` delta must be `< 50` (was ~1362) with `fsck dangling == 0`. **Not
+  resolved:** the large-delta case remains O(universe) per round — see Lever B below (incremental
+  point-updatable in-degree), still open.
 - **Logged (UTC):** 2026-07-05 (campaign S03 full 20M rows/400 parts)
 - **Severity:** s3-budget / efficiency
 - **Observed:** 161 idle-GC rounds over ~15 min on a STATIC pool: ~1362 CasGcGet + ~643 CasBlobHead
@@ -780,6 +792,15 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
   is unchanged — a large idle pool still burns steady S3 ops.
 
 ## S3-BUDGET/SCALABILITY — GC round duration is O(ref universe): ~93 s at 10000 tables
+- **RESOLVED (idle / small-delta case) 2026-07-06, `436714d80f0`..`3cba4f812f8` (Phase 4 Lever A,
+  "GC round skip-unchanged").** Same mechanism/fix as the `S3-BUDGET — idle GC …` entry above: a
+  round with no destructive decision DEFERs (re-adopts the sealed generation) instead of re-reading
+  the whole ref universe, with `graduationDue` force-folding within a bounded window so nothing is
+  starved. **Not resolved:** a round with a large delta (many tables actually changing in the same
+  round — the S05/S08 scaling this entry measured) is still O(universe) per fold, because a single
+  FOLD still rebuilds the whole in-degree generation. That is Lever B (incremental point-updatable
+  in-degree, so even a non-idle round is O(delta) not O(universe)) — still open, tracked in
+  `docs/superpowers/cas/ROADMAP.md` under "GC round is O(universe) not O(delta)".
   - **UPDATE (S08, 100000 tiny parts):** the same O(pool-object-count) scaling reached **398 s
     (6.6 min) for a SINGLE GC fold round** at ~100k parts (one round deleted 24392 manifests). Data
     points: 87 ms @ 400 parts (S03) -> 93 s @ 10k tables (S05) -> 398 s @ 100k parts (S08). The

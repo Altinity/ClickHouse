@@ -192,6 +192,19 @@ class S03(Scenario):
             list_counters, "pass",
             "recorded; a hard O(shards) bound oracle needs root_shards from config (not wired here)"))
 
+        # --- ops-budget: an IDLE round (no touch) does near-zero generation-run I/O -----------
+        # Phase 4 Lever A (GC round skip-unchanged; docs/superpowers/cas/ROADMAP.md): a round that
+        # makes no destructive decision DEFERs and re-adopts the sealed in-degree generation instead
+        # of rebuilding it from a full snapshot read. Pre-fix, BACKLOG "S3-BUDGET — idle GC has a high
+        # fixed per-round cost on a large static pool" measured ~1362 `CasGcGet` PER ROUND on a static
+        # pool; post-fix an isolated idle round (no touch immediately before it) should read near-zero.
+        idle_round_counters = _common.counters_window(ctx)
+        gc_mod.gc_drive_round(cl, log_fn=ctx.log)
+        idle_round_delta = idle_round_counters().get("_total", {})
+        idle_round_cas_gc_get = int(idle_round_delta.get("CasGcGet", 0))
+        result.observations["idle_round_ops_budget"] = {
+            k: int(idle_round_delta.get(k, 0)) for k in ("CasGcGet", "CasRootGet", "CasRootList")}
+
         _common.assert_replicas_agree(result, cl, sql.table_checksum_query(table),
                                       name="S03 replica agreement")
         end = _common.standard_end(ctx, result, [table])
@@ -199,6 +212,17 @@ class S03(Scenario):
         result.add(Verdict.check("live pool retained after idle GC",
                                  "fsck dangling==0 (live blobs not deleted by idle GC)",
                                  dangling, dangling == 0))
+
+        # Combine the isolated idle-round CasGcGet reading above with this checkpoint's fsck
+        # dangling==0 into the Phase 4 Lever A ops-budget acceptance check (spec §9).
+        ok_idle_budget = idle_round_cas_gc_get < 50 and dangling == 0
+        result.add(Verdict.check(
+            "idle GC round ops budget (Phase 4 Lever A skip-unchanged)",
+            "CasGcGet < 50 for an idle round (pre-fix ~1362; BACKLOG S3-BUDGET) and fsck dangling == 0",
+            f"CasGcGet={idle_round_cas_gc_get} dangling={dangling}", ok_idle_budget,
+            "" if ok_idle_budget else
+            "idle round re-read the generation in full (CasGcGet not near-zero) or left dangling refs "
+            "— the DEFER short-circuit may have regressed (see BACKLOG S3-BUDGET — idle GC)"))
 
 
 # ---------------------------------------------------------------------------
