@@ -90,23 +90,34 @@ Steps run in strict order; failure at any step aborts the open:
 **Status: DONE** (`cas-gc-ack-floor-fence`, `CasStore.cpp`, `CasServerRoot.cpp`).
 
 The standalone per-server watermark object and its `WatermarkKeeper` are **removed**: the build
-watermark folded into the mount lease, so one `SingleWriterSlot` subclass, one background thread, and
-one PUT per beat carry the lease extension, `min_active`, and the GC ack together (net **−1 PUT** per
-beat versus two heartbeats, **+1 GET** for the `gc/state` probe). The `MountLeaseKeeper`'s
-`observed_round_fn` runs the beat:
+watermark folded into the mount lease, so one `SingleWriterSlot` subclass and one PUT per renewal
+carry the lease extension, `min_active`, and the GC ack together (net **−1 PUT** per renewal versus
+two heartbeats).
 
-`Store::refreshViewForBeat` (every `T_renew`):
+**Lease / view-sync decouple** (2026-07-06, `cas-lease-view-sync-decouple`): the lease renewal and
+the retired-view refresh run on **separate threads**. The renewal reads only cheap, in-memory values,
+so the lease PUT does **no** `gc/state` GET and its cadence is independent of S3 latency (a slow view
+refresh can no longer push a renewal past its TTL — the S13 liveness bug). The `MountLeaseKeeper`'s
+`observed_round_fn` is `Store::observedGcRound` — the **currently-installed** `view_round`. A dedicated
+Store-owned poller thread runs the retired-view refresh on its own cadence, gated by
+`background_watermark` (production only):
 
-1. `GET gc/state`. On failure, skip steps 2–3 (the ack does not advance) but still attempt the
-   lease renewal — lease renewal is availability-critical, and a stale ack only stalls deletions
-   globally, which is safe.
-2. If `gc/state.round > view_round`, `GET` the current retired-list runs (per gc-shard, from
-   `retired_refs`). Any failure leaves the ack unadvanced this beat.
+`Store::syncRetiredView` (every `T_renew`, on the retired-view syncer thread):
+
+1. `GET gc/state`. On failure, leave the installed view (and therefore the advertised ack) unchanged
+   and retry next tick — the syncer never throws out of its loop.
+2. If `gc/state.round > view_round`, `GET` the current retired-list objects (per gc-shard, from
+   `retired_refs`). Any failure leaves the view unadvanced this tick.
 3. **Drain and swap:** take `view_gate` exclusive — this waits until every in-flight `mutateShard`
    that started under the old view has fully completed (its CAS response received; `mutateShard`
-   holds `view_gate` shared for its **whole** call) — then install the new retired view.
-4. `putOverwrite` the mount body: lease extension + `min_active` + `observed_gc_round = view_round`.
-   Token-guarded as before; a `PreconditionFailed` is a foreign touch ⇒ `tripMountLost`.
+   holds `view_gate` shared for its **whole** call) — then install the new retired view and emit one
+   `retired_view_advance` event per actual advance.
+
+The **lease renewal** (the keeper's renewal thread, every `T_renew`) `putOverwrite`s the mount body:
+lease extension + `min_active` + `observed_gc_round = observedGcRound()` (the last-installed
+`view_round`). Token-guarded as before; a `PreconditionFailed` is a foreign touch ⇒ `tripMountLost`.
+The advertised ack lags the syncer by at most one renewal period — conservative: a lower
+`observed_gc_round` only holds the heartbeat floor back, never advances it past an installed view.
 
 **Drain (the writer-side safety of the ack):** because the ack is advertised strictly *after* every
 old-view commit's CAS response, a heartbeat carrying `observed_gc_round = A` proves no commit with a
@@ -115,11 +126,15 @@ view older than `A` is still in flight from that server. **Monotone-ack invarian
 and drained.
 
 **Open ordering (writable open):** claim heartbeat (the S13 claim protocol; `gc_fenced` incarnations
-are simply superseded by the epoch bump) → load `gc/state` + retired list → stamp `observed_gc_round`
-via an immediate beat → **only then** enable mutations. This closes the new-mount-during-pass race:
-a mount the GC enumeration missed necessarily finished its creation PUT after the pass's round was
-already durable, so its first loaded view is ≥ that round. `doStart` anchoring the mount already
-carries an ack from a post-claim `gc/state` read, so the order holds by construction.
+are simply superseded by the epoch bump) → load `gc/state` + retired list (the initial
+`retire_view.refresh()` prime at open) → `doStart` stamps `observed_gc_round` via `observedGcRound()`
+→ **only then** enable mutations, and start the retired-view syncer thread. This closes the
+new-mount-during-pass race: a mount the GC enumeration missed necessarily finished its creation PUT
+after the pass's round was already durable, so its first loaded view is ≥ that round. `doStart`
+anchoring the mount already reads an ack from the post-claim view prime, so the order holds by
+construction. The **remount** path (`tryRemountOnce`, after a fence-out) has no such open-time prime,
+so it runs one synchronous `syncRetiredView()` before the fresh keeper's `doStart` — the fresh
+incarnation's first ack is current, not stale.
 
 ---
 
