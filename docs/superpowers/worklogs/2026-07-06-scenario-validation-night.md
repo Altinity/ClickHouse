@@ -19,6 +19,14 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **Full-scale (10000 tables, seed 20260707): PASS, 44/44 verdicts.** Clean at full scale — both servers clean-restarted with 10000 tables attached, the cluster came back, and: **all tables queryable after restart** + **no unknown-disk false positives** (the F1 `ca_ro` fix holds at 10000-table restart — the strongest F1 validation), **startup does not list all blobs** + startup root-metadata reads bounded (startup cost is metadata-bound, not blob-count-bound, confirmed at scale), first-query latency recorded, `fsck dangling=0`, replica agreement, event audit clean, GC no failed rounds. **S14 did NOT wedge on #3231** — bulk table creation is low-overwrite-churn (pool stayed at MB-scale metadata, no LIST storm). **This confirms the pattern: restart-heavy scenarios pass at full scale; only merge-CHURN-heavy scenarios (S13's 40 kill rounds) trigger the rustfs#3231 quiesce wedge.** S14 = clean PASS at full scale.
 
+## S15 — GC target-shard comparison {#s15}
+
+**What S15 checks:** runs the same workload under `gc_shards=1` (default) and `gc_shards=2` (gc_shards2 variant), asserts identical oracle checksums across shard counts, reducer memory doesn't balloon with shards, and `fsck dangling==0` under each.
+
+- **First run: FAIL (8/10)** — `no dangling after GC (gc_shards2)` = `None`. **Root-caused as MY OWN F1-fix regression, NOT a CAS bug:** the F1 fix pointed `soak/fsck.py` at `/etc/clickhouse-server/fsck-only.xml` globally, but I'd only mounted that file (and stripped `ca_ro`) in the DEFAULT compose — the **gc_shards2 compose still lacked the fsck-only mount**, so `clickhouse disks -C fsck-only.xml` found no config → fsck returned no summary → `dangling=None` → verdict fail. The real correctness verdicts PASSED even in this run: **identical oracle checksum default vs gc_shards2** (2400 rows, `12815430402022094066` both) and `orphan backlog drained (gc_shards2)`=0.
+- **Fix (F1 propagation):** stripped `ca_ro` from `storage_conf_gc_shards2_ch{1,2}.xml` and mounted `fsck_only_ca.xml` in `docker-compose-gc_shards2.yml` (both nodes). Re-run: **INCONCLUSIVE (9/10)** — both dangling verdicts now PASS (`default=0`, `gc_shards2=0`); the single remaining INCONCLUSIVE is `gc_shards=8 comparison` = unavailable (no gc_shards8 compose exists; only 1 and 2). That's a scale/infra gap, not a failure.
+- **Verdict: sharded-GC correctness VALIDATED** — identical results at gc_shards 1 and 2, dangling=0 both, reducer memory flat (0.60 → 0.61 GB), orphan backlog drained. The gc_shards=8 arm is unavailable (would need a gc_shards8 compose). No CAS defect. (Reminder for later: `10replicas`/`awss3` server configs still embed `ca_ro` + lack the fsck-only mount — same F1 propagation needed before their scenarios' fsck works.)
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
