@@ -230,6 +230,69 @@ TEST(CasGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
     EXPECT_EQ(fsck.dangling, 0u);
 }
 
+/// Companion to the test above: it proves `graduationDue` is the SOLE fold trigger at the assertion
+/// round. `DueGraduationForcesFoldAndSparesReReferencedBlob` opens its store at the DEFAULT
+/// `gc_fold_threshold` (1), so at its assertion round the +1 re-reference ALSO makes
+/// `changed_shards (>= 1) >= fold_threshold (1)` true -- that branch of `shouldDeferRound` would force
+/// the very same fold even if `graduationDue` were deleted or hard-wired false. Here `gc_fold_threshold`
+/// and `gc_fold_max_defer_rounds` are both set to 1000, so neither the changed-shards branch (one
+/// changed shard is nowhere near 1000) nor the liveness-bound branch (this is round 1) can fire --
+/// `graduationDue` is the ONLY thing in `shouldDeferRound` that can force this round's fold, making
+/// `EXPECT_FALSE(rep.deferred)` below load-bearing for `graduationDue` specifically.
+TEST(CasGcRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+                   .gc_trim_min_events = 0, .gc_fold_threshold = 1000, .gc_fold_max_defer_rounds = 1000});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    const UInt128 blob(1);
+
+    Gc gc(store, kGc);
+    /// Warm-up round on the still-empty pool: `gc/state` does not exist yet, so lease acquisition takes
+    /// the create-fresh path and succeeds immediately (`gc_id` becomes the owner in storage). This
+    /// matters because the `injectRetire` seeding below writes `gc/state` directly, and a fresh `Gc`
+    /// object's FIRST-EVER `acquireOrRenewLease` call against a PRE-EXISTING lease it has never observed
+    /// refuses to steal it (two-observation safety against stealing from a live incumbent) -- it would
+    /// return `acquired_lease=false` and the round would bail out BEFORE the fold-decision code, making
+    /// `EXPECT_FALSE(rep.deferred)` below vacuously true regardless of `graduationDue`. Running this
+    /// warm-up round FIRST makes `gc_id` the observed incumbent, so the assertion round's lease RENEWAL
+    /// (not a steal) succeeds unconditionally and the round actually reaches the decision it's testing.
+    gc.runRegularRound();
+
+    writeBlobBody(*backend, layout, blob);
+
+    /// Seed the CURRENT retired list directly with B already `delete_pending`, mirroring
+    /// `CasGcRoundDefer.GraduationDueDetectsDuePendingAndFloorCrossing` (Task 3's helper). At
+    /// `gc_fold_threshold = 1000` a real condemn -> graduate pipeline of `runRegularRound` calls is not
+    /// usable to set this up: every round before graduation would ITSELF defer (nothing due yet, and
+    /// changed_shards never nears 1000), so the pending state is injected directly instead of driven
+    /// through real rounds. `round`/`fence_seq` are passed as 0 to match the warm-up round's untouched
+    /// (deferred, so never advanced) persisted state.
+    injectRetire(*backend, layout, /*round*/0, /*fence_seq*/0, /*shard*/0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = blob, .token = {}, .size = 0,
+                      .condemn_round = 0, .delete_pending = true}});
+
+    /// The +1: a fresh manifest re-references B while it sits `delete_pending` -- one changed shard,
+    /// far below the threshold of 1000.
+    const ManifestRef r{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0xBB};
+    writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+
+    const RoundReport rep = gc.runRegularRound();
+
+    /// DISCRIMINATING (load-bearing): with graduationDue intact, the due delete_pending entry forces
+    /// the fold. If graduationDue were broken/hard-wired false, changed_shards (1) < threshold (1000)
+    /// and the defer bound (1000) is nowhere near reached, so `shouldDeferRound` would return true and
+    /// this round would DEFER instead.
+    EXPECT_FALSE(rep.deferred) << "a due graduation must be the SOLE fold trigger at a high fold threshold";
+    EXPECT_FALSE(blobAbsent(*backend, layout, blob)) << "the re-referenced blob must survive the forced fold";
+
+    const FsckReport fsck = runFsck(*store, /*detail*/true);
+    EXPECT_EQ(fsck.dangling, 0u);
+}
+
 /// Bounded deferral: with a large fold_threshold and a small standing delta (one shard changed,
 /// forever, since deferring never resolves it), at most gc_fold_max_defer_rounds consecutive rounds
 /// defer, then one round forces a fold (the liveness bound).
