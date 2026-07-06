@@ -116,6 +116,15 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 - `no unbounded leftovers` = inconclusive (residual=33, fsck prefix-detail unavailable to classify — same harness gap as prior scenarios; content itself reclaims per the drain check).
 - **This is the clean controlled corroboration of F5** (S30 showed 75→190 under mixed churn; S34 isolates it: root_dirs flat, CasRootGet linear in iterations). Same root cause; folded into the F5 backlog entry. **Design-sensitive** (D1 registry-reclaim path, same TLA+-gated area as the 2026-06-27 concurrent-leader leak) → backlog for code investigation, NOT an inline fix.
 
+## S35 — rapid same-name rotation: D1 incarnation monotonicity {#s35}
+
+**Dev-scale (30 tight `CREATE t; INSERT; DROP t` cycles on the same name `s35_rotation`, seed 20260707): effectively GREEN — 13/14 pass, the 1 inconclusive is the benign harness leftovers-classification gap.**
+- **Resurrect invariant holds under speed (the point of S35):** `no dangling after rapid same-name rotation`=0 and `rotation residual reclaimed to 0 (D1 reclaimable drain)`=0 — reclaim racing recreate on the same name (greater incarnation) and the revive-races-reclaim window at speed produced **no dangling, no leak, no revived-condemned object**. `[[feedback_ca_resurrect_invariant]]` validated live.
+- **Correctness:** `final recreated table queryable`=1, `S35 final-table replica agreement` identical checksum both nodes, `no bad CA-log events`=0, `no CREATE errors`=0, `no INSERT errors`=0, `event audit`=0, `GC no Failed rounds`=0.
+- **F3 did NOT fire here:** `dryrun ⊆ unreachable` = 0 candidates / 0 unreachable → PASS. Confirms F3 is *not* universal — it only manifests when dead-but-misclassified blobs exist at the dryrun snapshot (S18/S25/S26 reachable-variant, S33 pending-gc-variant); when the store is clean at snapshot time, dryrun is correct.
+- `no unbounded leftovers` = inconclusive (residual=43, fsck prefix-detail unavailable) — same harness gap as S33/S34, not a defect; the reclaimable-drain check separately confirms content reclaims to 0.
+- S3 error rates (info): read max 10.4% / write max 4.2% — rustfs under mild pressure at this cadence, retries absorbed, no functional impact.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
