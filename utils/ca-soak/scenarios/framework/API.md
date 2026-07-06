@@ -73,7 +73,7 @@ class S0X(Scenario):
 
 ## Observability (`framework.observe`)
 - `pool_shape(timeout_s=)` -> `{prefix:{objects,bytes}, "_total":{...}, "_ok":bool}` for prefixes
-  `blobs/roots/_manifests/_files/gc/other`.
+  `blobs/roots/_manifests/refs/_files/gc/_pool_meta/other`.
 - `cluster_events_snapshot(cluster)` / `cluster_events_delta(before, after)` — `Cas*`/`DiskS3*`/`S3*`.
 - `gc_log_all(cluster, since)` -> `{per_node, summary{failed,not_a_leader,success,deleted_total,...}}`.
 - `ca_event_counts_all(cluster, since)` -> `{per_node, bad_total}` (bad = read_missing/dangling_access/

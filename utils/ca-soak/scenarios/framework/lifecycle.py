@@ -158,7 +158,7 @@ def quiesce_cluster(cluster, tables, *, table_filter: str | None = None, optimiz
 def settle_fsck(container: str = DEFAULT_FSCK_CONTAINER, disk: str = DEFAULT_FSCK_DISK,
                 *, stable: int = 2, timeout_s: float = 300.0, interval_s: float = 3.0,
                 log_fn=print) -> dict:
-    """Poll a summary fsck until reachable+unreachable are stable for `stable` reads (publishes from
+    """Poll a summary fsck until reachable+dangling are stable for `stable` reads (publishes from
     the just-drained workload have settled), then return the last summary."""
     deadline = time.time() + timeout_s
     history = []

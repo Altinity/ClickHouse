@@ -61,6 +61,18 @@ def test_unreachable_manifest_is_reclaimable_not_bookkeeping():
     assert buckets == {"_manifests": 1, "blobs": 1, "gc": 1}
 
 
+def test_identity_from_key_post_relocation():
+    from scenarios.framework.observe import _identity_from_key
+
+    blob = _identity_from_key("soak_pool/blobs/ab/abcdef0123456789")
+    assert blob["object_hash"] == "abcdef0123456789"
+    man = _identity_from_key(
+        "soak_pool/cas/manifests/ca_soak_ch1/store/aa/uuid-1/3/12/000001.proto")
+    assert man["object_hash"] is None          # ordinal stem is NOT an id — must not be misused
+    assert man["token"] is None
+    assert man["namespace_hint"] == "ca_soak_ch1"
+
+
 def test_s3_error_rate_computation():
     from scenarios.framework.observe import _rates_from_counters
 

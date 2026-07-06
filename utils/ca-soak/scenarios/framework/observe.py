@@ -4,7 +4,8 @@ Everything the README §"Common observations" asks for, gathered from a running 
 
 - CA ProfileEvents counters (`Cas*`, `DiskS3*`, `S3*`) via `system.events` snapshot/delta.
 - Per-node server memory (`MemoryResident`, `MemoryTracking`) and cgroup container samples.
-- Physical pool shape: object count + bytes by prefix (`blobs`, `roots`, `_manifests`, `_files`, `gc`).
+- Physical pool shape: object count + bytes by prefix (`blobs`, `roots`, `_manifests`, `refs`,
+  `_files`, `gc`, `_pool_meta`).
 - `system.content_addressed_garbage_collection_log` rows + per-round outcomes.
 - `system.content_addressed_log` event counts by `event_type` / `object_kind` / `outcome`.
 - Raw system-table extracts written to TSV files for the run archive.
@@ -498,25 +499,26 @@ def dump_standard_extracts(ctx, cluster) -> None:
 # ---------------------------------------------------------------------------
 
 def _identity_from_key(key: str) -> dict:
-    """Best-effort extract the CA-log identity of an object from its pool key.
+    """Best-effort extract the CA-log identity of an object from its pool key, using the same
+    layout-aware classification as `classify_pool_path`.
 
-    A blob key `.../blobs/<aa>/<hash>` -> object_hash=<hash>. A part-manifest key
-    `.../_manifests/.../<aa>/<id>.proto` -> the manifest_instance_id stem (queried as both object_hash
-    and token, since the CA log keys manifest events differently across event types). Other keys yield
-    only the namespace path for a coarse ref/namespace match."""
+    A blob key (bucket `blobs`, `.../blobs/<aa>/<hash>`) -> object_hash=<hash>. A manifest key
+    (bucket `_manifests`, `cas/manifests/<srid>/store/<aa>/<uuid>/<gen>/<shard>/NNNNNN.proto`) carries
+    NO queryable id in the key itself: `NNNNNN` is a per-build ordinal, not a manifest id, and must
+    never be used as object_hash/token (that was the pre-relocation bug — this key shape used to be
+    matched by a stale `/_manifests/` substring check that no longer exists post-relocation). Only the
+    srid (the path segment right after `cas/manifests/`) is recoverable, as `namespace_hint`. Every
+    other key yields only the bare key with no identity."""
     out = {"key": key, "object_hash": None, "token": None, "namespace_hint": None}
-    if "/blobs/" in key:
+    klass = classify_pool_path(key)
+    if klass == "blobs":
         out["object_hash"] = key.rsplit("/", 1)[-1]
         return out
-    if "/_manifests/" in key:
-        stem = key.rsplit("/", 1)[-1]
-        if stem.endswith(".proto"):
-            stem = stem[:-len(".proto")]
-        out["object_hash"] = stem
-        out["token"] = stem
-        # namespace = the path segment right after roots/
-        if "/roots/" in key:
-            after = key.split("/roots/", 1)[1]
+    if klass == "_manifests":
+        marker = "cas/manifests/"
+        idx = key.find(marker)
+        if idx != -1:
+            after = key[idx + len(marker):]
             out["namespace_hint"] = after.split("/", 1)[0]
         return out
     return out
@@ -554,13 +556,19 @@ def dump_object_forensics(ctx, cluster, fsck_detail_res: dict, *, dangling_cap: 
     for klass, r in suspects:
         ident = _identity_from_key(r.get("key", ""))
         rows = []
-        for n in nodes:
-            if ident["object_hash"] or ident["token"]:
+        if ident["object_hash"] or ident["token"]:
+            for n in nodes:
                 rows += [dict(node=n.container, **row) for row in
                          object_lifetime(n, object_hash=ident["object_hash"], token=ident["token"])]
-        rows.sort(key=lambda x: x.get("event_time_microseconds", ""))
-        traces.append({"class": klass, "key": r.get("key"), "size": r.get("size"),
-                       "identity": ident, "lifetime": rows})
+            rows.sort(key=lambda x: x.get("event_time_microseconds", ""))
+        trace = {"class": klass, "key": r.get("key"), "size": r.get("size"),
+                 "identity": ident, "lifetime": rows}
+        if not ident["object_hash"] and not ident["token"]:
+            # Manifest keys (post-relocation layout) carry no queryable id — make the gap visible
+            # in the dump instead of silently emitting an empty-looking trace.
+            trace["note"] = ("manifest key carries no queryable id (post-relocation layout); "
+                              "see fsck detail + ca log by namespace")
+        traces.append(trace)
     (fdir / "object_lifetimes.json").write_text(json.dumps(traces, indent=2, default=str))
     summary = {"traced": len(traces), "dangling": len(dangling), "unreachable_sampled": len(unreachable),
                "dir": "forensics/"}

@@ -63,28 +63,6 @@ def test_scenario_result_finalize_and_markdown():
     assert "S99" in md and "fsck dangling" in md and "Budget verdict" in md
 
 
-def test_pool_shape_classification_logic():
-    # Simulate the classifier on representative relative paths.
-    samples = [
-        "blobs/aa/HASH1",
-        "roots/NS/_manifests/W/1/aa/M.proto",
-        "roots/NS/_files/mutation_5.txt",
-        "roots/NS/3",          # root shard object
-        "gc/gen/5/blob_target/0/0/xl.meta",
-        "_pool_meta",
-    ]
-    buckets = []
-    for rel in samples:
-        if "/_manifests/" in rel:
-            buckets.append("_manifests")
-        elif "/_files/" in rel:
-            buckets.append("_files")
-        else:
-            head = rel.split("/", 1)[0]
-            buckets.append(head if head in ("blobs", "gc", "roots") else "other")
-    assert buckets == ["blobs", "_manifests", "_files", "roots", "gc", "other"]
-
-
 def test_select_by_priority_and_name():
     # Registry is populated by importing cards; select() should resolve priorities and names.
     import scenarios.cards  # noqa: F401
