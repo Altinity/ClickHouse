@@ -211,7 +211,9 @@ TEST(CasFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
     const auto scoped = DB::Cas::runFsck(*store, false, {}, {}, false, /*namespace_prefix=*/"nsa");
     EXPECT_EQ(scoped.dangling, 0u);
     EXPECT_GT(scoped.reachable, 0u);
-    /// scoped mode does not classify the rest of the pool:
+    /// Scoped mode skips only the POOL-WIDE physical/pipeline classification; the manifest-debris
+    /// pass stays active for the scoped namespaces, so `unreachable` here counts THEIR orphan
+    /// manifest bodies — zero in this clean setup, legitimately nonzero on a churned pool.
     EXPECT_EQ(scoped.unreachable, 0u);
     EXPECT_EQ(scoped.pending_gc + scoped.awaiting_gc + scoped.unaccounted, 0u);
 }

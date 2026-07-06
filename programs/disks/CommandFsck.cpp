@@ -26,8 +26,9 @@ public:
                       "Exits nonzero if any reachable object is missing (dangling).";
         options_description.add_options()("detail", "list per-object rows (class, key, size, reachable_from)")(
             "timeout", po::value<UInt64>(), "abort the scan after N seconds with a clear error instead of hanging (default 600; 0 = unbounded)")(
-            "namespace", po::value<String>(), "scope the scan to namespaces with this prefix (dangling-only mode: "
-                                               "the pool-wide unreachable classification is skipped)")(
+            "namespace", po::value<String>(), "scope the scan to namespaces with this prefix (skips the pool-wide "
+                                               "physical/pipeline classification; still reports the scoped namespaces' "
+                                               "dangling refs and orphan-manifest debris as unreachable)")(
             "partial", "on --timeout, print the counts accumulated so far flagged partial=1 instead of aborting empty-handed");
     }
 
