@@ -80,6 +80,10 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **Dev-scale (seed 20260707): FAIL 11/13 — F3 AGAIN (3rd occurrence).** Core passes: `verbatim churn fsck clean`=0, `fsck dangling=0`, replica agreement. FAIL is `dryrun ⊆ unreachable`: 63 blobs fsck calls reachable, real GC keeps (`dangling=0`). **F3 now confirmed at 3 independent scenarios (S18 shadow / S25 non-Atomic / S26 verbatim churn), always over-proposing reachable BLOBS, real GC always safe** — this is a broad `ca-gc-dryrun` reachability under-count, not an edge case. (Effectively these three scenarios "pass" on all safety verdicts; only the dryrun-oracle false-fails.) No new info beyond F3; strengthens the backlog priority to fix `ca-gc-dryrun`'s reachability.
 
+## S28 — concurrent wide/large insert scratch pressure {#s28}
+
+**Dev-scale (seed 20260707): PASS 12/12.** Clean — concurrent wide/large-insert scratch pressure handled; `dangling=0`, no leftovers, event audit clean. No CAS defect (the whole-part scratch-spill resource concern is a documented separate item, not a correctness fail).
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
