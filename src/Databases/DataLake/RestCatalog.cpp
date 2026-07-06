@@ -73,6 +73,10 @@ namespace ProfileEvents
     extern const Event DataLakeRestCatalogGetCredentialsMicroseconds;
     extern const Event DataLakeRestCatalogCredentialsVended;
     extern const Event DataLakeRestCatalogCredentialsCacheHits;
+    extern const Event DataLakeRestCatalogAuthTokenCacheHits;
+    extern const Event DataLakeRestCatalogAuthTokenRefreshed;
+    extern const Event DataLakeRestCatalogAuthTokenRefreshedMicroseconds;
+    extern const Event DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized;
     extern const Event DataLakeRestCatalogCreateNamespace;
     extern const Event DataLakeRestCatalogCreateNamespaceMicroseconds;
     extern const Event DataLakeRestCatalogCreateTable;
@@ -278,6 +282,10 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
         {
             access_token = retrieveAccessToken();
         }
+        else
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCacheHits);
+        }
 
         DB::HTTPHeaderEntries headers;
         headers.emplace_back("Authorization", "Bearer " + access_token.value().token);
@@ -313,6 +321,9 @@ OneLakeCatalog::OneLakeCatalog(
 
 AccessToken RestCatalog::retrieveAccessToken() const
 {
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
+
     static constexpr auto oauth_tokens_endpoint = "oauth/tokens";
 
     /// TODO:
@@ -444,6 +455,10 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
         {
             access_token = retrieveGoogleCloudAccessToken();
         }
+        else
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCacheHits);
+        }
 
         DB::HTTPHeaderEntries headers;
         headers.emplace_back("Authorization", "Bearer " + access_token->token);
@@ -467,6 +482,9 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() const
 {
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
+
     if (google_adc_client_id.empty() || google_adc_client_secret.empty() || google_adc_refresh_token.empty())
         throw DB::Exception(
             DB::ErrorCodes::BAD_ARGUMENTS,
@@ -498,6 +516,9 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 
     /// Fallback to GCP metadata service (works inside GCP infrastructure)
     /// https://cloud.google.com/compute/docs/metadata/overview
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
+
     static constexpr auto DEFAULT_REQUEST_TOKEN_PATH = "/computeMetadata/v1/instance/service-accounts";
 
     Poco::URI url;
@@ -614,6 +635,7 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
             (status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED
              || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN))
         {
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized);
             return create_buffer(true);
         }
         throw;
@@ -1077,24 +1099,53 @@ void RestCatalog::sendRequest(const String & endpoint, Poco::JSON::Object::Ptr r
     DB::HTTPHeaderEntries extra_headers;
     extra_headers.emplace_back("Content-Type", "application/json");
 
-    DB::HTTPHeaderEntries headers = getAuthHeaders(/* update_token = */ true, method, url, extra_headers, body_str);
-    headers.emplace_back("Content-Type", "application/json");
-    auto wb = DB::BuilderRWBufferFromHTTP(url)
-        .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
-        .withMethod(method)
-        .withSettings(context->getReadSettings())
-        .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
-        .withHostFilter(&context->getRemoteHostFilter())
-        .withHeaders(headers)
-        .withOutCallback(out_stream_callback)
-        .withSkipNotFound(false)
-        .create(credentials);
+    auto create_buffer = [&](bool update_token)
+    {
+        DB::HTTPHeaderEntries headers = getAuthHeaders(update_token, method, url, extra_headers, body_str);
+        headers.emplace_back("Content-Type", "application/json");
+        return DB::BuilderRWBufferFromHTTP(url)
+            .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
+            .withMethod(method)
+            .withSettings(context->getReadSettings())
+            .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
+            .withHostFilter(&context->getRemoteHostFilter())
+            .withHeaders(headers)
+            .withOutCallback(out_stream_callback)
+            .withSkipNotFound(false)
+            .create(credentials);
+    };
 
-    String response_str;
-    if (!ignore_result)
-        readJSONObjectPossiblyInvalid(response_str, *wb);
-    else
-        wb->ignoreAll();
+    try
+    {
+        auto wb = create_buffer(false);
+
+        String response_str;
+        if (!ignore_result)
+            readJSONObjectPossiblyInvalid(response_str, *wb);
+        else
+            wb->ignoreAll();
+    }
+    catch (const DB::HTTPException & e)
+    {
+        const auto status = e.getHTTPStatus();
+        if (update_token_if_expired &&
+            (status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED
+             || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN))
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized);
+            auto wb = create_buffer(true);
+
+            String response_str;
+            if (!ignore_result)
+                readJSONObjectPossiblyInvalid(response_str, *wb);
+            else
+                wb->ignoreAll();
+        }
+        else
+        {
+            throw;
+        }
+    }
 }
 
 void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, const String & location) const

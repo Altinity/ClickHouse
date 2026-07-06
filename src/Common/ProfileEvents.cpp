@@ -1431,6 +1431,10 @@ The server successfully detected this situation and will download merged part fr
     M(DataLakeRestCatalogGetCredentialsMicroseconds, "Total time of 'get credentials' requests to Iceberg REST catalog.", ValueType::Microseconds) \
     M(DataLakeRestCatalogCredentialsVended, "Number of table metadata requests to Iceberg REST catalog that asked the catalog to vend storage credentials (i.e. cache miss).", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsCacheHits, "Number of table metadata requests to Iceberg REST catalog that reused cached storage credentials and did not ask the catalog to vend new ones.", ValueType::Number) \
+    M(DataLakeRestCatalogAuthTokenCacheHits, "Number of requests to Iceberg REST catalog that reused a cached access token and did not fetch a new one.", ValueType::Number) \
+    M(DataLakeRestCatalogAuthTokenRefreshed, "Number of new access tokens fetched for Iceberg REST catalog (OAuth client-credentials or GCP metadata/ADC).", ValueType::Number) \
+    M(DataLakeRestCatalogAuthTokenRefreshedMicroseconds, "Total time spent fetching access tokens for Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized, "Number of Iceberg REST catalog HTTP requests retried with a new access token after HTTP 401 or 403.", ValueType::Number) \
     M(DataLakeRestCatalogCreateNamespace, "Number of 'create namespace' requests to Iceberg REST catalog.", ValueType::Number) \
     M(DataLakeRestCatalogCreateNamespaceMicroseconds, "Total time of 'create namespace' requests to Iceberg REST catalog.", ValueType::Microseconds) \
     M(DataLakeRestCatalogCreateTable, "Number of 'create table' requests to Iceberg REST catalog.", ValueType::Number) \
@@ -1465,6 +1469,8 @@ The server successfully detected this situation and will download merged part fr
     M(DataLakeUnityCatalogGetSchemasMicroseconds, "Total time of 'get schemas' requests to Iceberg Unity catalog.", ValueType::Microseconds) \
     M(DataLakeUnityCatalogGetCredentials, "Number of 'get credentials' requests to Iceberg Unity catalog.", ValueType::Number) \
     M(DataLakeUnityCatalogGetCredentialsMicroseconds, "Total time of 'get credentials' requests to Iceberg Unity catalog.", ValueType::Microseconds) \
+    \
+    M(DataLakePaimonRestCatalogAuthTokenRefreshedOnUnauthorized, "Number of Paimon REST catalog DLF HTTP requests retried with a new authorization signature after HTTP 401.", ValueType::Number) \
 
 
 #ifdef APPLY_FOR_EXTERNAL_EVENTS
