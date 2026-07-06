@@ -278,7 +278,7 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
     /// https://github.com/apache/iceberg/blob/3badfe0c1fcf0c0adfc7aa4a10f0b50365c48cf9/open-api/rest-catalog-open-api.yaml#L3498C5-L3498C34
     if (!client_id.empty())
     {
-        if (!access_token.has_value() || update_token)
+        if (!access_token.has_value() || update_token || access_token->isExpired())
         {
             access_token = retrieveAccessToken();
         }
@@ -482,9 +482,6 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() const
 {
-    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
-    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
-
     if (google_adc_client_id.empty() || google_adc_client_secret.empty() || google_adc_refresh_token.empty())
         throw DB::Exception(
             DB::ErrorCodes::BAD_ARGUMENTS,
@@ -502,6 +499,9 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() con
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 {
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
+
     if (!google_adc_client_id.empty() && !google_adc_client_secret.empty() && !google_adc_refresh_token.empty())
     {
         try
@@ -516,9 +516,6 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 
     /// Fallback to GCP metadata service (works inside GCP infrastructure)
     /// https://cloud.google.com/compute/docs/metadata/overview
-    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
-    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
-
     static constexpr auto DEFAULT_REQUEST_TOKEN_PATH = "/computeMetadata/v1/instance/service-accounts";
 
     Poco::URI url;
