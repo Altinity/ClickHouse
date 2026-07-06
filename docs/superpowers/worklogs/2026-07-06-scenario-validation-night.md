@@ -62,6 +62,10 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **S22** (object-store throttling & retry budget) and **S27** (backend LIST pagination ambiguity) require a **fault-injecting S3 proxy** (503/429/slow/connection-close for S22; duplicate/unstable LIST pages for S27) interposed between ClickHouse and RustFS — not available on this stand (direct rustfs1 endpoint). NOT RUN (unchanged from prior campaigns). NOTE: S22's proxy is also what would let Task-6's mount-lease decouple be validated under *induced* S3 latency, and would let the rustfs#3231/503 wedge (F2) be exercised deliberately — a high-value dedicated infra build (BACKLOG estimate ~3h: toxiproxy + HTTP-status injector).
 
+## S23 — idle shared pool baseline {#s23}
+
+**Dev-scale (seed 20260707): INCONCLUSIVE 14/16 — effectively PASS.** 14 pass (all safety: `dangling=0`, no leftovers, event audit clean); the 2 INCONCLUSIVE are `1-server idle baseline` + `10-server idle baseline` — recorded-only idle-GC-cost observations (no fixed budget; the 10-server arm needs the unavailable 10-replica infra). Corroborates the documented S3-BUDGET idle-GC-cost item; no CAS defect.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
