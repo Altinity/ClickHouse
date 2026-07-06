@@ -34,8 +34,10 @@ BAD_EVENT_TYPES = (
     "snap_journal_incoherent", "exception",
 )
 
-# Pool prefixes reported in every run (README §"Common observations").
-POOL_PREFIXES = ("blobs", "roots", "_manifests", "_files", "gc")
+# Pool prefixes reported in every run (README §"Common observations"). Layout-aware buckets from
+# `classify_pool_path` (per-server-tree relocation): `_manifests` = `cas/manifests/`, `refs` =
+# `cas/refs/`. Key NAMES kept from the pre-relocation era — cards consume them.
+POOL_PREFIXES = ("blobs", "_manifests", "refs", "roots", "_files", "gc", "_pool_meta")
 
 
 def classify_pool_path(key: str) -> str:
@@ -224,9 +226,9 @@ def pool_shape(timeout_s: float = 120.0) -> dict:
     """Object count + bytes by prefix for the physical CA pool, via a single `find` inside the RustFS
     container. Returns {prefix: {objects, bytes}, "_total": {...}, "_ok": bool}.
 
-    Classification of each file path (relative to the pool dir):
-      contains `/_manifests/` -> _manifests ; `/_files/` -> _files ;
-      first component `blobs` -> blobs ; `gc` -> gc ; `roots` -> roots ; else `other`.
+    Classification of each file path (relative to the pool dir) is `classify_pool_path` — the
+    layout-aware shared classifier (blobs / cas/manifests -> _manifests / cas/refs -> refs /
+    roots / gc / _files / _pool_meta / other).
 
     This is O(filesystem inodes). On a multi-million-object pool it can be slow, so it is
     timeout-guarded; a timeout/failure yields `_ok=False` with whatever partial totals exist (the
@@ -255,13 +257,7 @@ def pool_shape(timeout_s: float = 120.0) -> dict:
         except ValueError:
             continue
         rel = path[2:] if path.startswith("./") else path
-        if "/_manifests/" in rel:
-            bucket = "_manifests"
-        elif "/_files/" in rel:
-            bucket = "_files"
-        else:
-            head = rel.split("/", 1)[0]
-            bucket = head if head in ("blobs", "gc", "roots") else "other"
+        bucket = classify_pool_path(rel)
         shape[bucket]["objects"] += 1
         shape[bucket]["bytes"] += size
         total_obj += 1
