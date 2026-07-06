@@ -135,8 +135,11 @@ So every accumulated delta is folded within a bounded number of rounds; reclaim 
 
 The round's `gc/state` advance is lease-guarded (attempt-scoped generation adoption, unchanged). A
 DEFER round writes nothing to `gc/state` (§5), so it changes nothing durable — a deposed leader's
-DEFER is inert. A FOLD round is the same single lease-guarded CAS as today. The gate models
-concurrent FOLD/DEFER/adopt.
+DEFER is inert. A FOLD round is the same single lease-guarded CAS as today. Leader/lease mutual
+exclusion is **below this model's abstraction** (it is proven by `CaGcLeaseCore` + the attempt-scoped
+generation adoption, unchanged here) — the `CaGcRoundDeferCore` gate models the DEFER/FOLD/graduate
+hazard, which is leader-agnostic: the +1-over-delete failure exists even for a single leader, so
+proving it single-leader is sufficient.
 
 ## 5. State-machine changes {#state-machine}
 
@@ -174,7 +177,8 @@ Extend/author a model (candidate `CaGcRoundDeferCore`) over the fold/graduate/de
 
 - **Actions:** `FoldRound` (fold accumulated delta, may condemn / graduate / delete), `DeferRound`
   (re-adopt, no snapshot change, no delete), `WriterAddEdge` (+1), `WriterRemoveEdge` (−1),
-  `AckAdvance` (min_ack rises), concurrent-leader variants.
+  `AckAdvance` (min_ack rises). (Single implicit leader — leader/lease mutual exclusion is below the
+  model's abstraction, as in `CaGcAckFloorCore`; the +1/defer hazard is leader-agnostic.)
 - **Invariants:**
   - `NoOverDelete` — a blob is never physically deleted while a live (folded-or-unfolded) `+1`
     reference exists (the +1 hazard). Equivalent to: every graduation is immediately preceded by a
