@@ -31,6 +31,10 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **Dev-scale (seed 20260707): INCONCLUSIVE 9/10 — effectively PASS.** 9 verdicts pass (all safety: `fsck dangling=0`, replica agreement, orphan drained, event audit clean, GC no failed rounds, no unbounded leftovers); the 1 INCONCLUSIVE is `resurrection counters recorded` — an observability gate (the condemned-blob revival/W-REVALIDATE counter wasn't exercised in the short dev window, like S13's precommit-reclaim gate). **No dangling, no wedge** — the hot-content overwrite churn at dev scale stayed under the #3231 threshold. (Full-scale hot-content churn would be #3231-limited like S13; validated at dev.) Note: BACKLOG had a historical S16 `dangling=1` forensics investigation (GC-CONCURRENT-LEADER-DANGLING) — **not reproduced here** (dangling=0).
 
+## S17 — detached, attach, drop detached {#s17}
+
+**Dev-scale (seed 20260707): PASS, 13/13 verdicts.** Clean — detach/attach/drop-detached lifecycle correct; `dangling=0`, replica agreement, event audit clean, no unbounded leftovers. No CAS defect. (Attach/detach-focused, low overwrite-churn → not #3231-sensitive.)
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
