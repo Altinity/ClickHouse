@@ -65,7 +65,12 @@ ManifestId publishPart(const StorePtr & s, const String & ns, const String & ref
 TEST(CasGcLog, EmitsStartFinishWithCounts)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    /// gc_fold_max_defer_rounds=0: this test drives up to 16 consecutive rounds through the scheduler
+    /// (no direct Gc handle to override per-instance) expecting each to fold; force fold-every-round
+    /// (Phase-4 Lever A would otherwise defer once the pool quiesces, stalling the mark-then-delete
+    /// pipeline within the round budget).
+    auto store = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"srv1/tbl"};
 
     /// Publish a part, then drop it so its blob/tree become collectable.

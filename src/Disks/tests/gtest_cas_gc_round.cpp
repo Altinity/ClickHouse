@@ -800,7 +800,7 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep the default 3 generations; one root shard so cursor keys are "ns/0".
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -851,7 +851,7 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -927,7 +927,7 @@ TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=3 retention floor (matches WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes).
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -986,7 +986,7 @@ TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=1: the retention floor is aggressive so the cursor reaches gen-1's neighbourhood fast.
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 1});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1045,7 +1045,7 @@ TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
 TEST(CasGcRetention, HandOffDeletesSupersededRef)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 1});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xAA);
 
@@ -1281,7 +1281,8 @@ TEST(CasGcRound, MaintenanceTrimCompactsEverythingOnce)
     /// Large thresholds so lazy trim never fires on its own.
     auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
                                                  .gc_trim_min_events = 256,
-                                                 .gc_trim_body_soft_limit = 1024ULL * 1024 * 1024});
+                                                 .gc_trim_body_soft_limit = 1024ULL * 1024 * 1024,
+                                                 .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/cc@cas@"};
     const ManifestRef r1 = ref(1, 0xF1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(0xAA));
@@ -1365,6 +1366,9 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     config.server_root_id = "test";
     config.manifest_sweep_list_budget_keys = 1;
     config.manifest_sweep_delete_budget_keys = 1;
+    /// This test drives MANY consecutive rounds expecting each to sweep + persist the cursor; force
+    /// fold-every-round (Phase-4 Lever A would otherwise defer once the pool quiesces).
+    config.gc_fold_max_defer_rounds = 0;
     auto store = openTestStoreWithConfig(backend, config);
 
     const RootNamespace ns{"test/aa@cas@"};

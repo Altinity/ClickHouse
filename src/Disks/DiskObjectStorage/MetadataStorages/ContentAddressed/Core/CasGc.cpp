@@ -186,6 +186,36 @@ RoundReport Gc::runRegularRound()
                     {"already_fenced", std::to_string(floor.already_fenced)}};
     });
 
+    /// Phase-4 skip-unchanged (spec 2026-07-06): decide DEFER vs FOLD from cheap pre-fold signals.
+    /// A DEFER round re-adopts the sealed generation — no fold, no delete, no gc/state write — so a
+    /// slow idle/small-delta round no longer rebuilds the whole in-degree snapshot. Safety: a due
+    /// graduation forces a FOLD (graduationDue), so no destructive decision runs on a stale snapshot.
+    {
+        const bool graduation_due = graduationDue(state, floor.min_ack);
+        const size_t changed = changedShardCount(state);
+        if (shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
+                             store->poolConfig().gc_fold_threshold,
+                             store->poolConfig().gc_fold_max_defer_rounds))
+        {
+            ++rounds_since_last_fold_;
+            report.deferred = true;
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::GcFence;   /// reuse the Snap round-event channel; outcome = "deferred"
+                e.object_kind = CasEventObjectKind::Snap;
+                e.round = state.round;
+                e.gen = state.snap_generation;
+                e.outcome = "deferred";
+                e.reason = "skip-unchanged: no changed shard reached the fold threshold and no graduation "
+                           "is due; re-adopting the sealed generation (snapshot rebuild elided)";
+                e.detail = {{"changed_shards", std::to_string(changed)},
+                            {"rounds_since_last_fold", std::to_string(rounds_since_last_fold_)}};
+            });
+            return report;   /// no fold, no pre-CAS deletes, no gc/state CAS — sealed generation stays pinned
+        }
+        rounds_since_last_fold_ = 0;   /// this round folds
+    }
+
     /// B170: fold begins — the round's single pass.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {

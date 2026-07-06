@@ -61,6 +61,10 @@ struct RebuildReport
 struct RoundReport
 {
     bool acquired_lease = false;  /// false => another leader is alive; nothing else was done
+    /// Phase-4 skip-unchanged (spec 2026-07-06): true iff this round DEFERRED (re-adopted the sealed
+    /// in-degree generation instead of folding). A deferred round performs no fold, no pre-CAS
+    /// deletes, and no gc/state CAS -- every other RoundReport field below is meaningless/zero on it.
+    bool deferred = false;
     uint64_t round = 0;
     uint64_t candidates = 0;      /// retired entries WRITTEN this round (absent candidates are skipped)
     uint64_t deleted = 0;
@@ -351,6 +355,11 @@ private:
     std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock              /// this leader's identity (random u128, never 0)
     bool trim_enabled = true;     /// TEST SEAM ONLY (M1): production always trims; see setTrimEnabledForTest
     bool maintenance_trim = false; /// B12 TEST SEAM: bypass lazy-trim thresholds for one round (full compaction); see setMaintenanceTrimForTest
+    /// Phase-4 skip-unchanged (spec 2026-07-06): leader-local, in-memory count of consecutive DEFERRED
+    /// rounds since the last FOLD. NOT persisted (a fresh/stolen leader starts at 0 -- conservative:
+    /// it may fold one round sooner than a long-lived leader would, never later). Reset to 0 whenever
+    /// a round folds; incremented on every DEFER. Bounds batching via `gc_fold_max_defer_rounds`.
+    uint64_t rounds_since_last_fold_ = 0;
 
     /// the contender's observation window (steal protocol)
     bool has_observation = false;

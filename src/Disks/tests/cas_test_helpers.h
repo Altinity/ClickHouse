@@ -455,10 +455,19 @@ inline uint64_t shardOfForTest(const String & ref_name, uint64_t root_shards)
 /// gc_trim_min_events=0 (eager, pre-B12 behaviour) is the test default so existing tests that
 /// assert "the event was trimmed after one round" do not need to be updated.
 /// New tests that want to exercise the lazy-trim threshold pass their own PoolConfig to Store::open.
-inline DB::Cas::StorePtr openStoreForTest(std::shared_ptr<DB::Cas::InMemoryBackend> backend)
+///
+/// `gc_fold_max_defer_rounds` defaults to the PoolConfig default (8) -- unchanged behaviour for every
+/// existing caller. A test that drives MANY consecutive genuinely-idle `runRegularRound` calls and
+/// asserts each one performs a full fold (round/generation advance, trim/sweep/retention) -- exactly
+/// what Phase-4 Lever A (spec 2026-07-06-cas-gc-round-skip-unchanged) is designed to skip -- passes 0
+/// here to force fold-every-round (shouldDeferRound's liveness bound: rounds_since_last_fold(0) >= 0
+/// is always true).
+inline DB::Cas::StorePtr openStoreForTest(
+    std::shared_ptr<DB::Cas::InMemoryBackend> backend, uint64_t gc_fold_max_defer_rounds = 8)
 {
     return DB::Cas::Store::open(std::move(backend),
-        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_trim_min_events = 0});
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+                            .gc_trim_min_events = 0, .gc_fold_max_defer_rounds = gc_fold_max_defer_rounds});
 }
 
 /// Write a blob object (envelope + payload) addressed by `hash`, so a HEAD returns a token. The bytes

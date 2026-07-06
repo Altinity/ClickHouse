@@ -302,7 +302,12 @@ TEST(CasGcAckFloor, CondemnThenDeleteNextRoundAfterAcks)
 TEST(CasGcAckFloor, StaleAckHoldsTheFloorWithoutBlockingTheRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    /// gc_fold_max_defer_rounds=0: this test asserts gc/state.round strictly advances on EVERY one of
+    /// 5 consecutive rounds with no further writes -- exactly the genuinely-idle case Phase-4 Lever A
+    /// (spec 2026-07-06-cas-gc-round-skip-unchanged) is designed to defer once quiesced. Force
+    /// fold-every-round so this test keeps proving its own intent (a stale ack does not wedge/error
+    /// the round pipeline), independent of the skip-unchanged batching feature.
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);

@@ -97,7 +97,10 @@ TEST(CasGcBaselineGuard, AbsentAdoptedSealFailsClosed)
 TEST(CasGcRebuild, RecoversLostStateAndConverges)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    /// gc_fold_max_defer_rounds=0: this test drives MANY consecutive rounds via runRoundsUntilAbsent
+    /// expecting every one to fold (Phase-4 Lever A would otherwise defer once the pool quiesces,
+    /// stalling the reclaim loop below the 8-round budget); force fold-every-round.
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef live_r = ref(1, 0xA1);
     const ManifestRef dead_r = ref(2, 0xA2);
