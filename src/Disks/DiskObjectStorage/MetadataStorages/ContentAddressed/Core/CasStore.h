@@ -155,6 +155,14 @@ struct PoolConfig
     /// store's inline threshold (e.g. RustFS 128 KiB, relevant while rustfs#3231 leaks data dirs
     /// on big-object overwrite) is achieved by root_shards sizing, not by this cap.
     uint64_t gc_trim_body_soft_limit = 8ULL << 20;   /// 8 MiB (backstop)
+    /// Phase-4 skip-unchanged (spec 2026-07-06-cas-gc-round-skip-unchanged): a GC round may DEFER
+    /// (re-adopt the sealed in-degree generation instead of rebuilding it) when fewer than this many
+    /// shards changed since the last fold AND no destructive decision is due. Default 1 = fold as soon
+    /// as anything changed (batching off; only idle rounds defer). > 1 batches small deltas.
+    uint64_t gc_fold_threshold = 1;
+    /// Liveness bound for batching: force a FOLD after this many consecutive DEFER rounds even below
+    /// the threshold. Inert at gc_fold_threshold == 1 (an idle defer has nothing to fold). Default 8.
+    uint64_t gc_fold_max_defer_rounds = 8;
     /// gc-rebuild (spec 2026-07-03): max in-memory edges per gc-shard batch during rebuildBaseline
     /// (~32 B each => default ~256 MB); each full batch folds into the next attempt number with the
     /// previous attempt's runs as priors, so memory is O(budget), never O(edges).

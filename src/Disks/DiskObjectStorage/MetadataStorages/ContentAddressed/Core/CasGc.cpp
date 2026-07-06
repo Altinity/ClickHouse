@@ -74,6 +74,18 @@ uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob
     return object_size - blob_header_len;
 }
 
+bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t rounds_since_last_fold,
+                      uint64_t fold_threshold, uint64_t fold_max_defer_rounds)
+{
+    if (graduation_due)
+        return false;
+    if (changed_shards >= fold_threshold)
+        return false;
+    if (rounds_since_last_fold >= fold_max_defer_rounds)
+        return false;
+    return true;
+}
+
 Gc::Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_)
     : store(std::move(store_))
     , gc_id(gc_id_)

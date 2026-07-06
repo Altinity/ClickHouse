@@ -20,6 +20,14 @@ namespace DB::Cas
 /// decision ever reads them.
 uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len);
 
+/// Phase-4 skip-unchanged decision (spec 2026-07-06). Pure. Returns true iff the current round may be
+/// DEFERRED (re-adopt the sealed generation, no fold/delete). A round MUST fold when: enough shards
+/// changed (>= fold_threshold), OR a destructive decision is due (graduation_due), OR the defer bound
+/// is reached (rounds_since_last_fold >= fold_max_defer_rounds). The graduation_due term is the
+/// load-bearing safety guard: no destructive decision ever runs on a not-fully-folded snapshot.
+bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t rounds_since_last_fold,
+                      uint64_t fold_threshold, uint64_t fold_max_defer_rounds);
+
 /// One anomaly the fold surfaced (a clamped cursor — a missing committed/removal body, or the fold
 /// barrier on a live missing-body precommit). Surfaced to fsck/logs; NEVER a throw (record-and-continue,
 /// per feedback_ca_gc_never_throw_on_404).
