@@ -399,6 +399,16 @@ public:
     /// advertises the already-installed round via `observedGcRound()`.
     uint64_t syncRetiredView();
 
+    /// Retired-view syncer (spec 2026-07-06-cas-lease-view-sync-decouple): a dedicated background
+    /// thread that runs `syncRetiredView` on `mount_renew_period`, decoupled from the lease-renewal
+    /// thread so slow S3 view work can never delay a lease renewal past its TTL. Gated on
+    /// `background_watermark` like every background thread (production only; unit tests drive
+    /// `syncRetiredView` explicitly via `renewWatermarkOnce`, or start/stop this thread directly).
+    /// Started on writable open after the fence is armed; stopped+joined in the destructor before
+    /// `retire_view`/`pool_backend` die.
+    void startRetiredViewSync(std::chrono::milliseconds period);
+    void stopRetiredViewSync();   /// idempotent
+
     /// P1 known-present blob-hash cache (design 2026-06-20, B168). A HINT only — correctness never
     /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.
     /// No-ops when disabled (dedup_cache_bytes == 0).
@@ -635,6 +645,14 @@ private:
     std::condition_variable remount_cv;
     std::mutex remount_cv_mutex;
     ThreadFromGlobalPool remount_thread;
+
+    /// Retired-view syncer private state: `startRetiredViewSync`/`stopRetiredViewSync` (public, above,
+    /// next to `syncRetiredView`) start/stop this thread; the loop body itself stays private.
+    void retiredViewSyncLoop(std::chrono::milliseconds period);
+    std::mutex retired_view_sync_mutex;
+    std::condition_variable retired_view_sync_cv;
+    bool retired_view_sync_stop = false;   /// guarded by retired_view_sync_mutex
+    ThreadFromGlobalPool retired_view_sync_thread;
 
     /// Local write fence (spec §write-fence). Permissive by default (deadline = time_point::max,
     /// lost = false), so mayMutate() is true until Task 7 arms it with a real lease deadline and the

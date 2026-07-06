@@ -316,6 +316,10 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// its own thread).
         if (store->config.background_watermark)
             store->mount_keeper->startBackground(store->config.mount_renew_period);
+        /// The retired-view syncer advances the installed round in the background, off the renewal
+        /// thread (spec 2026-07-06-decouple). Same production-only gate as the renewer.
+        if (store->config.background_watermark)
+            store->startRetiredViewSync(store->config.mount_renew_period);
 
         store->live_writer_epoch.store(writer_epoch, std::memory_order_release);
     }
@@ -333,6 +337,10 @@ Store::~Store()
         if (remount_thread.joinable())
             remount_thread.join();
     }
+
+    /// Stop the retired-view syncer before tearing down: its body touches retire_view / pool_backend /
+    /// view_gate / the event sink, which are destroyed with this Store.
+    stopRetiredViewSync();
 
     /// Retire the merged heartbeat on a clean Store teardown: stop() runs the keeper's terminal op,
     /// which stamps the lease already-expired (expires_at_ms = now) AND folds in the watermark
@@ -587,6 +595,50 @@ void Store::scheduleRemount()
         }
         remount_running.store(false);
     });
+}
+
+void Store::startRetiredViewSync(std::chrono::milliseconds period)
+{
+    std::lock_guard g(retired_view_sync_mutex);
+    if (retired_view_sync_thread.joinable())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS retired-view syncer already running");
+    retired_view_sync_stop = false;
+    retired_view_sync_thread = ThreadFromGlobalPool([this, period] { retiredViewSyncLoop(period); });
+}
+
+void Store::stopRetiredViewSync()
+{
+    ThreadFromGlobalPool to_join;
+    {
+        std::lock_guard g(retired_view_sync_mutex);
+        if (!retired_view_sync_thread.joinable())
+            return;
+        retired_view_sync_stop = true;
+        retired_view_sync_cv.notify_all();
+        to_join = std::move(retired_view_sync_thread);
+    }
+    to_join.join();
+}
+
+void Store::retiredViewSyncLoop(std::chrono::milliseconds period)
+{
+    std::unique_lock lock(retired_view_sync_mutex);
+    while (!retired_view_sync_stop)
+    {
+        if (retired_view_sync_cv.wait_for(lock, period, [this] { return retired_view_sync_stop; }))
+            break;
+        lock.unlock();
+        try
+        {
+            syncRetiredView();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("CasStore"),
+                "CAS retired-view sync: background sync failed; the installed view stays put and retries");
+        }
+        lock.lock();
+    }
 }
 
 uint64_t Store::syncRetiredView()

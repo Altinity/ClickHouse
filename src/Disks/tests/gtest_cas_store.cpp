@@ -2298,3 +2298,35 @@ TEST(CasShardQueue, StressNoConflictsNoLostMutations)
     EXPECT_EQ(total_version, kThreads * kPerThread);
     EXPECT_LE(blocking->cas_puts.load(), kThreads * kPerThread);
 }
+
+TEST(CasRetiredViewSyncer, StartStopIsCleanNoOp)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openStoreForTest(backend);
+    /// Starting then stopping the syncer must be a clean lifecycle: the thread joins, no hang, no throw.
+    store->startRetiredViewSync(std::chrono::milliseconds(5));
+    store->stopRetiredViewSync();
+    store->stopRetiredViewSync();   /// idempotent
+    SUCCEED();
+}
+
+TEST(CasRetiredViewSyncer, RunningSyncerAdvancesPublishedRound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openStoreForTest(backend);
+
+    GcState st;
+    st.round = 4;
+    backend->putIfAbsent(store->layout().gcStateKey(), encodeGcState(st));
+
+    store->startRetiredViewSync(std::chrono::milliseconds(2));
+
+    /// Bounded liveness assertion: the running syncer must install round 4 on its own. Poll the real
+    /// condition (not a fixed sleep); fail if it never advances within a generous bound.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (store->retireView().round() != 4u && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+
+    store->stopRetiredViewSync();
+    EXPECT_EQ(store->retireView().round(), 4u) << "the syncer thread must advance the installed round on its own";
+}
