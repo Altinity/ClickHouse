@@ -318,6 +318,7 @@ protected:
     void terminate() override;
     void onRenewSucceeded() override;
     void onRenewFailed() override;
+    void onRenewMismatch(const String & mismatched_key) override;
 
 private:
     String srid;

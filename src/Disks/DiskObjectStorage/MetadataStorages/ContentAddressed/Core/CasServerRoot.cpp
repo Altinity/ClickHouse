@@ -760,14 +760,58 @@ void MountLeaseKeeper::onRenewSucceeded()
 
 void MountLeaseKeeper::onRenewFailed()
 {
-    /// Background renewal failed: `renewOnce` threw on a foreign/superseded touch and the loop is
-    /// stopping. Latch the local write fence to lost so no further mutation proceeds — fail closed.
-    /// `renewOnce` (base class) does not surface the mismatching body here, so there is nothing to
-    /// attach beyond the srid + timestamp — still the timeline signal for the P1 investigation.
+    /// Background renewal failed: `renewOnce` threw and the loop is stopping. Latch the local write
+    /// fence to lost so no further mutation proceeds — fail closed. The mismatch itself was already
+    /// classified and emitted by `onRenewMismatch` (fenced_by_gc / superseded / foreign_writer) just
+    /// before this throw propagated here — this event is only the fence-latch timeline marker.
     emitMountEvent(event_sink, CasEventType::MountConflict, srid, "renew_failed", nullptr,
-        "background renew failed — foreign/superseded touch; write fence latched to lost");
+        "renew mismatch — see the preceding classified mount_conflict event; write fence latched to lost");
     if (on_lost)
         on_lost();
+}
+
+void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
+{
+    /// The base contract's PreconditionFailed just means "our token didn't match" — re-read the
+    /// CURRENT body to tell a GC fence of our own expired lease (recoverable: re-open with a fresh
+    /// writer_epoch) apart from a genuine foreign writer (the fail-closed single-writer violation
+    /// the base class stays loud about). Absent body, or same (uuid, epoch) unfenced — no plausible
+    /// classification — falls through to the base's generic throw.
+    const auto got = backend->get(mismatched_key);
+    if (got)
+    {
+        const MountLease current = decodeMountLease(got->bytes);
+
+        if (current.server_uuid == server_uuid && current.gc_fenced)
+        {
+            emitMountEvent(event_sink, CasEventType::MountConflict, srid, "fenced_by_gc", &current,
+                "own mount slot fenced by GC after lease expiry (late renewal) — recoverable with a "
+                "fresh writer_epoch");
+            throw Exception(ErrorCodes::CAS_MOUNT_FENCED,
+                "CAS mount-lease: key '{}' was fenced by GC after lease expiry (late renewal) ({}) — "
+                "recoverable: re-open with a fresh writer_epoch", mismatched_key, describeMountHolder(current));
+        }
+
+        if (current.server_uuid == server_uuid && current.writer_epoch != writer_epoch)
+        {
+            emitMountEvent(event_sink, CasEventType::MountConflict, srid, "superseded", &current,
+                "own mount slot is held by a different writer_epoch — superseded by a newer incarnation");
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS mount-lease: key '{}' was superseded by a newer incarnation ({})",
+                mismatched_key, describeMountHolder(current));
+        }
+
+        if (current.server_uuid != server_uuid)
+        {
+            emitMountEvent(event_sink, CasEventType::MountConflict, srid, "foreign_writer", &current,
+                "mount slot is held by a foreign server — failing closed, never taking over");
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS mount-lease: key '{}' is held by a foreign server ({}) — failing closed, never taking over",
+                mismatched_key, describeMountHolder(current));
+        }
+    }
+
+    SingleWriterSlot::onRenewMismatch(mismatched_key);
 }
 
 void MountLeaseKeeper::terminate()

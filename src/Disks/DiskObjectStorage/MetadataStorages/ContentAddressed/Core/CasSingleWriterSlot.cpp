@@ -71,10 +71,15 @@ void SingleWriterSlot::renewOnce()
     const String body = encodeBody(seq + 1, payload);
     const PutResult res = backend->putOverwrite(key, body, last_token);
     if (res.outcome != PutOutcome::Done)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS {}: key '{}' was touched by a foreign writer — failing closed, never re-minting", slot_name, key);
+        onRenewMismatch(key);
 
     recordWrite(seq + 1, res.token);
+}
+
+void SingleWriterSlot::onRenewMismatch(const String & mismatched_key)
+{
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "CAS {}: key '{}' was touched by a foreign writer — failing closed, never re-minting", slot_name, mismatched_key);
 }
 
 void SingleWriterSlot::doTerminate()

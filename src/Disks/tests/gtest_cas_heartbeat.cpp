@@ -299,3 +299,54 @@ TEST(CasMountAudit, KeeperAdoptRefusesFencedSelfWithTypedError)
     EXPECT_EQ(seen.back().type, CasEventType::MountConflict);
     EXPECT_EQ(seen.back().detail.at("branch"), "fenced_by_gc");
 }
+
+/// A renew mismatch is classified by BODY, not blamed on "a foreign writer" by default: the GC can
+/// fence our OWN (uuid, epoch) mount slot after our lease expires (a late renewal beat racing the
+/// GC's fence-out). The keeper must re-read and recognize this as its OWN incarnation being fenced —
+/// a RECOVERABLE `CAS_MOUNT_FENCED`, not the generic single-writer-violation text.
+TEST(CasHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
+
+    std::vector<CasEvent> seen;
+    CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
+                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; }, sink);
+    keeper.start();
+    seen.clear();
+
+    /// Mid-run: the GC fences our own (uuid, epoch) mount slot in place (as `computeHeartbeatFloor`
+    /// does on an expired lease), preserving the whole body — a token-guarded putOverwrite, exactly
+    /// as the GC's own fence-out does it.
+    {
+        const auto got = backend->get(layout.mountKey(srid));
+        MountLease fenced = decodeMountLease(got->bytes);
+        fenced.gc_fenced = true;
+        fenced.seq += 1;
+        ASSERT_EQ(backend->putOverwrite(layout.mountKey(srid), encodeMountLease(fenced), got->token).outcome,
+                  PutOutcome::Done);
+    }
+
+    /// The renewal must classify the fence honestly — not "foreign writer":
+    try
+    {
+        keeper.renewOnce();
+        FAIL() << "renewOnce over a fenced slot must throw";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CAS_MOUNT_FENCED);
+        EXPECT_TRUE(e.message().find("fenced by GC") != String::npos);
+        EXPECT_TRUE(e.message().find("foreign writer") == String::npos);
+    }
+    /// and the capture sink saw mount_conflict branch=fenced_by_gc with the fenced body's identity.
+    ASSERT_FALSE(seen.empty());
+    EXPECT_EQ(seen.back().type, CasEventType::MountConflict);
+    EXPECT_EQ(seen.back().detail.at("branch"), "fenced_by_gc");
+    EXPECT_EQ(seen.back().detail.at("holder_uuid"), u128ToHex(uuid));
+}

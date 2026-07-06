@@ -89,6 +89,12 @@ protected:
     /// `state_mutex`); the mount-lease keeper latches the write fence to lost here. Default no-op.
     virtual void onRenewFailed() {}
 
+    /// Called when the token-guarded renew PUT hits PreconditionFailed. The base contract stays
+    /// fail-closed and LOUD; subclasses may re-read and throw a more precisely classified
+    /// exception (the mount keeper distinguishes a GC fence of our own expired lease from a
+    /// genuine foreign writer). MUST throw — a renew mismatch never continues.
+    virtual void onRenewMismatch(const String & mismatched_key);
+
     /// Runs the slot's terminal op against the held `last_token`. Called under `state_mutex` with
     /// `dead` already set (so renewal can never race it). Owns its own fail-closed throws and final
     /// bookkeeping (the watermark bumps seq/last_token/last_renew_time on its retiring putOverwrite).
