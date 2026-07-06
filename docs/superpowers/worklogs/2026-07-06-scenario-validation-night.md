@@ -11,6 +11,14 @@ doc_type: 'guide'
 
 Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/view-sync decouple + Phase-4 Lever A GC round skip-unchanged, all landed). Stand: local `utils/ca-soak` (bind-mounts `build/programs/clickhouse`). Objective: anomalies in the WHOLE feature, not just the last increment — correctness, resource use, unjustified S3 budget, performance. No sugarcoating.
 
+## S14 — restart with many refs {#s14}
+
+**What S14 checks:** prefills many tables (many refs), cleanly restarts a node, then asserts all tables are queryable, startup reads scale with root METADATA (not total blob count — "startup does not list all blobs"), and no unknown-disk false positives.
+
+**Dev-scale (200 tables, seed 20260707): PASS, 19/19 verdicts.** All green — notably: **all tables queryable after restart** + **no unknown-disk false positives** (the F1 `ca_ro` fix holds under a 200-table restart — a strong F1 re-validation); **startup does not list all blobs** (startup cost is metadata-bound, the S14 thesis, confirmed); replica agreement across 8 sampled tables; `fsck dangling=0`; `dryrun ⊆ unreachable`; event audit clean; GC no failed rounds; no unbounded leftovers. Peak startup metadata reads recorded (bounded).
+
+**Full-scale (10000 tables, seed 20260707): PASS, 44/44 verdicts.** Clean at full scale — both servers clean-restarted with 10000 tables attached, the cluster came back, and: **all tables queryable after restart** + **no unknown-disk false positives** (the F1 `ca_ro` fix holds at 10000-table restart — the strongest F1 validation), **startup does not list all blobs** + startup root-metadata reads bounded (startup cost is metadata-bound, not blob-count-bound, confirmed at scale), first-query latency recorded, `fsck dangling=0`, replica agreement, event audit clean, GC no failed rounds. **S14 did NOT wedge on #3231** — bulk table creation is low-overwrite-churn (pool stayed at MB-scale metadata, no LIST storm). **This confirms the pattern: restart-heavy scenarios pass at full scale; only merge-CHURN-heavy scenarios (S13's 40 kill rounds) trigger the rustfs#3231 quiesce wedge.** S14 = clean PASS at full scale.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
