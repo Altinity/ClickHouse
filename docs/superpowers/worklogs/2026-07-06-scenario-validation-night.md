@@ -108,6 +108,14 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 - **PASS (the point of S33 — the 2026-06-27 GC-CONCURRENT-LEADER-LEAK guard):** `SAFETY: no dangling under concurrent GC leaders`=0 (no over-delete, no data loss) + `LIVENESS: reclaimable drains to 0 after concurrent leaders + recovery`=0 + `fsck dangling=0`; `not_a_leader=8` (the lease correctly gated non-leaders). **The concurrent-leader reclaim leak stays FIXED under live concurrent explicit GC.**
 - **FAIL = F3 (4th occurrence), oracle variant:** `dryrun ⊆ unreachable` — 34 candidates; but here fsck shows `unreachable=34 pending_gc=34` (the 34 are legitimately-condemned blobs IN the deletion pipeline), and the oracle's "unreachable" set excludes `pending-gc`. So this variant is the oracle being too strict (`dryrun ⊆ unreachable` should be `dryrun ⊆ (unreachable ∪ pending-gc)`), distinct from S18/S25/S26 where fsck called the proposed blobs fully reachable. Same root: the `dryrun ⊆ unreachable` oracle + dryrun reachability/classification don't align with fsck. No data loss. Folds into F3's backlog.
 
+## S34 — create/drop churn: D1 bounded GC fanout {#s34}
+
+**Dev-scale (40 create/insert/drop iterations, seed 20260707): FAIL 7/9 — CONFIRMS F5 (D1 fanout not bounded), correctness intact.**
+- **The D1-goal check FAILED (headline):** `per-round GC fanout bounded` — **`CasRootGet` grew 32 → 248 monotonically across the 40 create/drop iterations** while `root_dirs` stayed flat at **2**. So the *live* root set is bounded, but per-round GC GET count scales with **tables-ever-created**, not live tables. D1 (`[[project_d1_shard_incarnation_registry_removal]]`) was meant to eliminate exactly this monotone namespace registry — the reclaim of dropped-namespace state is **incomplete**: something enumerated per historical table (dropNamespace tombstones / retired-generation runs) still accumulates and is re-read every round.
+- **Correctness intact:** `fsck dangling`=0, `dropped content reclaimed to 0 (D1 reclaimable drain)` reclaimable=0 → no data loss, no over-delete, dropped content fully reclaims. This is a **GC-efficiency / D1-completeness defect, not a safety defect**.
+- `no unbounded leftovers` = inconclusive (residual=33, fsck prefix-detail unavailable to classify — same harness gap as prior scenarios; content itself reclaims per the drain check).
+- **This is the clean controlled corroboration of F5** (S30 showed 75→190 under mixed churn; S34 isolates it: root_dirs flat, CasRootGet linear in iterations). Same root cause; folded into the F5 backlog entry. **Design-sensitive** (D1 registry-reclaim path, same TLA+-gated area as the 2026-06-27 concurrent-leader leak) → backlog for code investigation, NOT an inline fix.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
