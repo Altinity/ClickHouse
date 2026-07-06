@@ -893,6 +893,7 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
 
 
 ## PRODUCT BUG (availability, HIGH) — mount-lease self-adoption fails closed under rapid crash-restart
+- **LIVE-VALIDATED 2026-07-06 (night):** manual fence-recovery cycle (crash-kill ch1 → GC-fenced → restart recovers as `writer_epoch=2` in 2s, no "foreign writer"/exit-49) AND S13 full-scale chaos (40 rapid crash-restarts of ch1/ch2 → ch1 reached `writer_epoch=26`, `state=live`, **zero exit-49 wedge, zero "foreign writer"** — the exact rapid-crash-restart trigger of this bug). P1 is fixed. (The S13-full run then wedged in the end-checkpoint quiesce on an INFRA limit — rustfs 503 near disk-full stalling a merge finalize — NOT this bug; see worklog 2026-07-06-scenario-validation-night finding F2.)
 - **RESOLVED 2026-07-06 (code complete + reviewed; live soak validation = the one remaining step).**
   Root cause (P3.1): the "foreign writer" of `ca_soak_ch1/mount` is the GC leader's **legitimate**
   fence-out of a lease that EXPIRED while ch1 was alive — the renewal thread also ran the S3-heavy
