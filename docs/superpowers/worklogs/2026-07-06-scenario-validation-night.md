@@ -76,6 +76,10 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **→ F3 upgraded to SYSTEMATIC:** the `ca-gc-dryrun` reachability under-counts vs fsck/real-GC across MULTIPLE roots — shadow/frozen refs (S18) AND non-Atomic DB paths + the all-zeros sentinel blob (S25). The real GC is safe in both (dangling=0). This is now clearly a **dryrun-tool reachability defect** (not scenario-specific): it proposes deleting blobs that are actually reachable. Two failure roots pinned. **Backlog priority raised — `ca-gc-dryrun` must use the SAME reachability walk as the real GC/fsck** (or the dryrun⊆unreachable oracle will keep false-failing, and an operator trusting dryrun would think GC deletes live data). Confirm the real GC's reachability never regresses to the dryrun's narrower view. `no unbounded leftovers` inconclusive (residual=10 = the same F3 blobs, detail-classification unavailable).
 
+## S26 — table-level verbatim file churn {#s26}
+
+**Dev-scale (seed 20260707): FAIL 11/13 — F3 AGAIN (3rd occurrence).** Core passes: `verbatim churn fsck clean`=0, `fsck dangling=0`, replica agreement. FAIL is `dryrun ⊆ unreachable`: 63 blobs fsck calls reachable, real GC keeps (`dangling=0`). **F3 now confirmed at 3 independent scenarios (S18 shadow / S25 non-Atomic / S26 verbatim churn), always over-proposing reachable BLOBS, real GC always safe** — this is a broad `ca-gc-dryrun` reachability under-count, not an edge case. (Effectively these three scenarios "pass" on all safety verdicts; only the dryrun-oracle false-fails.) No new info beyond F3; strengthens the backlog priority to fix `ca-gc-dryrun`'s reachability.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
