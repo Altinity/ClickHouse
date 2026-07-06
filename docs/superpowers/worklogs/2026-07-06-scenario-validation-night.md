@@ -102,6 +102,12 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **Dev-scale (seed 20260707): PASS 12/12.** Clean — TTL-expired parts reclaimed correctly; `dangling=0`, no leftovers, event audit clean. No CAS defect.
 
+## S33 — concurrent explicit GC leaders (reclaim-leak regression guard) {#s33}
+
+**Dev-scale (6 concurrent-GC collision rounds, seed 20260707): FAIL 8/10 — but the CORE guard PASSED; the FAIL is F3 (oracle variant).**
+- **PASS (the point of S33 — the 2026-06-27 GC-CONCURRENT-LEADER-LEAK guard):** `SAFETY: no dangling under concurrent GC leaders`=0 (no over-delete, no data loss) + `LIVENESS: reclaimable drains to 0 after concurrent leaders + recovery`=0 + `fsck dangling=0`; `not_a_leader=8` (the lease correctly gated non-leaders). **The concurrent-leader reclaim leak stays FIXED under live concurrent explicit GC.**
+- **FAIL = F3 (4th occurrence), oracle variant:** `dryrun ⊆ unreachable` — 34 candidates; but here fsck shows `unreachable=34 pending_gc=34` (the 34 are legitimately-condemned blobs IN the deletion pipeline), and the oracle's "unreachable" set excludes `pending-gc`. So this variant is the oracle being too strict (`dryrun ⊆ unreachable` should be `dryrun ⊆ (unreachable ∪ pending-gc)`), distinct from S18/S25/S26 where fsck called the proposed blobs fully reachable. Same root: the `dryrun ⊆ unreachable` oracle + dryrun reachability/classification don't align with fsck. No data loss. Folds into F3's backlog.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
