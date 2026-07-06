@@ -38,6 +38,44 @@ BAD_EVENT_TYPES = (
 POOL_PREFIXES = ("blobs", "roots", "_manifests", "_files", "gc")
 
 
+def classify_pool_path(key: str) -> str:
+    """Bucket a pool object key by the CURRENT per-server-tree layout (2026-07 relocation):
+    `blobs/<aa>/<hash>`, `cas/manifests/<srid>/...`, `cas/refs/<srid>/...`, `roots/<srid>/...`,
+    `gc/...`, `_pool_meta*`; verbatim part files keep a `/_files/` segment inside their tree.
+
+    Accepts both pool-relative paths and prefixed keys (`soak_pool/...`, `./...`): leading segments
+    are skipped until a known top-level anchor. The pre-relocation classifier bucketed the whole
+    `cas/` tree as `other` — the 2026-07-06 re-audit found S08 reporting 858081 objects / 138 GB as
+    "other" with `_manifests=0`, and (worse) `assertions._classify_key` treating an unreachable
+    manifest as bookkeeping — a real manifest leak would have PASSED "no unbounded leftovers"."""
+    segs = [s for s in key.split("/") if s not in ("", ".")]
+    for i, s in enumerate(segs):
+        if s in ("blobs", "roots", "gc") or s.startswith("_pool_meta"):
+            segs = segs[i:]
+            break
+        if s == "cas" and i + 1 < len(segs) and segs[i + 1] in ("manifests", "refs"):
+            segs = segs[i:]
+            break
+    if not segs:
+        return "other"
+    if "_files" in segs:
+        return "_files"
+    head = segs[0]
+    if head == "blobs":
+        return "blobs"
+    if head == "cas":
+        if len(segs) > 1 and segs[1] in ("manifests", "refs"):
+            return "_manifests" if segs[1] == "manifests" else "refs"
+        return "other"
+    if head == "roots":
+        return "roots"
+    if head == "gc":
+        return "gc"
+    if head.startswith("_pool_meta"):
+        return "_pool_meta"
+    return "other"
+
+
 # ---------------------------------------------------------------------------
 # ProfileEvents / system.events
 # ---------------------------------------------------------------------------
@@ -199,7 +237,10 @@ def pool_shape(timeout_s: float = 120.0) -> dict:
     # `stat -c '%s %n'` over the file list is busybox/coreutils portable (avoids find -printf).
     cmd = ("cd %s 2>/dev/null && find . -type f 2>/dev/null | "
            "xargs -r stat -c '%%s\t%%n' 2>/dev/null") % POOL_DIR
-    rc, so, se = _docker_exec(RUSTFS_CONTAINER, ["sh", "-c", f"timeout {int(timeout_s)} {cmd}"],
+    # `timeout N cd ...` is broken: `timeout` tries to EXEC `cd` (a shell builtin, no executable) and
+    # fails, so the `&& find` never runs and pool_shape returned no `_total` (observed None across the
+    # campaign). Wrap the whole pipe in `timeout N sh -c '<cmd>'` so timeout guards the find/xargs.
+    rc, so, se = _docker_exec(RUSTFS_CONTAINER, ["timeout", str(int(timeout_s)), "sh", "-c", cmd],
                               timeout_s=timeout_s + 10)
     if rc != 0 and not so:
         return shape
@@ -244,6 +285,11 @@ def gc_log_rows(node, since_event_time: str | None = None) -> list:
             "objects_deleted", "objects_absent", "objects_replaced", "objects_spared",
             "manifests_deleted", "forgotten_on_delete", "forgotten_absent", "duration_ms", "error")
     try:
+        # System log tables buffer in memory and materialize only every ~7.5 s (or on flush); the
+        # most recent GC rounds are invisible to a bare SELECT at end-checkpoint. Flush first so the
+        # caller sees ALL of its rounds (the S03 "no GC finish rows" INCONCLUSIVE was purely this —
+        # 161 rounds were present after a manual flush). Cheap and idempotent.
+        node.command("SYSTEM FLUSH LOGS")
         txt = node.query(
             f"SELECT {', '.join(cols)} FROM {GC_LOG} WHERE {where} "
             f"ORDER BY event_time FORMAT TabSeparated")
