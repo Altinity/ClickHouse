@@ -166,3 +166,52 @@ TEST(CasFsck, ForeignBlobClassifiesUnaccounted)
     EXPECT_EQ(rep.unaccounted, 1u);
     EXPECT_EQ(rep.pending_gc, 0u);
 }
+
+/// A scan whose deadline is already in the past: partial_on_deadline=false keeps the old
+/// throw-on-timeout contract; partial_on_deadline=true returns the accumulated lower-bound counts
+/// instead of failing empty-handed (the 2026-07-05 campaign lost 5 verdicts to this).
+TEST(CasFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    const auto past = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    /// partial_on_deadline=false keeps the old contract:
+    EXPECT_THROW(DB::Cas::runFsck(*store, /*detail=*/false, {}, past), DB::Exception);
+    /// partial_on_deadline=true returns a flagged report:
+    const auto report = DB::Cas::runFsck(*store, false, {}, past, /*partial_on_deadline=*/true);
+    EXPECT_TRUE(report.partial);
+    EXPECT_FALSE(report.partial_reason.empty());
+}
+
+/// A `namespace_prefix` scopes the scan to only the matching namespaces' refs (dangling-only): no
+/// pool-wide unreachable/pending/awaiting/unaccounted classification, since that needs the whole pool.
+TEST(CasFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+
+    const RootNamespace ns_a{"nsa"};
+    const ManifestRef r_a = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns_a, r_a, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns_a, "tbl", std::nullopt, r_a);
+
+    const RootNamespace ns_b{"nsb"};
+    const ManifestRef r_b = ref(1, 0xB1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(2));
+    writeManifestRaw(*backend, store->layout(), ns_b, r_b, {blobEntryFor("b", DB::UInt128(2))});
+    publishCommittedTransition(*backend, store->layout(), ns_b, "tbl", std::nullopt, r_b);
+
+    const auto scoped = DB::Cas::runFsck(*store, false, {}, {}, false, /*namespace_prefix=*/"nsa");
+    EXPECT_EQ(scoped.dangling, 0u);
+    EXPECT_GT(scoped.reachable, 0u);
+    /// scoped mode does not classify the rest of the pool:
+    EXPECT_EQ(scoped.unreachable, 0u);
+    EXPECT_EQ(scoped.pending_gc + scoped.awaiting_gc + scoped.unaccounted, 0u);
+}

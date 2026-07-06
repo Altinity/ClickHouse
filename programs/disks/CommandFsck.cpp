@@ -25,13 +25,18 @@ public:
         description = "Independently verify content-addressed pool reachability (read-only). "
                       "Exits nonzero if any reachable object is missing (dangling).";
         options_description.add_options()("detail", "list per-object rows (class, key, size, reachable_from)")(
-            "timeout", po::value<UInt64>(), "abort the scan after N seconds with a clear error instead of hanging (default 600; 0 = unbounded)");
+            "timeout", po::value<UInt64>(), "abort the scan after N seconds with a clear error instead of hanging (default 600; 0 = unbounded)")(
+            "namespace", po::value<String>(), "scope the scan to namespaces with this prefix (dangling-only mode: "
+                                               "the pool-wide unreachable classification is skipped)")(
+            "partial", "on --timeout, print the counts accumulated so far flagged partial=1 instead of aborting empty-handed");
     }
 
     void executeImpl(const CommandLineOptions & options, DisksClient & client) override
     {
         const bool detail = options.contains("detail");
         const UInt64 timeout_sec = getValueFromCommandLineOptionsWithDefault<UInt64>(options, "timeout", 600);
+        const String namespace_prefix = options.count("namespace") ? options["namespace"].as<String>() : "";
+        const bool partial = options.contains("partial");
         auto disk = client.getCurrentDiskWithPath().getDisk();
 
         auto * dos = dynamic_cast<DiskObjectStorage *>(disk.get());
@@ -58,14 +63,17 @@ public:
         if (timeout_sec > 0)
             deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
 
-        const Cas::FsckReport report = Cas::runFsck(*ca->store(), detail, on_progress, deadline);
+        const Cas::FsckReport report = Cas::runFsck(*ca->store(), detail, on_progress, deadline, partial, namespace_prefix);
 
         std::cout << "reachable=" << report.reachable << " dangling=" << report.dangling << " unreachable=" << report.unreachable
                   << " pending_gc=" << report.pending_gc << " awaiting_gc=" << report.awaiting_gc
                   << " unaccounted=" << report.unaccounted
                   << " physical_bytes=" << report.physical_bytes << " referenced_logical_bytes=" << report.referenced_logical_bytes
                   << " distinct_blobs=" << report.distinct_blobs << " total_blob_refs=" << report.total_blob_refs
-                  << " dedup_ratio=" << report.dedupRatio() << "\n";
+                  << " dedup_ratio=" << report.dedupRatio();
+        if (report.partial)
+            std::cout << " partial=1 reason='" << report.partial_reason << "'";
+        std::cout << "\n";
 
         /// De-alarm the pipeline classes for humans: on an active pool a nonzero pending/awaiting
         /// count is the ack-floor deletion pipeline working as designed, not a leak.

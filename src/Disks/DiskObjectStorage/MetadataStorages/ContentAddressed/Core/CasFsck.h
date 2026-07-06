@@ -57,6 +57,11 @@ struct FsckReport
     uint64_t total_blob_refs = 0;
     uint64_t distinct_blobs = 0;
 
+    /// Set when the scan hit its deadline in partial mode: counts cover only what was walked
+    /// before the deadline — a lower bound, not the pool truth.
+    bool partial = false;
+    String partial_reason;
+
     std::vector<FsckObject> objects;
 
     double dedupRatio() const { return distinct_blobs ? double(total_blob_refs) / double(distinct_blobs) : 0.0; }
@@ -67,9 +72,13 @@ struct FsckReport
 /// gc/snap) and diff against a raw object listing. Read-only. `detail` populates per-object rows.
 /// `deadline`, if set, bounds the WHOLE scan: it is checked between list pages and reachability
 /// refs, throwing `TIMEOUT_EXCEEDED` if exceeded (a slow-but-progressing scan surfaces a clear
-/// error instead of an opaque hang). A single LIST page stuck in S3-client retries is bounded
-/// separately by the disk's S3 retry/timeout settings, not here.
+/// error instead of an opaque hang) — unless `partial_on_deadline` is set, in which case the
+/// accumulated lower-bound counts are returned instead, flagged via `FsckReport::partial`. A single
+/// LIST page stuck in S3-client retries is bounded separately by the disk's S3 retry/timeout
+/// settings, not here. `namespace_prefix`, if non-empty, scopes the scan to namespaces with this
+/// prefix and skips the pool-wide unreachable classification (dangling-only mode).
 FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress = {},
-                   std::optional<std::chrono::steady_clock::time_point> deadline = {});
+                   std::optional<std::chrono::steady_clock::time_point> deadline = {},
+                   bool partial_on_deadline = false, const String & namespace_prefix = {});
 
 }

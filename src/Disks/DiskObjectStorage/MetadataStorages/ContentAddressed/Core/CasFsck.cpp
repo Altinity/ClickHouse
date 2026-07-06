@@ -99,15 +99,12 @@ bool parseBuildPrefix(const String & key, const String & manifests_prefix, Build
         return false;
     }
 }
-}
 
-FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
-                   std::optional<std::chrono::steady_clock::time_point> deadline)
+void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, const Deadline & deadline,
+                  const String & namespace_prefix, FsckReport & report)
 {
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
-
-    FsckReport report;
 
     /// OQ8 manifest audit. Reachability is recomputed from the AUTHORITATIVE refs (never from gc state):
     /// for each namespace, each committed ref resolves to a ManifestId; read its body; a committed ref
@@ -117,7 +114,7 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
     std::unordered_map<String, std::vector<String>> blob_labels;   /// blob key -> "ns/ref" (detail)
 
     uint64_t refs_walked = 0;
-    for (const String & ns_str : store.listNamespaces(""))
+    for (const String & ns_str : store.listNamespaces(namespace_prefix))
     {
         const RootNamespace ns{ns_str};
         for (const auto & [ref_name, resolved] : store.listRefs(ns))
@@ -181,6 +178,11 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
     }
     report.distinct_blobs = reachable_blobs.size();
 
+    /// Scoped mode skips the GLOBAL physical classification below: it is meaningless under a
+    /// filter (blobs owned by other namespaces would read as unreachable) and would cost a
+    /// pool-wide LIST for what should be O(scoped refs).
+    if (namespace_prefix.empty())
+    {
     /// Physical listing: blobs + manifest bodies.
     std::unordered_map<String, uint64_t> present_blobs;
     listAll(backend, layout.blobsPrefix(), present_blobs, on_progress, deadline, "listing blobs");
@@ -334,11 +336,42 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
             report.objects.push_back(std::move(o));
         }
     }
+    }
+    else
+    {
+        /// Scoped mode: dangling-only for the selected namespaces. Each blob named by a scoped ref
+        /// is HEAD-verified (O(scoped refs), no pool-wide LIST); the unreachable/pending pipeline
+        /// classification needs the whole pool and is intentionally skipped.
+        for (const String & bkey : reachable_blobs)
+        {
+            checkDeadline(deadline, "head-checking scoped blobs");
+            const HeadResult h = backend.head(bkey);
+            if (h.exists)
+            {
+                ++report.reachable;
+                report.physical_bytes += h.size;
+            }
+            else
+                ++report.dangling;
+            if (detail || !h.exists)
+            {
+                FsckObject o;
+                o.key = bkey;
+                o.kind = ObjectKind::Blob;
+                o.size = h.exists ? h.size : 0;
+                o.cls = h.exists ? FsckClass::Reachable : FsckClass::Dangling;
+                if (detail)
+                    if (const auto lit = blob_labels.find(bkey); lit != blob_labels.end())
+                        o.reachable_from = lit->second;
+                report.objects.push_back(std::move(o));
+            }
+        }
+    }
 
     /// Pre-precommit manifest debris: a `cas/manifests/` body with no committed owner. An ELIGIBLE prefix's
     /// orphan is reclaimable debris => INFO (Unreachable); a non-eligible (in-flight) one is also info,
     /// never an error. The owner-visible missing-body case is the error above.
-    for (const String & ns_str : store.listNamespaces(""))
+    for (const String & ns_str : store.listNamespaces(namespace_prefix))
     {
         const RootNamespace ns{ns_str};
         const String manifests_prefix = layout.manifestNamespacePrefix(ns);
@@ -367,6 +400,26 @@ FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
         }
     }
 
+}
+
+}
+
+FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
+                   std::optional<std::chrono::steady_clock::time_point> deadline,
+                   bool partial_on_deadline, const String & namespace_prefix)
+{
+    FsckReport report;
+    try
+    {
+        runFsckImpl(store, detail, on_progress, deadline, namespace_prefix, report);
+    }
+    catch (const Exception & e)
+    {
+        if (!partial_on_deadline || e.code() != ErrorCodes::TIMEOUT_EXCEEDED)
+            throw;
+        report.partial = true;
+        report.partial_reason = e.message();
+    }
     return report;
 }
 

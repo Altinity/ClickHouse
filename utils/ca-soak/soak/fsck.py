@@ -27,12 +27,26 @@ def parse_fsck_summary(line: str) -> dict:
 
     Integer fields are returned as `int`; fields containing a decimal point as `float`.
     Unknown tokens are silently skipped so that future fields do not break the parser.
+
+    On a `--partial` scan, the line ends with `partial=1 reason='<message>'` where `<message>`
+    (`FsckReport::partial_reason`, e.g. the `TIMEOUT_EXCEEDED` text) can contain spaces, periods,
+    and its own single quotes — a plain whitespace split would mis-tokenize it. `reason='...'` is
+    trimmed off (it is always the trailing field) and parsed separately as a string.
     """
+    marker = " reason='"
+    reason = None
+    idx = line.find(marker)
+    if idx != -1 and line.rstrip().endswith("'"):
+        reason = line.rstrip()[idx + len(marker):-1]
+        line = line[:idx]
+
     out: dict = {}
     for tok in line.strip().split():
         if "=" in tok:
             kk, vv = tok.split("=", 1)
             out[kk] = float(vv) if "." in vv else int(vv)
+    if reason is not None:
+        out["reason"] = reason
     return out
 
 
