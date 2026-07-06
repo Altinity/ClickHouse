@@ -50,6 +50,10 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 - **PASS (core):** `clone moves metadata only (no body re-upload)` (CasBlobPut for MOVE/REPLACE = 0 — clone republishes refs, doesn't copy blobs ✓), `moved partition lands in dst` (8 rows ✓), `no dangling after clone ops` (0), `fsck dangling`=0, `no unbounded leftovers`=0.
 - **FAIL → F4 (MINOR, matches BACKLOG "gated cross-disk move not failing closed" triage):** `ALTER TABLE s19_src MOVE PARTITION 2 TO DISK 'default'` correctly **failed closed** (raised `Code:479 UNKNOWN_DISK: No such disk 'default' in storage policy 'ca'`), but the verdict is strict ("publishes NO partial ref") and observed **2 `CasRootCas` ops during the rejected attempt** → the move does partial ref work before the destination-disk-not-in-policy check rejects it (not perfectly atomic). **Outcome is SAFE — `fsck dangling=0`, no leftovers** → the 2 CAS left no dangling ref. So: a minor atomicity/ordering concern (the CA move path publishes ref CAS before validating the target disk is in the policy), NOT data loss. Fix direction: validate the destination disk is in the storage policy BEFORE any ref CAS in the MOVE path. Backlog.
 
+## S20 — replicated fetch and relink {#s20}
+
+**Dev-scale (seed 20260707): INCONCLUSIVE 11/12 — effectively PASS.** 11 pass (all safety: `dangling=0`, no leftovers, event audit clean, relink zero-copy behavior); the 1 INCONCLUSIVE is `follower publishes its own refs` — the known BACKLOG S20 "follower-refs" observability gate (couldn't confirm the follower's own ref-publish in the dev window), not a failure. No CAS defect.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
