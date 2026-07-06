@@ -54,6 +54,14 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **Dev-scale (seed 20260707): INCONCLUSIVE 11/12 — effectively PASS.** 11 pass (all safety: `dangling=0`, no leftovers, event audit clean, relink zero-copy behavior); the 1 INCONCLUSIVE is `follower publishes its own refs` — the known BACKLOG S20 "follower-refs" observability gate (couldn't confirm the follower's own ref-publish in the dev window), not a failure. No CAS defect.
 
+## S21 — read-heavy many-ref workload {#s21}
+
+**Dev-scale (seed 20260707): INCONCLUSIVE 12/13 — effectively PASS.** 12 pass (all safety: `dangling=0`, no leftovers, event audit clean, read-path correctness); the 1 INCONCLUSIVE is `column-subset fetches only required blobs` — a read-path column-pruning observation gate (scale-gated at dev; BACKLOG S21 read-path-thresholds triage). No CAS defect.
+
+## S22 / S27 — NEEDS-INFRA (skipped) {#s22-s27}
+
+**S22** (object-store throttling & retry budget) and **S27** (backend LIST pagination ambiguity) require a **fault-injecting S3 proxy** (503/429/slow/connection-close for S22; duplicate/unstable LIST pages for S27) interposed between ClickHouse and RustFS — not available on this stand (direct rustfs1 endpoint). NOT RUN (unchanged from prior campaigns). NOTE: S22's proxy is also what would let Task-6's mount-lease decouple be validated under *induced* S3 latency, and would let the rustfs#3231/503 wedge (F2) be exercised deliberately — a high-value dedicated infra build (BACKLOG estimate ~3h: toxiproxy + HTTP-status injector).
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
