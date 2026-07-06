@@ -273,6 +273,10 @@ Operability/hygiene gates:
 - Streaming `putOverwrite` (B98 huge-blob displacement); promote-time recreate for SOURCED deps.
 - B66b relink-into-detached; B66a local-storage concurrent-fetch atomicity.
 - B15/B99/B169/B159 completion: per-part/ref `system.*` views + disks decode/introspect.
+- 2026-07-06: introspection package landed — `system.content_addressed_mounts`, `mount_claim`/
+  `mount_release`/`mount_conflict` audit events, first gauges (`CasGcIsLeader`,
+  `CasGcPendingReclaimEntries`), and scoped/partial `fsck` (`--namespace`, `--timeout`/`--partial`);
+  live-validated on the RustFS stand. See `docs/superpowers/plans/2026-07-06-cas-introspection-package.md`.
 - B14 expedited/GDPR delete; B17 encryption-at-rest interaction; B26+B135 local/NFS first-class.
 - Dedicated gc-round-log row for `rebuildBaseline`; `process_epoch` → `writer_epoch` unification;
   common-shard-prefix single-LIST discovery; fsck Orphan-class test gap.
