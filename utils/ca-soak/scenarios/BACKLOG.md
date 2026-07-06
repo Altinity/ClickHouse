@@ -332,6 +332,25 @@ SETTINGS storage_policy='ca', min_bytes_for_...(74 more chars)
 
 ## GC-DISCOVERY-LIST-QUADRATIC-OVER-ROOTS: GC root-shard discovery does a recursive, re-enumerated-per-page LIST over all of roots/ -> ~O(N^2) in the manifest backlog
 
+- **RESOLVED 2026-06-29..07-01 (verified against code 2026-07-06).** BOTH mechanisms of this entry
+  are gone — the fixes landed as a side-effect of the Phase-1 relocation + D1 registry removal and
+  this entry was never retired (it misled a 2026-07-06 re-read):
+  1. Discovery no longer walks `roots/`. `Gc::discoverUniverse` (`CasGc.cpp:1236`) and
+     `Gc::listRootShardTokens` (`CasGc.cpp:1281`) LIST `layout.casRefsPrefix()` = `cas/refs/`, a FLAT
+     one-object-per-`(ns,shard)` prefix (`cas/refs/<ns>/<shard>`); there is NO `rootsPrefix()` in any
+     GC discovery path. Landed `f5f96dce01a` (2026-06-29, relocate ref shards → `cas/refs/`) +
+     `644eb7c6ade` (2026-07-01, D1: `discoverUniverse` = `LIST(cas/refs/)`, `gc/registry` deleted).
+  2. The per-page re-enumeration is gone. `ObjectStorageBackend::list` (`CasObjectStorageBackend.cpp:715`)
+     uses a lazy `object_storage->iterate(prefix, max_keys=0, start_after=cursor)` on the native/S3
+     path — S3 honors `start_after`, each page = ONE LIST request, linear walk. The old
+     `listObjects(max_keys=0)` materialize-and-slice survives ONLY in the EmulatedSingleProcess (test)
+     branch. Landed `b15f1ef9d28` (2026-06-29, "paginate backend list with object iterator").
+  Release gate #16 is closed. **What this entry did NOT cover, and is still open:** the round is still
+  O(universe) per round because discovery does TWO full `cas/refs/` LISTs every round + re-reads the
+  generation, regardless of delta — see `S3-BUDGET — idle GC …` and `S3-BUDGET/SCALABILITY — GC round
+  duration is O(ref universe)` below. That is the Phase-4 "fold/discover skip-unchanged" item, distinct
+  from this now-fixed discovery-PLACEMENT quadratic. (Note: the per-shard fold READ already skips
+  unchanged shards via token-diff — `computeDiscoverDecisions`/`fold`, `CasGc.cpp:637-660,1379`.)
 - **Logged (UTC):** 2026-06-28T06:06:30
 - **Severity:** suspected-bug / perf-scalability (correctness-safe)
 - **Observed:** S3 ListObjectsV2 is recursive/flat by default (no delimiter). Gc::listRootShardTokens (CasGc.cpp:1168) lists layout.rootsPrefix() with backend.list(prefix,cursor,1000) and filters non-shard keys in-process. But ObjectStorageBackend::list (CasObjectStorageBackend.cpp:564) calls object_storage->listObjects(prefix, children, max_keys=0) = enumerate ALL keys under roots/ into memory + std::sort, then returns a 1000-key window after cursor. So the paging loop RE-ENUMERATES + RE-SORTS the entire roots/ prefix on EVERY page: ~N/1000 page-calls x a full N-key S3 enumeration each = ~O(N^2/1000) S3 LIST round-trips + O(N) mem per page, N = all objects under roots/ (dominated by the manifest backlog, 38k+ in the soak; only ~128 are actual shard objects). Recursion pulls _manifests/_files/watermarks/shadow too. This is the mechanism behind the B146/B154 fsck/GC timeouts at large pool: discovery cost explodes super-linearly with the manifest count -> gc_checkpoint fsck timed out (>180s) at ~150GB -> no reclaim -> pool grew. Correctness-safe (registry is the universe authority; LIST is only a token-diff accelerator).
@@ -339,6 +358,12 @@ SETTINGS storage_policy='ca', min_bytes_for_...(74 more chars)
 
 ## IDEA-COMMON-SHARD-PREFIX-SINGLE-LIST: IDEA: move shard objects to one common flat prefix + stable cached @cas@ reference -> GC discovery = a single LIST
 
+- **REALIZED / superseded 2026-06-29 (verified 2026-07-06).** The core of this idea already shipped:
+  ref (root-shard) objects live in ONE flat prefix `cas/refs/<ns>/<shard>` since the Phase-1
+  relocation (`f5f96dce01a`), so GC discovery IS a single paged `LIST(cas/refs/)` returning
+  `(ns,shard)->token`, O(shards), no manifest/_files noise. `_manifests/`/`_files` stay per-table and
+  are never enumerated by GC. Nothing further to relocate. The remaining per-round O(universe) cost is
+  the Phase-4 skip-unchanged item, not a placement problem.
 - **Logged (UTC):** 2026-06-28T06:09:53
 - **Severity:** design-idea (proposed fix for GC-DISCOVERY-LIST-QUADRATIC-OVER-ROOTS)
 - **Observed:** Root cause of the quadratic GC discovery: the GC-hot mutable shard objects live INSIDE each table tree (roots/<ns>/store/<uuid>@cas@/<shard>), interleaved with _manifests/ and _files/, so the token-diff accelerator must recursively LIST all of roots/ (enumerating the 38k+ manifest backlog to find ~128 shards). PROPOSAL: relocate every shard object into ONE common flat prefix (all namespaces shards together, key encodes (ns,shard) e.g. shards/<ns_id>/<shard_idx>); the table tree keeps @cas@ as a STABLE, CACHEABLE reference (pointer) to its shards rather than their physical home. Because namespaces are UUID-keyed the table->shards mapping never churns, so the reference is resolved once and cached — and if the mapping is made deterministic it is a pure function (no stored indirection object).
@@ -847,6 +872,30 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
 
 
 ## PRODUCT BUG (availability, HIGH) — mount-lease self-adoption fails closed under rapid crash-restart
+- **RESOLVED 2026-07-06 (code complete + reviewed; live soak validation = the one remaining step).**
+  Root cause (P3.1): the "foreign writer" of `ca_soak_ch1/mount` is the GC leader's **legitimate**
+  fence-out of a lease that EXPIRED while ch1 was alive — the renewal thread also ran the S3-heavy
+  retired-view refresh (`refreshViewForBeat`, exclusive `view_gate` + per-shard GETs) synchronously
+  before the lease PUT, so under RustFS retry storms (~19% read errors, backoff to minutes) the
+  renewal was pushed past the 30 s TTL. The PERMANENT wedge (exit 49 on restart) is that fence landing
+  inside the keeper's non-atomic adopt GET→CAS window during `Store::open`, which had no retry.
+  Two-part fix on `cas-gc-rebuild`, TLA+-gated (`FenceCostsEpoch` + `NoPermanentWedge`;
+  `CaCasMountCore`):
+  - **Fence recovery** ("a fence costs an epoch"): `FencedSelf` claim outcome + typed
+    `MountFencedException`, renewal mismatch classified by BODY (a GC fence of our own expired lease is
+    not a "foreign writer"), and a bounded fence-recovery loop in `Store::open` (re-alloc a fresh
+    `writer_epoch` and re-claim). Commits `d76d4e75e8e`..`4000161a2ab` (+ `cdf02bfd67b` ErrorCodes→typed).
+  - **Lease/view-sync decouple** (removes the CAUSE): the renewal reads the installed round in-memory
+    (`Store::observedGcRound`) and no longer runs the refresh; a dedicated syncer thread
+    (`syncRetiredView`, formerly `refreshViewForBeat`) advances the view off the renewal path, so a
+    slow object store can no longer block a renewal past its TTL. Commits `afb89a730bb`..`245b8ffd30e`.
+    (The `mount_beat` audit event referenced elsewhere in this backlog is renamed `retired_view_advance`.)
+  Unit suite `Cas*` green throughout. **Still TODO (Task 6):** live soak validation of the
+  fence-recovery cycle under induced S3 latency — renewal cadence stays ≤ period while the syncer
+  lags, the lease never expires on a live node, no spurious `gc_fence_out`, and a genuine fence-out
+  recovers in place as a fresh incarnation (higher `writer_epoch`, no "foreign writer" wedge). See
+  `docs/superpowers/specs/2026-07-06-cas-mount-lease-fence-recovery-design.md` +
+  `docs/superpowers/specs/2026-07-06-cas-lease-view-sync-decouple-design.md`.
 - **Logged (UTC):** 2026-07-06 (campaign S13 full, process-loss chaos, round 22)
 - **Severity:** CORRECTNESS/AVAILABILITY (the first non-budget bug of the campaign)
 - **Symptom:** S13 kills ch1 repeatedly (~every 40 s, 6 s down). At round 22 ch1 failed to restart and
@@ -881,7 +930,7 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
 - **Severity:** follow-up (compensated, not blocking)
 - **Observed:** the `mount_claim`/`mount_conflict` audit events (Phase 2) cannot capture the claim
   made DURING `Store::open` — the `CasEventSink` is installed after `open` returns. A kill-restart
-  cycle showed only `mount_beat` rows while the plain server log proved the reclaim fired
+  cycle showed only `retired_view_advance` (formerly `mount_beat`) rows while the plain server log proved the reclaim fired
   ("a stale mount lease is held by uuid=...; waiting for it to lapse, then reclaiming").
 - **Compensation in place:** the three keeper refusal exception messages now carry the observed
   holder identity (uuid/hostname/pid/epoch/seq/expires), so err.log names the toucher at first-open.
