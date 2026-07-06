@@ -17,6 +17,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int ABORTED;
 }
 }
 
@@ -172,6 +173,19 @@ struct MountClaimResult
     };
     Kind kind = ForeignOwner;
     MountLease body;
+};
+
+/// Thrown when a mount operation observes that OUR OWN (uuid, epoch) slot was `gc_fenced` by the GC
+/// after our lease expired — a RECOVERABLE state ("a fence costs an epoch"): the caller re-opens with
+/// a fresh `writer_epoch`. A CAS-local typed exception rather than a new `ErrorCodes` number: a fork
+/// carries these edits indefinitely and the numbered `ErrorCodes` list conflicts with upstream on
+/// every rebase. Catch sites match BY TYPE (`catch (const MountFencedException &)`), never by code;
+/// the base code is `ABORTED` so an uncaught one still surfaces as a clean startup abort.
+class MountFencedException : public DB::Exception
+{
+public:
+    explicit MountFencedException(const String & msg)
+        : DB::Exception(msg, DB::ErrorCodes::ABORTED) {}
 };
 
 MountClaimResult claimMount(

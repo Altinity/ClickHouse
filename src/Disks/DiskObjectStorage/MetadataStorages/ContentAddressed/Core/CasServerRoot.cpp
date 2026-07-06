@@ -21,7 +21,6 @@ namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
-    extern const int CAS_MOUNT_FENCED;
 }
 }
 
@@ -710,9 +709,9 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
     {
         emitMountEvent(event_sink, CasEventType::MountConflict, srid, "fenced_by_gc", &observed,
             "own mount slot fenced by GC after lease expiry — recoverable with a fresh writer_epoch");
-        throw Exception(ErrorCodes::CAS_MOUNT_FENCED,
+        throw MountFencedException(fmt::format(
             "CAS mount-lease: key '{}' was fenced by GC after lease expiry ({}) — "
-            "recoverable: re-open with a fresh writer_epoch", key, describeMountHolder(observed));
+            "recoverable: re-open with a fresh writer_epoch", key, describeMountHolder(observed)));
     }
 
     /// Same uuid AND same epoch → it is OUR OWN claim → ADOPT: overwrite against the observed token
@@ -732,9 +731,9 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
                 emitMountEvent(event_sink, CasEventType::MountConflict, srid, "fenced_by_gc", &current,
                     "GC fenced our mount between the adopt's read and write — recoverable with a "
                     "fresh writer_epoch");
-                throw Exception(ErrorCodes::CAS_MOUNT_FENCED,
+                throw MountFencedException(fmt::format(
                     "CAS mount-lease: key '{}' was fenced by GC inside the adopt window ({}) — "
-                    "recoverable: re-open with a fresh writer_epoch", key, describeMountHolder(current));
+                    "recoverable: re-open with a fresh writer_epoch", key, describeMountHolder(current)));
             }
             emitMountEvent(event_sink, CasEventType::MountConflict, srid, "adopt", &current,
                 "mount slot was touched while adopting our own mount slot — failing closed");
@@ -787,9 +786,9 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
             emitMountEvent(event_sink, CasEventType::MountConflict, srid, "fenced_by_gc", &current,
                 "own mount slot fenced by GC after lease expiry (late renewal) — recoverable with a "
                 "fresh writer_epoch");
-            throw Exception(ErrorCodes::CAS_MOUNT_FENCED,
+            throw MountFencedException(fmt::format(
                 "CAS mount-lease: key '{}' was fenced by GC after lease expiry (late renewal) ({}) — "
-                "recoverable: re-open with a fresh writer_epoch", mismatched_key, describeMountHolder(current));
+                "recoverable: re-open with a fresh writer_epoch", mismatched_key, describeMountHolder(current)));
         }
 
         if (current.server_uuid == server_uuid && current.writer_epoch != writer_epoch)

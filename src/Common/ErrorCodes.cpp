@@ -669,7 +669,6 @@
     M(1005, STALE_VERSION) \
     M(1006, INVALID_CURSOR_LOOKUP) \
     M(1007, ILLEGAL_STREAM) \
-    M(1008, CAS_MOUNT_FENCED) \
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -686,7 +685,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
-    constexpr ErrorCode END = 1008;
+    constexpr ErrorCode END = 1007;
     ErrorPairHolder values[END + 1]{};
 
     struct ErrorCodesNames

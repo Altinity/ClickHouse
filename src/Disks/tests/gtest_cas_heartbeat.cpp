@@ -10,10 +10,6 @@
 
 using namespace DB::Cas;
 
-namespace DB::ErrorCodes
-{
-extern const int CAS_MOUNT_FENCED;
-}
 
 /// MountLeaseKeeper behavior after the ack-floor merge (spec 2026-07-02-cas-gc-ack-floor-fence):
 /// the per-server mount lease and the merged build-watermark floor + GC-round acknowledgement all
@@ -253,7 +249,7 @@ TEST(CasHeartbeat, StopBeforeStartIsQuietNoOp)
 
 /// "A fence costs an epoch" at the keeper layer: the GC fenced our fresh lease before we adopted it
 /// (the lease expired mid-open — e.g. a slow first beat). This must fail closed with a TYPED,
-/// RECOVERABLE error (`CAS_MOUNT_FENCED`), distinct from the generic "touched by a foreign writer"
+/// recoverable `MountFencedException`, distinct from the generic "touched by a foreign writer"
 /// `LOGICAL_ERROR` — the open path (Task 4) tells "re-open with a fresh epoch" apart from "fail hard"
 /// by this code, not by parsing message text.
 TEST(CasMountAudit, KeeperAdoptRefusesFencedSelfWithTypedError)
@@ -286,10 +282,9 @@ TEST(CasMountAudit, KeeperAdoptRefusesFencedSelfWithTypedError)
     {
         keeper.start();
     }
-    catch (const DB::Exception & e)
+    catch (const MountFencedException & e)
     {
         threw = true;
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CAS_MOUNT_FENCED);
         EXPECT_NE(e.message().find("fenced by GC"), String::npos) << e.message();
         EXPECT_EQ(e.message().find("foreign writer"), String::npos) << e.message();
     }
@@ -303,7 +298,7 @@ TEST(CasMountAudit, KeeperAdoptRefusesFencedSelfWithTypedError)
 /// A renew mismatch is classified by BODY, not blamed on "a foreign writer" by default: the GC can
 /// fence our OWN (uuid, epoch) mount slot after our lease expires (a late renewal beat racing the
 /// GC's fence-out). The keeper must re-read and recognize this as its OWN incarnation being fenced —
-/// a RECOVERABLE `CAS_MOUNT_FENCED`, not the generic single-writer-violation text.
+/// a recoverable `MountFencedException`, not the generic single-writer-violation text.
 TEST(CasHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -338,9 +333,8 @@ TEST(CasHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
         keeper.renewOnce();
         FAIL() << "renewOnce over a fenced slot must throw";
     }
-    catch (const DB::Exception & e)
+    catch (const MountFencedException & e)
     {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CAS_MOUNT_FENCED);
         EXPECT_TRUE(e.message().find("fenced by GC") != String::npos);
         EXPECT_TRUE(e.message().find("foreign writer") == String::npos);
     }
