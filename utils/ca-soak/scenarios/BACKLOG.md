@@ -937,3 +937,42 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
 - **Fix direction:** synthesize one `mount_claim` event describing the open-time claim as soon as
   the sink is installed (the lease body is at hand), or install the sink before `Store::open`'s
   mount step. Small; touches `ContentAddressedMetadataStorage` startup wiring only.
+
+## ADAPTIVE-GC-CADENCE: GC frequency tuning — journal-pressure-triggered fold, not fixed interval
+- **Logged (UTC):** 2026-07-06
+- **Severity:** design / s3-budget (efficiency; follow-up to Phase 4 Lever A skip-unchanged)
+- **Insight:** the dominant cost of running GC RARELY is NOT S3 storage of dead (condemned-but-not-
+  yet-reclaimed) data — that is nearly free short-term (~$0.02/GB/mo; minutes of garbage negligible).
+  It is **journal growth**. Every writer mutation (publish/drop/precommit/promote) RMW-rewrites the
+  WHOLE root-shard body (live-refs + journal tail); flat-combining batches only concurrent mutations.
+  The journal tail is trimmed (B12) only up to the FOLD cursor, which GC advances — so **no fold ⇒ no
+  trim ⇒ the body grows and every mutation's CAS gets more expensive**. Without trim a shard's write
+  cost is O(mutations-since-fold) per mutation ⇒ **quadratic** in mutations over the interval. That is
+  the real feedback: rare GC → fat journals → slow writers.
+- **Tradeoff shape:** total S3 ops/sec ≈ A/interval + B·interval, where A = O(universe) snapshot
+  read+write per fold (fewer folds when interval grows) and B = writer amplification (journal tail
+  ∝ rate × time-since-fold, grows with interval). ⇒ **sqrt-optimal interval ∝ √U / r** (U = blob
+  universe, r = hottest-shard mutation rate): bigger pool → longer optimal interval; hotter writes →
+  shorter. HARD CEILING regardless of the optimum: the hottest shard's body must stay under the
+  object-store inline threshold (~128 KiB RustFS; 8 MiB `gc_trim_body_soft_limit` backstop) or RMW
+  goes pathological (rustfs#3231). Night data: 32 shards, hot table ~25 KB healthy, ~165 KB @ 10 min
+  under a storm (already over 128 KiB) ⇒ ceiling on a hot pool is single-digit minutes, not tens.
+- **KEY design point (for Phase 4 and beyond):** the fold trigger should key on **per-shard journal
+  pressure (event count / body size / age)**, NOT on changed-shard count. One hot shard mutated 10k
+  times = "1 changed shard" — a shard-count threshold would defer and let its journal explode. Journal
+  pressure is the correct signal for when a fold (and thus a trim) is actually necessary.
+- **Relation to Phase 4 Lever A (skip-unchanged, in progress):** with the default `gc_fold_threshold
+  = 1` (fold on any change), Lever A is already **journal-safe** — an active shard is folded/trimmed
+  every round it is touched, journals stay tiny; idle rounds DEFER (cheap). What Lever A does NOT do
+  is reduce O(universe) folds on an ACTIVE pool. Reducing active-pool fold frequency (tolerating
+  fatter journals to save folds) is THIS item — bounded by the hot-shard ceiling, and best driven by
+  a journal-pressure trigger.
+- **Prod direction:** the aggressive every-few-seconds GC is a TEST instrument; for prod use a modest
+  `gc_interval_sec` (~30–60 s — idle DEFER makes idle pools ~free) plus a journal-pressure fold
+  trigger (self-tuning: cold shards never force a fold, a hot shard forces one before its body crosses
+  the threshold). Constants (A, B, U, r) are pool-specific.
+- **Proposed action:** its own brainstorm + spec AFTER Phase 4 Lever A lands. Needs a cheap per-shard
+  journal-size signal (not from LIST — LIST gives the token, not the body size; the writer knows it
+  post-write, or GC reads hot shards' bodies which it does at fold anyway) and a **measurement soak**:
+  sweep `gc_interval_sec` (and/or a journal-size trigger), plot hot-shard CAS body size + writer
+  amplification vs GC ops/sec, find the knee. Do NOT block Lever A (which is journal-safe at default).
