@@ -40,6 +40,10 @@ ROOT_SHARDS = 8  # compose default; root-shard CAS contention is bounded by this
 # Local helpers
 # ---------------------------------------------------------------------------
 
+WIDE_PARSER_SETTINGS = {"max_query_size": 100 * 1024 * 1024,
+                        "max_ast_elements": 5_000_000, "max_expanded_ast_elements": 5_000_000}
+
+
 def _wide_columns(n_cols, *, key="k", col_type="UInt32"):
     """Column-list SQL for a wide table: a key column plus `n_cols` data columns c0..c{n-1}."""
     cols = [f"{key} UInt64"]
@@ -113,17 +117,28 @@ class S06(Scenario):
 
         cols = _wide_columns(n_cols)
         for n in cl.nodes():
-            sql.create_ca_table(n, table, columns=cols, order_by="k", wide=True)
+            sql.create_ca_table(n, table, columns=cols, order_by="k", wide=True,
+                                client_settings=WIDE_PARSER_SETTINGS)
 
         counters = _common.counters_window(ctx)
         committed = True
         limit_exceeded = False
         t0 = time.monotonic()
         try:
+            # A 10000-column SELECT is a ~260 KB SQL string — over the 256 KB default
+            # `max_query_size`, so raise it or the wide INSERT is rejected with SYNTAX_ERROR
+            # (code 62) BEFORE the CAS write path, never reaching the manifest-cap test under
+            # scrutiny (campaign 2026-07-05: full scale failed exactly here).
+            # A 10000-column INSERT also blows the AST-size limits (max_ast_elements default 50000,
+            # ~5 nodes/column). Raise query-size AND both AST caps so the SQL reaches the CAS write
+            # path (this is the wide-part/manifest test, not a parser-limits test).
+            wide_q = {"max_query_size": 100 * 1024 * 1024,
+                      "max_ast_elements": 5_000_000, "max_expanded_ast_elements": 5_000_000}
             # One row first (smallest possible Wide part), then a larger block.
-            sql.insert_values(cl.node1, table, _wide_select(n_cols, rows=1, base=0), timeout=1200)
+            sql.insert_values(cl.node1, table, _wide_select(n_cols, rows=1, base=0), timeout=1200,
+                              settings=wide_q)
             sql.insert_values(cl.node1, table, _wide_select(n_cols, rows=block_rows, base=1000),
-                              timeout=2400)
+                              timeout=2400, settings=wide_q)
             cl.node1.command(f"OPTIMIZE TABLE {table} FINAL", timeout=2400)
         except Exception as e:
             msg = str(e)
@@ -274,7 +289,8 @@ class S07(Scenario):
 
         cols = _wide_columns(n_cols)
         for n in cl.nodes():
-            sql.create_ca_table(n, table, columns=cols, order_by="k", wide=True)
+            sql.create_ca_table(n, table, columns=cols, order_by="k", wide=True,
+                                client_settings=WIDE_PARSER_SETTINGS)
 
         counters = _common.counters_window(ctx)
         triggered = False
@@ -282,6 +298,7 @@ class S07(Scenario):
         non_cap_error = None
         try:
             sql.insert_values(cl.node1, table, _wide_select(n_cols, rows=block_rows, base=0),
+                              settings=WIDE_PARSER_SETTINGS,
                               timeout=2400)
             cl.node1.command(f"OPTIMIZE TABLE {table} FINAL", timeout=2400)
         except Exception as e:

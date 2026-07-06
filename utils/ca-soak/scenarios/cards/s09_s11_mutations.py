@@ -138,13 +138,18 @@ class S09(Scenario):
 
         for n in cl.nodes():
             sql.create_ca_table(n, table, columns=columns, order_by="id", wide=True)
-
         # --- insert large parts ------------------------------------------------------
         for op in range(n_inserts):
             sql.insert_random(cl.node1, table, rows=rows_per_insert, payload_bytes=payload_bytes,
                               extra_cols_select=extra_cols_select, op_id=op * rows_per_insert)
         expected_rows = n_inserts * rows_per_insert
         result.observations["expected_rows"] = expected_rows
+
+        # Consolidate the insert parts NOW (before the baseline) so the merge that rewrites the
+        # ~payload body is captured in the baseline, not misattributed to the first mutation's
+        # pool-delta window. NOT `SYSTEM STOP MERGES` — that also halts mutations (they run via the
+        # merge scheduler), which stalls the ALTER UPDATEs (campaign 2026-07-06 regression).
+        cl.node1.command(f"OPTIMIZE TABLE {table} FINAL", timeout=2400)
 
         baseline = observe.pool_shape(timeout_s=90)
         result.observations["pool_after_inserts"] = baseline.get("_total")
@@ -396,21 +401,26 @@ class S10(Scenario):
             observed_rows == expected_rows,
             "deleted bucket rows must be gone; survivors exactly match the Python oracle"))
 
-        # Deleted rows are truly invisible (no row with a deleted bucket key survives).
-        # Use the LAST deleted bucket (highest k): it was deleted in the final burst, and no INSERT
-        # happens after the final burst's deletes, so its surviving count must be exactly 0.
-        # Using sorted()[0] (the first bucket) is incorrect because the same k value may be re-inserted
-        # in a later burst that ran after the delete (correct oracle behavior, not a bug).
-        if deleted_buckets:
-            some = sorted(deleted_buckets)[-1]
-            still = None
-            try:
-                still = int(cl.node1.scalar(f"SELECT count() FROM {table} WHERE k = {some}") or 0)
-            except Exception:
-                pass
-            result.add(Verdict.check(
-                "deleted bucket fully removed", "0 surviving rows for a deleted bucket",
-                f"k={some}: {still}", still == 0))
+        # Deleted rows are truly invisible. The workload interleaves DELETE bursts with INSERTs, and
+        # every INSERT writes rows for ALL 100 buckets (k = number % 100), so a bucket deleted mid-run
+        # is legitimately REPOPULATED by any later insert (the oracle accounts for this — 3M matches).
+        # To test "a delete fully removes rows" without that confound, issue a FRESH delete of one
+        # bucket as the FINAL operation (after all inserts) and verify it is empty. Lightweight DELETE
+        # is unreliable on this CA build (see above) — use ALTER DELETE and wait for the mutation.
+        some = 99
+        try:
+            cl.node1.command(f"ALTER TABLE {table} DELETE WHERE k = {some} SETTINGS mutations_sync=2",
+                             timeout=600)
+        except Exception as e:
+            result.note_anomaly(f"S10 final ALTER DELETE k={some} failed: {e}")
+        still = None
+        try:
+            still = int(cl.node1.scalar(f"SELECT count() FROM {table} WHERE k = {some}") or 0)
+        except Exception:
+            pass
+        result.add(Verdict.check(
+            "deleted bucket fully removed", "0 surviving rows after a final delete (no later insert)",
+            f"k={some}: {still}", still == 0))
 
         # No CA bad events during patch creation/merge/removal is asserted by standard_end; surface the
         # patch-part sub-point honestly.
@@ -541,7 +551,8 @@ class S11(Scenario):
             per_bucket_per_part[r % buckets] += 1
         for part in range(parts):
             sql.insert_random(cl.node1, table, rows=rows_per_part, payload_bytes=payload_bytes,
-                              extra_cols_select=f"(number % {buckets}) AS bucket", op_id=next_id)
+                              extra_cols_select=f"(number % {buckets}) AS bucket", op_id=next_id,
+                              settings={"max_partitions_per_insert_block": buckets + 16})
             next_id += rows_per_part
         inserted_rows = parts * rows_per_part
         result.observations["inserted_rows"] = inserted_rows
@@ -570,7 +581,8 @@ class S11(Scenario):
             if rnd % 3 == 0 and (buckets // 2) >= 2:
                 sql.insert_random(cl.node1, table, rows=rows_per_part, payload_bytes=payload_bytes,
                                   extra_cols_select=f"((number % {buckets // 2}) + {buckets // 2}) AS bucket",
-                                  op_id=next_id)
+                                  op_id=next_id,
+                                  settings={"max_partitions_per_insert_block": buckets + 16})
                 next_id += rows_per_part
                 inserted_rows += rows_per_part
             # interleave OPTIMIZE to force merges/part rotation.

@@ -23,8 +23,27 @@ def _make_table(node, name):
     sql.create_ca_table(node, name, columns="id UInt64, payload String", order_by="id", wide=True)
 
 
-def _insert_one_big_part(node, name, *, rows, payload_bytes, op_id=0, timeout=2400.0):
-    sql.insert_random(node, name, rows=rows, payload_bytes=payload_bytes, op_id=op_id, timeout=timeout)
+def _insert_one_big_part(node, name, *, rows, payload_bytes, op_id=0, timeout=2400.0,
+                          log_fn=lambda m: None):
+    """Land ONE part holding rows*payload_bytes of payload without materializing it in memory.
+
+    A single INSERT ... SELECT over numbers(rows) produces ONE pipeline block (numbers' block =
+    max_block_size >= rows for our row counts), i.e. the WHOLE payload allocated at once —
+    at --scale full (100 GiB) that is an instant MEMORY_LIMIT_EXCEEDED (observed live 2026-07-03).
+    A huge part is only constructible the way production constructs one: bounded inserts (one
+    ~1 GiB part each), then OPTIMIZE FINAL streams them into the single huge part/blob on disk.
+    The merge phase IS the huge-blob upload under test (streamed via putIfAbsentStream)."""
+    batch_rows = max(1, GIB // payload_bytes)
+    done = 0
+    while done < rows:
+        n_rows = min(batch_rows, rows - done)
+        sql.insert_random(node, name, rows=n_rows, payload_bytes=payload_bytes,
+                          op_id=op_id + done, timeout=timeout)
+        done += n_rows
+        log_fn(f"  inserted {done}/{rows} rows ({done * payload_bytes / GIB:.2f} GiB)")
+    if rows > batch_rows:
+        log_fn(f"  OPTIMIZE FINAL -> single part of {rows * payload_bytes / GIB:.2f} GiB (streamed merge)")
+        node.command(f"OPTIMIZE TABLE {name} FINAL", timeout=timeout)
 
 
 def _baseline_rss(cluster):
@@ -87,7 +106,8 @@ class S01(Scenario):
             gc_thread.start()
         t0 = time.monotonic()
         try:
-            _insert_one_big_part(cl.node1, table, rows=rows, payload_bytes=payload_bytes)
+            _insert_one_big_part(cl.node1, table, rows=rows, payload_bytes=payload_bytes,
+                                 log_fn=ctx.log)
         finally:
             stop_gc.set()
             if gc_thread:
@@ -186,10 +206,28 @@ class S02(Scenario):
             _make_table(n, t1)
             _make_table(n, t2)
 
-        gen = (f"SELECT number AS id, repeat(toString(number % 10), {per_row}) AS payload "
-               f"FROM numbers({rows})")
+        # Deterministic INCOMPRESSIBLE payload: `generateRandom` with a FIXED seed produces
+        # byte-identical output across the two inserts (so the dedup test holds — identical content
+        # -> identical blobs -> second insert avoids the body PUT), while being random bytes that do
+        # NOT LZ4-compress away. `repeat(single_digit)` (the old generator) compressed to ~0, so the
+        # physical blob stayed < dedup_head_first_min_bytes and the big-blob HEAD-before-PUT dedup
+        # path was never exercised (campaign finding 2026-07-03). Same seed + same block settings on
+        # both tables => identical row sequence => identical parts.
+        gen = (f"SELECT rowNumberInAllBlocks() AS id, payload "
+               f"FROM generateRandom('payload String', {int(p.get('gen_seed', 20260703))}, {per_row}) "
+               f"LIMIT {rows}")
+        # Bound the source block so numbers(rows) does NOT emit all rows (= the whole blob) in one
+        # block: at full scale that is an instant MEMORY_LIMIT_EXCEEDED (same class as S01's original
+        # single-INSERT OOM). ~512 MiB blocks stream into ONE part per table (one INSERT = one part),
+        # keeping content deterministic+identical across t1/t2 so the dedup test stays valid.
+        block_rows = max(1, (512 * MIB) // per_row)
+        # max_threads=1: generateRandom's seeded output is deterministic per (seed, block schedule);
+        # multi-threaded reads could interleave blocks differently between the two inserts and diverge
+        # the content, breaking dedup. Single-threaded read pins the row sequence identical.
+        big_insert_settings = {"max_block_size": block_rows, "min_insert_block_size_rows": block_rows,
+                               "max_threads": 1}
         ctx.log(f"S02: first insert ~{actual_bytes/GIB:.3f} GiB")
-        sql.insert_values(cl.node1, t1, gen, timeout=2400)
+        sql.insert_values(cl.node1, t1, gen, timeout=2400, settings=big_insert_settings)
         pool_after_first = _common.blob_count(ctx)
         bytes_after_first = observe.pool_shape(timeout_s=90)
         result.observations["pool_after_first"] = bytes_after_first.get("_total")
@@ -197,7 +235,7 @@ class S02(Scenario):
         # Second insert: identical content, different table (different part names), first kept live.
         counters = _common.counters_window(ctx)
         ctx.log("S02: second identical insert (expect remote body PUT avoided)")
-        sql.insert_values(cl.node1, t2, gen, timeout=2400)
+        sql.insert_values(cl.node1, t2, gen, timeout=2400, settings=big_insert_settings)
         delta = counters().get("_total", {})
         result.observations["second_insert_counters"] = delta
         bytes_after_second = observe.pool_shape(timeout_s=90)

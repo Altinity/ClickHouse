@@ -698,3 +698,180 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
 - **Run:** 20260703T015057_S27_seed20260703
 - **Observed:** NOT RUN — requires an instrumented object store / proxy that returns duplicate or unstable LIST pages for root-shard token listing; not available with the direct rustfs endpoint
 
+## S01-20260705T174845-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 241. DB::Exception: (total
+
+- **Logged (UTC):** 2026-07-05T17:49:01
+- **Severity:** suspected-bug
+- **Run:** 20260705T174845_S01_seed20260703
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 500: Code: 241. DB::Exception: (total) memory limit exceeded: would use 128.27 GiB (attempt to allocate chunk of 128.00 GiB), current RSS: 245.26 MiB, maximum: 25.20 GiB. OvercommitTracker decision: Query was selected to stop by OvercommitTracker: while executing 'FUNCTION randomString(8388608_UInt32 :: 2) -> randomString(8388608_UInt32) String : 0'. (MEMORY_LIMIT_EXCEEDED) (version 26.6.1.1) | sql=INSERT INTO s01_huge SELECT 0 + number AS id, randomString(8388608) AS payload FROM numbers(12800)
+
+
+---
+
+## RESOURCE — CAS write path spills the WHOLE part to local scratch (hash-before-upload)
+- **Logged (UTC):** 2026-07-05 (campaign full-scale S01)
+- **Severity:** resource-bug (scalability + local-disk amplification)
+- **Observed:** building/uploading a large part spills the ENTIRE object to `disks/ca/cas_scratch`
+  before the S3 upload — 24 GiB part -> ~24 GiB scratch; 100 GiB part -> 93 GiB scratch (measured).
+  The S3 upload itself streams (RSS stayed 115 MiB for a 100 GiB merge — memory is fine), but local
+  free disk must be >= part size or the write cannot complete. A part larger than local scratch is
+  unwritable even though nothing is held in RAM.
+- **Root cause hypothesis:** `HashingWriteBuffer` in the CA write path computes the content hash by
+  writing the full object to a local temp first, then uploads. The hash should be computed IN-STREAM
+  (hash the bytes as they are uploaded to S3) so no full local spill is needed — the streaming
+  HashingWriteBuffer already sees every byte on the way out.
+- **Impact:** caps max part/blob size at local-disk free space; on the campaign host a 100 GiB
+  single-blob merge exhausted the disk during OPTIMIZE FINAL (see worklog 2026-07-03-scenarios).
+- **Fix direction:** in-stream hash-while-upload (no full scratch spill), or a bounded chunked
+  hash that never materializes the whole object locally. Verify against the streaming-hash
+  convention (chunked CityHash128 over 2048-B blocks — chunking already exists, the spill is the issue).
+
+## RESOURCE — replicated OPTIMIZE re-merges + re-spills on every replica (shared pool)
+- **Logged (UTC):** 2026-07-05 (campaign full-scale S01)
+- **Severity:** resource-bug (duplicated work + local-disk amplification on shared pool)
+- **Observed:** ch2 (a replica on the SHARED CAS pool) independently ran the same OPTIMIZE FINAL
+  merge and spilled its OWN ~93 GiB scratch; dedup then keeps ONE pool blob. 186 GiB of local
+  scratch across two replicas to produce one deduped 100 GiB blob; both replicas burn CPU/IO
+  re-merging identical content.
+- **Fix direction:** a shared-pool replica should ADOPT the leader's already-uploaded merged blob
+  (the content hash is identical by construction) instead of re-merging + re-hashing + re-spilling
+  locally. Ties into the general "replicas share pool blobs, don't re-upload" design — the merge
+  path apparently does not take that shortcut.
+
+## S3-BUDGET — idle GC has a high fixed per-round cost on a large static pool
+- **Logged (UTC):** 2026-07-05 (campaign S03 full 20M rows/400 parts)
+- **Severity:** s3-budget / efficiency
+- **Observed:** 161 idle-GC rounds over ~15 min on a STATIC pool: ~1362 CasGcGet + ~643 CasBlobHead
+  + ~457 CasRootGet PER ROUND (~2500 S3 ops/round) with nothing changing. GC memory is bounded
+  (1.57 GB) but S3 op volume is not idle-cheap — each round re-reads the generation runs and HEADs
+  candidate blobs regardless of change.
+- **Components:** (a) the fold re-reads prior-generation runs every round even when the journal has
+  no new transitions; (b) B148 HEAD-storm-at-retire (per-candidate blob HEAD instead of stored token,
+  ~643/round). (b) is already a ROADMAP item; (a) is the bigger idle cost.
+- **Fix direction:** short-circuit a GC round when the ack-floor + journal show zero new transitions
+  since the last sealed generation (skip the re-fold entirely — "nothing to do" round is ~O(1) reads,
+  not O(generation)); land B148 stored-token retire to kill the per-round blob HEADs.
+- **Note:** prod `gc_interval_sec=60` reduces round COUNT 6x vs the soak's 10 s, but per-round cost
+  is unchanged — a large idle pool still burns steady S3 ops.
+
+## S3-BUDGET/SCALABILITY — GC round duration is O(ref universe): ~93 s at 10000 tables
+  - **UPDATE (S08, 100000 tiny parts):** the same O(pool-object-count) scaling reached **398 s
+    (6.6 min) for a SINGLE GC fold round** at ~100k parts (one round deleted 24392 manifests). Data
+    points: 87 ms @ 400 parts (S03) -> 93 s @ 10k tables (S05) -> 398 s @ 100k parts (S08). The
+    end-checkpoint settle_fsck cannot stabilize because each multi-minute round bulk-mutates the pool.
+    Correctness holds (manifests drain, no errors), but a 6.6-min GC round is a hard scalability wall.
+
+- **Logged (UTC):** 2026-07-05 (campaign S05 "10000 sparse tables" full)
+- **Severity:** scalability / s3-budget (latency)
+- **Observed:** GC fold rounds took **92.6 s and 93.9 s** each on a 10000-table pool (each table is a
+  namespace; discoverUniverse LISTs cas/refs/ across ~10000 namespaces × shards and the fold reads
+  the generation). Compare S03 (400 parts, one namespace): p95 87 ms. So round time scales with the
+  ref-universe size, reaching ~1.5 min/round at 10k tables.
+- **Consequences:** (1) with `gc_interval_sec=10` a 93 s round cannot keep cadence -> continuous
+  back-to-back GC; (2) `settle_fsck` cannot stabilize (background GC mutates the pool faster than fsck
+  can snapshot it — history oscillated 22415->22103->21212 reachable, dangling stayed 0 so correctness
+  is intact); (3) the forced-GC-to-fixpoint end-phase is very slow.
+- **Fix direction:** (a) skip-unchanged-namespace in discoverUniverse/fold (a namespace with no new
+  journal transitions since the last sealed generation should cost ~O(1), not a full re-read) —
+  the token-diff discovery should prune untouched namespaces; (b) incremental/partitioned fold so a
+  round is bounded regardless of total universe; (c) raise the default gc_interval for very large
+  universes so rounds don't overlap. Ties to the S03 "idle GC high per-round cost" item — same root:
+  the fold re-reads the whole universe every round.
+- **Correctness:** unaffected (dangling=0 throughout); this is cost/latency, not a data bug.
+## S06-20260705T215757-1: S06 wide-part write failed without a manifest-cap LIMIT_EXCEEDED
+
+- **Logged (UTC):** 2026-07-05T21:58:42
+- **Severity:** suspected-bug
+- **Run:** 20260705T215757_S06_seed20260703
+- **Observed:** S06 wide-part write failed without a manifest-cap LIMIT_EXCEEDED
+
+## S06-20260705T220753-1: S06 wide-part write failed without a manifest-cap LIMIT_EXCEEDED
+
+- **Logged (UTC):** 2026-07-05T22:08:16
+- **Severity:** suspected-bug
+- **Run:** 20260705T220753_S06_seed20260703
+- **Observed:** S06 wide-part write failed without a manifest-cap LIMIT_EXCEEDED
+
+## S07-20260705T224846-1: scenario raised: Node(localhost:8123) HTTP 400: Code: 62. DB::Exception: Max que
+
+- **Logged (UTC):** 2026-07-05T22:49:04
+- **Severity:** suspected-bug
+- **Run:** 20260705T224846_S07_seed20260703
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 400: Code: 62. DB::Exception: Max query size exceeded (can be increased with the `max_query_size` setting): Syntax error: failed at position 262144 (UI): UI. . (SYNTAX_ERROR) (version 26.6.1.1) | sql=CREATE TABLE s07_capwide (k UInt64, c0 UInt32, c1 UInt32, c2 UInt32, c3 UInt32, c4 UInt32, c5 UInt32, c6 UInt32, c7 UInt32, c8 UInt32, c9 UInt32, c10 UInt32, c11 UInt32, c12 UInt32, c13 UInt32, c14 UI...(288932 more chars)
+
+
+## S3-BUDGET/RESOURCE — wide part = O(columns) S3 ops; 20000-column merge exhausts ephemeral ports
+- **Logged (UTC):** 2026-07-06 (campaign S07 full, 20000 columns)
+- **Severity:** s3-budget / resource (connection churn)
+- **Observed:** OPTIMIZE FINAL on a 20000-column wide part stalled at progress=0 for 4+ min. Server
+  log: `Poco::Net Cannot assign requested address: 172.19.0.2:11121` (errno 99) — the CH container
+  EXHAUSTED its ephemeral TCP port range connecting to RustFS. The S3 client retried (attempt 7/501)
+  with backoff, so the merge crawled (S3PutObject +5 ops / 5 s). Each column file is a separate CAS
+  object → a HEAD/GET/PUT per column → ~20000 object-store ops in a burst for ONE part merge.
+- **Root cause:** wide-part operations issue O(columns) CAS ops; a burst of tens of thousands of
+  connections outpaces keep-alive reuse and exhausts local ports (TIME_WAIT accumulation).
+- **Fix direction:** (a) stronger connection pooling / keep-alive reuse in the CAS S3 path so a
+  wide-part op reuses a small connection set instead of churning per column; (b) batch per-column
+  HEAD/GET/PUT (the manifest already groups columns — read/write column blobs in batched requests);
+  (c) consider inlining small column files into the manifest (already happens for tiny ones — raise
+  the threshold so 20000 tiny columns don't each become a separate object). Also a deployment note:
+  raise net.ipv4.ip_local_port_range / tune S3 max connections for very wide tables.
+- **Correctness:** unaffected (the 20000-column part COMMITTED on insert; only the subsequent merge
+  stalls on port exhaustion). This is cost/latency/resource, not a data bug.
+## S11-20260706T025607-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 252. DB::Exception: Too ma
+
+- **Logged (UTC):** 2026-07-06T02:56:25
+- **Severity:** suspected-bug
+- **Run:** 20260706T025607_S11_seed20260703
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 500: Code: 252. DB::Exception: Too many partitions for single INSERT block (more than 100). The limit is controlled by 'max_partitions_per_insert_block' setting. Large number of partitions is a common misconception. It will lead to severe negative performance impact, including slow server startup, slow INSERT queries and slow SELECT queries. Recommended total number of partitions for a table is under 1000..10000. Please note, that partitioning is not intended to speed up SELECT queries (ORDER BY key is sufficient to make range queries fast). Partitions are intended for data manipulation (DROP PARTITION, etc). (TOO_MANY_PARTS) (version 26.6.1.1) | sql=INSERT INTO s11_buckets SELECT 0 + number AS id, randomString(2048) AS payload, (number % 256) AS bucket FROM numbers(10000)
+
+
+## S3-BUDGET — partitioned-table INSERT is O(partitions) CAS commits (256-partition insert ~10 s)
+- **Logged (UTC):** 2026-07-06 (campaign S11 full, PARTITION BY bucket, 256 buckets)
+- **Severity:** s3-budget / latency
+- **Observed:** each INSERT into a 256-partition table took ~10 s (only 4-5 inserts/min). A single
+  INSERT splits into one part-piece per partition, and each part-piece is a separate CAS commit
+  (manifest + ref + blob round-trip) -> ~256 S3 commit sequences per INSERT. On a non-CAS MergeTree
+  the per-partition parts are cheap local writes; CAS turns them into S3 round-trips, so
+  partition-heavy ingestion is latency-bound on S3 op count.
+- **Fix direction:** batch the per-partition part commits of a single INSERT into one shard-queue
+  flush / one manifest CAS where the parts share a namespace shard (the flat-combining queue already
+  coalesces same-shard mutations — verify it covers multi-partition single-INSERT part-pieces).
+- **Correctness:** unaffected — same O(N)-on-S3 family as the GC-round / wide-part findings.
+## S13-20260706T044329-1: quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+- **Logged (UTC):** 2026-07-06T05:15:46
+- **Severity:** suspected-bug
+- **Run:** 20260706T044329_S13_seed20260703
+- **Observed:** quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+
+## PRODUCT BUG (availability, HIGH) — mount-lease self-adoption fails closed under rapid crash-restart
+- **Logged (UTC):** 2026-07-06 (campaign S13 full, process-loss chaos, round 22)
+- **Severity:** CORRECTNESS/AVAILABILITY (the first non-budget bug of the campaign)
+- **Symptom:** S13 kills ch1 repeatedly (~every 40 s, 6 s down). At round 22 ch1 failed to restart and
+  stayed down (Exited 49); all downstream verdicts (health, replica agreement, fsck) went unavailable.
+- **Error chain (ch1 err log):**
+  1. While RUNNING (pre-kill): `CasMountLeaseKeeper: background renewal failed ... key
+     'soak_pool/gc/server-roots/ca_soak_ch1/mount' was touched by a FOREIGN WRITER — failing closed,
+     never re-minting. (LOGICAL_ERROR)`.
+  2. On RESTART: `CAS mount-lease: key '...ca_soak_ch1/mount' was touched while adopting our own mount
+     slot — failing closed. (LOGICAL_ERROR)` -> exit 49, node never comes up.
+- **Why it's a real bug (not a test artifact):** the mount slot is `.../server-roots/ca_soak_ch1/mount`
+  — ONLY ch1 should ever write its own slot. Something ELSE ("foreign writer") touched it while ch1
+  was alive AND during ch1's self-adopt on restart. Prime suspect: the GC leader (possibly ch2, or a
+  ch1 incarnation's delayed lease-renewal landing after the kill) writes/CASes another server's mount
+  slot during the heartbeat/liveness scan. The self-remount path (meant to re-adopt "my own stale
+  mount after a crash", landed 2026-07-02) cannot distinguish a genuine foreign owner from a
+  concurrent touch of its own slot under rapid restart, so it fails closed PERMANENTLY — the node
+  needs manual `mount`-object deletion to recover. Fail-closed is right for a true foreign owner, but
+  wedging a node forever on self-restart is an availability defect.
+- **Root-cause questions:** (1) who is the foreign writer of `ca_soak_ch1/mount`? (GC scan writing
+  peer mount slots? a delayed pre-kill renewal?) — instrument the mount-slot writers. (2) the
+  self-adopt CAS should treat "current value is MY OWN uuid's stale lease" as adoptable even if the
+  ETag/token changed between read and CAS (re-read and compare uuid, not just token). (3) does a
+  killed incarnation's async lease write land after restart and race the adopt?
+- **Repro:** S13 at full scale reliably (round 22). Also relevant to production: a pod that
+  crash-loops or restarts within the lease TTL could wedge itself out of its own pool.
+- **NOTE vs prior:** the ledger's "S13 mount self-recovery — RESOLVED (self-remount 2026-07-02)"
+  handled the simple stale-self case; this is a RACE gap in that path under rapid repeated kills.

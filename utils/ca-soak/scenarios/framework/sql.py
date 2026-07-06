@@ -10,7 +10,8 @@ from soak.cluster import retry_on_aborted, retry_on_transport, QueryError
 
 
 def create_ca_table(node, name, *, columns, order_by, partition_by=None, ttl=None,
-                    engine=None, extra_settings=None, wide=True, replica_path=None):
+                    engine=None, extra_settings=None, wide=True, replica_path=None,
+                    client_settings=None):
     """Create one table on `storage_policy='ca'`. `engine` defaults to ReplicatedMergeTree with a
     zk path derived from the table name (so both replicas share it). `columns` is the column list
     SQL (without parens). Wide parts forced by default."""
@@ -32,7 +33,9 @@ def create_ca_table(node, name, *, columns, order_by, partition_by=None, ttl=Non
     if ttl:
         parts.append(f"TTL {ttl}")
     parts.append(f"SETTINGS {setting_sql}")
-    node.command("\n".join(parts))
+    # client_settings (e.g. max_query_size / max_ast_elements) let a VERY wide CREATE (thousands
+    # of columns => a >256 KB / >50k-AST statement) reach the server instead of a parser-limit reject.
+    node.command("\n".join(parts), settings=client_settings)
 
 
 def drop_table_both(cluster, name, timeout=900):
