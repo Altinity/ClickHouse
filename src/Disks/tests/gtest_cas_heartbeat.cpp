@@ -228,3 +228,20 @@ TEST(CasMountAudit, KeeperForeignConflictRefusesAndNamesHolder)
     EXPECT_EQ(seen.back().type, CasEventType::MountConflict);
     EXPECT_EQ(seen.back().detail.at("holder_uuid"), u128ToHex(uuid_x));
 }
+
+/// `Store::open` can fail before/inside `doStart` (e.g. a foreign-conflict refusal, see
+/// `KeeperForeignConflictRefusesAndNamesHolder` above) — the keeper is destroyed without ever having
+/// claimed anything. Teardown must not throw "release before start"; there is nothing to release. A
+/// stop AFTER a successful start still performs the farewell (covered by
+/// `StopStampsExpiredAndFarewellSentinel` above); a genuinely-started DOUBLE terminate stays loud.
+TEST(CasHeartbeat, StopBeforeStartIsQuietNoOp)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    uint64_t now_ms = 1000;
+    MountLeaseKeeper keeper(backend, layout, "a", UInt128{1}, /*writer_epoch=*/1, std::chrono::milliseconds(10'000),
+                            [&] { return now_ms; }, [] { return uint64_t{0}; }, [] { return uint64_t{0}; });
+    /// start() never called.
+    EXPECT_NO_THROW(keeper.stop());
+    EXPECT_NO_THROW(keeper.stop());
+}

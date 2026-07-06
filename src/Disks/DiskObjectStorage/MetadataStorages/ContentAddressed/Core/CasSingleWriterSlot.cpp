@@ -83,10 +83,16 @@ void SingleWriterSlot::doTerminate()
     stopBackground();
 
     std::lock_guard lock(state_mutex);
+    if (seq == 0)
+        /// Never started (e.g. `Store::open` failed before/inside `doStart`) — nothing was claimed,
+        /// so there is nothing to release. A never-started slot is inert: BOTH/ALL terminate calls on
+        /// it are quiet no-ops, and — unlike the genuinely-started path below — we do NOT set `dead`,
+        /// so a second no-op call takes this same early-return rather than tripping the "double
+        /// terminate" throw below. Throwing here only turned an already-failing teardown into extra
+        /// `LOGICAL_ERROR` noise (2026-07-06 S13 post-mortem).
+        return;
     if (dead)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS {}: double {} on key '{}'", slot_name, terminal_verb, key);
-    if (seq == 0)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS {}: {} before start on key '{}'", slot_name, terminal_verb, key);
 
     /// Dead regardless of what terminate does below: we attempted the terminal op, the keeper must
     /// never renew this key again.
