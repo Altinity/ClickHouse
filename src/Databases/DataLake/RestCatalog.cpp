@@ -90,15 +90,10 @@ namespace ProfileEvents
     extern const Event DataLakeRestCatalogGetTableMetadataMicroseconds;
     extern const Event DataLakeRestCatalogGetCredentials;
     extern const Event DataLakeRestCatalogGetCredentialsMicroseconds;
-<<<<<<< HEAD
-=======
-    extern const Event DataLakeRestCatalogCredentialsVended;
-    extern const Event DataLakeRestCatalogCredentialsCacheHits;
     extern const Event DataLakeRestCatalogAuthTokenCacheHits;
     extern const Event DataLakeRestCatalogAuthTokenRefreshed;
     extern const Event DataLakeRestCatalogAuthTokenRefreshedMicroseconds;
     extern const Event DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized;
->>>>>>> 274c81be689 (Add ProfileEvents for DataLake catalog authorization token refresh.)
     extern const Event DataLakeRestCatalogCreateNamespace;
     extern const Event DataLakeRestCatalogCreateNamespaceMicroseconds;
     extern const Event DataLakeRestCatalogCreateTable;
@@ -342,7 +337,7 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
     if (!client_id.empty())
     {
         auto current = access_token.get();
-        if (!current || update_token)
+        if (!current || update_token || access_token->isExpired())
         {
             access_token.set(std::make_unique<AccessToken>(retrieveAccessToken()));
             current = access_token.get();
@@ -567,9 +562,6 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() const
 {
-    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
-    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
-
     if (google_adc_client_id.empty() || google_adc_client_secret.empty() || google_adc_refresh_token.empty())
         throw DB::Exception(
             DB::ErrorCodes::BAD_ARGUMENTS,
@@ -587,6 +579,9 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() con
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 {
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
+
     if (!google_adc_client_id.empty() && !google_adc_client_secret.empty() && !google_adc_refresh_token.empty())
     {
         try
@@ -601,9 +596,6 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 
     /// Fallback to GCP metadata service (works inside GCP infrastructure)
     /// https://cloud.google.com/compute/docs/metadata/overview
-    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
-    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
-
     static constexpr auto DEFAULT_REQUEST_TOKEN_PATH = "/computeMetadata/v1/instance/service-accounts";
 
     const auto & context = getContext();
