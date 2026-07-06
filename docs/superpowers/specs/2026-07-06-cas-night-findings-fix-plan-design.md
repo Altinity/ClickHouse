@@ -1,7 +1,10 @@
 # CAS night-campaign findings — fix plan (design) {#design}
 
-Date: 2026-07-06. Approved approach: **A — "instrument first, then surgery"** (four dependent
-phases). Source analysis: the 2026-07-05/06 full-scale scenario campaign
+Date: 2026-07-06. Approved approach: **A — "instrument first, then surgery"**. The four phases
+are INDEPENDENT work packages (user decision 2026-07-06: phases 2–4 do not wait for phase 1);
+the ordering below is priority/value, and the only real cross-phase edge is soft — the phase-2
+mount-audit events make the phase-3.1 investigation direct instead of inferential, and re-running
+the campaign scenarios for validation only becomes fully honest once phase 1 lands. Source analysis: the 2026-07-05/06 full-scale scenario campaign
 (`docs/superpowers/worklogs/2026-07-03-scenarios-full-scale-campaign.md`,
 `utils/ca-soak/scenarios/BACKLOG.md`) plus a four-way post-campaign re-audit of the raw data
 (all run `report.md`s, all scenario runner logs, both nodes' full-night server logs, and the
