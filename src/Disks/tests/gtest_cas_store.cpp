@@ -1702,6 +1702,79 @@ TEST(CasStoreBeat, GcStateReadFailureLeavesAckUnchanged)
     EXPECT_EQ(after.seq, before.seq + 1);
 }
 
+namespace
+{
+
+/// Delegating backend that fences the mount slot IN PLACE the first time a `get` returns a present
+/// body for the armed key — reproducing the S13 window: the GC's token-guarded fence-out lands
+/// between the keeper adopt's GET and its CAS. The caller's subsequent token-guarded `putOverwrite`
+/// then fails `PreconditionFailed`, the adopt re-reads, sees `gc_fenced`, and throws
+/// `MountFencedException` — which `Store::open`'s fence-recovery loop must turn into a fresh-epoch
+/// retry rather than a permanent wedge (P3.1 vector C).
+class FenceInAdoptWindowBackend final : public DB::Cas::Backend
+{
+public:
+    explicit FenceInAdoptWindowBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
+    String fence_key;   /// empty = fault disarmed; set to the mount key to arm the one-shot fence
+
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override
+    {
+        auto got = inner->get(k, r);
+        if (!fence_key.empty() && k == fence_key && got.has_value())
+        {
+            /// One-shot: fence the slot in place exactly as `computeHeartbeatFloor` does (preserve the
+            /// body, gc_fenced = true, seq + 1, token-guarded against the value we just read), then
+            /// disarm so the retry can adopt cleanly.
+            DB::Cas::MountLease fenced = DB::Cas::decodeMountLease(got->bytes);
+            fenced.gc_fenced = true;
+            fenced.seq += 1;
+            inner->putOverwrite(k, DB::Cas::encodeMountLease(fenced), got->token);
+            fence_key.clear();
+        }
+        return got;
+    }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
+    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, b, m); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, b, e, m); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, b, e, m); }
+    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+private:
+    std::shared_ptr<DB::Cas::Backend> inner;
+};
+
+}
+
+TEST(CasStoreMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
+{
+    auto inner = std::make_shared<InMemoryBackend>();
+    auto fencing = std::make_shared<FenceInAdoptWindowBackend>(inner);
+    /// Arm the one-shot fence on the mount slot. Store::open first claims the mount (fresh mint), then
+    /// the keeper adopts it — the adopt's GET trips the fence, its CAS fails, and open must recover.
+    const DB::Cas::Layout layout("p");
+    fencing->fence_key = layout.mountKey("test");
+
+    DB::Cas::StorePtr store;
+    ASSERT_NO_THROW(
+        store = DB::Cas::Store::open(fencing,
+            DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_trim_min_events = 0}))
+        << "open must recover from a fence in the adopt window, not wedge (exit-49 S13 bug)";
+    ASSERT_TRUE(store);
+
+    /// The final live lease is unfenced and at a HIGHER writer_epoch than the first attempt (a fence
+    /// costs an epoch): the first claim took epoch 1, got fenced, the retry took epoch 2 and mounted.
+    const auto got = inner->get(layout.mountKey("test"));
+    ASSERT_TRUE(got.has_value());
+    const MountLease final_lease = decodeMountLease(got->bytes);
+    EXPECT_FALSE(final_lease.gc_fenced);
+    EXPECT_GT(final_lease.writer_epoch, 1u) << "recovery must draw a fresh writer_epoch";
+    EXPECT_TRUE(fencing->fence_key.empty()) << "the one-shot fence must have fired";
+}
+
 TEST(CasStoreBeat, DrainBlocksAckWhileMutationInFlight)
 {
     auto backend = std::make_shared<InMemoryBackend>();

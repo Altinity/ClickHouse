@@ -174,7 +174,10 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         ///    durable value REPLACES the random `process_epoch` for identity, so the watermark + every
         ///    manifest ref carries it (the random mint above stays for the read-only
         ///    path, which never reaches here). Phase 2's epoch-aware sweep reads this value.
-        const uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
+        /// Mutable: a GC fence of our fresh lease during open (expiry mid-open racing a GC round) is
+        /// recoverable — a fence costs an epoch, so the fence-recovery loop below re-allocates a fresh
+        /// writer_epoch and re-claims (P3.1 vector C; TLA+ `NoPermanentWedge`).
+        uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
         store->process_epoch = writer_epoch;
 
         /// 4. Mount lease — LIVENESS. Decide over the current mount object using a wall-clock `now_ms`.
@@ -215,50 +218,85 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// `Store` destroyed before the `Store` itself.
         const auto emit_mount_event = [s = store.get()](const CasEvent & e) { s->emitEvent(e); };
 
+        Store * raw = store.get();
+
         /// S13 crash-recovery: a hard-killed prior incarnation leaves a stale, unreleased mount lease.
         /// Rather than aborting, wait (bounded by ttl + margin) for that lease to lapse and reclaim it;
         /// a genuinely live second server keeps renewing and is reported as LiveDoubleStart. The reclaim
         /// is token-guarded (see claimMountAwaitingExpiry), so a live twin is never stolen from.
-        const MountClaimResult claim = claimMountAwaitingExpiry(
-            *store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
-            [&now_ms]() { return now_ms(); }, ttl_ms, poll_interval_ms, margin_ms, sleep_ms, on_wait_start,
-            emit_mount_event);
-        if (claim.kind != MountClaimResult::Claimed)
+        ///
+        /// Fence-recovery loop (P3.1 vector C): if the GC fences our own fresh lease while we are opening
+        /// (the lease expired mid-open — e.g. a slow first beat — and a GC round fenced it), that is a
+        /// RECOVERABLE state, not a wedge: a fence costs an epoch, so allocate a fresh writer_epoch and
+        /// re-claim. Bounded so a pathological fence storm still fails closed. The fence can surface two
+        /// ways: `claimMount` observes an already-fenced own slot (`FencedSelf`), or the keeper's adopt
+        /// races a fence between its GET and CAS (`MountFencedException` from `start()`).
+        constexpr int max_fence_recoveries = 3;
+        for (int fence_recovery = 0; ; ++fence_recovery)
         {
-            /// LiveDoubleStart (waited out the bound → a live twin) or ForeignOwner → fail closed with
-            /// the actionable, multi-line startup error (spec §mount-safety).
-            throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));
-        }
-
-        /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which
-        /// ADOPTS that very (uuid, epoch) slot (Task 5) rather than self-tripping the double-start guard.
-        Store * raw = store.get();
-        /// Merged heartbeat (ack-floor redesign): the mount keeper now ALSO carries the per-server
-        /// build-watermark floor (`minActive`) and the acked GC round. Both are read off the
-        /// keeper's state lock (`prepareRenew` is the off-lock hook): `minActive` reaches into
-        /// builds_mutex; the observed-round callback runs the BEAT (`refreshViewForBeat` — gc/state
-        /// probe + retired-view load + drain + install). Open-ordering falls out of the wiring:
-        /// `doStart` computes the payload through this very callback, so the anchored mount body
-        /// carries an ack from a gc/state read that happened AFTER `claimMountAwaitingExpiry` wrote
-        /// the mount — a mount the GC's enumeration missed therefore still opened with a view at
-        /// least as fresh as any round that was durable before the miss.
-        store->mount_keeper = std::make_unique<MountLeaseKeeper>(
-            store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
-            store->config.mount_lease_ttl_ms, now_ms,
-            [raw] { return raw->minActive(); }, [raw] { return raw->refreshViewForBeat(); },
-            emit_mount_event);
-        /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh the
-        /// monotonic deadline; on a superseded/foreign renew failure latch the fence to lost. Set BEFORE
-        /// startBackground so no renewal can fire before the callbacks are in place.
-        store->mount_keeper->setFenceCallbacks(
-            [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
-            [raw]
+            const MountClaimResult claim = claimMountAwaitingExpiry(
+                *store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
+                [&now_ms]() { return now_ms(); }, ttl_ms, poll_interval_ms, margin_ms, sleep_ms, on_wait_start,
+                emit_mount_event);
+            if (claim.kind == MountClaimResult::FencedSelf)
             {
-                raw->tripMountLost();
-                /// Liveness counterpart of the fence-out: recover in place as a FRESH incarnation.
-                raw->scheduleRemount();
-            });
-        store->mount_keeper->start();
+                if (fence_recovery >= max_fence_recoveries)
+                    throw Exception(ErrorCodes::ABORTED,
+                        "CAS mount '{}': our own mount lease was GC-fenced repeatedly during open "
+                        "({} recoveries exhausted) — a fresh writer_epoch kept being fenced before we "
+                        "could adopt it. This should not persist; investigate GC fence-out timing.",
+                        srid, max_fence_recoveries);
+                writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
+                store->process_epoch = writer_epoch;
+                continue;
+            }
+            if (claim.kind != MountClaimResult::Claimed)
+            {
+                /// LiveDoubleStart (waited out the bound → a live twin) or ForeignOwner → fail closed
+                /// with the actionable, multi-line startup error (spec §mount-safety).
+                throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));
+            }
+
+            /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which
+            /// ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard.
+            /// Merged heartbeat (ack-floor redesign): the mount keeper now ALSO carries the per-server
+            /// build-watermark floor (`minActive`) and the acked GC round, read off the keeper's state
+            /// lock via `prepareRenew`; the observed-round callback runs the BEAT (`refreshViewForBeat`).
+            /// Open-ordering falls out of the wiring: `doStart` computes the payload through that callback,
+            /// so the anchored mount body carries an ack from a gc/state read AFTER the claim.
+            store->mount_keeper = std::make_unique<MountLeaseKeeper>(
+                store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
+                store->config.mount_lease_ttl_ms, now_ms,
+                [raw] { return raw->minActive(); }, [raw] { return raw->refreshViewForBeat(); },
+                emit_mount_event);
+            /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh
+            /// the monotonic deadline; on a superseded/foreign renew failure latch the fence to lost.
+            /// Set BEFORE startBackground so no renewal can fire before the callbacks are in place.
+            store->mount_keeper->setFenceCallbacks(
+                [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
+                [raw]
+                {
+                    raw->tripMountLost();
+                    /// Liveness counterpart of the fence-out: recover in place as a FRESH incarnation.
+                    raw->scheduleRemount();
+                });
+            try
+            {
+                store->mount_keeper->start();
+            }
+            catch (const MountFencedException &)
+            {
+                /// The GC fenced our fresh lease between the keeper's adopt GET and CAS. Recoverable:
+                /// drop this keeper, take a fresh epoch, and re-claim.
+                if (fence_recovery >= max_fence_recoveries)
+                    throw;
+                store->mount_keeper.reset();
+                writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
+                store->process_epoch = writer_epoch;
+                continue;
+            }
+            break;
+        }
 
         /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline now + ttl. From
         /// here ordinary mutations (mutateShard) are fence-gated via mayMutate().
