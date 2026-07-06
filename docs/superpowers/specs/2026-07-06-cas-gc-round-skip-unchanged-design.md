@@ -146,10 +146,17 @@ proving it single-leader is sufficient.
 **No `gc/state` schema change.** The defer counter is **leader-local, in-memory**
 (`rounds_since_last_fold`), not persisted:
 
-- A **DEFER round is a pure no-op**: it does the cheap decision phase (LIST + token-diff, retired-vs-
-  `min_ack` check, `min_ack` from heartbeats), decides DEFER, and **writes nothing to `gc/state`** —
-  no new generation artifact, no retire, no delete. `(snap_generation, snap_attempt)` stays pinned by
-  virtue of not being rewritten. The leader increments its in-memory counter.
+- A **DEFER round skips the fold and the round-commit**: it does the cheap decision phase (LIST +
+  token-diff, retired-vs-`min_ack` check, `min_ack` from heartbeats), decides DEFER, and **skips the
+  fold, the pre-CAS deletes, and the round-commit CAS** — no new generation artifact, no retire, no
+  delete, and `round` / `(snap_generation, snap_attempt)` / `retired_refs` stay pinned (not rewritten).
+  The leader increments its in-memory counter.
+  - **The lease-renew CAS still happens** (and MUST). `acquireOrRenewLease` runs at the START of
+    `runRegularRound` — BEFORE the DEFER decision — and CAS-renews `gc/state` (bumping `lease.seq`) to
+    keep leadership and heartbeat liveness. So a DEFER round is not literally write-free: it costs one
+    O(1) lease-renew CAS. This is load-bearing — if a DEFER round did NOT renew, the leader would drop
+    the lease on every idle round and leadership would thrash to another replica. `round` advances
+    only on a FOLD's round-commit, so it tracks folds, not wakes; a DEFER round leaves `round` at n.
 - A **FOLD round** is unchanged from today except that the accumulated delta since the *sealed*
   cursor may span several rounds' worth of journal (the sealed cursor simply hasn't moved). It resets
   the in-memory counter.
