@@ -372,22 +372,22 @@ public:
     /// durable writer_epoch bump + mount reclaim + fresh retired view + re-armed write fence — is
     /// exactly what a server restart would create, so a live server may create it in place. Runs the
     /// same claim machinery as `Store::open` (S13); the new keeper's anchor loads the retired view
-    /// through `refreshViewForBeat`, so open-ordering holds for the new incarnation too. Returns
+    /// through `syncRetiredView`, so open-ordering holds for the new incarnation too. Returns
     /// false (and changes nothing durable beyond the epoch bump) when the mount cannot be claimed
     /// (foreign owner / a genuinely live twin) — the caller retries. Safe to call concurrently
     /// (serialized internally); also the synchronous test seam.
     bool tryRemountOnce();
 
-    /// Ack-floor beat (spec 2026-07-02-cas-gc-ack-floor-fence-redesign): probe `gc/state`; when the
-    /// published round advanced past the installed view, load the retired view and install it under
-    /// the exclusive side of `view_gate` — the DRAIN: it waits out every in-flight `mutateShard`
-    /// (each holds the shared side for its whole call, gate evaluation through CAS response).
-    /// Returns the round the view is installed at — the value the heartbeat advertises as
-    /// `observed_gc_round`. Any read failure leaves the view and the returned round UNCHANGED: the
-    /// ack must never claim a view that was not actually loaded (fail-closed for the ack; the lease
-    /// renewal carrying it proceeds regardless — availability). Runs on the keeper thread
-    /// (`prepareRenew` is the off-state-lock hook) and in tests.
-    uint64_t refreshViewForBeat();
+    /// Retired-view sync (spec 2026-07-06-cas-lease-view-sync-decouple; formerly the ack-floor
+    /// "beat"): probe `gc/state`; when the published round advanced past the installed view, load the
+    /// retired view and install it under the exclusive side of `view_gate` — the DRAIN: it waits out
+    /// every in-flight `mutateShard` (each holds the shared side for its whole call, gate evaluation
+    /// through CAS response). Returns the round the view is installed at. Any read failure leaves the
+    /// view and the returned round UNCHANGED (fail-closed for the ack: never claim a view that was not
+    /// actually loaded). Runs on the dedicated retired-view syncer thread (`retiredViewSyncLoop`) and,
+    /// synchronously, at open/remount and in tests. It is NOT on the lease-renewal path — the renewal
+    /// advertises the already-installed round via `observedGcRound()`.
+    uint64_t syncRetiredView();
 
     /// P1 known-present blob-hash cache (design 2026-06-20, B168). A HINT only — correctness never
     /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.
@@ -582,7 +582,7 @@ private:
     Layout pool_layout;
     RetireView retire_view;
     /// The ack-floor view gate (spec 2026-07-02): `mutateShard` holds the SHARED side for its whole
-    /// call (condemn-gate evaluation through the CAS response); `refreshViewForBeat` installs a newer
+    /// call (condemn-gate evaluation through the CAS response); `syncRetiredView` installs a newer
     /// retired view under the EXCLUSIVE side. This is the writer-side DRAIN: an advertised
     /// `observed_gc_round` proves no in-flight mutation still gates on an older view.
     std::shared_mutex view_gate;

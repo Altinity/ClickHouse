@@ -142,7 +142,7 @@ Landed on `cas-copy-forward` (Tasks 0-3). Deviations and findings, all deliberat
 3. **`blob_copy_forward` event + `CasBlobCopyForward` counter landed with Task 2** (the primitive
    emits them), not Task 3.
 4. **Task 3 was extended with writer/mount introspection insights** (user request, same day):
-   `mount_beat` event per view advance (installed round, `from_round`, `retired_entries` loaded),
+   `retired_view_advance` event per view advance (installed round, `from_round`, `retired_entries` loaded),
    `mount_remount` event (ok/failed), and the GC round log gained the ack-floor pipeline columns
    (`entries_condemned/graduated/redeleted`, `fence_outs`, `min_ack`, `anomalies`), replacing the
    dead always-0 `children_cascaded`/`forgotten_*` columns (pre-release: no compat scaffolding).

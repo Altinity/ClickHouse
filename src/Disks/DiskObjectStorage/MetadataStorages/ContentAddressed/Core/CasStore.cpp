@@ -261,13 +261,13 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
             /// ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard.
             /// Merged heartbeat (ack-floor redesign): the mount keeper now ALSO carries the per-server
             /// build-watermark floor (`minActive`) and the acked GC round, read off the keeper's state
-            /// lock via `prepareRenew`; the observed-round callback runs the BEAT (`refreshViewForBeat`).
+            /// lock via `prepareRenew`; the observed-round callback runs the sync (`syncRetiredView`).
             /// Open-ordering falls out of the wiring: `doStart` computes the payload through that callback,
             /// so the anchored mount body carries an ack from a gc/state read AFTER the claim.
             store->mount_keeper = std::make_unique<MountLeaseKeeper>(
                 store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
                 store->config.mount_lease_ttl_ms, now_ms,
-                [raw] { return raw->minActive(); }, [raw] { return raw->refreshViewForBeat(); },
+                [raw] { return raw->minActive(); }, [raw] { return raw->syncRetiredView(); },
                 emit_mount_event);
             /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh
             /// the monotonic deadline; on a superseded/foreign renew failure latch the fence to lost.
@@ -501,7 +501,7 @@ bool Store::tryRemountOnce()
         mount_keeper = std::make_unique<MountLeaseKeeper>(
             pool_backend, pool_layout, srid, our_uuid, writer_epoch,
             config.mount_lease_ttl_ms, now_ms,
-            [raw] { return raw->minActive(); }, [raw] { return raw->refreshViewForBeat(); },
+            [raw] { return raw->minActive(); }, [raw] { return raw->syncRetiredView(); },
             emit_mount_event);
         mount_keeper->setFenceCallbacks(
             [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
@@ -510,7 +510,7 @@ bool Store::tryRemountOnce()
                 raw->tripMountLost();
                 raw->scheduleRemount();
             });
-        /// `start` anchors the new incarnation's body; its payload runs `refreshViewForBeat`, so the
+        /// `start` anchors the new incarnation's body; its payload runs `syncRetiredView`, so the
         /// retired view is LOADED (and the advertised ack fresh) before the fence re-arms below —
         /// the same open-ordering the model's WOpen requires.
         mount_keeper->start();
@@ -577,7 +577,7 @@ void Store::scheduleRemount()
     });
 }
 
-uint64_t Store::refreshViewForBeat()
+uint64_t Store::syncRetiredView()
 {
     /// 1. Probe the published round. Absent gc/state = a pool GC never touched (round-0 view is
     /// current by definition). Any failure leaves the installed view — and therefore the advertised
@@ -590,7 +590,7 @@ uint64_t Store::refreshViewForBeat()
     catch (...)
     {
         tryLogCurrentException(getLogger("CasStore"),
-            "CAS beat: gc/state probe failed; observed_gc_round stays at the installed view");
+            "CAS retired-view sync: gc/state probe failed; observed_gc_round stays at the installed view");
         return retire_view.round();
     }
     if (!got)
@@ -604,7 +604,7 @@ uint64_t Store::refreshViewForBeat()
     catch (...)
     {
         tryLogCurrentException(getLogger("CasStore"),
-            "CAS beat: gc/state undecodable; observed_gc_round stays at the installed view");
+            "CAS retired-view sync: gc/state undecodable; observed_gc_round stays at the installed view");
         return retire_view.round();
     }
 
@@ -624,7 +624,7 @@ uint64_t Store::refreshViewForBeat()
     catch (...)
     {
         tryLogCurrentException(getLogger("CasStore"),
-            "CAS beat: retired-view refresh failed; observed_gc_round stays at the installed view");
+            "CAS retired-view sync: retired-view refresh failed; observed_gc_round stays at the installed view");
     }
 
     /// Introspection: one event per VIEW ADVANCE (not per beat) — an unchanged view is silence, so the
@@ -634,10 +634,10 @@ uint64_t Store::refreshViewForBeat()
     {
         EventEmitter{*this}.emit([&](CasEvent & e)
         {
-            e.type = CasEventType::MountBeat;
+            e.type = CasEventType::RetiredViewAdvance;
             e.round = retire_view.round();
             e.outcome = "ok";
-            e.reason = "beat installed a newer retired view; observed_gc_round advances with it";
+            e.reason = "retired-view sync installed a newer view; observed_gc_round advances with it";
             e.detail = {{"from_round", std::to_string(from_round)},
                         {"retired_entries", std::to_string(retire_view.entryCount())}};
         });

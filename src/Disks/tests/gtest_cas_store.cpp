@@ -1641,11 +1641,11 @@ TEST(CasStoreBeat, AckAdvancesOnlyAfterViewLoad)
     EXPECT_EQ(store->retireView().round(), 3u);
 }
 
-TEST(CasStoreBeat, ViewAdvanceEmitsMountBeatEvent)
+TEST(CasStoreBeat, ViewAdvanceEmitsRetiredViewAdvanceEvent)
 {
     /// Introspection (copy-forward Task 3): a beat that INSTALLS a newer retired view emits exactly
-    /// one `mount_beat` event carrying the installed round, the prior round, and the loaded retired
-    /// entry count; a beat that observes nothing new is silent.
+    /// one `retired_view_advance` event carrying the installed round, the prior round, and the loaded
+    /// retired entry count; a beat that observes nothing new is silent.
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = DB::Cas::tests::openStoreForTest(backend);
     std::vector<CasEvent> seen;
@@ -1658,7 +1658,7 @@ TEST(CasStoreBeat, ViewAdvanceEmitsMountBeatEvent)
 
     size_t beats = 0;
     for (const CasEvent & e : seen)
-        if (e.type == CasEventType::MountBeat)
+        if (e.type == CasEventType::RetiredViewAdvance)
         {
             ++beats;
             EXPECT_EQ(e.round, 3u);
@@ -1671,7 +1671,7 @@ TEST(CasStoreBeat, ViewAdvanceEmitsMountBeatEvent)
     seen.clear();
     store->renewWatermarkOnce();
     for (const CasEvent & e : seen)
-        EXPECT_NE(e.type, CasEventType::MountBeat) << "an unchanged view must not emit mount_beat";
+        EXPECT_NE(e.type, CasEventType::RetiredViewAdvance) << "an unchanged view must not emit retired_view_advance";
     store->setEventSink(nullptr);
 }
 
@@ -1801,7 +1801,7 @@ TEST(CasStoreBeat, DrainBlocksAckWhileMutationInFlight)
     /// shared side of the view gate for its whole call).
     auto beat = std::async(std::launch::async, [&]
     {
-        const uint64_t r = store->refreshViewForBeat();
+        const uint64_t r = store->syncRetiredView();
         /// Order proof: by the time the beat returns, the mutation MUST have been released — the
         /// drain forbids installing a view over an in-flight old-view mutation.
         EXPECT_TRUE(released.load());

@@ -197,7 +197,7 @@ Key schema columns:
 `read_missing`, `dangling_access`, `corrupt_dangle`, `corrupt_decode`,
 `snap_journal_incoherent`, `exception`.
 
-**Writer/mount insight events (2026-07-02)**: `mount_beat` — one row per view ADVANCE (never per
+**Writer/mount insight events (2026-07-02)**: `retired_view_advance` — one row per view ADVANCE (never per
 beat): `round` = the installed round, `detail.from_round`, `detail.retired_entries` = the size of
 the retired list this writer just loaded; answers "when did this writer learn about round N".
 `mount_remount` — a self-remount attempt (`outcome` = `ok`/`failed`, `detail.writer_epoch`).
