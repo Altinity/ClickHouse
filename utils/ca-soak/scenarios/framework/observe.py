@@ -277,9 +277,14 @@ def gc_log_rows(node, since_event_time: str | None = None) -> list:
     where = "event_type='Finish'"
     if since_event_time:
         where += f" AND event_time >= '{since_event_time}'"
+    # Column list must track the ContentAddressedGarbageCollectionLog schema. The P9-era
+    # `forgotten_on_delete`/`forgotten_absent` columns were removed by the ack-floor redesign, but
+    # this query kept them -> UNKNOWN_IDENTIFIER 213x/night -> `gc_log` captured [] for EVERY
+    # scenario of the 2026-07-05 campaign and every GC verdict was vacuous (2026-07-06 re-audit).
     cols = ("event_time", "gc_id", "trigger", "round", "outcome", "candidates_marked",
             "objects_deleted", "objects_absent", "objects_replaced", "objects_spared",
-            "manifests_deleted", "forgotten_on_delete", "forgotten_absent", "duration_ms", "error")
+            "manifests_deleted", "entries_condemned", "entries_graduated", "entries_redeleted",
+            "fence_outs", "min_ack", "anomalies", "duration_ms", "error")
     try:
         # System log tables buffer in memory and materialize only every ~7.5 s (or on flush); the
         # most recent GC rounds are invisible to a bare SELECT at end-checkpoint. Flush first so the
