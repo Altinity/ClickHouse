@@ -93,14 +93,19 @@ Extend `docs/superpowers/models/CaCasMountCore.tla` (current model: atomic `Clai
 6. **Sabotage configs**: (a) the OLD adopt (no `gc_fenced` check, no retry) must violate the
    liveness witness (exhibits the wedge); (b) same-epoch resurrection after fence must violate
    `FENCE-COSTS-EPOCH`.
-7. **Open question the model must answer**: may `doStart`'s FIRST anchored ack also come from the
-   installed view (fully async beat), or must the first body's ack be post-claim-fresh? Model the
-   GC floor's spare decision against a stale first ack; if safety holds, B applies to `doStart`
-   too (simpler code); if not, `doStart` keeps one synchronous beat BUT the C retry loop makes the
-   expiry-during-open case recoverable anyway.
+7. **Open question — RESOLVED (2026-07-06)**: `doStart` KEEPS its one synchronous beat. Rationale:
+   a fully-async first ack could advertise a very stale round, and while that is SAFE for the floor
+   (a lower ack only lowers `min_ack` — strictly conservative), it is a LIVENESS hazard (a fresh
+   mount advertising round 0 stalls graduation pool-wide until its first beat lands). Vector B
+   therefore applies to BACKGROUND renewals only, and the expiry-during-open case is covered by the
+   C retry loop — which the model proves sufficient (`W_RemountAfterFence` reachable,
+   `NoPermanentWedge` holds).
 
-Gate: fixed-protocol model GREEN on all invariants + witnesses; both sabotage configs produce the
-expected counterexamples. Only then implementation.
+Gate: **PASSED 2026-07-06.** `stage1` GREEN (7 invariants incl. `FenceCostsEpoch` +
+`NoPermanentWedge`, 300405 distinct states); `sab_adoptwedge` violates `NoPermanentWedge` (the S13
+wedge reproduced); `sab_fenceresurrect` violates `FenceCostsEpoch` (same-epoch resurrection);
+`witness_remountafterfence` violated = the fence→new-epoch→remount recovery is reachable; the three
+pre-existing sabotage configs + reclaim witness unchanged-correct. Implementation may proceed.
 
 ## Implementation acceptance {#acceptance}
 
