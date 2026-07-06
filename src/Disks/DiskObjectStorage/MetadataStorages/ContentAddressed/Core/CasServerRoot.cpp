@@ -295,11 +295,41 @@ MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t no
         .expires_at_ms = now_ms + ttl_ms,
     };
 }
+
+/// The mount-slot writer audit (the P1 "foreign writer" instrument): every mount-slot WRITE
+/// (`MountClaim`/`MountRelease`) and every OBSERVED foreign/conflicting body (`MountConflict`)
+/// becomes one `system.content_addressed_log` row. `observed` is the CURRENT decoded body at the
+/// point of decision — for a conflict it carries the identity that made us refuse (holder_uuid/
+/// hostname/pid/epoch/seq/expires); null when no body was observed (e.g. a bare CAS race).
+/// No-op when `sink` is unset, so a disabled log does no per-call work.
+void emitMountEvent(const CasEventSink & sink, CasEventType type, const String & srid,
+                    const String & branch, const MountLease * observed, const String & reason)
+{
+    if (!sink)
+        return;
+    CasEvent e;
+    e.type = type;
+    e.object_kind = CasEventObjectKind::None;
+    e.outcome = branch;
+    e.reason = reason;
+    e.detail["srid"] = srid;
+    e.detail["branch"] = branch;
+    if (observed)
+    {
+        e.detail["holder_uuid"] = u128ToHex(observed->server_uuid);
+        e.detail["holder_hostname"] = observed->hostname;
+        e.detail["holder_pid"] = std::to_string(observed->pid);
+        e.detail["holder_epoch"] = std::to_string(observed->writer_epoch);
+        e.detail["holder_seq"] = std::to_string(observed->seq);
+        e.detail["holder_expires_at_ms"] = std::to_string(observed->expires_at_ms);
+    }
+    sink(e);
+}
 }
 
 MountClaimResult claimMount(
     Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
-    uint64_t now_ms, uint64_t ttl_ms)
+    uint64_t now_ms, uint64_t ttl_ms, const CasEventSink & sink)
 {
     const String key = l.mountKey(srid);
     const auto got = b.get(key);
@@ -311,8 +341,10 @@ MountClaimResult claimMount(
         const PutResult put = b.putIfAbsent(key, encodeMountLease(body));
         if (put.outcome != PutOutcome::Done)
             /// Raced with a concurrent writer between get and putIfAbsent. Treat as a live double
-            /// start — fail closed; never overwrite a slot that appeared under us.
+            /// start — fail closed; never overwrite a slot that appeared under us. No re-read was
+            /// done, so no conflicting identity is known to attach to an event.
             return {.kind = MountClaimResult::LiveDoubleStart, .body = body};
+        emitMountEvent(sink, CasEventType::MountClaim, srid, "mint", nullptr, "fresh mount slot minted");
         return {.kind = MountClaimResult::Claimed, .body = body};
     }
 
@@ -321,7 +353,11 @@ MountClaimResult claimMount(
     /// Foreign owner → fail closed regardless of expiry. (This runs after the owner gate, so a foreign
     /// mount should not normally exist, but the lease must never be taken across UUIDs.)
     if (existing.server_uuid != our_uuid)
+    {
+        emitMountEvent(sink, CasEventType::MountConflict, srid, "foreign_owner", &existing,
+            "mount slot is held by a foreign server_uuid — refusing to take over across identities");
         return {.kind = MountClaimResult::ForeignOwner, .body = existing};
+    }
 
     /// Same uuid + same epoch → it is OUR OWN claim (replay / adopt). Refresh seq + expiry.
     if (existing.writer_epoch == our_epoch)
@@ -330,6 +366,8 @@ MountClaimResult claimMount(
         const PutResult put = b.putOverwrite(key, encodeMountLease(body), got->token);
         if (put.outcome != PutOutcome::Done)
             return {.kind = MountClaimResult::LiveDoubleStart, .body = body};
+        emitMountEvent(sink, CasEventType::MountClaim, srid, "refresh", &existing,
+            "own claim replayed — refreshed seq + expiry");
         return {.kind = MountClaimResult::Claimed, .body = body};
     }
 
@@ -340,15 +378,22 @@ MountClaimResult claimMount(
     /// Same uuid, DIFFERENT epoch, NOT fenced, lease still LIVE → a second incarnation is genuinely
     /// up → double-start guard.
     if (!existing.gc_fenced && existing.expires_at_ms > now_ms)
+    {
+        emitMountEvent(sink, CasEventType::MountConflict, srid, "live_double_start", &existing,
+            "same server_uuid, different writer_epoch, lease still live — a second live incarnation "
+            "already holds the mount");
         return {.kind = MountClaimResult::LiveDoubleStart, .body = existing};
+    }
 
     /// Same uuid, DIFFERENT epoch, lease EXPIRED → reclaim with a fresh body (seq continues).
     const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
     const PutResult put = b.putOverwrite(key, encodeMountLease(body), got->token);
     if (put.outcome != PutOutcome::Done)
         /// The mount changed under us between get and putOverwrite — someone else is racing the
-        /// reclaim. Fail closed.
+        /// reclaim. Fail closed. No re-read was done, so no conflicting identity is known.
         return {.kind = MountClaimResult::LiveDoubleStart, .body = body};
+    emitMountEvent(sink, CasEventType::MountClaim, srid, "reclaim", &existing,
+        "same server_uuid, different writer_epoch, expired/fenced — reclaimed");
     return {.kind = MountClaimResult::Claimed, .body = body};
 }
 
@@ -377,12 +422,13 @@ MountClaimResult claimMountAwaitingExpiry(
     const std::function<uint64_t()> & now_ms_fn,
     uint64_t ttl_ms, uint64_t poll_interval_ms, uint64_t margin_ms,
     const std::function<void(uint64_t)> & sleep_ms_fn,
-    const std::function<void(const MountLease &, uint64_t)> & on_wait_start)
+    const std::function<void(const MountLease &, uint64_t)> & on_wait_start,
+    const CasEventSink & sink)
 {
     /// A zero poll interval would spin; a single-ms floor keeps the loop a real (bounded) wait.
     const uint64_t poll = poll_interval_ms == 0 ? 1 : poll_interval_ms;
 
-    MountClaimResult r = claimMount(b, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms);
+    MountClaimResult r = claimMount(b, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, sink);
     if (r.kind != MountClaimResult::LiveDoubleStart)
         return r;
 
@@ -402,7 +448,7 @@ MountClaimResult claimMountAwaitingExpiry(
     while (now_ms_fn() < wait_deadline)
     {
         sleep_ms_fn(poll);
-        r = claimMount(b, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms);
+        r = claimMount(b, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, sink);
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
     }
@@ -547,7 +593,8 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
 MountLeaseKeeper::MountLeaseKeeper(
     BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
-    std::function<uint64_t()> min_active_fn_, std::function<uint64_t()> observed_round_fn_)
+    std::function<uint64_t()> min_active_fn_, std::function<uint64_t()> observed_round_fn_,
+    CasEventSink event_sink_)
     : SingleWriterSlot(std::move(backend_), layout_.mountKey(srid_), "mount-lease", "release", "CasMountLeaseKeeper")
     , srid(srid_)
     , server_uuid(server_uuid_)
@@ -556,6 +603,7 @@ MountLeaseKeeper::MountLeaseKeeper(
     , now_ms_fn(std::move(now_ms_fn_))
     , min_active_fn(std::move(min_active_fn_))
     , observed_round_fn(std::move(observed_round_fn_))
+    , event_sink(std::move(event_sink_))
 {
 }
 
@@ -594,11 +642,14 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
     if (!head.exists)
     {
         /// Absent → put it ourselves (a fresh start that ran without a prior claimMount, or a slot
-        /// that lapsed and was swept). putIfAbsent fails closed if it appears under us.
+        /// that lapsed and was swept). putIfAbsent fails closed if it appears under us; that race has
+        /// no re-read (no observed body), so there is nothing to attach to a conflict event.
         const PutResult res = backend->putIfAbsent(key, body);
         if (res.outcome != PutOutcome::Done)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS mount-lease: key '{}' appeared between head and putIfAbsent — concurrent writer on our mount slot", key);
+        emitMountEvent(event_sink, CasEventType::MountClaim, srid, "mint", nullptr,
+            "mount slot absent — keeper minted it directly (no prior claimMount)");
         return res.token;
     }
 
@@ -609,25 +660,43 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
             "CAS mount-lease: key '{}' vanished between head and get while claiming", key);
     const MountLease observed = decodeMountLease(got->bytes);
 
-    /// Foreign uuid → fail closed (no cross-UUID takeover, ever).
+    /// Foreign uuid → fail closed (no cross-UUID takeover, ever). The P1 payload: the CURRENT decoded
+    /// body's identity is exactly WHO touched the slot.
     if (observed.server_uuid != server_uuid)
+    {
+        emitMountEvent(event_sink, CasEventType::MountConflict, srid, "adopt", &observed,
+            "mount slot is held by a foreign server — failing closed, never taking over");
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS mount-lease: key '{}' is held by a foreign server — failing closed, never taking over", key);
+    }
 
     /// Same uuid but a DIFFERENT epoch → a newer incarnation superseded us (or a concurrent
     /// double-start). Fail closed.
     if (observed.writer_epoch != writer_epoch)
+    {
+        emitMountEvent(event_sink, CasEventType::MountConflict, srid, "adopt", &observed,
+            fmt::format("mount slot is held by a different writer_epoch ({} != ours {}) — superseded, failing closed",
+                observed.writer_epoch, writer_epoch));
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS mount-lease: key '{}' is held by a different writer_epoch ({} != ours {}) — superseded, failing closed",
             key, observed.writer_epoch, writer_epoch);
+    }
 
     /// Same uuid AND same epoch → it is OUR OWN claim → ADOPT: overwrite against the observed token
     /// to refresh seq/expiry. (`body` is encoded for seq=1 by the base `doStart`; that is fine —
     /// renewals advance from there.)
     const PutResult res = backend->putOverwrite(key, body, got->token);
     if (res.outcome != PutOutcome::Done)
+    {
+        /// The observed body above (same uuid+epoch as ours) is the best CURRENT identity known —
+        /// something touched the slot between our GET and this PUT.
+        emitMountEvent(event_sink, CasEventType::MountConflict, srid, "adopt", &observed,
+            "mount slot was touched while adopting our own mount slot — failing closed");
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS mount-lease: key '{}' was touched while adopting our own mount slot — failing closed", key);
+    }
+    emitMountEvent(event_sink, CasEventType::MountClaim, srid, "adopt", &observed,
+        "adopted our own already-live (uuid, epoch) mount slot");
     return res.token;
 }
 
@@ -643,6 +712,10 @@ void MountLeaseKeeper::onRenewFailed()
 {
     /// Background renewal failed: `renewOnce` threw on a foreign/superseded touch and the loop is
     /// stopping. Latch the local write fence to lost so no further mutation proceeds — fail closed.
+    /// `renewOnce` (base class) does not surface the mismatching body here, so there is nothing to
+    /// attach beyond the srid + timestamp — still the timeline signal for the P1 investigation.
+    emitMountEvent(event_sink, CasEventType::MountConflict, srid, "renew_failed", nullptr,
+        "background renew failed — foreign/superseded touch; write fence latched to lost");
     if (on_lost)
         on_lost();
 }
@@ -685,6 +758,8 @@ void MountLeaseKeeper::terminate()
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS mount-lease: release of key '{}' hit a foreign incarnation — the world is broken", key);
     }
+    emitMountEvent(event_sink, CasEventType::MountRelease, srid, "farewell", nullptr,
+        "graceful release — lease stamped already-expired, watermark farewell folded in");
     recordWrite(seq + 1, res.token);
 }
 

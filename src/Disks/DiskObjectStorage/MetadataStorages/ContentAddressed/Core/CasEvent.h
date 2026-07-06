@@ -24,6 +24,7 @@ enum class CasEventType
     GcLeaseAcquire, GcLeaseSteal, GcLeaseHeartbeat,
     BuildStart, BuildPublish, BuildAbort, Precommit, PrecommitRemoved, PrecommitReclaim,
     GateRevalidate, GateResurrect, WatermarkRenew, MountBeat, MountRemount,
+    MountClaim, MountRelease, MountConflict,
     RefResolve, ReadMissing, DanglingAccess,
     CorruptDangle, CorruptDecode, SnapJournalIncoherent, Exception,
 };

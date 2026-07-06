@@ -62,6 +62,9 @@ String toString(CasEventType type)
         case CasEventType::WatermarkRenew:        return "watermark_renew";
         case CasEventType::MountBeat:             return "mount_beat";
         case CasEventType::MountRemount:          return "mount_remount";
+        case CasEventType::MountClaim:            return "mount_claim";
+        case CasEventType::MountRelease:          return "mount_release";
+        case CasEventType::MountConflict:         return "mount_conflict";
         case CasEventType::RefResolve:            return "ref_resolve";
         case CasEventType::ReadMissing:           return "read_missing";
         case CasEventType::DanglingAccess:        return "dangling_access";

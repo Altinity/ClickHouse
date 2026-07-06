@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasSingleWriterSlot.h>
 #include <Common/Exception.h>
 #include <base/types.h>
@@ -169,7 +170,7 @@ struct MountClaimResult
 
 MountClaimResult claimMount(
     Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
-    uint64_t now_ms, uint64_t ttl_ms);
+    uint64_t now_ms, uint64_t ttl_ms, const CasEventSink & sink = {});
 
 /// Format the operator-actionable startup error shown when the mount lease is held by a genuinely
 /// live second server (the same `server_root_id` is mounted twice). Produced only AFTER this server
@@ -194,7 +195,8 @@ MountClaimResult claimMountAwaitingExpiry(
     const std::function<uint64_t()> & now_ms_fn,
     uint64_t ttl_ms, uint64_t poll_interval_ms, uint64_t margin_ms,
     const std::function<void(uint64_t)> & sleep_ms_fn,
-    const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {});
+    const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {},
+    const CasEventSink & sink = {});
 
 /// GC heartbeat gate (ack-floor redesign, spec 2026-07-02, GC round protocol step 1). Run by the GC
 /// leader at the top of a round: LIST `gc/server-roots/` (O(servers), single-digit counts), GET each
@@ -281,7 +283,8 @@ public:
     MountLeaseKeeper(
         BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
-        std::function<uint64_t()> min_active_fn_, std::function<uint64_t()> observed_round_fn_);
+        std::function<uint64_t()> min_active_fn_, std::function<uint64_t()> observed_round_fn_,
+        CasEventSink event_sink_ = {});
 
     /// Claims (adopts) the mount slot for (server_uuid, writer_epoch) with seq following the observed
     /// one — durable when `start` returns.
@@ -320,6 +323,7 @@ private:
     std::function<uint64_t()> observed_round_fn;
     std::function<void()> on_renew_ok;
     std::function<void()> on_lost;
+    CasEventSink event_sink;
 };
 
 }

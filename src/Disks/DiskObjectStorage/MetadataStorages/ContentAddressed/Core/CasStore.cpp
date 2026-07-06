@@ -206,13 +206,23 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
                 held.expires_at_ms, wait_deadline_ms);
         };
 
+        /// Mount-slot writer audit (the P1 "foreign writer" instrument): route every mount-slot
+        /// write/conflict event through the Store's own sink. `setEventSink` runs AFTER `open`
+        /// returns (the `ContentAddressedMetadataStorage` wiring), so an event fired synchronously
+        /// during this very `open` call is dropped by the still-null sink — the same startup window
+        /// every other B170 emission site in this file already has (`hasEventSink()`/`emitEvent()`).
+        /// `s` outlives the lambda: it is captured by raw pointer into the keeper, a member of
+        /// `Store` destroyed before the `Store` itself.
+        const auto emit_mount_event = [s = store.get()](const CasEvent & e) { s->emitEvent(e); };
+
         /// S13 crash-recovery: a hard-killed prior incarnation leaves a stale, unreleased mount lease.
         /// Rather than aborting, wait (bounded by ttl + margin) for that lease to lapse and reclaim it;
         /// a genuinely live second server keeps renewing and is reported as LiveDoubleStart. The reclaim
         /// is token-guarded (see claimMountAwaitingExpiry), so a live twin is never stolen from.
         const MountClaimResult claim = claimMountAwaitingExpiry(
             *store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
-            [&now_ms]() { return now_ms(); }, ttl_ms, poll_interval_ms, margin_ms, sleep_ms, on_wait_start);
+            [&now_ms]() { return now_ms(); }, ttl_ms, poll_interval_ms, margin_ms, sleep_ms, on_wait_start,
+            emit_mount_event);
         if (claim.kind != MountClaimResult::Claimed)
         {
             /// LiveDoubleStart (waited out the bound → a live twin) or ForeignOwner → fail closed with
@@ -235,7 +245,8 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         store->mount_keeper = std::make_unique<MountLeaseKeeper>(
             store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
             store->config.mount_lease_ttl_ms, now_ms,
-            [raw] { return raw->minActive(); }, [raw] { return raw->refreshViewForBeat(); });
+            [raw] { return raw->minActive(); }, [raw] { return raw->refreshViewForBeat(); },
+            emit_mount_event);
         /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh the
         /// monotonic deadline; on a superseded/foreign renew failure latch the fence to lost. Set BEFORE
         /// startBackground so no renewal can fire before the callbacks are in place.
@@ -419,6 +430,10 @@ bool Store::tryRemountOnce()
         claimOwnerOrThrow(*pool_backend, pool_layout, srid, our_uuid);
         const uint64_t writer_epoch = allocateWriterEpoch(*pool_backend, pool_layout, srid);
 
+        /// Mount-slot writer audit: `this` is already fully open (setEventSink ran long ago), so
+        /// unlike the initial `open`, every event fired below reaches the real sink immediately.
+        const auto emit_mount_event = [this](const CasEvent & e) { emitEvent(e); };
+
         const auto sleep_ms = [](uint64_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
         const MountClaimResult claim = claimMountAwaitingExpiry(
             *pool_backend, pool_layout, srid, our_uuid, writer_epoch,
@@ -429,7 +444,8 @@ bool Store::tryRemountOnce()
                     "CAS self-remount '{}': waiting out a stale mount (uuid={} epoch={} expires_at_ms={}, "
                     "wait_deadline_ms={})",
                     srid, u128ToHex(held.server_uuid), held.writer_epoch, held.expires_at_ms, wait_deadline_ms);
-            });
+            },
+            emit_mount_event);
         if (claim.kind != MountClaimResult::Claimed)
         {
             LOG_WARNING(getLogger("CasStore"),
@@ -447,7 +463,8 @@ bool Store::tryRemountOnce()
         mount_keeper = std::make_unique<MountLeaseKeeper>(
             pool_backend, pool_layout, srid, our_uuid, writer_epoch,
             config.mount_lease_ttl_ms, now_ms,
-            [raw] { return raw->minActive(); }, [raw] { return raw->refreshViewForBeat(); });
+            [raw] { return raw->minActive(); }, [raw] { return raw->refreshViewForBeat(); },
+            emit_mount_event);
         mount_keeper->setFenceCallbacks(
             [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
             [raw]

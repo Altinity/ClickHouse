@@ -127,3 +127,61 @@ TEST(CasHeartbeat, ForeignTouchMakesRenewThrow)
     backend->putOverwrite(layout.mountKey(srid), encodeMountLease(foreign), h.token);
     EXPECT_ANY_THROW(keeper.renewOnce());
 }
+
+/// Mount-slot writer audit (the P1 "foreign writer" instrument): every mount-slot WRITE and every
+/// OBSERVED foreign/conflicting body becomes an event, carrying the conflicting body's identity —
+/// the payload the chronic "touched by a foreign writer" collisions need to be diagnosable.
+TEST(CasMountAudit, ClaimReleaseAndForeignConflictEmitEvents)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    std::vector<CasEvent> seen;
+    CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
+
+    const uint64_t now_ms = 1'000'000;
+    /// mint for uuid 1 -> one mount_claim
+    ASSERT_EQ(claimMount(*backend, layout, "a", UInt128{1}, 1, now_ms, /*ttl_ms=*/10'000, sink).kind,
+              MountClaimResult::Claimed);
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0].type, CasEventType::MountClaim);
+    EXPECT_EQ(seen[0].detail.at("srid"), "a");
+    EXPECT_EQ(seen[0].detail.at("branch"), "mint");
+
+    /// a FOREIGN uuid claiming a live slot -> mount_conflict carrying the current holder's identity
+    seen.clear();
+    (void)claimMount(*backend, layout, "a", UInt128{2}, 1, now_ms, /*ttl_ms=*/10'000, sink);
+    ASSERT_FALSE(seen.empty());
+    EXPECT_EQ(seen.back().type, CasEventType::MountConflict);
+    EXPECT_EQ(seen.back().detail.at("srid"), "a");
+    EXPECT_FALSE(seen.back().detail.at("holder_uuid").empty());
+}
+
+/// The MountLeaseKeeper wiring: `start` adopting an already-claimed slot emits mount_claim, `stop`
+/// (the farewell write) emits mount_release.
+TEST(CasMountAudit, KeeperAdoptEmitsClaimAndTerminateEmitsRelease)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
+
+    std::vector<CasEvent> seen;
+    CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
+                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; }, sink);
+    keeper.start();
+
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0].type, CasEventType::MountClaim);
+    EXPECT_EQ(seen[0].detail.at("branch"), "adopt");
+
+    seen.clear();
+    now_ms = 2000;
+    keeper.stop();
+
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0].type, CasEventType::MountRelease);
+    EXPECT_EQ(seen[0].detail.at("branch"), "farewell");
+}
