@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <limits>
+#include <map>
 #include <string>
 
 using namespace DB::Cas;
@@ -582,4 +583,42 @@ TEST(CasHeartbeatFloor, EmptyPrefixYieldsInfiniteFloor)
     EXPECT_EQ(floor.terminated, 0u);
     EXPECT_EQ(floor.fenced_now, 0u);
     EXPECT_EQ(floor.already_fenced, 0u);
+}
+
+/// ---- Task 1 (Phase 2): `listMounts` — read-only mount-slot enumeration for introspection ----
+
+TEST(CasListMounts, ClassifiesEveryStateReadOnly)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const uint64_t now_ms = 1'000'000;
+    const uint64_t ttl_ms = 10'000;
+
+    /// live: fresh claim for srid "a"
+    ASSERT_EQ(claimMount(*backend, layout, "a", UInt128{1}, /*writer_epoch=*/1, now_ms, ttl_ms).kind,
+              MountClaimResult::Claimed);
+    /// expired: claim for "b" whose lease ran out long before now_ms
+    ASSERT_EQ(claimMount(*backend, layout, "b", UInt128{2}, 1, now_ms - 100'000, ttl_ms).kind,
+              MountClaimResult::Claimed);
+    /// corrupt: garbage bytes in "c"'s mount slot
+    backend->putIfAbsent(layout.mountKey("c"), "garbage-not-a-proto", {});
+
+    auto mounts = listMounts(*backend, layout, now_ms, /*skew_margin_ms=*/ttl_ms / 2);
+    ASSERT_EQ(mounts.size(), 3u);
+    std::map<String, String> by_srid;
+    for (const auto & m : mounts)
+        by_srid[m.srid] = m.state;
+    EXPECT_EQ(by_srid["a"], "live");
+    EXPECT_EQ(by_srid["b"], "expired");
+    EXPECT_EQ(by_srid["c"], "corrupt");
+
+    /// READ-ONLY guarantee: "b" is expired but must NOT be fenced by listMounts
+    /// (computeHeartbeatFloor would stamp gc_fenced=true; the introspection view must not).
+    auto again = listMounts(*backend, layout, now_ms, ttl_ms / 2);
+    for (const auto & m : again)
+        if (m.srid == "b")
+        {
+            EXPECT_FALSE(m.lease.gc_fenced);
+            EXPECT_EQ(m.state, "expired");
+        }
 }

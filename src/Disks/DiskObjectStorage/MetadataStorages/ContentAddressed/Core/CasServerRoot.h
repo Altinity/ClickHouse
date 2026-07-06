@@ -239,6 +239,21 @@ struct HeartbeatFloor
 HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now_ms,
                                      uint64_t skew_margin_ms);
 
+/// A read-only snapshot of one server's mount slot, for introspection (`system.content_addressed_mounts`).
+/// state: `live` (lease within TTL+skew), `expired` (lease ran out; the next GC round's heartbeat floor
+/// will fence it), `terminated` (clean farewell: `min_active == UINT64_MAX`), `fenced` (`gc_fenced`),
+/// `corrupt` (body failed to decode — surfaced as a row, never an exception).
+struct MountInfo
+{
+    String srid;
+    MountLease lease;
+    String state;
+};
+
+/// Enumerate every mount slot under `gc/server-roots/`, decoded and classified — the read-only sibling
+/// of `computeHeartbeatFloor`: ZERO writes (no fence-out), per-row fail-open. One LIST + one GET per slot.
+std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint64_t now_ms, uint64_t skew_margin_ms);
+
 /// Per-server MERGED heartbeat (ack-floor redesign, spec 2026-07-02): one `SingleWriterSlot` over the
 /// per-server-root mount object carries the mount lease (liveness) AND the build-watermark floor
 /// (`min_active`) AND the GC-round acknowledgement (`observed_gc_round`). One beat renews all three,

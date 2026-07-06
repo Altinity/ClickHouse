@@ -496,6 +496,52 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
     return floor;
 }
 
+std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint64_t now_ms, uint64_t skew_margin_ms)
+{
+    std::vector<MountInfo> out;
+    String cursor;
+    while (true)
+    {
+        const ListPage page = backend.list(layout.serverRootsPrefix(), cursor, 1000);
+        for (const auto & k : page.keys)
+        {
+            static constexpr std::string_view suffix = "/mount";
+            if (!k.key.ends_with(suffix))
+                continue;
+            const auto got = backend.get(k.key);
+            if (!got)
+                continue;   /// raced a delete — read-only view, skip the row
+            MountInfo info;
+            const size_t end = k.key.size() - suffix.size();
+            const size_t start = k.key.rfind('/', end - 1);
+            info.srid = k.key.substr(start + 1, end - start - 1);
+            try
+            {
+                info.lease = decodeMountLease(got->bytes);
+            }
+            catch (...)
+            {
+                info.state = "corrupt";
+                out.push_back(std::move(info));
+                continue;
+            }
+            if (info.lease.gc_fenced)
+                info.state = "fenced";
+            else if (info.lease.min_active == std::numeric_limits<uint64_t>::max())
+                info.state = "terminated";
+            else if (now_ms <= info.lease.expires_at_ms + skew_margin_ms)
+                info.state = "live";
+            else
+                info.state = "expired";
+            out.push_back(std::move(info));
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    return out;
+}
+
 MountLeaseKeeper::MountLeaseKeeper(
     BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
