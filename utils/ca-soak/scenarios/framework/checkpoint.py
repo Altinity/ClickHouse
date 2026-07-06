@@ -12,6 +12,7 @@ lifecycle + observe + assertions + report).
 import time
 
 from . import assertions, gc as gc_mod, lifecycle, observe
+from .report import Verdict
 
 
 def end_checkpoint(ctx, cluster, result, tables, *, table_filter=None, abandons=False,
@@ -65,6 +66,15 @@ def end_checkpoint(ctx, cluster, result, tables, *, table_filter=None, abandons=
     pool = observe.pool_shape()
     mem = observe.cluster_memory(cluster)
     conts = observe.container_samples()
+
+    s3_rates = {n.container: observe.s3_error_rates(n) for n in cluster.nodes()}
+    result.observations["s3_error_rates"] = s3_rates
+    worst_read = max((v["read_error_rate"] or 0.0) for v in s3_rates.values()) if s3_rates else 0.0
+    worst_write = max((v["write_error_rate"] or 0.0) for v in s3_rates.values()) if s3_rates else 0.0
+    result.add(Verdict("S3 error rates (info)", "recorded; store-dependent, no fixed budget",
+                       f"read max {worst_read:.1%}, write max {worst_write:.1%}", "pass",
+                       "10-20% read-error rates were invisible all campaign (2026-07-06 re-audit); "
+                       "a spike here explains retry storms/slowness in the same window"))
 
     result.observations["pool_shape"] = pool
     result.observations["server_memory_final"] = mem

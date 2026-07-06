@@ -13,7 +13,7 @@ import time
 from . import observe
 
 _COLS = ["ts", "phase", "node", "mem_resident", "mem_tracking", "cont_mem_current",
-         "cont_mem_peak", "scratch_bytes", "pool_bytes", "pool_objects"]
+         "cont_mem_peak_incl_cache", "scratch_bytes", "pool_bytes", "pool_objects"]
 
 
 def open_db(path) -> sqlite3.Connection:
@@ -76,7 +76,10 @@ class MetricsSampler:
             self._record({
                 "ts": ts, "phase": phase, "node": node.container,
                 "mem_resident": mr, "mem_tracking": mem.get("mem_tracking"),
-                "cont_mem_current": c.get("mem_current"), "cont_mem_peak": c.get("mem_peak"),
+                "cont_mem_current": c.get("mem_current"),
+                # cgroup memory.peak INCLUDES page cache (5-21x above tracked RSS in the campaign) —
+                # keep it as cache-inclusive evidence only; verdicts use peak_mem_resident.
+                "cont_mem_peak_incl_cache": c.get("mem_peak"),
                 "scratch_bytes": c.get("scratch_bytes"),
                 "pool_bytes": pool_bytes, "pool_objects": pool_objects,
             })

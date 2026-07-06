@@ -250,6 +250,8 @@ class S04(Scenario):
             for pi in range(parts):
                 sql.insert_random(cl.node1, t, rows=rows, payload_bytes=payload,
                                   op_id=(ti * parts + pi) * rows)
+            if (ti + 1) % 10 == 0 or ti + 1 == len(tables):
+                ctx.log(f"S04 prefill: {ti + 1}/{len(tables)} tables")
         result.timings["prefill_s"] = round(time.monotonic() - t_prefill, 1)
 
         try:
@@ -415,6 +417,8 @@ class S05(Scenario):
         t_prefill = time.monotonic()
         for i, t in enumerate(tables):
             sql.insert_random(cl.node1, t, rows=rows, payload_bytes=payload, op_id=i * rows)
+            if (i + 1) % 200 == 0 or i + 1 == len(tables):
+                ctx.log(f"S05 prefill: {i + 1}/{len(tables)} tables")
         result.timings["prefill_s"] = round(time.monotonic() - t_prefill, 1)
 
         try:

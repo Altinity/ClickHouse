@@ -59,3 +59,15 @@ def test_unreachable_manifest_is_reclaimable_not_bookkeeping():
     ]}
     buckets = classify_unreachable(detail)
     assert buckets == {"_manifests": 1, "blobs": 1, "gc": 1}
+
+
+def test_s3_error_rate_computation():
+    from scenarios.framework.observe import _rates_from_counters
+
+    r = _rates_from_counters({"S3ReadRequestsErrors": 19, "S3ReadRequestsCount": 100,
+                              "S3WriteRequestsErrors": 0, "S3WriteRequestsCount": 50})
+    assert r["read_error_rate"] == 0.19
+    assert r["write_error_rate"] == 0.0
+    # Missing counters yield None, never 0 (a gap must be visible, not faked).
+    r2 = _rates_from_counters({})
+    assert r2["read_error_rate"] is None and r2["write_error_rate"] is None

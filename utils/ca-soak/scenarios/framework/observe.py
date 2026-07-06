@@ -135,6 +135,26 @@ def cluster_events_delta(before: dict, after: dict) -> dict:
     return per_node
 
 
+def _rates_from_counters(ev: dict) -> dict:
+    """Read/write S3 error rates from a `system.events` snapshot dict. None where the counters are
+    absent (a gap is visible rather than faked as 0)."""
+    out = {"read_errors": ev.get("S3ReadRequestsErrors"), "read_requests": ev.get("S3ReadRequestsCount"),
+           "write_errors": ev.get("S3WriteRequestsErrors"), "write_requests": ev.get("S3WriteRequestsCount"),
+           "read_error_rate": None, "write_error_rate": None}
+    if out["read_requests"]:
+        out["read_error_rate"] = round((out["read_errors"] or 0) / out["read_requests"], 4)
+    if out["write_requests"]:
+        out["write_error_rate"] = round((out["write_errors"] or 0) / out["write_requests"], 4)
+    return out
+
+
+def s3_error_rates(node) -> dict:
+    """Cumulative S3 read/write error rates for one node (containers are recreated per scenario, so
+    cumulative ~= per-run). The 2026-07-05 campaign ran with 10-20% read-error rates (RustFS
+    timeouts under load) that were invisible in every verdict table — surface them in each report."""
+    return _rates_from_counters(events_snapshot(node))
+
+
 # ---------------------------------------------------------------------------
 # Server memory
 # ---------------------------------------------------------------------------
