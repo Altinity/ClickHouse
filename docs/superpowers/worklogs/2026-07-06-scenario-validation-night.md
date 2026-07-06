@@ -35,6 +35,14 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **Dev-scale (seed 20260707): PASS, 13/13 verdicts.** Clean — detach/attach/drop-detached lifecycle correct; `dangling=0`, replica agreement, event audit clean, no unbounded leftovers. No CAS defect. (Attach/detach-focused, low overwrite-churn → not #3231-sensitive.)
 
+## S18 — freeze and unfreeze shadows {#s18}
+
+**Dev-scale (seed 20260707): FAIL 7/9, but the core freeze correctness PASSED — the FAIL is finding F3 (a dryrun-vs-GC reachability divergence for shadows).**
+
+- **PASS (core):** `frozen content survives a live-table drop` (`fsck dangling=0` after dropping the live table AND after forced-GC-to-fixpoint, 3 rounds) + `unfreeze releases shadow refs` (reclaimable unreachable=0). So a freeze snapshot correctly keeps its blobs alive across a live-table drop, and the real GC did NOT over-delete them.
+- **FAIL → finding F3 (real, MEDIUM-HIGH, needs code investigation):** the FINAL `ca-gc-dryrun` (post-forced-GC) proposed deleting **132 blobs** (e.g. `soak_pool/blobs/01/01072cc50e...`) that fsck classifies **reachable** (`unreachable=0`). The gc_log confirms the real GC condemned/`blob_retire`d other (legitimately-dead, dropped-live-table) blobs but — since `dangling=0` after 3 rounds — did NOT delete the frozen 132. **So `ca-gc-dryrun`'s reachability DIVERGES from the real GC + fsck for shadow/frozen-referenced blobs: dryrun over-proposes them for deletion.** This is the same discover-root divergence class as review-finding #3 (fsck/GC/dryrun compute reachability from different roots). Observed-safe here (real GC spares the frozen blobs), BUT it's a red flag: (a) the operator-facing `ca-gc-dryrun` is misleading on any pool with frozen data (over-reports deletions), (b) it breaks the `dryrun ⊆ unreachable` soak oracle for freeze scenarios, and (c) it must be code-confirmed that the REAL GC robustly protects shadow refs on ALL paths (not just the timing here). **Backlog: align `ca-gc-dryrun` reachability with the real GC/fsck for shadow/frozen references; audit whether GC's reachability universe (`discoverUniverse` over `cas/refs/`) includes frozen part-manifests' blob edges or relies on a shadow-walk fsck does but dryrun doesn't.**
+- Minor: `no unbounded leftovers` INCONCLUSIVE — residual=164 but the fsck detail wasn't available to classify by prefix (harness detail-availability gap, not a leak signal; `unfreeze releases shadow refs`=0 covers the reclaimable check).
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
