@@ -138,6 +138,13 @@ Result: **ch1 exits code 48 (`NOT_IMPLEMENTED`) during `IDisk::startup` → `che
 
 **Verdict:** the S3-cache-over-CA combination is correctly blocked at config-validation time. There is no workload to run against it (it never starts). The read-side rationale for eventually supporting it stays valid (immutable content-hash keys cache perfectly); the write-path wiring remains the open ROADMAP item. Recommendation unchanged: **CA policies must point at the CA disk directly** until that row is done.
 
+## Night status checkpoint (2026-07-07 ~01:51) {#status-checkpoint}
+
+Sweep + additional cases COMPLETE; final 4h chaos soak LAUNCHED and progressing.
+- **Scenarios S33/S34/S35 (dev):** S33 concurrent-leader reclaim-leak guard PASS (2026-06-27 leak stays fixed); S34 CONFIRMS F5 (D1 per-round fanout `CasRootGet` 32→248 linear in create/drop iters, `root_dirs` flat=2, correctness intact dangling=0/reclaimable=0 → efficiency defect, backlogged); S35 resurrect invariant GREEN under rapid same-name rotation (no dangling, residual drains to 0).
+- **S3-cache-disk case:** `<type>cache</type>` over CA still unsupported, now fails-CLOSED at startup (code 48, `checkAccess`, precise message naming wrapper+workaround); verified live 26.6.1.1; ROADMAP write-path gap, no data risk.
+- **4h Phase-3 chaos soak:** RUNNING (`utils/ca-soak/logs/soak_chaos_4h_20260707T015053.log`), seed/chaos-seed=20260707, workers=6, max_pool_gb=40; stage plan warmup→steady→mutations→ttl_pressure→gc_checkpoint→chaos(5760–12240s, 81 faults)→cliff→converge(→14400s); ETA ~05:50. Standard workload = 256 B dedupable payloads → stays under rustfs#3231 threshold (unlike S13's adversarial randomString(65536)). Monitored by the 10-min health-tick cron. Verdict pending run completion + checker/fsck.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
