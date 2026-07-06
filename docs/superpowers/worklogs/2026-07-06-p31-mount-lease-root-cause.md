@@ -1,7 +1,28 @@
 # P3.1 — mount-lease "foreign writer" race: root-cause investigation {#p31}
 
-Status: CODE ANALYSIS COMPLETE (this section); repro evidence being collected to confirm
-attribution. Method: systematic-debugging — no fix before the root cause is confirmed.
+Status: **ROOT CAUSE CONFIRMED** (code analysis + live experiments + historical-incident signature
+match). Method: systematic-debugging. Evidence: `.superpowers/sdd/p31-repro-evidence.md` + the
+threshold experiment below.
+
+## Evidence summary {#evidence}
+
+- **Quantitative threshold validation**: 20 rapid kill-restart cycles (~27 s each) produced ZERO
+  conflicts — the fence threshold is `ttl(30 s) + skew(ttl/2 = 15 s) = 45 s` unrenewed, never
+  reached. The night's collisions therefore required renewals BLOCKED past 45 s (the beat, under
+  load) — killing alone does not reproduce them. Confirms the timing model (P-3 shape).
+- **Direct fence observation (P-1 ✓)**: a 60 s stop of ch1 → the GC leader (ch2) fenced
+  `ca_soak_ch1`'s slot (`gc_fence_out` event at 10:35:54, `state=fenced` in
+  `system.content_addressed_mounts` — both Phase-2 instruments captured it). The fence preserves
+  ch1's own uuid (P-2 ✓ — the "foreign writer" is never a foreign uuid).
+- **Recovery path healthy**: restarting ch1 against its fenced slot reclaimed instantly (2 s,
+  fenced → live) via `claimMount`'s gc_fenced reclaim branch.
+- **Historical incident (2026-07-06 05:01–05:04)**: ch1's renewal hit "touched by a foreign
+  writer" at 05:01:52, then the restart aborted during metadata load with "touched while adopting
+  our own mount slot" (exit 49) — while ch2 hit the SAME race in the same window and survived
+  benignly (`writer_epoch` 2→3 in place via `scheduleRemount`). The asymmetry (renewal-path benign,
+  open-path fatal) matches the code analysis exactly.
+- The fence-out is the ONLY cross-process writer that preserves (uuid, epoch) — the write-site
+  inventory has no other candidate. Attribution is airtight.
 
 ## The mechanism (code-derived) {#mechanism}
 
