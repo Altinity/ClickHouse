@@ -1641,6 +1641,55 @@ TEST(CasStoreBeat, AckAdvancesOnlyAfterViewLoad)
     EXPECT_EQ(store->retireView().round(), 3u);
 }
 
+TEST(CasLeaseViewDecouple, RenewAdvertisesInstalledRoundNotPublished)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openStoreForTest(backend);
+
+    /// Publish a NEWER round but do NOT sync the view. The isolated renewal path must advertise the
+    /// round the view is currently INSTALLED at (0), proving it does not load the view.
+    GcState st;
+    st.round = 5;
+    backend->putIfAbsent(store->layout().gcStateKey(), encodeGcState(st));
+
+    store->renewLeaseOnlyForTest();
+
+    const auto got = backend->get(store->layout().mountKey("test"));
+    ASSERT_TRUE(got.has_value());
+    const MountLease after_renew = decodeMountLease(got->bytes);
+    EXPECT_EQ(after_renew.observed_gc_round, 0u) << "renewal must advertise the installed round, not the published one";
+    EXPECT_GT(after_renew.seq, 1u) << "the lease was renewed (seq advanced)";
+    EXPECT_EQ(store->retireView().round(), 0u) << "renewal must not install a newer view";
+
+    /// A sync installs round 5; the NEXT isolated renewal then advertises it.
+    store->syncRetiredView();
+    EXPECT_EQ(store->retireView().round(), 5u);
+    store->renewLeaseOnlyForTest();
+    const auto got2 = backend->get(store->layout().mountKey("test"));
+    ASSERT_TRUE(got2.has_value());
+    EXPECT_EQ(decodeMountLease(got2->bytes).observed_gc_round, 5u);
+}
+
+TEST(CasLeaseViewDecouple, RenewWatermarkOnceComposesSyncThenRenew)
+{
+    /// renewWatermarkOnce is the composed test driver: it syncs the view THEN renews, so a single
+    /// call still makes observed_gc_round follow the freshly-published round (the contract the GC
+    /// pipeline tests rely on).
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openStoreForTest(backend);
+
+    GcState st;
+    st.round = 7;
+    backend->putIfAbsent(store->layout().gcStateKey(), encodeGcState(st));
+
+    store->renewWatermarkOnce();
+
+    const auto got = backend->get(store->layout().mountKey("test"));
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(decodeMountLease(got->bytes).observed_gc_round, 7u);
+    EXPECT_EQ(store->retireView().round(), 7u);
+}
+
 TEST(CasStoreBeat, ViewAdvanceEmitsRetiredViewAdvanceEvent)
 {
     /// Introspection (copy-forward Task 3): a beat that INSTALLS a newer retired view emits exactly

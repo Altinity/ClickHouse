@@ -273,13 +273,21 @@ public:
     /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
     /// quiescent server's watermark floor advances to the next-to-be-allocated seq). Locks builds_mutex.
     uint64_t minActive();
+    /// The GC round the retired view is CURRENTLY INSTALLED at (spec 2026-07-06-decouple). Cheap,
+    /// in-memory — the value the lease renewal advertises as `observed_gc_round`. Race-safe against
+    /// the retired-view syncer via `RetireView`'s own internal shared_mutex; takes no Store lock.
+    uint64_t observedGcRound() const;
     /// Test/assertion accessor for the next-to-allocate build_seq under the lock.
     uint64_t peekNextBuildSeq();
-    /// Renew the merged heartbeat once (bump seq, refresh min_active/observed_gc_round from the live
-    /// callbacks, stamp a fresh expires_at_ms). The build-watermark floor rides this beat after the
-    /// ack-floor merge — there is no standalone watermark object. In production this is driven by the
-    /// background renewer (background_watermark); tests with the renewer disabled drive it explicitly
-    /// to make a finished build's floor advance durable.
+    /// Renew the merged heartbeat once (bump seq, refresh min_active from the live callback, stamp the
+    /// last-INSTALLED GC round via `observedGcRound()`, stamp a fresh expires_at_ms). The build-watermark
+    /// floor rides this beat after the ack-floor merge — there is no standalone watermark object. In
+    /// production this is driven by the background renewer (background_watermark), which no longer
+    /// depends on S3 (the retired-view syncer, Task 3, advances the installed round independently).
+    /// Redefined (spec 2026-07-06-decouple) as the composed test/manual driver: `syncRetiredView()`
+    /// THEN `mount_keeper->renewOnce()`, so a single call still makes `observed_gc_round` follow the
+    /// freshly-published round — the contract the GC pipeline tests rely on. Use `renewLeaseOnlyForTest`
+    /// to drive the isolated renewal path (renew without syncing).
     void renewWatermarkOnce();
 
     /// ---- local write fence (spec §write-fence, Phase 0 Task 6) ----
@@ -371,8 +379,10 @@ public:
     /// OLD incarnation may never write again (the keeper never re-mints), but a FRESH incarnation —
     /// durable writer_epoch bump + mount reclaim + fresh retired view + re-armed write fence — is
     /// exactly what a server restart would create, so a live server may create it in place. Runs the
-    /// same claim machinery as `Store::open` (S13); the new keeper's anchor loads the retired view
-    /// through `syncRetiredView`, so open-ordering holds for the new incarnation too. Returns
+    /// same claim machinery as `Store::open` (S13); a synchronous `syncRetiredView()` call primes the
+    /// view for the fresh incarnation before the new keeper's anchor (spec 2026-07-06-decouple — the
+    /// keeper's own renewal reads the installed round via `observedGcRound()`, it does not sync), so
+    /// open-ordering holds for the new incarnation too. Returns
     /// false (and changes nothing durable beyond the epoch bump) when the mount cannot be claimed
     /// (foreign owner / a genuinely live twin) — the caller retries. Safe to call concurrently
     /// (serialized internally); also the synchronous test seam.
@@ -420,6 +430,13 @@ public:
     /// never GC'd). Used by `precommitAdd` to self-floor a NEWBORN ref-shard to the current round so
     /// the `promote` gate forces a retire-view refresh before the shard's blobs can be committed.
     uint64_t currentGcRound() const;
+
+    /// Test seam (spec 2026-07-06-decouple): drive the ISOLATED lease renewal — renewOnce WITHOUT a
+    /// preceding view sync — so a test can prove the renewal path advertises only the installed round
+    /// and never loads the view. Production renewal runs this via the keeper's background thread;
+    /// `renewWatermarkOnce` is the composed (sync+renew) driver. Defined in CasStore.cpp beside
+    /// `renewWatermarkOnce` (needs `Exception`/`ErrorCodes::LOGICAL_ERROR`).
+    void renewLeaseOnlyForTest();
 
     /// B164b test seam: mutate root shard with explicit origin/kind for backpressure
     /// verification. Production code uses private `mutateShard` via Build/Gc friend

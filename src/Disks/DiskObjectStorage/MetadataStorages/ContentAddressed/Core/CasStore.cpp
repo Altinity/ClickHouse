@@ -261,13 +261,15 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
             /// ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard.
             /// Merged heartbeat (ack-floor redesign): the mount keeper now ALSO carries the per-server
             /// build-watermark floor (`minActive`) and the acked GC round, read off the keeper's state
-            /// lock via `prepareRenew`; the observed-round callback runs the sync (`syncRetiredView`).
-            /// Open-ordering falls out of the wiring: `doStart` computes the payload through that callback,
-            /// so the anchored mount body carries an ack from a gc/state read AFTER the claim.
+            /// lock via `prepareRenew`; the observed-round callback reads the already-installed round
+            /// (`observedGcRound`, cheap and in-memory — spec 2026-07-06-decouple), it does NOT sync.
+            /// Open-ordering falls out of the wiring: the initial `retire_view.refresh()` above (line
+            /// ~140) primes the view BEFORE this construction, so `doStart`'s first anchored ack already
+            /// reflects that primed round; the dedicated syncer (Task 3) keeps it current thereafter.
             store->mount_keeper = std::make_unique<MountLeaseKeeper>(
                 store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
                 store->config.mount_lease_ttl_ms, now_ms,
-                [raw] { return raw->minActive(); }, [raw] { return raw->syncRetiredView(); },
+                [raw] { return raw->minActive(); }, [raw] { return raw->observedGcRound(); },
                 emit_mount_event);
             /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh
             /// the monotonic deadline; on a superseded/foreign renew failure latch the fence to lost.
@@ -304,11 +306,14 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
             store->bootMsNow() + static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count()));
         /// Gate the background renewer with `background_watermark`: it runs only in production
         /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
-        /// drive renewOnce explicitly and rely on the armed sub-TTL deadline, never on the loop. The
-        /// keeper itself is still started above (it must claim/adopt the mount + arm the fence on every
-        /// writable open); only the renewal thread is conditional. The merged heartbeat renews at
-        /// `mount_renew_period` — the standalone watermark object (and its separate renew period) is
-        /// gone; one beat now renews the lease, the floor and the acked round together.
+        /// drive renewOnce (or the composed renewWatermarkOnce) explicitly and rely on the armed
+        /// sub-TTL deadline, never on the loop. The keeper itself is still started above (it must
+        /// claim/adopt the mount + arm the fence on every writable open); only the renewal thread is
+        /// conditional. The merged heartbeat renews at `mount_renew_period` — the standalone watermark
+        /// object (and its separate renew period) is gone; one beat now renews the lease and the floor,
+        /// and advertises the last-INSTALLED GC round (spec 2026-07-06-decouple: renewal no longer runs
+        /// the S3 view sync; the dedicated retired-view syncer, Task 3, advances the installed round on
+        /// its own thread).
         if (store->config.background_watermark)
             store->mount_keeper->startBackground(store->config.mount_renew_period);
 
@@ -438,6 +443,11 @@ uint64_t Store::minActive()
     return active_build_seqs.empty() ? next_build_seq : *active_build_seqs.begin();
 }
 
+uint64_t Store::observedGcRound() const
+{
+    return retire_view.round();
+}
+
 uint64_t Store::peekNextBuildSeq()
 {
     std::lock_guard lk(builds_mutex);
@@ -501,7 +511,7 @@ bool Store::tryRemountOnce()
         mount_keeper = std::make_unique<MountLeaseKeeper>(
             pool_backend, pool_layout, srid, our_uuid, writer_epoch,
             config.mount_lease_ttl_ms, now_ms,
-            [raw] { return raw->minActive(); }, [raw] { return raw->syncRetiredView(); },
+            [raw] { return raw->minActive(); }, [raw] { return raw->observedGcRound(); },
             emit_mount_event);
         mount_keeper->setFenceCallbacks(
             [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
@@ -510,9 +520,11 @@ bool Store::tryRemountOnce()
                 raw->tripMountLost();
                 raw->scheduleRemount();
             });
-        /// `start` anchors the new incarnation's body; its payload runs `syncRetiredView`, so the
-        /// retired view is LOADED (and the advertised ack fresh) before the fence re-arms below —
-        /// the same open-ordering the model's WOpen requires.
+        /// Prime the retired view for the fresh incarnation (open does this at Store::open via the
+        /// initial retire_view.refresh(); the remount path has no such prime). doStart then reads the
+        /// freshly-installed round via observedGcRound(), so the first anchored ack is current — the
+        /// open-ordering the model's WOpen requires.
+        syncRetiredView();
         mount_keeper->start();
         armMountFence(our_uuid, writer_epoch, bootMsNow() + ttl_ms);
         if (config.background_watermark)
@@ -647,12 +659,24 @@ uint64_t Store::syncRetiredView()
 
 void Store::renewWatermarkOnce()
 {
-    /// After the ack-floor merge the build-watermark floor rides the merged mount-keeper beat (there
-    /// is no standalone watermark object anymore), so one renewOnce re-reads `minActive` and stamps
-    /// it into the mount body. A read-only open never anchored the keeper; there is nothing to renew
-    /// (fail closed rather than fabricate one).
+    /// Composed test/manual driver (spec 2026-07-06-decouple): sync the retired view, THEN renew the
+    /// lease. In production these are two independent threads (the syncer + the keeper's renewal loop);
+    /// this one-call composition preserves the pipeline-test contract that a single renewWatermarkOnce
+    /// makes `observed_gc_round` follow the freshly-committed gc/state.round. A read-only open never
+    /// anchored the keeper; there is nothing to renew (fail closed rather than fabricate one).
     if (!mount_keeper)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renewWatermarkOnce on a read-only Store");
+    syncRetiredView();
+    mount_keeper->renewOnce();
+}
+
+void Store::renewLeaseOnlyForTest()
+{
+    /// Test seam (spec 2026-07-06-decouple): drive the ISOLATED renewal path — renewOnce WITHOUT a
+    /// preceding view sync — proving the renewal itself never loads the view (it only reads the
+    /// already-installed round via `observedGcRound`). Mirrors `renewWatermarkOnce`'s read-only guard.
+    if (!mount_keeper)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renewLeaseOnlyForTest on a read-only Store");
     mount_keeper->renewOnce();
 }
 

@@ -631,7 +631,8 @@ SingleWriterSlot::RenewPayload MountLeaseKeeper::prepareRenew() const
     /// Carry the three dynamic fields (all read OFF the state lock — the merged floor/round callbacks
     /// reach into the Store's own locks): `value` = wall-clock `now_ms` (so `encodeBody` stamps a
     /// fresh `expires_at_ms = now_ms + ttl`), `value2` = `min_active` (the build-watermark floor),
-    /// `value3` = `observed_gc_round` (the acked GC round).
+    /// `value3` = `observed_gc_round` (the last-INSTALLED GC round ack; spec 2026-07-06-decouple —
+    /// `observed_round_fn` READS this value in memory, it does not load the retired view).
     return {.value = now_ms_fn(), .value2 = min_active_fn(), .value3 = observed_round_fn()};
 }
 
