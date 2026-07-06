@@ -125,6 +125,19 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 - `no unbounded leftovers` = inconclusive (residual=43, fsck prefix-detail unavailable) — same harness gap as S33/S34, not a defect; the reclaimable-drain check separately confirms content reclaims to 0.
 - S3 error rates (info): read max 10.4% / write max 4.2% — rustfs under mild pressure at this cadence, retries absorbed, no functional impact.
 
+## S3-cache-disk case — `<type>cache</type>` filesystem cache over the CA disk {#s3-cache-disk}
+
+**Empirically re-verified live on 26.6.1.1 (2026-07-07): still UNSUPPORTED, but now fails CLOSED at startup with a precise, actionable diagnostic. Correct behavior; a known ROADMAP write-path gap, not a regression.**
+
+Harness: `configs/storage_conf_s3cache_ch1.xml` (a `<type>cache</type>` disk `ca_cache` wrapping the CA `ca` disk, 1 GiB fs-cache; policy points at `ca_cache`). Single-node bring-up over the shared RustFS pool.
+
+Result: **ch1 exits code 48 (`NOT_IMPLEMENTED`) during `IDisk::startup` → `checkAccess`**, before any table load:
+- Path: `IDisk::checkAccess` → `DiskObjectStorageTransaction::writeFileImpl` → CA `notYet("generateObjectKeyForPath")`. The cache wrapper (`MetadataStorageFromCacheObjectStorage`) forwards neither `isContentAddressed` nor the CA transaction surface, so the generic write path is taken and hits the CA stub. Matches the 2026-07-03 root cause in `[[project_ca_cache_disk_unwired]]`.
+- **The message is now precise and actionable** (improvement since the note): *"…not implemented for a content-addressed disk… usually means the disk is wrapped by a layer that bypasses the content-addressed write path — e.g. a `<type>cache</type>` disk over a content-addressed disk, which is not supported yet (use the content-addressed disk directly in the storage policy): While checking access for disk ca_cache."*
+- **Fail-closed & safe:** it refuses to start, names the exact wrapper (`ca_cache`), the reason, and the workaround — rather than coming up with a silently-broken disk. `checkAccess` runs before table load, so there is zero data-corruption exposure. This is the correct outcome for an unwired combination.
+
+**Verdict:** the S3-cache-over-CA combination is correctly blocked at config-validation time. There is no workload to run against it (it never starts). The read-side rationale for eventually supporting it stays valid (immutable content-hash keys cache perfectly); the write-path wiring remains the open ROADMAP item. Recommendation unchanged: **CA policies must point at the CA disk directly** until that row is done.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
