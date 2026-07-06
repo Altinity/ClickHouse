@@ -84,6 +84,10 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **Dev-scale (seed 20260707): PASS 12/12.** Clean — concurrent wide/large-insert scratch pressure handled; `dangling=0`, no leftovers, event audit clean. No CAS defect (the whole-part scratch-spill resource concern is a documented separate item, not a correctness fail).
 
+## S29 — large non-direct-blob file memory spike {#s29}
+
+**Dev-scale (seed 20260707): INCONCLUSIVE 9/10 — effectively PASS.** 9 safety verdicts pass (`dangling=0`, no leftovers, event audit clean); the 1 INCONCLUSIVE is `RSS growth during finalize not ~ non-direct-blob file size` — a memory-observation gate best exercised at full scale (streaming write-path behavior already established by the S01 putBlob-memory work). No CAS defect.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
