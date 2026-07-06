@@ -94,6 +94,10 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 - **PASS:** `fsck dangling=0`, `root_dirs 2 -> 2` (dir count bounded), replica/audit clean. No data loss.
 - **FAIL → F5 (real, MEDIUM, backlog + D1 follow-up):** `GC fanout bounded across ever-created namespaces (D1 registry removal)` — **`CasRootGet` per-round grew 75 -> 190 across the 30 create/drop cycles even though no table stayed live**. D1 (registry removal + dropped-shard reclaim) was meant to keep GC per-round work bounded across create/drop churn; this shows per-round GETs still growing. Residual=43 "other" (dropped-namespace remnants). `dangling=0` so it's a GC-EFFICIENCY / fanout issue, not correctness/data-loss. **Caveats to resolve in investigation:** (a) confirm at full scale (1000 iters) whether the growth is truly unbounded/linear or levels off; (b) the growth may be partly inflated by concurrent-leader `gc/state moved ... retry next round` retries (2-node, both GC-enabled) rather than pure dropped-namespace re-reads — separate the two; (c) audit dropped-namespace ref-shard reclaim completeness (are dropped `cas/refs/<ns>/*` fully removed, or lingering for `discoverUniverse` to re-read each round?). Relates to BACKLOG S30 "other"/dropNamespace-registry item + [[project_d1_shard_incarnation_registry_removal]]. `no unbounded leftovers` INCONCLUSIVE (residual=43, unclassified).
 
+## S31 — ca-gc-dryrun completeness under gc_shards>1 {#s31}
+
+**Dev-scale (seed 20260707, gc_shards2 variant): INCONCLUSIVE 9/10 — effectively PASS.** 9 pass — the dryrun COMPLETENESS verdicts (dryrun does not MISS dead blobs under gc_shards>1) hold, `dangling=0`. The 1 INCONCLUSIVE is the recurring `no unbounded leftovers` classification-detail gap. Note: S31 (completeness = dryrun catches all dead) is the OPPOSITE direction from F3 (dryrun proposes EXTRA reachable blobs) — so the dryrun under-count in F3 is not a completeness miss. No CAS defect.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
