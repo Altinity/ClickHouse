@@ -98,6 +98,10 @@ Binary under test: HEAD `ee63c36740e` (P3.1 mount-lease fence recovery + lease/v
 
 **Dev-scale (seed 20260707, gc_shards2 variant): INCONCLUSIVE 9/10 — effectively PASS.** 9 pass — the dryrun COMPLETENESS verdicts (dryrun does not MISS dead blobs under gc_shards>1) hold, `dangling=0`. The 1 INCONCLUSIVE is the recurring `no unbounded leftovers` classification-detail gap. Note: S31 (completeness = dryrun catches all dead) is the OPPOSITE direction from F3 (dryrun proposes EXTRA reachable blobs) — so the dryrun under-count in F3 is not a completeness miss. No CAS defect.
 
+## S32 — TTL expiry reclaim {#s32}
+
+**Dev-scale (seed 20260707): PASS 12/12.** Clean — TTL-expired parts reclaimed correctly; `dangling=0`, no leftovers, event audit clean. No CAS defect.
+
 ## Out-of-band notes / review comments {#notes}
 
 **CI: new CAS S3 functional-test lane has no RustFS provisioning (P1) — recorded 2026-07-06.**
