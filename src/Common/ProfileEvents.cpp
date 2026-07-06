@@ -1469,8 +1469,6 @@ The server successfully detected this situation and will download merged part fr
     M(DataLakeUnityCatalogGetSchemasMicroseconds, "Total time of 'get schemas' requests to Iceberg Unity catalog.", ValueType::Microseconds) \
     M(DataLakeUnityCatalogGetCredentials, "Number of 'get credentials' requests to Iceberg Unity catalog.", ValueType::Number) \
     M(DataLakeUnityCatalogGetCredentialsMicroseconds, "Total time of 'get credentials' requests to Iceberg Unity catalog.", ValueType::Microseconds) \
-    \
-    M(DataLakePaimonRestCatalogAuthTokenRefreshedOnUnauthorized, "Number of Paimon REST catalog DLF HTTP requests retried with a new authorization signature after HTTP 401.", ValueType::Number) \
 
 
 #ifdef APPLY_FOR_EXTERNAL_EVENTS
