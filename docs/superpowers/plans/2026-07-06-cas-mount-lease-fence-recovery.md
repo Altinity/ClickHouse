@@ -77,7 +77,7 @@ TEST(CasHeartbeat, StopBeforeStartIsQuietNoOp)
 **Files:**
 - Modify: `$CA/Core/CasServerRoot.h` (`MountClaimResult::Kind` gains `FencedSelf`)
 - Modify: `$CA/Core/CasServerRoot.cpp` (`claimMount` same-epoch branch; keeper `claim()` fenced check)
-- Modify: `src/Common/ErrorCodes.cpp` (new code `CAS_MOUNT_FENCED` — follow the file's append idiom, next free number)
+- ~~Modify: `src/Common/ErrorCodes.cpp`~~ **USER DECISION 2026-07-06: no new ErrorCodes number (fork-merge pain — the numbered list conflicts with upstream constantly).** Instead: a CAS-local typed exception `Cas::MountFencedException : DB::Exception` (declared in `CasServerRoot.h` next to `MountClaimResult`, base code `ErrorCodes::ABORTED`); all throw sites use it; catch sites match BY TYPE (`catch (const MountFencedException &)`), never by code.
 - Test: `src/Disks/tests/gtest_cas_mount.cpp` + `gtest_cas_heartbeat.cpp` (append)
 
 **Interfaces:**
@@ -301,9 +301,9 @@ For the ADOPT-WINDOW case (fence between claim and adopt): use a hook backend (s
             {
                 store->mount_keeper->start();
             }
-            catch (const Exception & e)
+            catch (const Cas::MountFencedException &)
             {
-                if (e.code() != ErrorCodes::CAS_MOUNT_FENCED || fence_recovery >= max_fence_recoveries)
+                if (fence_recovery >= max_fence_recoveries)
                     throw;
                 store->mount_keeper.reset();
                 writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
@@ -313,7 +313,7 @@ For the ADOPT-WINDOW case (fence between claim and adopt): use a hook backend (s
         }
 ```
 
-ADAPT to the real surrounding code: `writer_epoch` is currently a local computed before this block — make it mutable; `allocateWriterEpoch`'s real signature — grep and use verbatim; whatever uses `writer_epoch` AFTER the loop (`armMountFence(our_uuid, writer_epoch, ...)`) must use the FINAL value. The keeper-construction code stays inside the loop so each retry builds a keeper at the current epoch. Check the remount path (`tryRemountOnce`, CasStore.cpp ~:420-470): it already allocates a fresh epoch per attempt — extend its keeper-start `catch` to treat `CAS_MOUNT_FENCED` like its existing retryable failures (read it first; smallest edit that makes the remount loop retry on the typed code).
+ADAPT to the real surrounding code: `writer_epoch` is currently a local computed before this block — make it mutable; `allocateWriterEpoch`'s real signature — grep and use verbatim; whatever uses `writer_epoch` AFTER the loop (`armMountFence(our_uuid, writer_epoch, ...)`) must use the FINAL value. The keeper-construction code stays inside the loop so each retry builds a keeper at the current epoch. Check the remount path (`tryRemountOnce`, CasStore.cpp ~:420-470): it already allocates a fresh epoch per attempt — extend its keeper-start `catch` to treat `MountFencedException` (by type) like its existing retryable failures (read it first; smallest edit that makes the remount loop retry on the typed code).
 
 - [ ] **Step 4: GREEN + full sweep.**
 
