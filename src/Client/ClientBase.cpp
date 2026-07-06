@@ -127,6 +127,8 @@ namespace Setting
     extern const SettingsString promql_database;
     extern const SettingsString promql_table;
     extern const SettingsFloatAuto evaluation_time;
+    extern const SettingsBool use_client_time_zone;
+    extern const SettingsTimezone session_timezone;
 }
 
 namespace ErrorCodes
@@ -2256,6 +2258,16 @@ void ClientBase::processParsedSingleQuery(
             connect();
 
         applySettingsFromServerIfNeeded(); // after connect() and applySettingsFromQuery()
+
+        /// With `use_client_time_zone`, DateTime string literals must be interpreted in the client time
+        /// zone. The client parses synchronous INSERT literals itself, but literals interpreted server-side
+        /// (asynchronous INSERT, SELECT) rely on `session_timezone`. Seed it with the client time zone unless
+        /// the user set `session_timezone` explicitly. This is transient (reverted with the other query
+        /// settings below), so it tracks per-query `use_client_time_zone` changes in both directions.
+        if (!client_local_timezone.empty()
+            && client_context->getSettingsRef()[Setting::use_client_time_zone]
+            && !client_context->getSettingsRef().isChanged("session_timezone"))
+            client_context->setSetting("session_timezone", client_local_timezone);
 
         ASTPtr input_function;
         const auto * insert = parsed_query->as<ASTInsertQuery>();
