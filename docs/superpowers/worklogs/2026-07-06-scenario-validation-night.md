@@ -148,6 +148,41 @@ Sweep + additional cases COMPLETE; final 4h chaos soak LAUNCHED and progressing.
 - **S3-cache-disk case:** `<type>cache</type>` over CA still unsupported, now fails-CLOSED at startup (code 48, `checkAccess`, precise message naming wrapper+workaround); verified live 26.6.1.1; ROADMAP write-path gap, no data risk.
 - **4h Phase-3 chaos soak:** RUNNING (`utils/ca-soak/logs/soak_chaos_4h_20260707T015053.log`), seed/chaos-seed=20260707, workers=6, max_pool_gb=40; stage plan warmup→steady→mutations→ttl_pressure→gc_checkpoint→chaos(5760–12240s, 81 faults)→cliff→converge(→14400s); ETA ~05:50. Standard workload = 256 B dedupable payloads → stays under rustfs#3231 threshold (unlike S13's adversarial randomString(65536)). Monitored by the 10-min health-tick cron. Verdict pending run completion + checker/fsck.
 
+## needs-infra build-out — S12 / S22 / S27 now RUN (no more skips) {#needs-infra-buildout}
+
+**2026-07-07, at Mikhail's (repeated, escalated) instruction: stop skipping scenarios as
+"needs-infra"/inconclusive — build the infrastructure and run them. A per-scenario docker-compose for
+each. After this, `grep needs_infra scenarios/cards/*.py` returns NONE.**
+
+- **S12 (ten replicas, shared pool) — PASS 11/11.** Built the N-node harness: generalized
+  `soak/cluster.py` `Cluster` from a hardcoded 2 nodes to N (`Cluster(node_count=10)`); `cluster_boot`
+  variant→node_count + N-node health/log handling + scaled bring-up timeout; runner builds the N-node
+  cluster. Fixed an F1 regression the 10-replica configs still carried (`<ca_ro>` block in
+  `storage_conf_10replicas_ch3..ch10.xml` — stripped) and added the `fsck-only.xml` mount to ch1.
+  Real S12: 10-way concurrent inserts over one shared CA pool (shared identical block + per-replica
+  unique block) → all 10 replicas converge to a byte-identical checksum, CA content-dedup fires
+  (`CasBlobBodyPutAvoided=40`), dangling=0. Corrected the row-count oracle against a local-disk RMT
+  oracle (RMT does not row-dedup identical `INSERT...SELECT` — CA==local — so the count is the full
+  replicated union, not a row-dedup).
+- **S22 (object-store throttling / retry budget) — PASS 11/11.** Built `proxy/s3_fault_proxy.py`, an
+  HTTP proxy between ClickHouse and RustFS (Host preserved → SigV4 valid), runtime-armable via a
+  control port: 503/429/slow/reset. `docker-compose-s3faultproxy.yml` points the ca endpoint at it.
+  Found+fixed two proxy forward-path bugs via the CA blob check (relaying `Expect:100-continue`
+  corrupted ≥64 KiB PUTs; overwriting a `HEAD` response `Content-Length` broke the dedup probe →
+  size-0 `CORRUPTED_DATA`). Real S22: armed 503/429/slow, ran a write+merge workload → 336 faults
+  injected, 0 workload errors (retries absorbed them, bounded), replicas agree, dangling=0.
+- **S27 (backend LIST pagination ambiguity) — 11/12 (only the benign leftovers fsck-detail
+  inconclusive).** Reused the proxy in LIST-anomaly mode (`docker-compose` variant `s3listproxy`):
+  perturbs `LIST(cas/refs/)` (the prefix `discoverUniverse` enumerates) with duplicate keys / dropped
+  continuation token. Churned create/drop + drove GC under the anomalies → 40 LISTs perturbed, GC
+  tolerated the malformed pages (0 round errors), replicas agree, dangling=0, dropped content
+  reclaims. The conservative-reread behavior is visible: `CasRootGet` 74 (stable baseline) → 1373
+  (under unstable listings) — GC re-reads rather than skips a fold, the exact fail-safe the scenario
+  predicts.
+
+Reusable infra added: N-node `Cluster`; the `s3_fault_proxy` + its two compose variants; the
+`node_count_for` / variant maps in `cluster_boot`. All committed on `cas-gc-rebuild`.
+
 ## 4h chaos soak — RESULT (terminated ~97 min on the known TTL-band harness oracle; CA correctness GREEN throughout) {#chaos-soak-result}
 
 **Ran 2026-07-07 01:51→03:37 (~97 min, reached the `chaos` stage + 1 fault) on the standard 2-node stand (seed/chaos-seed=20260707, workers=6, `max_pool_gb=40`). Terminated on a HARNESS-oracle failure, not a CA bug. All three limitations it hit are already-known, non-CA-correctness issues.**
