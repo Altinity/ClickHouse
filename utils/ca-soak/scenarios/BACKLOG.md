@@ -1229,3 +1229,56 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 - **Oracle:** the improved class-aware `assert_no_leftovers` + graduation-drain CORRECTLY surfaces this
   (unaccounted/unreachable ⇒ leak ⇒ FAIL) — it was previously MASKED by the "fsck detail unavailable"
   inconclusive. So S30 (and any recurring-hash churn card) now FAILs on this real residual until fixed.
+## S30-20260707T120511-1: forced GC left 1 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manif
+
+- **Logged (UTC):** 2026-07-07T12:08:27
+- **Severity:** suspected-bug
+- **Run:** 20260707T120511_S30_seed1
+- **Observed:** forced GC left 1 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 1}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
+- **ROOT-CAUSED 2026-07-07 (auto-diagnosis above is WRONG — not concurrent-leader):** run was single-node
+  forced GC. The orphan is manifest `1:35:1` (ns `ca_soak_ch2/store/7a5/…@cas@`, part `all_0_0_0`). Decoding
+  the raw root-shard journals: shards for builds 34/36 show full precommit→promote→drop (R6-deleted); shard 59
+  for build 35 holds a **single `RootOwnerEvent{new_binding=Precommit, manifest_ref=1:35:1}` and NOTHING ELSE**
+  — no promote, no abandon, no drop. So this is a **DANGLING PRECOMMIT manifest binding**, a distinct bug from
+  the blob RESURRECT-REUPLOAD-ORPHAN (NO token-replace; all `manifest_delete` outcomes were `deleted`).
+  Mechanism: `CasOrphanManifestSweep.cpp` `activeManifestKeys` puts every `new_binding` Precommit into
+  `precommit_live` and only erases it on a removal event — none exists for 35 → sweep spares it EVERY round
+  (proven: 15 extra forced rounds, no change; eligibility satisfied, mount `min_active=37 > 35`). R6 never
+  folds a `-1` (owner never removed) → never deletes. fsck follows only COMMITTED refs → classes it
+  `unreachable`. Net: sweep says "live (precommit)", fsck says "leak (unreachable)" — permanent orphan + INV-2.
+  Likely trigger: a locally-inserted precommit (`all_0_0_0`, build 35) superseded by a replication-fetched
+  incarnation (`tmp-fetch…`, builds 34/36 that committed+dropped) and never abandoned. Aggregate signal was
+  visible (ch2: `precommit=36`, `build_publish=35`, `build_abort=0` → 1 build precommitted, never
+  published/aborted). **FIX = the precommit-abandon/cleanup path** (own brainstorming→spec→plan cycle,
+  started 2026-07-07). Separate from the committed blob fix.
+
+## INTROSPECTION-1 (2026-07-07): manifest/precommit lifecycle audit gap in `system.content_addressed_log`
+
+- **Logged (UTC):** 2026-07-07
+- **Severity:** missing-instrumentation
+- **Observed:** the CA event log is only half-instrumented for the manifest/precommit lifecycle, which is why
+  the DANGLING-PRECOMMIT orphan (S30 above) could not be diagnosed per-object from SQL and required hand-
+  decoding raw bucket objects. Concretely: `ManifestPut` has **0 emit sites** (only the manifest DELETE is
+  logged, never the body write), `PrecommitRemoved` has **0 emit sites** (the exact abandon/removal event
+  whose absence IS the bug), and `ManifestExpand`/`ManifestRetire`/`ManifestStrip` are **dead enum entries**
+  (declared, never emitted). This contradicts the table's design intent (every state-changing action logged
+  with motivation + details).
+- **Proposed action:** emit `ManifestPut` (key + token + motivation) and the owner-transition events at the
+  manifest-owner level (promote, `PrecommitRemoved`/abandon); implement or delete the dead
+  `ManifestExpand/Retire/Strip`. Goal: "precommit created, never removed" becomes visible per-object in
+  `system.content_addressed_log`. Debuggability-first, in the spirit of B170 (blob audit that pinned the
+  B140 dangle).
+
+## INTROSPECTION-2 (2026-07-07): no easy human-readable introspection of CA bucket objects
+
+- **Logged (UTC):** 2026-07-07
+- **Severity:** missing-instrumentation
+- **Observed:** diagnosing the DANGLING-PRECOMMIT orphan required spinning up an ephemeral `mc` container and
+  hand-decoding protobuf/custom-binary objects (root-shard journals, manifest bodies, mount leases, gc state)
+  by `od -tx1`. There is no supported way to inspect a decoded CA object. The decoders already exist in the
+  codebase (`decodeRootShard`, `decodePartManifest`, `decodeMountLease`, `decodeGcState`).
+- **Proposed action:** expose the decoders via `clickhouse-disks` (which already hosts `ca-fsck`/
+  `ca-gc-dryrun`) as e.g. `ca-inspect <key>` → human-readable JSON for any CA object; optionally extend fsck
+  detail to report the "why" per key (`reachable-via` / `spared-by-precommit` / `eligible`) so leaks like this
+  surface directly. Ends hand hex-decoding of the bucket.
+
