@@ -65,6 +65,7 @@ struct RetiredMergeResult
     std::vector<RetiredEntry> graduated;       /// newly floor-passed this pass — published pending, deleted NEXT pass
     std::vector<RetiredEntry> spared;          /// in-degree recovered — entry dropped
     std::vector<RetiredEntry> redelete;        /// pending in the PRIOR list — execute deleteExact pre-CAS, drop
+    std::vector<RetiredEntry> replaced;   /// re-condemned CURRENT tokens that superseded a stale entry (resurrect-replaced); caller emits blob_retire_replaced
 };
 
 /// Three-cursor extension (ack-floor redesign): `prior_retired` (Blob entries ONLY, sorted by hash
