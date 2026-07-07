@@ -154,6 +154,10 @@ namespace ExportPartitionUtils
         context_copy->setCurrentQueryId(manifest.query_id);
         context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
         context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
+        context_copy->setSetting("output_format_parquet_compression_method", manifest.parquet_compression_method);
+        context_copy->setSetting("output_format_compression_level", manifest.output_format_compression_level);
+        context_copy->setSetting("output_format_parquet_row_group_size", manifest.parquet_row_group_size);
+        context_copy->setSetting("output_format_parquet_row_group_size_bytes", manifest.parquet_row_group_size_bytes);
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
         context_copy->setSetting("export_merge_tree_part_max_bytes_per_file", manifest.max_bytes_per_file);
@@ -190,7 +194,7 @@ namespace ExportPartitionUtils
     {
         std::vector<std::string> exported_paths;
 
-        LOG_INFO(log, "ExportPartition: Getting exported paths for {}", export_path);
+        LOG_DEBUG(log, "ExportPartition: Getting exported paths for {}", export_path);
 
         const auto processed_parts_path = fs::path(export_path) / "processed";
 
@@ -200,7 +204,7 @@ namespace ExportPartitionUtils
         if (Coordination::Error::ZOK != zk->tryGetChildren(processed_parts_path, processed_parts))
         {
             /// todo arthur do something here
-            LOG_INFO(log, "ExportPartition: Failed to get parts children, exiting");
+            LOG_WARNING(log, "ExportPartition: Failed to get parts children, exiting");
             return {};
         }
 
@@ -224,7 +228,7 @@ namespace ExportPartitionUtils
                 /// todo arthur what to do in this case?
                 /// It could be that zk is corrupt, in that case we should fail the task
                 /// but it can also be some temporary network issue? not sure
-                LOG_INFO(log, "ExportPartition: Failed to get exported path, exiting");
+                LOG_WARNING(log, "ExportPartition: Failed to get exported path, exiting");
                 return {};
             }
 
@@ -268,7 +272,7 @@ namespace ExportPartitionUtils
         auto commit_lock = zkutil::EphemeralNodeHolder::tryCreate(commit_lock_path, *zk, replica_name);
         if (!commit_lock)
         {
-            LOG_INFO(log, "ExportPartition: commit_lock for {} is held by another replica, skipping commit on this replica", entry_path);
+            LOG_DEBUG(log, "ExportPartition: commit_lock for {} is held by another replica, skipping commit on this replica", entry_path);
             return;
         }
         LOG_INFO(log, "ExportPartition: commit_lock for {} acquired by replica {}", entry_path, replica_name);
@@ -281,7 +285,7 @@ namespace ExportPartitionUtils
         const auto status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(status_str);
         if (!status || *status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
         {
-            LOG_INFO(log, "ExportPartition: {} not PENDING, skipping commit", entry_path);
+            LOG_DEBUG(log, "ExportPartition: {} not PENDING, skipping commit", entry_path);
             return;
         }
 
@@ -356,14 +360,14 @@ namespace ExportPartitionUtils
         if (!zk->tryGet(status_path, current_status, &status_stat))
         {
             /// Task was removed (TTL cleanup or force-overwrite). Nothing to do.
-            LOG_INFO(log, "ExportPartition: /status missing for {}, skipping commit-failure bookkeeping", entry_path);
+            LOG_DEBUG(log, "ExportPartition: /status missing for {}, skipping commit-failure bookkeeping", entry_path);
             return false;
         }
 
         const auto status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(current_status);
         if (!status)
         {
-            LOG_INFO(log, "ExportPartition: Invalid status {} for task {}, skipping commit-failure bookkeeping", current_status, entry_path);
+            LOG_WARNING(log, "ExportPartition: Invalid status {} for task {}, skipping commit-failure bookkeeping", current_status, entry_path);
             return false;
         }
 
@@ -371,7 +375,7 @@ namespace ExportPartitionUtils
         {
             /// Another replica already reached a terminal state (COMPLETED or FAILED).
             /// Do NOT overwrite — a successful commit by a peer must win.
-            LOG_INFO(log,
+            LOG_DEBUG(log,
                 "ExportPartition: /status for {} is {} (not PENDING), skipping commit-failure bookkeeping",
                 entry_path, current_status);
             return false;
@@ -404,7 +408,7 @@ namespace ExportPartitionUtils
         const auto rc = zk->tryMulti(ops, responses);
         if (rc != Coordination::Error::ZOK)
         {
-            LOG_INFO(log, "ExportPartition: Failed to persist commit failure bookkeeping for {}: {}", entry_path, rc);
+            LOG_WARNING(log, "ExportPartition: Failed to persist commit failure bookkeeping for {}: {}", entry_path, rc);
             return false;
         }
 

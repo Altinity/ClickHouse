@@ -83,7 +83,7 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
     /// this is subject to TOCTOU - but for now we choose to live with it.
     if (available_move_executors == 0)
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: No available move executors, skipping");
+        LOG_DEBUG(storage.log, "ExportPartition scheduler task: No available move executors, skipping");
         return earliest_backoff_retry;
     }
 
@@ -101,7 +101,7 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
         return earliest_backoff_retry;
     }
 
-    LOG_INFO(storage.log, "ExportPartition scheduler task: Available move executors: {}", available_move_executors);
+    LOG_DEBUG(storage.log, "ExportPartition scheduler task: Available move executors: {}", available_move_executors);
 
     std::size_t scheduled_exports_count = 0;
 
@@ -124,14 +124,14 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
     {
         if (scheduled_exports_count >= available_move_executors)
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Scheduled exports count is greater than available move executors, skipping");
+            LOG_DEBUG(storage.log, "ExportPartition scheduler task: Scheduled exports count is greater than available move executors, skipping");
             break;
         }
 
         /// No need to query zk for status if the local one is not PENDING
         if (entry.status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Skipping... Local status is {}", magic_enum::enum_name(entry.status).data());
+            LOG_DEBUG(storage.log, "ExportPartition scheduler task: Skipping... Local status is {}", magic_enum::enum_name(entry.status).data());
             continue;
         }
 
@@ -146,7 +146,7 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
 
         if (!destination_storage)
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to reconstruct destination storage: {}, skipping", destination_storage_id.getNameForLogs());
+            LOG_WARNING(storage.log, "ExportPartition scheduler task: Failed to reconstruct destination storage: {}, skipping", destination_storage_id.getNameForLogs());
             continue;
         }
 
@@ -155,7 +155,7 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
         std::string status_in_zk_string;
         if (!zk->tryGet(fs::path(storage.zookeeper_path) / "exports" / key / "status", status_in_zk_string))
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get status, skipping");
+            LOG_WARNING(storage.log, "ExportPartition scheduler task: Failed to get status, skipping");
             continue;
         }
 
@@ -163,13 +163,13 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
 
         if (!status_in_zk)
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get status from zk, skipping");
+            LOG_WARNING(storage.log, "ExportPartition scheduler task: Failed to get status from zk, skipping");
             continue;
         }
 
         if (status_in_zk.value() != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Skipping {}... Status from zk is {}", key, magic_enum::enum_name(status_in_zk.value()).data());
+            LOG_DEBUG(storage.log, "ExportPartition scheduler task: Skipping {}... Status from zk is {}", key, magic_enum::enum_name(status_in_zk.value()).data());
             continue;
         }
 
@@ -179,14 +179,14 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
 
         if (Coordination::Error::ZOK != zk->tryGetChildren(fs::path(storage.zookeeper_path) / "exports" / key / "processing", parts_in_processing_or_pending))
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get parts in processing or pending, skipping");
+            LOG_WARNING(storage.log, "ExportPartition scheduler task: Failed to get parts in processing or pending, skipping");
             continue;
         }
 
 
         if (parts_in_processing_or_pending.empty())
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: No parts in processing or pending, skipping");
+            LOG_DEBUG(storage.log, "ExportPartition scheduler task: No parts in processing or pending, skipping");
             continue;
         }
 
@@ -199,7 +199,7 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
 
         if (Coordination::Error::ZOK != zk->tryGetChildren(fs::path(storage.zookeeper_path) / "exports" / key / "locks", locked_parts))
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get locked parts, skipping");
+            LOG_WARNING(storage.log, "ExportPartition scheduler task: Failed to get locked parts, skipping");
             continue;
         }
 
@@ -211,13 +211,13 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
         {
             if (scheduled_exports_count >= available_move_executors)
             {
-                LOG_INFO(storage.log, "ExportPartition scheduler task: Scheduled exports count is greater than available move executors, skipping");
+                LOG_DEBUG(storage.log, "ExportPartition scheduler task: Scheduled exports count is greater than available move executors, skipping");
                 break;
             }
 
             if (locked_parts_set.contains(zk_part_name))
             {
-                LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is locked, skipping", zk_part_name);
+                LOG_DEBUG(storage.log, "ExportPartition scheduler task: Part {} is locked, skipping", zk_part_name);
                 continue;
             }
 
@@ -229,7 +229,7 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
             const auto part = storage.getPartIfExists(zk_part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
             if (!part)
             {
-                LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} not found locally, skipping", zk_part_name);
+                LOG_DEBUG(storage.log, "ExportPartition scheduler task: Part {} not found locally, skipping", zk_part_name);
                 continue;
             }
 
@@ -239,7 +239,7 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
 
             try
             {
-                LOG_INFO(storage.log, "ExportPartition scheduler task: Exporting part to table");
+                LOG_DEBUG(storage.log, "ExportPartition scheduler task: Exporting part to table");
 
                 LOG_INFO(storage.log, "ExportPartition scheduler task: Attempting to lock part: {}", zk_part_name);
 
@@ -411,12 +411,12 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
 
     for (const auto & relative_path_in_destination_storage : relative_paths_in_destination_storage)
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: {}", relative_path_in_destination_storage);
+        LOG_DEBUG(storage.log, "ExportPartition scheduler task: {}", relative_path_in_destination_storage);
     }
 
     if (!tryToMovePartToProcessed(export_path, processing_parts_path, processed_part_path, part_name, relative_paths_in_destination_storage, zk))
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to move part to processed, will not commit export partition");
+        LOG_WARNING(storage.log, "ExportPartition scheduler task: Failed to move part to processed, will not commit export partition");
         return;
     }
 
@@ -486,13 +486,13 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
     if (!zk->tryGet(export_path / "locks" / part_name, locked_by, &locked_by_stat))
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is not locked by any replica, will not increment error counts", part_name);
+        LOG_DEBUG(storage.log, "ExportPartition scheduler task: Part {} is not locked by any replica, will not increment error counts", part_name);
         return;
     }
 
     if (locked_by != storage.replica_name)
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is locked by another replica, will not increment error counts", part_name);
+        LOG_DEBUG(storage.log, "ExportPartition scheduler task: Part {} is locked by another replica, will not increment error counts", part_name);
         return;
     }
 
@@ -519,7 +519,7 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
 
             if (Coordination::Error::ZBADVERSION == removal_code)
             {
-                LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} lock version mismatch, will not increment error counts", part_name);
+                LOG_DEBUG(storage.log, "ExportPartition scheduler task: Part {} lock version mismatch, will not increment error counts", part_name);
                 break;
             }
 
@@ -538,14 +538,14 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
     if (!zk->tryGet(status_path, current_status, &status_stat))
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: /status missing for {}, skipping failure bookkeeping", export_path.string());
+        LOG_DEBUG(storage.log, "ExportPartition scheduler task: /status missing for {}, skipping failure bookkeeping", export_path.string());
         return;
     }
 
     const auto status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(current_status);
     if (!status || *status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: /status for {} is {} (not PENDING), skipping failure bookkeeping", export_path.string(), current_status);
+        LOG_DEBUG(storage.log, "ExportPartition scheduler task: /status for {} is {} (not PENDING), skipping failure bookkeeping", export_path.string(), current_status);
         return;
     }
 
@@ -567,7 +567,7 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     }
     else
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} failed with retryable error (code {}), will back off and retry until the task timeout", part_name, exception->code());
+        LOG_DEBUG(storage.log, "ExportPartition scheduler task: Part {} failed with retryable error (code {}), will back off and retry until the task timeout", part_name, exception->code());
     }
 
     ExportPartitionUtils::appendExceptionOps(
@@ -579,7 +579,7 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     Coordination::Responses responses;
     if (Coordination::Error::ZOK != zk->tryMulti(ops, responses))
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: All failure mechanism failed, will not try to update it");
+        LOG_WARNING(storage.log, "ExportPartition scheduler task: All failure mechanism failed, will not try to update it");
         return;
     }
 
@@ -610,7 +610,7 @@ bool ExportPartitionTaskScheduler::tryToMovePartToProcessed(
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
     if (!zk->tryGet(export_path / "locks" / part_name, locked_by, &locked_by_stat))
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is not locked by any replica, will not commit or set it as completed", part_name);
+        LOG_DEBUG(storage.log, "ExportPartition scheduler task: Part {} is not locked by any replica, will not commit or set it as completed", part_name);
         return false;
     }
 
@@ -618,7 +618,7 @@ bool ExportPartitionTaskScheduler::tryToMovePartToProcessed(
     /// I guess we should not throw if file already exists for export partition, hard coded.
     if (locked_by != storage.replica_name)
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is locked by another replica, will not commit or set it as completed", part_name);
+        LOG_DEBUG(storage.log, "ExportPartition scheduler task: Part {} is locked by another replica, will not commit or set it as completed", part_name);
         return false;
     }
 
@@ -640,7 +640,7 @@ bool ExportPartitionTaskScheduler::tryToMovePartToProcessed(
     {
 
         /// todo  arthur remember what to do here
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to update export path, skipping");
+        LOG_WARNING(storage.log, "ExportPartition scheduler task: Failed to update export path, skipping");
         return false;
     }
 
@@ -656,13 +656,13 @@ bool ExportPartitionTaskScheduler::areAllPartsProcessed(
     Strings parts_in_processing_or_pending;
     if (Coordination::Error::ZOK != zk->tryGetChildren(export_path / "processing", parts_in_processing_or_pending))
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get parts in processing or pending, will not try to commit export partition");
+        LOG_WARNING(storage.log, "ExportPartition scheduler task: Failed to get parts in processing or pending, will not try to commit export partition");
         return false;
     }
 
     if (!parts_in_processing_or_pending.empty())
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: There are still parts in processing or pending, will not try to commit export partition");
+        LOG_DEBUG(storage.log, "ExportPartition scheduler task: There are still parts in processing or pending, will not try to commit export partition");
         return false;
     }
 
