@@ -1218,6 +1218,7 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   reads 0 throughout → A is never `spared` (L198-199) → A graduates → exact-token delete of A finds B →
   `outcome=replaced` skip → B orphaned. `settleEntry` settles the OLD token without re-observing that the
   physical object is now a NEWER token.
+- **TLA+ STATUS (2026-07-07): reproduced + fix validated.** `docs/superpowers/models/CaGcResurrectReuploadOrphan.tla` — `NoLeakForever` VIOLATED with the shipped hash-keyed/touch-gated behavior, HOLDS with the fix (re-condemn the CURRENT token when settling a prior entry whose token differs at in-degree 0). The fix makes `closeBlob` match `CaIncarnationCore`'s already-proven `GRetire` (condemn by (hash, current token)). Root of the miss: model-vs-code faithfulness gap (the proven model encoded the correct algorithm; the C++ drifted). NEXT = implement the C++ change in `CasBlobInDegree.cpp` closeBlob + gtest + rerun S30.
 - **Fix direction (design-sensitive — TLA+-gated core; do NOT rush):** in `closeBlob`, when settling a
   prior retired entry that is about to graduate/delete with cur_edges==0, `head_blob` the current token; if
   it DIFFERS from the retired entry's token (a resurrect replaced it), condemn the current token as a FRESH
