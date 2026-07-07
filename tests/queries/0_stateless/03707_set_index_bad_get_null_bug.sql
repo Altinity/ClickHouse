@@ -1,3 +1,5 @@
+set enable_parallel_replicas = 0;
+
 drop table if exists test;
 CREATE table test
 (
