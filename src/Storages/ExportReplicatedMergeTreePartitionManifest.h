@@ -160,8 +160,8 @@ struct ExportReplicatedMergeTreePartitionManifest
     size_t number_of_parts;
     std::vector<String> parts;
     time_t create_time;
-    size_t retry_initial_backoff_seconds;
-    size_t retry_max_backoff_seconds;
+    size_t retry_initial_backoff_seconds = 5;
+    size_t retry_max_backoff_seconds = 300;
     size_t task_timeout_seconds;
     size_t max_threads;
     bool parallel_formatting;
@@ -228,8 +228,15 @@ struct ExportReplicatedMergeTreePartitionManifest
         manifest.source_replica = json->getValue<String>("source_replica");
         manifest.number_of_parts = json->getValue<size_t>("number_of_parts");
 
-        manifest.retry_initial_backoff_seconds = json->getValue<size_t>("retry_initial_backoff_seconds");
-        manifest.retry_max_backoff_seconds = json->getValue<size_t>("retry_max_backoff_seconds");
+        if (json->has("retry_initial_backoff_seconds"))
+        {
+            manifest.retry_initial_backoff_seconds = json->getValue<size_t>("retry_initial_backoff_seconds");
+        }
+
+        if (json->has("retry_max_backoff_seconds"))
+        {
+            manifest.retry_max_backoff_seconds = json->getValue<size_t>("retry_max_backoff_seconds");
+        }
 
         if (json->has("iceberg_metadata_json"))
         {

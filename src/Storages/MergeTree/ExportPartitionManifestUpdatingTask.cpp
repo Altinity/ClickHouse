@@ -365,7 +365,20 @@ void ExportPartitionManifestUpdatingTask::poll()
                 continue;
             }
 
-            const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+            ExportReplicatedMergeTreePartitionManifest metadata;
+            try
+            {
+                metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+            }
+            catch (...)
+            {
+                /// A single unparseable metadata.json (e.g. genuinely corrupt, or written by a
+                /// future incompatible format) must not abort the whole poll and stall discovery,
+                /// cleanup and status convergence for every other task. Skip just this entry.
+                tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
+                LOG_WARNING(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: could not parse metadata.json", key);
+                continue;
+            }
 
             auto last_exception_per_replica = readLastExceptionPerReplica(
                 zk, fs::path(entry_path), key, storage.log.load());
