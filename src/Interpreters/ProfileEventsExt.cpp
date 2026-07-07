@@ -12,6 +12,11 @@
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDateTime.h>
 
+namespace DB::ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
 namespace ProfileEvents
 {
 
@@ -105,6 +110,9 @@ void getProfileEvents(
     ThreadIdToCountersSnapshot & last_sent_snapshots)
 {
     using namespace DB;
+    if (!CurrentThread::isInitialized())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CurrentThread is not initialized");
+
     static const NamesAndTypesList column_names_and_types = {
         {"host_name", std::make_shared<DataTypeString>()},
         {"current_time", std::make_shared<DataTypeDateTime>()},
@@ -121,6 +129,9 @@ void getProfileEvents(
     block = std::move(temp_columns);
     MutableColumns columns = block.mutateColumns();
     auto thread_group = CurrentThread::getGroup();
+    if (!thread_group)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Current thread is not attached to any thread group");
+
     ThreadIdToCountersSnapshot new_snapshots;
 
     ProfileEventsSnapshot group_snapshot;

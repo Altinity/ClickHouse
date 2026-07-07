@@ -97,14 +97,7 @@ ConcurrentHashJoin::ConcurrentHashJoin(
             pool->scheduleOrThrow(
                 [&, idx = i, thread_group = CurrentThread::getGroup()]()
                 {
-                    SCOPE_EXIT_SAFE({
-                        if (thread_group)
-                            CurrentThread::detachFromGroupIfNotDetached();
-                    });
-
-                    if (thread_group)
-                        CurrentThread::attachToGroupIfDetached(thread_group);
-                    setThreadName("ConcurrentJoin");
+                    ThreadGroupSwitcher switcher(thread_group, "ConcurrentJoin");
 
                     size_t reserve_size = 0;
                     if (auto hint = getSizeHint(stats_collecting_params, slots))
@@ -144,14 +137,7 @@ ConcurrentHashJoin::~ConcurrentHashJoin()
             pool->scheduleOrThrow(
                 [join = std::move(hash_joins[i]), thread_group = CurrentThread::getGroup()]()
                 {
-                    SCOPE_EXIT_SAFE({
-                        if (thread_group)
-                            CurrentThread::detachFromGroupIfNotDetached();
-                    });
-
-                    if (thread_group)
-                        CurrentThread::attachToGroupIfDetached(thread_group);
-                    setThreadName("ConcurrentJoin");
+                    ThreadGroupSwitcher switcher(thread_group, "ConcurrentJoin");
                 });
         }
         pool->wait();

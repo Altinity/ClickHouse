@@ -74,7 +74,7 @@ bool MutatePlainMergeTreeTask::executeStep()
     /// Make out memory tracker a parent of current thread memory tracker
     std::optional<ThreadGroupSwitcher> switcher;
     if (merge_list_entry)
-        switcher.emplace((*merge_list_entry)->thread_group);
+        switcher.emplace((*merge_list_entry)->thread_group, "", true);
 
     switch (state)
     {
