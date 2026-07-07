@@ -998,3 +998,67 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
   post-write, or GC reads hot shards' bodies which it does at fold anyway) and a **measurement soak**:
   sweep `gc_interval_sec` (and/or a journal-size trigger), plot hot-shard CAS body size + writer
   amplification vs GC ops/sec, find the knee. Do NOT block Lever A (which is journal-safe at default).
+## S18-20260706T231321-1: GC dry-run proposed deleting 132 key(s) NOT classified unreachable by fsck: ['so
+
+- **Logged (UTC):** 2026-07-06T23:13:50
+- **Severity:** suspected-bug
+- **Run:** 20260706T231321_S18_seed20260707
+- **Observed:** GC dry-run proposed deleting 132 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/01/01072cc50e01979bd48c985b2719ee8c', 'soak_pool/blobs/01/01c16d4da5bf1ada12a2024ca8591c4c', 'soak_pool/blobs/06/06d01b256bb15321515b1c38254ff56e', 'soak_pool/blobs/06/06eebc04b7f90340adf03dbc86868b02', 'soak_pool/blobs/07/0717efb8c793beebddb325cba8d076da', 'soak_pool/blobs/0f/0fca7b1e1f16c9752ba3f714aecb3c2c', 'soak_pool/blobs/12/12d68cf72c2f6217b3ca85ffb2fae4fe', 'soak_pool/blobs/14/14efb9d2dfe01430a62cd064e40fc318', 'soak_pool/blobs/15/151ef3fcaa9bd70cf26a36132b2432a8', 'soak_pool/blobs/1d/1d60ba4b3f5540694e218b5902602f41']
+
+## S25-20260706T232602-1: GC dry-run proposed deleting 10 key(s) NOT classified unreachable by fsck: ['soa
+
+- **Logged (UTC):** 2026-07-06T23:26:27
+- **Severity:** suspected-bug
+- **Run:** 20260706T232602_S25_seed20260707
+- **Observed:** GC dry-run proposed deleting 10 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/00/00000000000000000000000000000000', 'soak_pool/blobs/07/07596c79b6ee9d57c99a5e7272902c3f', 'soak_pool/blobs/0d/0d6b60b1f3397793f1c5f54f78326e1d', 'soak_pool/blobs/1b/1b243a06671e1270cd076b0a901ad65a', 'soak_pool/blobs/38/38aa643fcf9332594e0166ac106170b9', 'soak_pool/blobs/a3/a3af5524c8b55aa3cb374c923706ae39', 'soak_pool/blobs/c7/c7dedcceb2f845ee7ffe17e48ce96c0f', 'soak_pool/blobs/e1/e19d3c9977e508b0824410174ef10166', 'soak_pool/blobs/fb/fb85b48a48b6dbb3617b8ec2e460483b', 'soak_pool/blobs/fd/fd082a9a2007ea9bb93102b15e1a8f33']
+
+## S26-20260706T232811-1: GC dry-run proposed deleting 63 key(s) NOT classified unreachable by fsck: ['soa
+
+- **Logged (UTC):** 2026-07-06T23:28:39
+- **Severity:** suspected-bug
+- **Run:** 20260706T232811_S26_seed20260707
+- **Observed:** GC dry-run proposed deleting 63 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/0c/0cb03f16cfebaccc7750d4ca40ebc188', 'soak_pool/blobs/0f/0f2b0b701c916b38c32dcbd42bfd1be1', 'soak_pool/blobs/12/121a73e8a6b09205e6fb7fa75e5bf273', 'soak_pool/blobs/14/14174d2098c21591e0d4781382e7ce35', 'soak_pool/blobs/17/17147dcd91c5dcccb77fc50fe576ada1', 'soak_pool/blobs/1f/1fe03c0fb542471b31f32b62a54917c4', 'soak_pool/blobs/20/200d0e4f3db020618ce4eaca85fa3006', 'soak_pool/blobs/20/20225823b00d4d034be7ed1125075e28', 'soak_pool/blobs/21/21d8e7ce195f9b2f875908e0746e800b', 'soak_pool/blobs/25/25892a5e81965b3a3c2e9e17868966c1']
+
+## S30-20260706T233201-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGe
+
+- **Logged (UTC):** 2026-07-06T23:32:38
+- **Severity:** suspected-bug
+- **Run:** 20260706T233201_S30_seed20260707
+- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
+
+## S33-20260706T233703-1: GC dry-run proposed deleting 34 key(s) NOT classified unreachable by fsck: ['soa
+
+- **Logged (UTC):** 2026-07-06T23:37:39
+- **Severity:** suspected-bug
+- **Run:** 20260706T233703_S33_seed20260707
+- **Observed:** GC dry-run proposed deleting 34 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/07/070323332e252eb0620007c0728aa372', 'soak_pool/blobs/10/1000348b3e9635e7adef8c91774d6747', 'soak_pool/blobs/19/19fe4b0496717c2cd3cdbe977451fd62', 'soak_pool/blobs/1a/1a742de0de639e55306b48fba511985d', 'soak_pool/blobs/20/200961efba8a14242a2d97a83c2fdfb2', 'soak_pool/blobs/24/24a908bed8ddfacfc5aaf7cc96a8f01d', 'soak_pool/blobs/2f/2f5e04d458d0eebfeea76204b7228ea2', 'soak_pool/blobs/35/35cb2108cb4974f86801b513f7e33b08', 'soak_pool/blobs/3a/3ac9f384f1f74e0a14be1aa360c192a4', 'soak_pool/blobs/44/440730c92b5561bda171664ea355263a']
+
+## S34-20260706T233911-1: S34 D1 regression: per-round GC fanout grew across create/drop iterations (CasRo
+
+- **Logged (UTC):** 2026-07-06T23:39:55
+- **Severity:** suspected-bug
+- **Run:** 20260706T233911_S34_seed20260707
+- **Observed:** S34 D1 regression: per-round GC fanout grew across create/drop iterations (CasRootGet first=32 -> last=248, root_dirs 2 -> 2) — D1 should have eliminated the monotone namespace registry; investigate dropNamespace / tombstone GC reclaim path
+
+
+## SOAK-LONG-CHAOS-HARNESS-REMEDIATION (2026-07-07, from the 4h chaos soak) — MEDIUM, harness-only
+
+A clean multi-hour chaos soak is currently blocked by THREE non-CA limits (all reconfirmed by the
+2026-07-07 4h run; CA correctness stayed GREEN — perfect replica agreement through the chaos fault,
+`dangling=0` while fsck worked). To enable a meaningful long chaos soak on this host, the harness/infra
+needs (independent, ranked):
+1. **Relax the TTL-band checkpoint oracle for long chaos runs** (`soak/run.py:443` `ambiguous_band_nonempty`,
+   `AMBIGUOUS_BAND_EPS`; TTL = `90 MINUTE` in the DDL `run.py:94` + `model.py` `ttl_seconds`). Under chaos a
+   row parked within `eps` of its TTL boundary makes the recovery checkpoint unassertable → hard FAIL at
+   ~97 min (only 1 of 81 faults exercised). Fix = downgrade the stuck-band checkpoint to INCONCLUSIVE (skip)
+   under an active fault window, OR drop/lengthen the TTL for long runs. This is the immediate blocker.
+2. **Reduce the fsck discovery cost or raise its bound** (B146/B154 / discovery-quadratic): at 183 GB /
+   2.14 M objects the `detail=False` fsck exceeds 180 s → the `dangling==0` gate is SKIPPED, blinding the
+   correctness oracle from ~t+84 min onward. Even with (1) fixed, a long run runs blind past this point.
+3. **Hard-cap the pool or use a compacting store**: `_THROTTLE_MAX=1.0 s`/insert can't hold `max_pool_gb`
+   because rustfs does no background compaction and merge/mutation write-amp outpaces insert-pacing
+   (pool → 187 GB in the 4h run). Options: a compacting object store on the stand, a lower object-count
+   scale, or a throttle that can fully stall inserts when over budget.
+Also: the soak's own `pool_objects` probe returned None the entire run and `pool_bytes` None ~half the ticks
+(telemetry-robustness gap; the throttle fail-closes on None, resmon du is ground truth).
+Full writeup: `docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md#chaos-soak-result`.
