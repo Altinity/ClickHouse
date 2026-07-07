@@ -1062,3 +1062,84 @@ needs (independent, ranked):
 Also: the soak's own `pool_objects` probe returned None the entire run and `pool_bytes` None ~half the ticks
 (telemetry-robustness gap; the throttle fail-closes on None, resmon du is ground truth).
 Full writeup: `docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md#chaos-soak-result`.
+## S34-20260707T061202-1: S34 D1 regression: per-round GC fanout grew across create/drop iterations (CasRo
+
+- **Logged (UTC):** 2026-07-07T06:14:00
+- **Severity:** suspected-bug
+- **Run:** 20260707T061202_S34_seed20260707
+- **Observed:** S34 D1 regression: per-round GC fanout grew across create/drop iterations (CasRootGet first=0 -> last=214, root_dirs 2 -> 2) — D1 should have eliminated the monotone namespace registry; investigate dropNamespace / tombstone GC reclaim path
+
+## S22-20260707T064805-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 246. DB::Exception: Build:
+
+- **Logged (UTC):** 2026-07-07T06:48:32
+- **Severity:** suspected-bug
+- **Run:** 20260707T064805_S22_seed20260707
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 500: Code: 246. DB::Exception: Build: blob object soak_pool/blobs/f2/f2123bb7f1630af47810ea1a47068929 size 0 is below the pool blob header length 256. (CORRUPTED_DATA) (version 26.6.1.1) | sql=INSERT INTO s22_t0 SELECT 0 + number AS id, randomString(4096) AS payload FROM numbers(750)
+
+## S13-20260707T071428-1: forced GC left 1 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possible
+
+- **Logged (UTC):** 2026-07-07T07:17:19
+- **Severity:** suspected-bug
+- **Run:** 20260707T071428_S13_seed20260707
+- **Observed:** forced GC left 1 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possible leak; full residual by prefix: {'_manifests': 1}. If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events permanently.
+
+## S13-20260707T071428-2: S13 residual unreachable=5 after forced GC; classified by prefix={}
+
+- **Logged (UTC):** 2026-07-07T07:17:19
+- **Severity:** suspected-bug
+- **Run:** 20260707T071428_S13_seed20260707
+- **Observed:** S13 residual unreachable=5 after forced GC; classified by prefix={}
+
+## S18-20260707T072144-1: GC dry-run proposed deleting 132 key(s) NOT classified unreachable by fsck: ['so
+
+- **Logged (UTC):** 2026-07-07T07:22:17
+- **Severity:** suspected-bug
+- **Run:** 20260707T072144_S18_seed20260707
+- **Observed:** GC dry-run proposed deleting 132 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/01/01072cc50e01979bd48c985b2719ee8c', 'soak_pool/blobs/01/01c16d4da5bf1ada12a2024ca8591c4c', 'soak_pool/blobs/06/06d01b256bb15321515b1c38254ff56e', 'soak_pool/blobs/06/06eebc04b7f90340adf03dbc86868b02', 'soak_pool/blobs/07/0717efb8c793beebddb325cba8d076da', 'soak_pool/blobs/0f/0fca7b1e1f16c9752ba3f714aecb3c2c', 'soak_pool/blobs/12/12d68cf72c2f6217b3ca85ffb2fae4fe', 'soak_pool/blobs/14/14efb9d2dfe01430a62cd064e40fc318', 'soak_pool/blobs/15/151ef3fcaa9bd70cf26a36132b2432a8', 'soak_pool/blobs/1d/1d60ba4b3f5540694e218b5902602f41']
+
+## S25-20260707T072448-1: GC dry-run proposed deleting 10 key(s) NOT classified unreachable by fsck: ['soa
+
+- **Logged (UTC):** 2026-07-07T07:25:18
+- **Severity:** suspected-bug
+- **Run:** 20260707T072448_S25_seed20260707
+- **Observed:** GC dry-run proposed deleting 10 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/00/00000000000000000000000000000000', 'soak_pool/blobs/0d/0d6b60b1f3397793f1c5f54f78326e1d', 'soak_pool/blobs/1b/1b243a06671e1270cd076b0a901ad65a', 'soak_pool/blobs/2f/2f47273814e4e7c29145a9e1543e52fa', 'soak_pool/blobs/9b/9bb486c1ee93987ad634bc7792f24bb3', 'soak_pool/blobs/c7/c7dedcceb2f845ee7ffe17e48ce96c0f', 'soak_pool/blobs/c8/c89a7d919795d0202f37af4ed5930700', 'soak_pool/blobs/d9/d94fa6eb80490d0867c25e78ee8ef02d', 'soak_pool/blobs/fb/fb85b48a48b6dbb3617b8ec2e460483b', 'soak_pool/blobs/fd/fd082a9a2007ea9bb93102b15e1a8f33']
+
+## S26-20260707T072518-1: GC dry-run proposed deleting 63 key(s) NOT classified unreachable by fsck: ['soa
+
+- **Logged (UTC):** 2026-07-07T07:25:50
+- **Severity:** suspected-bug
+- **Run:** 20260707T072518_S26_seed20260707
+- **Observed:** GC dry-run proposed deleting 63 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/04/040fa185ea949400f8f8f13f41e7a6eb', 'soak_pool/blobs/09/09eceded07bc90a7a9c054998a757811', 'soak_pool/blobs/0a/0a2c77daea60b234a72cd951fecf1fc3', 'soak_pool/blobs/0a/0a8b602963ffd45c68488dbe0db13ee1', 'soak_pool/blobs/0b/0b7d1c9998e7f02fcd3abb72bdf4094a', 'soak_pool/blobs/0f/0f2b0b701c916b38c32dcbd42bfd1be1', 'soak_pool/blobs/11/118b5356bdf4d4b87fc1feab72929d4a', 'soak_pool/blobs/12/121a73e8a6b09205e6fb7fa75e5bf273', 'soak_pool/blobs/16/160493b5223359bae725615333faff0e', 'soak_pool/blobs/18/182467fb900cf2494daae8acee7eab48']
+
+## S30-20260707T072639-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGe
+
+- **Logged (UTC):** 2026-07-07T07:27:19
+- **Severity:** suspected-bug
+- **Run:** 20260707T072639_S30_seed20260707
+- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
+
+
+## F3-single-leader-dryrun-overproposal (2026-07-07, S18/S25/S26 gc_shards=1) — MEDIUM, tool defect not a CA bug
+- **Observed:** at the quiesced end checkpoint (AFTER `forced_gc_to_fixpoint` drained the pool: fsck
+  `unreachable=0`, `dangling=0`, real GC no over-delete), `ca-gc-dryrun` (`Gc::previewDeletes`) still
+  proposes deleting N blobs that fsck classifies REACHABLE — S18: 132, S26: 63, S25: 10 candidates /
+  0 unreachable. Consistent across the S13–S32 sweep + earlier campaign. CA correctness is intact
+  (dangling=0, replica agreement holds); ONLY the write-free preview over-proposes.
+- **Root cause (CasGc.cpp:1860 `previewDeletes`):** the preview computes zero-in-degree candidates
+  from the ADOPTED FOLD SEAL's `blob_target_runs` (`readFoldSeal(state.snap_generation,
+  state.snap_attempt)`) — the last sealed generation's in-degree — and only HEAD-filters for
+  existence. A blob referenced by a ref published AFTER that seal reads as zero-in-degree → proposed.
+  Real GC does NOT over-delete because it re-folds current refs before condemning; the preview is a
+  shortcut that reads the stale seal without re-folding. The header already limits the guarantee:
+  "{preview} ⊆ {genuinely-unreachable} holds ONLY at quiescence" — but "quiescence" here must mean
+  "no ref published since the seal", which the soak's forced-GC-to-fixpoint does not guarantee (the
+  last fold may not have re-sealed after the final refs landed).
+- **Fix options (design-sensitive — align preview reachability with real GC; do NOT rush unattended):**
+  (a) `previewDeletes` re-folds / re-verifies current in-degree (as a regular round does) before
+  proposing, so it can't be stale; or (b) gate the preview to re-seal first, or return a
+  "seal-generation" stamp so the oracle only asserts the subset when the seal is provably current; or
+  (c) weaken the scenario oracle to `dryrun ⊆ (unreachable ∪ not-in-current-fold)` — but (a) is the
+  correct product fix (a preview a human runs should not name reachable blobs as deletable).
+- **Distinct from:** `S31-*-dryrun-shard0` (preview iterated only shard 0 under gc_shards>1 — that
+  facet is fixed: previewDeletes now loops `shard < state.gc_shards`) and the concurrent-leader leak
+  (that leaves genuinely-unreachable orphans; this over-proposes REACHABLE blobs at clean quiescence).
