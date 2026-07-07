@@ -1165,3 +1165,41 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
      non-blob-footprint comparison is unmeasurable at dev scale (cache hits entirely; footprint too
      small). Re-run at `--scale ci` (or full) where the comparison is meaningful; consider a card note
      that dev is expected-inconclusive for these.
+## S30-20260707T085740-1: forced GC left 3 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manif
+
+- **Logged (UTC):** 2026-07-07T09:00:58
+- **Severity:** suspected-bug
+- **Run:** 20260707T085740_S30_seed20260707
+- **Observed:** forced GC left 3 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'blobs': 3}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
+
+
+## RESURRECT-REUPLOAD-ORPHAN (2026-07-07, S30 churn; found via content_addressed_log) — MEDIUM, real leak (small)
+- **Observed:** under rapid create/insert/DROP churn with RECURRING content hashes (a small ~300 B blob
+  whose content repeats across tables), forced-GC-to-fixpoint + the graduation-drain leaves a small,
+  STUCK residual (3 objects in repro; S30 real run showed 3) that fsck classes `unaccounted`
+  (INV-2: "outside the whole GC view — should be impossible once GC has run") — sometimes `unreachable`.
+  Does NOT drain over a long window (24+ rounds x 11s). `dangling=0` throughout (no committed ref to a
+  missing object). Magnitude tiny, but it is a real orphaned physical object + an INV-2 violation.
+- **Root cause (proven via `system.content_addressed_log` token trail):**
+  1. `blob_put` token A → referenced → unreferenced → `blob_retire` (A condemned, in retired list).
+  2. A new insert with the SAME content hash hits `blob_reuse_resurrect` ("observed token A condemned;
+     caller must re-upload") and does `blob_put` token B — a NEW incarnation at the same content-hash key.
+  3. GC's two-phase pipeline was tracking token A: `gc_recheck_verdict` publishes delete_pending for A,
+     then `blob_delete` token A runs with `outcome=replaced` — the exact-token guard finds token B present
+     and FAIL-SAFE SKIPS the delete (correct: never delete a newer incarnation you weren't told to).
+  4. But incarnation B, once ITS table is dropped, is never re-entered into the condemn pipeline — GC
+     never re-observes it as a zero-in-degree candidate. B is orphaned → `unaccounted`. The physical
+     object survives in the store (verified: blobs/59/59fae…/xl.meta present, token B).
+- **So:** the resurrect → re-upload → re-condemn path has a gap. The exact-token delete guard (fence-like)
+  correctly protects the newer incarnation B; the defect is that B is not re-tracked for condemnation
+  after the guarded skip, so a recurring-hash churn workload slowly orphans re-uploaded incarnations.
+- **Impact:** small permanent leak of tiny recurring-hash blobs under churn; INV-2 violation. Real
+  workloads with unique content hit it far less (needs the content hash to recur across the condemn window).
+- **Fix direction (design-sensitive — resurrect/condemn interaction; do NOT rush):** when the exact-token
+  delete finds a REPLACED (newer) incarnation, GC should re-observe/re-fold that incarnation's current
+  in-degree so a zero-in-degree token B is re-condemned rather than dropped from tracking; OR the resurrect
+  re-upload should register the new incarnation into the same shard's in-degree accounting so a later
+  indeg_zero condemns it. Relates to [[feedback_ca_resurrect_invariant]] and the B140-dangle lineage.
+- **Oracle:** the improved class-aware `assert_no_leftovers` + graduation-drain CORRECTLY surfaces this
+  (unaccounted/unreachable ⇒ leak ⇒ FAIL) — it was previously MASKED by the "fsck detail unavailable"
+  inconclusive. So S30 (and any recurring-hash churn card) now FAILs on this real residual until fixed.
