@@ -410,6 +410,47 @@ TEST(CasGcLeak, ResurrectReplacedReclaimIsIdempotent)
     EXPECT_EQ(after.dangling, 0u) << "idempotent extra rounds must never lose a reachable object";
 }
 
+/// WRITER-SIDE half of the RESURRECT-REUPLOAD-ORPHAN fold: after the round that folds the resurrect-
+/// replaced incarnation B's dereference re-condemns B, a fresh writer dedup-hitting the SAME content hash
+/// must see B as condemned via `retireView().isCondemnedToken` — never as an adoptable live token. If GC's
+/// bookkeeping instead kept treating B as adopt-eligible (the pre-fix bug), a concurrent writer's `putBlob`
+/// would adopt the being-reclaimed B rather than resurrect a fresh incarnation, racing the delete pipeline.
+///
+/// Depending on round/ack-floor timing, by the time the view refreshes B may be (a) still present and
+/// visibly condemned, or (b) already physically deleted by the delete pipeline — BOTH outcomes prove B is
+/// never adoptable. The assertion only fails on the pre-fix shape: B present and NOT condemned.
+TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInRetireView)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const RootNamespace ns{"test/tbl"};
+    Gc gc(s, hexToU128("00000000000000000000000000000006"));
+    const String P = "resurrect-payload-view";
+
+    /// 1. Publish ref r1 -> token A referenced, then drop it and condemn via ONE GC round.
+    publishOneBlobPart(s, ns, "r1", P);
+    s->dropRef(ns, "r1");
+    s->renewWatermarkOnce();   /// advance the floor so A is not spared as in-flight
+    gc.runRegularRound();
+    s->retireView().refresh();
+
+    /// 2. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B.
+    publishOneBlobPart(s, ns, "r2", P);
+    const HeadResult hB = b->head(s->layout().blobKey(idOf(P)));
+    ASSERT_TRUE(hB.exists);
+    s->dropRef(ns, "r2");
+    s->renewWatermarkOnce();
+
+    /// 3. The round that folds B's dereference re-condemns token B.
+    gc.runRegularRound();
+    s->retireView().refresh();
+
+    EXPECT_TRUE(s->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), hB.token)
+        || !blobPresent(b, s->layout(), P))
+        << "the replaced incarnation B must be visible as condemned (or already reclaimed) so a "
+           "dedup-hitting writer resurrects, not adopts";
+}
+
 /// NO-LEAK (abandon): a build stages a manifest, precommitAdds it (activating +1 for its OWN unique
 /// blob, body present), uploads that blob, then VANISHES (crash: never promoted, never abandoned). GC's
 /// automatic precommit-reclaim (B8) judges the build dead via the watermark and appends a PrecommitRemove
