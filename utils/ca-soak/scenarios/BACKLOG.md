@@ -1119,30 +1119,27 @@ Full writeup: `docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md
 - **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
 
 
-## F3-single-leader-dryrun-overproposal (2026-07-07, S18/S25/S26 gc_shards=1) — MEDIUM, tool defect not a CA bug
-- **Observed:** at the quiesced end checkpoint (AFTER `forced_gc_to_fixpoint` drained the pool: fsck
-  `unreachable=0`, `dangling=0`, real GC no over-delete), `ca-gc-dryrun` (`Gc::previewDeletes`) still
-  proposes deleting N blobs that fsck classifies REACHABLE — S18: 132, S26: 63, S25: 10 candidates /
-  0 unreachable. Consistent across the S13–S32 sweep + earlier campaign. CA correctness is intact
-  (dangling=0, replica agreement holds); ONLY the write-free preview over-proposes.
-- **Root cause (CasGc.cpp:1860 `previewDeletes`):** the preview computes zero-in-degree candidates
-  from the ADOPTED FOLD SEAL's `blob_target_runs` (`readFoldSeal(state.snap_generation,
-  state.snap_attempt)`) — the last sealed generation's in-degree — and only HEAD-filters for
-  existence. A blob referenced by a ref published AFTER that seal reads as zero-in-degree → proposed.
-  Real GC does NOT over-delete because it re-folds current refs before condemning; the preview is a
-  shortcut that reads the stale seal without re-folding. The header already limits the guarantee:
-  "{preview} ⊆ {genuinely-unreachable} holds ONLY at quiescence" — but "quiescence" here must mean
-  "no ref published since the seal", which the soak's forced-GC-to-fixpoint does not guarantee (the
-  last fold may not have re-sealed after the final refs landed).
-- **Fix options (design-sensitive — align preview reachability with real GC; do NOT rush unattended):**
-  (a) `previewDeletes` re-folds / re-verifies current in-degree (as a regular round does) before
-  proposing, so it can't be stale; or (b) gate the preview to re-seal first, or return a
-  "seal-generation" stamp so the oracle only asserts the subset when the seal is provably current; or
-  (c) weaken the scenario oracle to `dryrun ⊆ (unreachable ∪ not-in-current-fold)` — but (a) is the
-  correct product fix (a preview a human runs should not name reachable blobs as deletable).
-- **Distinct from:** `S31-*-dryrun-shard0` (preview iterated only shard 0 under gc_shards>1 — that
-  facet is fixed: previewDeletes now loops `shard < state.gc_shards`) and the concurrent-leader leak
-  (that leaves genuinely-unreachable orphans; this over-proposes REACHABLE blobs at clean quiescence).
+## F3-single-leader-dryrun-overproposal (2026-07-07, S18/S25/S26) — RESOLVED: over-strict oracle, NOT a tool/CA defect
+- **CORRECTION (evidence beat my first hypothesis):** I initially guessed `previewDeletes` reads a
+  stale fold seal and over-proposes REACHABLE blobs. WRONG. A minimal repro (create/insert/DROP →
+  forced-GC-to-fixpoint → fsck-detail + ca-gc-dryrun) showed: fixpoint residual=7, fsck
+  classes `{reachable:6, pending-gc:7}`, dryrun proposes exactly the **7 `pending-gc`** objects — ZERO
+  reachable. So `ca-gc-dryrun` is CORRECT: it previews the next round's deletes = condemned objects in
+  the two-phase graduation pipeline. The candidate count equalling the reclaimable residual in the
+  sweep (S25 10=10, S26 63=63) is the same signal.
+- **Real root cause = the SCENARIO ORACLE.** `assert_dryrun_subset` accepted only fsck `class=="unreachable"`,
+  but fsck splits not-reachable objects into `unreachable` (orphans not yet condemned) and
+  `pending-gc`/`awaiting-gc` (condemned, awaiting min-ack graduation). The preview legitimately targets
+  the UNION. Any create/insert/DROP scenario leaves a bounded `pending-gc` residual at the fixpoint (the
+  last drop's condemned blobs), so the oracle falsely failed.
+- **FIX (committed):** `scenarios/framework/assertions.py` `assert_dryrun_subset` now checks
+  `dryrun ⊆ (unreachable ∪ pending-gc ∪ awaiting-gc)`, and still FAILS + notes the class if a candidate
+  is genuinely `reachable`/`dangling`/absent (the real over-proposal this oracle exists to catch).
+  Verified: S18/S25/S26 + S33 + S31 re-run green on this.
+- **Also resolves** the paired "no unbounded leftovers" inconclusive interpretation: a `pending-gc`
+  residual at the fixpoint is EXPECTED (condemned-awaiting-graduation), not a leak.
+- **Distinct from:** `S31-*-dryrun-shard0` (preview-only-shard-0 under gc_shards>1 — already fixed) and
+  the concurrent-leader leak (genuine orphans left forever — a real, separate liveness bug).
 
 ## NEXT-TASK-scenario-infra-and-inconclusives (2026-07-07, deferred after F3) — continue the no-vacuous-scenarios sweep
 After the `Gc::previewDeletes` (F3) fix, resume closing the S13–S32 inconclusives that are still

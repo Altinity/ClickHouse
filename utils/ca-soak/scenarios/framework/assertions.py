@@ -37,26 +37,46 @@ def assert_fsck_clean(result, fsck: dict):
     return [v]
 
 
+# fsck object classes that a `ca-gc-dryrun` candidate may legitimately fall into. `ca-gc-dryrun`
+# previews the NEXT GC round's deletes, which is the union of:
+#   - `unreachable`  — orphan objects GC has not condemned yet;
+#   - `pending-gc` / `awaiting-gc` — objects already CONDEMNED, sitting in the two-phase graduation
+#     pipeline (zero in-degree, awaiting the min-ack rounds before physical delete).
+# fsck splits "not reachable" into those sub-classes; the preview correctly targets all of them. The
+# earlier oracle accepted only `unreachable`, so a run left with a bounded condemned residual (any
+# create/insert/DROP scenario at the fixpoint — the last drop's blobs are condemned but not yet
+# graduated) FALSELY failed with "dryrun ⊄ unreachable" while every candidate was actually `pending-gc`
+# (verified 2026-07-07: minimal DROP repro → 7 candidates, all classified `pending-gc`, 0 reachable).
+# A candidate classified `reachable` (or `dangling`/`unaccounted`) IS a real over-proposal and still
+# fails — that is the genuine defect this oracle exists to catch.
+_DRYRUN_DELETABLE_CLASSES = {"unreachable", "pending-gc", "awaiting-gc"}
+
+
 def assert_dryrun_subset(result, fsck_detail_res: dict, dryrun_res: dict):
-    """Dry-run delete candidates ⊆ fsck unreachable key set. Requires a detailed fsck; if detail is
-    unavailable the assertion is inconclusive (the subset oracle cannot be evaluated)."""
+    """Dry-run delete candidates ⊆ fsck DELETABLE key set (unreachable ∪ pending-gc ∪ awaiting-gc).
+    Requires a detailed fsck; if detail is unavailable the assertion is inconclusive."""
     if not fsck_detail_res or "detail" not in fsck_detail_res:
         return [result.add(Verdict.inconclusive(
-            "dryrun ⊆ unreachable", "subset", "detailed fsck unavailable"))]
+            "dryrun ⊆ deletable (unreachable ∪ pending-gc)", "subset", "detailed fsck unavailable"))]
     if not dryrun_res or "entries" not in dryrun_res:
         return [result.add(Verdict.inconclusive(
-            "dryrun ⊆ unreachable", "subset", "dry-run output unavailable"))]
-    unreachable_keys = {r["key"] for r in fsck_detail_res["detail"] if r.get("class") == "unreachable"}
+            "dryrun ⊆ deletable (unreachable ∪ pending-gc)", "subset", "dry-run output unavailable"))]
+    deletable_keys = {r["key"] for r in fsck_detail_res["detail"]
+                      if r.get("class") in _DRYRUN_DELETABLE_CLASSES}
     candidate_keys = {e["key"] for e in dryrun_res["entries"]}
-    leaked = sorted(candidate_keys - unreachable_keys)
+    leaked = sorted(candidate_keys - deletable_keys)
     ok = not leaked
-    note = "" if ok else f"{len(leaked)} candidate(s) not in unreachable set, e.g. {leaked[:3]}"
-    v = result.add(Verdict.check("dryrun ⊆ unreachable", "subset",
-                                 f"{len(candidate_keys)} candidates / {len(unreachable_keys)} unreachable",
+    # Classify the leaked candidates so the note distinguishes a real over-proposal (a candidate fsck
+    # calls `reachable`) from a harness/fsck-detail gap (candidate absent from the detail listing).
+    by_key = {r["key"]: r.get("class") for r in fsck_detail_res["detail"]}
+    leaked_classes = {k: by_key.get(k, "NOT-IN-FSCK") for k in leaked}
+    note = "" if ok else f"{len(leaked)} candidate(s) not deletable, classes={sorted(set(leaked_classes.values()))}, e.g. {leaked[:3]}"
+    v = result.add(Verdict.check("dryrun ⊆ deletable (unreachable ∪ pending-gc)", "subset",
+                                 f"{len(candidate_keys)} candidates / {len(deletable_keys)} deletable",
                                  ok, note))
     if leaked:
-        result.note_anomaly(f"GC dry-run proposed deleting {len(leaked)} key(s) NOT classified "
-                            f"unreachable by fsck: {leaked[:10]}")
+        result.note_anomaly(f"GC dry-run proposed deleting {len(leaked)} key(s) NOT in the deletable "
+                            f"set (classes={leaked_classes}): {leaked[:10]}")
     return [v]
 
 
