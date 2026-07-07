@@ -26,12 +26,16 @@ _VARIANT_FILE = {
     "smalldedupcache": "docker-compose-small_dedup_cache.yml",
     # S12: 10-replica shared-pool compose (ch1..ch10 over one CA pool).
     "tenreplicas": "docker-compose-10replicas.yml",
+    # S22: fault-injecting S3 proxy (503/429/slow/reset) between ClickHouse and RustFS.
+    "s3faultproxy": "docker-compose-s3faultproxy.yml",
+    # S27: same proxy, LIST-anomaly mode (duplicate keys / dropped continuation token).
+    "s3listproxy": "docker-compose-s3faultproxy.yml",
 }
 
 # Replica count per compose variant — drives the N-node Cluster + health wait + log-dir prep.
 _VARIANT_NODES = {
     None: 2, "default": 2, "gc_shards2": 2, "smalldedupcache": 2,
-    "tenreplicas": 10,
+    "tenreplicas": 10, "s3faultproxy": 2, "s3listproxy": 2,
 }
 
 

@@ -604,41 +604,154 @@ class S22(Scenario):
     name = "S22"
     title = "object-store throttling and retry budget"
     priority = "P1"
-    # The current compose wires ClickHouse's `ca` disk endpoint straight at the RustFS container
-    # (http://rustfs1:11121/test/soak_pool/) with no interposing proxy, so there is no way to inject
-    # bounded 503/429/slow/connection-close faults between ClickHouse and the object store. Declaring
-    # `needs_infra` makes the runner mark the scenario inconclusive and skip run() entirely.
-    needs_infra = ("requires a fault-injecting S3 proxy (503/429/slow/connection-close) between "
-                   "ClickHouse and RustFS; not in the current compose (direct rustfs1 endpoint)")
+    # Runs on the fault-proxy compose (docker-compose-s3faultproxy.yml): a small HTTP proxy sits
+    # between ClickHouse and RustFS (ca endpoint -> s3proxy:11121, forwarded verbatim to rustfs1).
+    # Faults are armed/disarmed at runtime via the proxy control port (localhost:8474).
+    compose_variant = "s3faultproxy"
+
+    param_table = {
+        "dev": {"tables": 2, "rows": 1500, "payload_bytes": 4096, "fault_rate": 0.25,
+                "modes": ["503", "429", "slow"]},
+        "ci": {"tables": 4, "rows": 20000, "payload_bytes": 4096, "fault_rate": 0.2,
+               "modes": ["503", "429", "slow"]},
+        "full": {"tables": 6, "rows": 100000, "payload_bytes": 4096, "fault_rate": 0.15,
+                 "modes": ["503", "429", "slow"]},
+    }
+
+    _CTL = "http://localhost:8474"
+
+    def _ctl(self, path, obj=None, timeout=10):
+        import json as _json
+        import urllib.request
+        url = self._CTL + path
+        if obj is None:
+            return _json.loads(urllib.request.urlopen(url, timeout=timeout).read().decode())
+        req = urllib.request.Request(url, data=_json.dumps(obj).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        return _json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
 
     def run(self, ctx, result):
-        """Object-store throttling and retry-budget scenario — NOT runnable on the current compose.
+        """Object-store throttling / retry-budget under injected transient faults. With the proxy
+        armed to return `503 SlowDown` / `429` / artificial latency on a fraction of GET/PUT/HEAD, a
+        write+merge workload must still COMPLETE CORRECTLY (the S3 client retries within its budget)
+        and every replica must converge (agreement), with no committed ref to a missing blob/manifest
+        (`fsck dangling == 0`). The proxy's own fault counter proves the fault path was actually
+        exercised (else the test is vacuous)."""
+        import json as _json
+        cl = ctx.cluster
+        p = ctx.params
+        nodes = cl.nodes()
+        n_tables = int(p["tables"])
+        rows = int(p["rows"])
+        payload = int(p["payload_bytes"])
+        rate = float(p["fault_rate"])
+        modes = list(p["modes"])
+        tables = [f"s22_t{i}" for i in range(n_tables)]
 
-        A real implementation needs a fault-injecting object-store proxy interposed between every
-        ClickHouse server and RustFS, configured to inject *bounded* transient faults:
+        # Proxy reachable?
+        try:
+            hz = self._ctl("/healthz")
+        except Exception as e:
+            result.add(Verdict.inconclusive("fault proxy reachable", "control :8474 up",
+                                            f"unreachable: {e}"))
+            return
+        result.observations["proxy"] = {"healthz": hz}
 
-        - HTTP `503 SlowDown` / `429 Too Many Requests` on a fraction of `GET`/`PUT`/`HEAD`/`LIST`.
-        - Artificial latency (slow responses) on a fraction of requests.
-        - Mid-response connection closes (TCP reset) to exercise the streaming retry path.
+        # Baseline (faults DISARMED): create tables on both replicas + a seed insert.
+        self._ctl("/config", {"rate": 0.0})
+        for t in tables:
+            for n in nodes:
+                sql.create_ca_table(n, t, columns="id UInt64, payload String", order_by="id", wide=True)
+            sql.insert_random(nodes[0], t, rows=rows // 2, payload_bytes=payload, op_id=0)
 
-        Wiring options for this compose:
+        # Snapshot S3 retry counters before the fault window.
+        def s3_counters():
+            out = {}
+            for n in nodes:
+                try:
+                    txt = n.query(
+                        "SELECT event, value FROM system.events WHERE event LIKE 'DiskS3%' "
+                        "AND (event LIKE '%Error%' OR event LIKE '%Attempt%' OR event LIKE '%Throttl%') "
+                        "FORMAT TabSeparated")
+                    out[n.container] = {r.split("\t")[0]: int(r.split("\t")[1])
+                                        for r in txt.splitlines() if "\t" in r}
+                except Exception:
+                    out[n.container] = {}
+            return out
 
-        - A `toxiproxy` sidecar in `docker-compose.yml` between `ch*` and `rustfs1`, with the `ca`
-          disk `endpoint` repointed at the toxiproxy listener; toxics added/removed at runtime via the
-          toxiproxy HTTP API to bound the fault rate and duration.
-        - Or a custom mitm S3 proxy sidecar (a small HTTP proxy that forwards to `rustfs1` and injects
-          the fault classes above on a deterministic, seed-driven schedule), again with the `ca` disk
-          endpoint pointed at the proxy.
+        before_ctr = s3_counters()
 
-        Counters that would prove the property (README §S22 "Observations"):
+        # ARM faults, then run a write + merge workload that forces many GET/PUT/HEAD through the proxy.
+        armed = self._ctl("/config", {"rate": rate, "modes": modes,
+                                      "methods": ["GET", "PUT", "HEAD", "POST"], "seed": 22})
+        result.observations["armed_config"] = armed.get("config")
+        errors = []
+        for t in tables:
+            try:
+                sql.insert_random(nodes[0], t, rows=rows // 2, payload_bytes=payload, op_id=rows)
+                sql.insert_random(nodes[1 % len(nodes)], t, rows=rows // 2, payload_bytes=payload,
+                                  op_id=2 * rows)
+                # OPTIMIZE forces merges -> reads existing part blobs + writes merged blobs (GET/PUT
+                # storm through the proxy) -> exercises the read + write retry paths.
+                nodes[0].command(f"OPTIMIZE TABLE {t} FINAL", timeout=300)
+            except Exception as e:
+                errors.append({"table": t, "err": str(e)[:200]})
 
-        - `DiskS3*RetryableErrors` (e.g. `DiskS3ReadRequestsErrors`, `DiskS3WriteRequestsErrors`) and
-          `DiskS3*RequestAttempts` / `DiskS3*Requests*` must show retries occurred and were bounded by
-          the configured retry budget (no unbounded attempt counts).
-        - `Cas*` counters and `system.content_addressed_log` must show successful statements remained
-          correct (replica-agreement oracle holds) and failed statements failed cleanly with no
-          committed partial ref (`fsck` dangling==0; no `dangling_access`/`read_missing` rows).
+        # DISARM before the checkpoint (fsck/GC must see ground truth, not faults).
+        self._ctl("/config", {"rate": 0.0})
+        stats = self._ctl("/stats")
+        result.observations["proxy_stats"] = stats
 
-        Until that proxy is wired, this card is intentionally inconclusive.
-        """
-        self.run_inconclusive(ctx, result)
+        # 1. The fault path was actually exercised (otherwise the whole scenario is vacuous).
+        injected = int(stats.get("faults", 0))
+        result.add(Verdict.check(
+            "transient faults were injected (test not vacuous)", "> 0 faults", f"{injected}",
+            injected > 0, "" if injected > 0 else "proxy injected 0 faults — rate too low / no matching requests"))
+
+        # 2. Successful workload statements completed despite faults (retries absorbed them).
+        result.observations["workload_errors"] = errors
+        result.add(Verdict.check(
+            "write+merge workload succeeded under injected faults", "0 hard errors",
+            f"{len(errors)} errors", not errors,
+            "" if not errors else f"{errors[:3]} — retries did not absorb the transient faults"))
+
+        # 3. Retries actually occurred AND were bounded (no unbounded attempt blow-up).
+        after_ctr = s3_counters()
+        def _delta(ev):
+            tot = 0
+            for c in after_ctr:
+                tot += after_ctr.get(c, {}).get(ev, 0) - before_ctr.get(c, {}).get(ev, 0)
+            return tot
+        read_err = _delta("DiskS3ReadRequestsErrors")
+        write_err = _delta("DiskS3WriteRequestsErrors")
+        read_att = _delta("DiskS3ReadRequestAttempts")
+        write_att = _delta("DiskS3WriteRequestAttempts")
+        result.observations["s3_retry_delta"] = {
+            "ReadRequestsErrors": read_err, "WriteRequestsErrors": write_err,
+            "ReadRequestAttempts": read_att, "WriteRequestAttempts": write_att}
+        retried = (read_err + write_err) > 0
+        # Bounded: total attempts must be within a sane multiple of the injected faults (retry budget),
+        # not an unbounded storm. Use a generous ceiling.
+        att_total = read_att + write_att
+        bounded = att_total <= max(1000, injected * 50)
+        result.add(Verdict.check(
+            "S3 retries occurred and were bounded by the retry budget",
+            "retryable errors > 0 and attempts bounded",
+            f"errors={read_err + write_err}, attempts={att_total}, injected={injected}",
+            retried and bounded,
+            "" if (retried and bounded) else
+            ("no retryable errors recorded despite injected faults" if not retried
+             else f"attempt count {att_total} looks unbounded vs {injected} injected faults")))
+
+        # 4. All replicas converge despite the fault window.
+        for t in tables:
+            for n in nodes:
+                try:
+                    n.command(f"SYSTEM SYNC REPLICA {t}", timeout=300)
+                except Exception as e:
+                    ctx.log(f"S22 SYNC {t}@{n.container}: {e}")
+            _common.assert_replicas_agree(result, cl, sql.table_checksum_query(t),
+                                          name=f"S22 replica agreement [{t}]")
+
+        # 5. No committed ref to a missing blob/manifest; GC-safe end.
+        _common.standard_end(ctx, result, tables, table_filter="table LIKE 's22_%'")
