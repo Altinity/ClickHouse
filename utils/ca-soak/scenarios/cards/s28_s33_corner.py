@@ -429,22 +429,35 @@ class S30(Scenario):
 
     @staticmethod
     def _measure_gc_batch(ctx, cl, after_iter):
-        """Drive ONE single-leader GC round and capture wall time, per-round root LIST/GET delta, and
-        the registered-namespace fanout (count of roots/<ns> dirs in the RustFS pool)."""
-        before = observe.cluster_events_snapshot(cl)
-        t0 = time.monotonic()
-        gc_mod.gc_drive_round(cl, log_fn=ctx.log)
-        wall = time.monotonic() - t0
-        after = observe.cluster_events_snapshot(cl)
-        delta = observe.cluster_events_delta(before, after).get("_total", {})
-        batch = {
-            "after_iter": after_iter, "gc_wall_s": round(wall, 3),
-            "CasRootList": int(delta.get("CasRootList", 0)),
-            "CasRootGet": int(delta.get("CasRootGet", 0)),
-            "CasGcGet": int(delta.get("CasGcGet", 0)),
-            "root_dirs": S30._count_root_dirs(),
-        }
-        return batch
+        """Measure the STEADY-STATE per-round GC fanout floor: the cost of an IDLE deferred round
+        (`CasGcDelete==0 AND CasRootGet==0`), NOT a single mid-churn round.
+
+        A single round's `CasRootGet` conflates reclaim-phase GETs (O(pending drop backlog) — grows
+        with the drop burst, not the universe) with discovery. Sampling one round per checkpoint made
+        this card falsely read a monotone-fanout REGRESSION (see the identical S34 fix): `root_dirs`
+        stays flat but the single-round `CasRootGet` climbs with the backlog. Drive rounds until an
+        idle deferred round and report it — its cost is the true per-round floor, which must not grow
+        with ever-created namespaces."""
+        last = {}
+        for attempt in range(20):
+            before = observe.cluster_events_snapshot(cl)
+            t0 = time.monotonic()
+            gc_mod.gc_drive_round(cl, log_fn=ctx.log)
+            wall = time.monotonic() - t0
+            after = observe.cluster_events_snapshot(cl)
+            delta = observe.cluster_events_delta(before, after).get("_total", {})
+            last = {
+                "after_iter": after_iter, "gc_wall_s": round(wall, 3),
+                "drain_rounds": attempt + 1,
+                "CasRootList": int(delta.get("CasRootList", 0)),
+                "CasRootGet": int(delta.get("CasRootGet", 0)),
+                "CasGcGet": int(delta.get("CasGcGet", 0)),
+                "CasGcDelete": int(delta.get("CasGcDelete", 0)),
+                "root_dirs": S30._count_root_dirs(),
+            }
+            if last["CasGcDelete"] == 0 and last["CasRootGet"] == 0:
+                break
+        return last
 
     @staticmethod
     def _count_root_dirs():

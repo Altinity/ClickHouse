@@ -176,14 +176,25 @@ class S19(Scenario):
             k: int(gate_delta.get(k, 0)) for k in ("CasBlobPut", "CasRootCas")}
         if gate_err is not None:
             result.observations["gated_move_error"] = gate_err[:600]
+            # Fail-closed proof must be MOVE-ATTRIBUTABLE. `CasBlobPut` during the attempt is: the move
+            # is the only thing writing blobs here, so CasBlobPut==0 proves no partial body was
+            # published. Do NOT gate on `CasRootCas`: it is a global per-node counter and the lease-gated
+            # BACKGROUND GC (gc_interval_sec=10) CASes root refs on its own schedule, so a GC round
+            # landing inside the move's wall-clock window inflates it with ref-CASes that have nothing
+            # to do with the move (observed: UNKNOWN_DISK is rejected at PLANNING with CasBlobPut=0, yet
+            # CasRootCas=2 from a concurrent GC round). The real "no partial ref" invariant is
+            # dangling==0, asserted by the standard end checkpoint below.
+            blob_put = int(gate_delta.get("CasBlobPut", 0))
             result.add(Verdict.check(
                 "gated cross-disk move fails closed",
-                "ALTER ... MOVE PARTITION TO non-CA DISK raises and publishes no partial ref",
-                f"raised; CasRootCas during attempt = {int(gate_delta.get('CasRootCas', 0))}",
-                int(gate_delta.get("CasRootCas", 0)) == 0,
-                "" if int(gate_delta.get("CasRootCas", 0)) == 0 else
-                "gated move raised but a ref CAS was observed during the failed attempt — a partial "
-                "ref may have been published; verify fsck dangling stays 0"))
+                "ALTER ... MOVE PARTITION TO non-CA DISK raises and writes no partial body",
+                f"raised ({gate_err.split('DB::Exception:')[-1].strip()[:60]}); "
+                f"CasBlobPut={blob_put} (CasRootCas={int(gate_delta.get('CasRootCas', 0))}, "
+                f"background-GC-confounded, not gated)",
+                blob_put == 0,
+                "" if blob_put == 0 else
+                "gated move raised but a blob body was written during the failed attempt — a partial "
+                "object was published; verify fsck dangling stays 0"))
         else:
             # Not gated in this build: the cross-disk move was accepted. That is a legitimate build
             # configuration (the move target disk may exist), so record it as inconclusive for the
