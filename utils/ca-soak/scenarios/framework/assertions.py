@@ -130,8 +130,19 @@ def _classify_key(key: str) -> str:
     return observe.classify_pool_path(key)
 
 
+# fsck classes that mean a content object is a genuine ORPHAN leak (uncondemned / lost): GC is not
+# tracking it toward deletion. Distinct from the two-phase deletion PIPELINE classes below.
+_LEAK_CLASSES = {"unreachable", "dangling", "unaccounted"}
+# fsck classes that mean a content object is CONDEMNED and in the two-phase graduation pipeline —
+# zero in-degree, awaiting the ack-floor to advance past its condemn round, then delete_pending, then
+# delete. This is GC working as designed (the checkpoint's forensics logic treats these as non-triggers
+# for the same reason); a bounded pipeline residual at the quiesced fixpoint is EXPECTED, not a leak.
+_PIPELINE_CLASSES = {"pending-gc", "awaiting-gc"}
+
+
 def classify_unreachable(fsck_detail_res: dict) -> dict:
-    """Bucket the fsck `unreachable` detail rows by object prefix."""
+    """Bucket the fsck `unreachable` detail rows by object prefix (kept for callers that want the raw
+    unreachable breakdown; `assert_no_leftovers` uses the fuller class-aware classifier below)."""
     buckets: dict = {}
     for r in (fsck_detail_res or {}).get("detail", []):
         if r.get("class") == "unreachable":
@@ -140,58 +151,76 @@ def classify_unreachable(fsck_detail_res: dict) -> dict:
     return buckets
 
 
+def _classify_residual(fsck_detail_res: dict) -> dict:
+    """Split the non-reachable detail rows into: `leak` (uncondemned orphan blobs/_manifests — a real
+    leak), `pipeline` (condemned pending-gc/awaiting-gc content in the deletion pipeline — expected),
+    and `bookkeeping` (everything else: gc/ state, root objects, _pool_meta, verbatim _files)."""
+    leak, pipeline, bookkeeping = {}, {}, {}
+    for r in (fsck_detail_res or {}).get("detail", []):
+        cls = r.get("class")
+        if cls == "reachable":
+            continue
+        prefix = _classify_key(r.get("key", ""))
+        if cls in _PIPELINE_CLASSES:
+            pipeline[prefix] = pipeline.get(prefix, 0) + 1
+        elif cls in _LEAK_CLASSES and prefix in RECLAIMABLE_UNREACHABLE_PREFIXES:
+            leak[prefix] = leak.get(prefix, 0) + 1
+        else:  # unreachable/dangling on a bookkeeping prefix, or any other non-reachable class
+            bookkeeping[f"{cls}:{prefix}"] = bookkeeping.get(f"{cls}:{prefix}", 0) + 1
+    return {"leak": leak, "pipeline": pipeline, "bookkeeping": bookkeeping}
+
+
 def assert_no_leftovers(result, fsck: dict, abandons: bool = False, residual_after_gc=None,
                         fsck_detail_res: dict = None):
-    """After forced GC, no reclaimable content (`blobs/`, `_manifests/`) remains unreachable.
-
-    The raw `unreachable` count is NOT required to be 0: GC state (`gc/`), root shard objects +
-    `_watermark`, `_pool_meta`, and verbatim `_files` legitimately persist (and a dropped table leaves
-    its namespace registered — monotone registry). So we CLASSIFY the residual by prefix: a residual
-    composed only of bookkeeping is `pass` (bounded+classified); any unreachable `blobs/`/`_manifests/`
-    object is a `fail` (a real content/manifest leak). For an abandoning scenario even the content
-    check is relaxed to a recorded+classified residual (the scenario's own bound assertion governs)."""
+    """After forced GC, no reclaimable content is a genuine ORPHAN. The residual is split by fsck
+    class: `leak` (uncondemned unreachable/dangling `blobs/`/`_manifests/` — a real content leak, e.g.
+    the GC-CONCURRENT-LEADER-LEAK) FAILS; `pipeline` (condemned `pending-gc`/`awaiting-gc` content
+    awaiting ack-floor graduation) is EXPECTED and bounded — it PASSES (a create/insert/DROP at the
+    quiesced fixpoint always leaves the last drop's condemned blobs in the pipeline until the periodic
+    retired-view sync advances the floor); `bookkeeping` (GC state, root/namespace-registry objects)
+    also PASSES. Abandoning scenarios relax to recorded+classified (their own bound assertion governs)."""
     val = residual_after_gc if residual_after_gc is not None else (fsck or {}).get("unreachable")
     if val is None:
-        return [result.add(Verdict.inconclusive("no unbounded leftovers", "unreachable==0",
+        return [result.add(Verdict.inconclusive("no unbounded leftovers", "no orphan content",
                                                 "unreachable count unavailable"))]
-    buckets = classify_unreachable(fsck_detail_res) if fsck_detail_res else {}
-    result.observations["unreachable_classification"] = {"residual_count": val, "by_prefix": buckets}
-    reclaimable = sum(buckets.get(p, 0) for p in RECLAIMABLE_UNREACHABLE_PREFIXES)
-    bookkeeping = {k: v for k, v in buckets.items() if k not in RECLAIMABLE_UNREACHABLE_PREFIXES}
+    parts = _classify_residual(fsck_detail_res) if fsck_detail_res else None
+    result.observations["residual_classification"] = {"residual_count": val, **(parts or {})}
 
     if val == 0:
-        return [result.add(Verdict.check("no unbounded leftovers", "no unreachable content", 0, True))]
+        return [result.add(Verdict.check("no unbounded leftovers", "no orphan content", 0, True))]
 
-    if not buckets:
-        # We have a nonzero count but no detail to classify it — cannot prove it is bookkeeping.
+    if parts is None or (not parts["leak"] and not parts["pipeline"] and not parts["bookkeeping"]):
+        # Nonzero count but no per-object detail to classify — cannot prove it is not a leak.
         return [result.add(Verdict.inconclusive(
-            "no unbounded leftovers", "no unreachable content/manifests",
-            f"residual={val} but fsck detail unavailable to classify by prefix"))]
+            "no unbounded leftovers", "no orphan content",
+            f"residual={val} but fsck detail unavailable to classify by class"))]
+
+    leak_n = sum(parts["leak"].values())
+    pipeline_n = sum(parts["pipeline"].values())
 
     if abandons:
-        v = result.add(Verdict("leftovers (abandoning scenario)", "bounded+classified",
-                               f"residual={val} by_prefix={buckets}", "pass",
-                               "abandoning scenario — see scenario-specific bound assertion"))
-        return [v]
+        return [result.add(Verdict("leftovers (abandoning scenario)", "bounded+classified",
+                                   f"residual={val} classes={parts}", "pass",
+                                   "abandoning scenario — see scenario-specific bound assertion"))]
 
-    if reclaimable > 0:
+    if leak_n > 0:
         v = result.add(Verdict.check(
-            "no unbounded leftovers", "no unreachable blobs/manifests after forced GC",
-            f"{reclaimable} reclaimable (by_prefix={buckets})", False,
-            "unreachable content/manifest objects remain — possible GC leak"))
+            "no unbounded leftovers", "no uncondemned orphan blobs/manifests after forced GC",
+            f"{leak_n} orphan (leak={parts['leak']}, pipeline={parts['pipeline']})", False,
+            "uncondemned unreachable content/manifest objects remain — a real GC leak"))
         result.note_anomaly(
-            f"forced GC left {reclaimable} unreachable RECLAIMABLE object(s) (blobs/_manifests) — "
-            f"possible leak; full residual by prefix: {buckets}. If explicit GC was driven concurrently "
-            f"with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK "
-            f"(see BACKLOG): a divergent-fold abort orphans owner-removal events permanently.")
+            f"forced GC left {leak_n} UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): "
+            f"{parts['leak']}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit "
+            f"GC was driven concurrently with background GC (or on both replicas), this is likely the known "
+            f"GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.")
         return [v]
 
-    # Residual is entirely bookkeeping — expected and bounded.
-    v = result.add(Verdict(
-        "no unbounded leftovers", "residual is GC/namespace bookkeeping only",
-        f"residual={val} (bookkeeping: {bookkeeping})", "pass",
-        "no reclaimable content unreachable; residual is GC state / monotone-registry root objects"))
-    return [v]
+    # No orphan leak. Residual is the condemned deletion pipeline and/or bookkeeping — expected+bounded.
+    return [result.add(Verdict(
+        "no unbounded leftovers", "residual is condemned pipeline (pending-gc) and/or bookkeeping",
+        f"residual={val} (pipeline={parts['pipeline']}, bookkeeping={parts['bookkeeping']})", "pass",
+        f"no uncondemned orphan content; {pipeline_n} object(s) are condemned and awaiting ack-floor "
+        "graduation (two-phase delete pipeline — drains once the retired-view sync advances the floor)"))]
 
 
 def assert_reclaimable_drained(result, verdict_name, residual, fsck_detail_res: dict = None):

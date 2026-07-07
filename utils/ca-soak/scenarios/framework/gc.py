@@ -99,3 +99,48 @@ def forced_gc_to_fixpoint(cluster, unreachable_fn, *, max_seconds: float = 240.0
             last_nudge = now
         if now > deadline:
             return n, history
+
+
+def drain_condemned_pipeline(cluster, unreachable_fn, *, sync_period_s: float = 11.0,
+                             max_seconds: float = 150.0, disk: str = "ca", round_timeout: float = 600.0,
+                             log_fn=print, sleep_fn=time.sleep, monotonic_fn=time.monotonic):
+    """Drive the TWO-PHASE graduation pipeline to completion and return (residual, history).
+
+    After `forced_gc_to_fixpoint`, a bounded residual of CONDEMNED content (fsck `pending-gc`) can
+    remain: a condemned blob graduates only once the ack floor advances past its condemn round, and the
+    floor (`min` over live writers' `observed_gc_round`) advances when each server runs its PERIODIC
+    retired-view sync (`mount_renew_period`, ~10 s) — NOT by driving GC rounds alone. `forced_gc_to_fixpoint`
+    polls faster than that period, so it reports the residual as "settled" while the floor simply has
+    not advanced yet. Here we drive ONE single-leader round then WAIT ~`sync_period_s` so both servers'
+    syncs bump `observed_gc_round`, letting graduation + the delete_pending → delete step complete;
+    repeat until the residual reaches 0 or `max_seconds`. A HEALTHY condemned residual drains within a
+    few periods (~45-55 s observed); a residual that does NOT drain within the budget is a real finding
+    (stuck ack floor, or an uncondemned orphan that GC never tracks) — the caller's `assert_no_leftovers`
+    classifies the surviving residual by fsck class (unreachable/dangling ⇒ leak ⇒ FAIL)."""
+    history = []
+    node = cluster.nodes()[0]
+    deadline = monotonic_fn() + max_seconds
+    while True:
+        try:
+            n = int(unreachable_fn())
+        except Exception as e:
+            log_fn(f"drain_condemned_pipeline: unreachable probe failed: {e}")
+            n = None
+        if n is not None:
+            history.append(n)
+            if n == 0:
+                return 0, history
+        if monotonic_fn() >= deadline:
+            return (n if n is not None else (history[-1] if history else None)), history
+        try:
+            gc_round(node, disk, round_timeout)
+        except QueryError as e:
+            if e.is_aborted:
+                log_fn(f"drain_condemned_pipeline: round raced background tick (ABORTED) — benign")
+            else:
+                log_fn(f"drain_condemned_pipeline: round on {node.container} raised: {e}")
+        except Exception as e:
+            log_fn(f"drain_condemned_pipeline: round transport error: {e}")
+        # Wait a retired-view-sync period so both servers advance observed_gc_round (raises the ack
+        # floor); driving rounds back-to-back without this wait does NOT graduate anything.
+        sleep_fn(sync_period_s)

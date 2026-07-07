@@ -46,6 +46,22 @@ def end_checkpoint(ctx, cluster, result, tables, *, table_filter=None, abandons=
     result.observations["gc_residual_unreachable"] = residual
     ctx.log(f"end checkpoint: forced GC residual unreachable={residual} (rounds={len(history)})")
 
+    # A bounded residual here is typically CONDEMNED content (fsck pending-gc) that graduates only once
+    # the ack floor advances via the servers' periodic retired-view sync (~mount_renew_period), which
+    # forced_gc_to_fixpoint polls faster than. Drive the two-phase graduation to completion (one round
+    # per sync period) so a healthy pipeline drains to 0 — giving assert_no_leftovers a true post-
+    # graduation residual. A residual that will NOT drain (stuck floor / uncondemned orphan) survives
+    # and is classified by fsck class downstream (unreachable/dangling ⇒ real leak ⇒ FAIL).
+    if residual and residual > 0:
+        ctx.log(f"end checkpoint: draining condemned graduation pipeline (residual={residual})")
+        td = time.monotonic()
+        residual, drain_hist = gc_mod.drain_condemned_pipeline(
+            cluster, lifecycle.unreachable_probe(fsck_container), log_fn=ctx.log)
+        result.timings["graduation_drain_s"] = round(time.monotonic() - td, 1)
+        result.observations["graduation_drain_history"] = drain_hist
+        result.observations["gc_residual_unreachable"] = residual
+        ctx.log(f"end checkpoint: post-graduation-drain residual unreachable={residual}")
+
     ctx.log("end checkpoint: final detailed fsck + dry-run")
     fsck_final = {}
     fsck_det = {}
