@@ -1143,3 +1143,28 @@ Full writeup: `docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md
 - **Distinct from:** `S31-*-dryrun-shard0` (preview iterated only shard 0 under gc_shards>1 — that
   facet is fixed: previewDeletes now loops `shard < state.gc_shards`) and the concurrent-leader leak
   (that leaves genuinely-unreachable orphans; this over-proposes REACHABLE blobs at clean quiescence).
+
+## NEXT-TASK-scenario-infra-and-inconclusives (2026-07-07, deferred after F3) — continue the no-vacuous-scenarios sweep
+After the `Gc::previewDeletes` (F3) fix, resume closing the S13–S32 inconclusives that are still
+infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
+
+1. **Build S15 + S23 infra:**
+   - **S15 (GC target-shard comparison):** needs a `gc_shards=8` compose variant (only default=1 and
+     `gc_shards2`=2 exist today). Add `storage_conf_gc_shards8_ch{1,2}.xml` + `docker-compose-gc_shards8.yml`
+     + register the variant in `cluster_boot._VARIANT_FILE/_VARIANT_NODES`, mirroring the gc_shards2 wiring.
+   - **S23 (idle shared-pool baseline):** needs a 1-server baseline and a 10-server baseline; the
+     10-server case can REUSE the tenreplicas compose (`Cluster(node_count=10)`); the 1-server case
+     needs a 1-node compose (or run against ch1 only). Wire both so the card measures real idle-pool
+     baselines instead of recording "compose fixed at 2 servers".
+
+2. **Chase the dev-scale inconclusives (measurement-oriented):**
+   - **S16 (hot content cycle):** "resurrection counters not present in system.metrics/system.events on
+     this build" — find the real counter names on 26.6.1.1 (grep system.events for resurrect/revive/
+     recreate-ish CA counters) and wire them, or assert the property another way.
+   - **S20 (replicated fetch and relink):** follower `CasRootCas=0` — the counter may not be scoped
+     per-node; find a per-node attribution (per-node ProfileEvents query) so "follower publishes its own
+     refs" is decidable.
+   - **S21 (read-heavy many-ref) / S29 (large non-direct-blob memory spike):** the blob-cache /
+     non-blob-footprint comparison is unmeasurable at dev scale (cache hits entirely; footprint too
+     small). Re-run at `--scale ci` (or full) where the comparison is meaningful; consider a card note
+     that dev is expected-inconclusive for these.
