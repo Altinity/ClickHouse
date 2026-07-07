@@ -427,8 +427,10 @@ TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInRetireView)
     Gc gc(s, hexToU128("00000000000000000000000000000006"));
     const String P = "resurrect-payload-view";
 
-    /// 1. Publish ref r1 -> token A referenced, then drop it and condemn via ONE GC round.
+    /// 1. Publish ref r1 -> token A referenced; capture A, then drop it and condemn via ONE GC round.
     publishOneBlobPart(s, ns, "r1", P);
+    const HeadResult hA = b->head(s->layout().blobKey(idOf(P)));
+    ASSERT_TRUE(hA.exists);
     s->dropRef(ns, "r1");
     s->renewWatermarkOnce();   /// advance the floor so A is not spared as in-flight
     gc.runRegularRound();
@@ -438,6 +440,7 @@ TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInRetireView)
     publishOneBlobPart(s, ns, "r2", P);
     const HeadResult hB = b->head(s->layout().blobKey(idOf(P)));
     ASSERT_TRUE(hB.exists);
+    ASSERT_NE(hB.token.value, hA.token.value) << "resurrect must mint a distinct incarnation";
     s->dropRef(ns, "r2");
     s->renewWatermarkOnce();
 
