@@ -709,34 +709,125 @@ class S27(Scenario):
     name = "S27"
     title = "backend list pagination ambiguity"
     priority = "P2"
-    needs_infra = ("requires an instrumented object store / proxy that returns duplicate or unstable "
-                   "LIST pages for root-shard token listing; not available with the direct rustfs "
-                   "endpoint")
+    # Runs on the S3 proxy compose in LIST-anomaly mode: the proxy perturbs LIST(cas/refs/) responses
+    # (duplicate keys / dropped continuation token) — the prefix GC discovery (discoverUniverse) uses.
+    compose_variant = "s3listproxy"
+
+    param_table = {
+        "dev": {"namespaces": 6, "rows": 200, "payload_bytes": 512, "gc_rounds": 4},
+        "ci": {"namespaces": 40, "rows": 500, "payload_bytes": 512, "gc_rounds": 8},
+        "full": {"namespaces": 200, "rows": 800, "payload_bytes": 512, "gc_rounds": 12},
+    }
+
+    _CTL = "http://localhost:8474"
+
+    def _ctl(self, path, obj=None, timeout=10):
+        import json as _json
+        import urllib.request
+        url = self._CTL + path
+        if obj is None:
+            return _json.loads(urllib.request.urlopen(url, timeout=timeout).read().decode())
+        req = urllib.request.Request(url, data=_json.dumps(obj).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        return _json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
 
     def run(self, ctx, result):
-        """Prove paginated LIST anomalies force safe rereads, not skipped folds (README §S27).
+        """Paginated / unstable LIST anomalies must force safe rereads, NEVER a skipped fold. GC
+        discovery enumerates `(namespace, shard)` via `LIST(cas/refs/)`; the proxy perturbs those
+        responses (duplicate keys, dropped continuation token). The safety invariant: under injected
+        list anomalies GC must still be correct — no committed ref to a missing object (`fsck
+        dangling==0`), dropped content still reclaims (reclaimable drains to 0 — a falsely-skipped
+        shard would strand it), replicas agree, and no `Failed` GC round. The proxy's list-perturb
+        counter proves the anomaly path was exercised."""
+        cl = ctx.cluster
+        p = ctx.params
+        nodes = cl.nodes()
+        n_ns = int(p["namespaces"])
+        rows = int(p["rows"])
+        payload = int(p["payload_bytes"])
+        gc_rounds = int(p["gc_rounds"])
+        tables = [f"s27_ns{i}" for i in range(n_ns)]
 
-        What this needs that the current 2-server + RustFS compose does NOT provide:
+        try:
+            hz = self._ctl("/healthz")
+        except Exception as e:
+            result.add(Verdict.inconclusive("list-anomaly proxy reachable", "control :8474 up",
+                                            f"unreachable: {e}"))
+            return
+        result.observations["proxy"] = {"healthz": hz}
 
-        - An object-storage proxy (or an instrumented backend) sitting in front of the `ca` disk
-          endpoint that, for `roots/`-prefix `LIST` calls used by `listRootShardTokens` /
-          token-diff discovery, deliberately returns duplicate keys across pages, drops the
-          continuation token mid-listing, or returns pages whose per-key list-tokens are unstable
-          between two listings of the same unchanged shard.
-        - The direct RustFS endpoint serves stable, well-ordered pages, so the ambiguous-key code
-          path in GC discovery is never taken with this compose.
+        # Build many (namespace, shard) refs so cas/refs/ has real breadth to LIST.
+        self._ctl("/config", {"rate": 0.0, "list_anomaly": None})
+        for t in tables:
+            for n in nodes:
+                sql.create_ca_table(n, t, columns="id UInt64, payload String", order_by="id", wide=True)
+            sql.insert_random(nodes[0], t, rows=rows, payload_bytes=payload, op_id=0)
 
-        Expected property to assert once that instrumentation exists:
+        # Baseline GC round with STABLE listing → reference discovery cost.
+        base_before = _common.counters_window(ctx)
+        gc_mod.gc_drive_round(cl, log_fn=ctx.log)
+        base_delta = base_before().get("_total", {})
+        result.observations["baseline_CasRootGet"] = int(base_delta.get("CasRootGet", 0))
 
-        - An ambiguous / unstable key (a root-shard token that cannot be proven unchanged) is treated
-          as CHANGED and re-read — the fold must NOT skip it. This is the conservative, fail-safe
-          choice: a falsely-skipped shard would make GC blind to a real owner transition.
-        - Correctness is preserved end-to-end: the replica-agreement oracle still matches and `fsck`
-          stays clean despite the injected list anomalies.
-        - The cost of the conservative reread is visible: `CasRootGet` increases (the shard body is
-          fetched because token-diff could not prove it unchanged) relative to a stable-listing run,
-          while `CasBlobDelete` does not delete anything that is still reachable.
+        # ARM LIST anomalies on the cas/refs/ prefix, then churn + GC so discovery keeps re-listing.
+        self._ctl("/config", {"list_anomaly": "duplicate", "list_prefix": "cas/refs/"})
+        anomaly_before = _common.counters_window(ctx)
+        gc_errors = []
+        # Drop half the tables (creates owner transitions the fold must not skip) and drive GC while
+        # the proxy perturbs each cas/refs/ LIST.
+        for i, t in enumerate(tables):
+            if i % 2 == 0:
+                try:
+                    sql.drop_table_both(cl, t)
+                except Exception as e:
+                    gc_errors.append({"op": f"drop {t}", "err": str(e)[:150]})
+        for r in range(gc_rounds):
+            # alternate the two anomaly kinds across rounds
+            self._ctl("/config", {"list_anomaly": "drop_token" if r % 2 else "duplicate",
+                                  "list_prefix": "cas/refs/"})
+            try:
+                gc_mod.gc_drive_round(cl, log_fn=ctx.log)
+            except Exception as e:
+                gc_errors.append({"op": f"gc round {r}", "err": str(e)[:150]})
+        anomaly_delta = anomaly_before().get("_total", {})
+        result.observations["anomaly_CasRootGet"] = int(anomaly_delta.get("CasRootGet", 0))
 
-        Until that proxy/instrumented backend exists this card cannot run; it records inconclusive.
-        """
-        self.run_inconclusive(ctx, result)
+        # DISARM before the checkpoint (fsck/GC must see ground truth).
+        self._ctl("/config", {"list_anomaly": None, "rate": 0.0})
+        stats = self._ctl("/stats")
+        result.observations["proxy_stats"] = stats
+
+        # 1. The anomaly path was actually exercised.
+        perturbed = int(stats.get("list_perturbed", 0))
+        result.add(Verdict.check(
+            "LIST anomalies were injected on cas/refs/ (test not vacuous)", "> 0 perturbed LISTs",
+            f"{perturbed}", perturbed > 0,
+            "" if perturbed > 0 else "proxy perturbed 0 LISTs — discovery may not have re-listed cas/refs/"))
+
+        # 2. GC never errored under the injected anomalies (a malformed page must not crash the round).
+        result.observations["gc_errors"] = gc_errors
+        result.add(Verdict.check(
+            "GC discovery tolerated malformed LIST pages (no round error)", "0 errors",
+            f"{len(gc_errors)} errors", not gc_errors, "" if not gc_errors else f"{gc_errors[:3]}"))
+
+        # 3. Cost-of-conservatism (informational): reread cost under anomalies vs the stable baseline.
+        result.add(Verdict(
+            "conservative-reread cost under unstable listings (info)",
+            "recorded", f"CasRootGet baseline={result.observations['baseline_CasRootGet']} "
+            f"anomaly-window={result.observations['anomaly_CasRootGet']}", "pass"))
+
+        # 4. Surviving tables' replicas still agree despite the anomaly window.
+        for i, t in enumerate(tables):
+            if i % 2 == 1:  # the ones not dropped
+                for n in nodes:
+                    try:
+                        n.command(f"SYSTEM SYNC REPLICA {t}", timeout=300)
+                    except Exception as e:
+                        ctx.log(f"S27 SYNC {t}@{n.container}: {e}")
+                _common.assert_replicas_agree(result, cl, sql.table_checksum_query(t),
+                                              name=f"S27 replica agreement [{t}]")
+
+        # 5. Safety end-checkpoint: dangling=0 and dropped content fully reclaims (no skipped fold
+        #    stranded a shard) — the core S27 invariant.
+        _common.standard_end(ctx, result, [t for i, t in enumerate(tables) if i % 2 == 1],
+                             table_filter="table LIKE 's27_%'")
