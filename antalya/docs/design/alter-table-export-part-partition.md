@@ -422,12 +422,13 @@ The following notes expand on expected behavior of commands.
    every active part of partition `p` across all replicas that host
    it; `system.replicated_partition_exports` converges to `COMPLETED`.
 
-4. Re-issuing the same `EXPORT PARTITION` within
-   `export_merge_tree_partition_manifest_ttl` is a no-op (no
-   duplicate files) unless `export_merge_tree_partition_force_export = 1`. This
-   behavior avoids accidentally exporting the same data twice. Note, however
-   that forcing the operation is dangerous if ClickHouse can't clean up the
-   previous operation. In this case you'll potentially commit files twice. 
+4. Re-issuing the same `EXPORT PARTITION` is rejected (no duplicate
+   files) unless `export_merge_tree_partition_force_export = 1`. Export
+   entries are kept indefinitely in `system.replicated_partition_exports`
+   as history; they never expire. This behavior avoids accidentally
+   exporting the same data twice. Note, however that forcing the
+   operation is dangerous if ClickHouse can't clean up the previous
+   operation. In this case you'll potentially commit files twice. 
 
 5. Killing an in-flight partition export via `KILL EXPORT PARTITION`
    transitions status to `KILLED` and stops all replicas' contributions.
@@ -481,7 +482,6 @@ The following notes expand on expected behavior of commands.
 | `export_merge_tree_part_filename_pattern` | query | `{part_name}_{checksum}` | `String` | both | Filename template; supports `{part_name}`, `{checksum}`, `{database}`, `{table}`, server macros. |
 | `export_merge_tree_partition_force_export` | query | `false` | `Bool` | `EXPORT PARTITION` | Overwrite a live Keeper manifest for the same `(source, destination, partition_id)`. Dangerous — can produce duplicate data on the destination; use with caution. |
 | `export_merge_tree_partition_max_retries` | query | `3` | `UInt64` | `EXPORT PARTITION` | Retry budget applied to both per-part export attempts and per-task commit attempts (Iceberg). The task fails terminally if commit retries alone exceed the budget. |
-| `export_merge_tree_partition_manifest_ttl` | query | `180` (seconds) | `UInt64` | `EXPORT PARTITION` | Live-manifest TTL; acts as the idempotency window. Does not interrupt in-flight tasks. Keep this greater than `export_merge_tree_partition_task_timeout_seconds` if you want the `KILLED` entry to remain visible in `system.replicated_partition_exports` after the timeout fires. |
 | `export_merge_tree_partition_task_timeout_seconds` | query | `3600` (seconds) | `UInt64` (`0`=disable) | `EXPORT PARTITION` | Wall-clock cap for `PENDING` tasks; on expiry transitions to `KILLED` with a timeout reason. Measured from manifest `create_time`. Enforcement latency ≈ one manifest-updater poll cycle (~30s) plus Keeper watch propagation. |
 | `export_merge_tree_partition_system_table_prefer_remote_information` | query | `false` | `Bool` | `EXPORT PARTITION` | When `true`, `system.replicated_partition_exports` fetches fresh state from Keeper (requires the `MULTI_READ` feature flag); when `false`, uses local cached state. **Default flipped from `true` to `false` in this release** — Keeper round-trips were more expensive than warranted for the typical observability workload. (See NOTE 2.)|
 | `export_merge_tree_part_file_already_exists_policy` | query | `skip` | `skip` / `error` / `overwrite` | `EXPORT PARTITION` | Per-file policy during partition export. |
@@ -722,7 +722,8 @@ peak memory. Hot path is the Parquet encoder, which warrants a guard against reg
   (`parts_to_do > 0`) rather than corrupt data. Acceptable but must be documented in the
   upgrade notes.
 - **Risk (object-storage cost / accidental large exports):** mitigated by the experimental
-  gates (default off) and the manifest idempotency window.
+  gates (default off) and the duplicate-export rejection (an existing export key is refused
+  unless `export_merge_tree_partition_force_export` is set).
 - **Risk (Iceberg catalog manifest retention):** if the catalog reaps old manifest files
   with a retention window shorter than `export_merge_tree_partition_task_timeout_seconds`,
   the rare "sole-node commits, crashes, recovers after reaper deleted the commit manifest"

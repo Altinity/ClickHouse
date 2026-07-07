@@ -8,6 +8,7 @@ from ci.jobs.scripts.workflow_hooks.new_tests_check import (
 )
 from ci.jobs.scripts.workflow_hooks.pr_labels_and_category import Labels
 from ci.praktika.info import Info
+from ci.praktika.settings import Settings
 
 
 def only_docs(changed_files):
@@ -57,6 +58,19 @@ FUNCTIONAL_TEST_FLAKY_CHECK_JOBS = [
     "Stateless tests (amd_debug, flaky check)",
     "Stateless tests (amd_binary, flaky check)",
 ]
+
+DOCKER_REQUIRED_ARM_JOBS = {
+    "Build (arm_release)",
+    Settings.DOCKER_BUILD_ARM_LINUX_JOB_NAME,
+    Settings.DOCKER_BUILD_MANIFEST_JOB_NAME,
+}
+
+
+def is_ci_excluded_by_tag(job_name, tag):
+    if tag in ("aarch64", "arm") and job_name in DOCKER_REQUIRED_ARM_JOBS:
+        return False
+
+    return tag in job_name.lower()
 
 
 _info_cache = None
@@ -225,7 +239,7 @@ def should_skip_job(job_name):
 
     ci_exclude_tags = _info_cache.get_kv_data("ci_exclude_tags") or []
     for tag in ci_exclude_tags:
-        if tag in job_name.lower():
+        if is_ci_excluded_by_tag(job_name, tag):
             return True, f"Skipped, job name includes excluded tag '{tag}'"
 
     # NOTE (strtgbb): disabled this feature for now

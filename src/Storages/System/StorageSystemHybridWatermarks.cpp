@@ -61,7 +61,7 @@ void StorageSystemHybridWatermarks::fillData(
 
     /// Enumerate only Hybrid tables (StorageDistributed with getName() == "Hybrid").
     std::map<String, std::map<String, StoragePtr>> tables;
-    for (const auto & db : DatabaseCatalog::instance().getDatabases(GetDatabasesOptions{.with_datalake_catalogs = false}))
+    for (const auto & db : DatabaseCatalog::instance().getDatabases(GetDatabasesOptions{.with_remote_databases = false}))
     {
         if (db.second->isExternal())
             continue;

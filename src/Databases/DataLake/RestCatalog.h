@@ -7,7 +7,13 @@
 #include <IO/ReadWriteBufferFromHTTP.h>
 #include <IO/HTTPHeaderEntries.h>
 #include <Interpreters/Context_fwd.h>
+#include <base/defines.h>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <Poco/JSON/Object.h>
 
 namespace DB
@@ -29,6 +35,13 @@ struct AccessToken
             return false;
         return std::chrono::system_clock::now() >= expires_at.value();
     }
+};
+
+struct VendedStorageCredentials
+{
+    std::shared_ptr<IStorageCredentials> credentials;
+    std::string endpoint;
+    std::optional<std::chrono::system_clock::time_point> expires_at;
 };
 
 class RestCatalog : public ICatalog, public DB::WithContext
@@ -82,6 +95,8 @@ public:
 
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
 
+    void setVendedCredentialsCacheTTL(std::chrono::seconds ttl) override { vended_credentials_cache_ttl.store(ttl, std::memory_order_relaxed); }
+
     String getClientId() const { return client_id; }
     String getClientSecret() const { return client_secret; }
 
@@ -126,6 +141,16 @@ protected:
     std::string oauth_server_uri;
     bool oauth_server_use_request_body;
     mutable std::optional<AccessToken> access_token;
+
+    /// TTL for caching vended credentials per table (0 means no caching).
+    std::atomic<std::chrono::seconds> vended_credentials_cache_ttl{std::chrono::seconds::zero()};
+
+    /// Sweep trigger threshold, not capacity!
+    static constexpr size_t credentials_cache_cleanup_threshold = 1000;
+    mutable std::mutex credentials_cache_mutex;
+
+    mutable std::map<std::pair<std::string, std::string>, VendedStorageCredentials> credentials_cache
+        TSA_GUARDED_BY(credentials_cache_mutex);
 
 public:
     class AllowedNamespaces
@@ -180,7 +205,12 @@ protected:
         TableMetadata & result) const;
 
     Config loadConfig();
-    virtual DB::HTTPHeaderEntries getAuthHeaders(bool update_token) const;
+    virtual DB::HTTPHeaderEntries getAuthHeaders(
+        bool update_token,
+        const String & method = {},
+        const Poco::URI & url = {},
+        const DB::HTTPHeaderEntries & extra_headers = {},
+        const String & body = {}) const;
     static void parseCatalogConfigurationSettings(const Poco::JSON::Object::Ptr & object, Config & result);
 
     void sendRequest(
@@ -189,7 +219,13 @@ protected:
         const String & method = Poco::Net::HTTPRequest::HTTP_POST,
         bool ignore_result = false) const;
 
-    std::pair<std::shared_ptr<IStorageCredentials>, String> getCredentialsAndEndpoint(Poco::JSON::Object::Ptr object, const String & location) const;
+    VendedStorageCredentials getCredentialsAndEndpoint(Poco::JSON::Object::Ptr object, const String & location) const;
+
+    std::optional<VendedStorageCredentials> tryGetCachedCredentials(
+        const std::string & namespace_name, const std::string & table_name) const;
+
+    void cacheCredentials(
+        const std::string & namespace_name, const std::string & table_name, const VendedStorageCredentials & parsed) const;
 
     AccessToken retrieveAccessToken() const;
 };
@@ -242,7 +278,12 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE;
     }
 
-    DB::HTTPHeaderEntries getAuthHeaders(bool update_token) const override;
+    DB::HTTPHeaderEntries getAuthHeaders(
+        bool update_token,
+        const String & method = {},
+        const Poco::URI & url = {},
+        const DB::HTTPHeaderEntries & extra_headers = {},
+        const String & body = {}) const override;
 
     const std::string & getGoogleADCClientId() const { return google_adc_client_id; }
     const std::string & getGoogleADCClientSecret() const { return google_adc_client_secret; }

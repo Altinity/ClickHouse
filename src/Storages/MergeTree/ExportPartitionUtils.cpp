@@ -9,7 +9,12 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <filesystem>
 #include <thread>
+#include <Core/Block.h>
+#include <Core/Settings.h>
+#include <DataTypes/Utils.h>
+#include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ExpressionActions.h>
 
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
@@ -37,6 +42,11 @@ namespace ErrorCodes
     extern const int NETWORK_ERROR;
 }
 
+namespace Setting
+{
+    extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
+}
+
 namespace FailPoints
 {
     extern const char iceberg_export_after_commit_before_zk_completed[];
@@ -47,14 +57,13 @@ namespace fs = std::filesystem;
 
 namespace ExportPartitionUtils
 {
-    std::vector<Field> getPartitionValuesForIcebergCommit(
+    Block getPartitionSourceBlockForIcebergCommit(
         MergeTreeData & storage, const String & partition_id)
     {
         auto lock = storage.readLockParts();
         const auto parts = storage.getDataPartsVectorInPartitionForInternalUsage(
             MergeTreeDataPartState::Active, partition_id, lock);
-        
-        /// todo arthur: bad arguments for now, pick a better one
+
         if (parts.empty())
             throw Exception(ErrorCodes::NO_SUCH_DATA_PART,
                 "Cannot find active part for partition_id '{}' to derive Iceberg partition "
@@ -62,7 +71,7 @@ namespace ExportPartitionUtils
                 "or this replica has not yet received any part for this partition. "
                 "The commit will be retried.",
                 partition_id);
-        return parts.front()->partition.value;
+        return parts.front()->minmax_idx->getBlock(storage);
     }
 
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest)
@@ -72,6 +81,10 @@ namespace ExportPartitionUtils
         context_copy->setCurrentQueryId(manifest.query_id);
         context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
         context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
+        context_copy->setSetting("output_format_parquet_compression_method", manifest.parquet_compression_method);
+        context_copy->setSetting("output_format_compression_level", manifest.output_format_compression_level);
+        context_copy->setSetting("output_format_parquet_row_group_size", manifest.parquet_row_group_size);
+        context_copy->setSetting("output_format_parquet_row_group_size_bytes", manifest.parquet_row_group_size_bytes);
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
         context_copy->setSetting("export_merge_tree_part_max_bytes_per_file", manifest.max_bytes_per_file);
@@ -92,6 +105,12 @@ namespace ExportPartitionUtils
         /// stalls when the setting is only set at the query level.
         context_copy->setSetting("allow_insert_into_iceberg", true);
 
+        /// Reapply the initiator's lossy-cast decision (persisted in the manifest) so the
+        /// worker's schema revalidation honors the user's choice. Without this, a task
+        /// scheduled without the opt-in could still apply a lossy cast if the destination
+        /// schema drifts to a lossy target between scheduling and execution.
+        context_copy->setSetting("export_merge_tree_part_allow_lossy_cast", manifest.allow_lossy_cast);
+
 	    return context_copy;
     }
 
@@ -102,7 +121,7 @@ namespace ExportPartitionUtils
     {
         std::vector<std::string> exported_paths;
 
-        LOG_INFO(log, "ExportPartition: Getting exported paths for {}", export_path);
+        LOG_DEBUG(log, "ExportPartition: Getting exported paths for {}", export_path);
 
         const auto processed_parts_path = fs::path(export_path) / "processed";
 
@@ -112,7 +131,7 @@ namespace ExportPartitionUtils
         if (Coordination::Error::ZOK != zk->tryGetChildren(processed_parts_path, processed_parts))
         {
             /// todo arthur do something here
-            LOG_INFO(log, "ExportPartition: Failed to get parts children, exiting");
+            LOG_WARNING(log, "ExportPartition: Failed to get parts children, exiting");
             return {};
         }
 
@@ -136,7 +155,7 @@ namespace ExportPartitionUtils
                 /// todo arthur what to do in this case?
                 /// It could be that zk is corrupt, in that case we should fail the task
                 /// but it can also be some temporary network issue? not sure
-                LOG_INFO(log, "ExportPartition: Failed to get exported path, exiting");
+                LOG_WARNING(log, "ExportPartition: Failed to get exported path, exiting");
                 return {};
             }
 
@@ -180,10 +199,22 @@ namespace ExportPartitionUtils
         auto commit_lock = zkutil::EphemeralNodeHolder::tryCreate(commit_lock_path, *zk, replica_name);
         if (!commit_lock)
         {
-            LOG_INFO(log, "ExportPartition: commit_lock for {} is held by another replica, skipping commit on this replica", entry_path);
+            LOG_DEBUG(log, "ExportPartition: commit_lock for {} is held by another replica, skipping commit on this replica", entry_path);
             return;
         }
         LOG_INFO(log, "ExportPartition: commit_lock for {} acquired by replica {}", entry_path, replica_name);
+
+        /// Honor a concurrent KILL: commit_lock serializes us against killExportPartition,
+        /// so a non-PENDING status here means cancel won the race.
+        std::string status_str;
+        if (!zk->tryGet(fs::path(entry_path) / "status", status_str))
+            return;
+        const auto status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(status_str);
+        if (!status || *status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        {
+            LOG_DEBUG(log, "ExportPartition: {} not PENDING, skipping commit", entry_path);
+            return;
+        }
 
         const auto exported_paths = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
 
@@ -204,8 +235,8 @@ namespace ExportPartitionUtils
         {
             iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
             if (source_storage.getInMemoryMetadataPtr()->hasPartitionKey())
-                iceberg_args.partition_values =
-                    getPartitionValuesForIcebergCommit(source_storage, manifest.partition_id);
+                iceberg_args.partition_source_block =
+                    getPartitionSourceBlockForIcebergCommit(source_storage, manifest.partition_id);
         }
 
         const auto destination_commit_info = destination_storage->commitExportPartitionTransaction(
@@ -286,14 +317,14 @@ namespace ExportPartitionUtils
         if (!zk->tryGet(status_path, current_status, &status_stat))
         {
             /// Task was removed (TTL cleanup or force-overwrite). Nothing to do.
-            LOG_INFO(log, "ExportPartition: /status missing for {}, skipping commit-failure bookkeeping", entry_path);
+            LOG_DEBUG(log, "ExportPartition: /status missing for {}, skipping commit-failure bookkeeping", entry_path);
             return false;
         }
 
         const auto status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(current_status);
         if (!status)
         {
-            LOG_INFO(log, "ExportPartition: Invalid status {} for task {}, skipping commit-failure bookkeeping", current_status, entry_path);
+            LOG_WARNING(log, "ExportPartition: Invalid status {} for task {}, skipping commit-failure bookkeeping", current_status, entry_path);
             return false;
         }
 
@@ -301,7 +332,7 @@ namespace ExportPartitionUtils
         {
             /// Another replica already reached a terminal state (COMPLETED or FAILED).
             /// Do NOT overwrite — a successful commit by a peer must win.
-            LOG_INFO(log,
+            LOG_DEBUG(log,
                 "ExportPartition: /status for {} is {} (not PENDING), skipping commit-failure bookkeeping",
                 entry_path, current_status);
             return false;
@@ -371,7 +402,7 @@ namespace ExportPartitionUtils
             /// non-fatal: the next attempt re-reads /status and either skips (terminal
             /// state won) or retries the bookkeeping. Worst case we delay FAILED by one
             /// poll cycle, which matches the best-effort property of the existing counters.
-            LOG_INFO(log, "ExportPartition: Failed to persist commit failure bookkeeping for {}: {}", entry_path, rc);
+            LOG_WARNING(log, "ExportPartition: Failed to persist commit failure bookkeeping for {}: {}", entry_path, rc);
             return false;
         }
 
@@ -549,6 +580,50 @@ namespace ExportPartitionUtils
         }
     }
 #endif
+
+    void verifyExportSchemaCastable(
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const StorageID & destination_storage_id,
+        const ContextPtr & context)
+    {
+        /// Build (and discard) the same converting DAG the export worker will build
+        /// later, to surface structural mismatches (column count, untyped casts) early.
+        Block source_sample_block;
+        for (const auto & column : source_metadata->getColumns().getReadable())
+            source_sample_block.insert({column.type->createColumn(), column.type, column.name});
+
+        const auto destination_sample_block = destination_metadata->getSampleBlockNonMaterialized();
+
+        const auto source_columns = source_sample_block.getColumnsWithTypeAndName();
+        const auto destination_columns = destination_sample_block.getColumnsWithTypeAndName();
+
+        (void) ActionsDAG::makeConvertingActions(
+            source_columns,
+            destination_columns,
+            ActionsDAG::MatchColumnsMode::Position,
+            context);
+
+        /// Lossy casts may silently change values, so reject them unless the user opts in.
+        if (context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast])
+            return;
+
+        const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
+        for (size_t i = 0; i < num_columns; ++i)
+        {
+            const auto & source_column = source_columns[i];
+            const auto & destination_column = destination_columns[i];
+            if (!canBeSafelyCast(source_column.type, destination_column.type))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export to {}: column '{}' requires a lossy cast from {} to {}, "
+                    "which may change values. Set `export_merge_tree_part_allow_lossy_cast = 1` "
+                    "to allow lossy casts during export.",
+                    destination_storage_id.getFullTableName(),
+                    destination_column.name,
+                    source_column.type->getName(),
+                    destination_column.type->getName());
+        }
+    }
 }
 
 }
