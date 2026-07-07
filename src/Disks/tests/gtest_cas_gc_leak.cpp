@@ -361,6 +361,55 @@ TEST(CasGcLeak, ResurrectReplacedIncarnationReclaimed)
     EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of(P)), 0) << "no stranded positive in-degree";
 }
 
+/// IDEMPOTENCY of the RESURRECT-REUPLOAD-ORPHAN fold: drives the exact same condemn-A / resurrect-B /
+/// drop-B / reclaim sequence as `ResurrectReplacedIncarnationReclaimed` above, then keeps running the
+/// regular round PAST the fixpoint. The re-condemn that reclaims the resurrect-replaced incarnation B
+/// must fire exactly once: extra rounds on an already-reclaimed content hash must be no-ops (no
+/// re-condemn churn, no duplicate retired entry) and must never manufacture fresh fsck debris.
+TEST(CasGcLeak, ResurrectReplacedReclaimIsIdempotent)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const RootNamespace ns{"test/tbl"};
+    const String P = "resurrect-payload-idem";
+
+    /// 1. Publish ref r1 -> token A referenced, then drop it.
+    publishOneBlobPart(s, ns, "r1", P);
+    s->dropRef(ns, "r1");
+    s->renewWatermarkOnce();   /// advance the floor so A is not spared as in-flight
+
+    /// 2. ONE GC round: A transitions to in-degree 0 and is condemned (retired), NOT yet deleted.
+    Gc gc(s, hexToU128("00000000000000000000000000000005"));
+    gc.runRegularRound();
+    s->retireView().refresh();
+
+    /// 3. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B.
+    publishOneBlobPart(s, ns, "r2", P);
+    s->dropRef(ns, "r2");
+    s->renewWatermarkOnce();
+
+    /// 4. Reclaim B to a fixpoint (the RESURRECT-REUPLOAD-ORPHAN fold under test).
+    runGcToFixpoint(s, gc);
+    ASSERT_FALSE(blobPresent(b, s->layout(), P)) << "B must be reclaimed before the idempotency check";
+
+    /// 5. Extra rounds past the fixpoint: nothing is left to do for this hash. The fold must not
+    /// re-condemn it (that would be the churn/duplicate-entry bug) and must not resurrect any debris.
+    for (int round = 0; round < 3; ++round)
+    {
+        const RoundReport r = gc.runRegularRound();
+        if (r.acquired_lease)
+            EXPECT_EQ(r.condemned, 0u) << "no re-condemn of an already-reclaimed hash on extra round " << round;
+        s->renewWatermarkOnce();
+    }
+
+    EXPECT_FALSE(blobPresent(b, s->layout(), P)) << "stays deleted across extra rounds";
+    EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of(P)), 0) << "no stranded positive in-degree";
+
+    const FsckReport after = runFsck(*s, /*detail=*/false);
+    EXPECT_EQ(after.unreachable, 0u) << "re-condemn churn must not manufacture a fresh unreachable object";
+    EXPECT_EQ(after.dangling, 0u) << "idempotent extra rounds must never lose a reachable object";
+}
+
 /// NO-LEAK (abandon): a build stages a manifest, precommitAdds it (activating +1 for its OWN unique
 /// blob, body present), uploads that blob, then VANISHES (crash: never promoted, never abandoned). GC's
 /// automatic precommit-reclaim (B8) judges the build dead via the watermark and appends a PrecommitRemove
