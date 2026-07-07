@@ -231,7 +231,31 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         /// Settle the retired entry for the blob being closed, against its post-merge in-degree...
         if (ri < prior_retired.size() && prior_retired[ri].hash == cur_blob)
         {
-            settleEntry(prior_retired[ri++], cur_edges);
+            /// RESURRECT-REUPLOAD-ORPHAN: on a re-reference cycle (touched this window, net in-degree 0),
+            /// re-observe the CURRENT token. If it differs from the retired entry's token, a resurrect
+            /// replaced the incarnation at this key — supersede the stale entry with a fresh condemn of the
+            /// current token so the replacement enters the pipeline (the stale token's exact-token delete
+            /// would only find the new token and no-op). Keyed on (hash, current token), matching GRetire.
+            bool superseded = false;
+            if (cur_edges == 0 && cur_touched && head_blob)
+            {
+                if (const auto hr = head_blob(cur_blob);
+                    hr && hr->exists && hr->token != prior_retired[ri].token)
+                {
+                    RetiredEntry fresh;
+                    fresh.kind = ObjectKind::Blob;
+                    fresh.hash = cur_blob;
+                    fresh.token = hr->token;
+                    fresh.size = hr->size;
+                    fresh.condemn_round = condemn_round;
+                    rmr.replaced.push_back(fresh);              /// caller emits blob_retire_replaced
+                    rmr.still_retired.push_back(std::move(fresh));
+                    ++ri;                                       /// drop the stale entry (superseded)
+                    superseded = true;
+                }
+            }
+            if (!superseded)
+                settleEntry(prior_retired[ri++], cur_edges);
         }
         /// ...or condemn a fresh transition-to-zero (no prior entry). `head_blob` captures the exact
         /// incarnation token for the later exact-token delete; an absent object needs no entry.

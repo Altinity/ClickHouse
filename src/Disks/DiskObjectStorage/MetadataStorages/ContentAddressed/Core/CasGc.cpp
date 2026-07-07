@@ -24,6 +24,7 @@ namespace ProfileEvents
     extern const Event CasGcRetiredSpared;
     extern const Event CasGcRetiredGraduated;
     extern const Event CasGcRetiredRedeleted;
+    extern const Event CasGcRetireReplaced;
     extern const Event CasGcHeartbeatFenceOuts;
     extern const Event CasGcFloorHeldByStaleAck;
 }
@@ -331,6 +332,24 @@ RoundReport Gc::runRegularRound()
                 e.outcome = "pending";
                 e.reason = "condemn_round < min_ack; published delete_pending (two-phase graduation)";
                 e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}};
+            });
+        }
+        for (const RetiredEntry & entry : merge.replaced)
+        {
+            ProfileEvents::increment(ProfileEvents::CasGcRetireReplaced);
+            /// RESURRECT-REUPLOAD-ORPHAN: the current object token differed from a stale retired entry;
+            /// the fold superseded that entry and re-condemned the current token in the same window.
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::BlobRetireReplaced;
+                e.object_kind = CasEventObjectKind::Blob;
+                e.object_hash = u128ToHex(entry.hash);
+                e.token = entry.token.value;
+                e.round = new_round;
+                e.gen = generation;
+                e.outcome = "replaced";
+                e.reason = "current object token differs from the retired entry — resurrect replaced the "
+                           "incarnation; superseded the stale entry and re-condemned the current token";
             });
         }
     }
