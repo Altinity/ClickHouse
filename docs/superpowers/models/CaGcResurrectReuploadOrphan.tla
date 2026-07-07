@@ -18,9 +18,10 @@
 (*   - FALSE (shipped bug): retire keyed on hash; settle the stale entry;     *)
 (*       the fold, being touch-gated, never re-condemns the replaced token.   *)
 (*       => NoLeakForever VIOLATED (the re-uploaded incarnation orphans).     *)
-(*   - TRUE  (fix): when the fold settles a prior entry whose token differs   *)
-(*       from the current object (a resurrect replaced it) with in-degree 0,  *)
-(*       re-condemn the CURRENT token in the SAME (touched) fold.             *)
+(*   - TRUE  (fix): condemn keyed on `(hash, current token)`. When the fold  *)
+(*       settles a prior entry whose token differs from the current object   *)
+(*       (a resurrect replaced it) with `touched /\ in-degree = 0`, re-condemn*)
+(*       the CURRENT token in that SAME fold round.                          *)
 (*       => NoLeakForever HOLDS.                                             *)
 (*                                                                          *)
 (* PROPERTY: NoLeakForever == a present, ever-edged, unreferenced incarnation *)
@@ -125,8 +126,14 @@ GcFold ==
        THEN \* SETTLE the existing retired entry (unconditional every round)
             IF indeg > 0
             THEN /\ retTok' = 0 /\ retPending' = FALSE           \* SPARE: recovery wins (in-degree > 0)
+                 \* FIX rule (final wording): re-condemn keyed on the CURRENT token, gated on
+                 \* touched /\ in-degree = 0. `touched` is not spelled out in the guard below because,
+                 \* by construction, `objTok /= retTok` only arises via Resurrect (which sets touched'
+                 \* = TRUE), and this round is the very next GcFold to observe it (GcFold always
+                 \* consumes a `retTok /= 0` entry the round it fires, resetting `touched` to FALSE in
+                 \* the SAME step) — so `touched` is invariantly TRUE whenever this branch is taken.
             ELSE IF FixReCondemnCurrentToken /\ retTok /= objTok /\ objTok /= 0
-                 THEN /\ retTok' = objTok /\ retPending' = FALSE  \* FIX: object REPLACED -> re-condemn current token
+                 THEN /\ retTok' = objTok /\ retPending' = FALSE  \* FIX: object REPLACED -> re-condemn CURRENT token
                  ELSE /\ retTok' = retTok /\ retPending' = TRUE   \* SHIPPED: graduate the STALE token; never re-observe current
        ELSE \* retTok = 0: FRESH-CONDEMN a newly discovered zero-in-degree blob (TOUCH-GATED)
             IF touched /\ indeg = 0 /\ objTok /= 0 /\ everEdged
